@@ -1674,12 +1674,15 @@ impl Scheduler {
             QueueId::Thread(thread) => thread,
             QueueId::Process(_) => target,
         };
-        if crate::syscalls::host_signal_send_refused(
+        // Linux re-queues this expiry (`posixtimer_sig_unignore`), and the
+        // guest sees it, so a refused send ends the run rather than lose it.
+        if let Some(refusal) = crate::syscalls::host_signal_send_refusal(
             "the re-queue of a timer expiry at unignore",
             process.as_raw(),
             addressee.as_raw(),
             signal,
         ) {
+            self.host_signal_send_refusal.get_or_insert(refusal);
             return;
         }
         let token = self.discard_kept_token(queue, signal);
@@ -1687,6 +1690,10 @@ impl Scheduler {
         let every_thread_blocks = matches!(queue, QueueId::Process(_))
             && self.models_signal_targets
             && self.kernel_signal_target(process, target, signal).is_none();
+        #[cfg(test)]
+        {
+            self.host_signal_attempts += 1;
+        }
         // SAFETY: tgkill and kill take only integers; the siginfo forms take
         // a pointer to `info`, which outlives the call.
         let rc = match (queue, info.as_ref()) {

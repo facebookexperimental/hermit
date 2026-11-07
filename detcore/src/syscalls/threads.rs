@@ -1360,18 +1360,40 @@ pub(crate) fn host_signal_state_reads_refused() -> bool {
 /// ([`read_kernel_signal_state`]). This is the send latch of SIGSHARE's
 /// design (section 7.3): every scheduler send on such a backend goes through
 /// the backend's publication instead, and this backstop catches a path that
-/// misses its gate.
+/// misses its gate. Only the test-only fault hooks log and go on; a send whose
+/// signal the guest would see ends the run instead
+/// ([`host_signal_send_refusal`]).
 pub(crate) fn host_signal_send_refused(site: &str, pid: i32, tid: i32, signal: i32) -> bool {
-    if !host_signal_state_reads_refused() {
-        return false;
+    match host_signal_send_refusal(site, pid, tid, signal) {
+        Some(refusal) => {
+            error!("{}", refusal);
+            true
+        }
+        None => false,
     }
-    error!(
-        "HERMIT_REFUSAL host-signal-send: {} would send host signal {} to guest thread {} \
-         (process {}): this backend's guest thread IDs do not name host tasks, so nothing \
-         was sent",
-        site, signal, tid, pid
-    );
-    true
+}
+
+/// [`host_signal_send_refused`]'s refusal as the message that ends the run, for
+/// a send whose signal the guest would see: `None` where the send may be made.
+/// Skipping such a send would silently lose a signal Linux delivers, a
+/// different guest result than Linux's, which principle 6 forbids; so the
+/// scheduler ends the run with it (`exit_on_scheduler_refusal`), as it ends
+/// the run for its other refusals (the coord7 review of
+/// <https://github.com/rrnewton/hermit/pull/5221>, finding 6).
+pub(crate) fn host_signal_send_refusal(
+    site: &str,
+    pid: i32,
+    tid: i32,
+    signal: i32,
+) -> Option<String> {
+    host_signal_state_reads_refused().then(|| {
+        format!(
+            "HERMIT_REFUSAL host-signal-send: {} would send host signal {} to guest thread {} \
+             (process {}): this backend's guest thread IDs do not name host tasks, so nothing \
+             was sent",
+            site, signal, tid, pid
+        )
+    })
 }
 
 /// Read `tid`'s signal state from the kernel.

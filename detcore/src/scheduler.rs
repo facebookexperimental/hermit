@@ -2045,6 +2045,14 @@ pub struct Scheduler {
     /// as long as the call blocks.
     kernel_run_signal_refusal: Option<String>,
 
+    /// Set where a scheduler send whose signal the guest would see would make
+    /// a host signal syscall to a guest thread ID that names no host task
+    /// (`crate::syscalls::host_signal_send_refusal`, KVM): the unignore's
+    /// re-queue of a parked timer expiry, and a host-timed parent-death
+    /// signal. The send is not made, and `sched_loop_inner` ends the run with
+    /// it (`exit_on_scheduler_refusal`) rather than lose the signal.
+    host_signal_send_refusal: Option<String>,
+
     /// When the SIGKILL fence started waiting for the current committed
     /// victims, in host time (`sigkill_retirement`).
     sigkill_fence_wait_since: Option<std::time::Instant>,
@@ -4267,6 +4275,12 @@ async fn sched_loop_inner(
         if let Some(refusal) = kernel_run_refusal {
             exit_on_scheduler_refusal(&refusal);
         }
+        // A guest-visible host signal send refused where guest thread IDs name
+        // no host task (`host_signal_send_refusal`).
+        let host_send_refusal = sched.lock().unwrap().host_signal_send_refusal.take();
+        if let Some(refusal) = host_send_refusal {
+            exit_on_scheduler_refusal(&refusal);
+        }
         // A SIGKILL whose victims' deaths or exit publications never arrived
         // (`Scheduler::SIGKILL_FENCE_VALVE`).
         let sigkill_refusal = sched.lock().unwrap().sigkill_fence_refusal.take();
@@ -6186,6 +6200,7 @@ impl Scheduler {
             vfork_barrier_refusal: None,
             kernel_run_requests: Default::default(),
             kernel_run_signal_refusal: None,
+            host_signal_send_refusal: None,
             sigkill_fence_wait_since: None,
             sigkill_fence_refusal: None,
             controlled_child_exits: Default::default(),
@@ -8062,13 +8077,20 @@ impl Scheduler {
                         HostTimedSignalScope::Caller,
                         kernel_signal_bit(signal as libc::c_int),
                     );
-                    if !crate::syscalls::host_signal_send_refused(
+                    // The guest sees this signal, so a refused send ends the
+                    // run rather than lose it.
+                    match crate::syscalls::host_signal_send_refusal(
                         "a host-timed parent-death signal",
                         child.as_raw(),
                         child.as_raw(),
                         signal as libc::c_int,
                     ) {
-                        let _ = signal::kill(Pid::from_raw(child.as_raw()), signal);
+                        Some(refusal) => {
+                            self.host_signal_send_refusal.get_or_insert(refusal);
+                        }
+                        None => {
+                            let _ = signal::kill(Pid::from_raw(child.as_raw()), signal);
+                        }
                     }
                 }
             }
