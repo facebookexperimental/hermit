@@ -499,7 +499,26 @@ impl Recording {
     /// A record whose format this Hermit refuses fails with a
     /// `RecordFormatRefusal` in its chain, whichever format it is in.
     pub fn read_from<R: Read + Seek>(input: &mut R) -> anyhow::Result<Self> {
-        let (recording, _) = Self::read_fingerprinted(input)?;
+        let start = input.stream_position()?;
+        let (recording, _) = Self::read_fingerprinted(input).map_err(|error| {
+            if error.chain().any(|cause| cause.is::<serde_json::Error>()) {
+                // As in `decode`: a record that cannot be decoded is still
+                // refused by a format this Hermit does not read, probed from
+                // its bytes, rather than reporting the decoding error.
+                let probed = (|| {
+                    input.seek(SeekFrom::Start(start))?;
+                    let mut bytes = Vec::new();
+                    input.read_to_end(&mut bytes)?;
+                    anyhow::Ok(bytes)
+                })();
+                match probed {
+                    Ok(bytes) => refuse_undecodable_format(&bytes, error),
+                    Err(_) => error,
+                }
+            } else {
+                error
+            }
+        })?;
         recording
             .metadata()
             .validate_format()
