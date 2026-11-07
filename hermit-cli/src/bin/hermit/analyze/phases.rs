@@ -8959,7 +8959,8 @@ mod tests {
         // is read from the record: here its epoch, which the run arguments'
         // --epoch would contradict.
         let newer = edited("newer", &|json| {
-            json["format_version"] = (detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX + 1).into();
+            json["format_version"] =
+                (detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX + 1).into();
             json["epoch"] = "2001-02-03T04:05:06Z".into();
         });
         // Recorded under --chaos-per-thread-slowdown: its rows hold slowdown
@@ -9036,10 +9037,6 @@ mod tests {
         )
         .unwrap();
     }
-
-    /// Every record analyze writes states the trials' signal-state copy
-    /// setting, and a recording made under the other setting is refused
-    /// before any trial; one that states no setting is accepted.
 
     /// Every record analyze writes states the trials' signal-state copy
     /// setting, and a recording made under the other setting is refused
