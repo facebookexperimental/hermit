@@ -2057,3 +2057,145 @@ async fn a_replayed_callback_slice_end_refreshes_its_slowdown_epoch_without_repl
     .await
     .expect("bounded replayed callback slowdown transition");
 }
+
+/// A process that switched to its post-crash bound through the real
+/// caught-signal and exec transitions, then reaches a recorded callback
+/// checkpoint as an administrative turn: the restart there moves the
+/// backstop by the effective (post-crash) bound, not the raw maximum,
+/// so the replayed slice keeps the recording's clock. With the raw
+/// maximum the restart lands a whole post-crash bound early.
+#[tokio::test]
+async fn a_post_crash_checkpoint_restarts_at_the_effective_bound() {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        use reverie::Tool;
+        use crate::preemptions::callback_history::{Origin, Site, Startup};
+        use crate::slice_boundary::callbacks::Callback;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kept-slice.json");
+        let tid = DetTid::from_raw(17);
+        let max_timeslice = 5_000_000;
+        let post_crash = 20_000_000;
+        let mut config = Config {
+            sequentialize_threads: true,
+            chaos: true,
+            post_crash_timeslice: std::num::NonZeroU64::new(post_crash),
+            replay_schedule_from: Some(path.clone()),
+            max_timeslice: std::num::NonZeroU64::new(max_timeslice),
+            target_timeslice: std::num::NonZeroU64::new(1_000_000),
+            ..Config::default()
+        }
+        .with_backend(|backend| {
+            backend.delivers_preemption_timer_events = true;
+            backend.kernel_signal_state_is_guests = true;
+        });
+        config.validate();
+        let start = crate::ThreadState::new(tid, &config, ()).thread_logical_time.as_nanos();
+        let at = start + Duration::from_nanos(110);
+        let call = SchedEvent::syscall(
+            tid,
+            Sysno::close,
+            detcore_model::schedule::SyscallPhase::Prehook,
+        );
+        let (config, state, mut thread) = schedule_replay_thread(
+            &path,
+            config,
+            &[
+                SchedEvent::branches(tid, 1),
+                SchedEvent::branches(tid, 10),
+                other_instructions(tid),
+                call,
+                SchedEvent::branches(tid, 90),
+            ],
+            // The recorded run began a new slice at the call, after 11
+            // branches, and kept running.
+            |writer| {
+                writer.insert_reprioritization(tid, at, 11, DEFAULT_PRIORITY, DEFAULT_PRIORITY, None);
+                writer.insert_callback_checkpoint(
+                    tid,
+                    Origin {
+                        callback: Callback::Syscall(Sysno::close),
+                        site: Site::Prehook,
+                        progress: 12,
+                        last_op: Some(Op::OtherInstructions),
+                        time: at,
+                        rcbs: 11,
+                    },
+                );
+            },
+        );
+        // Switch through the real scheduler's caught-signal and exec transitions.
+        {
+            use crate::post_crash::PostCrashEvent;
+            let mut scheduler = state.sched.lock().unwrap();
+            assert_eq!(scheduler.post_crash_step(tid, PostCrashEvent::Delivered {
+                signal: libc::SIGABRT, default_action: false,
+            }), None);
+            let bound = scheduler.post_crash_step(tid, PostCrashEvent::Exec);
+            assert_eq!(bound, std::num::NonZeroU64::new(post_crash));
+            thread.post_crash_bound = bound;
+        }
+        thread.next_timeslice(&config);
+        assert_eq!(thread.end_of_timeslice, Some(start + Duration::from_nanos(post_crash)));
+        let backstop = thread.replay_backstop.expect("the kept slice's backstop");
+        assert_eq!(thread.end_of_timeslice, Some(backstop));
+        thread.callback_history.install(Startup {
+            checkpoints: state
+                .sched
+                .lock()
+                .unwrap()
+                .callback_checkpoints
+                .get(&tid)
+                .map(|points| points.iter().cloned().collect())
+                .unwrap_or_default(),
+            ..Startup::default()
+        });
+        let mut guest = schedule_replay_guest(&state, &config, thread, 1);
+        let tool: Detcore = Detcore::new(Tid::from_raw(tid.as_raw()), &config);
+        let mut previous = Err(crate::scheduler::SkipTurn);
+        for rcbs in [1, 11] {
+            guest.reported_rcbs = rcbs;
+            let pre = tool.pre_handler_hook_observed(
+                &mut guest,
+                true,
+                crate::CheckIn::Event,
+                Some(Callback::PmuTimer),
+            );
+            let (token, _, _) = drive_callback_hook(&state, tid, pre, &mut previous).await;
+            drive_callback_hook(
+                &state,
+                tid,
+                tool.post_handler_hook_observed(&mut guest, crate::CheckIn::Event, token),
+                &mut previous,
+            )
+            .await;
+        }
+        assert_eq!(guest.thread.thread_logical_time.as_nanos(), at);
+        assert_eq!(guest.thread.end_of_timeslice, Some(backstop));
+
+        let call = tool.pre_handler_hook_observed(
+            &mut guest,
+            false,
+            crate::CheckIn::Event,
+            Some(Callback::Syscall(Sysno::close)),
+        );
+        drive_callback_hook(&state, tid, call, &mut previous).await;
+        let restarted = at + Duration::from_nanos(post_crash);
+        assert!(restarted > backstop);
+        assert_eq!(guest.thread.end_of_timeslice, Some(restarted));
+        assert_eq!(guest.thread.max_timeslice_end, Some(restarted));
+        assert_eq!(guest.thread.replay_backstop, Some(restarted));
+        let scheduler = state.sched.lock().unwrap();
+        assert!(scheduler.callback_checkpoints.values().all(|points| points.is_empty()));
+        assert!(
+            scheduler
+                .replayer
+                .as_ref()
+                .unwrap()
+                .desync_counts
+                .values()
+                .all(|stats| stats.soft == 0 && stats.hard == 0)
+        );
+    })
+    .await
+    .expect("bounded kept slice at a replayed checkpoint");
+}

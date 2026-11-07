@@ -21074,6 +21074,146 @@ mod tests {
         );
     }
 
+    /// A first recorded slice can end on the startup backstop's exact
+    /// nanosecond. Installing it must transfer ownership to the schedule,
+    /// so a later kept callback cannot move that end as a provisional one.
+    #[test]
+    fn finish_thread_start_keeps_a_recorded_deadline_equal_to_its_backstop() {
+        let trace_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            trace_file.path(),
+            PreemptionRecord::from_sched_events(vec![]).to_string(),
+        )
+        .unwrap();
+        let mut config = Config {
+            sequentialize_threads: true,
+            chaos: true,
+            max_timeslice: std::num::NonZeroU64::new(1_000),
+            target_timeslice: None,
+            replay_schedule_from: Some(trace_file.path().to_path_buf()),
+            ..Config::default()
+        }
+        .with_backend(|backend| backend.needs_killed_thread_rpc_cancellation = true);
+        config.validate();
+        assert!(config.use_rcb_time());
+        let (config, state, tid, process) = cancellation_test_state_with_config(config);
+        let length = LogicalTime::from_nanos(1_000);
+        for first_slice in [Some(length), None] {
+            let mut thread = crate::ThreadState::new(tid, &config, ());
+            thread.detpid = Some(process);
+            thread.past_global_first_execve = true;
+            thread.last_grant_deadline = Some(Duration::from_nanos(1));
+            let initial_time = thread.thread_logical_time.as_nanos();
+            let generator = thread.chaos_prng.clone();
+            let mut guest = ExternalRegistrationGuest {
+                global: &state,
+                config: &config,
+                thread,
+                requests: Mutex::new(Vec::new()),
+                post_exec: false,
+                ppid: None,
+                private_memory: None,
+            };
+            super::finish_thread_start(&config, &mut guest, None, first_slice);
+            let thread = &mut guest.thread;
+            let initial_end = initial_time + length;
+            assert_eq!(thread.thread_logical_time.as_nanos(), initial_time);
+            assert_eq!(thread.end_of_timeslice, Some(initial_end));
+            assert_eq!(thread.max_timeslice_end, Some(initial_end));
+            assert_eq!(thread.last_grant_deadline, None);
+            assert_eq!(thread.chaos_prng, generator);
+            let stats = serde_json::to_value(&thread.stats).unwrap();
+
+            thread.thread_logical_time.add_rcbs(91);
+            let advanced = thread.thread_logical_time.as_nanos();
+            assert!(advanced > initial_time);
+            assert!(advanced < initial_end);
+            thread.restart_replay_backstop(&config);
+            let expected_end = if first_slice.is_some() {
+                initial_end
+            } else {
+                advanced + length
+            };
+            assert_eq!(thread.end_of_timeslice, Some(expected_end));
+            assert_eq!(thread.max_timeslice_end, Some(expected_end));
+            assert_eq!(
+                thread.replay_backstop,
+                first_slice.is_none().then_some(expected_end)
+            );
+            assert_eq!(thread.thread_logical_time.as_nanos(), advanced);
+            assert_eq!(serde_json::to_value(&thread.stats).unwrap(), stats);
+            assert_eq!(thread.chaos_prng, generator);
+            assert!(guest.requests.lock().unwrap().is_empty());
+        }
+    }
+
+    /// The actual startup reset also admits a cooperative target without a
+    /// PMU maximum. A recorded first slice supplies only its logical end;
+    /// absent or pre-exec first slices retain the reset's provisional end.
+    #[test]
+    fn finish_thread_start_installs_a_target_only_replayed_first_slice() {
+        let trace_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            trace_file.path(),
+            PreemptionRecord::from_sched_events(vec![]).to_string(),
+        )
+        .unwrap();
+        let mut config = Config {
+            sequentialize_threads: true,
+            chaos: true,
+            no_rcb_time: true,
+            max_timeslice: None,
+            target_timeslice: std::num::NonZeroU64::new(100_000),
+            replay_schedule_from: Some(trace_file.path().to_path_buf()),
+            ..Config::default()
+        }
+        .with_backend(|backend| backend.needs_killed_thread_rpc_cancellation = true);
+        config.validate();
+        assert!(!config.use_rcb_time());
+        assert_eq!(config.max_timeslice, None);
+        assert_eq!(config.target_timeslice, std::num::NonZeroU64::new(100_000));
+        let (config, state, tid, process) = cancellation_test_state_with_config(config);
+        let length = LogicalTime::from_nanos(830);
+        for (first_slice, past_global_first_execve) in
+            [(Some(length), true), (None, true), (Some(length), false)]
+        {
+            let mut thread = crate::ThreadState::new(tid, &config, ());
+            thread.detpid = Some(process);
+            thread.past_global_first_execve = past_global_first_execve;
+            thread.last_grant_deadline = Some(Duration::from_nanos(1));
+            let initial_time = thread.thread_logical_time.as_nanos();
+            let generator = thread.chaos_prng.clone();
+            let initial_slices = thread.stats.timeslice_count;
+            let mut guest = ExternalRegistrationGuest {
+                global: &state,
+                config: &config,
+                thread,
+                requests: Mutex::new(Vec::new()),
+                post_exec: false,
+                ppid: None,
+                private_memory: None,
+            };
+            super::finish_thread_start(&config, &mut guest, None, first_slice);
+            let recorded = first_slice.is_some() && past_global_first_execve;
+            let expected_end = if recorded {
+                initial_time + length
+            } else {
+                LogicalTime::MAX
+            };
+            assert_eq!(guest.thread.end_of_timeslice, Some(expected_end));
+            assert_eq!(guest.thread.max_timeslice_end, None);
+            assert_eq!(
+                guest.thread.replay_backstop,
+                (!recorded).then_some(LogicalTime::MAX)
+            );
+            assert_eq!(guest.thread.thread_logical_time.as_nanos(), initial_time);
+            assert_eq!(guest.thread.stats.timeslice_count, initial_slices + 1);
+            assert_eq!(guest.thread.last_grant_deadline, None);
+            assert_eq!(guest.thread.chaos_prng, generator);
+            assert!(guest.requests.lock().unwrap().is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn child_start_clock_is_independent_of_first_rpc_arrival() {
         for child_first in [true, false] {

@@ -380,10 +380,10 @@ fn fixtures(root: &Path) -> Vec<PathBuf> {
 fn every_lit_fixture_is_within_the_supported_subset() {
     let root = lit_root();
     let fixtures = fixtures(&root);
-    // 28 main.{rs,c,go} files, 48 .lit, 6 .test and 2 scheduler scripts.
+    // 29 main.{rs,c,go} files, 48 .lit, 6 .test and 2 scheduler scripts.
     // fifo_jump_replay (main.c + hermit-run.lit) joined with the guest-poll
-    // replay work: 82 + 2 = 84.
-    assert_eq!(fixtures.len(), 84, "{fixtures:#?}");
+    // replay work: 82 + 2 = 84. PR 4614's chaos_schedule_replay fixture: 85.
+    assert_eq!(fixtures.len(), 85, "{fixtures:#?}");
     let placeholder = Path::new("/placeholder");
     let substitutions = [
         ("hermit", placeholder),

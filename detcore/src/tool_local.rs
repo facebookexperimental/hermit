@@ -10267,8 +10267,8 @@ impl<T> ThreadState<T> {
         if self.end_of_timeslice.is_none() || self.end_of_timeslice != self.replay_backstop {
             return;
         }
-        let end =
-            self.thread_logical_time.as_nanos() + Duration::from_nanos(u64::from(max_timeslice));
+        let end = self.thread_logical_time.as_nanos()
+            + Duration::from_nanos(u64::from(self.after_post_crash(max_timeslice)));
         self.end_of_timeslice = Some(end);
         self.max_timeslice_end = Some(end);
         self.replay_backstop = Some(end);
