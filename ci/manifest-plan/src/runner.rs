@@ -20813,15 +20813,31 @@ int main(int argc, char **argv) {
         let mut mode = test.modes.remove("verify").unwrap();
         mode.runs = Some(3);
         test.modes.insert("naked".into(), mode);
+        // Widen the wall deadline and the upper duration bound against a
+        // measured reference (dh-ravrz): time one real spawn+sleep on
+        // this host; a loaded host that takes twice as long gets twice
+        // the margin, so the start-up allowance scales with the host
+        // instead of being consumed by it. The property is unchanged.
+        let reference_started = std::time::Instant::now();
+        let reference = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 0.7"])
+            .status()
+            .expect("reference sleep");
+        assert!(reference.success());
+        let host_factor = (reference_started.elapsed().as_secs_f64() / 0.7).clamp(1.0, 4.0);
+        let phase_deadline_seconds = (10.0 * host_factor).ceil() as u64;
+
         // The property under test: three attempts that each sleep 0.7 s spend
         // at least 2.1 s of wall time but almost no CPU, so the cell must
         // pass under a 1 s aggregate CPU budget. That needs only total wall
         // time > cpu_timeout_seconds; the wall deadline is the backstop for a
         // wedged process, not part of the property. A 3 s deadline left
         // about 0.9 s for three shell start-ups and timed out at 3.048 s on a
-        // heavily loaded host, so the deadline and the upper duration bound
-        // carry several seconds of margin. The lower bound of 2_000 ms still
-        // proves that wall time exceeded the CPU budget.
+        // heavily loaded host, and a fixed 10 s bound timed out at 10.319 s
+        // at load 210-250 (dh-ravrz-c8ce8eb264a): the deadline and the upper
+        // duration bound now scale with the measured host factor above. The
+        // lower bound of 2_000 ms still proves that wall time exceeded the
+        // CPU budget.
         let cell = SelectedCell {
             image: None,
             category: "fixture".into(),
@@ -20832,7 +20848,7 @@ int main(int argc, char **argv) {
             },
             test,
             enabled: true,
-            timeout_seconds: 10,
+            timeout_seconds: phase_deadline_seconds,
             cpu_timeout_seconds: 1,
             host_level: HostLevel::default(),
         };
@@ -20880,7 +20896,7 @@ int main(int argc, char **argv) {
             .duration_ms
             .expect("a cell that executed must report measured wall time");
         assert!(
-            (2_000..10_000).contains(&duration_ms),
+            (2_000u128..(phase_deadline_seconds as u128) * 1_000).contains(&duration_ms),
             "three sleeping attempts should pass despite exceeding the old one-second wall cap: {duration_ms}ms"
         );
         let attempt_cpu_usage_usec = result.attempts.iter().try_fold(0u64, |total, attempt| {
