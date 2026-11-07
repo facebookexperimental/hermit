@@ -28217,9 +28217,9 @@ fn branch_free_race_offset_args<'a>(seed: &'a str, extra: &[&'a str]) -> Vec<&'a
 fn an_instruction_offset_record_replays_from_its_schedule_and_analyze_verifies_its_endpoints() {
     let _guard = hermit_run_guard();
     const SEED: u64 = 1;
-    const ITERATIONS: u64 = 30000;
+    const ITERATIONS: &str = "30000";
     assert!(
-        branch_free_race_lost_at(SEED, &["--chaos-instruction-offset=8"], ITERATIONS) > 0,
+        branch_free_race_lost_at(SEED, &["--chaos-instruction-offset=8"], 30000) > 0,
         "fixed seed {SEED} at {ITERATIONS} iterations should lose an update"
     );
     let seed_arg = format!("--sched-seed={SEED}");
