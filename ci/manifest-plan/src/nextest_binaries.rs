@@ -361,10 +361,6 @@ fn source_identity(root: &Path) -> Result<String, String> {
     Ok(source_snapshot(root)?.0)
 }
 
-fn source_part(root: &Path) -> Result<SourcePart, String> {
-    Ok(source_snapshot(root)?.1)
-}
-
 /// Why CURRENT no longer matches RECORD, naming the first differing
 /// root and part (dh-0pw53): HEAD, tree, tracked diff, or the first
 /// added/removed/changed untracked file.
@@ -1155,15 +1151,23 @@ type SourceMap = BTreeMap<PathBuf, String>;
 type SourcePartMap = BTreeMap<PathBuf, SourcePart>;
 
 fn sources_and_parts(cargo: &Value, root: &Path) -> Result<(SourceMap, SourcePartMap), String> {
-    let collected = sources(cargo, root)?;
+    // One snapshot per root, never two: the identity and the parts must
+    // describe the same instant. Taking them in two passes lets an
+    // untracked file created (or removed) between the passes change the
+    // identity while the parts agree with the record, which degraded
+    // the stale refusal to a bare "source identity changed at <root>"
+    // naming neither part nor path (dh-j8eb7).
+    let mut sources = BTreeMap::new();
     let mut parts = BTreeMap::new();
-    for root in collected.keys() {
-        parts.insert(root.clone(), source_part(root)?);
+    for root in source_roots(cargo, root)? {
+        let (identity, part) = source_snapshot(&root)?;
+        sources.insert(root.clone(), identity);
+        parts.insert(root, part);
     }
-    Ok((collected, parts))
+    Ok((sources, parts))
 }
 
-fn sources(cargo: &Value, root: &Path) -> Result<BTreeMap<PathBuf, String>, String> {
+fn source_roots(cargo: &Value, root: &Path) -> Result<BTreeSet<PathBuf>, String> {
     let mut roots = BTreeSet::from([root.to_owned()]);
     for package in cargo["packages"]
         .as_array()
@@ -1185,7 +1189,11 @@ fn sources(cargo: &Value, root: &Path) -> Result<BTreeMap<PathBuf, String>, Stri
             .trim();
         roots.insert(PathBuf::from(git_root));
     }
-    roots
+    Ok(roots)
+}
+
+fn sources(cargo: &Value, root: &Path) -> Result<BTreeMap<PathBuf, String>, String> {
+    source_roots(cargo, root)?
         .into_iter()
         .map(|root| source_identity(&root).map(|identity| (root, identity)))
         .collect()
@@ -4011,6 +4019,95 @@ mod tests {
             removed.contains("untracked file gone was removed"),
             "untracked removal not named: {removed}"
         );
+    }
+
+    /// The v7 shape behind dh-j8eb7: a test in a sibling node creates an
+    /// untracked directory inside the source root and removes it again
+    /// (property_snapshot's hermit-test-relative-copies-<pid>/). If the
+    /// identity and the parts of one verification come from two different
+    /// snapshots of that root, the refusal degrades to a bare "source
+    /// identity changed at <root>" naming neither part nor path, even
+    /// though the landed detail code could have named the file. Every
+    /// mismatch observed while the directory churns must name it.
+    #[test]
+    fn stale_detail_names_a_created_then_removed_untracked_directory() {
+        let f = Fixture::new();
+        fs::write(f.root.join(".gitignore"), "custom-target/\n").unwrap();
+        fs::write(f.root.join("Cargo.toml"), "[package]\nname='fixture'\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "Cargo.toml", ".gitignore"],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        ] {
+            git_bytes(&f.root, &args).unwrap();
+        }
+        let (mut record, _) = f.selection();
+        let transient = f.root.join("hermit-test-relative-copies-1762");
+        let transient_file = "hermit-test-relative-copies-1762/u:object_r:test_prop:s0";
+        fs::create_dir(&transient).unwrap();
+        fs::write(transient.join("u:object_r:test_prop:s0"), "snapshot").unwrap();
+        let (before_sources, before_parts) = sources_and_parts(&f.cargo, &f.root).unwrap();
+        assert!(
+            before_parts[&f.root]
+                .untracked
+                .iter()
+                .any(|(name, _, _)| name == transient_file),
+            "fixture snapshot missed the transient file: {:?}",
+            before_parts[&f.root].untracked
+        );
+        record.sources = before_sources;
+        record.source_parts = before_parts;
+        fs::remove_dir_all(&transient).unwrap();
+        let (current_sources, current_parts) = sources_and_parts(&f.cargo, &f.root).unwrap();
+        assert_ne!(record.sources, current_sources);
+        let removed = stale_source_detail(&record, &current_sources, &current_parts);
+        assert!(
+            removed.contains(&f.root.display().to_string())
+                && removed.contains(&format!("untracked file {transient_file} was removed")),
+            "created-then-removed directory not named: {removed}"
+        );
+        // Churn the directory while snapshots are taken: any pair whose
+        // identity disagrees with the record must still name the file,
+        // never degrade to the bare root-only refusal.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let churn_root = f.root.clone();
+        let churn_stop = stop.clone();
+        let churn = std::thread::spawn(move || {
+            let dir = churn_root.join("hermit-test-relative-copies-1762");
+            while !churn_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = fs::create_dir(&dir);
+                let _ = fs::write(dir.join("u:object_r:test_prop:s0"), "snapshot");
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let _ = fs::remove_dir_all(&dir);
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        });
+        let mut mismatches = 0;
+        for _ in 0..160 {
+            let Ok((sources, parts)) = sources_and_parts(&f.cargo, &f.root) else {
+                continue;
+            };
+            if sources == record.sources {
+                continue;
+            }
+            mismatches += 1;
+            let detail = stale_source_detail(&record, &sources, &parts);
+            assert!(
+                detail.contains(&format!("untracked file {transient_file}")),
+                "churned snapshot degraded to a bare refusal: {detail}"
+            );
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        churn.join().unwrap();
+        assert!(mismatches > 0, "churn never changed a snapshot identity");
     }
 
     /// A disposable run summary must not move source identity, and a stray one
