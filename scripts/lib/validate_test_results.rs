@@ -446,6 +446,33 @@ pub fn retain(
     } else {
         None
     };
+    // Transitional (dh-h3z82): an all-zero selected producer verifies
+    // under the tolerance in manifest-plan's ledger, but ci-hub's
+    // canonical writer verifies retained evidence with the recorded
+    // hermit pin, which does not carry that tolerance yet — retaining
+    // here would make the writer refuse the row and leave a PASSED
+    // run with no canonical verdict. Refuse retention instead (the
+    // caller warns and the row proceeds without schema-9 evidence,
+    // exactly as before the tolerance), until the pin advances past
+    // the tolerance; then delete this refusal.
+    for summary in &summaries {
+        let totals = &summary.totals;
+        if summary.row_count == 0
+            && totals.executed_tests == 0
+            && totals.passed_tests == 0
+            && totals.failed_tests == 0
+            && totals.filtered_tests == 0
+            && totals.diagnostic_failed_tests == 0
+            && totals.skipped_tests == 0
+        {
+            return Err(format!(
+                "selected producer {} produced no test rows; retained evidence \
+                 requires the canonical writer's all-zero producer tolerance \
+                 (dh-h3z82)",
+                summary.node
+            ));
+        }
+    }
     // The run totals count passes and executions only; every executed test
     // that did not pass is a blocking failure, a diagnostic failure, or a
     // runtime skip.
@@ -748,6 +775,49 @@ mod tests {
             "a verdict mutation with a recomputed artifact digest was accepted"
         );
         assert!(retain_once().unwrap_err().contains("already exists"));
+    }
+
+    #[test]
+    fn an_all_zero_producer_is_refused_at_retention_until_the_writer_tolerates_it() {
+        // Transitional (dh-h3z82): the manifest-plan verifier accepts an
+        // all-zero selected producer, but the canonical writer (recorded
+        // hermit pin) does not, so retaining would leave a PASSED run
+        // with no canonical verdict. Retention refuses, naming the
+        // producer; the caller warns and the row proceeds unretained.
+        let root = tempfile::tempdir().unwrap();
+        let selected = fixture_selected_producers(&["test.alpha", "test.beta"], false).unwrap();
+        let nodes = vec![
+            NodeTestResultsInput {
+                node: "test.alpha".into(),
+                outer_attempt: 1,
+                test_results: terminal_results(1, 0, vec![result("a", true)]).unwrap(),
+            },
+            NodeTestResultsInput {
+                node: "test.beta".into(),
+                outer_attempt: 1,
+                test_results: terminal_results(0, 0, vec![]).unwrap(),
+            },
+        ];
+        let error = retain(
+            root.path(),
+            ValidatePath::Full,
+            "fixture-run",
+            "0123456789abcdef0123456789abcdef01234567",
+            false,
+            &selected,
+            nodes,
+            None,
+            ExactTestTotals {
+                executed_tests: 1,
+                passed_tests: 1,
+                filtered_tests: 0,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("test.beta") && error.contains("dh-h3z82"),
+            "all-zero producer not refused at retention: {error}"
+        );
     }
 
     #[test]

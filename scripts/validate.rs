@@ -27758,7 +27758,9 @@ fn write_ledger_with_snapshot(
                 return Some(record);
             }
             Ok(output) => eprintln!(
-                "validate: warning: canonical ledger writer {} refused: {}",
+                "validate: warning: canonical ledger writer {} refused: {}; \
+                 this run will have NO canonical verdict (the adapter will \
+                 report COULD-NOT-DETERMINE)",
                 adapter.display(),
                 String::from_utf8_lossy(&output.stderr).trim()
             ),
