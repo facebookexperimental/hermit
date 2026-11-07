@@ -450,7 +450,7 @@ const MAX_SCRIPT_HOPS: usize = 4;
 /// On a host that is not x86-64 no CPU profile is presented: an ELF64 image
 /// built for the host's own machine declares no x86-64 ISA level, so auto
 /// names the default profile, which there serves nothing
-/// ([`isa_needs_on`]). Every other read and refusal is the same as on an
+/// (`isa_needs_on`). Every other read and refusal is the same as on an
 /// x86-64 host.
 pub fn resolve_auto(
     program: &Path,
