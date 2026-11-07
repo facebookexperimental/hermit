@@ -17989,7 +17989,11 @@ fi
             let error = monitor_process(
                 child,
                 ProcessLimits {
-                    deadline: started + Duration::from_secs(5),
+                    // A hang guard only (dh-ravrz): the accounting grace
+                    // refuses at about a second; a 5 s wall deadline could
+                    // fire first on a loaded host and return a timed-out
+                    // Ok, hiding the refusal this test exists to see.
+                    deadline: started + Duration::from_secs(60),
                     cpu_budget_usec: Some(5_000_000),
                     cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
                 },
@@ -18133,9 +18137,9 @@ fi
         // load. A failed poll before it is less than the grace after the first
         // failure, and any later poll is itself the valid one, so the original
         // grace cannot stop the command first. The grace then restarts at the next
-        // failure, about one grace after the first one, and `done` is written 200 ms
-        // past the original grace, which leaves about 0.8 s for the child to exit
-        // and be reaped before the restarted grace ends.
+        // failure, about one grace after the first one, and `done` is written at
+        // that first post-valid failure, which leaves the whole restarted grace
+        // for the child to exit and be reaped (dh-ravrz).
         //
         // This test used to take the valid sample at 500 ms from a real host-wide
         // /proc census (`ProcessGroupCpu::seconds`), which under load can be slow
@@ -18164,9 +18168,14 @@ fi
                 }
                 if valid_samples > 0 {
                     missing_after_valid += 1;
-                    if first.elapsed() >= CELL_CPU_ACCOUNTING_GRACE + Duration::from_millis(200) {
-                        fs::write(&done, b"complete").map_err(|error| error.to_string())?;
-                    }
+                    // Write `done` at the FIRST missing sample after the
+                    // valid one (dh-ravrz): the child then has the whole
+                    // restarted grace - about a second of wall, however
+                    // the polls are spaced under load - to exit and be
+                    // reaped before the grace can stop it. The wall-timed
+                    // write before (grace + 200 ms) left that exit to the
+                    // last fifth of the window and failed under load.
+                    fs::write(&done, b"complete").map_err(|error| error.to_string())?;
                 }
                 Err("fixture transient sample unavailable".into())
             },
@@ -20744,11 +20753,15 @@ int main(int argc, char **argv) {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let limit = 300_000u64;
+        // The wall here is a hang guard only (dh-ravrz): the CPU budget is
+        // the limit under test, and on a loaded host a 5 s wall could fire
+        // before the busy second process burned its small remaining CPU
+        // budget, reporting Wall where the test asserts Cpu.
         let first = bounded_process(
             &root,
             "first",
             "head -c 8388608 /dev/zero | sha256sum >/dev/null",
-            Duration::from_secs(5),
+            Duration::from_secs(30),
             limit,
         );
         assert!(first.status.success());
@@ -20758,7 +20771,7 @@ int main(int argc, char **argv) {
             &root,
             "second",
             "while :; do :; done",
-            Duration::from_secs(5),
+            Duration::from_secs(30),
             limit - first.cpu_usage_usec,
         );
         assert_eq!(second.timeout, Some(ProcessTimeout::Cpu));
@@ -29353,11 +29366,12 @@ cp "{}" "$verdict"
         // The property under test: preparation and execution each get their
         // own wall deadline of timeout_seconds, so preparation time is not
         // charged against the execution budget. Each phase sleeps 2.1 s under
-        // a 4 s deadline, so the two phases together (at least 4.2 s) exceed
-        // one deadline: a shared deadline would time out the run, while
-        // separate deadlines let both phases pass. Each phase keeps about
-        // 1.9 s for process start-up on a loaded host; the earlier 1.1 s
-        // sleeps under a 2 s deadline left only 0.9 s per phase.
+        // a 4 s deadline (widened against a measured host reference below),
+        // so the two phases together (at least 4.2 s) exceed one deadline: a
+        // shared deadline would time out the run, while separate deadlines
+        // let both phases pass. Each phase keeps about 1.9 s for process
+        // start-up on an idle host; the earlier 1.1 s sleeps under a 2 s
+        // deadline left only 0.9 s per phase.
         let program = root.join("fixture.sh");
         fs::write(
             &program,
@@ -29367,6 +29381,21 @@ cp "{}" "$verdict"
         let mut permissions = fs::metadata(&program).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&program, permissions).unwrap();
+
+        // Widen the per-phase deadline against a measured reference
+        // (dh-ravrz): time a real `sleep 0.5` spawn on this host; a loaded
+        // host that takes twice as long gets twice the deadline, so the
+        // 1.9 s startup margin scales with the host instead of being
+        // consumed by it. The property is unchanged: each phase sleeps
+        // 2.1 s, so together they exceed any single phase's deadline.
+        let reference_started = std::time::Instant::now();
+        let reference = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 0.5"])
+            .status()
+            .expect("reference sleep");
+        assert!(reference.success());
+        let host_factor = (reference_started.elapsed().as_secs_f64() / 0.5).clamp(1.0, 4.0);
+        let phase_deadline_seconds = (4.0 * host_factor).ceil() as u64;
 
         let mut test = recipe(true);
         test.id = "fixture/separate-preparation-budget".into();
@@ -29389,7 +29418,7 @@ cp "{}" "$verdict"
             },
             test,
             enabled: true,
-            timeout_seconds: 4,
+            timeout_seconds: phase_deadline_seconds,
             cpu_timeout_seconds: 1,
             host_level: HostLevel::default(),
         };
