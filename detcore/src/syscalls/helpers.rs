@@ -13575,9 +13575,12 @@ mod turn_decision_tests {
                 sequentialize_threads,
                 ..Config::default().with_backend(|b| *b = backend)
             };
-            // KVM keeps the record only once its Reverie pin declares
-            // `kernel_signal_targets_are_predictable` (SIGSHARE S3b's flip),
-            // which this pin does not: the KVM row holds either way.
+            if name == "kvm" {
+                assert!(
+                    crate::scheduler::discarded_at_send::records(&cfg),
+                    "KVM keeps the record since S3b"
+                );
+            }
             assert_eq!(turn_decides_interruption(&cfg), expected, "{name}");
         }
     }

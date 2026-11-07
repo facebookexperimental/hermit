@@ -26607,22 +26607,25 @@ use TargetExpectation::Diverges;
 use TargetExpectation::Linux;
 
 /// A mode of tests/c/process_signal_target.c, the line Linux prints for it,
-/// and how ptrace's run is judged.
+/// and how ptrace's and KVM's runs are judged.
 struct ProcessSignalTargetCase {
     mode: &'static str,
     linux: &'static str,
     ptrace: TargetExpectation,
+    kvm: TargetExpectation,
 }
 
 const fn target_case(
     mode: &'static str,
     linux: &'static str,
     ptrace: TargetExpectation,
+    kvm: TargetExpectation,
 ) -> ProcessSignalTargetCase {
     ProcessSignalTargetCase {
         mode,
         linux,
         ptrace,
+        kvm,
     }
 }
 
@@ -26680,58 +26683,127 @@ const PTRACE_POLLER_PASSED_OVER: TargetExpectation = Diverges(KnownDivergence {
 /// printed the same at b198041ece8
 /// (<https://github.com/rrnewton/hermit/issues/5242>, trail in minibeads dh-90p9w).
 ///
-/// KVM's half of these cases, and its own KNOWN DIVERGENCES, arrive with the
-/// Reverie pin in which KvmBackend declares
-/// `kernel_signal_targets_are_predictable` (SIGSHARE S3b's flip); this pin
-/// does not, so KVM's receivers are not yet the scheduler's to choose.
+/// KVM's KNOWN DIVERGENCES are its POSIX-timer modes but `posix-sigwait`: KVM
+/// steers a timer's process-directed signal only when it is SIGALRM
+/// (https://github.com/rrnewton/hermit/issues/4929), and a `timer_create`
+/// `SIGEV_SIGNAL` timer whose signal is another one (SIGUSR1 here) is
+/// published to the process with no receiver chosen, so no handler runs for
+/// it where Linux's walk or busy rule picks a thread. Each diverged at
+/// b198041ece8, before SIGSHARE S3b, too: `posix-walk` and `posix-busy` with
+/// the same line, and `posix-curr-target` at its setup (no thread took the
+/// steering `SIGCHLD`), which S3b's child-exit choice now completes. This is
+/// <https://github.com/rrnewton/hermit/issues/4995>'s gap (the generalisation
+/// to every timer signal is tracked in minibeads dh-ly7rb), and each record
+/// flips once it closes. `posix-sigwait`, where M waits for the signal, prints
+/// Linux's line on KVM, as it did at b198041ece8. In `chld-busy` KVM gives the
+/// child's `SIGCHLD` to W2, as Linux does, but its backend also queues a
+/// `SIGCHLD` for W1's vfork child, whose exit signal is 0 and for which Linux
+/// sends nothing (https://github.com/rrnewton/reverie/issues/1300), and W1 takes it once released; busy=
+/// names it. Before SIGSHARE S3b that copy merged into the child's, which no
+/// thread had taken, and was not seen.
 const PROCESS_SIGNAL_TARGET_CASES: [ProcessSignalTargetCase; 23] = [
     target_case(
         "chld-creator",
         "receiver=M interrupted=M\n",
         PTRACE_POLLER_PASSED_OVER,
+        Linux,
     ),
-    target_case("chld-walk", "receiver=W2 interrupted=W2\n", Linux),
-    target_case("chld-worker", "receiver=W1 interrupted=W1\n", Linux),
-    target_case("chld-queued", "pending=1 receiver=W2\n", Linux),
+    target_case("chld-walk", "receiver=W2 interrupted=W2\n", Linux, Linux),
+    target_case("chld-worker", "receiver=W1 interrupted=W1\n", Linux, Linux),
+    target_case("chld-queued", "pending=1 receiver=W2\n", Linux, Linux),
     target_case(
         "alrm-leader",
         "receiver=M interrupted=M\n",
         PTRACE_POLLER_PASSED_OVER,
+        Linux,
     ),
-    target_case("alrm-walk", "receiver=W2 interrupted=W2\n", Linux),
-    target_case("alrm-queued", "pending=1 receiver=W1\n", Linux),
-    target_case("posix-walk", "receiver=W2 interrupted=W2\n", Linux),
-    target_case("alrm-ignored-blocked", "pending=1 receiver=W2\n", Linux),
+    target_case("alrm-walk", "receiver=W2 interrupted=W2\n", Linux, Linux),
+    target_case("alrm-queued", "pending=1 receiver=W1\n", Linux, Linux),
+    target_case(
+        "posix-walk",
+        "receiver=W2 interrupted=W2\n",
+        Linux,
+        kvm_unsteered_timer_signal("receiver=none interrupted=none\n"),
+    ),
+    target_case(
+        "alrm-ignored-blocked",
+        "pending=1 receiver=W2\n",
+        Linux,
+        Linux,
+    ),
     target_case(
         "alrm-ignored-unblocked",
         "generated=1 pending=0 receiver=none\n",
         Linux,
+        Linux,
     ),
-    target_case("chld-curr-target", "receiver=W2 interrupted=W2\n", Linux),
-    target_case("alrm-curr-target", "receiver=W2 interrupted=W2\n", Linux),
-    target_case("posix-curr-target", "receiver=W2 interrupted=W2\n", Linux),
+    target_case(
+        "chld-curr-target",
+        "receiver=W2 interrupted=W2\n",
+        Linux,
+        Linux,
+    ),
+    target_case(
+        "alrm-curr-target",
+        "receiver=W2 interrupted=W2\n",
+        Linux,
+        Linux,
+    ),
+    target_case(
+        "posix-curr-target",
+        "receiver=W2 interrupted=W2\n",
+        Linux,
+        kvm_unsteered_timer_signal("receiver=none interrupted=none\n"),
+    ),
     target_case(
         "chld-sigwait",
         "waited=1 receiver=none interrupted=none\n",
+        Linux,
         Linux,
     ),
     target_case(
         "alrm-sigwait",
         "waited=1 receiver=none interrupted=none\n",
         Linux,
+        Linux,
     ),
     target_case(
         "posix-sigwait",
         "waited=1 receiver=none interrupted=none\n",
         Linux,
+        Linux,
     ),
-    target_case("chld-busy", "receiver=W2 interrupted=W2 busy=W1\n", Linux),
-    target_case("alrm-busy", "receiver=W2 interrupted=W2 busy=W1\n", Linux),
-    target_case("posix-busy", "receiver=W2 interrupted=W2 busy=W1\n", Linux),
-    target_case("coalesced-child-curr", "steer=W2 chld=W1 final=W2\n", Linux),
+    target_case(
+        "chld-busy",
+        "receiver=W2 interrupted=W2 busy=W1\n",
+        Linux,
+        Diverges(KnownDivergence {
+            issue: "https://github.com/rrnewton/reverie/issues/1300",
+            line: "receiver=W2 interrupted=W2 busy=W1+W1\n",
+        }),
+    ),
+    target_case(
+        "alrm-busy",
+        "receiver=W2 interrupted=W2 busy=W1\n",
+        Linux,
+        Linux,
+    ),
+    target_case(
+        "posix-busy",
+        "receiver=W2 interrupted=W2 busy=W1\n",
+        Linux,
+        kvm_unsteered_timer_signal("receiver=none interrupted=none busy=W1+W1\n"),
+    ),
+    target_case(
+        "coalesced-child-curr",
+        "steer=W2 chld=W1 final=W2\n",
+        Linux,
+        Linux,
+    ),
     target_case(
         "ignored-busy",
         "receiver=none interrupted=none busy=W1\n",
+        Linux,
         Linux,
     ),
     target_case(
@@ -26741,9 +26813,24 @@ const PROCESS_SIGNAL_TARGET_CASES: [ProcessSignalTargetCase; 23] = [
             issue: "https://github.com/rrnewton/hermit/issues/5242",
             line: "steer=W2 pending=1 final=W1\n",
         }),
+        Linux,
     ),
-    target_case("default-child-curr", "steer=W2 pending=0 final=W1\n", Linux),
+    target_case(
+        "default-child-curr",
+        "steer=W2 pending=0 final=W1\n",
+        Linux,
+        Linux,
+    ),
 ];
+
+/// KVM's KNOWN DIVERGENCE for a POSIX timer whose signal is not SIGALRM
+/// (#4995, minibeads dh-ly7rb; `PROCESS_SIGNAL_TARGET_CASES`): `line`.
+const fn kvm_unsteered_timer_signal(line: &'static str) -> TargetExpectation {
+    Diverges(KnownDivergence {
+        issue: "https://github.com/rrnewton/hermit/issues/4995",
+        line,
+    })
+}
 
 fn process_signal_target_guest() -> &'static Path {
     PROCESS_SIGNAL_TARGET_GUEST.get_or_init(|| compile_c_guest("process_signal_target"))
@@ -26828,13 +26915,40 @@ fn judge_process_signal_target(
     }
 }
 
-/// SIGSHARE S3b on ptrace: a process-directed signal the kernel generates for
-/// a multithreaded process (a child's exit `SIGCHLD`, an ITIMER_REAL or POSIX
-/// timer expiry) reaches the thread Linux's `complete_signal` chooses, where
-/// the scheduler models signal targets: each mode of
+/// SIGSHARE S3b: on KVM the scheduler models signal targets
+/// (`kernel_signal_targets_are_predictable`), so a process-directed signal the
+/// kernel generates for a multithreaded process reaches the thread Linux's
+/// `complete_signal` chooses, where the scheduler steers it: a child's exit
+/// `SIGCHLD`, and a timer whose signal is SIGALRM. The scheduler chooses the
+/// thread from each thread's mask, wait and pending signals, as on ptrace,
+/// and the backend's delivery permit follows the choice. Each mode of
 /// [`PROCESS_SIGNAL_TARGET_CASES`] must print Linux's line natively, and on
-/// ptrace, at bitwise parity, as its ptrace expectation says. The KVM half
-/// arrives with SIGSHARE S3b's flip.
+/// KVM at bitwise parity as its KVM expectation says. Before S3b KVM printed
+/// `receiver=M interrupted=none` for `chld-creator` and `chld-worker` (the
+/// backend's own choice, M, outside its wait), and `receiver=none` for
+/// `chld-walk` and `posix-walk`, whose copy no thread took.
+#[test]
+fn run_kvm_a_kernel_sent_process_signal_reaches_the_thread_linux_chooses() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM process-signal-target cases: /dev/kvm is unavailable");
+        return;
+    }
+    for case in PROCESS_SIGNAL_TARGET_CASES {
+        assert_eq!(
+            native_process_signal_target(case.mode),
+            case.linux,
+            "{}: natively",
+            case.mode
+        );
+        let kvm = process_signal_target_at_l2(&["--backend=kvm"], case.mode);
+        judge_process_signal_target("KVM", case.mode, case.linux, case.kvm, &kvm);
+    }
+}
+
+/// The native and ptrace halves of
+/// `run_kvm_a_kernel_sent_process_signal_reaches_the_thread_linux_chooses`:
+/// each mode must print Linux's line natively, and on ptrace, at bitwise
+/// parity, as its ptrace expectation says.
 #[test]
 fn a_kernel_sent_process_signal_reaches_the_thread_linux_chooses_natively_and_on_ptrace() {
     for case in PROCESS_SIGNAL_TARGET_CASES {

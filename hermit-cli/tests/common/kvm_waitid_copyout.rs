@@ -355,43 +355,42 @@ fn assert_ignored_signal_trace(log: &[u8], stdout: &[u8]) {
         "Err(Errno(ECHILD))",
     );
     let park = regex::Regex::new(&format!(r"^\[scheduler\] NONCOMMIT turn \d+, parking dettid {waiter} for child ChildWaitSpec \{{ selector: Exact\(DetPid\({child}\)\), owner: None, exit_class: Sigchld \}}$")).unwrap();
-    // This single-resource Debug spelling is bound to SigWrapper's actual
-    // derive and scheduler formatter. Until a released run emits it, the
-    // proposal makes no claim to have observed this particular event.
+    // The sibling's SIGURG is unblocked and ignored by default, so Linux
+    // discards it as it is sent (`prepare_signal`'s `sig_ignored`) and never
+    // wakes the waiter (`complete_signal` is not reached). Since SIGSHARE S3b
+    // KVM keeps ptrace's record of copies Linux discards at send
+    // (`kernel_signal_targets_are_predictable`), so the waiter is granted no
+    // `WaitidSignals` turn for it and is never parked again: it stays in its
+    // first park until the child's release. Before S3b the backend's queued
+    // copy woke it once, and it parked again.
     let grant = regex::Regex::new(&format!(r"(?s)^\[sched-step5\] >>>>>>>\n\n COMMIT turn (\d+), dettid {waiter} using resources \{{WaitidSignals\(\[SigWrapper\(23\)\]\): W\}}, on previously committed [^\n]+$")).unwrap();
-    let mut grants = Vec::new();
-    for (index, record) in records.iter().enumerate() {
-        let Some((message, metadata)) = record.rsplit_once(" DETLOG_RECORD=") else {
-            continue;
-        };
-        if let Some(capture) = grant.captures(message) {
-            let value: serde_json::Value = serde_json::from_str(metadata).unwrap();
-            assert_eq!(value["schema"], 1);
-            assert_eq!(value["event"]["kind"], "scheduler_commit");
-            assert_eq!(
-                value["event"]["scheduler_turn"].as_u64(),
-                Some(capture[1].parse::<u64>().unwrap())
-            );
-            grants.push(index);
-        }
-    }
-    assert_eq!(grants.len(), 1, "one actual ignored-signal grant");
-    let granted = grants[0];
-    assert!(wait.0 < send.0 && send.0 < granted && send.1 < release.0);
-    assert!(granted < release.0 && release.0 < wait.1 && wait.1 < gone.0);
-    assert!(
-        records
-            .iter()
-            .enumerate()
-            .any(|(n, message)| wait.0 < n && n < send.0 && park.is_match(message)),
-        "actual initial park before sibling send"
+    let grants: Vec<usize> = records
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| {
+            record
+                .rsplit_once(" DETLOG_RECORD=")
+                .is_some_and(|(message, _)| grant.is_match(message))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    assert!(grants.is_empty(), "no ignored-signal grant: {grants:?}");
+    assert!(wait.0 < send.0 && send.1 < release.0);
+    assert!(release.0 < wait.1 && wait.1 < gone.0);
+    let parks: Vec<usize> = records
+        .iter()
+        .enumerate()
+        .filter(|(n, message)| wait.0 < *n && *n < release.0 && park.is_match(message))
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(
+        parks.len(),
+        1,
+        "one park, before the sibling's send: {parks:?}"
     );
     assert!(
-        records
-            .iter()
-            .enumerate()
-            .any(|(n, message)| granted < n && n < release.0 && park.is_match(message)),
-        "actual re-park before child release"
+        parks[0] < send.0,
+        "the waiter parked before the sibling's send"
     );
 }
 

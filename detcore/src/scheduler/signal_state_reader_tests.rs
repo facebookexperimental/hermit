@@ -412,6 +412,62 @@ fn woke_with(scheduler: &Scheduler, signals: &[i32]) -> bool {
                 .collect::<Vec<_>>()
 }
 
+/// SIGSHARE S3b: KVM keeps the record of copies Linux discarded at send, so a
+/// guest's send to a parked poll is decided in the sender's turn, as on
+/// ptrace: the sender records the copy's fate (`discard_pre_send`, from the
+/// receiver's dispositions read through the backend), and the record refuses
+/// a discarded copy at admission (`notify_signal_pending`), so an unblocked
+/// ignored signal, explicitly or by default, never reaches the drain, and a
+/// caught one wakes the poll. Mutation: with the record not consulted at
+/// admission, the ignored rows wake the poll.
+#[test]
+fn with_the_record_a_kvm_poll_is_decided_in_the_senders_turn() {
+    for (name, state, signal, wakes) in [
+        (
+            "ignored",
+            sets(0, bit(libc::SIGUSR1), 0),
+            libc::SIGUSR1,
+            false,
+        ),
+        ("default-ignored", sets(0, 0, 0), libc::SIGURG, false),
+        (
+            "caught",
+            sets(0, 0, bit(libc::SIGUSR1)),
+            libc::SIGUSR1,
+            true,
+        ),
+    ] {
+        let control = Arc::new(ScriptedControl::default());
+        let mut scheduler = kvm_scheduler(&control, true);
+        assert!(scheduler.models_signal_targets, "{name}");
+        add_bound_thread(&mut scheduler, POLLER, POLLER);
+        control.script(POLLER, vec![Ok(state)]);
+        let mut polling = Resources::new(POLLER);
+        polling.insert(ResourceID::InternalIOPolling, Permission::W);
+        polling.set_signal_interrupt_errno(Errno::ERESTARTSYS);
+        polling.signal_state_task = Some((POLLER.as_raw(), POLLER.as_raw()));
+        polling.fyi("read");
+        scheduler.next_turns.get_mut(&POLLER).unwrap().req = Ivar::full(Ok(polling));
+        scheduler.runqueue_push_back(POLLER);
+        // The guest's send, as the guest hooks record it.
+        let token = scheduler.discard_pre_send(
+            POLLER,
+            discarded_at_send::QueueId::Thread(POLLER),
+            signal,
+            None,
+        );
+        assert_eq!(token.discarded, !wakes, "{name}");
+        scheduler.discard_note_send(token, None, None);
+        let woken = send_and_drain(&mut scheduler, signal);
+        if wakes {
+            assert!(woke_with(&scheduler, &[signal]), "{name}");
+        } else {
+            assert!(woken.is_empty(), "{name}");
+            assert!(keeps_polling(&scheduler), "{name}");
+        }
+    }
+}
+
 #[test]
 fn a_blocked_signal_does_not_wake_a_kvm_poll() {
     // Caught, but blocked by the thread's mask.

@@ -9459,6 +9459,111 @@ fn controlled_child_exit_to_pop_from(
     (s, backend, parent)
 }
 
+/// Revastra2's round-2 review of SIGSHARE S3b, F1: a child-exit SIGCHLD that
+/// KVM's publication sends nothing for moves no `curr_target`. The parent's
+/// leader (the creator) blocks SIGCHLD and sleeps in a wait the grant leaves
+/// Undecided (a `nanosleep`, as a futex wait is), and its second thread 101
+/// leaves SIGCHLD unblocked, so the walk from the leader chooses 101. Queued
+/// (caught), the copy reaches `complete_signal` and `curr_target` moves to
+/// 101; suppressed (explicit SIG_IGN: `do_notify_parent` sends nothing,
+/// whatever the masks) or coalesced, it reaches none and `curr_target`
+/// stays. Before, every effect committed the walk. Mutation "commit for
+/// every landed publication". Left SIG_DFL (ignored by default), the copy
+/// the blocked creator has queued still reaches `complete_signal`, so
+/// `curr_target` moves to 101, which discards it as it dequeues it: the
+/// receiver's discard is not one at generation by the named thread (the
+/// round-3 reviews, P1; `default-child-curr`). Mutation "a receiver's
+/// discard marks no walk".
+#[test]
+fn a_child_exit_kvm_published_no_copy_for_moves_no_curr_target() {
+    let bit = kernel_signal_bit(libc::SIGCHLD);
+    let caught = reverie::SignalSets::new(0, 0, bit, 0, bit);
+    let ignored = reverie::SignalSets::new(0, 0, bit, bit, 0);
+    let defaulted = reverie::SignalSets::new(0, 0, bit, 0, 0);
+    for (name, leader, worker_sets, effect, waitable, moved) in [
+        (
+            "queued",
+            caught,
+            sigchld_sets(false, false, true),
+            ChildExitPublicationEffect::Queued,
+            true,
+            true,
+        ),
+        (
+            "coalesced",
+            caught,
+            sigchld_sets(false, false, true),
+            ChildExitPublicationEffect::Coalesced,
+            true,
+            false,
+        ),
+        (
+            "suppressed",
+            ignored,
+            sigchld_sets(false, true, false),
+            ChildExitPublicationEffect::SuppressedExplicitIgnore,
+            false,
+            false,
+        ),
+        (
+            "default, discarded by its receiver",
+            defaulted,
+            sigchld_sets(false, false, false),
+            ChildExitPublicationEffect::Queued,
+            true,
+            true,
+        ),
+    ] {
+        let (mut s, backend) = kvm_fixture();
+        let (parent, _, _) = add(&mut s, 100, 100);
+        let (worker, _, _) = add(&mut s, 100, 101);
+        let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
+        backend.signal_sets.lock().unwrap().insert(100, leader);
+        backend.signal_sets.lock().unwrap().insert(101, worker_sets);
+        *backend.child_effect.lock().unwrap() = Some(effect);
+        park_nanosleep(&mut s, parent);
+        file_restartable_read(&mut s, worker);
+        grant_group_exit(&mut s, child, child_mm);
+        let permit = s.parked.exit_fences[&child].permit;
+        s.consume_signal_boundary(SignalBoundaryReceipt {
+            permit,
+            outcome: SignalBoundaryOutcome::Terminated {
+                group: true,
+                wait_status: 7 << 8,
+            },
+        })
+        .unwrap();
+        let event = child_exit_event(
+            task(100, 100).process,
+            task(200, 200).process,
+            ExitStatus::Exited(7),
+            waitable,
+        );
+        let scheduler = Arc::new(Mutex::new(s));
+        let mut publication = Box::pin(super::signal_control::ChildExitPublicationFuture::new(
+            scheduler.clone(),
+            event,
+        ));
+        assert!(matches!(poll_child_exit(&mut publication), Poll::Pending));
+        assert!(matches!(
+            poll_child_exit(&mut publication),
+            Poll::Ready(Ok(()))
+        ));
+        drop(publication);
+        let mut s = Arc::try_unwrap(scheduler).unwrap().into_inner().unwrap();
+        s.committed_time = s.committed_time + LogicalTime::from_nanos(1);
+        let clock = committed_clock(&s);
+        s.step2b_process_timed(&clock);
+        assert!(child_exit_timers(&s).is_empty(), "{name}: the timer popped");
+        assert_eq!(s.controlled_child_exits.refusal_for_test(), None, "{name}");
+        assert_eq!(
+            s.signal_curr_targets.get(&DetPid::from_raw(100)),
+            moved.then_some(&worker),
+            "{name}"
+        );
+    }
+}
+
 /// Mutations "Queued wakes nobody" (design G5: the parent's read is never
 /// woken), "Coalesced wakes" (Linux does not queue a standard signal already
 /// pending, so no thread is woken) and "the publication's effect not kept for
@@ -9902,6 +10007,10 @@ enum AlarmThread {
     FutexWait,
     /// A vfork parent waiting for its child; SIGALRM unblocked.
     VforkParent,
+    /// A vfork parent waiting for its child outside the schedule
+    /// (`external_io_blockers`), SIGALRM unblocked, with SIGUSR1, which it
+    /// does not block either, pending for it alone.
+    BusyVforkParent,
     /// Polling `poll`, whose probe never takes a pending signal, with the
     /// EINTR marker its request carries for the idle-poller diagnosis
     /// (`Detcore::handle_internal_poll_until`); SIGALRM unblocked.
@@ -9975,7 +10084,7 @@ fn choose_alarm_receiver(
         };
         let usr1 = 1 << (libc::SIGUSR1 - 1);
         let (pending, ignored) = match state {
-            AlarmThread::Busy | AlarmThread::BusyPause => (usr1, 0),
+            AlarmThread::Busy | AlarmThread::BusyPause | AlarmThread::BusyVforkParent => (usr1, 0),
             AlarmThread::IgnoredPending => (usr1, usr1),
             _ => (0, 0),
         };
@@ -10029,6 +10138,12 @@ fn choose_alarm_receiver(
             }
             AlarmThread::VforkParent => {
                 file_ordinary(&mut s, tid);
+                s.vfork_barriers.insert(tid, None);
+            }
+            AlarmThread::BusyVforkParent => {
+                s.blocked
+                    .external_io_blockers
+                    .insert(tid, ExternalOpId::new(tid, 1));
                 s.vfork_barriers.insert(tid, None);
             }
             AlarmThread::PollPoller => file_poller(&mut s, tid, "poll", Some(Errno::EINTR)),
@@ -10128,7 +10243,7 @@ fn alarm_action(
 fn one_receiver_choice_takes_a_published_alarm_as_complete_signal_chooses() {
     use AlarmThread::*;
     let t = DetTid::from_raw;
-    let cases: [ReceiverCase; 32] = [
+    let cases: [ReceiverCase; 33] = [
         (
             "a runnable leader that wants it, beside a parked sibling",
             &[Runnable, Pause],
@@ -10279,6 +10394,20 @@ fn one_receiver_choice_takes_a_published_alarm_as_complete_signal_chooses() {
             &[VforkParent, Runnable],
             None,
             None,
+            None,
+        ),
+        // SIGSHARE S3b-1 fix 9 (`alarm_wants`): a vfork parent's pending set
+        // is read although it waits outside the schedule, since no host
+        // timing ends its call or posts it a signal, so with a signal pending
+        // it is busy and the walk passes it over (`wants_signal`,
+        // kernel/signal.c:958-961 at v6.17). Mutation "a vfork parent outside
+        // the schedule is never busy": the leader is chosen, and the copy
+        // waits for it.
+        (
+            "a busy vfork parent leader outside the schedule is passed over",
+            &[BusyVforkParent, Runnable],
+            None,
+            Some(t(101)),
             None,
         ),
         (
