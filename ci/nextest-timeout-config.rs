@@ -292,6 +292,56 @@ const SIGNAL_PERMITS_CPU_SECONDS: u64 = 34;
 // ceil(1.5 * 24.1) = 36. Wall stays the profile's 57 seconds.
 const FULL_TABLE_IO_WRAPPER_NAME: &str = "hermit-full-table-io-cpu";
 const FULL_TABLE_IO_CPU_SECONDS: u64 = 36;
+// Measured 2026-11-07 from the per-test CPU files of that day's queue
+// validations (338 .cpu.json files under ignored/validate on the
+// measurement host named in docs/TESTING_ENVIRONMENTS.md, "Named
+// measurement hosts"), ordinary tests only: every test whose p90 CPU
+// exceeded the 22-second base cap divided by 1.5 and which had no
+// allowance yet (dh-5p14j). Each cap is ceil(1.5 * the largest
+// completed observation that day); wall is eight times the cap, as
+// for the other measured allowances. Attempts that day:
+// hermit-run::cli a_schedule_replay_keeps_the_clock_of_a_thread_that_
+// yields_beside_a_computing_one (n=12, max 33.7) -> 51;
+// chaos_instruction_offset_splits_a_branch_free_window (n=12, max
+// 29.4) -> 45; a_chaos_instruction_offset_run_verifies_and_replays_
+// at_its_offsets (n=12, max 21.0) -> 32;
+// a_schedule_replay_keeps_the_long_slices_of_a_preemption_replay
+// (n=10, max 19.7) -> 30;
+// chaos_change_points_come_within_a_timeslice_of_turn_charges (n=13,
+// max 19.4) -> 30;
+// posix_timer_signal_rows_are_delivered_as_on_linux_at_bitwise_parity
+// (n=13, max 17.3) -> 26; hermit-verify::replay_modes
+// trace_replay_split_just_spin (n=13, max 18.4) -> 28 and
+// chaos_replay_shell_par_work (n=13, max 15.7) -> 24;
+// hermit-run::rr_suite rr_vdso_time_stack (n=14, max 15.8) -> 24,
+// rr_vdso_gettimeofday_stack (n=14, max 15.9) -> 24 and
+// rr_vdso_clock_gettime_stack (n=14, max 15.4) -> 24;
+// hermit-manifest-plan shipped_export_is_deterministic_and_matches_
+// the_comparable_projection (n=13, max 17.3) -> 26.
+const SCHEDULE_REPLAY_CLOCK_WRAPPER_NAME: &str = "hermit-schedule-replay-clock-cpu";
+const SCHEDULE_REPLAY_CLOCK_CPU_SECONDS: u64 = 51;
+const CHAOS_OFFSET_SPLIT_WRAPPER_NAME: &str = "hermit-chaos-offset-split-cpu";
+const CHAOS_OFFSET_SPLIT_CPU_SECONDS: u64 = 45;
+const CHAOS_OFFSET_VERIFY_WRAPPER_NAME: &str = "hermit-chaos-offset-verify-cpu";
+const CHAOS_OFFSET_VERIFY_CPU_SECONDS: u64 = 32;
+const SCHEDULE_REPLAY_LONG_SLICES_WRAPPER_NAME: &str = "hermit-schedule-replay-long-slices-cpu";
+const SCHEDULE_REPLAY_LONG_SLICES_CPU_SECONDS: u64 = 30;
+const CHAOS_CHANGE_POINTS_WRAPPER_NAME: &str = "hermit-chaos-change-points-cpu";
+const CHAOS_CHANGE_POINTS_CPU_SECONDS: u64 = 30;
+const POSIX_TIMER_SIGNAL_ROWS_WRAPPER_NAME: &str = "hermit-posix-timer-signal-rows-cpu";
+const POSIX_TIMER_SIGNAL_ROWS_CPU_SECONDS: u64 = 26;
+const TRACE_REPLAY_SPLIT_WRAPPER_NAME: &str = "hermit-trace-replay-split-cpu";
+const TRACE_REPLAY_SPLIT_CPU_SECONDS: u64 = 28;
+const CHAOS_REPLAY_SHELL_WRAPPER_NAME: &str = "hermit-chaos-replay-shell-cpu";
+const CHAOS_REPLAY_SHELL_CPU_SECONDS: u64 = 24;
+const RR_VDSO_TIME_WRAPPER_NAME: &str = "hermit-rr-vdso-time-cpu";
+const RR_VDSO_TIME_CPU_SECONDS: u64 = 24;
+const RR_VDSO_GETTIMEOFDAY_WRAPPER_NAME: &str = "hermit-rr-vdso-gettimeofday-cpu";
+const RR_VDSO_GETTIMEOFDAY_CPU_SECONDS: u64 = 24;
+const RR_VDSO_CLOCK_GETTIME_WRAPPER_NAME: &str = "hermit-rr-vdso-clock-gettime-cpu";
+const RR_VDSO_CLOCK_GETTIME_CPU_SECONDS: u64 = 24;
+const SHIPPED_EXPORT_WRAPPER_NAME: &str = "hermit-shipped-export-cpu";
+const SHIPPED_EXPORT_CPU_SECONDS: u64 = 26;
 const CPU_TERMINATION_GRACE_SECONDS: u64 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -340,7 +390,7 @@ const PMU_LONE_REPLAY_ALLOWANCE: MeasuredCpuAllowance = MeasuredCpuAllowance {
     wall_seconds: Some(320),
 };
 
-const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 33] = [
+const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 45] = [
     MeasuredCpuAllowance {
         wrapper_name: DETCORE_ALLOCATOR_WRAPPER_NAME,
         package: "hermit-run",
@@ -565,6 +615,102 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 33] = [
         test: "another_processs_io_reads_with_a_full_descriptor_table_on_every_backend",
         cpu_seconds: FULL_TABLE_IO_CPU_SECONDS,
         wall_seconds: Some(8 * FULL_TABLE_IO_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: SCHEDULE_REPLAY_CLOCK_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::cli",
+        test: "a_schedule_replay_keeps_the_clock_of_a_thread_that_yields_beside_a_computing_one",
+        cpu_seconds: SCHEDULE_REPLAY_CLOCK_CPU_SECONDS,
+        wall_seconds: Some(8 * SCHEDULE_REPLAY_CLOCK_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: CHAOS_OFFSET_SPLIT_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::cli",
+        test: "chaos_instruction_offset_splits_a_branch_free_window",
+        cpu_seconds: CHAOS_OFFSET_SPLIT_CPU_SECONDS,
+        wall_seconds: Some(8 * CHAOS_OFFSET_SPLIT_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: CHAOS_OFFSET_VERIFY_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::cli",
+        test: "a_chaos_instruction_offset_run_verifies_and_replays_at_its_offsets",
+        cpu_seconds: CHAOS_OFFSET_VERIFY_CPU_SECONDS,
+        wall_seconds: Some(8 * CHAOS_OFFSET_VERIFY_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: SCHEDULE_REPLAY_LONG_SLICES_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::cli",
+        test: "a_schedule_replay_keeps_the_long_slices_of_a_preemption_replay",
+        cpu_seconds: SCHEDULE_REPLAY_LONG_SLICES_CPU_SECONDS,
+        wall_seconds: Some(8 * SCHEDULE_REPLAY_LONG_SLICES_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: CHAOS_CHANGE_POINTS_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::cli",
+        test: "chaos_change_points_come_within_a_timeslice_of_turn_charges",
+        cpu_seconds: CHAOS_CHANGE_POINTS_CPU_SECONDS,
+        wall_seconds: Some(8 * CHAOS_CHANGE_POINTS_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: POSIX_TIMER_SIGNAL_ROWS_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::cli",
+        test: "posix_timer_signal_rows_are_delivered_as_on_linux_at_bitwise_parity",
+        cpu_seconds: POSIX_TIMER_SIGNAL_ROWS_CPU_SECONDS,
+        wall_seconds: Some(8 * POSIX_TIMER_SIGNAL_ROWS_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: TRACE_REPLAY_SPLIT_WRAPPER_NAME,
+        package: "hermit-verify",
+        binary: "hermit-verify::replay_modes",
+        test: "trace_replay_split_just_spin",
+        cpu_seconds: TRACE_REPLAY_SPLIT_CPU_SECONDS,
+        wall_seconds: Some(8 * TRACE_REPLAY_SPLIT_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: CHAOS_REPLAY_SHELL_WRAPPER_NAME,
+        package: "hermit-verify",
+        binary: "hermit-verify::replay_modes",
+        test: "chaos_replay_shell_par_work",
+        cpu_seconds: CHAOS_REPLAY_SHELL_CPU_SECONDS,
+        wall_seconds: Some(8 * CHAOS_REPLAY_SHELL_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: RR_VDSO_TIME_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::rr_suite",
+        test: "rr_vdso_time_stack",
+        cpu_seconds: RR_VDSO_TIME_CPU_SECONDS,
+        wall_seconds: Some(8 * RR_VDSO_TIME_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: RR_VDSO_GETTIMEOFDAY_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::rr_suite",
+        test: "rr_vdso_gettimeofday_stack",
+        cpu_seconds: RR_VDSO_GETTIMEOFDAY_CPU_SECONDS,
+        wall_seconds: Some(8 * RR_VDSO_GETTIMEOFDAY_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: RR_VDSO_CLOCK_GETTIME_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::rr_suite",
+        test: "rr_vdso_clock_gettime_stack",
+        cpu_seconds: RR_VDSO_CLOCK_GETTIME_CPU_SECONDS,
+        wall_seconds: Some(8 * RR_VDSO_CLOCK_GETTIME_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: SHIPPED_EXPORT_WRAPPER_NAME,
+        package: "hermit-manifest-plan",
+        binary: "hermit-manifest-plan",
+        test: "manifest_metadata::tests::shipped_export_is_deterministic_and_matches_the_comparable_projection",
+        cpu_seconds: SHIPPED_EXPORT_CPU_SECONDS,
+        wall_seconds: Some(8 * SHIPPED_EXPORT_CPU_SECONDS),
     },
 ];
 
@@ -1387,7 +1533,7 @@ fn resolve_budgets(
 fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
     if args == [std::ffi::OsString::from("--help")] || args == [std::ffi::OsString::from("-h")] {
         println!(
-            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), CPU-profile v3 host loader ({CPU_PROFILE_V3_LOADER_CPU_SECONDS}s), rr thread stress ({RR_THREAD_STRESS_CPU_SECONDS}s), the four external-signal poll-deadline tests ({ESI_POLL_DEADLINE_CPU_SECONDS}s), lit chaos verify ({LIT_CHAOS_VERIFY_CPU_SECONDS}s), DBT virtual kernel files ({DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS}s), CPU-profile v3 guest ({CPU_PROFILE_V3_GUEST_CPU_SECONDS}s), parity post-pass ({PARITY_POST_PASS_NO_GUEST_CPU_SECONDS}s), epoll_pwait2 strict ({EPOLL_PWAIT2_STRICT_CPU_SECONDS}s), epoll_pwait temporary mask ({EPOLL_PWAIT_MASK_CPU_SECONDS}s), lone-slice-end backstop ({LONE_BACKSTOP_CPU_SECONDS}s), ptrace signal permits ({SIGNAL_PERMITS_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. The PMU integration node alone gives replays_take_recorded_lone_slice_ends_the_same_way 40 CPU seconds and 320 wall seconds; KVM and unscoped invocations keep their prior bounds. Every exact prepared selected liteinst_stacks identity, the Detcore allocator leaf, and the CPU-profile v3 host loader, gets a separate base wall backstop of eight times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
+            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), CPU-profile v3 host loader ({CPU_PROFILE_V3_LOADER_CPU_SECONDS}s), rr thread stress ({RR_THREAD_STRESS_CPU_SECONDS}s), the four external-signal poll-deadline tests ({ESI_POLL_DEADLINE_CPU_SECONDS}s), lit chaos verify ({LIT_CHAOS_VERIFY_CPU_SECONDS}s), DBT virtual kernel files ({DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS}s), CPU-profile v3 guest ({CPU_PROFILE_V3_GUEST_CPU_SECONDS}s), parity post-pass ({PARITY_POST_PASS_NO_GUEST_CPU_SECONDS}s), epoll_pwait2 strict ({EPOLL_PWAIT2_STRICT_CPU_SECONDS}s), epoll_pwait temporary mask ({EPOLL_PWAIT_MASK_CPU_SECONDS}s), lone-slice-end backstop ({LONE_BACKSTOP_CPU_SECONDS}s), ptrace signal permits ({SIGNAL_PERMITS_CPU_SECONDS}s), schedule-replay clock ({SCHEDULE_REPLAY_CLOCK_CPU_SECONDS}s), chaos offset split ({CHAOS_OFFSET_SPLIT_CPU_SECONDS}s), chaos offset verify ({CHAOS_OFFSET_VERIFY_CPU_SECONDS}s), schedule-replay long slices ({SCHEDULE_REPLAY_LONG_SLICES_CPU_SECONDS}s), chaos change points ({CHAOS_CHANGE_POINTS_CPU_SECONDS}s), posix timer signal rows ({POSIX_TIMER_SIGNAL_ROWS_CPU_SECONDS}s), trace replay split ({TRACE_REPLAY_SPLIT_CPU_SECONDS}s), chaos replay shell ({CHAOS_REPLAY_SHELL_CPU_SECONDS}s), rr vdso time ({RR_VDSO_TIME_CPU_SECONDS}s), rr vdso gettimeofday ({RR_VDSO_GETTIMEOFDAY_CPU_SECONDS}s), rr vdso clock_gettime ({RR_VDSO_CLOCK_GETTIME_CPU_SECONDS}s), shipped export ({SHIPPED_EXPORT_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. The PMU integration node alone gives replays_take_recorded_lone_slice_ends_the_same_way 40 CPU seconds and 320 wall seconds; KVM and unscoped invocations keep their prior bounds. Every exact prepared selected liteinst_stacks identity, the Detcore allocator leaf, and the CPU-profile v3 host loader, gets a separate base wall backstop of eight times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
         );
         return Ok(());
     }
@@ -3175,7 +3321,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(selected.len(), 15);
-        assert_eq!(MEASURED_CPU_ALLOWANCES.len(), 33);
+        assert_eq!(MEASURED_CPU_ALLOWANCES.len(), 45);
         for (cpu_multiplier, wall_multiplier) in [(1.0, 1.0), (1.25, 1.5), (0.01, 0.1)] {
             let rendered = scaled_config_with_allowances(
                 include_str!("../.config/nextest.toml"),
