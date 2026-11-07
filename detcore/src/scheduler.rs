@@ -44274,6 +44274,335 @@ mod test {
         );
     }
 
+    /// Process 100's leader and child-creating thread 101 (`sigchld_family`),
+    /// with workers 102 and 103, and each thread's mask: `blocked` for the
+    /// leader and the creator, none for the workers.
+    fn four_thread_family(signo: libc::c_int) -> (Scheduler, [DetTid; 4]) {
+        let bit = kernel_signal_bit(signo);
+        let (mut scheduler, parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+        let w1 = DetTid::from_raw(102);
+        let w2 = DetTid::from_raw(103);
+        for worker in [w1, w2] {
+            scheduler.thread_tree.add_child(parent, worker, false);
+            register_known_thread(&mut scheduler, worker);
+        }
+        for (thread, blocked) in [(parent, bit), (creator, bit), (w1, 0), (w2, 0)] {
+            scheduler.test_kernel_signal_states.insert(
+                thread,
+                KernelSignalState {
+                    blocked,
+                    ..signal_state(bit, 0)
+                },
+            );
+        }
+        (scheduler, [parent, creator, w1, w2])
+    }
+
+    /// F1 of revastra2's review of SIGSHARE S3b: a child's exit `SIGCHLD`
+    /// that its creator does not want goes to the first thread that does,
+    /// walking the thread list from the process's `curr_target`
+    /// (`complete_signal`, kernel/signal.c:983-997 at v6.17), and the walk's
+    /// choice is the new `curr_target`; a creator that wants it is named and
+    /// takes it, moving nothing. Before, the order was the creator, then
+    /// thread-ID order, so W1 took a copy whose walk starts at W2.
+    #[test]
+    fn a_child_exit_sigchld_walks_from_curr_target() {
+        let (mut scheduler, [parent, creator, w1, w2]) = four_thread_family(libc::SIGCHLD);
+        assert_eq!(
+            scheduler.child_exit_sigchld_choice(parent, creator),
+            (w1, Some(w1)),
+            "from the leader, where curr_target starts, the walk reaches W1"
+        );
+        scheduler.signal_curr_targets.insert(parent, w2);
+        assert_eq!(
+            scheduler.child_exit_sigchld_choice(parent, creator),
+            (w2, Some(w2)),
+            "from W2 the walk reaches W2 before W1"
+        );
+        scheduler
+            .test_kernel_signal_states
+            .insert(creator, signal_state(kernel_signal_bit(libc::SIGCHLD), 0));
+        assert_eq!(
+            scheduler.child_exit_sigchld_choice(parent, creator),
+            (creator, None),
+            "a creator that wants it is named and takes it"
+        );
+    }
+
+    /// F2 of revastra2's review of SIGSHARE S3b: a thread waiting in
+    /// `rt_sigtimedwait` for the signal wants it whatever its own mask says,
+    /// since Linux unblocks the waited set for the wait (`do_sigtimedwait`,
+    /// kernel/signal.c:3776-3777 at v6.17): the creator waiting for its
+    /// child's `SIGCHLD` takes it ahead of a worker that leaves it unblocked,
+    /// and so does a leader waiting for a timer's SIGALRM. Before, the mask
+    /// alone was read, and the worker took it.
+    #[test]
+    fn a_thread_waiting_for_the_signal_in_sigtimedwait_wants_it() {
+        let (mut scheduler, [parent, creator, w1, _w2]) = four_thread_family(libc::SIGCHLD);
+        scheduler
+            .sigtimedwait_sets
+            .insert(creator, kernel_signal_bit(libc::SIGCHLD));
+        assert_eq!(
+            scheduler.child_exit_sigchld_choice(parent, creator),
+            (creator, None)
+        );
+        scheduler.sigtimedwait_sets.clear();
+        assert_eq!(
+            scheduler.child_exit_sigchld_choice(parent, creator),
+            (w1, Some(w1)),
+            "without the wait the mask decides"
+        );
+
+        let (mut scheduler, [leader, _creator, w1, _w2]) = four_thread_family(libc::SIGALRM);
+        scheduler
+            .sigtimedwait_sets
+            .insert(leader, kernel_signal_bit(libc::SIGALRM));
+        assert_eq!(
+            scheduler.timer_signal_choice(leader, leader, Signal::SIGALRM),
+            (leader, None)
+        );
+        scheduler.sigtimedwait_sets.clear();
+        assert_eq!(
+            scheduler.timer_signal_choice(leader, leader, Signal::SIGALRM),
+            (w1, Some(w1))
+        );
+    }
+
+    /// A child's exit moves `curr_target` although the kernel's own copy of
+    /// that exit is already in the shared queue, which it posts when the child
+    /// exits, at a moment host timing sets: only a copy the scheduler left
+    /// there earlier, because every thread blocked it
+    /// (`shared_queue_scheduler_signals`), makes this exit's copy merge into it
+    /// with no `complete_signal` (`legacy_queue`). A timer's copy is sent by
+    /// the scheduler, so the queue read decides for it. Before, the child's
+    /// exit read the queue too, found its own kernel copy, and never moved
+    /// `curr_target`.
+    #[test]
+    fn a_child_exits_walk_moves_curr_target_although_its_kernel_copy_is_queued() {
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        let (mut scheduler, [parent, creator, w1, w2]) = four_thread_family(libc::SIGCHLD);
+        for thread in [parent, creator, w1, w2] {
+            scheduler
+                .test_kernel_signal_states
+                .get_mut(&thread)
+                .unwrap()
+                .shared_pending = chld;
+        }
+        scheduler.commit_kernel_signal_walk(
+            parent,
+            creator,
+            libc::SIGCHLD,
+            Some(w1),
+            KernelSignalSource::ChildExit,
+        );
+        assert_eq!(scheduler.signal_curr_targets.get(&parent), Some(&w1));
+
+        scheduler.signal_curr_targets.clear();
+        scheduler.note_signal_left_in_shared_queue(parent, libc::SIGCHLD);
+        scheduler.commit_kernel_signal_walk(
+            parent,
+            creator,
+            libc::SIGCHLD,
+            Some(w2),
+            KernelSignalSource::ChildExit,
+        );
+        assert_eq!(
+            scheduler.signal_curr_targets.get(&parent),
+            None,
+            "an earlier copy the scheduler left in the queue absorbs this one"
+        );
+
+        scheduler.shared_queue_scheduler_signals.clear();
+        scheduler.commit_kernel_signal_walk(
+            parent,
+            parent,
+            libc::SIGCHLD,
+            Some(w2),
+            KernelSignalSource::Timer,
+        );
+        assert_eq!(
+            scheduler.signal_curr_targets.get(&parent),
+            None,
+            "a timer's copy reads the queue"
+        );
+    }
+
+    /// Delta F1 of revastra2's review of SIGSHARE S3b's fix round: a child's
+    /// exit `SIGCHLD` that merges into one already pending in the shared
+    /// queue reaches no `complete_signal` (`legacy_queue`,
+    /// kernel/signal.c:1128-1129 at v6.17), so its walk moves no
+    /// `curr_target`; one that is queued moves it to the walk's choice. Only
+    /// the send knows which (`guest_send_reached_no_walk`): the pending copy may be
+    /// one a vfork parent was chosen for and has not taken, which the ledger
+    /// of copies every thread blocked does not hold. Before, the walk was
+    /// committed ahead of the send, and `coalesced-child-curr` in
+    /// `process_signal_target.c` ended with W1 where Linux gives W2.
+    #[test]
+    fn a_coalesced_child_exit_sigchld_moves_no_curr_target() {
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        for (coalesces, curr_target) in [(true, 103), (false, 102)] {
+            let (mut scheduler, [parent, creator, w1, w2]) = four_thread_family(libc::SIGCHLD);
+            scheduler
+                .test_kernel_signal_states
+                .get_mut(&w2)
+                .unwrap()
+                .blocked = chld;
+            for thread in [parent, creator, w1, w2] {
+                scheduler.runqueue_push_back(thread);
+            }
+            scheduler.signal_curr_targets.insert(parent, w2);
+            scheduler.test_sent_signals = Some(Vec::new());
+            scheduler.test_sends_reach_no_walk = coalesces;
+            assert_eq!(
+                scheduler.fire_child_exit_alarm(parent, creator, None, None),
+                Some(w1),
+                "coalesces={coalesces}: the walk from W2 reaches W1"
+            );
+            assert_eq!(
+                scheduler.signal_curr_targets.get(&parent),
+                Some(&DetTid::from_raw(curr_target)),
+                "coalesces={coalesces}"
+            );
+        }
+    }
+
+    /// A vfork parent with a signal pending is busy: `wants_signal` passes
+    /// over a thread that is not running and has a signal pending
+    /// (kernel/signal.c:958-961 at v6.17), and a vfork parent's pending set is
+    /// a function of the schedule, as no host timing ends its call or posts it
+    /// a signal, so it is read like a stopped thread's. A thread outside the
+    /// schedule for another call is still read only for its wake. Before, a
+    /// vfork parent was never busy, and took a child's `SIGCHLD` that it could
+    /// not handle until its vfork ended, where Linux gives it to the next
+    /// thread.
+    #[test]
+    fn a_vfork_parent_with_a_signal_pending_is_busy() {
+        let usr2 = kernel_signal_bit(libc::SIGUSR2);
+        let (mut scheduler, [parent, creator, w1, w2]) = four_thread_family(libc::SIGCHLD);
+        commit_out_of_scheduler_call(
+            &mut scheduler,
+            w1,
+            ResourceID::BlockingVfork(ExternalOpId::new(w1, 1)),
+            Some(0),
+        );
+        scheduler.vfork_barriers.insert(w1, None);
+        scheduler
+            .test_kernel_signal_states
+            .get_mut(&w1)
+            .unwrap()
+            .thread_pending = usr2;
+        scheduler.signal_curr_targets.insert(parent, w1);
+        assert_eq!(
+            scheduler.child_exit_sigchld_choice(parent, creator),
+            (w2, Some(w2)),
+            "the busy vfork parent is passed over"
+        );
+        scheduler
+            .test_kernel_signal_states
+            .get_mut(&w1)
+            .unwrap()
+            .thread_pending = 0;
+        assert_eq!(
+            scheduler.child_exit_sigchld_choice(parent, creator),
+            (w1, Some(w1)),
+            "with nothing pending it wants it"
+        );
+        scheduler
+            .test_kernel_signal_states
+            .get_mut(&w1)
+            .unwrap()
+            .thread_pending = usr2;
+        scheduler.vfork_barriers.remove(&w1);
+        assert_eq!(
+            scheduler.child_exit_sigchld_choice(parent, creator),
+            (w1, Some(w1)),
+            "a thread outside the schedule for another call is not read"
+        );
+    }
+
+    /// Delta F2 of revastra2's review of SIGSHARE S3b's fix round: a vfork
+    /// parent whose own queue holds only a copy Linux discarded as it was
+    /// generated (an ignored SIGWINCH a sibling sent it, which the kernel
+    /// still holds for a traced task) is not busy, since Linux never queued
+    /// it (`sig_ignored`, kernel/signal.c:1089-1090 at v6.17) and so never set
+    /// `TIF_SIGPENDING`; it takes the child's `SIGCHLD`. A copy queued while
+    /// blocked is kept although ignored, and keeps it busy. Before, any copy
+    /// counted, and `ignored-busy` in `process_signal_target.c` passed W1
+    /// over for W2.
+    #[test]
+    fn a_vfork_parent_holding_only_a_discarded_copy_is_not_busy() {
+        let winch = libc::SIGWINCH;
+        let (mut scheduler, [parent, creator, w1, w2]) = four_thread_family(libc::SIGCHLD);
+        commit_out_of_scheduler_call(
+            &mut scheduler,
+            w1,
+            ResourceID::BlockingVfork(ExternalOpId::new(w1, 1)),
+            Some(0),
+        );
+        scheduler.vfork_barriers.insert(w1, None);
+        scheduler
+            .test_kernel_signal_states
+            .get_mut(&w1)
+            .unwrap()
+            .thread_pending = kernel_signal_bit(winch);
+        scheduler.signal_curr_targets.insert(parent, w1);
+        let queue = discarded_at_send::QueueId::Thread(w1);
+        let pre = scheduler.discarded_at_send.pre_send(queue, winch, false);
+        scheduler
+            .discarded_at_send
+            .note_send(queue, winch, true, pre, None);
+        assert_eq!(
+            scheduler.child_exit_sigchld_choice(parent, creator),
+            (w1, Some(w1)),
+            "a copy Linux discarded leaves the vfork parent wanting it"
+        );
+        let pre = scheduler.discarded_at_send.pre_send(queue, winch, true);
+        scheduler
+            .discarded_at_send
+            .note_send(queue, winch, false, pre, None);
+        assert_eq!(
+            scheduler.child_exit_sigchld_choice(parent, creator),
+            (w2, Some(w2)),
+            "a copy queued while blocked keeps it busy"
+        );
+    }
+
+    /// A process-directed timer signal names the leader, as Linux does
+    /// (`it_real_fn` sends to `leader_pid`; `posixtimer_get_target`), not the
+    /// thread drawn for it (the one that armed it): a drawn worker that leaves
+    /// it unblocked does not take it ahead of a leader that wants it, but
+    /// keeps it where every thread blocks it. Under targeted chaos the drawn
+    /// thread is named, as before, and without modelling it is kept.
+    #[test]
+    fn a_timer_signal_names_the_leader_not_the_drawn_thread() {
+        let alrm = kernel_signal_bit(libc::SIGALRM);
+        let (mut scheduler, leader, worker, _child) = sigchld_family(libc::SIGCHLD);
+        for thread in [leader, worker] {
+            scheduler
+                .test_kernel_signal_states
+                .insert(thread, signal_state(alrm, 0));
+        }
+        assert!(scheduler.models_signal_targets);
+        assert_eq!(
+            scheduler.timer_signal_choice(leader, worker, Signal::SIGALRM),
+            (leader, None),
+            "the leader is named and wants it"
+        );
+        scheduler.chaos_target_races = true;
+        assert_eq!(
+            scheduler.timer_signal_choice(leader, worker, Signal::SIGALRM),
+            (worker, None),
+            "under targeted chaos the drawn thread is named"
+        );
+        scheduler.chaos_target_races = false;
+        scheduler.models_signal_targets = false;
+        assert_eq!(
+            scheduler.timer_signal_choice(leader, worker, Signal::SIGALRM),
+            (worker, None),
+            "without modelling the drawn thread is kept"
+        );
+    }
+
     /// A signal the scheduler sent while every thread blocked it waits in the
     /// process's shared queue, and a call that begins under a mask admitting
     /// it is ended by it at once. Such a call is armed for the release
@@ -53716,6 +54045,24 @@ mod test {
         assert_eq!(ask(&mut scheduler), ChildExitSigchldAnswer::Placed(true));
         scheduler.models_signal_targets = false;
         assert_eq!(ask(&mut scheduler), ChildExitSigchldAnswer::Placed(false));
+    }
+
+    /// A vfork parent that leaves `SIGCHLD` unblocked does not stop its
+    /// process from using the send window: Linux sleeps it killable in its
+    /// vfork wait, so it takes the signal only on its return, after its
+    /// continuation. Before, it did, and on ptrace a child's `SIGCHLD` that
+    /// merged into the one the parent held was not seen to coalesce, so its
+    /// walk moved `curr_target` (delta F1 of revastra2's review of SIGSHARE
+    /// S3b's fix round, `coalesced-child-curr`).
+    #[test]
+    fn a_vfork_parent_leaves_the_sigchld_window_usable() {
+        let (mut scheduler, parent, creator, _) = owned_sigchld_family();
+        scheduler.vfork_barriers.insert(creator, None);
+        scheduler.note_outside_blocker(creator, Some(0), false);
+        assert!(scheduler.sigchld_window_usable(parent));
+        scheduler.vfork_barriers.remove(&creator);
+        scheduler.note_outside_blocker(creator, Some(0), false);
+        assert!(!scheduler.sigchld_window_usable(parent));
     }
 
     /// A background read by `thread` of descriptor `fd` in the table `thread`
