@@ -7,18 +7,18 @@
         "note": "Two independent same-host builds agreed byte-for-byte. This does not establish cross-host reproducibility; issue 5031 tracks the cross-host fixes these builds carry (sandboxed builds, deterministic Rust flags)."
     },
     "repin": {
-        "superseded_reference": "localhost/hermit-hermetic-validate@sha256:786a9fd2a7ad03dc7c58b385ae9e64c8c1628dc5a0815b25ebb13b1aa9aaa7da",
-        "superseded_archive_sha256": "01a1fab0c894e28c4cafccd5cc707895abd7a4375c4751c4aedf9a4c35b7aad2",
-        "replacement_reference": "localhost/hermit-hermetic-validate@sha256:7facbb1c720365215f215030c6e1c652628db55ddabbfddad4b5c3725f19b17c",
-        "rationale": "The 786a9fd2 root predates the issue-5031 deterministic-build fixes and the Go toolchain the KVM SP1 os/exec cell needs. This repin moves the pin to the reproducible build of the fixed flake (sandboxed builds, --remap-path-prefix, codegen-units=1, no incremental) with pkgs.go added, so the pinned image is a reproducible pure function of its locked inputs and carries every toolchain a gated cell names."
+        "superseded_reference": "localhost/hermit-hermetic-validate@sha256:7facbb1c720365215f215030c6e1c652628db55ddabbfddad4b5c3725f19b17c",
+        "superseded_archive_sha256": "92d3399bf185179c7b56544d636a8280c2e9938ab8c71c7bbfcdb8fe72c773e8",
+        "replacement_reference": "localhost/hermit-hermetic-validate@sha256:4e1605ecbb13a6c5c6f45f4259f49e2c07efb21a7e6e7b7aabb5b97329232d6e",
+        "rationale": "The 7facbb1c root has no abseil-cpp, googletest or benchmark, so the vendored gVisor C++ syscall tests can only resolve those dependencies through host pkg-config system libraries and cannot build inside the pinned root. This repin moves the pin to the reproducible build of the flake that carries the three pinned packages in nativeLibs, so the pinned image is a reproducible pure function of its locked inputs and contains every library a gated cell names."
     },
     "source": {
         "repository": "https://github.com/rrnewton/hermit",
-        "git_commit": "7271aea02e50312da2a4469e7340fef85f16bda2",
-        "git_tree": "215772b9e07350aaed19f844ae3966088bcdde26",
+        "git_commit": "1c8aa13591b52ace5b0d65f3fb85a1de83de7dad",
+        "git_tree": "684a274d12992d40d95dc829dc647e476dfaefc6",
         "clean": true,
-        "git_archive_sha256": "7a73bd83cc587e4aad7f5fe3add855e9a920d1f8dcba0751a020919a3a1afd7a",
-        "git_archive_size_bytes": 71976960,
+        "git_archive_sha256": "cdef881b66a33f07c1d8a40413a17ec8334be0652981cc39d40c416b905132fc",
+        "git_archive_size_bytes": 91422720,
         "inputs": [
             {
                 "path": "ci/hermetic/build-image.sh",
@@ -32,8 +32,8 @@
             },
             {
                 "path": "ci/hermetic/flake.nix",
-                "sha256": "6c33d53e384f50ffde64b3b6a4d5b3e8f1ad0dc1b5017cfd760f2ff85dadae54",
-                "size_bytes": 15882
+                "sha256": "0ca49071f89a1c3350c7f0c4f9b66f1cb4838d04d379fda06381f444d46fedb4",
+                "size_bytes": 16744
             },
             {
                 "path": "ci/hermetic/guest-paths.txt",
@@ -45,11 +45,11 @@
     "nix": {
         "version": "nix (Nix) 2.35.2",
         "system": "x86_64-linux",
-        "derivation_path": "/nix/store/2yq58kpbzbfvp0pi6gcp5w6jbr7wnqj4-hermit-hermetic-validate.tar.gz.drv",
-        "derivation_sha256": "5c1f23f7ae69f70df0696f9303f20f4c572196b993692726441f754a77c1f886",
-        "output_path": "/nix/store/1v56fgq6ylv7sp1k2gwcg5pbxcc5ddyz-hermit-hermetic-validate.tar.gz",
-        "output_nar_hash": "sha256-iI+hX9RCQxPpuQg/iZXNryebAGkyE7alN1cjx70ARfA=",
-        "output_nar_size_bytes": 1714568888,
+        "derivation_path": "/nix/store/4kx0m189agsiv7kz4m8gwwiyn3mydzbh-hermit-hermetic-validate.tar.gz.drv",
+        "derivation_sha256": "7f593118905fc2ca6945130d4c12ba1ede80777eba88ae900339d740a14828a9",
+        "output_path": "/nix/store/r5jadk7g4jbwskbhc47gda7zq63qq1rn-hermit-hermetic-validate.tar.gz",
+        "output_nar_hash": "sha256-ysIA/N+h3OfXSbHYFSkrHeq5uLZMwr9DQZ7h6RArO5g=",
+        "output_nar_size_bytes": 1716858512,
         "locked_inputs": [
             {
                 "name": "nixpkgs",
@@ -85,18 +85,18 @@
     },
     "evidence_limitations": [
         "Each service ran under systemd-run with only PATH and NIX_SSL_CERT_FILE set explicitly; fetches went through the host forward proxy (with-proxy). Only variable names were recorded, not their values.",
-        "Each build substituted first from a file binary cache copied from the build host's default Nix store with the three unsigned realized inputs and the image output itself removed, and second from cache.nixos.org under its trusted key for paths the host store no longer held; the removed realized inputs (rust-script, cargo-nextest and coreutils) were rebuilt in each store. Substituted paths are trusted by Nix signature or content hash and NAR hash, not rebuilt.",
+        "Each build substituted only from cache.nixos.org under its trusted key; the removed realized inputs (rust-script, cargo-nextest and coreutils) were rebuilt in each store. Substituted paths are trusted by Nix signature or content hash and NAR hash, not rebuilt.",
         "Both builds forced the Nix sandbox on (--option sandbox true), so builders ran as unprivileged nixbld users with a fixed build directory; no host shell or host path is an image input. This is the issue-5031 fix the previous receipt could not claim (its builds ran unsandboxed).",
         "Build logs, unit records and Nix path-info records were retained only on the build host; this receipt does not authenticate them.",
-        "The superseded 786a9fd2 archive was not rebuilt for this receipt; its 01a1fab0 SHA-256 is carried from the prior receipt that produced the replaced pin.",
+        "The superseded 7facbb1c archive was not rebuilt for this receipt; its 92d3399b SHA-256 is carried from the prior receipt that produced the replaced pin.",
         "The recorded build-source commit and tree are historical review evidence. Rebases can rewrite their ancestry; live verification establishes equivalence only for the four enumerated image input files, not the complete source tree or archive."
     ],
     "runs": [
         {
-            "run_id": "hermetic-repin4-a.service",
-            "source_snapshot_identity": "src@48:5365387181",
-            "nix_store_identity": "nix-root/nix@48:5365390644",
-            "podman_store_identity": "repin4-a/podman-data",
+            "run_id": "hermetic-gtest-repin-a.service",
+            "source_snapshot_identity": "src@48:6415744274",
+            "nix_store_identity": "nix-root/nix@48:6415748303",
+            "podman_store_identity": "gtest-repin-a/podman-data",
             "full_rebuild_observed": true,
             "resource_bound": {
                 "wall_seconds": 2400,
@@ -108,39 +108,39 @@
                 "service_result": "success",
                 "exit_status": 0,
                 "oom_kills": 0,
-                "last_observed_memory_peak_bytes": 8589934592,
-                "last_observed_cpu_nanoseconds": 1318354494000
+                "last_observed_memory_peak_bytes": 8589938688,
+                "last_observed_cpu_nanoseconds": 1472214479000
             },
             "artifact": {
-                "archive_sha256": "92d3399bf185179c7b56544d636a8280c2e9938ab8c71c7bbfcdb8fe72c773e8",
-                "archive_size_bytes": 1714568775,
-                "loaded_reference": "localhost/hermit-hermetic-validate@sha256:7facbb1c720365215f215030c6e1c652628db55ddabbfddad4b5c3725f19b17c",
+                "archive_sha256": "df1f0dd4f9aa0c82fd6fedceac64d5607143add2f8d0d40a0163850b19289453",
+                "archive_size_bytes": 1716858397,
+                "loaded_reference": "localhost/hermit-hermetic-validate@sha256:4e1605ecbb13a6c5c6f45f4259f49e2c07efb21a7e6e7b7aabb5b97329232d6e",
                 "manifest_media_type": "application/vnd.docker.distribution.manifest.v2+json",
-                "manifest_digest": "sha256:7facbb1c720365215f215030c6e1c652628db55ddabbfddad4b5c3725f19b17c",
+                "manifest_digest": "sha256:4e1605ecbb13a6c5c6f45f4259f49e2c07efb21a7e6e7b7aabb5b97329232d6e",
                 "manifest_size_bytes": 598,
-                "config_digest": "sha256:7eef77c18c15e6b78f4de28751361bc3161cf424f24a83e45469a2c99406406e",
-                "config_size_bytes": 21217,
+                "config_digest": "sha256:99b4079cf73ef0e4245994fb21272127bb37bc5e8b05af9922738b26cd5eacc6",
+                "config_size_bytes": 22069,
                 "layers": [
                     {
-                        "digest": "sha256:430adc4038b3b8ac62cd98c6161006dcf6dc4840e4e2ffeed5ed1f6430e2a05f",
-                        "size_bytes": 5633546240
+                        "digest": "sha256:f106242342d9037290612bdcd422b10c009b2f67a12b299fcc84d79e9ce2705d",
+                        "size_bytes": 5643857920
                     },
                     {
-                        "digest": "sha256:d5a6468d04efa41e91bb5e635196dcb1806762a5efbf77a7999fdbc3994347e6",
-                        "size_bytes": 143216640
+                        "digest": "sha256:d3c87dd196d927e23ebcef73a30799f8efe3f895e320a09f13469efdaf17ae2d",
+                        "size_bytes": 144363520
                     }
                 ],
                 "diff_ids": [
-                    "sha256:430adc4038b3b8ac62cd98c6161006dcf6dc4840e4e2ffeed5ed1f6430e2a05f",
-                    "sha256:d5a6468d04efa41e91bb5e635196dcb1806762a5efbf77a7999fdbc3994347e6"
+                    "sha256:f106242342d9037290612bdcd422b10c009b2f67a12b299fcc84d79e9ce2705d",
+                    "sha256:d3c87dd196d927e23ebcef73a30799f8efe3f895e320a09f13469efdaf17ae2d"
                 ]
             }
         },
         {
-            "run_id": "hermetic-repin4-b.service",
-            "source_snapshot_identity": "src@48:5366994846",
-            "nix_store_identity": "nix-root/nix@48:5366999159",
-            "podman_store_identity": "repin4-b/podman-data",
+            "run_id": "hermetic-gtest-repin-b.service",
+            "source_snapshot_identity": "src@48:6417250157",
+            "nix_store_identity": "nix-root/nix@48:6417254190",
+            "podman_store_identity": "gtest-repin-b/podman-data",
             "full_rebuild_observed": true,
             "resource_bound": {
                 "wall_seconds": 2400,
@@ -153,30 +153,30 @@
                 "exit_status": 0,
                 "oom_kills": 0,
                 "last_observed_memory_peak_bytes": 8589934592,
-                "last_observed_cpu_nanoseconds": 1453587969000
+                "last_observed_cpu_nanoseconds": 1388853031000
             },
             "artifact": {
-                "archive_sha256": "92d3399bf185179c7b56544d636a8280c2e9938ab8c71c7bbfcdb8fe72c773e8",
-                "archive_size_bytes": 1714568775,
-                "loaded_reference": "localhost/hermit-hermetic-validate@sha256:7facbb1c720365215f215030c6e1c652628db55ddabbfddad4b5c3725f19b17c",
+                "archive_sha256": "df1f0dd4f9aa0c82fd6fedceac64d5607143add2f8d0d40a0163850b19289453",
+                "archive_size_bytes": 1716858397,
+                "loaded_reference": "localhost/hermit-hermetic-validate@sha256:4e1605ecbb13a6c5c6f45f4259f49e2c07efb21a7e6e7b7aabb5b97329232d6e",
                 "manifest_media_type": "application/vnd.docker.distribution.manifest.v2+json",
-                "manifest_digest": "sha256:7facbb1c720365215f215030c6e1c652628db55ddabbfddad4b5c3725f19b17c",
+                "manifest_digest": "sha256:4e1605ecbb13a6c5c6f45f4259f49e2c07efb21a7e6e7b7aabb5b97329232d6e",
                 "manifest_size_bytes": 598,
-                "config_digest": "sha256:7eef77c18c15e6b78f4de28751361bc3161cf424f24a83e45469a2c99406406e",
-                "config_size_bytes": 21217,
+                "config_digest": "sha256:99b4079cf73ef0e4245994fb21272127bb37bc5e8b05af9922738b26cd5eacc6",
+                "config_size_bytes": 22069,
                 "layers": [
                     {
-                        "digest": "sha256:430adc4038b3b8ac62cd98c6161006dcf6dc4840e4e2ffeed5ed1f6430e2a05f",
-                        "size_bytes": 5633546240
+                        "digest": "sha256:f106242342d9037290612bdcd422b10c009b2f67a12b299fcc84d79e9ce2705d",
+                        "size_bytes": 5643857920
                     },
                     {
-                        "digest": "sha256:d5a6468d04efa41e91bb5e635196dcb1806762a5efbf77a7999fdbc3994347e6",
-                        "size_bytes": 143216640
+                        "digest": "sha256:d3c87dd196d927e23ebcef73a30799f8efe3f895e320a09f13469efdaf17ae2d",
+                        "size_bytes": 144363520
                     }
                 ],
                 "diff_ids": [
-                    "sha256:430adc4038b3b8ac62cd98c6161006dcf6dc4840e4e2ffeed5ed1f6430e2a05f",
-                    "sha256:d5a6468d04efa41e91bb5e635196dcb1806762a5efbf77a7999fdbc3994347e6"
+                    "sha256:f106242342d9037290612bdcd422b10c009b2f67a12b299fcc84d79e9ce2705d",
+                    "sha256:d3c87dd196d927e23ebcef73a30799f8efe3f895e320a09f13469efdaf17ae2d"
                 ]
             }
         }
