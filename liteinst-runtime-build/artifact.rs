@@ -975,6 +975,12 @@ pub(crate) mod native {
                 .unwrap()
                 .starts_with(fs::canonicalize(&nested).unwrap())
         );
+        // This producer always builds the liteinst-off runtime, so bind the
+        // actual current build as the no-scope qualification witness.
+        let build_command = runner.commands.last().unwrap();
+        let sources = sources
+            .with_current_build(build_command, &runtime_path, &nested)
+            .unwrap_or_else(|error| panic!("actual native compiler evidence refused: {error}"));
         sources.verify_unchanged(&mut runner).unwrap();
         let qualification = qualifier::qualify_detcore_native_entry_with_sources(
             &runtime_path,
