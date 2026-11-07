@@ -3822,6 +3822,23 @@ fn expected_for_label<'a>(label: &str, cells: &'a [DagManifest]) -> Vec<&'a DagM
 
 /// The Buck full selection replaces exactly the cargo E2E path and reports
 /// the same cells, each owned by exactly one node.
+/// The extension tags the Buck E2E selection drops, pinned by name.
+/// Independent of any selection: a same-count swap must fail here.
+const BUCK_E2E_EXTENSION_DROPPED: [&str; 2] = ["e2e.manifest_gvisor", "e2e.manifest_rr"];
+
+fn check_buck_e2e_extension_dropped(actual: &BTreeSet<String>) -> Result<(), String> {
+    let expected = BUCK_E2E_EXTENSION_DROPPED
+        .iter()
+        .map(|tag| (*tag).to_string())
+        .collect::<BTreeSet<_>>();
+    if *actual != expected {
+        return Err(format!(
+            "the Buck E2E selection drops extension tags {actual:?}, expected exactly {expected:?}"
+        ));
+    }
+    Ok(())
+}
+
 fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), String> {
     let replaced = buck_replaced_tags(cfg)?;
     let mut expected_replaced = BUCK_REPLACED_PRODUCERS
@@ -3902,16 +3919,17 @@ fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(
             "the Buck E2E selection still selects replaced node(s) {kept_replaced:?}"
         ));
     }
-    // Extension tags present in full but absent from the actual selection
-    // are dropped without being replaced; the set is derived from the
-    // selection itself, so this arm no longer independently catches an
-    // extension node being dropped (the script-level buck plan test pins
-    // the exact current tags).
+    // Extension tags present in full but absent from the selection are
+    // dropped without being replaced. The expected set is pinned by
+    // name, independently of the selection: deriving it from the
+    // selection itself (as this code briefly did) cannot catch a swap
+    // that drops a different extension tag at the same count.
     let extension_dropped = crate::dag_source_ownership::extension_tags()
         .iter()
         .filter(|tag| full_tags.contains(*tag) && !selected_tags.contains(*tag))
         .cloned()
         .collect::<BTreeSet<_>>();
+    check_buck_e2e_extension_dropped(&extension_dropped)?;
     let mut expected_dropped = replaced
         .intersection(&full_tags)
         .cloned()
@@ -7950,6 +7968,27 @@ sys.exit(37)
         // (step_limits.rs).
         assert_eq!(local.timeout, 1080);
         assert_eq!(hosted.timeout, local.timeout);
+    }
+
+    #[test]
+    fn buck_e2e_extension_dropped_check_refuses_a_same_count_swap() {
+        let exact: BTreeSet<String> = BUCK_E2E_EXTENSION_DROPPED
+            .iter()
+            .map(|tag| (*tag).to_string())
+            .collect();
+        check_buck_e2e_extension_dropped(&exact).unwrap();
+        // Same count, one tag swapped for another extension tag: the
+        // selection-derived check this replaces could not see this.
+        let mut swapped = exact.clone();
+        swapped.remove("e2e.manifest_rr");
+        swapped.insert("build.reverie_buck".to_string());
+        assert_eq!(swapped.len(), exact.len());
+        let error = check_buck_e2e_extension_dropped(&swapped).unwrap_err();
+        assert!(error.contains("e2e.manifest_rr"), "{error}");
+        // A missing tag (smaller set) refuses too.
+        let mut subset = exact.clone();
+        subset.remove("e2e.manifest_gvisor");
+        assert!(check_buck_e2e_extension_dropped(&subset).is_err());
     }
 
     #[test]

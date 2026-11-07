@@ -2617,7 +2617,14 @@ fn apply_harvest(
     Ok(())
 }
 
+/// Why Buck build mode is refused, by name, until a prepared Nextest
+/// selection really consumes Buck-built executables (follow-up dh-iz46e).
+pub const BUCK_BUILD_REFUSAL: &str = "HERMIT_VALIDATE_BUILD_MODE=buck is refused: no prepared Nextest selection consumes Buck-built executables yet; cargo is the only build mode (follow-up dh-iz46e)";
+
 pub fn prepare(root: &Path, profile: &str, build_mode: &str) -> Result<(), PreparationError> {
+    if build_mode == "buck" {
+        return Err(PreparationError::from(BUCK_BUILD_REFUSAL.to_string()));
+    }
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let prepared_project = project(&root)?;
     let tool_owner = project_tools(prepared_project.as_ref())?;
@@ -3217,173 +3224,6 @@ mod tests {
         assert!(!changed.iter().any(|field| field.starts_with("mode ")));
         assert_eq!(changed.last().unwrap(), "nlink 1 -> 1");
         fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn apply_harvest_repoints_matched_binaries_and_refuses_no_match() {
-        let root = std::env::temp_dir().join(format!(
-            "apply-harvest-test-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let generation = root.join("generation");
-        std::fs::create_dir_all(&generation).unwrap();
-        let buck_file = root.join("target/validate/buck-harvest/basics");
-        std::fs::create_dir_all(buck_file.parent().unwrap()).unwrap();
-        let script = "#!/bin/sh\nprintf 'alpha: test\\nbeta: test\\n'\n";
-        std::fs::write(&buck_file, script).unwrap();
-        std::fs::set_permissions(&buck_file, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let buck_so = root.join("target/validate/buck-harvest/libreverie_examples.so");
-        std::fs::write(&buck_so, b"buck shared library").unwrap();
-        let cargo_file = root.join("cargo-basics");
-        std::fs::write(&cargo_file, script).unwrap();
-        std::fs::set_permissions(&cargo_file, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let cargo_so = root.join("libreverie_examples.so");
-        std::fs::write(&cargo_so, b"cargo shared library").unwrap();
-        let identity = |path: &Path| FileIdentity {
-            path: path.to_path_buf(),
-            size: 0,
-            mode: 0,
-            sha256: String::new(),
-        };
-        let metadata_path = generation.join("full.json");
-        std::fs::write(
-            &metadata_path,
-            serde_json::to_vec(&serde_json::json!({
-                "rust-binaries": {
-                    "pkg:basics:test": {
-                        "binary-id": "pkg:basics:test",
-                        "binary-path": cargo_file.display().to_string(),
-                    }
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let manifest = serde_json::json!({
-            "files": [{
-                "name": "basics",
-                "harvested_to": "target/validate/buck-harvest/basics",
-            }]
-        });
-        let record = SelectionRecord {
-            build_args: vec![],
-            metadata: identity(&metadata_path),
-            binaries: vec![BinaryIdentity {
-                binary_id: "pkg:basics:test".into(),
-                package_id: "pkg".into(),
-                binary_name: "basics".into(),
-                kind: "test".into(),
-                build_platform: "target".into(),
-                executable: identity(&cargo_file),
-            }],
-            runtime_files: vec![identity(&cargo_so)],
-        };
-        let mut selections = BTreeMap::from([("full".to_string(), record)]);
-        apply_harvest(&manifest, &root, &generation, &mut selections).unwrap();
-        let record = &selections["full"];
-        assert_eq!(record.binaries[0].executable.path, buck_file);
-        assert!(!record.binaries[0].executable.sha256.is_empty());
-        // The sibling .so identity is bound to the harvested copy too.
-        assert_eq!(record.runtime_files[0].path, buck_so);
-        assert!(!record.runtime_files[0].sha256.is_empty());
-        let patched = read_json(&metadata_path).unwrap();
-        assert_eq!(
-            patched["rust-binaries"]["pkg:basics:test"]["binary-path"],
-            buck_file.display().to_string()
-        );
-        // No matching binary name: buck mode refuses a Cargo record.
-        let mut unmatched = BTreeMap::from([(
-            "full".to_string(),
-            SelectionRecord {
-                build_args: vec![],
-                metadata: identity(&metadata_path),
-                binaries: vec![],
-                runtime_files: vec![],
-            },
-        )]);
-        assert!(apply_harvest(&manifest, &root, &generation, &mut unmatched).is_err());
-        // A Buck binary enumerating fewer cases than its Cargo twin refuses.
-        std::fs::write(&buck_file, "#!/bin/sh\nprintf 'alpha: test\\n'\n").unwrap();
-        let mut fewer = BTreeMap::from([(
-            "full".to_string(),
-            SelectionRecord {
-                build_args: vec![],
-                metadata: identity(&metadata_path),
-                binaries: vec![BinaryIdentity {
-                    binary_id: "pkg:basics:test".into(),
-                    package_id: "pkg".into(),
-                    binary_name: "basics".into(),
-                    kind: "test".into(),
-                    build_platform: "target".into(),
-                    executable: identity(&cargo_file),
-                }],
-                runtime_files: vec![],
-            },
-        )]);
-        let error = apply_harvest(&manifest, &root, &generation, &mut fewer).unwrap_err();
-        assert!(error.to_string().contains("case set"), "{error}");
-        std::fs::write(&buck_file, script).unwrap();
-        // A placed (Cargo-overwriting) manifest entry refuses, whatever
-        // env the harvest ran under: this kills the env-removal mutant.
-        let placed_manifest = serde_json::json!({
-            "files": [{
-                "name": "basics",
-                "harvested_to": "target/validate/buck-harvest/basics",
-                "placed_over_cargo": true,
-            }]
-        });
-        let mut placed = BTreeMap::from([(
-            "full".to_string(),
-            SelectionRecord {
-                build_args: vec![],
-                metadata: identity(&metadata_path),
-                binaries: vec![BinaryIdentity {
-                    binary_id: "pkg:basics:test".into(),
-                    package_id: "pkg".into(),
-                    binary_name: "basics".into(),
-                    kind: "test".into(),
-                    build_platform: "target".into(),
-                    executable: identity(&cargo_file),
-                }],
-                runtime_files: vec![],
-            },
-        )]);
-        let error = apply_harvest(&placed_manifest, &root, &generation, &mut placed).unwrap_err();
-        assert!(error.to_string().contains("placed over Cargo"), "{error}");
-        // Two manifest names, one matched binary: the drifted stem refuses
-        // by name (kills the name-set-equality mutant).
-        let two_names = serde_json::json!({
-            "files": [
-                {"name": "basics", "harvested_to": "target/validate/buck-harvest/basics"},
-                {"name": "exit", "harvested_to": "target/validate/buck-harvest/basics"},
-            ]
-        });
-        let mut partial = BTreeMap::from([(
-            "full".to_string(),
-            SelectionRecord {
-                build_args: vec![],
-                metadata: identity(&metadata_path),
-                binaries: vec![BinaryIdentity {
-                    binary_id: "pkg:basics:test".into(),
-                    package_id: "pkg".into(),
-                    binary_name: "basics".into(),
-                    kind: "test".into(),
-                    build_platform: "target".into(),
-                    executable: identity(&cargo_file),
-                }],
-                runtime_files: vec![],
-            },
-        )]);
-        let error = apply_harvest(&two_names, &root, &generation, &mut partial).unwrap_err();
-        assert!(error.to_string().contains("exit"), "{error}");
-        // The recomputed hash stays bound to the bytes that run: tampering
-        // with the harvested file after substitution is refused by the same
-        // check_identity every consumer path runs.
-        std::fs::write(&buck_file, b"tampered basics").unwrap();
-        let record = &selections["full"];
-        assert!(check_identity(&record.binaries[0].executable, true).is_err());
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
