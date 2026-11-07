@@ -3665,6 +3665,8 @@ fn alarm_receiver_reach_guest() -> &'static Path {
         );
         guest
     })
+}
+
 #[cfg(target_arch = "x86_64")]
 fn build_branch_free_race(name: &str, defines: &[&str]) -> PathBuf {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
