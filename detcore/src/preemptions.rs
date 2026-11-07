@@ -607,7 +607,6 @@ pub(crate) fn unread_format_message(format: Option<u32>, skips: usize) -> String
     )
 }
 
-
 /// Whether `PreemptionRecord::time_skips` has nothing to write.
 fn lists_no_time_skips(skips: &Option<Vec<TimeSkip>>) -> bool {
     skips.as_ref().is_none_or(Vec::is_empty)

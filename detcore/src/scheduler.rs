@@ -29058,7 +29058,7 @@ mod test {
                         end_rip: detcore_model::schedule::InstructionPointer::new(12345),
                         end_time: Some(LogicalTime::from_nanos(123)),
                         stopless: false,
-                       instruction_offset: None,
+                        instruction_offset: None,
                     };
                     let mut sched = plain_replay_with_writer(vec![terminal.clone(), next.clone()]);
                     if boundary {
@@ -40791,7 +40791,7 @@ mod test {
             end_rip: std::num::NonZeroUsize::new(rip),
             end_time: Some(LogicalTime::from_nanos(0)),
             stopless: false,
-           instruction_offset: None,
+            instruction_offset: None,
         };
         let directory = tempfile::tempdir().unwrap();
         let schedule = directory.path().join("schedule.json");
