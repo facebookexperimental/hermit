@@ -11671,6 +11671,10 @@ pub(crate) fn finish_thread_start<G, T>(
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    // The start grant's offset, installed by `thread_start_request` beside
+    // its first slice: the startup reset clears it (`next_timeslice`), so it
+    // is carried across the reset and restored with the slice it belongs to.
+    let start_offset = guest.thread_state().replay_instruction_offset;
     let reset = {
         let thread = guest.thread_state_mut();
         thread.preemption_points = history.map(|history| history.into_iter());
@@ -11682,6 +11686,7 @@ pub(crate) fn finish_thread_start<G, T>(
     if let Some(length) = first_slice {
         install_replayed_timeslice(guest, length);
     }
+    guest.thread_state_mut().replay_instruction_offset = start_offset;
     crate::slice_boundary::grant::finish_start(guest.thread_state_mut(), reset)
         .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
 }
@@ -14932,6 +14937,35 @@ mod tests {
             (Some(slice), None)
         );
     }
+    /// The startup reset clears `replay_instruction_offset`
+    /// (`ThreadState::next_timeslice`), so `finish_thread_start` carries
+    /// the start grant's offset across it: after the reset the thread's
+    /// first slice still stops at the recorded instruction, not at its
+    /// branch target.
+    #[tokio::test]
+    async fn a_start_grants_offset_survives_the_startup_reset() {
+        let offset = crate::resources::InstructionOffset {
+            rcb_target: 120,
+            instructions: 6,
+        };
+        let slice = LogicalTime::from_rcbs(123);
+        let (config, state, tid, process) = cancellation_test_state();
+        let mut thread = crate::ThreadState::new(tid, &config, ());
+        thread.detpid = Some(process);
+        thread.replay_instruction_offset = Some(offset);
+        let mut guest = ExternalRegistrationGuest {
+            global: &state,
+            config: &config,
+            thread,
+            requests: Mutex::new(Vec::new()),
+            post_exec: false,
+            ppid: None,
+            private_memory: None,
+        };
+        super::finish_thread_start(&config, &mut guest, None, Some(slice));
+        assert_eq!(guest.thread.replay_instruction_offset, Some(offset));
+    }
+
     #[tokio::test]
     async fn automatic_guest_ids_skip_registered_guest_choices() {
         let config = Config {
