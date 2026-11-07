@@ -298,7 +298,7 @@ fn rcb_accounting_progresses_without_an_implicit_preemption_timer() {
                             end_rip: None,
                             end_time: Some(nanos),
                             stopless: false,
-                            instruction_offset: None,
+                           instruction_offset: None,
                         });
                     }
                     // Imprecise cuts record OtherInstructions even when the
@@ -311,7 +311,7 @@ fn rcb_accounting_progresses_without_an_implicit_preemption_timer() {
                         end_rip: std::num::NonZeroUsize::new(RIP as usize),
                         end_time: Some(nanos),
                         stopless: false,
-                        instruction_offset: None,
+                       instruction_offset: None,
                     });
                 }
                 assert_eq!(
@@ -425,7 +425,7 @@ fn interleaved_clock_observations_preserve_deadlines_and_timer_capability() {
                             end_rip: None,
                             end_time: Some(nanos),
                             stopless: false,
-                            instruction_offset: None,
+                           instruction_offset: None,
                         });
                     }
                     expected_records.push(SchedEvent {
@@ -436,7 +436,7 @@ fn interleaved_clock_observations_preserve_deadlines_and_timer_capability() {
                         end_rip: std::num::NonZeroUsize::new(RIP as usize),
                         end_time: Some(nanos),
                         stopless: false,
-                        instruction_offset: None,
+                       instruction_offset: None,
                     });
                 }
                 assert_eq!(*guest.records.lock().unwrap(), expected_records);
@@ -602,7 +602,7 @@ async fn replay_continue_installs_a_logical_deadline_without_requiring_a_timer()
             end_rip: std::num::NonZeroUsize::new(RIP as usize),
             end_time: Some(sample_time),
             stopless: false,
-            instruction_offset: None,
+           instruction_offset: None,
         };
         let branch = SchedEvent {
             op: Op::Branch,
@@ -723,6 +723,7 @@ async fn a_prehook_switch_hands_the_switching_thread_the_recorded_slice() {
         end_rip: std::num::NonZeroUsize::new(RIP as usize),
         end_time: Some(sample_time),
         stopless: false,
+        instruction_offset: None,
     };
     // The next thread's slice, ended by a timer preemption as recordings
     // write it: branches with no OtherInstructions after them, then another
@@ -735,6 +736,7 @@ async fn a_prehook_switch_hands_the_switching_thread_the_recorded_slice() {
         end_rip: None,
         end_time: Some(sample_time + LogicalTime::from_rcbs(123)),
         stopless: false,
+        instruction_offset: None,
     };
     let after = SchedEvent {
         dettid: DetTid::from_raw(19),
@@ -744,6 +746,7 @@ async fn a_prehook_switch_hands_the_switching_thread_the_recorded_slice() {
         end_rip: std::num::NonZeroUsize::new(RIP as usize),
         end_time: Some(sample_time + LogicalTime::from_rcbs(123)),
         stopless: false,
+        instruction_offset: None,
     };
     let file = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(

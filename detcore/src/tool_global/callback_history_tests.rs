@@ -1147,7 +1147,7 @@ async fn an_instruction_offset_slice_is_armed_recorded_and_replayed_alike() {
     let schedule = serde_json::from_str::<crate::preemptions::PreemptionRecord>(&record).unwrap();
     assert_eq!(
         schedule.format_version(),
-        Some(crate::preemptions::INSTRUCTION_OFFSET_FORMAT),
+        Some(crate::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT),
         "{record}"
     );
     let events = schedule.schedevents();
@@ -1315,14 +1315,14 @@ async fn a_schedule_replay_arms_a_recorded_instruction_offset() {
             end_rip: std::num::NonZeroUsize::new(1),
             end_time: None,
             stopless: false,
-            instruction_offset: None,
+           instruction_offset: None,
         });
         writer.insert_schedevent(SchedEvent::branches(tid, 1));
         let record = writer.into_string();
         assert!(
             record.contains(&format!(
                 r#""format_version":{}"#,
-                crate::preemptions::INSTRUCTION_OFFSET_FORMAT
+                crate::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT
             )),
             "{record}"
         );

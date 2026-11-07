@@ -1193,6 +1193,7 @@ mod builder {
                 end_rip: InstructionPointer::new(end_rip),
                 end_time: Some(self.time.as_nanos()),
                 stopless: false,
+               instruction_offset: None,
                 op: Op::Syscall(sys_no, SyscallPhase::Prehook),
             }
         }
@@ -1206,6 +1207,7 @@ mod builder {
                 end_rip: InstructionPointer::new(end_rip),
                 end_time: Some(self.time.as_nanos()),
                 stopless: false,
+               instruction_offset: None,
                 op: Op::Syscall(sys_no, SyscallPhase::Posthook),
             }
         }
@@ -1217,6 +1219,7 @@ mod builder {
                 start_rip: None,
                 end_time: Some(self.time.as_nanos()),
                 stopless: false,
+               instruction_offset: None,
                 op: Op::OtherInstructions,
                 end_rip: InstructionPointer::new(end_rip),
             }
@@ -1230,6 +1233,7 @@ mod builder {
                 end_rip: None,
                 end_time: Some(self.time.as_nanos()),
                 stopless: false,
+               instruction_offset: None,
                 op: Op::Branch,
                 start_rip: None,
             }
@@ -2144,6 +2148,7 @@ mod tests {
         let stopped = SchedEvent {
             end_rip: std::num::NonZeroUsize::new(SOME_RIP),
             stopless: false,
+           instruction_offset: None,
             ..stopless.clone()
         };
         assert!(events_match(&stopped, &stopless));

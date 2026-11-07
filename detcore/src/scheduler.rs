@@ -2603,6 +2603,23 @@ pub struct Scheduler {
     /// information and needs to "cooperate" and setup it's preemption for the amount
     pub timeslices: BTreeMap<DetTid, Option<LogicalTime>>,
 
+    /// Where the timer of each `timeslices` entry's slice was armed past its
+    /// branch target in the recording (`SchedEvent::instruction_offset`),
+    /// for a schedule replay of a preemption recorded with
+    /// `--chaos-instruction-offset`. Written and removed with its
+    /// `timeslices` entry (`set_replay_timeslice`, `forget_replay_timeslice`,
+    /// and the grant that consumes the timeslice, `grant_replay_timeslice`).
+    pub(crate) replay_instruction_offsets:
+        BTreeMap<DetTid, detcore_model::schedule::InstructionOffset>,
+
+    /// The offset beside the timeslice each thread's latest grant carried
+    /// (`grant_replay_timeslice`), until that grant's receiver takes it:
+    /// a `TraceSchedEvent` that yielded for the grant, or a nonleader exec's
+    /// continuation (`take_granted_replay_instruction_offset`). Every grant
+    /// replaces it, so a receiver takes its own grant's offset or none.
+    pub(crate) granted_replay_instruction_offsets:
+        BTreeMap<DetTid, detcore_model::schedule::InstructionOffset>,
+
     /// Typed boundary expectations carried by the same existing grant reply.
     /// Unlike legacy `timeslices`, these are guest RCB identities, not logical
     /// durations. No production lookahead populates this staged mailbox yet.
@@ -5466,6 +5483,12 @@ pub struct ConsumeResult {
     /// The number of this event in the global total order of events.
     #[allow(dead_code)]
     pub event_ix: u64,
+    /// Where `timeslice_remaining`'s slice had its timer armed past its branch
+    /// target in the recording (`Replayer::next_instruction_offset`): `Some`
+    /// only beside a timeslice for the thread that keeps running. A context
+    /// switch's timeslice belongs to the thread it switches to, which takes
+    /// its offset with its grant (`Scheduler::replay_instruction_offsets`).
+    pub instruction_offset: Option<detcore_model::schedule::InstructionOffset>,
 }
 
 /// A slice length that no recorded slice exceeds, for the schedule replay of
@@ -6327,6 +6350,8 @@ impl Scheduler {
             thread_tree: Default::default(),
             priorities: Default::default(),
             timeslices: Default::default(),
+            replay_instruction_offsets: Default::default(),
+            granted_replay_instruction_offsets: Default::default(),
             boundary_budgets: Default::default(),
             boundary_owners: boundaries.then(Default::default),
             deadline_hints: Default::default(),
@@ -7396,6 +7421,7 @@ impl Scheduler {
                         print_stack,
                         event_ix: ix,
                         timeslice_remaining,
+                        instruction_offset: None,
                     };
                 }
                 replayer::ReplayAction::Stop(StopReason::FatalDesync) => immediate_fatal_exit(),
@@ -7444,6 +7470,7 @@ impl Scheduler {
                         print_stack,
                         event_ix: ix,
                         timeslice_remaining,
+                        instruction_offset: None,
                     };
                 }
             };
@@ -7454,6 +7481,7 @@ impl Scheduler {
             print_stack: None,
             event_ix: 0,
             timeslice_remaining: None,
+            instruction_offset: None,
         }
     }
 
@@ -9879,6 +9907,14 @@ impl Scheduler {
         }
         self.instruction_offsets.insert(thread, offset);
         true
+    }
+
+    /// Forget `tid`'s replay timeslice and its offset, granted or not: the
+    /// thread is gone, or its entry no longer describes its next grant.
+    pub(crate) fn forget_replay_timeslice(&mut self, tid: &DetTid) {
+        self.timeslices.remove(tid);
+        self.replay_instruction_offsets.remove(tid);
+        self.granted_replay_instruction_offsets.remove(tid);
     }
 
     /// Record (`Some`) or withdraw (`None`) `thread`'s mask as Detcore's copy
@@ -22101,6 +22137,7 @@ impl Scheduler {
                 print_stack,
                 event_ix: _,
                 timeslice_remaining: _,
+                instruction_offset: _,
             } = self.consume_schedevent(&ev);
             // We should not ever need to background the thread when it is going to exit anyway.
             if !keep_running {
@@ -24250,6 +24287,7 @@ mod test {
             end_rip: std::num::NonZeroUsize::new(100),
             end_time: Some(LogicalTime::from_nanos(0)),
             stopless: false,
+            instruction_offset: None,
         };
         let directory = tempfile::tempdir().unwrap();
         let schedule = directory.path().join("schedule.json");
@@ -28957,6 +28995,7 @@ mod test {
                         end_rip: detcore_model::schedule::InstructionPointer::new(12345),
                         end_time: Some(LogicalTime::from_nanos(123)),
                         stopless: false,
+                       instruction_offset: None,
                     };
                     let mut sched = plain_replay_with_writer(vec![terminal.clone(), next.clone()]);
                     if boundary {
@@ -40689,6 +40728,7 @@ mod test {
             end_rip: std::num::NonZeroUsize::new(rip),
             end_time: Some(LogicalTime::from_nanos(0)),
             stopless: false,
+           instruction_offset: None,
         };
         let directory = tempfile::tempdir().unwrap();
         let schedule = directory.path().join("schedule.json");

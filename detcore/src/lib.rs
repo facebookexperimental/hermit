@@ -1920,6 +1920,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         end_rip: None,
                         end_time: None,
                         stopless: false,
+                       instruction_offset: None,
                     },
                 );
                 let ev = with_guest_rip(guest, ev).await;
@@ -2086,6 +2087,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         precise_branch: bool,
+        timer_event: bool,
     ) -> Option<Vec<SchedEvent>> {
         if self.cfg.max_timeslice.is_some() {
             let precise_timers = !guest.config().imprecise_timers;
@@ -2164,6 +2166,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
             if self.cfg.use_rcb_time() && self.cfg.observes_schedevents() {
                 let mut vec = Vec::new();
+                // A PMU timer armed past its branch target
+                // (`--chaos-instruction-offset`) that stopped the thread at or
+                // past that target ended these branches: the batch records
+                // where the timer was armed, so a schedule replay arms it again
+                // (`trace_schedevent`). Only the timer's own event: a syscall
+                // or trap among its steps ends the batch where the guest
+                // decides, which a replay reaches without the timer.
+                let instruction_offset = timer_event
+                    .then_some(guest.thread_state().armed_instruction_offset)
+                    .flatten()
+                    .filter(|offset| clock_value >= offset.rcb_target);
                 let ev = with_guest_time(
                     guest,
                     SchedEvent::branches(
@@ -2171,7 +2184,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                         delta_rcbs
                             .try_into()
                             .expect("should not have more than 2^32 branches at once"),
-                    ),
+                    )
+                    .with_instruction_offset(instruction_offset),
                 );
                 let ev = if guest.thread_state().replaying_lone_slice_end.is_some()
                     && guest.thread_state().lone_slice_end_at_check_in
@@ -2212,6 +2226,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                             end_rip: None,
                             end_time: None,
                             stopless: false,
+                           instruction_offset: None,
                         },
                     );
                     // Fill in end_rip because current rip represents the end of this event.
@@ -2578,6 +2593,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     end_rip: None,
                     end_time: Some(nanos),
                     stopless: false,
+                   instruction_offset: None,
                 },
                 true,
                 access,
@@ -2673,6 +2689,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     end_rip: None,
                     end_time: Some(nanos),
                     stopless: false,
+                   instruction_offset: None,
                 },
                 true,
                 access,
@@ -3044,7 +3061,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest.thread_state_mut().yield_after_futex_wake = false;
         guest.thread_state_mut().returned_from_sigreturn = false;
         let dettid = guest.thread_state().dettid;
-        let evs = self.update_logical_time_rcbs(guest, precise_branch).await;
+        let timer_event = matches!(entry, Some(slice_boundary::callbacks::Callback::PmuTimer));
+        let evs = self
+            .update_logical_time_rcbs(guest, precise_branch, timer_event)
+            .await;
 
         if guest.thread_state().replaying_lone_slice_end.is_some() {
             // The guest is stopped later, not at this end: its registers are
@@ -5013,6 +5033,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         end_rip: None,
                         end_time: Some(nanos),
                         stopless: false,
+                       instruction_offset: None,
                     },
                     true,
                 )
@@ -5104,6 +5125,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         end_rip: None,
                         end_time: None,
                         stopless: false,
+                       instruction_offset: None,
                     },
                 );
                 trace_schedevent(guest, ev, true).await;

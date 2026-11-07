@@ -591,6 +591,17 @@ impl std::fmt::Display for RecordFormatRefusal {
 
 impl std::error::Error for RecordFormatRefusal {}
 
+/// Why a record stating `format` (with `skips` time skips) is refused:
+/// this Hermit reads formats 1 to [`PREEMPTION_RECORD_FORMAT_MAX`], and
+/// time skips need format [`TIME_SKIPS_FORMAT`] or later.
+pub(crate) fn unread_format_message(format: Option<u32>, skips: usize) -> String {
+    format!(
+        "record format {format:?} with {skips} time skips: this Hermit reads formats 1 to \
+         {PREEMPTION_RECORD_FORMAT_MAX}, and time skips need format {TIME_SKIPS_FORMAT} or later"
+    )
+}
+
+
 /// Whether `PreemptionRecord::time_skips` has nothing to write.
 fn lists_no_time_skips(skips: &Option<Vec<TimeSkip>>) -> bool {
     skips.as_ref().is_none_or(Vec::is_empty)
@@ -2638,6 +2649,7 @@ mod tests {
         };
         let marked_syscall = SchedEvent {
             stopless: true,
+            instruction_offset: None,
             ..SchedEvent::syscall(tid, Sysno::getppid, SyscallPhase::Prehook)
         };
 
@@ -2760,6 +2772,7 @@ mod tests {
             end_rip: None,
             end_time: None,
             stopless: false,
+            instruction_offset: None,
         };
         let events = vec![
             SchedEvent::branches(tid, 123).taken_without_stop(),
@@ -2800,6 +2813,7 @@ mod tests {
             end_rip: None,
             end_time: None,
             stopless: false,
+            instruction_offset: None,
         });
         let refusal = writer
             .serialized_string()
@@ -2855,6 +2869,7 @@ mod tests {
             end_rip: None,
             end_time: Some(LogicalTime::from_nanos(5)),
             stopless: false,
+            instruction_offset: None,
         };
         let read = |writer: PreemptionWriter| -> PreemptionRecord {
             serde_json::from_str(&writer.into_string()).unwrap()
@@ -3377,6 +3392,7 @@ mod tests {
             end_rip: None,
             end_time: None,
             stopless: false,
+            instruction_offset: None,
         };
         let invisible = [
             SchedEvent::branches(tid, 123).taken_without_stop(),
@@ -3788,6 +3804,7 @@ mod tests {
                 end_rip: None,
                 end_time: end.map(LogicalTime::from_nanos),
                 stopless: false,
+                instruction_offset: None,
             });
         }
         let marked = writer.into_string();
@@ -3820,6 +3837,7 @@ mod tests {
                 end_rip: None,
                 end_time: end.map(LogicalTime::from_nanos),
                 stopless: false,
+                instruction_offset: None,
             });
         }
         waited.note_longest_slice(40);
@@ -3838,6 +3856,7 @@ mod tests {
                 end_rip: None,
                 end_time: Some(LogicalTime::from_nanos(end)),
                 stopless: false,
+                instruction_offset: None,
             });
         }
         past.note_longest_slice(9_400_000);
@@ -4588,6 +4607,7 @@ mod tests {
             end_rip: None,
             end_time: None,
             stopless: false,
+            instruction_offset: None,
         };
         let marks =
             |record: &PreemptionRecord| record.global.iter().filter(|event| event.stopless).count();

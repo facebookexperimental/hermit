@@ -2518,7 +2518,7 @@ mod tests {
     /// `a_minimize_record_states_only_what_its_rows_hold`.)
     #[test]
     fn a_prefix_trial_of_trace_offsets_keeps_its_timing_at_every_length() {
-        use detcore::preemptions::INSTRUCTION_OFFSET_FORMAT;
+        use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
         use detcore::preemptions::InstructionOffset;
         use detcore::preemptions::PreemptionWriter;
         use detcore::preemptions::RecordedOffsets;
@@ -2541,7 +2541,7 @@ mod tests {
         let output = directory.path().join("prefix.json");
         for with_jump in [false, true] {
             let mut writer = PreemptionWriter::new(None)
-                .with_format(Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT));
+                .with_format(Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX));
             writer.register_thread(tid, detcore::DEFAULT_PRIORITY);
             writer.insert_reprioritization(
                 tid,
@@ -2560,7 +2560,7 @@ mod tests {
             writer.insert_schedevent(SchedEvent::branches(tid, 3));
             let source: PreemptionRecord = serde_json::from_str(&writer.into_string()).unwrap();
             source.validate().unwrap();
-            assert_eq!(source.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
+            assert_eq!(source.format_version(), Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
 
             let args =
                 crate::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
@@ -2581,12 +2581,12 @@ mod tests {
                 assert_eq!(written.schedevents().len(), len, "{what}");
                 assert_eq!(
                     written.format_version(),
-                    Some(INSTRUCTION_OFFSET_FORMAT),
+                    Some(INSTRUCTION_OFFSET_ROWS_FORMAT),
                     "{what}"
                 );
                 assert_eq!(
                     written.timing_format(),
-                    Some(INSTRUCTION_OFFSET_FORMAT),
+                    Some(INSTRUCTION_OFFSET_ROWS_FORMAT),
                     "{what}"
                 );
                 assert!(written.lists_its_time_skips(), "{what}");
@@ -2617,7 +2617,7 @@ mod tests {
     /// with offsets, which both admit.
     #[test]
     fn rows_alone_restated_in_the_trace_offsets_format_still_hold_rows_only() {
-        use detcore::preemptions::INSTRUCTION_OFFSET_FORMAT;
+        use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
         use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
         use detcore::preemptions::InstructionOffset;
         use detcore::preemptions::PreemptionWriter;
@@ -2631,7 +2631,7 @@ mod tests {
             instructions: 4,
         };
         let mut writer = PreemptionWriter::new(None)
-            .with_format(Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT));
+            .with_format(Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX));
         writer.register_thread(tid, detcore::DEFAULT_PRIORITY);
         writer.insert_reprioritization(
             tid,
@@ -2646,11 +2646,11 @@ mod tests {
         writer.insert_schedevent(SchedEvent::branches(tid, 3));
         let source: PreemptionRecord = serde_json::from_str(&writer.into_string()).unwrap();
         source.validate().unwrap();
-        assert_eq!(source.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
+        assert_eq!(source.format_version(), Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
         let rows = source.clone_preemptions_only();
         assert_eq!(rows.format_version(), Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
-        let restated = rows.clone().with_format(Some(INSTRUCTION_OFFSET_FORMAT));
-        assert_eq!(restated.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
+        let restated = rows.clone().with_format(Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
+        assert_eq!(restated.format_version(), Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
         restated.validate().unwrap();
 
         let args = crate::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
@@ -2726,7 +2726,7 @@ mod tests {
     /// both. Writing the prefix in the sources' timing format fails this test.
     #[test]
     fn a_prefix_trial_of_a_recording_with_offset_rows_keeps_its_offsets_format() {
-        use detcore::preemptions::INSTRUCTION_OFFSET_FORMAT;
+        use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
         use detcore::preemptions::InstructionOffset;
         use detcore::preemptions::PreemptionWriter;
         use detcore::preemptions::RecordedOffsets;
@@ -2739,7 +2739,7 @@ mod tests {
             instructions: 4,
         };
         let mut writer = PreemptionWriter::new(None)
-            .with_format(Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT));
+            .with_format(Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX));
         writer.register_thread(tid, detcore::DEFAULT_PRIORITY);
         writer.insert_schedevent(SchedEvent::branches(tid, 20));
         writer.insert_reprioritization(
@@ -2755,7 +2755,7 @@ mod tests {
         writer.insert_schedevent(SchedEvent::branches(tid, 3));
         let current: PreemptionRecord = serde_json::from_str(&writer.into_string()).unwrap();
         current.validate().unwrap();
-        assert_eq!(current.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
+        assert_eq!(current.format_version(), Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
         assert!(current.rows_carry_instruction_offsets());
         // The same rows in a record written by a Hermit whose schedule traces
         // did not hold offsets: format 6, no event offset.
@@ -2825,13 +2825,13 @@ mod tests {
     /// A whole-schedule trial of a recording with instruction offsets takes
     /// its jumps from that recording: the trial cache tells recordings apart
     /// by their events' offsets too (`crate::time_skip_carry`), so S in format
-    /// 3 (the format below the offsets format) and T in `INSTRUCTION_OFFSET_FORMAT`
+    /// 3 (the format below the offsets format) and T in `INSTRUCTION_OFFSET_ROWS_FORMAT`
     /// with an offset, over the same branches and with
     /// other jumps, never lend each other their jumps, written and read back,
     /// in either cache order.
     #[test]
     fn a_trial_of_a_recording_with_instruction_offsets_keeps_its_own_jumps() {
-        use detcore::preemptions::INSTRUCTION_OFFSET_FORMAT;
+        use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
         use detcore::preemptions::InstructionOffset;
         use detcore::types::DetTid;
 
@@ -2862,7 +2862,7 @@ mod tests {
             s.format_version(),
             Some(detcore::preemptions::BACKGROUND_STARTS_FORMAT - 1)
         );
-        assert_eq!(t.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
+        assert_eq!(t.format_version(), Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("trial.json");
         for order in [[&s, &t], [&t, &s]] {
@@ -2876,7 +2876,7 @@ mod tests {
                 options.time_skip_sources.lock().unwrap().remember(source);
             }
             for (source, format, target) in [
-                (&t, INSTRUCTION_OFFSET_FORMAT, 2000),
+                (&t, INSTRUCTION_OFFSET_ROWS_FORMAT, 2000),
                 (&s, detcore::preemptions::BACKGROUND_STARTS_FORMAT - 1, 1000),
             ] {
                 options

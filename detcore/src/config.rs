@@ -389,6 +389,13 @@ mod tests {
         // 8 because main's 41 took domain 6 and 2b-1's payload types moved
         // to 7). Digest measured at this head.
         (53, "21665db7c6c7db51", "f013e36743d8d9e6"),
+        // Adds `GlobalResponse::WithReplayInstructionOffset` and
+        // `SchedEvent::instruction_offset`, which the event's bincode always
+        // writes and domain 4 covers (#4845; 23 on its own base, renumbered
+        // to 27 in the PR stack, to 53 at its rebase onto main's 52, and to
+        // 54 at this rebase onto main's 53 (RecordExecStrings), skipping
+        // reserved 33 to 39 and 42 to 44; digest measured at this head).
+        (54, "4a8fdaad9b3c03b7", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

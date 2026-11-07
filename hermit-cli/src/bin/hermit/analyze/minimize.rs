@@ -442,7 +442,7 @@ mod tests {
     /// when it is given back to analyze as an input, as any rows-only record.
     #[test]
     fn a_minimize_record_states_only_what_its_rows_hold() {
-        use detcore::preemptions::INSTRUCTION_OFFSET_FORMAT;
+        use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
         use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
         use detcore::preemptions::InstructionOffset;
         use detcore::preemptions::PreemptionWriter;
@@ -471,7 +471,7 @@ mod tests {
             let workspace = tempfile::tempdir().unwrap();
             let preempts_path = workspace.path().join("target.preempts");
             let mut writer = PreemptionWriter::new(None)
-                .with_format(Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT));
+                .with_format(Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX));
             writer.register_thread(tid, detcore::DEFAULT_PRIORITY);
             let mut prior = detcore::DEFAULT_PRIORITY;
             for k in 1..=8u64 {
@@ -497,7 +497,7 @@ mod tests {
             assert_eq!(
                 source.format_version(),
                 Some(if with_offsets {
-                    INSTRUCTION_OFFSET_FORMAT
+                    INSTRUCTION_OFFSET_ROWS_FORMAT
                 } else {
                     // A writer that notes no background starts states the
                     // format below theirs.

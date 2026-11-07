@@ -8048,6 +8048,7 @@ impl GlobalState {
                 print_stack,
                 event_ix: _,
                 timeslice_remaining: mut end_of_timeslice,
+                instruction_offset: _,
             } = consumed;
             trace!(
                 "keep_running :{}, end_of_timeslice: {:?}",
@@ -8431,8 +8432,13 @@ pub enum SignalScope {
 /// 53 appends `RecordExecStrings` and `ProcessExecStrings` (package K item
 /// 2b slice 2b-3; 42 on its old base, then 43, 47 and 49 at its rebases onto
 /// 2b-1, 51 on S2b's unlanded head, 52 at its rebase onto main's 51, and
-/// mechanically 53 at its rebase onto main's 52) and is the current revision.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 53;
+/// mechanically 53 at its rebase onto main's 52); the revisions called
+/// current above precede it. 54 adds
+/// `GlobalResponse::WithReplayInstructionOffset` and
+/// `SchedEvent::instruction_offset`, which the event's bincode always
+/// writes and domain 4 covers (#4845, renumbered mechanically at each
+/// rebase) and is current.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 54;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
@@ -9484,6 +9490,7 @@ pub enum GlobalResponse {
     /// wait (inside `Granted`), so a thread arms before it runs guest code
     /// again (`crate::watch`). Unwrapped by `send_and_update_time`.
     WithWatchOrder(crate::watch::WatchOrder, Box<GlobalResponse>),
+    WithReplayInstructionOffset(crate::resources::InstructionOffset, Box<GlobalResponse>),
     RequestResources(ResumeStatus),
     ParkedRequest(ResourceReply),
     ResumeParkedRequest(ResourceReply),
@@ -24049,6 +24056,7 @@ mod tests {
             end_rip: None,
             end_time: Some(LogicalTime::from_nanos(1)),
             stopless: false,
+            instruction_offset: None,
         };
         let next_event = SchedEvent {
             dettid: next_tid,
@@ -26894,7 +26902,7 @@ mod record_format_installer_tests {
 
     /// The record each case installs for a priority replay.
     fn record(case: &str) -> String {
-        let newest = crate::preemptions::PREEMPTION_RECORD_FORMAT;
+        let newest = crate::preemptions::PREEMPTION_RECORD_FORMAT_MAX;
         match case {
             "newer" => format!(
                 r#"{{"per_thread":{{}},"global":[],"format_version":{}}}"#,
@@ -26936,7 +26944,7 @@ mod record_format_installer_tests {
             let _state = GlobalState::for_tests(&config);
             return;
         }
-        let newest = crate::preemptions::PREEMPTION_RECORD_FORMAT;
+        let newest = crate::preemptions::PREEMPTION_RECORD_FORMAT_MAX;
         for (case, refused) in [
             ("newer", Some(Some(newest + 1))),
             ("zero", Some(Some(0))),
