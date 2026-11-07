@@ -501,6 +501,21 @@ fn isa_needs_on(host: u16, path: &Path) -> Option<detcore::exec_record::IsaNeeds
     needs
 }
 
+/// Require the complete ELF64 header before the non-x86 interpreter fallback,
+/// just as the executable's `program_interpreter_of` read does. The existing
+/// ISA reader still owns all machine and ISA admission decisions.
+fn interpreter_isa_needs_on(host: u16, path: &Path) -> Option<detcore::exec_record::IsaNeeds> {
+    if host != EM_X86_64 && host != 0 {
+        use std::io::Read as _;
+        let mut header = [0_u8; 64];
+        std::fs::File::open(path)
+            .ok()?
+            .read_exact(&mut header)
+            .ok()?;
+    }
+    isa_needs_on(host, path)
+}
+
 /// [`resolve_auto`] on a host of ELF machine `host`.
 fn resolve_auto_on(
     host: u16,
@@ -559,7 +574,7 @@ fn resolve_auto_on(
             };
             objects.push((
                 format!("its program interpreter {}", interpreter.display()),
-                isa_needs_on(host, &interpreter_on_host),
+                interpreter_isa_needs_on(host, &interpreter_on_host),
             ));
         }
         Err(why) => return Err(format!("{} cannot be read: {why}", image.display())),
@@ -1915,6 +1930,101 @@ mod tests {
         );
         let why = super::resolve_auto_on(super::EM_AARCH64, &orphan, same).unwrap_err();
         assert!(why.contains("no-such-loader"), "{why}");
+    }
+
+    // Full little-endian ELF64 fixtures for the interpreter-only regressions.
+    fn auto_interpreter_image(
+        directory: &std::path::Path,
+        name: &str,
+        machine: u16,
+        interpreter: Option<&std::path::Path>,
+    ) -> std::path::PathBuf {
+        let mut bytes = vec![0_u8; 64];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2; // ELFCLASS64
+        bytes[5] = 1; // ELFDATA2LSB
+        bytes[6] = 1; // EV_CURRENT
+        bytes[16..18].copy_from_slice(&2_u16.to_le_bytes()); // ET_EXEC
+        bytes[18..20].copy_from_slice(&machine.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[52..54].copy_from_slice(&64_u16.to_le_bytes()); // e_ehsize
+        bytes[54..56].copy_from_slice(&56_u16.to_le_bytes()); // e_phentsize
+        if let Some(interpreter) = interpreter {
+            bytes[32..40].copy_from_slice(&64_u64.to_le_bytes()); // e_phoff
+            bytes[56..58].copy_from_slice(&1_u16.to_le_bytes()); // e_phnum
+            let mut name = interpreter.as_os_str().as_encoded_bytes().to_vec();
+            name.push(0);
+            let mut header = vec![0_u8; 56];
+            header[..4].copy_from_slice(&3_u32.to_le_bytes()); // PT_INTERP
+            header[8..16].copy_from_slice(&120_u64.to_le_bytes()); // p_offset
+            header[32..40].copy_from_slice(&(name.len() as u64).to_le_bytes());
+            bytes.extend(header);
+            bytes.extend(name);
+        }
+        let path = directory.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn auto_refuses_a_truncated_interpreter_on_a_host_that_is_not_x86_64() {
+        let directory = tempfile::tempdir().unwrap();
+        let loader = auto_interpreter_image(directory.path(), "loader", super::EM_AARCH64, None);
+        let program = auto_interpreter_image(
+            directory.path(),
+            "program",
+            super::EM_AARCH64,
+            Some(&loader),
+        );
+        let same = |path: &std::path::Path| Some(path.to_path_buf());
+        assert_eq!(
+            super::resolve_auto_on(super::EM_AARCH64, &program, same)
+                .unwrap()
+                .0,
+            super::CpuProfile::X86_64V2
+        );
+        let mut bytes = std::fs::read(&loader).unwrap();
+        assert_eq!(bytes.len(), 64);
+        bytes.truncate(20); // The machine word remains, but the ELF64 header does not.
+        std::fs::write(&loader, bytes).unwrap();
+        assert_eq!(
+            super::resolve_auto_on(super::EM_AARCH64, &program, same),
+            Err(format!(
+                "its program interpreter {} is unreadable, or neither a little-endian ELF64 image \
+                 for this aarch64 host nor an x86-64 one",
+                loader.display()
+            ))
+        );
+    }
+
+    #[test]
+    fn auto_refuses_a_foreign_interpreter_on_a_host_that_is_not_x86_64() {
+        let directory = tempfile::tempdir().unwrap();
+        let loader = auto_interpreter_image(directory.path(), "loader", super::EM_AARCH64, None);
+        let program = auto_interpreter_image(
+            directory.path(),
+            "program",
+            super::EM_AARCH64,
+            Some(&loader),
+        );
+        let same = |path: &std::path::Path| Some(path.to_path_buf());
+        assert_eq!(
+            super::resolve_auto_on(super::EM_AARCH64, &program, same)
+                .unwrap()
+                .0,
+            super::CpuProfile::X86_64V2
+        );
+        // A complete ELF64 header for RISC-V, not an unreadable or short file.
+        auto_interpreter_image(directory.path(), "loader", 243, None); // EM_RISCV
+        assert_eq!(std::fs::metadata(&loader).unwrap().len(), 64);
+        assert_eq!(
+            super::resolve_auto_on(super::EM_AARCH64, &program, same),
+            Err(format!(
+                "its program interpreter {} is unreadable, or neither a little-endian ELF64 image \
+                 for this aarch64 host nor an x86-64 one",
+                loader.display()
+            ))
+        );
     }
 
     /// `--cpu-profile auto` follows a valid script chain (script to
