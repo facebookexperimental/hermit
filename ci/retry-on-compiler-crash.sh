@@ -52,9 +52,23 @@ retries_eligible() { # retries_eligible COMMAND [ARGS...]: whether this command 
 run_logged() { # run_logged LOG COMMAND...: run COMMAND, copying both streams to LOG; return its status
     local log=$1
     shift
-    "$@" > >(tee -a -- "$log") 2> >(tee -a -- "$log" >&2)
-    local status=$?
-    wait
+    # Each tee runs on its own file descriptor with its PID kept, and
+    # both are waited on explicitly. The old
+    #   "$@" > >(tee ...) 2> >(tee ...)
+    #   wait
+    # did not reliably wait for the process substitutions (they are
+    # not jobs), so the caller's crash-pattern grep could read the log
+    # before the stderr tee had written the crash line into it and
+    # skip the one sanctioned rerun (dh-hzk5u).
+    local out_fd err_fd status tee_out tee_err
+    exec {out_fd}> >(tee -a -- "$log")
+    tee_out=$!
+    exec {err_fd}> >(tee -a -- "$log" >&2)
+    tee_err=$!
+    "$@" >&"$out_fd" 2>&"$err_fd"
+    status=$?
+    exec {out_fd}>&- {err_fd}>&-
+    wait "$tee_out" "$tee_err"
     return "$status"
 }
 
@@ -114,6 +128,16 @@ fi
 echo "Finished"
 EOF
     chmod +x "$dir/bin/cargo"
+    # A tee that delays before copying: with TEE_DELAY_SECONDS set, the
+    # crash line reaches the log only after that delay, which makes the
+    # old un-waited process substitutions lose the rerun every time
+    # (dh-hzk5u). Only the slow-tee check puts $dir/bin first in PATH.
+    cat >"$dir/bin/tee" <<'EOF'
+#!/usr/bin/env bash
+sleep "${TEE_DELAY_SECONDS:-0}"
+exec /usr/bin/tee "$@"
+EOF
+    chmod +x "$dir/bin/tee"
     local self
     self=$(realpath -- "${BASH_SOURCE[0]}")
     check() { # check NAME EXPECTED_STATUS EXPECTED_CALLS CRASHES ARGS...
@@ -134,6 +158,7 @@ EOF
     check "clean build runs once" 0 1 0 build || return 1
     check "a plain build error is not rerun" 101 1 0 build fail || return 1
     check "a rustc crash is rerun once and passes" 0 2 1 build || return 1
+    PATH="$dir/bin:$PATH" TEE_DELAY_SECONDS=0.5 check "a crash line delayed by a slow stderr tee still reruns" 0 2 1 build || return 1
     grep -q 'INFRA RETRY: passed on its one rerun' <<<"$out" || { echo "self-test: no pass record" >&2; return 1; }
     grep -q 'interrupted by SIGSEGV' "$dir/state/compiler-crash-retries/"* || { echo "self-test: no state record" >&2; return 1; }
     [[ $(find "$dir/state/compiler-crash-retries" -name '*.txt' | wc -l) == 1 ]] || { echo "self-test: one rerun left more than one record" >&2; return 1; }
