@@ -1750,6 +1750,38 @@ pub(crate) fn restarts_woken_calls_only_through_erestartsys(backend: &BackendCap
     backend.provides_process_signal_control && !backend.supports_blocked_wait_signal_interruption
 }
 
+#[cfg(test)]
+mod restarts_woken_calls_tests {
+    use crate::config::Config;
+
+    /// Residual R1 of the musereviewc review of
+    /// <https://github.com/rrnewton/hermit/pull/5221>: every row of the
+    /// capability table. A backend that leaves signal delivery to the kernel
+    /// (`provides_process_signal_control` false: ptrace, LiteInst,
+    /// InGuestTrap, SaBRe, DBT) hands `handle_signal` the call's own restart
+    /// code, so it never restarts only through `ERESTARTSYS`, whether or not
+    /// it also declares restart-errno delivery.
+    #[test]
+    fn only_a_backend_owning_delivery_without_restart_codes_restarts_through_erestartsys() {
+        for (owns_delivery, restart_codes, expected) in [
+            (true, false, true),
+            (true, true, false),
+            (false, true, false),
+            (false, false, false),
+        ] {
+            let config = Config::default().with_backend(|backend| {
+                backend.provides_process_signal_control = owns_delivery;
+                backend.supports_blocked_wait_signal_interruption = restart_codes;
+            });
+            assert_eq!(
+                super::restarts_woken_calls_only_through_erestartsys(&config.backend),
+                expected,
+                "owns_delivery={owns_delivery} restart_codes={restart_codes}"
+            );
+        }
+    }
+}
+
 /// The errno for a backend's answer that names no signal sets: the errno it
 /// gave (`ESRCH` for a task that is gone, `EAGAIN` for a read an exec
 /// overlapped), or `ENOSYS` where it does not report the fact, which callers
