@@ -9,8 +9,8 @@
   "counts": {
     "all": {
       "cells": 3885,
-      "applicable": 2273,
-      "selectable": 1780,
+      "applicable": 2274,
+      "selectable": 1781,
       "population": 3065,
       "population_candidate_selected": 1781,
       "population_candidate_not_selected": 475,
@@ -37,8 +37,8 @@
       },
       "kvm": {
         "cells": 777,
-        "applicable": 605,
-        "selectable": 596,
+        "applicable": 606,
+        "selectable": 597,
         "population": 613,
         "population_candidate_selected": 597,
         "population_candidate_not_selected": 3,

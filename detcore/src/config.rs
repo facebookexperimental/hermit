@@ -348,6 +348,14 @@ mod tests {
         // tree. Revision 50 is provisional; the merge queue assigns the
         // final number at landing.
         (50, "317db02ddad70067", "f013e36743d8d9e6"),
+        // Adds `GlobalRequest::SuspendHoldsDiscarded` and its response
+        // (SIGSHARE S2b, https://github.com/rrnewton/hermit/pull/5175): after(this
+        // base's last row); renumbered mechanically at each rebase: 41 on
+        // its old base, 42 after main's 41, 46 after main's 45, 48 after
+        // main's 47, 49 after main's 48, 50 after main's 49.
+        // (renumbered from 50 to 51 at landing by the merge queue; digests measured on the combined
+        // tree)
+        (51, "ad4bb7658a751c72", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
