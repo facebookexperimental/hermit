@@ -810,6 +810,11 @@ pub struct Prepared {
     pub guest: PathBuf,
     pub native: PathBuf,
     pub installation: PathBuf,
+    /// Node-private copies of the VERIFICATION_INPUTS files, taken at
+    /// prepare time (dh-j8eb7 snapshot): the inventory hashes these, so
+    /// a writer in the shared tree cannot move a hashed input while
+    /// collection runs.
+    verification_snapshots: Vec<(String, PathBuf)>,
     executor: Executor,
     input_inventory: String,
     cohort_inputs: BTreeMap<String, CohortInput>,
@@ -1389,6 +1394,49 @@ fn inventory_difference(before: &str, after: &str) -> String {
     }
 }
 
+/// Copy a declared installation tree into a node-private snapshot,
+/// preserving directories, files and symlinks (dh-j8eb7).
+fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|error| format!("input snapshot metadata {}: {error}", source.display()))?;
+    if metadata.is_dir() {
+        fs::create_dir_all(target)
+            .map_err(|error| format!("input snapshot directory {}: {error}", target.display()))?;
+        let mut children = fs::read_dir(source)
+            .map_err(|error| format!("input snapshot read {}: {error}", source.display()))?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("input snapshot entries {}: {error}", source.display()))?;
+        children.sort();
+        for child in children {
+            let name = child.file_name().ok_or("input snapshot child has no name")?;
+            copy_tree(&child, &target.join(name))?;
+        }
+    } else if metadata.file_type().is_symlink() {
+        let dest = fs::read_link(source)
+            .map_err(|error| format!("input snapshot link {}: {error}", source.display()))?;
+        std::os::unix::fs::symlink(&dest, target)
+            .map_err(|error| format!("input snapshot symlink {}: {error}", target.display()))?;
+    } else if metadata.is_file() {
+        fs::copy(source, target)
+            .map_err(|error| format!("input snapshot copy {}: {error}", source.display()))?;
+    } else {
+        return Err(format!(
+            "input snapshot: {} is not a file, directory or symlink",
+            source.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Copy one executable into the snapshot, keeping its mode.
+fn copy_executable(source: &Path, target: &Path) -> Result<(), String> {
+    fs::copy(source, target).map_err(|error| {
+        format!("input snapshot executable {}: {error}", source.display())
+    })?;
+    Ok(())
+}
+
 fn input_inventory(prepared: &Prepared) -> Result<String, String> {
     let mut rows = vec![prepared.command_bindings.inventory()?];
     for (role, path) in [
@@ -1417,10 +1465,10 @@ fn input_inventory(prepared: &Prepared) -> Result<String, String> {
             }
         }
     }
-    for (snapshot, source) in VERIFICATION_INPUTS {
+    for (snapshot, path) in &prepared.verification_snapshots {
         rows.push(format!(
             "SOURCE {snapshot} sha256={}\n",
-            digest(&prepared.repository.join(source))?
+            digest(path)?
         ));
     }
     if let Some(registry) = &prepared.descriptor_registry {
@@ -2191,6 +2239,74 @@ impl Prepared {
         fs::write(artifacts.join("inputs.sha256"), hashes)
             .map_err(|error| format!("producer hashes: {error}"))?;
         let installation = installation_for(&repository, &hermit, installation)?;
+        // Snapshot the hashed executables and the declared installation
+        // into this node's own artifacts, then run AND hash the copies
+        // (dh-j8eb7, option B): what is tested is exactly what is hashed,
+        // and no sibling process - in this run or any other checkout -
+        // can move a hashed input while collection runs. The copies are
+        // taken after every prepare-time authentication above, so a copy
+        // is the authenticated bytes. Verification inputs were already
+        // copied beside the artifacts for inputs.sha256; the inventory
+        // hashes those copies through verification_snapshots below.
+        let snapshot = artifacts.join("input-snapshot");
+        fs::create_dir(&snapshot)
+            .map_err(|error| format!("input snapshot root: {error}"))?;
+        let hermit = {
+            let copy = snapshot.join("hermit");
+            copy_executable(&hermit, &copy)?;
+            copy
+        };
+        let executor = match executor {
+            Executor::SafeHermit(path) => {
+                let copy = snapshot.join("safehermit");
+                copy_executable(&path, &copy)?;
+                Executor::SafeHermit(copy)
+            }
+            Executor::Integration {
+                capture,
+                sources,
+                binary,
+            } => {
+                let copy = snapshot.join("executor");
+                copy_executable(&binary, &copy)?;
+                Executor::Integration {
+                    capture,
+                    sources: sources
+                        .iter()
+                        .enumerate()
+                        .map(|(index, _)| {
+                            artifacts.join(format!("executor-source-{index}.rs"))
+                        })
+                        .collect(),
+                    binary: copy,
+                }
+            }
+        };
+        let installation = {
+            let copy = snapshot.join("installation");
+            copy_tree(&installation, &copy)?;
+            copy
+        };
+        let verification_snapshots = VERIFICATION_INPUTS
+            .iter()
+            .map(|(name, _)| (name.to_string(), artifacts.join(name)))
+            .collect::<Vec<_>>();
+        // Descriptor references were authenticated against their expected
+        // digests above; hash node-private copies from here on, so a
+        // later writer of the retained evidence cannot move them either.
+        let descriptor_registry = match descriptor_registry {
+            Some(mut registry) => {
+                let mut remapped = BTreeMap::new();
+                for (index, (path, expected)) in registry.references.iter().enumerate() {
+                    let copy = snapshot.join(format!("descriptor-{index}"));
+                    copy_executable(path, &copy)?;
+                    remapped.insert(copy, expected.clone());
+                }
+                registry.references = remapped;
+                Some(registry)
+            }
+            None => None,
+        };
         let mut prepared = Self {
             repository,
             hermit,
@@ -2198,6 +2314,7 @@ impl Prepared {
             guest,
             native,
             installation,
+            verification_snapshots,
             executor,
             input_inventory: String::new(),
             cohort_inputs,
@@ -2707,6 +2824,59 @@ mod inventory_difference_tests {
         let difference = inventory_difference(before, after);
         assert!(difference.contains("removed"), "{difference}");
         assert!(difference.contains("added"), "{difference}");
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::{copy_executable, copy_tree, digest, inventory_tree};
+    use std::fs;
+
+    /// dh-j8eb7 option-B fixture: snapshot the hashed executables and
+    /// installation at prepare, then mutate the ORIGINALS mid-collection
+    /// (what a sibling build in the shared tree does). Digests taken
+    /// over the copies - which are also what the cells execute - must
+    /// not move, and the copies must hold the prepared bytes.
+    #[test]
+    fn mutating_the_originals_mid_collection_moves_no_snapshot_digest() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-isolation-snapshot-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let originals = root.join("originals");
+        let snapshot = root.join("input-snapshot");
+        fs::create_dir_all(originals.join("installation/rsrcs")).unwrap();
+        fs::create_dir_all(&snapshot).unwrap();
+        let hermit = originals.join("hermit");
+        fs::write(&hermit, b"hermit-v1").unwrap();
+        fs::write(originals.join("installation/rsrcs/data"), b"data-v1").unwrap();
+
+        let hermit_copy = snapshot.join("hermit");
+        copy_executable(&hermit, &hermit_copy).unwrap();
+        let installation_copy = snapshot.join("installation");
+        copy_tree(&originals.join("installation"), &installation_copy).unwrap();
+
+        let digests = |hermit_path: &std::path::Path, installation: &std::path::Path| {
+            let mut rows = vec![format!("EXECUTABLE hermit sha256={}\n", digest(hermit_path).unwrap())];
+            inventory_tree(installation, installation, &mut rows).unwrap();
+            rows.concat()
+        };
+        let before = digests(&hermit_copy, &installation_copy);
+
+        // A sibling restages the installation and relinks the binary.
+        fs::write(&hermit, b"hermit-v2-relinked").unwrap();
+        fs::write(originals.join("installation/rsrcs/data"), b"data-v2").unwrap();
+        fs::write(originals.join("installation/rsrcs/new"), b"new").unwrap();
+
+        assert_eq!(digests(&hermit_copy, &installation_copy), before);
+        assert_eq!(fs::read(&hermit_copy).unwrap(), b"hermit-v1");
+        assert_ne!(
+            digests(&hermit, &originals.join("installation")),
+            before,
+            "the fixture must actually mutate the originals"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }
 
