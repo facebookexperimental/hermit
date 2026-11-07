@@ -11686,11 +11686,11 @@ pub(crate) fn finish_thread_start<G, T>(
     if let Some(length) = first_slice {
         install_replayed_timeslice(guest, length);
     }
-    // Only a schedule first-slice pair displaces the reset's own decision:
-    // with no first slice, a history (preemption-row) replay installs its
-    // row's offset during the reset, and that decision stands.
-    if first_slice.is_some() {
-        guest.thread_state_mut().replay_instruction_offset = start_offset;
+    // Restore only what this start grant actually carried: a saved None
+    // must not erase the row-derived offset a history replay installs
+    // during the reset (`next_timeslice`), with or without a first slice.
+    if let Some(offset) = start_offset {
+        guest.thread_state_mut().replay_instruction_offset = Some(offset);
     }
     crate::slice_boundary::grant::finish_start(guest.thread_state_mut(), reset)
         .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
