@@ -14272,6 +14272,29 @@ mod case_selection_tests {
     }
 
     #[test]
+    fn case_plan_refuses_a_node_whose_dependencies_are_not_planned() {
+        // dh-koqvv: a privileged-test node's producers sit outside the
+        // portable lane subset, so a --tests plan for its cases used to
+        // run the node with none of them and fail inside
+        // run-in-pinned-root as if the change had failed.
+        let args = parse_argv(&[
+            "--tests".to_string(),
+            "privileged-test.pmu_cli_cases::hermit-run::pmu$some_case".to_string(),
+        ])
+        .unwrap();
+        let root = test_source_root();
+        let error = match build_plan(&root, &args, &std::env::temp_dir()) {
+            Ok(_) => panic!("a privileged --tests selection planned successfully"),
+            Err(error) => error,
+        };
+        assert!(error.contains("privileged-test.pmu_cli_cases"), "{error}");
+        assert!(error.contains("privileged-build.privileged_tests"), "{error}");
+        assert!(error.contains("setup.pinned_root_fetch"), "{error}");
+        assert!(error.contains("tests-portable"), "{error}");
+        assert!(error.contains("--selected"), "{error}");
+    }
+
+    #[test]
     fn fixture_conf_binds_each_declared_fixture_read_only() {
         let conf = fixture_containers_conf(&[
             (
@@ -14912,6 +14935,52 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
             &committed,
             &tags.into_iter().collect::<Vec<_>>(),
         )?;
+        // A case node whose committed build/setup dependencies the
+        // focused plan does not contain (a privileged-test node, whose
+        // producers sit outside the portable lane subset) would fail
+        // minutes later inside run-in-pinned-root with an error that
+        // reads as the change's failure. Refuse here, naming them.
+        // gate.manifest is deliberately pruned from every case plan
+        // (it audits verdicts; it produces nothing a case consumes),
+        // so it never counts as missing.
+        let planned: BTreeSet<String> = cfg.steps.iter().map(|step| step.tag()).collect();
+        let committed_by_tag: BTreeMap<String, &Step> = committed
+            .steps
+            .iter()
+            .map(|step| (step.tag(), step))
+            .collect();
+        for node in cases.keys() {
+            let mut missing: BTreeSet<String> = BTreeSet::new();
+            let mut stack: Vec<String> = vec![node.clone()];
+            let mut seen: BTreeSet<String> = BTreeSet::new();
+            while let Some(tag) = stack.pop() {
+                if !seen.insert(tag.clone()) {
+                    continue;
+                }
+                if let Some(step) = committed_by_tag.get(&tag) {
+                    for dep in &step.deps {
+                        if dep != "gate.manifest" && !planned.contains(dep) {
+                            missing.insert(dep.clone());
+                        }
+                        stack.push(dep.clone());
+                    }
+                }
+            }
+            if !missing.is_empty() {
+                return Err(format!(
+                    "test selection names cases of {node}, whose dependencies {} are not in profile {}; select the node with --selected or choose a profile that has them",
+                    missing
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    args.focused
+                        .as_ref()
+                        .expect("matched focused mode")
+                        .profile(),
+                ));
+            }
+        }
         inject_case_filters(&mut cfg.steps, cases)?;
         let plan = Plan {
             planned_test_nodes: test_nodes_of(&cfg),
