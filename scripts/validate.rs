@@ -15117,7 +15117,26 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
             vec![label.into()]
         };
         let mut cfg = if label == "full" && args.e2e_runner != E2E_RUNNER_CARGO {
-            hermit_manifest_plan::validation_dag::buck_e2e_selection(&committed)?
+            let mut buck_cfg =
+                hermit_manifest_plan::validation_dag::buck_e2e_selection(&committed)?;
+            // The Buck E2E composition excludes post-split extension
+            // brackets (build.reverie_buck, M2) by design; the runner plan
+            // is where the Reverie Buck-build bracket belongs, so re-add
+            // the committed step here. Its deps are ordinary full nodes
+            // the composition already selected.
+            if !buck_cfg
+                .steps
+                .iter()
+                .any(|step| step.tag() == "build.reverie_buck")
+            {
+                let bracket = committed
+                    .steps
+                    .iter()
+                    .find(|step| step.tag() == "build.reverie_buck")
+                    .ok_or("buck runner plan: build.reverie_buck disappeared")?;
+                buck_cfg.steps.push(bracket.clone());
+            }
+            buck_cfg
         } else {
             dagrun::select_steps_by_labels(&committed, &selection_labels)?
         };
