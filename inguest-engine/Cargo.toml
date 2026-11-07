@@ -53,10 +53,10 @@ rand = "0.10.2"
 tracing = "0.1.41"
 # One exact core source owns the shared ordinary/native Guest and RPC services.
 # Native compilation and loader qualification remain separate required gates.
-reverie = { package = "reverie-core", version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "bfb829839924dbfb37fa8860b9478b5ffe17897d" }
-reverie-inguest = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "bfb829839924dbfb37fa8860b9478b5ffe17897d", default-features = false, features = ["coordinator-rpc", "rcb-clock"] }
-reverie-liteinst = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "bfb829839924dbfb37fa8860b9478b5ffe17897d", default-features = false }
-reverie-rpc-transport = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "bfb829839924dbfb37fa8860b9478b5ffe17897d" }
+reverie = { package = "reverie-core", version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "8ff253f159f587d0392d30c8b2323f1474adb746" }
+reverie-inguest = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "8ff253f159f587d0392d30c8b2323f1474adb746", default-features = false, features = ["coordinator-rpc", "rcb-clock"] }
+reverie-liteinst = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "8ff253f159f587d0392d30c8b2323f1474adb746", default-features = false }
+reverie-rpc-transport = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "8ff253f159f587d0392d30c8b2323f1474adb746" }
 
 [dev-dependencies]
 serde_json = "1.0.140"
