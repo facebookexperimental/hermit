@@ -1903,6 +1903,15 @@ impl GlobalState {
         if let Some(refusal) = crate::post_crash::admission_refusal(cfg) {
             crate::scheduler::exit_on_scheduler_refusal(&refusal);
         }
+        // Production construction no longer passes through the old
+        // `Scheduler::new` admission checks, so keep its fail-closed
+        // virtual-timeout/debugger refusal here, before preparing or
+        // admitting any replay input.
+        if let Err(refusal) =
+            detcore_model::virtual_timeout::refuse_debugger(cfg.virtual_timeout, cfg.gdbserver)
+        {
+            crate::scheduler::exit_on_scheduler_refusal(&refusal);
+        }
         // Phases 1 to 3 of `crate::clock_identity` (qualify, admit every
         // replay input, pin), then phase 4 from the admitted inputs.
         crate::scheduler::refuse_invalid_strict_boundary_config(cfg);
@@ -15043,6 +15052,43 @@ mod tests {
         }
         assert_eq!(state.take_guest_id().await, Some(5002));
         assert_eq!(state.take_guest_id().await, Some(5003));
+    }
+
+    /// Production global-state construction keeps the scheduler's
+    /// fail-closed virtual-timeout/debugger admission. The existing
+    /// `Scheduler::new` test covers only the test-only wrapper, so this
+    /// exercises `GlobalState::initialize`, the path production launches
+    /// take, in a child process that must take the policy-refusal exit.
+    #[test]
+    fn a_virtual_timeout_with_a_debugger_is_refused_by_global_state_initialization() {
+        if !in_child_expecting_refusal(
+            "a_virtual_timeout_with_a_debugger_is_refused_by_global_state_initialization",
+            "HERMIT_VIRTUAL_TIMEOUT_WITH_DEBUGGER",
+        ) {
+            // Each option alone retains production admission.
+            for config in [
+                Config {
+                    gdbserver: true,
+                    ..Config::default()
+                },
+                Config {
+                    virtual_timeout: std::num::NonZeroU64::new(5_000_000_000),
+                    ..Config::default()
+                },
+            ] {
+                let _state = GlobalState::initialize(&config, false);
+            }
+            return;
+        }
+        let _state = GlobalState::initialize(
+            &Config {
+                virtual_timeout: std::num::NonZeroU64::new(5_000_000_000),
+                gdbserver: true,
+                ..Config::default()
+            },
+            false,
+        );
+        panic!("GlobalState::initialize admitted a debugger with a virtual bound");
     }
 
     /// The last positive candidate may be taken only once. Exhaustion stays
