@@ -71,7 +71,9 @@ fn a_prepared_record_only_run_writes_its_committed_identity() {
 /// writes a history that states it is unqualified, and pins nothing.
 #[test]
 fn an_unqualified_record_only_run_writes_unqualified_and_pins_nothing() {
-    let unqualified = Some(HistoryIdentity::Unqualified("claim-unset".to_owned()));
+    let unqualified = Some(HistoryIdentity::Unqualified(
+        "claim-unset: no-mechanism-contract".to_owned(),
+    ));
     assert_eq!(emitted(record_only()), (unqualified.clone(), None));
     let kvm = Config {
         backend: BackendCapabilities::KVM,
