@@ -442,6 +442,7 @@ mod tests {
     /// when it is given back to analyze as an input, as any rows-only record.
     #[test]
     fn a_minimize_record_states_only_what_its_rows_hold() {
+        use detcore::preemptions::INSTRUCTION_OFFSET_FORMAT;
         use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
         use detcore::preemptions::InstructionOffset;
         use detcore::preemptions::PreemptionWriter;
@@ -496,7 +497,7 @@ mod tests {
             assert_eq!(
                 source.format_version(),
                 Some(if with_offsets {
-                    INSTRUCTION_OFFSET_ROWS_FORMAT
+                    INSTRUCTION_OFFSET_FORMAT
                 } else {
                     // A writer that notes no background starts states the
                     // format below theirs.

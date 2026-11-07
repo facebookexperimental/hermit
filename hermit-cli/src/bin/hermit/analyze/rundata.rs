@@ -2672,7 +2672,7 @@ mod tests {
     /// `a_minimize_record_states_only_what_its_rows_hold`.)
     #[test]
     fn a_prefix_trial_of_trace_offsets_keeps_its_timing_at_every_length() {
-        use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
+        use detcore::preemptions::INSTRUCTION_OFFSET_FORMAT;
         use detcore::preemptions::InstructionOffset;
         use detcore::preemptions::PreemptionWriter;
         use detcore::preemptions::RecordedOffsets;
@@ -2714,7 +2714,7 @@ mod tests {
             writer.insert_schedevent(SchedEvent::branches(tid, 3));
             let source: PreemptionRecord = serde_json::from_str(&writer.into_string()).unwrap();
             source.validate().unwrap();
-            assert_eq!(source.format_version(), Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
+            assert_eq!(source.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
 
             let args =
                 crate::app::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
@@ -2735,12 +2735,12 @@ mod tests {
                 assert_eq!(written.schedevents().len(), len, "{what}");
                 assert_eq!(
                     written.format_version(),
-                    Some(INSTRUCTION_OFFSET_ROWS_FORMAT),
+                    Some(INSTRUCTION_OFFSET_FORMAT),
                     "{what}"
                 );
                 assert_eq!(
                     written.timing_format(),
-                    Some(INSTRUCTION_OFFSET_ROWS_FORMAT),
+                    Some(INSTRUCTION_OFFSET_FORMAT),
                     "{what}"
                 );
                 assert!(written.lists_its_time_skips(), "{what}");
@@ -2771,6 +2771,7 @@ mod tests {
     /// with offsets, which both admit.
     #[test]
     fn rows_alone_restated_in_the_trace_offsets_format_still_hold_rows_only() {
+        use detcore::preemptions::INSTRUCTION_OFFSET_FORMAT;
         use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
         use detcore::preemptions::InstructionOffset;
         use detcore::preemptions::PreemptionWriter;
@@ -2799,14 +2800,15 @@ mod tests {
         writer.insert_schedevent(SchedEvent::branches(tid, 3));
         let source: PreemptionRecord = serde_json::from_str(&writer.into_string()).unwrap();
         source.validate().unwrap();
-        assert_eq!(source.format_version(), Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
+        assert_eq!(source.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
         let rows = source.clone_preemptions_only();
         assert_eq!(rows.format_version(), Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
-        let restated = rows.clone().with_format(Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
-        assert_eq!(restated.format_version(), Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
+        let restated = rows.clone().with_format(Some(INSTRUCTION_OFFSET_FORMAT));
+        assert_eq!(restated.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
         restated.validate().unwrap();
 
-        let args = crate::app::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
+        let args =
+            crate::app::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
         let crate::app::Subcommand::Analyze(mut options) = args.command else {
             panic!("not analyze")
         };
@@ -2834,7 +2836,7 @@ mod tests {
             assert_eq!(written.recorded_offsets(), expected, "{what}: written");
             let recorded = detcore::preemptions::read_recorded_offsets(&output).unwrap();
             assert_eq!(recorded, expected, "{what}: settings");
-            let trial = RunData::raw_runopts(&options);
+            let trial = RunData::get_raw_runopts(&options);
             let mut replay = trial.det_opts.det_config.clone();
             replay.chaos = false;
             let guard = crate::app::run::instruction_offset_replay_refusal(
@@ -2879,7 +2881,7 @@ mod tests {
     /// both. Writing the prefix in the sources' timing format fails this test.
     #[test]
     fn a_prefix_trial_of_a_recording_with_offset_rows_keeps_its_offsets_format() {
-        use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
+        use detcore::preemptions::INSTRUCTION_OFFSET_FORMAT;
         use detcore::preemptions::InstructionOffset;
         use detcore::preemptions::PreemptionWriter;
         use detcore::preemptions::RecordedOffsets;
@@ -2908,7 +2910,7 @@ mod tests {
         writer.insert_schedevent(SchedEvent::branches(tid, 3));
         let current: PreemptionRecord = serde_json::from_str(&writer.into_string()).unwrap();
         current.validate().unwrap();
-        assert_eq!(current.format_version(), Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
+        assert_eq!(current.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
         assert!(current.rows_carry_instruction_offsets());
         // The same rows in a record written by a Hermit whose schedule traces
         // did not hold offsets: format 6, no event offset.
@@ -2946,7 +2948,7 @@ mod tests {
                     source.format_version(),
                     "prefix of {len}"
                 );
-                let trial = RunData::raw_runopts(&options);
+                let trial = RunData::get_raw_runopts(&options);
                 let mut replay = trial.det_opts.det_config.clone();
                 replay.chaos = false;
                 let guard = crate::app::run::instruction_offset_replay_refusal(

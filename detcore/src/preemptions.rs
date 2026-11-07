@@ -708,7 +708,7 @@ impl RecordedOffsets {
             } else {
                 Self::None
             }
-        } else if format >= INSTRUCTION_OFFSET_ROWS_FORMAT {
+        } else if format >= INSTRUCTION_OFFSET_FORMAT {
             if rows || schedule {
                 Self::Recorded
             } else {
@@ -826,7 +826,7 @@ impl std::fmt::Display for PreemptionRecord {
 impl PreemptionRecord {
     /// TODO: This is not ideal because PreemptionRecord shouldn't be doing double duty as an eventlog.
     pub fn from_sched_events(events: Vec<SchedEvent>) -> Self {
-        Self {
+        let mut record = Self {
             per_thread: Default::default(),
             global: events,
             epoch: None,
@@ -855,7 +855,12 @@ impl PreemptionRecord {
             background_starts_unnoted: false,
             rewrite_exclusives: None,
             rewrite_exclusives_stripped_heuristic: false,
-        }
+        };
+        // A schedule spliced, cut or continued from a recording keeps the
+        // offsets of the events it took, and says so: only a recording in the
+        // offsets format (`INSTRUCTION_OFFSET_FORMAT`) has events with offsets.
+        record.adopt_offsets_format();
+        record
     }
 
     /// Whether the run this record came from charged a run of expired timed
@@ -1602,8 +1607,16 @@ impl PreemptionRecord {
     fn forget_background_starts(&mut self) {
         self.background_starts.clear();
         self.background_starts_unnoted = false;
-        self.format_version = format_without_background_starts(self.format_version);
-        self.adopt_offsets_format();
+        if reads_format(self.format_version)
+            && self
+                .format_version
+                .is_some_and(|format| format >= INSTRUCTION_OFFSET_FORMAT)
+        {
+            self.background_starts_unnoted = !self.rows_alone;
+        } else {
+            self.format_version = format_without_background_starts(self.format_version);
+            self.adopt_offsets_format();
+        }
         self.forget_stopless_marks_below_their_format();
     }
 
