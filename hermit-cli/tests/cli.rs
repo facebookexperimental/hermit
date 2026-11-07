@@ -28202,10 +28202,13 @@ fn branch_free_race_offset_args<'a>(seed: &'a str, extra: &[&'a str]) -> Vec<&'a
 /// (-O0) guest at 30,000 iterations it loses 17,883 of 60,000 increments
 /// on code without the schedule-trace fix, while at 20,000 seeds 1-8
 /// lose none; the case therefore stays on a genuinely racy schedule
-/// without runtime seed probes. In the
-/// validation profile at d005dfbdc512, the 30,000-iteration case used
-/// 36.780064 CPU seconds, so its exact PMU-node cap is 56 CPU seconds
-/// (about 1.5x that use), not the node's ordinary 88-second cap.
+/// without runtime seed probes. With fixed seed 4 at 30,000
+/// iterations the case used 33.03, 28.06 and 28.39 CPU seconds in its
+/// cgroup in the validation profile at this head (the d005dfbdc512
+/// sample of 36.780064 CPU seconds was the earlier seeds 1-8 search
+/// variant, which did more work), so its exact PMU-node cap is 52 CPU
+/// seconds (base 13 under the node's CPU multiplier of 4; above
+/// ceil(1.5 * 33.03) = 50), not the node's ordinary 88-second cap.
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn an_instruction_offset_record_replays_from_its_schedule_and_analyze_verifies_its_endpoints() {
