@@ -462,38 +462,40 @@ fn work_tree_root(start: &Path) -> Option<PathBuf> {
     (!root.is_empty()).then(|| PathBuf::from(root))
 }
 
+/// Whether git ignores PATH under TOP: the summary written there is
+/// excluded from the very enumeration (`git ls-files --others
+/// --exclude-standard`) whose poisoning the refusal below exists to
+/// prevent, so it needs no disposable home. A checkout's `target/`
+/// directory is the common case - hermit's own test fixtures run there.
+fn path_is_ignored(top: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(top) else {
+        return false;
+    };
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(top)
+        .args(["check-ignore", "-q", "--"])
+        .arg(relative)
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
 fn summary_dir_under(start: &Path) -> Result<PathBuf, Error> {
-    // A real work tree whose .gitignore has no `ignored/` rule has no
-    // disposable home for the summary: writing it at the work-tree
-    // root (the old fallback) puts an untracked file exactly where
-    // prepared source identity enumerates. Cargo git checkouts are
-    // such trees (reverie and rust-shed checkouts carry no `ignored/`
-    // rule), and a hermit run started in one poisoned every later
-    // prepared node in validate run 20261107T000239Z the same way
-    // run 1819 was poisoned at the checkout root. Refuse, as the
-    // un-creatable-directory case below already does; the fallback
-    // below remains for directories in no work tree at all.
-    if let Some(top) = work_tree_root(start) {
-        if disposable_dir_is_ignored(&top) {
-            let disposable = top.join("ignored");
-            std::fs::create_dir_all(&disposable).with_context(|| {
-                format!(
-                    "creating the disposable run-summary directory {}; refusing to fall back to \
-                     the work tree, where this file would be counted as prepared source",
-                    disposable.display()
-                )
-            })?;
-            return Ok(disposable);
-        }
-        return Err(Error::msg(format!(
-            "run summary has no disposable home: work tree {} does not ignore ignored/; \
-             refusing to write it into the work tree, where it would be counted as prepared source",
-            top.display()
-        )));
-    }
     // The enumeration is rooted at the work tree, not at the process cwd, so a
     // summary in ANY tracked subdirectory still trips it. Resolve the work-tree
     // root rather than assuming this runs from it.
+    //
+    // The NEAREST `.git` ancestor decides, in this order:
+    // - it ignores `ignored/`: the summary goes in that disposable
+    //   directory (a test fixture's own fake work tree counts here, even
+    //   nested inside a real checkout);
+    // - it is a real work tree (git resolves it as its own top level)
+    //   with no such rule: a cargo git checkout is such a tree, and a
+    //   summary written in it is counted as prepared source - refuse,
+    //   unless git already ignores the start itself (a checkout's
+    //   `target/`), which enumeration never counts;
+    // - it is a stray `.git` git cannot resolve: not a work tree, keep
+    //   walking up.
     let mut root = start;
     loop {
         if root.join(".git").exists() && disposable_dir_is_ignored(root) {
@@ -519,6 +521,25 @@ fn summary_dir_under(start: &Path) -> Result<PathBuf, Error> {
                 )
             })?;
             return Ok(disposable);
+        }
+        if root.join(".git").exists()
+            && work_tree_root(root).is_some_and(|top| {
+                top.canonicalize().unwrap_or(top)
+                    == root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
+            })
+        {
+            // A real work tree with no disposable rule. A start git
+            // already ignores is never enumerated, so it stays in
+            // place; anything else would be counted as prepared
+            // source, so refuse rather than write it.
+            if path_is_ignored(root, start) {
+                return Ok(start.to_path_buf());
+            }
+            return Err(Error::msg(format!(
+                "run summary has no disposable home: work tree {} does not ignore ignored/; \
+                 refusing to write it into the work tree, where it would be counted as prepared source",
+                root.display()
+            )));
         }
         match root.parent() {
             Some(parent) => root = parent,
@@ -21862,6 +21883,31 @@ mod tests {
         assert!(
             !root.join(".hermit-verify-summary-fixture").exists(),
             "a summary was written into the work tree"
+        );
+    }
+
+    /// A start git itself ignores is never enumerated as prepared
+    /// source, so it keeps the in-place location even in a work tree
+    /// with no `ignored/` rule. Hermit's own cli fixtures run under a
+    /// checkout's `target/` and rely on this (PR 5223's first head
+    /// refused there and broke max_log_bytes_verify_exits_promptly).
+    #[test]
+    fn summary_dir_in_a_git_ignored_directory_stays_in_place() {
+        let tmp = tempfile::tempdir().expect("fixture root");
+        let root = tmp.path();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(root)
+            .output()
+            .expect("git init fixture");
+        assert!(init.status.success(), "git init failed: {init:?}");
+        std::fs::write(root.join(".gitignore"), "target/\n").expect("fixture ignore rule");
+        let nested = root.join("target").join("tmp").join("fixture");
+        std::fs::create_dir_all(&nested).expect("fixture subdirectory");
+        assert_eq!(
+            summary_dir_under(&nested).expect("an ignored start keeps its place"),
+            nested,
+            "a git-ignored start must not be refused or relocated"
         );
     }
 
