@@ -1561,6 +1561,7 @@ fn other_instructions(tid: DetTid) -> SchedEvent {
         end_rip: None,
         end_time: None,
         stopless: false,
+        instruction_offset: None,
     }
 }
 
@@ -2033,7 +2034,10 @@ async fn a_replayed_callback_slice_end_refreshes_its_slowdown_epoch_without_repl
                 let mut expected_clock = guest.thread.thread_logical_time.clone();
                 expected_clock.add_rcbs_with_multiplier(7, expected_factor);
                 guest.reported_rcbs += 7;
-                let events = tool.update_logical_time_rcbs(&mut guest, true).await.unwrap();
+                let events = tool
+                    .update_logical_time_rcbs(&mut guest, true, false)
+                    .await
+                    .unwrap();
                 assert_eq!(events.len(), 1);
                 assert_eq!((events[0].op, events[0].count), (Op::Branch, 7));
                 assert_eq!(guest.thread.committed_clock_value, 1_107);
