@@ -32,8 +32,10 @@ fn run() -> Result<i32, String> {
             let mut rest = args.peekable();
             if rest.peek().is_some_and(|arg| arg == "--build-mode") {
                 rest.next();
-                match rest.next().map(String::as_str) {
-                    Some(mode @ ("cargo" | "buck")) => build_mode = mode,
+                let mode_arg = rest.next();
+                match mode_arg.as_deref() {
+                    Some("cargo") => build_mode = "cargo",
+                    Some("buck") => build_mode = "buck",
                     _ => return Err("prepare --build-mode needs cargo or buck".into()),
                 }
             }
