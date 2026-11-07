@@ -268,6 +268,9 @@ fn compare_desync(observed: &SchedEvent, expected: &SchedEvent) -> String {
         if observed.end_time != expected.end_time {
             msg = "TIME-".to_owned() + &msg;
         }
+        if observed.instruction_offset != expected.instruction_offset {
+            msg = "OFFSET-".to_owned() + &msg;
+        }
         if observed.op == Op::Branch
             && expected.op == Op::Branch
             && observed.count != expected.count
@@ -1281,6 +1284,125 @@ mod builder {
 
 #[cfg(test)]
 mod tests {
+
+    /// A batch of branches observed without the offset its recording carries
+    /// (a replay that did not stop the thread where its recording did), or
+    /// with another one, is a hard desync that names the offset, and a fatal
+    /// one under `--die-on-desync`.
+    #[test]
+    fn a_missed_instruction_offset_is_a_hard_desync() {
+        let offset = detcore_model::schedule::InstructionOffset {
+            rcb_target: 120,
+            instructions: 6,
+        };
+        let mut b = builder::SchedTestBuilder::new();
+        let recorded = b.branch(123, tid(3)).with_instruction_offset(Some(offset));
+        let missed = SchedEvent {
+            instruction_offset: None,
+            ..recorded
+        };
+        let moved = SchedEvent {
+            instruction_offset: Some(detcore_model::schedule::InstructionOffset {
+                instructions: 5,
+                ..offset
+            }),
+            ..recorded
+        };
+        for observed in [&missed, &moved] {
+            assert!(is_desync(observed, &recorded));
+            assert!(is_hard_desync(observed, &recorded));
+            assert_eq!(
+                hard_desync_fields(observed, &recorded),
+                vec!["instruction_offset"]
+            );
+            assert!(compare_desync(observed, &recorded).starts_with("OFFSET-"));
+        }
+        // And in the other direction: an offset the recording does not have.
+        assert!(is_hard_desync(&recorded, &missed));
+        assert!(!is_desync(&recorded, &recorded));
+
+        let mut replayer = Replayer::new(vec![recorded.clone(), b.branch(1, tid(5))]);
+        replayer.die_on_desync = true;
+        assert_eq!(
+            replayer.observe_event(&missed),
+            ReplayAction::Stop(StopReason::FatalDesync)
+        );
+    }
+
+    /// A recorded preemption's instruction offset comes with the timeslice
+    /// the replayer derives from its batch of branches, for the thread that
+    /// keeps running and for one a context switch hands the turn to, and never
+    /// without that timeslice.
+    #[test]
+    fn a_recorded_instruction_offset_comes_with_its_timeslice() {
+        let offset = detcore_model::schedule::InstructionOffset {
+            rcb_target: 120,
+            instructions: 6,
+        };
+        let mut b = builder::SchedTestBuilder::new();
+        let continuing = vec![
+            b.other(SOME_RIP, tid(3)),
+            b.branch(123, tid(3)).with_instruction_offset(Some(offset)),
+            b.other(SOME_RIP, tid(3)),
+            b.branch(1, tid(5)),
+        ];
+        let mut replayer = Replayer::new(continuing.clone());
+        assert_eq!(replayer.next_instruction_offset(), None);
+        assert_eq!(
+            replayer.observe_event(&continuing[0]),
+            ReplayAction::Continue(Some(ReplayedSliceEnd {
+                length: LogicalTime::from_rcbs(123),
+                stopless: false,
+            }))
+        );
+        assert_eq!(replayer.next_instruction_offset(), Some(offset));
+        assert_eq!(
+            replayer.next_resume(),
+            Some((tid(3), Some(LogicalTime::from_rcbs(123))))
+        );
+
+        let switching = vec![
+            b.other(SOME_RIP, tid(5)),
+            b.branch(123, tid(3)).with_instruction_offset(Some(offset)),
+            b.other(SOME_RIP, tid(3)),
+            b.branch(1, tid(5)),
+        ];
+        let mut replayer = Replayer::new(switching.clone());
+        assert_eq!(
+            replayer.observe_event(&switching[0]),
+            ReplayAction::ContextSwitch(
+                true,
+                tid(3),
+                Some(ReplayedSliceEnd {
+                    length: LogicalTime::from_rcbs(123),
+                    stopless: false,
+                })
+            )
+        );
+        assert_eq!(replayer.next_instruction_offset(), Some(offset));
+
+        // As a recording produces it when the thread kept running after the
+        // slice end: the offset timer's batch, its `OtherInstructions`
+        // event, then a syscall of the same thread at once. The batch keeps
+        // its timeslice and offset (`resolve_time_to_run`), as a timer stop
+        // with its RIP does, so the replay stops the thread where the
+        // recording did before it runs on to the syscall.
+        let continued_to_a_syscall = vec![
+            b.other(SOME_RIP, tid(3)),
+            b.branch(123, tid(3)).with_instruction_offset(Some(offset)),
+            b.other(SOME_RIP, tid(3)),
+            b.syscall_pre(Sysno::write, SOME_RIP, tid(3)),
+        ];
+        let mut replayer = Replayer::new(continued_to_a_syscall.clone());
+        assert_eq!(
+            replayer.observe_event(&continued_to_a_syscall[0]),
+            ReplayAction::Continue(Some(ReplayedSliceEnd {
+                length: LogicalTime::from_rcbs(123),
+                stopless: false,
+            }))
+        );
+        assert_eq!(replayer.next_instruction_offset(), Some(offset));
+    }
     use detcore_model::schedule::InstructionPointer;
     use pretty_assertions::assert_eq;
     use reverie::syscalls::Sysno;

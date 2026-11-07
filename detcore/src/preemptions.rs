@@ -2805,6 +2805,785 @@ impl Iterator for ThreadHistoryIterator {
 
 #[cfg(test)]
 mod tests {
+
+    /// A slice-boundary recording holds no instruction offset
+    /// (`BoundaryRecording::new` refuses one in its events and in its rows,
+    /// built or read), so a writer that noted an offset in a thread's rows,
+    /// which can come before any event, cannot become a boundary writer, while
+    /// one with plain rows can. A boundary writer states no format that claims
+    /// the offsets, and keeps one this Hermit does not read as stated.
+    #[test]
+    fn a_writer_that_noted_an_instruction_offset_cannot_become_a_boundary_writer() {
+        let tid = DetTid::from_raw(3);
+        let offset = InstructionOffset {
+            rcb_target: 18,
+            instructions: 4,
+        };
+        let rows = |decision: Option<InstructionOffset>| {
+            let mut writer = PreemptionWriter::new(None);
+            writer.register_thread(tid, DEFAULT_PRIORITY);
+            writer.insert_reprioritization(
+                tid,
+                LogicalTime::from_nanos(10),
+                18,
+                DEFAULT_PRIORITY,
+                5,
+                decision,
+            );
+            writer
+        };
+        let noted = rows(Some(offset));
+        assert_eq!(
+            noted.inner.format_version,
+            Some(INSTRUCTION_OFFSET_ROWS_FORMAT)
+        );
+        assert!(noted.with_slice_boundaries().is_err());
+        assert!(rows(None).with_slice_boundaries().is_ok());
+        for format in [
+            INSTRUCTION_OFFSET_ROWS_FORMAT,
+            INSTRUCTION_OFFSET_FORMAT,
+            PREEMPTION_RECORD_FORMAT_MAX + 1,
+            0,
+        ] {
+            let mut writer = PreemptionWriter::new(None);
+            writer.inner.format_version = Some(format);
+            assert_eq!(
+                writer.with_slice_boundaries().unwrap().inner.format_version,
+                format_without_background_starts(format_without_instruction_offsets(Some(format))),
+                "format {format}"
+            );
+        }
+    }
+
+    /// The offsets cap lowers only a format this Hermit reads at or above
+    /// `INSTRUCTION_OFFSET_FORMAT`. A newer format, and an invalid 0, stay as
+    /// stated through a schedule replay's re-record (the writer, with or
+    /// without an offset decision), `with_current_format` and a prefix, so that
+    /// reading still refuses the record by name: lowered, a newer Hermit's
+    /// record would read as one without what it may hold. A plain `min` in
+    /// `format_without_instruction_offsets` fails this test.
+    #[test]
+    fn a_format_this_hermit_does_not_read_survives_the_offsets_cap() {
+        let tid = DetTid::from_raw(3);
+        let offset = InstructionOffset {
+            rcb_target: 18,
+            instructions: 4,
+        };
+        for stated in [
+            PREEMPTION_RECORD_FORMAT_MAX + 1,
+            PREEMPTION_RECORD_FORMAT_MAX + 2,
+            0,
+        ] {
+            assert_eq!(
+                format_without_instruction_offsets(Some(stated)),
+                Some(stated)
+            );
+            let refusal = unread_format_message(Some(stated), 0);
+            let refused = |record: &PreemptionRecord, path: &str| {
+                assert_eq!(record.format_version(), Some(stated), "{path}");
+                let back: PreemptionRecord =
+                    serde_json::from_str(&serde_json::to_string(record).unwrap()).unwrap();
+                assert_eq!(back.format_version(), Some(stated), "{path}");
+                assert_eq!(back.validate_format(), Err(refusal.clone()), "{path}");
+            };
+            for decision in [None, Some(offset)] {
+                let mut writer = PreemptionWriter::new(None).with_format(Some(stated));
+                writer.insert_schedevent(
+                    SchedEvent::branches(tid, 20).with_instruction_offset(decision),
+                );
+                let written: PreemptionRecord =
+                    serde_json::from_str(&writer.into_string()).unwrap();
+                refused(&written, "schedule replay re-record");
+            }
+            let mut record = PreemptionRecord::from_sched_events(vec![
+                SchedEvent::branches(tid, 10),
+                SchedEvent::branches(tid, 20),
+            ]);
+            record.format_version = Some(stated);
+            refused(&record.clone().with_current_format(), "with_current_format");
+            refused(&record.schedule_prefix(1), "prefix");
+        }
+    }
+
+    /// Every format a record can state, read as a replay reads it
+    /// (`Recording::decode`): a record without a format, and formats 2 to
+    /// `PREEMPTION_RECORD_FORMAT_MAX`, are read; an explicit 1, 0 and every format
+    /// past the newest are refused by name with main's `validate_format`
+    /// message, kept typed (`RecordFormatRefusal`) through
+    /// `Recording::decode`, for a legacy record and a slice-boundary one
+    /// alike. `probe_format` reads the same format from the bytes.
+    #[test]
+    fn a_record_is_read_only_in_a_format_this_hermit_reads() {
+        let tid = DetTid::from_raw(3);
+        let legacy = |format: Option<u32>| {
+            let mut writer = PreemptionWriter::new(None);
+            writer.insert_schedevent(SchedEvent::branches(tid, 20));
+            let mut json: serde_json::Value = serde_json::from_str(&writer.into_string()).unwrap();
+            if let Some(format) = format {
+                json["format_version"] = format.into();
+            }
+            json.to_string()
+        };
+        let boundary = |format: Option<u32>| {
+            let mut json: serde_json::Value =
+                serde_json::from_slice(&boundary_recording::tests::sample(false).encode().unwrap())
+                    .unwrap();
+            if let Some(format) = format {
+                json["slice_boundary_recording"]["preemptions"]["format_version"] = format.into();
+            }
+            json.to_string()
+        };
+        let newest = PREEMPTION_RECORD_FORMAT_MAX;
+        let read: Vec<Option<u32>> = std::iter::once(None)
+            .chain((TIME_SKIPS_FORMAT..=newest).map(Some))
+            .collect();
+        for (name, make) in [
+            ("legacy", &legacy as &dyn Fn(Option<u32>) -> String),
+            ("boundary", &boundary),
+        ] {
+            for format in
+                read.iter()
+                    .copied()
+                    .chain([Some(1), Some(0), Some(newest + 1), Some(newest + 3)])
+            {
+                let bytes = make(format);
+                assert_eq!(
+                    boundary_recording::probe_format(bytes.as_bytes())
+                        .unwrap()
+                        .format,
+                    format,
+                    "{name}"
+                );
+                let decoded = boundary_recording::Recording::decode(bytes.as_bytes());
+                if read.contains(&format) {
+                    decoded.unwrap_or_else(|e| panic!("{name} {format:?}: {e:#}"));
+                    continue;
+                }
+                let error = decoded.unwrap_err();
+                let refusal = error
+                    .downcast_ref::<RecordFormatRefusal>()
+                    .unwrap_or_else(|| panic!("{name} {format:?}: {error:#}"));
+                assert_eq!(refusal.0, unread_format_message(format, 0), "{name}");
+                assert!(
+                    refusal.0.contains(&format!(
+                        "record format {format:?} with 0 time skips: this Hermit reads formats 1 \
+                         to {newest}"
+                    )),
+                    "{name}: {}",
+                    refusal.0
+                );
+            }
+        }
+    }
+
+    /// A prefix keeps its source's events, instruction offsets included, so a
+    /// record that notes no background starts states its source's format,
+    /// whether the prefix replays some, all or more than all of the
+    /// schedule's events. (A shorter prefix of one that notes them drops them
+    /// and states the format below theirs,
+    /// `a_schedule_prefix_keeps_the_background_starts_only_for_the_whole_schedule`;
+    /// one whose offsets keep it at their format says it notes none,
+    /// `a_record_that_drops_its_background_starts_keeps_its_offsets_format_and_says_so`.)
+    #[test]
+    fn a_schedule_prefix_keeps_its_sources_record_format() {
+        let tid = DetTid::from_raw(3);
+        for format in [None, Some(SWITCH_IN_CHARGE_FORMAT)] {
+            let mut record = PreemptionRecord::from_sched_events(vec![
+                SchedEvent::branches(tid, 10),
+                SchedEvent::branches(tid, 20),
+            ]);
+            record.format_version = format;
+            for len in [0, 1, 2, 9] {
+                assert_eq!(
+                    record.schedule_prefix(len).format_version,
+                    format,
+                    "format {format:?}, prefix of {len} events"
+                );
+            }
+        }
+    }
+
+    /// A `stopless` mark on a batch that also carries an instruction offset
+    /// is refused wherever a record is built, written or read: the offset is
+    /// stepped from a stop at its branch target, which an end taken without a
+    /// stop does not make, so no recording writes the pair, and a schedule
+    /// replay of one would arm both. Both builders refuse it, in either
+    /// order; a writer that keeps marks and records offsets refuses it; and
+    /// the public reader and `validate` refuse the record by name, as a
+    /// record-format refusal. The offset alone and the mark alone are read.
+    #[test]
+    fn a_stopless_mark_beside_an_instruction_offset_is_refused_everywhere() {
+        use std::panic::AssertUnwindSafe;
+        use std::panic::catch_unwind;
+
+        let tid = DetTid::from_raw(3);
+        let offset = Some(InstructionOffset {
+            rcb_target: 98,
+            instructions: 3,
+        });
+        let both = SchedEvent {
+            stopless: true,
+            ..SchedEvent::branches(tid, 100).with_instruction_offset(offset)
+        };
+        assert!(
+            catch_unwind(|| SchedEvent::branches(tid, 100)
+                .taken_without_stop()
+                .with_instruction_offset(offset))
+            .is_err()
+        );
+        assert!(
+            catch_unwind(|| SchedEvent::branches(tid, 100)
+                .with_instruction_offset(offset)
+                .taken_without_stop())
+            .is_err()
+        );
+        let mut writer = PreemptionWriter::new(None)
+            .with_format(Some(PREEMPTION_RECORD_FORMAT_MAX))
+            .noting_background_starts();
+        assert!(catch_unwind(AssertUnwindSafe(|| writer.insert_schedevent(both.clone()))).is_err());
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("record.json");
+        // A record that notes its background starts, the only kind that holds
+        // stopless marks, so that the mark is refused for the offset beside it.
+        let record = |event: SchedEvent| {
+            let mut record = PreemptionRecord::from_sched_events(vec![event]);
+            record.format_version = Some(PREEMPTION_RECORD_FORMAT_MAX);
+            record.background_starts_unnoted = false;
+            record
+        };
+        let read = |event: SchedEvent| {
+            std::fs::write(&path, serde_json::to_string(&record(event)).unwrap()).unwrap();
+            PreemptionReader::try_new(&path).map(|_| ())
+        };
+        let refusal = "has no instruction offset";
+        let error = read(both.clone()).expect_err("a stopless mark beside an offset is read");
+        assert!(
+            error.chain().any(|cause| cause.is::<RecordFormatRefusal>()),
+            "{error:#}"
+        );
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("record event 0") && message.contains(refusal),
+            "{message}"
+        );
+        let decoded: PreemptionRecord =
+            serde_json::from_str(&serde_json::to_string(&record(both)).unwrap()).unwrap();
+        assert!(
+            decoded
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains(refusal)
+        );
+        read(SchedEvent::branches(tid, 100).with_instruction_offset(offset)).unwrap();
+        read(SchedEvent::branches(tid, 100).taken_without_stop()).unwrap();
+    }
+
+    /// Instruction offsets stamp the record `INSTRUCTION_OFFSET_FORMAT` and round-trip through
+    /// JSON. A record without them is written exactly as before, with
+    /// neither the field nor a version. An edit keeps the format of the
+    /// record it edits, whatever it drops, and a schedule rebuilt from events
+    /// with offsets states `INSTRUCTION_OFFSET_FORMAT`. An offset that a record's format cannot
+    /// hold, on an event other than a batch of branches, or of zero steps, is
+    /// refused.
+    /// A record whose schedule trace holds every offset decision
+    /// (`INSTRUCTION_OFFSET_FORMAT`) and that dropped its background starts
+    /// keeps that format, says it notes no starts, drops its `stopless`
+    /// marks (which only a record that notes its starts holds), and still
+    /// reads as recorded with offsets: a prefix of no events, one that ends
+    /// before the first offset, and an edit, through JSON. Lowered, the
+    /// prefixes would read as a trace without offsets (rows only, since the
+    /// rows hold one), which a schedule replay refuses; without the rule in
+    /// `forget_background_starts`, this test fails.
+    #[test]
+    fn a_trace_offsets_record_keeps_its_format_when_it_drops_its_background_starts() {
+        let tid = DetTid::from_raw(3);
+        let offset = InstructionOffset {
+            rcb_target: 18,
+            instructions: 4,
+        };
+        let mut writer = PreemptionWriter::new(None).noting_background_starts();
+        writer.register_thread(tid, DEFAULT_PRIORITY);
+        writer.insert_schedevent(SchedEvent::branches(tid, 10).taken_without_stop());
+        writer.insert_background_start(tid, 1);
+        writer.insert_reprioritization(
+            tid,
+            LogicalTime::from_nanos(20),
+            20,
+            DEFAULT_PRIORITY,
+            5,
+            Some(offset),
+        );
+        writer
+            .insert_schedevent(SchedEvent::branches(tid, 20).with_instruction_offset(Some(offset)));
+        let run: PreemptionRecord = serde_json::from_str(&writer.into_string()).unwrap();
+        run.validate().unwrap();
+        assert_eq!(run.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
+        assert!(run.notes_background_starts());
+        for (what, record) in [
+            ("a prefix of no events", run.schedule_prefix(0)),
+            ("a prefix before the offset", run.schedule_prefix(1)),
+            ("an edit", run.with_latest_preempt_removed()),
+        ] {
+            let back: PreemptionRecord = serde_json::from_str(&record.to_string()).unwrap();
+            back.validate()
+                .unwrap_or_else(|error| panic!("{what}: {error}"));
+            assert_eq!(
+                back.format_version(),
+                Some(INSTRUCTION_OFFSET_FORMAT),
+                "{what}"
+            );
+            assert!(back.background_starts_unnoted, "{what}");
+            assert!(!back.notes_background_starts(), "{what}");
+            assert!(back.background_starts().is_empty(), "{what}");
+            assert!(back.global.iter().all(|event| !event.stopless), "{what}");
+            assert_eq!(back.recorded_offsets(), RecordedOffsets::Recorded, "{what}");
+        }
+        // The whole prefix keeps the starts, the claim and the mark.
+        let whole = run.schedule_prefix(2);
+        assert_eq!(whole.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
+        assert!(whole.notes_background_starts());
+        assert!(whole.global[0].stopless);
+    }
+
+    /// A record written by a Hermit whose schedule traces did not hold
+    /// offsets has them in its rows alone, in format 6
+    /// (`INSTRUCTION_OFFSET_ROWS_FORMAT`, `RecordedOffsets::RowsOnly`). No
+    /// edit raises its format to 5, so no edit makes its schedule trace
+    /// replayable as one that holds the offsets.
+    #[test]
+    fn an_edit_of_a_rows_only_record_keeps_it_rows_only() {
+        let (three, four) = (DetTid::from_raw(3), DetTid::from_raw(4));
+        let at = |ns| LogicalTime::from_nanos(ns);
+        let offset = InstructionOffset {
+            rcb_target: 18,
+            instructions: 4,
+        };
+        let mut writer = PreemptionWriter::new(None);
+        writer.register_thread(three, DEFAULT_PRIORITY);
+        writer.register_thread(four, DEFAULT_PRIORITY);
+        writer.insert_reprioritization(three, at(10), 10, DEFAULT_PRIORITY, 5, None);
+        writer.insert_reprioritization(three, at(20), 20, 5, 6, Some(offset));
+        writer.insert_reprioritization(four, at(15), 15, DEFAULT_PRIORITY, 8, None);
+        writer.insert_schedevent(SchedEvent::branches(three, 20));
+        writer.insert_schedevent(SchedEvent::branches(four, 15));
+        let legacy: PreemptionRecord = serde_json::from_str(&writer.into_string()).unwrap();
+        // As a Hermit whose schedule traces did not hold offsets wrote it: its
+        // rows' format, 4.
+        assert_eq!(legacy.format_version, Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
+        legacy.validate().unwrap();
+        assert_eq!(legacy.recorded_offsets(), RecordedOffsets::RowsOnly);
+
+        let rows_only = |edited: &PreemptionRecord, what: &str| {
+            assert_eq!(
+                edited.format_version,
+                Some(INSTRUCTION_OFFSET_ROWS_FORMAT),
+                "{what}"
+            );
+            assert_eq!(
+                edited.recorded_offsets(),
+                RecordedOffsets::RowsOnly,
+                "{what}"
+            );
+        };
+        let mut split = legacy.clone();
+        split.split_map(|event, _| vec![event.clone(), event]);
+        rows_only(&split, "split_map");
+        let mut events = legacy.clone();
+        events
+            .schedevents_iter_mut()
+            .for_each(|event| event.count += 1);
+        rows_only(&events, "schedevents_iter_mut");
+        let mut preemptions = legacy.clone();
+        preemptions.preemptions_only();
+        rows_only(&preemptions, "preemptions_only");
+        rows_only(&legacy.clone_preemptions_only(), "clone_preemptions_only");
+        rows_only(
+            &PreemptionRecord::from_vecs_of(&legacy.as_vecs(), &legacy).unwrap(),
+            "from_vecs_of",
+        );
+        let mut stripped = legacy.clone();
+        stripped.strip_event_times();
+        rows_only(&stripped, "strip_event_times");
+        // Rows knocked out: the record is still of no format, and its
+        // remaining rows carry no offset.
+        let removed = legacy.with_latest_preempt_removed();
+        assert_eq!(removed.format_version, Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
+        let emptied = legacy.clone().strip_contents();
+        assert_eq!(emptied.format_version, Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
+        assert_eq!(emptied.recorded_offsets(), RecordedOffsets::None);
+        // A schedule rebuilt from its events has no offset to say it holds.
+        let rebuilt = PreemptionRecord::from_sched_events(legacy.clone().into_global());
+        assert_eq!(rebuilt.format_version, None);
+        assert_eq!(rebuilt.recorded_offsets(), RecordedOffsets::None);
+    }
+
+    /// A record stating a format this Hermit does not read (0, an explicit 1,
+    /// or one above `PREEMPTION_RECORD_FORMAT_MAX`) keeps it through every path
+    /// that raises a record's format for an instruction offset: a schedule
+    /// adopting its events' format (`adopt_event_offsets_format`), and the
+    /// writer's offset rows and offset events (`raise_format`). Written and
+    /// read back, it still states that format, and reading still refuses it
+    /// by name (`validate_format`, main's message).
+    #[test]
+    fn an_unread_stated_format_survives_every_format_raise() {
+        let tid = DetTid::from_raw(3);
+        let offset = InstructionOffset {
+            rcb_target: 18,
+            instructions: 4,
+        };
+        let event = SchedEvent::branches(tid, 20).with_instruction_offset(Some(offset));
+        for stated in [
+            0,
+            1,
+            PREEMPTION_RECORD_FORMAT_MAX + 1,
+            PREEMPTION_RECORD_FORMAT_MAX + 2,
+        ] {
+            let mut json: serde_json::Value = serde_json::from_str(
+                &PreemptionRecord::from_sched_events(vec![event.clone()]).to_string(),
+            )
+            .unwrap();
+            json["format_version"] = stated.into();
+            let read: PreemptionRecord = serde_json::from_str(&json.to_string()).unwrap();
+            assert_eq!(read.format_version(), Some(stated));
+
+            let mut adopted = read.clone();
+            adopted.adopt_offsets_format();
+            let mut writer = PreemptionWriter::new(None);
+            writer.inner = read;
+            writer.register_thread(tid, DEFAULT_PRIORITY);
+            writer.insert_reprioritization(
+                tid,
+                LogicalTime::from_nanos(10),
+                18,
+                DEFAULT_PRIORITY,
+                5,
+                Some(offset),
+            );
+            writer.insert_schedevent(event.clone());
+            for (path, written) in [
+                ("adopted", adopted.to_string()),
+                ("written", writer.into_string()),
+            ] {
+                let back: PreemptionRecord = serde_json::from_str(&written).unwrap();
+                assert_eq!(back.format_version(), Some(stated), "{path}: {written}");
+                assert!(back.validate().is_err(), "{path}: {written}");
+                assert_eq!(
+                    back.validate_format(),
+                    Err(unread_format_message(Some(stated), 0)),
+                    "{path}"
+                );
+            }
+        }
+    }
+
+    /// What each older reader makes of this change's records. A Hermit that
+    /// predates instruction offsets reads formats 1 to 5; one whose offsets
+    /// live in rows alone reads formats 1 to 6. A recording whose schedule
+    /// trace holds an offset states 7, so both refuse it by name rather than
+    /// replay its trace without the offset. Its rows alone, as minimization
+    /// (`from_vecs_of`) and `clone_preemptions_only` leave them, state 6,
+    /// which the first refuses and the second reads as the rows-only plan it
+    /// is. A record without an offset, fresh or minimized, stays in a format
+    /// both read.
+    #[test]
+    fn each_older_reader_refuses_the_offsets_it_cannot_replay() {
+        let reads = |newest: u32, format: Option<u32>| {
+            format.is_none_or(|format| (TIME_SKIPS_FORMAT..=newest).contains(&format))
+        };
+        let tid = DetTid::from_raw(3);
+        let at = |ns| LogicalTime::from_nanos(ns);
+        let offset = InstructionOffset {
+            rcb_target: 18,
+            instructions: 4,
+        };
+        let record = |offset: Option<InstructionOffset>| {
+            let mut writer =
+                PreemptionWriter::new(None).with_format(Some(PREEMPTION_RECORD_FORMAT_MAX));
+            writer.register_thread(tid, DEFAULT_PRIORITY);
+            writer.insert_reprioritization(tid, at(10), 10, DEFAULT_PRIORITY, 5, None);
+            writer.insert_reprioritization(tid, at(20), 20, 5, 6, offset);
+            writer.insert_schedevent(SchedEvent::branches(tid, 10));
+            writer.insert_schedevent(SchedEvent::branches(tid, 10).with_instruction_offset(offset));
+            serde_json::from_str::<PreemptionRecord>(&writer.into_string()).unwrap()
+        };
+        let fresh = record(Some(offset));
+        assert_eq!(fresh.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
+        assert_eq!(fresh.recorded_offsets(), RecordedOffsets::Recorded);
+        let minimized = PreemptionRecord::from_vecs_of(&fresh.as_vecs(), &fresh).unwrap();
+        assert_eq!(
+            minimized.format_version(),
+            Some(INSTRUCTION_OFFSET_ROWS_FORMAT)
+        );
+        assert_eq!(minimized.recorded_offsets(), RecordedOffsets::RowsOnly);
+        let plain = record(None);
+        assert_eq!(plain.format_version(), Some(SWITCH_IN_CHARGE_FORMAT));
+        let plain_minimized = PreemptionRecord::from_vecs_of(&plain.as_vecs(), &plain).unwrap();
+        for (what, written, before_offsets, rows_only) in [
+            ("a fresh recording", &fresh, false, false),
+            ("its minimized rows", &minimized, false, true),
+            (
+                "its rows alone",
+                &fresh.clone_preemptions_only(),
+                false,
+                true,
+            ),
+            ("a recording without an offset", &plain, true, true),
+            ("its minimized rows", &plain_minimized, true, true),
+        ] {
+            let back: PreemptionRecord = serde_json::from_str(&written.to_string()).unwrap();
+            back.validate().unwrap();
+            assert_eq!(
+                reads(INSTRUCTION_OFFSET_ROWS_FORMAT - 1, back.format_version()),
+                before_offsets,
+                "{what}"
+            );
+            assert_eq!(
+                reads(INSTRUCTION_OFFSET_ROWS_FORMAT, back.format_version()),
+                rows_only,
+                "{what}"
+            );
+        }
+    }
+
+    /// Minimization rebuilds rows from times and priorities alone
+    /// (`from_vecs`), which replay by time and end at a branch. From a record
+    /// with instruction offsets, `from_vecs_of` gives each kept row its exact
+    /// branch target and offset back, so a minimization trial still stops
+    /// where the record did; from one without, it rebuilds as `from_vecs`.
+    /// Either way the rebuilt rows state no format: they hold no schedule
+    /// trace and no jumps of global time, and one that keeps an offset is
+    /// the rows-only plan a preemption replay arms.
+    #[test]
+    fn minimized_rows_keep_their_branch_targets_and_offsets() {
+        let (three, four) = (DetTid::from_raw(3), DetTid::from_raw(4));
+        let at = |ns| LogicalTime::from_nanos(ns);
+        let offset = InstructionOffset {
+            rcb_target: 18,
+            instructions: 4,
+        };
+        let mut writer = PreemptionWriter::new(None);
+        writer.register_thread(three, DEFAULT_PRIORITY);
+        writer.register_thread(four, DEFAULT_PRIORITY);
+        writer.insert_reprioritization(three, at(10), 10, DEFAULT_PRIORITY, 5, None);
+        writer.insert_reprioritization(three, at(20), 20, 5, 6, Some(offset));
+        writer.insert_reprioritization(three, at(30), 30, 6, 7, None);
+        writer.insert_reprioritization(four, at(15), 15, DEFAULT_PRIORITY, 8, None);
+        let source: PreemptionRecord = serde_json::from_str(&writer.into_string()).unwrap();
+        assert_eq!(source.format_version, Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
+
+        // Knock out thread 3's first row, as a minimization round does.
+        let mut vecs = source.as_vecs();
+        vecs.get_mut(&three).unwrap().remove(1);
+        let kept = PreemptionRecord::from_vecs_of(&vecs, &source).unwrap();
+        kept.validate().unwrap();
+        assert_eq!(kept.format_version, Some(INSTRUCTION_OFFSET_ROWS_FORMAT));
+        assert_eq!(kept.timing_format(), None);
+        assert_eq!(kept.recorded_offsets(), RecordedOffsets::RowsOnly);
+        let mut rows = kept.per_thread[&three].clone().into_iter();
+        assert_eq!(
+            rows.next_with_offset(),
+            Some((at(20), DEFAULT_PRIORITY, Some(20), Some(offset)))
+        );
+        assert_eq!(rows.next_with_offset(), Some((at(30), 6, Some(30), None)));
+        assert_eq!(kept.per_thread[&four].preemption_rcbs, vec![15]);
+        // The offset's row knocked out: the rows keep their branch targets,
+        // and the record, holding no offset, states no format.
+        let mut vecs = source.as_vecs();
+        vecs.get_mut(&three).unwrap().remove(2);
+        let without_offset = PreemptionRecord::from_vecs_of(&vecs, &source).unwrap();
+        assert!(!without_offset.carries_instruction_offsets());
+        assert_eq!(without_offset.format_version, None);
+        assert_eq!(
+            without_offset.per_thread[&three].preemption_rcbs,
+            vec![10, 30]
+        );
+        // A row the source does not have.
+        let mut vecs = source.as_vecs();
+        vecs.get_mut(&three).unwrap().push((at(40), 9));
+        assert!(PreemptionRecord::from_vecs_of(&vecs, &source).is_err());
+
+        // A source without offsets is rebuilt by time alone, as before.
+        let mut plain = PreemptionWriter::new(None);
+        plain.register_thread(three, DEFAULT_PRIORITY);
+        plain.insert_reprioritization(three, at(10), 10, DEFAULT_PRIORITY, 5, None);
+        let plain: PreemptionRecord = serde_json::from_str(&plain.into_string()).unwrap();
+        assert_eq!(
+            PreemptionRecord::from_vecs_of(&plain.as_vecs(), &plain).unwrap(),
+            PreemptionRecord::from_vecs(&plain.as_vecs())
+        );
+    }
+
+    /// Only a record whose schedule trace holds an instruction offset states
+    /// `INSTRUCTION_OFFSET_FORMAT`: a writer that records none, and
+    /// `with_current_format` on a record without any, state the format below
+    /// it with the same timing rules; recording an offset, or a schedule that
+    /// holds one, raises the format to it, and lowering never raises an older
+    /// format.
+    #[test]
+    fn only_a_schedule_with_instruction_offsets_states_their_format() {
+        let below = Some(INSTRUCTION_OFFSET_ROWS_FORMAT - 1);
+        assert_eq!(
+            format_without_instruction_offsets(Some(PREEMPTION_RECORD_FORMAT_MAX)),
+            below
+        );
+        assert_eq!(
+            format_without_instruction_offsets(Some(TIME_SKIPS_FORMAT)),
+            Some(TIME_SKIPS_FORMAT)
+        );
+        assert_eq!(format_without_instruction_offsets(None), None);
+        let tid = DetTid::from_raw(3);
+        let offset = InstructionOffset {
+            rcb_target: 18,
+            instructions: 4,
+        };
+        let read = |writer: PreemptionWriter| -> PreemptionRecord {
+            serde_json::from_str(&writer.into_string()).unwrap()
+        };
+        // A writer that notes no background starts states the format below
+        // theirs too (`PreemptionWriter::with_format`).
+        let mut plain = PreemptionWriter::new(None).with_format(Some(PREEMPTION_RECORD_FORMAT_MAX));
+        plain.insert_schedevent(SchedEvent::branches(tid, 20));
+        assert_eq!(
+            read(plain).format_version(),
+            format_without_background_starts(below)
+        );
+        let mut offsets =
+            PreemptionWriter::new(None).with_format(Some(PREEMPTION_RECORD_FORMAT_MAX));
+        offsets
+            .insert_schedevent(SchedEvent::branches(tid, 20).with_instruction_offset(Some(offset)));
+        let offsets = read(offsets);
+        assert_eq!(offsets.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
+        assert_eq!(offsets.recorded_offsets(), RecordedOffsets::Recorded);
+        assert_eq!(
+            PreemptionRecord::from_sched_events(vec![SchedEvent::branches(tid, 20)])
+                .with_current_format()
+                .format_version(),
+            format_without_background_starts(below)
+        );
+        assert_eq!(
+            PreemptionRecord::from_sched_events(offsets.schedevents().clone())
+                .with_current_format()
+                .format_version(),
+            Some(INSTRUCTION_OFFSET_FORMAT)
+        );
+        let mut older = PreemptionWriter::new(None).with_format(Some(TIME_SKIPS_FORMAT));
+        older.insert_schedevent(SchedEvent::branches(tid, 20));
+        assert_eq!(read(older).format_version(), Some(TIME_SKIPS_FORMAT));
+    }
+
+    #[test]
+    fn schedule_offsets_version_the_record_and_ride_its_edits() {
+        let tid = DetTid::from_raw(3);
+        let offset = InstructionOffset {
+            rcb_target: 18,
+            instructions: 4,
+        };
+        let branch = |offset: Option<InstructionOffset>| {
+            SchedEvent::branches(tid, 20).with_instruction_offset(offset)
+        };
+        let mut plain = PreemptionWriter::new(None);
+        plain.insert_schedevent(branch(None));
+        assert_eq!(
+            plain.into_string(),
+            r#"{"per_thread":{},"global":[{"dettid":3,"op":"Branch","count":20,"start_rip":null,"end_rip":null,"end_time":null}],"rejoins":[]}"#
+        );
+        let unedited = PreemptionRecord::from_sched_events(vec![branch(None)]);
+        assert_eq!(unedited.format_version, None);
+        assert_eq!(unedited.recorded_offsets(), RecordedOffsets::None);
+
+        let mut writer = PreemptionWriter::new(None);
+        writer.insert_schedevent(branch(None));
+        writer.insert_schedevent(branch(Some(offset)));
+        let json = writer.into_string();
+        // The writer notes no background starts, so the offsets' format says
+        // it notes none (`background_starts_unnoted`).
+        assert!(
+            json.ends_with(&format!(
+                r#""instruction_offset":{{"rcb_target":18,"instructions":4}}}}],"format_version":{INSTRUCTION_OFFSET_FORMAT},"rejoins":[],"background_starts_unnoted":true}}"#
+            )),
+            "{json}"
+        );
+        let record: PreemptionRecord = serde_json::from_str(&json).unwrap();
+        record.validate().unwrap();
+        assert_eq!(record.format_version(), Some(INSTRUCTION_OFFSET_FORMAT));
+        assert_eq!(record.recorded_offsets(), RecordedOffsets::Recorded);
+        assert_eq!(record.to_string(), json);
+
+        // A schedule rebuilt from its events (a trial, a splice, a final
+        // schedule), split, or stripped of times keeps the offset and the
+        // format.
+        let rebuilt = PreemptionRecord::from_sched_events(record.clone().into_global());
+        assert_eq!(rebuilt.format_version, Some(INSTRUCTION_OFFSET_FORMAT));
+        assert_eq!(rebuilt.schedevents()[1].instruction_offset, Some(offset));
+        // A split is an edit (`forget_run_points`): it drops the readmissions
+        // and keeps the events, the format and the mark.
+        let mut split = record.clone();
+        split.split_map(|event, _| vec![event]);
+        assert_eq!(split.schedevents(), record.schedevents());
+        assert_eq!(split.format_version, Some(INSTRUCTION_OFFSET_FORMAT));
+        assert!(split.background_starts_unnoted);
+        split.validate().unwrap();
+        let mut stripped = record.clone();
+        stripped.strip_event_times();
+        assert_eq!(stripped.format_version, Some(INSTRUCTION_OFFSET_FORMAT));
+        // An edit that drops the schedule, or its offsets, keeps the format:
+        // the record still comes from a Hermit that traces every offset.
+        // Main's `clone_preemptions_only` states no format; this record holds
+        // its offsets in its schedule alone, so the copy holds none.
+        let rows = record.clone_preemptions_only();
+        assert_eq!(rows.format_version, None);
+        assert_eq!(rows.recorded_offsets(), RecordedOffsets::None);
+        let mut preemptions = record.clone();
+        preemptions.preemptions_only();
+        assert_eq!(preemptions.format_version, Some(INSTRUCTION_OFFSET_FORMAT));
+        assert_eq!(preemptions.recorded_offsets(), RecordedOffsets::None);
+        let mut dropped = record.clone();
+        dropped.split_map(|event, _| vec![event.with_instruction_offset(None)]);
+        assert_eq!(dropped.format_version, Some(INSTRUCTION_OFFSET_FORMAT));
+        dropped.validate().unwrap();
+
+        // What a record's format cannot hold, or no batch of branches has.
+        // Stated older, as a writer that predates the offsets would leave it,
+        // without the mark only a later format sets (`background_starts_unnoted`).
+        let mut below = record.clone();
+        below.format_version = None;
+        below.background_starts_unnoted = false;
+        let error = below.validate().unwrap_err();
+        assert!(
+            error.contains("cannot hold")
+                && error.contains(&format!("offsets need format {INSTRUCTION_OFFSET_FORMAT}")),
+            "{error}"
+        );
+        below.format_version = Some(TIME_SKIPS_FORMAT);
+        assert!(below.validate().unwrap_err().contains("cannot hold"));
+        // A format this Hermit does not read is refused as such, by name,
+        // whatever the record holds, not as a record its offsets do not fit.
+        for unread in [0, 1, PREEMPTION_RECORD_FORMAT_MAX + 1] {
+            let mut unread_record = record.clone();
+            unread_record.format_version = Some(unread);
+            assert_eq!(
+                unread_record.validate(),
+                Err(unread_format_message(Some(unread), 0)),
+                "format {unread}"
+            );
+        }
+        let mut on_syscall = record.clone();
+        on_syscall.global[1].op = Op::OtherInstructions;
+        assert!(
+            on_syscall
+                .validate()
+                .unwrap_err()
+                .contains("only a batch of branches")
+        );
+        let mut zero_steps = record;
+        zero_steps.global[1].instruction_offset = Some(InstructionOffset {
+            rcb_target: 18,
+            instructions: 0,
+        });
+        assert!(zero_steps.validate().unwrap_err().contains("zero steps"));
+    }
     use detcore_model::schedule::Op;
     use pretty_assertions::assert_eq;
     use test_case::test_case;
@@ -6469,18 +7248,25 @@ impl PreemptionWriter {
     /// event. Metadata stays in the legacy history, with exactly one global
     /// stream in the new envelope. Existing writers remain legacy by default.
     pub fn with_slice_boundaries(mut self) -> Result<Self, String> {
-        // A boundary replay takes no background starts
-        // (`BoundaryRecording::new`), so a writer that noted one cannot
-        // become a boundary writer, and a boundary writer states no format
-        // that claims their list.
+        // A boundary replay takes no background starts, and a slice-boundary
+        // recording holds no instruction offset (`BoundaryRecording::new`), so
+        // a writer that noted either cannot become a boundary writer, and a
+        // boundary writer states no format that claims them.
         if !self.inner.global.is_empty()
             || !self.inner.background_starts.is_empty()
+            || self
+                .inner
+                .per_thread
+                .values()
+                .any(|history| history.has_instruction_offsets())
             || self.boundary_records.is_some()
         {
             self.flushed = true;
             return Err("slice-boundary protocol must be selected before recording events".into());
         }
-        self.inner.format_version = format_without_background_starts(self.inner.format_version);
+        self.inner.format_version = format_without_background_starts(
+            format_without_instruction_offsets(self.inner.format_version),
+        );
         self.boundary_records = Some(Vec::new());
         Ok(self)
     }
@@ -6785,6 +7571,13 @@ impl PreemptionWriter {
             )
         });
         assert_eq!(history.final_prio, prior_prio);
+        // --chaos-instruction-offset refuses --strict-schedule-boundaries,
+        // and a slice-boundary recording holding one is malformed
+        // (`BoundaryRecording::new`).
+        assert!(
+            offset.is_none() || self.boundary_records.is_none(),
+            "slice-boundary protocol refuses instruction offsets"
+        );
 
         if let Some((last, _prio)) = history.prio_changes.last() {
             assert!(&time > last);

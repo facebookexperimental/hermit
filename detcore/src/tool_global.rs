@@ -7441,6 +7441,13 @@ impl GlobalState {
             }
             _ => None,
         };
+        // A new thread installs no replay instruction offset from its start
+        // grant. Whatever the replayer gave it for that grant goes now,
+        // staged or moved by the grant: a signaled start grant consumes
+        // neither, and they must not reach a later grant
+        // (`Scheduler::forget_replay_timeslice`). The first slice's length
+        // above is a copy and is installed by `finish_thread_start`.
+        self.sched.lock().unwrap().forget_replay_timeslice(&dettid);
         if let Some(pr) = &self.preemptions_to_replay {
             let (history, old_prio) = {
                 let mut sched = self.lock_rpc_scheduler(false).await;
@@ -14781,6 +14788,118 @@ where
 
 #[cfg(test)]
 mod tests {
+
+    /// The coordinator's half of a schedule replay's exec continuation: the
+    /// `ResumeExec` answer carries the instruction offset beside the timeslice
+    /// its grant consumed (`exec_identity::exec_continuation_slice` reads
+    /// both), through the real RPC and a scheduler turn. The replay pair is
+    /// staged by hand here: the leader transfer that stages it and
+    /// `reconnect_exec`'s installation are not exercised, and no recorded
+    /// trace holds a nonleader exec (`reconnect_exec` refuses one while
+    /// recording, EOPNOTSUPP). A new thread installs no replay timeslice from
+    /// its start grant, with or without an offset, so a start grant, plain or
+    /// signaled, leaves neither the staged pair nor a granted offset behind.
+    #[tokio::test]
+    async fn a_resume_exec_answer_carries_its_grants_offset_and_a_start_grant_drops_it() {
+        let offset = crate::resources::InstructionOffset {
+            rcb_target: 120,
+            instructions: 6,
+        };
+        let slice = LogicalTime::from_rcbs(123);
+        // 0: exec continuation; 1: start, granted by a turn; 2: start,
+        // answered with a pending signal, which consumes no timeslice.
+        for case in 0..3u8 {
+            let start = case != 0;
+            let (config, state, tid, process) = cancellation_test_state();
+            install_test_registration(&state, tid, Ivar::new());
+            let mut thread = crate::ThreadState::new(tid, &config, ());
+            thread.detpid = Some(process);
+            if !start {
+                thread.next_timeslice(&config);
+            }
+            state
+                .sched
+                .lock()
+                .unwrap()
+                .set_replay_timeslice(tid, Some(slice), Some(offset));
+            let mut guest = ExternalRegistrationGuest {
+                global: &state,
+                config: &config,
+                thread,
+                requests: Mutex::new(Vec::new()),
+                post_exec: false,
+                ppid: None,
+                private_memory: None,
+            };
+            let mut request = Box::pin(async {
+                if start {
+                    // `thread_start_request` now returns the thread's history
+                    // and timeslice as a pair; the start cases assert on the
+                    // scheduler's staged state below.
+                    let _ = super::thread_start_request(&config, &mut guest, process).await;
+                    None
+                } else {
+                    let response =
+                        super::send_and_update_time(&mut guest, GlobalRequest::ResumeExec(process))
+                            .await;
+                    Some(crate::tool_global::exec_identity::exec_continuation_slice(
+                        response.1,
+                    ))
+                }
+            });
+            for _ in 0..8 {
+                assert!(futures::poll!(&mut request).is_pending());
+                if state.sched.lock().unwrap().next_turns[&tid]
+                    .req
+                    .try_read()
+                    .is_some()
+                {
+                    break;
+                }
+            }
+            if case == 2 {
+                let response = state.sched.lock().unwrap().next_turns[&tid].resp.clone();
+                response.put(crate::scheduler::SchedResponse::Signaled(Some(vec![
+                    crate::types::SigWrapper(libc::SIGUSR1),
+                ])));
+            } else {
+                crate::scheduler::do_a_turn_blocking(
+                    state.sched.clone(),
+                    state.global_time.clone(),
+                    &Err(crate::scheduler::SkipTurn),
+                )
+                .await
+                .expect("the grant's turn must commit");
+            }
+            let delivered = request.await;
+            if start {
+                assert_eq!(delivered, None);
+            } else {
+                assert_eq!(delivered, Some((Some(slice), Some(offset))));
+            }
+            let scheduler = state.sched.lock().unwrap();
+            assert!(
+                !scheduler.timeslices.contains_key(&tid),
+                "case {case}: the timeslice outlived its grant"
+            );
+            assert!(
+                scheduler.replay_instruction_offsets.is_empty(),
+                "case {case}: the staged offset outlived its grant"
+            );
+            assert!(
+                scheduler.granted_replay_instruction_offsets.is_empty(),
+                "case {case}: the granted offset outlived its grant"
+            );
+        }
+        // Without an offset the continuation's grant is as before.
+        assert_eq!(
+            crate::tool_global::exec_identity::exec_continuation_slice(GlobalResponse::ResumeExec(
+                ResumeStatus::Normal,
+                Some(slice)
+            )),
+            (Some(slice), None)
+        );
+    }
     #[tokio::test]
     async fn automatic_guest_ids_skip_registered_guest_choices() {
         let config = Config {

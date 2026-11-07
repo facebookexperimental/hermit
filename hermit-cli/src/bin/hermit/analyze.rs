@@ -16,7 +16,7 @@ mod minimize;
 mod phases;
 mod race_report;
 mod races;
-mod rundata;
+pub(crate) mod rundata;
 mod stop;
 mod types;
 mod verdict;

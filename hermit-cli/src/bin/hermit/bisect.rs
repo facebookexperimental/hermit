@@ -283,6 +283,117 @@ fn read_schedule(path: &Path, label: &str) -> anyhow::Result<PreemptionRecord> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Bisect accepts schedules whose events carry instruction offsets, keeps
+    /// them in the events it searches, and replays its trials without chaos
+    /// (`AnalyzeOpts::adopt_instruction_offsets`) and without drawing
+    /// offsets of its own. A schedule of a newer format is refused by name,
+    /// before anything else is read from it (here its epoch, which the run
+    /// arguments' would contradict).
+    #[test]
+    fn bisect_replays_offset_schedules_without_chaos() {
+        let tid = DetTid::from_raw(3);
+        let offset = detcore::preemptions::InstructionOffset {
+            rcb_target: 18,
+            instructions: 4,
+        };
+        let batch =
+            |count, offset| SchedEvent::branches(tid, count).with_instruction_offset(offset);
+        // A recording without offsets states main's format below the offsets
+        // format, the timing format the recording with them shares.
+        let mut good = search_record(vec![batch(20, None), batch(5, None)]);
+        good["format_version"] =
+            serde_json::json!(detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT - 1);
+        let bad = search_record(vec![batch(22, Some(offset)), batch(3, None)]);
+        assert_eq!(
+            bad["format_version"],
+            detcore::preemptions::INSTRUCTION_OFFSET_FORMAT,
+            "{bad}"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let (good_path, bad_path) = (dir.path().join("good.json"), dir.path().join("bad.json"));
+        fs::write(&good_path, good.to_string()).unwrap();
+        fs::write(&bad_path, bad.to_string()).unwrap();
+        let prepare = |bad_path: &Path| {
+            let args = crate::app::Args::try_parse_from([
+                "hermit".to_owned(),
+                "bisect".to_owned(),
+                format!("--good={}", good_path.display()),
+                format!("--bad={}", bad_path.display()),
+                "--".to_owned(),
+                format!("--epoch={RECORDED}"),
+                "--pipe-wake-latency=3000000".to_owned(),
+                "--chaos".to_owned(),
+                "/bin/true".to_owned(),
+            ])
+            .unwrap();
+            let crate::app::Subcommand::Bisect(options) = args.command else {
+                panic!("expected bisect")
+            };
+            options.prepare(&args.global)
+        };
+        let (mut analyzer, _, bad_events) = prepare(&bad_path).unwrap();
+        assert!(analyzer.replays_instruction_offsets);
+        assert_eq!(bad_events.schedevents()[0].instruction_offset, Some(offset));
+        analyzer.tmp_dir = Some(dir.path().to_path_buf());
+        let raw = crate::app::analyze::rundata::RunData::raw_runopts(&analyzer);
+        assert!(raw.det_opts.det_config.chaos);
+        let trial = crate::app::analyze::rundata::RunData::new(&analyzer, "trial".to_owned(), raw)
+            .with_schedule_replay_from(bad_path.clone())
+            .into_runopts();
+        assert!(!trial.det_opts.det_config.chaos);
+        assert_eq!(trial.det_opts.det_config.chaos_instruction_offset, 0);
+
+        // A schedule of a newer format is refused by name as a policy refusal,
+        // with main's `validate_format` message, before its epoch is read.
+        let newer_format = detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX + 1;
+        let mut newer = bad.clone();
+        newer["format_version"] = serde_json::json!(newer_format);
+        newer["epoch"] = serde_json::json!("2001-02-03T04:05:06Z");
+        let newer_path = dir.path().join("newer.json");
+        fs::write(&newer_path, newer.to_string()).unwrap();
+        let Err(error) = prepare(&newer_path) else {
+            panic!("a newer format is refused")
+        };
+        assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+        assert!(
+            format!("{error:#}").contains(&format!(
+                "record format Some({newer_format}) with 0 time skips"
+            )),
+            "{error:#}"
+        );
+    }
+
+    /// Endpoints that differ only in where an instruction-offset timer ended a
+    /// batch are different event traces, so bisect searches between them;
+    /// the same offset at both ends is refused as identical.
+    #[test]
+    fn bisect_tells_endpoints_apart_by_their_instruction_offsets() {
+        let tid = DetTid::from_raw(3);
+        let ended = |instructions| {
+            SchedEvent::branches(tid, 8).with_instruction_offset(Some(
+                detcore::preemptions::InstructionOffset {
+                    rcb_target: 100,
+                    instructions,
+                },
+            ))
+        };
+        let record =
+            |instructions| search_record(vec![ended(instructions), SchedEvent::branches(tid, 4)]);
+        let (_, good, bad) = prepare_search_records(&record(6), &record(7)).unwrap();
+        assert_eq!(
+            (
+                good.schedevents()[0].instruction_offset,
+                bad.schedevents()[0].instruction_offset
+            ),
+            (ended(6).instruction_offset, ended(7).instruction_offset)
+        );
+        let error = prepare_search_records(&record(6), &record(6)).unwrap_err();
+        assert!(
+            error.to_string().contains("identical event traces"),
+            "{error:#}"
+        );
+    }
     use std::num::NonZeroUsize;
 
     use detcore::types::DetTid;

@@ -7869,6 +7869,10 @@ impl Scheduler {
         self.kernel_run_requests.remove(dtid);
         self.published_masks.remove(dtid);
         self.instruction_offsets.remove(dtid);
+        // A schedule replay's timeslice for it, and the offset beside it,
+        // die with it too, even when it dies between the replayer choosing it
+        // and its grant (idempotent with the exec paths' own call).
+        self.forget_replay_timeslice(dtid);
         let retired = self
             .discarded_at_send
             .retire(discarded_at_send::QueueId::Thread(*dtid));
@@ -9959,6 +9963,41 @@ impl Scheduler {
             (None, _) => {
                 self.granted_replay_instruction_offsets.remove(&tid);
                 None
+            }
+        }
+    }
+
+    /// The answer for a grant: a control answer (a fatal alarm, pending
+    /// signals, a futex timeout) consumes no replay timeslice, so the staged
+    /// pair stays together, timeslice and offset, for the thread's next
+    /// grant; a plain grant then moves both.
+    fn grant_answer(
+        &mut self,
+        dtid: DetTid,
+        fatal_alarm: bool,
+        signaled: bool,
+        signals: Vec<SigWrapper>,
+        futex_timed_out: bool,
+        alone: bool,
+    ) -> SchedResponse {
+        if fatal_alarm {
+            SchedResponse::InGuestFatalAlarm
+        } else if signaled {
+            SchedResponse::Signaled(Some(signals))
+        } else if futex_timed_out {
+            SchedResponse::Go(Some(SchedValue::TimeOut))
+        } else {
+            let timeslice = self.grant_replay_timeslice(dtid);
+            // TODO(T137799529): use a more strongly typed representation rather than reusing
+            // SchedValue/u64:
+            let as_schedvalue = timeslice
+                .as_ref()
+                .map(LogicalTime::as_nanos)
+                .map(SchedValue::Value);
+            if alone {
+                SchedResponse::GoAlone(as_schedvalue)
+            } else {
+                SchedResponse::Go(as_schedvalue)
             }
         }
     }
@@ -21683,26 +21722,8 @@ impl Scheduler {
         }
         self.sigchld_deferrals_pass(dtid, guest_progress);
         self.sigchld_fence_commit(dtid, guest_progress);
-        let answer = if fatal_alarm {
-            SchedResponse::InGuestFatalAlarm
-        } else if signaled {
-            SchedResponse::Signaled(Some(signals))
-        } else if futex_timed_out {
-            SchedResponse::Go(Some(SchedValue::TimeOut))
-        } else {
-            let timeslice = self.grant_replay_timeslice(dtid);
-            // TODO(T137799529): use a more strongly typed representation rather than reusing
-            // SchedValue/u64:
-            let as_schedvalue = timeslice
-                .as_ref()
-                .map(LogicalTime::as_nanos)
-                .map(SchedValue::Value);
-            if alone {
-                SchedResponse::GoAlone(as_schedvalue)
-            } else {
-                SchedResponse::Go(as_schedvalue)
-            }
-        };
+        let answer =
+            self.grant_answer(dtid, fatal_alarm, signaled, signals, futex_timed_out, alone);
         match self.grant_deadline_hint(dtid) {
             Some(remaining) => self.deadline_hints.insert(dtid, remaining),
             None => self.deadline_hints.remove(&dtid),
