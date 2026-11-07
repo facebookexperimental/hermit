@@ -660,16 +660,6 @@ fn reverie_buck_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
             .deps
             .iter()
             .any(|dep| dep == "build.workspace_in_pinned_root")
-        || !cfg
-            .steps
-            .iter()
-            .find(|step| step.tag() == "build.workspace")
-            .is_some_and(|workspace| {
-                workspace
-                    .deps
-                    .iter()
-                    .any(|dep| dep == "build.reverie_buck")
-            })
     {
         return Err(
             "reverie-buck bracket: Reverie Buck producer lost its closed mode branch".into(),
@@ -678,9 +668,87 @@ fn reverie_buck_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Route (ii) ordering for the constructed full Buck plan: the host
+/// harvest must complete before the pinned prepare consumes its declared
+/// manifest. The committed graph carries no such edge (it would enter
+/// the portable frozen closure), so only a constructed Buck plan gets
+/// the step and the dependency.
+fn apply_buck_build_ordering(cfg: &mut DagConfig, committed: &DagConfig) -> Result<(), String> {
+    if !cfg.steps.iter().any(|step| step.tag() == "build.reverie_buck") {
+        let bracket = committed
+            .steps
+            .iter()
+            .find(|step| step.tag() == "build.reverie_buck")
+            .ok_or("buck build plan: build.reverie_buck disappeared")?;
+        cfg.steps.push(bracket.clone());
+    }
+    let prepare = cfg
+        .steps
+        .iter_mut()
+        .find(|step| step.tag() == "build.workspace_in_pinned_root")
+        .ok_or("buck build plan: pinned workspace prepare disappeared")?;
+    if !prepare.deps.iter().any(|dep| dep == "build.reverie_buck") {
+        prepare.deps.push("build.reverie_buck".into());
+        prepare.deps.sort();
+        prepare.deps.dedup();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod artifact_plan_tests {
     use super::*;
+
+    #[test]
+    fn buck_build_ordering_orders_the_pinned_prepare_after_the_host_harvest() {
+        let committed = validate_plan::validation_config(&test_source_root()).unwrap();
+        // The committed graph must not carry the edge: it would enter
+        // the portable frozen closure.
+        let committed_prepare = committed
+            .steps
+            .iter()
+            .find(|step| step.tag() == "build.workspace_in_pinned_root")
+            .unwrap();
+        assert!(
+            !committed_prepare
+                .deps
+                .iter()
+                .any(|dep| dep == "build.reverie_buck"),
+            "committed pinned prepare must not depend on build.reverie_buck"
+        );
+        let mut cfg = committed.clone();
+        cfg.steps
+            .retain(|step| step.tag() != "build.reverie_buck");
+        apply_buck_build_ordering(&mut cfg, &committed).unwrap();
+        assert!(
+            cfg.steps.iter().any(|step| step.tag() == "build.reverie_buck"),
+            "constructed Buck plan must contain the host harvest"
+        );
+        let prepare = cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "build.workspace_in_pinned_root")
+            .unwrap();
+        assert!(
+            prepare.deps.iter().any(|dep| dep == "build.reverie_buck"),
+            "constructed Buck plan must order the pinned prepare after the harvest"
+        );
+        // Idempotent: a second application adds no duplicate edge.
+        apply_buck_build_ordering(&mut cfg, &committed).unwrap();
+        let prepare = cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "build.workspace_in_pinned_root")
+            .unwrap();
+        assert_eq!(
+            prepare
+                .deps
+                .iter()
+                .filter(|dep| *dep == "build.reverie_buck")
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn actual_host_and_pinned_consumers_require_their_artifact_and_resource_producers() {
@@ -15155,6 +15223,17 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         } else {
             dagrun::select_steps_by_labels(&committed, &selection_labels)?
         };
+        // Route (ii) ordering, constructed-plan only: in Buck build mode
+        // the host harvest (build.reverie_buck) must complete before the
+        // pinned prepare consumes its declared manifest. The committed
+        // graph carries no such edge (it would enter the portable frozen
+        // closure), so the constructed full plan adds the step and the
+        // dependency here, only for a Buck run.
+        if label == "full"
+            && std::env::var(BUILD_MODE_ENV).is_ok_and(|mode| mode == BUILD_MODE_BUCK)
+        {
+            apply_buck_build_ordering(&mut cfg, &committed)?;
+        }
         let suite_complete = label == "full" && args.selected.is_none();
         let mut selection_mode = if suite_complete { "full" } else { "label" };
         if let Some(selected) = args.selected.as_deref() {
