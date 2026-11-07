@@ -112,7 +112,14 @@ mod tests {
     /// https://github.com/rrnewton/hermit/pull/5230 (source revision 44,
     /// carried and landed as 50). 51 adds `SuspendHoldsDiscarded` and its
     /// response from https://github.com/rrnewton/hermit/pull/5175 (carried
-    /// as 50 and renumbered to 51 at landing), and is current.
+    /// as 50 and renumbered to 51 at landing). 52 adds
+    /// `TraceSchedEventResponse::backstop` to the `GlobalResponse::TraceSchedEvent`
+    /// replay reply from https://github.com/rrnewton/hermit/pull/4759 (carried
+    /// as 49 and renumbered to 52 at landing).
+    /// 53 appends `RecordExecStrings` and `ProcessExecStrings` (package K item
+    /// 2b slice 2b-3; 42 on its old base, then 43, 47 and 49 at its rebases onto
+    /// 2b-1, 51 on S2b's unlanded head, 52 at its rebase onto main's 51, and
+    /// mechanically 53 at its rebase onto main's 52) and is the current revision.
     /// The table below records the landed history; the reservation list
     /// is unchanged.
     const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[33, 34, 35, 36, 37, 38, 39, 42, 43, 44];
@@ -345,11 +352,10 @@ mod tests {
         // (renumbered from 48 to 49 at landing by the merge queue; digests measured on the combined
         // tree)
         (49, "cc10df0910192a63", "f013e36743d8d9e6"),
-        // Adds `Found::unverified_pairs` to the positional StoreExclusive
-        // payload. Source revision 44 is carried after main's landed 49.
-        // Both digests were printed by the revision guard on the carried
-        // tree. Revision 50 is provisional; the merge queue assigns the
-        // final number at landing.
+        // Adds `Found::unverified_pairs` to the positional `StoreExclusive`
+        // payload. Landed as 50 via https://github.com/rrnewton/hermit/pull/5230,
+        // from source revision 44, after main's landed 49. Both digests
+        // were printed by the revision guard on the carried tree.
         (50, "317db02ddad70067", "f013e36743d8d9e6"),
         // Adds `GlobalRequest::SuspendHoldsDiscarded` and its response
         // (SIGSHARE S2b, https://github.com/rrnewton/hermit/pull/5175): after(this
