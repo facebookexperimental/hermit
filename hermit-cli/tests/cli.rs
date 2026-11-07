@@ -30967,7 +30967,7 @@ fn a_schedule_replay_of_a_pipe_reader_whose_writers_exited_is_no_deadlock() {
 /// A schedule replay keeps the clock of a thread that yields beside a
 /// computing one. The static guest, with no libc and no dynamic loader, has
 /// its main task call sched_yield, compute briefly and read CLOCK_MONOTONIC,
-/// 40 times, while a second task made by a raw clone computes for 1,500,000
+/// 40 times, while a second task made by a raw clone computes for 500,000
 /// iterations, long enough to outlast every yield at both slice lengths; it
 /// prints a digest of the main task's clock reads. Each recording, at an
 /// explicit --max-timeslice of 100 us and of 400 us and without --chaos, has
