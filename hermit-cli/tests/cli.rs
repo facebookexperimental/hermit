@@ -28201,9 +28201,28 @@ fn branch_free_race_offset_args<'a>(seed: &'a str, extra: &[&'a str]) -> Vec<&'a
 #[test]
 fn an_instruction_offset_record_replays_from_its_schedule_and_analyze_verifies_its_endpoints() {
     let _guard = hermit_run_guard();
-    const ITERATIONS: &str = "100000";
+    // 30,000 iterations (not the 100,000 of the sibling chaos cases): the
+    // record, its schedule replay and the analyze search all scale with the
+    // guest's run. Measured in its own cgroup on this host (2026-11-07,
+    // load ~150): 100,000 iterations cost 135.9 CPU-s / 145.0 s wall for
+    // this case alone, most of its PMU node's 190 CPU-s budget; 30,000
+    // cost 81.3 CPU-s / 59.6 s wall, same assertions, and the race still
+    // loses updates (the seed search below proves it for the chosen seed;
+    // at 20,000 no seed 1-8 lost one).
+    const ITERATIONS: &str = "30000";
     let seed = (1..=8)
-        .find(|seed| branch_free_race_lost(*seed, &["--chaos-instruction-offset=8"]) > 0)
+        .find(|seed| {
+            let guest = branch_free_race_guest()
+                .to_str()
+                .expect("guest path should be UTF-8");
+            let seed_arg = format!("--sched-seed={seed}");
+            let mut argv = vec!["run"];
+            argv.extend(branch_free_race_offset_args(&seed_arg, &[]));
+            argv.extend(["--", guest, ITERATIONS]);
+            let output = hermit(&argv);
+            assert_success(&output, &argv);
+            parse_branch_free_race(&stdout(&output)) > 0
+        })
         .expect("one of seeds 1-8 should lose an update");
     let seed_arg = format!("--sched-seed={seed}");
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
