@@ -55,7 +55,7 @@ const EVIDENCE_LIMITATIONS: [&str; 6] = [
     "Each build substituted only from cache.nixos.org under its trusted key; the removed realized inputs (rust-script, cargo-nextest and coreutils) were rebuilt in each store. Substituted paths are trusted by Nix signature or content hash and NAR hash, not rebuilt.",
     "Both builds forced the Nix sandbox on (--option sandbox true), so builders ran as unprivileged nixbld users with a fixed build directory; no host shell or host path is an image input. This is the issue-5031 fix the previous receipt could not claim (its builds ran unsandboxed).",
     "Build logs, unit records and Nix path-info records were retained only on the build host; this receipt does not authenticate them.",
-    "The superseded 7facbb1c archive was not rebuilt for this receipt; its 92d3399b SHA-256 is carried from the prior receipt that produced the replaced pin.",
+    "The superseded 4e1605ec archive was not rebuilt for this receipt; its df1f0dd4 SHA-256 is carried from the prior receipt that produced the replaced pin.",
     "The recorded build-source commit and tree are historical review evidence. Rebases can rewrite their ancestry; live verification establishes equivalence only for the four enumerated image input files, not the complete source tree or archive.",
 ];
 
@@ -70,20 +70,20 @@ struct ExpectedRun {
 
 const EXPECTED_RUNS: [ExpectedRun; 2] = [
     ExpectedRun {
-        run_id: "hermetic-stable-repin2-a.service",
-        source_snapshot_identity: "src@50:3659107834",
-        nix_store_identity: "nix-root/nix@50:3659114750",
-        podman_store_identity: "stable-repin-a/podman-data",
-        memory_peak_bytes: 8_589_934_592,
-        cpu_nanoseconds: 1_527_828_915_000,
+        run_id: "hermetic-stable-abseil-repin5-c.service",
+        source_snapshot_identity: "src@50:3834828530",
+        nix_store_identity: "nix-root/nix@50:3834843063",
+        podman_store_identity: "musestable-5213-abseil-repin/c/podman-data",
+        memory_peak_bytes: 8590163968,
+        cpu_nanoseconds: 1774605025000,
     },
     ExpectedRun {
-        run_id: "hermetic-stable-repin2-b.service",
-        source_snapshot_identity: "src@50:3659111292",
-        nix_store_identity: "nix-root/nix@50:3659114751",
-        podman_store_identity: "stable-repin-b/podman-data",
-        memory_peak_bytes: 8_589_934_592,
-        cpu_nanoseconds: 1_518_053_090_000,
+        run_id: "hermetic-stable-abseil-repin5-d.service",
+        source_snapshot_identity: "src@50:3834836059",
+        nix_store_identity: "nix-root/nix@50:3834843081",
+        podman_store_identity: "musestable-5213-abseil-repin/d/podman-data",
+        memory_peak_bytes: 8590176256,
+        cpu_nanoseconds: 1776617838000,
     },
 ];
 

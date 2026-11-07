@@ -9,16 +9,16 @@
     "repin": {
         "superseded_reference": "localhost/hermit-hermetic-validate@sha256:4e1605ecbb13a6c5c6f45f4259f49e2c07efb21a7e6e7b7aabb5b97329232d6e",
         "superseded_archive_sha256": "df1f0dd4f9aa0c82fd6fedceac64d5607143add2f8d0d40a0163850b19289453",
-        "replacement_reference": "localhost/hermit-hermetic-validate@sha256:76dfca29644a22b554d0aa2bb6be0c22cd1cf2141bf6315c41fb2fb78926e3a1",
-        "rationale": "The 4e1605ec root pins nightly Rust while the repository build compiler is now the exact stable 1.97.1. This repin moves the image toolchain to that same stable, made reproducible as a pure function of its locked inputs by two clean isolated Nix stores agreeing byte-for-byte, so host and pinned-root validation run the same compiler."
+        "replacement_reference": "localhost/hermit-hermetic-validate@sha256:8cc3da4d4aad5a5322ab6358bfb805c4f3662db1ce5cab217289547cb3f5752f",
+        "rationale": "The 4e1605ec root pins nightly Rust while the repository build compiler is now the exact stable 1.97.1. This repin moves the image toolchain to that same stable while retaining the gVisor C++ test libraries the 4e1605ec root added, made reproducible as a pure function of its locked inputs by two clean isolated Nix stores agreeing byte-for-byte, so host and pinned-root validation run the same compiler and image contents."
     },
     "source": {
         "repository": "https://github.com/rrnewton/hermit",
-        "git_commit": "efaef3b118fe36b705305284c214da7b033419a5",
-        "git_tree": "007e2cdd073cd55e4ff5011b9e5d7926bec2579c",
+        "git_commit": "b2a60ba74633e2ed3b62dfe4369ec74950ade72e",
+        "git_tree": "31c4f860f05ce1bdfa436940aae9d4f213347498",
         "clean": true,
-        "git_archive_sha256": "c9ec5ebaa2afc86bb3c993f681a8d0fa3ca97a5225531c9fd6a003fd1cb34bc6",
-        "git_archive_size_bytes": 80537600,
+        "git_archive_sha256": "3d744cb98a3014c20d97e8efddbd084d6a47c5fc2a56e50ef0374d6f36928910",
+        "git_archive_size_bytes": 92446720,
         "inputs": [
             {
                 "path": "ci/hermetic/build-image.sh",
@@ -45,11 +45,11 @@
     "nix": {
         "version": "nix (Nix) 2.35.2",
         "system": "x86_64-linux",
-        "derivation_path": "/nix/store/9m495q7ja45y6k55lm2r3rpjls60g5gw-hermit-hermetic-validate.tar.gz.drv",
-        "derivation_sha256": "1c59e645a3f4e7c71636c7c037ba6f632163f8c60758cd53a232d8ac9334d95c",
-        "output_path": "/nix/store/a54vrvcizbdbciynjjzisv9hjcbaivgp-hermit-hermetic-validate.tar.gz",
-        "output_nar_hash": "sha256-AWLJHtWq0p5MMI80C2B2BU6VfOv3lXEMLT7XAw1Mmeg=",
-        "output_nar_size_bytes": 1714666008,
+        "derivation_path": "/nix/store/0am28327vyciiq0s4ahlz03d2kfc2rbk-hermit-hermetic-validate.tar.gz.drv",
+        "derivation_sha256": "f4cc8ba45b0360f4a34ac78c6d6b811c812cd19d038534549a636b3e43f3a4fe",
+        "output_path": "/nix/store/sbh9qilrfsvljhl9bndrmkd303li399p-hermit-hermetic-validate.tar.gz",
+        "output_nar_hash": "sha256-BYTTZBIXHV4arWuuXdJO7rOxTCCqx4gGsT618GPAJzg=",
+        "output_nar_size_bytes": 1716955720,
         "locked_inputs": [
             {
                 "name": "nixpkgs",
@@ -88,15 +88,15 @@
         "Each build substituted only from cache.nixos.org under its trusted key; the removed realized inputs (rust-script, cargo-nextest and coreutils) were rebuilt in each store. Substituted paths are trusted by Nix signature or content hash and NAR hash, not rebuilt.",
         "Both builds forced the Nix sandbox on (--option sandbox true), so builders ran as unprivileged nixbld users with a fixed build directory; no host shell or host path is an image input. This is the issue-5031 fix the previous receipt could not claim (its builds ran unsandboxed).",
         "Build logs, unit records and Nix path-info records were retained only on the build host; this receipt does not authenticate them.",
-        "The superseded 7facbb1c archive was not rebuilt for this receipt; its 92d3399b SHA-256 is carried from the prior receipt that produced the replaced pin.",
+        "The superseded 4e1605ec archive was not rebuilt for this receipt; its df1f0dd4 SHA-256 is carried from the prior receipt that produced the replaced pin.",
         "The recorded build-source commit and tree are historical review evidence. Rebases can rewrite their ancestry; live verification establishes equivalence only for the four enumerated image input files, not the complete source tree or archive."
     ],
     "runs": [
         {
-            "run_id": "hermetic-stable-repin2-a.service",
-            "source_snapshot_identity": "src@50:3659107834",
-            "nix_store_identity": "nix-root/nix@50:3659114750",
-            "podman_store_identity": "stable-repin-a/podman-data",
+            "run_id": "hermetic-stable-abseil-repin5-c.service",
+            "source_snapshot_identity": "src@50:3834828530",
+            "nix_store_identity": "nix-root/nix@50:3834843063",
+            "podman_store_identity": "musestable-5213-abseil-repin/c/podman-data",
             "full_rebuild_observed": true,
             "resource_bound": {
                 "wall_seconds": 2400,
@@ -108,39 +108,39 @@
                 "service_result": "success",
                 "exit_status": 0,
                 "oom_kills": 0,
-                "last_observed_memory_peak_bytes": 8589934592,
-                "last_observed_cpu_nanoseconds": 1527828915000
+                "last_observed_memory_peak_bytes": 8590163968,
+                "last_observed_cpu_nanoseconds": 1774605025000
             },
             "artifact": {
-                "archive_sha256": "881f37f1925490b5151d28aff5033b758c21da3e2891e995bd0847f06f79310e",
-                "archive_size_bytes": 1714665896,
-                "loaded_reference": "localhost/hermit-hermetic-validate@sha256:76dfca29644a22b554d0aa2bb6be0c22cd1cf2141bf6315c41fb2fb78926e3a1",
+                "archive_sha256": "00e0b5e547d7f7905ca88c77e880833d2d29bb1f980d05ac1debec6104bdb08f",
+                "archive_size_bytes": 1716955601,
+                "loaded_reference": "localhost/hermit-hermetic-validate@sha256:8cc3da4d4aad5a5322ab6358bfb805c4f3662db1ce5cab217289547cb3f5752f",
                 "manifest_media_type": "application/vnd.docker.distribution.manifest.v2+json",
-                "manifest_digest": "sha256:76dfca29644a22b554d0aa2bb6be0c22cd1cf2141bf6315c41fb2fb78926e3a1",
-                "manifest_size_bytes": 598,
-                "config_digest": "sha256:92a15885cefcf42866dfdc4906f1364ba9c2ced55692436f376fa2fdca899daa",
-                "config_size_bytes": 21065,
+                "manifest_digest": "sha256:8cc3da4d4aad5a5322ab6358bfb805c4f3662db1ce5cab217289547cb3f5752f",
+                "manifest_size_bytes": 391,
+                "config_digest": "sha256:f9589929b552324217208af9f21e1c4e91f424c5626fa5376088936083b20741",
+                "config_size_bytes": 21917,
                 "layers": [
                     {
-                        "digest": "sha256:e4c7b5117c1d94631e40f4455db9f1286f3ce4dfc5fcd59ab7f3cb80542a9f39",
-                        "size_bytes": 5633566720
+                        "digest": "sha256:ec9d282c22f67ea5f2995ee77b847c655a1c90bcbb13e9234b6be7a00b5bbdaa",
+                        "size_bytes": 5643888640
                     },
                     {
-                        "digest": "sha256:b462b100e1dad6aa35cefe93087d0cb8637f6c0ec4d0a2a91e0c1baa4b8b6b30",
-                        "size_bytes": 142448640
+                        "digest": "sha256:c4bcf6f1312ab750ddeaac1780c0aade12c0dec70076cdaa7c9e0343cbb06dca",
+                        "size_bytes": 143595520
                     }
                 ],
                 "diff_ids": [
-                    "sha256:e4c7b5117c1d94631e40f4455db9f1286f3ce4dfc5fcd59ab7f3cb80542a9f39",
-                    "sha256:b462b100e1dad6aa35cefe93087d0cb8637f6c0ec4d0a2a91e0c1baa4b8b6b30"
+                    "sha256:ec9d282c22f67ea5f2995ee77b847c655a1c90bcbb13e9234b6be7a00b5bbdaa",
+                    "sha256:c4bcf6f1312ab750ddeaac1780c0aade12c0dec70076cdaa7c9e0343cbb06dca"
                 ]
             }
         },
         {
-            "run_id": "hermetic-stable-repin2-b.service",
-            "source_snapshot_identity": "src@50:3659111292",
-            "nix_store_identity": "nix-root/nix@50:3659114751",
-            "podman_store_identity": "stable-repin-b/podman-data",
+            "run_id": "hermetic-stable-abseil-repin5-d.service",
+            "source_snapshot_identity": "src@50:3834836059",
+            "nix_store_identity": "nix-root/nix@50:3834843081",
+            "podman_store_identity": "musestable-5213-abseil-repin/d/podman-data",
             "full_rebuild_observed": true,
             "resource_bound": {
                 "wall_seconds": 2400,
@@ -152,31 +152,31 @@
                 "service_result": "success",
                 "exit_status": 0,
                 "oom_kills": 0,
-                "last_observed_memory_peak_bytes": 8589934592,
-                "last_observed_cpu_nanoseconds": 1518053090000
+                "last_observed_memory_peak_bytes": 8590176256,
+                "last_observed_cpu_nanoseconds": 1776617838000
             },
             "artifact": {
-                "archive_sha256": "881f37f1925490b5151d28aff5033b758c21da3e2891e995bd0847f06f79310e",
-                "archive_size_bytes": 1714665896,
-                "loaded_reference": "localhost/hermit-hermetic-validate@sha256:76dfca29644a22b554d0aa2bb6be0c22cd1cf2141bf6315c41fb2fb78926e3a1",
+                "archive_sha256": "00e0b5e547d7f7905ca88c77e880833d2d29bb1f980d05ac1debec6104bdb08f",
+                "archive_size_bytes": 1716955601,
+                "loaded_reference": "localhost/hermit-hermetic-validate@sha256:8cc3da4d4aad5a5322ab6358bfb805c4f3662db1ce5cab217289547cb3f5752f",
                 "manifest_media_type": "application/vnd.docker.distribution.manifest.v2+json",
-                "manifest_digest": "sha256:76dfca29644a22b554d0aa2bb6be0c22cd1cf2141bf6315c41fb2fb78926e3a1",
-                "manifest_size_bytes": 598,
-                "config_digest": "sha256:92a15885cefcf42866dfdc4906f1364ba9c2ced55692436f376fa2fdca899daa",
-                "config_size_bytes": 21065,
+                "manifest_digest": "sha256:8cc3da4d4aad5a5322ab6358bfb805c4f3662db1ce5cab217289547cb3f5752f",
+                "manifest_size_bytes": 391,
+                "config_digest": "sha256:f9589929b552324217208af9f21e1c4e91f424c5626fa5376088936083b20741",
+                "config_size_bytes": 21917,
                 "layers": [
                     {
-                        "digest": "sha256:e4c7b5117c1d94631e40f4455db9f1286f3ce4dfc5fcd59ab7f3cb80542a9f39",
-                        "size_bytes": 5633566720
+                        "digest": "sha256:ec9d282c22f67ea5f2995ee77b847c655a1c90bcbb13e9234b6be7a00b5bbdaa",
+                        "size_bytes": 5643888640
                     },
                     {
-                        "digest": "sha256:b462b100e1dad6aa35cefe93087d0cb8637f6c0ec4d0a2a91e0c1baa4b8b6b30",
-                        "size_bytes": 142448640
+                        "digest": "sha256:c4bcf6f1312ab750ddeaac1780c0aade12c0dec70076cdaa7c9e0343cbb06dca",
+                        "size_bytes": 143595520
                     }
                 ],
                 "diff_ids": [
-                    "sha256:e4c7b5117c1d94631e40f4455db9f1286f3ce4dfc5fcd59ab7f3cb80542a9f39",
-                    "sha256:b462b100e1dad6aa35cefe93087d0cb8637f6c0ec4d0a2a91e0c1baa4b8b6b30"
+                    "sha256:ec9d282c22f67ea5f2995ee77b847c655a1c90bcbb13e9234b6be7a00b5bbdaa",
+                    "sha256:c4bcf6f1312ab750ddeaac1780c0aade12c0dec70076cdaa7c9e0343cbb06dca"
                 ]
             }
         }
