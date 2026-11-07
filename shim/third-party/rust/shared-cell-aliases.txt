@@ -21,7 +21,6 @@ kvm-bindings
 kvm-ioctls
 linked-hash-map
 linux-raw-sys
-liteinst
 memmap2
 never-say-never
 num-traits
