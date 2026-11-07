@@ -2531,13 +2531,25 @@ impl Prepared {
                 verdict: Verdict::Match,
                 detail: "content hashes of the CLI, selected executor and sources, guest, native helper, verification parser/policy/standalone/manifest/lock inputs, and complete declared installation before and after collection".to_owned(),
             },
-            Ok(inventory) => Assertion {
-                name: "receipt.input_stability".to_owned(),
-                verdict: Verdict::NoResult,
-                detail: format!(
-                    "input inventory changed during collection (dh-j8eb7): {}",
-                    inventory_difference(&self.input_inventory, &inventory)
-                ),
+            Ok(inventory) => {
+                // Keep the after inventory beside the cell's report on
+                // failure (dh-j8eb7): the before inventory is already
+                // retained as installation.inputs at prepare, so the
+                // differing row stays diffable after the run - tonight's
+                // hits lost both when their volumes were reaped.
+                let difference = inventory_difference(&self.input_inventory, &inventory);
+                let _ = fs::write(directory.join("input-inventory.after"), &inventory);
+                let _ = fs::write(
+                    directory.join("input-inventory.difference"),
+                    format!("{difference}\n"),
+                );
+                Assertion {
+                    name: "receipt.input_stability".to_owned(),
+                    verdict: Verdict::NoResult,
+                    detail: format!(
+                        "input inventory changed during collection (dh-j8eb7): {difference}"
+                    ),
+                }
             },
             Err(error) => Assertion {
                 name: "receipt.input_stability".to_owned(),
