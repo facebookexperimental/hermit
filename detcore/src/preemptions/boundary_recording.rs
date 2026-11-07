@@ -493,7 +493,7 @@ pub(super) fn read_settings<T: serde::de::DeserializeOwned>(path: &Path) -> Resu
         // Settings do not depend on the record's format, which the replay
         // itself checks and refuses (`Recording::decode`), with the
         // refusal's exit status.
-        let (recording, typed_digest) = Recording::read_fingerprinted(input)?;
+        let (recording, typed_digest) = Recording::read_fingerprinted(input, false)?;
         require_same_input(digest, typed_digest)?;
         Ok(serde_json::from_value(
             super::record_serde::settings_value(recording.metadata())
@@ -552,7 +552,7 @@ pub(super) fn settings_in<T: serde::de::DeserializeOwned>(
             require_same_input(digest, typed_digest)?;
             return Ok(settings);
         }
-        let (recording, typed_digest) = Recording::read_fingerprinted(&mut input)?;
+        let (recording, typed_digest) = Recording::read_fingerprinted(&mut input, false)?;
         require_same_input(digest, typed_digest)?;
         Ok(serde_json::from_value(
             super::record_serde::settings_value(recording.metadata())
@@ -767,7 +767,7 @@ impl Recording {
     /// `RecordFormatRefusal` in its chain, whichever format it is in.
     pub fn read_from<R: Read + Seek>(input: &mut R) -> anyhow::Result<Self> {
         let start = input.stream_position()?;
-        let (recording, _) = Self::read_fingerprinted(input).map_err(|error| {
+        let (recording, _) = Self::read_fingerprinted(input, true).map_err(|error| {
             if error.chain().any(|cause| cause.is::<serde_json::Error>()) {
                 // As in `decode`: a record that cannot be decoded is still
                 // refused by a format this Hermit does not read, probed from
@@ -797,8 +797,14 @@ impl Recording {
     /// recording whose format the replay itself refuses (settings).
     /// Inspect only to dispatch. Deserialize the complete input again so
     /// duplicate fields in the envelope are rejected. A malformed new
-    /// recording never falls back to legacy.
-    fn read_fingerprinted<R: Read + Seek>(input: &mut R) -> anyhow::Result<(Self, [u8; 32])> {
+    /// recording never falls back to legacy. With `check_identity` false
+    /// (settings readers only), an unsupported envelope format or identity
+    /// is not converted or refused here -- the replay's own admission
+    /// refuses it by name with the policy exit, after settings are read.
+    fn read_fingerprinted<R: Read + Seek>(
+        input: &mut R,
+        check_identity: bool,
+    ) -> anyhow::Result<(Self, [u8; 32])> {
         let start = input.stream_position()?;
         let (probe, digest) = super::streaming::parse_pass::<FormatProbe, _>(&mut *input)?;
         input.seek(SeekFrom::Start(start))?;
@@ -809,21 +815,27 @@ impl Recording {
             let (head, head_digest) =
                 super::streaming::parse_pass::<IdentityEnvelope<FormatProbe>, _>(&mut *input)?;
             require_same_input(digest, head_digest)?;
-            if head.rcb_history.format != RCB_HISTORY_FORMAT {
-                return Err(format_refusal(format!(
-                    "unsupported rcb_history format {}: this Hermit reads format {}; replay \
-                     it with the Hermit build that wrote it, or record it again with this build",
-                    head.rcb_history.format, RCB_HISTORY_FORMAT
-                )));
-            }
-            let identity = HistoryIdentity::try_from(head.rcb_history.identity)
-                .map_err(|error| format_refusal(error.to_string()))?;
-            if head.rcb_history.recording.rcb_history {
-                return Err(format_refusal(
-                    "nested rcb_history envelope: record the history again with this build"
-                        .to_owned(),
-                ));
-            }
+            let identity = if check_identity {
+                if head.rcb_history.format != RCB_HISTORY_FORMAT {
+                    return Err(format_refusal(format!(
+                        "unsupported rcb_history format {}: this Hermit reads format {}; \
+                         replay it with the Hermit build that wrote it, or record it again \
+                         with this build",
+                        head.rcb_history.format, RCB_HISTORY_FORMAT
+                    )));
+                }
+                let identity = HistoryIdentity::try_from(head.rcb_history.identity)
+                    .map_err(|error| format_refusal(error.to_string()))?;
+                if head.rcb_history.recording.rcb_history {
+                    return Err(format_refusal(
+                        "nested rcb_history envelope: record the history again with this build"
+                            .to_owned(),
+                    ));
+                }
+                Some(identity)
+            } else {
+                None
+            };
             input.seek(SeekFrom::Start(start))?;
             let (mut recording, typed_digest) =
                 if head.rcb_history.recording.slice_boundary_recording {
@@ -846,7 +858,7 @@ impl Recording {
                     (Self::Legacy(envelope.rcb_history.recording), typed_digest)
                 };
             require_same_input(digest, typed_digest)?;
-            recording.metadata_mut().identity = Some(identity);
+            recording.metadata_mut().identity = identity;
             return Ok((recording, typed_digest));
         }
         let (recording, typed_digest) = if probe.slice_boundary_recording {
@@ -2378,14 +2390,16 @@ mod identity_tests {
         // A well-formed envelope this build cannot execute -- a newer
         // format, an identity it does not know, or a nested envelope -- is
         // a typed format refusal (the policy exit), not a parse error.
-        for (bytes, cause) in [
+        for (bytes, cause, settings_readable) in [
             (
                 mutate(&|v| v["rcb_history"]["format"] = 3.into()),
                 "unsupported rcb_history format 3",
+                true,
             ),
             (
                 mutate(&|v| v["rcb_history"]["identity"] = "rcb:cond-retired:user:v2".into()),
                 "unknown RCB coordinate identity",
+                true,
             ),
             (
                 mutate(&|v| {
@@ -2393,8 +2407,19 @@ mod identity_tests {
                     v["rcb_history"]["recording"] = serde_json::json!({ "rcb_history": inner });
                 }),
                 "nested rcb_history envelope",
+                false,
             ),
         ] {
+            // Settings stay readable for an unsupported format or identity,
+            // so a replay reaches its own identity admission and refuses
+            // there by name rather than failing as an opaque settings parse
+            // error first.
+            if settings_readable {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("unsupported.json");
+                std::fs::write(&path, &bytes).unwrap();
+                assert!(super::super::read_recorded_epoch(&path).is_ok());
+            }
             let error = Recording::decode(&bytes).unwrap_err();
             assert!(
                 error.is::<crate::preemptions::RecordFormatRefusal>(),
