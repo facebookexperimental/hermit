@@ -10,11 +10,11 @@
     "all": {
       "cells": 4040,
       "applicable": 2274,
-      "selectable": 1781,
-      "population": 3065,
-      "population_candidate_selected": 1781,
+      "selectable": 1782,
+      "population": 3070,
+      "population_candidate_selected": 1782,
       "population_candidate_not_selected": 475,
-      "population_candidate_disabled": 809
+      "population_candidate_disabled": 813
     },
     "by_backend": {
       "dbt": {
@@ -38,9 +38,9 @@
       "kvm": {
         "cells": 808,
         "applicable": 606,
-        "selectable": 597,
-        "population": 613,
-        "population_candidate_selected": 597,
+        "selectable": 598,
+        "population": 614,
+        "population_candidate_selected": 598,
         "population_candidate_not_selected": 3,
         "population_candidate_disabled": 13
       },
