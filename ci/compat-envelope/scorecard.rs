@@ -42,6 +42,7 @@ use fs2::FileExt;
 use hermit_manifest_plan::canonical_verdict;
 use hermit_manifest_plan::ledger::HistoryRow;
 use hermit_manifest_plan::parity::LedgerVerdict;
+use hermit_manifest_plan::parity::PARITY_CELLS_DIR;
 use hermit_manifest_plan::parity::PARITY_CELLS_PATH;
 use hermit_manifest_plan::parity::ParityBackend;
 use hermit_manifest_plan::parity::ParityLedgerRow;
@@ -6122,19 +6123,96 @@ impl ParityCommitFacts {
         if shas.is_empty() {
             return Self::default();
         }
-        Self::from_answers(
+        let objects = git_cat_file_batch(root, &Self::batch_names(shas));
+        let mut facts = Self::from_answers(
             shas,
-            git_cat_file_batch(root, &Self::batch_names(shas)),
+            objects.clone(),
             |commits| git_commit_depths(root, commits),
             |names| main.and_then(|main| git_commits_off_main(main, names)),
-        )
+        );
+        // Commits at or after the sharded layout answer the single file as a
+        // tree (or missing) and the directory as a tree of shard blobs: read
+        // those blobs in a second batch and union their selections.
+        if let Ok(Some(answers)) = &objects {
+            let mut shard_oids: Vec<(String, String, String)> = Vec::new();
+            for (sha, triple) in shas.iter().zip(answers.chunks(3)) {
+                if let Some((kind, bytes)) = &triple[2] {
+                    if kind == "tree" {
+                        if let Ok(entries) = parse_git_tree(bytes) {
+                            for (name, oid) in entries {
+                                if name.ends_with(".json") {
+                                    shard_oids.push((sha.clone(), name, oid));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !shard_oids.is_empty() {
+                let names: Vec<String> =
+                    shard_oids.iter().map(|(_, _, oid)| oid.clone()).collect();
+                if let Ok(Some(blobs)) = git_cat_file_batch(root, &names) {
+                    let mut texts: BTreeMap<String, BTreeMap<String, String>> =
+                        BTreeMap::new();
+                    for ((sha, name, _), blob) in shard_oids.iter().zip(blobs.iter()) {
+                        if let Some((_, bytes)) = blob {
+                            if let Ok(text) = std::str::from_utf8(bytes) {
+                                texts
+                                    .entry(sha.clone())
+                                    .or_default()
+                                    .insert(name.clone(), text.to_string());
+                            }
+                        }
+                    }
+                    for (sha, shards) in texts {
+                        let mut selected = CommittedParityCells::new();
+                        let mut error: Option<String> = None;
+                        for (name, text) in &shards {
+                            match committed_parity_cells(text) {
+                                Ok(cells) => {
+                                    for cell in cells {
+                                        if !selected.insert(cell.clone()) && error.is_none() {
+                                            error = Some(format!(
+                                                "{sha}:{PARITY_CELLS_DIR}/{name} selects {}@{} twice across shards",
+                                                cell.0, cell.1
+                                            ));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error = Some(format!(
+                                        "{sha}:{PARITY_CELLS_DIR}/{name}: {e}"
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                        facts.committed.insert(
+                            sha.clone(),
+                            error.map(Err).unwrap_or(Ok(Some(selected))),
+                        );
+                    }
+                }
+            }
+        }
+        facts
     }
 
     /// The `cat-file --batch` request for `shas`: each commit, then its
-    /// [`PARITY_CELLS_PATH`], in `shas` order.
+    /// [`PARITY_CELLS_PATH`] single file and its [`PARITY_CELLS_DIR`]
+    /// directory, in `shas` order. A pre-shard commit answers the file as a
+    /// blob and the directory missing; a sharded commit answers the file
+    /// missing (or a tree at that path in no layout) and the directory as a
+    /// tree whose shard blobs [`Self::read`] then fetches.
     fn batch_names(shas: &BTreeSet<String>) -> Vec<String> {
         shas.iter()
-            .flat_map(|sha| [sha.clone(), format!("{sha}:{PARITY_CELLS_PATH}")])
+            .flat_map(|sha| {
+                [
+                    sha.clone(),
+                    format!("{sha}:{PARITY_CELLS_PATH}"),
+                    format!("{sha}:{PARITY_CELLS_DIR}"),
+                ]
+            })
             .collect()
     }
 
@@ -6173,7 +6251,7 @@ impl ParityCommitFacts {
             }
         };
         let mut commits = Vec::new();
-        for (sha, pair) in shas.iter().zip(objects.chunks(2)) {
+        for (sha, pair) in shas.iter().zip(objects.chunks(3)) {
             if matches!(&pair[0], Some((kind, _)) if kind == "commit") {
                 commits.push(sha.as_str());
             }
@@ -6211,6 +6289,39 @@ impl ParityCommitFacts {
             ))
         })
     }
+}
+
+/// One git tree object's entries, from its raw `cat-file` bytes:
+/// (`<mode> <name>\0<20-byte object id>`)*. Names are returned with their
+/// hex object ids; a malformed entry refuses the whole tree.
+fn parse_git_tree(bytes: &[u8]) -> Result<Vec<(String, String)>, String> {
+    let mut entries = Vec::new();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let space = rest
+            .iter()
+            .position(|byte| *byte == b' ')
+            .ok_or_else(|| "git tree entry without a mode".to_string())?;
+        let nul = rest[space..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|at| space + at)
+            .ok_or_else(|| "git tree entry without a name terminator".to_string())?;
+        let name = std::str::from_utf8(&rest[space + 1..nul])
+            .map_err(|_| "git tree entry name is not UTF-8".to_string())?
+            .to_string();
+        let oid_end = nul + 1 + 20;
+        if rest.len() < oid_end {
+            return Err("git tree entry without a full object id".into());
+        }
+        let oid: String = rest[nul + 1..oid_end]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        entries.push((name, oid));
+        rest = &rest[oid_end..];
+    }
+    Ok(entries)
 }
 
 /// Every name's object in the checkout at `root`, from one
@@ -44063,19 +44174,25 @@ mod parity_summary_tests {
             .collect::<BTreeSet<_>>();
         let names = ParityCommitFacts::batch_names(&shas);
         let at = |sha: &str| format!("{sha}:{PARITY_CELLS_PATH}");
+        let at_dir = |sha: &str| format!("{sha}:{PARITY_CELLS_DIR}");
         assert_eq!(
             names,
             [
                 without.clone(),
                 at(&without),
+                at_dir(&without),
                 good.clone(),
                 at(&good),
+                at_dir(&good),
                 broken.clone(),
                 at(&broken),
+                at_dir(&broken),
                 directory.clone(),
                 at(&directory),
+                at_dir(&directory),
                 absent.to_string(),
                 at(absent),
+                at_dir(absent),
             ]
         );
         // Git's answer to that request. Each commit, the selection and the
@@ -44089,14 +44206,19 @@ mod parity_summary_tests {
         for answer in [
             batch_answer(&without, "commit", commit),
             format!("{} missing\n", at(&without)).into_bytes(),
+            format!("{} missing\n", at_dir(&without)).into_bytes(),
             batch_answer(&good, "commit", commit),
             batch_answer(&at(&good), "blob", selection.as_bytes()),
+            format!("{} missing\n", at_dir(&good)).into_bytes(),
             batch_answer(&broken, "commit", commit),
             batch_answer(&at(&broken), "blob", b"{not json"),
+            format!("{} missing\n", at_dir(&broken)).into_bytes(),
             batch_answer(&directory, "commit", commit),
             batch_answer(&at(&directory), "tree", b"100644 inner\0\n\x01\x02"),
+            format!("{} missing\n", at_dir(&directory)).into_bytes(),
             format!("{absent} missing\n").into_bytes(),
             format!("{} missing\n", at(absent)).into_bytes(),
+            format!("{} missing\n", at_dir(absent)).into_bytes(),
         ] {
             stdout.extend(answer);
         }
@@ -44254,6 +44376,26 @@ mod parity_summary_tests {
             parse_cat_file_batch(first, &stdout),
             Err("git cat-file --batch answered more names than it was asked".into())
         );
+    }
+
+    #[test]
+    fn a_git_tree_parses_to_its_named_blob_ids() {
+        // Two entries in raw git tree form: "<mode> <name>\0<20-byte id>".
+        let mut tree = Vec::new();
+        tree.extend_from_slice(b"100644 gvisor.json\0");
+        tree.extend_from_slice(&[0xabu8; 20]);
+        tree.extend_from_slice(b"100644 compat.json\0");
+        tree.extend_from_slice(&[0xcdu8; 20]);
+        assert_eq!(
+            parse_git_tree(&tree).unwrap(),
+            [
+                ("gvisor.json".to_string(), "ab".repeat(20)),
+                ("compat.json".to_string(), "cd".repeat(20)),
+            ]
+        );
+        assert!(parse_git_tree(b"100644 truncated").is_err());
+        assert!(parse_git_tree(b"100644 x\0short").is_err());
+        assert_eq!(parse_git_tree(b"").unwrap(), Vec::new());
     }
 
     #[test]

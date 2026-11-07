@@ -844,11 +844,7 @@ fn parity_references(
     sampled: &[TrackedCell],
     tracked_by_id: &BTreeMap<CellId, TrackedCell>,
 ) -> Result<(Vec<TrackedCell>, Vec<String>), String> {
-    let path = root.join(parity::PARITY_CELLS_PATH);
-    let snapshot: parity::ParityCells = serde_json::from_slice(
-        &fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?,
-    )
-    .map_err(|e| format!("invalid {}: {e}", path.display()))?;
+    let snapshot = parity::load_snapshot(root)?;
     let applicable: BTreeMap<(String, parity::ParityBackend), bool> = snapshot
         .cells
         .iter()
@@ -17055,23 +17051,12 @@ fn run_state_exclusive_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
 /// snapshot ([`parity::PARITY_CELLS_PATH`]) lists as applicable. Read from the
 /// snapshot's JSON, independently of the planner.
 fn snapshot_parity_pairs(root: &Path) -> Result<BTreeSet<(String, String)>, String> {
-    let path = root.join(parity::PARITY_CELLS_PATH);
-    let snapshot: JsonValue = serde_json::from_slice(
-        &fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?,
-    )
-    .map_err(|e| format!("invalid {}: {e}", path.display()))?;
-    let cells = snapshot["cells"]
-        .as_array()
-        .ok_or_else(|| format!("{} has no cells array", path.display()))?;
-    Ok(cells
+    let snapshot = parity::load_snapshot(root)?;
+    Ok(snapshot
+        .cells
         .iter()
-        .filter(|cell| cell["applicable"] == json!(true))
-        .filter_map(|cell| {
-            Some((
-                cell["test_id"].as_str()?.to_string(),
-                cell["backend"].as_str()?.to_string(),
-            ))
-        })
+        .filter(|cell| cell.applicable)
+        .map(|cell| (cell.test_id.clone(), cell.backend.to_string()))
         .collect())
 }
 

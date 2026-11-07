@@ -781,7 +781,7 @@ fn generate_parity_cells_refuses_conflicting_or_repeated_modes() {
         .join("../..")
         .canonicalize()
         .expect("repository root");
-    let snapshot = root.join("ci/compat-envelope/parity-cells.json");
+    let snapshot = root.join("ci/compat-envelope/parity-cells/applications.json");
     let before = std::fs::read(&snapshot).expect("read the committed snapshot");
     let modified_before = std::fs::metadata(&snapshot)
         .and_then(|metadata| metadata.modified())
@@ -826,7 +826,7 @@ fn generate_parity_cells_refuses_conflicting_or_repeated_modes() {
     assert!(check.status.success(), "{check:?}");
     assert!(
         String::from_utf8_lossy(&check.stdout)
-            .starts_with("ci/compat-envelope/parity-cells.json is canonical and fresh\n"),
+            .starts_with("ci/compat-envelope/parity-cells/ is canonical and fresh\n"),
         "{check:?}"
     );
 }

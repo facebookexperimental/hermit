@@ -1,0 +1,79 @@
+{
+  "schema": 2,
+  "regenerate": "cargo run -p hermit-manifest-plan --bin generate-parity-cells -- --write",
+  "reference": {
+    "backend": "ptrace",
+    "mode": "verify"
+  },
+  "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
+  "counts": {
+    "all": {
+      "cells": 10,
+      "applicable": 5,
+      "selectable": 4,
+      "population": 10,
+      "population_candidate_selected": 4,
+      "population_candidate_not_selected": 1,
+      "population_candidate_disabled": 5
+    },
+    "by_backend": {
+      "dbt": {
+        "cells": 2,
+        "applicable": 2,
+        "selectable": 2,
+        "population": 2,
+        "population_candidate_selected": 2,
+        "population_candidate_not_selected": 0,
+        "population_candidate_disabled": 0
+      },
+      "in-guest-trap": {
+        "cells": 2,
+        "applicable": 0,
+        "selectable": 0,
+        "population": 2,
+        "population_candidate_selected": 0,
+        "population_candidate_not_selected": 0,
+        "population_candidate_disabled": 2
+      },
+      "kvm": {
+        "cells": 2,
+        "applicable": 2,
+        "selectable": 2,
+        "population": 2,
+        "population_candidate_selected": 2,
+        "population_candidate_not_selected": 0,
+        "population_candidate_disabled": 0
+      },
+      "liteinst": {
+        "cells": 2,
+        "applicable": 0,
+        "selectable": 0,
+        "population": 2,
+        "population_candidate_selected": 0,
+        "population_candidate_not_selected": 0,
+        "population_candidate_disabled": 2
+      },
+      "sabre": {
+        "cells": 2,
+        "applicable": 1,
+        "selectable": 0,
+        "population": 2,
+        "population_candidate_selected": 0,
+        "population_candidate_not_selected": 1,
+        "population_candidate_disabled": 1
+      }
+    }
+  },
+  "cells": [
+    {"test_id":"bin-c/posix-timer-test","backend":"dbt","category":"bin-c","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"bin-c/posix-timer-test","backend":"in-guest-trap","category":"bin-c","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
+    {"test_id":"bin-c/posix-timer-test","backend":"kvm","category":"bin-c","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"bin-c/posix-timer-test","backend":"liteinst","category":"bin-c","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)"},
+    {"test_id":"bin-c/posix-timer-test","backend":"sabre","category":"bin-c","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"bin-c/robust-futex-test","backend":"dbt","category":"bin-c","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"bin-c/robust-futex-test","backend":"in-guest-trap","category":"bin-c","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
+    {"test_id":"bin-c/robust-futex-test","backend":"kvm","category":"bin-c","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"bin-c/robust-futex-test","backend":"liteinst","category":"bin-c","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: The LiteInst host-hybrid backend refuses clone3 with ENOTSUPP before the guest creates its first thread, so this multi-threaded guest cannot run there yet; unrelated to robust-futex owner death"},
+    {"test_id":"bin-c/robust-futex-test","backend":"sabre","category":"bin-c","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Robust-futex owner-death wakeup exercises core Detcore scheduling and currently times out under SaBRe; owner review is required"}
+  ]
+}

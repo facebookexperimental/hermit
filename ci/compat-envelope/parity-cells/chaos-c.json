@@ -1,0 +1,74 @@
+{
+  "schema": 2,
+  "regenerate": "cargo run -p hermit-manifest-plan --bin generate-parity-cells -- --write",
+  "reference": {
+    "backend": "ptrace",
+    "mode": "verify"
+  },
+  "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
+  "counts": {
+    "all": {
+      "cells": 5,
+      "applicable": 3,
+      "selectable": 2,
+      "population": 5,
+      "population_candidate_selected": 2,
+      "population_candidate_not_selected": 1,
+      "population_candidate_disabled": 2
+    },
+    "by_backend": {
+      "dbt": {
+        "cells": 1,
+        "applicable": 1,
+        "selectable": 1,
+        "population": 1,
+        "population_candidate_selected": 1,
+        "population_candidate_not_selected": 0,
+        "population_candidate_disabled": 0
+      },
+      "in-guest-trap": {
+        "cells": 1,
+        "applicable": 0,
+        "selectable": 0,
+        "population": 1,
+        "population_candidate_selected": 0,
+        "population_candidate_not_selected": 0,
+        "population_candidate_disabled": 1
+      },
+      "kvm": {
+        "cells": 1,
+        "applicable": 1,
+        "selectable": 1,
+        "population": 1,
+        "population_candidate_selected": 1,
+        "population_candidate_not_selected": 0,
+        "population_candidate_disabled": 0
+      },
+      "liteinst": {
+        "cells": 1,
+        "applicable": 0,
+        "selectable": 0,
+        "population": 1,
+        "population_candidate_selected": 0,
+        "population_candidate_not_selected": 0,
+        "population_candidate_disabled": 1
+      },
+      "sabre": {
+        "cells": 1,
+        "applicable": 1,
+        "selectable": 0,
+        "population": 1,
+        "population_candidate_selected": 0,
+        "population_candidate_not_selected": 1,
+        "population_candidate_disabled": 0
+      }
+    }
+  },
+  "cells": [
+    {"test_id":"chaos-c/lock-granularity","backend":"dbt","category":"chaos-c","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"chaos-c/lock-granularity","backend":"in-guest-trap","category":"chaos-c","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
+    {"test_id":"chaos-c/lock-granularity","backend":"kvm","category":"chaos-c","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"chaos-c/lock-granularity","backend":"liteinst","category":"chaos-c","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"},
+    {"test_id":"chaos-c/lock-granularity","backend":"sabre","category":"chaos-c","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Historical canonical verification diverged at recorded positions. The later clean observations do not erase that retained failure, so this backend remains excluded pending separate qualification."}
+  ]
+}

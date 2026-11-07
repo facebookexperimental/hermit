@@ -1,0 +1,74 @@
+{
+  "schema": 2,
+  "regenerate": "cargo run -p hermit-manifest-plan --bin generate-parity-cells -- --write",
+  "reference": {
+    "backend": "ptrace",
+    "mode": "verify"
+  },
+  "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
+  "counts": {
+    "all": {
+      "cells": 5,
+      "applicable": 4,
+      "selectable": 4,
+      "population": 5,
+      "population_candidate_selected": 4,
+      "population_candidate_not_selected": 0,
+      "population_candidate_disabled": 1
+    },
+    "by_backend": {
+      "dbt": {
+        "cells": 1,
+        "applicable": 1,
+        "selectable": 1,
+        "population": 1,
+        "population_candidate_selected": 1,
+        "population_candidate_not_selected": 0,
+        "population_candidate_disabled": 0
+      },
+      "in-guest-trap": {
+        "cells": 1,
+        "applicable": 1,
+        "selectable": 1,
+        "population": 1,
+        "population_candidate_selected": 1,
+        "population_candidate_not_selected": 0,
+        "population_candidate_disabled": 0
+      },
+      "kvm": {
+        "cells": 1,
+        "applicable": 1,
+        "selectable": 1,
+        "population": 1,
+        "population_candidate_selected": 1,
+        "population_candidate_not_selected": 0,
+        "population_candidate_disabled": 0
+      },
+      "liteinst": {
+        "cells": 1,
+        "applicable": 1,
+        "selectable": 1,
+        "population": 1,
+        "population_candidate_selected": 1,
+        "population_candidate_not_selected": 0,
+        "population_candidate_disabled": 0
+      },
+      "sabre": {
+        "cells": 1,
+        "applicable": 0,
+        "selectable": 0,
+        "population": 1,
+        "population_candidate_selected": 0,
+        "population_candidate_not_selected": 0,
+        "population_candidate_disabled": 1
+      }
+    }
+  },
+  "cells": [
+    {"test_id":"util-c/pmu-skid","backend":"dbt","category":"util-c","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"util-c/pmu-skid","backend":"in-guest-trap","category":"util-c","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"util-c/pmu-skid","backend":"kvm","category":"util-c","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"util-c/pmu-skid","backend":"liteinst","category":"util-c","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"util-c/pmu-skid","backend":"sabre","category":"util-c","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately"}
+  ]
+}

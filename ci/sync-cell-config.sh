@@ -14,7 +14,7 @@
 # script then rewrites, in dependency order,
 #
 #   test-harness sync-cells      ci/expected-e2e-plan.json, ci/optional-e2e-cells.txt
-#   generate-parity-cells        ci/compat-envelope/parity-cells.json (the parity
+#   generate-parity-cells        ci/compat-envelope/parity-cells/ shards (the parity
 #                                population, derived from the manifests)
 #   scorecard.rs update          SCORECARD.md, ci/compat-envelope/cells.json,
 #                                ci/compat-envelope/known-gaps.json (the known-gap
@@ -33,7 +33,7 @@ usage() {
 Usage: ci/sync-cell-config.sh [--check]
 
 Regenerate every file derived from the E2E manifests after a cell flip: the
-expected plan, the optional-cell inventory, parity-cells.json, the scorecard and cell
+expected plan, the optional-cell inventory, the parity-cells shards, the scorecard and cell
 table, and the validation DAG. Edit the manifest, run this,
 and commit the manifest with the files it rewrites.
 

@@ -1,0 +1,74 @@
+{
+  "schema": 2,
+  "regenerate": "cargo run -p hermit-manifest-plan --bin generate-parity-cells -- --write",
+  "reference": {
+    "backend": "ptrace",
+    "mode": "verify"
+  },
+  "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
+  "counts": {
+    "all": {
+      "cells": 5,
+      "applicable": 5,
+      "selectable": 4,
+      "population": 5,
+      "population_candidate_selected": 4,
+      "population_candidate_not_selected": 1,
+      "population_candidate_disabled": 0
+    },
+    "by_backend": {
+      "dbt": {
+        "cells": 1,
+        "applicable": 1,
+        "selectable": 1,
+        "population": 1,
+        "population_candidate_selected": 1,
+        "population_candidate_not_selected": 0,
+        "population_candidate_disabled": 0
+      },
+      "in-guest-trap": {
+        "cells": 1,
+        "applicable": 1,
+        "selectable": 1,
+        "population": 1,
+        "population_candidate_selected": 1,
+        "population_candidate_not_selected": 0,
+        "population_candidate_disabled": 0
+      },
+      "kvm": {
+        "cells": 1,
+        "applicable": 1,
+        "selectable": 1,
+        "population": 1,
+        "population_candidate_selected": 1,
+        "population_candidate_not_selected": 0,
+        "population_candidate_disabled": 0
+      },
+      "liteinst": {
+        "cells": 1,
+        "applicable": 1,
+        "selectable": 1,
+        "population": 1,
+        "population_candidate_selected": 1,
+        "population_candidate_not_selected": 0,
+        "population_candidate_disabled": 0
+      },
+      "sabre": {
+        "cells": 1,
+        "applicable": 1,
+        "selectable": 0,
+        "population": 1,
+        "population_candidate_selected": 0,
+        "population_candidate_not_selected": 1,
+        "population_candidate_disabled": 0
+      }
+    }
+  },
+  "cells": [
+    {"test_id":"debugger-c/debuggee","backend":"dbt","category":"debugger-c","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"debugger-c/debuggee","backend":"in-guest-trap","category":"debugger-c","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"debugger-c/debuggee","backend":"kvm","category":"debugger-c","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"debugger-c/debuggee","backend":"liteinst","category":"debugger-c","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"debugger-c/debuggee","backend":"sabre","category":"debugger-c","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."}
+  ]
+}
