@@ -12994,6 +12994,12 @@ impl RunOpts {
         self.refuse_replay_under_another_pipe_wake_latency()?;
         self.refuse_replay_under_another_signal_state_copy()?;
         self.adopt_replayed_post_crash_timeslice()?;
+        // Chosen reserved-input provenance (and the other replay-input
+        // checks Detcore makes per record) before identity admission, as
+        // on the Detcore route: a record failing its provenance is refused
+        // for that specific reason even where its identity would also
+        // refuse. The launch path validates again below.
+        detcore::preemptions::validate_chosen_provenance(&self.effective_det_config())?;
         self.refuse_unadmitted_rcb_histories(&[])?;
         // Refused here too, before stdin is read; each run's preparation
         // below sets the configuration from the same record. After identity

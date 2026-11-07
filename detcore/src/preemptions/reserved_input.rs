@@ -273,6 +273,35 @@ pub fn read_recorded_reserved_input(
 /// (`super::rewrite_exclusives_mismatch` against the final config), so
 /// every launch path -- the CLI and the public library entries alike --
 /// refuses another rewrite before any backend starts the guest.
+/// The Chosen provenance half of [`validate_config_replay_inputs`], with
+/// each record validated under its own recorded guest numbering. A CLI
+/// preflight that runs before the run adopts the recorded numbering uses
+/// this so a record failing provenance is refused for that specific
+/// reason, before identity admission, as the Detcore route refuses it;
+/// the launch still repeats the full check against the final config.
+pub fn validate_chosen_provenance(config: &crate::Config) -> anyhow::Result<()> {
+    for (option, path) in [
+        ("--replay-schedule-from", &config.replay_schedule_from),
+        ("--replay-preemptions-from", &config.replay_preemptions_from),
+    ] {
+        if let Some(path) = path {
+            let source = format!("{option} {}", path.display());
+            let recording = super::boundary_recording::Recording::read(path)?;
+            recording.validate_replay_inputs(&source, recording.guest_ids())?;
+            if let Some(refusal) = super::rewrite_exclusives_mismatch(
+                &source,
+                recording.recorded_rewrite_exclusives(),
+                super::config_rewrite_exclusives(config),
+            ) {
+                return Err(RecordAdmissionRefusal(refusal).into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every replay input in `config` validated against the run's final
+/// guest numbering and exclusive-loop rewrite, as documented above.
 pub fn validate_config_replay_inputs(config: &crate::Config) -> anyhow::Result<()> {
     for (option, path) in [
         ("--replay-schedule-from", &config.replay_schedule_from),

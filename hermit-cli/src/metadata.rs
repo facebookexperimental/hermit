@@ -1572,7 +1572,9 @@ pub(crate) fn admit_recorded_rcb_identity(
         )));
     };
     let recorded = detcore::preemptions::boundary_recording::history_identity_from_json(raw)
-        .map_err(|error| record_format_refusal(error.to_string()))?;
+        .map_err(|error| {
+            record_format_refusal(format!("hermit refused to replay {source}: {error}"))
+        })?;
     let validated = detcore::clock_identity::validate_run_clock(
         config,
         &detcore::clock_identity::ClockSources::process(),

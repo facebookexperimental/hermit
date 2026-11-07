@@ -691,11 +691,16 @@ fn bisect_rejects_a_timed_out_replay() {
     let bad = dir.path().join("bad.json");
     let report = dir.path().join("report.json");
     for (path, syscall) in [(&good, Sysno::getpid), (&bad, Sysno::getppid)] {
-        let record = PreemptionRecord::from_sched_events(vec![SchedEvent::syscall(
-            DetTid::from_raw(3),
-            syscall,
-            SyscallPhase::Prehook,
-        )]);
+        let record = PreemptionRecord::from_sched_events_with_identity(
+            vec![SchedEvent::syscall(
+                DetTid::from_raw(3),
+                syscall,
+                SyscallPhase::Prehook,
+            )],
+            Some(detcore::preemptions::HistoryIdentity::Known(
+                reverie::pmu_config::RcbMetric::ConditionalBranchesRetiredUserV1,
+            )),
+        );
         record.validate().unwrap();
         record.write_to_disk(path).unwrap();
     }

@@ -27,6 +27,7 @@ pub use reserved_input::RecordAdmissionRefusal;
 pub(crate) use reserved_input::ReservedInputLayout;
 pub use reserved_input::ReservedInputMetadata;
 pub use reserved_input::read_recorded_reserved_input;
+pub use reserved_input::validate_chosen_provenance;
 pub use reserved_input::validate_config_replay_inputs;
 use serde::Deserialize;
 use serde::Serialize;

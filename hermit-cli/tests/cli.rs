@@ -5884,7 +5884,11 @@ fn analyze_replays_a_recorded_target_instead_of_panicking() {
     let _guard = hermit_run_guard();
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let record = directory.path().join("target.preempts");
-    std::fs::write(&record, "{\"per_thread\":{},\"global\":[]}").unwrap();
+    std::fs::write(
+        &record,
+        "{\"rcb_history\":{\"format\":2,\"identity\":\"rcb:cond-retired:user:v1\",\"recording\":{\"per_thread\":{},\"global\":[]}}}",
+    )
+    .unwrap();
     let run1_preemptions = format!("--run1-preemptions={}", record.display());
     let tmp_dir = format!("--tmp-dir={}", directory.path().join("ws").display());
     let analyzed = hermit(&[
@@ -34713,7 +34717,14 @@ fn a_fair_continuation_does_not_hand_a_spinner_a_timeslice_per_write() {
     let schedule = directory.path().join("empty.preempts");
     fs::write(
         &schedule,
-        serde_json::json!({"per_thread": {}, "global": []}).to_string(),
+        serde_json::json!({
+            "rcb_history": {
+                "format": 2,
+                "identity": "rcb:cond-retired:user:v1",
+                "recording": {"per_thread": {}, "global": []}
+            }
+        })
+        .to_string(),
     )
     .unwrap();
     let replay = format!("--replay-schedule-from={}", schedule.display());
