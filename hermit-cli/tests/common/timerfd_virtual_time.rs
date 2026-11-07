@@ -30,11 +30,13 @@ const MIB: u64 = 1024 * 1024;
 /// takes 3.67 s CPU. The wall figures are hang backstops at 8x the former
 /// wall limits (20 s compile, 57 s run); donor job eb64ff5f failed the old
 /// 20 s wall compile limit at load ~980 while doing 0.2 s of CPU work.
-/// The compile now happens once per test-binary run (see `guest`), so this
-/// cap is paid at most once; it is sized at 1.5x the worst compile observed
-/// anywhere (0.51 s CPU on a loaded donor, dh-322bp) rather than 1.5x the
-/// fast local host's 0.19 s.
-const COMPILE_CPU: Duration = Duration::from_millis(800);
+/// `COMPILE_CPU` is an anti-runaway guard, not a 1.5x measurement allowance:
+/// compile CPU inflates under host contention (loaded observation
+/// 0.55-0.64 CPU-s at 1-min load 308 on 2026-11-07, idle 0.18-0.20 CPU-s),
+/// so the guard sits well above the loaded observation, inside the owner's
+/// 60 CPU-s cap. A genuinely stuck compile still fails, by name, on this
+/// guard; the wall backstop remains the harness-level hang backstop.
+const COMPILE_CPU: Duration = Duration::from_secs(30);
 const COMPILE_WALL_BACKSTOP: Duration = Duration::from_secs(160);
 const RUN_CPU: Duration = Duration::from_secs(6);
 const RUN_WALL_BACKSTOP: Duration = Duration::from_secs(456);
@@ -103,6 +105,7 @@ fn guest() -> &'static Path {
                 &compile,
                 COMPILE_CPU,
                 COMPILE_WALL_BACKSTOP,
+                "timerfd fixture compile COMPILE_CPU guard",
             );
             assert!(status.success(), "timerfd fixture compilation failed");
             fs::rename(&staging, &guest).expect("publish timerfd fixture");
@@ -185,7 +188,13 @@ pub(super) fn verify(backend: &str, mode: &str, expected: &str) {
     args.extend(["--", guest().to_str().unwrap(), mode]);
     let mut command = super::hermit_command(&args);
     command.env("HERMIT_LOG_MAX_BYTES", (64 * MIB).to_string());
-    let status = bounded_command_with_budgets(&mut command, &directory, RUN_CPU, RUN_WALL_BACKSTOP);
+    let status = bounded_command_with_budgets(
+        &mut command,
+        &directory,
+        RUN_CPU,
+        RUN_WALL_BACKSTOP,
+        "timerfd run RUN_CPU guard",
+    );
     let stdout =
         String::from_utf8_lossy(&bounded_read(&directory.join("stdout"), 16 * MIB)).into_owned();
     let stderr =
@@ -228,7 +237,13 @@ pub(super) fn refused(backend: &str, mode: &str, env: Option<(&str, &str)>, reas
     if let Some((name, value)) = env {
         command.env(name, value);
     }
-    let status = bounded_command_with_budgets(&mut command, &directory, RUN_CPU, RUN_WALL_BACKSTOP);
+    let status = bounded_command_with_budgets(
+        &mut command,
+        &directory,
+        RUN_CPU,
+        RUN_WALL_BACKSTOP,
+        "timerfd run RUN_CPU guard",
+    );
     let stderr =
         String::from_utf8_lossy(&bounded_read(&directory.join("stderr"), 16 * MIB)).into_owned();
     assert_eq!(
@@ -270,7 +285,13 @@ pub(super) fn signal_during_publish(backend: &str) {
     ];
     let mut command = super::hermit_command(&args);
     command.env("HERMIT_TEST_TIMERFD_FAULT", "signal-before-arm");
-    let status = bounded_command_with_budgets(&mut command, &directory, RUN_CPU, RUN_WALL_BACKSTOP);
+    let status = bounded_command_with_budgets(
+        &mut command,
+        &directory,
+        RUN_CPU,
+        RUN_WALL_BACKSTOP,
+        "timerfd run RUN_CPU guard",
+    );
     let stdout =
         String::from_utf8_lossy(&bounded_read(&directory.join("stdout"), 16 * MIB)).into_owned();
     let stderr =

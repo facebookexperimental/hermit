@@ -190,7 +190,7 @@ pub(super) fn bounded_command_with_timeout(
     directory: &Path,
     wall_limit: Duration,
 ) -> ExitStatus {
-    bounded_command_polling(command, directory, None, wall_limit, || {})
+    bounded_command_polling(command, directory, None, wall_limit, "CPU limit", || {})
 }
 
 /// `bounded_command_with_timeout` with a CPU-time primary limit: the command
@@ -199,15 +199,25 @@ pub(super) fn bounded_command_with_timeout(
 /// load a descheduled command passes wall bounds while doing little work, so
 /// wall must not be the primary limit (owner rule, 2026-11-01; donor job
 /// eb64ff5f, 2026-11-05: a 0.2 s-CPU fixture compile exceeded a 20 s wall
-/// limit at load ~980). Callers size `cpu_limit` at about 1.5x observed CPU
-/// and `wall_backstop` at about 8x the former wall limit.
+/// limit at load ~980). A fixture-compile `cpu_limit` is an anti-runaway
+/// guard, not a 1.5x measurement allowance: compile CPU inflates under host
+/// contention, so callers size it well above loaded observations.
+/// `limit_name` names the guard in the failure message.
 pub(super) fn bounded_command_with_budgets(
     command: &mut Command,
     directory: &Path,
     cpu_limit: Duration,
     wall_backstop: Duration,
+    limit_name: &str,
 ) -> ExitStatus {
-    bounded_command_polling(command, directory, Some(cpu_limit), wall_backstop, || {})
+    bounded_command_polling(
+        command,
+        directory,
+        Some(cpu_limit),
+        wall_backstop,
+        limit_name,
+        || {},
+    )
 }
 
 /// CPU time (user + system, including waited-for children) summed over the
@@ -277,7 +287,7 @@ pub(super) fn bounded_verify_command(
     let logs = directory.join("verify-logs");
     let capture = directory.join("captured-run2.log");
     let mut captured = false;
-    let status = bounded_command_polling(command, directory, None, wall_limit, || {
+    let status = bounded_command_polling(command, directory, None, wall_limit, "CPU limit", || {
         if !captured {
             captured = super::run2_log::link_run2_log(&logs, &capture);
         }
@@ -290,6 +300,7 @@ pub(super) fn bounded_command_polling(
     directory: &Path,
     cpu_limit: Option<Duration>,
     wall_limit: Duration,
+    limit_name: &str,
     mut poll: impl FnMut(),
 ) -> ExitStatus {
     fs::create_dir_all(directory).expect("create retained command directory");
@@ -336,8 +347,8 @@ pub(super) fn bounded_command_polling(
             let cpu = process_group_cpu(child.child.id(), clk_tck);
             assert!(
                 cpu < cpu_limit,
-                "{:.1}-second CPU limit exceeded ({:.2}s CPU over {:.1}s wall); \
-                 evidence at {}",
+                "{limit_name} exceeded: {:.1}-second CPU limit exceeded \
+                 ({:.2}s CPU over {:.1}s wall); evidence at {}",
                 cpu_limit.as_secs_f64(),
                 cpu.as_secs_f64(),
                 start.elapsed().as_secs_f64(),
@@ -820,13 +831,14 @@ mod cpu_budget_tests {
     /// The CPU limit is primary: a busy loop is stopped for burning CPU long
     /// before the generous wall backstop could fire.
     #[test]
-    #[should_panic(expected = "CPU limit exceeded")]
+    #[should_panic(expected = "test CPU budget guard exceeded: 0.2-second CPU limit exceeded")]
     fn cpu_budget_stops_a_busy_loop_before_the_wall_backstop() {
         bounded_command_with_budgets(
             Command::new("sh").args(["-c", "while :; do :; done"]),
             &scratch("busy"),
             Duration::from_millis(200),
             Duration::from_secs(600),
+            "test CPU budget guard",
         );
     }
 
@@ -839,6 +851,7 @@ mod cpu_budget_tests {
             &scratch("sleep"),
             Duration::from_millis(200),
             Duration::from_secs(600),
+            "test CPU budget guard",
         );
         assert!(status.success(), "{status}");
     }

@@ -327,6 +327,7 @@ pub(super) fn exec_refusal() {
             &directory,
             None,
             remaining(start, budget),
+            "CPU limit",
             || {
                 if released
                     || !fs::read(directory.join("stdout"))
