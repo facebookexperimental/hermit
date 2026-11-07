@@ -2043,7 +2043,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And run::untrap_passthrough_syscalls_refuses_preemption_records_by_every_route: 1383 + 1 = 1384.
     // And tests::the_library_entry_points_refuse_untrapping_without_its_prerequisites
     // (the same pull request's post-facto review): 1384 + 1 = 1385.
-    ("test.hermit_unit", 1386),
+    ("test.hermit_unit", 1387),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3368,7 +3368,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_transferred_exec_gives_the_leader_the_survivors_own_cpu_time and
     // a_pre_exec_cpu_publication_after_a_transferred_exec_is_dropped: 3665.
     // Four census provenance units plus the non-PROGBITS control: 3665 + 5.
-    ("test.detcore_unit", 3687),
+    ("test.detcore_unit", 3695),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -6093,7 +6093,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // merge-queue recount after #5219: 3659.
     // The same six 2b-1 units: 3659 + 6 = 3665.
     // Four census provenance units plus the non-PROGBITS control: 3665 + 5.
-    ("test.detcore_unit_on_host", 3687),
+    ("test.detcore_unit_on_host", 3695),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6526,7 +6526,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1323 + 4 = 1327.
     // PR #4746: the same 37 hermit-run units: 1327 + 37 = 1364.
     // PR #4764: the same three hermit-run untrap units: 1376 + 3 = 1379.
-    ("test.hermit_unit_on_host", 1380),
+    ("test.hermit_unit_on_host", 1381),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
