@@ -166,7 +166,8 @@ fn run() -> proof::Result<()> {
             .last()
             .ok_or("packaged runtime build command was not retained")?
             .clone();
-        let sources = sources.with_current_build(&build_command, &artifact.reported_path, &target)?;
+        let sources =
+            sources.with_current_build(&build_command, &artifact.reported_path, &target)?;
         let qualification = proof::qualify_detcore_constructor_with_sources(
             &artifact.reported_path,
             &mut runner,
