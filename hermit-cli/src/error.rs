@@ -527,7 +527,8 @@ mod tests {
         let known = HistoryIdentity::Known(
             reverie::pmu_config::RcbMetric::ConditionalBranchesRetiredUserV1,
         );
-        let cases: [(&str, &dyn Fn(&mut serde_json::Value), &str); 2] = [
+        type Edit = dyn Fn(&mut serde_json::Value);
+        let cases: [(&str, &Edit, &str); 2] = [
             (
                 "format3.json",
                 &|v: &mut serde_json::Value| v["rcb_history"]["format"] = 3.into(),
