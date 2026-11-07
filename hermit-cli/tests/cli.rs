@@ -28157,6 +28157,8 @@ fn a_schedule_replay_keeps_the_long_slices_of_a_preemption_replay() {
         marked(&schedule_record),
         "a schedule replay of a marked record drops the mark"
     );
+}
+
 /// The run arguments of tests/c/branch_free_race.c's strict chaos runs at
 /// 200 us timeslices, with `--chaos-instruction-offset=8` and `extra`.
 #[cfg(target_arch = "x86_64")]

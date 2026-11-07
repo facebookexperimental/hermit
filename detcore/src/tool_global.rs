@@ -5317,8 +5317,8 @@ impl GlobalState {
                         // The offset the replayer put beside this start
                         // grant's first slice rides with it; whatever pair a
                         // signaled grant left staged goes now.
-                        let granted_offset = sched
-                            .take_granted_replay_instruction_offset(dettid, first_slice);
+                        let granted_offset =
+                            sched.take_granted_replay_instruction_offset(dettid, first_slice);
                         sched.forget_replay_timeslice(&dettid);
                         let response = R::StartNewThread(history, first_slice);
                         let response = match granted_offset {
@@ -11644,10 +11644,7 @@ where
         // Publish only after the deterministic start grant. Before
         // it, parent registration and this RPC can race in host time.
         publish_runtime_private_memory(guest).await;
-        crate::reserved_input::granted(
-            guest,
-            reverie::reserved_input::InputGrantKind::Ordinary,
-        );
+        crate::reserved_input::granted(guest, reverie::reserved_input::InputGrantKind::Ordinary);
         trace!("[detcore, dtid {}] new thread UNBLOCKED (post-rpc)", dettid);
         (preempts, first_slice)
     } else {
