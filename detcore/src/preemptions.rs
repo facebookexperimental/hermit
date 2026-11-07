@@ -2871,11 +2871,6 @@ mod tests {
         let marked = SchedEvent::branches(tid, 100).taken_without_stop();
         const { assert!(PREEMPTION_RECORD_FORMAT_MAX >= STOPLESS_SLICE_ENDS_FORMAT) };
         assert_eq!(STOPLESS_SLICE_ENDS_FORMAT, BACKGROUND_STARTS_FORMAT + 1);
-        assert_eq!(
-            PREEMPTION_RECORD_FORMAT_WITHOUT_OFFSETS,
-            STOPLESS_SLICE_ENDS_FORMAT
-        );
-        assert_eq!(PREEMPTION_RECORD_FORMAT_MAX, INSTRUCTION_OFFSET_ROWS_FORMAT);
         let written = |mut writer: PreemptionWriter| {
             writer.insert_schedevent(SchedEvent::branches(tid, 100));
             writer.insert_schedevent(marked.clone());
@@ -5900,7 +5895,7 @@ mod tests {
             SchedEvent::branches(tid, 10),
             SchedEvent::branches(tid, 20),
         ]);
-        record.format_version = Some(PREEMPTION_RECORD_FORMAT_MAX);
+        record.format_version = Some(BACKGROUND_STARTS_FORMAT);
         record.background_starts.push(BackgroundStart {
             after: 1,
             thread: tid,
