@@ -147,7 +147,11 @@ pub fn validate_run_clock(
             },
         };
     match (cfg.rcb_clock_claim, effective) {
-        (RcbClockClaim::Unset, _) => Ok(ValidatedClock {
+        (RcbClockClaim::Unset, Err(reason)) => Ok(ValidatedClock {
+            producer: ProducerIdentity::Unqualified(format!("claim-unset: {reason}")),
+            ticket: None,
+        }),
+        (RcbClockClaim::Unset, Ok(_)) => Ok(ValidatedClock {
             producer: ProducerIdentity::Unqualified("claim-unset".to_owned()),
             ticket: None,
         }),
@@ -671,7 +675,7 @@ mod tests {
             let validated = validate_run_clock(&cfg, &on(&host, &state)).unwrap();
             assert_eq!(
                 validated.producer(),
-                &ProducerIdentity::Unqualified("claim-unset".to_owned())
+                &ProducerIdentity::Unqualified("claim-unset: no-mechanism-contract".to_owned())
             );
             assert_eq!(state.pinned(), None);
         }
