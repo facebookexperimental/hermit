@@ -346,9 +346,10 @@ mod tests {
         // tree)
         (49, "cc10df0910192a63", "f013e36743d8d9e6"),
         // Adds `Found::unverified_pairs` to the positional StoreExclusive
-        // payload (https://github.com/rrnewton/hermit/pull/5230; source
-        // revision 44, carried and landed as 50). Both digests were printed
-        // by the revision guard on the carried tree.
+        // payload. Source revision 44 is carried after main's landed 49.
+        // Both digests were printed by the revision guard on the carried
+        // tree. Revision 50 is provisional; the merge queue assigns the
+        // final number at landing.
         (50, "317db02ddad70067", "f013e36743d8d9e6"),
         // Adds `GlobalRequest::SuspendHoldsDiscarded` and its response
         // (SIGSHARE S2b, https://github.com/rrnewton/hermit/pull/5175): after(this
