@@ -2041,17 +2041,15 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
     )
     .with_wait4(wait4);
     write_attempt_atomic(&record_dir, &record)?;
-    if let Some(outcome) = match &completion {
-        AttemptCompletion::CpuTimeout { .. } => Some("CPU timeout"),
-        AttemptCompletion::SupervisorSignal { .. } => Some("supervisor stop"),
-        _ => None,
-    } {
+    // A supervisor signal does not prove a timeout; preserve its streams exactly.
+    // Only our CPU-timeout decision can add a diagnostic to the child output.
+    if matches!(&completion, AttemptCompletion::CpuTimeout { .. }) {
         let wall = mapped_wall_seconds.map_or_else(
             || "unknown (no resolved budget map)".to_string(),
             |seconds| format!("{seconds} s"),
         );
         eprintln!(
-            "nextest-cpu-wrapper: {outcome}; effective CPU budget: {cpu_budget_usec} us; Nextest wall backstop: {wall}"
+            "nextest-cpu-wrapper: CPU timeout; effective CPU budget: {cpu_budget_usec} us; Nextest wall backstop: {wall}"
         );
     }
     // Remove the credit file now: propagating a signal ends this process
