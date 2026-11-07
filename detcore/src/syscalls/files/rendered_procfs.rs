@@ -1226,6 +1226,7 @@ pub(super) fn io_access_by_real_credentials(
     let CapabilitySets {
         effective,
         permitted,
+        ..
     } = reader.capabilities;
     let within_effective = task_permitted & !effective == 0;
     let within_permitted = task_permitted & !permitted == 0;
@@ -1468,12 +1469,13 @@ pub(super) enum CapabilitySet {
     Permitted,
 }
 
-/// A task's effective and permitted capability sets, their low 64 bits, as
-/// `capget` reports them.
+/// A task's effective, permitted and inheritable capability sets, their low
+/// 64 bits, as `capget` reports them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CapabilitySets {
     pub(super) effective: u64,
     pub(super) permitted: u64,
+    pub(super) inheritable: u64,
 }
 
 /// The configured epoch as a stat time.
@@ -2101,6 +2103,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // process table, and its owner's access (FileAccess).
             if procfs.per_process_name().is_some() {
                 if self.kernel_serves_every_comm(&procfs)
+                    || self.kernel_serves_every_status(&procfs)
                     || self.kernel_serves_every_address_space_file(&procfs)
                 {
                     return Ok(None);
@@ -2603,6 +2606,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(Some(Ok(CapabilitySets {
             effective: set(0),
             permitted: set(1),
+            inheritable: set(2),
         })))
     }
 
@@ -3850,6 +3854,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             if !self.renders_procfs(guest)
                 || self.kernel_serves_every_comm(&file)
+                || self.kernel_serves_every_status(&file)
                 || self.kernel_serves_every_address_space_file(&file)
             {
                 return Ok(None);
@@ -3936,6 +3941,23 @@ impl<T: RecordOrReplay> Detcore<T> {
             let facts = crate::tool_global::task_stat_facts(guest, task).await;
             return !crate::procfs::task_stat::renders_task_comm(&facts, self.comm_source());
         }
+        // A task's `status` (package K item 2b slice 2b-2): where Detcore
+        // renders any (`Self::kernel_serves_every_status`), every task's of
+        // the process table but the reader's own process's where the name's
+        // source is the kernel, whose file stays the kernel's, sanitized, as
+        // before (`procfs::task_status::renders_task_status`).
+        if file.is_task_status() {
+            if self.kernel_serves_every_status(file) {
+                return true;
+            }
+            let facts = crate::tool_global::task_stat_facts(guest, task).await;
+            let own = facts.process == Some(self.own_detpid(guest).as_raw());
+            return !crate::procfs::task_status::renders_task_status(
+                &facts,
+                self.comm_source(),
+                own,
+            );
+        }
         if file.is_task_stat() {
             let facts = crate::tool_global::task_stat_facts(guest, task).await;
             let own = self.own_detpid(guest).as_raw();
@@ -3999,6 +4021,29 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// global tool, so those backends pay nothing for the file.
     pub(super) fn kernel_serves_every_comm(&self, file: &ProcfsFile) -> bool {
         file.is_task_comm() && self.comm_source() == crate::procfs::task_stat::CommSource::Kernel
+    }
+
+    /// Whether Detcore renders any task's `status` on this backend (package
+    /// K item 2b slice 2b-2): where the backend reports every guest task's
+    /// signal sets (`Guest::signal_sets`), which the file shows: where the
+    /// guest's threads are host tasks the tool reads
+    /// (`host_task_reads_reach_guest_threads`: ptrace) and where the
+    /// backend delivers the guest's signals from the state it keeps, which
+    /// is where the name's source is Detcore's record ([`Self::comm_source`]:
+    /// KVM). Decided by the declared capabilities alone, never by which
+    /// backend it is.
+    pub(super) fn renders_any_status(&self) -> bool {
+        self.cfg.backend.host_task_reads_reach_guest_threads
+            || self.comm_source() == crate::procfs::task_stat::CommSource::Record
+    }
+
+    /// Whether `file` is a task's `status` and Detcore renders none on this
+    /// backend ([`Self::renders_any_status`]): then every spelling of every
+    /// task's `status`, its lookup, metadata and listing included, is the
+    /// kernel's, sanitized, exactly as before Detcore rendered any (package
+    /// K item 2b slice 2b-2), decided before any request to the global tool.
+    pub(super) fn kernel_serves_every_status(&self, file: &ProcfsFile) -> bool {
+        file.is_task_status() && !self.renders_any_status()
     }
 
     /// Whether `file` is a process's `smaps`, `smaps_rollup` or `numa_maps`
@@ -4309,7 +4354,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(None);
         };
         let Some(file) = ProcfsFile::from_rendered_path(path)
-            .filter(|file| file.is_task_stat() || file.is_task_comm())
+            .filter(|file| file.is_task_stat() || file.is_task_comm() || file.is_task_status())
         else {
             return Ok(None);
         };
@@ -4328,7 +4373,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         let comm = match crate::procfs::task_stat::stat_comm(source, kernel, facts.comm) {
             Ok(comm) => comm,
             Err(why) => {
-                let file_name = if file.is_task_comm() { "comm" } else { "stat" };
+                let file_name = if file.is_task_comm() {
+                    "comm"
+                } else if file.is_task_status() {
+                    "status"
+                } else {
+                    "stat"
+                };
                 let reason = format!(
                     "the /proc/<pid>/{file_name} of task {task:?} has no name to render: {why}"
                 );
@@ -4337,7 +4388,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let described = task.thread.unwrap_or(task.process);
         let own = facts.process == Some(self.own_detpid(guest).as_raw());
-        // A `comm` shows the name alone.
+        // A `comm` shows the name alone. A `status` shows the parent as a
+        // `stat` does.
         let ppid = if own || file.is_task_comm() {
             ppid
         } else {
@@ -4348,8 +4400,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             facts.cpu
         };
-        let permitted =
-            own || file.is_task_comm() || Self::io_read_allowed(guest, task).await?.is_ok();
+        // `proc_pid_status` asks no permission for any line (fs/proc/array.c
+        // in 6.17), so a `status` never asks the model.
+        let permitted = own
+            || file.is_task_comm()
+            || file.is_task_status()
+            || Self::io_read_allowed(guest, task).await?.is_ok();
         Ok(Some(crate::procfs::task_stat::TaskStat {
             pid: described,
             comm,
@@ -4361,6 +4417,249 @@ impl<T: RecordOrReplay> Detcore<T> {
             cpu,
             permitted,
         }))
+    }
+
+    /// What a rendered `status` of the task `stat` describes shows beyond
+    /// its `stat` (package K item 2b slice 2b-2, `procfs::task_status`), each
+    /// line from the source that answers the guest's own matching query in
+    /// this run, on this backend:
+    ///
+    /// - `Groups`: the reader's own `getgroups`, injected. Detcore makes
+    ///   `setgroups` a no-op, so every guest task keeps the groups the run
+    ///   started with, which every task's `getgroups` answers.
+    /// - The signal sets: the backend's (`Guest::signal_sets`) of the
+    ///   described thread, with the guest mask that thread published in
+    ///   place of Detcore's private one (`syscalls::status_published_sigblk`,
+    ///   as the kernel's `status` is corrected); none for a zombie, for which
+    ///   the backends report none.
+    /// - `CapInh`, `CapPrm`, `CapEff`: `capget` of the described thread,
+    ///   injected (of the reader itself, `capget(0)`); none where it fails
+    ///   (KVM's executor answers ESRCH for any task but the caller).
+    /// - `CapBnd`, `CapAmb`: the reader's own `PR_CAPBSET_READ` and
+    ///   `PR_CAP_AMBIENT_IS_SET`, injected, for the reader's own thread only,
+    ///   since no call answers them for another.
+    /// - The affinity: Detcore's, under `--virtual-cpus`, as
+    ///   `sched_getaffinity` answers.
+    ///
+    /// `Err` where an injection could not be finished cleanly, after the
+    /// failure policy, never an answer with a line made up.
+    pub(super) async fn rendered_task_status<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        stat: crate::procfs::task_stat::TaskStat,
+    ) -> Result<crate::procfs::task_status::TaskStatus, Error> {
+        use crate::procfs::task_status::StatusCapabilities;
+        use crate::procfs::task_status::StatusSignals;
+        let described = stat.pid;
+        let groups = Box::pin(Self::inject_reader_groups(guest)).await?;
+        let signals = if stat.facts.exited {
+            None
+        } else {
+            match guest.signal_sets(reverie::Pid::from_raw(described)) {
+                Ok(sets) => {
+                    let published = super::status_published_sigblk(guest, Some(described))
+                        .await?
+                        .sigblk;
+                    Some(StatusSignals {
+                        pending: sets.pending,
+                        shared_pending: sets.shared_pending,
+                        blocked: published.unwrap_or(sets.blocked),
+                        ignored: sets.ignored,
+                        caught: sets.caught,
+                    })
+                }
+                Err(reverie::FactError::NotProvided | reverie::FactError::Errno(Errno::ESRCH)) => {
+                    None
+                }
+                Err(error) => {
+                    let reason = format!(
+                        "the signal sets of task {described}, which its /proc status shows, \
+                         could not be read: {error:?}"
+                    );
+                    return Err(Self::scratch_failure(guest, Sysno::read, reason).await);
+                }
+            }
+        };
+        let kernel = if stat.reader_is_task {
+            0
+        } else if Self::registered_kernel_ids(guest) {
+            match crate::tool_global::procfs_ids(guest, true, vec![described])
+                .await
+                .into_iter()
+                .next()
+                .flatten()
+            {
+                Some(kernel) => kernel,
+                None => {
+                    let reason = format!(
+                        "task {described}, whose /proc status shows its capability sets, has \
+                         no kernel number to ask capget by"
+                    );
+                    return Err(Self::scratch_failure(guest, Sysno::read, reason).await);
+                }
+            }
+        } else {
+            described
+        };
+        let inheritable_permitted_effective =
+            match Box::pin(Self::inject_capget_of(guest, kernel)).await? {
+                Some(Ok(sets)) => Some((sets.inheritable, sets.permitted, sets.effective)),
+                Some(Err(_)) => None,
+                None => {
+                    let reason = "no guest stack scratch can hold capget's data for a /proc \
+                                  status"
+                        .to_owned();
+                    return Err(Self::scratch_failure(guest, Sysno::capget, reason).await);
+                }
+            };
+        let (bounding, ambient) = if stat.reader_is_task {
+            Self::inject_reader_bounding_and_ambient(guest).await
+        } else {
+            (None, None)
+        };
+        let cpus_allowed = self
+            .cfg
+            .virtual_cpus
+            .map(|cpus| (stat.facts.cpus.allowed(cpus.get()), cpus.get()));
+        Ok(crate::procfs::task_status::TaskStatus {
+            stat,
+            groups,
+            signals,
+            capabilities: StatusCapabilities {
+                inheritable_permitted_effective,
+                bounding,
+                ambient,
+            },
+            cpus_allowed,
+        })
+    }
+
+    /// The reader's supplementary groups, as an injected `getgroups`
+    /// answers: its count first (`getgroups(0, NULL)`, no memory), then the
+    /// groups into borrowed stack scratch, put back on every path. `Err`
+    /// where they cannot be read, after the failure policy.
+    async fn inject_reader_groups<G: Guest<Self>>(guest: &mut G) -> Result<Vec<u32>, Error> {
+        /// The most groups the scratch holds.
+        const MOST: usize = 64;
+        let count = match guest
+            .inject(Syscall::from_raw(
+                Sysno::getgroups,
+                super::procfs_levels::raw_args([0; 6]),
+            ))
+            .await
+        {
+            Ok(count) => count as usize,
+            Err(errno) => {
+                let reason = format!("getgroups for a /proc status failed with {errno}");
+                return Err(Self::scratch_failure(guest, Sysno::getgroups, reason).await);
+            }
+        };
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        if count > MOST {
+            let reason = format!(
+                "the reader has {count} supplementary groups, more than the {MOST} a /proc \
+                 status rendering reads"
+            );
+            return Err(Self::scratch_failure(guest, Sysno::getgroups, reason).await);
+        }
+        let (scratch, original, stack_guard) = match Self::borrow_scratch::<G, { 4 * MOST }>(guest)
+            .await
+        {
+            Ok(Some(borrowed)) => borrowed,
+            Ok(None) => {
+                let reason = "no guest stack scratch can hold getgroups's list for a /proc status"
+                    .to_owned();
+                return Err(Self::scratch_failure(guest, Sysno::getgroups, reason).await);
+            }
+            Err(reason) => {
+                return Err(Self::scratch_failure(guest, Sysno::getgroups, reason).await);
+            }
+        };
+        let answer = guest
+            .inject(Syscall::from_raw(
+                Sysno::getgroups,
+                super::procfs_levels::raw_args([count, scratch.as_raw(), 0, 0, 0, 0]),
+            ))
+            .await;
+        let mut bytes = [0_u8; 4 * MOST];
+        let read = match answer {
+            Ok(written) if written as usize == count => guest
+                .memory()
+                .read_exact(scratch, &mut bytes[..4 * count])
+                .map_err(|errno| format!("its list could not be read back: {errno}")),
+            Ok(written) => Err(format!(
+                "it wrote {written} groups where it counted {count}"
+            )),
+            Err(errno) => Err(format!("it failed with {errno}")),
+        };
+        let restored = guest.memory().write_exact(scratch, &original);
+        drop(stack_guard);
+        if let Err(errno) = restored {
+            let reason = format!(
+                "the guest stack scratch under an injected getgroups could not be restored: \
+                 {errno}"
+            );
+            return Err(Self::scratch_failure(guest, Sysno::getgroups, reason).await);
+        }
+        if let Err(detail) = read {
+            let reason = format!("getgroups for a /proc status: {detail}");
+            return Err(Self::scratch_failure(guest, Sysno::getgroups, reason).await);
+        }
+        Ok(bytes[..4 * count]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|group| u32::from_ne_bytes(*group))
+            .collect())
+    }
+
+    /// The reader's own capability bounding and ambient sets, as injected
+    /// `prctl(PR_CAPBSET_READ, n)` and `prctl(PR_CAP_AMBIENT,
+    /// PR_CAP_AMBIENT_IS_SET, n)` answer for each capability `n` from 0 up to
+    /// the first the kernel beneath does not know (EINVAL), its
+    /// `cap_last_cap`. A set is `None` where a query fails otherwise.
+    async fn inject_reader_bounding_and_ambient<G: Guest<Self>>(
+        guest: &mut G,
+    ) -> (Option<u64>, Option<u64>) {
+        async fn set<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+            guest: &mut G,
+            args: impl Fn(usize) -> [usize; 6],
+        ) -> Option<u64> {
+            let mut bits = 0_u64;
+            for capability in 0..64 {
+                match guest
+                    .inject(Syscall::from_raw(
+                        Sysno::prctl,
+                        super::procfs_levels::raw_args(args(capability)),
+                    ))
+                    .await
+                {
+                    Ok(0) => {}
+                    Ok(_) => bits |= 1 << capability,
+                    Err(Errno::EINVAL) => return Some(bits),
+                    Err(_) => return None,
+                }
+            }
+            Some(bits)
+        }
+        let bounding = set(guest, |capability| {
+            [libc::PR_CAPBSET_READ as usize, capability, 0, 0, 0, 0]
+        })
+        .await;
+        let ambient = set(guest, |capability| {
+            [
+                libc::PR_CAP_AMBIENT as usize,
+                libc::PR_CAP_AMBIENT_IS_SET as usize,
+                capability,
+                0,
+                0,
+                0,
+            ]
+        })
+        .await;
+        (bounding, ambient)
     }
 
     /// The CPU times the `stat` of `task`, a task of the reader's own
@@ -9058,6 +9357,7 @@ mod tests {
             capabilities: CapabilitySets {
                 effective,
                 permitted,
+                inheritable: 0,
             },
         };
         // A refusal stands, whatever the sets.
@@ -9154,6 +9454,7 @@ mod tests {
             capabilities: CapabilitySets {
                 effective: full & !(1 << CAP_SYS_PTRACE),
                 permitted: full,
+                inheritable: 0,
             },
         };
         for owner_may_differ in [false, true] {

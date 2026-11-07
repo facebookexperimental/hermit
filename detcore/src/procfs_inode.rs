@@ -1199,7 +1199,7 @@ mod tests {
 
     /// The first seven per-process files keep the numbers they had when the
     /// field above the pid was bit 63 and a 3-bit index from 1 (tags 9 to
-    /// 15); the files after them take tags 1 to 6 below them; and every file
+    /// 15); the files after them take tags 1 to 7 below them; and every file
     /// of one task has a number of its own, at 2^60 or above.
     #[test]
     fn per_process_files_take_tags_that_keep_the_first_seven_numbers() {
@@ -1207,7 +1207,7 @@ mod tests {
             (0..crate::procfs::ProcfsFile::PER_PROCESS_NAMES.len())
                 .map(per_process_tag)
                 .collect::<Vec<_>>(),
-            [9, 10, 11, 12, 13, 14, 15, 1, 2, 3, 4, 5, 6]
+            [9, 10, 11, 12, 13, 14, 15, 1, 2, 3, 4, 5, 6, 7]
         );
         let task = 3 << (PID_BITS + 2 * INCARNATION_BITS) | 1 << INCARNATION_BITS;
         let inode = |name: &str| {

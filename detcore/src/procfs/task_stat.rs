@@ -410,7 +410,7 @@ pub(crate) struct TaskStat {
 /// while it reads; `Z` for a zombie; `S` for every other task. With threads
 /// sequentialized no other task runs while the file is read, and Detcore
 /// does not model a task's kernel wait states (`D`, `t`, `T`): a fixed `S`.
-fn state(stat: &TaskStat) -> char {
+pub(crate) fn state(stat: &TaskStat) -> char {
     if stat.facts.exited {
         'Z'
     } else if stat.reader_is_task {

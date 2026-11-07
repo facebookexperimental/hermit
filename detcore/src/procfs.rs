@@ -41,6 +41,7 @@ pub(crate) mod locks;
 pub(crate) mod memory_map;
 pub(crate) mod private_maps;
 pub(crate) mod task_stat;
+pub(crate) mod task_status;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ProcfsKind {
@@ -1777,6 +1778,10 @@ pub(crate) struct ProcfsSnapshotContext {
     /// its name and what the reader adds to them (`procfs::task_stat`).
     /// Built by the caller, which asks Detcore's global state.
     pub(crate) task_stat: Option<task_stat::TaskStat>,
+    /// For a task's `status` Detcore opened as rendered, the task's facts
+    /// and what the reader's queries answered (`procfs::task_status`, package
+    /// K item 2b slice 2b-2). Built by the caller.
+    pub(crate) task_status: Option<task_status::TaskStatus>,
     /// For a descriptor's fdinfo Detcore opened as rendered, its text
     /// (`procfs::fdinfo::render`). Built by the caller, from the descriptor's
     /// state at this read (`Detcore::render_own_fdinfo`).
@@ -2071,6 +2076,7 @@ impl ProcfsFile {
     fn per_process_name_of(kind: &ProcfsKind) -> Option<&'static str> {
         let kind = match kind {
             ProcfsKind::Stat | ProcfsKind::ThreadStat => &ProcfsKind::ProcessStat,
+            ProcfsKind::Status | ProcfsKind::ThreadStatus => &ProcfsKind::ProcessStatus,
             other => other,
         };
         Self::PER_PROCESS_KINDS
@@ -2086,8 +2092,11 @@ impl ProcfsFile {
     /// `smaps_rollup` and `numa_maps` only where the guest's procfs is not
     /// the kernel's ([`RenderedFiles::address_space`]). A name's index
     /// numbers its files' inodes (`procfs_inode::per_process_inode`), so a new
-    /// name goes last.
-    const PER_PROCESS_KINDS: [(ProcfsKind, &'static str); 13] = [
+    /// name goes last. A task's `status` (package K item 2b slice 2b-2) is
+    /// rendered only where Detcore renders it
+    /// (`Detcore::kernel_serves_every_status`, `kept_by_kernel`); every
+    /// other open of one stays the kernel's.
+    const PER_PROCESS_KINDS: [(ProcfsKind, &'static str); 14] = [
         (ProcfsKind::ProcessCgroup, "cgroup"),
         (ProcfsKind::ProcessAuxv, "auxv"),
         (ProcfsKind::Mountinfo, "mountinfo"),
@@ -2101,10 +2110,11 @@ impl ProcfsFile {
         (ProcfsKind::Smaps, "smaps"),
         (ProcfsKind::SmapsRollup, "smaps_rollup"),
         (ProcfsKind::NumaMaps, "numa_maps"),
+        (ProcfsKind::ProcessStatus, "status"),
     ];
 
     /// The names of the per-process files Detcore renders.
-    pub(crate) const PER_PROCESS_NAMES: [&'static str; 13] = [
+    pub(crate) const PER_PROCESS_NAMES: [&'static str; 14] = [
         "cgroup",
         "auxv",
         "mountinfo",
@@ -2118,6 +2128,7 @@ impl ProcfsFile {
         "smaps",
         "smaps_rollup",
         "numa_maps",
+        "status",
     ];
 
     /// Pin which view of the mounts this kernel-opened `mountinfo` or `mounts`
@@ -2215,11 +2226,16 @@ impl ProcfsFile {
     /// takes at the first read and keeps, whether it renders the file
     /// (package K slice N4) or the kernel opened it, so that every backend
     /// serves them alike ([`Self::lists_address_space`]).
+    ///
+    /// Nor a task's `status` the kernel opened, which keeps the snapshot it
+    /// had before Detcore rendered any (package K item 2b slice 2b-2); one
+    /// Detcore opened as rendered shows at each read, as Linux's does.
     pub(crate) fn shows_at_read(&self) -> bool {
         self.per_process_name().is_some()
             && !self.is_plain_process_file()
             && self.mount_table_rendering().is_none()
             && !self.lists_rendered_address_space()
+            && (self.rendered || !self.is_task_status())
     }
 
     /// Whether this is a process's `smaps`, `smaps_rollup` or `numa_maps`,
@@ -2248,6 +2264,14 @@ impl ProcfsFile {
     /// Whether this is a process's `cmdline`.
     pub(crate) fn is_process_cmdline(&self) -> bool {
         self.kind == ProcfsKind::ProcessCmdline
+    }
+
+    /// Whether this is a task's `status`, by any spelling.
+    pub(crate) fn is_task_status(&self) -> bool {
+        matches!(
+            self.kind,
+            ProcfsKind::Status | ProcfsKind::ThreadStatus | ProcfsKind::ProcessStatus
+        )
     }
 
     /// Whether this is a process's `stat`, by any spelling.
@@ -2282,6 +2306,7 @@ impl ProcfsFile {
     pub(crate) fn renders_task_record(&self) -> bool {
         self.rendered
             && (self.is_task_stat()
+                || self.is_task_status()
                 || self.is_task_comm()
                 || self.is_fdinfo()
                 || self.lists_locks())
@@ -2565,6 +2590,12 @@ impl ProcfsFile {
             // for one Detcore renders. A descriptor the kernel opened keeps
             // the answer it had before Detcore rendered any (declared).
             ProcfsKind::Fdinfo => !self.rendered,
+            // A task's `status` is a `ONE()` entry too (fs/proc/base.c), so
+            // for one Detcore renders (package K item 2b slice 2b-2). A
+            // descriptor the kernel opened keeps the answer it had before.
+            ProcfsKind::Status | ProcfsKind::ThreadStatus | ProcfsKind::ProcessStatus => {
+                !self.rendered
+            }
             // A task's `statm`, `io` and `arch_status` are `ONE()` entries
             // too (fs/proc/base.c), served by `proc_single_file_operations`.
             ProcfsKind::Statm | ProcfsKind::ProcessIo | ProcfsKind::ArchStatus => false,
@@ -2674,6 +2705,10 @@ impl ProcfsFile {
             | ProcfsKind::ThreadStat
             | ProcfsKind::ProcessStat
             | ProcfsKind::ProcessComm => b"",
+            // The bytes are the task's facts in Detcore's process table and
+            // what the reader's queries answer, which the first read supplies
+            // (`procfs::task_status`).
+            ProcfsKind::Status | ProcfsKind::ThreadStatus | ProcfsKind::ProcessStatus => b"",
             // The bytes are the session's container mount table, which the
             // first read supplies (`Detcore::mount_table_snapshot`).
             ProcfsKind::Mountinfo | ProcfsKind::ProcessMounts => b"",
@@ -3054,6 +3089,7 @@ impl ProcfsFile {
             cpus_allowed,
             lock_rows_kept,
             task_stat,
+            task_status,
             fdinfo_rendering,
         } = context;
         // Linux prints a task's `Cpus_allowed` with `nr_cpu_ids` bits.
@@ -3067,6 +3103,11 @@ impl ProcfsFile {
         if self.rendered && self.is_fdinfo() {
             self.contents =
                 Some(fdinfo_rendering.expect("a rendered fdinfo read without its rendering"));
+            return;
+        }
+        if self.rendered && self.is_task_status() {
+            let status = task_status.expect("a rendered status read without its task's facts");
+            self.contents = Some(task_status::render_status(&status));
             return;
         }
         if self.renders_task_record() && !self.lists_locks() {
@@ -11601,7 +11642,7 @@ total_commit_ms 0\n"
     #[test]
     fn a_task_smaps_rollup_and_numa_maps_are_rendered_only_where_procfs_is_not_the_kernels() {
         assert_eq!(
-            ProcfsFile::PER_PROCESS_NAMES[10..],
+            ProcfsFile::PER_PROCESS_NAMES[10..13],
             ["smaps", "smaps_rollup", "numa_maps"]
         );
         // KVM's session, and ptrace's (the kernel's procfs).

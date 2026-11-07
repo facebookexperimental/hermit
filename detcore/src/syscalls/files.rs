@@ -10024,6 +10024,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                 None,
             )
         };
+        // A task's `status` Detcore opened renders its `stat` facts and what
+        // the reader's queries answer as of this read (`procfs::task_status`,
+        // package K item 2b slice 2b-2). Boxed, as above.
+        let task_status = match task_stat {
+            Some(stat)
+                if guest
+                    .thread_state()
+                    .with_detfd(call.fd(), |detfd| detfd.procfs_is_rendered_status())? =>
+            {
+                Some(Box::pin(self.rendered_task_status(guest, stat)).await?)
+            }
+            _ => None,
+        };
         guest.thread_state().with_detfd(call.fd(), |detfd| {
             detfd.initialize_procfs(
                 contents.clone(),
@@ -10053,6 +10066,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     cpus_allowed,
                     lock_rows_kept: lock_rows_kept.clone(),
                     task_stat,
+                    task_status: task_status.clone(),
                     fdinfo_rendering: fdinfo_rendering.clone(),
                 },
             );
@@ -19247,6 +19261,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )
                 .is_some_and(|file| {
                     !self.kernel_serves_every_comm(&file)
+                        && !self.kernel_serves_every_status(&file)
                         && file.rendered_path(session_files).is_some()
                 });
                 let ino = match looked_up {

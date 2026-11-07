@@ -2853,6 +2853,16 @@ impl DetFd {
         })
     }
 
+    /// Whether this is a task's `status` Detcore opened as rendered (package
+    /// K item 2b slice 2b-2, `procfs::task_status`).
+    pub(crate) fn procfs_is_rendered_status(&self) -> bool {
+        self.with_description(|d| {
+            d.procfs
+                .as_ref()
+                .is_some_and(|procfs| procfs.is_rendered() && procfs.is_task_status())
+        })
+    }
+
     pub(crate) fn procfs_target_fd(&self) -> Option<i32> {
         self.with_description(|d| d.procfs.as_ref().and_then(ProcfsFile::target_fd))
     }

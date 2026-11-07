@@ -2047,6 +2047,12 @@
       "why": "tests/c/proc_other_process_stat.c is owned by hermit-cli/tests/cli.rs: another_processs_stat_and_comm_answer_as_linux runs it on ptrace and run_kvm_another_processs_stat_and_comm_answer_as_linux on KVM, each under run --strict --verify --verify-strict at bitwise parity, and requires its transcript of another process's /proc/<pid>/stat, task/<tid>/stat and comm (a live child named by PR_SET_NAME with a named second thread and the CPU time it used, read by path and relative to a descriptor of its directory, whose listing it checks; the parent's stat read by the child before the parent opened its own; a zombie's, with its exit code) to equal the same guest's native run line for line (package K item 2b slice 2b-1). A generic manifest cannot compare a backend's transcript with a native run whose pids and CPU time differ from run to run, so the guest prints those as comparisons and the test compares the transcripts."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/proc_other_process_status.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/proc_other_process_status.c is owned by hermit-cli/tests/cli.rs: another_processs_status_answers_as_linux runs it on ptrace and run_kvm_another_processs_status_answers_as_linux on KVM, each under run --strict --verify --verify-strict at bitwise parity, and requires its transcript of another process's /proc/<pid>/status and task/<tid>/status (a live child named by PR_SET_NAME with a named second thread, a blocked, an ignored and a caught signal, read by path and relative to a descriptor of its directory; a zombie's) and of the reader's own /proc/self/status, each line checked against the reader's own queries, to equal the same guest's native run line for line (package K item 2b slice 2b-2). A generic manifest cannot compare a backend's transcript with a native run whose ids, memory sizes and signal dispositions differ from run to run, so the guest prints those as comparisons and the test compares the transcripts."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/proc_own_links.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",

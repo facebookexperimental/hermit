@@ -72881,12 +72881,21 @@ fn without_core_dumps(command: &mut Command) {
 }
 
 /// The other-process stat guest's transcript under Hermit on `backend` at
+/// L2 ([`guest_transcript_at_l2`]).
+fn proc_other_process_stat_at_l2(backend: &str) -> String {
+    guest_transcript_at_l2(
+        backend,
+        proc_other_process_stat_guest(),
+        proc_other_process_stat_args(backend),
+    )
+}
+
+/// `guest`'s transcript, run with `guest_args` under Hermit on `backend` at
 /// L2: two runs at bitwise parity under `--verify-strict`, with the same
 /// nonzero number of INFO records compared. Hermit runs under
 /// [`without_core_dumps`], as the native run does, and its guest processes
 /// inherit that limit.
-fn proc_other_process_stat_at_l2(backend: &str) -> String {
-    let guest = proc_other_process_stat_guest();
+fn guest_transcript_at_l2(backend: &str, guest: &Path, guest_args: &[&str]) -> String {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let report = directory.path().join(format!("{backend}.json"));
     let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
@@ -72905,7 +72914,7 @@ fn proc_other_process_stat_at_l2(backend: &str) -> String {
         guest.to_str().expect("guest path is UTF-8"),
     ]
     .into_iter()
-    .chain(proc_other_process_stat_args(backend).iter().copied())
+    .chain(guest_args.iter().copied())
     .collect::<Vec<_>>();
     let mut command = hermit_command(&args);
     without_core_dumps(&mut command);
@@ -72958,6 +72967,129 @@ fn run_kvm_another_processs_stat_and_comm_answer_as_linux() {
     }
     let native = proc_other_process_stat_native("kvm");
     assert_eq!(proc_other_process_stat_at_l2("kvm"), native, "kvm");
+}
+
+static PROC_OTHER_PROCESS_STATUS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+/// `tests/c/proc_other_process_status.c`'s guest.
+fn proc_other_process_status_guest() -> &'static Path {
+    compiled_c_guest(
+        &PROC_OTHER_PROCESS_STATUS_GUEST,
+        "proc_other_process_status",
+    )
+}
+
+/// The other-process status guest's transcript run natively, checked line by
+/// line first, so a host that answers otherwise fails here rather than in
+/// the comparison. The line lists leave out the lines Hermit never renders
+/// (Detcore's `procfs::task_status::OMITTED_STATUS_LINES`, which the guest
+/// names), the capability lines (checked against `capget` instead) and a
+/// zombie's signal sets.
+fn proc_other_process_status_native() -> String {
+    const LIVE: &str = "Name,State,Tgid,Ngid,Pid,PPid,TracerPid,Uid,Gid,Groups,NStgid,NSpid,\
+        NSpgid,NSsid,Kthread,VmPeak,VmSize,VmLck,VmPin,VmHWM,VmRSS,RssAnon,RssFile,RssShmem,\
+        VmData,VmStk,VmExe,VmLib,VmPTE,VmSwap,HugetlbPages,Threads,SigPnd,ShdPnd,SigBlk,SigIgn,\
+        SigCgt,Cpus_allowed,Cpus_allowed_list,Mems_allowed,Mems_allowed_list,\
+        voluntary_ctxt_switches,nonvoluntary_ctxt_switches";
+    const ZOMBIE: &str = "Name,State,Tgid,Ngid,Pid,PPid,TracerPid,Uid,Gid,Groups,NStgid,NSpid,\
+        NSpgid,NSsid,Kthread,Threads,Cpus_allowed,Cpus_allowed_list,Mems_allowed,\
+        Mems_allowed_list,voluntary_ctxt_switches,nonvoluntary_ctxt_switches";
+    let output = Command::new(proc_other_process_status_guest())
+        .stdin(Stdio::null())
+        .output()
+        .expect("run the other-process status guest natively");
+    assert!(output.status.success(), "native: {output:?}");
+    let native = stdout(&output);
+    let mut expected = Vec::new();
+    for (label, name, threads) in [
+        ("child status", "status-child", 2),
+        ("thread status", "status-thread", 2),
+    ] {
+        expected.push(format!(
+            "{label}: name={name} state=S (sleeping) pid,nspid match=1 tgid,nstgid match=1 \
+             ppid is reader=1 tracerpid=0 threads={threads} (want {threads})"
+        ));
+        expected.push(format!(
+            "{label}: uid,gid as the reader's=1 groups as the reader's=1 \
+             nspgid,nssid as getpgid,getsid=1 ngid,kthread=0,0"
+        ));
+        expected.push(format!(
+            "{label}: capability lines as capget answers=1 cpus as sched_getaffinity=1 \
+             mems as get_mempolicy=1"
+        ));
+        expected.push(format!("{label}: lines={LIVE}"));
+    }
+    expected.extend(
+        [
+            "child status: SIGUSR1 blocked=1 SIGUSR2 ignored=1 SIGTERM caught=1",
+            "child status (relative): lines as by path=1 name=status-child",
+            "thread status: SIGUSR1 blocked=0 SIGUSR2 ignored=1 SIGTERM caught=1",
+            "zombie status: name=proc_other_proc state=Z (zombie) pid,nspid match=1 \
+             tgid,nstgid match=1 ppid is reader=1 tracerpid=0 threads=1 (want 1)",
+            "zombie status: capability lines as capget answers=1 cpus as sched_getaffinity=1 \
+             mems as get_mempolicy=1",
+            "zombie status: name as the reader's=1",
+            "own status: pid,tgid match=1 ppid as getppid=1 threads=1",
+            "own status: uid,gid as getresuid,getresgid=1 groups as getgroups=1",
+            "own status: capability lines as capget answers=1 bounding as PR_CAPBSET_READ=1 \
+             ambient as PR_CAP_AMBIENT=1",
+            "failures=0",
+        ]
+        .map(str::to_owned),
+    );
+    expected.push(format!("zombie status: lines={ZOMBIE}"));
+    expected.push(format!("own status: lines={LIVE}"));
+    assert_eq!(native.lines().count(), 21, "{native}");
+    for line in expected {
+        assert!(
+            native.lines().any(|native| native == line),
+            "{line}: {native}"
+        );
+    }
+    native
+}
+
+/// Another process's `/proc/<pid>/status` and `task/<tid>/status`, and the
+/// reader's own `/proc/self/status` (`tests/c/proc_other_process_status.c`),
+/// on ptrace, at L2, exactly as natively, every line: a live child's (named
+/// by `PR_SET_NAME`, two threads, a blocked, an ignored and a caught
+/// signal), read by path and relative to a descriptor of its directory, its
+/// thread's, and a zombie's (`Z (zombie)`, no memory lines), each line
+/// checked against what the reader's own queries answer. Package K item 2b
+/// slice 2b-2 renders another process's `status` from Detcore's state on
+/// ptrace and KVM; ptrace showed the kernel's, sanitized, before it, which
+/// showed a zombie as `S (sleeping)`. The reader's own stays the kernel's,
+/// sanitized, on ptrace.
+#[test]
+fn another_processs_status_answers_as_linux() {
+    let native = proc_other_process_status_native();
+    assert_eq!(
+        guest_transcript_at_l2("ptrace", proc_other_process_status_guest(), &[]),
+        native,
+        "ptrace"
+    );
+}
+
+/// [`another_processs_status_answers_as_linux`] on KVM, at L2, exactly as
+/// natively, every line. Before package K item 2b slice 2b-2 another
+/// process's `status` failed with EACCES and a zombie's with ENOENT (the KVM
+/// provider's), and the reader's own was the provider's 13 lines, without
+/// the memory, signal, capability and affinity lines; Detcore now renders
+/// both from its own state. KVM's `capget` answers only for the caller, so
+/// another process's status has no capability lines there, as the guest
+/// checks (present exactly where `capget` answers).
+#[test]
+fn run_kvm_another_processs_status_answers_as_linux() {
+    let test = "run_kvm_another_processs_status_answers_as_linux";
+    if kvm_unavailable(test) {
+        return;
+    }
+    let native = proc_other_process_status_native();
+    assert_eq!(
+        guest_transcript_at_l2("kvm", proc_other_process_status_guest(), &[]),
+        native,
+        "kvm"
+    );
 }
 
 /// The link-targets guest's `--directory-links` transcript, line by line:

@@ -3145,6 +3145,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )
                 .is_some_and(|file| {
                     !self.kernel_serves_every_comm(&file)
+                        && !self.kernel_serves_every_status(&file)
                         && file.rendered_path(session_files).is_some()
                 });
                 let ino = match looked_up {
@@ -3241,6 +3242,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 crate::procfs::ProcfsFile::from_path(&path).is_some_and(|file| {
                     file.per_process_name().is_some()
                         && !self.kernel_serves_every_comm(&file)
+                        && !self.kernel_serves_every_status(&file)
                         && file.rendered_path(session_files).is_some()
                 })
             }
