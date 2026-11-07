@@ -554,9 +554,15 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/exclusive_loop_bare.S",
+      "runner": "hermit-cli/tests/aarch64_exclusive_rewrite.rs",
+      "why": "tests/c/exclusive_loop_bare.S is owned by hermit-cli/tests/aarch64_exclusive_rewrite.rs: The aarch64 integration test builds this guest without a C library, so its image holds no ADRP or ADR, and checks that `--rewrite-exclusives` rewrites its LDAXR/ADD/STLXR/CBNZ loop in the guest's memory and that the counter is exact."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/exclusive_loop_counter.c",
       "runner": "hermit-cli/tests/aarch64_exclusive_rewrite.rs",
-      "why": "tests/c/exclusive_loop_counter.c is owned by hermit-cli/tests/aarch64_exclusive_rewrite.rs: The aarch64 integration test compiles this guest, whose four threads add to one counter through an LDAXR/ADD/STLXR/CBNZ loop, and checks that `--rewrite-exclusives` rewrites the loop in the guest's memory and that the counter is exact."
+      "why": "tests/c/exclusive_loop_counter.c is owned by hermit-cli/tests/aarch64_exclusive_rewrite.rs: The aarch64 integration test compiles this C-library guest, whose four threads add to one counter through an LDAXR/ADD/STLXR/CBNZ loop, and checks that `--rewrite-exclusives` leaves the loop, naming why (its start files hold address computations the rewrite cannot follow), and that the counter is exact."
     },
     {
       "disposition": "guest-fixture",
