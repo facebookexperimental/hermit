@@ -8,7 +8,7 @@
   "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
   "counts": {
     "all": {
-      "cells": 3885,
+      "cells": 4040,
       "applicable": 2274,
       "selectable": 1781,
       "population": 3065,
@@ -36,7 +36,7 @@
         "population_candidate_disabled": 299
       },
       "kvm": {
-        "cells": 777,
+        "cells": 808,
         "applicable": 606,
         "selectable": 597,
         "population": 613,
