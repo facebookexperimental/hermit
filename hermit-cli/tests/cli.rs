@@ -25963,6 +25963,8 @@ fn a_chaos_instruction_offset_run_verifies_and_replays_at_its_offsets() {
     let replay = hermit(&args);
     assert_success(&replay, &args);
     assert_eq!(parse_branch_free_race(&stdout(&replay)), lost);
+}
+
 /// A record made while replaying preemptions says its slices ran without the
 /// `--max-timeslice` bound, and a schedule replay of it ends slices where the
 /// record does. A preemption replay ends its slices where its record says, so

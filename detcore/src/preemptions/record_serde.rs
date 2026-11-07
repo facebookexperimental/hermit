@@ -130,6 +130,8 @@ struct InfoRecord {
     post_crash_timeslice: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     post_crash: Option<Vec<crate::post_crash::PostCrashSwitch>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    uncapped_slices: Option<u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     callback_checkpoints: BTreeMap<DetTid, Vec<callback_history::Checkpoint>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -993,6 +995,7 @@ mod tests {
             background_starts_unnoted: _,
             rewrite_exclusives: _,
             rewrite_exclusives_stripped_heuristic: _,
+            uncapped_slices: _,
         } = record;
         // A stated overlay provenance round-trips byte for byte, as the
         // last field of the raw form.
