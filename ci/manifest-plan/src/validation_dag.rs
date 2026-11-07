@@ -6385,11 +6385,17 @@ sys.exit(37)
         for step in &steps {
             assert_eq!(
                 step.env.get(SCOPE).map(String::as_str),
-                (step.tag() == PMU_INTEGRATION_TAG).then_some("pmu-integration"),
+                if step.tag() == PMU_INTEGRATION_TAG {
+                    Some("pmu-integration")
+                } else if step.tag() == "privileged-test.pmu_cli_cases" {
+                    Some("pmu-cli-cases")
+                } else {
+                    None
+                },
                 "{}",
                 step.tag()
             );
-            if step.tag() == PMU_INTEGRATION_TAG {
+            if step.tag() == PMU_INTEGRATION_TAG || step.tag() == "privileged-test.pmu_cli_cases" {
                 assert!(pinned_root_command(step).contains(&format!(" --env {SCOPE} ")));
             }
         }
@@ -6399,7 +6405,13 @@ sys.exit(37)
         for step in &sharded.steps {
             assert_eq!(
                 step.env.get(SCOPE).map(String::as_str),
-                tags.contains(&step.tag()).then_some("pmu-integration"),
+                if tags.contains(&step.tag()) {
+                    Some("pmu-integration")
+                } else if step.tag() == "privileged-test.pmu_cli_cases" {
+                    Some("pmu-cli-cases")
+                } else {
+                    None
+                },
                 "{}",
                 step.tag()
             );

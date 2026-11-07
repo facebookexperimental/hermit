@@ -27924,7 +27924,8 @@ fn branch_free_race_lost(seed: u64, extra: &[&str]) -> u64 {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn branch_free_race_lost_at(seed: u64, extra: &[&str], iterations: u64) -> u64 {    let guest = branch_free_race_guest()
+fn branch_free_race_lost_at(seed: u64, extra: &[&str], iterations: u64) -> u64 {
+    let guest = branch_free_race_guest()
         .to_str()
         .expect("guest path should be UTF-8");
     let seed = format!("--sched-seed={seed}");
