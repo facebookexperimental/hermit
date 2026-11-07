@@ -21,6 +21,7 @@ use dagrun::TestResult;
 use dagrun::TestResults;
 use dagrun::TestResultsWriteError;
 use dagrun::structured_test_results_recovery_path;
+use nextest_cpu::AttemptCompletion;
 use nextest_cpu::AttemptIdentity;
 use nextest_cpu::AttemptRecord;
 use nextest_cpu::BinaryMap;
@@ -634,6 +635,18 @@ fn reconcile_cpu_attempts(
     directory: &Path,
     binary_map: &BinaryMap,
 ) -> Result<CpuReport, String> {
+    Ok(reconcile_cpu_attempts_with_cancelled(parsed, directory, binary_map)?.0)
+}
+
+/// Reconcile the typed attempts with the CPU wrapper's records.
+/// Also returns the identities of attempts a fail-fast cancel killed in
+/// flight (signal completions with no typed attempt); the caller records
+/// those as cancelled, never as passed (dh-825jy).
+fn reconcile_cpu_attempts_with_cancelled(
+    parsed: &ParsedEvents,
+    directory: &Path,
+    binary_map: &BinaryMap,
+) -> Result<(CpuReport, Vec<AttemptIdentity>), String> {
     for attempt in &parsed.expected_attempts {
         // The declared Nextest version has no stress-run wrapper identity.
         // Historical count-only parsing still preserves stress_index; never
@@ -711,6 +724,21 @@ fn reconcile_cpu_attempts(
         .filter(|identity| !expected.contains_key(*identity))
         .cloned()
         .collect::<Vec<_>>();
+    // A fail-fast cancel kills attempts in flight: the CPU wrapper holds a
+    // record for each, killed by a signal, but nextest never reported a
+    // typed attempt for them. Those are cancelled attempts, kept in the
+    // CPU report as such - not a disagreement, and never a pass. An
+    // unexpected record that EXITED (any code) or hit its CPU budget is a
+    // real disagreement: a test that ran to a verdict nextest did not
+    // report. Missing records likewise still refuse (dh-825jy).
+    let (cancelled, unexpected): (Vec<AttemptIdentity>, Vec<AttemptIdentity>) =
+        unexpected.into_iter().partition(|identity| {
+            matches!(
+                actual[identity].completion,
+                AttemptCompletion::Signal { .. }
+                    | AttemptCompletion::SupervisorSignal { .. }
+            )
+        });
     if !missing.is_empty() || !unexpected.is_empty() {
         return Err(format!(
             "nextest CPU attempt identities disagree with typed events; missing={missing:?}; unexpected={unexpected:?}"
@@ -728,7 +756,10 @@ fn reconcile_cpu_attempts(
             ));
         }
     }
-    Ok(CpuReport::new(run_id, actual.into_values().collect()))
+    Ok((
+        CpuReport::new(run_id, actual.into_values().collect()),
+        cancelled,
+    ))
 }
 
 fn parse_events(path: &Path, inventory: Option<&EventInventory>) -> Result<ParsedEvents, String> {
@@ -1104,6 +1135,68 @@ fn apply_skid_infra_markers(
     Ok(results)
 }
 
+/// Record fail-fast-cancelled in-flight attempts as cancelled on the
+/// rows they belong to (dh-825jy). A cancelled attempt follows its test's
+/// terminal typed attempt; it is never a pass, and a test with no typed
+/// row at all stays only in the CPU report, so executed counts never
+/// move. A cancelled identity that is not the row's next attempt is a
+/// real disagreement and refuses.
+fn apply_cancelled_attempts(
+    results: Vec<TestResult>,
+    cancelled: &[AttemptIdentity],
+    binary_map: Option<&BinaryMap>,
+) -> Result<Vec<TestResult>, String> {
+    if cancelled.is_empty() {
+        return Ok(results);
+    }
+    let Some(binary_map) = binary_map else {
+        return Err("nextest-test-results: cancelled attempts without a binary map".into());
+    };
+    let mut results = results;
+    for identity in cancelled {
+        let kind = binary_map
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.package == identity.package && entry.binary == identity.binary
+            })
+            .map(|entry| entry.kind.as_str())
+            .ok_or_else(|| {
+                format!(
+                    "nextest-test-results: cancelled attempt {identity:?} names no binary-map entry"
+                )
+            })?;
+        let id = displayed_test_id(
+            &identity.package,
+            &identity.binary,
+            &identity.test,
+            kind,
+            None,
+        );
+        let Some(row) = results.iter_mut().find(|row| row.id == id) else {
+            continue; // no typed row: the CPU report alone records it
+        };
+        if row.passed || identity.attempt != row.attempts + 1 {
+            return Err(format!(
+                "nextest-test-results: cancelled attempt {identity:?} does not follow the terminal attempt of {id:?}"
+            ));
+        }
+        let mut attempts = row.attempt_results.clone().ok_or_else(|| {
+            format!("nextest-test-results: row {id:?} lacks classified attempts")
+        })?;
+        attempts.push(TestAttemptResult::new(
+            identity.attempt,
+            TestAttemptOutcome::Cancelled,
+            Some(
+                "attempt was cancelled in flight by a fail-fast cancel (dh-825jy)"
+                    .into(),
+            ),
+        )?);
+        *row = TestResult::with_attempt_results(row.id.clone(), false, attempts)?;
+    }
+    Ok(results)
+}
+
 fn publish_with_recovery(
     report: &TestResults,
     path: &Path,
@@ -1257,18 +1350,23 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), ProducerError> {
                 .into(),
         );
     }
-    let cpu_report = match (attempt_records, binary_map, cpu_report) {
+    let (cpu_report, cancelled_attempts) = match (attempt_records, binary_map.as_ref(), cpu_report) {
         (Some(records), Some(binary_map), Some(output)) => {
-            let report = reconcile_cpu_attempts(&parsed, Path::new(&records), &binary_map)?;
-            Some((report, output))
+            let (report, cancelled) =
+                reconcile_cpu_attempts_with_cancelled(&parsed, Path::new(&records), &binary_map)?;
+            (Some((report, output)), cancelled)
         }
-        (None, None, None) => None,
+        (None, None, None) => (None, Vec::new()),
         _ => unreachable!("argument pairing was checked above"),
     };
     let results = if schema_5 {
-        apply_skid_infra_markers(
-            apply_skip_markers(parsed.results, &markers)?,
-            &skid_infra_markers,
+        apply_cancelled_attempts(
+            apply_skid_infra_markers(
+                apply_skip_markers(parsed.results, &markers)?,
+                &skid_infra_markers,
+            )?,
+            &cancelled_attempts,
+            binary_map.as_ref(),
         )?
     } else {
         parsed.results
@@ -2987,6 +3085,78 @@ mod tests {
         let error = reconcile_cpu_attempts(
             &parse_event_text(sample_events()).unwrap(),
             &unexpected.0,
+            &sample_binary_map(),
+        )
+        .unwrap_err();
+        assert!(error.contains("unexpected="), "{error}");
+    }
+
+    /// dh-825jy, the bb8e4570 shape: a fail-fast cancel leaves two
+    /// in-flight attempts with signal CPU records and no typed attempts.
+    /// They reconcile as cancelled - the real failure stays named, the
+    /// cancelled attempts are kept and never passed - while an unexpected
+    /// record that EXITED still refuses.
+    #[test]
+    fn fail_fast_cancelled_attempts_reconcile_as_cancelled() {
+        let events = concat!(
+            "{\"type\":\"suite\",\"event\":\"started\",\"test_count\":3,\"nextest\":{\"crate\":\"suite\",\"test_binary\":\"suite\",\"kind\":\"lib\"}}\n",
+            "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"suite::suite$passes\"}\n",
+            "{\"type\":\"test\",\"event\":\"failed\",\"name\":\"suite::suite$fails\"}\n",
+            "{\"type\":\"suite\",\"event\":\"failed\",\"passed\":1,\"failed\":1,\"ignored\":0,\"measured\":0,\"filtered_out\":0,\"nextest\":{\"crate\":\"suite\",\"test_binary\":\"suite\",\"kind\":\"lib\"}}\n",
+        );
+        let parsed = parse_event_text(events).unwrap();
+        assert_eq!(parsed.results.len(), 2);
+        assert!(!parsed.results.iter().find(|row| row.id.ends_with("$fails")).unwrap().passed);
+
+        let scratch = Scratch::new();
+        for record in [
+            attempt("passes", 1, AttemptCompletion::Exit { code: 0 }),
+            attempt("fails", 1, AttemptCompletion::Exit { code: 23 }),
+            // In flight at the cancel: the failed test's retry and a
+            // test nextest never reported at all.
+            attempt("fails", 2, AttemptCompletion::SupervisorSignal { signal: 9 }),
+            attempt("never_reported", 1, AttemptCompletion::Signal { signal: 15 }),
+        ] {
+            write_record(&scratch.0, &record);
+        }
+        let (report, cancelled) =
+            reconcile_cpu_attempts_with_cancelled(&parsed, &scratch.0, &sample_binary_map())
+                .unwrap();
+        assert_eq!(report.attempts.len(), 4);
+        assert_eq!(cancelled.len(), 2);
+        assert!(cancelled.iter().all(|identity| identity.attempt >= 1));
+        assert!(
+            report.attempts.iter().all(|record| !matches!(
+                record.completion,
+                AttemptCompletion::Signal { .. } | AttemptCompletion::SupervisorSignal { .. }
+            ) || !record.completion.is_success()),
+            "a cancelled attempt was recorded as a success"
+        );
+
+        // The schema-5 row for the real failure gains the cancelled
+        // attempt, in sequence, as `cancelled` - never `passed`.
+        let rows = vec![TestResult::new("suite$fails".into(), false, 1).unwrap()];
+        let rows = apply_skip_markers(rows, &[]).unwrap();
+        let rows = apply_cancelled_attempts(rows, &cancelled, Some(&sample_binary_map())).unwrap();
+        let row = &rows[0];
+        assert!(!row.passed);
+        assert_eq!(row.attempts, 2);
+        let attempts = row.attempt_results.as_ref().unwrap();
+        assert_eq!(attempts[0].outcome, TestAttemptOutcome::Failed);
+        assert_eq!(attempts[1].outcome, TestAttemptOutcome::Cancelled);
+
+        // An unexpected record that EXITED is still a disagreement.
+        let exited = Scratch::new();
+        for record in [
+            attempt("passes", 1, AttemptCompletion::Exit { code: 0 }),
+            attempt("fails", 1, AttemptCompletion::Exit { code: 23 }),
+            attempt("fails", 2, AttemptCompletion::Exit { code: 1 }),
+        ] {
+            write_record(&exited.0, &record);
+        }
+        let error = reconcile_cpu_attempts_with_cancelled(
+            &parsed,
+            &exited.0,
             &sample_binary_map(),
         )
         .unwrap_err();
