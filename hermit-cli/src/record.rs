@@ -95,6 +95,14 @@ impl Record {
             metadata.cpu_table_digest = Some(hex_digest(&detcore::virtual_cpuid_digest(&config)));
         }
 
+        // The coordinates this recording's event stream will count, stated
+        // before the guest starts so a replay can admit only the same
+        // identity. A contradicted clock claim refuses here, by name.
+        metadata.rcb_identity = Some(
+            detcore::preemptions::boundary_recording::history_identity_to_json(
+                &crate::metadata::record_rcb_identity(&config)?,
+            ),
+        );
         let metadata_path = dir.join(METADATA_NAME);
         write_metadata(fs::File::create(&metadata_path)?, &metadata)
             .context("Failed to serialize metadata")?;

@@ -51,6 +51,10 @@ pub enum ProducerIdentity {
         /// The clock key pinned for the run.
         key: ClockKey,
     },
+    /// A backend-local clock stated by its opaque, versioned token. Its
+    /// coordinates are executable only under the same token; Detcore
+    /// compares tokens and never interprets them.
+    BackendLocal(&'static str),
     /// Not a qualified clock, for the reason given.
     Unqualified(String),
 }
@@ -60,6 +64,7 @@ impl ProducerIdentity {
     pub fn history_identity(&self) -> HistoryIdentity {
         match self {
             Self::Known { metric, .. } => HistoryIdentity::Known(*metric),
+            Self::BackendLocal(token) => HistoryIdentity::BackendLocal((*token).to_owned()),
             Self::Unqualified(reason) => HistoryIdentity::Unqualified(reason.clone()),
         }
     }
@@ -147,6 +152,21 @@ pub fn validate_run_clock(
             },
         };
     match (cfg.rcb_clock_claim, effective) {
+        (RcbClockClaim::BackendLocal(token), _) if token.trim().is_empty() => Err(
+            "hermit refused the run: it was prepared for an empty backend-local RCB clock \
+             identity"
+                .to_owned(),
+        ),
+        (RcbClockClaim::BackendLocal(token), _) if cfg.backend.rcb_clock_contract.is_some() => {
+            Err(format!(
+                "hermit refused the run: it was prepared for backend-local RCB clock \
+                 {token}, but the backend states a qualified shared RCB clock contract"
+            ))
+        }
+        (RcbClockClaim::BackendLocal(token), _) => Ok(ValidatedClock {
+            producer: ProducerIdentity::BackendLocal(token),
+            ticket: None,
+        }),
         (RcbClockClaim::Unset, Err(reason)) => Ok(ValidatedClock {
             producer: ProducerIdentity::Unqualified(format!("claim-unset: {reason}")),
             ticket: None,
@@ -202,8 +222,10 @@ impl ValidatedClock {
 }
 
 /// May a history stating `recorded`, read from `source`, run under
-/// `consumer`? Only a qualified history under a qualified clock of the same
-/// metric may; a raw event or model need not match.
+/// `consumer`? A qualified history needs a qualified clock of the same
+/// metric (a raw event or model need not match); a backend-local history
+/// needs the same backend-local token. Every other pairing is refused
+/// naming both identities.
 pub fn admit_identity(
     source: &str,
     recorded: Option<&HistoryIdentity>,
@@ -220,6 +242,39 @@ pub fn admit_identity(
             "hermit refused to replay {source}: it was recorded with an unqualified RCB clock \
              ({reason}), so its coordinates cannot be executed."
         )),
+        (
+            Some(HistoryIdentity::BackendLocal(recorded)),
+            ProducerIdentity::BackendLocal(consumer),
+        ) => {
+            if recorded.as_str() == *consumer {
+                Ok(())
+            } else {
+                Err(format!(
+                    "hermit refused to replay {source}: it counts backend-local RCB clock \
+                     {recorded}, and this run counts {consumer}."
+                ))
+            }
+        }
+        (Some(HistoryIdentity::BackendLocal(recorded)), ProducerIdentity::Known { metric, .. }) => {
+            Err(format!(
+                "hermit refused to replay {source}: it counts backend-local RCB clock \
+             {recorded}, and this run counts {}.",
+                metric.id()
+            ))
+        }
+        (Some(HistoryIdentity::Known(recorded)), ProducerIdentity::BackendLocal(consumer)) => {
+            Err(format!(
+                "hermit refused to replay {source}: it counts {}, and this run counts \
+             backend-local RCB clock {consumer}.",
+                recorded.id()
+            ))
+        }
+        (Some(HistoryIdentity::BackendLocal(recorded)), ProducerIdentity::Unqualified(reason)) => {
+            Err(format!(
+                "hermit refused to replay {source} ({recorded}): this run's RCB clock is not \
+             qualified ({reason})."
+            ))
+        }
         (Some(HistoryIdentity::Known(metric)), ProducerIdentity::Unqualified(reason)) => {
             Err(format!(
                 "hermit refused to replay {source} ({}): this run's RCB clock is not qualified \
@@ -705,6 +760,66 @@ mod tests {
         let refused =
             validate_run_clock(&prepared(&sapphire_rapids()), &on(&amd(), &state)).unwrap_err();
         assert!(refused.contains("hermit refused the run"), "{refused}");
+    }
+
+    /// A backend-local claim is executable only under the same opaque
+    /// token: it needs no shared contract or pin, a different token or a
+    /// qualified metric refuses naming both identities, and a qualified
+    /// history refuses under a local consumer. A local claim prepared
+    /// against a shared-contract backend is contradictory and refused.
+    #[test]
+    fn backend_local_histories_replay_only_under_the_same_token() {
+        let state = PmuState::new();
+        let mut cfg = prepared(&amd());
+        cfg.backend.rcb_clock_contract = None;
+        cfg.rcb_clock_claim =
+            detcore_model::config::RcbClockClaim::BackendLocal("test:local-rcb:v1");
+        let validated = validate_run_clock(&cfg, &on(&amd(), &state)).unwrap();
+        assert_eq!(
+            validated.producer(),
+            &ProducerIdentity::BackendLocal("test:local-rcb:v1")
+        );
+        assert_eq!(
+            validated.producer().history_identity(),
+            HistoryIdentity::BackendLocal("test:local-rcb:v1".to_owned())
+        );
+        assert_eq!(state.pinned(), None);
+        let local = ProducerIdentity::BackendLocal("test:local-rcb:v1");
+        let same = HistoryIdentity::BackendLocal("test:local-rcb:v1".to_owned());
+        assert!(admit_identity("schedule", Some(&same), &local).is_ok());
+        for (recorded, consumer, recorded_text, consumer_text) in [
+            (
+                HistoryIdentity::BackendLocal("test:other-rcb:v1".to_owned()),
+                local.clone(),
+                "test:other-rcb:v1",
+                "test:local-rcb:v1",
+            ),
+            (
+                V1.clone(),
+                local.clone(),
+                RcbMetric::ConditionalBranchesRetiredUserV1.id(),
+                "test:local-rcb:v1",
+            ),
+            (
+                same.clone(),
+                ProducerIdentity::Known {
+                    metric: RcbMetric::ConditionalBranchesRetiredUserV1,
+                    key: amd().key(),
+                },
+                "test:local-rcb:v1",
+                RcbMetric::ConditionalBranchesRetiredUserV1.id(),
+            ),
+        ] {
+            let refusal = admit_identity("schedule", Some(&recorded), &consumer).unwrap_err();
+            assert!(refusal.contains(recorded_text), "{refusal}");
+            assert!(refusal.contains(consumer_text), "{refusal}");
+        }
+        let mut contradictory = prepared(&amd());
+        contradictory.rcb_clock_claim =
+            detcore_model::config::RcbClockClaim::BackendLocal("test:local-rcb:v1");
+        let refusal = validate_run_clock(&contradictory, &on(&amd(), &state)).unwrap_err();
+        assert!(refusal.contains("backend-local RCB clock"), "{refusal}");
+        assert!(refusal.contains("test:local-rcb:v1"), "{refusal}");
     }
 
     /// An unprepared run executes unqualified: it pins nothing, and what it

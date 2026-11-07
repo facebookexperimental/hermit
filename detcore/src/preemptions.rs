@@ -50,6 +50,10 @@ use crate::types::SchedEvent;
 pub enum HistoryIdentity {
     /// Its RCB coordinates count this metric.
     Known(reverie::pmu_config::RcbMetric),
+    /// Its RCB coordinates count the backend-local clock this opaque,
+    /// versioned token states (backend kind, counter, and version).
+    /// Executable only under the same token.
+    BackendLocal(String),
     /// Its producer's RCB clock was not a qualified contract, for the reason
     /// it states. Never executable.
     Unqualified(String),
@@ -59,6 +63,7 @@ impl std::fmt::Display for HistoryIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Known(metric) => f.write_str(metric.id()),
+            Self::BackendLocal(token) => f.write_str(token),
             Self::Unqualified(reason) => write!(f, "unqualified ({reason})"),
         }
     }

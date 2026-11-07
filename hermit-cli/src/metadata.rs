@@ -1088,6 +1088,13 @@ pub struct Metadata {
     pub envs: BTreeMap<String, String>,
     /// Hermit record/replay version.
     pub version: RecordVersion,
+    /// The RCB coordinate identity the recording's event stream counts, in
+    /// the `rcb_history` envelope's JSON form. A replay admits it only
+    /// under the same identity and refuses pre-guest otherwise. Absent in
+    /// a recording made before identities were recorded, whose replay is
+    /// refused for stating none.
+    #[serde(default)]
+    pub rcb_identity: Option<serde_json::Value>,
     /// Why this recording cannot be replayed faithfully, when the recording
     /// run said so (`detcore::detlog::replay_refusal`): replay refuses before
     /// starting the guest (<https://github.com/rrnewton/hermit/issues/3994>).
@@ -1208,6 +1215,9 @@ impl Metadata {
             envs,
             replay_refused: None,
             version: RECORD_VERSION,
+            // Stamped by the recorder from its validated clock claim
+            // before the metadata is written.
+            rcb_identity: None,
             proc_readonly: None,
             mountinfo_root_rewrites: Vec::new(),
             mountinfo_mount_ids: Vec::new(),
@@ -1359,9 +1369,16 @@ fn record_or_replay_config_with_timer_support(
         // Record and replay run under the ptrace backend.
         backend: <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),
         // A recording replays no standalone history (`replay_schedule_from`
-        // and `replay_preemptions_from` stay unset below) and writes none;
-        // its compatibility is the record epoch's.
-        rcb_clock_claim: Default::default(),
+        // and `replay_preemptions_from` stay unset below) and writes none,
+        // but its event stream still counts RCB coordinates: prepare the
+        // ptrace clock claim as `hermit run` does, so the recorder can
+        // state the identity in its metadata and the replayer admits only
+        // the same identity.
+        rcb_clock_claim: crate::prepare_backend_config(
+            detcore::Config::default(),
+            crate::Backend::Ptrace,
+        )
+        .rcb_clock_claim,
         // As `hermit run` sets it for ptrace (`prepare_backend_config` in
         // lib.rs). With it off, the scheduler did not model signal targets, so
         // a thread asleep in a backgrounded rt_sigsuspend that a child-exit
@@ -1514,6 +1531,55 @@ fn record_or_replay_config_with_timer_support(
         disable_timeslice_without_a_timer(&mut config, &reason);
     }
     config
+}
+
+/// A full recording in a format this build cannot execute, typed so the
+/// CLI classifies it as the policy refusal (exit 122), not an internal
+/// failure.
+pub(crate) fn record_format_refusal(message: String) -> Error {
+    anyhow::Error::new(detcore::preemptions::RecordFormatRefusal(message))
+}
+
+/// The RCB coordinate identity a recording made under `config` counts,
+/// validated (not pinned) against this host. A contradicted prepared
+/// claim is the named refusal, as at a run's preparation.
+pub(crate) fn record_rcb_identity(
+    config: &detcore::Config,
+) -> Result<detcore::preemptions::HistoryIdentity, Error> {
+    let validated = detcore::clock_identity::validate_run_clock(
+        config,
+        &detcore::clock_identity::ClockSources::process(),
+    )
+    .map_err(record_format_refusal)?;
+    Ok(validated.producer().history_identity())
+}
+
+/// Admit `metadata`'s stated RCB identity under the replay configuration
+/// `config`, before any guest starts: no stated identity, an identity
+/// this build does not know, and any other identity than this run's own
+/// are each the named policy refusal.
+pub(crate) fn admit_recorded_rcb_identity(
+    config: &detcore::Config,
+    metadata: &Metadata,
+    source: &str,
+) -> Result<(), Error> {
+    let Some(raw) = &metadata.rcb_identity else {
+        return Err(record_format_refusal(format!(
+            "hermit refused to replay {source}: it states no RCB coordinate identity, so \
+             the unit of its recorded coordinates is unknown (it was written before \
+             identities were recorded, or by hand). Record it again with this build, or \
+             replay it with the build that made it."
+        )));
+    };
+    let recorded = detcore::preemptions::boundary_recording::history_identity_from_json(raw)
+        .map_err(|error| record_format_refusal(error.to_string()))?;
+    let validated = detcore::clock_identity::validate_run_clock(
+        config,
+        &detcore::clock_identity::ClockSources::process(),
+    )
+    .map_err(record_format_refusal)?;
+    detcore::clock_identity::admit_identity(source, Some(&recorded), validated.producer())
+        .map_err(record_format_refusal)
 }
 
 /// Whether this host can arm Reverie's ptrace timer for a record or replay:

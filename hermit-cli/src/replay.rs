@@ -75,8 +75,9 @@ impl Replay {
         let recording_version = &metadata.version;
         let replayer_version = &RECORD_VERSION;
         if !replayer_version.compatible_with(recording_version) {
-            return Err(anyhow::anyhow!(format!(
-                "Version mismatch, recording version {:?}, replayer version {:?}",
+            return Err(crate::metadata::record_format_refusal(format!(
+                "Version mismatch, recording version {:?}, replayer version {:?}; record it \
+                 again with this build, or replay it with the build that made it",
                 recording_version, replayer_version
             )));
         }
@@ -135,6 +136,13 @@ impl Replay {
         config.proc_level = metadata.proc_level.unwrap_or_default();
         // The recording's schedule: a chaos recording replays under its seed.
         metadata.schedule.apply(&mut config);
+        // The RCB coordinates the event stream counts: admit only this
+        // replay's own identity, before the chroot or any guest exists.
+        crate::metadata::admit_recorded_rcb_identity(
+            &config,
+            &metadata,
+            &format!("hermit replay {}", dir.display()),
+        )?;
         let sequentialize_threads = config.sequentialize_threads;
 
         let (chroot, bootstrap_program, materialization_scope, replay_mounts) =
@@ -662,8 +670,13 @@ mod tests {
         .unwrap();
         let error = match Replay::spawn(dir.path(), false, None, &[]).await {
             Ok(_) => panic!("replay accepted the pre-pairing 0x196 recording"),
-            Err(error) => error.to_string(),
+            Err(error) => error,
         };
+        assert!(
+            error.is::<detcore::preemptions::RecordFormatRefusal>(),
+            "a version mismatch is the policy refusal, not an internal failure: {error:#}"
+        );
+        let error = error.to_string();
         assert!(
             error.contains("Version mismatch, recording version RecordVersion(406)"),
             "the old epoch must be refused before guest startup: {error}"
@@ -672,6 +685,55 @@ mod tests {
             error.contains(&format!("replayer version {RECORD_VERSION:?}")),
             "the refusal must identify this replayer's epoch: {error}"
         );
+    }
+
+    /// A recording at the current epoch states the RCB identity its event
+    /// stream counts: none stated, one this build does not know, and one
+    /// for another (backend-local) clock are each the typed policy
+    /// refusal before the guest starts, not an internal failure.
+    #[tokio::test]
+    async fn replay_refuses_a_recording_without_this_runs_rcb_identity() {
+        for (identity, cause) in [
+            (None, "states no RCB coordinate identity"),
+            (
+                Some(serde_json::json!("rcb:cond-retired:user:v9")),
+                "unknown RCB coordinate identity",
+            ),
+            (
+                Some(serde_json::json!({"backend_local": "test:other-clock:v1"})),
+                "test:other-clock:v1",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut metadata = serde_json::json!({
+                "exe": "/bin/true",
+                "program": "true",
+                "arg0": "true",
+                "args": [],
+                "current_dir": "/",
+                "hostname": null,
+                "domainname": null,
+                "envs": {},
+                "version": serde_json::to_value(RECORD_VERSION).unwrap(),
+            });
+            if let Some(identity) = identity {
+                metadata["rcb_identity"] = identity;
+            }
+            fs::write(
+                dir.path().join(crate::consts::METADATA_NAME),
+                metadata.to_string(),
+            )
+            .unwrap();
+            let error = match Replay::spawn(dir.path(), false, None, &[]).await {
+                Ok(_) => panic!("replay accepted a recording without this run's RCB identity"),
+                Err(error) => error,
+            };
+            assert!(
+                error.is::<detcore::preemptions::RecordFormatRefusal>(),
+                "{error:#}"
+            );
+            assert!(format!("{error:#}").contains(cause), "{error:#}");
+        }
     }
 
     /// A recording whose run recorded a replay refusal is refused before the

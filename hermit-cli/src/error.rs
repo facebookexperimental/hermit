@@ -416,16 +416,14 @@ fn unconsumed_schedule_for_test(
 pub(crate) async fn terminal_replay_refusal_for_test() -> Error {
     use detcore::preemptions::HistoryIdentity;
     // The replay reaches its terminal refusal only past identity admission:
-    // the schedule states this host's qualified RCB metric, and the run is
-    // prepared for this host's clock as `prepare_backend_config` prepares a
-    // ptrace run. Its other capabilities stay the defaults.
-    let host = reverie::pmu_config::resolve_host_clock()
-        .expect("a terminal replay needs this host's RCB clock qualified");
-    let prepared =
-        crate::prepare_backend_config(detcore::Config::default(), crate::Backend::Ptrace);
+    // the schedule and the run state the same backend-local clock, so the
+    // fixture needs no qualified host counter. Its other capabilities stay
+    // the defaults apart from the stated clock contract.
+    const LOCAL: &str = "test:terminal-replay:v1";
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("unconsumed.json");
-    let recording = unconsumed_schedule_for_test(Some(HistoryIdentity::Known(host.metric)));
+    let recording =
+        unconsumed_schedule_for_test(Some(HistoryIdentity::BackendLocal(LOCAL.to_owned())));
     std::fs::write(&path, recording.encode().unwrap()).unwrap();
     let mut config = detcore::Config {
         sequentialize_threads: true,
@@ -434,8 +432,8 @@ pub(crate) async fn terminal_replay_refusal_for_test() -> Error {
         record_preemptions: false,
         ..detcore::Config::default()
     };
-    config.backend.rcb_clock_contract = prepared.backend.rcb_clock_contract;
-    config.rcb_clock_claim = prepared.rcb_clock_claim;
+    config.backend.rcb_clock_contract = None;
+    config.rcb_clock_claim = detcore_model::config::RcbClockClaim::BackendLocal(LOCAL);
     detcore::GlobalState::init_for_external_scheduler(&config)
         .clean_up(false, &None)
         .await

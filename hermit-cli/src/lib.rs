@@ -3620,10 +3620,26 @@ pub fn run_with_backend_timeout(
     skid_overshoot_report.finish(result)
 }
 
+/// KVM's backend-local RCB clock identity: its guest-only perf counter
+/// counting retired conditional branches in guest user mode, version 1 of
+/// that counting contract. Interim for the typed Reverie contract tracked
+/// in dh-6gve6. Two recordings are comparable only under the same token.
+const KVM_RCB_LOCAL_TOKEN: &str = "kvm:guest-user-retired-conditional-branches:v1";
+
 // TODO-HUMAN-REVIEW(PR-749): Review LiteInst backend configuration normalization.
 #[doc(hidden)]
 pub fn prepare_backend_config(config: DetConfig, backend: Backend) -> DetConfig {
-    prepare_backend_config_with_capabilities(config, backend_capabilities(backend))
+    let mut config =
+        prepare_backend_config_with_capabilities(config, backend_capabilities(backend));
+    // KVM counts its own guest-only RCB clock, not the qualified shared
+    // contract: state that as an opaque backend-local claim. Detcore
+    // compares the token and never interprets it, so a KVM history
+    // replays on KVM and is refused elsewhere.
+    if backend == Backend::Kvm {
+        config.rcb_clock_claim =
+            detcore_model::config::RcbClockClaim::BackendLocal(KVM_RCB_LOCAL_TOKEN);
+    }
+    config
 }
 
 /// Prepare the common Detcore configuration from the physical runtime's
@@ -9008,8 +9024,24 @@ mod tests {
         // this test exercises only past identity admission, as the
         // refusing sibling above (whose bare records take the earlier
         // rewrite refusal) does not need to.
-        let host = reverie::pmu_config::resolve_host_clock()
-            .expect("admitting a replay needs this host's RCB clock qualified");
+        // This test launches a real guest, so it needs this host's
+        // qualified counter in a way no fixture can supply: skip logged,
+        // as the PMU-timer tests do, and fail under HERMIT_REQUIRE_PMU.
+        let host = match reverie::pmu_config::resolve_host_clock() {
+            Ok(host) => host,
+            Err(reason) => {
+                assert!(
+                    std::env::var_os("HERMIT_REQUIRE_PMU").is_none(),
+                    "HERMIT_REQUIRE_PMU is set, but this host has no qualified RCB clock: \
+                     {reason}"
+                );
+                eprintln!(
+                    "skipping run_with_output_admits_the_matching_exclusive_rewrite: this \
+                     host has no qualified RCB clock ({reason})"
+                );
+                return;
+            }
+        };
         let enveloped = |json: String| {
             format!(
                 r#"{{"rcb_history":{{"format":2,"identity":"{}","recording":{json}}}}}"#,

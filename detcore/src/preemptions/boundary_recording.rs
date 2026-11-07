@@ -53,7 +53,14 @@ struct IdentityBody<R> {
 #[serde(untagged)]
 enum IdentityWire {
     Known(String),
+    BackendLocal(BackendLocalWire),
     Unqualified(UnqualifiedWire),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackendLocalWire {
+    backend_local: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -66,6 +73,9 @@ impl From<&HistoryIdentity> for IdentityWire {
     fn from(identity: &HistoryIdentity) -> Self {
         match identity {
             HistoryIdentity::Known(metric) => Self::Known(metric.id().to_owned()),
+            HistoryIdentity::BackendLocal(token) => Self::BackendLocal(BackendLocalWire {
+                backend_local: token.clone(),
+            }),
             HistoryIdentity::Unqualified(reason) => Self::Unqualified(UnqualifiedWire {
                 unqualified: reason.clone(),
             }),
@@ -86,11 +96,36 @@ impl TryFrom<IdentityWire> for HistoryIdentity {
                          build that wrote it, or record it again with this build"
                     )
                 }),
+            IdentityWire::BackendLocal(BackendLocalWire { backend_local }) => {
+                if backend_local.trim().is_empty() {
+                    bail!(
+                        "empty backend-local RCB coordinate identity; record the history \
+                         again with this build"
+                    );
+                }
+                Ok(Self::BackendLocal(backend_local))
+            }
             IdentityWire::Unqualified(UnqualifiedWire { unqualified }) => {
                 Ok(Self::Unqualified(unqualified))
             }
         }
     }
+}
+
+/// The JSON form of `identity` in an `rcb_history` envelope, for stores
+/// that embed the same identity beside another recording format (full
+/// record/replay metadata).
+pub fn history_identity_to_json(identity: &HistoryIdentity) -> serde_json::Value {
+    serde_json::to_value(IdentityWire::from(identity))
+        .expect("an identity wire value always serializes")
+}
+
+/// Parses the JSON form written by [`history_identity_to_json`]. An
+/// identity this build does not know is an error naming the working path,
+/// exactly as envelope decoding reports it.
+pub fn history_identity_from_json(value: &serde_json::Value) -> anyhow::Result<HistoryIdentity> {
+    let wire: IdentityWire = serde_json::from_value(value.clone())?;
+    HistoryIdentity::try_from(wire)
 }
 
 /// `recording` inside the `rcb_history` envelope stating `identity`.
@@ -2209,7 +2244,15 @@ mod identity_tests {
 
     #[test]
     fn an_identity_recording_round_trips_with_its_identity() {
-        for identity in [known(), HistoryIdentity::Unqualified("claim-unset".into())] {
+        for identity in [
+            known(),
+            HistoryIdentity::BackendLocal("test:local-rcb:v1".into()),
+            HistoryIdentity::Unqualified("claim-unset".into()),
+        ] {
+            assert_eq!(
+                history_identity_from_json(&history_identity_to_json(&identity)).unwrap(),
+                identity
+            );
             let legacy = PreemptionRecord::from_sched_events_with_identity(
                 vec![SchedEvent::branches(DetTid::from_raw(3), 7)],
                 Some(identity.clone()),

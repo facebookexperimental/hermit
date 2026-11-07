@@ -76,6 +76,11 @@ pub enum RcbClockClaim {
     Unset,
     /// Prepared for this qualified clock key.
     Known(reverie::pmu_config::ClockKey),
+    /// Prepared for a backend-local RCB clock stated only by this opaque,
+    /// versioned token. The token names what makes two recordings
+    /// comparable (backend kind, the counter it counts, and a version);
+    /// Detcore compares tokens for equality and never interprets them.
+    BackendLocal(&'static str),
 }
 
 /// Sets `supports_blocked_wait_signal_interruption` and the four capabilities
