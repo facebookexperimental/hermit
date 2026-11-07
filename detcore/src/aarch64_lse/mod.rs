@@ -51,7 +51,9 @@ pub mod rewrite;
 /// or the address held where the scan stops, every executable byte.
 /// 8: a UDF #imm16 word, which traps and never branches, no longer refuses
 /// the image. 9: nor does a word of the SVE encodings, which hold no branch.
-pub const REWRITE_FORMAT_VERSION: u32 = 9;
+/// 10: flag-setting read-modify-write loops retain the original ALU
+/// instruction after the LSE atomic so their outgoing flags are preserved.
+pub const REWRITE_FORMAT_VERSION: u32 = 10;
 
 /// Whether this host executes the FEAT_LSE atomics the rewrite emits.
 ///
