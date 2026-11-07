@@ -5913,11 +5913,7 @@ pub fn resolved_cell_timeouts(
     cell: &SelectedCell,
     timeout_multipliers: TimeoutMultipliers,
 ) -> Result<ResolvedTestTimeouts, String> {
-    resolve_test_timeouts(
-        cell.cpu_timeout_seconds,
-        cell.timeout_seconds,
-        timeout_multipliers,
-    )
+    resolve_test_timeouts(cell.cpu_timeout_seconds, timeout_multipliers)
 }
 
 pub(crate) fn cell_timeouts(
@@ -16936,8 +16932,9 @@ fi
         };
         let resolved = resolved_cell_timeouts(cell, multipliers).unwrap();
         assert_eq!(resolved.cpu_seconds, 28);
-        // Wall backstop 180 s (8x policy) scaled by 1.5 = 270 s.
-        assert_eq!(resolved.wall_seconds, 270);
+        // Wall derives from the scaled CPU: min(8 x 28, 600) = 224,
+        // scaled by the wall multiplier 1.5 = 336 s.
+        assert_eq!(resolved.wall_seconds, 336);
         let mut context = run_context(&root);
         context.timeout_multipliers = multipliers;
         let retained = infrastructure_error_result(&context, cell, "fixture".into());
