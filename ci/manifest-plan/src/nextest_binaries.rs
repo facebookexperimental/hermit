@@ -3130,6 +3130,12 @@ mod tests {
             },
         )]);
         assert!(apply_harvest(&manifest, &root, &generation, &mut unmatched).is_err());
+        // The recomputed hash stays bound to the bytes that run: tampering
+        // with the harvested file after substitution is refused by the same
+        // check_identity every consumer path runs.
+        std::fs::write(&buck_file, b"tampered basics").unwrap();
+        let record = &selections["full"];
+        assert!(check_identity(&record.binaries[0].executable, true).is_err());
         std::fs::remove_dir_all(&root).unwrap();
     }
 
