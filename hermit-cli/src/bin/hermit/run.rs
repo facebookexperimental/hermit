@@ -6811,7 +6811,7 @@ fn replay_of_instruction_offsets_is_refused_where_unsupported() {
         .unwrap();
         path
     };
-    let newest = detcore::preemptions::PREEMPTION_RECORD_FORMAT;
+    let newest = detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX;
     for format in [newest + 1, newest + 3] {
         let legacy = dir.path().join(format!("legacy-{format}.json"));
         {

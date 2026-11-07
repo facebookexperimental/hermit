@@ -475,6 +475,13 @@ pub struct AnalyzeOpts {
     #[clap(skip)]
     pub time_skip_sources: crate::app::time_skip_carry::SharedTimeSkipSources,
 
+    /// Whether the analysis replays `--chaos-instruction-offset` decisions:
+    /// its run arguments draw them, or a recording it starts from holds them
+    /// (`AnalyzeOpts::adopt_instruction_offsets`). Its schedule replays then
+    /// run without chaos (`RunData::with_schedule_replay_from`).
+    #[clap(skip)]
+    pub replays_instruction_offsets: bool,
+
     /// The invocation's --time-budget and --trial-budget, counted from
     /// `AnalyzeOpts::main`; shared by every copy of these options.
     #[clap(skip)]

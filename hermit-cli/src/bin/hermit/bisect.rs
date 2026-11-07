@@ -119,6 +119,7 @@ impl BisectOpts {
             prefix_search: false,
             continuation_timeslice: crate::app::analyze::ContinuationTimeslice::Auto,
             imprecise_search: false,
+            replays_instruction_offsets: false,
             run1_seed: None,
             run1_preemptions: None,
             run1_schedule: None,

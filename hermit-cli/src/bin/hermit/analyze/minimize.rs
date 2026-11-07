@@ -443,7 +443,6 @@ mod tests {
     #[test]
     fn a_minimize_record_states_only_what_its_rows_hold() {
         use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
-        use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
         use detcore::preemptions::InstructionOffset;
         use detcore::preemptions::PreemptionWriter;
         use detcore::preemptions::RecordedOffsets;
@@ -521,7 +520,7 @@ mod tests {
             let options =
                 AnalyzeOpts::try_parse_from(["analyze", "--analyze-seed=7", "--", "/bin/true"])
                     .unwrap();
-            let trial = crate::app::analyze::rundata::RunData::get_raw_runopts(&options);
+            let trial = crate::app::analyze::rundata::RunData::raw_runopts(&options);
             let mut schedule_replay = trial.det_opts.det_config.clone();
             schedule_replay.chaos = false;
             let guard = |recorded, schedule| {

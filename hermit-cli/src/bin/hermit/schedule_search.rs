@@ -1447,7 +1447,7 @@ mod tests {
             record.validate().unwrap();
             assert_eq!(
                 record.format_version(),
-                Some(detcore::preemptions::INSTRUCTION_OFFSET_FORMAT)
+                Some(detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT)
             );
         }
         // An offset, like an end address, makes an event more than "the

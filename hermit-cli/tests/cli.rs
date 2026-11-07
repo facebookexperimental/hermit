@@ -28234,7 +28234,7 @@ fn an_instruction_offset_record_replays_from_its_schedule_and_analyze_verifies_i
         // offsets format; a record without one states the format below it.
         assert_eq!(
             json["format_version"],
-            detcore::preemptions::INSTRUCTION_OFFSET_FORMAT,
+            detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT,
             "{label}"
         );
         let events = json["global"].as_array().expect("schedule trace");
