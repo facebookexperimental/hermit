@@ -218,6 +218,58 @@ fn a_parked_suspend_ends_exactly_for_a_signal_its_temporary_mask_lets_in() {
     }
 }
 
+/// The coord7 review of https://github.com/rrnewton/hermit/pull/5221, finding
+/// 1: a SIGALRM at its default action, which ends the process, for a waiter
+/// whose own mask blocks it and whose suspend's temporary mask lets it in. The
+/// SIGALRM receiver choice counts the parked waiter, as Linux's
+/// `complete_signal` does a thread asleep in `sigsuspend` under that mask
+/// (kernel/signal.c:4835-4846 and 963-997 at v7.1.3), so the choice finds a
+/// thread and the fatal refusal (`fatal_alarm_refusal`), which runs only
+/// where it finds none, is not reached; the drain then wakes the waiter for
+/// the copy, and its own turn ends the process. Before, the choice passed the
+/// waiter over as out of reach (D1), found no thread, and KVM refused the run
+/// with exit 122 where Linux, ptrace and the base end it with SIGALRM (142).
+/// A temporary mask that blocks it leaves the waiter unchosen and asleep.
+#[test]
+fn a_fatal_alarm_for_a_backend_sigsuspend_is_not_refused() {
+    let alrm = bit(libc::SIGALRM);
+    for place in [Place::Parked, Place::Queued] {
+        // Pending in the shared queue, blocked by its own mask, default action.
+        let (mut scheduler, _) = kvm(Ok(state(0, alrm, alrm, 0, 0)));
+        file(&mut scheduler, WAITER, suspend_request(WAITER, 0), place);
+        // The backend reports no recipient: its own mask blocks SIGALRM.
+        assert_eq!(
+            scheduler.alarm_receiver(PROCESS, &[]),
+            Some(WAITER),
+            "{place:?}"
+        );
+        scheduler.wake_backend_signal_waits();
+        assert_eq!(
+            woken(&scheduler, WAITER),
+            Some(vec![libc::SIGALRM]),
+            "{place:?}"
+        );
+        // Woken but not yet run, it is still inside the call, under its mask:
+        // still the receiver, not passed over for its own mask.
+        assert_eq!(scheduler.controlled_temporary_mask(WAITER), Ok(Some(0)));
+        assert_eq!(
+            scheduler.alarm_receiver(PROCESS, &[]),
+            Some(WAITER),
+            "{place:?}"
+        );
+    }
+    let (mut scheduler, _) = kvm(Ok(state(0, alrm, 0, 0, 0)));
+    file(
+        &mut scheduler,
+        WAITER,
+        suspend_request(WAITER, alrm),
+        Place::Parked,
+    );
+    assert_eq!(scheduler.alarm_receiver(PROCESS, &[]), None);
+    scheduler.wake_backend_signal_waits();
+    assert!(still_waits(&scheduler, WAITER));
+}
+
 /// Mutation "SIGCHLD held with a child" (S2b's fallback, removed by S4): in a
 /// process with a child whose exit sends SIGCHLD, a pending child-exit SIGCHLD
 /// ends a suspend that lets it in as any other signal does, because the

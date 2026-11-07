@@ -135,9 +135,16 @@ pub(super) enum AlarmReach {
     Queued,
     /// A vfork parent: Linux cannot wake it either, so the copy waits for it.
     VforkParent,
+    /// Parked in an `rt_sigsuspend` the backend's own call serves
+    /// (`Scheduler::backend_suspend_mask`, SIGSHARE S2b): the step-2 drain's
+    /// `wake_backend_signal_waits` ends that wait for a signal its temporary
+    /// mask lets in, after this generation, as Linux's interruptible sleep
+    /// under the call's mask ends (`sys_rt_sigsuspend`). Nothing is done here.
+    BackendSuspend,
     /// Waiting where this backend cannot interrupt the wait: a futex wait, a
     /// call outside the schedule, or another wait outside the run queue that
-    /// the observation protocol does not cover. Passed over (D1).
+    /// neither the observation protocol nor the step-2 drain ends (not a
+    /// backend-served `rt_sigsuspend`, `BackendSuspend`). Passed over (D1).
     OutOfReach,
 }
 /// Which threads a SIGALRM receiver choice counts as able to take the copy
@@ -1730,7 +1737,12 @@ impl Scheduler {
                     self.parked.alarm_takers.insert(pid, tid);
                 }
             }
-            AlarmReach::TakesAtItsProbe | AlarmReach::VforkParent | AlarmReach::OutOfReach => {}
+            // A backend-served `rt_sigsuspend` is woken for the copy by the
+            // step-2 drain after this generation (`wake_backend_signal_waits`).
+            AlarmReach::TakesAtItsProbe
+            | AlarmReach::BackendSuspend
+            | AlarmReach::VforkParent
+            | AlarmReach::OutOfReach => {}
         }
         Ok(false)
     }
@@ -1876,8 +1888,10 @@ impl Scheduler {
     /// one more thread is passed over, which Linux would choose: one waiting
     /// where Linux interrupts the wait for the signal (`signal_wake_up`) but
     /// this backend cannot (`AlarmReach::OutOfReach`: a futex wait, a call
-    /// outside the schedule, or another wait outside the run queue that the
-    /// observation protocol does not cover). It cannot take the copy until
+    /// outside the schedule, or another wait outside the run queue that
+    /// neither the observation protocol nor the step-2 drain ends; a
+    /// backend-served `rt_sigsuspend`, which the drain ends, is counted,
+    /// `AlarmReach::BackendSuspend`). It cannot take the copy until
     /// that wait ends, so choosing it would leave the copy pending, and could
     /// leave the run without progress where the signal's handler is what ends
     /// the wait; passing it over, as Linux passes over a thread that cannot
@@ -1970,7 +1984,8 @@ impl Scheduler {
     ///
     /// Decided from the scheduler's committed state: a vfork barrier, the
     /// pools of calls running outside the schedule, the parked request's
-    /// origin, and run-queue membership. A thread outside the schedule files
+    /// origin, a backend-served `rt_sigsuspend`'s filed request, and run-queue
+    /// membership. A thread outside the schedule files
     /// its rejoin when host timing finishes its call, so its request is not
     /// read. A queued thread's request is read, for which call it polls: it
     /// filed that request in its own turn.
@@ -2002,6 +2017,18 @@ impl Scheduler {
             && !turn.resp.is_full()
         {
             return AlarmReach::Parked;
+        }
+        // S2b's park of an `rt_sigsuspend` the backend serves: an indefinite
+        // sleep, held in the timed waiters, that the step-2 drain ends
+        // (`wake_backend_signal_waits`). Linux sleeps interruptibly there under
+        // the call's mask, so a signal that mask lets in ends the wait, and a
+        // fatal one ends the process (`sigsuspend`, kernel/signal.c:4835-4846
+        // at v7.1.3; `complete_signal`'s fatal path, lines 999-1027). Passed
+        // over as out of reach, a default-action SIGALRM was refused (exit
+        // 122) where Linux, ptrace and the base ended the process (the coord7
+        // review of https://github.com/rrnewton/hermit/pull/5221, finding 1).
+        if self.backend_suspend_mask(tid).is_some() {
+            return AlarmReach::BackendSuspend;
         }
         if !self.run_queue.contains_tid(tid) {
             return AlarmReach::OutOfReach;

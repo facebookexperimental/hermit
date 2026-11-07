@@ -26207,6 +26207,88 @@ fn run_kvm_a_paused_leader_takes_its_own_signal_as_linux_wakes_it() {
     }
 }
 
+/// The coord7 review of <https://github.com/rrnewton/hermit/pull/5221>,
+/// finding 1: a SIGALRM for a main thread waiting in `sigsuspend` under an
+/// empty mask while its own mask blocks the signal. Linux's `sigsuspend` sleeps
+/// interruptibly under the call's mask (kernel/signal.c:4835-4846 at v7.1.3),
+/// so `complete_signal` chooses the waiter, which the expiry names; at the
+/// default action it ends the process at once (lines 999-1027). In
+/// tests/c/alarm_receiver_reach.c's `dflsuspend` the waiter is alone, and in
+/// `dflsuspend2` a second thread that blocks SIGALRM waits in `pause`: each dies
+/// of SIGALRM natively (exit 142 from a shell, 5 of 5 runs each on Linux
+/// 7.1.3), and must on ptrace and on KVM, in two runs each (`--verify` refuses a
+/// run whose guest dies of a signal). In `suspend` a handler takes it and a
+/// second thread that leaves SIGALRM unblocked waits in `pause`: the handler
+/// runs on the waiter and `sigsuspend` fails with EINTR, which must hold
+/// natively, then on ptrace and on KVM at bitwise parity. Before, KVM's
+/// receiver choice passed the backend-served suspend over as a wait it cannot
+/// interrupt (D1): `dflsuspend` and `dflsuspend2` were refused with exit 122,
+/// and `suspend` ended as a deadlock under Hermit's model (exit 121). The ptrace
+/// legs run wherever this test runs.
+#[test]
+fn run_kvm_a_default_alarm_ends_a_sigsuspend_as_linux_does() {
+    use std::os::unix::process::ExitStatusExt;
+    let (mode, linux) = ("suspend", "mode=suspend on_leader=1 eintr=1\n");
+    assert_eq!(
+        native_alarm_receiver_reach(mode, linux),
+        linux,
+        "{mode}: natively"
+    );
+    for fatal in ["dflsuspend", "dflsuspend2"] {
+        let output = Command::new(alarm_receiver_reach_guest())
+            .arg(fatal)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run the alarm-receiver-reach guest natively");
+        assert_eq!(
+            output.status.signal(),
+            Some(libc::SIGALRM),
+            "{fatal}: natively: {output:?}"
+        );
+    }
+    let kvm = Path::new("/dev/kvm").exists();
+    if !kvm {
+        eprintln!("skipping the KVM sigsuspend alarm cases: /dev/kvm is unavailable");
+    }
+    let backends: &[&[&str]] = if kvm {
+        &[&[], &["--backend=kvm"]]
+    } else {
+        &[&[]]
+    };
+    for backend in backends {
+        assert_eq!(
+            alarm_receiver_reach_at_l2(backend, mode),
+            linux,
+            "{mode}: {backend:?}"
+        );
+        let _guard = hermit_run_guard();
+        let guest = alarm_receiver_reach_guest()
+            .to_str()
+            .expect("guest path should be UTF-8");
+        for fatal in ["dflsuspend", "dflsuspend2"] {
+            let mut args: Vec<&str> = backend.to_vec();
+            args.extend([
+                "run",
+                "--strict",
+                "--base-env=minimal",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--",
+                guest,
+                fatal,
+            ]);
+            for run in 0..2 {
+                let output = hermit(&args);
+                assert_eq!(
+                    output.status.signal(),
+                    Some(libc::SIGALRM),
+                    "{fatal} {backend:?} run {run}: {output:?}"
+                );
+                assert_eq!(stdout(&output), "", "{fatal} {backend:?} run {run}");
+            }
+        }
+    }
+}
+
 /// A line a backend prints where Linux prints another, recorded with the
 /// issue that tracks the difference.
 struct KnownDivergence {

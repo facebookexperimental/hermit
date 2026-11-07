@@ -9142,6 +9142,23 @@ fn file_masked_pselect6(s: &mut Scheduler, tid: DetTid, mask: u64) {
     s.next_turns[&tid].req.put(Ok(r));
 }
 
+/// Parks `tid` in an `rt_sigsuspend` under temporary mask `mask`, as
+/// `Detcore::handle_rt_sigsuspend` files it where the backend serves the wait
+/// (SIGSHARE S2b, `Scheduler::backend_suspend_mask`): an indefinite sleep
+/// tagged `RT_SIGSUSPEND_FYI` that carries the mask, held in the timed waiters.
+fn file_backend_suspend(s: &mut Scheduler, tid: DetTid, mask: u64) {
+    let mut r = Resources::new(tid);
+    r.insert(
+        ResourceID::SleepUntil(LogicalTime::INDEFINITE),
+        Permission::W,
+    );
+    r.fyi(crate::resources::RT_SIGSUSPEND_FYI);
+    r.blocked_signal_mask = Some(mask);
+    s.next_turns[&tid].req.put(Ok(r));
+    s.blocked.timed_waiters.insert(LogicalTime::INDEFINITE, tid);
+    assert_eq!(s.backend_suspend_mask(tid), Some(mask));
+}
+
 /// Files `tid`'s retry of a call polled by `retry_nonblocking_syscall_helper`
 /// (`fyi`, with the restart marker `marker`, if any) and queues it as a
 /// poller, as step 4 defers a retry that is not ready.
@@ -9391,6 +9408,13 @@ enum AlarmThread {
     /// rejoin, filed when host timing finished the call, says its temporary
     /// mask is unknown; SIGALRM unblocked.
     OutsideWithUnknownRejoin,
+    /// Parked in an `rt_sigsuspend` the backend serves (SIGSHARE S2b), held in
+    /// the timed waiters, whose temporary mask admits SIGALRM, which its own
+    /// mask blocks.
+    BackendSuspend,
+    /// As `BackendSuspend`, with a temporary mask that blocks SIGALRM, which
+    /// its own mask does not.
+    BackendSuspendBlocks,
 }
 
 /// Each `Pause` thread of `choose_alarm_receiver` and its response.
@@ -9423,9 +9447,10 @@ fn choose_alarm_receiver(
         let raw = 100 + i32::try_from(i).unwrap();
         let (tid, mm, site) = add(&mut s, 100, raw);
         let own_mask = match state {
-            AlarmThread::Blocks | AlarmThread::MaskedWaitAdmits | AlarmThread::Sigtimedwait => {
-                SIGALRM_BIT
-            }
+            AlarmThread::Blocks
+            | AlarmThread::MaskedWaitAdmits
+            | AlarmThread::Sigtimedwait
+            | AlarmThread::BackendSuspend => SIGALRM_BIT,
             _ => 0,
         };
         let usr1 = 1 << (libc::SIGUSR1 - 1);
@@ -9515,6 +9540,8 @@ fn choose_alarm_receiver(
                 r.blocked_signal_mask_unknown = true;
                 s.next_turns[&tid].req.put(Ok(r));
             }
+            AlarmThread::BackendSuspend => file_backend_suspend(&mut s, tid, 0),
+            AlarmThread::BackendSuspendBlocks => file_backend_suspend(&mut s, tid, SIGALRM_BIT),
         }
     }
     if let Some(target) = curr_target {
@@ -9573,7 +9600,7 @@ fn alarm_action(
 fn one_receiver_choice_takes_a_published_alarm_as_complete_signal_chooses() {
     use AlarmThread::*;
     let t = DetTid::from_raw;
-    let cases: [ReceiverCase; 28] = [
+    let cases: [ReceiverCase; 30] = [
         (
             "a runnable leader that wants it, beside a parked sibling",
             &[Runnable, Pause],
@@ -9764,6 +9791,22 @@ fn one_receiver_choice_takes_a_published_alarm_as_complete_signal_chooses() {
         (
             "a thread outside the schedule is passed over, its rejoin unread",
             &[OutsideWithUnknownRejoin, Pause],
+            None,
+            None,
+            Some(t(101)),
+        ),
+        (
+            "a leader in a backend-served sigsuspend whose mask admits it is \
+             chosen, and the drain's wake takes it: not passed over for a \
+             parked sibling",
+            &[BackendSuspend, Pause],
+            None,
+            None,
+            None,
+        ),
+        (
+            "a backend-served sigsuspend whose mask blocks it is passed over",
+            &[BackendSuspendBlocks, Pause],
             None,
             None,
             Some(t(101)),
@@ -10618,6 +10661,9 @@ fn the_linux_choice_differs_from_the_backends_only_by_the_named_gap() {
             Some(t(101)),
             Some(t(102)),
         ),
+        // A backend-served sigsuspend is no gap: the drain ends its wait.
+        (&[BackendSuspend][..], Some(t(100)), Some(t(100))),
+        (&[BackendSuspend, Pause][..], Some(t(100)), Some(t(100))),
     ] {
         let (s, b, _) = choose_alarm_receiver(threads, None);
         let recipients = b

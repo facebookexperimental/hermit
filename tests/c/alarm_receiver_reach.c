@@ -260,6 +260,20 @@
  *       No timer: the leader loops in pause() until a worker's SIGUSR1,
  *       sent after 3 ms, has run its handler. Linux wakes the leader for it.
  *       Prints "mode=busypausealone usr1=1".
+ *   dflsuspend, dflsuspend2
+ *       SIGALRM at its default action; the main thread blocks it and waits in
+ *       sigsuspend() under an empty mask, and a one-shot 10 ms ITIMER_REAL
+ *       expires. Linux's sigsuspend sleeps interruptibly under the call's mask
+ *       (sys_rt_sigsuspend), so the main thread wants the signal and Linux
+ *       ends the process at generation. In dflsuspend2 a second thread, which
+ *       blocks SIGALRM, waits in pause(). Killed by SIGALRM; "sigsuspend:
+ *       returned" would mean it was not.
+ *   suspend
+ *       As dflsuspend with a handler, and a second thread that leaves SIGALRM
+ *       unblocked waits in pause(): Linux gives the copy to the main thread,
+ *       which the expiry names and whose sigsuspend mask admits it; the
+ *       handler runs there and sigsuspend fails with EINTR. Prints
+ *       "mode=suspend on_leader=1 eintr=1".
  */
 
 #define _GNU_SOURCE
@@ -1278,6 +1292,61 @@ static int poll_retry(const char* mode) {
   return 0;
 }
 
+/* dflsuspend, dflsuspend2, suspend: a SIGALRM for a main thread waiting in
+ * sigsuspend() (the coord7 review of https://github.com/rrnewton/hermit/pull/5221,
+ * finding 1). */
+static void on_suspend_alarm(int signal) {
+  (void)signal;
+  handled_by = (pid_t)syscall(SYS_gettid);
+}
+
+static void* blocked_pauser(void* arg) {
+  (void)arg;
+  sigset_t alarm;
+  sigemptyset(&alarm);
+  sigaddset(&alarm, SIGALRM);
+  pthread_sigmask(SIG_BLOCK, &alarm, NULL);
+  for (;;) {
+    pause();
+  }
+  return NULL;
+}
+
+static int suspend_wait(const char* mode) {
+  int fatal = strncmp(mode, "dfl", 3) == 0;
+  struct sigaction action;
+  memset(&action, 0, sizeof(action));
+  action.sa_handler = fatal ? SIG_DFL : on_suspend_alarm;
+  sigaction(SIGALRM, &action, NULL);
+  pthread_t thread;
+  if (strcmp(mode, "suspend") == 0) {
+    if (pthread_create(&thread, NULL, pauser, NULL) != 0) {
+      return 1;
+    }
+  } else if (strcmp(mode, "dflsuspend2") == 0) {
+    if (pthread_create(&thread, NULL, blocked_pauser, NULL) != 0) {
+      return 1;
+    }
+  }
+  sigset_t alarm;
+  sigemptyset(&alarm);
+  sigaddset(&alarm, SIGALRM);
+  sigprocmask(SIG_BLOCK, &alarm, NULL);
+  struct timespec settle = {0, 20000000};
+  nanosleep(&settle, NULL);
+  arm_one_shot();
+  sigset_t empty;
+  sigemptyset(&empty);
+  int result = sigsuspend(&empty);
+  int eintr = result == -1 && errno == EINTR;
+  if (fatal) {
+    printf("sigsuspend: returned %d eintr=%d\n", result, eintr);
+    return 1;
+  }
+  printf("mode=%s on_leader=%d eintr=%d\n", mode, handled_by == getpid(), eintr);
+  return 0;
+}
+
 /* busypause, busypausealone: a thread-directed SIGUSR1 to a leader parked
  * in pause(), which Linux wakes for it whatever a SIGALRM does
  * (https://github.com/rrnewton/hermit/issues/4929). */
@@ -1360,6 +1429,10 @@ int main(int argc, char** argv) {
   const char* mode = argc > 1 ? argv[1] : "poll";
   if (strncmp(mode, "busypause", 9) == 0) {
     return busy_pause(mode);
+  }
+  if (strcmp(mode, "dflsuspend") == 0 || strcmp(mode, "dflsuspend2") == 0 ||
+      strcmp(mode, "suspend") == 0) {
+    return suspend_wait(mode);
   }
   if (strcmp(mode, "twotimers") == 0) {
     return two_timers();

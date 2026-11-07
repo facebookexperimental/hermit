@@ -217,8 +217,10 @@ impl Scheduler {
     ///   recorded (`BlockedPool::continuation_masks`), or else its own;
     /// - any other thread: its filed request's temporary mask
     ///   (`Resources::blocked_signal_mask`, which a controlled backend's
-    ///   probed call fills too), or else its own. `Err` where the request says
-    ///   the mask is unknown.
+    ///   probed call fills too), or, for a backend-served `rt_sigsuspend` that
+    ///   a wake replaced the request of and that has not run since
+    ///   (`backend_suspend_woken`), the suspend's mask, or else its own. `Err`
+    ///   where the request says the mask is unknown.
     pub(crate) fn controlled_temporary_mask(
         &self,
         thread: DetTid,
@@ -246,7 +248,20 @@ impl Scheduler {
         if request.blocked_signal_mask_unknown {
             return Err(TemporaryMaskUnknown);
         }
-        Ok(request.blocked_signal_mask)
+        // A woken `rt_sigsuspend` is still inside the call until its own turn
+        // returns: Linux restores the thread's mask only as the woken call
+        // delivers its signal (`restore_saved_sigmask`), so until then the
+        // call's mask is the one `blocked` holds. The wake's signal-set
+        // request does not carry it, so S2b keeps it
+        // (`note_backend_suspend_replaced`). Read as the thread's own mask, a
+        // waiter that blocks the signal outside the call was passed over once
+        // the step-2 drain woke it, and a sibling parked in `pause` took the
+        // copy its `sigsuspend` was woken for, which then waited for ever (the
+        // `suspend` mode of tests/c/alarm_receiver_reach.c; the coord7 review
+        // of https://github.com/rrnewton/hermit/pull/5221, finding 1).
+        Ok(request
+            .blocked_signal_mask
+            .or_else(|| self.backend_suspend_woken.get(&thread).copied()))
     }
 
     /// `request` as the scheduler's polling record prints it (the NONCOMMIT
