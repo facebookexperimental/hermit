@@ -12998,8 +12998,11 @@ impl RunOpts {
         // checks Detcore makes per record) before identity admission, as
         // on the Detcore route: a record failing its provenance is refused
         // for that specific reason even where its identity would also
-        // refuse. The launch path validates again below.
-        detcore::preemptions::validate_chosen_provenance(&self.effective_det_config())?;
+        // refuse. The launch path validates again below. Namespace-only
+        // ignores schedule inputs entirely.
+        if !self.namespace_only {
+            detcore::preemptions::validate_chosen_provenance(&self.effective_det_config())?;
+        }
         self.refuse_unadmitted_rcb_histories(&[])?;
         // Refused here too, before stdin is read; each run's preparation
         // below sets the configuration from the same record. After identity

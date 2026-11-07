@@ -29200,8 +29200,7 @@ fn a_schedule_replay_names_a_host_input_changed_since_the_recording() {
     assert_eq!(out, "input\n");
     // The schedule and the summary carry the same set, which holds `F` with
     // its size and the SHA-256 of its bytes (`printf 'input\n' | sha256sum`).
-    let recorded: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&schedule).unwrap()).unwrap();
+    let recorded = hermit_test::recorded_preemption_json(&schedule);
     assert_eq!(
         recorded["host_inputs"], summary["host_inputs"],
         "{recorded}"
@@ -29768,8 +29767,7 @@ fn a_schedule_replay_names_a_stdio_kind_changed_since_the_recording() {
     assert_eq!(recorded, "fsync(stderr) = 0\n");
     assert!(named(&recorded_stderr).is_empty(), "{recorded_stderr}");
     assert_eq!(recorded_summary["host_inputs"]["stdio"]["stderr"], "file");
-    let record: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(&schedule).unwrap()).unwrap();
+    let record = hermit_test::recorded_preemption_json(&schedule);
     assert_eq!(record["host_inputs"]["stdio"]["stderr"], "file");
 
     let (piped, piped_stderr, piped_summary) = run(&replay_arg, "replay-pipe", false);
