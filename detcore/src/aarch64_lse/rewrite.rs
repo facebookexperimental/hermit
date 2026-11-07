@@ -1522,6 +1522,145 @@ mod tests {
     }
 
     #[test]
+    fn a_register_operand_that_is_the_stored_value_is_rewritten_as_the_first_attempt() {
+        // The zero-failed-store native path is valid: Rs takes the entry Rm
+        // before the atomic, and the copied ALU still reads that entry Rm
+        // before writing Rv. Pin all four emitted words for Rm == Rv, for
+        // the existing plain operations as well as ADDS and SUBS.
+        // Literal W/X materialisers and release-only LSE words keep this
+        // oracle independent of the encoder helpers used by the rewriter.
+        let operations = [
+            (
+                "add",
+                AluOp::Add,
+                false,
+                0x8b0b_012b,
+                [0x2a0b_03ea, 0xaa0b_03ea],
+                [0xb86a_0109, 0xf86a_0109],
+            ),
+            (
+                "adds",
+                AluOp::Add,
+                true,
+                0xab0b_012b,
+                [0x2a0b_03ea, 0xaa0b_03ea],
+                [0xb86a_0109, 0xf86a_0109],
+            ),
+            (
+                "sub",
+                AluOp::Sub,
+                false,
+                0xcb0b_012b,
+                [0x4b0b_03ea, 0xcb0b_03ea],
+                [0xb86a_0109, 0xf86a_0109],
+            ),
+            (
+                "subs",
+                AluOp::Sub,
+                true,
+                0xeb0b_012b,
+                [0x4b0b_03ea, 0xcb0b_03ea],
+                [0xb86a_0109, 0xf86a_0109],
+            ),
+            (
+                "orr",
+                AluOp::Orr,
+                false,
+                0xaa0b_012b,
+                [0x2a0b_03ea, 0xaa0b_03ea],
+                [0xb86a_3109, 0xf86a_3109],
+            ),
+            (
+                "eor",
+                AluOp::Eor,
+                false,
+                0xca0b_012b,
+                [0x2a0b_03ea, 0xaa0b_03ea],
+                [0xb86a_2109, 0xf86a_2109],
+            ),
+            (
+                "bic",
+                AluOp::Bic,
+                false,
+                0x8a2b_012b,
+                [0x2a0b_03ea, 0xaa0b_03ea],
+                [0xb86a_1109, 0xf86a_1109],
+            ),
+            (
+                "and",
+                AluOp::And,
+                false,
+                0x8a0b_012b,
+                [0x2a2b_03ea, 0xaa2b_03ea],
+                [0xb86a_1109, 0xf86a_1109],
+            ),
+        ];
+        for (index, (width, sf, load, store)) in [
+            ("w", false, 0x885f_7d09, 0x880a_fd0b),
+            ("x", true, 0xc85f_7d09, 0xc80a_fd0b),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (name, op, sets_flags, xword, materialise, atomic) in operations {
+                let alu = if sf { xword } else { xword & !(1 << 31) };
+                assert_eq!(
+                    decode(alu),
+                    Insn::Alu {
+                        op,
+                        sets_flags,
+                        sf,
+                        rd: 11,
+                        rn: 9,
+                        operand: Operand::Reg(11),
+                    },
+                    "{width} {name} fixture"
+                );
+                let words = [load, alu, store, 0x35ff_ffaa];
+                let expected = [materialise[index], atomic[index], alu, 0x2a1f_03ea];
+                let report = plan(&words, BASE);
+                assert_eq!(report.refused, vec![], "{width} {name}: {report:?}");
+                assert_eq!(
+                    report.patched,
+                    vec![Site {
+                        addr: BASE,
+                        idiom: Idiom::Rmw,
+                        words: expected.to_vec(),
+                    }],
+                    "{width} {name} first attempt"
+                );
+                let mut rewritten = words;
+                apply(&mut rewritten, BASE, &report);
+                assert_eq!(rewritten, expected, "{width} {name} exact rewrite");
+
+                // Only Rm changes, to a register the loop never writes.
+                let distinct = (alu & !(0x1f << 16)) | (12 << 16);
+                let control = [load, distinct, store, 0x35ff_ffaa];
+                let report = plan(&control, BASE);
+                assert_eq!(report.refused, vec![], "{width} {name} distinct operand");
+                assert_eq!(report.patched.len(), 1, "{width} {name}: {report:?}");
+                assert_eq!(report.patched[0].idiom, Idiom::Rmw);
+                assert_eq!(report.patched[0].addr, BASE);
+                assert_eq!(report.patched[0].words.len(), 4);
+                assert_eq!(report.patched[0].words[2], distinct);
+            }
+        }
+
+        // The immediate operand in Rust's Arc drop keeps its exact rewrite.
+        let arc_drop = [0xc85f_7d09, 0xf100_0529, 0xc80a_fd09, 0x35ff_ffaa];
+        let report = plan(&arc_drop, BASE);
+        assert_eq!(report.refused, vec![], "{report:?}");
+        assert_eq!(
+            report.patched,
+            vec![Site {
+                addr: BASE,
+                idiom: Idiom::Rmw,
+                words: vec![0x9280_000a, 0xf86a_0109, 0xf100_0529, 0x2a1f_03ea],
+            }]
+        );
+    }
+
+    #[test]
     fn the_flags_an_arc_drop_leaves_are_kept_for_the_branch_after_it() {
         // The linker's `Arc` drop and the `b.ne` after it that reads the flags
         // the loop's SUBS set: only the loop is replaced, and the replacement's
