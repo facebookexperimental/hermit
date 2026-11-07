@@ -106,6 +106,7 @@ pub(crate) use threads::reads_signal_state_from_backend;
 pub(crate) use threads::real_uid;
 pub(crate) use threads::refuse_host_signal_state_reads;
 pub(crate) use threads::refuses_host_signal_state_reads;
+pub(crate) use threads::restarts_woken_calls_only_through_erestartsys;
 pub(crate) use threads::retires_others_at_fatal_delivery;
 pub(crate) use threads::signal_sets_errno;
 #[cfg(test)]

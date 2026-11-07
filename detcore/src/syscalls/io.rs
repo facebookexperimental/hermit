@@ -1153,6 +1153,22 @@ fn canonicalize_socket_timestamps(control: &mut [u8], now: LogicalTime) -> usize
     messages.len()
 }
 
+/// [`Detcore::keep_deadline_for_rerun`]'s rule: a `poll` with an end time
+/// (`deadline`) keeps it for its rerun on a backend that restarts a woken call
+/// only through `ERESTARTSYS` (`restarts_only_through_erestartsys`), when a
+/// signal woke it (`woken`) or it ends with `ERESTARTSYS`.
+fn keeps_poll_deadline_for_rerun(
+    restarts_only_through_erestartsys: bool,
+    deadline: Option<LogicalTime>,
+    woken: crate::syscalls::helpers::WokenWait,
+    result: &Result<i64, Error>,
+) -> bool {
+    restarts_only_through_erestartsys
+        && deadline.is_some()
+        && (woken == crate::syscalls::helpers::WokenWait::Poll
+            || matches!(result, Err(Error::Errno(errno)) if *errno == Errno::ERESTARTSYS))
+}
+
 fn sanitize_ppoll_signal_mask(mask: u64) -> u64 {
     let signal_bit = (reverie::PERF_EVENT_SIGNAL as usize) - 1;
     mask & !(1_u64 << signal_bit)
@@ -3669,16 +3685,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         rsrc.polls_guest_state_only = rsrc.relies_on_guest_held_marks;
         let result = retry_nonblocking_syscall_with_timeout(guest, call, rsrc, deadline).await;
         keep_restart_block(guest, &result, RestartCall::Poll(call), deadline).await;
-        self.keep_deadline_for_rerun(guest, &result, call, deadline)
-            .await;
+        Self::keep_deadline_for_rerun(guest, &result, call, deadline).await;
         result
     }
 
     /// Where a signal woke this `poll` and no handler ran, Linux restarts it
     /// through its restart block, which keeps the call's end time
-    /// (`do_restart_poll`; fs/select.c:1076-1090 at v6.17). A backend with a
-    /// process signal control (KVM) restarts it by running the guest's own
-    /// `poll` again after `ERESTARTSYS` (`woken_poll_errno`), with the timeout
+    /// (`do_restart_poll`; fs/select.c:1076-1090 at v6.17). A backend that
+    /// restarts a woken call only through `ERESTARTSYS`
+    /// (`restarts_woken_calls_only_through_erestartsys`, KVM) restarts it by
+    /// running the guest's own `poll` again (`woken_poll_errno`), with the timeout
     /// the guest passed, so the deadline is kept here, in the thread's restart
     /// record, as a rerun record (`RestartCall::PollRerun`), for that next run
     /// of the same call at the same address ([`Self::handle_poll`], or
@@ -3696,17 +3712,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// `poll` is then its own, and waits its whole timeout.
     #[cfg(target_arch = "x86_64")]
     pub(crate) async fn keep_deadline_for_rerun<G: Guest<Self>>(
-        &self,
         guest: &mut G,
         result: &Result<i64, Error>,
         call: syscalls::Poll,
         deadline: Option<LogicalTime>,
     ) {
-        if self.cfg.backend.provides_process_signal_control
-            && deadline.is_some()
-            && (guest.thread_state().woken_wait == crate::syscalls::helpers::WokenWait::Poll
-                || matches!(result, Err(Error::Errno(errno)) if *errno == Errno::ERESTARTSYS))
-        {
+        if keeps_poll_deadline_for_rerun(
+            crate::syscalls::restarts_woken_calls_only_through_erestartsys(&guest.config().backend),
+            deadline,
+            guest.thread_state().woken_wait,
+            result,
+        ) {
             let rip = crate::arch::instruction_pointer(&guest.regs().await);
             guest.thread_state_mut().restart_block = Some(crate::syscalls::helpers::RestartBlock {
                 rip,
@@ -6285,6 +6301,62 @@ fn warn_property_set_not_visible() {
 
 #[cfg(test)]
 mod tests {
+    /// Mutation M23 of the coord7 review of
+    /// https://github.com/rrnewton/hermit/pull/5221 (finding 4): a `poll` with
+    /// an end time keeps it for its rerun exactly where the backend restarts a
+    /// woken call only through `ERESTARTSYS`, and only when a signal woke it or
+    /// it ends with `ERESTARTSYS`. Linux's restart block keeps the end time
+    /// (`do_restart_poll`, fs/select.c:1076-1090 at v6.17); a backend that
+    /// hands the delivery a restart errno restarts through that block, and a
+    /// call that ends with `EINTR` is not restarted at all.
+    #[test]
+    fn a_poll_keeps_its_end_time_for_a_rerun_only_through_erestartsys() {
+        use reverie::Errno;
+        use reverie::Error;
+
+        use crate::syscalls::helpers::WokenWait;
+        use crate::types::LogicalTime;
+        let at = Some(LogicalTime::from_nanos(5_000_000));
+        let ready: Result<i64, Error> = Ok(1);
+        let restart: Result<i64, Error> = Err(Error::Errno(Errno::ERESTARTSYS));
+        let eintr: Result<i64, Error> = Err(Error::Errno(Errno::EINTR));
+        for (label, restarts, deadline, woken, result, kept) in [
+            ("woken, then ready", true, at, WokenWait::Poll, &ready, true),
+            (
+                "not woken, ERESTARTSYS",
+                true,
+                at,
+                WokenWait::None,
+                &restart,
+                true,
+            ),
+            (
+                "woken, no end time",
+                true,
+                None,
+                WokenWait::Poll,
+                &restart,
+                false,
+            ),
+            (
+                "a backend with restart codes",
+                false,
+                at,
+                WokenWait::Poll,
+                &restart,
+                false,
+            ),
+            ("not woken, EINTR", true, at, WokenWait::None, &eintr, false),
+            ("not woken, ready", true, at, WokenWait::None, &ready, false),
+        ] {
+            assert_eq!(
+                super::keeps_poll_deadline_for_rerun(restarts, deadline, woken, result),
+                kept,
+                "{label}"
+            );
+        }
+    }
+
     /// Only init's two property service sockets count: an exact `sun_path`, with
     /// or without its terminating NUL, under `AF_UNIX`.
     #[test]

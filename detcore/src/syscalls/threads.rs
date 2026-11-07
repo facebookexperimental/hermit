@@ -1703,6 +1703,31 @@ pub(crate) fn reads_signal_state_from_backend(backend: &BackendCapabilities) -> 
     backend.provides_process_signal_control
 }
 
+/// Whether a backend with `backend`'s capabilities restarts a guest call that
+/// a signal woke only by running the call again after `ERESTARTSYS`, and
+/// cannot hand the kernel's signal delivery Linux's other restart codes
+/// (`ERESTARTNOHAND`, `ERESTART_RESTARTBLOCK`): it owns signal delivery
+/// (`provides_process_signal_control`), so no kernel `handle_signal` sees the
+/// call's return, and it does not hand the delivery a restart errno
+/// (`supports_blocked_wait_signal_interruption`, which promises exactly that).
+/// True on KVM alone today.
+///
+/// Linux turns `ERESTARTNOHAND` and `ERESTART_RESTARTBLOCK` into `EINTR`
+/// whenever a handler runs, whatever `SA_RESTART` says, and restarts the call
+/// when none does (`handle_signal`, arch/x86/kernel/signal.c:266-270 at v6.17,
+/// and `arch_do_signal_or_restart`); `ERESTARTSYS` restarts after a handler
+/// with `SA_RESTART`. Where only `ERESTARTSYS` reaches the delivery, Detcore
+/// settles a woken `poll`, unmasked `ppoll` or recorded-socket wait itself at
+/// its return (`woken_poll_errno`) and keeps a `poll`'s end time for its rerun
+/// (`Detcore::keep_deadline_for_rerun`). Every site that decides so reads this
+/// one predicate (the coord7 review of
+/// <https://github.com/rrnewton/hermit/pull/5221>, finding 4). Once KVM can
+/// hand the delivery a restart errno (N8a), it declares
+/// `supports_blocked_wait_signal_interruption` and this turns false there.
+pub(crate) fn restarts_woken_calls_only_through_erestartsys(backend: &BackendCapabilities) -> bool {
+    backend.provides_process_signal_control && !backend.supports_blocked_wait_signal_interruption
+}
+
 /// The errno for a backend's answer that names no signal sets: the errno it
 /// gave (`ESRCH` for a task that is gone, `EAGAIN` for a read an exec
 /// overlapped), or `ENOSYS` where it does not report the fact, which callers

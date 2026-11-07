@@ -1827,7 +1827,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         ) {
             return Ok(());
         }
-        if guest.config().backend.provides_process_signal_control
+        if crate::syscalls::restarts_woken_calls_only_through_erestartsys(&guest.config().backend)
             && sent == 0
             && let Ok(sets) = guest.signal_sets(guest.tid())
             && !crate::syscalls::helpers::delivers_a_signal_with_an_effect(sets)
@@ -2003,8 +2003,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await
             .and_then(|pollfds| Self::network_poll_result(guest, address, &pollfds));
-        self.keep_deadline_for_rerun(guest, &result, call, deadline)
-            .await;
+        Self::keep_deadline_for_rerun(guest, &result, call, deadline).await;
         result
     }
 
@@ -2263,7 +2262,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // `pselect6`) with `ERESTARTNOHAND`, or `poll` with
                 // `ERESTART_RESTARTBLOCK`: `EINTR` once a handler runs, a
                 // restart with the time left when none does. On a backend
-                // that restarts a call only through `ERESTARTSYS` (KVM), a
+                // that restarts a call only through `ERESTARTSYS`
+                // (`restarts_woken_calls_only_through_erestartsys`, KVM), a
                 // signal that wakes this wait is settled as one that wakes an
                 // ordinary `poll` (`woken_poll_errno`, and again at the
                 // return, `settle_woken_wait_at_return`): an ignored copy,
@@ -2273,8 +2273,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // `poll` keeps its deadline for that restart
                 // (`network_poll`); the others write the time left back to
                 // the guest's timeout, which the restart reads.
-                if guest.config().backend.provides_process_signal_control
-                    && interrupted == Errno::EINTR
+                if crate::syscalls::restarts_woken_calls_only_through_erestartsys(
+                    &guest.config().backend,
+                ) && interrupted == Errno::EINTR
                 {
                     drop(guard);
                     return Err(woken_poll_errno(guest, resumed).await?.into());

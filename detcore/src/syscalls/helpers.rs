@@ -3515,9 +3515,10 @@ fn receive_interrupt_errno(default: Errno, socket_timeout: Option<ReceiveTimeout
 /// Linux ends it only through [`woken_poll_errno`]: a `poll` or an unmasked
 /// `ppoll`, whose Linux interrupt is a restart code (`ERESTARTNOHAND`, or
 /// `ERESTART_RESTARTBLOCK` for a `poll` with a deadline;
-/// [`NonblockableSyscall::kernel_restart_errno`]), on a backend with a process
-/// signal control (KVM), which restarts a call only through `ERESTARTSYS`'s
-/// protocol and refuses Linux's other restart codes
+/// [`NonblockableSyscall::kernel_restart_errno`]), on a backend that restarts a
+/// woken call only through `ERESTARTSYS`'s protocol and cannot hand the
+/// delivery Linux's other restart codes
+/// ([`crate::syscalls::restarts_woken_calls_only_through_erestartsys`], KVM)
 /// (<https://github.com/rrnewton/hermit/issues/4929>). Every other call, and
 /// every other backend, keeps its interrupt errno.
 fn restarts_without_a_handler_through_erestartsys<T, G, C>(guest: &G, call: &C) -> bool
@@ -3527,18 +3528,18 @@ where
     G: Guest<Detcore<T>>,
 {
     woken_call_ends_through_erestartsys(
-        guest.config().backend.provides_process_signal_control,
+        crate::syscalls::restarts_woken_calls_only_through_erestartsys(&guest.config().backend),
         call,
     )
 }
 
 /// [`restarts_without_a_handler_through_erestartsys`], given whether the
-/// backend has a process signal control.
+/// backend restarts a woken call only through `ERESTARTSYS`.
 fn woken_call_ends_through_erestartsys<C: NonblockableSyscall>(
-    signal_control: bool,
+    restarts_only_through_erestartsys: bool,
     call: &C,
 ) -> bool {
-    signal_control
+    restarts_only_through_erestartsys
         && call.signal_interrupt_errno() == Errno::EINTR
         && matches!(
             call.kernel_restart_errno(),
@@ -10506,6 +10507,52 @@ pub(crate) mod kernel_signal_wait_failures {
         )
         .await;
         (result, kernel, script)
+    }
+
+    /// Mutation M23 of the coord7 review of
+    /// https://github.com/rrnewton/hermit/pull/5221 (finding 4): a woken
+    /// `poll` with an end time keeps it in the thread's restart record, as a
+    /// rerun record (`RestartCall::PollRerun`), on a backend that restarts a
+    /// woken call only through `ERESTARTSYS` (KVM today), so the rerun ends when
+    /// the first call would have (`do_restart_poll`, fs/select.c:1076-1090 at
+    /// v6.17). A backend that hands the delivery a restart errno (ptrace, or
+    /// KVM once N8a declares `supports_blocked_wait_signal_interruption`)
+    /// keeps none: the kernel's restart block holds the end time there.
+    #[cfg(target_arch = "x86_64")]
+    #[tokio::test]
+    async fn a_woken_poll_keeps_its_end_time_for_its_rerun() {
+        let deadline = Some(LogicalTime::from_nanos(7_000_000));
+        for (label, signal_control, restart_codes, kept) in [
+            ("KVM", true, false, true),
+            ("ptrace", false, true, false),
+            ("KVM after N8a", true, true, false),
+        ] {
+            let (mut guest, _) = WaitGuest::live(0);
+            guest.config.backend.provides_process_signal_control = signal_control;
+            guest
+                .config
+                .backend
+                .supports_blocked_wait_signal_interruption = restart_codes;
+            guest.proof_script = Some(Arc::new(Mutex::new(ProofScript {
+                observe_retry_masks: true,
+                ..ProofScript::default()
+            })));
+            guest.thread.woken_wait = WokenWait::Poll;
+            let call = syscalls::Poll::new().with_nfds(0).with_timeout(7);
+            <crate::Detcore>::keep_deadline_for_rerun(&mut guest, &Ok(0), call, deadline).await;
+            match guest.thread.restart_block {
+                Some(RestartBlock {
+                    deadline: kept_deadline,
+                    call: RestartCall::PollRerun(rerun),
+                    ..
+                }) if kept => {
+                    assert_eq!(kept_deadline, deadline, "{label}");
+                    assert_eq!(rerun, call, "{label}");
+                }
+                None if !kept => {}
+                other => panic!("{label}: {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
