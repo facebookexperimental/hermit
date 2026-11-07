@@ -3233,22 +3233,12 @@ mod runtime {
             Pid::from_raw(std::process::id() as i32)
         }
 
-        /// Why these tests cannot run on this host, if they cannot. They map
-        /// and run code from `/dev/shm`, which a `noexec` mount refuses, and
-        /// with `writes` they write this process's code through
+        /// Why these tests cannot write on this host, if they cannot.
+        /// With `writes` they write this process's code through
         /// `/proc/<pid>/mem`, which Linux 6.12's `proc_mem.force_override`
         /// (or its build-time default) can refuse: a probe write to a private
         /// read-only page says.
         fn cannot_run(writes: bool) -> Option<String> {
-            // SAFETY: an all-zero `statvfs` is a valid buffer.
-            let mut fs: libc::statvfs = unsafe { std::mem::zeroed() };
-            // SAFETY: a NUL-terminated path and a `statvfs` buffer.
-            if unsafe { libc::statvfs(c"/dev/shm".as_ptr(), &mut fs) } != 0 {
-                return Some(format!("/dev/shm: {}", std::io::Error::last_os_error()));
-            }
-            if fs.f_flag & libc::ST_NOEXEC != 0 {
-                return Some("/dev/shm is mounted noexec".to_owned());
-            }
             if !writes {
                 return None;
             }
@@ -3293,11 +3283,73 @@ mod runtime {
             }
         }
 
-        /// An image file in a fresh directory on tmpfs: a file opened by name
-        /// is proven to be the mapped one only outside btrfs and overlayfs,
-        /// and an unprivileged test cannot open `/proc/<pid>/map_files`.
+        /// Create fixtures only below an explicitly selected disk directory.
+        fn fixture_dir() -> tempfile::TempDir {
+            let root = std::env::var_os("HERMIT_AARCH64_TEST_ROOT")
+                .filter(|root| !root.is_empty())
+                .map(PathBuf::from)
+                .expect("this host cannot run this test: set HERMIT_AARCH64_TEST_ROOT to a disk directory");
+            assert!(
+                root.is_absolute(),
+                "HERMIT_AARCH64_TEST_ROOT must be absolute"
+            );
+            let root = root.canonicalize().unwrap_or_else(|error| {
+                panic!(
+                    "this host cannot run this test: {}: {error}",
+                    root.display()
+                )
+            });
+            assert!(
+                !["/tmp", "/dev/shm", "/run/user"]
+                    .iter()
+                    .any(|prefix| root.starts_with(prefix)),
+                "this host cannot run this test: {} is a prohibited temporary location",
+                root.display()
+            );
+            let directory = std::fs::File::open(&root).unwrap_or_else(|error| {
+                panic!(
+                    "this host cannot run this test: {}: {error}",
+                    root.display()
+                )
+            });
+            assert!(directory.metadata().unwrap().is_dir());
+            // SAFETY: zeroed output buffers and a live descriptor for the actual root.
+            let (mut mount, mut kind): (libc::statvfs, libc::statfs) =
+                unsafe { std::mem::zeroed() };
+            // SAFETY: both output buffers are writable and the descriptor stays open.
+            let inspected = unsafe {
+                libc::fstatvfs(directory.as_raw_fd(), &mut mount) == 0
+                    && libc::fstatfs(directory.as_raw_fd(), &mut kind) == 0
+            };
+            assert!(
+                inspected,
+                "this host cannot run this test: inspect {}: {}",
+                root.display(),
+                std::io::Error::last_os_error()
+            );
+            assert!(
+                mount.f_flag & libc::ST_NOEXEC == 0,
+                "this host cannot run this test: {} is mounted noexec",
+                root.display()
+            );
+            // TMPFS_MAGIC and RAMFS_MAGIC: a pathname alone does not prove disk backing.
+            assert!(
+                ![0x0102_1994, 0x8584_58f6].contains(&(kind.f_type as u64)),
+                "this host cannot run this test: {} is not disk-backed",
+                root.display()
+            );
+            tempfile::tempdir_in(&root).unwrap_or_else(|error| {
+                panic!(
+                    "this host cannot run this test: create in {}: {error}",
+                    root.display()
+                )
+            })
+        }
+
+        /// An image file in an owned disk directory. Mapping::new checks the
+        /// actual mapping identity through the same proof as the rewriter.
         fn image_file(words: &[u32]) -> (tempfile::TempDir, PathBuf, Vec<u8>) {
-            let dir = tempfile::tempdir_in("/dev/shm").expect("a directory on /dev/shm (tmpfs)");
+            let dir = fixture_dir();
             let path = dir.path().join("image");
             let image = elf_with_text(words);
             std::fs::write(&path, &image).unwrap();
@@ -3332,10 +3384,26 @@ mod runtime {
                     "{}",
                     std::io::Error::last_os_error()
                 );
-                Self {
+                let mapping = Self {
                     address: address as u64,
                     len,
-                }
+                };
+                let (map, key) = mapping.listed();
+                let (_, opened) =
+                    open_mapped(this_process(), path, &map, key).unwrap_or_else(|error| {
+                        panic!(
+                            "this host cannot run this test: {}: {error}",
+                            path.display()
+                        )
+                    });
+                // This is identity evidence, not permission to write process memory.
+                // Even read-only plan/cache cases require the same mapped-file proof.
+                assert!(
+                    opened.may_plan_writes(),
+                    "this host cannot run this test: {} needs exact map_files access or reliable inode/device identity",
+                    path.display()
+                );
+                mapping
             }
 
             /// The bytes the mapping holds at `offset`, as this process
@@ -3397,7 +3465,7 @@ mod runtime {
         /// it keep the loop. Asking again finds it done; a sequence that is
         /// not new, or a shared mapping, is left as the file has it.
         #[test]
-        #[ignore = "host-limited: runs code from /dev/shm and writes it through /proc/self/mem; run with --run-ignored where both work (docs/TESTING_ENVIRONMENTS.md)"]
+        #[ignore = "host-limited: needs HERMIT_AARCH64_TEST_ROOT on executable disk, proven mapping identity and forced proc-mem writes (docs/TESTING_ENVIRONMENTS.md)"]
         fn the_rewrite_writes_only_this_private_mapping_through_proc_mem() {
             require_host(true);
             let (_dir, path, image) = image_file(&ONE_LOOP);
@@ -3440,10 +3508,10 @@ mod runtime {
         /// it in `exclusive_rewrite_unmarked` as it names a file with no mapping
         /// symbols at all.
         #[test]
-        #[ignore = "host-limited: runs code from /dev/shm; run with --run-ignored where it works (docs/TESTING_ENVIRONMENTS.md)"]
+        #[ignore = "host-limited: needs HERMIT_AARCH64_TEST_ROOT on executable disk and proven mapping identity (docs/TESTING_ENVIRONMENTS.md)"]
         fn a_mapping_holding_an_unsupported_mapping_symbol_is_named_unproven() {
             require_host(false);
-            let dir = tempfile::tempdir_in("/dev/shm").expect("a directory on /dev/shm (tmpfs)");
+            let dir = fixture_dir();
             let path = dir.path().join("image");
             let image = elf_with_unsupported_mark(&ONE_LOOP, 5);
             std::fs::write(&path, &image).unwrap();
@@ -3469,7 +3537,7 @@ mod runtime {
         /// A name that leads to another file than the mapped one plans
         /// nothing: the mapping is counted as failed and keeps its loop.
         #[test]
-        #[ignore = "host-limited: runs code from /dev/shm and writes it through /proc/self/mem; run with --run-ignored where both work (docs/TESTING_ENVIRONMENTS.md)"]
+        #[ignore = "host-limited: needs HERMIT_AARCH64_TEST_ROOT on executable disk, proven mapping identity and forced proc-mem writes (docs/TESTING_ENVIRONMENTS.md)"]
         fn a_mapping_whose_name_now_leads_elsewhere_is_not_written() {
             require_host(true);
             let (dir, path, image) = image_file(&ONE_LOOP);
@@ -3512,7 +3580,7 @@ mod runtime {
         /// in a page the cache samples, so this does not test the cache's
         /// comparison of whole bytes; the model's `ByteCache` test does.)
         #[test]
-        #[ignore = "host-limited: runs code from /dev/shm; run with --run-ignored where /dev/shm is not noexec (docs/TESTING_ENVIRONMENTS.md)"]
+        #[ignore = "host-limited: needs HERMIT_AARCH64_TEST_ROOT on executable disk and proven mapping identity (docs/TESTING_ENVIRONMENTS.md)"]
         fn the_plan_follows_the_files_bytes_through_the_cache() {
             require_host(false);
             let (_dir, path, image) = image_file(&ONE_LOOP);
