@@ -21886,6 +21886,36 @@ mod tests {
         );
     }
 
+    /// The cli fixture's exact shape (dh-f3tm1): an EMPTY `.git`
+    /// directory - not a git repository - inside a real checkout's
+    /// `target/`, with its own `ignored/` rule. The fixture root is the
+    /// nearest `.git` ancestor and its rule must win over the enclosing
+    /// real tree, whose root the first version of this change wrongly
+    /// resolved to.
+    #[test]
+    fn summary_dir_prefers_a_fixture_git_dir_inside_target() {
+        let tmp = tempfile::tempdir().expect("fixture root");
+        let outer = tmp.path();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(outer)
+            .output()
+            .expect("git init fixture");
+        assert!(init.status.success(), "git init failed: {init:?}");
+        std::fs::write(outer.join(".gitignore"), "target/\n").expect("outer ignore rule");
+        let fixture = outer.join("target").join("tmp").join("fixture");
+        std::fs::create_dir_all(&fixture).expect("fixture directory");
+        std::fs::create_dir(fixture.join(".git")).expect("fixture empty git dir");
+        std::fs::write(fixture.join(".gitignore"), "ignored/\n").expect("fixture ignore rule");
+        let nested = fixture.join("guest");
+        std::fs::create_dir(&nested).expect("fixture subdirectory");
+        assert_eq!(
+            summary_dir_under(&nested).expect("resolving under a fixture git dir"),
+            fixture.join("ignored"),
+            "the fixture's own disposable directory must win over the enclosing tree"
+        );
+    }
+
     /// A start git itself ignores is never enumerated as prepared
     /// source, so it keeps the in-place location even in a work tree
     /// with no `ignored/` rule. Hermit's own cli fixtures run under a
