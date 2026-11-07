@@ -4771,7 +4771,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // privileged-test.pmu_cli_cases: 823 - 2 = 821, listed.
     // Package K slice 2b-1's another_processs_stat_and_comm_answer_as_linux
     // (the ptrace twin of the KVM other-process stat test): 821 + 1 = 822.
-    ("test.cli", 822),
+    // PR #4759's a_schedule_replay_keeps_the_long_slices_of_a_preemption_replay: 822 + 1 = 823.
+    ("test.cli", 823),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5475,7 +5476,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two --chaos-instruction-offset tests: 742, skipped by
     // exact name as in test.cli: 742 - 2 = 740, listed.
     // The same 2b-1 other-process stat ptrace twin: 740 + 1 = 741.
-    ("test.cli_on_host", 741),
+    // PR #4759's same CLI case: 741 + 1 = 742.
+    ("test.cli_on_host", 742),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
