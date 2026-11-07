@@ -5515,6 +5515,9 @@ struct ReplayStep {
     /// The event's traced index.
     traced_ix: u64,
     action: replayer::ReplayAction,
+    /// The recorded offset beside the action's timeslice
+    /// (`Replayer::next_instruction_offset`).
+    instruction_offset: Option<detcore_model::schedule::InstructionOffset>,
     /// The schedule position of the recorded event the event consumed, for
     /// `--stacktrace-at-schedule-positions` (`Replayer::stacktrace_position`).
     position: Option<u64>,
@@ -7373,15 +7376,18 @@ impl Scheduler {
         if let Some(ReplayStep {
             traced_ix: ix,
             action,
+            instruction_offset,
             position,
             released_now,
         }) = self.replayer.as_mut().map(|r| {
             let traced_ix = r.traced_event_count;
             let was_released = r.released();
             let action = r.observe_event(observed);
+            let instruction_offset = r.next_instruction_offset();
             ReplayStep {
                 traced_ix,
                 action,
+                instruction_offset,
                 position: r.stacktrace_position(traced_ix),
                 released_now: !was_released && r.released(),
             }
@@ -7421,7 +7427,7 @@ impl Scheduler {
                         print_stack,
                         event_ix: ix,
                         timeslice_remaining,
-                        instruction_offset: None,
+                        instruction_offset,
                     };
                 }
                 replayer::ReplayAction::Stop(StopReason::FatalDesync) => immediate_fatal_exit(),
@@ -7463,8 +7469,11 @@ impl Scheduler {
                     // A thread the replay switches to takes its first
                     // timeslice end with a stop: the grant that resumes it
                     // carries only the length.
-                    self.timeslices
-                        .insert(new_tid, timeslice_remaining.map(|end| end.length));
+                    self.set_replay_timeslice(
+                        new_tid,
+                        timeslice_remaining.map(|end| end.length),
+                        instruction_offset,
+                    );
                     return ConsumeResult {
                         keep_running: !is_now,
                         print_stack,
@@ -9915,6 +9924,60 @@ impl Scheduler {
         self.timeslices.remove(tid);
         self.replay_instruction_offsets.remove(tid);
         self.granted_replay_instruction_offsets.remove(tid);
+    }
+
+    /// Stage `tid`'s next replay timeslice and the offset beside it
+    /// (`Replayer::next_instruction_offset`), replacing any earlier pair.
+    pub(crate) fn set_replay_timeslice(
+        &mut self,
+        tid: DetTid,
+        timeslice: Option<LogicalTime>,
+        offset: Option<detcore_model::schedule::InstructionOffset>,
+    ) {
+        self.timeslices.insert(tid, timeslice);
+        match offset {
+            Some(offset) => self.replay_instruction_offsets.insert(tid, offset),
+            None => self.replay_instruction_offsets.remove(&tid),
+        };
+    }
+
+    /// The replay timeslice `tid`'s grant carries, consumed. The offset beside
+    /// it moves with it, for that grant's receiver
+    /// (`take_granted_replay_instruction_offset`); a grant without a
+    /// timeslice carries no offset either.
+    fn grant_replay_timeslice(&mut self, tid: DetTid) -> Option<LogicalTime> {
+        let timeslice = self.timeslices.remove(&tid).flatten();
+        let offset = self.replay_instruction_offsets.remove(&tid);
+        match (timeslice, offset) {
+            (Some(timeslice), offset) => {
+                match offset {
+                    Some(offset) => self.granted_replay_instruction_offsets.insert(tid, offset),
+                    None => self.granted_replay_instruction_offsets.remove(&tid),
+                };
+                Some(timeslice)
+            }
+            (None, _) => {
+                self.granted_replay_instruction_offsets.remove(&tid);
+                None
+            }
+        }
+    }
+
+    /// The offset `tid`'s latest grant carried, taken by its receiver: a
+    /// `TraceSchedEvent` that yielded for it, or a nonleader exec's
+    /// continuation. `None` where the grant carried no timeslice, or its
+    /// slice had none, and takes the mismatch too: the receiver of a
+    /// different grant never takes its offset.
+    pub(crate) fn take_granted_replay_instruction_offset(
+        &mut self,
+        tid: DetTid,
+        duration: Option<LogicalTime>,
+    ) -> Option<detcore_model::schedule::InstructionOffset> {
+        let granted = self.granted_replay_instruction_offsets.remove(&tid);
+        match duration {
+            Some(_) => granted,
+            None => None,
+        }
     }
 
     /// Record (`Some`) or withdraw (`None`) `thread`'s mask as Detcore's copy
@@ -21627,7 +21690,7 @@ impl Scheduler {
         } else if futex_timed_out {
             SchedResponse::Go(Some(SchedValue::TimeOut))
         } else {
-            let timeslice = self.timeslices.remove(&dtid).flatten();
+            let timeslice = self.grant_replay_timeslice(dtid);
             // TODO(T137799529): use a more strongly typed representation rather than reusing
             // SchedValue/u64:
             let as_schedvalue = timeslice

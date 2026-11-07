@@ -4613,7 +4613,22 @@ impl GlobalState {
                     .recv_request_resources(from, process, resources, Some(request_mm))
                     .await;
                 match response {
-                    SchedulerRpcResult::Continue(status) => R::ResumeExec(status, duration),
+                    SchedulerRpcResult::Continue(status) => {
+                        // A schedule replay's continuation installs the
+                        // grant's timeslice, and so the offset beside it.
+                        let offset = self
+                            .sched
+                            .lock()
+                            .unwrap()
+                            .take_granted_replay_instruction_offset(dtid, duration);
+                        let response = R::ResumeExec(status, duration);
+                        match offset {
+                            Some(offset) => {
+                                R::WithReplayInstructionOffset(offset, Box::new(response))
+                            }
+                            None => response,
+                        }
+                    }
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
                 }
             }
@@ -5513,7 +5528,16 @@ impl GlobalState {
                     .recv_trace_schedevent(ev, detpid, request_mm, command_bootstrap, access, watch)
                     .await
                 {
-                    SchedulerRpcResult::Continue(response) => R::TraceSchedEvent(response),
+                    SchedulerRpcResult::Continue((response, None)) => R::TraceSchedEvent(response),
+                    // The timeslice's recorded offset rides beside it, only
+                    // where there is one, so a replay of a schedule without
+                    // offsets answers exactly as before.
+                    SchedulerRpcResult::Continue((response, Some(offset))) => {
+                        R::WithReplayInstructionOffset(
+                            offset,
+                            Box::new(R::TraceSchedEvent(response)),
+                        )
+                    }
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
                 }
             }
@@ -7984,7 +8008,10 @@ impl GlobalState {
         command_bootstrap: bool,
         access: Option<Box<crate::access_trace::AccessPayload>>,
         watch: Option<crate::watch::WatchStatus>,
-    ) -> SchedulerRpcResult<TraceSchedEventResponse> {
+    ) -> SchedulerRpcResult<(
+        TraceSchedEventResponse,
+        Option<crate::resources::InstructionOffset>,
+    )> {
         let ev = {
             let mut sched = self.lock_rpc_scheduler(false).await;
             if !sched.rpc_incarnation_matches(ev.dettid, request_mm) {
@@ -8048,7 +8075,7 @@ impl GlobalState {
                 print_stack,
                 event_ix: _,
                 timeslice_remaining: mut end_of_timeslice,
-                instruction_offset: _,
+                instruction_offset,
             } = consumed;
             trace!(
                 "keep_running :{}, end_of_timeslice: {:?}",
@@ -8098,15 +8125,19 @@ impl GlobalState {
                 .lock_rpc_scheduler(false)
                 .await
                 .trace_replay_reply(ev.dettid);
-            TraceSchedEventResponse {
-                print_stack_strace: print_stack.or(print_stack2),
-                timeslice: end_of_timeslice,
-                schedule_released,
-                schedule_over,
-                // After any wait above: the order the thread resumes with.
-                watch: self.sched.lock().unwrap().watch_order(),
-                backstop,
-            }
+            let carried_offset = instruction_offset.filter(|_| end_of_timeslice.is_some());
+            (
+                TraceSchedEventResponse {
+                    print_stack_strace: print_stack.or(print_stack2),
+                    timeslice: end_of_timeslice,
+                    schedule_released,
+                    schedule_over,
+                    // After any wait above: the order the thread resumes with.
+                    watch: self.sched.lock().unwrap().watch_order(),
+                    backstop,
+                },
+                carried_offset,
+            )
         } else {
             let (print_stack_strace, watch) = {
                 let mut sched = self.lock_rpc_scheduler(false).await;
@@ -8125,17 +8156,20 @@ impl GlobalState {
                 };
                 (stack, sched.watch_order())
             };
-            TraceSchedEventResponse {
-                print_stack_strace,
-                timeslice: None,
-                schedule_released: false,
-                schedule_over: false,
-                watch,
-                backstop: None,
-            }
+            (
+                TraceSchedEventResponse {
+                    print_stack_strace,
+                    timeslice: None,
+                    schedule_released: false,
+                    schedule_over: false,
+                    watch,
+                    backstop: None,
+                },
+                None,
+            )
         };
 
-        if result.print_stack_strace.is_some() && self.cfg.stacktrace_signal.is_some() {
+        if result.0.print_stack_strace.is_some() && self.cfg.stacktrace_signal.is_some() {
             let _sched = self.lock_rpc_scheduler(false).await;
             self.signal_requested_stacktrace(ev.dettid);
         }
@@ -12572,6 +12606,11 @@ pub async fn trace_schedevent_with_access<G, T>(
     }
     let watch_status =
         (!guest.config().watch.is_empty()).then(|| guest.thread_state().watch.status());
+    // In a schedule replay, an event that carries an instruction offset is
+    // the one the replayed offset was armed for: that offset is spent. (A
+    // preemption replay takes its offsets from its rows, slice by slice.)
+    let spends_offset =
+        ev.instruction_offset.is_some() && guest.config().replay_schedule_from.is_some();
     let resp = send_and_update_time(
         guest,
         GlobalRequest::TraceSchedEvent(
@@ -12585,7 +12624,14 @@ pub async fn trace_schedevent_with_access<G, T>(
     .await;
 
     trace!("trace_schedevent result: {:?}", resp);
-    match resp {
+    let (instruction_offset, response) = match resp.1 {
+        GlobalResponse::WithReplayInstructionOffset(offset, response) => (Some(offset), *response),
+        response => (None, response),
+    };
+    if spends_offset {
+        guest.thread_state_mut().replay_instruction_offset = None;
+    }
+    match (resp.0, response) {
         (
             _,
             GlobalResponse::TraceSchedEvent(TraceSchedEventResponse {
@@ -12619,6 +12665,10 @@ pub async fn trace_schedevent_with_access<G, T>(
             let mut stopless_end = None;
             if let Some(timeslice) = timeslice {
                 install_replayed_timeslice(guest, timeslice.length);
+                // Where the recorded slice this timeslice replays had its
+                // timer armed past its branch target, or `None`: the timer
+                // `post_handler_hook` arms for this slice.
+                guest.thread_state_mut().replay_instruction_offset = instruction_offset;
                 // Each reply decides anew which end, if any, the thread may
                 // take without a stop
                 // (`Detcore::replay_allows_stopless_end`): only the one this

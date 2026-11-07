@@ -153,6 +153,139 @@ fn marker_present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<b
     serde::de::IgnoredAny::deserialize(deserializer).map(|_| true)
 }
 
+/// A `format_version` as [`probe_format`] reads it: a format number, or
+/// `None` for anything else, which the record's ordinary decoding reports.
+struct StatedFormat(Option<u32>);
+
+impl<'de> Deserialize<'de> for StatedFormat {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(Self(
+            value.as_u64().and_then(|format| u32::try_from(format).ok()),
+        ))
+    }
+}
+
+/// The envelope field, present (even as null) or absent, so that a null
+/// envelope is not taken for a legacy record.
+fn present_envelope<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<T>>, D::Error> {
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+/// What [`probe_format`] reads of a record: the format it states (`None`
+/// when absent or not a number) and how many jumps of global time it lists.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ProbedFormat {
+    pub(super) format: Option<u32>,
+    pub(super) time_skips: usize,
+}
+
+/// The format a preemption record states (`PreemptionRecord::format_version`),
+/// and the number of its time skips, read from its bytes without decoding the
+/// record: at the top level of a legacy record, and only in the preemptions of
+/// a slice-boundary one (a field beside the envelope is the envelope decoder's
+/// to refuse). [`Recording::decode`] consults it only when the record cannot
+/// be decoded, so that a record of a format this Hermit does not read is
+/// refused as such ([`super::RecordFormatRefusal`]) even when its body is one
+/// this Hermit cannot read; a record it can decode is refused, or not, by
+/// `validate_format` alone. The probe is typed, so a duplicated
+/// `format_version` or `preemptions` is an error here, as in the strict
+/// decoders, never a format; every other field is skipped unread. A format
+/// that is not a number, or a null envelope, reads as none, and an envelope
+/// that is not an object is an error, each left to the record's ordinary
+/// decoding to report. A record marked incomplete
+/// (`PreemptionRecord::replay_departed_at`) is written inside an
+/// `incomplete_preemption_record` envelope, as a legacy record or as a
+/// slice-boundary recording's preemptions, and states its format only in that
+/// envelope's record.
+pub(super) fn probe_format(bytes: &[u8]) -> Result<ProbedFormat, serde_json::Error> {
+    #[derive(Deserialize)]
+    struct Payload {
+        #[serde(default)]
+        format_version: Option<StatedFormat>,
+        #[serde(default)]
+        time_skips: Option<Vec<serde::de::IgnoredAny>>,
+    }
+    #[derive(Deserialize)]
+    struct Marked {
+        #[serde(default)]
+        record: Option<Payload>,
+    }
+    #[derive(Deserialize)]
+    struct Preemptions {
+        #[serde(default)]
+        format_version: Option<StatedFormat>,
+        #[serde(default)]
+        time_skips: Option<Vec<serde::de::IgnoredAny>>,
+        #[serde(default, deserialize_with = "present_envelope")]
+        incomplete_preemption_record: Option<Option<Marked>>,
+    }
+    type Stated = (Option<StatedFormat>, Option<Vec<serde::de::IgnoredAny>>);
+    impl Preemptions {
+        // A field beside the incomplete-record envelope is the decoder's to
+        // refuse, as one beside the slice-boundary envelope is.
+        fn stated(self) -> Stated {
+            match self.incomplete_preemption_record {
+                Some(marked) => marked
+                    .and_then(|marked| marked.record)
+                    .map_or((None, None), |record| {
+                        (record.format_version, record.time_skips)
+                    }),
+                None => (self.format_version, self.time_skips),
+            }
+        }
+    }
+    #[derive(Deserialize)]
+    struct Envelope {
+        #[serde(default)]
+        preemptions: Option<Preemptions>,
+    }
+    #[derive(Deserialize)]
+    struct Probe {
+        #[serde(default)]
+        format_version: Option<StatedFormat>,
+        #[serde(default)]
+        time_skips: Option<Vec<serde::de::IgnoredAny>>,
+        #[serde(default, deserialize_with = "present_envelope")]
+        incomplete_preemption_record: Option<Option<Marked>>,
+        #[serde(default, deserialize_with = "present_envelope")]
+        slice_boundary_recording: Option<Option<Envelope>>,
+    }
+    let probe: Probe = serde_json::from_slice(bytes)?;
+    let (stated, skips) = match probe.slice_boundary_recording {
+        Some(envelope) => envelope
+            .and_then(|envelope| envelope.preemptions)
+            .map_or((None, None), Preemptions::stated),
+        None => Preemptions {
+            format_version: probe.format_version,
+            time_skips: probe.time_skips,
+            incomplete_preemption_record: probe.incomplete_preemption_record,
+        }
+        .stated(),
+    };
+    Ok(ProbedFormat {
+        format: stated.and_then(|format| format.0),
+        time_skips: skips.map_or(0, |skips| skips.len()),
+    })
+}
+
+/// The error for a record that `serde` could not decode: a refusal by its
+/// format (`super::RecordFormatRefusal`, with `validate_format`'s message) when
+/// it states a format this Hermit does not read, else `error` itself.
+fn refuse_undecodable_format(bytes: &[u8], error: anyhow::Error) -> anyhow::Error {
+    match probe_format(bytes) {
+        Ok(probed) if !super::reads_format(probed.format) => {
+            anyhow::Error::new(super::RecordFormatRefusal(super::unread_format_message(
+                probed.format,
+                probed.time_skips,
+            )))
+        }
+        _ => error,
+    }
+}
+
 pub(super) fn read_settings<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
     fn seekable<T: serde::de::DeserializeOwned, R: Read + Seek>(
         input: &mut R,
@@ -348,7 +481,16 @@ impl Recording {
     /// A record whose format this Hermit refuses fails with a
     /// `RecordFormatRefusal` in its chain, whichever format it is in.
     pub fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
-        Self::read_from(&mut Cursor::new(bytes))
+        // A record that cannot be decoded is still refused by a format this
+        // Hermit does not read (`probe_format`); one that can is refused, or
+        // not, by `validate_format` below.
+        Self::read_from(&mut Cursor::new(bytes)).map_err(|error| {
+            if error.chain().any(|cause| cause.is::<serde_json::Error>()) {
+                refuse_undecodable_format(bytes, error)
+            } else {
+                error
+            }
+        })
     }
 
     /// Stream a seekable input with no raw-byte or Value-tree copy. Every pass
@@ -956,6 +1098,7 @@ mod tests {
     /// by its format, and a current one keeps its decoding error. Applying the
     /// probe before decoding fails this test: the empty list of time skips
     /// and the zero-step offset would be reported as a format refusal.
+    #[test]
     #[test]
     fn the_format_probe_fires_only_when_a_record_cannot_be_decoded() {
         let newest = crate::preemptions::PREEMPTION_RECORD_FORMAT_MAX;

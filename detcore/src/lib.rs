@@ -3646,6 +3646,35 @@ impl<T: RecordOrReplay> Detcore<T> {
                     LogicalTime::ZERO
                 };
                 (logical_remaining, target - current_pmu_rcbs)
+            } else if let Some(offset) =
+                replay_offset.filter(|_| self.cfg.replay_schedule_from.is_some())
+            {
+                // A schedule replay of a preemption recorded past its branch
+                // target (`trace_schedevent`): the replayer's timeslice runs
+                // to the end of the recorded batch of branches, which can lie
+                // up to one branch per step beyond the target, so the timer is
+                // armed at the recorded target and steps instead, exactly as
+                // it was recorded. At or past the target, the recorded point
+                // can no longer be reached, as in a preemption replay.
+                let logical_remaining = max_timeslice_end - current_time;
+                let rcbs =
+                    match replay_timer_target(Some(offset), offset.rcb_target, current_pmu_rcbs) {
+                        ReplayTimer::Recorded(target) => target - current_pmu_rcbs,
+                        ReplayTimer::InsideOffset(offset) => {
+                            report_replay_inside_offset(
+                                self.cfg.panic_on_rcb_overshoot,
+                                offset,
+                                current_pmu_rcbs,
+                            );
+                            replay_offset = None;
+                            guest.thread_state_mut().replay_instruction_offset = None;
+                            // The timer fires at the next branch, without
+                            // steps, and the slice runs on to the replayer's
+                            // deadline, in a run already marked.
+                            1
+                        }
+                    };
+                (logical_remaining, rcbs)
             } else {
                 let logical_remaining = max_timeslice_end - current_time;
                 (
@@ -3699,7 +3728,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // never is.
                 let armed_offset = if !timer_is_max {
                     None
-                } else if replay_rcb_end.is_some() {
+                } else if replay_rcb_end.is_some() || self.cfg.replay_schedule_from.is_some() {
+                    // A preemption replay's row, or a schedule replay's
+                    // recorded batch of branches (`None` for one recorded at
+                    // its branch target).
                     replay_offset
                 } else {
                     let instructions = guest.thread_state().slice_instruction_offset;

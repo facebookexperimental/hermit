@@ -2117,6 +2117,35 @@ impl PreemptionRecord {
         if self.rows_alone && !self.global.is_empty() {
             return Err("a record of rows alone (rows_alone) holds a schedule trace".to_string());
         }
+        for (index, event) in self.global.iter().enumerate() {
+            let Some(offset) = event.instruction_offset else {
+                continue;
+            };
+            // A format this Hermit does not read is refused as such
+            // (`validate_format`), whatever it holds.
+            let stated = self.format_version.unwrap_or(1);
+            if reads_format(self.format_version) && stated < INSTRUCTION_OFFSET_ROWS_FORMAT {
+                return Err(format!(
+                    "schedule event #{index} of thread {} records an instruction offset, which a \
+                     format-{stated} record cannot hold (offsets need format \
+                     {INSTRUCTION_OFFSET_ROWS_FORMAT})",
+                    event.dettid,
+                ));
+            }
+            if event.op != crate::types::Op::Branch {
+                return Err(format!(
+                    "schedule event #{index} of thread {} records an instruction offset on a \
+                     {:?} event; only a batch of branches has one",
+                    event.dettid, event.op
+                ));
+            }
+            if offset.instructions == 0 {
+                return Err(format!(
+                    "schedule event #{index} of thread {} has an instruction offset of zero steps",
+                    event.dettid
+                ));
+            }
+        }
         self.validate_callback_checkpoints()?;
         self.validate_histories()
     }
@@ -6876,6 +6905,9 @@ impl PreemptionWriter {
             return;
         }
         if ev.count > 0 {
+            if ev.instruction_offset.is_some() {
+                self.inner.raise_format(INSTRUCTION_OFFSET_ROWS_FORMAT);
+            }
             self.inner.global.push(ev)
             // TODO, aggregation: possibly check if the last event was the SAME, and combine them,
             // increasing the count.

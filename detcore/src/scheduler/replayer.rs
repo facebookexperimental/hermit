@@ -576,12 +576,19 @@ impl Replayer {
             count,
             dettid,
             end_rip,
+            instruction_offset,
             ..
         } = next
         else {
             return None;
         };
+        // A batch with an instruction offset ended at an offset timer
+        // (`--chaos-instruction-offset`) by construction. Its recording
+        // follows it with the thread's OtherInstructions, the instructions
+        // the timer stepped past the branch target, and gives it no RIP, so
+        // the shape alone would read as a slice that reached a check-in.
         let timer_preemption = end_rip.is_some()
+            || instruction_offset.is_some()
             || self
                 .cursor
                 .peek_nth(1)
@@ -624,6 +631,21 @@ impl Replayer {
     pub(super) fn next_resume(&self) -> Option<(DetTid, Option<LogicalTime>)> {
         self.next_slice_end()
             .map(|(thread, end)| (thread, end.map(|end| end.length)))
+    }
+
+    /// Where the timer of the slice that [`Self::next_resume`]'s, and the last
+    /// `ReplayAction`'s, timeslice runs to was armed past its branch target,
+    /// if its recording armed it so (`SchedEvent::instruction_offset`). Read
+    /// right after `observe_event`, it belongs to that action's timeslice:
+    /// both come from the next event to replay, the timeslice from its
+    /// branch count (`resolve_time_to_run`) and this from its offset, so an
+    /// offset comes only with a timeslice.
+    pub(super) fn next_instruction_offset(
+        &self,
+    ) -> Option<detcore_model::schedule::InstructionOffset> {
+        let next = self.cursor.peek()?;
+        self.resolve_time_to_run(next)?;
+        next.instruction_offset
     }
 
     /// [`Self::next_resume`] with the replayed slice end itself: its length,
