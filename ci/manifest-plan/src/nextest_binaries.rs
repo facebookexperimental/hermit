@@ -2370,6 +2370,7 @@ fn substitute_harvested_binaries(
 ) -> Result<(), PreparationError> {
     let status = std::process::Command::new("./ci/harvest-reverie-buck.sh")
         .current_dir(root)
+        .env("HARVEST_BUCK_HARVEST_ONLY", "1")
         .status()
         .map_err(|error| format!("buck harvest could not start: {error}"))?;
     if !status.success() {
@@ -2383,6 +2384,28 @@ fn substitute_harvested_binaries(
         )
     })?;
     apply_harvest(&manifest, root, generation, selections)
+}
+
+/// Enumerate one test binary's case names (`--list`, libtest format).
+fn listed_case_names(binary: &Path) -> Result<BTreeSet<String>, String> {
+    let output = std::process::Command::new(binary)
+        .arg("--list")
+        .output()
+        .map_err(|error| format!("could not list {}: {error}", binary.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "listing {} failed with {}",
+            binary.display(),
+            output.status
+        ));
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|_| format!("listing {} is not UTF-8", binary.display()))?;
+    Ok(text
+        .lines()
+        .filter_map(|line| line.strip_suffix(": test"))
+        .map(str::to_string)
+        .collect())
 }
 
 /// The substitution half of [`substitute_harvested_binaries`], split out so
@@ -2406,12 +2429,13 @@ fn apply_harvest(
     if harvested.is_empty() {
         return Err("harvest manifest names no files".into());
     }
-    let mut substituted = 0usize;
+    let buck_so = root.join("target/validate/buck-harvest/libreverie_examples.so");
+    let mut matched_names: BTreeSet<String> = BTreeSet::new();
     for (key, record) in selections.iter_mut() {
         let metadata_path = generation.join(format!("{key}.json"));
         let mut metadata = read_json(&metadata_path)?;
         let mut patched = false;
-        for binary in &mut record.binaries {
+        for binary in &record.binaries {
             let Some(buck_path) = harvested.get(&binary.binary_name) else {
                 continue;
             };
@@ -2423,6 +2447,20 @@ fn apply_harvest(
                 )
                 .into());
             }
+            // Per-target case-set equality with the Cargo twin (names and
+            // count): a Buck binary enumerating fewer cases refuses here,
+            // in prepare, not in an external comparison.
+            let cargo_cases = listed_case_names(&binary.executable.path)?;
+            let buck_cases = listed_case_names(buck_path)?;
+            if cargo_cases != buck_cases {
+                return Err(format!(
+                    "buck case set for {} differs from its Cargo twin: cargo-only={:?} buck-only={:?}",
+                    binary.binary_name,
+                    cargo_cases.difference(&buck_cases).collect::<Vec<_>>(),
+                    buck_cases.difference(&cargo_cases).collect::<Vec<_>>(),
+                )
+                .into());
+            }
             let binaries = metadata
                 .get_mut("rust-binaries")
                 .and_then(Value::as_object_mut)
@@ -2431,11 +2469,61 @@ fn apply_harvest(
                 .get_mut(&binary.binary_id)
                 .ok_or_else(|| format!("Nextest metadata lost binary {}", binary.binary_id))?;
             entry["binary-path"] = Value::String(buck_path.display().to_string());
-            binary.executable = file_identity(buck_path, true)?;
-            substituted += 1;
+            matched_names.insert(binary.binary_name.clone());
             patched = true;
         }
         if patched {
+            // Bind the sibling shared library the substituted binaries
+            // load: repoint the recorded libreverie_examples.so runtime
+            // file at the harvested copy in the metadata, so
+            // metadata_binaries rehashes the Buck bytes.
+            if buck_so.is_file() {
+                if let Some(build) = metadata
+                    .get_mut("rust-build-meta")
+                    .and_then(Value::as_object_mut)
+                {
+                    if let Some(non_test) = build
+                        .get_mut("non-test-binaries")
+                        .and_then(Value::as_object_mut)
+                    {
+                        for files in non_test.values_mut() {
+                            if let Some(entries) = files.as_array_mut() {
+                                for entry in entries {
+                                    if entry.get("path").and_then(Value::as_str).is_some_and(
+                                        |path| path.ends_with("libreverie_examples.so"),
+                                    ) {
+                                        entry["path"] =
+                                            Value::String(buck_so.display().to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Repoint the recorded binary identities at the Buck bytes
+            // (metadata_binaries in verify_selection recomputes these from
+            // the patched metadata, so record and metadata must agree).
+            for binary in &mut record.binaries {
+                if let Some(buck_path) = harvested.get(&binary.binary_name) {
+                    binary.executable = file_identity(buck_path, true)?;
+                }
+            }
+            // Bind the sibling .so in the record too: any recorded
+            // libreverie_examples.so runtime file now names the harvested
+            // copy, rehashed. A recorded .so with no harvested copy refuses.
+            for runtime in &mut record.runtime_files {
+                if runtime
+                    .path
+                    .file_name()
+                    .is_some_and(|name| name == "libreverie_examples.so")
+                {
+                    if !buck_so.is_file() {
+                        return Err("recorded libreverie_examples.so has no harvested copy".into());
+                    }
+                    *runtime = file_identity(&buck_so, false)?;
+                }
+            }
             fs::write(
                 &metadata_path,
                 serde_json::to_vec(&metadata).map_err(|e| e.to_string())?,
@@ -2444,12 +2532,27 @@ fn apply_harvest(
             record.metadata = file_identity(&metadata_path, false)?;
         }
     }
-    if substituted == 0 {
+    // Exact name-set refusal: a manifest entry matching no selection
+    // binary (a drifted stem) must not silently stay Cargo in a buck run.
+    let manifest_names: BTreeSet<String> = harvested.keys().cloned().collect();
+    if matched_names != manifest_names {
+        return Err(format!(
+            "buck harvest name set differs from selection binaries: unmatched={:?}",
+            manifest_names
+                .difference(&matched_names)
+                .collect::<Vec<_>>()
+        )
+        .into());
+    }
+    if matched_names.is_empty() {
         return Err(
             "buck mode harvested no binary any selection records; refusing a Cargo record".into(),
         );
     }
-    eprintln!("buck prepare: substituted {substituted} harvested binaries");
+    eprintln!(
+        "buck prepare: substituted {} harvested binaries",
+        matched_names.len()
+    );
     Ok(())
 }
 
@@ -3057,19 +3160,25 @@ mod tests {
 
     #[test]
     fn apply_harvest_repoints_matched_binaries_and_refuses_no_match() {
-        let root = std::env::temp_dir().join(format!("apply-harvest-test-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "apply-harvest-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         let generation = root.join("generation");
         std::fs::create_dir_all(&generation).unwrap();
         let buck_file = root.join("target/validate/buck-harvest/basics");
         std::fs::create_dir_all(buck_file.parent().unwrap()).unwrap();
-        std::fs::write(&buck_file, b"buck-built basics").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&buck_file, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        let script = "#!/bin/sh\nprintf 'alpha: test\\nbeta: test\\n'\n";
+        std::fs::write(&buck_file, script).unwrap();
+        std::fs::set_permissions(&buck_file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let buck_so = root.join("target/validate/buck-harvest/libreverie_examples.so");
+        std::fs::write(&buck_so, b"buck shared library").unwrap();
         let cargo_file = root.join("cargo-basics");
-        std::fs::write(&cargo_file, b"cargo-built basics").unwrap();
+        std::fs::write(&cargo_file, script).unwrap();
+        std::fs::set_permissions(&cargo_file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cargo_so = root.join("libreverie_examples.so");
+        std::fs::write(&cargo_so, b"cargo shared library").unwrap();
         let identity = |path: &Path| FileIdentity {
             path: path.to_path_buf(),
             size: 0,
@@ -3107,13 +3216,16 @@ mod tests {
                 build_platform: "target".into(),
                 executable: identity(&cargo_file),
             }],
-            runtime_files: vec![],
+            runtime_files: vec![identity(&cargo_so)],
         };
         let mut selections = BTreeMap::from([("full".to_string(), record)]);
         apply_harvest(&manifest, &root, &generation, &mut selections).unwrap();
         let record = &selections["full"];
         assert_eq!(record.binaries[0].executable.path, buck_file);
         assert!(!record.binaries[0].executable.sha256.is_empty());
+        // The sibling .so identity is bound to the harvested copy too.
+        assert_eq!(record.runtime_files[0].path, buck_so);
+        assert!(!record.runtime_files[0].sha256.is_empty());
         let patched = read_json(&metadata_path).unwrap();
         assert_eq!(
             patched["rust-binaries"]["pkg:basics:test"]["binary-path"],
@@ -3130,6 +3242,27 @@ mod tests {
             },
         )]);
         assert!(apply_harvest(&manifest, &root, &generation, &mut unmatched).is_err());
+        // A Buck binary enumerating fewer cases than its Cargo twin refuses.
+        std::fs::write(&buck_file, "#!/bin/sh\nprintf 'alpha: test\\n'\n").unwrap();
+        let mut fewer = BTreeMap::from([(
+            "full".to_string(),
+            SelectionRecord {
+                build_args: vec![],
+                metadata: identity(&metadata_path),
+                binaries: vec![BinaryIdentity {
+                    binary_id: "pkg:basics:test".into(),
+                    package_id: "pkg".into(),
+                    binary_name: "basics".into(),
+                    kind: "test".into(),
+                    build_platform: "target".into(),
+                    executable: identity(&cargo_file),
+                }],
+                runtime_files: vec![],
+            },
+        )]);
+        let error = apply_harvest(&manifest, &root, &generation, &mut fewer).unwrap_err();
+        assert!(error.to_string().contains("case set"), "{error}");
+        std::fs::write(&buck_file, script).unwrap();
         // The recomputed hash stays bound to the bytes that run: tampering
         // with the harvested file after substitution is refused by the same
         // check_identity every consumer path runs.

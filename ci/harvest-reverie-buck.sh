@@ -99,7 +99,9 @@ for entry in "${TARGETS[@]}"; do
     echo "harvest-reverie-buck: multiple Cargo counterparts for $name: ${matches[*]}" >&2
     exit 2
   fi
-  if [[ ${#matches[@]} -eq 1 ]]; then
+  # HARVEST_BUCK_HARVEST_ONLY=1 (set by nextest prepare, option b): never
+  # overwrite Cargo's target files; placement is buck-harvest/ only.
+  if [[ ${HARVEST_BUCK_HARVEST_ONLY:-} != 1 && ${#matches[@]} -eq 1 ]]; then
     dest=${matches[0]}
     placed=true
   fi
