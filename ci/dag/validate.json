@@ -25017,7 +25017,7 @@
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1387",
+        "NEXTEST_EXPECTED_EXECUTED": "1388",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"liteinst,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -25068,7 +25068,7 @@
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "3695",
+        "NEXTEST_EXPECTED_EXECUTED": "3752",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -26192,7 +26192,7 @@
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
         "HERMIT_REQUIRE_DAP": "1",
         "HERMIT_REQUIRE_DAP_GDB": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "823",
+        "NEXTEST_EXPECTED_EXECUTED": "834",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"liteinst\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -26245,7 +26245,7 @@
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
         "HERMIT_REQUIRE_DAP": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "742",
+        "NEXTEST_EXPECTED_EXECUTED": "753",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"liteinst\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -43787,7 +43787,7 @@
       "env": {
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1381",
+        "NEXTEST_EXPECTED_EXECUTED": "1382",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"liteinst,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -43834,7 +43834,7 @@
       "env": {
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "3695",
+        "NEXTEST_EXPECTED_EXECUTED": "3752",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
