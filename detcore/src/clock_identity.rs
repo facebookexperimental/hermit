@@ -318,10 +318,10 @@ pub(crate) fn prepare_run_with(
         None => None,
         Some(path) => {
             let history = HistoryReader::read_for_replay(path, cfg.guest_ids).map_err(|error| {
-                if error
-                    .chain()
-                    .any(|cause| cause.is::<crate::preemptions::RecordAdmissionRefusal>())
-                {
+                if error.chain().any(|cause| {
+                    cause.is::<crate::preemptions::RecordAdmissionRefusal>()
+                        || cause.is::<crate::preemptions::RecordFormatRefusal>()
+                }) {
                     PrepareError::Refused(format!("{error:#}"))
                 } else {
                     PrepareError::Unreadable(error)
@@ -788,6 +788,50 @@ mod tests {
                     assert_eq!(prepared.schedule.unwrap().recording.identity(), Some(&V1));
                     assert_eq!(prepared.history.unwrap().recording().identity(), Some(&V1));
                 }
+            }
+        }
+    }
+
+    /// A well-formed envelope this build cannot execute -- a newer
+    /// `rcb_history` format or an identity it does not know -- is a
+    /// named refusal before the pin on either replay route, never an
+    /// unreadable-file panic.
+    #[test]
+    fn unsupported_rcb_history_envelopes_are_refused_before_the_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let mutated = |name: &str, change: &dyn Fn(&mut serde_json::Value)| {
+            let path = dir.path().join(name);
+            write(&path, Some(V1));
+            let mut value: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            change(&mut value);
+            std::fs::write(&path, value.to_string()).unwrap();
+            path
+        };
+        for (path, cause) in [
+            (
+                mutated("format3.json", &|v| v["rcb_history"]["format"] = 3.into()),
+                "unsupported rcb_history format 3",
+            ),
+            (
+                mutated("unknown.json", &|v| {
+                    v["rcb_history"]["identity"] = "rcb:cond-retired:user:v2".into()
+                }),
+                "unknown RCB coordinate identity",
+            ),
+        ] {
+            for schedule in [true, false] {
+                let state = PmuState::new();
+                let mut cfg = prepared(&amd());
+                if schedule {
+                    cfg.replay_schedule_from = Some(path.clone());
+                } else {
+                    cfg.replay_preemptions_from = Some(path.clone());
+                }
+                let reason = refusal(prepare_run_with(&cfg, &on(&amd(), &state)));
+                assert!(reason.contains(cause), "{reason}");
+                assert!(reason.contains(&path.display().to_string()), "{reason}");
+                assert_eq!(state.pinned(), None);
             }
         }
     }

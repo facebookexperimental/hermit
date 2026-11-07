@@ -521,6 +521,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_unknown_rcb_history_is_a_named_refusal_not_a_parse_error() {
+        use detcore::preemptions::HistoryIdentity;
+
+        let directory = tempfile::tempdir().unwrap();
+        let known = HistoryIdentity::Known(
+            reverie::pmu_config::RcbMetric::ConditionalBranchesRetiredUserV1,
+        );
+        let cases: [(&str, &dyn Fn(&mut serde_json::Value), &str); 2] = [
+            (
+                "format3.json",
+                &|v: &mut serde_json::Value| v["rcb_history"]["format"] = 3.into(),
+                "unsupported rcb_history format 3",
+            ),
+            (
+                "unknown.json",
+                &|v: &mut serde_json::Value| {
+                    v["rcb_history"]["identity"] = "rcb:cond-retired:user:v2".into()
+                },
+                "unknown RCB coordinate identity",
+            ),
+        ];
+        for (name, change, cause) in cases {
+            let mut value: serde_json::Value = serde_json::from_slice(
+                &unconsumed_schedule_for_test(Some(known.clone()))
+                    .encode()
+                    .unwrap(),
+            )
+            .unwrap();
+            change(&mut value);
+            let path = directory.path().join(name);
+            std::fs::write(&path, value.to_string()).unwrap();
+            let refusal = crate::rcb_history_refusal(
+                &detcore::Config::default(),
+                &[("--replay-schedule-from", path.as_path())],
+            )
+            .unwrap()
+            .expect("an unknown rcb_history envelope is refused, not a parse error");
+            assert!(refusal.contains(cause), "{refusal}");
+        }
+    }
+
     #[tokio::test]
     async fn terminal_refusal_is_typed_direct_and_through_reverie() {
         for wrapped in [false, true] {

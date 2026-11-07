@@ -80,7 +80,12 @@ impl TryFrom<IdentityWire> for HistoryIdentity {
         match wire {
             IdentityWire::Known(id) => reverie::pmu_config::RcbMetric::from_id(&id)
                 .map(Self::Known)
-                .ok_or_else(|| anyhow::anyhow!("unknown RCB coordinate identity {id:?}")),
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unknown RCB coordinate identity {id:?}; replay it with the Hermit \
+                         build that wrote it, or record it again with this build"
+                    )
+                }),
             IdentityWire::Unqualified(UnqualifiedWire { unqualified }) => {
                 Ok(Self::Unqualified(unqualified))
             }
@@ -479,6 +484,13 @@ pub(super) fn read_settings<T: serde::de::DeserializeOwned>(path: &Path) -> Resu
     parsed.map_err(|e| format!("cannot parse preemption record {}: {e}", path.display()))
 }
 
+/// A well-formed history in a format this Hermit cannot execute, typed so
+/// callers classify it as the policy refusal (exit 122) rather than a
+/// malformed-file parse error.
+fn format_refusal(message: String) -> anyhow::Error {
+    anyhow::Error::new(super::RecordFormatRefusal(message))
+}
+
 fn require_same_input(probe: [u8; 32], typed: [u8; 32]) -> anyhow::Result<()> {
     if probe != typed {
         bail!("schedule input changed between complete parsing passes");
@@ -756,23 +768,49 @@ impl Recording {
         let (probe, digest) = super::streaming::parse_pass::<FormatProbe, _>(&mut *input)?;
         input.seek(SeekFrom::Start(start))?;
         if probe.rcb_history {
-            let (envelope, typed_digest) = super::streaming::parse_pass::<
-                IdentityEnvelope<Box<serde_json::value::RawValue>>,
-                _,
-            >(&mut *input)?;
+            // Probe only the envelope head and the inner recording's format
+            // markers first. The inner recording is then parsed typed from
+            // the same seekable input, so no raw copy of it is retained.
+            let (head, head_digest) =
+                super::streaming::parse_pass::<IdentityEnvelope<FormatProbe>, _>(&mut *input)?;
+            require_same_input(digest, head_digest)?;
+            if head.rcb_history.format != RCB_HISTORY_FORMAT {
+                return Err(format_refusal(format!(
+                    "unsupported rcb_history format {}: this Hermit reads format {}; replay \
+                     it with the Hermit build that wrote it, or record it again with this build",
+                    head.rcb_history.format, RCB_HISTORY_FORMAT
+                )));
+            }
+            let identity = HistoryIdentity::try_from(head.rcb_history.identity)
+                .map_err(|error| format_refusal(error.to_string()))?;
+            if head.rcb_history.recording.rcb_history {
+                return Err(format_refusal(
+                    "nested rcb_history envelope: record the history again with this build"
+                        .to_owned(),
+                ));
+            }
+            input.seek(SeekFrom::Start(start))?;
+            let (mut recording, typed_digest) =
+                if head.rcb_history.recording.slice_boundary_recording {
+                    let (envelope, typed_digest) =
+                        super::streaming::parse_pass::<IdentityEnvelope<Envelope>, _>(&mut *input)?;
+                    (
+                        Self::Boundaries(envelope.rcb_history.recording.slice_boundary_recording),
+                        typed_digest,
+                    )
+                } else {
+                    let (envelope, typed_digest) = super::streaming::parse_pass::<
+                        IdentityEnvelope<PreemptionRecord>,
+                        _,
+                    >(&mut *input)?;
+                    envelope
+                        .rcb_history
+                        .recording
+                        .validate_contents()
+                        .map_err(anyhow::Error::msg)?;
+                    (Self::Legacy(envelope.rcb_history.recording), typed_digest)
+                };
             require_same_input(digest, typed_digest)?;
-            if envelope.rcb_history.format != RCB_HISTORY_FORMAT {
-                bail!(
-                    "unsupported rcb_history format {}",
-                    envelope.rcb_history.format
-                );
-            }
-            let identity = HistoryIdentity::try_from(envelope.rcb_history.identity)?;
-            let inner = envelope.rcb_history.recording.get().as_bytes();
-            if serde_json::from_slice::<FormatProbe>(inner)?.rcb_history {
-                bail!("nested rcb_history envelope");
-            }
-            let (mut recording, _) = Self::read_fingerprinted(&mut Cursor::new(inner))?;
             recording.metadata_mut().identity = Some(identity);
             return Ok((recording, typed_digest));
         }
@@ -2294,16 +2332,37 @@ mod identity_tests {
             f(&mut value);
             serde_json::to_vec(&value).unwrap()
         };
+        // A well-formed envelope this build cannot execute -- a newer
+        // format, an identity it does not know, or a nested envelope -- is
+        // a typed format refusal (the policy exit), not a parse error.
+        for (bytes, cause) in [
+            (
+                mutate(&|v| v["rcb_history"]["format"] = 3.into()),
+                "unsupported rcb_history format 3",
+            ),
+            (
+                mutate(&|v| v["rcb_history"]["identity"] = "rcb:cond-retired:user:v2".into()),
+                "unknown RCB coordinate identity",
+            ),
+            (
+                mutate(&|v| {
+                    let inner = v["rcb_history"].clone();
+                    v["rcb_history"]["recording"] = serde_json::json!({ "rcb_history": inner });
+                }),
+                "nested rcb_history envelope",
+            ),
+        ] {
+            let error = Recording::decode(&bytes).unwrap_err();
+            assert!(
+                error.is::<crate::preemptions::RecordFormatRefusal>(),
+                "{error:#}"
+            );
+            assert!(format!("{error:#}").contains(cause), "{error:#}");
+        }
         for bytes in [
-            mutate(&|v| v["rcb_history"]["format"] = 3.into()),
-            mutate(&|v| v["rcb_history"]["identity"] = "rcb:cond-retired:user:v2".into()),
             mutate(&|v| v["rcb_history"]["identity"] = serde_json::json!({"unqualified": 1})),
             mutate(&|v| v["rcb_history"]["extra"] = 1.into()),
             mutate(&|v| v["per_thread"] = serde_json::json!({})),
-            mutate(&|v| {
-                let inner = v["rcb_history"].clone();
-                v["rcb_history"]["recording"] = serde_json::json!({ "rcb_history": inner });
-            }),
             mutate(&|v| v["rcb_history"]["recording"] = serde_json::json!({"global": []})),
         ] {
             assert!(

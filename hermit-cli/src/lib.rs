@@ -3715,7 +3715,8 @@ fn rcb_clock_claim(config: &DetConfig) -> detcore_model::config::RcbClockClaim {
 /// does not check a history's strict or legacy mode, which Detcore checks
 /// when the run starts, as it checks identity again. It reads CPUID and the
 /// process's PMU state, installs and pins nothing, so a `--skid-margin`
-/// recorded later still applies. An unreadable history is an error, not a
+/// recorded later still applies. A history in a format this build refuses
+/// is a refusal; an otherwise unreadable history is an error, not a
 /// refusal.
 pub fn rcb_history_refusal(
     config: &DetConfig,
@@ -3733,7 +3734,20 @@ pub fn rcb_history_refusal(
         Err(refusal) => return Ok(Some(refusal)),
     };
     for (option, path) in inputs {
-        let recording = detcore::preemptions::boundary_recording::Recording::read(path)?;
+        let recording = match detcore::preemptions::boundary_recording::Recording::read(path) {
+            Ok(recording) => recording,
+            Err(error)
+                if error
+                    .chain()
+                    .any(|cause| cause.is::<detcore::preemptions::RecordFormatRefusal>()) =>
+            {
+                return Ok(Some(format!(
+                    "hermit refused to replay {option} {}: {error:#}",
+                    path.display()
+                )));
+            }
+            Err(error) => return Err(error),
+        };
         if let Err(refusal) = validated.admit(&format!("{option} {}", path.display()), &recording) {
             return Ok(Some(refusal));
         }
