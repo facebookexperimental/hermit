@@ -550,7 +550,7 @@ fn preemption_replay_preserves_equal_rcb_software_callback_boundaries() {
     };
     let recorded = run(&recorded_path, None);
     let original = fs::read(&recorded_path).unwrap();
-    let record: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    let record = hermit_binary::recorded_preemption_json(&recorded_path);
     let checkpoints = record["callback_checkpoints"].as_object().unwrap();
     let mut exec_at_rcb_zero = false;
     let mut distinct_equal_rcb_endpoints = false;
