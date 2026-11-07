@@ -97,6 +97,9 @@ rust_library(
                     "toml": {"version": "0.8.23"},
                 },
                 "dev-dependencies": {
+                    # Export debt: Cargo makes this test dependency x86_64-only.
+                    # This override is not target-synchronized; see the Cargo/Buck
+                    # coverage note in docs/TESTING_ENVIRONMENTS.md.
                     "reverie-inguest": {"default-features": False, "features": ["exec-stop"]},
                     "toml": {"version": "0.8.23"},
                 },
@@ -129,6 +132,7 @@ rust_library(
     test_srcs = glob([
         "src/bin/**/*.rs",
         "test-resources/**/*.json",
+        "tests/common/exclusive_rewrite_summary.rs",
         "tests/common/readonly_proc.rs",
         "tests/fixtures/staged-summary.gitignore",
     ]),
@@ -225,6 +229,9 @@ rust_binary(
                     "toml": {"version": "0.8.23"},
                 },
                 "dev-dependencies": {
+                    # Export debt: Cargo makes this test dependency x86_64-only.
+                    # This override is not target-synchronized; see the Cargo/Buck
+                    # coverage note in docs/TESTING_ENVIRONMENTS.md.
                     "reverie-inguest": {"default-features": False, "features": ["exec-stop"]},
                     "toml": {"version": "0.8.23"},
                 },
@@ -272,6 +279,7 @@ rust_library(
     test_srcs = glob([
         "src/bin/**/*.rs",
         "test-resources/**/*.json",
+        "tests/common/exclusive_rewrite_summary.rs",
         "tests/common/readonly_proc.rs",
         "tests/fixtures/staged-summary.gitignore",
     ]),

@@ -511,3 +511,24 @@ may set the launcher to `official` for the direct selected binary. That explicit
 caller declaration does not prove bounds, and agents must not select it for
 ad-hoc runs. These fixtures remain ARM-only; an x86 zero-test integration build
 is wiring evidence, not an ARM execution result.
+
+### AArch64 test coverage in Cargo and Buck
+
+Cargo discovers `hermit-cli/tests/aarch64_exclusive_rewrite.rs`, whose physical
+ARM test is ignored by default and has no scheduled CI node. Its manual,
+host-limited status is recorded in `ci/undeclared-test-binaries.tsv`. The Buck
+library rules do not auto-discover this integration binary: no ARM Buck
+integration target or execution coverage is claimed.
+
+The portable CLI library test and the physical integration share
+`tests/common/exclusive_rewrite_summary.rs`. Both Buck library `test_srcs`
+lists include that helper explicitly, just as they include other common test
+sources.
+
+Cargo's `reverie-inguest` exec-stop dev dependency is x86_64-only. The two
+internal-autocargo dev-dependency overrides in `hermit-cli/BUCK` remain
+unconditional: this is an **unsynchronized export exception**, not completed
+Cargo/Buck metadata parity. A supported target-specific override schema and
+maintained synchronization tool were not established in this public export;
+no guessed metadata table is used. Internal autocargo synchronization remains
+required before claiming the corresponding ARM Buck test build is supported.
