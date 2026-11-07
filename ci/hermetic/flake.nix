@@ -198,7 +198,18 @@
       # image closure (libunwind's runtime and dev outputs reference it) but
       # not on LIBRARY_PATH, which made the link fail with
       # `unable to find library -llzma`.
-      nativeLibs = with pkgs; [ libunwind elfutils zlib openssl xz ];
+      # abseil-cpp, gtest and gbenchmark carry the C++ test dependencies of
+      # the vendored gVisor syscall tests (third-party/gvisor-syscall-tests):
+      # on the host they resolve through shim//third-party pkg-config system
+      # libraries, so inside this image they must come from these pinned
+      # packages instead. At this nixpkgs revision the GoogleTest and Google
+      # Benchmark attributes are `gtest` and `gbenchmark`; their pkg-config
+      # names are unchanged (gtest/gmock, benchmark, and the 23 absl_*
+      # components the shim enumerates, all present in the dev outputs).
+      # gbenchmark ships no `dev` output (headers and the static libraries
+      # live in `out`), so the buildTools mapping below resolves the `dev`
+      # output with a fallback instead of naming it directly.
+      nativeLibs = with pkgs; [ libunwind elfutils zlib openssl xz abseil-cpp gtest gbenchmark ];
       # ⚠️ unixtools.xxd IS A BUILD DEPENDENCY, NOT A CONVENIENCE. e9patch's Makefile
       # generates two C sources by running `xxd -i` over its loader binaries
       # (Makefile:73 and :79). Without it the build dies at `Error 127` -- command not
@@ -210,7 +221,7 @@
       buildTools = with pkgs; [
         rustToolchain gcc binutils gnumake cmake pkg-config rustScript cargoNextest
         unixtools.xxd
-      ] ++ nativeLibs ++ map (package: package.dev) nativeLibs;
+      ] ++ nativeLibs ++ map (package: pkgs.lib.getOutput "dev" package) nativeLibs;
     in
     {
       packages.${system} = {

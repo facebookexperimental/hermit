@@ -108,16 +108,19 @@ explain later image loss.
 Before each canonical pinned-root DAG node starts, the wrapper checks the
 network boundary and four different dependency populations rather than folding
 them into one tool list: 18 executable build
-dependencies, five native library packages with their development headers, 24
+dependencies, eight native library packages with their development headers, 24
 commands selected portable cells run as hermit guests, and 11 literal FHS paths
 those cells name. Some commands occur in both executable sets because they are
 used in both roles. `xxd` occurs only in the build set: e9patch runs `xxd -i`
 while generating two C sources, but no selected portable cell runs it as a
 guest. The assertion also checks the exact headers and libraries consumed from
-`nativeLibs`, so their absence is named before compilation begins. The fifth
+`nativeLibs`, so their absence is named before compilation begins. One
 package, xz, supplies liblzma: libunwind's pkg-config metadata names `-llzma`
 in `Libs.private`, and reverie-ptrace's build script requests that `--static`
 closure, so a root without `liblzma.so` on `LIBRARY_PATH` fails at link time.
+Three more packages (abseil-cpp, googletest and benchmark) carry the vendored
+gVisor syscall tests' C++ dependencies, which resolve through host pkg-config
+system libraries outside this root.
 
 ## V3 per-cell execution contract
 

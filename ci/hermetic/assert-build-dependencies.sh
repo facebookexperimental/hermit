@@ -34,7 +34,12 @@ build_dependencies=(
 # xz provides liblzma. libunwind's pkg-config metadata names -llzma in
 # Libs.private and reverie-ptrace asks for that --static closure, so a link
 # without liblzma.so fails late with `unable to find library -llzma`.
-native_libraries=(libunwind elfutils zlib openssl xz)
+# abseil-cpp, googletest and benchmark carry the vendored gVisor syscall
+# tests' C++ dependencies; on the host they resolve through pkg-config
+# system libraries, so the pinned root must name them before the Buck build
+# does. gbenchmark ships only the static archives (no libbenchmark.so), so
+# its check names the archive the linker actually consumes.
+native_libraries=(libunwind elfutils zlib openssl xz abseil-cpp googletest benchmark)
 
 check_build_dependencies() {
     local search_path=${1:-$PATH}
@@ -101,6 +106,20 @@ check_native_libraries() {
     if ! path_has_file "$include_path" lzma.h \
         || ! path_has_file "$library_path" liblzma.so; then
         missing+=(xz)
+    fi
+    if ! path_has_file "$include_path" absl/strings/string_view.h \
+        || ! path_has_file "$library_path" libabsl_strings.so \
+        || ! path_has_file "$library_path" libabsl_time.so; then
+        missing+=(abseil-cpp)
+    fi
+    if ! path_has_file "$include_path" gtest/gtest.h \
+        || ! path_has_file "$library_path" libgtest.so \
+        || ! path_has_file "$library_path" libgmock.so; then
+        missing+=(googletest)
+    fi
+    if ! path_has_file "$include_path" benchmark/benchmark.h \
+        || ! path_has_file "$library_path" libbenchmark.a; then
+        missing+=(benchmark)
     fi
 
     if ((${#missing[@]} > 0)); then
@@ -211,7 +230,9 @@ self_test() {
         ln -s "$stub" "$fixture/$tool"
     done
 
-    mkdir -p "$fixture/include/elfutils" "$fixture/include/openssl" "$fixture/lib"
+    mkdir -p "$fixture/include/elfutils" "$fixture/include/openssl" \
+        "$fixture/include/absl/strings" "$fixture/include/gtest" \
+        "$fixture/include/benchmark" "$fixture/lib"
     touch "$fixture/include/libunwind.h" \
         "$fixture/include/elfutils/libdw.h" \
         "$fixture/include/zlib.h" \
@@ -224,13 +245,21 @@ self_test() {
         "$fixture/lib/libssl.so" \
         "$fixture/lib/libcrypto.so" \
         "$fixture/include/lzma.h" \
-        "$fixture/lib/liblzma.so"
+        "$fixture/lib/liblzma.so" \
+        "$fixture/include/absl/strings/string_view.h" \
+        "$fixture/lib/libabsl_strings.so" \
+        "$fixture/lib/libabsl_time.so" \
+        "$fixture/include/gtest/gtest.h" \
+        "$fixture/lib/libgtest.so" \
+        "$fixture/lib/libgmock.so" \
+        "$fixture/include/benchmark/benchmark.h" \
+        "$fixture/lib/libbenchmark.a"
     output=$(check_native_libraries "$fixture/include" "$fixture/lib" 2>&1) || {
         echo "assert-build-dependencies --self-test: complete native library fixture was rejected" >&2
         echo "$output" >&2
         return 1
     }
-    [[ $output == *"5/5 native libraries and development headers are present"* ]] || {
+    [[ $output == *"8/8 native libraries and development headers are present"* ]] || {
         echo "assert-build-dependencies --self-test: native library success count was not reported" >&2
         echo "$output" >&2
         return 1
@@ -262,12 +291,24 @@ self_test() {
     rc=$?
     set -e
     [[ $rc -eq 2 && $output == *"missing required native library: xz"* \
-        && $output == *"1 of 5 native libraries are missing"* ]] || {
+        && $output == *"1 of 8 native libraries are missing"* ]] || {
         echo "assert-build-dependencies --self-test: missing liblzma.so was not refused as xz ($rc): $output" >&2
         return 1
     }
+    touch "$fixture/lib/liblzma.so"
 
-    echo "PASS: assert-build-dependencies accepts 20/20 executables and 5/5 native libraries, and names xxd, readelf, objdump, libunwind and xz when required files are absent"
+    rm "$fixture/lib/libabsl_time.so"
+    set +e
+    output=$(check_native_libraries "$fixture/include" "$fixture/lib" 2>&1)
+    rc=$?
+    set -e
+    [[ $rc -eq 2 && $output == *"missing required native library: abseil-cpp"* ]] || {
+        echo "assert-build-dependencies --self-test: missing libabsl_time.so was not refused as abseil-cpp ($rc): $output" >&2
+        return 1
+    }
+    touch "$fixture/lib/libabsl_time.so"
+
+    echo "PASS: assert-build-dependencies accepts 20/20 executables and 8/8 native libraries, and names xxd, readelf, objdump, libunwind, xz and abseil-cpp when required files are absent"
 
     local guest_root=$fixture/guest-root manifest path
     manifest=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/guest-paths.txt
