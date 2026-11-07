@@ -30496,13 +30496,45 @@ mod pressure_sample_tests {
             .cloned()
             .expect("the matrix has a comparable parity cell of another test");
         let (results, cleanup) = parity_self_test_results("parity");
+        // This fixture's whole-run bound is derived from the selected
+        // cell's resolved budget, not pinned to the production default:
+        // the cell-wall derivation (max(declared, min(8x CPU, 600)))
+        // raised resolved walls, and PROMOTION_REPETITIONS runs of this
+        // cell - serial when it holds an exclusive resource - must fit
+        // the bound they are planned against. The production
+        // PRESSURE_RUN_TIMEOUT_SECONDS (7200) is unchanged.
+        let selected_budget = budgets
+            .get(&(
+                selected.id.test.clone(),
+                selected.id.mode.clone(),
+                selected.id.backend.clone(),
+            ))
+            .expect("the selected cell has a manifest budget");
+        let resolved_timeouts = resolve_test_timeouts(
+            u64::try_from(selected_budget.cpu_timeout_seconds).unwrap(),
+            u64::try_from(selected_budget.timeout_seconds).unwrap(),
+            TimeoutMultipliers::default(),
+        )
+        .unwrap();
+        let per_run_seconds = pressure_timeout(
+            &CellBudget {
+                cpu_timeout_seconds: i64::try_from(resolved_timeouts.cpu_seconds).unwrap(),
+                timeout_seconds: i64::try_from(resolved_timeouts.wall_seconds).unwrap(),
+                attempts: selected_budget.attempts,
+            },
+            None,
+            false,
+        )
+        .unwrap();
+        let run_timeout_seconds =
+            per_run_seconds * i64::try_from(PROMOTION_REPETITIONS).unwrap() + 600;
         let selection = CellSelection {
             test: Some(selected.id.test.clone()),
             mode: Some("verify".into()),
             backend: Some("ptrace".into()),
             repetitions: Some(PROMOTION_REPETITIONS),
             run_id_prefix: Some("parity-post-pass".into()),
-            run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+            run_timeout_seconds: Some(run_timeout_seconds),
             ..CellSelection::default()
         };
         let (mut metadata, _) = write_plan_after_scorecard_check(
