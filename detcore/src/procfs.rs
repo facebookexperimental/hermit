@@ -1480,6 +1480,18 @@ pub(crate) struct ProcfsFile {
     /// ptrace's debug round trip) never reads it.
     #[serde(skip)]
     link_name: Option<PathBuf>,
+    /// For a process's `environ` Detcore opened as rendered, the number of
+    /// the image whose strings Detcore recorded for the process at the open
+    /// (`tool_global::ProcessAuxvTable::current_exec_strings`): Linux's open
+    /// pins the process's memory map (`__mem_open`), so a read after the
+    /// process has exec'd another image reads nothing
+    /// (`Detcore::read_rendered_cmdline`). `None` where the open found no
+    /// record. Never serialized, for the reason [`Self::link_name`] is not:
+    /// only KVM renders an `environ`
+    /// (`Detcore::serves_exec_strings`), and its global RPC hands an exec's
+    /// descriptor state to the global state in memory.
+    #[serde(skip)]
+    exec_image: Option<u64>,
     /// Detcore renders this file without the backend opening it: the guest's
     /// descriptor is a placeholder and no kernel bytes exist to capture (see
     /// [`ProcfsFile::rendered_path`]).
@@ -2119,6 +2131,7 @@ impl ProcfsFile {
             schedstat_thread: None,
             timer_slack_identity: None,
             link_name: None,
+            exec_image: None,
             rendered: false,
             guest_numbers: None,
             mount_view_kernel: None,
@@ -3119,6 +3132,18 @@ impl ProcfsFile {
     /// at its open ([`Self::bind_link_name`]).
     pub(crate) fn link_name(&self) -> Option<&Path> {
         self.link_name.as_deref()
+    }
+
+    /// Pin the image a process's `environ` reads, the one the process held
+    /// at the open (`ProcfsFile::exec_image`).
+    pub(crate) fn pin_exec_image(&mut self, image: u64) {
+        self.exec_image = Some(image);
+    }
+
+    /// The image a process's `environ` was pinned to at its open, if any
+    /// ([`Self::pin_exec_image`]).
+    pub(crate) fn pinned_exec_image(&self) -> Option<u64> {
+        self.exec_image
     }
 
     /// Returns true when this snapshot consumes deterministic random bytes.

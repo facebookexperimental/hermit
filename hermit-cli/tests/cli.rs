@@ -73119,7 +73119,11 @@ fn proc_other_process_cmdline_guest() -> &'static Path {
 /// The other-process cmdline guest's transcript, as Linux answers it to a
 /// reader that is not real root in the initial user namespace (a zombie's
 /// `environ` is then global root's, mode 0400: EACCES). No pid or path is
-/// printed, and no process rewrites its strings after its exec.
+/// printed, and no process rewrites its strings after its exec. An
+/// `environ` held open across its process's exec reads nothing (its open
+/// pinned the first image's memory map) and a `cmdline` held so reads the
+/// second image's arguments, another process's and the caller's own alike
+/// (review round 1 of package K item 2b slice 2b-3).
 const PROC_OTHER_PROCESS_CMDLINE_LINES: &[&str] = &[
     "arguments cmdline: length=22 bytes=kid\\0alpha\\0\\0beta gamma\\0",
     "arguments environ: length=57 bytes=TWIN_ROLE=wait\\0TWIN_READY=100\\0TWIN_HOLD=101\\0K1=v1\\0EMPTY=\\0",
@@ -73136,6 +73140,14 @@ const PROC_OTHER_PROCESS_CMDLINE_LINES: &[&str] = &[
     "zombie cmdline: length=0 bytes=",
     "zombie environ: EACCES",
     "non-dumpable child: environ open=EACCES cmdline length=12",
+    "across exec: kept environ before: length=56 bytes=TWIN_ROLE=reexec\\0TWIN_READY=100\\0TWIN_HOLD=101\\0PHASE=one\\0",
+    "across exec: kept cmdline before: length=11 bytes=before\\0one\\0",
+    "across exec: kept environ after: read=0 errno=ok",
+    "across exec: kept cmdline after: length=10 bytes=after\\0two\\0",
+    "across exec: reopened environ: length=54 bytes=TWIN_ROLE=wait\\0TWIN_READY=100\\0TWIN_HOLD=101\\0PHASE=two\\0",
+    "own across exec: kept environ after: read=0",
+    "own across exec: kept cmdline after: length=8 bytes=own\\0two\\0",
+    "own across exec: fresh environ: length=68 bytes=TWIN_ROLE=own-after-exec\\0TWIN_READY=100\\0TWIN_HOLD=101\\0PHASE=own-two\\0",
     "failures=0",
 ];
 

@@ -1372,6 +1372,14 @@ static CAPABILITY_REFUSAL_WARNED_IO: std::sync::atomic::AtomicBool =
 static CAPABILITY_REFUSAL_WARNED_ENVIRON: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Whether the run has warned that another process's `cmdline` or `environ`
+/// was served from the strings its image's `execve` passed rather than from
+/// its memory (`Detcore::read_rendered_cmdline`, the interim of minibeads
+/// dh-ngy9z): once per tool process, which is once per run on the one
+/// backend that serves them (KVM's tool runs in Hermit's process).
+static EXEC_STRINGS_FALLBACK_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// The owner Linux reports for the rendered file `path`: a per-process file
 /// belongs to its process's owner (`task_dump_owner`), which for every guest
 /// process is Detcore's virtual root, 0 (the credential calls are emulated to
@@ -2783,6 +2791,25 @@ impl<T: RecordOrReplay> Detcore<T> {
             ))
             .await??;
         }
+        // ... and pins the process's memory map (`__mem_open`), which an exec
+        // replaces: pin the image whose strings Detcore recorded for the
+        // process now, so that a read after the process has exec'd another
+        // image reads nothing (`Self::read_rendered_cmdline`).
+        let procfs = if procfs.is_process_environ() && !flags.contains(OFlag::O_PATH) {
+            let mut procfs = procfs;
+            if let Some(task) = procfs.bound_task()
+                && let (_, Some((image, _))) = crate::tool_global::process_exec_strings(
+                    guest,
+                    detcore_model::pid::DetPid::from_raw(task.process),
+                )
+                .await
+            {
+                procfs.pin_exec_image(image);
+            }
+            procfs
+        } else {
+            procfs
+        };
         GuestProcfs::remember();
         // Read before the placeholder exists, so that a failure leaves the
         // guest nothing open.
@@ -4811,9 +4838,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// A rendered `environ` is read the same way, by Linux's `environ_read`
     /// rule (`procfs::read_environ`, fs/proc/base.c:1006-1067): the reader's
     /// own from its memory, another process's from the record. Its open
-    /// pinned the memory map in Linux and checked access
-    /// (`Self::ptrace_read_allowed_for`); a process that has exited reads
-    /// nothing, as a map that is gone does.
+    /// checked access (`Self::ptrace_read_allowed_for`) and pinned the
+    /// memory map in Linux, which Detcore models by the number of the image
+    /// whose strings it recorded at the open (`ProcfsFile::pinned_exec_image`):
+    /// a process that has exited, or has exec'd another image since, reads
+    /// nothing, as a map that is gone does (`mmget_not_zero` fails). A
+    /// `cmdline` pins nothing (`get_task_mm` at each read), so it reads the
+    /// process's current image.
+    ///
+    /// The first read of the run that another process's strings answer from
+    /// the record is named at Hermit's default level (WARN), so that the
+    /// interim's known limit shows in the run's log.
     pub(crate) async fn read_rendered_cmdline<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -4850,13 +4885,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         if count == 0 {
             return Ok(0);
         }
+        // The image an `environ`'s open pinned, which an exec since has
+        // replaced where the process's current record names another
+        // (`environ_read`'s `mmget_not_zero` of a map nothing uses: 0).
+        let pinned = if environ {
+            guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.procfs_pinned_exec_image())?
+        } else {
+            None
+        };
         // Another process's file, where Detcore serves it, reads the strings
         // its image's `execve` passed.
         if process != self.own_detpid(guest) && self.serves_exec_strings() {
-            let Some(strings) = crate::tool_global::process_exec_strings(guest, process)
+            let current = crate::tool_global::process_exec_strings(guest, process)
                 .await
-                .1
-            else {
+                .1;
+            if let Some(pinned) = pinned
+                && current.as_ref().is_none_or(|(image, _)| *image != pinned)
+            {
+                return Ok(0);
+            }
+            let Some((_, strings)) = current else {
                 // A descriptor kept across the process's exec into an image
                 // whose strings Detcore could not record (every image records
                 // them where the backend reports its initial stack pointer,
@@ -4891,7 +4941,27 @@ impl<T: RecordOrReplay> Detcore<T> {
             if let Some(failure) = adapter.failure {
                 return Err(failure.into());
             }
+            if !EXEC_STRINGS_FALLBACK_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                warn!(
+                    "[detcore] another process's /proc/<pid>/{} is served from the strings its \
+                     image's execve passed, recorded before its first instruction: the tool \
+                     cannot read another guest process's memory on this backend, so an \
+                     in-place rewrite after the exec (setproctitle) is not shown, where Linux \
+                     reads the process's memory (minibeads dh-ngy9z; named once per run)",
+                    if environ { "environ" } else { "cmdline" }
+                );
+            }
             return Ok(read?);
+        }
+        // The caller's own `environ`, kept across its own exec into another
+        // image, reads nothing, as another process's does.
+        if let Some(pinned) = pinned
+            && crate::tool_global::process_exec_strings(guest, process)
+                .await
+                .1
+                .is_none_or(|(image, _)| image != pinned)
+        {
+            return Ok(0);
         }
         // Another process's file, or the caller's own where Detcore recorded
         // no argument area for its current image (a stack layout

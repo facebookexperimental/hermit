@@ -2188,6 +2188,12 @@ impl DetFd {
         self.with_description(|d| d.procfs.as_ref().and_then(ProcfsFile::opened_path))
     }
 
+    /// The image a rendered `environ` was pinned to at its open
+    /// (`ProcfsFile::pinned_exec_image`).
+    pub(crate) fn procfs_pinned_exec_image(&self) -> Option<u64> {
+        self.with_description(|d| d.procfs.as_ref().and_then(ProcfsFile::pinned_exec_image))
+    }
+
     /// The procfs path of a file whose every byte Detcore renders
     /// (`ProcfsFile::rendered_path`), whether Detcore opened it as a
     /// placeholder or the kernel opened it: through a symbolic link or `..`,
