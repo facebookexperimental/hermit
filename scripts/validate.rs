@@ -14295,6 +14295,26 @@ mod case_selection_tests {
     }
 
     #[test]
+    fn case_plan_off_record_portable_case_is_not_refused() {
+        // The off-record preflight drops the producer nodes; a
+        // portable case whose only unplanned committed deps sit
+        // behind the pruned gate.manifest must still plan (it runs
+        // today). The dependency walk prunes the gate.manifest edge
+        // instead of counting the gate's own producers as missing.
+        let args = parse_argv(&[
+            "--allow-local-off-the-record-run".to_string(),
+            "--tests".to_string(),
+            "test.cli::hermit-run::cli$some_test".to_string(),
+        ])
+        .unwrap();
+        let root = test_source_root();
+        let plan = build_plan(&root, &args, &std::env::temp_dir()).unwrap();
+        let tags: std::collections::BTreeSet<String> =
+            plan.cfg.steps.iter().map(|step| step.tag()).collect();
+        assert!(tags.contains("test.cli"), "{tags:?}");
+    }
+
+    #[test]
     fn fixture_conf_binds_each_declared_fixture_read_only() {
         let conf = fixture_containers_conf(&[
             (
@@ -14959,7 +14979,14 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
                 }
                 if let Some(step) = committed_by_tag.get(&tag) {
                     for dep in &step.deps {
-                        if dep != "gate.manifest" && !planned.contains(dep) {
+                        // Prune the walk at gate.manifest: it is
+                        // deliberately absent from every case plan, so
+                        // neither it nor anything only it needs (its
+                        // producer deps) counts as a case dependency.
+                        if dep == "gate.manifest" {
+                            continue;
+                        }
+                        if !planned.contains(dep) {
                             missing.insert(dep.clone());
                         }
                         stack.push(dep.clone());
