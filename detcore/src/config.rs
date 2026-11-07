@@ -106,6 +106,10 @@ mod tests {
     /// `PublishInstructionOffset` revision, 47 is
     /// https://github.com/rrnewton/hermit/pull/4735's `StoreExclusive`
     /// payload layout, and 48, package K item 2b slice 2b-1's, is current.
+    /// From https://github.com/rrnewton/hermit/pull/5222, merged at landing by the merge queue:
+    /// `PublishInstructionOffset` revision. 47 is this change's
+    /// `StoreExclusive` payload layout; 48 adds `Rewrite::not_written`
+    /// and is current.
     /// 42 to 44 are queued or advisory claims at this rebase
     /// (42 on drain/4759, 43 for PR 4627, 44 for kvm-2b-3 in the
     /// allocation table). Remove an entry when its change lands, with
@@ -334,6 +338,12 @@ mod tests {
         // own; domain 6 on its old base, moved to 7 because main's 41 took
         // domain 6 for `HostFileIdentity`. Digest measured at this head.
         (48, "e40e244635167e09", "f013e36743d8d9e6"),
+        // The `StoreExclusive` payload's `Rewrite` says why loops were not
+        // written (`not_written`); its fields cross the wire positionally.
+        // Carried after main's 47; digest measured by the revision guard.
+        // (renumbered from 48 to 49 at landing by the merge queue; digests measured on the combined
+        // tree)
+        (49, "cc10df0910192a63", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
