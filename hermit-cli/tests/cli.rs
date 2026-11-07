@@ -15630,12 +15630,7 @@ fn no_namespace_preemption_records_replay_under_their_base() {
     // run's, or one written before the field existed).
     let mut json: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path("recorded.json")).unwrap()).unwrap();
-    let inner = match json.get_mut("rcb_history") {
-        Some(envelope) => envelope
-            .get_mut("recording")
-            .expect("an enveloped schedule carries its recording"),
-        None => &mut json,
-    };
+    let inner = hermit_test::recorded_preemption_inner_mut(&mut json);
     inner.as_object_mut().unwrap().remove("guest_ids");
     fs::write(path("stripped.json"), json.to_string()).unwrap();
     let stripped_arg = format!("--replay-preemptions-from={}", path("stripped.json"));
@@ -28217,8 +28212,7 @@ fn a_schedule_replay_keeps_the_long_slices_of_a_preemption_replay() {
         stdout(&output)
     };
     let marked = |path: &str| -> bool {
-        let json: serde_json::Value =
-            serde_json::from_slice(&fs::read(path).expect("no preemption record")).unwrap();
+        let json = hermit_test::recorded_preemption_json(Path::new(path));
         json.get("uncapped_slices")
             .is_some_and(serde_json::Value::is_u64)
     };
@@ -28230,15 +28224,19 @@ fn a_schedule_replay_keeps_the_long_slices_of_a_preemption_replay() {
     assert!(!marked(&chaos_record), "an ordinary recording is marked");
     let mut json: serde_json::Value =
         serde_json::from_slice(&fs::read(&chaos_record).unwrap()).unwrap();
-    for thread in json["per_thread"].as_object_mut().unwrap().values_mut() {
+    let inner = hermit_test::recorded_preemption_inner_mut(&mut json);
+    for thread in inner["per_thread"].as_object_mut().unwrap().values_mut() {
         let changes = thread["prio_changes"].as_array_mut().unwrap();
         let last = changes.split_off(changes.len().saturating_sub(1));
         *changes = last;
         thread["preemption_rcbs"] = serde_json::json!([]);
         thread["chaos_epochs"] = serde_json::json!([]);
     }
-    json["global"] = serde_json::json!([]);
-    json.as_object_mut().unwrap().remove("callback_checkpoints");
+    inner["global"] = serde_json::json!([]);
+    inner
+        .as_object_mut()
+        .unwrap()
+        .remove("callback_checkpoints");
     fs::write(&edited, serde_json::to_vec(&json).unwrap()).unwrap();
 
     let replayed = run(&[
