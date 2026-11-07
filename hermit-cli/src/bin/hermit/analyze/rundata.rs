@@ -2432,52 +2432,6 @@ impl AnalyzeOpts {
         RunData::get_raw_runopts(self).ensure_timeout_supported()
     }
 
-    /// Refuses (exit 122) `--chaos-instruction-offset` in the run arguments,
-    /// and any of `recordings` (or a record the run arguments replay) whose
-    /// timeslices it delivered past their branch targets. The searches edit
-    /// preemption records and schedule traces row by row and replay them by
-    /// logical time and branch count, which cannot carry an instruction
-    /// offset, so their trials would not reproduce the run they started from.
-    pub fn refuse_instruction_offsets(&self, recordings: &[(&str, &Path)]) -> anyhow::Result<()> {
-        let trial = RunData::get_raw_runopts(self);
-        let config = &trial.det_opts.det_config;
-        let refuse = |what: String| {
-            Err(
-                anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
-                    "`hermit analyze` and `hermit bisect` cannot search {what}: their edited \
-                     records do not carry --chaos-instruction-offset's instruction offsets, so \
-                     a trial would not reproduce the run. Search without the option, or replay \
-                     the record with `hermit run --replay-preemptions-from`."
-                )),
-            )
-        };
-        if config.chaos_instruction_offset > 0 {
-            return refuse("runs with --chaos-instruction-offset".to_owned());
-        }
-        let in_run_arguments = [
-            (
-                "--replay-schedule-from",
-                config.replay_schedule_from.as_deref(),
-            ),
-            (
-                "--replay-preemptions-from",
-                config.replay_preemptions_from.as_deref(),
-            ),
-        ];
-        for (option, path) in recordings.iter().copied().chain(
-            in_run_arguments
-                .into_iter()
-                .filter_map(|(option, path)| Some((option, path?))),
-        ) {
-            if detcore::preemptions::read_recorded_instruction_offsets(path)
-                .map_err(anyhow::Error::msg)?
-            {
-                return refuse(format!("{option} {}", path.display()));
-            }
-        }
-        Ok(())
-    }
-
     /// Refuses (exit 122) run arguments that a trial would accept and run
     /// without (`RunOpts::options_only_main_applies`), before any workspace,
     /// schedule read or trial exists. Accepting them would run every trial
@@ -2987,7 +2941,6 @@ mod tests {
     #[test]
     fn a_trial_of_a_recording_with_instruction_offsets_keeps_its_own_jumps() {
         use detcore::preemptions::INSTRUCTION_OFFSET_FORMAT;
-        use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
         use detcore::preemptions::InstructionOffset;
         use detcore::types::DetTid;
 

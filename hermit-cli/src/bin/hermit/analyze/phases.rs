@@ -3535,6 +3535,9 @@ impl AnalyzeOpts {
         .into_iter()
         .filter_map(|(option, path)| Some((option, path?)))
         .collect();
+        // First: a recording of a format this Hermit does not read is
+        // refused before anything else is read from it.
+        self.refuse_unread_record_formats(&recordings)?;
         Self::refuse_recordings_numbered_apart(&recordings)?;
         self.adopt_recorded_epoch(&recordings)?;
         // Every trial charges expired timed waits as the target did.
@@ -3545,7 +3548,7 @@ impl AnalyzeOpts {
         self.adopt_recorded_timeslice(&recordings)?;
         self.refuse_unsound_continuation_timeslice()?;
         self.refuse_recordings_under_another_pipe_wake_latency(&recordings)?;
-        self.refuse_instruction_offsets(&recordings)?;
+        self.adopt_instruction_offsets(&recordings)?;
         self.prepare_trial_guest_ids(&recordings)
     }
 

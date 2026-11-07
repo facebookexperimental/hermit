@@ -1125,6 +1125,7 @@ mod tests {
                     end_rip: None,
                     end_time: None,
                     stopless: false,
+                    instruction_offset: None,
                 })
                 .collect::<Vec<_>>()
         };

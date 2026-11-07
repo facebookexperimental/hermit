@@ -1099,7 +1099,6 @@ mod tests {
     /// probe before decoding fails this test: the empty list of time skips
     /// and the zero-step offset would be reported as a format refusal.
     #[test]
-    #[test]
     fn the_format_probe_fires_only_when_a_record_cannot_be_decoded() {
         let newest = crate::preemptions::PREEMPTION_RECORD_FORMAT_MAX;
         let refusal = |bytes: &[u8]| {

@@ -381,7 +381,6 @@ mod tests {
     /// counts as.
     #[test]
     fn a_source_of_rows_alone_with_instruction_offsets_counts_as_format_one() {
-        use detcore::preemptions::INSTRUCTION_OFFSET_FORMAT;
         use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
         use detcore::preemptions::InstructionOffset;
         use detcore::preemptions::PreemptionWriter;
@@ -423,7 +422,6 @@ mod tests {
     #[test]
     fn a_trial_shares_the_timing_format_of_a_recording_with_instruction_offsets() {
         use detcore::preemptions::INSTRUCTION_OFFSET_FORMAT;
-        use detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT;
         use detcore::preemptions::InstructionOffset;
         let offset = InstructionOffset {
             rcb_target: 18,
