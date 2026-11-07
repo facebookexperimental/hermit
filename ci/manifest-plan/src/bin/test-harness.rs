@@ -8910,7 +8910,15 @@ sys.exit(1 if failed else 0)
         // nowhere new). Full selects none of them while ci: false, so
         // their parity cells are unreported until the auto-flip promotes
         // the overnight-green ones to required.
-        assert_eq!(unreported.len(), 149, "{unreported:?}");
+        // 149 + 274 with the gVisor batch-2 PR-A optional rows
+        // (2026-11-07): the first 129 of 530 more vendored cases
+        // measured in the pinned image (dup, access, getdents, stat,
+        // uname whole suites; the remaining ~370 follow after the
+        // parity-cells shard). Their enabled candidate cells
+        // (native-pass and Hermit-pass per backend only) are optional
+        // until overnight evidence, so full reports none of them yet:
+        // gVisor's unreported total is 411 including the 137 above.
+        assert_eq!(unreported.len(), 423, "{unreported:?}");
         let sabre_only = unreported
             .iter()
             .filter(|cell| cell.starts_with("compat/") && cell.ends_with("@sabre"))

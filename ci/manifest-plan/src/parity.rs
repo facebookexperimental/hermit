@@ -6323,8 +6323,11 @@ mod tests {
         // per candidate backend: 3145. The gvisor bucket's 148 vendored
         // cases add one row per candidate backend each (148 x 5): 3885.
         // Batch 1's 31 further rr guests add one row per candidate backend
-        // each: 4040.
-        assert_eq!(parsed.cells.len(), 4040);
+        // each: 4040. The gVisor batch-2 optional rows (530 more vendored
+        // cases measured in the pinned image 2026-11-07) add one row per
+        // candidate backend each (129 x 5 for PR A's first suites; the
+        // remaining batch-2 cases follow the parity-cells shard): 4685.
+        assert_eq!(parsed.cells.len(), 4685);
         assert_eq!(parsed.schema, PARITY_CELLS_SCHEMA);
         // The repository's limit for a text file is 2 MiB. This bound was
         // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448
