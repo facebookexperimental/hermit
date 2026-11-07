@@ -881,7 +881,6 @@ async fn drive_callback_hook<F: std::future::Future>(
     panic!("bounded actual callback request sequence did not finish");
 }
 
-async fn legacy_callback_expired_deadline_trial(annotated: bool, owner_switch: bool) -> (LogicalTime, LogicalTime) {
 async fn legacy_callback_expired_deadline_trial(
     annotated: bool,
     owner_switch: bool,
@@ -1561,6 +1560,7 @@ fn other_instructions(tid: DetTid) -> SchedEvent {
         start_rip: None,
         end_rip: None,
         end_time: None,
+        stopless: false,
     }
 }
 
@@ -1736,7 +1736,7 @@ async fn a_replayed_checkpoint_that_keeps_the_slice_restarts_its_backstop() {
             // The recorded run began a new slice at the call, after 11
             // branches, and kept running.
             |writer| {
-                writer.insert_reprioritization(tid, at, 11, DEFAULT_PRIORITY, DEFAULT_PRIORITY);
+                writer.insert_reprioritization(tid, at, 11, DEFAULT_PRIORITY, DEFAULT_PRIORITY, None);
                 writer.insert_callback_checkpoint(
                     tid,
                     Origin {
@@ -1893,7 +1893,7 @@ async fn a_replayed_callback_slice_end_refreshes_its_slowdown_epoch_without_repl
                 Sysno::close,
                 detcore_model::schedule::SyscallPhase::Prehook,
             ));
-            writer.insert_reprioritization(tid, at, rcbs, DEFAULT_PRIORITY, DEFAULT_PRIORITY);
+            writer.insert_reprioritization(tid, at, rcbs, DEFAULT_PRIORITY, DEFAULT_PRIORITY, None);
             writer.insert_callback_checkpoint(
                 tid,
                 Origin {
