@@ -637,6 +637,25 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Route (ii) staging bracket: prepare runs inside the pinned root,
+/// whose /src/target mount (ignored/hermetic/split/target) shadows the
+/// checkout's target/, so the host harvest must mirror its declared
+/// input there or prepare cannot read the manifest at all.
+#[cfg(test)]
+fn harvest_staging_bracket(root: &std::path::Path) -> Result<(), String> {
+    let script = std::fs::read_to_string(root.join("ci/harvest-reverie-buck.sh"))
+        .map_err(|error| format!("harvest staging bracket: cannot read harvest script: {error}"))?;
+    if !script.contains("ignored/hermetic/split/target/validate")
+        || !script.contains("cp -- \"$MANIFEST\" \"$PINNED_VALIDATE/harvested-files.json\"")
+        || !script.contains("target/validate/buck-harvest/*")
+    {
+        return Err(
+            "harvest staging bracket: harvest does not mirror the manifest and buck-harvest into the pinned prepare's declared input location".into(),
+        );
+    }
+    Ok(())
+}
+
 fn reverie_buck_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
     let reverie_buck = cfg
         .steps
@@ -755,6 +774,7 @@ mod artifact_plan_tests {
         let cfg = validate_plan::validation_config(&test_source_root()).unwrap();
         release_artifact_plan_bracket(&cfg).unwrap();
         reverie_buck_plan_bracket(&cfg).unwrap();
+        harvest_staging_bracket(&test_source_root()).unwrap();
         let mut tags = hermit_manifest_plan::validation_dag::hermit_integration_shard_tags();
         tags.push("test.hermit_integration_on_host".into());
         for tag in tags {

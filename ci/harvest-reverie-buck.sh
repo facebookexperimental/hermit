@@ -9,7 +9,10 @@
 # Placement is buck-harvest-only by default: binaries land in
 # target/validate/buck-harvest/<name>, and nextest prepare repoints the
 # recorded metadata at them (option b; Cargo's target files are never
-# written). HARVEST_ALLOW_PLACED=1 is the explicit legacy opt-in that
+# written). The manifest and buck-harvest/ are also mirrored into
+# ignored/hermetic/split/target/validate/, the pinned prepare's declared
+# input location (its /src/target mount shadows this checkout's target/).
+# HARVEST_ALLOW_PLACED=1 is the explicit legacy opt-in that
 # instead replaces an existing Cargo counterpart in
 # target/validate/deps/; prepare refuses any manifest produced that way.
 #
@@ -172,4 +175,28 @@ with open("target/validate/harvested-files.json", "w") as fh:
     fh.write("\n")
 print(f"harvest-reverie-buck: wrote target/validate/harvested-files.json with {len(files)} files", file=sys.stderr)
 '
+# Route (ii) staging: prepare runs inside the pinned root, where
+# /src/target is the split output mount (ignored/hermetic/split/target)
+# and shadows this checkout's target/. Mirror the declared input --
+# the manifest and the buck-harvest files it names, nothing else --
+# into that location so prepare can read and hash-verify it there.
+# Prepare's verification is unchanged: it refuses missing, mismatched
+# or extra files by name against this same manifest.
+PINNED_VALIDATE=ignored/hermetic/split/target/validate
+mkdir -p "$PINNED_VALIDATE"
+rm -rf "$PINNED_VALIDATE/buck-harvest"
+mkdir -p "$PINNED_VALIDATE/buck-harvest"
+cp -- "$MANIFEST" "$PINNED_VALIDATE/harvested-files.json"
+printf '%s' "$ENTRIES" | while IFS='|' read -r _target name _src dest _placed _sha _bytes _listed; do
+  case $dest in
+    target/validate/buck-harvest/*)
+      cp -- "$dest" "$PINNED_VALIDATE/buck-harvest/$name"
+      ;;
+  esac
+done
+if [[ -f target/validate/buck-harvest/libreverie_examples.so ]]; then
+  cp -- target/validate/buck-harvest/libreverie_examples.so \
+    "$PINNED_VALIDATE/buck-harvest/libreverie_examples.so"
+fi
+echo "harvest-reverie-buck: staged manifest and buck-harvest into $PINNED_VALIDATE" >&2
 echo "harvest-reverie-buck: done" >&2
