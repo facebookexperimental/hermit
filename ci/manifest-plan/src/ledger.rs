@@ -2185,12 +2185,31 @@ impl TestResultsEvidenceV9 {
 
         for summary in &self.nodes {
             let producer = TestResultProducerIdentity::Node(summary.node.clone());
-            let recomputed = counts.remove(&producer).ok_or_else(|| {
-                format!(
-                    "schema 9 test-results artifact omits selected producer {}",
-                    summary.node
-                )
-            })?;
+            // A selected producer with no rows at all is present only as
+            // its zero totals: an empty bucket (e2e.manifest_gvisor runs
+            // with --allow-empty and can legitimately produce zero test
+            // rows) writes no artifact rows, so there is no counts entry
+            // to remove. Absence with any nonzero summary total is still
+            // the omission this check exists to refuse.
+            let recomputed = match counts.remove(&producer) {
+                Some(counts) => counts,
+                None if summary.row_count == 0
+                    && summary.totals.executed_tests == 0
+                    && summary.totals.passed_tests == 0
+                    && summary.totals.failed_tests == 0
+                    && summary.totals.filtered_tests == 0
+                    && summary.totals.diagnostic_failed_tests == 0
+                    && summary.totals.skipped_tests == 0 =>
+                {
+                    RecomputedTestResultCounts::default()
+                }
+                None => {
+                    return Err(format!(
+                        "schema 9 test-results artifact omits selected producer {}",
+                        summary.node
+                    ));
+                }
+            };
             if recomputed.executed_tests != summary.row_count
                 || recomputed.executed_tests != summary.totals.executed_tests
                 || recomputed.passed_tests != summary.totals.passed_tests
@@ -3490,6 +3509,42 @@ mod tests {
             &bytes,
             "omits selected producer",
         );
+
+        // The empty-bucket case (e2e.manifest_gvisor, --allow-empty):
+        // the producer's summary is zero in every total including
+        // filtered, and the artifact simply has no rows for it. That
+        // verifies; the omitted case above, whose summary still claims
+        // filtered rows, still refuses.
+        let zero_rows = schema9_artifact_rows()
+            .into_iter()
+            .filter(|row| {
+                !matches!(
+                    &row.producer,
+                    TestResultProducer::Node { node, .. } if node == "test.beta"
+                )
+            })
+            .collect::<Vec<_>>();
+        let zero_bytes = schema9_artifact_bytes(&zero_rows);
+        let mut zero = schema9_row();
+        zero["test_results"]["nodes"][1]["totals"] = serde_json::json!({
+            "executed_tests": 0,
+            "passed_tests": 0,
+            "failed_tests": 0,
+            "filtered_tests": 0
+        });
+        zero["test_results"]["nodes"][1]["row_count"] = serde_json::json!(0);
+        zero["test_results"]["totals"]["executed_tests"] = serde_json::json!(3);
+        zero["test_results"]["totals"]["passed_tests"] = serde_json::json!(2);
+        zero["test_results"]["totals"]["filtered_tests"] = serde_json::json!(3);
+        zero["test_results"]["recorded_count"] = serde_json::json!(3);
+        zero["executed_tests"] = serde_json::json!(3);
+        zero["passed_tests"] = serde_json::json!(2);
+        zero["filtered_tests"] = serde_json::json!(3);
+        bind_schema9_artifact(&mut zero, &zero_bytes, 3);
+        let zero_row: HistoryRow = serde_json::from_value(zero).unwrap();
+        zero_row
+            .verify_test_results_artifact_bytes(&constructed_plan_steps, true, &zero_bytes)
+            .expect("an all-zero selected producer must verify without rows");
 
         let mut compatibility_omitted_rows = schema9_artifact_rows();
         compatibility_omitted_rows.pop();
