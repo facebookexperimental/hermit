@@ -6638,7 +6638,7 @@ fn replay_of_instruction_offsets_is_refused_where_unsupported() {
             serde_json::from_slice(&std::fs::read(&with).unwrap()).unwrap();
         assert_eq!(
             json["format_version"],
-            detcore::preemptions::INSTRUCTION_OFFSET_FORMAT,
+            detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT,
             "{json}"
         );
         let object = json.as_object_mut().unwrap();
@@ -10813,7 +10813,7 @@ pub(crate) fn malformed_offsets() -> String {
     format!(
         "its schedule trace holds instruction offsets, which a record below format {} cannot \
          hold; the record is malformed",
-        detcore::preemptions::INSTRUCTION_OFFSET_FORMAT
+        detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT
     )
 }
 
