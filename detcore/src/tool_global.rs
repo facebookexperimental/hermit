@@ -8290,17 +8290,20 @@ pub enum SignalScope {
 /// register a placeholder (`Detcore::serves_placeholders`).
 // 26 follows SP2's 25, whose variants come before this revision's
 // `ChildSubreaper` pair. 27 is pidfd's `PidfdSelfQualificationRefusal`;
-// 29 is PR 4884's `StoreExclusive` retype, and 31 is PR #4867's `PostCrash`
-// pair (both landed in batch D2).
+// 29 is https://github.com/rrnewton/hermit/pull/4884's `StoreExclusive`
+// retype, and 31 is https://github.com/rrnewton/hermit/pull/4867's
+// `PostCrash` pair (both landed in batch D2).
 /// https://github.com/rrnewton/hermit/pull/4728's `SchedEvent::stopless`
 /// and `ReplayedSliceEnd` are revision 30, reserved for this change by the
 /// D2 seal; the combined layout on top of 31 appends revision 32.
-/// 40 appends the `CpuClockProcess` pair (drain of PR 4885, allocated
-/// revision 40) after 32, skipping reserved 33 to 39. 41 appends
-/// `HostFileIdentity::content` (PR #4791; allocated 25, renumbered to 36
-/// on main's 27, then renumbered mechanically to 41 on main's 40). 45 is
-/// #4796's TraceSchedEvent/WithWatchOrder revision, live-computed at its
-/// rebase onto 41 skipping reserved 42 to 44.
+/// 40 appends the `CpuClockProcess` pair
+/// (https://github.com/rrnewton/hermit/pull/4885) after 32, skipping reserved
+/// 33 to 39. 41 appends `HostFileIdentity::content`
+/// (https://github.com/rrnewton/hermit/pull/4791; allocated 25, renumbered to
+/// 36 on main's 27, then renumbered mechanically to 41 on main's 40).
+/// 45 is the `TraceSchedEvent`/`WithWatchOrder` revision from
+/// https://github.com/rrnewton/hermit/pull/4796, measured at its rebase onto
+/// 41, skipping reserved 42 to 44.
 /// https://github.com/rrnewton/hermit/pull/4769's `PublishInstructionOffset`
 /// pair, appended after the `CpuClockProcess` pair at the tail of each
 /// enum, is revision 46, the next revision after 45. 47 adds
@@ -8310,13 +8313,9 @@ pub enum SignalScope {
 /// landed 46). 48 adds `WithCpuTime` and `RecordExitCode` (package K item
 /// 2b slice 2b-1, allocated 39, renumbered 41 at its rebase onto 40, 42 at
 /// its rebase onto 41, 46 at its rebase onto 45, then mechanically to 48
-/// at its rebase onto 47) and is the current revision.
-/// From https://github.com/rrnewton/hermit/pull/5222, merged at landing by the merge queue (its
-/// revision 48 is 49):
-/// `Rewrite::unmarked` to the `StoreExclusive` payload (numbered 42 at
-/// this change's rebase onto main's 41, renumbered to 47, the next
-/// revision after the landed 46). 48 adds `Rewrite::not_written` to the
-/// `StoreExclusive` payload and is current.
+/// at its rebase onto 47). 49 adds `Rewrite::not_written` to the
+/// `StoreExclusive` payload (https://github.com/rrnewton/hermit/pull/5222;
+/// numbered 48 on its source base, renumbered to 49 at landing).
 pub(crate) const GLOBAL_RPC_REVISION: u32 = 49;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`

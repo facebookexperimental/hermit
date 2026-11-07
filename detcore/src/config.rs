@@ -87,11 +87,10 @@ mod tests {
     use super::*;
 
     /// Revisions reserved for a change that is not on this base yet, which
-    /// `GLOBAL_RPC_REVISIONS` therefore skips: 33 to 39 are reserved for
-    /// pending changes in the coordinator's allocation table (39 for kvm
-    /// 2b-1), and 42 to 44 and 46 are reserved claims at this rebase
-    /// (42 and 46 for PR 4769, 43 for PR 4627, 44 for kvm-2b-3 in the
-    /// allocation table). At this head 28 is
+    /// `GLOBAL_RPC_REVISIONS` therefore skips: 33 to 39 and 42 to 44 retain
+    /// the coordinator's reserved allocation numbers. A landed change uses
+    /// the next available row; its earlier reservation remains separate
+    /// until the allocation is released. At this head 28 is
     /// https://github.com/rrnewton/hermit/pull/4789's, 29 is
     /// https://github.com/rrnewton/hermit/pull/4884's, 30 is
     /// https://github.com/rrnewton/hermit/pull/4728's, 31 is
@@ -105,15 +104,11 @@ mod tests {
     /// https://github.com/rrnewton/hermit/pull/4769's
     /// `PublishInstructionOffset` revision, 47 is
     /// https://github.com/rrnewton/hermit/pull/4735's `StoreExclusive`
-    /// payload layout, and 48, package K item 2b slice 2b-1's, is current.
-    /// From https://github.com/rrnewton/hermit/pull/5222, merged at landing by the merge queue:
-    /// `PublishInstructionOffset` revision. 47 is this change's
-    /// `StoreExclusive` payload layout; 48 adds `Rewrite::not_written`
-    /// and is current.
-    /// 42 to 44 are queued or advisory claims at this rebase
-    /// (42 on drain/4759, 43 for PR 4627, 44 for kvm-2b-3 in the
-    /// allocation table). Remove an entry when its change lands, with
-    /// its row.
+    /// payload layout. 48 adds `WithCpuTime` and `RecordExitCode` from
+    /// package K item 2b slice 2b-1. 49 adds `Rewrite::not_written` from
+    /// https://github.com/rrnewton/hermit/pull/5222, numbered 48 on its
+    /// source base and renumbered to 49 at landing. The table below is the
+    /// authority for the landed rows; the reservation list is unchanged.
     const RESERVED_GLOBAL_RPC_REVISIONS: &[u32] = &[33, 34, 35, 36, 37, 38, 39, 42, 43, 44];
 
     /// Every revision of the global RPC, oldest first, with the digest of the
