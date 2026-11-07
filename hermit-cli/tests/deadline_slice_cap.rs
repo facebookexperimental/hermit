@@ -1484,9 +1484,9 @@ fn a_recording_keeps_lone_slice_ends_and_marks_them() {
 /// of it takes them, since it checks none.
 #[test]
 fn replays_take_recorded_lone_slice_ends_the_same_way() {
-    let (recorded, marked, marked_record) = lone_record("wait", false);
+    let (recorded, marked, marked_record) = lone_record("wait-short", false);
     let recorded_events = global_events(&marked_record);
-    let (_, unmarked, _) = lone_record("wait", true);
+    let (_, unmarked, _) = lone_record("wait-short", true);
     let marked_ends = global_events(&marked_record)
         .iter()
         .filter(|event| event.stopless)
@@ -1496,7 +1496,7 @@ fn replays_take_recorded_lone_slice_ends_the_same_way() {
         let replay = |record: &Path, eager: bool, tag: &str| {
             let tag = format!("{}-{tag}", option.trim_start_matches("--"));
             lone_run_with(
-                "wait",
+                "wait-short",
                 "1000",
                 eager,
                 &tag,
@@ -1509,7 +1509,7 @@ fn replays_take_recorded_lone_slice_ends_the_same_way() {
         ));
         let _ = fs::remove_file(&rerecorded);
         let lazy = lone_run_with(
-            "wait",
+            "wait-short",
             "1000",
             false,
             &format!("{}-marked", option.trim_start_matches("--")),

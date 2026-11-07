@@ -13,6 +13,10 @@
 //   timeout, so no other thread can run before main's next syscall) while
 //   main runs a 25000-iteration loop without a syscall; then both add 5000 to
 //   a shared counter without a lock.
+// - "wait-short": "wait" with an 8000-iteration loop, for the replay test
+//   that runs this guest eight times; at 25000 iterations its counted CPU
+//   cost outgrew the per-test budget under load, and 8000 still records
+//   hundreds of stopless slice ends and timer checkpoints.
 // - "sleep": the worker naps 100 us at a time (a timed wait, so any slice end
 //   may hand it the turn) through main's loop, of 8000 iterations here, and
 //   main exits without waking it.
@@ -130,7 +134,7 @@ int main(int argc, char** argv) {
   unsigned long iterations = 25000;
   if (strcmp(mode, "long") == 0) {
     iterations = 1250000;
-  } else if (napping) {
+  } else if (napping || strcmp(mode, "wait-short") == 0) {
     iterations = 8000;
   }
   int segv = strcmp(mode, "segv") == 0;
