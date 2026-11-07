@@ -655,7 +655,7 @@ mod tests {
     fn an_unreadable_first_pass_refusal_keeps_its_policy_class_across_the_container_boundary() {
         let config = detcore::Config {
             sequentialize_threads: true,
-            backend: crate::backend_capabilities(crate::Backend::Kvm),
+            backend: crate::backend_capabilities(crate::Backend::Liteinst),
             sleep_registration: Some(detcore_model::config::SleepRegistration::FirstPass),
             ..detcore::Config::default()
         };

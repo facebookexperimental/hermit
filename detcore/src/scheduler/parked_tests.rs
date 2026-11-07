@@ -9082,7 +9082,8 @@ fn kvm_fixture() -> (Scheduler, Arc<Backend>) {
         max_timeslice: None,
         ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::KVM)
     });
-    assert!(!s.models_signal_targets);
+    // SIGSHARE S3b: KVM's kernel signal targets are predictable.
+    assert!(s.models_signal_targets);
     let backend = Arc::new(Backend::default());
     assert_eq!(
         s.install_signal_control(
@@ -9286,12 +9287,14 @@ fn a_controlled_exit_to_a_one_thread_parent_is_classified_at_its_grant() {
             false,
             Some(N::Undecided),
         ),
+        // SIGSHARE S3b: KVM models signal targets, so a parent with another
+        // live thread is decided too, as on ptrace.
         (
             "two threads",
             sigchld_sets(false, false, true),
             true,
             true,
-            None,
+            Some(N::Deliver),
         ),
     ] {
         let (mut s, backend) = kvm_fixture();
@@ -9324,6 +9327,25 @@ fn a_controlled_exit_to_a_one_thread_parent_is_classified_at_its_grant() {
         // No hold waits for a kernel publication report on this backend.
         assert!(s.child_exit_publications_pending.is_empty(), "{name}");
     }
+    // Where the scheduler does not model signal targets (before S3b), a
+    // parent with another live thread keeps the backend's decision.
+    let (mut s, backend) = kvm_fixture();
+    s.models_signal_targets = false;
+    let (parent, _, _) = add(&mut s, 100, 100);
+    let _ = add(&mut s, 100, 101);
+    let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
+    backend
+        .signal_sets
+        .lock()
+        .unwrap()
+        .insert(100, sigchld_sets(false, false, true));
+    file_restartable_read(&mut s, parent);
+    grant_group_exit(&mut s, child, child_mm);
+    assert_eq!(
+        s.controlled_child_exits_decision(DetPid::from_raw(200)),
+        None
+    );
+    assert!(child_exit_timers(&s).is_empty());
 }
 
 /// The cross-check table (design S4 and S0 correction 2): the only allowed

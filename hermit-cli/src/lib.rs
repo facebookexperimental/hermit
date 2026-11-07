@@ -8555,8 +8555,12 @@ mod tests {
             // Readings of the field above until A5 step 3c.0 split them out,
             // with its value on every backend.
             "kernel_signal_state_is_guests": matches!(backend, CapabilityCase::Ptrace | CapabilityCase::E9patch),
-            "kernel_signal_targets_are_predictable":
-                matches!(backend, CapabilityCase::Ptrace | CapabilityCase::E9patch),
+            // SIGSHARE S3b: KVM chooses no receiver of its own; a thread
+            // takes a signal only with the delivery permit the tool reserves.
+            "kernel_signal_targets_are_predictable": matches!(
+                backend,
+                CapabilityCase::Ptrace | CapabilityCase::E9patch | CapabilityCase::Kvm
+            ),
             "host_task_reads_reach_guest_threads":
                 matches!(backend, CapabilityCase::Ptrace | CapabilityCase::E9patch),
             "host_timed_signals_are_physical":

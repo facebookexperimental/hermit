@@ -140,12 +140,13 @@ mod tests {
 
     // Post-split core backends whose sleepers' signal state is not read.
     // (DBT/SaBRe left core with the split; their rows move to the external
-    // backend repositories.)
-    const UNREADABLE: [Backend; 3] = [Backend::Liteinst, Backend::InGuestTrap, Backend::Kvm];
+    // backend repositories.) KVM left this list with SIGSHARE S3b: the
+    // scheduler models its signal targets.
+    const UNREADABLE: [Backend; 2] = [Backend::Liteinst, Backend::InGuestTrap];
 
     /// An explicit `first-pass` is refused by name on every backend whose
     /// sleepers' signal state the scheduler does not read, and admitted on
-    /// ptrace and under the in-guest delivery gate. The default and
+    /// ptrace, on KVM and under the in-guest delivery gate. The default and
     /// `when-chosen` are never refused, nor is anything under `hermit
     /// record`/`replay`.
     #[test]
@@ -199,16 +200,19 @@ mod tests {
                 "{name}"
             );
         }
-        for registration in [
-            None,
-            Some(SleepRegistration::FirstPass),
-            Some(SleepRegistration::WhenChosen),
-        ] {
-            assert_eq!(
-                refuse_unreadable_first_pass_launch(&prepared(Backend::Ptrace, registration)),
-                Ok(()),
-                "ptrace, {registration:?}"
-            );
+        for backend in [Backend::Ptrace, Backend::Kvm] {
+            for registration in [
+                None,
+                Some(SleepRegistration::FirstPass),
+                Some(SleepRegistration::WhenChosen),
+            ] {
+                assert_eq!(
+                    refuse_unreadable_first_pass_launch(&prepared(backend, registration)),
+                    Ok(()),
+                    "{}, {registration:?}",
+                    backend.as_str()
+                );
+            }
         }
         // Without sequentialized threads the scheduler models no signal
         // targets, on ptrace too, and the refusal says so.
@@ -241,7 +245,7 @@ mod tests {
                 let config = Config {
                     replay_schedule_from: schedule.then(|| path.clone()),
                     replay_preemptions_from: (!schedule).then(|| path.clone()),
-                    ..prepared(Backend::Kvm, None)
+                    ..prepared(Backend::Liteinst, None)
                 };
                 let result = refuse_unreadable_first_pass_launch(&config);
                 if first_pass {

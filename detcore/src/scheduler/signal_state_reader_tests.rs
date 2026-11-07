@@ -146,7 +146,8 @@ pub(super) fn kvm_scheduler(control: &Arc<ScriptedControl>, installed: bool) -> 
         ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::KVM)
     });
     assert!(scheduler.backend.provides_process_signal_control);
-    assert!(!scheduler.models_signal_targets);
+    // SIGSHARE S3b: KVM's kernel signal targets are predictable.
+    assert!(scheduler.models_signal_targets);
     if installed {
         assert_eq!(
             scheduler
@@ -353,6 +354,12 @@ fn kvm_poller(
 ) -> (Scheduler, Arc<ScriptedControl>) {
     let control = Arc::new(ScriptedControl::default());
     let mut scheduler = kvm_scheduler(&control, true);
+    // These cases pin S2a's drain filter, which decides from the backend's
+    // dispositions where no record of copies Linux discarded at send is
+    // kept. Since SIGSHARE S3b KVM keeps that record (`models_signal_targets`),
+    // and the sender's turn decides instead
+    // (`with_the_record_a_kvm_poll_is_decided_in_the_senders_turn`).
+    scheduler.models_signal_targets = false;
     add_bound_thread(&mut scheduler, POLLER, POLLER);
     control.script(POLLER, vec![Ok(state)]);
     let mut polling = Resources::new(POLLER);

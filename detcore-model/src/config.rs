@@ -5226,28 +5226,37 @@ mod tests {
     /// The four capabilities split out of
     /// `supports_blocked_wait_signal_interruption` in A5 step 3c.0 equal it
     /// on every backend, as the readings they replace did, so no backend's
-    /// behaviour moves; and `models_signal_targets` is serialized threads and
-    /// `kernel_signal_targets_are_predictable`, under both thread modes.
+    /// behaviour moves, except `kernel_signal_targets_are_predictable` on
+    /// KVM, which SIGSHARE S3b sets alone: under Tool-controlled delivery the
+    /// tool's choice is the target. `models_signal_targets` is serialized
+    /// threads and `kernel_signal_targets_are_predictable`, under both thread
+    /// modes.
     #[test]
     fn split_signal_facts_equal_their_former_bundle_on_every_backend() {
-        // Only ptrace and e9patch set the bundle today.
+        // Only ptrace and e9patch set the bundle today; KVM sets
+        // `kernel_signal_targets_are_predictable` alone (the last column).
         let backends = [
-            ("ptrace", BackendCapabilities::PTRACE, true),
-            ("e9patch", BackendCapabilities::E9PATCH, true),
-            ("liteinst", BackendCapabilities::LITEINST_IN_GUEST, false),
-            ("sabre", BackendCapabilities::SABRE, false),
-            ("dbt", BackendCapabilities::DBT, false),
-            ("kvm", BackendCapabilities::KVM, false),
-            ("unprepared", DEFAULT_BACKEND_CAPABILITIES, false),
+            ("ptrace", BackendCapabilities::PTRACE, true, true),
+            ("e9patch", BackendCapabilities::E9PATCH, true, true),
+            (
+                "liteinst",
+                BackendCapabilities::LITEINST_IN_GUEST,
+                false,
+                false,
+            ),
+            ("sabre", BackendCapabilities::SABRE, false, false),
+            ("dbt", BackendCapabilities::DBT, false, false),
+            ("kvm", BackendCapabilities::KVM, false, true),
+            ("unprepared", DEFAULT_BACKEND_CAPABILITIES, false, false),
         ];
-        for (name, backend, expected) in backends {
+        for (name, backend, expected, predictable) in backends {
             assert_eq!(
                 backend.supports_blocked_wait_signal_interruption, expected,
                 "{name}"
             );
             assert_eq!(backend.kernel_signal_state_is_guests, expected, "{name}");
             assert_eq!(
-                backend.kernel_signal_targets_are_predictable, expected,
+                backend.kernel_signal_targets_are_predictable, predictable,
                 "{name}"
             );
             assert_eq!(
@@ -5267,7 +5276,9 @@ mod tests {
             set_kernel_signal_facts(&mut toggled, !expected);
             assert_eq!(toggled, flipped, "{name}");
             set_kernel_signal_facts(&mut toggled, expected);
-            assert_eq!(toggled, backend, "{name}");
+            let mut uniform = backend;
+            uniform.kernel_signal_targets_are_predictable = expected;
+            assert_eq!(toggled, uniform, "{name}");
             for sequentialize_threads in [false, true] {
                 let cfg = Config {
                     sequentialize_threads,
@@ -5276,7 +5287,7 @@ mod tests {
                 };
                 assert_eq!(
                     cfg.models_signal_targets(),
-                    sequentialize_threads && expected,
+                    sequentialize_threads && predictable,
                     "{name}, sequentialize_threads={sequentialize_threads}"
                 );
             }
@@ -8846,9 +8857,9 @@ mod tests {
     }
 
     /// By default a queued sleep registers at the first pass only where the scheduler reads a
-    /// sleeper's signal state: a backend whose kernel signal targets it predicts (ptrace), or any
-    /// backend under the in-guest delivery gate. DBT, SaBRe, LiteInst and KVM register when
-    /// chosen by default. An explicit value decides here; a `first-pass` the backend cannot honour
+    /// sleeper's signal state: a backend whose kernel signal targets it predicts (ptrace, and KVM
+    /// since SIGSHARE S3b), or any backend under the in-guest delivery gate. DBT, SaBRe and
+    /// LiteInst register when chosen by default. An explicit value decides here; a `first-pass` the backend cannot honour
     /// is refused at launch. Race search and `hermit record`/`replay` keep their rule.
     #[test]
     fn first_pass_sleep_registration_is_the_default_only_where_signal_state_is_read() {
@@ -8864,6 +8875,7 @@ mod tests {
         for (name, backend) in [
             ("PTRACE", BackendCapabilities::PTRACE),
             ("E9PATCH", BackendCapabilities::E9PATCH),
+            ("KVM", BackendCapabilities::KVM),
         ] {
             let default = config(backend, false, None);
             assert!(default.reads_sleeper_signal_state(), "{name}");
@@ -8873,7 +8885,6 @@ mod tests {
             ("DBT", BackendCapabilities::DBT),
             ("SABRE", BackendCapabilities::SABRE),
             ("LITEINST_IN_GUEST", BackendCapabilities::LITEINST_IN_GUEST),
-            ("KVM", BackendCapabilities::KVM),
         ] {
             let default = config(backend, false, None);
             assert!(!default.reads_sleeper_signal_state(), "{name}");
