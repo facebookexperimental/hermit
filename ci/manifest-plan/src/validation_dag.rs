@@ -542,7 +542,7 @@ fn exclusion_flags(excluded: &[&str]) -> String {
 }
 // The capacity column is the DAG's one resource_caps entry: a hosted run selects its
 // steps from the same validate.json, so it carries the same 20 slots as a local run.
-const HOSTED_RESOURCE_TUPLES: [(&str, &str, i64, i64); 14] = [
+const HOSTED_RESOURCE_TUPLES: [(&str, &str, i64, i64); 15] = [
     ("e2e.manifest_applications", "manifest_guest", 1, 20),
     ("e2e.manifest_bin_c", "manifest_guest", 1, 20),
     ("e2e.manifest_c_programs", "manifest_guest", 8, 20),

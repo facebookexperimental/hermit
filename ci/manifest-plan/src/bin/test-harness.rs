@@ -8646,7 +8646,7 @@ sys.exit(1 if failed else 0)
         // (e2e.manifest_rr_on_host, the first post-split extension bucket)
         // and gvisor (e2e.manifest_gvisor_on_host,
         // https://github.com/rrnewton/hermit/pull/5194): fifteen.
-        assert_eq!(hosted, 14, "hosted-portable harness steps");
+        assert_eq!(hosted, 15, "hosted-portable harness steps");
         assert_eq!(portable_focused, 1, "portable-strict-compat-only steps");
         assert!(local > hosted, "local harness steps: {local}");
     }
@@ -8725,7 +8725,7 @@ sys.exit(1 if failed else 0)
         // gvisor extension bucket adds the same shape: +1 pinned
         // (e2e.manifest_gvisor) and +2 direct (its _on_host and _buck
         // twins, https://github.com/rrnewton/hermit/pull/5194).
-        assert_eq!((pinned, direct), (21, 37));
+        assert_eq!((pinned, direct), (22, 39));
     }
 
     /// The full profile's harness nodes together report each cell of the
@@ -8794,7 +8794,7 @@ sys.exit(1 if failed else 0)
         // and the reports below are unchanged. 18 with
         // e2e.manifest_gvisor, the vendored gVisor bucket's full node
         // (https://github.com/rrnewton/hermit/pull/5194).
-        assert_eq!(nodes, 17);
+        assert_eq!(nodes, 18);
         // The size of the population is not pinned here: parity.rs derives it
         // from the manifests and parity-cells.json snapshots it. This pins
         // what no generator checks: each population cell is reported by
@@ -9984,8 +9984,8 @@ sys.exit(1 if failed else 0)
         // e2e.manifest_gvisor_on_host joined the same shard with the
         // vendored gVisor bucket
         // (https://github.com/rrnewton/hermit/pull/5194; 20 to 21).
-        assert_eq!(physical_rows, 20);
-        assert_eq!(resolved.len(), 20);
+        assert_eq!(physical_rows, 21);
+        assert_eq!(resolved.len(), 21);
         assert_eq!(actual_aliases, expected_aliases);
         // Run the complete real budget audit too: all original workflow,
         // critical-path and exact inversion-baseline comparisons remain active.

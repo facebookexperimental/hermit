@@ -7815,14 +7815,16 @@ mod e2e_runner_tests {
             .difference(&buck_tags)
             .cloned()
             .collect::<BTreeSet<_>>();
-        // The two runner nodes (e2e.buck_stage, e2e.buck_cells) plus 18
-        // `_buck` import twins: 17 until e2e.manifest_gvisor_buck, the
-        // vendored gVisor bucket's twin
+        // The two runner nodes (e2e.buck_stage, e2e.buck_cells) plus 19
+        // `_buck` import twins: 17 originally, +1 for e2e.manifest_rr_buck
+        // (rr Batch 0) and +1 for e2e.manifest_gvisor_buck, the vendored
+        // gVisor bucket's twin
         // (https://github.com/rrnewton/hermit/pull/5194).
-        assert_eq!(added.len(), 20, "{added:?}");
+        assert_eq!(added.len(), 21, "{added:?}");
         assert!(added.contains("e2e.buck_stage"));
         assert!(added.contains("e2e.buck_cells"));
         assert!(added.contains("full-scorecard.compatibility_buck"));
+        assert!(added.contains("e2e.manifest_rr_buck"));
         assert!(added.contains("e2e.manifest_gvisor_buck"));
         for tag in &added {
             if tag != "e2e.buck_cells" && tag != "e2e.buck_stage" {
@@ -7832,11 +7834,12 @@ mod e2e_runner_tests {
         }
         // 21 dropped since the host compatprep.fixtures step retired from
         // full (issue 4997, one writer): the Cargo full plan no longer
-        // carries it for the Buck plan to drop. 22 before, and 22 again with
-        // e2e.manifest_gvisor swapped for its _buck twin
+        // carries it for the Buck plan to drop. 22 before, 22 again with
+        // e2e.manifest_rr swapped for its _buck twin (rr Batch 0), and 23
+        // with e2e.manifest_gvisor swapped for its _buck twin
         // (https://github.com/rrnewton/hermit/pull/5194).
-        assert_eq!(dropped.len(), 22, "{dropped:?}");
-        assert_eq!(buck_tags.len(), cargo_tags.len() - 22 + 20);
+        assert_eq!(dropped.len(), 23, "{dropped:?}");
+        assert_eq!(buck_tags.len(), cargo_tags.len() - 23 + 21);
         assert_eq!(buck.profile, "full");
         assert_eq!(buck.selection_mode, "full");
         assert!(buck.suite_complete);
@@ -20512,11 +20515,12 @@ printf 'FORWARDED_CPU=%s\nFORWARDED_WALL=%s\n' "$cpu_value" "$wall_value"
         // retired with the compat/strict-<row> tests
         // (https://github.com/rrnewton/hermit/issues/4276). 56 with
         // supercompat.manifest_compat, the super run type's heavy compat rows
-        // (same issue). The frozen original stays 56; the gVisor extension
-        // bucket's three nodes (e2e.manifest_gvisor and twins) join the actual
-        // population by registry declaration; with the one patching-owned frozen
-        // row (sabrecompat.manifest_compat) never in the core set, 55 frozen
-        // core + 3 declared = 58 steps match below.
+        // (same issue). The frozen original stays 56; the two extension
+        // buckets' six nodes (e2e.manifest_rr and e2e.manifest_gvisor, each
+        // with twins) join the actual population by registry declaration;
+        // with the one patching-owned frozen row
+        // (sabrecompat.manifest_compat) never in the core set, 55 frozen
+        // core + 6 declared = 61 steps match below.
         hermit_manifest_plan::dag_source_ownership::assert_named_population(
             "manifest_publishers",
             56,
@@ -37611,11 +37615,12 @@ mod raw_census_publication_tests {
         // retired with the compat/strict-<row> tests
         // (https://github.com/rrnewton/hermit/issues/4276). 56 with
         // supercompat.manifest_compat, the super run type's heavy compat rows
-        // (same issue). The frozen original stays 56; the gVisor extension
-        // bucket's three nodes (e2e.manifest_gvisor and twins) join the actual
-        // population by registry declaration; with the one patching-owned frozen
-        // row (sabrecompat.manifest_compat) never in the core set, 55 frozen
-        // core + 3 declared = 58 publishers match below.
+        // (same issue). The frozen original stays 56; the two extension
+        // buckets' six nodes (e2e.manifest_rr and e2e.manifest_gvisor, each
+        // with twins) join the actual population by registry declaration;
+        // with the one patching-owned frozen row
+        // (sabrecompat.manifest_compat) never in the core set, 55 frozen
+        // core + 6 declared = 61 publishers match below.
         hermit_manifest_plan::dag_source_ownership::assert_named_population(
             "manifest_publishers",
             56,
