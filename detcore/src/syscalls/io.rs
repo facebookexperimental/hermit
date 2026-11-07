@@ -2205,8 +2205,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                     // Each probe is a new select call, so a descriptor closed during
                     // the wait gets EBADF, where Linux reports it ready. Without the
                     // kernel's signal state, a scheduler `Signaled` answer still ends
-                    // the call before the probe.
-                    if signals.is_none() && signaled && !gated {
+                    // the call before the probe, unless the probes carry the call's
+                    // temporary mask (`probe_mask_cell`, KVM): the probe then takes
+                    // the signal that woke the wait under that mask, which the backend
+                    // delivers there as it answers EINTR, as Linux delivers it before
+                    // it restores the thread's own mask (`restore_saved_sigmask`).
+                    // Ended before the probe, the call answered EINTR with the signal
+                    // still pending under an own mask that blocks it, and no handler
+                    // ran (`chld-pselect-lets-in` in tests/c/process_signal_target.c,
+                    // the Codex review of https://github.com/rrnewton/hermit/pull/5259).
+                    if signals.is_none() && signaled && !gated && probe_mask_cell.is_none() {
                         self.write_pselect6_remaining(guest, call, deadline).await?;
                         return Err(Errno::EINTR.into());
                     }

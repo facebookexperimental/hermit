@@ -42,6 +42,7 @@ use crate::ivar::Ivar;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::syscalls::KernelSignalState;
 use crate::tool_global::ResumeStatus;
 use crate::types::ChildWaitExitClass;
 use crate::types::ChildWaitSpec;
@@ -1805,8 +1806,9 @@ impl Scheduler {
 
     /// Whether `thread` has a signal pending for it alone that it neither
     /// blocks nor ignores (Linux's `task_sigpending` after `prepare_signal`
-    /// dropped the ignored ones), read as `alarm_wants` reads a busy thread.
-    fn has_own_signal_to_take(&self, thread: DetTid) -> bool {
+    /// dropped the ignored ones), read as `alarm_wants` reads a busy thread
+    /// (`own_signals_to_take`).
+    pub(super) fn has_own_signal_to_take(&self, thread: DetTid) -> bool {
         if !self.reads_settled_signal_state(thread) {
             return false;
         }
@@ -1815,8 +1817,27 @@ impl Scheduler {
         };
         self.read_guest_signal_state(thread).is_ok_and(|state| {
             let mask = temporary.unwrap_or(state.blocked);
-            state.thread_pending & !mask & !state.ignored_at_generation() != 0
+            self.own_signals_to_take(thread, &state, mask) != 0
         })
+    }
+
+    /// The signals pending for `thread` alone (`state`, the reader's) that it
+    /// takes under `mask`: not blocked, not ignored now, and not a copy Linux
+    /// discarded as it was sent (`discarded_bits`). An unblocked signal the
+    /// thread ignored when it was sent was never queued
+    /// (`prepare_signal` returns `!sig_ignored`, and `__send_signal_locked`
+    /// returns before queueing, kernel/signal.c:935 and 1053-1054 at v6.17),
+    /// so a handler installed afterwards never sees it (`sig_ignored`, lines
+    /// 106-125). This backend keeps such a copy for the Tool to observe; read
+    /// by the current disposition alone, it counted as caught once a handler
+    /// was installed, and the observation interrupted a parked `waitid` for a
+    /// `SIGURG` Linux had discarded (the Codex review of
+    /// <https://github.com/rrnewton/hermit/pull/5259>, P1). A copy that was
+    /// blocked when sent was queued, and keeps counting: the record keeps its
+    /// bit clear (`DiscardedAtSend::note_send`).
+    fn own_signals_to_take(&self, thread: DetTid, state: &KernelSignalState, mask: u64) -> u64 {
+        let (discarded, _) = self.discarded_bits(thread);
+        state.thread_pending & !mask & !state.ignored_at_generation() & !discarded
     }
 
     /// The thread Linux's `complete_signal` wakes for a SIGALRM in `pid`'s
@@ -1966,7 +1987,7 @@ impl Scheduler {
                 let busy = !outside
                     && self.read_guest_signal_state(thread).is_ok_and(|state| {
                         let mask = temporary.unwrap_or(state.blocked) & !waited;
-                        state.thread_pending & !mask & !state.ignored_at_generation() != 0
+                        self.own_signals_to_take(thread, &state, mask) != 0
                     });
                 (thread, if busy { Wants::Busy } else { Wants::Yes })
             })

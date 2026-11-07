@@ -503,7 +503,26 @@ static void additional_interrupt_cases(void) {
  * atomics cross the thread boundary before join. The sibling owns its three
  * descriptors because pthreads share the descriptor table. Yield counts are
  * finite opportunities; the Rust harness also requires the actual park,
- * signal grant, re-park and release ordering in BOTH retained INFO logs. */
+ * send and release ordering in BOTH retained INFO logs.
+ *
+ * Two contrasts follow the plain case. In LATE_HANDLER the sibling installs a
+ * counting SIGURG handler after its send and before the release: Linux
+ * discarded the unblocked default-ignored SIGURG as it was sent
+ * (prepare_signal's sig_ignored, kernel/signal.c:935 at v6.17), so the handler
+ * never runs, and the wait still ends with EFAULT. In BLOCKED_LATE_HANDLER the
+ * waiter blocks SIGURG before the send, so Linux queues it (sig_ignored keeps
+ * a blocked signal, lines 113-114); once the wait has ended and the sibling
+ * joined, the waiter unblocks it and the late handler runs exactly once. */
+enum sibling_variant { IGNORED, LATE_HANDLER, BLOCKED_LATE_HANDLER };
+static const char *const sibling_names[] = {
+    "ignored-sibling-sigurg", "ignored-sibling-sigurg-late-handler",
+    "blocked-sibling-sigurg-late-handler"};
+static volatile sig_atomic_t sibling_handled;
+static void sibling_handler(int sig) {
+  (void)sig;
+  ++sibling_handled;
+}
+
 _Static_assert(ATOMIC_INT_LOCK_FREE == 2, "lock-free sibling protocol");
 struct ignored_sibling {
   _Atomic int returned, release_started;
@@ -513,7 +532,8 @@ struct ignored_sibling {
   unsigned char *info_snapshot, *aux_snapshot;
   size_t length;
   int failure, pre_returned, wait_release_seen, send_calls;
-  struct result start, send, release, ack;
+  enum sibling_variant variant;
+  struct result start, send, release, ack, handler;
 };
 
 static struct result byte_read(int fd, char *byte) {
@@ -554,6 +574,16 @@ static void *ignored_sender(void *opaque) {
     if (value != 0 || error != 0) s->failure = 1;
     for (int n = 0; n < 4; ++n)
       if (sched_yield() != 0) s->failure = 1;
+    if (s->variant != IGNORED) {
+      /* The process-wide action changes after the send, before release. */
+      struct sigaction late = {.sa_handler = sibling_handler};
+      sigemptyset(&late.sa_mask);
+      errno = 0;
+      long installed = sigaction(SIGURG, &late, NULL);
+      int install_error = errno;
+      s->handler = (struct result){installed, install_error};
+      if (installed != 0) s->failure = 1;
+    }
   } else {
     s->failure = 1;
   }
@@ -579,7 +609,7 @@ static void *ignored_sender(void *opaque) {
   return NULL;
 }
 
-static void ignored_sibling_case(void) {
+static void ignored_sibling_case(enum sibling_variant variant) {
   struct arena i = arena_new(), u = arena_new();
   unsigned char *is = malloc(i.length), *us = malloc(u.length);
   int start[2] = {-1, -1}, release[2] = {-1, -1}, ack[2] = {-1, -1};
@@ -592,7 +622,9 @@ static void ignored_sibling_case(void) {
   struct result r = {-2, 0}, start_result = {-2, 0};
   struct ignored_sibling s = {.start_fd = -1, .release_fd = -1, .ack_fd = -1,
       .info = i.memory, .aux = u.memory, .info_snapshot = is, .aux_snapshot = us,
-      .length = i.length, .send = {-2, 0}, .release = {-2, 0}, .ack = {-2, 0}};
+      .length = i.length, .send = {-2, 0}, .release = {-2, 0}, .ack = {-2, 0},
+      .variant = variant, .handler = {-2, 0}};
+  sibling_handled = 0;
   atomic_init(&s.returned, 0);
   atomic_init(&s.release_started, 0);
   if (!is || !us) { failure = 1; goto cleanup; }
@@ -603,7 +635,8 @@ static void ignored_sibling_case(void) {
   }
   have_action = 1;
   sigemptyset(&unblocked); sigaddset(&unblocked, SIGURG);
-  if (pthread_sigmask(SIG_UNBLOCK, &unblocked, &previous_mask) != 0) {
+  if (pthread_sigmask(variant == BLOCKED_LATE_HANDLER ? SIG_BLOCK : SIG_UNBLOCK,
+                      &unblocked, &previous_mask) != 0) {
     failure = 1; goto cleanup;
   }
   have_mask = 1;
@@ -663,7 +696,17 @@ static void ignored_sibling_case(void) {
   struct result follow = raw_waitid(P_PID, child, check + 16,
                                    WEXITED | WNOHANG, NULL);
   child_consumed = follow.value == -1 && follow.error == ECHILD;
-  printf("{\"type\":\"case\",\"name\":\"ignored-sibling-sigurg\","
+  /* A queued SIGURG is taken as this returns; a discarded one never is. */
+  struct result unblock = {0, 0};
+  if (variant == BLOCKED_LATE_HANDLER) {
+    errno = 0;
+    unblock.value = pthread_sigmask(SIG_UNBLOCK, &unblocked, NULL);
+    unblock.error = errno;
+  }
+  int handled = sibling_handled;
+  printf("{\"type\":\"case\",\"name\":\"%s\","
+         "\"late_handler\":%d,\"blocked_at_send\":%d,\"handler_rc\":%ld,"
+         "\"handler_errno\":%d,\"unblock_rc\":%ld,\"handled\":%d,"
          "\"which\":%d,\"id\":%d,\"tgid\":%d,\"waiter_tid\":%d,\"sender_tid\":%d,"
          "\"rc\":%ld,\"errno\":%d,\"options\":\"%#x\",\"alarms\":%d,"
          "\"info_mode\":2,\"info_offset\":64,\"usage_protection\":%d,\"null_usage\":1,"
@@ -671,6 +714,8 @@ static void ignored_sibling_case(void) {
          "\"send_rc\":%ld,\"send_errno\":%d,\"pre_returned\":%d,\"release_seen\":%d,"
          "\"release_fd\":%d,\"release_rc\":%ld,\"release_errno\":%d,"
          "\"ack_rc\":%ld,\"ack_errno\":%d,\"sender_failure\":%d,\"pre_info\":\"",
+         sibling_names[variant], variant != IGNORED, variant == BLOCKED_LATE_HANDLER,
+         s.handler.value, s.handler.error, unblock.value, handled,
          P_PID, child, s.tgid, s.waiter_tid, s.sender_tid, r.value, r.error,
          WEXITED, alarms, RW, SIGURG, wait_calls, s.send_calls,
          s.send.value, s.send.error, s.pre_returned, s.wait_release_seen,
@@ -693,7 +738,9 @@ static void ignored_sibling_case(void) {
       memcmp(check, expected, sizeof(check)) == 0 &&
       memcmp(is, i.before, i.length) == 0 && memcmp(us, u.before, u.length) == 0 &&
       memcmp(i.memory, i.before, i.length) == 0 &&
-      memcmp(u.memory, u.before, u.length) == 0);
+      memcmp(u.memory, u.before, u.length) == 0 &&
+      unblock.value == 0 && handled == (variant == BLOCKED_LATE_HANDLER) &&
+      (variant == IGNORED) == (s.handler.value == -2));
 cleanup:
   /* No running sibling may outlive its stack argument on a returning path. */
   if (thread_started) _exit(96);
@@ -777,7 +824,9 @@ static void error_cases(void) {
   info_check("live-child-ECHILD", child, WEXITED | WNOHANG, ECHILD, -1);
   forget(child);
   additional_interrupt_cases();
-  ignored_sibling_case();
+  ignored_sibling_case(IGNORED);
+  ignored_sibling_case(LATE_HANDLER);
+  ignored_sibling_case(BLOCKED_LATE_HANDLER);
 }
 
 int main(int argc, char **argv) {

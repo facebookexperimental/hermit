@@ -16750,7 +16750,7 @@ impl Scheduler {
     /// (`process_signal_receiver::complete_signal`): `named` if it
     /// `wants_signal`, else the first thread that does, walking the thread
     /// list from `curr_target`. A thread wants it (`kernel_sent_wants`) under
-    /// the mask Linux's `blocked` holds now (`thread_signal_mask_for`) less a
+    /// the mask Linux's `blocked` holds now (`kernel_sent_signal_mask`) less a
     /// set it waits for in `rt_sigtimedwait` (`sigtimedwait_sets`), which
     /// Linux unblocks for the wait (`do_sigtimedwait`, kernel/signal.c:3777),
     /// when it is not exiting and has no other unblocked signal pending for it
@@ -16772,7 +16772,7 @@ impl Scheduler {
         let bit = kernel_signal_bit(signo);
         let threads = self.process_signal_targets(process);
         let mask = |thread: DetTid| {
-            self.thread_signal_mask_for(thread, signo)
+            self.kernel_sent_signal_mask(thread, signo)
                 .map(|mask| mask & !self.sigtimedwait_sets.get(&thread).copied().unwrap_or(0))
         };
         if let Some(sleeper) = threads.iter().copied().find(|thread| {
@@ -17007,6 +17007,39 @@ impl Scheduler {
     fn thread_signal_mask_for(&self, thread: DetTid, signal: i32) -> Option<u64> {
         self.recorded_signal_mask(thread)
             .unwrap_or_else(|| self.blocked_mask_for(thread, signal))
+    }
+
+    /// `thread_signal_mask_for` for a signal the kernel itself generates
+    /// between turns (`kernel_signal_choice`): with a process signal control
+    /// installed (KVM), the temporary mask Linux holds installed for a call
+    /// `thread` waits in (`controlled_temporary_mask`) takes the place of the
+    /// published and backend masks, which are the thread's own between a
+    /// call's probes. `ppoll` and `pselect6` install the call's mask for the
+    /// whole call (`set_user_sigmask`, kernel/signal.c:3272-3288 at v6.17)
+    /// and `rt_sigsuspend` until its signal is delivered (`sigsuspend`, lines
+    /// 4833-4844), and `wants_signal` (line 948) tests that installed
+    /// `blocked` set. A mask the scheduler recorded comes first, as before
+    /// (`recorded_signal_mask`: a delivery's override, a parked futex wait's
+    /// watch, a call outside the schedule, a readmitted call's continuation
+    /// mask), and a temporary mask the request says is unknown makes the mask
+    /// unknown (`None`: no target), never the thread's own.
+    ///
+    /// Before, the own mask was read: a creator that blocks `SIGCHLD` but lets
+    /// it in for its `ppoll` was passed over for a sibling, and one whose
+    /// `ppoll` blocks it was chosen and never took it (the Codex review of
+    /// <https://github.com/rrnewton/hermit/pull/5259>, P1).
+    fn kernel_sent_signal_mask(&self, thread: DetTid, signal: i32) -> Option<u64> {
+        if let Some(recorded) = self.recorded_signal_mask(thread) {
+            return recorded;
+        }
+        if self.reads_signal_state_through_control() {
+            match self.controlled_temporary_mask(thread) {
+                Ok(Some(temporary)) => return Some(temporary),
+                Ok(None) => {}
+                Err(signal_state_reader::TemporaryMaskUnknown) => return None,
+            }
+        }
+        self.blocked_mask_for(thread, signal)
     }
 
     /// The sources of `thread_signal_mask` before the kernel's, in order;

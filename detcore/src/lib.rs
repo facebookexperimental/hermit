@@ -2496,7 +2496,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             match answer {
                 DiscardedSignalAnswer::Delivery(DeliveryAnswer::Suppress) => {
                     info!(
-                        "[dtid {}] signal {} is a stale POSIX timer entry; skipped",
+                        "[dtid {}] signal {} is a stale POSIX timer entry, or a copy Linux discarded as it was sent; skipped",
                         guest.thread_state().dettid,
                         signal
                     );

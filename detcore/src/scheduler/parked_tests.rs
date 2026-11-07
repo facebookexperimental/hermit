@@ -12052,3 +12052,224 @@ fn an_unrun_probe_out_of_the_run_queue_is_released_with_a_loss_at_step3() {
     assert_eq!(grant_selected(&mut s), other);
     assert_eq!(grant_selected(&mut s), reader);
 }
+/// A call a KVM thread waits in under a temporary mask, as its request
+/// stands where the kernel-sent receiver choice reads it.
+#[derive(Clone, Copy, Debug)]
+enum TemporaryMaskWait {
+    /// A masked `ppoll`'s wait turn (`masked_ppoll_wait_request`).
+    Ppoll,
+    /// A masked `pselect6`'s probe turn (`handle_internal_pselect6`).
+    Pselect6,
+    /// A backend-served `rt_sigsuspend`, parked (`backend_rt_sigsuspend`).
+    ParkedSuspend,
+    /// The same, woken by the step-2 drain for another signal and not yet
+    /// granted (`backend_suspend_woken`).
+    WokenSuspend,
+}
+
+/// File `tid`'s `wait` under the temporary mask `temporary` (`None`: the
+/// request says the mask is unknown), queued.
+fn file_temporary_mask_wait(
+    s: &mut Scheduler,
+    tid: DetTid,
+    wait: TemporaryMaskWait,
+    temporary: Option<u64>,
+) {
+    let mut request = Resources::new(tid);
+    match wait {
+        TemporaryMaskWait::Ppoll | TemporaryMaskWait::Pselect6 => {
+            request.insert(ResourceID::InternalIOPolling, Permission::W);
+            request.fyi(if matches!(wait, TemporaryMaskWait::Ppoll) {
+                "ppoll"
+            } else {
+                "pselect6"
+            });
+            request.set_signal_interrupt_errno(reverie::syscalls::Errno::EINTR);
+        }
+        TemporaryMaskWait::ParkedSuspend | TemporaryMaskWait::WokenSuspend => {
+            request.insert(
+                ResourceID::SleepUntil(LogicalTime::INDEFINITE),
+                Permission::W,
+            );
+            request.fyi(crate::resources::RT_SIGSUSPEND_FYI);
+        }
+    }
+    request.blocked_signal_mask = temporary;
+    request.blocked_signal_mask_unknown = temporary.is_none();
+    s.next_turns.get_mut(&tid).unwrap().req = Ivar::full(Ok(request));
+    if matches!(wait, TemporaryMaskWait::WokenSuspend) {
+        // The drain's wake replaces the request and keeps the suspend's mask.
+        s.note_backend_suspend_replaced(tid);
+        let mut woken = Resources::new(tid);
+        woken.insert(
+            ResourceID::WaitidSignals(vec![SigWrapper(libc::SIGUSR1)]),
+            Permission::W,
+        );
+        s.next_turns.get_mut(&tid).unwrap().req = Ivar::full(Ok(woken));
+    }
+    s.runqueue_push_back(tid);
+}
+
+/// The Codex review of https://github.com/rrnewton/hermit/pull/5259, P1: on
+/// KVM the receiver of a child's exit `SIGCHLD` is chosen by the mask Linux's
+/// `blocked` holds, which for a thread waiting in `ppoll`, `pselect6` or
+/// `rt_sigsuspend` is the call's temporary mask (`set_user_sigmask`,
+/// kernel/signal.c:3272 at v6.17; `sigsuspend`, line 4833; `wants_signal`,
+/// line 948), not its own. The creator M (100) waits in each call, under
+/// both orientations, beside an eligible sibling W (101) in a pipe read:
+/// - its own mask blocks SIGCHLD and the call's lets it in: Linux names M,
+///   which wants it, and the queued copy interrupts M's wait;
+/// - its own mask lets SIGCHLD in and the call's blocks it: M does not want
+///   it, the walk reaches W, and on M the copy would stay pending.
+///
+/// A temporary mask the request says is unknown makes M no target: W.
+/// Mutation "the own mask read" (`thread_signal_mask_for` in
+/// `kernel_signal_choice`, the backend's sets in `queued_sigchld_fate`):
+/// every row fails, choosing W for M and M for W.
+#[test]
+fn a_kvm_child_exit_receiver_is_chosen_by_the_temporary_mask_its_call_installs() {
+    use super::controlled_child_exit::QueuedSigchld;
+    let sigchld = kernel_signal_bit(libc::SIGCHLD);
+    for wait in [
+        TemporaryMaskWait::Ppoll,
+        TemporaryMaskWait::Pselect6,
+        TemporaryMaskWait::ParkedSuspend,
+        TemporaryMaskWait::WokenSuspend,
+    ] {
+        for (own_blocks, temporary, expected_m) in [(true, 0, true), (false, sigchld, false)] {
+            let case = format!("{wait:?}, own mask blocks SIGCHLD: {own_blocks}");
+            let (mut s, backend) = kvm_fixture();
+            let (creator, _, _) = add(&mut s, 100, 100);
+            let (sibling, _, _) = add(&mut s, 100, 101);
+            backend
+                .signal_sets
+                .lock()
+                .unwrap()
+                .insert(100, sigchld_sets(own_blocks, false, true));
+            backend
+                .signal_sets
+                .lock()
+                .unwrap()
+                .insert(101, sigchld_sets(false, false, true));
+            file_temporary_mask_wait(&mut s, creator, wait, Some(temporary));
+            file_restartable_read(&mut s, sibling);
+            assert_eq!(
+                s.controlled_temporary_mask(creator),
+                Ok(Some(temporary)),
+                "{case}"
+            );
+            let expected = if expected_m { creator } else { sibling };
+            assert_eq!(
+                s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD)
+                    .0,
+                Some(expected),
+                "{case}"
+            );
+            assert_eq!(
+                s.queued_sigchld_fate(creator),
+                if expected_m {
+                    QueuedSigchld::Interrupts
+                } else {
+                    QueuedSigchld::StaysPending
+                },
+                "{case}"
+            );
+        }
+        // Unknown: never the own mask, which lets SIGCHLD in here.
+        let (mut s, backend) = kvm_fixture();
+        let (creator, _, _) = add(&mut s, 100, 100);
+        let (sibling, _, _) = add(&mut s, 100, 101);
+        backend
+            .signal_sets
+            .lock()
+            .unwrap()
+            .insert(100, sigchld_sets(false, false, true));
+        backend
+            .signal_sets
+            .lock()
+            .unwrap()
+            .insert(101, sigchld_sets(false, false, true));
+        file_temporary_mask_wait(&mut s, creator, wait, None);
+        file_restartable_read(&mut s, sibling);
+        if !matches!(wait, TemporaryMaskWait::WokenSuspend) {
+            assert_eq!(
+                s.controlled_temporary_mask(creator),
+                Err(TemporaryMaskUnknown),
+                "{wait:?}"
+            );
+            assert_eq!(
+                s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD)
+                    .0,
+                Some(sibling),
+                "{wait:?}: unknown temporary mask"
+            );
+        }
+    }
+}
+
+/// The Codex review of https://github.com/rrnewton/hermit/pull/5259, P1: an
+/// unblocked SIGURG sent to a KVM thread while it is ignored by default is
+/// one Linux discards before it is queued (`prepare_signal`,
+/// `__send_signal_locked`, kernel/signal.c:935 and 1053 at v6.17), so a
+/// handler installed afterwards never sees it, though the backend keeps the
+/// copy for the Tool. The parked observation must not count it as the
+/// thread's own signal to take (`has_own_signal_to_take`), and a delivery
+/// stop that dequeues it delivers nothing
+/// (`delivers_a_copy_linux_discarded`). A copy that was blocked when sent was
+/// queued (`sig_ignored`, lines 113-114) and is taken under the late handler
+/// as before; one still ignored is delivered as before (the kernel ignores
+/// it). Mutation "the current disposition alone": the first row counts the
+/// discarded copy and delivers it.
+#[test]
+fn a_kvm_copy_linux_discarded_at_send_is_never_taken_by_a_later_handler() {
+    let urg = kernel_signal_bit(libc::SIGURG);
+    for (name, blocked_at_send, caught_now, takes, suppressed) in [
+        ("unblocked at send, caught now", false, true, false, true),
+        ("blocked at send, caught now", true, true, true, false),
+        (
+            "unblocked at send, still ignored",
+            false,
+            false,
+            false,
+            false,
+        ),
+    ] {
+        let (mut s, backend) = kvm_fixture();
+        let (_, _, _) = add(&mut s, 100, 100);
+        let (waiter, _, _) = add(&mut s, 100, 101);
+        file_restartable_read(&mut s, waiter);
+        let at_send = if blocked_at_send { urg } else { 0 };
+        backend
+            .signal_sets
+            .lock()
+            .unwrap()
+            .insert(101, reverie::SignalSets::new(0, 0, at_send, 0, 0));
+        // The sibling's send, as the guest hooks record it.
+        let token = s.discard_pre_send(
+            waiter,
+            discarded_at_send::QueueId::Thread(waiter),
+            libc::SIGURG,
+            None,
+        );
+        assert_eq!(token.discarded, !blocked_at_send, "{name}");
+        s.discard_note_send(token, None, None);
+        // The copy is pending for the waiter, unblocked now, and a handler
+        // may have been installed since.
+        backend.signal_sets.lock().unwrap().insert(
+            101,
+            reverie::SignalSets::new(urg, 0, 0, 0, if caught_now { urg } else { 0 }),
+        );
+        assert_eq!(s.has_own_signal_to_take(waiter), takes, "{name}");
+        // A delivery stop dequeued it: nothing is pending after.
+        backend.signal_sets.lock().unwrap().insert(
+            101,
+            reverie::SignalSets::new(0, 0, 0, 0, if caught_now { urg } else { 0 }),
+        );
+        assert_eq!(
+            s.delivers_a_copy_linux_discarded(waiter, libc::SIGURG),
+            suppressed,
+            "{name}"
+        );
+    }
+}
+

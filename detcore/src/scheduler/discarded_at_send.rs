@@ -1572,7 +1572,19 @@ impl Scheduler {
                 DiscardedSignalAnswer::Bits { thread, process }
             }
             DiscardedSignalControl::Dequeue { signal, at } => {
-                DiscardedSignalAnswer::Delivery(self.timer_signal_dequeue(dtid, signal, Some(at)))
+                use super::posix_timer_coalesce::DeliveryAnswer;
+                match self.timer_signal_dequeue(dtid, signal, Some(at)) {
+                    DeliveryAnswer::AsIs if self.delivers_a_copy_linux_discarded(dtid, signal) => {
+                        tracing::info!(
+                            target: "detcore::scheduler",
+                            "[dtid {}] signal {} is a copy Linux discarded as it was sent, now acted on; delivering nothing.",
+                            dtid,
+                            signal
+                        );
+                        DiscardedSignalAnswer::Delivery(DeliveryAnswer::Suppress)
+                    }
+                    answer => DiscardedSignalAnswer::Delivery(answer),
+                }
             }
             DiscardedSignalControl::DeliveryInfo { signal, at } => {
                 match self.timer_delivery_info(dtid, signal, at) {
@@ -1786,6 +1798,63 @@ impl Scheduler {
         let id = super::timed_waiters::SignalTimerId::Posix(producer.process, producer.timer);
         self.blocked.timed_waiters.signal_timer_period(id).is_some()
             && self.posix_timer_arm_generation(producer.process, producer.timer) == producer.arm_gen
+    }
+
+    /// Whether the copy of the standard `signal` that a delivery stop of
+    /// `thread` dequeued is one Linux discarded as it was sent, which the
+    /// thread's process now acts on: the delivery is then suppressed
+    /// (`DeliveryAnswer::Suppress`), as a take skips such a copy
+    /// (`DiscardedAtSend::take_from`). Linux never queued it: an unblocked
+    /// signal the named thread ignored when it was sent is dropped before it
+    /// is queued (`prepare_signal` returns `!sig_ignored` and
+    /// `__send_signal_locked` returns, kernel/signal.c:935 and 1053-1054 at
+    /// v6.17), so a handler installed afterwards never sees it (`sig_ignored`,
+    /// lines 106-125, keeps only a blocked or traced task's copy). The backend
+    /// keeps the copy (ptrace's tracee, KVM's Tool-observable queue), and
+    /// before this a handler installed after the send ran for it (the Codex
+    /// review of <https://github.com/rrnewton/hermit/pull/5259>, P1: `SIGURG`
+    /// to a worker parked in `waitid`, natively 0 handler runs, 1 on ptrace
+    /// and KVM).
+    ///
+    /// Decided as `take_from` decides the source queue, from the record:
+    /// the private queue's copy is dequeued first, so it is the one taken
+    /// where a recorded send left one there, kept or discarded; the shared
+    /// queue's discarded copy is the one taken only if no copy of the signal
+    /// is left there after the dequeue (one left there means an unrecorded
+    /// private copy was taken). A queue holding POSIX timer entries is left
+    /// to `timer_signal_dequeue`. A signal the process still ignores is
+    /// delivered as before: the kernel ignores it, and the scheduling record
+    /// of such a run is unchanged. A stale bit over an empty private queue
+    /// is the record's named residual (module docs).
+    pub(crate) fn delivers_a_copy_linux_discarded(&self, thread: DetTid, signal: i32) -> bool {
+        if !(1..32).contains(&signal) {
+            return false;
+        }
+        let process = self.thread_tree.process_of(thread).unwrap_or(thread);
+        let (private, shared) = (QueueId::Thread(thread), QueueId::Process(process));
+        let record = &self.discarded_at_send;
+        if record.lists.is_listed(private, signal) || record.lists.is_listed(shared, signal) {
+            return false;
+        }
+        let bit = kernel_signal_bit(signal);
+        if record
+            .kept
+            .get(&private)
+            .is_some_and(|kept| kept & bit != 0)
+        {
+            return false;
+        }
+        let private_discarded = record.is_discarded(private, signal);
+        if !private_discarded && !record.is_discarded(shared, signal) {
+            return false;
+        }
+        let Ok(after) = self.read_guest_signal_state(thread) else {
+            return false;
+        };
+        if after.ignored_at_generation() & bit != 0 {
+            return false;
+        }
+        private_discarded || after.shared_pending & bit == 0
     }
 
     /// The bits of `thread`'s private queue and of its process's shared

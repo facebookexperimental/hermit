@@ -172,6 +172,26 @@
  *                 W1 unblocks SIGALRM, and a final SIGALRM walks from W1 to
  *                 W1 (final=). revastra2's default-child-curr.c.
  *                 "steer=W2 pending=0 final=W1".
+ *   chld-ppoll-lets-in, chld-pselect-lets-in, chld-suspend-lets-in
+ *                 chld-creator with M waiting in ppoll(), pselect() or
+ *                 sigsuspend() instead of poll(): M's own mask blocks
+ *                 SIGCHLD, and the call's temporary mask lets it in. Linux
+ *                 installs that mask for the call (set_user_sigmask,
+ *                 sigsuspend), and wants_signal reads the installed one, so M
+ *                 is named, wants it and takes it in its call.
+ *                 "receiver=M interrupted=M".
+ *   chld-ppoll-keeps-out, chld-pselect-keeps-out, chld-suspend-keeps-out
+ *                 the inverse: M's own mask lets SIGCHLD in, and the call's
+ *                 temporary mask blocks it, so M does not want it and the
+ *                 walk from M reaches W1. "receiver=W1 interrupted=W1".
+ *                 A sigsuspend() has no bound of its own: W2 waits for a
+ *                 handler's report (bounded at 2 s) and then ends M's wait
+ *                 with a SIGUSR2 that only M's temporary mask lets in, whose
+ *                 handler reports nothing; M's own mask blocks SIGUSR2, so
+ *                 a SIGUSR2 that arrives after M's call stays pending, and
+ *                 interrupted= names M only if M's SIGCHLD handler ran. W2
+ *                 waits in poll() there, not read(), which neither line
+ *                 depends on: Linux's walk from M reaches W1 first.
  */
 
 #define _GNU_SOURCE
@@ -185,6 +205,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -196,6 +217,11 @@ static const char* const NAMES[THREADS] = {"M", "W1", "W2"};
 
 /* What generates a mode's signal. */
 enum source { CHILD_EXIT, ITIMER, POSIX_TIMER };
+
+/* The call M waits in, in a TAKEN mode where it leaves the signal unblocked
+ * (chld-*-lets-in, chld-*-keeps-out: its temporary mask and M's own mask
+ * differ about the signal). */
+enum call { POLL, PPOLL, PSELECT, SUSPEND };
 
 /* How M waits for it and what the mode prints. */
 enum shape {
@@ -239,32 +265,43 @@ struct mode {
   /* In a busy mode, the signal pending for W1 is an ignored SIGWINCH, which
    * Linux discards as it is sent, instead of a caught SIGUSR2. */
   int busy_ignored;
+  /* The call M waits in; with a temporary mask (not POLL), whether that mask
+   * blocks the signal (M's own then lets it in) or lets it in (M's own then
+   * blocks it). */
+  enum call call;
+  int temporary_blocks;
 };
 
 static const struct mode MODES[] = {
-    {"chld-creator", CHILD_EXIT, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0},
-    {"chld-walk", CHILD_EXIT, TAKEN, {1, 1, 0}, M, 0, 0, 0, 0},
-    {"chld-worker", CHILD_EXIT, TAKEN, {0, 0, 0}, W1, 0, 0, 0, 0},
-    {"chld-queued", CHILD_EXIT, QUEUED, {1, 1, 1}, W2, 0, 0, 0, 0},
-    {"alrm-leader", ITIMER, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0},
-    {"alrm-walk", ITIMER, TAKEN, {1, 1, 0}, M, 0, 0, 0, 0},
-    {"alrm-queued", ITIMER, QUEUED, {1, 1, 1}, W1, 0, 0, 0, 0},
-    {"posix-walk", POSIX_TIMER, TAKEN, {1, 1, 0}, M, 0, 0, 0, 0},
-    {"alrm-ignored-blocked", ITIMER, QUEUED, {1, 1, 1}, W2, 1, 0, 0, 0},
-    {"alrm-ignored-unblocked", ITIMER, HELD, {1, 1, 0}, W2, 1, 0, 0, 0},
-    {"chld-curr-target", CHILD_EXIT, TAKEN, {1, 1, 0}, M, 0, 1, ITIMER, 0},
-    {"alrm-curr-target", ITIMER, TAKEN, {1, 1, 0}, M, 0, 1, CHILD_EXIT, 0},
-    {"posix-curr-target", POSIX_TIMER, TAKEN, {1, 1, 0}, M, 0, 1, CHILD_EXIT, 0},
-    {"chld-sigwait", CHILD_EXIT, SIGWAIT, {1, 0, 1}, M, 0, 0, 0, 0},
-    {"alrm-sigwait", ITIMER, SIGWAIT, {1, 0, 1}, M, 0, 0, 0, 0},
-    {"posix-sigwait", POSIX_TIMER, SIGWAIT, {1, 0, 1}, M, 0, 0, 0, 0},
-    {"chld-busy", CHILD_EXIT, BUSY, {1, 0, 0}, M, 0, 0, 0, 0},
-    {"alrm-busy", ITIMER, BUSY, {1, 0, 0}, M, 0, 0, 0, 0},
-    {"posix-busy", POSIX_TIMER, BUSY, {1, 0, 0}, M, 0, 0, 0, 0},
-    {"coalesced-child-curr", CHILD_EXIT, COALESCED, {1, 0, 1}, M, 0, 1, ITIMER, 0},
-    {"ignored-busy", CHILD_EXIT, BUSY, {1, 0, 0}, M, 0, 0, 0, 1},
-    {"suppressed-child-curr", CHILD_EXIT, SUPPRESSED, {1, 0, 1}, M, 1, 1, ITIMER, 0},
-    {"default-child-curr", CHILD_EXIT, DEFAULTED, {1, 0, 1}, M, 0, 1, ITIMER, 0},
+    {"chld-creator", CHILD_EXIT, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0, POLL, 0},
+    {"chld-walk", CHILD_EXIT, TAKEN, {1, 1, 0}, M, 0, 0, 0, 0, POLL, 0},
+    {"chld-worker", CHILD_EXIT, TAKEN, {0, 0, 0}, W1, 0, 0, 0, 0, POLL, 0},
+    {"chld-queued", CHILD_EXIT, QUEUED, {1, 1, 1}, W2, 0, 0, 0, 0, POLL, 0},
+    {"alrm-leader", ITIMER, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0, POLL, 0},
+    {"alrm-walk", ITIMER, TAKEN, {1, 1, 0}, M, 0, 0, 0, 0, POLL, 0},
+    {"alrm-queued", ITIMER, QUEUED, {1, 1, 1}, W1, 0, 0, 0, 0, POLL, 0},
+    {"posix-walk", POSIX_TIMER, TAKEN, {1, 1, 0}, M, 0, 0, 0, 0, POLL, 0},
+    {"alrm-ignored-blocked", ITIMER, QUEUED, {1, 1, 1}, W2, 1, 0, 0, 0, POLL, 0},
+    {"alrm-ignored-unblocked", ITIMER, HELD, {1, 1, 0}, W2, 1, 0, 0, 0, POLL, 0},
+    {"chld-curr-target", CHILD_EXIT, TAKEN, {1, 1, 0}, M, 0, 1, ITIMER, 0, POLL, 0},
+    {"alrm-curr-target", ITIMER, TAKEN, {1, 1, 0}, M, 0, 1, CHILD_EXIT, 0, POLL, 0},
+    {"posix-curr-target", POSIX_TIMER, TAKEN, {1, 1, 0}, M, 0, 1, CHILD_EXIT, 0, POLL, 0},
+    {"chld-sigwait", CHILD_EXIT, SIGWAIT, {1, 0, 1}, M, 0, 0, 0, 0, POLL, 0},
+    {"alrm-sigwait", ITIMER, SIGWAIT, {1, 0, 1}, M, 0, 0, 0, 0, POLL, 0},
+    {"posix-sigwait", POSIX_TIMER, SIGWAIT, {1, 0, 1}, M, 0, 0, 0, 0, POLL, 0},
+    {"chld-busy", CHILD_EXIT, BUSY, {1, 0, 0}, M, 0, 0, 0, 0, POLL, 0},
+    {"alrm-busy", ITIMER, BUSY, {1, 0, 0}, M, 0, 0, 0, 0, POLL, 0},
+    {"posix-busy", POSIX_TIMER, BUSY, {1, 0, 0}, M, 0, 0, 0, 0, POLL, 0},
+    {"coalesced-child-curr", CHILD_EXIT, COALESCED, {1, 0, 1}, M, 0, 1, ITIMER, 0, POLL, 0},
+    {"ignored-busy", CHILD_EXIT, BUSY, {1, 0, 0}, M, 0, 0, 0, 1, POLL, 0},
+    {"suppressed-child-curr", CHILD_EXIT, SUPPRESSED, {1, 0, 1}, M, 1, 1, ITIMER, 0, POLL, 0},
+    {"default-child-curr", CHILD_EXIT, DEFAULTED, {1, 0, 1}, M, 0, 1, ITIMER, 0, POLL, 0},
+    {"chld-ppoll-lets-in", CHILD_EXIT, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0, PPOLL, 0},
+    {"chld-ppoll-keeps-out", CHILD_EXIT, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0, PPOLL, 1},
+    {"chld-pselect-lets-in", CHILD_EXIT, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0, PSELECT, 0},
+    {"chld-pselect-keeps-out", CHILD_EXIT, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0, PSELECT, 1},
+    {"chld-suspend-lets-in", CHILD_EXIT, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0, SUSPEND, 0},
+    {"chld-suspend-keeps-out", CHILD_EXIT, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0, SUSPEND, 1},
 };
 
 static const struct mode* mode;
@@ -306,14 +343,24 @@ static int signal_of(enum source source) {
   return source == CHILD_EXIT ? SIGCHLD : source == ITIMER ? SIGALRM : SIGUSR1;
 }
 
+/* Whether this thread's handler for the mode's signals ran (sigsuspend modes:
+ * M's call also ends for the SIGUSR2 that bounds it). */
+static __thread volatile sig_atomic_t took_signal;
+
 static void on_signal(int sig) {
   (void)sig;
   int saved = errno;
+  took_signal = 1;
   char who = (char)self;
   if (write(report_pipe[1], &who, 1) != 1) {
     _exit(98);
   }
   errno = saved;
+}
+
+/* The SIGUSR2 that ends a sigsuspend mode's wait: it reports nothing. */
+static void on_wake(int sig) {
+  (void)sig;
 }
 
 static void set_action(int sig, void (*handler)(int)) {
@@ -581,6 +628,7 @@ static long main_wait_syscall(void) {
  *       pthread_sigmask returns);
  *   'v' make the CLONE_VFORK child, which acknowledges, and wait for it;
  *       acknowledge once it exited and any signal pending was taken;
+ *   'k' end M's sigsuspend() once a handler reported (sigsuspend modes, W2);
  *   'q' end.
  * W1 forks the child first in chld-worker. */
 static void* worker(void* arg) {
@@ -659,6 +707,17 @@ static void* worker(void* arg) {
         mask(SIG_UNBLOCK, SIGALRM);
         acknowledge();
         break;
+      case 'k':
+        /* A sigsuspend mode, W2: once a handler has reported (bounded at
+         * 2 s), end M's wait. A handler runs only after the child's exit,
+         * which waits for M to sleep in its call; one that ran on M has
+         * ended that call already, and the SIGUSR2 then stays pending. */
+        await_readable(report_pipe[0]);
+        if (syscall(SYS_tgkill, getpid(), tids[M], SIGUSR2) != 0) {
+          die("tgkill");
+        }
+        acknowledge();
+        break;
       case 'n':
         acknowledge();
         break;
@@ -716,6 +775,52 @@ static void receivers(char* out, size_t size) {
     }
     used += (size_t)n;
   }
+}
+
+/* M's wait in a chld-*-lets-in or chld-*-keeps-out mode: the mode's call,
+ * under a temporary mask that differs from M's own about signo, on M's own
+ * pipe (ppoll and pselect bounded at 200 ms, as poll is; sigsuspend ended by
+ * W2). Returns as poll does: -1 with EINTR when M's handler for the mode's
+ * signal ended the wait, 0 otherwise. */
+static int wait_in_call(struct pollfd* fd, int signo) {
+  sigset_t temporary;
+  if (pthread_sigmask(SIG_SETMASK, NULL, &temporary) != 0) {
+    die("pthread_sigmask");
+  }
+  if (mode->temporary_blocks) {
+    sigaddset(&temporary, signo);
+  } else {
+    sigdelset(&temporary, signo);
+  }
+  struct timespec bound = {0, 200 * 1000000L};
+  int n;
+  switch (mode->call) {
+    case PPOLL:
+      n = ppoll(fd, 1, &bound, &temporary);
+      break;
+    case PSELECT: {
+      fd_set readable;
+      FD_ZERO(&readable);
+      FD_SET(fd->fd, &readable);
+      n = pselect(fd->fd + 1, &readable, NULL, NULL, &bound, &temporary);
+      break;
+    }
+    case SUSPEND:
+      sigdelset(&temporary, SIGUSR2);
+      n = sigsuspend(&temporary) < 0 && errno == EINTR && took_signal ? -1 : 0;
+      /* W2 sent its SIGUSR2 once it acknowledges. */
+      await_acknowledgement();
+      errno = n < 0 ? EINTR : 0;
+      break;
+    default:
+      die("call");
+      return 0;
+  }
+  if (n > 0) {
+    errno = 0;
+    die("the call found M's pipe readable");
+  }
+  return n;
 }
 
 /* Steer curr_target to W2 with the steering signal, which only W2 leaves
@@ -916,6 +1021,14 @@ int main(int argc, char** argv) {
   if (mode->blocks[M]) {
     mask(SIG_BLOCK, signo);
   }
+  if (mode->call != POLL && !mode->temporary_blocks) {
+    /* M's own mask blocks the signal; its call's temporary mask lets it in. */
+    mask(SIG_BLOCK, signo);
+  }
+  if (mode->call == SUSPEND) {
+    set_action(SIGUSR2, on_wake);
+    mask(SIG_BLOCK, SIGUSR2);
+  }
   if (mode->source == POSIX_TIMER) {
     struct sigevent event;
     memset(&event, 0, sizeof(event));
@@ -980,6 +1093,9 @@ int main(int argc, char** argv) {
    * timer; W2 does in a busy mode, where W1 is in its vfork wait, and W1
    * otherwise. */
   if (mode->source == CHILD_EXIT) {
+    if (mode->call == SUSPEND) {
+      command(W2, 'k');
+    }
     if (forker == M) {
       forked = fork_child();
     }
@@ -1017,7 +1133,7 @@ int main(int argc, char** argv) {
      * where Linux gave the signal to another thread cannot hang; nothing
      * writes the pipe, so only a handler ends the wait early. */
     struct pollfd fd = {wake_pipes[M][0], POLLIN, 0};
-    int n = poll(&fd, 1, 200);
+    int n = mode->call == POLL ? poll(&fd, 1, 200) : wait_in_call(&fd, signo);
     if (n < 0 && errno == EINTR) {
       pthread_mutex_lock(&lock);
       if (interrupted_by < 0) {

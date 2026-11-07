@@ -74,6 +74,20 @@ const ERROR_CASES: &[&str] = &[
     "interrupted-writable-info",
     "restarted-writable-info",
     "ignored-sibling-sigurg",
+    "ignored-sibling-sigurg-late-handler",
+    "blocked-sibling-sigurg-late-handler",
+];
+
+/// The fixture's same-process SIGURG cases: the plain one, its late-handler
+/// contrast (unblocked at the send, so Linux discards it and the handler the
+/// sibling installs afterwards never runs), and its blocked contrast (queued,
+/// so the late handler runs once the waiter unblocks it), each with whether
+/// the late handler is installed, whether the waiter blocks SIGURG at the
+/// send, and how often the handler runs.
+const SIGURG_SIBLING_CASES: &[(&str, i64, i64, i64)] = &[
+    ("ignored-sibling-sigurg", 0, 0, 0),
+    ("ignored-sibling-sigurg-late-handler", 1, 0, 0),
+    ("blocked-sibling-sigurg-late-handler", 1, 1, 1),
 ];
 
 fn assert_observations(stdout: &[u8], mode: &str, expected: &[&str], children: u64) {
@@ -86,7 +100,7 @@ fn assert_observations(stdout: &[u8], mode: &str, expected: &[&str], children: u
     let mut names = BTreeSet::new();
     let mut checks = 0;
     let mut summaries = 0;
-    let mut ignored_child = None;
+    let mut ignored_children = BTreeSet::new();
     let mut ignored_checks = 0;
     for (index, row) in rows.iter().enumerate() {
         match row["type"].as_str().expect("observation type") {
@@ -112,8 +126,20 @@ fn assert_observations(stdout: &[u8], mode: &str, expected: &[&str], children: u
                 }
                 assert!(row["rc"].is_i64());
                 assert!(row["errno"].is_i64());
-                if name == "ignored-sibling-sigurg" {
-                    assert!(ignored_child.replace(row["id"].as_u64().unwrap()).is_none());
+                if let Some(&(_, late_handler, blocked_at_send, handled)) =
+                    SIGURG_SIBLING_CASES.iter().find(|(case, ..)| *case == name)
+                {
+                    assert!(ignored_children.insert(row["id"].as_u64().unwrap()));
+                    for (key, expected) in [
+                        ("late_handler", late_handler),
+                        ("blocked_at_send", blocked_at_send),
+                        ("handled", handled),
+                        ("handler_rc", if late_handler == 1 { 0 } else { -2 }),
+                        ("handler_errno", 0),
+                        ("unblock_rc", 0),
+                    ] {
+                        assert_eq!(row[key].as_i64(), Some(expected), "{name}: {key}");
+                    }
                     for (key, expected) in [
                         ("which", 1),
                         ("rc", -1),
@@ -136,7 +162,11 @@ fn assert_observations(stdout: &[u8], mode: &str, expected: &[&str], children: u
                         ("ack_errno", 0),
                         ("sender_failure", 0),
                     ] {
-                        assert_eq!(row[key].as_i64(), Some(i64::from(expected)), "{key}");
+                        assert_eq!(
+                            row[key].as_i64(),
+                            Some(i64::from(expected)),
+                            "{name}: {key}"
+                        );
                     }
                     assert_eq!(row["options"], "0x4");
                     assert_eq!(row["signal_default"], true);
@@ -193,7 +223,7 @@ fn assert_observations(stdout: &[u8], mode: &str, expected: &[&str], children: u
                 assert!(arena.bytes().all(|byte| byte.is_ascii_hexdigit()));
                 if row["name"] == "ignored-child-ECHILD" {
                     ignored_checks += 1;
-                    assert_eq!(row["pid"].as_u64(), ignored_child);
+                    assert!(ignored_children.contains(&row["pid"].as_u64().unwrap()));
                     assert_eq!(row["rc"], -1);
                     assert_eq!(row["errno"], libc::ECHILD);
                     assert_eq!(row["options"], "0x5");
@@ -231,7 +261,14 @@ fn assert_observations(stdout: &[u8], mode: &str, expected: &[&str], children: u
         "actual child peeks and reap checks must execute"
     );
     assert_eq!(summaries, 1);
-    assert_eq!(ignored_checks, usize::from(mode == "errors"));
+    assert_eq!(
+        ignored_checks,
+        if mode == "errors" {
+            SIGURG_SIBLING_CASES.len()
+        } else {
+            0
+        }
+    );
 }
 
 // Full INFO records can span lines (scheduler commits do). Retain their
@@ -265,18 +302,6 @@ fn assert_ignored_signal_trace(log: &[u8], stdout: &[u8]) {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    let selected: Vec<_> = rows
-        .iter()
-        .filter(|row| row["name"] == "ignored-sibling-sigurg")
-        .collect();
-    assert_eq!(selected.len(), 1);
-    let row = selected[0];
-    let waiter = row["waiter_tid"].as_u64().unwrap();
-    let sender = row["sender_tid"].as_u64().unwrap();
-    let child = row["id"].as_u64().unwrap();
-    let tgid = row["tgid"].as_u64().unwrap();
-    let fd = row["release_fd"].as_u64().unwrap();
-    assert!(waiter > 0 && sender > 0 && child > 0 && tgid > 0 && waiter != sender);
     let records = info_records(std::str::from_utf8(log).expect("complete UTF-8 INFO log"));
     let entry = regex::Regex::new(
         r"^DETLOG \[syscall\]\[detcore, dtid (\d+)\] inbound syscall: (.+) = \?$",
@@ -334,64 +359,100 @@ fn assert_ignored_signal_trace(log: &[u8], stdout: &[u8]) {
         assert!(*begin < ends[0].0);
         (*begin, ends[0].0)
     };
-    let wait = pair(
-        waiter,
-        &format!(r"^waitid\(1, {child}, 0x[0-9a-f]+, 4, NULL\)$"),
-        "Err(Errno(EFAULT))",
-    );
-    let send = pair(
-        sender,
-        &format!(r"^tgkill\({tgid}, {waiter}, 23\)$"),
-        "Ok(0)",
-    );
-    let release = pair(
-        sender,
-        &format!(r"^write\({fd}, 0x[0-9a-f]+, 1\)$"),
-        "Ok(1)",
-    );
-    let gone = pair(
-        waiter,
-        &format!(r"^waitid\(1, {child}, 0x[0-9a-f]+, 5, NULL\)$"),
-        "Err(Errno(ECHILD))",
-    );
-    let park = regex::Regex::new(&format!(r"^\[scheduler\] NONCOMMIT turn \d+, parking dettid {waiter} for child ChildWaitSpec \{{ selector: Exact\(DetPid\({child}\)\), owner: None, exit_class: Sigchld \}}$")).unwrap();
-    // The sibling's SIGURG is unblocked and ignored by default, so Linux
-    // discards it as it is sent (`prepare_signal`'s `sig_ignored`) and never
-    // wakes the waiter (`complete_signal` is not reached). Since SIGSHARE S3b
-    // KVM keeps ptrace's record of copies Linux discards at send
-    // (`kernel_signal_targets_are_predictable`), so the waiter is granted no
-    // `WaitidSignals` turn for it and is never parked again: it stays in its
-    // first park until the child's release. Before S3b the backend's queued
-    // copy woke it once, and it parked again.
-    let grant = regex::Regex::new(&format!(r"(?s)^\[sched-step5\] >>>>>>>\n\n COMMIT turn (\d+), dettid {waiter} using resources \{{WaitidSignals\(\[SigWrapper\(23\)\]\): W\}}, on previously committed [^\n]+$")).unwrap();
-    let grants: Vec<usize> = records
-        .iter()
-        .enumerate()
-        .filter(|(_, record)| {
-            record
-                .rsplit_once(" DETLOG_RECORD=")
-                .is_some_and(|(message, _)| grant.is_match(message))
-        })
-        .map(|(index, _)| index)
-        .collect();
-    assert!(grants.is_empty(), "no ignored-signal grant: {grants:?}");
-    assert!(wait.0 < send.0 && send.1 < release.0);
-    assert!(release.0 < wait.1 && wait.1 < gone.0);
-    let parks: Vec<usize> = records
-        .iter()
-        .enumerate()
-        .filter(|(n, message)| wait.0 < *n && *n < release.0 && park.is_match(message))
-        .map(|(n, _)| n)
-        .collect();
-    assert_eq!(
-        parks.len(),
-        1,
-        "one park, before the sibling's send: {parks:?}"
-    );
-    assert!(
-        parks[0] < send.0,
-        "the waiter parked before the sibling's send"
-    );
+    for &(name, late_handler, blocked_at_send, _) in SIGURG_SIBLING_CASES {
+        let selected: Vec<_> = rows.iter().filter(|row| row["name"] == name).collect();
+        assert_eq!(selected.len(), 1, "{name}");
+        let row = selected[0];
+        let waiter = row["waiter_tid"].as_u64().unwrap();
+        let sender = row["sender_tid"].as_u64().unwrap();
+        let child = row["id"].as_u64().unwrap();
+        let tgid = row["tgid"].as_u64().unwrap();
+        let fd = row["release_fd"].as_u64().unwrap();
+        assert!(waiter > 0 && sender > 0 && child > 0 && tgid > 0 && waiter != sender);
+        let wait = pair(
+            waiter,
+            &format!(r"^waitid\(1, {child}, 0x[0-9a-f]+, 4, NULL\)$"),
+            "Err(Errno(EFAULT))",
+        );
+        let send = pair(
+            sender,
+            &format!(r"^tgkill\({tgid}, {waiter}, 23\)$"),
+            "Ok(0)",
+        );
+        let release = pair(
+            sender,
+            &format!(r"^write\({fd}, 0x[0-9a-f]+, 1\)$"),
+            "Ok(1)",
+        );
+        let gone = pair(
+            waiter,
+            &format!(r"^waitid\(1, {child}, 0x[0-9a-f]+, 5, NULL\)$"),
+            "Err(Errno(ECHILD))",
+        );
+        assert!(wait.0 < send.0 && send.1 < release.0, "{name}");
+        assert!(release.0 < wait.1 && wait.1 < gone.0, "{name}");
+        if late_handler == 1 {
+            // The sibling installs the late handler after its send and
+            // before it releases the child, while the waiter waits.
+            let install = pair(
+                sender,
+                r"^rt_sigaction\(23, 0x[0-9a-f]+, NULL, 8\)$",
+                "Ok(0)",
+            );
+            assert!(send.1 < install.0 && install.1 < release.0, "{name}");
+        }
+        let park = regex::Regex::new(&format!(r"^\[scheduler\] NONCOMMIT turn \d+, parking dettid {waiter} for child ChildWaitSpec \{{ selector: Exact\(DetPid\({child}\)\), owner: None, exit_class: Sigchld \}}$")).unwrap();
+        let grant = regex::Regex::new(&format!(r"(?s)^\[sched-step5\] >>>>>>>\n\n COMMIT turn (\d+), dettid {waiter} using resources \{{WaitidSignals\(\[SigWrapper\(23\)\]\): W\}}, on previously committed [^\n]+$")).unwrap();
+        // The grants of the SIGURG to the waiter while it waits, and its
+        // parks for the child before the release.
+        let grants: Vec<usize> = records
+            .iter()
+            .enumerate()
+            .filter(|(n, record)| {
+                wait.0 < *n
+                    && *n < wait.1
+                    && record
+                        .rsplit_once(" DETLOG_RECORD=")
+                        .is_some_and(|(message, _)| grant.is_match(message))
+            })
+            .map(|(n, _)| n)
+            .collect();
+        let parks: Vec<usize> = records
+            .iter()
+            .enumerate()
+            .filter(|(n, message)| wait.0 < *n && *n < release.0 && park.is_match(message))
+            .map(|(n, _)| n)
+            .collect();
+        assert!(!parks.is_empty(), "{name}: the waiter parked");
+        assert!(
+            parks[0] < send.0,
+            "{name}: the waiter parked before the sibling's send"
+        );
+        if blocked_at_send == 0 {
+            // The sibling's SIGURG is unblocked and ignored by default, so
+            // Linux discards it as it is sent (`prepare_signal`'s
+            // `sig_ignored`) and never wakes the waiter (`complete_signal`
+            // is not reached). Since SIGSHARE S3b KVM keeps ptrace's record
+            // of copies Linux discards at send
+            // (`kernel_signal_targets_are_predictable`), so the waiter is
+            // granted no `WaitidSignals` turn for it and is never parked
+            // again: it stays in its first park until the child's release.
+            // Before S3b the backend's queued copy woke it once, and it
+            // parked again. A handler installed after the send does not
+            // revive the discarded copy either: no grant, no observation,
+            // and the wait ends with EFAULT rather than EINTR (the Codex
+            // review of https://github.com/rrnewton/hermit/pull/5259, P1).
+            assert!(
+                grants.is_empty(),
+                "{name}: no ignored-signal grant: {grants:?}"
+            );
+            assert_eq!(
+                parks.len(),
+                1,
+                "{name}: one park, before the sibling's send: {parks:?}"
+            );
+        }
+    }
 }
 
 fn assert_sibling_observations(stdout: &[u8], direction: &str, selector: &str, consume: &str) {
@@ -537,7 +598,7 @@ fn assert_sibling_observations(stdout: &[u8], direction: &str, selector: &str, c
 pub(super) fn run(mode: &str) {
     let (expected, children) = match mode {
         "terminal" => (TERMINAL_CASES, 23),
-        "errors" => (ERROR_CASES, 5),
+        "errors" => (ERROR_CASES, 7),
         _ => panic!("unknown waitid fixture mode"),
     };
     run_fixture(

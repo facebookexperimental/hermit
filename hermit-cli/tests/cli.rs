@@ -26636,11 +26636,24 @@ const PTRACE_POLLER_PASSED_OVER: TargetExpectation = Diverges(KnownDivergence {
     line: "receiver=W1 interrupted=W1\n",
 });
 
+/// ptrace's KNOWN DIVERGENCE in `chld-ppoll-keeps-out`
+/// (`PROCESS_SIGNAL_TARGET_CASES`): the traced scheduler chooses a `ppoll`
+/// waiter by its own mask, not the call's temporary one, which ptrace's
+/// `ppoll` request does not carry, so it names M, whose call blocks SIGCHLD,
+/// and M takes the copy only after its call. KVM's half of the same finding
+/// is fixed (the Codex review of <https://github.com/rrnewton/hermit/pull/5259>,
+/// P1); ptrace printed the same before it.
+const PTRACE_TEMPORARY_MASK_UNREAD: TargetExpectation = Diverges(KnownDivergence {
+    issue: "https://github.com/rrnewton/hermit/pull/5259",
+    line: "receiver=M interrupted=none\n",
+});
+
 /// tests/c/process_signal_target.c's modes and the line Linux prints for each:
 /// every boundary the line depends on is reached causally and required (the
 /// guest ends unconfirmed, with no line, past a bound), so each mode has one
 /// native outcome (200 of 200 runs each, and 50 of 50 with four spinners on
-/// its two CPUs, 2026-11-06), and the native half of each test runs it once. Each mode is a process-directed signal the kernel itself
+/// its two CPUs, 2026-11-06; the six `chld-*-lets-in` and `chld-*-keeps-out`
+/// modes likewise on 2026-11-07), and the native half of each test runs it once. Each mode is a process-directed signal the kernel itself
 /// generates for a three-thread process (main thread M, workers W1 and W2): a
 /// child's exit `SIGCHLD`, an ITIMER_REAL expiry or a POSIX timer's
 /// `SIGEV_SIGNAL` (SIGUSR1). Linux's `complete_signal` gives it to the thread
@@ -26671,7 +26684,11 @@ const PTRACE_POLLER_PASSED_OVER: TargetExpectation = Diverges(KnownDivergence {
 /// `chld-creator` and `alrm-leader` the copy is taken by W1, which a drain
 /// resumes before M, polling (its poll blocks every signal in place, so the
 /// choice passes it over), takes it
-/// (https://github.com/rrnewton/hermit/issues/4991's class).
+/// (https://github.com/rrnewton/hermit/issues/4991's class), and the same in
+/// `chld-ppoll-lets-in` and `chld-pselect-lets-in`, whose M polls under a
+/// temporary mask that lets SIGCHLD in; in `chld-ppoll-keeps-out` the traced
+/// scheduler reads M's own mask rather than its `ppoll`'s
+/// (`PTRACE_TEMPORARY_MASK_UNREAD`).
 /// `alrm-ignored-unblocked` holds W2 in a vfork wait, so that the guest sees
 /// the ignored expiry generated, and W2 takes and discards it on its return
 /// from the wait, as Linux does; the #5014 class, a queued ignored expiry
@@ -26701,7 +26718,7 @@ const PTRACE_POLLER_PASSED_OVER: TargetExpectation = Diverges(KnownDivergence {
 /// sends nothing (https://github.com/rrnewton/reverie/issues/1300), and W1 takes it once released; busy=
 /// names it. Before SIGSHARE S3b that copy merged into the child's, which no
 /// thread had taken, and was not seen.
-const PROCESS_SIGNAL_TARGET_CASES: [ProcessSignalTargetCase; 23] = [
+const PROCESS_SIGNAL_TARGET_CASES: [ProcessSignalTargetCase; 29] = [
     target_case(
         "chld-creator",
         "receiver=M interrupted=M\n",
@@ -26818,6 +26835,42 @@ const PROCESS_SIGNAL_TARGET_CASES: [ProcessSignalTargetCase; 23] = [
     target_case(
         "default-child-curr",
         "steer=W2 pending=0 final=W1\n",
+        Linux,
+        Linux,
+    ),
+    target_case(
+        "chld-ppoll-lets-in",
+        "receiver=M interrupted=M\n",
+        PTRACE_POLLER_PASSED_OVER,
+        Linux,
+    ),
+    target_case(
+        "chld-ppoll-keeps-out",
+        "receiver=W1 interrupted=W1\n",
+        PTRACE_TEMPORARY_MASK_UNREAD,
+        Linux,
+    ),
+    target_case(
+        "chld-pselect-lets-in",
+        "receiver=M interrupted=M\n",
+        PTRACE_POLLER_PASSED_OVER,
+        Linux,
+    ),
+    target_case(
+        "chld-pselect-keeps-out",
+        "receiver=W1 interrupted=W1\n",
+        Linux,
+        Linux,
+    ),
+    target_case(
+        "chld-suspend-lets-in",
+        "receiver=M interrupted=M\n",
+        Linux,
+        Linux,
+    ),
+    target_case(
+        "chld-suspend-keeps-out",
+        "receiver=W1 interrupted=W1\n",
         Linux,
         Linux,
     ),

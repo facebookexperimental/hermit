@@ -253,8 +253,17 @@ impl Scheduler {
     ///
     /// The receiver's sets are the backend's (`backend_signal_state`, S2a),
     /// under the mask the guest published while Detcore holds a private one
-    /// (`under_published_mask`), filtered as the drain filters a restartable
-    /// poll (`poll_wake_signals`). They are read at the timer's pop, a
+    /// (`under_published_mask`), or under the temporary mask Linux holds
+    /// installed for a call the receiver waits in where there is one
+    /// (`controlled_temporary_mask`: a `ppoll`, a `pselect6`, a parked or
+    /// woken `rt_sigsuspend`; `set_user_sigmask` and `sigsuspend`,
+    /// kernel/signal.c:3272 and 4833 at v6.17), as the receiver was chosen
+    /// (`Scheduler::kernel_sent_signal_mask`), filtered as the drain filters
+    /// a restartable poll (`poll_wake_signals`). A temporary mask the request
+    /// says is unknown leaves the mask as before. Read under the thread's own
+    /// mask, a creator chosen for the `SIGCHLD` its `ppoll` lets in was left
+    /// waiting, the copy pending (the Codex review of
+    /// <https://github.com/rrnewton/hermit/pull/5259>, P1). They are read at the timer's pop, a
     /// committed point where no guest thread holds the turn, so the answer is
     /// a function of the schedule. An unreadable state wakes the thread, as
     /// before this filter.
@@ -268,7 +277,13 @@ impl Scheduler {
         let bit = super::kernel_signal_bit(libc::SIGCHLD);
         match self.backend_signal_state(dettid) {
             Some(Ok(state)) => {
-                let state = self.under_published_mask(dettid, state);
+                let state = match self.controlled_temporary_mask(dettid) {
+                    Ok(Some(temporary)) => crate::syscalls::KernelSignalState {
+                        blocked: temporary,
+                        ..state
+                    },
+                    Ok(None) | Err(_) => self.under_published_mask(dettid, state),
+                };
                 // The pop is the copy's generation, so its discard is decided
                 // here, from the dispositions read now, before the wake: where
                 // the scheduler models signal targets the drain's filter
