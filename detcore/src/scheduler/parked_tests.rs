@@ -9142,6 +9142,18 @@ fn file_masked_pselect6(s: &mut Scheduler, tid: DetTid, mask: u64) {
     s.next_turns[&tid].req.put(Ok(r));
 }
 
+/// Files `tid`'s polled masked `ppoll` whose temporary mask is `mask`, as
+/// `Detcore::backend_masked_ppoll_wait` files it where the backend serves the
+/// wait (SIGSHARE S2b): the request carries the mask, and the EINTR marker.
+fn file_masked_ppoll(s: &mut Scheduler, tid: DetTid, mask: u64) {
+    let mut r = Resources::new(tid);
+    r.insert(ResourceID::InternalIOPolling, Permission::W);
+    r.fyi("ppoll");
+    r.blocked_signal_mask = Some(mask);
+    r.set_signal_interrupt_errno(Errno::EINTR);
+    s.next_turns[&tid].req.put(Ok(r));
+}
+
 /// Parks `tid` in an `rt_sigsuspend` under temporary mask `mask`, as
 /// `Detcore::handle_rt_sigsuspend` files it where the backend serves the wait
 /// (SIGSHARE S2b, `Scheduler::backend_suspend_mask`): an indefinite sleep
@@ -9204,6 +9216,7 @@ fn a_controlled_expiry_the_leader_ignores_is_discarded_at_generation() {
     enum Filed {
         Ordinary,
         Masked(u64),
+        MaskedPpoll(u64),
         Exit,
     }
     // (case, the leader's (blocked, ignored, caught) if reported, its filed
@@ -9246,6 +9259,18 @@ fn a_controlled_expiry_the_leader_ignores_is_discarded_at_generation() {
             true,
         ),
         (
+            "SIG_IGN, unblocked, a masked ppoll's temporary mask blocks it",
+            Some((0, SIGALRM_BIT, 0)),
+            Filed::MaskedPpoll(SIGALRM_BIT),
+            false,
+        ),
+        (
+            "SIG_IGN, blocked, a masked ppoll's temporary mask admits it",
+            Some((SIGALRM_BIT, SIGALRM_BIT, 0)),
+            Filed::MaskedPpoll(0),
+            true,
+        ),
+        (
             "SIG_IGN, unblocked, its exit filed",
             Some((0, SIGALRM_BIT, 0)),
             Filed::Exit,
@@ -9267,6 +9292,7 @@ fn a_controlled_expiry_the_leader_ignores_is_discarded_at_generation() {
         match filed {
             Filed::Ordinary => file_ordinary(&mut s, leader),
             Filed::Masked(mask) => file_masked_pselect6(&mut s, leader, mask),
+            Filed::MaskedPpoll(mask) => file_masked_ppoll(&mut s, leader, mask),
             Filed::Exit => file_exit(&mut s, leader, mm),
         }
         s.replace_real_timer(
@@ -9415,6 +9441,12 @@ enum AlarmThread {
     /// As `BackendSuspend`, with a temporary mask that blocks SIGALRM, which
     /// its own mask does not.
     BackendSuspendBlocks,
+    /// Queued to run in a masked `ppoll` the backend serves (SIGSHARE S2b),
+    /// whose temporary mask blocks SIGALRM, which its own mask does not.
+    MaskedPpoll,
+    /// Queued to run in a masked `ppoll` whose temporary mask admits SIGALRM,
+    /// which its own mask blocks.
+    MaskedPpollAdmits,
 }
 
 /// Each `Pause` thread of `choose_alarm_receiver` and its response.
@@ -9450,7 +9482,8 @@ fn choose_alarm_receiver(
             AlarmThread::Blocks
             | AlarmThread::MaskedWaitAdmits
             | AlarmThread::Sigtimedwait
-            | AlarmThread::BackendSuspend => SIGALRM_BIT,
+            | AlarmThread::BackendSuspend
+            | AlarmThread::MaskedPpollAdmits => SIGALRM_BIT,
             _ => 0,
         };
         let usr1 = 1 << (libc::SIGUSR1 - 1);
@@ -9542,6 +9575,14 @@ fn choose_alarm_receiver(
             }
             AlarmThread::BackendSuspend => file_backend_suspend(&mut s, tid, 0),
             AlarmThread::BackendSuspendBlocks => file_backend_suspend(&mut s, tid, SIGALRM_BIT),
+            AlarmThread::MaskedPpoll => {
+                file_masked_ppoll(&mut s, tid, SIGALRM_BIT);
+                s.runqueue_push_back(tid);
+            }
+            AlarmThread::MaskedPpollAdmits => {
+                file_masked_ppoll(&mut s, tid, 0);
+                s.runqueue_push_back(tid);
+            }
         }
     }
     if let Some(target) = curr_target {
@@ -9600,7 +9641,7 @@ fn alarm_action(
 fn one_receiver_choice_takes_a_published_alarm_as_complete_signal_chooses() {
     use AlarmThread::*;
     let t = DetTid::from_raw;
-    let cases: [ReceiverCase; 30] = [
+    let cases: [ReceiverCase; 32] = [
         (
             "a runnable leader that wants it, beside a parked sibling",
             &[Runnable, Pause],
@@ -9810,6 +9851,20 @@ fn one_receiver_choice_takes_a_published_alarm_as_complete_signal_chooses() {
             None,
             None,
             Some(t(101)),
+        ),
+        (
+            "a masked ppoll's temporary mask blocks it",
+            &[Blocks, MaskedPpoll, Runnable],
+            None,
+            Some(t(102)),
+            None,
+        ),
+        (
+            "a masked ppoll's temporary mask admits it: its probe takes it",
+            &[Blocks, MaskedPpollAdmits, Runnable],
+            None,
+            None,
+            None,
         ),
     ];
     for (case, threads, curr_target, taker, observed) in cases {
@@ -10635,6 +10690,51 @@ fn a_fatal_alarm_that_d1_leaves_without_a_receiver_is_refused_by_name() {
             && refusal.contains("KVM gap D1 until N8a"),
         "{refusal}"
     );
+}
+
+/// The coord7 review of https://github.com/rrnewton/hermit/pull/5221, finding
+/// 5, and the kvm coordinator's addition (10:36 PM ET, 11-06): a masked
+/// `ppoll` files its temporary mask on its request, and that mask must not
+/// make it a wait the backend cannot interrupt. Its probe applies the mask
+/// inside the call and takes a pending signal the mask lets in, as
+/// `pselect6`'s does, so it takes the copy at its probe
+/// (`AlarmReach::TakesAtItsProbe`), and the backend's choice is Linux's.
+/// Classified only by its mask (the rule for a polled call with a temporary
+/// mask and no probe that takes signals), it was passed over (D1): alone,
+/// no receiver was found and a fatal SIGALRM would have been refused by name
+/// where Linux ends the process; beside a runnable thread, that thread took
+/// the copy where Linux gives it to the `ppoll`. Here the SIGALRM is at its
+/// default action, so the fatal refusal is what a pass-over would reach.
+#[test]
+fn a_masked_ppoll_that_files_its_mask_takes_the_alarm_at_its_probe() {
+    use AlarmThread::*;
+    let t = DetTid::from_raw;
+    let pid = DetPid::from_raw(100);
+    for threads in [&[MaskedPpollAdmits][..], &[MaskedPpollAdmits, Runnable][..]] {
+        let (s, b, _) = choose_alarm_receiver(threads, None);
+        // SIGALRM at its default action, blocked by the leader's own mask.
+        replace_signal_sets(
+            &b,
+            100,
+            100,
+            reverie::SignalSets::new(0, SIGALRM_BIT, SIGALRM_BIT, 0, 0),
+        );
+        let recipients = b
+            .alarm_recipients(task(100, 100).process)
+            .expect("recipients");
+        assert_eq!(
+            s.alarm_receiver_and_walk(pid, &recipients, AlarmReachRule::Linux)
+                .0,
+            Some(t(100)),
+            "{threads:?}"
+        );
+        assert_eq!(
+            s.alarm_receiver(pid, &recipients),
+            Some(t(100)),
+            "{threads:?}: the backend's choice is Linux's, so no fatal refusal"
+        );
+        assert_eq!(s.first_alarm_taker(), None, "{threads:?}");
+    }
 }
 
 /// https://github.com/rrnewton/hermit/issues/4929 (D1, accepted as a named

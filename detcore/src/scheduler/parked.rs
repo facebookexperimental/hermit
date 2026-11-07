@@ -127,9 +127,9 @@ pub(super) enum AlarmReach {
     /// woken (`Scheduler::wake_polling_alarm_receiver`).
     Poll,
     /// Polling a call whose probe takes a pending signal itself, under the
-    /// call's own temporary mask (`select`, `pselect6`, whose requests carry
-    /// the EINTR marker, as a `poll`'s and a `ppoll`'s also do): its next
-    /// probe takes the copy.
+    /// call's own temporary mask (`select`, `pselect6`, and a `ppoll` with a
+    /// temporary mask, whose requests carry the EINTR marker, as a `poll`'s
+    /// and an unmasked `ppoll`'s also do): its next probe takes the copy.
     TakesAtItsProbe,
     /// Queued to run with a request filed: step 3 resumes it first.
     Queued,
@@ -2050,12 +2050,18 @@ impl Scheduler {
         // (`Scheduler::poller_may_run_external_handler`), but their probe
         // never ends for a pending signal, so they are woken below. The
         // request names its call (`Resources::fyi`). A `ppoll` under a
-        // temporary mask never polls here: the one backend that installs a
-        // control (KVM) reports no `supports_blocked_wait_signal_interruption`,
-        // so such a call that would block fails closed
-        // (`Detcore::handle_internal_ppoll`).
+        // temporary mask polls here on KVM since SIGSHARE S2b
+        // (`Detcore::backend_masked_ppoll_wait`): each probe carries the
+        // call's mask, so the backend applies it inside the call and the probe
+        // takes a pending signal that mask lets in, as `pselect6`'s does, and
+        // its request files that mask (`blocked_signal_mask`). It is told from
+        // an unmasked `ppoll` by that mask. Passed over below as out of reach,
+        // a lone masked `ppoll` that Linux chooses would have had a fatal
+        // SIGALRM refused (the coord7 review of
+        // https://github.com/rrnewton/hermit/pull/5221, finding 5).
         if request.signal_interrupt_errno() == Some(reverie::syscalls::Errno::EINTR.into_raw())
-            && matches!(request.fyi.as_str(), "select" | "pselect6")
+            && (matches!(request.fyi.as_str(), "select" | "pselect6")
+                || (request.fyi.as_str() == "ppoll" && request.blocked_signal_mask.is_some()))
         {
             return AlarmReach::TakesAtItsProbe;
         }

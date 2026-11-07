@@ -26303,6 +26303,39 @@ fn run_kvm_a_default_alarm_ends_a_sigsuspend_as_linux_does() {
     }
 }
 
+/// The coord7 review of <https://github.com/rrnewton/hermit/pull/5221>,
+/// finding 5 (minibeads dh-02sy1): tests/c/alarm_receiver_reach.c's
+/// `maskppoll`, in which the main thread, whose own mask is empty, waits for a
+/// pipe byte in `ppoll(-1)` under a temporary mask that blocks SIGALRM while a
+/// second thread waits in `pause`. Linux installs ppoll's mask for the whole
+/// call (`set_user_sigmask`, kernel/signal.c:3274 at v6.17; fs/select.c:1108),
+/// so `complete_signal` passes the main thread over and the handler runs on
+/// the second thread, which writes the byte (10 of 10 native runs on Linux
+/// 7.1.3). KVM must print Linux's line at bitwise parity. Before, KVM's masked
+/// `ppoll` filed no mask, so its receiver choice read the thread's own mask,
+/// chose the main thread, woke its poll for a copy its probe never takes, and
+/// the run hung (killed at a 120 s wall deadline); the base, before #4929
+/// slice 2's receiver choice, printed Linux's line. No ptrace leg: on ptrace
+/// this mode hangs at the base too (a ptrace gap outside this change).
+#[test]
+fn run_kvm_a_masked_ppoll_takes_the_alarm_under_its_own_mask() {
+    let (mode, linux) = ("maskppoll", "mode=maskppoll handler_on=W eintr=0 n=1\n");
+    assert_eq!(
+        native_alarm_receiver_reach(mode, linux),
+        linux,
+        "{mode}: natively"
+    );
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM masked-ppoll alarm case: /dev/kvm is unavailable");
+        return;
+    }
+    assert_eq!(
+        alarm_receiver_reach_at_l2(&["--backend=kvm"], mode),
+        linux,
+        "{mode}: KVM"
+    );
+}
+
 /// A line a backend prints where Linux prints another, recorded with the
 /// issue that tracks the difference.
 struct KnownDivergence {

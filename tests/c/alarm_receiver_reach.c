@@ -274,6 +274,14 @@
  *       which the expiry names and whose sigsuspend mask admits it; the
  *       handler runs there and sigsuspend fails with EINTR. Prints
  *       "mode=suspend on_leader=1 eintr=1".
+ *   maskppoll
+ *       The main thread, whose own mask is empty, waits for a pipe byte in
+ *       ppoll(-1) under a temporary mask that blocks SIGALRM, a second thread
+ *       waits in pause(), and a one-shot 10 ms ITIMER_REAL expires. Linux
+ *       installs ppoll's mask for the whole call (set_user_sigmask), so the
+ *       main thread does not want the signal and complete_signal gives it to
+ *       the second thread, whose handler writes the byte; the ppoll returns
+ *       it. Prints "mode=maskppoll handler_on=W eintr=0 n=1".
  */
 
 #define _GNU_SOURCE
@@ -1347,6 +1355,39 @@ static int suspend_wait(const char* mode) {
   return 0;
 }
 
+/* maskppoll: a SIGALRM while the main thread waits in a ppoll() whose mask
+ * blocks it (the coord7 review of https://github.com/rrnewton/hermit/pull/5221,
+ * finding 5). */
+static int masked_ppoll(void) {
+  if (pipe(fds)) {
+    perror("pipe");
+    return 1;
+  }
+  struct sigaction action;
+  memset(&action, 0, sizeof(action));
+  action.sa_handler = wake;
+  sigaction(SIGALRM, &action, NULL);
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, pauser, NULL) != 0) {
+    return 1;
+  }
+  struct timespec settle = {0, 20000000};
+  nanosleep(&settle, NULL);
+  arm_one_shot();
+  sigset_t alarm;
+  sigemptyset(&alarm);
+  sigaddset(&alarm, SIGALRM);
+  struct pollfd wait_for = {.fd = fds[0], .events = POLLIN};
+  int n;
+  int eintr = 0;
+  while ((n = ppoll(&wait_for, 1, NULL, &alarm)) == -1 && errno == EINTR) {
+    eintr++;
+  }
+  printf("mode=maskppoll handler_on=%s eintr=%d n=%d\n", handled_by == getpid() ? "L" : "W",
+         eintr, n);
+  return 0;
+}
+
 /* busypause, busypausealone: a thread-directed SIGUSR1 to a leader parked
  * in pause(), which Linux wakes for it whatever a SIGALRM does
  * (https://github.com/rrnewton/hermit/issues/4929). */
@@ -1433,6 +1474,9 @@ int main(int argc, char** argv) {
   if (strcmp(mode, "dflsuspend") == 0 || strcmp(mode, "dflsuspend2") == 0 ||
       strcmp(mode, "suspend") == 0) {
     return suspend_wait(mode);
+  }
+  if (strcmp(mode, "maskppoll") == 0) {
+    return masked_ppoll();
   }
   if (strcmp(mode, "twotimers") == 0) {
     return two_timers();

@@ -1169,6 +1169,33 @@ fn keeps_poll_deadline_for_rerun(
             || matches!(result, Err(Error::Errno(errno)) if *errno == Errno::ERESTARTSYS))
 }
 
+/// The request each turn of a masked ppoll's wait files
+/// (`Detcore::backend_masked_ppoll_wait`), before its guest-dependent poll
+/// fields: a polled call (`InternalIOPolling`) named `ppoll`, with the EINTR
+/// marker, and the call's temporary mask `signal_mask` as Linux installs it.
+/// Linux holds that mask in `blocked` for the whole call (`set_user_sigmask`,
+/// kernel/signal.c:3274 at v6.17, called by `do_sys_ppoll`, fs/select.c:1108),
+/// while this backend's `blocked` between probes is the thread's own. Filed
+/// here, as `pselect6` files its mask (`handle_internal_pselect6`), so the
+/// scheduler decides by the call's mask: a SIGALRM expiry's discard at
+/// generation and the choice of the thread that takes it
+/// (`signal_state_reader`). Before, it filed none, and a masked ppoll whose
+/// mask blocked SIGALRM was chosen for the copy by its own mask, woken, and
+/// never took it (the coord7 review of
+/// <https://github.com/rrnewton/hermit/pull/5221>, finding 5). The
+/// scheduler's polling record leaves the mask out of the request it prints
+/// (`Scheduler::logged_polling_request`), as for `pselect6`.
+fn masked_ppoll_wait_request(dettid: DetTid, signal_mask: KernelSigset) -> Resources {
+    let mut rsrc = Resources::new(dettid);
+    rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
+    rsrc.fyi("ppoll");
+    rsrc.set_signal_interrupt_errno(Errno::EINTR);
+    rsrc.blocked_signal_mask = Some(kernel_installed_signal_mask(sanitize_ppoll_signal_mask(
+        signal_mask,
+    )));
+    rsrc
+}
+
 fn sanitize_ppoll_signal_mask(mask: u64) -> u64 {
     let signal_bit = (reverie::PERF_EVENT_SIGNAL as usize) - 1;
     mask & !(1_u64 << signal_bit)
@@ -3544,9 +3571,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         deadline: Option<LogicalTime>,
     ) -> Result<i64, Error> {
         let mask = sanitize_ppoll_signal_mask(signal_mask);
-        let mut rsrc = Resources::new(guest.thread_state().dettid);
-        rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
-        rsrc.fyi("ppoll");
+        let mut rsrc = masked_ppoll_wait_request(guest.thread_state().dettid, signal_mask);
         rsrc.poll_deadline = poll_deadline_for(guest, deadline);
         rsrc.relies_on_guest_held_marks = poll_targets_guest_held(
             guest,
@@ -3554,7 +3579,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             call.nfds() as usize,
         );
         rsrc.polls_guest_state_only = rsrc.relies_on_guest_held_marks;
-        rsrc.set_signal_interrupt_errno(Errno::EINTR);
         rsrc.signal_state_task = guest_signal_state_task(guest);
         let mut guest_held = GuestHeldPollProof::capture(guest, call.into(), &mut rsrc);
         loop {
@@ -6301,6 +6325,49 @@ fn warn_property_set_not_visible() {
 
 #[cfg(test)]
 mod tests {
+    /// The coord7 review of https://github.com/rrnewton/hermit/pull/5221
+    /// (finding 5): each turn of a masked ppoll's wait files the call's
+    /// temporary mask as Linux installs it for the whole call
+    /// (`set_user_sigmask`, kernel/signal.c:3274 at v6.17): `SIGKILL` and
+    /// `SIGSTOP` dropped (`set_current_blocked`), and Reverie's preemption
+    /// marker too, as the probe drops it. With the EINTR marker and the call's
+    /// name, it reads as a `pselect6`-like wait whose probe takes a signal.
+    #[test]
+    fn a_masked_ppoll_files_its_mask_for_the_scheduler() {
+        use crate::types::DetTid;
+        let bit = |signal: i32| 1u64 << (signal - 1);
+        let tid = DetTid::from_raw(7);
+        for (label, mask, filed) in [
+            ("empty", 0, 0),
+            ("SIGALRM", bit(libc::SIGALRM), bit(libc::SIGALRM)),
+            (
+                "unblockable and the marker",
+                bit(libc::SIGALRM)
+                    | bit(libc::SIGKILL)
+                    | bit(libc::SIGSTOP)
+                    | bit(reverie::PERF_EVENT_SIGNAL as i32),
+                bit(libc::SIGALRM),
+            ),
+        ] {
+            let request = super::masked_ppoll_wait_request(tid, mask);
+            assert_eq!(request.blocked_signal_mask, Some(filed), "{label}");
+            assert!(!request.blocked_signal_mask_unknown, "{label}");
+            assert_eq!(request.fyi.as_str(), "ppoll", "{label}");
+            assert_eq!(
+                request.signal_interrupt_errno(),
+                Some(reverie::Errno::EINTR.into_raw()),
+                "{label}"
+            );
+            assert!(
+                request
+                    .resources
+                    .contains_key(&crate::resources::ResourceID::InternalIOPolling)
+                    && request.resources.len() == 1,
+                "{label}"
+            );
+        }
+    }
+
     /// Mutation M23 of the coord7 review of
     /// https://github.com/rrnewton/hermit/pull/5221 (finding 4): a `poll` with
     /// an end time keeps it for its rerun exactly where the backend restarts a
