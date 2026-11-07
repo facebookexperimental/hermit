@@ -995,7 +995,7 @@ dependencies = [
 [[package]]
 name = "reverie-core"
 version = "0.5.4"
-source = "git+https://github.com/rrnewton/reverie.git?rev=831a3a0e79892a7e6bfafc6a86dd73c987feeabb#831a3a0e79892a7e6bfafc6a86dd73c987feeabb"
+source = "git+https://github.com/rrnewton/reverie.git?rev=3bbfffc778c0800e447f6a78abd1ebcf12f81712#3bbfffc778c0800e447f6a78abd1ebcf12f81712"
 dependencies = [
  "addr2line",
  "anyhow",
@@ -1024,7 +1024,7 @@ dependencies = [
 [[package]]
 name = "reverie-inguest"
 version = "0.5.4"
-source = "git+https://github.com/rrnewton/reverie.git?rev=831a3a0e79892a7e6bfafc6a86dd73c987feeabb#831a3a0e79892a7e6bfafc6a86dd73c987feeabb"
+source = "git+https://github.com/rrnewton/reverie.git?rev=3bbfffc778c0800e447f6a78abd1ebcf12f81712#3bbfffc778c0800e447f6a78abd1ebcf12f81712"
 dependencies = [
  "bincode",
  "libc",
@@ -1042,7 +1042,7 @@ dependencies = [
 [[package]]
 name = "reverie-liteinst"
 version = "0.5.4"
-source = "git+https://github.com/rrnewton/reverie.git?rev=831a3a0e79892a7e6bfafc6a86dd73c987feeabb#831a3a0e79892a7e6bfafc6a86dd73c987feeabb"
+source = "git+https://github.com/rrnewton/reverie.git?rev=3bbfffc778c0800e447f6a78abd1ebcf12f81712#3bbfffc778c0800e447f6a78abd1ebcf12f81712"
 dependencies = [
  "bincode",
  "iced-x86",
@@ -1060,7 +1060,7 @@ dependencies = [
 [[package]]
 name = "reverie-liteinst-artifact"
 version = "0.5.4"
-source = "git+https://github.com/rrnewton/reverie.git?rev=831a3a0e79892a7e6bfafc6a86dd73c987feeabb#831a3a0e79892a7e6bfafc6a86dd73c987feeabb"
+source = "git+https://github.com/rrnewton/reverie.git?rev=3bbfffc778c0800e447f6a78abd1ebcf12f81712#3bbfffc778c0800e447f6a78abd1ebcf12f81712"
 dependencies = [
  "goblin",
  "libc",
@@ -1072,7 +1072,7 @@ dependencies = [
 [[package]]
 name = "reverie-liteinst-preload"
 version = "0.5.4"
-source = "git+https://github.com/rrnewton/reverie.git?rev=831a3a0e79892a7e6bfafc6a86dd73c987feeabb#831a3a0e79892a7e6bfafc6a86dd73c987feeabb"
+source = "git+https://github.com/rrnewton/reverie.git?rev=3bbfffc778c0800e447f6a78abd1ebcf12f81712#3bbfffc778c0800e447f6a78abd1ebcf12f81712"
 dependencies = [
  "libc",
  "reverie-core",
@@ -1082,7 +1082,7 @@ dependencies = [
 [[package]]
 name = "reverie-memory"
 version = "0.5.4"
-source = "git+https://github.com/rrnewton/reverie.git?rev=831a3a0e79892a7e6bfafc6a86dd73c987feeabb#831a3a0e79892a7e6bfafc6a86dd73c987feeabb"
+source = "git+https://github.com/rrnewton/reverie.git?rev=3bbfffc778c0800e447f6a78abd1ebcf12f81712#3bbfffc778c0800e447f6a78abd1ebcf12f81712"
 dependencies = [
  "syscalls",
 ]
@@ -1090,7 +1090,7 @@ dependencies = [
 [[package]]
 name = "reverie-process"
 version = "0.5.4"
-source = "git+https://github.com/rrnewton/reverie.git?rev=831a3a0e79892a7e6bfafc6a86dd73c987feeabb#831a3a0e79892a7e6bfafc6a86dd73c987feeabb"
+source = "git+https://github.com/rrnewton/reverie.git?rev=3bbfffc778c0800e447f6a78abd1ebcf12f81712#3bbfffc778c0800e447f6a78abd1ebcf12f81712"
 dependencies = [
  "bincode",
  "bitflags 2.13.1",
@@ -1107,7 +1107,7 @@ dependencies = [
 [[package]]
 name = "reverie-rpc-transport"
 version = "0.5.4"
-source = "git+https://github.com/rrnewton/reverie.git?rev=831a3a0e79892a7e6bfafc6a86dd73c987feeabb#831a3a0e79892a7e6bfafc6a86dd73c987feeabb"
+source = "git+https://github.com/rrnewton/reverie.git?rev=3bbfffc778c0800e447f6a78abd1ebcf12f81712#3bbfffc778c0800e447f6a78abd1ebcf12f81712"
 dependencies = [
  "async-trait",
  "bincode",
@@ -1122,7 +1122,7 @@ dependencies = [
 [[package]]
 name = "reverie-syscalls"
 version = "0.5.4"
-source = "git+https://github.com/rrnewton/reverie.git?rev=831a3a0e79892a7e6bfafc6a86dd73c987feeabb#831a3a0e79892a7e6bfafc6a86dd73c987feeabb"
+source = "git+https://github.com/rrnewton/reverie.git?rev=3bbfffc778c0800e447f6a78abd1ebcf12f81712#3bbfffc778c0800e447f6a78abd1ebcf12f81712"
 dependencies = [
  "bitflags 2.13.1",
  "derive_more",
@@ -1414,9 +1414,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.53.1"
+version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "202caea871b69668250d242070849eb495be178ed697a3e98aebce5bc81a0bed"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",
