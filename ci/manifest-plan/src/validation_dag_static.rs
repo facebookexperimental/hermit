@@ -3368,7 +3368,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_transferred_exec_gives_the_leader_the_survivors_own_cpu_time and
     // a_pre_exec_cpu_publication_after_a_transferred_exec_is_dropped: 3665.
     // Four census provenance units plus the non-PROGBITS control: 3665 + 5.
-    ("test.detcore_unit", 3766),
+    // PR #4614's fifteen schedule-replay slice-end units: 3766 + 15 = 3781.
+    ("test.detcore_unit", 3781),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4776,10 +4777,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And slice 2b-2's another_processs_status_answers_as_linux: 834 + 1 = 835.
     // And slice 2b-3's another_processs_cmdline_and_environ_answer_as_linux:
     // 835 + 1 = 836.
+    // PR #4614's a_schedule_replay_under_chaos_follows_its_recording_at_seed_{1,2,3}:
+    // 836 + 3 = 839.
     // And a_schedule_replay_ends_each_recorded_slice_once_at_seed_{1,2,3}
-    // (PR #4614): 836 + 3 = 839, skipped by exact name here and run in
-    // privileged-test.pmu_cli_cases: 839 - 3 = 836, listed.
-    ("test.cli", 836),
+    // (PR #4614): 839 + 3 = 842, skipped by exact name here and run in
+    // privileged-test.pmu_cli_cases: 842 - 3 = 839, listed.
+    ("test.cli", 839),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5505,8 +5508,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // merge-queue recount after #5221: 753.
     // The same 2b-2 other-process status ptrace twin: 753 + 1 = 754.
     // And the 2b-3 other-process cmdline ptrace twin: 754 + 1 = 755.
-    // And the same three slice-once seeds (PR #4614): 755 + 3 - 3 = 755.
-    ("test.cli_on_host", 755),
+    // And the same three chaos-follows seeds (PR #4614): 755 + 3 = 758.
+    // And the same three slice-once seeds (PR #4614): 758 + 3 - 3 = 758.
+    ("test.cli_on_host", 758),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -6134,7 +6138,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // merge-queue recount after #5219: 3659.
     // The same six 2b-1 units: 3659 + 6 = 3665.
     // Four census provenance units plus the non-PROGBITS control: 3665 + 5.
-    ("test.detcore_unit_on_host", 3766),
+    // The same fifteen PR #4614 units (same growth as test.detcore_unit): 3766 + 15 = 3781.
+    ("test.detcore_unit_on_host", 3781),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
