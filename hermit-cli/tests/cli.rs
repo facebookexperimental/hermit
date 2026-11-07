@@ -26516,8 +26516,8 @@ const PTRACE_POLLER_PASSED_OVER: TargetExpectation = Diverges(KnownDivergence {
 /// `suppressed-child-curr` differs too: the traced parent keeps the
 /// scheduler's `SIGCHLD` for an explicitly ignored child queued (pending=1),
 /// which Linux never sends, and W1 takes it once a handler is installed; it
-/// printed the same at b198041ece8 (dh-90p9w,
-/// https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-90p9w.md).
+/// printed the same at b198041ece8
+/// (<https://github.com/rrnewton/hermit/issues/5242>, trail in minibeads dh-90p9w).
 ///
 /// KVM's half of these cases, and its own KNOWN DIVERGENCES, arrive with the
 /// Reverie pin in which KvmBackend declares
@@ -26577,7 +26577,7 @@ const PROCESS_SIGNAL_TARGET_CASES: [ProcessSignalTargetCase; 23] = [
         "suppressed-child-curr",
         "steer=W2 pending=0 final=W2\n",
         Diverges(KnownDivergence {
-            issue: "https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-90p9w.md",
+            issue: "https://github.com/rrnewton/hermit/issues/5242",
             line: "steer=W2 pending=1 final=W1\n",
         }),
     ),
