@@ -20,7 +20,7 @@ pub const TEST_WALL_TIMEOUT_MULTIPLIER_ENV: &str = "HERMIT_TEST_WALL_TIMEOUT_MUL
 
 /// Frozen retained-data census used to calibrate the per-test policy.
 pub const TIMEOUT_CALIBRATION_CUTOFF_UTC: &str = "2026-09-03T02:18:30Z";
-pub const CALIBRATED_CI_CELL_COUNT: usize = 492;
+pub const CALIBRATED_CI_CELL_COUNT: usize = 493;
 pub const DEFAULT_COVERED_CI_CELL_COUNT: usize = 487;
 pub const NON_CI_CELL_COUNT: usize = 173;
 /// Additional selected cells covered by the KVM qualification evidence.
@@ -256,7 +256,24 @@ pub struct TimeoutCalibration {
 
 /// The only selected cells whose retained p90-derived bounds exceed at least
 /// one ordinary default at [`TIMEOUT_CALIBRATION_CUTOFF_UTC`].
-pub const EXPLICIT_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 5] = [
+pub const EXPLICIT_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 6] = [
+    // The gVisor batch-2 qualification allowance (2026-11-07): the only
+    // selected cell whose measured bound exceeds a default. Samples are
+    // the low-concurrency retries in the pinned hermetic image; the
+    // configured CPU bound is ceil(1.5 x 21.23) and wall 8x it, the same
+    // measured-allowance pattern as the entries below.
+    TimeoutCalibration {
+        test: "gvisor/eventfd-eventfdtest-notifynonzero",
+        mode: "verify",
+        backend: "ptrace",
+        samples: 1,
+        p90_cpu_usec: 21_230_000,
+        p90_wall_millis: 24_370,
+        required_cpu_seconds: 32,
+        required_wall_seconds: 98,
+        configured_cpu_seconds: 32,
+        configured_wall_seconds: 256,
+    },
     TimeoutCalibration {
         test: "applications/kvm-python-examples",
         mode: "verify",

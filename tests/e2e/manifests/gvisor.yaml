@@ -28,6 +28,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -168,6 +172,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -238,6 +246,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -308,6 +320,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -378,6 +394,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -448,6 +468,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -518,6 +542,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -588,6 +616,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -734,6 +766,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -804,6 +840,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -874,6 +914,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -944,6 +988,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -1014,6 +1062,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -1084,6 +1136,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -1154,6 +1210,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -1224,6 +1284,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -1294,6 +1358,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -1364,6 +1432,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -1434,6 +1506,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -1504,6 +1580,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -1574,6 +1654,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -1644,6 +1728,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -1714,6 +1802,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -1784,6 +1876,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -1854,6 +1950,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -1924,6 +2024,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -1994,6 +2098,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -2064,6 +2172,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -2134,6 +2246,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -2204,6 +2320,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -2274,6 +2394,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -2344,6 +2468,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -2414,6 +2542,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -2484,6 +2616,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -2554,6 +2690,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -2624,6 +2764,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -2694,6 +2838,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -2764,6 +2912,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -2834,6 +2986,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -8296,6 +8452,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -8366,6 +8526,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -8436,6 +8600,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: gVisor corpus not yet qualified on SaBRe
@@ -10206,6 +10374,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -10276,6 +10448,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -10346,6 +10522,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -10416,6 +10596,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -10486,6 +10670,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -10556,6 +10744,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -10626,6 +10818,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -10696,6 +10892,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -10766,6 +10966,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -10835,9 +11039,13 @@ test:
           - ptrace
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
-          kvm: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/access.cc:156: Failure"
+          kvm: "measured failing 2026-11-07: upstream/test/syscalls/linux/access.cc:156: Failure"
           sabre: "gVisor corpus not yet qualified on SaBRe"
 
       chaos:
@@ -10906,6 +11114,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -10975,9 +11187,13 @@ test:
           - ptrace
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
-          kvm: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/access.cc:172: Failure"
+          kvm: "measured failing 2026-11-07: upstream/test/syscalls/linux/access.cc:172: Failure"
           sabre: "gVisor corpus not yet qualified on SaBRe"
 
       chaos:
@@ -11045,9 +11261,13 @@ test:
           - ptrace
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
-          kvm: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/access.cc:185: Failure"
+          kvm: "measured failing 2026-11-07: upstream/test/syscalls/linux/access.cc:185: Failure"
           sabre: "gVisor corpus not yet qualified on SaBRe"
 
       chaos:
@@ -11116,6 +11336,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -11186,6 +11410,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -11256,6 +11484,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -11326,6 +11558,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -11395,10 +11631,10 @@ test:
           - ptrace
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
-          kvm: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/access.cc:279: Failure"
+          kvm: "measured failing 2026-11-07: upstream/test/syscalls/linux/access.cc:279: Failure"
           sabre: "gVisor corpus not yet qualified on SaBRe"
-          liteinst: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/access.cc:279: Failure"
-          in-guest-trap: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/access.cc:279: Failure"
+          liteinst: "measured failing 2026-11-07: upstream/test/syscalls/linux/access.cc:279: Failure"
+          in-guest-trap: "measured failing 2026-11-07: upstream/test/syscalls/linux/access.cc:279: Failure"
 
       chaos:
         ci: false
@@ -11466,6 +11702,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -11536,6 +11776,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -11606,6 +11850,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -11676,6 +11924,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -11746,6 +11998,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -11815,10 +12071,10 @@ test:
           - ptrace
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
-          kvm: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/dup.cc:127: Failure"
+          kvm: "measured failing 2026-11-07: upstream/test/syscalls/linux/dup.cc:127: Failure"
           sabre: "gVisor corpus not yet qualified on SaBRe"
-          liteinst: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/dup.cc:127: Failure"
-          in-guest-trap: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/dup.cc:127: Failure"
+          liteinst: "measured failing 2026-11-07: upstream/test/syscalls/linux/dup.cc:127: Failure"
+          in-guest-trap: "measured failing 2026-11-07: upstream/test/syscalls/linux/dup.cc:127: Failure"
 
       chaos:
         ci: false
@@ -11886,6 +12142,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -11956,6 +12216,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -12026,6 +12290,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -12096,6 +12364,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -12166,6 +12438,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -12726,6 +13002,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -12795,9 +13075,13 @@ test:
           - ptrace
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
-          kvm: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/getdents.cc:480: Failure"
+          kvm: "measured failing 2026-11-07: upstream/test/syscalls/linux/getdents.cc:480: Failure"
           sabre: "gVisor corpus not yet qualified on SaBRe"
 
       chaos:
@@ -12865,9 +13149,13 @@ test:
           - ptrace
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
-          kvm: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/getdents.cc:491: Failure"
+          kvm: "measured failing 2026-11-07: upstream/test/syscalls/linux/getdents.cc:491: Failure"
           sabre: "gVisor corpus not yet qualified on SaBRe"
 
       chaos:
@@ -12935,9 +13223,13 @@ test:
           - ptrace
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
-          kvm: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/getdents.cc:502: Failure"
+          kvm: "measured failing 2026-11-07: upstream/test/syscalls/linux/getdents.cc:502: Failure"
           sabre: "gVisor corpus not yet qualified on SaBRe"
 
       chaos:
@@ -13076,6 +13368,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -13215,9 +13511,13 @@ test:
           - ptrace
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
-          kvm: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/getdents.cc:595: Failure"
+          kvm: "measured failing 2026-11-07: upstream/test/syscalls/linux/getdents.cc:595: Failure"
           sabre: "gVisor corpus not yet qualified on SaBRe"
 
       chaos:
@@ -13285,9 +13585,13 @@ test:
           - ptrace
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
-          kvm: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/getdents.cc:607: Failure"
+          kvm: "measured failing 2026-11-07: upstream/test/syscalls/linux/getdents.cc:607: Failure"
           sabre: "gVisor corpus not yet qualified on SaBRe"
 
       chaos:
@@ -13776,6 +14080,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -13846,6 +14154,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -13916,6 +14228,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -13986,6 +14302,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -14126,6 +14446,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -14266,6 +14590,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -14336,6 +14664,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -14406,6 +14738,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -14476,6 +14812,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -14546,6 +14886,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -14616,6 +14960,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -14686,6 +15034,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -14756,6 +15108,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -14826,6 +15182,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -14896,6 +15256,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -14966,6 +15330,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -15036,6 +15404,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -15106,6 +15478,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -15176,6 +15552,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -15316,6 +15696,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -15386,6 +15770,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -15456,6 +15844,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -15526,6 +15918,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -15596,6 +15992,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -15666,6 +16066,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -15736,6 +16140,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -15806,6 +16214,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -15876,6 +16288,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -15946,6 +16362,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -16016,6 +16436,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -16086,6 +16510,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -16156,6 +16584,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -16226,6 +16658,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -16296,6 +16732,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -16366,6 +16806,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -16506,6 +16950,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -16576,6 +17024,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -16646,6 +17098,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -16716,6 +17172,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -16786,6 +17246,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -16856,6 +17320,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -16926,6 +17394,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -16996,6 +17468,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -17066,6 +17542,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -17136,6 +17616,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -17206,6 +17690,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -17276,6 +17764,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -17346,6 +17838,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -17415,10 +17911,10 @@ test:
           - ptrace
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
-          kvm: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:888: Failure"
+          kvm: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:888: Failure"
           sabre: "gVisor corpus not yet qualified on SaBRe"
-          liteinst: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:888: Failure"
-          in-guest-trap: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:888: Failure"
+          liteinst: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:888: Failure"
+          in-guest-trap: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:888: Failure"
 
       chaos:
         ci: false
@@ -17486,6 +17982,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -17556,6 +18056,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -17625,10 +18129,10 @@ test:
           - ptrace
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
-          kvm: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:948: Failure"
+          kvm: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:948: Failure"
           sabre: "gVisor corpus not yet qualified on SaBRe"
-          liteinst: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:948: Failure"
-          in-guest-trap: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:948: Failure"
+          liteinst: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:948: Failure"
+          in-guest-trap: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:948: Failure"
 
       chaos:
         ci: false
@@ -17695,10 +18199,10 @@ test:
           - ptrace
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
-          kvm: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:969: Failure"
+          kvm: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:969: Failure"
           sabre: "gVisor corpus not yet qualified on SaBRe"
-          liteinst: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:969: Failure"
-          in-guest-trap: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:969: Failure"
+          liteinst: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:969: Failure"
+          in-guest-trap: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:969: Failure"
 
       chaos:
         ci: false
@@ -17766,6 +18270,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -17836,6 +18344,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -17906,6 +18418,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -17976,6 +18492,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -18045,10 +18565,10 @@ test:
           - ptrace
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
-          kvm: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1000: Failure"
+          kvm: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1000: Failure"
           sabre: "gVisor corpus not yet qualified on SaBRe"
-          liteinst: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1000: Failure"
-          in-guest-trap: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1000: Failure"
+          liteinst: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1000: Failure"
+          in-guest-trap: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1000: Failure"
 
       chaos:
         ci: false
@@ -18115,10 +18635,10 @@ test:
           - ptrace
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
-          kvm: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1013: Failure"
+          kvm: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1013: Failure"
           sabre: "gVisor corpus not yet qualified on SaBRe"
-          liteinst: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1013: Failure"
-          in-guest-trap: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1013: Failure"
+          liteinst: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1013: Failure"
+          in-guest-trap: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1013: Failure"
 
       chaos:
         ci: false
@@ -18185,10 +18705,10 @@ test:
           - ptrace
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
-          kvm: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1029: Failure"
+          kvm: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1029: Failure"
           sabre: "gVisor corpus not yet qualified on SaBRe"
-          liteinst: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1029: Failure"
-          in-guest-trap: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1029: Failure"
+          liteinst: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1029: Failure"
+          in-guest-trap: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1029: Failure"
 
       chaos:
         ci: false
@@ -18256,6 +18776,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -18326,6 +18850,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -18395,10 +18923,10 @@ test:
           - ptrace
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
-          kvm: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1000: Failure"
+          kvm: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1000: Failure"
           sabre: "gVisor corpus not yet qualified on SaBRe"
-          liteinst: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1000: Failure"
-          in-guest-trap: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1000: Failure"
+          liteinst: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1000: Failure"
+          in-guest-trap: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1000: Failure"
 
       chaos:
         ci: false
@@ -18465,10 +18993,10 @@ test:
           - ptrace
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
-          kvm: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1013: Failure"
+          kvm: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1013: Failure"
           sabre: "gVisor corpus not yet qualified on SaBRe"
-          liteinst: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1013: Failure"
-          in-guest-trap: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1013: Failure"
+          liteinst: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1013: Failure"
+          in-guest-trap: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1013: Failure"
 
       chaos:
         ci: false
@@ -18535,10 +19063,10 @@ test:
           - ptrace
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
-          kvm: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1029: Failure"
+          kvm: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1029: Failure"
           sabre: "gVisor corpus not yet qualified on SaBRe"
-          liteinst: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1029: Failure"
-          in-guest-trap: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1029: Failure"
+          liteinst: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1029: Failure"
+          in-guest-trap: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1029: Failure"
 
       chaos:
         ci: false
@@ -18606,6 +19134,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -18676,6 +19208,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -18745,10 +19281,10 @@ test:
           - ptrace
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
-          kvm: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1000: Failure"
+          kvm: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1000: Failure"
           sabre: "gVisor corpus not yet qualified on SaBRe"
-          liteinst: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1000: Failure"
-          in-guest-trap: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1000: Failure"
+          liteinst: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1000: Failure"
+          in-guest-trap: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1000: Failure"
 
       chaos:
         ci: false
@@ -18815,10 +19351,10 @@ test:
           - ptrace
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
-          kvm: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1013: Failure"
+          kvm: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1013: Failure"
           sabre: "gVisor corpus not yet qualified on SaBRe"
-          liteinst: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1013: Failure"
-          in-guest-trap: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1013: Failure"
+          liteinst: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1013: Failure"
+          in-guest-trap: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1013: Failure"
 
       chaos:
         ci: false
@@ -18885,10 +19421,10 @@ test:
           - ptrace
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
-          kvm: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1029: Failure"
+          kvm: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1029: Failure"
           sabre: "gVisor corpus not yet qualified on SaBRe"
-          liteinst: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1029: Failure"
-          in-guest-trap: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/stat.cc:1029: Failure"
+          liteinst: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1029: Failure"
+          in-guest-trap: "measured failing 2026-11-07: upstream/test/syscalls/linux/stat.cc:1029: Failure"
 
       chaos:
         ci: false
@@ -18956,6 +19492,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -19025,10 +19565,10 @@ test:
           - ptrace
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
-          kvm: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/uname.cc:52: Failure"
+          kvm: "measured failing 2026-11-07: upstream/test/syscalls/linux/uname.cc:52: Failure"
           sabre: "gVisor corpus not yet qualified on SaBRe"
-          liteinst: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/uname.cc:52: Failure"
-          in-guest-trap: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/uname.cc:52: Failure"
+          liteinst: "measured failing 2026-11-07: upstream/test/syscalls/linux/uname.cc:52: Failure"
+          in-guest-trap: "measured failing 2026-11-07: upstream/test/syscalls/linux/uname.cc:52: Failure"
 
       chaos:
         ci: false
@@ -19096,6 +19636,10 @@ test:
           - kvm
           - liteinst
           - in-guest-trap
+        hermit_args:
+          liteinst: [--max-timeslice=disabled]
+          in-guest-trap: [--max-timeslice=disabled]
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; the batch-1/2 qualification runs in the pinned image (2026-11-07) exercised the same harness parity-inputs path.
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
           sabre: "gVisor corpus not yet qualified on SaBRe"
@@ -19165,7 +19709,7 @@ test:
           - ptrace
         backends_disabled:
           dbt: "unqualified: DBT dispatch refused from the core pinned image (prerequisite: ci/build-compatible-cli.rs compatible-CLI producer; owner 2026-11-01 DBT hold also applies)"
-          kvm: "measured failing 2026-11-07: /src/third-party/gvisor-syscall-tests/upstream/test/syscalls/linux/uname.cc:111: Failure"
+          kvm: "measured failing 2026-11-07: upstream/test/syscalls/linux/uname.cc:111: Failure"
           sabre: "gVisor corpus not yet qualified on SaBRe"
           liteinst: "measured failing 2026-11-07: HERMIT_POLICY_REFUSAL class=policy-refusal"
           in-guest-trap: "measured failing 2026-11-07: HERMIT_POLICY_REFUSAL class=policy-refusal"
