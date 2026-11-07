@@ -34,6 +34,13 @@ pub const OUTPUT: &str = "ci/dag/validate.json";
 const EXPECTED_PLAN: &str = "ci/expected-e2e-plan.json";
 const SUPER_REPETITIONS: &str = "20";
 const PINNED_ROOT_FETCH_TAG: &str = "setup.pinned_root_fetch";
+/// The three isolation-matrix nodes, which hash the declared
+/// installation build.workspace_in_pinned_root stages (dh-j8eb7).
+const ISOLATION_MATRIX_TAGS: [&str; 3] = [
+    "test.isolation_matrix_ptrace_runtime",
+    "test.isolation_matrix_dbt_in_guest",
+    "privileged-test.isolation_matrix_kvm",
+];
 const PINNED_ROOT_FETCH_COMMAND: &str = "seed=(); if [ -n \"${CARGO_HOME:-}\" ]; then seed=(--seed-cargo \"$CARGO_HOME\"); fi; ./ci/hermetic/run-split-validate.sh --fetch-only \"${seed[@]}\"";
 const DAGRUN_PREPARE_COMMAND: &str = "AGENT_UTILS_RS_ENSURE_ONLY=1 ./agent-utils/rs/bin/dagrun && ";
 /// The rust-script producer invocation, and its pinned-root form. No pinned-root node
@@ -2687,6 +2694,26 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
             .any(|dependency| dependency == PINNED_ROOT_FETCH_TAG)
         {
             step.deps.push(PINNED_ROOT_FETCH_TAG.into());
+        }
+        // The isolation matrix reads and hashes the declared installation
+        // (target/install_pkg) before and after every cell, and
+        // build.workspace_in_pinned_root is the node whose stager
+        // (stage-detcore-liteinst) rewrites install_pkg/libdetcore_liteinst.so
+        // while the matrix runs: in 3 of 3 failing donor jobs the stager
+        // rewrote it +7.5 to +25.4 s into the matrix and the same cells
+        // failed input_stability; in the 2 passing jobs the compile ran
+        // past the matrix (+173/+188 s). This is a true data dependency -
+        // the matrix hashes that node's output - not an ordering hint
+        // (https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-j8eb7.md).
+        if ISOLATION_MATRIX_TAGS.contains(&step.tag().as_str())
+            && !step
+                .deps
+                .iter()
+                .any(|dependency| dependency == "build.workspace_in_pinned_root")
+        {
+            step.deps.push("build.workspace_in_pinned_root".into());
+            step.deps.sort();
+            step.deps.dedup();
         }
         step.deps.sort();
         step.deps.dedup();

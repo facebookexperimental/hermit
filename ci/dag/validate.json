@@ -25860,6 +25860,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
@@ -25905,6 +25906,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
@@ -27863,6 +27865,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.pinned_root_fetch"
