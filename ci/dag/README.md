@@ -92,9 +92,10 @@ setup.manifest_plan stopped waiting for the Rust-script producer on 2026-10-16,
 then 4740 until the step-limit recalibration of 2026-11-02 below;
 the longest path is now the pinned-root one through
 build.rust_scripts_in_pinned_root and setup.manifest_plan_in_pinned_root). The separately labelled hosted privileged smoke preserves its historical
-12-node population and has a 2400-second critical path (2100 before the
-Rust-script producer's wall cap went from 900 to 1200 seconds), so the manual
-workflow uses an audited 2460-second launcher bound. The stale hosted file omitted CPU
+12-node population and has a 3650-second critical path (2400 before the
+cell wall derivation raised the hosted applications node's wall bound
+for its retry window), so the manual
+workflow uses an audited 3720-second launcher bound. The stale hosted file omitted CPU
 budgets and therefore inherited dagrun's 10-second fallback; every hosted node
 now carries the corresponding current-plan CPU budget explicitly. This is a
 correctness repair, not a claim that the obsolete fallback was equivalent.

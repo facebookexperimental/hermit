@@ -2027,10 +2027,18 @@ pub fn resolve_test_timeouts(
 ) -> Result<ResolvedTestTimeouts, String> {
     let cpu_seconds = scale_timeout_seconds(cpu_base_seconds, multipliers.cpu, "CPU timeout")?;
     // Floor the derived wall at the declared wall (walls are generous:
-    // never shorter than the cell declared), then apply the wall
-    // multiplier and the 600 s cap.
+    // never shorter than the cell declared). The 600 s cap lives in
+    // wall_backstop_seconds, on the derivation from the scaled CPU;
+    // the wall multiplier then scales the result, so a heavy cell
+    // (CPU 599, declared wall 600) keeps wall > CPU under a CPU
+    // multiplier instead of being capped back below its own CPU.
     let derived = wall_base_seconds.max(wall_backstop_seconds(cpu_seconds));
-    let wall_seconds = scale_timeout_seconds(derived, multipliers.wall, "wall timeout")?.min(600);
+    let wall_seconds = scale_timeout_seconds(derived, multipliers.wall, "wall timeout")?;
+    if wall_seconds <= cpu_seconds {
+        return Err(format!(
+            "scaled wall timeout must remain greater than scaled CPU timeout, got wall={wall_seconds}s cpu={cpu_seconds}s"
+        ));
+    }
     Ok(ResolvedTestTimeouts {
         cpu_seconds,
         wall_seconds,
@@ -2317,6 +2325,19 @@ mod tests {
                 TimeoutMultipliers {
                     cpu: 3.0,
                     wall: 0.0,
+                },
+            )
+            .is_err()
+        );
+        // A CPU multiplier that pushes the scaled CPU past the 600 s
+        // wall cap leaves wall <= CPU and is refused.
+        assert!(
+            resolve_test_timeouts(
+                22,
+                180,
+                TimeoutMultipliers {
+                    cpu: 30.0,
+                    wall: 1.0,
                 },
             )
             .is_err()

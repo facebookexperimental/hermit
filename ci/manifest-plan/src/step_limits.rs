@@ -85,6 +85,66 @@ pub(crate) const WALL_CEILING_EXCEPTIONS: &[(&str, &str)] = &[
         "61 passing runs to 2026-11-02 peaked at a 707-second wall; 1.5 times that needs 1061 s",
     ),
     (
+        "e2e.manifest_applications",
+        "the cell retry window (scripts/validate.rs require_manifest_selection_headroom: two attempts of the largest resolved cell wall at CPU 1.25x/wall 1.5x plus grace) exceeds 600 s since cell walls derive as max(declared, min(8x CPU, 600))",
+    ),
+    (
+        "e2e.manifest_bin_c",
+        "the cell retry window (scripts/validate.rs require_manifest_selection_headroom: two attempts of the largest resolved cell wall at CPU 1.25x/wall 1.5x plus grace) exceeds 600 s since cell walls derive as max(declared, min(8x CPU, 600))",
+    ),
+    (
+        "e2e.manifest_chaos_c",
+        "the cell retry window (scripts/validate.rs require_manifest_selection_headroom: two attempts of the largest resolved cell wall at CPU 1.25x/wall 1.5x plus grace) exceeds 600 s since cell walls derive as max(declared, min(8x CPU, 600))",
+    ),
+    (
+        "e2e.manifest_compat",
+        "the cell retry window (scripts/validate.rs require_manifest_selection_headroom: two attempts of the largest resolved cell wall at CPU 1.25x/wall 1.5x plus grace) exceeds 600 s since cell walls derive as max(declared, min(8x CPU, 600))",
+    ),
+    (
+        "portablecompat.manifest_compat",
+        "the cell retry window (scripts/validate.rs require_manifest_selection_headroom: two attempts of the largest resolved cell wall at CPU 1.25x/wall 1.5x plus grace) exceeds 600 s since cell walls derive as max(declared, min(8x CPU, 600))",
+    ),
+    (
+        "rrcompat.manifest_compat",
+        "the cell retry window (scripts/validate.rs require_manifest_selection_headroom: two attempts of the largest resolved cell wall at CPU 1.25x/wall 1.5x plus grace) exceeds 600 s since cell walls derive as max(declared, min(8x CPU, 600))",
+    ),
+    (
+        "e2e.manifest_data_handling",
+        "the cell retry window (scripts/validate.rs require_manifest_selection_headroom: two attempts of the largest resolved cell wall at CPU 1.25x/wall 1.5x plus grace) exceeds 600 s since cell walls derive as max(declared, min(8x CPU, 600))",
+    ),
+    (
+        "e2e.manifest_debugger_c",
+        "the cell retry window (scripts/validate.rs require_manifest_selection_headroom: two attempts of the largest resolved cell wall at CPU 1.25x/wall 1.5x plus grace) exceeds 600 s since cell walls derive as max(declared, min(8x CPU, 600))",
+    ),
+    (
+        "e2e.manifest_determinism_stress_c",
+        "the cell retry window (scripts/validate.rs require_manifest_selection_headroom: two attempts of the largest resolved cell wall at CPU 1.25x/wall 1.5x plus grace) exceeds 600 s since cell walls derive as max(declared, min(8x CPU, 600))",
+    ),
+    (
+        "e2e.manifest_determinism_stress",
+        "the cell retry window (scripts/validate.rs require_manifest_selection_headroom: two attempts of the largest resolved cell wall at CPU 1.25x/wall 1.5x plus grace) exceeds 600 s since cell walls derive as max(declared, min(8x CPU, 600))",
+    ),
+    (
+        "e2e.manifest_shared_futex_c",
+        "the cell retry window (scripts/validate.rs require_manifest_selection_headroom: two attempts of the largest resolved cell wall at CPU 1.25x/wall 1.5x plus grace) exceeds 600 s since cell walls derive as max(declared, min(8x CPU, 600))",
+    ),
+    (
+        "e2e.manifest_util_c",
+        "the cell retry window (scripts/validate.rs require_manifest_selection_headroom: two attempts of the largest resolved cell wall at CPU 1.25x/wall 1.5x plus grace) exceeds 600 s since cell walls derive as max(declared, min(8x CPU, 600))",
+    ),
+    (
+        "privileged-e2e.manifest_applications",
+        "the cell retry window (scripts/validate.rs require_manifest_selection_headroom: two attempts of the largest resolved cell wall at CPU 1.25x/wall 1.5x plus grace) exceeds 600 s since cell walls derive as max(declared, min(8x CPU, 600))",
+    ),
+    (
+        "privileged-e2e.manifest_c_programs",
+        "the cell retry window (scripts/validate.rs require_manifest_selection_headroom: two attempts of the largest resolved cell wall at CPU 1.25x/wall 1.5x plus grace) exceeds 600 s since cell walls derive as max(declared, min(8x CPU, 600))",
+    ),
+    (
+        "privileged-e2e.manifest_system_utils",
+        "the cell retry window (scripts/validate.rs require_manifest_selection_headroom: two attempts of the largest resolved cell wall at CPU 1.25x/wall 1.5x plus grace) exceeds 600 s since cell walls derive as max(declared, min(8x CPU, 600))",
+    ),
+    (
         "e2e.manifest_language_runtimes",
         "71 passing runs to 2026-11-02 peaked at a 515-second wall; 1.5 times that needs 772 s",
     ),
@@ -216,7 +276,7 @@ pub(crate) const UNMEASURED_FAMILIES: &[(Family, &str)] = &[
     ),
     (
         Family::GroupPrefix("privileged-only-"),
-        "the privileged lane, whose hosted-privileged twins and 2400-second critical path are bounded by ci-privileged.yml's 2460-second launcher",
+        "the privileged lane, whose hosted-privileged twins and 3650-second critical path are bounded by ci-privileged.yml's 3720-second launcher",
     ),
     (
         Family::Group("envelope"),
