@@ -327,21 +327,6 @@ const CHAOS_OFFSET_VERIFY_WRAPPER_NAME: &str = "hermit-chaos-offset-verify-cpu";
 const CHAOS_OFFSET_VERIFY_CPU_SECONDS: u64 = 32;
 const SCHEDULE_REPLAY_LONG_SLICES_WRAPPER_NAME: &str = "hermit-schedule-replay-long-slices-cpu";
 const SCHEDULE_REPLAY_LONG_SLICES_CPU_SECONDS: u64 = 30;
-// PR #4614's a_schedule_replay_under_chaos_follows_its_recording_at_seed_{1,2,3}:
-// each records and replays the branch-heavy chaos_replay_new_thread guest, so
-// the ordinary 22-second cap kills every attempt (queue v14 ejection and the
-// e2df9671 pre-flight). Measured 2026-11-07 in three counted runs
-// (ci/run-nextest-counted.sh, cpu_usage_usec per attempt) on the measurement
-// host named in docs/TESTING_ENVIRONMENTS.md, "Named measurement hosts":
-// seed_1 max 37.268 CPU-s -> ceil(1.5x) = 56; seed_2 max 36.172 -> 55;
-// seed_3 max 35.559 -> 54. Wall is eight times the cap, as for the other
-// measured allowances.
-const CHAOS_REPLAY_FOLLOWS_SEED1_WRAPPER_NAME: &str = "hermit-chaos-replay-follows-seed1-cpu";
-const CHAOS_REPLAY_FOLLOWS_SEED1_CPU_SECONDS: u64 = 56;
-const CHAOS_REPLAY_FOLLOWS_SEED2_WRAPPER_NAME: &str = "hermit-chaos-replay-follows-seed2-cpu";
-const CHAOS_REPLAY_FOLLOWS_SEED2_CPU_SECONDS: u64 = 55;
-const CHAOS_REPLAY_FOLLOWS_SEED3_WRAPPER_NAME: &str = "hermit-chaos-replay-follows-seed3-cpu";
-const CHAOS_REPLAY_FOLLOWS_SEED3_CPU_SECONDS: u64 = 54;
 const CHAOS_CHANGE_POINTS_WRAPPER_NAME: &str = "hermit-chaos-change-points-cpu";
 const CHAOS_CHANGE_POINTS_CPU_SECONDS: u64 = 30;
 const POSIX_TIMER_SIGNAL_ROWS_WRAPPER_NAME: &str = "hermit-posix-timer-signal-rows-cpu";
@@ -426,7 +411,7 @@ const PMU_SCHEDULE_OFFSET_ALLOWANCE: MeasuredCpuAllowance = MeasuredCpuAllowance
     wall_seconds: None,
 };
 
-const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 48] = [
+const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 45] = [
     MeasuredCpuAllowance {
         wrapper_name: DETCORE_ALLOCATOR_WRAPPER_NAME,
         package: "hermit-run",
@@ -683,30 +668,6 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 48] = [
         test: "a_schedule_replay_keeps_the_long_slices_of_a_preemption_replay",
         cpu_seconds: SCHEDULE_REPLAY_LONG_SLICES_CPU_SECONDS,
         wall_seconds: Some(8 * SCHEDULE_REPLAY_LONG_SLICES_CPU_SECONDS),
-    },
-    MeasuredCpuAllowance {
-        wrapper_name: CHAOS_REPLAY_FOLLOWS_SEED1_WRAPPER_NAME,
-        package: "hermit-run",
-        binary: "hermit-run::cli",
-        test: "a_schedule_replay_under_chaos_follows_its_recording_at_seed_1",
-        cpu_seconds: CHAOS_REPLAY_FOLLOWS_SEED1_CPU_SECONDS,
-        wall_seconds: Some(8 * CHAOS_REPLAY_FOLLOWS_SEED1_CPU_SECONDS),
-    },
-    MeasuredCpuAllowance {
-        wrapper_name: CHAOS_REPLAY_FOLLOWS_SEED2_WRAPPER_NAME,
-        package: "hermit-run",
-        binary: "hermit-run::cli",
-        test: "a_schedule_replay_under_chaos_follows_its_recording_at_seed_2",
-        cpu_seconds: CHAOS_REPLAY_FOLLOWS_SEED2_CPU_SECONDS,
-        wall_seconds: Some(8 * CHAOS_REPLAY_FOLLOWS_SEED2_CPU_SECONDS),
-    },
-    MeasuredCpuAllowance {
-        wrapper_name: CHAOS_REPLAY_FOLLOWS_SEED3_WRAPPER_NAME,
-        package: "hermit-run",
-        binary: "hermit-run::cli",
-        test: "a_schedule_replay_under_chaos_follows_its_recording_at_seed_3",
-        cpu_seconds: CHAOS_REPLAY_FOLLOWS_SEED3_CPU_SECONDS,
-        wall_seconds: Some(8 * CHAOS_REPLAY_FOLLOWS_SEED3_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: CHAOS_CHANGE_POINTS_WRAPPER_NAME,
@@ -1606,7 +1567,7 @@ fn resolve_budgets(
 fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
     if args == [std::ffi::OsString::from("--help")] || args == [std::ffi::OsString::from("-h")] {
         println!(
-            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), CPU-profile v3 host loader ({CPU_PROFILE_V3_LOADER_CPU_SECONDS}s), rr thread stress ({RR_THREAD_STRESS_CPU_SECONDS}s), the four external-signal poll-deadline tests ({ESI_POLL_DEADLINE_CPU_SECONDS}s), lit chaos verify ({LIT_CHAOS_VERIFY_CPU_SECONDS}s), DBT virtual kernel files ({DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS}s), CPU-profile v3 guest ({CPU_PROFILE_V3_GUEST_CPU_SECONDS}s), parity post-pass ({PARITY_POST_PASS_NO_GUEST_CPU_SECONDS}s), epoll_pwait2 strict ({EPOLL_PWAIT2_STRICT_CPU_SECONDS}s), epoll_pwait temporary mask ({EPOLL_PWAIT_MASK_CPU_SECONDS}s), lone-slice-end backstop ({LONE_BACKSTOP_CPU_SECONDS}s), ptrace signal permits ({SIGNAL_PERMITS_CPU_SECONDS}s), schedule-replay clock ({SCHEDULE_REPLAY_CLOCK_CPU_SECONDS}s), chaos offset split ({CHAOS_OFFSET_SPLIT_CPU_SECONDS}s), chaos offset verify ({CHAOS_OFFSET_VERIFY_CPU_SECONDS}s), schedule-replay long slices ({SCHEDULE_REPLAY_LONG_SLICES_CPU_SECONDS}s), chaos replay follows seed 1 ({CHAOS_REPLAY_FOLLOWS_SEED1_CPU_SECONDS}s), seed 2 ({CHAOS_REPLAY_FOLLOWS_SEED2_CPU_SECONDS}s) and seed 3 ({CHAOS_REPLAY_FOLLOWS_SEED3_CPU_SECONDS}s), chaos change points ({CHAOS_CHANGE_POINTS_CPU_SECONDS}s), posix timer signal rows ({POSIX_TIMER_SIGNAL_ROWS_CPU_SECONDS}s), trace replay split ({TRACE_REPLAY_SPLIT_CPU_SECONDS}s), chaos replay shell ({CHAOS_REPLAY_SHELL_CPU_SECONDS}s), rr vdso time ({RR_VDSO_TIME_CPU_SECONDS}s), rr vdso gettimeofday ({RR_VDSO_GETTIMEOFDAY_CPU_SECONDS}s), rr vdso clock_gettime ({RR_VDSO_CLOCK_GETTIME_CPU_SECONDS}s), shipped export ({SHIPPED_EXPORT_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. The PMU integration node alone gives replays_take_recorded_lone_slice_ends_the_same_way 40 CPU seconds and 320 wall seconds; The PMU CLI node (scope pmu-cli-cases) gives the schedule-offset case a 13-second base allowance, which that node's CPU multiplier of 4 scales to an actual 52 CPU seconds; other unscoped invocations keep their prior bounds. Every exact prepared selected liteinst_stacks identity, the Detcore allocator leaf, and the CPU-profile v3 host loader, gets a separate base wall backstop of eight times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
+            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), CPU-profile v3 host loader ({CPU_PROFILE_V3_LOADER_CPU_SECONDS}s), rr thread stress ({RR_THREAD_STRESS_CPU_SECONDS}s), the four external-signal poll-deadline tests ({ESI_POLL_DEADLINE_CPU_SECONDS}s), lit chaos verify ({LIT_CHAOS_VERIFY_CPU_SECONDS}s), DBT virtual kernel files ({DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS}s), CPU-profile v3 guest ({CPU_PROFILE_V3_GUEST_CPU_SECONDS}s), parity post-pass ({PARITY_POST_PASS_NO_GUEST_CPU_SECONDS}s), epoll_pwait2 strict ({EPOLL_PWAIT2_STRICT_CPU_SECONDS}s), epoll_pwait temporary mask ({EPOLL_PWAIT_MASK_CPU_SECONDS}s), lone-slice-end backstop ({LONE_BACKSTOP_CPU_SECONDS}s), ptrace signal permits ({SIGNAL_PERMITS_CPU_SECONDS}s), schedule-replay clock ({SCHEDULE_REPLAY_CLOCK_CPU_SECONDS}s), chaos offset split ({CHAOS_OFFSET_SPLIT_CPU_SECONDS}s), chaos offset verify ({CHAOS_OFFSET_VERIFY_CPU_SECONDS}s), schedule-replay long slices ({SCHEDULE_REPLAY_LONG_SLICES_CPU_SECONDS}s), chaos change points ({CHAOS_CHANGE_POINTS_CPU_SECONDS}s), posix timer signal rows ({POSIX_TIMER_SIGNAL_ROWS_CPU_SECONDS}s), trace replay split ({TRACE_REPLAY_SPLIT_CPU_SECONDS}s), chaos replay shell ({CHAOS_REPLAY_SHELL_CPU_SECONDS}s), rr vdso time ({RR_VDSO_TIME_CPU_SECONDS}s), rr vdso gettimeofday ({RR_VDSO_GETTIMEOFDAY_CPU_SECONDS}s), rr vdso clock_gettime ({RR_VDSO_CLOCK_GETTIME_CPU_SECONDS}s), shipped export ({SHIPPED_EXPORT_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. The PMU integration node alone gives replays_take_recorded_lone_slice_ends_the_same_way 40 CPU seconds and 320 wall seconds; The PMU CLI node (scope pmu-cli-cases) gives the schedule-offset case a 13-second base allowance, which that node's CPU multiplier of 4 scales to an actual 52 CPU seconds; other unscoped invocations keep their prior bounds. Every exact prepared selected liteinst_stacks identity, the Detcore allocator leaf, and the CPU-profile v3 host loader, gets a separate base wall backstop of eight times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
         );
         return Ok(());
     }
@@ -3432,7 +3393,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(selected.len(), 15);
-        assert_eq!(MEASURED_CPU_ALLOWANCES.len(), 48);
+        assert_eq!(MEASURED_CPU_ALLOWANCES.len(), 45);
         for (cpu_multiplier, wall_multiplier) in [(1.0, 1.0), (1.25, 1.5), (0.01, 0.1)] {
             let rendered = scaled_config_with_allowances(
                 include_str!("../.config/nextest.toml"),

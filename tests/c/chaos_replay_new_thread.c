@@ -31,7 +31,13 @@
 #include <time.h>
 #include <unistd.h>
 
-#define ROUNDS 200000UL
+// 50k rounds per compute: at 200k each record+replay test cost
+// 28-58 CPU-seconds and blew the ordinary 22 CPU-second test cap
+// under load. At 50k the same record still holds 73-200 timer
+// checkpoints and the syscall-mode checkpoints, the chaos-draws
+// mutant still makes every seed's replay diverge, and a counted
+// run costs 8-13 CPU-seconds (measured 2026-11-07).
+#define ROUNDS 50000UL
 
 enum { NOBODY, MAIN, WORKER };
 
