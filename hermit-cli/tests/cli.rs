@@ -26847,7 +26847,8 @@ fn a_fatal_alarm_ends_a_joining_process_at_the_expiry() {
 /// `on_leader=0`. This pins that behaviour at bitwise parity, so that
 /// N8a changes it deliberately, here and in
 /// `kvm_alarm_reaches_a_futex_waiting_main_thread_after_n8a`
-/// (docs/ARCHITECTURE.md, pending the owner's approval). The difference is never
+/// (tracked under https://github.com/rrnewton/hermit/issues/4485, pending the
+/// owner's approval). The difference is never
 /// silent: the parked module's DEBUG names it for the copy, the main thread
 /// (dtid 3) as Linux's receiver and the worker (dtid 5) as KVM's. Not INFO,
 /// which `--verify-strict` and the cross-backend parity pass compare. `pjoin`
@@ -26902,7 +26903,7 @@ fn run_kvm_a_futex_waiting_main_thread_is_passed_over_until_n8a() {
 /// The N8a flip of `run_kvm_a_futex_waiting_main_thread_is_passed_over_until_n8a`:
 /// Linux's result, which KVM reaches only once it can interrupt a futex wait
 /// for a signal. Remove the `ignore`, and that test, together with D1's
-/// item in docs/ARCHITECTURE.md (pending the owner's approval).
+/// entry under https://github.com/rrnewton/hermit/issues/4485.
 #[test]
 #[ignore = "N8a: KVM cannot interrupt a futex wait for a signal until supports_blocked_wait_signal_interruption holds there, so D1 passes the waiting main thread over (https://github.com/rrnewton/hermit/issues/4929)"]
 fn kvm_alarm_reaches_a_futex_waiting_main_thread_after_n8a() {

@@ -1897,7 +1897,8 @@ impl Scheduler {
     /// the wait; passing it over, as Linux passes over a thread that cannot
     /// take a signal now (a stopped or traced one, lines 957-958), lets the
     /// walk reach a thread that can. This is the named KVM gap D1, until the
-    /// backend can interrupt such a wait (N8a; docs/ARCHITECTURE.md). The
+    /// backend can interrupt such a wait (N8a; tracked under
+    /// <https://github.com/rrnewton/hermit/issues/4485>). The
     /// thread is decided first, before its request slot is read
     /// (`reads_settled_signal_state`). `AlarmReachRule::Linux` counts it, to
     /// name the difference and to refuse a fatal copy that would otherwise
