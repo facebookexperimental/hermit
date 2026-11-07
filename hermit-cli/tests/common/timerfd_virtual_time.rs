@@ -30,47 +30,88 @@ const MIB: u64 = 1024 * 1024;
 /// takes 3.67 s CPU. The wall figures are hang backstops at 8x the former
 /// wall limits (20 s compile, 57 s run); donor job eb64ff5f failed the old
 /// 20 s wall compile limit at load ~980 while doing 0.2 s of CPU work.
-const COMPILE_CPU: Duration = Duration::from_millis(500);
+/// The compile now happens once per test-binary run (see `guest`), so this
+/// cap is paid at most once; it is sized at 1.5x the worst compile observed
+/// anywhere (0.51 s CPU on a loaded donor, dh-322bp) rather than 1.5x the
+/// fast local host's 0.19 s.
+const COMPILE_CPU: Duration = Duration::from_millis(800);
 const COMPILE_WALL_BACKSTOP: Duration = Duration::from_secs(160);
 const RUN_CPU: Duration = Duration::from_secs(6);
 const RUN_WALL_BACKSTOP: Duration = Duration::from_secs(456);
 
-/// The fixture, compiled once per test process.
+/// The fixture, compiled once per test-binary run: the binary is cached
+/// under `CARGO_TARGET_TMPDIR`, keyed by the fixture source, so the parallel
+/// test processes of one run share a single compile instead of each paying
+/// it under the compile CPU cap (dh-322bp).
 fn guest() -> &'static Path {
     static GUEST: OnceLock<PathBuf> = OnceLock::new();
     GUEST.get_or_init(|| {
-        let root = tempfile::Builder::new()
-            .prefix("timerfd-virtual-time-")
-            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-            .expect("timerfd fixture directory")
-            .keep();
         let fixture =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/timerfd_virtual_time.c");
+        let source = fs::read(&fixture).expect("timerfd fixture source");
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash_slice(&source, &mut hasher);
+        let key = std::hash::Hasher::finish(&hasher);
+        let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("timerfd-virtual-time-fixture-{key:016x}"));
+        fs::create_dir_all(&root).expect("timerfd fixture cache directory");
         let guest = root.join("program");
-        let compile = root.join("compile");
-        let status = bounded_command_with_budgets(
-            Command::new("cc")
-                .args([
-                    "-std=gnu11",
-                    "-O2",
-                    "-g",
-                    "-Wall",
-                    "-Wextra",
-                    "-Wpedantic",
-                    "-Wformat=2",
-                    "-Werror",
-                    "-fno-pie",
-                    "-no-pie",
-                ])
-                .arg(&fixture)
-                .arg("-o")
-                .arg(&guest),
-            &compile,
-            COMPILE_CPU,
-            COMPILE_WALL_BACKSTOP,
-        );
-        assert!(status.success(), "timerfd fixture compilation failed");
-        guest
+        if guest.exists() {
+            return guest;
+        }
+        // One compiler per cache key; the rest wait and then reuse. A holder
+        // that dies mid-compile must not wedge the waiters: after the wall
+        // backstop they compile to their own staging file instead (the
+        // publish rename is atomic, so a late duplicate is harmless).
+        let lock = root.join("compile.lock");
+        let wait_start = std::time::Instant::now();
+        let mut holds_lock = false;
+        loop {
+            match fs::create_dir(&lock) {
+                Ok(()) => {
+                    holds_lock = true;
+                    break;
+                }
+                Err(_) if guest.exists() => return guest,
+                Err(_) if wait_start.elapsed() >= COMPILE_WALL_BACKSTOP => break,
+                Err(_) => std::thread::sleep(Duration::from_millis(100)),
+            }
+        }
+        let compiled = (|| {
+            if guest.exists() {
+                return guest.clone();
+            }
+            let staging = root.join(format!("program.tmp-{}", std::process::id()));
+            let compile = root.join("compile");
+            let status = bounded_command_with_budgets(
+                Command::new("cc")
+                    .args([
+                        "-std=gnu11",
+                        "-O2",
+                        "-g",
+                        "-Wall",
+                        "-Wextra",
+                        "-Wpedantic",
+                        "-Wformat=2",
+                        "-Werror",
+                        "-fno-pie",
+                        "-no-pie",
+                    ])
+                    .arg(&fixture)
+                    .arg("-o")
+                    .arg(&staging),
+                &compile,
+                COMPILE_CPU,
+                COMPILE_WALL_BACKSTOP,
+            );
+            assert!(status.success(), "timerfd fixture compilation failed");
+            fs::rename(&staging, &guest).expect("publish timerfd fixture");
+            guest.clone()
+        })();
+        if holds_lock {
+            let _ = fs::remove_dir(&lock);
+        }
+        compiled
     })
 }
 
