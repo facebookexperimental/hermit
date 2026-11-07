@@ -3820,8 +3820,6 @@ fn expected_for_label<'a>(label: &str, cells: &'a [DagManifest]) -> Vec<&'a DagM
         .collect()
 }
 
-/// The Buck full selection replaces exactly the cargo E2E path and reports
-/// the same cells, each owned by exactly one node.
 /// The extension tags the Buck E2E selection drops, pinned by name.
 /// Independent of any selection: a same-count swap must fail here.
 const BUCK_E2E_EXTENSION_DROPPED: [&str; 2] = ["e2e.manifest_gvisor", "e2e.manifest_rr"];
@@ -3839,6 +3837,8 @@ fn check_buck_e2e_extension_dropped(actual: &BTreeSet<String>) -> Result<(), Str
     Ok(())
 }
 
+/// The Buck full selection replaces exactly the cargo E2E path and reports
+/// the same cells, each owned by exactly one node.
 fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(), String> {
     let replaced = buck_replaced_tags(cfg)?;
     let mut expected_replaced = BUCK_REPLACED_PRODUCERS
@@ -3867,12 +3867,6 @@ fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(
     }
     for category in ["applications", "c_programs", "system_utils"] {
         expected_replaced.insert(format!("privileged-e2e.manifest_{category}"));
-    }
-    if replaced != expected_replaced {
-        return Err(format!(
-            "the Buck E2E selection replaces {:?}, expected {:?}",
-            replaced, expected_replaced
-        ));
     }
     let selected = buck_e2e_selection(cfg)?;
     let full = select_steps_by_labels(cfg, &["full".to_string()])?;
@@ -3930,6 +3924,12 @@ fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(
         .cloned()
         .collect::<BTreeSet<_>>();
     check_buck_e2e_extension_dropped(&extension_dropped)?;
+    if replaced != expected_replaced {
+        return Err(format!(
+            "the Buck E2E selection replaces {:?}, expected {:?}",
+            replaced, expected_replaced
+        ));
+    }
     let mut expected_dropped = replaced
         .intersection(&full_tags)
         .cloned()
@@ -7989,6 +7989,47 @@ sys.exit(37)
         let mut subset = exact.clone();
         subset.remove("e2e.manifest_gvisor");
         assert!(check_buck_e2e_extension_dropped(&subset).is_err());
+    }
+
+    #[test]
+    fn buck_e2e_selection_refuses_a_planted_same_count_extension_swap() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let cells = expected_cells(&crate::git_environment::checkout_root()).unwrap();
+        assert_buck_e2e_selection(&committed, &cells).unwrap();
+        // Plant: keep e2e.manifest_rr selected (remove its Buck twin so
+        // it is not replaced) and drop a different extension tag,
+        // build.reverie_buck, instead (a fake twin makes it replaced).
+        // The dropped extension count is unchanged at two; the pinned
+        // named set must refuse, naming the expected set.
+        let mut planted = committed.clone();
+        let mut fake_twin = planted
+            .steps
+            .iter()
+            .find(|step| step.tag() == "e2e.manifest_rr_buck")
+            .unwrap()
+            .clone();
+        planted
+            .steps
+            .retain(|step| step.tag() != "e2e.manifest_rr_buck");
+        // A kept cargo bucket must not still need the replaced
+        // producers, or the selection derivation itself refuses first.
+        let rr = planted
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "e2e.manifest_rr")
+            .unwrap();
+        rr.deps.retain(|dep| {
+            dep != "build.manifest_guests_in_pinned_root"
+                && dep != "setup.manifest_plan_in_pinned_root"
+        });
+        fake_twin.group = "build".into();
+        fake_twin.job = "reverie_buck_buck".into();
+        planted.steps.push(fake_twin);
+        let error = assert_buck_e2e_selection(&planted, &cells).unwrap_err();
+        assert!(
+            error.contains("expected exactly {\"e2e.manifest_gvisor\", \"e2e.manifest_rr\"}"),
+            "{error}"
+        );
     }
 
     #[test]
