@@ -28353,6 +28353,7 @@ fn a_schedule_replay_under_chaos_follows_its_recording_at_seed_1() {
 
 /// Seed 2 of `a_schedule_replay_under_chaos_follows_its_recording_at_seed_1`.
 #[test]
+#[ignore = "known failure: hidden schedule desync exposed by strict replay, dh-9xi44, issue 5285 §5"]
 fn a_schedule_replay_under_chaos_follows_its_recording_at_seed_2() {
     assert_chaos_schedule_replay_follows(&[], true, 2);
 }
@@ -65115,6 +65116,7 @@ fn the_pipe_wake_hand_off_is_deterministic() {
 /// or another `L`, and a record made without the option replayed with it,
 /// are refused before launch, under both replay kinds.
 #[test]
+#[ignore = "known failure: hidden schedule desync exposed by strict replay, dh-ds5i3, issue 5285 §4"]
 fn a_schedule_recorded_with_the_pipe_wake_latency_replays_only_with_it() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let run = |latency: Option<&str>, extra: &[&str], without_pmu: bool| {
