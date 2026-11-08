@@ -969,20 +969,18 @@ impl Replayer {
                 );
             }
 
-            let phase_only =
-                is_desync(observed, &expected) && is_phase_only_desync(observed, &expected);
-            // An observed Polling against a recorded Posthook is an extra
-            // host retry the recording did not make: it consumes nothing.
-            // The reverse (observed Posthook, recorded Polling) retires
-            // the recorded retry below, before the matching pop.
-            let phase_only_insertion =
-                phase_only && matches!(observed.op, Op::Syscall(_, SyscallPhase::Polling));
-            if phase_only {
-                // Not a desync (owner ruling, issue 5285): count and
-                // report the resync, go on.
-                if !phase_only_insertion {
-                    let _ = self.pop_next();
-                }
+            // Phase-only differences (owner ruling, issue 5285) are not
+            // desyncs. An observed Polling against a recorded Posthook is
+            // an extra host retry the recording did not make: it consumes
+            // nothing. The reverse retires the recorded retry, and the
+            // observed event is then reclassified against the new recorded
+            // event before anything else is consumed: only a fully
+            // equivalent recorded retry may be retired, and the actual
+            // completion is always compared under the strict rule.
+            let mut phase_only_insertion = false;
+            let mut retired_retry = false;
+            let mut expected = expected;
+            while is_desync(observed, &expected) && is_phase_only_desync(observed, &expected) {
                 self.desync_counts
                     .entry(mytid)
                     .or_default()
@@ -993,7 +991,18 @@ impl Replayer {
                     observed,
                     expected,
                 );
+                if matches!(observed.op, Op::Syscall(_, SyscallPhase::Polling)) {
+                    phase_only_insertion = true;
+                    break;
+                }
+                retired_retry = true;
+                let _ = self.pop_next();
+                let Some(next) = self.peek_next() else { break };
+                expected = next;
             }
+            let phase_only = phase_only_insertion
+                || retired_retry && !is_desync(observed, &expected)
+                || retired_retry && self.cursor.is_empty();
             let is_desync = is_desync(observed, &expected) && !phase_only;
             let mut in_hard_desync_mode = false;
             if is_desync {
@@ -1469,6 +1478,40 @@ mod tests {
             ReplayAction::Stop(StopReason::FatalDesync)
         );
         assert_eq!(replayer.desync_counts[&tid(3)].phase_only_resyncs, 1);
+
+        // Recorded [Polling, Posthook(t+1), next], observed Posthook(t):
+        // retiring the recorded Polling must reclassify the completion
+        // against the recorded Posthook, whose time differs: REFUSE.
+        {
+            let recorded_poll = polling.clone();
+            let recorded_post = SchedEvent {
+                end_time: Some(recorded.end_time.unwrap() + LogicalTime::from_nanos(1)),
+                ..recorded.clone()
+            };
+            let mut replayer =
+                Replayer::new(vec![recorded_poll, recorded_post, b.branch(1, tid(5))]);
+            replayer.die_on_desync = true;
+            assert_eq!(
+                replayer.observe_event(&recorded),
+                ReplayAction::Stop(StopReason::FatalDesync)
+            );
+        }
+        // Recorded [Polling, Polling, Posthook, next], observed Posthook:
+        // both recorded retries retire (count 2), the completion pops.
+        {
+            let mut replayer = Replayer::new(vec![
+                polling.clone(),
+                polling.clone(),
+                recorded.clone(),
+                b.branch(1, tid(5)),
+            ]);
+            replayer.die_on_desync = true;
+            assert_ne!(
+                replayer.observe_event(&recorded),
+                ReplayAction::Stop(StopReason::FatalDesync)
+            );
+            assert_eq!(replayer.desync_counts[&tid(3)].phase_only_resyncs, 2);
+        }
 
         // Different RIP, time or syscall: still a hard stop.
         for observed in [

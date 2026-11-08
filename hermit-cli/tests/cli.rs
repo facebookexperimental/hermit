@@ -34109,11 +34109,14 @@ fn a_desynced_schedule_replay_refuses_a_non_root_process_child() {
 /// sched_yield, where the schedule's next event is the main thread's join. It
 /// kept running the main thread, the thread that event names, and held the
 /// worker back, so the spinner took every turn and the run never finished
-/// (it ran into `--timeout`, exit 124; the fixed run takes under a second). After a thousand unmatched events the
-/// replay now drops the rest of the schedule and gives every thread the
-/// default priority, as when a schedule runs out. A stack trace requested
-/// for a traced index past where the run ends is reported at its end rather
-/// than dropped silently.
+/// (it ran into `--timeout`, exit 124; the fixed run takes under a second).
+/// After a thousand unmatched events the replay would drop the rest of
+/// the schedule (the release policy, still implemented and reachable
+/// through analyze's internal lenient trials). Under the strict default
+/// (dh-mvz7y) the public replay refuses at the FIRST divergence instead:
+/// the input really differs (recorded without "spin", replayed with it),
+/// so strict refusal is the right default (issue 5285). Restoring the
+/// release's positive coverage is follow-up work (dh-yopm3).
 #[test]
 fn a_replay_stuck_off_its_schedule_lets_every_thread_run() {
     let _guard = hermit_run_guard();
@@ -34152,33 +34155,50 @@ fn a_replay_stuck_off_its_schedule_lets_every_thread_run() {
     ]);
     let replay = hermit(&replay_args);
     let log = stderr(&replay);
+    // Strict default: refuses at the first divergence (the Branch event
+    // where the spinning replay leaves its schedule), with the exact
+    // ERROR line, and the guest never finishes.
     assert_eq!(
         replay.status.code(),
-        Some(0),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
         "{replay_args:?}:\n{}",
         log.lines().take(40).collect::<Vec<_>>().join("\n")
     );
-    assert_eq!(stdout(&replay), "done\n");
+    assert_eq!(stdout(&replay), "", "the guest ran on past the refusal");
+    let bail_event = log
+        .lines()
+        .find_map(|line| {
+            line.split("ERROR HERMIT_REPLAY_DESYNC thread=")
+                .nth(1)?
+                .split(" event=")
+                .nth(1)?
+                .split(' ')
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })
+        .expect("a bail line names its event");
     assert!(
-        log.contains("the replay no longer follows the schedule"),
-        "the replay did not leave its schedule, so this is not the case:\n{log}"
+        log.lines().any(
+            |line| line.starts_with("ERROR HERMIT_REPLAY_DESYNC thread=")
+                && line.contains(&format!(" event={bail_event} "))
+                && line.contains("Branch")
+        ),
+        "no ERROR line at the first divergence (event {bail_event}):\n{log}"
     );
-    // The run summary, which `hermit analyze` keeps for each trial, says so
-    // too: a released trial is not a faithful replay of its schedule.
-    let summary: RunSummary = serde_json::from_slice(&fs::read(&summary).unwrap()).unwrap();
-    let desyncs = summary.desync_descrip.unwrap_or_default();
     assert!(
-        desyncs.contains("RELEASED replayed schedule at event #"),
-        "the summary does not record the release:\n{desyncs}"
+        !log.contains("the replay no longer follows the schedule"),
+        "the replay released its schedule instead of refusing at the first divergence:\n{log}"
     );
     assert!(
         log.lines().any(|line| line
             == format!(
                 "Missed stack trace for scheduled event #{unreached} (requested for stderr): the \
-                 run ended before reaching it"
+                 replay stopped (strict replay) before reaching it"
             )),
-        "index #{unreached}, past the run's end, is not reported:\n{log}"
+        "index #{unreached}, past the stop, is not reported:\n{log}"
     );
+    let _ = summary;
 }
 
 /// A thread that catches SIGABRT and execs `/bin/true` from its handler
@@ -34527,13 +34547,14 @@ fn a_fatal_time_skip_desync_reports_an_unreached_schedule_position() {
     );
 }
 
-/// Under `--replay-exhausted-panic` a replay that leaves its schedule stops
-/// there, as one that runs out of it does, instead of running on unguided:
-/// the container exits with status 1 (`immediate_fatal_exit`), which hermit
-/// reports as its internal-failure exit, with the reason on stderr, and the
-/// guest never finishes. Every stack trace still requested is reported at the
-/// stop, which skips the run's end, as at a strict replay stop, at
-/// the replay's first hard desync.
+/// Under `--replay-exhausted-panic` a replay that leaves its schedule would
+/// stop where it left it; under the strict default (dh-mvz7y) the public
+/// replay refuses earlier, at its first hard desync, with the same exit
+/// and the ERROR line, and the guest never finishes. The exhausted stop
+/// itself remains implemented for analyze's internal lenient trials;
+/// restoring its public positive coverage is follow-up work
+/// (dh-yopm3, issue 5285). Every stack trace still requested
+/// is reported at the strict stop.
 #[test]
 fn a_replay_stuck_off_its_schedule_stops_under_replay_exhausted_panic() {
     let _guard = hermit_run_guard();
@@ -34579,10 +34600,15 @@ fn a_replay_stuck_off_its_schedule_stops_under_replay_exhausted_panic() {
         log.lines().take(40).collect::<Vec<_>>().join("\n")
     );
     assert!(
-        log.contains("The replay left its schedule at event #")
-            && log.contains("stopping (--replay-exhausted-panic)")
-            && log.contains("class=container-child-exit status=Exited(1)"),
-        "the replay did not stop where it left its schedule:\n{log}"
+        log.lines().any(
+            |line| line.starts_with("ERROR HERMIT_REPLAY_DESYNC thread=")
+                && line.contains("Branch")
+        ) && log.contains("class=container-child-exit status=Exited(1)"),
+        "the replay did not refuse at its first hard desync:\n{log}"
+    );
+    assert!(
+        !log.contains("stopping (--replay-exhausted-panic)"),
+        "the exhausted stop fired instead of the strict first-desync refusal:\n{log}"
     );
     assert_eq!(stdout(&replay), "", "the guest ran on past the release");
     let reported_at_stop = |log: &str, index: u64, flag: &str| {
@@ -34595,7 +34621,7 @@ fn a_replay_stuck_off_its_schedule_stops_under_replay_exhausted_panic() {
     };
     for index in pending {
         assert!(
-            reported_at_stop(&log, index, "--replay-exhausted-panic"),
+            reported_at_stop(&log, index, "strict replay"),
             "index #{index} is not reported at the stop:\n{log}"
         );
     }
@@ -34620,7 +34646,8 @@ fn a_replay_stuck_off_its_schedule_stops_under_replay_exhausted_panic() {
         log.lines().take(40).collect::<Vec<_>>().join("\n")
     );
     assert!(
-        log.contains("Replay mode desynchronized from trace, bailing out"),
+        log.lines()
+            .any(|line| line.starts_with("ERROR HERMIT_REPLAY_DESYNC thread=")),
         "the replay did not stop at its desync:\n{log}"
     );
     for index in pending {
