@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""TPX-style census diff: base listed population vs candidate outcomes.
+
+Every base ID must have a recorded outcome in the candidate
+(passed|failed|skipped(reason)|omitted(reason)) or an explicit drop
+record (Test-Dropped: <id> -- <reason>). A disappearance with no record
+fails naming the missing IDs. Additions are reported and pass. Totals
+are reported, never asserted.
+
+Usage:
+  ci/census-diff --base DIR --candidate DIR [--dropped FILE] [--report-only]
+
+Base DIR: one <suite>.listed-ids (or .txt) file per suite, one ID/line
+  (the .listed-ids the counted wrapper retains beside its counts).
+Candidate DIR: per suite either <suite>.outcomes.json
+  {"outcomes": [{"id": ..., "outcome": "passed|failed|skipped|omitted",
+                 "reason": "..."}]}
+  or <suite>.listed-ids (every listed ID counts as passed).
+Drop records: lines "Test-Dropped: <id> -- <reason>" (commit trailers
+  dumped from `git log base..head`, or an UNSELECTED-style table file).
+Exit: 0 pass, 1 unrecorded disappearance / unreasoned skip|omit, 2 usage.
+"""
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+OUTCOMES = {"passed", "failed", "skipped", "omitted"}
+
+
+def base_populations(base: Path) -> dict[str, list[str]]:
+    pops: dict[str, list[str]] = {}
+    for f in sorted(base.iterdir()):
+        if f.suffix in (".ids",) or f.name.endswith(".listed-ids") or f.suffix == ".txt":
+            suite = f.name
+            for suf in (".listed-ids", ".txt"):
+                if suite.endswith(suf):
+                    suite = suite[: -len(suf)]
+                    break
+            pops[suite] = [ln.strip() for ln in f.read_text().splitlines() if ln.strip()]
+    return pops
+
+
+def candidate_outcomes(cand: Path) -> dict[str, dict[str, tuple[str, str]]]:
+    out: dict[str, dict[str, tuple[str, str]]] = {}
+    for f in sorted(cand.iterdir()):
+        if f.name.endswith(".outcomes.json"):
+            suite = f.name[: -len(".outcomes.json")]
+            data = json.loads(f.read_text())
+            rows = data["outcomes"] if isinstance(data, dict) else data
+            out[suite] = {
+                str(r["id"]): (str(r["outcome"]), str(r.get("reason", "")))
+                for r in rows
+            }
+    for f in sorted(cand.iterdir()):
+        if f.name.endswith(".listed-ids") or f.suffix == ".txt":
+            suite = f.name
+            for suf in (".listed-ids", ".txt"):
+                if suite.endswith(suf):
+                    suite = suite[: -len(suf)]
+                    break
+            ids = [ln.strip() for ln in f.read_text().splitlines() if ln.strip()]
+            out.setdefault(suite, {})
+            for i in ids:
+                out[suite].setdefault(i, ("passed", ""))
+    return out
+
+
+def dropped_records(path: Path | None) -> dict[str, str]:
+    if path is None or not path.exists():
+        return {}
+    recs: dict[str, str] = {}
+    for ln in path.read_text().splitlines():
+        ln = ln.strip()
+        if ln.startswith("Test-Dropped:"):
+            ln = ln[len("Test-Dropped:"):].strip()
+        if " -- " in ln:
+            ident, reason = ln.split(" -- ", 1)
+            if ident.strip() and reason.strip():
+                recs[ident.strip()] = reason.strip()
+    return recs
+
+
+def main(argv: list[str]) -> int:
+    def arg(name: str) -> str | None:
+        return argv[argv.index(name) + 1] if name in argv else None
+
+    base_s, cand_s = arg("--base"), arg("--candidate")
+    if not base_s or not cand_s:
+        print(__doc__)
+        return 2
+    report_only = "--report-only" in argv
+    dropped = dropped_records(Path(arg("--dropped")) if arg("--dropped") else None)
+    base, cand = base_populations(Path(base_s)), candidate_outcomes(Path(cand_s))
+    failures: list[str] = []
+    totals = {"passed": 0, "failed": 0, "skipped": 0, "omitted": 0, "added": 0}
+    for suite in sorted(set(base) | set(cand)):
+        b_ids, c = base.get(suite, []), cand.get(suite, {})
+        b_set = set(b_ids)
+        for ident in b_ids:
+            if ident in c:
+                outcome, reason = c[ident]
+                if outcome not in OUTCOMES:
+                    failures.append(f"{suite}: {ident}: unknown outcome {outcome!r}")
+                elif outcome in ("skipped", "omitted") and not reason:
+                    failures.append(f"{suite}: {ident}: {outcome} without a reason")
+                else:
+                    totals[outcome] += 1
+            elif ident in dropped:
+                totals["omitted"] += 1
+            else:
+                failures.append(f"{suite}: {ident}: MISSING (no outcome, no drop record)")
+        added = [i for i in c if i not in b_set]
+        totals["added"] += len(added)
+        parts = [f"{k}={v}" for k, v in
+                 (("passed", sum(1 for i in b_ids if c.get(i, ("",))[0] == "passed")),
+                  ("failed", sum(1 for i in b_ids if c.get(i, ("",))[0] == "failed")),
+                  ("skipped", sum(1 for i in b_ids if c.get(i, ("",))[0] == "skipped")),
+                  ("omitted", sum(1 for i in b_ids if c.get(i, ("",))[0] == "omitted")
+                   + sum(1 for i in b_ids if i not in c and i in dropped)),
+                  ("added", len(added)))]
+        print(f"census {suite}: {' '.join(parts)}")
+        for i in added:
+            print(f"census {suite}: +{i} ({c[i][0]})")
+    print("census totals: " + " ".join(f"{k}={v}" for k, v in totals.items()))
+    for f in failures:
+        print(f"census FAIL: {f}", file=sys.stderr)
+    if failures and not report_only:
+        print(f"census-diff: {len(failures)} unrecorded disappearance(s)/bad outcome(s)", file=sys.stderr)
+        return 1
+    if failures:
+        print("census-diff: report-only, not failing", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
