@@ -21144,7 +21144,11 @@ mod tests {
         let trace_file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
             trace_file.path(),
-            PreemptionRecord::from_sched_events(vec![]).to_string(),
+            PreemptionRecord::from_sched_events_with_identity(
+                vec![],
+                Some(crate::clock_identity::test_sources::known()),
+            )
+            .to_string(),
         )
         .unwrap();
         let mut config = Config {
@@ -21158,7 +21162,9 @@ mod tests {
         .with_backend(|backend| backend.needs_killed_thread_rpc_cancellation = true);
         config.validate();
         assert!(config.use_rcb_time());
-        let (config, state, tid, process) = cancellation_test_state_with_config(config);
+        let (config, state, tid, process) = cancellation_test_state_with_config(
+            crate::clock_identity::test_sources::qualified(config),
+        );
         let length = LogicalTime::from_nanos(1_000);
         for first_slice in [Some(length), None] {
             let mut thread = crate::ThreadState::new(tid, &config, ());
@@ -21217,7 +21223,11 @@ mod tests {
         let trace_file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
             trace_file.path(),
-            PreemptionRecord::from_sched_events(vec![]).to_string(),
+            PreemptionRecord::from_sched_events_with_identity(
+                vec![],
+                Some(crate::clock_identity::test_sources::known()),
+            )
+            .to_string(),
         )
         .unwrap();
         let mut config = Config {
@@ -21234,7 +21244,9 @@ mod tests {
         assert!(!config.use_rcb_time());
         assert_eq!(config.max_timeslice, None);
         assert_eq!(config.target_timeslice, std::num::NonZeroU64::new(100_000));
-        let (config, state, tid, process) = cancellation_test_state_with_config(config);
+        let (config, state, tid, process) = cancellation_test_state_with_config(
+            crate::clock_identity::test_sources::qualified(config),
+        );
         let length = LogicalTime::from_nanos(830);
         for (first_slice, past_global_first_execve) in
             [(Some(length), true), (None, true), (Some(length), false)]

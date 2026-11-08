@@ -41051,12 +41051,17 @@ mod test {
         // (`Config::chaos_draws_schedule`).
         let directory = tempfile::tempdir().unwrap();
         let schedule = directory.path().join("schedule.json");
-        std::fs::write(&schedule, r#"{"per_thread": {}, "global": []}"#).unwrap();
-        let replay = Scheduler::new(&Config {
+        std::fs::write(
+            &schedule,
+            r#"{"rcb_history": {"format": 2, "identity": "rcb:cond-retired:user:v1",
+                 "recording": {"per_thread": {}, "global": []}}}"#,
+        )
+        .unwrap();
+        let replay = Scheduler::new(&crate::clock_identity::test_sources::qualified(Config {
             chaos: true,
             replay_schedule_from: Some(schedule),
             ..Config::default()
-        });
+        }));
         assert_eq!(replay.requeue_after(&sched_yield), Requeue::OneTurnYield);
     }
 

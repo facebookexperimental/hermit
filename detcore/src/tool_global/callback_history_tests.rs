@@ -1213,7 +1213,10 @@ async fn an_instruction_offset_slice_is_armed_recorded_and_replayed_alike() {
     // The schedule trace records it too, on the timer's batch of branches,
     // which the address the steps stopped at follows; the record states the
     // offsets format.
-    let schedule = serde_json::from_str::<crate::preemptions::PreemptionRecord>(&record).unwrap();
+    let schedule = crate::preemptions::boundary_recording::Recording::decode(record.as_bytes())
+        .unwrap()
+        .into_legacy("instruction-offset record")
+        .unwrap();
     assert_eq!(
         schedule.format_version(),
         Some(crate::preemptions::INSTRUCTION_OFFSET_FORMAT),
@@ -1372,7 +1375,8 @@ async fn a_schedule_replay_arms_a_recorded_instruction_offset() {
             rcb_target: 98,
             instructions: 3,
         };
-        let mut writer = crate::preemptions::PreemptionWriter::new(None);
+        let mut writer = crate::preemptions::PreemptionWriter::new(None)
+            .with_identity(crate::clock_identity::test_sources::known());
         writer.register_thread(tid, DEFAULT_PRIORITY);
         writer.insert_schedevent(SchedEvent::branches(tid, 10));
         writer.insert_schedevent(SchedEvent::branches(tid, 90).with_instruction_offset(Some(offset)));
@@ -1397,7 +1401,7 @@ async fn a_schedule_replay_arms_a_recorded_instruction_offset() {
         );
         std::fs::write(&path, record).unwrap();
 
-        let (config, state, tid, process) = cancellation_test_state_with_config(config);
+        let (config, state, tid, process) = cancellation_test_state_with_config(crate::clock_identity::test_sources::qualified(config));
         install_test_registration(&state, tid, Ivar::new());
         state.past_first_execve.store(true, std::sync::atomic::Ordering::SeqCst);
         let mut thread = crate::ThreadState::new(tid, &config, ());
@@ -1554,7 +1558,8 @@ fn schedule_replay_thread(
     events: &[SchedEvent],
     more: impl FnOnce(&mut crate::preemptions::PreemptionWriter),
 ) -> (Config, GlobalState, crate::ThreadState<()>) {
-    let mut writer = crate::preemptions::PreemptionWriter::new(None);
+    let mut writer = crate::preemptions::PreemptionWriter::new(None)
+        .with_identity(crate::clock_identity::test_sources::known());
     let tid = DetTid::from_raw(17);
     writer.register_thread(tid, DEFAULT_PRIORITY);
     for event in events {
@@ -1562,7 +1567,10 @@ fn schedule_replay_thread(
     }
     more(&mut writer);
     std::fs::write(path, writer.into_string()).unwrap();
-    let (config, state, tid, process) = cancellation_test_state_with_config(config);
+    let (config, state, tid, process) =
+        cancellation_test_state_with_config(crate::clock_identity::test_sources::qualified(
+            config,
+        ));
     install_test_registration(&state, tid, Ivar::new());
     state
         .past_first_execve
@@ -1906,7 +1914,8 @@ async fn a_replayed_callback_slice_end_refreshes_its_slowdown_epoch_without_repl
             } else {
                 Callback::Syscall(Sysno::close)
             };
-            let mut writer = crate::preemptions::PreemptionWriter::new(None);
+            let mut writer = crate::preemptions::PreemptionWriter::new(None)
+                .with_identity(crate::clock_identity::test_sources::known());
             writer.register_thread(tid, DEFAULT_PRIORITY);
             if logical_slice {
                 writer.insert_schedevent(SchedEvent::branches(tid, u32::try_from(rcbs).unwrap()));
@@ -1930,7 +1939,9 @@ async fn a_replayed_callback_slice_end_refreshes_its_slowdown_epoch_without_repl
                 },
             );
             std::fs::write(&path, writer.into_string()).unwrap();
-            let (config, state, registered, process) = cancellation_test_state_with_config(config);
+            let (config, state, registered, process) = cancellation_test_state_with_config(
+                crate::clock_identity::test_sources::qualified(config),
+            );
             assert_eq!(registered, tid);
             install_test_registration(&state, tid, Ivar::new());
             state
