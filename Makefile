@@ -253,6 +253,7 @@ LINT_CHECK_TARGETS := \
     lint-check-conformance-test-counts \
     lint-check-recount-pins \
     lint-check-census-diff \
+    lint-check-runner-guard \
     lint-check-no-sve
 .PHONY: lint-checks $(LINT_CHECK_TARGETS)
 lint-checks: $(LINT_CHECK_TARGETS) ## The lint checkers CI schedules as one node (everything in `lint` except the two cargo passes)
@@ -436,6 +437,9 @@ lint-check-recount-pins:
 
 lint-check-census-diff:
 	python3 ./ci/test_census_diff.py
+
+lint-check-runner-guard:
+	python3 ./ci/test_runner_guard.py
 
 lint-check-no-sve:
 	rust-script --test ./scripts/check-no-sve.rs

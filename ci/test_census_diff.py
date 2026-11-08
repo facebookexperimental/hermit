@@ -197,22 +197,5 @@ def test_declared_drop_passes_and_unreasoned_skip_fails(tmp_path):
 
 
 if __name__ == "__main__":
-    import tempfile
-    _tests = [(n, f) for n, f in sorted(globals().items())
-              if n.startswith("test_") and callable(f)]
-    if not _tests:
-        print("census-diff test runner: ERROR: zero tests collected "
-              "(no test_* functions found)", file=sys.stderr)
-        sys.exit(2)
-    _failed = 0
-    for _name, _fn in _tests:
-        try:
-            with tempfile.TemporaryDirectory(prefix="test-census-diff-") as _td:
-                _fn(Path(_td))
-        except Exception as _exc:
-            _failed += 1
-            print(f"FAIL {_name}: {_exc!r}", file=sys.stderr)
-        else:
-            print(f"PASS {_name}")
-    print(f"{len(_tests) - _failed}/{len(_tests)} tests passed")
-    sys.exit(1 if _failed else 0)
+    from runner_guard import run_main
+    sys.exit(run_main(__file__, globals(), "census-diff"))
