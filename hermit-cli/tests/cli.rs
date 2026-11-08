@@ -34418,13 +34418,20 @@ fn a_prefix_stack_prints_at_its_schedule_position_whatever_the_retries() {
             let bail_event = log
                 .lines()
                 .find_map(|line| {
-                    line.split("event #").nth(1)?.split(' ').next()?.parse::<u64>().ok()
+                    line.split("event #")
+                        .nth(1)?
+                        .split(' ')
+                        .next()?
+                        .parse::<u64>()
+                        .ok()
                 })
                 .expect("a bail line names its event");
             assert!(
-                log.lines().any(|line| line.starts_with("ERROR HERMIT_REPLAY_DESYNC thread=")
-                    && line.contains(&format!(" event={bail_event} "))
-                    && line.contains("Syscall(connect")),
+                log.lines().any(
+                    |line| line.starts_with("ERROR HERMIT_REPLAY_DESYNC thread=")
+                        && line.contains(&format!(" event={bail_event} "))
+                        && line.contains("Syscall(connect")
+                ),
                 "{recorded_retries} recorded retries: no ERROR at event {bail_event}:\n{log}"
             );
             let _ = at;
