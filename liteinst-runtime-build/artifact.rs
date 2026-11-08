@@ -638,6 +638,106 @@ pub(crate) mod native {
             .run(program, &args, cwd)
             .unwrap_or_else(|e| panic!("native producer command failed: {e}"))
     }
+    // Keep the Nix linker switch local to this runner command and its ledger.
+    fn retain_native_link(runner: &mut qualifier::Runner, cc: &str, args: Vec<String>, cwd: &Path) {
+        assert!(
+            !cc.contains('='),
+            "native runner link refuses CC containing '=': env would parse an assignment"
+        );
+        let target = env::var("TARGET").expect("native runner link requires Cargo TARGET");
+        assert!(
+            !target.is_empty(),
+            "native runner link requires nonempty Cargo TARGET"
+        );
+        // Retain the compiler's answer and use it only for link-time lookup.
+        let query = runner
+            .run(cc, &["-print-file-name=libm.so.6".to_owned()], cwd)
+            .unwrap_or_else(|e| panic!("native runner libm query failed: {e}"));
+        let answer =
+            std::str::from_utf8(&query).expect("native runner libm query returned invalid UTF-8");
+        let mut lines = answer.lines();
+        let filename = lines
+            .next()
+            .filter(|line| !line.is_empty())
+            .expect("native runner libm query returned no path");
+        assert!(
+            lines.next().is_none(),
+            "native runner libm query returned multiple paths"
+        );
+        let library = Path::new(filename);
+        assert!(
+            library.is_absolute(),
+            "native runner libm query returned an unresolved or relative path: {filename}"
+        );
+        let metadata = fs::metadata(library).unwrap_or_else(|e| {
+            panic!("native runner libm query path is unavailable: {filename}: {e}")
+        });
+        assert!(
+            metadata.is_file(),
+            "native runner libm query did not resolve a regular file: {filename}"
+        );
+        // Preserve the directory containing the queried name if it is a symlink.
+        let directory = library
+            .parent()
+            .expect("native runner libm query path has no parent");
+        let directory = fs::canonicalize(directory).unwrap_or_else(|e| {
+            panic!("native runner libm query directory is unavailable: {filename}: {e}")
+        });
+        let directory = directory
+            .to_str()
+            .expect("native runner libm query directory is not UTF-8");
+        assert!(
+            !directory.contains([',', ':', '\n', '\r']),
+            "native runner libm query directory cannot be represented by -Wl,-rpath-link: {directory}"
+        );
+        let mut scoped = vec![
+            format!("NIX_DONT_SET_RPATH_{}=1", target.replace('-', "_")),
+            cc.to_owned(),
+        ];
+        scoped.extend(args);
+        scoped.push(format!("-Wl,-rpath-link={directory}"));
+        retain(runner, "env", scoped, cwd);
+    }
+    // Match the consumer's five forbidden dynamic tags before publication.
+    // Inspect the exact bytes bound to the identity that publish_file verifies.
+    fn require_no_loader_overrides(role: &str, identity: &qualifier::FileIdentity) {
+        use goblin::elf::dynamic;
+
+        let bytes = fs::read(&identity.path).unwrap_or_else(|e| {
+            panic!(
+                "read produced native {role} {}: {e}",
+                identity.path.display()
+            )
+        });
+        assert_eq!(
+            qualifier::sha256(&bytes),
+            identity.sha256,
+            "produced native {role} identity changed before loader validation: {}",
+            identity.path.display()
+        );
+        let elf = Elf::parse(&bytes).unwrap_or_else(|e| {
+            panic!(
+                "parse produced native {role} {}: {e}",
+                identity.path.display()
+            )
+        });
+        if let Some(table) = &elf.dynamic {
+            for entry in &table.dyns {
+                let tag = match entry.d_tag {
+                    dynamic::DT_RPATH => "DT_RPATH",
+                    dynamic::DT_RUNPATH => "DT_RUNPATH",
+                    dynamic::DT_TEXTREL => "DT_TEXTREL",
+                    dynamic::DT_AUDIT => "DT_AUDIT",
+                    dynamic::DT_DEPAUDIT => "DT_DEPAUDIT",
+                    _ => continue,
+                };
+                panic!(
+                    "produced native {role} requests unsupported loader search or text writes ({tag}): {}",
+                    identity.path.display()
+                );
+            }
+        }
+    }
     fn gate_digest(path: &Path) -> [u8; 32] {
         let bytes = fs::read(path).expect("read current native bootstrap");
         let elf = Elf::parse(&bytes).expect("parse current native bootstrap");
@@ -957,17 +1057,19 @@ pub(crate) mod native {
             "-o".into(),
             text(&runner_file),
         ]);
-        retain(&mut runner, &cc, args, &native_sources);
+        retain_native_link(&mut runner, &cc, args, &native_sources);
         for source in &source_files {
             source.verify().unwrap();
         }
         proof_source.verify().unwrap();
         sources.verify_unchanged(&mut runner).unwrap();
-        let runtime_identity = qualifier::FileIdentity::read(&runtime).unwrap();
+        let runtime_identity = qualifier::FileIdentity::read(&runtime)
+            .unwrap_or_else(|e| panic!("identify produced native runtime: {e}"));
         assert_eq!(runtime_identity.sha256, qualification.artifact.sha256);
         qualification.artifact.verify().unwrap();
         let bootstrap_identity = qualifier::FileIdentity::read(&bootstrap).unwrap();
-        let runner_identity = qualifier::FileIdentity::read(&runner_file).unwrap();
+        let runner_identity = qualifier::FileIdentity::read(&runner_file)
+            .unwrap_or_else(|e| panic!("identify produced native runner: {e}"));
         let source_digest = detcore_model::liteinst_native_exec_sources::digest(
             reverie_inguest::native_exec_sources::digest(),
         );
@@ -983,6 +1085,8 @@ pub(crate) mod native {
             .expect("native runtime lacks qualified fixed gate evidence")
             .verify_bootstrap_page_digest(&gate_digest)
             .unwrap_or_else(|e| panic!("native bootstrap/runtime gate pages differ: {e}"));
+        require_no_loader_overrides("runner", &runner_identity);
+        require_no_loader_overrides("runtime", &runtime_identity);
         // Publish only data, after all existing source/entry/gate qualifications.
         // Each temporary is create-new inside this invocation's unique directory.
         for (name, identity) in [
