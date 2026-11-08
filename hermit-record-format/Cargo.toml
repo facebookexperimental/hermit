@@ -12,7 +12,7 @@ bincode = { version = "2", features = ["serde"] }
 detcore = { package = "hermit-detcore", version = "0.5.4", path = "../detcore" }
 goblin = { version = "0.10.7", features = ["elf32", "elf64", "endian_fd"] }
 libc = "0.2.186"
-reverie = { package = "reverie-core", version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "45c56d0a21701f03f6f91842782b9abd86ad5f47" }
+reverie = { package = "reverie-core", version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "78d41ebd4befc6ba364ca695e168cb8656223545" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
