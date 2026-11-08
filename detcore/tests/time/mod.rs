@@ -1684,17 +1684,36 @@ fn a_futex_wake_yield_survives_a_preemption_record_and_replay() {
             futex_wake_yields: yields,
             ..base.clone()
         };
-        // The claim this record must state: the product's own validation of
-        // the prepared config, so a launch preparation that stops binding
-        // the clock contract or claim fails here instead of silently taking
-        // the refusal branch below.
-        let expected = detcore::clock_identity::validate_run_clock(
-            &detcore_testutils::prepare_ptrace_timer_config(config.clone()),
-            &detcore::clock_identity::ClockSources::process(),
-        )
-        .unwrap()
-        .producer()
-        .history_identity();
+        // The identity this host's record must state, derived straight
+        // from the product's host table and the ptrace backend's stated
+        // contract, never from prepare_ptrace_timer_config. That helper
+        // launches the recording below, so deriving the expectation from
+        // it would let a helper that stops binding the contract or claim
+        // switch this test to the refusal branch silently. With an
+        // independent oracle the record states an unqualified identity
+        // instead, the assert below fails, and the test goes red on a
+        // qualified host.
+        let expected = {
+            let capabilities = <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities();
+            let mut oracle = config.clone();
+            oracle.backend.rcb_clock_contract = capabilities.rcb_clock_contract;
+            if matches!(oracle.rcb_clock_claim, detcore::RcbClockClaim::Unset) {
+                oracle.rcb_clock_claim = match (
+                    capabilities.rcb_clock_contract,
+                    reverie::pmu_config::resolve_host_clock(),
+                ) {
+                    (Some(_), Ok(host)) => detcore::RcbClockClaim::Known(host.key()),
+                    _ => detcore::RcbClockClaim::Unset,
+                };
+            }
+            detcore::clock_identity::validate_run_clock(
+                &oracle,
+                &detcore::clock_identity::ClockSources::process(),
+            )
+            .unwrap()
+            .producer()
+            .history_identity()
+        };
         let recorded = guest_stdout(
             guest,
             detcore::Config {
@@ -1712,7 +1731,7 @@ fn a_futex_wake_yield_survives_a_preemption_record_and_replay() {
         assert_eq!(
             recording.identity(),
             Some(&expected),
-            "the record does not state the prepared clock claim"
+            "the record does not state the host-table clock identity"
         );
         let unqualified = match &expected {
             detcore::preemptions::HistoryIdentity::Unqualified(reason) => Some(format!(
