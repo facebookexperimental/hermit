@@ -150,12 +150,13 @@ fn render(output: &Output) -> String {
 }
 
 /// Compiles `tests/c/<guest>.c` into a directory of this test process's own.
-fn compile_guest(guest: &str, directory: &Path) -> PathBuf {
+fn compile_guest(guest: &str, directory: &Path, cflags: &[&str]) -> PathBuf {
     let source = repository().join("tests/c").join(format!("{guest}.c"));
     let binary = directory.join(guest);
     let output = Command::new("cc")
         .args(["-O2", "-g", "-pthread", "-D_GNU_SOURCE", "-I"])
         .arg(repository().join("tests/c"))
+        .args(cflags)
         .arg("-o")
         .arg(&binary)
         .arg(&source)
@@ -184,11 +185,15 @@ fn rust_guest(guest: &str) -> PathBuf {
 }
 
 fn run_replay_case(guest: &str, scenario: Option<&str>, mode: Mode) {
+    run_replay_case_with_cflags(guest, scenario, mode, &[]);
+}
+
+fn run_replay_case_with_cflags(guest: &str, scenario: Option<&str>, mode: Mode, cflags: &[&str]) {
     let directory = tempfile::Builder::new()
         .prefix(&format!("replay-{guest}-"))
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("failed to create the guest build directory");
-    let binary = compile_guest(guest, directory.path());
+    let binary = compile_guest(guest, directory.path(), cflags);
     run_replay(&binary, scenario, mode);
 }
 
@@ -3104,9 +3109,12 @@ shell_replay_case!(
 );
 
 // The internal trace_replay_split target, which only just_spin has.
-replay_case!(
-    trace_replay_split_just_spin,
-    "just_spin",
-    None,
-    Mode::TraceReplaySplit
-);
+#[test]
+fn trace_replay_split_just_spin() {
+    run_replay_case_with_cflags(
+        "just_spin",
+        None,
+        Mode::TraceReplaySplit,
+        &["-DJUST_SPIN_ITERATIONS=5000000"],
+    );
+}

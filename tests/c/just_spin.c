@@ -9,6 +9,10 @@
 #include <pthread.h>
 #include <stdlib.h>
 
+#ifndef JUST_SPIN_ITERATIONS
+#define JUST_SPIN_ITERATIONS (15 * 1000 * 1000)
+#endif
+
 static long x = 0;
 
 void __attribute__((noinline)) foo() {
@@ -17,7 +21,7 @@ void __attribute__((noinline)) foo() {
   x /= 2;
 }
 void __attribute__((optnone)) spin() {
-  for (int i = 0; i < 15 * 1000 * 1000; i++) {
+  for (int i = 0; i < JUST_SPIN_ITERATIONS; i++) {
     foo();
   }
 }
