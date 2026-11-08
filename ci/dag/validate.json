@@ -25163,7 +25163,7 @@
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1389",
+        "NEXTEST_EXPECTED_EXECUTED": "1390",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"liteinst,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -43976,7 +43976,7 @@
       "env": {
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1383",
+        "NEXTEST_EXPECTED_EXECUTED": "1384",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"liteinst,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,

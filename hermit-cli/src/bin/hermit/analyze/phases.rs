@@ -6213,6 +6213,154 @@ mod tests {
         );
     }
 
+    /// The positive prefix-stack cases (dh-mvz7y): a prefix whose connect
+    /// holds exactly 0, 1 and 2 recorded polling retries prints its stack
+    /// at the schedule position of the main thread's next syscall entry,
+    /// whatever retries the live connect makes. Edited schedule replays
+    /// are analysis trials, so they launch through `prefix_stack_trial`
+    /// (which sets the internal lenient replay opt-in); the public strict
+    /// CLI refusal of the same edited prefix is covered in cli.rs
+    /// (a_schedule_replay_refuses_a_prefix_whose_connect_return_is_recorded_as_polling).
+    /// Tracking: https://github.com/rrnewton/hermit/issues/5285
+    #[test]
+    fn analyze_prefix_stack_prints_at_its_schedule_position_whatever_the_retries() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let guest = directory.path().join("loopback_accept_reader");
+        let output = std::process::Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/loopback_accept_reader.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the loopback guest");
+        assert!(
+            output.status.success(),
+            "guest compilation failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let tmp_dir = format!("--tmp-dir={}", directory.path().join("work").display());
+        let mut options = AnalyzeOpts::try_parse_from([
+            "analyze",
+            tmp_dir.as_str(),
+            "--",
+            guest.to_str().unwrap(),
+        ])
+        .unwrap();
+        let _workspace = options.phase0_initialize(Retention::Remove).unwrap();
+
+        // Record the guest once.
+        let mut record_run = RunData::new_baseline(&options, "record".to_string())
+            .unwrap()
+            .with_schedule_recording();
+        record_run.launch().unwrap();
+        let record_path = record_run.sched_path_out().to_path_buf();
+        let record: PreemptionRecord = PreemptionReader::try_new(&record_path)
+            .unwrap()
+            .into_inner();
+        let recorded: serde_json::Value = serde_json::to_value(&record).unwrap();
+        let events = recorded["global"].as_array().unwrap().clone();
+        let syscall = |event: &serde_json::Value, phase: &str| {
+            (event["op"]["Syscall"][1].as_str() == Some(phase))
+                .then(|| event["op"]["Syscall"][0].as_i64())
+                .flatten()
+        };
+        let connect = events
+            .iter()
+            .position(|event| syscall(event, "Prehook") == Some(libc::SYS_connect))
+            .expect("the recording holds the connect");
+        let main = events[connect]["dettid"].clone();
+        let of_main = |ix: &usize| events[*ix]["dettid"] == main;
+        let returned = (connect + 1..events.len())
+            .filter(of_main)
+            .find(|&ix| syscall(&events[ix], "Posthook") == Some(libc::SYS_connect))
+            .expect("the connect returns");
+        let target = (returned + 1..events.len())
+            .filter(of_main)
+            .find(|&ix| syscall(&events[ix], "Prehook").is_some())
+            .expect("the main thread enters another syscall after its connect");
+        let prefix_len = (target + 20).min(events.len());
+        let retries: Vec<usize> = (connect + 1..returned)
+            .filter(of_main)
+            .filter(|&ix| syscall(&events[ix], "Polling").is_some())
+            .collect();
+        let mut retry = events[returned].clone();
+        retry["op"]["Syscall"][1] = serde_json::json!("Polling");
+        let identity = |event: &serde_json::Value| {
+            (
+                event["dettid"].clone(),
+                event["end_time"].clone(),
+                event["op"].clone(),
+            )
+        };
+        let mut moved = Vec::new();
+        for recorded_retries in 0..3 {
+            let mut prefix: Vec<serde_json::Value> = events[..prefix_len]
+                .iter()
+                .enumerate()
+                .filter(|(ix, _)| !retries.contains(ix))
+                .map(|(_, event)| event.clone())
+                .collect();
+            let at = returned - retries.len();
+            for _ in 0..recorded_retries {
+                prefix.insert(at, retry.clone());
+            }
+            let position = target - retries.len() + recorded_retries;
+            assert_eq!(identity(&prefix[position]), identity(&events[target]));
+            let mut edited = recorded.clone();
+            edited["global"] = serde_json::Value::Array(prefix);
+            let edited: PreemptionRecord = serde_json::from_value(edited).unwrap();
+            let (mut run, stack_path) = options
+                .prefix_stack_trial(
+                    &format!("prefix_stack_{recorded_retries}"),
+                    &edited,
+                    prefix_len,
+                    position,
+                    None,
+                )
+                .unwrap();
+            run = run.with_schedule_recording();
+            options
+                .launch_prefix_trial(&mut run, RunData::launch)
+                .unwrap();
+            let stack: serde_json::Value =
+                serde_json::from_reader(File::open(&stack_path).unwrap()).unwrap();
+            assert!(
+                stack["frames"]
+                    .as_array()
+                    .is_some_and(|frames| !frames.is_empty()),
+                "{recorded_retries} recorded retries: stack at schedule position \
+                 {position} has no frames: {stack}"
+            );
+            let realized: PreemptionRecord = PreemptionReader::try_new(run.sched_path_out())
+                .unwrap()
+                .into_inner();
+            let observed = serde_json::to_value(&realized).unwrap()["global"]
+                .as_array()
+                .unwrap()
+                .clone();
+            assert!(
+                observed
+                    .iter()
+                    .any(|event| identity(event) == identity(&events[target])),
+                "{recorded_retries} recorded retries: the realized schedule lost the target event"
+            );
+            if identity(&observed[position]) != identity(&events[target]) {
+                moved.push(recorded_retries);
+            }
+        }
+        assert!(
+            !moved.is_empty(),
+            "every replay made the connect retries its schedule held, so no case moved \
+             the traced index: the cases exercise nothing"
+        );
+    }
+
     /// A candidate's check keeps the callback checkpoints of the unchanged
     /// events it replays, and refuses an edit they do not fit instead of
     /// replaying a bare schedule.
