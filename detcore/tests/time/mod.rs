@@ -1651,6 +1651,24 @@ fn guest_stdout(guest: fn(), config: detcore::Config) -> String {
 /// without the policy or at a wake that woke no one.
 #[test]
 fn a_futex_wake_yield_survives_a_preemption_record_and_replay() {
+    // Child mode: attempt only the replay of the parent's record. Admission
+    // of an unqualified history exits this process with the policy status
+    // before any guest runs, which is what the parent asserts.
+    const REPLAY_CHILD_RECORD: &str = "HERMIT_FUTEX_WAKE_YIELD_REPLAY_RECORD";
+    if let Ok(record) = std::env::var(REPLAY_CHILD_RECORD) {
+        let record = std::path::PathBuf::from(record);
+        let _ = guest_stdout(
+            || {},
+            detcore::Config {
+                virtualize_time: true,
+                sequentialize_threads: true,
+                futex_wake_yields: true,
+                replay_preemptions_from: Some(record),
+                ..Default::default()
+            },
+        );
+        panic!("an unqualified replay was admitted");
+    }
     let base = detcore::Config {
         virtualize_time: true,
         sequentialize_threads: true,
@@ -1666,6 +1684,17 @@ fn a_futex_wake_yield_survives_a_preemption_record_and_replay() {
             futex_wake_yields: yields,
             ..base.clone()
         };
+        // The claim this record must state: the product's own validation of
+        // the prepared config, so a launch preparation that stops binding
+        // the clock contract or claim fails here instead of silently taking
+        // the refusal branch below.
+        let expected = detcore::clock_identity::validate_run_clock(
+            &detcore_testutils::prepare_ptrace_timer_config(config.clone()),
+            &detcore::clock_identity::ClockSources::process(),
+        )
+        .unwrap()
+        .producer()
+        .history_identity();
         let recorded = guest_stdout(
             guest,
             detcore::Config {
@@ -1673,6 +1702,48 @@ fn a_futex_wake_yield_survives_a_preemption_record_and_replay() {
                 record_preemptions_to: Some(record.clone()),
                 ..config.clone()
             },
+        );
+        // Branch on the identity this host's recorder stated, read back
+        // through Detcore's own decoder: a qualified (or backend-local)
+        // history must replay; an unqualified one must be refused before
+        // any guest runs, in a child process because the refusal exits
+        // the tracer process with the policy status.
+        let recording = detcore::preemptions::boundary_recording::Recording::read(&record).unwrap();
+        assert_eq!(
+            recording.identity(),
+            Some(&expected),
+            "the record does not state the prepared clock claim"
+        );
+        let unqualified = match &expected {
+            detcore::preemptions::HistoryIdentity::Unqualified(reason) => Some(format!(
+                "it was recorded with an unqualified RCB clock ({reason})"
+            )),
+            _ => None,
+        };
+        if let Some(expected) = unqualified {
+            eprintln!("unqualified branch: recording states {expected}; asserting replay refusal");
+            let case = std::thread::current()
+                .name()
+                .unwrap_or_default()
+                .to_string();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &case, "--nocapture", "--test-threads=1"])
+                .env(REPLAY_CHILD_RECORD, &record)
+                .output()
+                .unwrap();
+            std::fs::remove_file(&record).unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+                "{output:?}"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(&expected), "child stderr: {stderr}");
+            return None;
+        }
+        eprintln!(
+            "qualified branch: recording states {:?}; replay must succeed",
+            recording.identity()
         );
         let replayed = guest_stdout(
             guest,
@@ -1683,20 +1754,20 @@ fn a_futex_wake_yield_survives_a_preemption_record_and_replay() {
         );
         std::fs::remove_file(&record).unwrap();
         assert_eq!(recorded, replayed, "yields={yields}");
-        recorded
+        Some(recorded)
     };
+    let Some(first) = round_trip(|| futex_wake_snapshot(true), true) else {
+        return;
+    };
+    assert_eq!(first, "wake=1 seen=1 sibling=1\n");
     assert_eq!(
-        round_trip(|| futex_wake_snapshot(true), true),
-        "wake=1 seen=1 sibling=1\n"
-    );
-    assert_eq!(
-        round_trip(|| futex_wake_snapshot(true), false),
+        round_trip(|| futex_wake_snapshot(true), false).expect("qualified host"),
         "wake=1 seen=0 sibling=0\n"
     );
     // The waiter was joined before this wake, so only `sibling` can show a
     // yield here.
     assert_eq!(
-        round_trip(|| futex_wake_snapshot(false), true),
+        round_trip(|| futex_wake_snapshot(false), true).expect("qualified host"),
         "wake=0 seen=1 sibling=0\n"
     );
 }

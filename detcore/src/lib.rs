@@ -160,6 +160,7 @@ pub use config::FatalCoreCapture;
 pub use config::InheritedSeccomp;
 pub use config::LITEINST_CONFIG_FINGERPRINT_ENV;
 pub use config::LaunchImage;
+pub use config::RcbClockClaim;
 pub use config::RunsPostFork;
 pub use config::SchedHeuristic;
 pub use config::config_fingerprint_mismatch;

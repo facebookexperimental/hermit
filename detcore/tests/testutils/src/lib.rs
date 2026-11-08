@@ -82,8 +82,9 @@ struct DetTestState {
     test_run_num: u64,
 }
 
-/// Bind the timer mechanism provided by the ptrace launcher used by these tests,
-/// and resolve the CPU profile the way a launch must. Keep each test's
+/// Bind the timer mechanism and RCB clock contract provided by the ptrace
+/// launcher used by these tests, state this host's prepared clock claim the
+/// way a launch must, and resolve the CPU profile. Keep each test's
 /// configured maximum (including `None`) and every other backend fact
 /// unchanged; the generic helpers also serve non-Detcore tools.
 ///
@@ -95,9 +96,18 @@ struct DetTestState {
 /// profiles pass through untouched, and Detcore's own refusal of an
 /// unresolved `auto` still guards every other launch path.
 pub fn prepare_ptrace_timer_config(mut config: Config) -> Config {
-    config.backend.delivers_preemption_timer_events =
-        <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities()
-            .delivers_preemption_timer_events;
+    let capabilities = <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities();
+    config.backend.delivers_preemption_timer_events = capabilities.delivers_preemption_timer_events;
+    config.backend.rcb_clock_contract = capabilities.rcb_clock_contract;
+    if matches!(config.rcb_clock_claim, detcore::RcbClockClaim::Unset) {
+        config.rcb_clock_claim = match (
+            capabilities.rcb_clock_contract,
+            reverie::pmu_config::resolve_host_clock(),
+        ) {
+            (Some(_), Ok(host)) => detcore::RcbClockClaim::Known(host.key()),
+            _ => detcore::RcbClockClaim::Unset,
+        };
+    }
     if config.cpu_profile == detcore::CpuProfile::Auto {
         config.cpu_profile = detcore::CpuProfile::X86_64V2;
     }
