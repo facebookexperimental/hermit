@@ -650,12 +650,21 @@ fn has_blocking_failure(rows: &[serde_json::Value], key: &CacheKey<'_>) -> bool 
 /// prove it, so refusing the kind here is what keeps a by-tree reuse from
 /// carrying an unproven floor. The cost is one real run in the rare case of an
 /// identical tree.
+///
+/// A `queue-base` row is refused for the same reason: its claim (the floor
+/// is merge-base(target, M)) is a Git fact this reader decodes but does not
+/// recompute, so a by-tree reuse would carry an unproven floor.
 fn pass_row_qualifies(row: &serde_json::Value) -> bool {
     if row.get("admission_floor_evidence").is_some()
         && !serde_json::from_value::<hermit_manifest_plan::ledger::HistoryRow>(row.clone())
             .is_ok_and(|original| {
                 original.admission_evidence().is_ok_and(|e| {
-                    e.is_some_and(|evidence| evidence.floor().kind != "disjoint-main")
+                    e.is_some_and(|evidence| {
+                        !matches!(
+                            evidence.floor().kind.as_str(),
+                            "disjoint-main" | "queue-base"
+                        )
+                    })
                 })
             })
     {
