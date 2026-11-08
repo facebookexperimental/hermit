@@ -328,7 +328,12 @@ const CHAOS_OFFSET_VERIFY_CPU_SECONDS: u64 = 32;
 const SCHEDULE_REPLAY_LONG_SLICES_WRAPPER_NAME: &str = "hermit-schedule-replay-long-slices-cpu";
 const SCHEDULE_REPLAY_LONG_SLICES_CPU_SECONDS: u64 = 30;
 const CHAOS_CHANGE_POINTS_WRAPPER_NAME: &str = "hermit-chaos-change-points-cpu";
-const CHAOS_CHANGE_POINTS_CPU_SECONDS: u64 = 30;
+// Re-measured 2026-11-08 from the queue's retained per-test CPU rows
+// (last 14 merge-queue runs): chaos_change_points largest completed
+// 24.7 CPU-s (n=10, one attempt capped at the old 30) -> ceil(1.5*24.7) = 38;
+// shipped_export largest completed 22.8 CPU-s (n=11, two attempts capped
+// at the old 26) -> ceil(1.5*22.8) = 35. Walls stay 8x the cap.
+const CHAOS_CHANGE_POINTS_CPU_SECONDS: u64 = 38;
 const POSIX_TIMER_SIGNAL_ROWS_WRAPPER_NAME: &str = "hermit-posix-timer-signal-rows-cpu";
 const POSIX_TIMER_SIGNAL_ROWS_CPU_SECONDS: u64 = 26;
 const TRACE_REPLAY_SPLIT_WRAPPER_NAME: &str = "hermit-trace-replay-split-cpu";
@@ -342,7 +347,7 @@ const RR_VDSO_GETTIMEOFDAY_CPU_SECONDS: u64 = 24;
 const RR_VDSO_CLOCK_GETTIME_WRAPPER_NAME: &str = "hermit-rr-vdso-clock-gettime-cpu";
 const RR_VDSO_CLOCK_GETTIME_CPU_SECONDS: u64 = 24;
 const SHIPPED_EXPORT_WRAPPER_NAME: &str = "hermit-shipped-export-cpu";
-const SHIPPED_EXPORT_CPU_SECONDS: u64 = 26;
+const SHIPPED_EXPORT_CPU_SECONDS: u64 = 35;
 const CPU_TERMINATION_GRACE_SECONDS: u64 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
