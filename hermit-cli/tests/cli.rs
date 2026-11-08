@@ -34365,8 +34365,10 @@ fn a_schedule_replay_refuses_a_prefix_whose_connect_return_is_recorded_as_pollin
         "{args:?}:\n{log}"
     );
     assert!(
-        log.lines().any(|line| line.starts_with("ERROR HERMIT_REPLAY_DESYNC thread=")
-            && line.contains("Syscall(connect")),
+        log.lines().any(
+            |line| line.starts_with("ERROR HERMIT_REPLAY_DESYNC thread=")
+                && line.contains("Syscall(connect")
+        ),
         "no ERROR line naming connect:\n{log}"
     );
     assert!(
