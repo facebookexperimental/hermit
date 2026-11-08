@@ -11,10 +11,13 @@
 //! `Detcore::answer_system_directory_link`.
 
 use std::ffi::CString;
+use std::os::fd::AsRawFd;
+use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 
+use nix::fcntl::OFlag;
 use reverie::Errno;
 use reverie::Guest;
 use reverie::syscalls;
@@ -31,8 +34,9 @@ use crate::types::DetPid;
 /// A thread of a KVM-like run: the guest's procfs is not the kernel's
 /// (`provides_process_signal_control`), Detcore serves `/proc` on a
 /// placeholder, and the thread's process is known. The kernel's answer to
-/// any call Detcore forwards is `reply`.
-fn kvm_thread(reply: Result<i64, Errno>) -> InjectGuest<NoopTool> {
+/// any call Detcore forwards is `reply`. With `proc_fd`, the thread also
+/// holds that descriptor open on `/proc`, served on a placeholder.
+fn kvm_thread(reply: Result<i64, Errno>, proc_fd: Option<RawFd>) -> InjectGuest<NoopTool> {
     let mut guest = InjectGuest::<NoopTool>::new(reply);
     guest.config = Config {
         directory_placeholder: Some(std::path::PathBuf::from("/placeholder")),
@@ -40,7 +44,29 @@ fn kvm_thread(reply: Result<i64, Errno>) -> InjectGuest<NoopTool> {
     }
     .with_backend(|backend| backend.provides_process_signal_control = true);
     let tid = guest.tid().as_raw();
-    guest.thread_state_mut().detpid = Some(DetPid::from_raw(tid));
+    let thread = guest.thread_state_mut();
+    thread.detpid = Some(DetPid::from_raw(tid));
+    if let Some(fd) = proc_fd {
+        thread
+            .add_fd(
+                fd,
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY,
+                crate::fd::FdType::Regular,
+                None,
+            )
+            .unwrap();
+        thread
+            .with_detfd(fd, |detfd| {
+                detfd.set_path(std::path::PathBuf::from("/proc"));
+                detfd.set_placeholder(crate::fd::PlaceholderState {
+                    directory: crate::procfs::fd_directory::PlaceholderDirectory::Root,
+                    tag: None,
+                    position: 0,
+                    path_only: false,
+                });
+            })
+            .unwrap();
+    }
     guest
 }
 
@@ -48,12 +74,22 @@ fn kvm_thread(reply: Result<i64, Errno>) -> InjectGuest<NoopTool> {
 /// `readlinkat(AT_FDCWD, path, buffer, 256)` on a [`kvm_thread`] whose kernel
 /// answers `reply`, with the calls each forwarded.
 fn readlinks(path: &[u8], reply: Result<i64, Errno>) -> Vec<(Result<i64, Errno>, Vec<Sysno>)> {
+    readlinks_holding(path, reply, None)
+}
+
+/// [`readlinks`] by a thread that also holds `proc_fd` open on `/proc`
+/// ([`kvm_thread`]).
+fn readlinks_holding(
+    path: &[u8],
+    reply: Result<i64, Errno>,
+    proc_fd: Option<RawFd>,
+) -> Vec<(Result<i64, Errno>, Vec<Sysno>)> {
     let path = CString::new(path).unwrap();
     let mut buffer = [0u8; 256];
     let tool = detcore::<NoopTool>();
     let mut answers = Vec::new();
     for at in [false, true] {
-        let mut guest = kvm_thread(reply);
+        let mut guest = kvm_thread(reply, proc_fd);
         let path_ptr = PathPtr::from_ptr(path.as_ptr());
         let buf = AddrMut::from_raw(buffer.as_mut_ptr() as usize);
         let result = futures::executor::block_on(async {
@@ -124,6 +160,155 @@ fn an_overlong_system_directory_spelling_is_left_to_the_kernel() {
     for (result, forwarded) in readlinks(&overlong, Err(Errno::ENAMETOOLONG)) {
         assert_eq!(result, Err(Errno::ENAMETOOLONG));
         assert_eq!(forwarded.len(), 1, "{forwarded:?}");
+    }
+}
+
+/// Linux's `readlink` of `path`, as the host answers it, settled: the
+/// link's length or the errno, and how many attempts it took. An ELOOP is
+/// asked again, up to 8 times, for this native reference only (Detcore is
+/// asked once): Linux keeps a lookup's link count across the restart of its
+/// RCU walk (`set_nameidata` once, then `path_lookupat` again; fs/namei.c
+/// v6.12), which a mount anywhere on the host forces, so a native lookup
+/// near `MAXSYMLINKS` can fail with ELOOP below the budget, though it never
+/// succeeds past it.
+fn native_readlink(path: &[u8]) -> (Result<i64, Errno>, usize) {
+    let path = CString::new(path).unwrap();
+    let mut buffer = [0u8; 256];
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        // SAFETY: a NUL-terminated path and a buffer of the length given.
+        let length =
+            unsafe { libc::readlink(path.as_ptr(), buffer.as_mut_ptr().cast(), buffer.len()) };
+        let answer = if length < 0 {
+            Err(Errno::last())
+        } else {
+            Ok(length as i64)
+        };
+        if answer != Err(Errno::ELOOP) || attempts == 8 {
+            return (answer, attempts);
+        }
+    }
+}
+
+/// [`native_readlink`] of `path`, which must be `expected`: a lookup
+/// below the budget that is still ELOOP after 8 attempts fails the test as
+/// "native unsettled", never taken for the answer.
+fn assert_native(path: &[u8], expected: Result<i64, Errno>, label: &str) {
+    let (answer, attempts) = native_readlink(path);
+    assert!(
+        !(answer == Err(Errno::ELOOP) && expected != answer),
+        "native unsettled: {label}, ELOOP on all {attempts} attempts"
+    );
+    assert_eq!(answer, expected, "the host, {label} ({attempts} attempts)");
+}
+
+/// `dir/chain0 -> chain1 -> ... -> chain38 -> /proc/sys`: 39 links.
+fn make_chain(dir: &Path) {
+    for index in 0..38 {
+        std::os::unix::fs::symlink(
+            format!("chain{}", index + 1),
+            dir.join(format!("chain{index}")),
+        )
+        .unwrap();
+    }
+    std::os::unix::fs::symlink("/proc/sys", dir.join("chain38")).unwrap();
+}
+
+/// One `MAXSYMLINKS` budget (40) covers the whole lookup: the links
+/// Detcore resolves itself through the caller's descriptor `R` on `/proc`
+/// (`/proc/self` and `/proc/self/fd/R`, 2), and the links of the rest of the
+/// walk, which Detcore walks and counts itself, here a chain of symbolic
+/// links whose last names `/proc/sys`, spelled with a final `/` so that the
+/// lookup follows the last link too. 39 and 40 links reach `/proc/sys`, no
+/// link, so EINVAL; 41 is ELOOP (`reserve_stack`, fs/namei.c). So too
+/// through a pathname of `PATH_MAX - 1` bytes, to which Detcore's walk adds
+/// nothing. The host answers each spelling first, with `R` a real
+/// descriptor on `/proc`, so that native Linux decides every answer.
+#[test]
+fn one_link_budget_covers_descriptor_links_and_the_rest() {
+    let native_proc = std::fs::File::open("/proc").unwrap();
+    // The same number for the host's descriptor and the guest's placeholder,
+    // so that the spellings are the same length.
+    let r = native_proc.as_raw_fd();
+    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::util::canonicalize(fixture.path()).unwrap();
+    make_chain(&fixture);
+    let through = format!("/proc/self/fd/{r}/..");
+    // A directory below the fixture that makes `through` + it + "/chain0/"
+    // PATH_MAX - 1 bytes long.
+    let mut deep = fixture.clone();
+    let room =
+        libc::PATH_MAX as usize - 1 - through.len() - fixture.as_os_str().len() - "/chain0/".len();
+    // Names of at most 255 bytes (NAME_MAX), each with its "/".
+    let count = room.div_ceil(256);
+    let letters = room - count;
+    for index in 0..count {
+        deep.push("d".repeat(letters / count + usize::from(index < letters % count)));
+        std::fs::create_dir(&deep).unwrap();
+    }
+    make_chain(&deep);
+    let spelled = |prefix: &str, dir: &Path, first: usize| {
+        let mut path = prefix.as_bytes().to_vec();
+        path.extend_from_slice(dir.as_os_str().as_bytes());
+        path.extend_from_slice(format!("/chain{first}/").as_bytes());
+        path
+    };
+    for (label, path) in [
+        ("39 links", spelled("", &fixture, 0)),
+        ("39 links through R", spelled(&through, &fixture, 2)),
+        ("40 links through R", spelled(&through, &fixture, 1)),
+        ("41 links through R", spelled(&through, &fixture, 0)),
+        ("39 links through R, deep", spelled(&through, &deep, 2)),
+        ("40 links through R, deep", spelled(&through, &deep, 1)),
+        ("41 links through R, deep", spelled(&through, &deep, 0)),
+    ] {
+        if label.ends_with("deep") {
+            assert_eq!(path.len(), libc::PATH_MAX as usize - 1, "{label}");
+        }
+        let expected = if label.starts_with("41") {
+            Err(Errno::ELOOP)
+        } else {
+            Err(Errno::EINVAL)
+        };
+        assert_native(&path, expected, label);
+        for (result, forwarded) in readlinks_holding(&path, Err(Errno::EACCES), Some(r)) {
+            assert_eq!(result, expected, "{label}");
+            assert!(forwarded.is_empty(), "{label}: {forwarded:?}");
+        }
+    }
+}
+
+/// Detcore's walk takes each step as Linux does, by the object reached, not
+/// by the spelling: a fixture's own `proc/self/cwd`, a symbolic link to
+/// `/proc/sys`, reaches `/proc/sys/kernel`; `..` after a symbolic link is
+/// the parent of the directory the link reaches; and procfs's `self` and
+/// `thread-self`, recognised as links in procfs's root, are left again by
+/// `..`. Each is EINVAL natively, and so on KVM.
+#[test]
+fn the_walk_takes_each_step_by_the_object_reached() {
+    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::util::canonicalize(fixture.path()).unwrap();
+    std::fs::create_dir_all(fixture.join("proc/self")).unwrap();
+    std::os::unix::fs::symlink("/proc/sys", fixture.join("proc/self/cwd")).unwrap();
+    std::os::unix::fs::symlink("/proc/sys/kernel/random", fixture.join("to-random")).unwrap();
+    for path in [
+        fixture.join("proc/self/cwd/kernel"),
+        fixture.join("to-random/../random"),
+        Path::new("/proc/self/../sys").to_path_buf(),
+        Path::new("/proc/thread-self/../../../sys").to_path_buf(),
+    ] {
+        let path = path.as_os_str().as_bytes();
+        assert_native(path, Err(Errno::EINVAL), &String::from_utf8_lossy(path));
+        for (result, forwarded) in readlinks(path, Err(Errno::EACCES)) {
+            assert_eq!(
+                result,
+                Err(Errno::EINVAL),
+                "{}",
+                String::from_utf8_lossy(path)
+            );
+            assert!(forwarded.is_empty(), "{forwarded:?}");
+        }
     }
 }
 

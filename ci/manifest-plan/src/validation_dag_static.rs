@@ -3379,7 +3379,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_system_procfs_directory_is_no_link_on_kvm,
     // an_overlong_system_directory_spelling_is_left_to_the_kernel and
     // a_bind_over_proc_sys_keeps_its_links (PR #5273 review): 3782 + 3 = 3785.
-    ("test.detcore_unit", 3785),
+    // And one_link_budget_covers_descriptor_links_and_the_rest and
+    // the_walk_takes_each_step_by_the_object_reached (Detcore's own link
+    // walk, #5278): 3785 + 2 = 3787.
+    ("test.detcore_unit", 3787),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -6166,7 +6169,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same system_directories_follow_the_table unit (same growth as
     // test.detcore_unit): 3781 + 1 = 3782.
     // The same three system_directory_link_tests units: 3782 + 3 = 3785.
-    ("test.detcore_unit_on_host", 3785),
+    // The same two units of Detcore's own link walk (#5278): 3785 + 2 = 3787.
+    ("test.detcore_unit_on_host", 3787),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

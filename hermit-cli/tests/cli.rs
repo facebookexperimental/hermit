@@ -63579,6 +63579,30 @@ fn procfs_system_directory_links_guest() -> String {
     .to_owned()
 }
 
+/// `output` of the guest's native `--native-settle` run without its
+/// ` settle=N` fields, after checking that no row below the link budget is
+/// ELOOP on all 8 attempts ("native unsettled"): Linux can overcount the
+/// links of a lookup whose RCU walk a host mount restarts (fs/namei.c v6.12,
+/// `set_nameidata` once, then `path_lookupat` again), and the native
+/// reference takes its settled answer, never a constant.
+fn settled_native_reference(output: &str) -> String {
+    let mut settled = String::new();
+    for line in output.lines() {
+        assert!(
+            line.contains("41 links") || !line.contains("ELOOP settle=8"),
+            "native unsettled: {line}"
+        );
+        let mut rest = line;
+        while let Some(at) = rest.find(" settle=") {
+            settled.push_str(&rest[..at]);
+            rest = rest[at + " settle=".len()..].trim_start_matches(|c: char| c.is_ascii_digit());
+        }
+        settled.push_str(rest);
+        settled.push('\n');
+    }
+    settled
+}
+
 /// On KVM, whose executor serves no procfs directory and refuses every
 /// procfs object with `EACCES`, Detcore answers `readlink` and `readlinkat`
 /// of the system-wide procfs directories as Linux does, by every spelling
@@ -63586,9 +63610,24 @@ fn procfs_system_directory_links_guest() -> String {
 /// a `/proc` descriptor, a spelling through a symbolic link to `/proc/sys`,
 /// the longest pathname Linux takes (4095 bytes, `EINVAL`), and one longer
 /// (4105 bytes), which Linux refuses with `ENAMETOOLONG` before any lookup.
-/// Each line must match the guest's own native run. Before the fix the
-/// directories were `EACCES`; at 1aa06612 the overlong spelling was `EINVAL`
-/// and the spelling through the link `EACCES`.
+/// One `MAXSYMLINKS` budget covers the whole lookup, which Detcore walks
+/// and counts itself: a chain of 39 symbolic links ending at `/proc/sys`,
+/// reached directly, behind `/proc/self/fd/N/..` (2 more links), behind
+/// `/proc/self/../..` (1 each), or both, and through a 4,095-byte pathname,
+/// is `EINVAL` at 39 and 40 links and `ELOOP` at 41. Each step is decided
+/// by the object reached: a fixture's own `proc/self/cwd` link, `..` after
+/// a link, and `..` out of procfs's `self` and `thread-self`. Each KVM line,
+/// one call each, must match the guest's settled native run
+/// ([`settled_native_reference`]). Before the fix the directories were
+/// `EACCES`; at 1aa06612 the overlong spelling was `EINVAL` and the spelling
+/// through the link `EACCES`; at eaf0feb6 the 41-link spellings through the
+/// descriptor were `EINVAL`.
+///
+/// The caller's own magic links (`--magic`) are not Detcore's to follow on
+/// KVM, whose guest tasks are no host tasks: a path below `/proc/self/cwd`
+/// stays as LinuxEmu answers it (ELOOP, #4717; `chdir("/proc/sys")` is
+/// EACCES, #5062), which this checks is unchanged, while ptrace answers as
+/// Linux does.
 #[test]
 fn run_kvm_procfs_system_directory_links_answer_as_linux() {
     if kvm_unavailable("run_kvm_procfs_system_directory_links_answer_as_linux") {
@@ -63598,13 +63637,21 @@ fn run_kvm_procfs_system_directory_links_answer_as_linux() {
     let native_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let native = Command::new(&guest)
         .arg(native_dir.path())
+        .arg("--native-settle")
         .stdin(Stdio::null())
         .output()
         .expect("failed to run the guest natively");
     assert!(native.status.success(), "natively: {native:?}");
-    let native = String::from_utf8(native.stdout).expect("native stdout is UTF-8");
+    let native = settled_native_reference(
+        &String::from_utf8(native.stdout).expect("native stdout is UTF-8"),
+    );
     assert!(
-        native.contains("(4105 bytes) /proc/ + slashes + sys: readlink=ENAMETOOLONG"),
+        native.contains("(4105 bytes) /proc/ + slashes + sys: readlink=ENAMETOOLONG")
+            && native.contains("/proc/self/fd/N/.. + chain, 40 links: readlink=EINVAL")
+            && native.contains("/proc/self/fd/N/.. + chain, 41 links: readlink=ELOOP")
+            && native.contains(
+                "(4095 bytes) deep /proc/self/fd/N/.. + chain, 40 links: readlink=EINVAL"
+            ),
         "natively: {native}"
     );
     let _guard = hermit_run_guard();
@@ -63621,6 +63668,44 @@ fn run_kvm_procfs_system_directory_links_answer_as_linux() {
     let output = hermit(&args);
     assert_success(&output, &args);
     assert_eq!(stdout(&output), native, "KVM against native Linux");
+
+    let magic_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let native_magic = Command::new(&guest)
+        .arg("--magic")
+        .arg(magic_dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(native_magic.status.success(), "natively: {native_magic:?}");
+    let native_magic = String::from_utf8(native_magic.stdout).expect("native stdout is UTF-8");
+    for (backend, expected) in [
+        ("--backend=ptrace", native_magic.as_str()),
+        (
+            "--backend=kvm",
+            "cwd=F: /proc/self/cwd/kernel: readlink=ELOOP readlinkat=ELOOP\n\
+             cwd=F: /proc/self/cwd/kernel/: readlink=ELOOP readlinkat=ELOOP\n\
+             cwd=F: /proc/self/cwd/kernel/..: readlink=ELOOP readlinkat=ELOOP\n\
+             chdir /proc/sys: EACCES\n\
+             cwd=/proc/sys: /proc/self/cwd/: readlink=EINVAL readlinkat=EINVAL\n\
+             cwd=/proc/sys: /proc/self/cwd/kernel: readlink=ELOOP readlinkat=ELOOP\n\
+             cwd=/proc/sys: /proc/thread-self/cwd/kernel: readlink=ELOOP readlinkat=ELOOP\n",
+        ),
+    ] {
+        let args = [
+            backend,
+            "run",
+            "--strict",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--base-env=minimal",
+            "--",
+            guest.as_str(),
+            "--magic",
+            "/tmp",
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{backend} --magic");
+    }
 }
 
 /// A user mount over `/proc/sys` keeps its own objects: with a fixture bound

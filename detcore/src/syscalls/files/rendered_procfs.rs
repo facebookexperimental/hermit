@@ -368,6 +368,240 @@ pub(super) fn proc_device() -> Option<u64> {
     *PROC_DEVICE.get_or_init(|| GuestProcfs::stat(c"/proc").ok().map(|stat| stat.st_dev))
 }
 
+/// Linux's `MAXSYMLINKS` (include/linux/namei.h): `reserve_stack` fails the
+/// 41st symbolic link of one lookup with ELOOP.
+const MAXSYMLINKS: usize = 40;
+
+/// procfs's root inode number (`PROC_ROOT_INO`, fs/proc/internal.h).
+const PROC_ROOT_INO: u64 = 1;
+
+/// A descriptor the walk below opened, closed when dropped.
+struct WalkFd(i32);
+
+impl Drop for WalkFd {
+    fn drop(&mut self) {
+        // SAFETY: the descriptor is the walk's own, closed once.
+        let _ = unsafe { raw_syscall(libc::SYS_close, [self.0 as u64, 0, 0, 0, 0, 0]) };
+    }
+}
+
+/// `openat(dirfd, name, O_PATH | O_NOFOLLOW)`, and the object's `stat`.
+fn walk_open(dirfd: i32, name: &[u8]) -> Result<(WalkFd, libc::stat), Errno> {
+    let name = std::ffi::CString::new(name).map_err(|_| Errno::ENOENT)?;
+    // SAFETY: the name is NUL-terminated; the descriptor is owned below.
+    let fd = raw_errno(unsafe {
+        raw_syscall(
+            libc::SYS_openat,
+            [
+                dirfd as u64,
+                name.as_ptr() as u64,
+                (libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64,
+                0,
+                0,
+                0,
+            ],
+        )
+    })? as i32;
+    let fd = WalkFd(fd);
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `fd` is open and `stat` is writable.
+    raw_errno(unsafe {
+        raw_syscall(
+            libc::SYS_fstat,
+            [fd.0 as u64, stat.as_mut_ptr() as u64, 0, 0, 0, 0],
+        )
+    })?;
+    // SAFETY: the call succeeded and initialized the structure.
+    Ok((fd, unsafe { stat.assume_init() }))
+}
+
+/// The bytes of the symbolic link `fd` (`O_PATH`) holds, or the kernel's name
+/// of any object `fd` holds when `fd` is read through `/proc/self/fd`.
+fn walk_readlink(dirfd: i32, name: &std::ffi::CStr) -> Option<Vec<u8>> {
+    let mut bytes = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: the name is NUL-terminated and `bytes` is writable for its
+    // length.
+    let length = raw_errno(unsafe {
+        raw_syscall(
+            libc::SYS_readlinkat,
+            [
+                dirfd as u64,
+                name.as_ptr() as u64,
+                bytes.as_mut_ptr() as u64,
+                bytes.len() as u64,
+                0,
+                0,
+            ],
+        )
+    })
+    .ok()? as usize;
+    bytes.truncate(length);
+    Some(bytes)
+}
+
+/// The kernel's name of the object descriptor `fd` holds.
+fn kernel_name(fd: i32) -> Option<Vec<u8>> {
+    walk_readlink(
+        libc::AT_FDCWD,
+        &std::ffi::CString::new(format!("/proc/self/fd/{fd}")).ok()?,
+    )
+}
+
+/// The names of `path` to walk, as `link_path_walk` takes them (fs/namei.c):
+/// empty names and `.` change nothing and are dropped, except that a final
+/// `/` or `.` makes the last name one the lookup follows and requires to be
+/// a directory (`LOOKUP_FOLLOW | LOOKUP_DIRECTORY`), kept as a final `.`.
+fn walk_names(path: &[u8]) -> std::collections::VecDeque<Vec<u8>> {
+    let mut names: std::collections::VecDeque<Vec<u8>> = path
+        .split(|byte| *byte == b'/')
+        .filter(|name| !name.is_empty() && *name != b".")
+        .map(<[u8]>::to_vec)
+        .collect();
+    if path
+        .rsplit(|byte| *byte == b'/')
+        .next()
+        .is_some_and(|last| last.is_empty() || last == b".")
+    {
+        names.push_back(b".".to_vec());
+    }
+    names
+}
+
+/// Where Detcore's own walk of a path ends.
+enum Walked {
+    /// The object it reaches, without following a final symbolic link.
+    Reached(WalkFd),
+    /// A step Detcore cannot take for the guest, so that it takes the
+    /// kernel's lookup of the whole path instead (`kernel_lookup`).
+    Unclassified,
+}
+
+/// Linux's lookup of the absolute path `path` (no final link followed),
+/// taken one name at a time, each by `openat(O_PATH | O_NOFOLLOW)`, so that
+/// no kernel lookup follows a symbolic link and Detcore counts every link
+/// itself, from `links` already followed by the guest's walk to `path`.
+///
+/// So the count does not depend on the host: Linux keeps a lookup's count
+/// across the restart of its RCU walk in reference mode (`set_nameidata`
+/// once, then `path_lookupat` or `path_openat` again), which a mount or
+/// rename anywhere on the host forces, so a kernel lookup of many links can
+/// fail with ELOOP below the budget.
+///
+/// Linux's rules, as fs/namei.c v6.12 takes them: each symbolic link the
+/// walk follows costs one (`reserve_stack`; ELOOP past [`MAXSYMLINKS`]); a
+/// link before the last name is always followed (`walk_component`, then
+/// `step_into`), and the last only before a final `/` or `.` ([`walk_names`],
+/// `lookup_last`); an absolute link restarts at the root (`nd_jump_root`),
+/// which is the guest's (the tool shares it where Detcore answers); an
+/// empty link is ENOENT (`get_link`); `..` is the kernel's own, taken from
+/// the directory reached (`handle_dots`), across mount roots and at the
+/// root; and ENOTDIR, ENOENT or any other refusal is the kernel's answer to
+/// that one name (`Ok(None)` here, as for any failed lookup, so that the
+/// backend answers the call).
+///
+/// What the tool's procfs cannot show the guest's: the task directories
+/// `/proc/<n>`, `/proc/self` and `/proc/thread-self` name hermit's own tasks
+/// in the tool, not the guest's. `self` and `thread-self` are recognised by
+/// identity, as symbolic links on the guest's procfs mount inside its root
+/// (`PROC_ROOT_INO`) to `<n>` or `<n>/task/<n>`: each costs one link and
+/// enters the caller's own task directory, which always exists, where the
+/// walk can only climb back out by `..`. Any other step into or below a task
+/// directory, a magic link above all, and any other procfs link, is
+/// [`Walked::Unclassified`].
+fn walk_counting_links(path: &[u8], mut links: usize) -> Result<Option<Walked>, Errno> {
+    if !path.starts_with(b"/") {
+        return Ok(Some(Walked::Unclassified));
+    }
+    let procfs = proc_device();
+    let is_procfs_root =
+        |stat: &libc::stat| Some(stat.st_dev) == procfs && stat.st_ino == PROC_ROOT_INO;
+    let Ok((root, root_stat)) = walk_open(libc::AT_FDCWD, b"/") else {
+        return Ok(None);
+    };
+    let mut current: Option<(WalkFd, libc::stat)> = None;
+    let mut names = walk_names(path);
+    // How deep below `current`, a procfs root, the walk is in the caller's
+    // own task directory, entered by `self` or `thread-self`.
+    let mut task_depth = 0usize;
+    while let Some(name) = names.pop_front() {
+        if task_depth > 0 {
+            match name.as_slice() {
+                b".." => task_depth -= 1,
+                // A final `.`: the task directory itself, no system directory.
+                b"." if names.is_empty() => return Ok(None),
+                _ => return Ok(Some(Walked::Unclassified)),
+            }
+            continue;
+        }
+        let (dirfd, dir_stat) = current
+            .as_ref()
+            .map_or((root.0, &root_stat), |(fd, stat)| (fd.0, stat));
+        let Ok((fd, stat)) = walk_open(dirfd, &name) else {
+            return Ok(None);
+        };
+        let kind = stat.st_mode & libc::S_IFMT;
+        if kind == libc::S_IFLNK && !names.is_empty() {
+            links += 1;
+            if links > MAXSYMLINKS {
+                return Err(Errno::ELOOP);
+            }
+            let Some(target) = walk_readlink(fd.0, c"") else {
+                return Ok(None);
+            };
+            if Some(stat.st_dev) == procfs {
+                let numbers: Vec<&[u8]> = target.split(|byte| *byte == b'/').collect();
+                let number = |name: &[u8]| !name.is_empty() && name.iter().all(u8::is_ascii_digit);
+                let own_task = match numbers.as_slice() {
+                    [pid] => number(pid),
+                    [pid, b"task", tid] => number(pid) && number(tid),
+                    _ => false,
+                };
+                if !is_procfs_root(dir_stat) || !own_task {
+                    return Ok(Some(Walked::Unclassified));
+                }
+                task_depth = numbers.len();
+                continue;
+            }
+            if target.is_empty() {
+                return Ok(None);
+            }
+            if target.starts_with(b"/") {
+                current = None;
+            }
+            for linked in walk_names(&target).into_iter().rev() {
+                names.push_front(linked);
+            }
+            continue;
+        }
+        if kind == libc::S_IFDIR && is_procfs_root(dir_stat) && name != b".." {
+            let task = kernel_name(fd.0).is_some_and(|name| {
+                name.strip_prefix(b"/proc/")
+                    .is_some_and(|rest| !rest.is_empty() && rest.iter().all(u8::is_ascii_digit))
+            });
+            if task {
+                return Ok(Some(Walked::Unclassified));
+            }
+        }
+        current = Some((fd, stat));
+    }
+    if task_depth > 0 {
+        return Ok(None);
+    }
+    Ok(Some(Walked::Reached(match current {
+        Some((fd, _)) => fd,
+        None => root,
+    })))
+}
+
+/// The kernel's lookup of the whole of the absolute path `path`, without
+/// following a final symbolic link: the object, or `None`. Linux counts the
+/// links of this one lookup, and a restart can inflate the count
+/// ([`walk_counting_links`]); it is taken only for a path Detcore's walk
+/// cannot take for the guest, as it was taken for every path before.
+fn kernel_lookup(path: &[u8]) -> Option<WalkFd> {
+    walk_open(libc::AT_FDCWD, path).ok().map(|(fd, _)| fd)
+}
+
 /// The name of the procfs directory that a lookup of the absolute path `path`
 /// reaches, without following a final symbolic link, if it reaches one: a
 /// directory on the guest's procfs mount ([`proc_device`]), named as the
@@ -376,63 +610,46 @@ pub(super) fn proc_device() -> Option<u64> {
 /// guest's mount namespace ([`GuestProcfs`]), so this is the object, and the
 /// name, the guest's own lookup reaches: a user mount over part of `/proc`
 /// reaches its own objects, on another device, and a symbolic link is no
-/// directory. `None` for any other object, or one the lookup does not reach.
-pub(super) fn procfs_directory_reached(path: &Path) -> Option<PathBuf> {
-    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    // SAFETY: the path is NUL-terminated; the descriptor is closed below.
-    let fd = raw_errno(unsafe {
+/// directory. `Ok(None)` for any other object, or one the lookup does not
+/// reach.
+///
+/// Detcore walks `path` itself ([`walk_counting_links`]), with `links`
+/// symbolic links already followed by the guest's walk to it, so that one
+/// `MAXSYMLINKS` budget covers the whole lookup: `Err(ELOOP)` past it. A
+/// path whose walk Detcore cannot take for the guest is decided by the
+/// kernel's lookup of the whole of it ([`kernel_lookup`]), which counts its
+/// own links only.
+pub(super) fn procfs_directory_reached(
+    path: &Path,
+    links: usize,
+) -> Result<Option<PathBuf>, Errno> {
+    let bytes = path.as_os_str().as_bytes();
+    let fd = match walk_counting_links(bytes, links)? {
+        None => return Ok(None),
+        Some(Walked::Reached(fd)) => fd,
+        Some(Walked::Unclassified) => match kernel_lookup(bytes) {
+            Some(fd) => fd,
+            None => return Ok(None),
+        },
+    };
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: `fd` is open and `stat` is writable.
+    if raw_errno(unsafe {
         raw_syscall(
-            libc::SYS_openat,
-            [
-                libc::AT_FDCWD as u64,
-                path.as_ptr() as u64,
-                (libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64,
-                0,
-                0,
-                0,
-            ],
+            libc::SYS_fstat,
+            [fd.0 as u64, stat.as_mut_ptr() as u64, 0, 0, 0, 0],
         )
     })
-    .ok()? as i32;
-    let reached = (|| {
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
-        // SAFETY: `fd` is open and `stat` is writable.
-        raw_errno(unsafe {
-            raw_syscall(
-                libc::SYS_fstat,
-                [fd as u64, stat.as_mut_ptr() as u64, 0, 0, 0, 0],
-            )
-        })
-        .ok()?;
-        // SAFETY: the call succeeded and initialized the structure.
-        let stat = unsafe { stat.assume_init() };
-        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR || proc_device() != Some(stat.st_dev) {
-            return None;
-        }
-        let link = std::ffi::CString::new(format!("/proc/self/fd/{fd}")).ok()?;
-        let mut name = vec![0u8; libc::PATH_MAX as usize];
-        // SAFETY: the link is NUL-terminated and `name` is writable for its
-        // length.
-        let length = raw_errno(unsafe {
-            raw_syscall(
-                libc::SYS_readlinkat,
-                [
-                    libc::AT_FDCWD as u64,
-                    link.as_ptr() as u64,
-                    name.as_mut_ptr() as u64,
-                    name.len() as u64,
-                    0,
-                    0,
-                ],
-            )
-        })
-        .ok()? as usize;
-        name.truncate(length);
-        Some(PathBuf::from(std::ffi::OsString::from_vec(name)))
-    })();
-    // SAFETY: `fd` is the descriptor opened above, closed once.
-    let _ = unsafe { raw_syscall(libc::SYS_close, [fd as u64, 0, 0, 0, 0, 0]) };
-    reached
+    .is_err()
+    {
+        return Ok(None);
+    }
+    // SAFETY: the call succeeded and initialized the structure.
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR || proc_device() != Some(stat.st_dev) {
+        return Ok(None);
+    }
+    Ok(kernel_name(fd.0).map(|name| PathBuf::from(std::ffi::OsString::from_vec(name))))
 }
 
 /// The rendered file among `paths` that the kernel's procfs inode
