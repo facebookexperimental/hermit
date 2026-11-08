@@ -36391,7 +36391,7 @@
       "backend": "ptrace",
       "category": "applications",
       "classification": "required",
-      "cpu_timeout_seconds": 22,
+      "cpu_timeout_seconds": 34,
       "lane": "portable",
       "mode": "verify",
       "requires": [
@@ -36402,7 +36402,7 @@
         "python3"
       ],
       "test": "applications/example-timed-progress-bar",
-      "timeout_seconds": 180
+      "timeout_seconds": 272
     },
     {
       "backend": "kvm",

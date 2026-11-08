@@ -118,6 +118,12 @@ test:
         backends_disabled:
           native: Elapsed time changes, but the final progress-bar output is intentionally stable
       verify:
+        timeout_seconds:
+          ptrace: 272
+        cpu_timeout_seconds:
+          ptrace: 34
+        slow_reason:
+          ptrace: Measured allowance for this identical 50 x 20 ms workload from 291 retained verify/ptrace rows over the 7 days before 2026-11-08 on the measurement host named in docs/TESTING_ENVIRONMENTS.md (Named measurement hosts), CPU median 12.16 seconds, p90 15.81, completed max 21.72, and loaded attempts censored at the ordinary 22-second cap (up to 22.07 CPU seconds). 34 is ceil(1.5 x 22.07) under the owner's 2026-11-01 formula; wall is the standard 8x CPU allowance, 272 seconds, below the 600-second maximum. Because 22.07 is censored, this may still be short; record the post-change timeout rate over the next 50 verify/ptrace runs, and propose occasional placement if any still time out. The underlying cost is one ptrace stop per busy-poll clock read.
         ci:
           ptrace: true
           # DBT timed-progress: 20/20 strict canonical pairs at ed4a5dd9, plus c0216c84 control; full 50 x 20 ms example.
