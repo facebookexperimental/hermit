@@ -6,11 +6,14 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-// Looks up the CPUs and NUMA nodes other than number 0 that the sysfs
-// listings leave out, and registers an rseq area, and prints what each call
-// returns. Under Hermit, which presents one CPU and one node, every lookup
-// fails with ENOENT, and rseq fails with ENOSYS under the default policy;
-// natively, on a host with more than one CPU, the cpu1 lookups succeed.
+// Looks up the CPUs other than number 0 and every NUMA node that the
+// sysfs listings leave out, and registers an rseq area, and prints what
+// each call returns. Under Hermit, which presents one CPU and a kernel
+// without NUMA, every such lookup fails with ENOENT, and rseq fails
+// with ENOSYS under the default policy; natively, on a host with more
+// than one CPU, the cpu1 lookups succeed. Its `backlinks` mode lists a
+// present CPU's directory and looks up its `node<N>` backlink by every
+// spelling, which a kernel without NUMA does not create.
 //
 // The lookups name the absent entry absolutely, below it, relative to a
 // directory descriptor, through /sys/bus (including the processor driver's
@@ -45,6 +48,33 @@ static void open_and_close(const char *path) {
     }
 }
 
+static int bound_entry(const char *path, const char *name);
+
+static void probe_backlink(const char *path) {
+    char label[512];
+    struct stat st;
+    open_and_close(path);
+
+    snprintf(label, sizeof(label), "stat %s", path);
+    report(label, stat(path, &st));
+    snprintf(label, sizeof(label), "lstat %s", path);
+    report(label, lstat(path, &st));
+    char target[256];
+    snprintf(label, sizeof(label), "readlink %s", path);
+    report(label, (int)readlink(path, target, sizeof(target)));
+}
+
+static int backlinks(void) {
+    int failed = bound_entry("/sys/devices/system/cpu/cpu0", "node0");
+    failed |= bound_entry("/sys/bus/cpu/devices/cpu0", "node0");
+    probe_backlink("/sys/devices/system/cpu/cpu0/node0");
+    probe_backlink("/sys/bus/cpu/devices/cpu0/node0");
+    probe_backlink("/sys/bus/cpu/drivers/processor/cpu0/node0");
+    open_and_close("/sys/devices/system/cpu/cpu0/node0/cpulist");
+    open_and_close("/sys/devices/system/cpu/cpu0/topology/core_id");
+    return failed;
+}
+
 struct rseq_area {
     uint32_t cpu_id_start;
     uint32_t cpu_id;
@@ -77,6 +107,9 @@ static int bound_entry(const char *path, const char *name) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "backlinks") == 0) {
+        return backlinks();
+    }
     if (argc == 4 && strcmp(argv[1], "bound") == 0) {
         return bound_entry(argv[2], argv[3]);
     }

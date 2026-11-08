@@ -921,7 +921,9 @@ pub enum Comparator {
     Stripped,
 }
 
-/// The one nonzero guest disposition a verify cell requires.
+/// The one guest disposition a verify cell requires: nonzero there, while
+/// a replay recipe may instead restate success where record mode answers
+/// a different disposition from run mode.
 ///
 /// Hermit's default `--verify` policy rejects a first run that does not exit
 /// 0, so a guest that fails on purpose never reaches a comparison. Naming the
@@ -1020,11 +1022,14 @@ fn inherited<'a, T>(
     inherited_recipes(cell).find_map(pick)
 }
 
-/// The recipe whose declared guest exit and stdout a cell's verdict checks.
+/// The recipe whose declared stdout (and, absent a replay override, guest
+/// exit) a cell's verdict checks.
 ///
-/// Validation admits those declarations only on a verify recipe, so a replay
+/// Validation admits stdout declarations only on a verify recipe, so a replay
 /// cell reads its verify recipe's, and no other mode has any; the same field
-/// on another mode's recipe is not authority for a pass there.
+/// on another mode's recipe is not authority for a pass there. A replay
+/// recipe may declare its own guest exit instead (see
+/// [`cell_expected_guest_exit`]).
 fn expectation_recipe(cell: &SelectedCell) -> Option<&ModeRecipe> {
     matches!(cell.id.mode.as_str(), "verify" | "replay")
         .then(|| cell.test.modes.get("verify"))
@@ -1066,7 +1071,22 @@ fn cell_mode_env(cell: &SelectedCell) -> BTreeMap<String, String> {
 }
 
 /// The declared guest disposition for a selected verify or replay cell.
+///
+/// A replay recipe's own declaration wins for its cell, so record mode can
+/// require success (or another exact disposition) where its verify recipe
+/// requires a failure; without one a replay cell inherits verify's, as
+/// [`expectation_recipe`] chooses for its stdout.
 pub fn cell_expected_guest_exit(cell: &SelectedCell) -> Option<ExpectedGuestExit> {
+    if cell.id.mode == "replay" {
+        let own = cell
+            .test
+            .modes
+            .get("replay")
+            .and_then(|recipe| recipe.expected_guest_exit.clone());
+        if own.is_some() {
+            return own;
+        }
+    }
     expectation_recipe(cell)?.expected_guest_exit.clone()
 }
 
@@ -1464,52 +1484,54 @@ pub fn validate_expected_guest_exit(
     let Some(expected) = expected else {
         return Ok(());
     };
-    if mode != "verify" {
+    if !matches!(mode, "verify" | "replay") {
         return Err(format!(
-            "{id}: expected_guest_exit is supported only by verify mode"
+            "{id}: expected_guest_exit is supported only by verify and replay modes"
         ));
     }
     match (expected.code, expected.signal) {
+        // A replay declaration restates record mode's disposition, which
+        // may be the success a verify declaration cannot name.
+        (Some(code), None) if mode == "replay" && (0..=255).contains(&code) => {}
         (Some(code), None) if (1..=255).contains(&code) => {}
         (Some(code), None) => {
             return Err(format!(
-                "{id}: verify expected_guest_exit.code must be a nonzero exit status in 1..=255, not {code}"
+                "{id}: {mode} expected_guest_exit.code must be an exit status in {}..=255, not {code}",
+                if mode == "replay" { 0 } else { 1 }
             ));
         }
         (None, Some(signal)) if (1..=64).contains(&signal) => {}
         (None, Some(signal)) => {
             return Err(format!(
-                "{id}: verify expected_guest_exit.signal must be a signal number in 1..=64, not {signal}"
+                "{id}: {mode} expected_guest_exit.signal must be a signal number in 1..=64, not {signal}"
             ));
         }
         _ => {
             return Err(format!(
-                "{id}: verify expected_guest_exit must name exactly one of code or signal"
+                "{id}: {mode} expected_guest_exit must name exactly one of code or signal"
             ));
         }
     }
     if expected.reason.trim().is_empty() {
         return Err(format!(
-            "{id}: verify expected_guest_exit.reason must be substantive"
+            "{id}: {mode} expected_guest_exit.reason must be substantive"
         ));
     }
     Ok(())
 }
 
 /// Check a declared guest exit that a result row, or a series row built from
-/// one, carries in `mode`. A replay cell inherits its verify recipe's
-/// declaration ([`cell_expected_guest_exit`]) and passes on it only through
-/// the verify cell's gate (a matched canonical replay whose guest and Hermit
-/// both end exactly that way), so a row may carry it in verify or replay mode.
-/// A recipe may still declare it only in verify mode
-/// ([`validate_expected_guest_exit`]).
+/// one, carries in `mode`. A replay cell carries its own replay recipe's
+/// declaration where it has one, else its verify recipe's
+/// ([`cell_expected_guest_exit`]), and passes on it only through the verify
+/// cell's gate (a matched canonical replay whose guest and Hermit both end
+/// exactly that way), so a row is checked by its own mode's rules.
 pub fn validate_result_expected_guest_exit(
     id: &str,
     mode: &str,
     expected: Option<&ExpectedGuestExit>,
 ) -> Result<(), String> {
-    let recipe_mode = if mode == "replay" { "verify" } else { mode };
-    validate_expected_guest_exit(id, recipe_mode, expected)
+    validate_expected_guest_exit(id, mode, expected)
 }
 
 /// Whether `hermit_args`, an attempt's argv before the guest separator, is an
@@ -27457,8 +27479,11 @@ cp "{}" "$verdict"
         );
     }
 
-    /// Only a verify cell carries a declaration; the same recipe field on any
-    /// other mode is not authority for a nonzero pass there.
+    /// Only verify and replay cells carry a declaration (a replay cell its
+    /// own, where declared; here its recipe's field is what
+    /// `cell_expected_guest_exit` reads, with no verify recipe beside it);
+    /// the same recipe field on any other mode is not authority for a
+    /// nonzero pass there.
     #[test]
     fn only_a_verify_cell_carries_its_declared_expected_exit() {
         let mut verify = ptrace_cell("verify");
@@ -27472,7 +27497,7 @@ cp "{}" "$verdict"
             cell_expected_guest_exit(&verify),
             Some(expected_exit(Some(3), None))
         );
-        for mode in ["chaos", "replay", "naked"] {
+        for mode in ["chaos", "naked"] {
             let mut other = ptrace_cell(mode);
             other.test.modes.get_mut(mode).unwrap().expected_guest_exit =
                 Some(expected_exit(Some(3), None));
@@ -27533,9 +27558,9 @@ cp "{}" "$verdict"
         assert_ne!(undeclared.outcome, "PASS", "{:?}", undeclared.reason);
     }
 
-    /// A result row may carry a declared guest exit in verify or replay mode,
-    /// since a replay cell inherits its verify recipe's declaration, while a
-    /// recipe may declare one only in verify mode. A reader credits it only
+    /// A result row may carry a declared guest exit in verify or replay mode:
+    /// a replay cell carries its own replay recipe's declaration where it
+    /// has one, else its verify recipe's. A reader credits it only
     /// from the invocation the runner writes for it: a verify comparison with
     /// `--verify-allow=failure`, or a replay's `record start`, whose
     /// comparison takes `--verify-allow=both`.
@@ -27551,9 +27576,11 @@ cp "{}" "$verdict"
                 "{mode}"
             );
         }
-        assert!(validate_expected_guest_exit("recipe", "replay", Some(&expected)).is_err());
+        validate_expected_guest_exit("recipe", "replay", Some(&expected)).unwrap();
         let zero = expected_exit(Some(0), None);
-        assert!(validate_result_expected_guest_exit("row", "replay", Some(&zero)).is_err());
+        validate_result_expected_guest_exit("row", "replay", Some(&zero)).unwrap();
+        assert!(validate_expected_guest_exit("recipe", "verify", Some(&zero)).is_err());
+        assert!(validate_result_expected_guest_exit("row", "verify", Some(&zero)).is_err());
         let verify = ["hermit", "run", "--verify-allow=failure"];
         let replay = [
             "hermit-verify-pair",
@@ -27573,6 +27600,37 @@ cp "{}" "$verdict"
             &["hermit", "log-diff", "--verify-allow=both", "hermit", "run"]
         ));
         assert!(!invocation_admits_declared_guest_exit("chaos", &replay));
+    }
+
+    /// A replay recipe may declare its own expected guest exit where record
+    /// mode answers a different disposition from run mode, success
+    /// included; it wins over the verify recipe's declaration for the
+    /// replay cell alone, and its result row may carry that success.
+    #[test]
+    fn a_replay_recipe_may_override_the_inherited_expected_exit_with_success() {
+        let base = ptrace_cell("verify").test.modes["verify"].clone();
+        let mut verify = base.clone();
+        verify.expected_guest_exit = Some(expected_exit(Some(1), None));
+        let mut replay = base.clone();
+        replay.expected_guest_exit = Some(expected_exit(Some(0), None));
+        validate_expected_guest_exit(
+            "fixture/test",
+            "replay",
+            replay.expected_guest_exit.as_ref(),
+        )
+        .unwrap();
+        let cell = replay_cell_with_verify(verify.clone(), replay);
+        assert_eq!(
+            cell_expected_guest_exit(&cell),
+            Some(expected_exit(Some(0), None))
+        );
+        let inherited = replay_cell_with_verify(verify, base);
+        assert_eq!(
+            cell_expected_guest_exit(&inherited),
+            Some(expected_exit(Some(1), None))
+        );
+        validate_result_expected_guest_exit("row", "replay", Some(&expected_exit(Some(0), None)))
+            .unwrap();
     }
 
     fn replay_cell_with_verify(verify: ModeRecipe, replay: ModeRecipe) -> SelectedCell {
@@ -28740,11 +28798,11 @@ cp "{}" "$verdict"
         for (expected, message) in [
             (
                 expected_exit(Some(0), None),
-                "code must be a nonzero exit status",
+                "code must be an exit status in 1..=255",
             ),
             (
                 expected_exit(Some(256), None),
-                "code must be a nonzero exit status",
+                "code must be an exit status in 1..=255",
             ),
             (
                 expected_exit(None, Some(0)),
@@ -28773,7 +28831,7 @@ cp "{}" "$verdict"
         assert!(
             check("chaos", expected_exit(Some(7), None))
                 .unwrap_err()
-                .contains("supported only by verify mode")
+                .contains("supported only by verify and replay modes")
         );
     }
 

@@ -82,6 +82,20 @@ pub(super) enum Lookups {
     MessageAddress,
 }
 
+/// How a descriptor might name a real procfs task directory under record
+/// and replay ([`Detcore::recordreplay_task_directory_candidate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordTaskDirectoryCandidate {
+    /// It does not: no placeholder task directory, and no recorded opening
+    /// path naming a process or thread directory.
+    No,
+    /// A placeholder bound to a process or thread directory at its open.
+    Placeholder,
+    /// A real descriptor whose recorded opening path names a process or
+    /// thread directory, still to be authenticated against the descriptor.
+    Spelling,
+}
+
 /// What `sysno` looks up.
 ///
 /// Calls Detcore refuses whatever their path names (`mount` and its family,
@@ -1230,10 +1244,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         fd: RawFd,
     ) -> bool {
+        self.recorded_descriptor_on_procfs(guest, fd)
+            .await
+            .unwrap_or(true)
+    }
+
+    /// [`Self::recorded_descriptor_is_on_procfs`] without its fail-closed
+    /// default: `None` where there is no page for the question.
+    async fn recorded_descriptor_on_procfs<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Option<bool> {
         const LENGTH: usize = std::mem::size_of::<libc::statfs>();
-        let Some(page) = map_transient(guest, LENGTH).await else {
-            return true;
-        };
+        let page = map_transient(guest, LENGTH).await?;
         let mut contents = [0u8; LENGTH];
         let answered = self
             .record_or_replay(
@@ -1248,9 +1272,107 @@ impl<T: RecordOrReplay> Detcore<T> {
             && guest.memory().read_exact(page, &mut contents).is_ok();
         unmap_transient(guest, page, LENGTH).await;
         // `f_type` is the first field.
-        answered
-            && i64::from_ne_bytes(contents[..8].try_into().expect("8 bytes"))
-                == libc::PROC_SUPER_MAGIC
+        Some(
+            answered
+                && i64::from_ne_bytes(contents[..8].try_into().expect("8 bytes"))
+                    == libc::PROC_SUPER_MAGIC,
+        )
+    }
+
+    /// How the descriptor `fd` might name a real task directory under record
+    /// and replay, from the open file description Detcore kept at its open:
+    /// a placeholder bound to a process or thread directory is that
+    /// directory by construction; a real descriptor is only a candidate from
+    /// its recorded opening path, for [`Self::recordreplay_task_directory`]
+    /// to authenticate against the descriptor itself. Neither a link itself
+    /// nor a missing or non-task spelling is one.
+    fn recordreplay_task_directory_candidate<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        fd: RawFd,
+    ) -> RecordTaskDirectoryCandidate {
+        if !self.cfg.recordreplay_modes {
+            return RecordTaskDirectoryCandidate::No;
+        }
+        let Ok((path, placeholder, link_itself)) = guest.thread_state().with_detfd(fd, |detfd| {
+            (
+                detfd.path(),
+                detfd.placeholder(),
+                detfd.procfs_link_itself(),
+            )
+        }) else {
+            return RecordTaskDirectoryCandidate::No;
+        };
+        if link_itself {
+            return RecordTaskDirectoryCandidate::No;
+        }
+        if let Some(state) = placeholder {
+            return match state.directory {
+                crate::procfs::fd_directory::PlaceholderDirectory::Task(binding)
+                    if matches!(
+                        binding.kind,
+                        crate::procfs::fd_directory::TaskDirectoryKind::Process
+                            | crate::procfs::fd_directory::TaskDirectoryKind::Thread
+                    ) =>
+                {
+                    RecordTaskDirectoryCandidate::Placeholder
+                }
+                _ => RecordTaskDirectoryCandidate::No,
+            };
+        }
+        match path {
+            Some(path)
+                if matches!(
+                    crate::procfs::listing::classify(&path, 0, 0),
+                    Some(
+                        crate::procfs::listing::ModeledDirectory::Process(_)
+                            | crate::procfs::listing::ModeledDirectory::Thread(..)
+                    )
+                ) =>
+            {
+                RecordTaskDirectoryCandidate::Spelling
+            }
+            _ => RecordTaskDirectoryCandidate::No,
+        }
+    }
+
+    /// Whether `fd` is authenticated as a real procfs task directory under
+    /// record and replay: a placeholder task directory is one by
+    /// construction, and a real descriptor is one when its recorded
+    /// opening path names a task directory and the descriptor itself,
+    /// asked through the recording, is on procfs. The path alone is not
+    /// authentication: a user bind over that spelling is on another
+    /// filesystem and keeps its entries. Where the question cannot be
+    /// asked (no transient page, no descriptor, no recorded path), it is
+    /// not authenticated.
+    pub(crate) async fn recordreplay_task_directory<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> bool {
+        match self.recordreplay_task_directory_candidate(guest, fd) {
+            RecordTaskDirectoryCandidate::Placeholder => true,
+            RecordTaskDirectoryCandidate::Spelling => {
+                self.recorded_descriptor_on_procfs(guest, fd).await == Some(true)
+            }
+            RecordTaskDirectoryCandidate::No => false,
+        }
+    }
+
+    /// Whether a `getdents` of `fd` under record and replay must omit
+    /// exactly `numa_maps`: the descriptor is a candidate task directory
+    /// (see [`Self::recordreplay_task_directory_candidate`]). Authentication
+    /// itself is left to the filtering, so a call that no candidate names
+    /// keeps the direct recorded path.
+    pub(crate) fn recordreplay_task_directory_candidate_for<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        fd: RawFd,
+    ) -> bool {
+        !matches!(
+            self.recordreplay_task_directory_candidate(guest, fd),
+            RecordTaskDirectoryCandidate::No
+        )
     }
 
     /// Whether the descriptor `fd` is on the named filesystem, as the

@@ -18680,7 +18680,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let virtualize = guest.config().virtualize_metadata;
         if !virtualize
             && (call.dirent().is_none()
-                || !self.is_caller_descriptor_table(guest, call.fd() as i32))
+                || (!self.recordreplay_task_directory_candidate_for(guest, call.fd() as i32)
+                    && !self.is_caller_descriptor_table(guest, call.fd() as i32)))
         {
             return Ok(self.record_or_replay(guest, call).await?);
         }
@@ -18709,7 +18710,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let virtualize = guest.config().virtualize_metadata;
         if !virtualize
             && (call.dirent().is_none()
-                || !self.is_caller_descriptor_table(guest, call.fd() as i32))
+                || (!self.recordreplay_task_directory_candidate_for(guest, call.fd() as i32)
+                    && !self.is_caller_descriptor_table(guest, call.fd() as i32)))
         {
             return Ok(self.record_or_replay(guest, call).await?);
         }
@@ -19453,6 +19455,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         entries: &mut Vec<DirEntry>,
     ) -> Result<(), Error> {
         if self.cfg.recordreplay_modes {
+            // One name is still dropped under record and replay:
+            // `numa_maps` in an authenticated real task directory (see
+            // [`Self::recordreplay_task_directory`]). It is in no `--proc`
+            // level, so run mode never lists it, and a recording made now
+            // must not list it either, even though every other recorded
+            // listing is served as recorded.
+            if self.recordreplay_task_directory(guest, fd).await {
+                entries.retain(|entry| entry.name != b"numa_maps");
+            }
             return Ok(());
         }
         let link = format!("{}/fd/{fd}", self.caller_proc_directory(guest));
@@ -19662,6 +19673,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         // The longest any call wrote: a reissued call can write less than the
         // one before it, whose dropped names lie past it.
         let virtualize = guest.config().virtualize_metadata;
+        // Under record and replay without metadata virtualization, one name
+        // is still dropped: `numa_maps` in an authenticated task directory.
+        let omit_recorded_numa_maps =
+            !virtualize && self.recordreplay_task_directory(guest, call.fd).await;
         let mut written = 0;
         let mut dropped = false;
         let (len, mut entries) = loop {
@@ -19700,6 +19715,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 entries.retain(|entry| {
                     !runtime_owned_descriptor_entry(&entry.name, |fd| guest.is_runtime_owned_fd(fd))
                 });
+                if omit_recorded_numa_maps {
+                    entries.retain(|entry| entry.name != b"numa_maps");
+                }
                 if entries.len() == original && !dropped {
                     return Ok(len as i64);
                 }

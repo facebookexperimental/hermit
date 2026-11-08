@@ -1407,8 +1407,9 @@ fn validate_mode_with_cpu(
         ]),
         // A replay cell may restate the environment it records with, an empty
         // mapping included (runner::cell_mode_env); otherwise it inherits its
-        // verify cell's.
-        "replay" => allowed.push("env"),
+        // verify cell's. It may likewise declare its own expected guest
+        // exit where record mode answers a different disposition.
+        "replay" => allowed.extend(["env", "expected_guest_exit"]),
         _ => {}
     }
     ensure_keys(spec_value, &allowed, &format!("{id}.modes.{mode}"));
@@ -1488,6 +1489,14 @@ fn validate_mode_with_cpu(
         let expected_guest_exit: Option<ExpectedGuestExit> =
             spec.get("expected_guest_exit").map(|value| {
                 parse_schema_value(value, &format!("{id}: modes.verify.expected_guest_exit"))
+            });
+        validate_expected_guest_exit(id, mode, expected_guest_exit.as_ref())
+            .unwrap_or_else(|error| die(error));
+    }
+    if mode == "replay" {
+        let expected_guest_exit: Option<ExpectedGuestExit> =
+            spec.get("expected_guest_exit").map(|value| {
+                parse_schema_value(value, &format!("{id}: modes.replay.expected_guest_exit"))
             });
         validate_expected_guest_exit(id, mode, expected_guest_exit.as_ref())
             .unwrap_or_else(|error| die(error));
@@ -2380,7 +2389,7 @@ in-guest-trap = "unsupported"
     }
 
     #[test]
-    #[should_panic(expected = "expected_guest_exit.code must be a nonzero exit status")]
+    #[should_panic(expected = "verify expected_guest_exit.code must be an exit status in 1..=255")]
     fn rejects_expected_guest_exit_of_success() {
         let spec = parse_mode(
             r#"

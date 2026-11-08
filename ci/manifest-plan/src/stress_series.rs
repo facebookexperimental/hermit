@@ -2337,7 +2337,7 @@ mod tests {
         cases.push(("no attempts", other, "attempts must be nonempty"));
         let mut other = base();
         declared(&mut other).code = Some(0);
-        cases.push(("code 0", other, "code must be a nonzero exit status"));
+        cases.push(("code 0", other, "code must be an exit status in 1..=255"));
         let mut other = base();
         declared(&mut other).signal = Some(11);
         cases.push(("code and signal", other, "exactly one of code or signal"));
@@ -2359,7 +2359,11 @@ mod tests {
         ));
         let mut other = base();
         other.series.cell = "fixture/test/chaos/ptrace".into();
-        cases.push(("chaos mode", other, "supported only by verify mode"));
+        cases.push((
+            "chaos mode",
+            other,
+            "supported only by verify and replay modes",
+        ));
         let mut other = base();
         other.series.attempt = None;
         cases.push((

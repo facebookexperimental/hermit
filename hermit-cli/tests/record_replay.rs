@@ -3379,6 +3379,55 @@ fn record_replay_serves_a_directory_seek_from_the_recording() {
     );
 }
 
+/// A recording and its replay omit `numa_maps` from listings of a real
+/// task directory, as run mode on Detcore's kernel without NUMA does,
+/// while other task files stay and an ordinary directory's own file of
+/// that name remains listed. The guest's lines name no task number, so
+/// canonical comparison distinguishes the listing itself.
+#[test]
+fn record_replay_omits_numa_maps_from_task_directory_listings() {
+    let _guard = hermit_record_lock();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest build directory");
+    let guest = build.path().join("record_replay_procfs_listing");
+    let output = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(repository.join("tests/c/record_replay_procfs_listing.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile tests/c/record_replay_procfs_listing.c");
+    assert!(
+        output.status.success(),
+        "tests/c/record_replay_procfs_listing.c failed to compile:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let ordinary = build.path().join("ordinary");
+    fs::create_dir(&ordinary).expect("failed to create the ordinary directory");
+    fs::write(ordinary.join("numa_maps"), b"guest-owned\n")
+        .expect("failed to create the ordinary directory's numa_maps");
+    fs::write(ordinary.join("other"), b"guest-owned\n")
+        .expect("failed to create the ordinary directory's other entry");
+    let output = canonical_record_replay_command(
+        "procfs task-directory listing",
+        &guest,
+        &[ordinary.as_os_str()],
+    );
+    let expected = "self numa_maps=0 stat=1 task=1\n\
+        thread-self numa_maps=0 stat=1 task=1\n\
+        pid numa_maps=0 stat=1 task=1\n\
+        pid-thread numa_maps=0 stat=1 task=1\n\
+        ordinary numa_maps=1 other=1\n\
+        open numa_maps=ENOENT\n";
+    assert!(
+        output.contains(expected),
+        "the guest must print {expected:?}:\n{output}"
+    );
+}
+
 /// A clear-TID join wake that overlaps another admission records and replays
 /// to the same order. In each of 20 rounds the main thread waits for a forked
 /// child while a second thread joins a thread that exits, and each records in

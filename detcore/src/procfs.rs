@@ -4038,16 +4038,48 @@ impl CpuConstantFile {
 /// a kernel built without NUMA (https://github.com/rrnewton/hermit/issues/5269).
 /// Without `drivers/base/node.o` Linux registers no node subsystem, so the
 /// `node` directory itself is missing from `/sys/devices/system` and from
-/// `/sys/bus` — not an empty directory — and no memory block holds a link
-/// to a node. glibc's `get_nprocs_conf` (`sysconf(_SC_NPROCESSORS_CONF)`,
+/// `/sys/bus` — not an empty directory — and neither a memory block nor a
+/// CPU holds a link to a node. glibc's `get_nprocs_conf`
+/// (`sysconf(_SC_NPROCESSORS_CONF)`,
 /// `nproc --all`) counts the `cpuN` entries of `/sys/devices/system/cpu`,
 /// and libnuma counts them and probes `/sys/devices/system/node`, which a
 /// kernel without NUMA does not have.
+/// Whether `directory` is one CPU's own sysfs directory, by any of its
+/// spellings: the device directory, its bus alias, or through the processor
+/// driver's link to it. Only a direct `cpu<N>` child of those parents names
+/// one; a directory below a CPU (its `topology`, say) or the `cpufreq`
+/// directory does not.
+fn cpu_backlink_directory(directory: &Path) -> bool {
+    let Some(directory) = directory.to_str() else {
+        return false;
+    };
+    [
+        "/sys/devices/system/cpu/cpu",
+        "/sys/bus/cpu/devices/cpu",
+        "/sys/bus/cpu/drivers/processor/cpu",
+    ]
+    .into_iter()
+    .any(|prefix| {
+        directory
+            .strip_prefix(prefix)
+            .is_some_and(|cpu| !cpu.is_empty() && cpu.bytes().all(|byte| byte.is_ascii_digit()))
+    })
+}
+
 pub(crate) fn is_absent_cpu_entry(directory: &Path, name: &[u8], cpus: u32) -> bool {
     // The node directory itself, in each of its two parents.
     match directory.to_str() {
         Some("/sys/devices/system" | "/sys/bus") if name == b"node" => return true,
         _ => {}
+    }
+    // The backlink each CPU directory holds to its node is absent for every
+    // node number, on a present CPU just as on an absent one: without the
+    // node subsystem no CPU is registered on a node (`register_cpu`'s
+    // `register_cpu_under_node` is a `CONFIG_NUMA` stub returning 0).
+    if cpu_backlink_directory(directory) {
+        return name
+            .strip_prefix(b"node")
+            .is_some_and(|node| !node.is_empty() && node.iter().all(u8::is_ascii_digit));
     }
     let (prefix, present): (&[u8], u32) = match directory.to_str() {
         Some(
@@ -9044,6 +9076,30 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
                 &["node0", "node1"],
                 &["online"],
             ),
+            // A CPU's backlink to its node is absent for every node number,
+            // on a present CPU just as on an absent one; only an actual
+            // `node<N>` child is dropped, not the CPU's other entries.
+            (
+                "/sys/devices/system/cpu/cpu0",
+                &["node0", "node2", "node999"],
+                &["node", "nodex", "online", "topology"],
+            ),
+            (
+                "/sys/bus/cpu/devices/cpu0",
+                &["node0", "node999"],
+                &["node", "driver", "subsystem", "topology"],
+            ),
+            (
+                "/sys/bus/cpu/drivers/processor/cpu0",
+                &["node0"],
+                &["node", "topology"],
+            ),
+            (
+                "/sys/devices/system/cpu/cpu0/topology",
+                &[][..],
+                &["node0", "core_id"],
+            ),
+            ("/sys/devices/system/cpu/cpufreq", &[][..], &["node0"]),
             (
                 "/sys/devices/system/cpu/cpufreq",
                 &["policy1", "policy315"],
@@ -9073,6 +9129,9 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             ("/sys/devices/system/cpu/cpufreq", "policy3", false),
             ("/sys/devices/system/cpu/cpufreq", "policy4", true),
             ("/sys/devices/system/node", "node1", true),
+            ("/sys/devices/system/cpu/cpu3", "node0", true),
+            ("/sys/devices/system/cpu/cpu3", "node99", true),
+            ("/sys/devices/system/cpu/cpu3", "topology", false),
         ] {
             assert_eq!(
                 is_absent_cpu_entry(Path::new(directory), name.as_bytes(), 4),
@@ -9130,6 +9189,22 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
                 "/sys/devices/system/memory/memory3/node1/cpulist",
                 "/sys/devices/system/memory/memory3/node1",
             ),
+            (
+                "/sys/devices/system/cpu/cpu0/node0",
+                "/sys/devices/system/cpu/cpu0/node0",
+            ),
+            (
+                "/sys/devices/system/cpu/cpu0/node0/cpulist",
+                "/sys/devices/system/cpu/cpu0/node0",
+            ),
+            (
+                "/sys/bus/cpu/devices/cpu0/node2/meminfo",
+                "/sys/bus/cpu/devices/cpu0/node2",
+            ),
+            (
+                "/sys/bus/cpu/drivers/processor/cpu0/node0",
+                "/sys/bus/cpu/drivers/processor/cpu0/node0",
+            ),
         ] {
             assert_eq!(
                 absent_cpu_entry_prefix(Path::new(path), 1).as_deref(),
@@ -9138,6 +9213,8 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             );
         }
         for path in [
+            "/sys/devices/system/cpu/cpu0/topology/node0",
+            "/sys/devices/system/cpu/cpufreq/node0",
             "/sys/devices/system/cpu/cpu0/topology/core_id",
             "/sys/devices/system/cpu/online",
             "/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq",

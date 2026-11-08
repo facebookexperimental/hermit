@@ -2480,6 +2480,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_procfs_listing.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_procfs_listing.c is owned by hermit-cli/tests/record_replay.rs: record_replay_omits_numa_maps_from_task_directory_listings compiles this raw-getdents64 guest and runs it under record start --strict --verify --verify-strict on an ordinary directory argument, requiring every task-directory spelling to omit numa_maps while stat (and a process directory's task) stays listed, the ordinary directory's own numa_maps file to stay listed, and opening /proc/self/numa_maps to fail ENOENT, in recording and replay alike (https://github.com/rrnewton/hermit/issues/5269). It stays a fixture because it needs an ordinary directory argument and a record/replay command that a generic manifest does not express."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/record_replay_scm_rights.c",
       "runner": "hermit-cli/tests/record_replay.rs",
       "why": "tests/c/record_replay_scm_rights.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this workload and checks that descriptors received over SCM_RIGHTS, pipe ends sent within the process and a memfd and pipe end sent by a forked child, keep the blocking state and contents Linux gives them under record and under replay, which holds placeholders where the recording held them, and that a blocking read through a received pipe end waits for its writer; and that threads receiving pipe ends in blocking recvmsg calls over connections to the guest's own abstract AF_UNIX listener, while the sender opens eventfds between sends, replay to the same output, including an infinite poll on a received pipe end and such a socket; and that eventfds received over SCM_RIGHTS within the process read back the counts Linux gives them under record and under replay, while one whose sender closed its copy and one from a forked child, anonymous inodes Detcore does not record, fail their reads with the same EBADF in both phases; and that MAP_SHARED mappings of one memfd in one process, including one through a received descriptor at an offset and one a thread makes, share memory under record and under replay; and that an inotify instance received over SCM_RIGHTS after its sender closed its copy reads the same IN_CREATE event under record and under replay."

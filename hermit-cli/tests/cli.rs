@@ -52784,6 +52784,72 @@ fn cpu_directory_reads_list_only_cpu0_on_every_path() {
     assert_eq!(report["bitwise_parity"], true, "{report}");
 }
 
+/// The `node<N>` backlink in a present CPU's directory, by its device and
+/// bus spellings, is absent from its listing and every lookup of it is
+/// ENOENT on `backend`, at bitwise parity, while a neighbouring topology
+/// file stays found.
+fn absent_cpu_node_backlinks(backend: &str) {
+    let guest = futex_c_guest(&ABSENT_CPU_LOOKUPS_GUEST, "absent_cpu_lookups")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let expected = "bound listing node0: 0\n\
+                    bound openat: ENOENT\n\
+                    bound listing node0: 0\n\
+                    bound openat: ENOENT\n\
+                    /sys/devices/system/cpu/cpu0/node0: ENOENT\n\
+                    stat /sys/devices/system/cpu/cpu0/node0: ENOENT\n\
+                    lstat /sys/devices/system/cpu/cpu0/node0: ENOENT\n\
+                    readlink /sys/devices/system/cpu/cpu0/node0: ENOENT\n\
+                    /sys/bus/cpu/devices/cpu0/node0: ENOENT\n\
+                    stat /sys/bus/cpu/devices/cpu0/node0: ENOENT\n\
+                    lstat /sys/bus/cpu/devices/cpu0/node0: ENOENT\n\
+                    readlink /sys/bus/cpu/devices/cpu0/node0: ENOENT\n\
+                    /sys/bus/cpu/drivers/processor/cpu0/node0: ENOENT\n\
+                    stat /sys/bus/cpu/drivers/processor/cpu0/node0: ENOENT\n\
+                    lstat /sys/bus/cpu/drivers/processor/cpu0/node0: ENOENT\n\
+                    readlink /sys/bus/cpu/drivers/processor/cpu0/node0: ENOENT\n\
+                    /sys/devices/system/cpu/cpu0/node0/cpulist: ENOENT\n\
+                    /sys/devices/system/cpu/cpu0/topology/core_id: ok\n";
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let verdict = directory.path().join("verify.json");
+    let mut args = vec![
+        "--log=info",
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        verdict.to_str().unwrap(),
+    ];
+    // KVM refuses a `--timeout` it cannot enforce; `run_with_deadline`
+    // bounds the run either way.
+    if backend != "kvm" {
+        args.extend(["--timeout", "60"]);
+    }
+    args.extend(["--", guest.as_str(), "backlinks"]);
+    let (status, log) = run_with_deadline(
+        hermit_command(&args),
+        directory.path(),
+        Duration::from_secs(180),
+        false,
+    );
+    let guest_stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "{backend}: stdout:\n{guest_stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(guest_stdout, expected, "{backend}: stderr:\n{log}");
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
+            .expect("the verdict must be JSON");
+    assert_eq!(report["bitwise_parity"], true, "{backend}: {report}");
+}
+
 /// The CPUs other than number 0 that the sysfs listings leave out, and
 /// every NUMA node — Hermit presents a kernel without NUMA, so the node
 /// directory itself does not exist
@@ -52930,6 +52996,7 @@ fn absent_cpus_and_nodes_are_not_found_and_rseq_is_refused() {
     let bound = directory.path().join("bound");
     fs::create_dir(&bound).unwrap();
     fs::write(bound.join("cpu1"), "guest-owned CPU name").unwrap();
+    fs::write(bound.join("node0"), "guest-owned node name").unwrap();
     fs::write(bound.join("node1"), "guest-owned node name").unwrap();
     // (Not /sys/devices/system/node/node0, the original first target: on
     // the kernel without NUMA that Hermit presents the node directory
@@ -52939,6 +53006,7 @@ fn absent_cpus_and_nodes_are_not_found_and_rseq_is_refused() {
         ("/sys/devices/system/cpu/cpu0", "cpu1"),
         ("/sys/bus/cpu/drivers/processor", "cpu1"),
         ("/sys/devices/system/memory/memory0", "node1"),
+        ("/sys/devices/system/cpu/cpu0", "node0"),
     ] {
         let expected = format!("bound listing {name}: 1\nbound openat: ok\n");
         let native = Command::new(&guest)
@@ -52958,6 +53026,18 @@ fn absent_cpus_and_nodes_are_not_found_and_rseq_is_refused() {
         assert_success(&output, &args);
         assert_eq!(stdout(&output), expected, "{target}: {}", stderr(&output));
     }
+
+    absent_cpu_node_backlinks("ptrace");
+}
+
+/// [`absent_cpu_node_backlinks`] on KVM.
+#[test]
+fn run_kvm_absent_cpu_node_backlinks_are_not_found() {
+    let test = "run_kvm_absent_cpu_node_backlinks_are_not_found";
+    if kvm_unavailable(test) {
+        return;
+    }
+    absent_cpu_node_backlinks("kvm");
 }
 
 /// A vfork child that waits for a thread other than its own vfork child

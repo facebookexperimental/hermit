@@ -20818,7 +20818,9 @@ mod nextest_timeout_tests {
                 // platform (https://github.com/rrnewton/hermit/issues/5269):
                 // their shell wrappers exec, which the in-guest backends
                 // refuse; ptrace and KVM keep proving the new answers.
-                assert_eq!(all.len(), 2990, "the original all-owner population is retained");
+                // 2994 again when the direct utility rows restore those four
+                // cells with no wrapper to exec.
+                assert_eq!(all.len(), 2994, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");

@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 1105,
-      "applicable": 760,
-      "selectable": 532,
+      "applicable": 764,
+      "selectable": 536,
       "population": 1060,
-      "population_candidate_selected": 532,
+      "population_candidate_selected": 536,
       "population_candidate_not_selected": 211,
-      "population_candidate_disabled": 317
+      "population_candidate_disabled": 313
     },
     "by_backend": {
       "dbt": {
@@ -28,12 +28,12 @@
       },
       "in-guest-trap": {
         "cells": 221,
-        "applicable": 60,
-        "selectable": 60,
+        "applicable": 62,
+        "selectable": 62,
         "population": 212,
-        "population_candidate_selected": 60,
+        "population_candidate_selected": 62,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 152
+        "population_candidate_disabled": 150
       },
       "kvm": {
         "cells": 221,
@@ -46,12 +46,12 @@
       },
       "liteinst": {
         "cells": 221,
-        "applicable": 62,
-        "selectable": 62,
+        "applicable": 64,
+        "selectable": 64,
         "population": 212,
-        "population_candidate_selected": 62,
+        "population_candidate_selected": 64,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 150
+        "population_candidate_disabled": 148
       },
       "sabre": {
         "cells": 221,
@@ -691,14 +691,14 @@
     {"test_id":"compat/nproc","backend":"liteinst","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/nproc","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/numactl-hardware","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"compat/numactl-hardware","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Its verify runs end as a named policy refusal on in-guest-trap: since Hermit presents a kernel without NUMA (https://github.com/rrnewton/hermit/issues/5269), the row's shell runs /usr/bin/numactl in a command substitution — to require its exit 1 with \"No NUMA available on this system\" — a forked child that execs it, and the in-guest runtime refuses exec with a typed refusal that ends the run (HERMIT_POLICY_REFUSAL, execveat; measured in the full validation of 834b862aee). The ptrace and KVM cells prove the no-NUMA answer."},
+    {"test_id":"compat/numactl-hardware","backend":"in-guest-trap","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/numactl-hardware","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"compat/numactl-hardware","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Its verify runs end as a named policy refusal on liteinst: since Hermit presents a kernel without NUMA (https://github.com/rrnewton/hermit/issues/5269), the row's shell runs /usr/bin/numactl in a command substitution — to require its exit 1 with \"No NUMA available on this system\" — a forked child that execs it, and the in-guest runtime refuses exec with a typed refusal that ends the run (HERMIT_POLICY_REFUSAL, execveat; measured in the full validation of 834b862aee). The ptrace and KVM cells prove the no-NUMA answer."},
+    {"test_id":"compat/numactl-hardware","backend":"liteinst","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/numactl-hardware","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/numastat","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"compat/numastat","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Its verify runs end as a named policy refusal on in-guest-trap: since Hermit presents a kernel without NUMA (https://github.com/rrnewton/hermit/issues/5269), the row's shell runs /usr/bin/numastat in a command substitution — to accept its exit 1 when the sysfs node directory is absent — a forked child that execs it, and the in-guest runtime refuses exec with a typed refusal that ends the run (HERMIT_POLICY_REFUSAL, execveat; measured in the full validations of 834b862aee and 7d6c94023b). The ptrace and KVM cells prove the no-NUMA answer."},
+    {"test_id":"compat/numastat","backend":"in-guest-trap","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/numastat","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"compat/numastat","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Its verify runs end as a named policy refusal on liteinst: since Hermit presents a kernel without NUMA (https://github.com/rrnewton/hermit/issues/5269), the row's shell runs /usr/bin/numastat in a command substitution — to accept its exit 1 when the sysfs node directory is absent — a forked child that execs it, and the in-guest runtime refuses exec with a typed refusal that ends the run (HERMIT_POLICY_REFUSAL, execveat; measured in the full validations of 834b862aee and 7d6c94023b). The ptrace and KVM cells prove the no-NUMA answer."},
+    {"test_id":"compat/numastat","backend":"liteinst","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/numastat","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/numfmt","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/numfmt","backend":"in-guest-trap","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

@@ -227,6 +227,57 @@ struct CorpusRowPolicy {
     rows: BTreeMap<String, String>,
 }
 
+/// One expected guest disposition of a corpus row, expanded into a mode
+/// recipe's `expected_guest_exit`. The runner's own type is the authority
+/// for what the declaration means; this is its corpus spelling.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CorpusExpectedGuestExit {
+    code: Option<i32>,
+    signal: Option<i32>,
+    reason: String,
+}
+
+impl CorpusExpectedGuestExit {
+    fn validate(
+        &self,
+        bucket: &str,
+        label: &str,
+        field: &str,
+        allow_success: bool,
+    ) -> Result<(), String> {
+        nonempty(
+            bucket,
+            &format!("row `{label}` {field} reason"),
+            &self.reason,
+        )?;
+        let valid = match (self.code, self.signal) {
+            (Some(code), None) => (if allow_success { 0..=255 } else { 1..=255 }).contains(&code),
+            (None, Some(signal)) => (1..=64).contains(&signal),
+            _ => false,
+        };
+        if !valid {
+            return Err(format!(
+                "{bucket}: corpus row `{label}` {field} must name exactly one of an exit status in {}..=255 or a signal in 1..=64",
+                if allow_success { 0 } else { 1 }
+            ));
+        }
+        Ok(())
+    }
+
+    fn value(&self) -> Value {
+        let mut fields = Vec::new();
+        if let Some(code) = self.code {
+            fields.push(("code", Value::from(code)));
+        }
+        if let Some(signal) = self.signal {
+            fields.push(("signal", Value::from(signal)));
+        }
+        fields.push(("reason", string(&self.reason)));
+        mapping(fields)
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CorpusRow {
@@ -248,6 +299,15 @@ struct CorpusRow {
     /// `proc`), when the program reads a name Hermit's default level omits.
     #[serde(default)]
     proc: Option<String>,
+    /// The exact guest disposition each verify cell requires, where the
+    /// program's own answer is a failure run mode must reproduce.
+    #[serde(default)]
+    expected_guest_exit: Option<CorpusExpectedGuestExit>,
+    /// The exact guest disposition the replay cell requires where record
+    /// mode answers a different one; without it the replay cell inherits
+    /// `expected_guest_exit`.
+    #[serde(default)]
+    replay_expected_guest_exit: Option<CorpusExpectedGuestExit>,
 }
 
 fn string(value: &str) -> Value {
@@ -613,6 +673,20 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
         }
         None => BTreeSet::new(),
     };
+    for row in &corpus.rows {
+        if let Some(expected) = &row.expected_guest_exit {
+            expected.validate(bucket, &row.label, "expected_guest_exit", false)?;
+        }
+        if let Some(expected) = &row.replay_expected_guest_exit {
+            expected.validate(bucket, &row.label, "replay_expected_guest_exit", true)?;
+            if corpus.replay.is_none() || replay_excepted.contains(row.label.as_str()) {
+                return Err(format!(
+                    "{bucket}: corpus row `{}` declares replay_expected_guest_exit, which has no replay cell",
+                    row.label
+                ));
+            }
+        }
+    }
     let off_reason = format!(
         "A {bucket} corpus row runs only its lane's verify cell on {}",
         corpus.backend
@@ -900,6 +974,9 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
             verify.push(("hermit_args_reason", reason));
         }
         push_shared_verify_settings(&mut verify, &corpus.verify);
+        if let Some(expected) = &row.expected_guest_exit {
+            verify.push(("expected_guest_exit", expected.value()));
+        }
         let row_env = additional
             .iter()
             .filter_map(|additional| {
@@ -982,6 +1059,9 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
             }
             labels.push(replay.label.clone());
             recipe.push(("labels", per_cell(strings(&labels))));
+            if let Some(expected) = &row.replay_expected_guest_exit {
+                recipe.push(("expected_guest_exit", expected.value()));
+            }
             // Declared empty, so the cell does not inherit the verify cell's
             // environment (runner::cell_mode_env).
             recipe.push(("env", Value::Mapping(Mapping::new())));
@@ -2106,6 +2186,54 @@ mod tests {
         assert_eq!(big["replay"]["labels"], seq("{ptrace: [rr-compat-only]}"));
         assert_eq!(big["replay"]["ci"], true);
         assert_eq!(big["verify"]["ci"], seq("{ptrace: false, sabre: true}"));
+    }
+
+    /// A row's expected guest exit expands onto its verify recipe, and a
+    /// separate replay expectation onto its replay recipe: record mode can
+    /// answer a different disposition from run mode (numastat reads the
+    /// host's node counters while recording and exits 1 where run mode
+    /// hides the node directory), so one declaration cannot speak for both.
+    #[test]
+    fn a_corpus_row_expands_expected_guest_exits_by_mode() {
+        let corpus = replay_corpus().replace(
+            "    - {label: \"g++\", id: gxx, argv: [\"/usr/bin/g++\", \"--version\"]}",
+            "    - label: \"g++\"\n      id: gxx\n      argv: [\"/usr/bin/g++\", \"--version\"]\n      expected_guest_exit: {code: 1, reason: \"the fixture program fails without NUMA\"}\n      replay_expected_guest_exit: {code: 0, reason: \"record mode sees the host's nodes\"}",
+        );
+        let expanded = expand_corpus(document(&corpus)).unwrap();
+        let gxx = tests_of(&expanded)
+            .iter()
+            .find(|test| test["id"] == "fixture/gxx")
+            .unwrap();
+        let seq = |text: &str| serde_yaml::from_str::<Value>(text).unwrap();
+        assert_eq!(
+            gxx["modes"]["verify"]["expected_guest_exit"],
+            seq("{code: 1, reason: 'the fixture program fails without NUMA'}")
+        );
+        assert_eq!(
+            gxx["modes"]["replay"]["expected_guest_exit"],
+            seq("{code: 0, reason: \"record mode sees the host's nodes\"}")
+        );
+        for test in tests_of(&expanded) {
+            if test["id"] != "fixture/gxx" {
+                assert!(test["modes"]["verify"].get("expected_guest_exit").is_none());
+                assert!(test["modes"]["replay"].get("expected_guest_exit").is_none());
+            }
+        }
+
+        // A replay expectation on a row with no replay cell is refused, and
+        // a malformed declaration is refused rather than dropped.
+        let no_replay = CORPUS.replace(
+            "    - {label: \"echo\", argv: [\"/bin/echo\", \"x\"]}",
+            "    - label: \"echo\"\n      argv: [\"/bin/echo\", \"x\"]\n      replay_expected_guest_exit: {code: 0, reason: \"record mode succeeds\"}",
+        );
+        let error = expand_corpus(document(&no_replay)).unwrap_err();
+        assert!(error.contains("replay_expected_guest_exit"), "{error}");
+        let malformed = corpus.replace(
+            "expected_guest_exit: {code: 1,",
+            "expected_guest_exit: {code: 1, signal: 9,",
+        );
+        let error = expand_corpus(document(&malformed)).unwrap_err();
+        assert!(error.contains("expected_guest_exit"), "{error}");
     }
 
     /// With `full: true` every replay cell also carries the default run type,
