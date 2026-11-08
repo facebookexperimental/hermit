@@ -993,7 +993,18 @@ impl RecordVersion {
 // identity is refused before the guest starts. An older recording would
 // place its events elsewhere; it is refused here.
 // https://github.com/rrnewton/hermit/pull/4668
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x19e);
+// 0x19e -> 0x19f (HIGHEST_SHIPPED+1 at this change's rebase onto main
+// shipping 0x19e; reserved in minibeads dh-gxmvo, renumbered from its
+// provisional 0x19e when that number landed first): Detcore presents a
+// kernel built without NUMA
+// (https://github.com/rrnewton/hermit/issues/5269). The six
+// memory-policy syscalls answer ENOSYS where they answered as a one-node
+// machine, /proc/<pid>/numa_maps does not exist at any --proc level
+// where the standard level listed it, and /sys/devices/system/node and
+// /sys/bus/node do not exist in run mode where their files read as one
+// node's. Replay answers each of these itself, so an older recording of
+// any of them would replay with different answers; it is refused here.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x19f);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -1018,7 +1029,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x19e);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x19e;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x19f;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -2213,14 +2224,14 @@ mod tests {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x147)));
     }
 
-    /// A recording older than 0x19e was made when the memory-policy
+    /// A recording older than 0x19f was made when the memory-policy
     /// syscalls answered as a one-node machine, the standard /proc level
     /// listed numa_maps, and the sysfs node files read as one node's;
     /// Detcore now presents a kernel without NUMA
     /// (https://github.com/rrnewton/hermit/issues/5269).
     #[test]
     fn record_version_rejects_streams_from_before_the_no_numa_platform() {
-        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x19d)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x19e)));
         assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
     }
 
@@ -2625,7 +2636,7 @@ mod tests {
     fn record_version_rejects_streams_from_before_the_corrected_rcb_event() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x19a)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x186)));
-        assert!(RECORD_VERSION.compatible_with(&RecordVersion(0x19e)));
+        assert!(RECORD_VERSION.compatible_with(&RecordVersion(0x19f)));
     }
 
     #[test]
