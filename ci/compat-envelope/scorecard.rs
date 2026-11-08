@@ -11895,12 +11895,11 @@ where
     let derived = check_tracked(root)?;
     let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
     reconcile_history_catalogue(root, &mut tracked)?;
-    let rows = snapshot.materialize_rows()?;
-    project_observation_rows(
+    project_observation_rows_held(
         root,
         &derived,
         tracked,
-        &rows,
+        &snapshot,
         &ObservationRowSource {
             source: &source.path,
             repository: source.repository.as_deref(),
@@ -11952,18 +11951,118 @@ where
     let mut projection =
         apply_series_rows_in_place(root, &mut tracked, &unrepresented, Some(&source))?;
     projection.represented_rows += representation.represented_event_ids.len();
-    let skipped = &projection.skipped;
+    finish_projection(
+        root,
+        derived,
+        &before,
+        tracked,
+        projection,
+        representation.has_unrepresented_direct_evidence,
+        rows.len() as u64,
+        row_source,
+        refreshed_at,
+        verify_source,
+    )
+}
 
-    let rows_read = rows.len() as u64;
+/// The held-snapshot twin of [`project_observation_rows`]: same guards, same
+/// outcome accounting, same written files, but rows are rebuilt from the
+/// held payload pass by pass instead of held typed throughout.
+fn project_observation_rows_held<VerifySource>(
+    root: &Path,
+    derived: &Derived,
+    mut tracked: TrackedCells,
+    held: &HeldScorecardSeriesSnapshot,
+    row_source: &ObservationRowSource<'_>,
+    refreshed_at: &str,
+    verify_source: VerifySource,
+) -> Result<(), String>
+where
+    VerifySource: FnOnce() -> Result<(), String>,
+{
+    let before = tracked.clone();
+    let source = row_source.source.to_string();
+    // Snapshot validation refused a repeated event_id, so one index per event.
+    let by_event = held
+        .index
+        .iter()
+        .enumerate()
+        .map(|(index, row)| (row.event_id.as_str(), index))
+        .collect::<BTreeMap<_, _>>();
+    let lookup = |event_id: &str| -> Result<Vec<SeriesRow>, String> {
+        by_event
+            .get(event_id)
+            .map(|index| held.parse_row(*index).map(|row| vec![row]))
+            .unwrap_or_else(|| Ok(Vec::new()))
+    };
+    let attempts = validate_attempt_bindings_by(&tracked, Some(&lookup))?;
+    let representation = direct_representation_held(&tracked, held, &attempts)?;
+    remove_replaceable_projected_observations_with(
+        &mut tracked,
+        || {
+            held.index
+                .iter()
+                .map(|row| row.event_id.as_str())
+                .collect()
+        },
+        Some(&source),
+    )?;
+    let subset = HeldRowSubset {
+        held,
+        indices: (0..held.row_count())
+            .filter(|index| {
+                !representation
+                    .represented_event_ids
+                    .contains(&held.index[*index].event_id)
+            })
+            .collect(),
+    };
+    let mut projection = apply_series_rows_inner(root, &mut tracked, &subset, Some(&source))?;
+    projection.represented_rows += representation.represented_event_ids.len();
+    finish_projection(
+        root,
+        derived,
+        &before,
+        tracked,
+        projection,
+        representation.has_unrepresented_direct_evidence,
+        held.row_count() as u64,
+        row_source,
+        refreshed_at,
+        verify_source,
+    )
+}
+
+/// Stamp, cap, guard, verify, write, and report one finished projection.
+/// Shared by the typed-slice and held-snapshot row sources so both produce
+/// the same files and the same summary from the same outcome.
+#[allow(clippy::too_many_arguments)]
+fn finish_projection<VerifySource>(
+    root: &Path,
+    derived: &Derived,
+    before: &TrackedCells,
+    mut tracked: TrackedCells,
+    projection: ProjectObservationsOutcome,
+    has_unrepresented_direct_evidence: bool,
+    rows_read: u64,
+    row_source: &ObservationRowSource<'_>,
+    refreshed_at: &str,
+    verify_source: VerifySource,
+) -> Result<(), String>
+where
+    VerifySource: FnOnce() -> Result<(), String>,
+{
+    let skipped = &projection.skipped;
+    let source = row_source.source;
     tracked.schema = SCHEMA;
     tracked.projection = Some(ObservationProjection {
-        source: source.clone(),
+        source: source.to_string(),
         source_repository: row_source.repository.map(str::to_string),
         source_commit: Some(row_source.commit.to_string()),
         source_tree: Some(row_source.tree.to_string()),
         refreshed_at: refreshed_at.to_string(),
         rows_read,
-        pre_series_corpus: rows.is_empty() || representation.has_unrepresented_direct_evidence,
+        pre_series_corpus: rows_read == 0 || has_unrepresented_direct_evidence,
         comparison_attempt_bindings_v1: comparison_attempt_bindings(&tracked).cloned(),
         observations_capped: false,
     });
@@ -11972,8 +12071,8 @@ where
 
     // The guard runs BEFORE the write, not after. A projection that has already
     // hit the disk is a projection someone has to notice and revert.
-    enforce_projection_preserves_evidence(&before, &tracked, rows_read)?;
-    enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
+    enforce_projection_preserves_evidence(before, &tracked, rows_read)?;
+    enforce_writer_boundary(before, &tracked, Writer::Observations)?;
     verify_source()?;
     write_observation_files(root, derived, &tracked)?;
 
@@ -13441,6 +13540,59 @@ struct PreparedSeriesRow {
     provenance: ObservationProvenance,
     result: Option<ObservedResult>,
     no_verdict: bool,
+    num_runs: u64,
+}
+
+/// Random access to the rows one projection applies, so the fold can run
+/// over a typed slice or over rows rebuilt on demand from a held snapshot
+/// payload. `order_key` and `identity_key` answer from data held beside the
+/// rows (the typed row's own fields, or the snapshot's row index), never by
+/// rebuilding a row: the sort and the per-row count maps call them per row.
+trait PreparedRowSource<'a> {
+    fn row_count(&self) -> usize;
+    fn row(&self, index: usize) -> Result<std::borrow::Cow<'a, SeriesRow>, String>;
+    /// Canonical apply order: emitted_at, run_id, run_index, event_id.
+    fn order_key(&self, index: usize) -> (&'a str, &'a str, u64, &'a str);
+    /// (Hermit commit, run_id) for the preserved-evidence maps.
+    fn identity_key(&self, index: usize) -> (&'a str, &'a str);
+    fn event_id(&self, index: usize) -> &'a str;
+}
+
+struct TypedRows<'a, R> {
+    rows: &'a [R],
+}
+
+impl<'a, R: std::borrow::Borrow<SeriesRow>> PreparedRowSource<'a> for TypedRows<'a, R> {
+    fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn row(&self, index: usize) -> Result<std::borrow::Cow<'a, SeriesRow>, String> {
+        let row: &'a R = &self.rows[index];
+        Ok(std::borrow::Cow::Borrowed(row.borrow()))
+    }
+
+    fn order_key(&self, index: usize) -> (&'a str, &'a str, u64, &'a str) {
+        let row: &'a R = &self.rows[index];
+        let row = row.borrow();
+        (
+            row.emitted_at.as_str(),
+            row.run_id.as_str(),
+            row.series.run_index,
+            row.event_id.as_str(),
+        )
+    }
+
+    fn identity_key(&self, index: usize) -> (&'a str, &'a str) {
+        let row: &'a R = &self.rows[index];
+        let row = row.borrow();
+        (row.series.tree.as_str(), row.run_id.as_str())
+    }
+
+    fn event_id(&self, index: usize) -> &'a str {
+        let row: &'a R = &self.rows[index];
+        row.borrow().event_id.as_str()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15752,6 +15904,84 @@ fn finish_direct_representation(
     })
 }
 
+/// [`direct_representation`] over a held snapshot, rebuilding only the rows
+/// that can matter: validate rows whose (cell, Hermit commit, run) a bound
+/// comparison claims, and rows whose (cell, Hermit commit, run) a tracked
+/// direct key claims. The source map is read back only by exact direct
+/// base, so a row producing no claimed base cannot change the outcome;
+/// the one error a skipped row could have raised (a non-object-id tree or
+/// detcore_tree in `series_observation_identity`) is already refused by
+/// `validate_for_read` in the held snapshot's validation pass.
+fn direct_representation_held(
+    tracked: &TrackedCells,
+    held: &HeldScorecardSeriesSnapshot,
+    current_attempts: &ValidatedComparisonAttempts,
+) -> Result<DirectRepresentation, String> {
+    let (direct, opaque) = direct_evidence_keys(tracked)?;
+    let bound = current_bound_attempts(tracked, current_attempts, &direct)?;
+    let bound_by_run = bound_by_run_index(&bound);
+    let (represented_event_ids, represented_direct) = current_comparison_representation_rows(
+        tracked,
+        &bound_by_run,
+        &direct,
+        held.index.iter().enumerate().filter_map(|(index, row)| {
+            (row.producer == SeriesProducer::Validate
+                && bound_by_run.contains_key(&(
+                    row.cell.as_str(),
+                    row.tree.as_str(),
+                    row.run_id.as_str(),
+                )))
+            .then(|| held.parse_row_typed(index))
+        }),
+    )?;
+    let bound_attempts = bound_direct_attempts(tracked, current_attempts)?;
+    let cells = SeriesCellIndex::new(tracked);
+    let direct_bases = direct
+        .keys()
+        .map(|key| {
+            (
+                key.base.cell.as_str(),
+                key.base.hermit_sha.as_str(),
+                key.base.run_id.as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut source = BTreeMap::<
+        DirectEvidenceBase,
+        Vec<(Option<DirectEvidenceKey>, String, Option<u64>, u64)>,
+    >::new();
+    for (index, row_index) in held.index.iter().enumerate() {
+        if represented_event_ids.contains(&row_index.event_id) {
+            continue;
+        }
+        if !direct_bases.contains(&(
+            row_index.cell.as_str(),
+            row_index.tree.as_str(),
+            row_index.run_id.as_str(),
+        )) {
+            continue;
+        }
+        let row = held.parse_row_typed(index)?;
+        let Some((base, key)) = source_direct_evidence_key(&row, &cells)? else {
+            continue;
+        };
+        source.entry(base).or_default().push((
+            key,
+            row.event_id.clone(),
+            row.series.attempt,
+            row.series.num_runs,
+        ));
+    }
+    finish_direct_representation(
+        &direct,
+        opaque,
+        represented_event_ids,
+        represented_direct,
+        &bound_attempts,
+        &source,
+    )
+}
+
 fn is_object_id(value: &str) -> bool {
     value.len() == 40
         && value
@@ -16155,18 +16385,23 @@ fn remove_replaceable_projected_observations<R: std::borrow::Borrow<SeriesRow>>(
     rows: &[R],
     projection_source: Option<&str>,
 ) -> Result<usize, String> {
-    let current_event_ids = rows
-        .iter()
-        .map(|row| row.borrow().event_id.as_str())
-        .collect::<BTreeSet<_>>();
-    remove_replaceable_projected_observations_with(tracked, &current_event_ids, projection_source)
+    remove_replaceable_projected_observations_with(
+        tracked,
+        || {
+            rows.iter()
+                .map(|row| row.borrow().event_id.as_str())
+                .collect::<BTreeSet<_>>()
+        },
+        projection_source,
+    )
 }
 
 /// [`remove_replaceable_projected_observations`] over a caller-built event
 /// set (the held snapshot's row index), so the check needs no typed rows.
-fn remove_replaceable_projected_observations_with(
+/// The set is built only once there is projector-owned evidence to check.
+fn remove_replaceable_projected_observations_with<'a>(
     tracked: &mut TrackedCells,
-    current_event_ids: &BTreeSet<&str>,
+    current_event_ids: impl FnOnce() -> BTreeSet<&'a str>,
     projection_source: Option<&str>,
 ) -> Result<usize, String> {
     let owned = tracked
@@ -16201,6 +16436,7 @@ fn remove_replaceable_projected_observations_with(
             projection.source
         ));
     }
+    let current_event_ids = current_event_ids();
     if let Some((cell, event_id)) = tracked.cells.iter().find_map(|cell| {
         cell.observations.iter().find_map(|observation| {
             observation
@@ -16229,7 +16465,12 @@ fn apply_series_rows<R: std::borrow::Borrow<SeriesRow>>(
     projection_source: Option<&str>,
 ) -> Result<ProjectObservationsOutcome, String> {
     let mut updated = tracked.clone();
-    let outcome = apply_series_rows_inner(ambient_git_root, &mut updated, rows, projection_source)?;
+    let outcome = apply_series_rows_inner(
+        ambient_git_root,
+        &mut updated,
+        &TypedRows { rows },
+        projection_source,
+    )?;
     *tracked = updated;
     Ok(outcome)
 }
@@ -16244,18 +16485,26 @@ fn apply_series_rows_in_place<R: std::borrow::Borrow<SeriesRow>>(
     rows: &[R],
     projection_source: Option<&str>,
 ) -> Result<ProjectObservationsOutcome, String> {
-    apply_series_rows_inner(ambient_git_root, tracked, rows, projection_source)
+    apply_series_rows_inner(
+        ambient_git_root,
+        tracked,
+        &TypedRows { rows },
+        projection_source,
+    )
 }
 
-fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
+fn apply_series_rows_inner<'a, S: PreparedRowSource<'a>>(
     _ambient_git_root: &Path,
     tracked: &mut TrackedCells,
-    rows: &[R],
+    rows: &S,
     projection_source: Option<&str>,
 ) -> Result<ProjectObservationsOutcome, String> {
     validate_observation_identity_namespace(tracked)?;
-    let replaced_observations =
-        remove_replaceable_projected_observations(tracked, rows, projection_source)?;
+    let replaced_observations = remove_replaceable_projected_observations_with(
+        tracked,
+        || (0..rows.row_count()).map(|index| rows.event_id(index)).collect(),
+        projection_source,
+    )?;
     let mut cell_indices: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (index, cell) in tracked.cells.iter().enumerate() {
         cell_indices
@@ -16266,8 +16515,9 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
 
     let mut prepared = Vec::new();
     let mut skipped = Vec::new();
-    for (row_index, row) in rows.iter().enumerate() {
-        let row: &SeriesRow = row.borrow();
+    for row_index in 0..rows.row_count() {
+        let row = rows.row(row_index)?;
+        let row: &SeriesRow = &row;
         let label = row.label();
         if let Err(why) = row.validate_for_projection() {
             if row.series.no_verdict_evidence.is_some() {
@@ -16327,13 +16577,14 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
             provenance,
             result: evidence.result,
             no_verdict: evidence.no_verdict,
+            num_runs: row.series.num_runs,
         });
     }
 
-    if !rows.is_empty() && prepared.is_empty() {
+    if rows.row_count() != 0 && prepared.is_empty() {
         return Err(format!(
             "every one of the {} readable series row(s) determined nothing for the legacy projection, so the projection was not written:\n{}",
-            rows.len(),
+            rows.row_count(),
             skipped
                 .iter()
                 .map(|line| format!("  skipped {line}"))
@@ -16344,10 +16595,7 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
 
     let admitted_rows = prepared.len();
     let no_verdict_rows = prepared.iter().filter(|row| row.no_verdict).count();
-    let admitted_runs = prepared
-        .iter()
-        .map(|row| rows[row.row_index].borrow().series.num_runs)
-        .sum();
+    let admitted_runs = prepared.iter().map(|row| row.num_runs).sum();
     let admitted_cells = prepared
         .iter()
         .map(|row| row.cell_index)
@@ -16389,14 +16637,9 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
     }
     let mut source_counts = BTreeMap::<(usize, ObservationProvenance, &str, &str), usize>::new();
     for row in &prepared {
-        let source = rows[row.row_index].borrow();
+        let (tree, run_id) = rows.identity_key(row.row_index);
         *source_counts
-            .entry((
-                row.cell_index,
-                row.provenance,
-                source.series.tree.as_str(),
-                source.run_id.as_str(),
-            ))
+            .entry((row.cell_index, row.provenance, tree, run_id))
             .or_insert(0usize) += 1;
     }
     let mut represented_rows = 0usize;
@@ -16409,17 +16652,14 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
             to_project.push(row);
             continue;
         }
-        let source = rows[row.row_index].borrow();
-        let key = (
-            row.cell_index,
-            row.provenance,
-            source.series.tree.as_str(),
-            source.run_id.as_str(),
-        );
+        let (tree, run_id) = rows.identity_key(row.row_index);
+        let key = (row.cell_index, row.provenance, tree, run_id);
         let Some((matches, results)) = preserved.get(&key) else {
             to_project.push(row);
             continue;
         };
+        let source = rows.row(row.row_index)?;
+        let source: &SeriesRow = &source;
         let attempt = source.series.attempt.unwrap_or(1);
         if attempt != 1 {
             return Err(format!(
@@ -16455,32 +16695,37 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
     drop(source_counts);
     let mut prepared = to_project;
 
+    // Cell-major, canonical within each cell: the fold below flushes one
+    // cell at a time, so only that cell's grouped observations are live at
+    // once. Holding every cell's groups until the end cost about 9 GiB at
+    // full-corpus scale. Within a cell the order is exactly the canonical
+    // order the fold has always used.
     prepared.sort_by(|left, right| {
-        let left_row = rows[left.row_index].borrow();
-        let right_row = rows[right.row_index].borrow();
-        (
-            left_row.emitted_at.as_str(),
-            left_row.run_id.as_str(),
-            left_row.series.run_index,
-            left_row.event_id.as_str(),
-        )
-            .cmp(&(
-                right_row.emitted_at.as_str(),
-                right_row.run_id.as_str(),
-                right_row.series.run_index,
-                right_row.event_id.as_str(),
-            ))
+        left.cell_index.cmp(&right.cell_index).then_with(|| {
+            rows.order_key(left.row_index)
+                .cmp(&rows.order_key(right.row_index))
+        })
     });
     let mut grouped =
-        BTreeMap::<(usize, SeriesObservationIdentity, ObservationProvenance), Observation>::new();
-    let mut latest_by_cell: BTreeMap<usize, usize> = BTreeMap::new();
-    for (prepared_index, row) in prepared.iter().enumerate() {
+        BTreeMap::<(SeriesObservationIdentity, ObservationProvenance), Observation>::new();
+    let mut current_cell: Option<usize> = None;
+    let mut latest_in_cell: Option<&PreparedSeriesRow> = None;
+    for row in &prepared {
+        if current_cell != Some(row.cell_index) {
+            if let Some(cell_index) = current_cell {
+                flush_projected_cell(
+                    tracked,
+                    cell_index,
+                    std::mem::take(&mut grouped),
+                    latest_in_cell,
+                    rows,
+                )?;
+            }
+            current_cell = Some(row.cell_index);
+            latest_in_cell = None;
+        }
         let observation = grouped
-            .entry((
-                row.cell_index,
-                row.observation_identity.clone(),
-                row.provenance,
-            ))
+            .entry((row.observation_identity.clone(), row.provenance))
             .or_insert_with(|| Observation {
                 detcore_tree: row.observation_identity.detcore_tree().map(str::to_string),
                 event_ids: BTreeSet::new(),
@@ -16495,7 +16740,8 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
                 first_divergent_record: ObservedPositions::default(),
                 first_divergent_syscall: ObservedPositions::default(),
             });
-        let source = rows[row.row_index].borrow();
+        let source = rows.row(row.row_index)?;
+        let source: &SeriesRow = &source;
         observation.event_ids.insert(source.event_id.clone());
         observation.depth = source.series.depth.clone();
         observation.hermit_shas.insert(source.series.tree.clone());
@@ -16532,48 +16778,13 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
                     .and_then(|coordinates| coordinates.first_divergent_syscall),
             );
         }
-        latest_by_cell.insert(row.cell_index, prepared_index);
+        latest_in_cell = Some(row);
+    }
+    if let Some(cell_index) = current_cell {
+        flush_projected_cell(tracked, cell_index, grouped, latest_in_cell, rows)?;
     }
 
-    for ((cell_index, _, _), observation) in grouped {
-        let cell = &mut tracked.cells[cell_index];
-        cell.observations.push(observation);
-        cell.observations.sort_by(|left, right| {
-            left.detcore_tree
-                .cmp(&right.detcore_tree)
-                .then(left.provenance.cmp(&right.provenance))
-                .then(left.event_ids.cmp(&right.event_ids))
-        });
-    }
-
-    for (cell_index, prepared_index) in latest_by_cell {
-        let row = &prepared[prepared_index];
-        let source = rows[row.row_index].borrow();
-        let Some(detcore_tree) = row.observation_identity.detcore_tree() else {
-            continue;
-        };
-        if should_replace_last_tested_at(
-            tracked.cells[cell_index].last_tested.as_ref(),
-            &source.series.tree,
-            source.series.main_ancestry,
-            &source.series.depth,
-        ) {
-            tracked.cells[cell_index].last_tested = Some(LastTested {
-                hermit_sha: source.series.tree.clone(),
-                detcore_tree: detcore_tree.to_string(),
-                depth: source.series.depth.clone(),
-                // Projected from historical series rows. Neither the check
-                // identity nor the applicability AT THAT TIME survives in the
-                // row, and today's applicability is not evidence about then, so
-                // both stay unrecorded. This is the case the type exists for.
-                check: None,
-                applicable_when_tested: None,
-                comparison_verdict: None,
-            });
-        }
-    }
-
-    let pre_series_corpus = rows.is_empty()
+    let pre_series_corpus = rows.row_count() == 0
         || tracked.cells.iter().any(|cell| {
             cell.observations
                 .iter()
@@ -16590,6 +16801,58 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
         skipped,
         pre_series_corpus,
     })
+}
+
+/// Push one cell's folded observations, order them, and advance the cell's
+/// last-tested stamp from its latest prepared row. Projected observations
+/// have pairwise-distinct sort keys (their event_ids sets are nonempty and
+/// disjoint), so one stable sort here gives the order the previous
+/// sort-after-every-push produced.
+fn flush_projected_cell<'a, S: PreparedRowSource<'a>>(
+    tracked: &mut TrackedCells,
+    cell_index: usize,
+    grouped: BTreeMap<(SeriesObservationIdentity, ObservationProvenance), Observation>,
+    latest: Option<&PreparedSeriesRow>,
+    rows: &S,
+) -> Result<(), String> {
+    let cell = &mut tracked.cells[cell_index];
+    for (_, observation) in grouped {
+        cell.observations.push(observation);
+    }
+    cell.observations.sort_by(|left, right| {
+        left.detcore_tree
+            .cmp(&right.detcore_tree)
+            .then(left.provenance.cmp(&right.provenance))
+            .then(left.event_ids.cmp(&right.event_ids))
+    });
+    let Some(row) = latest else {
+        return Ok(());
+    };
+    let Some(detcore_tree) = row.observation_identity.detcore_tree() else {
+        return Ok(());
+    };
+    let source = rows.row(row.row_index)?;
+    let source: &SeriesRow = &source;
+    if should_replace_last_tested_at(
+        tracked.cells[cell_index].last_tested.as_ref(),
+        &source.series.tree,
+        source.series.main_ancestry,
+        &source.series.depth,
+    ) {
+        tracked.cells[cell_index].last_tested = Some(LastTested {
+            hermit_sha: source.series.tree.clone(),
+            detcore_tree: detcore_tree.to_string(),
+            depth: source.series.depth.clone(),
+            // Projected from historical series rows. Neither the check
+            // identity nor the applicability AT THAT TIME survives in the
+            // row, and today's applicability is not evidence about then, so
+            // both stay unrecorded. This is the case the type exists for.
+            check: None,
+            applicable_when_tested: None,
+            comparison_verdict: None,
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -17357,6 +17620,44 @@ impl HeldScorecardSeriesSnapshot {
             ));
         }
         Ok(())
+    }
+}
+
+/// A selected subset of a held snapshot's rows (held indices, in snapshot
+/// order), rebuilt typed on demand for [`apply_series_rows_inner`].
+struct HeldRowSubset<'a> {
+    held: &'a HeldScorecardSeriesSnapshot,
+    indices: Vec<usize>,
+}
+
+impl<'a> PreparedRowSource<'a> for HeldRowSubset<'a> {
+    fn row_count(&self) -> usize {
+        self.indices.len()
+    }
+
+    fn row(&self, index: usize) -> Result<std::borrow::Cow<'a, SeriesRow>, String> {
+        Ok(std::borrow::Cow::Owned(
+            self.held.parse_row_typed(self.indices[index])?,
+        ))
+    }
+
+    fn order_key(&self, index: usize) -> (&'a str, &'a str, u64, &'a str) {
+        let row = &self.held.index[self.indices[index]];
+        (
+            row.emitted_at.as_str(),
+            row.run_id.as_str(),
+            row.run_index,
+            row.event_id.as_str(),
+        )
+    }
+
+    fn identity_key(&self, index: usize) -> (&'a str, &'a str) {
+        let row = &self.held.index[self.indices[index]];
+        (row.tree.as_str(), row.run_id.as_str())
+    }
+
+    fn event_id(&self, index: usize) -> &'a str {
+        self.held.index[self.indices[index]].event_id.as_str()
     }
 }
 
