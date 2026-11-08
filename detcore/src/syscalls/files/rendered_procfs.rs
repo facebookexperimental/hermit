@@ -892,6 +892,43 @@ pub(super) fn procfs_directory_reached(
     Ok(kernel_name(fd.0).map(|name| PathBuf::from(std::ffi::OsString::from_vec(name))))
 }
 
+/// The kernel's metadata of the procfs object at the absolute path `path`,
+/// without following a final symbolic link, as the guest's own `lstat` of it
+/// finds it on the kernel's procfs (ptrace): the tool runs in the guest's
+/// mount and user namespaces ([`GuestProcfs`]), so the owner is the one the
+/// guest's user namespace sees (global root unmapped, a network namespace's
+/// sysctl directories its owner's root). For the system-wide directories
+/// Detcore serves where the guest's procfs is not the kernel's (KVM), and
+/// their entries.
+pub(super) fn procfs_object_stat(path: &Path) -> Result<libc::stat, Errno> {
+    kernel_stat(path, false)
+}
+
+/// The kernel's `stat` of the absolute path `path` in the guest's mount
+/// namespace, which the tool shares ([`GuestProcfs`]), following a final
+/// symbolic link where `follow` says so, and triggering no automount.
+pub(super) fn kernel_stat(path: &Path, follow: bool) -> Result<libc::stat, Errno> {
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)?;
+    let flags = libc::AT_NO_AUTOMOUNT | if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: the path is NUL-terminated and `stat` is writable.
+    raw_errno(unsafe {
+        raw_syscall(
+            libc::SYS_newfstatat,
+            [
+                libc::AT_FDCWD as u64,
+                path.as_ptr() as u64,
+                stat.as_mut_ptr() as u64,
+                flags as u64,
+                0,
+                0,
+            ],
+        )
+    })?;
+    // SAFETY: the call succeeded and initialized the structure.
+    Ok(unsafe { stat.assume_init() })
+}
+
 /// The rendered file among `paths` that the kernel's procfs inode
 /// `(dev, ino)` is, if it is one.
 fn rendered_path_among(

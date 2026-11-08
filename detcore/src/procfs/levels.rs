@@ -456,36 +456,64 @@ pub(crate) fn system_entries(names: &[&[u8]], level: ProcLevel) -> Option<Vec<(V
     found.then_some(entries)
 }
 
-/// Whether the absolute path `path` names one of the system-wide directories
-/// below `/proc` that the table gives `level` ([`system_entries`]):
-/// `/proc/sys`, `/proc/sys/kernel/random`, and so on. Not `/proc` itself,
-/// procfs's root, nor a name in or below a process's or thread's directory
-/// (`self`, `thread-self`, a number), nor a spelling with a `..` component,
-/// which the kernel resolves (see [`procfs_name`]'s callers).
-pub(crate) fn names_system_directory(path: &Path, level: ProcLevel) -> bool {
+/// The system-wide directory below `/proc` that the absolute path `path`
+/// names at `level`, if it names one the table gives `level`
+/// ([`system_entries`]): `/proc/sys`, `/proc/sys/kernel/random`, and so on,
+/// by its index in [`system_directories`], which [`system_directory_path`]
+/// takes back. Not `/proc` itself, procfs's root, nor a name in or below a
+/// process's or thread's directory (`self`, `thread-self`, a number), nor a
+/// spelling with a `..` component, which the kernel resolves (see
+/// [`procfs_name`]'s callers).
+pub(crate) fn system_directory(path: &Path, level: ProcLevel) -> Option<u16> {
     let mut components = path.components();
     if components.next() != Some(Component::RootDir) {
-        return false;
+        return None;
     }
     match components.next() {
         Some(Component::Normal(name)) if name == "proc" => {}
-        _ => return false,
+        _ => return None,
     }
     let mut names = Vec::new();
     for component in components {
         match component {
             Component::Normal(name) => names.push(name.as_bytes()),
             Component::CurDir => {}
-            _ => return false,
+            _ => return None,
         }
     }
-    let Some(first) = names.first() else {
-        return false;
-    };
+    let first = names.first()?;
     if *first == b"self" || *first == b"thread-self" || first.iter().all(u8::is_ascii_digit) {
-        return false;
+        return None;
     }
-    system_entries(&names, level).is_some()
+    system_entries(&names, level)?;
+    let relative = names.join(&b'/');
+    let index = system_directories()
+        .iter()
+        .position(|directory| directory.as_bytes() == relative.as_slice())?;
+    u16::try_from(index).ok()
+}
+
+/// The path relative to `/proc` (`sys/kernel`) of the system-wide directory
+/// whose index in [`system_directories`] is `index`.
+pub(crate) fn system_directory_path(index: u16) -> Option<&'static str> {
+    system_directories().get(usize::from(index)).copied()
+}
+
+/// Every system-wide directory below `/proc` that the table holds at any
+/// level, as its path relative to `/proc`, once each, in the table's order:
+/// the directories on the way to each name of [`MINIMAL`], then of
+/// [`STANDARD`] (`sys`, `sys/kernel`, `sys/kernel/random`, ...).
+fn system_directories() -> Vec<&'static str> {
+    let mut directories: Vec<&'static str> = Vec::new();
+    for entry in MINIMAL.iter().chain(STANDARD) {
+        for (at, _) in entry.match_indices('/') {
+            let directory = &entry[..at];
+            if !directories.contains(&directory) {
+                directories.push(directory);
+            }
+        }
+    }
+    directories
 }
 
 /// The names in a process's directory, or a thread's (`thread`), at
@@ -810,8 +838,54 @@ mod tests {
             ("/procfs/sys", false, false),
         ] {
             let path = Path::new(path);
-            assert_eq!(names_system_directory(path, Minimal), minimal, "{path:?}");
-            assert_eq!(names_system_directory(path, Standard), standard, "{path:?}");
+            assert_eq!(
+                system_directory(path, Minimal).is_some(),
+                minimal,
+                "{path:?}"
+            );
+            assert_eq!(
+                system_directory(path, Standard).is_some(),
+                standard,
+                "{path:?}"
+            );
         }
+    }
+
+    /// Each system-wide directory has one index at every level that holds
+    /// it, which names it back: the twelve directories of the two levels,
+    /// the four of `minimal` first.
+    #[test]
+    fn system_directories_are_named_by_their_index() {
+        use ProcLevel::*;
+        let expected = [
+            ("sys", true),
+            ("sys/kernel", true),
+            ("sys/kernel/random", true),
+            ("sys/vm", true),
+            ("driver", false),
+            ("pressure", false),
+            ("sys/fs", false),
+            ("sys/kernel/pty", false),
+            ("sys/net", false),
+            ("sys/net/core", false),
+            ("sys/net/ipv4", false),
+            ("tty", false),
+        ];
+        assert_eq!(system_directories().len(), expected.len());
+        for (index, (relative, minimal)) in expected.into_iter().enumerate() {
+            let index = u16::try_from(index).unwrap();
+            assert_eq!(system_directory_path(index), Some(relative));
+            let spelled = format!("/proc//{relative}/.");
+            let path = Path::new(&spelled);
+            assert_eq!(system_directory(path, Standard), Some(index), "{relative}");
+            assert_eq!(
+                system_directory(path, Minimal),
+                minimal.then_some(index),
+                "{relative}"
+            );
+        }
+        assert_eq!(system_directory_path(12), None);
+        assert_eq!(system_directory(Path::new("/proc"), Standard), None);
+        assert_eq!(system_directory(Path::new("/proc/net"), Standard), None);
     }
 }

@@ -8445,7 +8445,9 @@ pub enum SignalScope {
 /// revision did not move from 26: every earlier variant keeps its encoding, and only KVM
 /// encodes the new ones, where Detcore runs in the Hermit process beside its
 /// coordinator. The in-guest runtimes, the only peers built apart, never
-/// register a placeholder (`Detcore::serves_placeholders`).
+/// register a placeholder (`Detcore::serves_placeholders`). The KVM
+/// system-directory placeholders appended `PlaceholderDirectory::System` and
+/// `PlaceholderLockKey::System` under the same rule, for the same reasons.
 // 26 follows SP2's 25, whose variants come before this revision's
 // `ChildSubreaper` pair. 27 is pidfd's `PidfdSelfQualificationRefusal`;
 // 29 is https://github.com/rrnewton/hermit/pull/4884's `StoreExclusive`

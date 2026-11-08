@@ -10,8 +10,13 @@
 //! descriptor: the caller's own descriptor directory, `/proc/<pid>/fd`, from
 //! Detcore's own descriptor table (package K slice F1, toward
 //! <https://github.com/rrnewton/hermit/issues/4604>), and `/proc` itself, from
-//! Detcore's procfs model (`procfs::listing`, package K slice P1). The models,
-//! and the parts of Linux they follow, are in [`crate::procfs::fd_directory`].
+//! Detcore's procfs model (`procfs::listing`, package K slice P1), and, where
+//! the guest's procfs is not the kernel's (KVM), the system-wide directories
+//! of the `--proc` level table (`/proc/sys`, `/proc/tty`, ...:
+//! `PlaceholderDirectory::System`), from the same model, decided by the
+//! object a lookup reaches ([`Detcore::system_directory_reached`]). The
+//! models, and the parts of Linux they follow, are in
+//! [`crate::procfs::fd_directory`].
 //!
 //! An open of such a directory injects an open of the descriptor's object,
 //! with the caller's `O_CLOEXEC`, and records which directory the descriptor
@@ -135,6 +140,7 @@ use crate::procfs::fd_directory;
 use crate::procfs::fd_directory::DescriptorDirectoryBinding;
 use crate::procfs::fd_directory::DescriptorDirectoryTable;
 use crate::procfs::fd_directory::PlaceholderDirectory;
+use crate::procfs::fd_directory::SystemDirectory;
 use crate::procfs::fd_directory::TaskDirectoryBinding;
 use crate::procfs::fd_directory::TaskDirectoryKind;
 use crate::procfs_inode;
@@ -202,6 +208,10 @@ pub(super) enum OpenedDirectory {
     /// backend Detcore serves the task directories on has, so the open is
     /// refused by name ([`Detcore::open_placeholder`]).
     SelectorLink { thread: bool },
+    /// One of the system-wide directories of the `--proc` level
+    /// (`/proc/sys`, ...), by the object a lookup reaches
+    /// ([`Detcore::system_directory_reached`]).
+    System(SystemDirectory),
 }
 
 /// The calls whose path operands are each looked up relative to a directory
@@ -1745,7 +1755,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         directory: &PlaceholderDirectory,
     ) -> bool {
         match directory {
-            PlaceholderDirectory::Root => true,
+            PlaceholderDirectory::Root | PlaceholderDirectory::System(_) => true,
             PlaceholderDirectory::Descriptors(binding) => Self::bound_task(guest, binding).await.1,
             PlaceholderDirectory::Task(binding) => Self::bound_own_task(guest, binding).await.1,
         }
@@ -2073,6 +2083,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 })
             }
             OpenedDirectory::Root => PlaceholderDirectory::Root,
+            OpenedDirectory::System(directory) => PlaceholderDirectory::System(directory),
             OpenedDirectory::Reopened(directory) => directory,
             OpenedDirectory::Task(kind, process, thread) => PlaceholderDirectory::Task(
                 self.task_directory_binding(guest, kind, (process, thread))
@@ -2117,8 +2128,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                         ..
                     })
                 );
+                // A system-wide directory is read-only to every caller that
+                // may not act as its owner, and a sysctl directory to every
+                // caller (`test_perm` of its 0555 table entry): EACCES.
+                let unwritable = match directory {
+                    PlaceholderDirectory::System(system) => {
+                        system.is_sysctl() || !placeholder_owner_or_capable(&directory)?
+                    }
+                    _ => false,
+                };
                 return Err(if immutable {
                     Errno::EPERM
+                } else if unwritable {
+                    Errno::EACCES
                 } else {
                     Errno::EOPNOTSUPP
                 }
@@ -3189,6 +3211,69 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok((entries, inodes, DirectoryOrder::ProcfsIds))
     }
 
+    /// The entries of the system-wide directory `directory` as Detcore lists
+    /// it, and how to key their inode numbers, for its placeholder's
+    /// directory stream: what `modeled_directory_snapshot` gives a
+    /// descriptor on the kernel's directory (ptrace), from the same table
+    /// (`procfs::listing`, at the run's `--proc` level), in the same order
+    /// (`DirectoryOrder::NameBytes`), with the same entries left out: one
+    /// the kernel's procfs does not have (a name the level lists that this
+    /// kernel lacks, `rendered_procfs::procfs_object_stat`'s ENOENT), unless
+    /// Detcore renders it. A system-wide entry is the same for every task,
+    /// so the tool's own lookup in the guest's namespaces finds what the
+    /// guest's would. No kernel cookies (the stream's positions are the
+    /// guest's), and each entry numbered by its path's key on the procfs key
+    /// device ([`Self::procfs_key_device`]), as a stat of a directory below
+    /// numbers it ([`Self::system_directory_metadata`]).
+    pub(super) fn system_placeholder_snapshot<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        directory: &SystemDirectory,
+    ) -> Result<(Vec<DirEntry>, DirectoryInodes, DirectoryOrder), Error> {
+        use crate::procfs::listing;
+        let names = listing::entries(
+            &directory.modeled(),
+            self.cfg.proc_level,
+            &listing::ListingFacts::default(),
+        )
+        .unwrap_or_default();
+        let device = Self::procfs_key_device(guest);
+        let within = directory.within();
+        let canonical = directory.canonical();
+        let session_files = self.rendered_files(guest);
+        let entries = names
+            .into_iter()
+            .filter_map(|(name, ty)| {
+                let entry = match name.as_slice() {
+                    b"." => within.clone(),
+                    b".." => within.parent().unwrap_or(&within).to_path_buf(),
+                    name => {
+                        let path = canonical.join(OsStr::from_bytes(name));
+                        // A file Detcore renders exists whatever the kernel
+                        // has.
+                        let rendered = crate::procfs::ProcfsFile::from_path(&path)
+                            .is_some_and(|file| file.rendered_path(session_files).is_some());
+                        if !rendered
+                            && super::rendered_procfs::procfs_object_stat(&path).err()
+                                == Some(Errno::ENOENT)
+                        {
+                            return None;
+                        }
+                        within.join(OsStr::from_bytes(name))
+                    }
+                };
+                Some(DirEntry {
+                    ino: procfs_inode::path_inode(device, &entry).ino,
+                    off: 0,
+                    ty,
+                    name,
+                })
+            })
+            .collect::<Vec<_>>();
+        let inodes = DirectoryInodes::new(device, Some(ProcfsDirectory::new(within)));
+        Ok((entries, inodes, DirectoryOrder::NameBytes))
+    }
+
     /// The entries of the task directory `binding` as Detcore lists it, the
     /// caller's own (package K slice K10) or another process's (slice 2b-1),
     /// and how to key their inode numbers,
@@ -3355,6 +3440,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             let (entries, inodes, order) = match &state.directory {
                 PlaceholderDirectory::Task(binding) => {
                     self.task_placeholder_snapshot(guest, binding).await?
+                }
+                PlaceholderDirectory::System(directory) => {
+                    self.system_placeholder_snapshot(guest, directory)?
                 }
                 _ => self.root_placeholder_snapshot(guest, fd).await?,
             };
@@ -3531,6 +3619,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             PlaceholderDirectory::Task(binding) => {
                 self.task_directory_metadata(guest, binding).await
             }
+            PlaceholderDirectory::System(directory) => {
+                self.system_directory_metadata(guest, directory).await
+            }
         }
     }
 
@@ -3607,6 +3698,51 @@ impl<T: RecordOrReplay> Detcore<T> {
         })
     }
 
+    /// The metadata of the system-wide directory `directory`, as the guest's
+    /// stat of it reports it where the kernel serves it (ptrace,
+    /// `Detcore::determinize_stat` of a procfs directory): the kernel's mode,
+    /// links, owner, size and blocks, as the guest's user namespace sees them
+    /// (`rendered_procfs::procfs_object_stat`: global root unmapped, the
+    /// network namespace owner's root for `/proc/sys/net`, and on a
+    /// `proc_dir_entry` directory such as `/proc/tty` two links and one per
+    /// subdirectory), procfs's 1024-byte blocks and device, the inode number
+    /// Detcore's pool gives its path, which its `.` entry gets in a listing
+    /// of it ([`Self::system_placeholder_snapshot`]), and the epoch.
+    async fn system_directory_metadata<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        directory: &SystemDirectory,
+    ) -> Result<DetStat, Error> {
+        let kernel = super::rendered_procfs::procfs_object_stat(&directory.canonical())?;
+        let device = Self::procfs_key_device(guest);
+        let mark = crate::tool_global::directory_snapshot_mark(guest).await;
+        let ino = self
+            .directory_inode(guest, device, &directory.within(), mark)
+            .await;
+        let epoch = super::rendered_procfs::epoch_time(guest.config().epoch);
+        Ok(DetStat {
+            mask: StatxMask::STATX_BASIC_STATS | StatxMask::STATX_MNT_ID,
+            mode: libc::S_IFDIR | (kernel.st_mode & 0o7777),
+            uid: kernel.st_uid,
+            gid: kernel.st_gid,
+            attributes: StatxAttributes::empty(),
+            attributes_mask: StatxAttributes::STATX_ATTR_AUTOMOUNT
+                | StatxAttributes::STATX_ATTR_MOUNT_ROOT
+                | StatxAttributes::STATX_ATTR_DAX,
+            dev: Self::reported_procfs_device(guest),
+            rdev: 0,
+            inode: ino,
+            nlink: kernel.st_nlink,
+            size: kernel.st_size,
+            blksize: procfs_inode::PROC_BLOCK_SIZE,
+            blocks: kernel.st_blocks,
+            atime: epoch,
+            btime: epoch,
+            ctime: epoch,
+            mtime: epoch,
+        })
+    }
+
     /// The metadata of the caller's `/proc/self` or `/proc/thread-self` link
     /// itself (`spelling`, not followed), as Linux reports it
     /// (`proc_setup_self`, `proc_setup_thread_self`, fs/proc/self.c and
@@ -3671,7 +3807,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(None);
         };
         let position = match state.directory {
-            PlaceholderDirectory::Root | PlaceholderDirectory::Task(_) => guest
+            PlaceholderDirectory::Root
+            | PlaceholderDirectory::Task(_)
+            | PlaceholderDirectory::System(_) => guest
                 .thread_state()
                 .with_detfd(fd, |detfd| detfd.directory_stream_position())?,
             PlaceholderDirectory::Descriptors(_) => state.position,
@@ -3785,9 +3923,25 @@ impl<T: RecordOrReplay> Detcore<T> {
                                 return Err(Errno::ELOOP.into());
                             }
                             Some(directory) => directory,
+                            None => match self
+                                .system_directory_reached(guest, &path, &spelling, links, true)?
+                            {
+                                Some(directory) => directory,
+                                None => return Ok(None),
+                            },
+                        },
+                        // A final `/` or `/.` follows a final link, as for
+                        // the selector links above.
+                        None => match self.system_directory_reached(
+                            guest,
+                            &path,
+                            &spelling,
+                            links,
+                            !super::opens_the_link_itself(&path, OFlag::O_NOFOLLOW),
+                        )? {
+                            Some(directory) => directory,
                             None => return Ok(None),
                         },
-                        None => return Ok(None),
                     },
                 };
                 (directory, None)
@@ -3963,7 +4117,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             Syscall::Getdents(_) | Syscall::Getdents64(_)
                 if matches!(
                     state.directory,
-                    PlaceholderDirectory::Root | PlaceholderDirectory::Task(_)
+                    PlaceholderDirectory::Root
+                        | PlaceholderDirectory::Task(_)
+                        | PlaceholderDirectory::System(_)
                 ) =>
             {
                 self.serve_root_placeholder(guest, call, fd, state).await
@@ -4207,7 +4363,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 })?;
                 Ok(position as i64)
             }
-            PlaceholderDirectory::Root | PlaceholderDirectory::Task(_) => {
+            PlaceholderDirectory::Root
+            | PlaceholderDirectory::Task(_)
+            | PlaceholderDirectory::System(_) => {
                 let current = guest
                     .thread_state()
                     .with_detfd(fd, |detfd| detfd.directory_stream_position())?;
@@ -4881,7 +5039,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         state: PlaceholderState,
     ) -> Result<i64, Error> {
         let owned = match state.directory {
-            PlaceholderDirectory::Root => None,
+            PlaceholderDirectory::Root | PlaceholderDirectory::System(_) => None,
             PlaceholderDirectory::Descriptors(binding) => Some(binding.pid),
             PlaceholderDirectory::Task(binding) => Some(binding.pid),
         };
@@ -4935,7 +5093,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         if times.is_some_and(|times| times.iter().any(|time| !valid(time.tv_nsec))) {
             return Err(Errno::EINVAL.into());
         }
-        if state.directory != PlaceholderDirectory::Root {
+        // A system-wide directory is the caller's to touch where it may act
+        // as the directory's owner (`setattr_prepare`; `proc_sys_setattr`
+        // and `proc_notify_change` then keep the times), as a descriptor
+        // directory is its own; otherwise it is answered as global root's
+        // `/proc` is.
+        let owned = match &state.directory {
+            PlaceholderDirectory::Root => false,
+            PlaceholderDirectory::System(_) => placeholder_owner_or_capable(&state.directory)?,
+            PlaceholderDirectory::Descriptors(_) | PlaceholderDirectory::Task(_) => true,
+        };
+        if owned {
             return Ok(0);
         }
         match times {
@@ -4961,7 +5129,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Err(Errno::EINVAL);
         }
-        if *directory == PlaceholderDirectory::Root && mode & libc::W_OK != 0 {
+        // A system-wide directory grants no write either: a sysctl
+        // directory to no one (`test_perm` of its 0555 table entry), and
+        // another only to a caller that may override its owner's mode.
+        let unwritable = match directory {
+            PlaceholderDirectory::Root => true,
+            PlaceholderDirectory::System(system) => {
+                system.is_sysctl() || !placeholder_owner_or_capable(directory)?
+            }
+            PlaceholderDirectory::Descriptors(_) | PlaceholderDirectory::Task(_) => false,
+        };
+        if unwritable && mode & libc::W_OK != 0 {
             return Err(Errno::EACCES);
         }
         Ok(0)
@@ -5152,7 +5330,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> i64 {
         match state.directory {
             PlaceholderDirectory::Descriptors(_) => state.position as i64,
-            PlaceholderDirectory::Root | PlaceholderDirectory::Task(_) => guest
+            PlaceholderDirectory::Root
+            | PlaceholderDirectory::Task(_)
+            | PlaceholderDirectory::System(_) => guest
                 .thread_state()
                 .with_detfd(fd, |detfd| detfd.directory_stream_position())
                 .map_or(0, |position| position as i64),
@@ -5317,6 +5497,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                         PlaceholderDirectory::Task(binding) => {
                             let within = binding.within().into_os_string().into_encoded_bytes();
                             (within[1..].to_vec(), binding.canonical())
+                        }
+                        PlaceholderDirectory::System(directory) => {
+                            let within = directory.within().into_os_string().into_encoded_bytes();
+                            (within[1..].to_vec(), directory.canonical())
                         }
                     };
                     let (rest, changed) =
@@ -5494,6 +5678,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let within = binding.within().into_os_string().into_encoded_bytes();
                     out.extend_from_slice(&within);
                     logical = binding.canonical().into_os_string().into_encoded_bytes();
+                    changed = true;
+                }
+                PlaceholderDirectory::System(directory) => {
+                    let within = directory.within().into_os_string().into_encoded_bytes();
+                    out.extend_from_slice(&within);
+                    logical = directory.canonical().into_os_string().into_encoded_bytes();
                     changed = true;
                 }
             }
@@ -5815,7 +6005,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// 4's `sysctl` takes for a refusal when it checks each component of a
     /// key's path.
     ///
-    /// In the kernel's order: a pathname of `PATH_MAX` bytes or more is
+    /// Which directories it answers for is [`Self::system_directory_reached`]'s,
+    /// without following a final symbolic link, as `readlink` does not. In
+    /// the kernel's order: a pathname of `PATH_MAX` bytes or more is
     /// refused (ENAMETOOLONG, `getname_flags`) before any lookup, so it is
     /// left to the kernel's path; and the lookup keeps one `MAXSYMLINKS`
     /// budget across the descriptor links [`Self::readlink_walk`] replaced
@@ -5835,41 +6027,158 @@ impl<T: RecordOrReplay> Detcore<T> {
         original: &Path,
         spelled: &Path,
     ) -> Option<Result<i64, Error>> {
-        if original.as_os_str().len() >= libc::PATH_MAX as usize
-            || !Self::serves_task_directories(guest)
-        {
+        if !Self::serves_task_directories(guest) {
             return None;
         }
         let (decided, _, links) =
             Self::readlink_walk(guest, spelled.as_os_str().as_bytes()).ok()?;
         let decided = PathBuf::from(std::ffi::OsString::from_vec(decided));
-        match super::rendered_procfs::procfs_directory_reached(&decided, links) {
-            // The whole walk, the links Detcore replaced included, passed
-            // `MAXSYMLINKS`: Linux's ELOOP, which a lookup of the rest by the
-            // backend could not count.
+        match self.system_directory_reached(guest, original, &decided, links, false) {
+            Ok(Some(_)) => Some(Err(Errno::EINVAL.into())),
+            Ok(None) => None,
             Err(errno) => Some(Err(errno.into())),
-            Ok(Some(reached))
-                if crate::procfs::levels::names_system_directory(&reached, self.cfg.proc_level) =>
-            {
-                Some(Err(Errno::EINVAL.into()))
-            }
-            Ok(_) => None,
         }
+    }
+
+    /// The system-wide procfs directory of the `--proc` level
+    /// ([`SystemDirectory`]: `/proc/sys`, `/proc/sys/kernel/random`, ...)
+    /// that a lookup of the absolute guest path `decided` reaches, or `/proc`
+    /// itself where the lookup climbs back to it from one
+    /// (`/proc/sys/..`, which `names_procfs_root` leaves to the kernel's
+    /// walk), as the placeholder directory Detcore serves for it, following
+    /// a final symbolic link where `follow` says so, where Detcore serves
+    /// these directories on placeholders ([`Self::serves_task_directories`]:
+    /// KVM, whose executor serves no procfs directory and refuses every
+    /// procfs object with EACCES), for a call whose own pathname is
+    /// `original`. Where the guest's procfs is the kernel's (ptrace) the
+    /// kernel serves them, and Detcore lists them from its model
+    /// (`Detcore::modeled_directory_snapshot`), from the same table.
+    ///
+    /// In the kernel's order: a pathname of `PATH_MAX` bytes or more is
+    /// refused (ENAMETOOLONG, `getname_flags`) before any lookup, so it is
+    /// left to the backend. The rest is decided by the object the lookup
+    /// reaches in the guest's mount namespace, which the tool shares, and by
+    /// the kernel's name for it (`rendered_procfs::procfs_directory_reached`),
+    /// never by the spelling, as [`Self::own_link_directory`] answers from
+    /// the descriptor's own identity: a user mount over part of `/proc`
+    /// (`--mount ...,target=/proc/sys`) keeps its own objects, and a spelling
+    /// through a symbolic link to `/proc/sys` reaches the procfs directory it
+    /// names. `links` counts the symbolic links the guest's lookup followed
+    /// before it reached `decided` (the descriptor links Detcore replaced,
+    /// [`Self::decided_path`], [`Self::readlink_walk`]), so that one
+    /// `MAXSYMLINKS` budget covers the whole lookup; an `Err` is the lookup's
+    /// own failure (ELOOP past that budget), the guest's answer.
+    ///
+    /// Detcore walks the path itself, counting every link
+    /// (`rendered_procfs::procfs_directory_reached`, which never follows a
+    /// final link; a call that follows it walks the path with a final `/`,
+    /// which the walk follows as the trailing link, `WALK_TRAILING`, with
+    /// `pick_link`'s checks, as Linux follows the last name of a lookup with
+    /// `LOOKUP_FOLLOW`; the `LOOKUP_DIRECTORY` that a `/` adds refuses only
+    /// what is no directory, which is never served here). Where no
+    /// descriptor link was replaced, one kernel `stat` of the path decides
+    /// first whether it can reach a procfs directory at all, so that the
+    /// lookups that cannot, nearly every one, cost the tool one call rather
+    /// than one per name: a kernel lookup can only count more links than
+    /// Linux's walk of the same path (`walk_counting_links`), never fewer, so
+    /// the object it reaches is the walk's, and only its ELOOP is left to the
+    /// walk to decide. Every other refusal of that stat (`fs.protected_symlinks`
+    /// for a followed final link, a security module's) is the tool's kernel
+    /// lookup of the same path, which is what the walk itself falls back to
+    /// in exactly those cases (`procfs_directory_reached`'s `kernel_lookup`),
+    /// so it decides nothing the walk would decide otherwise.
+    pub(crate) fn system_directory_reached<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        original: &Path,
+        decided: &Path,
+        links: usize,
+        follow: bool,
+    ) -> Result<Option<PlaceholderDirectory>, Errno> {
+        if original.as_os_str().len() >= libc::PATH_MAX as usize
+            || !Self::serves_task_directories(guest)
+        {
+            return Ok(None);
+        }
+        if links == 0 {
+            match super::rendered_procfs::kernel_stat(decided, follow) {
+                Ok(stat)
+                    if stat.st_mode & libc::S_IFMT == libc::S_IFDIR
+                        && super::rendered_procfs::proc_device() == Some(stat.st_dev) => {}
+                Err(Errno::ELOOP) => {}
+                _ => return Ok(None),
+            }
+        }
+        let walked = if follow {
+            let mut bytes = decided.as_os_str().as_bytes().to_vec();
+            bytes.push(b'/');
+            PathBuf::from(std::ffi::OsString::from_vec(bytes))
+        } else {
+            decided.to_path_buf()
+        };
+        let Some(reached) = super::rendered_procfs::procfs_directory_reached(&walked, links)?
+        else {
+            return Ok(None);
+        };
+        Ok(if reached == Path::new("/proc") {
+            Some(PlaceholderDirectory::Root)
+        } else {
+            SystemDirectory::named(&reached, self.cfg.proc_level).map(PlaceholderDirectory::System)
+        })
+    }
+
+    /// The system-wide procfs directory an open of `observed`, the guest's
+    /// absolute spelling of its pathname `original`, names, if Detcore
+    /// serves it ([`Self::system_directory_reached`], through the caller's
+    /// descriptor links to placeholders as [`Self::decided_path`] resolves
+    /// them; following the last component unless the open opens a link
+    /// itself, `opens_the_link_itself`). As for every directory Detcore
+    /// serves ([`Self::descriptor_directory_opened`]), the flags
+    /// `build_open_flags` refuses are the answer first; `open_placeholder`
+    /// checks the rest.
+    pub(super) fn system_directory_opened<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        original: &Path,
+        observed: &Path,
+        flags: OFlag,
+    ) -> Option<Result<OpenedDirectory, Errno>> {
+        if !Self::serves_task_directories(guest) {
+            return None;
+        }
+        let (decided, links) = Self::decided_path(guest, observed).ok()?;
+        let follow = !super::opens_the_link_itself(observed, flags);
+        let reached = self.system_directory_reached(guest, original, &decided, links, follow);
+        let opened = match reached {
+            Ok(Some(PlaceholderDirectory::System(directory))) => {
+                Ok(OpenedDirectory::System(directory))
+            }
+            Ok(Some(PlaceholderDirectory::Root)) => Ok(OpenedDirectory::Root),
+            Ok(_) => return None,
+            Err(errno) => Err(errno),
+        };
+        Some(match super::rendered_procfs::open_flags_refused(flags) {
+            Some(errno) => Err(errno),
+            None => opened,
+        })
     }
 
     /// Whether the absolute guest path `observed`, followed, names a
     /// placeholder directory Detcore serves: `/proc` by any spelling (through
     /// tasks that exist, [`NamedTask`]), one of the caller's own descriptor
-    /// directories, or a descriptor link of the caller's to a placeholder, as
-    /// `statfs` reaches it.
+    /// directories, a descriptor link of the caller's to a placeholder, or a
+    /// system-wide directory ([`Self::system_directory_reached`], for the
+    /// guest's own pathname `original`), as `statfs` reaches it.
     pub(super) async fn names_placeholder_directory<G: Guest<Self>>(
+        &self,
         guest: &mut G,
+        original: &Path,
         observed: &Path,
     ) -> bool {
         let Some(own) = Self::descriptor_directory_caller(guest) else {
             return false;
         };
-        let Ok((decided, _)) = Self::decided_path(guest, observed) else {
+        let Ok((decided, links)) = Self::decided_path(guest, observed) else {
             return false;
         };
         if fd_directory::classify(&decided, own).is_some()
@@ -5879,7 +6188,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         match names_procfs_root(&decided) {
             Some(tasks) => Self::named_tasks_exist(guest, &tasks).await,
-            None => false,
+            // A system-wide directory, by the object the lookup reaches
+            // from the guest's own pathname `original`.
+            None => matches!(
+                self.system_directory_reached(guest, original, &decided, links, true),
+                Ok(Some(_))
+            ),
         }
     }
 
@@ -6147,7 +6461,10 @@ const RWH_WRITE_LIFE_EXTREME: u64 = 5;
 /// directory is its own; `/proc` is global root's, whom the caller may act
 /// as only where the guest's user namespace maps it, as the guest's own stat
 /// of `/proc` shows (`guest_procfs_root`: an unmapped owner reads as the
-/// overflow ID, which no mapped caller has).
+/// overflow ID, which no mapped caller has); a system-wide directory is its
+/// owner's as the kernel reports it in the guest's user namespace
+/// (`rendered_procfs::procfs_object_stat`: global root, or the root of the
+/// network namespace's owner for `/proc/sys/net`).
 fn placeholder_owner_or_capable(directory: &PlaceholderDirectory) -> Result<bool, Errno> {
     const OVERFLOW_ID: u32 = 65534;
     match directory {
@@ -6155,6 +6472,10 @@ fn placeholder_owner_or_capable(directory: &PlaceholderDirectory) -> Result<bool
         PlaceholderDirectory::Root => {
             let (_, uid, gid) = super::rendered_procfs::guest_procfs_root()?;
             Ok(uid != OVERFLOW_ID && gid != OVERFLOW_ID)
+        }
+        PlaceholderDirectory::System(system) => {
+            let stat = super::rendered_procfs::procfs_object_stat(&system.canonical())?;
+            Ok(stat.st_uid != OVERFLOW_ID && stat.st_gid != OVERFLOW_ID)
         }
     }
 }
@@ -6165,7 +6486,8 @@ fn placeholder_owner_or_capable(directory: &PlaceholderDirectory) -> Result<bool
 /// Detcore takes the caller to be the guest's root, which owns its own task's
 /// descriptor directory (`rendered_file_owner`), and owns `/proc` only where
 /// global root is the guest's root, as the guest's own stat of `/proc` shows
-/// (`guest_procfs_root`: uid 0). Read from the same facts as
+/// (`guest_procfs_root`: uid 0), and a system-wide directory where its owner
+/// is (`rendered_procfs::procfs_object_stat`). Read from the same facts as
 /// [`placeholder_owner_or_capable`], which also lets a caller act as an owner
 /// its user namespace maps, as `inode_owner_or_capable` does and
 /// `vfs_setlease` does not.
@@ -6175,6 +6497,10 @@ fn placeholder_lease_owner(directory: &PlaceholderDirectory) -> Result<bool, Err
         PlaceholderDirectory::Root => {
             let (_, uid, _) = super::rendered_procfs::guest_procfs_root()?;
             Ok(uid == 0)
+        }
+        PlaceholderDirectory::System(system) => {
+            let stat = super::rendered_procfs::procfs_object_stat(&system.canonical())?;
+            Ok(stat.st_uid == 0)
         }
     }
 }

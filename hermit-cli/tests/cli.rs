@@ -232,6 +232,7 @@ static CHAOS_LAST_BAND_ADMISSION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static YIELD_LOOP_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DIRECTORY_SIZE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCFS_SYSTEM_DIRECTORY_LINKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PROCFS_SYSTEM_DIRECTORIES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUSE_DIRECTORY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LAST_BAND_BACKGROUND_CALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHAOS_POLLER_BESIDE_SLEEPERS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -63980,6 +63981,83 @@ fn run_kvm_a_user_mount_over_proc_sys_keeps_its_links() {
         let output = hermit(&args);
         assert_success(&output, &args);
         assert_eq!(stdout(&output), expected, "{backend}");
+    }
+}
+
+/// On KVM, whose executor serves no procfs directory and refused every one
+/// with `EACCES`, Detcore serves the system-wide directories of the
+/// `--proc` level table (`/proc/sys`, `/proc/sys/kernel/random`, `/proc/tty`,
+/// ...) on placeholders, from the table ptrace's listing of the kernel's
+/// directories uses: tests/c/procfs_system_directories.c's stat, lstat,
+/// opendir, fstat and listing of each of the twelve, the inode agreement of
+/// the listing with stat, rewind, `fstatfs`, `O_TMPFILE`, `access(W_OK)` and
+/// `statfs`, and the same through a symbolic link to `/proc/sys`, by
+/// redundant spellings, with `..`, for names the level or the kernel lacks,
+/// and at `PATH_MAX` (4095 bytes served, 4096 `ENAMETOOLONG`). At both levels
+/// every line on KVM must equal ptrace's. Before the change every directory
+/// was `EACCES` on KVM.
+#[test]
+fn run_kvm_procfs_system_directories_answer_as_on_ptrace() {
+    if kvm_unavailable("run_kvm_procfs_system_directories_answer_as_on_ptrace") {
+        return;
+    }
+    let guest = futex_c_guest(
+        &PROCFS_SYSTEM_DIRECTORIES_GUEST,
+        "procfs_system_directories",
+    )
+    .to_str()
+    .unwrap()
+    .to_owned();
+    let _guard = hermit_run_guard();
+    for (level, anchors) in [
+        (
+            "--proc=minimal",
+            [
+                "/proc/sys: stat=mode:40555,",
+                "readdir=[./4 ../4 kernel/4 vm/4] inodes=agree rewind=same",
+                "/proc/sys/fs: stat=ENOENT lstat=ENOENT opendir=ENOENT",
+                "/proc/sys/kernel/random: stat=mode:40555,",
+            ],
+        ),
+        (
+            "--proc=standard",
+            [
+                "/proc/sys: stat=mode:40555,",
+                "readdir=[./4 ../4 fs/4 kernel/4 net/4 vm/4] inodes=agree rewind=same",
+                "/proc/tty: stat=mode:40555,",
+                "readdir=[./4 ../4 ip_local_port_range/8]",
+            ],
+        ),
+    ] {
+        let mut outputs = Vec::new();
+        for backend in ["--backend=ptrace", "--backend=kvm"] {
+            let args = [
+                backend,
+                "run",
+                "--strict",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--base-env=minimal",
+                level,
+                "--",
+                guest.as_str(),
+                "/tmp",
+            ];
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            outputs.push(stdout(&output));
+        }
+        let (ptrace, kvm) = (&outputs[0], &outputs[1]);
+        for anchor in anchors {
+            assert!(
+                ptrace.contains(anchor),
+                "{level}: {anchor:?} on ptrace:\n{ptrace}"
+            );
+        }
+        assert!(
+            ptrace.contains("(4096 bytes) /proc/sys + /. + /: stat=ENAMETOOLONG"),
+            "{level}: ptrace:\n{ptrace}"
+        );
+        assert_eq!(kvm, ptrace, "{level}: KVM against ptrace");
     }
 }
 

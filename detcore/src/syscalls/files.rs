@@ -96,6 +96,8 @@ mod rendered_fdinfo;
 pub(crate) mod rendered_procfs;
 #[cfg(test)]
 mod system_directory_link_tests;
+#[cfg(test)]
+mod system_directory_tests;
 
 /// A conversion from SOCK_* flags to O_* flags which makes unsafe (but checked during testing) assumptions.
 fn oflag_from_sock_bits(s_bits: i32) -> OFlag {
@@ -6540,10 +6542,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         // `/proc` itself, or the caller's own descriptor directory, which
         // Detcore serves on a placeholder descriptor, listing them from its
-        // model on ptrace and KVM (`descriptor_directory`).
+        // model on ptrace and KVM, and on KVM the system-wide directories of
+        // the `--proc` level, by the object the lookup reaches
+        // (`descriptor_directory`).
         if !path.as_os_str().is_empty()
             && !Self::starts_at_a_recorded_link(guest, call.dirfd(), &path)
-            && let Some(opened) = self
+            && let Some(opened) = match self
                 .descriptor_directory_opened(
                     guest,
                     guest_spelled
@@ -6555,6 +6559,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                     call.flags(),
                 )
                 .await
+            {
+                Some(opened) => Some(opened),
+                None => self.system_directory_opened(
+                    guest,
+                    &path,
+                    guest_spelled
+                        .as_ref()
+                        .map_or(&observed_path, |(observed, _)| observed),
+                    call.flags(),
+                ),
+            }
         {
             let name_and_slash = descriptor_directory::ends_in_a_name_and_slash(
                 guest_spelled
@@ -16033,7 +16048,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Self::prepare_guest_cwd(guest, libc::AT_FDCWD, &path).await;
             let observed = Self::observed_path(guest, libc::AT_FDCWD, &path)?;
             if self.rendered_procfs_at(guest, &observed).await?.is_some()
-                || Box::pin(Self::names_placeholder_directory(guest, &observed)).await
+                || Box::pin(self.names_placeholder_directory(guest, &path, &observed)).await
                 || self
                     .placeholder_reached(guest, libc::AT_FDCWD, Some(pointer), true)
                     .await

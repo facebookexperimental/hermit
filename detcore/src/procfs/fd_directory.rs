@@ -152,6 +152,10 @@ pub enum PlaceholderDirectory {
     /// (package K slice K10). Last, so that the earlier variants keep their
     /// numbers in the global RPC's positional encoding.
     Task(TaskDirectoryBinding),
+    /// One of the system-wide directories below `/proc` that the `--proc`
+    /// level table holds (`/proc/sys`, `/proc/sys/kernel/random`, ...), the
+    /// same directory for every task. Last, as [`Self::Task`] is.
+    System(SystemDirectory),
 }
 
 impl PlaceholderDirectory {
@@ -163,6 +167,7 @@ impl PlaceholderDirectory {
             Self::Root => PathBuf::from("/proc"),
             Self::Descriptors(binding) => binding.canonical(),
             Self::Task(binding) => binding.canonical(),
+            Self::System(directory) => directory.canonical(),
         }
     }
 
@@ -175,6 +180,7 @@ impl PlaceholderDirectory {
             Self::Root => PathBuf::from("/proc"),
             Self::Descriptors(binding) => binding.lookup_base(caller),
             Self::Task(binding) => binding.lookup_base(caller),
+            Self::System(directory) => directory.canonical(),
         }
     }
 
@@ -198,7 +204,69 @@ impl PlaceholderDirectory {
                 thread: (binding.kind == TaskDirectoryKind::Thread)
                     .then_some((binding.tid, binding.thread_incarnation)),
             },
+            Self::System(directory) => PlaceholderLockKey::System(*directory),
         }
+    }
+}
+
+/// One of the system-wide directories below `/proc` that the `--proc` level
+/// table holds, by its index in the table's list of them
+/// (`levels::system_directory`): a value only that table makes, so every one
+/// names a directory.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize
+)]
+pub struct SystemDirectory(u16);
+
+impl SystemDirectory {
+    /// The system-wide directory the absolute path `path` names at `level`
+    /// (`levels::system_directory`): `/proc/sys`, `/proc/sys/kernel/random`,
+    /// and so on, by any spelling without `..`; not `/proc` itself.
+    pub(crate) fn named(path: &Path, level: detcore_model::config::ProcLevel) -> Option<Self> {
+        super::levels::system_directory(path, level).map(Self)
+    }
+
+    /// The directory's path relative to `/proc` (`sys/kernel`).
+    fn relative(&self) -> &'static str {
+        super::levels::system_directory_path(self.0)
+            .expect("a system directory is made from the level table's index of it")
+    }
+
+    /// The directory's path within procfs (`/sys/kernel`).
+    pub(crate) fn within(&self) -> PathBuf {
+        Path::new("/").join(self.relative())
+    }
+
+    /// The directory's absolute guest path (`/proc/sys/kernel`).
+    pub(crate) fn canonical(&self) -> PathBuf {
+        Path::new("/proc").join(self.relative())
+    }
+
+    /// Whether the directory is a sysctl directory, below `/proc/sys`, whose
+    /// permission Linux takes from the sysctl table entry
+    /// (`proc_sys_permission`, `test_perm`) rather than from its inode's
+    /// owner and mode (`generic_permission`, as for `/proc/tty`).
+    pub(crate) fn is_sysctl(&self) -> bool {
+        self.relative() == "sys" || self.relative().starts_with("sys/")
+    }
+
+    /// The model's directory ([`super::listing::ModeledDirectory`]).
+    pub(crate) fn modeled(&self) -> super::listing::ModeledDirectory {
+        super::listing::ModeledDirectory::System(
+            self.relative()
+                .split('/')
+                .map(|name| name.as_bytes().to_vec())
+                .collect(),
+        )
     }
 }
 
@@ -243,6 +311,8 @@ pub enum PlaceholderLockKey {
         /// For a thread's directory, the thread and its incarnation.
         thread: Option<(i32, Option<u32>)>,
     },
+    /// A system-wide directory (`/proc/sys`, ...). Last, as `Task` is.
+    System(SystemDirectory),
 }
 
 /// Which of the caller's own descriptor directories the absolute guest path
