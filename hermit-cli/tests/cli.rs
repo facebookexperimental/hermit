@@ -29708,7 +29708,7 @@ fn a_schedule_replay_leaves_out_a_fifo_its_guest_writes() {
 /// replay with stderr a file again names nothing. Only a warning: the replay
 /// still runs.
 #[test]
-fn a_schedule_replay_names_a_stdio_kind_changed_since_the_recording() {
+fn a_schedule_replay_refuses_a_stdio_kind_changed_since_the_recording() {
     let program = stderr_fsync_guest()
         .to_str()
         .expect("stderr-fsync guest path should be UTF-8");
@@ -29766,8 +29766,28 @@ fn a_schedule_replay_names_a_stdio_kind_changed_since_the_recording() {
     let record = hermit_test::recorded_preemption_json(&schedule);
     assert_eq!(record["host_inputs"]["stdio"]["stderr"], "file");
 
-    let (piped, piped_stderr, piped_summary) = run(&replay_arg, "replay-pipe", false);
-    assert_eq!(piped, "fsync(stderr) = Invalid argument\n");
+    // The piped replay diverges where the guest checks the changed kind
+    // (fsync on a pipe takes another path), and strict replay refuses it
+    // (dh-mvz7y): the named cause prints first, then the ERROR line and
+    // the internal-failure status. It no longer completes.
+    let piped_args = [
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+        replay_arg.as_str(),
+        "--",
+        program,
+    ];
+    let mut piped_command = hermit_command(&piped_args);
+    piped_command.stdin(Stdio::null());
+    let piped = hermit_test::hermit_output("replay-pipe", &mut piped_command);
+    let piped_stderr = stderr(&piped);
+    assert_eq!(
+        piped.status.code(),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        "{piped_stderr}"
+    );
     assert_eq!(
         named(&piped_stderr),
         vec![
@@ -29778,10 +29798,11 @@ fn a_schedule_replay_names_a_stdio_kind_changed_since_the_recording() {
         ],
         "{piped_stderr}"
     );
-    assert_eq!(piped_summary["host_inputs"]["stdio"]["stderr"], "pipe");
-    assert_eq!(
-        piped_summary["stdio_changed"],
-        serde_json::json!([{"fd": 2, "recorded": "file", "now": "pipe"}])
+    assert!(
+        piped_stderr
+            .lines()
+            .any(|line| line.starts_with("ERROR HERMIT_REPLAY_DESYNC thread=")),
+        "{piped_stderr}"
     );
 
     let (again, again_stderr, again_summary) = run(&replay_arg, "replay-file", true);

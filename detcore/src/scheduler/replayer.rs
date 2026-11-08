@@ -964,8 +964,16 @@ impl Replayer {
                     counts.hard += 1;
                     in_hard_desync_mode = true;
                 } else {
-                    // TODO: we need to handle a mismatch in counts by doing a partial-pop on the
-                    // replayer state.
+                    // A soft desync is still a desync: strict replay stops
+                    // at it (dh-mvz7y; the counter and the verdict agree).
+                    if self.die_on_desync {
+                        return self.stop_fatal(
+                            mytid,
+                            current_ix,
+                            format!("{expected}"),
+                            format!("{observed}"),
+                        );
+                    }
                     counts.soft += 1;
                 }
             }
@@ -978,15 +986,18 @@ impl Replayer {
                 counts.resync_deletions += 1;
                 // The background starts recorded among the dropped events were
                 // missed, as an untaken due start is, before the matched event
-                // is accepted.
-                if self.retire_skipped_starts(ix as u64, current_ix) > 0 && self.die_on_desync {
+                // is accepted. Retire them first so their counts land even
+                // though strict replay then stops on the resync itself.
+                let retired = self.retire_skipped_starts(ix as u64, current_ix);
+                if self.die_on_desync {
                     return self.stop_fatal(
                         mytid,
                         current_ix,
-                        "recorded starts skipped by the resync".to_owned(),
+                        "recorded events the replay dropped to resync".to_owned(),
                         format!("{observed}"),
                     );
                 }
+                let _ = retired;
                 in_hard_desync_mode = false;
                 // is_desync = false; // Logically correct, but... unused_assignments
             }
@@ -1937,7 +1948,9 @@ mod tests {
             strict.observe_event(&schedule[1]),
             ReplayAction::Stop(StopReason::FatalDesync)
         );
-        assert_eq!(strict.desync_counts[&tid(5)].hard, 1);
+        // Strict now stops at the soft mismatch itself, before the
+        // fast-forward can retire the skipped start (dh-mvz7y).
+        assert!(strict.fatal_desync.is_some());
 
         // A call begun with no start of it due is a hard desync of its thread.
         let mut unrecorded =
@@ -2095,6 +2108,7 @@ mod tests {
         };
         let mut replayer = Replayer::new(schedule)
             .with_background_starts(&[start(1, 5, 1), start(2, 7, 1), start(3, 9, 1)], true);
+        replayer.die_on_desync = false; // lenient accounting (dh-mvz7y)
         // Drop the first two events: the starts after events 1 and 2 are past.
         replayer.retire_skipped_starts(2, 0);
         assert_eq!(replayer.desync_counts[&tid(5)].hard, 1);
@@ -2117,6 +2131,7 @@ mod tests {
         let observed = schedule[1].clone();
         let mut lenient =
             Replayer::new(schedule.clone()).with_background_starts(&[start(1, 5, 1)], true);
+        lenient.die_on_desync = false;
         assert_ne!(
             lenient.observe_event(&observed),
             ReplayAction::ContextSwitch(false, tid(5), None)
@@ -2129,7 +2144,9 @@ mod tests {
             strict.observe_event(&observed),
             ReplayAction::Stop(StopReason::FatalDesync)
         );
-        assert_eq!(strict.desync_counts[&tid(5)].hard, 1);
+        // Strict now stops at the soft mismatch itself, before the
+        // fast-forward can retire the skipped start (dh-mvz7y).
+        assert!(strict.fatal_desync.is_some());
 
         // The rest of the schedule survives the fast-forward: five events of
         // one thread with a start recorded after the fourth and one after the
@@ -2148,6 +2165,7 @@ mod tests {
         ]);
         let mut resynced = Replayer::new(five.clone())
             .with_background_starts(&[start(4, 3, 1), start(5, 3, 2)], true);
+        resynced.die_on_desync = false; // lenient accounting (dh-mvz7y)
         resynced.observe_event(&five[1]);
         assert_eq!(resynced.desync_counts[&tid(3)].fast_forwards, 1);
         assert_eq!(resynced.cursor.peek(), Some(&five[2]));
@@ -2520,6 +2538,25 @@ mod tests {
         );
         assert_eq!(r.cursor.peek(), Some(&recorded));
         assert_eq!(r.events_popped, 0);
+    }
+
+    /// Strict replay stops at a soft desync too (dh-mvz7y): a single
+    /// recorded end_time moved by 1 ns is a desync, and the counter and
+    /// the verdict agree — it must not finish green with desynced=1.
+    #[test]
+    fn a_soft_time_mutation_stops_strict_replay() {
+        let mut b = builder::SchedTestBuilder::new();
+        let recorded = b.branch(123, tid(3));
+        let mut mutated = recorded.clone();
+        mutated.end_time = recorded.end_time.map(|t| t + LogicalTime::from_nanos(1));
+        let mut replayer = Replayer::new([recorded]);
+        assert!(replayer.die_on_desync);
+        let action = replayer.observe_event(&mutated);
+        assert_eq!(action, ReplayAction::Stop(StopReason::FatalDesync));
+        let (thread, _event, expected, observed) = replayer.fatal_desync.clone().unwrap();
+        assert_eq!(thread, tid(3));
+        assert!(expected.contains("123"), "{expected}");
+        assert!(observed.contains("123"), "{observed}");
     }
 
     #[test]

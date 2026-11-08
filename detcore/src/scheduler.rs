@@ -20273,6 +20273,11 @@ impl Scheduler {
                 );
                 let unrecorded_start_is_fatal = replayer.note_unrecorded_background_start(dettid);
                 if unrecorded_start_is_fatal {
+                    eprintln!(
+                        "ERROR HERMIT_REPLAY_DESYNC thread={dettid} event={} \
+                         expected=recorded background start observed=unrecorded call {call}",
+                        replayer.traced_event_count
+                    );
                     self.report_stacktrace_positions_at_replay_stop("strict replay");
                     immediate_fatal_exit();
                 }
@@ -32742,6 +32747,54 @@ mod test {
     /// record that notes starts but none here hands over no call by the
     /// prehook heuristic (`replay_prehook_handoff`): a poller queued first
     /// keeps its place.
+    /// Strict replay of an unrecorded background start prints the ERROR
+    /// line before it ends (dh-mvz7y): the child runs the production path.
+    #[test]
+    fn an_unrecorded_background_start_prints_the_desync_error() {
+        const CHILD: &str = "HERMIT_STRICT_BG_CHILD";
+        const NAME: &str =
+            "scheduler::test::an_unrecorded_background_start_prints_the_desync_error";
+        if std::env::var_os(CHILD).is_some() {
+            let caller = DetTid::from_raw(5);
+            let next = DetTid::from_raw(7);
+            let operation = ExternalOpId::new(caller, 1);
+            let observed = SchedEvent::syscall(caller, Sysno::ioctl, SyscallPhase::Prehook)
+                .with_time(LogicalTime::from_nanos(10_000));
+            let next_event = SchedEvent::syscall(next, Sysno::getpid, SyscallPhase::Prehook)
+                .with_time(LogicalTime::from_nanos(20_000));
+            let mut sched = Scheduler::new(&Config::default());
+            for tid in [caller, next] {
+                sched.register_thread_for_test(tid);
+                let mut request = Resources::new(tid);
+                if tid == caller {
+                    request.insert(ResourceID::BlockingExternalIO(operation), Permission::RW);
+                }
+                sched.next_turns.get_mut(&tid).unwrap().req = Ivar::full(Ok(request));
+                sched.priorities.insert(tid, REPLAY_DEFERRED_PRIORITY);
+                sched.runqueue_push_back(tid);
+            }
+            sched.priorities.insert(caller, REPLAY_FOREGROUND_PRIORITY);
+            sched.replayer = Some(
+                Replayer::new([observed.clone(), next_event]).with_background_starts(&[], true),
+            );
+            assert!(sched.replayer.as_ref().unwrap().die_on_desync);
+            let _ = sched.consume_schedevent(&observed);
+            sched.record_or_replay_background_start(caller, 1);
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("ERROR HERMIT_REPLAY_DESYNC thread=5"),
+            "{stderr}"
+        );
+    }
+
     #[test]
     fn a_recorded_background_start_begins_its_call_where_the_recording_did() {
         let poller = DetTid::from_raw(3);
