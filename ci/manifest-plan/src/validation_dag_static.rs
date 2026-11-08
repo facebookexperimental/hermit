@@ -2419,7 +2419,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 780,
+        timeout: 1320,
         cpu_timeout: 780,
         jobs_flag: None,
         jobs_env: None,

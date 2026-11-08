@@ -146,7 +146,7 @@ pub(crate) const WALL_CEILING_EXCEPTIONS: &[(&str, &str)] = &[
     ),
     (
         "e2e.manifest_language_runtimes",
-        "71 passing runs to 2026-11-02 peaked at a 515-second wall; 1.5 times that needs 772 s",
+        "the cell retry window (scripts/validate.rs require_manifest_selection_headroom: two attempts of the largest resolved cell wall at CPU 1.25x/wall 1.5x plus grace) needs 1269 s since rustc-hello verify/kvm's measured budget (dh-ss1l0) raised its resolved wall to 624 s: 2 x (624 + 10) = 1268, so the wall is 1320",
     ),
     (
         "e2e.manifest_system_utils",
