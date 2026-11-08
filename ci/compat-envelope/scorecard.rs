@@ -1731,6 +1731,13 @@ enum ExpectedOutputFailure {
         declared_stdout_bytes: u64,
         declared_stdout_sha256: String,
     },
+    /// Both compared runs printed these stderr bytes, not the declared exact bytes.
+    ExpectedStderr {
+        observed_stderr_bytes: u64,
+        observed_stderr_sha256: String,
+        declared_stderr_bytes: u64,
+        declared_stderr_sha256: String,
+    },
     /// Both compared runs printed these bytes, which omit the declared text.
     ExpectedStdoutContains {
         observed_stdout_bytes: u64,
@@ -1755,6 +1762,18 @@ impl ExpectedOutputFailure {
                 observed_stdout_sha256,
                 *declared_stdout_bytes,
                 declared_stdout_sha256,
+            ),
+            Self::ExpectedStderr {
+                observed_stderr_bytes,
+                observed_stderr_sha256,
+                declared_stderr_bytes,
+                declared_stderr_sha256,
+            } => hermit_manifest_plan::runner::expected_stderr_mismatch_reason(
+                "first",
+                *observed_stderr_bytes,
+                observed_stderr_sha256,
+                *declared_stderr_bytes,
+                declared_stderr_sha256,
             ),
             Self::ExpectedStdoutContains {
                 observed_stdout_bytes,
@@ -1783,6 +1802,22 @@ impl ExpectedOutputFailure {
                     && observed_stdout_sha256 == declared_stdout_sha256
                 {
                     Some("the declared stdout is the observed stdout")
+                } else {
+                    None
+                }
+            }
+            Self::ExpectedStderr {
+                observed_stderr_bytes,
+                observed_stderr_sha256,
+                declared_stderr_bytes,
+                declared_stderr_sha256,
+            } => {
+                if !is_sha256(observed_stderr_sha256) || !is_sha256(declared_stderr_sha256) {
+                    Some("a stderr digest is not SHA-256")
+                } else if observed_stderr_bytes == declared_stderr_bytes
+                    && observed_stderr_sha256 == declared_stderr_sha256
+                {
+                    Some("the declared stderr is the observed stderr")
                 } else {
                     None
                 }
@@ -2573,6 +2608,27 @@ impl ResultRow {
                     declared_stdout_sha256: declared_sha256,
                 }
             }
+            ExpectedOutputFailureReason::ExactStderr {
+                run,
+                observed_bytes,
+                observed_sha256,
+                declared_bytes,
+                declared_sha256,
+            } => {
+                // The runner names the first run whose stderr differs, and
+                // both runs of a matched report print the same bytes.
+                if run != "first" {
+                    return Err(contradiction(&format!(
+                        "it names the {run} run, but the first run of a matched pair printed the same bytes"
+                    )));
+                }
+                ExpectedOutputFailure::ExpectedStderr {
+                    observed_stderr_bytes: observed_bytes,
+                    observed_stderr_sha256: observed_sha256,
+                    declared_stderr_bytes: declared_bytes,
+                    declared_stderr_sha256: declared_sha256,
+                }
+            }
             ExpectedOutputFailureReason::Contains {
                 captured_bytes,
                 captured_sha256,
@@ -2586,25 +2642,37 @@ impl ResultRow {
         if let Some(why) = failure.malformation() {
             return Err(contradiction(why));
         }
-        let (ExpectedOutputFailure::ExpectedStdout {
-            observed_stdout_bytes: bytes,
-            observed_stdout_sha256: digest,
-            ..
-        }
-        | ExpectedOutputFailure::ExpectedStdoutContains {
-            observed_stdout_bytes: bytes,
-            observed_stdout_sha256: digest,
-            ..
-        }) = &failure;
+        let (bytes, digest, stderr) = match &failure {
+            ExpectedOutputFailure::ExpectedStdout {
+                observed_stdout_bytes,
+                observed_stdout_sha256,
+                ..
+            }
+            | ExpectedOutputFailure::ExpectedStdoutContains {
+                observed_stdout_bytes,
+                observed_stdout_sha256,
+                ..
+            } => (observed_stdout_bytes, observed_stdout_sha256, false),
+            ExpectedOutputFailure::ExpectedStderr {
+                observed_stderr_bytes,
+                observed_stderr_sha256,
+                ..
+            } => (observed_stderr_bytes, observed_stderr_sha256, true),
+        };
         let outputs = report
             .compared_outputs
             .as_ref()
             .ok_or_else(|| contradiction("the matched report records no compared outputs"))?;
         for (run, output) in [("first", &outputs.left), ("second", &outputs.right)] {
-            if output.stdout_bytes != *bytes || &output.stdout_sha256 != digest {
+            let (printed_bytes, printed_sha256, stream) = if stderr {
+                (output.stderr_bytes, &output.stderr_sha256, "stderr")
+            } else {
+                (output.stdout_bytes, &output.stdout_sha256, "stdout")
+            };
+            if printed_bytes != *bytes || printed_sha256 != digest {
                 return Err(contradiction(&format!(
-                    "the report's {run} run printed {} bytes with sha256 {}, not the stdout the reason names",
-                    output.stdout_bytes, output.stdout_sha256
+                    "the report's {run} run printed {} bytes with sha256 {}, not the {stream} the reason names",
+                    printed_bytes, printed_sha256
                 )));
             }
         }

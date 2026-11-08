@@ -1394,6 +1394,7 @@ fn validate_mode_with_cpu(
             "expected_guest_exit",
             "expected_stdout",
             "expected_stdout_contains",
+            "expected_stderr",
             "hermit_args",
             "hermit_args_reason",
             "env",
@@ -1635,6 +1636,25 @@ fn validate_mode_with_cpu(
             if text.as_str().is_none() {
                 die(format!(
                     "{id}: modes.{mode}.expected_stdout.{backend} must be a string"
+                ));
+            }
+        }
+    }
+    if let Some(expected_stderr) = spec.get("expected_stderr") {
+        let expected_stderr = expected_stderr.as_table().unwrap_or_else(|| {
+            die(format!(
+                "{id}: modes.{mode}.expected_stderr must be a table"
+            ))
+        });
+        for (backend, text) in expected_stderr {
+            if !enabled_names.contains(backend.as_str()) {
+                die(format!(
+                    "{id}: modes.{mode}.expected_stderr.{backend} names a backend outside backends_enabled"
+                ));
+            }
+            if text.as_str().is_none() {
+                die(format!(
+                    "{id}: modes.{mode}.expected_stderr.{backend} must be a string"
                 ));
             }
         }

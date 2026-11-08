@@ -7223,6 +7223,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // also one whose spelling classifies: a spelling through `..`
                 // (`/proc/self/../self/io`) classifies as the file it reaches,
                 // which may be outside the level.
+                let mut recordreplay_task_directory = false;
                 if procfs.is_none() || self.cfg.recordreplay_modes {
                     let resolved = if self.cfg.recordreplay_modes {
                         self.recorded_open_path(guest, fd).await?
@@ -7278,6 +7279,27 @@ impl<T: RecordOrReplay> Detcore<T> {
                             .await;
                         resource_release_all(guest).await;
                         return Err(Errno::ENOENT.into());
+                    }
+                    // Authenticate the opened object itself as a task
+                    // directory for the record/replay listing filter: the
+                    // recorded link names a process or thread directory
+                    // and the descriptor answers procfs through the
+                    // recording. An ordinary symlink to the directory
+                    // carries it; a user bind over that spelling, on
+                    // another filesystem, does not.
+                    if self.cfg.recordreplay_modes
+                        && resolved.as_deref().is_some_and(|resolved| {
+                            matches!(
+                                crate::procfs::listing::classify(resolved, 0, 0),
+                                Some(
+                                    crate::procfs::listing::ModeledDirectory::Process(_)
+                                        | crate::procfs::listing::ModeledDirectory::Thread(..)
+                                )
+                            )
+                        })
+                    {
+                        recordreplay_task_directory =
+                            self.recorded_descriptor_on_procfs(guest, fd).await == Some(true);
                     }
                     if procfs.is_none() {
                         procfs = resolved
@@ -7666,6 +7688,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 };
                 guest.thread_state().with_detfd(fd, |detfd| {
                     detfd.set_path(&recorded_path);
+                    if recordreplay_task_directory {
+                        detfd.set_recordreplay_task_directory();
+                    }
                     if let Some((reached, incarnation)) = reached.clone() {
                         detfd.set_procfs_reached(reached, incarnation);
                     }
@@ -18680,7 +18705,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let virtualize = guest.config().virtualize_metadata;
         if !virtualize
             && (call.dirent().is_none()
-                || (!self.recordreplay_task_directory_candidate_for(guest, call.fd() as i32)
+                || (!self.recordreplay_task_directory(guest, call.fd() as i32)
                     && !self.is_caller_descriptor_table(guest, call.fd() as i32)))
         {
             return Ok(self.record_or_replay(guest, call).await?);
@@ -18710,7 +18735,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let virtualize = guest.config().virtualize_metadata;
         if !virtualize
             && (call.dirent().is_none()
-                || (!self.recordreplay_task_directory_candidate_for(guest, call.fd() as i32)
+                || (!self.recordreplay_task_directory(guest, call.fd() as i32)
                     && !self.is_caller_descriptor_table(guest, call.fd() as i32)))
         {
             return Ok(self.record_or_replay(guest, call).await?);
@@ -19461,7 +19486,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // level, so run mode never lists it, and a recording made now
             // must not list it either, even though every other recorded
             // listing is served as recorded.
-            if self.recordreplay_task_directory(guest, fd).await {
+            if self.recordreplay_task_directory(guest, fd) {
                 entries.retain(|entry| entry.name != b"numa_maps");
             }
             return Ok(());
@@ -19676,7 +19701,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Under record and replay without metadata virtualization, one name
         // is still dropped: `numa_maps` in an authenticated task directory.
         let omit_recorded_numa_maps =
-            !virtualize && self.recordreplay_task_directory(guest, call.fd).await;
+            !virtualize && self.recordreplay_task_directory(guest, call.fd);
         let mut written = 0;
         let mut dropped = false;
         let (len, mut entries) = loop {
@@ -23307,6 +23332,61 @@ mod inject_fstat_scratch {
             assert_eq!(
                 crate::syscalls::binder::delivered(&guest.memory(), words.as_ptr() as usize, 0).fds,
                 vec![123]
+            );
+        }
+    }
+
+    /// The virtualized listing filter's record/replay branch drops exactly
+    /// `numa_maps` from an authenticated task directory's entries, and
+    /// nothing from an unauthenticated descriptor's (dh-6jx9q). No public
+    /// configuration reaches this branch — record and replay force
+    /// `virtualize_metadata` off — so both flags are set by hand here.
+    #[tokio::test]
+    async fn virtualized_recordreplay_filter_drops_only_numa_maps() {
+        let (_, mut guest) = ScriptedGuest::new(true, false);
+        guest.config.recordreplay_modes = true;
+        assert!(guest.config.virtualize_metadata);
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+        let entry = |name: &str| DirEntry {
+            name: name.as_bytes().to_vec(),
+            ino: 1,
+            off: 1,
+            ty: libc::DT_REG,
+        };
+        for (fd, authenticated) in [(97, true), (98, false)] {
+            guest
+                .thread
+                .add_fd(fd, OFlag::O_RDONLY, FdType::Regular, None)
+                .unwrap();
+            if authenticated {
+                guest
+                    .thread
+                    .with_detfd(fd, |detfd| detfd.set_recordreplay_task_directory())
+                    .unwrap();
+            }
+            let mut entries = vec![
+                entry("numa_maps"),
+                entry("stat"),
+                entry("task"),
+                entry("numa_maps2"),
+            ];
+            tool.drop_absent_entries(&mut guest, fd, &mut entries)
+                .await
+                .unwrap();
+            let names: Vec<&[u8]> = entries.iter().map(|entry| entry.name.as_slice()).collect();
+            assert_eq!(
+                names,
+                if authenticated {
+                    vec![&b"stat"[..], &b"task"[..], &b"numa_maps2"[..]]
+                } else {
+                    vec![
+                        &b"numa_maps"[..],
+                        &b"stat"[..],
+                        &b"task"[..],
+                        &b"numa_maps2"[..],
+                    ]
+                },
+                "fd {fd}"
             );
         }
     }

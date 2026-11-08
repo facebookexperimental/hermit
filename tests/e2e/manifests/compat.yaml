@@ -2139,10 +2139,14 @@ corpus:
     - label: "numastat"
       argv: ["/usr/bin/numastat"]
       expected_guest_exit: {code: 1, reason: "numastat exits 1 when the sysfs node directory is absent, as on a kernel without NUMA"}
+      expected_stdout: ""
+      expected_stderr: "sysfs not mounted or system not NUMA aware: No such file or directory\n"
       replay_expected_guest_exit: {code: 0, reason: "record mode leaves sysfs lookups alone, so numastat reads the sanitized host node counters and succeeds"}
     - label: "numactl-hardware"
       argv: ["/usr/bin/numactl", "--hardware"]
       expected_guest_exit: {code: 1, reason: "numactl exits 1 when libnuma's probe answers ENOSYS on a kernel without NUMA"}
+      expected_stdout: "No NUMA available on this system\n"
+      expected_stderr: ""
     - {label: "ps", argv: ["/usr/bin/ps", "aux"]}
     - {label: "vmstat", argv: ["/usr/bin/vmstat", "-s"], proc: standard}
     - {label: "top", argv: ["/usr/bin/env", "HOME={{VALIDATE_RUN_STATE}}/strict-compat/top-home", "XDG_CONFIG_HOME={{VALIDATE_RUN_STATE}}/strict-compat/top-home/.config", "/bin/bash", "-c", "set -euo pipefail; LC_ALL=C /usr/bin/top -b -n 1 -p $$ -w 80 >/dev/null; printf \"top-ok\\n\""]}

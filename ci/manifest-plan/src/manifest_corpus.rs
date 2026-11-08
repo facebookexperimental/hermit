@@ -308,6 +308,14 @@ struct CorpusRow {
     /// `expected_guest_exit`.
     #[serde(default)]
     replay_expected_guest_exit: Option<CorpusExpectedGuestExit>,
+    /// The exact stdout every verify cell requires, on each enabled
+    /// backend, where the program's diagnostic is its stdout.
+    #[serde(default)]
+    expected_stdout: Option<String>,
+    /// The exact stderr every verify cell requires, on each enabled
+    /// backend, where the program's diagnostic is its stderr.
+    #[serde(default)]
+    expected_stderr: Option<String>,
 }
 
 fn string(value: &str) -> Value {
@@ -1179,6 +1187,38 @@ fn test_recipe(
     mut enabled: Vec<(&str, Vec<(&str, Value)>)>,
     off_reason: &str,
 ) -> Value {
+    // A row's exact stream expectations name every backend its verify
+    // recipe enables, with the row's one text.
+    for (mode, recipe) in &mut enabled {
+        if *mode == "verify" {
+            let backends: Vec<String> = recipe
+                .iter()
+                .find(|(key, _)| *key == "backends_enabled")
+                .and_then(|(_, value)| value.as_sequence())
+                .map(|sequence| {
+                    sequence
+                        .iter()
+                        .filter_map(|backend| backend.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (key, text) in [
+                ("expected_stdout", &row.expected_stdout),
+                ("expected_stderr", &row.expected_stderr),
+            ] {
+                if let Some(text) = text {
+                    recipe.push((
+                        key,
+                        mapping(
+                            backends
+                                .iter()
+                                .map(|backend| (backend.as_str(), string(text))),
+                        ),
+                    ));
+                }
+            }
+        }
+    }
     let mut modes = Vec::with_capacity(MODES.len());
     for mode in MODES {
         if let Some(index) = enabled.iter().position(|(name, _)| *name == mode) {
@@ -2197,7 +2237,7 @@ mod tests {
     fn a_corpus_row_expands_expected_guest_exits_by_mode() {
         let corpus = replay_corpus().replace(
             "    - {label: \"g++\", id: gxx, argv: [\"/usr/bin/g++\", \"--version\"]}",
-            "    - label: \"g++\"\n      id: gxx\n      argv: [\"/usr/bin/g++\", \"--version\"]\n      expected_guest_exit: {code: 1, reason: \"the fixture program fails without NUMA\"}\n      replay_expected_guest_exit: {code: 0, reason: \"record mode sees the host's nodes\"}",
+            "    - label: \"g++\"\n      id: gxx\n      argv: [\"/usr/bin/g++\", \"--version\"]\n      expected_guest_exit: {code: 1, reason: \"the fixture program fails without NUMA\"}\n      replay_expected_guest_exit: {code: 0, reason: \"record mode sees the host's nodes\"}\n      expected_stdout: \"exact out\\n\"\n      expected_stderr: \"exact err\\n\"",
         );
         let expanded = expand_corpus(document(&corpus)).unwrap();
         let gxx = tests_of(&expanded)
@@ -2209,6 +2249,20 @@ mod tests {
             gxx["modes"]["verify"]["expected_guest_exit"],
             seq("{code: 1, reason: 'the fixture program fails without NUMA'}")
         );
+        for (key, text) in [
+            ("expected_stdout", "exact out\n"),
+            ("expected_stderr", "exact err\n"),
+        ] {
+            let table = gxx["modes"]["verify"][key].as_mapping().unwrap();
+            assert!(!table.is_empty(), "{key}");
+            assert_eq!(table.get(Value::from("ptrace")).unwrap(), text, "{key}");
+            assert!(
+                table.values().all(|value| value.as_str() == Some(text)),
+                "{key}: {table:?}"
+            );
+        }
+        assert!(gxx["modes"]["replay"].get("expected_stdout").is_none());
+        assert!(gxx["modes"]["replay"].get("expected_stderr").is_none());
         assert_eq!(
             gxx["modes"]["replay"]["expected_guest_exit"],
             seq("{code: 0, reason: \"record mode sees the host's nodes\"}")

@@ -944,6 +944,16 @@ struct OpenFileDescription {
     /// a fork's copies, as Linux shares the position.
     #[serde(default)]
     placeholder: Option<PlaceholderState>,
+    /// Under record and replay, this open file was authenticated at its
+    /// open as a real procfs task directory: the descriptor link the
+    /// recording read named a process or thread directory and the
+    /// descriptor itself answered procfs to a recorded `fstatfs`. The
+    /// identity comes from the opened object, not the guest's spelling,
+    /// so a symlink alias to the directory carries it and a user bind
+    /// over a task spelling does not. Its listings omit `numa_maps` in
+    /// both phases (`Detcore::recordreplay_task_directory`).
+    #[serde(default)]
+    recordreplay_task_directory: bool,
     /// File status flags shared by dup and fork aliases.
     status_flags: i32,
     /// File path associated with fd.
@@ -1738,6 +1748,7 @@ impl DetFd {
                 procfs_reached: None,
                 procfs_link_itself: false,
                 placeholder: None,
+                recordreplay_task_directory: false,
                 inherited_external_read: None,
                 status_flags: bits & !OFlag::O_CLOEXEC.bits(),
                 path: None,
@@ -2085,6 +2096,18 @@ impl DetFd {
     /// Make this open file a placeholder directory, or change its state.
     pub(crate) fn set_placeholder(&self, state: PlaceholderState) {
         self.with_description(|d| d.placeholder = Some(state))
+    }
+
+    /// Whether this open file was authenticated at its open as a real
+    /// procfs task directory under record and replay
+    /// (`OpenFileDescription::recordreplay_task_directory`).
+    pub(crate) fn recordreplay_task_directory(&self) -> bool {
+        self.with_description(|d| d.recordreplay_task_directory)
+    }
+
+    /// Record that authentication (`OpenFileDescription::recordreplay_task_directory`).
+    pub(crate) fn set_recordreplay_task_directory(&self) {
+        self.with_description(|d| d.recordreplay_task_directory = true)
     }
 
     /// The task directory this open file is, if Detcore knows it

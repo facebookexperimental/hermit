@@ -3411,16 +3411,20 @@ fn record_replay_omits_numa_maps_from_task_directory_listings() {
         .expect("failed to create the ordinary directory's numa_maps");
     fs::write(ordinary.join("other"), b"guest-owned\n")
         .expect("failed to create the ordinary directory's other entry");
+    let alias = build.path().join("task-alias");
+    std::os::unix::fs::symlink("/proc/self", &alias)
+        .expect("failed to link the ordinary alias to the task directory");
     let output = canonical_record_replay_command(
         "procfs task-directory listing",
         &guest,
-        &[ordinary.as_os_str()],
+        &[ordinary.as_os_str(), alias.as_os_str()],
     );
     let expected = "self numa_maps=0 stat=1 task=1\n\
         thread-self numa_maps=0 stat=1 task=1\n\
         pid numa_maps=0 stat=1 task=1\n\
         pid-thread numa_maps=0 stat=1 task=1\n\
         ordinary numa_maps=1 other=1\n\
+        alias numa_maps=0 stat=1 task=1\n\
         open numa_maps=ENOENT\n";
     assert!(
         output.contains(expected),

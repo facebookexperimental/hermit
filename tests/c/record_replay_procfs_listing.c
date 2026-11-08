@@ -79,7 +79,7 @@ static int report_task(const char *label, const char *path, int process) {
 }
 
 int main(int argc, char **argv) {
-  if (argc != 2) {
+  if (argc != 2 && argc != 3) {
     return 2;
   }
   char path[128];
@@ -105,6 +105,13 @@ int main(int argc, char **argv) {
   printf(
       "ordinary numa_maps=%d other=%d\n", ordinary_numa, ordinary_other);
   failed |= ordinary_numa != 1 || ordinary_other != 1;
+
+  // The same task directory reached through an ordinary symlink: the
+  // listing is the object's, not the spelling's, so it omits the name
+  // exactly as the direct spellings do.
+  if (argc == 3) {
+    failed |= report_task("alias", argv[2], 1);
+  }
 
   errno = 0;
   int fd = open("/proc/self/numa_maps", O_RDONLY | O_CLOEXEC);
