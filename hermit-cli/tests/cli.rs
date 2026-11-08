@@ -49156,11 +49156,6 @@ fn a_process_directed_signal_goes_to_the_thread_linux_chooses() {
                 + exited,
             true,
         ),
-        (
-            "segv-pidfd",
-            "child killed by signal 11\n".to_owned(),
-            false,
-        ),
     ];
     for (mode, expected, verify) in cases {
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -49213,7 +49208,6 @@ fn a_process_directed_signal_goes_to_the_thread_linux_chooses() {
 /// (its `--verify` is not at parity either, above). Before, the replay refused
 /// every such send by name.
 #[test]
-#[ignore = "known failing: segv-pidfd replay desyncs at the signal delivery point (Branch vs OtherInstructions); https://github.com/rrnewton/hermit/issues/5274, dh-mlrq7"]
 fn a_schedule_replay_delivers_a_process_directed_signal_as_its_recording_did() {
     let guest = process_signal_receiver_guest().to_str().unwrap().to_owned();
     let receiver =
@@ -49226,11 +49220,6 @@ fn a_schedule_replay_delivers_a_process_directed_signal_as_its_recording_did() {
             "term-queued",
             "pending after the send: SIGTERM\n".to_owned() + &receiver("worker 2") + exited,
             true,
-        ),
-        (
-            "segv-pidfd",
-            "child killed by signal 11\n".to_owned(),
-            false,
         ),
     ];
     for (mode, expected, exact) in cases {
@@ -49267,6 +49256,43 @@ fn a_schedule_replay_delivers_a_process_directed_signal_as_its_recording_did() {
                 serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
             assert_eq!(summary["schedevent_desynced"], 0, "{mode}: {summary}");
         }
+    }
+}
+
+/// The segv-pidfd leg of the signal-delivery matrix above, split out so
+/// its healthy modes stay live: its replay desyncs deterministically at
+/// the delivery point (recorded as OtherInstructions, replayed as a
+/// Branch event), which strict replay now refuses.
+/// https://github.com/rrnewton/hermit/issues/5274, dh-mlrq7.
+#[test]
+#[ignore = "known failing: segv-pidfd replay desyncs at the signal delivery point (Branch vs OtherInstructions); https://github.com/rrnewton/hermit/issues/5274, dh-mlrq7"]
+fn a_schedule_replay_delivers_a_segv_pidfd_signal_as_its_recording_did() {
+    let guest = process_signal_receiver_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let schedule = directory.path().join("schedule.json");
+    let record = format!("--record-preemptions-to={}", schedule.display());
+    let replay = format!("--replay-schedule-from={}", schedule.display());
+    for (leg, run_args) in [
+        ("recording", vec!["--chaos", "--seed=1", record.as_str()]),
+        ("replay", vec![replay.as_str()]),
+    ] {
+        let mut command_args = vec!["--log=error", "run", "--strict"];
+        command_args.extend(run_args);
+        command_args.extend(["--timeout", "60", "--", guest.as_str(), "segv-pidfd"]);
+        let (status, log) = run_with_deadline(
+            hermit_command(&command_args),
+            directory.path(),
+            Duration::from_secs(180),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "segv-pidfd {leg}:\nstdout:\n{stdout}\nstderr:\n{log}"
+        );
+        assert_eq!(stdout, "child killed by signal 11\n", "segv-pidfd {leg}");
     }
 }
 
