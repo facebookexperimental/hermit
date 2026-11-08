@@ -397,6 +397,9 @@ pub const HOSTED_PORTABLE_PMU_TIMER_RR_TESTS: &[&str] = &["rr_no_mask_timeslice"
 /// `--preemption-timeout`, time out: their guests spin waiting for another
 /// thread, which only a preemption lets run. The other 185 of the 190 that run
 /// locally pass.
+/// `trace_replay_split_just_spin` remains selected in both profiles: its
+/// comparisons still run without PMU support, while its additional correction
+/// coverage guard reports not applicable only for corroborated run downgrades.
 pub const HOSTED_PORTABLE_PMU_TIMER_REPLAY_TESTS: &[&str] = &[
     "chaos_replay_ipc_determinism_eventfd",
     "chaos_replay_ipc_determinism_pipe_order",
@@ -7865,6 +7868,17 @@ sys.exit(37)
                 // The hosted twin also excludes exactly the PMU-timer replay
                 // cases, which the local selection must keep running.
                 assert!(!local_payload.contains(" -E "));
+                const SPLIT_FIXTURE: &str = "trace_replay_split_just_spin";
+                assert!(
+                    !HOSTED_PORTABLE_PMU_TIMER_REPLAY_TESTS.contains(&SPLIT_FIXTURE),
+                    "the split fixture's comparisons must still run without a PMU"
+                );
+                assert!(!hosted.cmd.contains(SPLIT_FIXTURE));
+                assert!(!local_payload.contains(SPLIT_FIXTURE));
+                assert!(HOSTED_PORTABLE_PMU_TIMER_REPLAY_TESTS.iter().all(|name| {
+                    !name.starts_with("split_trace::tests::")
+                        && *name != "split_trace_coverage_failure_is_recorded_after_skid_retry"
+                }));
                 assert_eq!(
                     local_payload.matches(REGULAR_CRATES_SELECTION_END).count(),
                     1

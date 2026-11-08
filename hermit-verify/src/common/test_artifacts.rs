@@ -32,6 +32,12 @@ impl TestArtifacts {
             self.copy_file(&env.std_err_file_path, env_number)?;
             self.copy_file(&env.exit_status_file_path, env_number)?;
             self.copy_file(&env.schedule_file, env_number)?;
+            // Split trace replay keeps the unedited recording here. Retain it
+            // alongside the edited schedule so tests can witness a real split.
+            let original_schedule = env.schedule_file.with_extension("bak");
+            if original_schedule.try_exists()? {
+                self.copy_file(&original_schedule, env_number)?;
+            }
         }
 
         Ok(())
@@ -65,6 +71,10 @@ mod test {
             .run_count(2)
             .build()?;
         let artifactd_dir = tempdir()?;
+        std::fs::write(
+            env.runs()[0].schedule_file.with_extension("bak"),
+            "original",
+        )?;
         let artifacts = super::TestArtifacts::new(artifactd_dir.path().to_path_buf());
         artifacts.copy_run_results(&env)?;
 
@@ -75,6 +85,7 @@ mod test {
             format!("{}/1_std_err", artifactd_dir.path().display()),
             format!("{}/1_exit_status", artifactd_dir.path().display()),
             format!("{}/1_sched", artifactd_dir.path().display()),
+            format!("{}/1_sched.bak", artifactd_dir.path().display()),
             format!("{}/2_log", artifactd_dir.path().display()),
             format!("{}/2_std_out", artifactd_dir.path().display()),
             format!("{}/2_std_err", artifactd_dir.path().display()),
@@ -90,6 +101,10 @@ mod test {
         copied_artifacts.sort();
 
         assert_eq!(expected_artifacts, copied_artifacts);
+        assert_eq!(
+            std::fs::read_to_string(artifactd_dir.path().join("1_sched.bak"))?,
+            "original"
+        );
         Ok(())
     }
 

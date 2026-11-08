@@ -57,6 +57,8 @@ use std::process::Output;
 
 #[path = "../../hermit-cli/tests/common/skid_overshoot.rs"]
 mod skid_overshoot;
+#[path = "common/split_trace.rs"]
+mod split_trace;
 
 /// Attempts at one case when its Hermit runs are refused for PMU skid
 /// overshoot, as hermit-cli's tests allow (`hermit_test::hermit_output`).
@@ -254,7 +256,25 @@ fn run_replay_with(binary: &Path, scenario: Option<&str>, mode: Mode, hermit_arg
     // The verifier copies to fixed basenames. Keep each case and each typed
     // skid retry separate when artifact retention is requested, and refuse
     // to overwrite evidence from an earlier invocation of this test.
-    let artifact_directory = std::env::var_os("TEST_RESULT_ARTIFACTS_DIR").map(|root| {
+    let artifact_root = std::env::var_os("TEST_RESULT_ARTIFACTS_DIR");
+    // The split fixture must inspect both runs even when the caller does not
+    // retain artifacts. This private fallback lives only until the check ends.
+    let private_artifacts = if matches!(mode, Mode::TraceReplaySplit) && artifact_root.is_none() {
+        Some(
+            tempfile::Builder::new()
+                .prefix("split-trace-artifacts-")
+                .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+                .expect("failed to create split-trace artifact directory"),
+        )
+    } else {
+        None
+    };
+    let artifact_root = artifact_root.or_else(|| {
+        private_artifacts
+            .as_ref()
+            .map(|directory| directory.path().as_os_str().to_owned())
+    });
+    let artifact_directory = artifact_root.map(|root| {
         assert!(
             !root.is_empty(),
             "TEST_RESULT_ARTIFACTS_DIR must not be empty"
@@ -283,12 +303,12 @@ fn run_replay_with(binary: &Path, scenario: Option<&str>, mode: Mode, hermit_arg
         directory
     });
     let mut attempt = 0;
-    let (_, _, output) = skid_overshoot::retry_typed_skid_refusal(
+    let (_, _, (output, coverage)) = skid_overshoot::retry_typed_skid_refusal(
         &name,
         SKID_ATTEMPTS,
         || {
             attempt += 1;
-            if let Some(directory) = &artifact_directory {
+            let attempt_directory = artifact_directory.as_ref().map(|directory| {
                 let directory = directory.join(format!("attempt-{attempt}"));
                 std::fs::create_dir(&directory).unwrap_or_else(|error| {
                     panic!(
@@ -296,20 +316,25 @@ fn run_replay_with(binary: &Path, scenario: Option<&str>, mode: Mode, hermit_arg
                         directory.display()
                     )
                 });
-                command.env("TEST_RESULT_ARTIFACTS_DIR", directory);
-            }
+                command.env("TEST_RESULT_ARTIFACTS_DIR", &directory);
+                directory
+            });
             let output = command
                 .output()
                 .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
-            let judged = match refused_run_stderr(&output) {
-                Some(stderr) => Output {
-                    status: ExitStatus::from_raw(detcore_model::HERMIT_POLICY_REFUSAL_EXIT << 8),
-                    stdout: Vec::new(),
-                    stderr: stderr.into_bytes(),
-                },
-                None => output.clone(),
-            };
-            (judged, output)
+            judge_replay_attempt(output, || {
+                if matches!(mode, Mode::TraceReplaySplit) {
+                    // A refused attempt cannot supply coverage for this one.
+                    let directory = attempt_directory
+                        .as_deref()
+                        .expect("the split fixture always retains artifacts");
+                    split_trace::check_artifacts(directory).map_err(|error| {
+                        error.context(format!("artifacts in {}", directory.display()))
+                    })
+                } else {
+                    Ok(())
+                }
+            })
         },
         &|_| {},
     );
@@ -318,6 +343,132 @@ fn run_replay_with(binary: &Path, scenario: Option<&str>, mode: Mode, hermit_arg
         "{rendered} did not replay its recording\n{}",
         render(&output)
     );
+    coverage.unwrap_or_else(|error| {
+        panic!(
+            "split trace coverage failed: {error:#}\n{}",
+            render(&output)
+        )
+    });
+}
+
+/// Include the fixture's success checks before the retry helper publishes its
+/// final outcome. Keep the verifier's actual output and coverage error for the
+/// caller's assertion; a coverage failure never earns a skid retry or flaky pass.
+fn judge_replay_attempt(
+    output: Output,
+    validate_success: impl FnOnce() -> anyhow::Result<()>,
+) -> (Output, (Output, anyhow::Result<()>)) {
+    let coverage = if output.status.success() {
+        validate_success()
+    } else {
+        Ok(())
+    };
+    let judged = if let Err(error) = &coverage {
+        Output {
+            // EXIT-CLASS: ordinary fixture failure, never a policy/skid refusal.
+            status: ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: format!("split trace coverage failed: {error:#}\n").into_bytes(),
+        }
+    } else {
+        match refused_run_stderr(&output) {
+            Some(stderr) => Output {
+                status: ExitStatus::from_raw(detcore_model::HERMIT_POLICY_REFUSAL_EXIT << 8),
+                stdout: Vec::new(),
+                stderr: stderr.into_bytes(),
+            },
+            None => output.clone(),
+        }
+    };
+    (judged, (output, coverage))
+}
+
+#[test]
+fn split_trace_coverage_failure_is_recorded_after_skid_retry() {
+    const TEST: &str = "split_trace_coverage_failure_is_recorded_after_skid_retry";
+    const CHILD: &str = "HERMIT_SPLIT_COVERAGE_RETRY_TEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let mut calls = 0;
+        let mut checks = 0;
+        let (attempt, judged, (raw, coverage)) = skid_overshoot::retry_typed_skid_refusal(
+            TEST,
+            3,
+            || {
+                calls += 1;
+                let output = if calls == 1 {
+                    Output {
+                        status: ExitStatus::from_raw(1 << 8),
+                        stdout: b"Executed command with status: 122\n\
+                            :: ------------------Stderr----------------------\n\
+                            HERMIT_SKID_OVERSHOOT rcb_actual=101 rcb_target=100 skid_margin=10 overshoot=1\n\
+                            HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=1\n\
+                            :: ----------------End Stderr--------------------\n".to_vec(),
+                        stderr: b"Error: Nonzero exit not allowed.\n".to_vec(),
+                    }
+                } else {
+                    Output {
+                        status: ExitStatus::from_raw(0),
+                        stdout: b"verifier comparisons passed\n".to_vec(),
+                        stderr: Vec::new(),
+                    }
+                };
+                judge_replay_attempt(output, || {
+                    checks += 1;
+                    anyhow::bail!("forced coverage failure")
+                })
+            },
+            &|_| {},
+        );
+        assert_eq!((attempt, calls, checks), (2, 2, 1));
+        assert_eq!(judged.status.code(), Some(1));
+        assert!(raw.status.success());
+        assert_eq!(raw.stdout.as_slice(), b"verifier comparisons passed\n");
+        assert!(
+            coverage
+                .unwrap_err()
+                .to_string()
+                .contains("forced coverage failure")
+        );
+        return;
+    }
+
+    // Isolate synthetic accounting from the caller's real counted-run files,
+    // without changing process-global environment during parallel libtest runs.
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let record = directory.path().join("retry.jsonl");
+    let retries = directory.path().join("skid.log");
+    let credit = directory.path().join("credit");
+    let infra = directory.path().join("infra");
+    std::fs::write(&credit, "").unwrap();
+    std::fs::write(&infra, "").unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", TEST, "--nocapture"])
+        .env(CHILD, "1")
+        .env(skid_overshoot::RETRY_RECORD_ENV, &record)
+        .env(skid_overshoot::SKID_RETRY_RECORD_ENV, &retries)
+        .env(skid_overshoot::SKID_RETRY_CREDIT_ENV, &credit)
+        .env(skid_overshoot::SKID_INFRA_FILE_ENV, &infra)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", render(&output));
+    let records = std::fs::read_to_string(record).unwrap();
+    assert_eq!(records.lines().count(), 1, "{records}");
+    let record: serde_json::Value = serde_json::from_str(&records).unwrap();
+    assert_eq!(record["attempts"], 2);
+    assert_eq!(record["retries"], 1);
+    assert_eq!(
+        record["attempt_outcomes"],
+        serde_json::json!(["ERROR", "FAIL"])
+    );
+    assert_eq!(record["final_outcome"], "FAIL");
+    assert_eq!(record["flaky_pass"], false);
+    assert_eq!(
+        record["attempt_classes"],
+        serde_json::json!(["skid_overshoot", "product_failure"])
+    );
+    assert_eq!(std::fs::read_to_string(retries).unwrap().lines().count(), 1);
+    assert_eq!(std::fs::read_to_string(credit).unwrap().lines().count(), 1);
+    assert!(std::fs::read(infra).unwrap().is_empty());
 }
 
 macro_rules! shell_replay_case {
