@@ -417,6 +417,11 @@ impl RunData {
     /// (`BudgetExpired`), to run it again when resumed.
     pub fn launch(&mut self) -> anyhow::Result<()> {
         stop::check()?;
+        if self.runopts.det_opts.det_config.lenient_replay {
+            // Analyze-family replays are best-effort by explicit opt-in
+            // (dh-mvz7y); plain record/replay is strict by default.
+            eprintln!(":: {} best-effort replay (analyze opt-in)", self.runname);
+        }
         let journal = self.analyze_opts.journal.clone();
         let key = if journal.is_on() {
             Some(self.journal_key())
@@ -1185,6 +1190,9 @@ impl RunData {
     pub fn with_edited_preempts_path_in(self, path: PathBuf) -> Self {
         let mut run = self.with_preempts_path_in(path);
         run.runopts.det_opts.det_config.replay_edited_preemptions = true;
+        // Edited records do not replay faithfully by construction: analyze
+        // replays are best-effort (dh-mvz7y).
+        run.runopts.det_opts.det_config.lenient_replay = true;
         run
     }
 
@@ -1232,6 +1240,9 @@ impl RunData {
 
     pub fn with_schedule_replay_from(mut self, path: PathBuf) -> Self {
         self.runopts.det_opts.det_config.replay_schedule_from = Some(path);
+        // A schedule-replay trial follows a guide that may not match the
+        // run exactly: analyze replays are best-effort (dh-mvz7y).
+        self.runopts.det_opts.det_config.lenient_replay = true;
         // A schedule-replay trial follows its guide, and its recording
         // must hold the priorities it takes: it records logical
         // priorities (no chaos draw, no scheduling heuristic), so the

@@ -90,6 +90,9 @@ pub struct Replayer {
     pub replay_exhausted_panic: bool,
     /// A cached copy of the same (immutable) field in Config.
     pub die_on_desync: bool,
+    /// The first fatal desync, for the ERROR line at the stop:
+    /// (thread, event index, recorded, observed).
+    pub fatal_desync: Option<(DetTid, u64, String, String)>,
     /// The syscall each thread has in flight, as its observed events name it:
     /// the number its prehook named, and the number its latest unsuccessful
     /// attempt named (a retry may probe with another call than the guest's).
@@ -380,7 +383,8 @@ impl Replayer {
             kept_retry: None,
             cursor,
             desync_counts: BTreeMap::new(),
-            die_on_desync: false,
+            die_on_desync: true,
+            fatal_desync: None,
             replay_exhausted_panic: false,
             traced_event_count: 0,
             events_popped: 0,
@@ -846,6 +850,18 @@ impl Replayer {
         }
     }
 
+    /// Record a fatal desync for the ERROR line and stop the replay.
+    fn stop_fatal(
+        &mut self,
+        thread: DetTid,
+        event: u64,
+        expected: String,
+        observed: String,
+    ) -> ReplayAction {
+        self.fatal_desync = Some((thread, event, expected, observed));
+        ReplayAction::Stop(StopReason::FatalDesync)
+    }
+
     pub fn observe_event(&mut self, observed: &SchedEvent) -> ReplayAction {
         let mytid = observed.dettid;
         let current_ix = self.traced_event_count;
@@ -885,7 +901,13 @@ impl Replayer {
             });
         }
         if !untaken.is_empty() && self.die_on_desync {
-            return ReplayAction::Stop(StopReason::FatalDesync);
+            let (thread, call, _) = untaken[0];
+            return self.stop_fatal(
+                thread,
+                current_ix,
+                format!("recorded start of thread {thread}'s call {call}"),
+                format!("thread {thread} ran past it"),
+            );
         }
 
         if let Some(expected) = self.peek_next() {
@@ -932,7 +954,12 @@ impl Replayer {
                             observed,
                             expected,
                         );
-                        return ReplayAction::Stop(StopReason::FatalDesync);
+                        return self.stop_fatal(
+                            mytid,
+                            current_ix,
+                            format!("{expected}"),
+                            format!("{observed}"),
+                        );
                     }
                     counts.hard += 1;
                     in_hard_desync_mode = true;
@@ -953,7 +980,12 @@ impl Replayer {
                 // missed, as an untaken due start is, before the matched event
                 // is accepted.
                 if self.retire_skipped_starts(ix as u64, current_ix) > 0 && self.die_on_desync {
-                    return ReplayAction::Stop(StopReason::FatalDesync);
+                    return self.stop_fatal(
+                        mytid,
+                        current_ix,
+                        "recorded starts skipped by the resync".to_owned(),
+                        format!("{observed}"),
+                    );
                 }
                 in_hard_desync_mode = false;
                 // is_desync = false; // Logically correct, but... unused_assignments
@@ -1448,6 +1480,7 @@ mod tests {
             b.syscall_pre(Sysno::close, SOME_RIP, tid(3)),
         ];
         let mut replayer = Replayer::new(schedule.clone());
+        replayer.die_on_desync = false; // lenient accounting (dh-mvz7y)
 
         let _ = replayer.observe_event(&schedule[0]);
         assert_eq!(replayer.stacktrace_position(0), Some(0));
@@ -1482,6 +1515,7 @@ mod tests {
         let recorded = b.other(SOME_RIP, tid(3));
         let spinner = b.other(SOME_RIP + 8, tid(5));
         let mut replayer = Replayer::new([recorded.clone(), recorded.clone(), recorded]);
+        replayer.die_on_desync = false; // lenient accounting (dh-mvz7y)
         for _ in 0..UNMATCHED_EVENTS_BEFORE_RELEASE {
             let _ = replayer.observe_event(&spinner);
         }
@@ -1502,6 +1536,7 @@ mod tests {
         let recorded = b.other(SOME_RIP, tid(3));
         let spinner = b.other(SOME_RIP + 8, tid(5));
         let mut replayer = Replayer::new([recorded.clone(), recorded.clone(), recorded.clone()]);
+        replayer.die_on_desync = false; // lenient accounting (dh-mvz7y)
 
         let unmatched = |replayer: &mut Replayer, count: u64| {
             for _ in 0..count {
@@ -1554,6 +1589,7 @@ mod tests {
         let release_after = |retries: u64| {
             let mut replayer =
                 Replayer::new([recorded.clone(), recorded.clone(), recorded.clone()]);
+            replayer.die_on_desync = false; // lenient accounting (dh-mvz7y)
             for _ in 1..UNMATCHED_EVENTS_BEFORE_RELEASE {
                 assert_eq!(replayer.observe_event(&spinner), held);
             }
@@ -1937,6 +1973,7 @@ mod tests {
             ],
             true,
         );
+        replayer.die_on_desync = false; // lenient accounting (dh-mvz7y)
         // The start after event 0 is due, and event #1 comes without it.
         replayer.observe_event(&ten[0]);
         replayer.observe_event(&ten[1]);
@@ -1994,6 +2031,7 @@ mod tests {
         };
         let mut replayer = Replayer::new(recorded.clone())
             .with_background_starts(&[start(2, 7, 1), start(4, 9, 1)], true);
+        replayer.die_on_desync = false; // lenient accounting (dh-mvz7y)
         assert_eq!(
             replayer.observe_event(&recorded[0]),
             ReplayAction::Continue(None)
@@ -2325,6 +2363,7 @@ mod tests {
             b.branch(100, tid(3)).taken_without_stop(),
         ];
         let mut replayer = Replayer::new(switch.clone());
+        replayer.die_on_desync = false; // lenient accounting (dh-mvz7y)
         assert_eq!(
             replayer.observe_event(&switch[0]),
             ReplayAction::ContextSwitch(true, tid(3), Some(stop_after(100)))
@@ -2336,6 +2375,7 @@ mod tests {
             b.syscall_pre(Sysno::write, SOME_RIP, tid(3)),
         ];
         let mut replayer = Replayer::new(unmatched);
+        replayer.die_on_desync = false; // lenient accounting (dh-mvz7y)
         let observed = b.syscall_pre(Sysno::read, SOME_RIP, tid(3));
         assert_eq!(
             replayer.observe_event(&observed),
@@ -2497,6 +2537,7 @@ mod tests {
             b.syscall_pre(Sysno::exit, SOME_RIP, tid(3)),
         ]);
         let mut replayer = Replayer::new(expected);
+        replayer.die_on_desync = false; // lenient accounting (dh-mvz7y)
         let action1 = replayer.observe_event(&observed[0]);
         {
             let counts = replayer.desync_counts.get(&tid(3)).unwrap();

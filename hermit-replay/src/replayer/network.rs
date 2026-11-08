@@ -254,6 +254,17 @@ fn scm_rights_fds(control: &[u8]) -> Vec<i32> {
     fds
 }
 
+/// A replay divergence is an internal error (dh-mvz7y): print the ERROR
+/// line and exit with the internal-failure status, never panic.
+/// `HERMIT_INTERNAL_FAILURE_EXIT` in detcore-model (125): hermit-replay does
+/// not depend on detcore-model, so the pinned value is spelled here.
+const REPLAY_DESYNC_EXIT: i32 = 125;
+
+fn diverged(context: &str) -> ! {
+    eprintln!("ERROR HERMIT_REPLAY_DESYNC {context}");
+    std::process::exit(REPLAY_DESYNC_EXIT);
+}
+
 impl Replayer {
     #[cfg(target_arch = "x86_64")]
     pub(super) async fn handle_epoll_wait<G: Guest<Self>>(
@@ -431,27 +442,31 @@ impl Replayer {
         // address prefix. These writes succeeded during recording into the
         // same address space, so a failure here means replay has diverged.
         if let Some(addr_len) = event.addr_len {
-            let len_address = syscall
-                .addrlen()
-                .expect("replay diverged: recorded accept4 wrote addrlen, replay passed none");
+            let Some(len_address) = syscall.addrlen() else {
+                diverged("replay diverged: recorded accept4 wrote addrlen, replay passed none")
+            };
             guest
                 .memory()
                 .write_value(len_address.cast::<libc::socklen_t>(), &addr_len)
                 .unwrap_or_else(|error| {
-                    panic!("replay diverged: cannot write the recorded accept4 addrlen: {error}")
+                    diverged(&format!(
+                        "replay diverged: cannot write the recorded accept4 addrlen: {error}"
+                    ))
                 });
         }
         if !event.addr.is_empty() {
-            let sockaddr = syscall.sockaddr().expect(
-                "replay diverged: recorded accept4 wrote a peer address, replay passed none",
-            );
+            let Some(sockaddr) = syscall.sockaddr() else {
+                diverged(
+                    "replay diverged: recorded accept4 wrote a peer address, replay passed none",
+                )
+            };
             guest
                 .memory()
                 .write_exact(sockaddr.cast::<u8>(), &event.addr)
                 .unwrap_or_else(|error| {
-                    panic!(
+                    diverged(&format!(
                         "replay diverged: cannot write the recorded accept4 peer address: {error}"
-                    )
+                    ))
                 });
         }
 

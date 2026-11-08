@@ -644,8 +644,8 @@ like the desync and `Missed stack trace` lines, counts every traced event,
 polling retries included, so a release's number is not a `--stacktrace-event`
 index. A requested index the run never reaches is reported, not dropped. The
 report comes in the run summary of a run that records or replays a schedule,
-or before a replay stops the run under `--replay-exhausted-panic` or
-`--die-on-desync`. A run that ends without a summary, such as a non-ptrace
+or before a replay stops the run under `--replay-exhausted-panic` or a
+strict replay stop (strict is the default; `--die-on-desync` is retired). A run that ends without a summary, such as a non-ptrace
 backend's `--timeout`, does not report.
 
 Under `--strict-schedule-boundaries` a `--stacktrace-event` index is a

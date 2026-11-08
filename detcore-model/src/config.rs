@@ -1024,9 +1024,17 @@ pub struct Config {
     #[clap(long)]
     pub replay_exhausted_panic: bool,
 
-    /// When playing a schedule trace from disk, bail out on the first time we desynchronize from
-    /// the event sequence specified in the trace.
-    #[clap(long)]
+    /// Replay a schedule or preemption record leniently: count desyncs and
+    /// continue instead of stopping at the first one (strict by default,
+    /// dh-mvz7y). Internal only: set by the analyze, bisect and minimize
+    /// entry points, whose replay is best-effort; there is no user flag.
+    #[serde(default)]
+    #[clap(skip)]
+    pub lenient_replay: bool,
+
+    /// Retired: strict replay is the default (dh-mvz7y), so this is a no-op
+    /// kept only so scripts still passing it do not break; it warns once.
+    #[clap(long = "die-on-desync", hide = true)]
     pub die_on_desync: bool,
 
     /// The preemption record `--replay-preemptions-from` reads is not the recording of this
@@ -2160,6 +2168,18 @@ impl Config {
     pub fn validate(&mut self) {
         self.validate_invariants();
 
+        if self.die_on_desync {
+            // Retired (dh-mvz7y): strict replay is the default, so the flag
+            // is a no-op; warn once so scripts still passing it notice.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "warning: --die-on-desync is retired and has no effect; replay is strict by default"
+                );
+            });
+            self.die_on_desync = false;
+        }
+
         // TODO(T124429978) Restore the eprintln! calls below to tracing::warn! when the tracing
         // subscriber is set up early enough for these warnings to print.
 
@@ -2663,9 +2683,6 @@ impl fmt::Display for Config {
         }
         if self.replay_exhausted_panic {
             write!(f, " --replay-exhausted-panic")?;
-        }
-        if self.die_on_desync {
-            write!(f, " --die-on-desync")?;
         }
         if self.replay_edited_preemptions {
             write!(f, " --replay-edited-preemptions")?;
@@ -4312,7 +4329,7 @@ mod legacy_backend_json {
     /// states its provenance, so it is never written and reads as false.
     /// `untrap_passthrough_syscalls` came after it too. `hermit run` refuses it
     /// on every backend but ptrace, so it is never written and reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 60] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 61] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -4350,6 +4367,7 @@ mod legacy_backend_json {
         "virtual_cpus",
         "notice_host_network_abstract_binds",
         "replay_edited_preemptions",
+        "lenient_replay",
         "eager_lone_preemptions",
         "chaos_timeslice_range",
         "chaos_timeslice_draw",
@@ -4518,6 +4536,7 @@ mod legacy_backend_json {
                     | "container_procfs"
                     | "notice_host_network_abstract_binds"
                     | "replay_edited_preemptions"
+                    | "lenient_replay"
                     | "eager_lone_preemptions"
                     | "replay_continue_fairly"
                     | "strict_binder"
@@ -4887,6 +4906,7 @@ mod legacy_backend_json {
                 | "virtual_cpus"
                 | "notice_host_network_abstract_binds"
                 | "replay_edited_preemptions"
+                | "lenient_replay"
                 | "eager_lone_preemptions"
                 | "chaos_timeslice_range"
                 | "chaos_timeslice_draw"
@@ -5901,7 +5921,7 @@ mod tests {
     /// `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
     /// `replaying`,
     /// `scheduler_turn_cost`, `cap_preemption_charge`,
-    /// `inherited_seccomp`, `replay_edited_preemptions` or `detlog_anon`,
+    /// `inherited_seccomp`, `replay_edited_preemptions`, `lenient_replay` or `detlog_anon`,
     /// which is the key order the encoder writes.
     #[test]
     fn legacy_positions_are_the_encoded_key_order() {
@@ -5953,6 +5973,7 @@ mod tests {
                 | "virtual_cpus"
                 | "notice_host_network_abstract_binds"
                 | "replay_edited_preemptions"
+                | "lenient_replay"
                 | "eager_lone_preemptions"
                 | "chaos_timeslice_range"
                 | "chaos_timeslice_draw"
@@ -6018,9 +6039,9 @@ mod tests {
         // `chaos_instruction_offset`, `rewrite_exclusives_overlay_requested`,
         // `rewrite_exclusives_unmarked`, `untrap_passthrough_syscalls`
         // and `strict_schedule_boundaries` none: fourteen more keys and
-        // fifty-nine fewer, so forty-five keys fewer than fields.
+        // sixty fewer (lenient_replay joined them in dh-mvz7y), so forty-six keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 45);
+        assert_eq!(fields.len(), keys.len() + 46);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:

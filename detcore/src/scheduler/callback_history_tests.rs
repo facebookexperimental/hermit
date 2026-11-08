@@ -9,6 +9,18 @@
 #[cfg(test)]
 mod callback_history_scheduler_tests {
 
+    /// A replayer for tests that study desync accounting itself: lenient, so
+    /// a desync is counted instead of stopping the test process (strict is
+    /// the production default since dh-mvz7y and is asserted separately).
+    fn lenient_replayer(
+        events: impl IntoIterator<Item = SchedEvent>,
+    ) -> crate::scheduler::replayer::Replayer {
+        let mut replayer = crate::scheduler::replayer::Replayer::new(events);
+        replayer.die_on_desync = false;
+        replayer
+    }
+
+
     /// A schedule replay hands a recorded instruction offset to the thread
     /// whose timeslice it belongs to: with the continuing thread's own
     /// timeslice in the consume result, and beside a context switch's
@@ -39,7 +51,7 @@ mod callback_history_scheduler_tests {
         let mut scheduler = Scheduler::new(&Config::default());
 
         // The thread that keeps running gets its offset in the result.
-        scheduler.replayer = Some(replayer::Replayer::new(vec![
+        scheduler.replayer = Some(lenient_replayer(vec![
             other(three),
             branch(three, 123).with_instruction_offset(Some(offset)),
             other(three),
@@ -52,7 +64,7 @@ mod callback_history_scheduler_tests {
         assert!(scheduler.replay_instruction_offsets.is_empty());
 
         // A context switch leaves it for the thread switched to.
-        scheduler.replayer = Some(replayer::Replayer::new(vec![
+        scheduler.replayer = Some(lenient_replayer(vec![
             other(five),
             branch(three, 123).with_instruction_offset(Some(offset)),
             other(three),
@@ -242,7 +254,6 @@ mod callback_history_scheduler_tests {
     // The original record-vs-replay failure remains in retained baseline evidence.
     fn legacy_after_nonleader(annotated: bool) -> (i32, u64, LogicalTime, Resources) {
         let replaying = true;
-        use crate::scheduler::replayer::Replayer;
         let a = tid(3);
         let b = tid(4);
         let d = tid(5);
@@ -254,7 +265,7 @@ mod callback_history_scheduler_tests {
             event.end_time = Some(LogicalTime::ZERO);
         }
         if replaying {
-            s.replayer = Some(Replayer::new([d_pre.clone(), b_post.clone(), a_post]));
+            s.replayer = Some(lenient_replayer([d_pre.clone(), b_post.clone(), a_post]));
         }
         assert!(s.boundary_replayer.is_none());
         let global = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
@@ -361,7 +372,6 @@ mod callback_history_scheduler_tests {
 
     #[test]
     fn callback_checkpoint_selected_operation_reads_current_band_after_cursor_transfer() {
-        use crate::scheduler::replayer::Replayer;
         for exhausted in [false, true] {
             let a = tid(3);
             let b = tid(4);
@@ -370,7 +380,7 @@ mod callback_history_scheduler_tests {
             let mut a_post = SchedEvent::syscall(a, Sysno::close, SyscallPhase::Posthook);
             b_post.end_time = Some(LogicalTime::ZERO);
             a_post.end_time = Some(LogicalTime::ZERO);
-            s.replayer = Some(Replayer::new(if exhausted {
+            s.replayer = Some(lenient_replayer(if exhausted {
                 vec![b_post.clone()]
             } else {
                 vec![b_post.clone(), a_post]
@@ -442,7 +452,10 @@ mod callback_history_scheduler_tests {
             scheduler.replayer = Some(crate::scheduler::replayer::Replayer::new([
                 SchedEvent::branches(t, 7),
             ]));
-            assert!(!scheduler.replayer.as_ref().unwrap().die_on_desync);
+            assert!(scheduler.replayer.as_ref().unwrap().die_on_desync);
+            // The accounting below studies counted desyncs; run it lenient
+            // (strict would stop the process at the first mismatch).
+            scheduler.replayer.as_mut().unwrap().die_on_desync = false;
             let point = Checkpoint {
                 history_index: 0,
                 origin: Origin {
@@ -602,7 +615,7 @@ mod callback_history_scheduler_tests {
             ..SchedEvent::branches(thread, count)
         };
         let mut scheduler = Scheduler::new(&Config::default());
-        scheduler.replayer = Some(crate::scheduler::replayer::Replayer::new([
+        scheduler.replayer = Some(lenient_replayer([
             event(t, 7, 70),
             event(t, 5, 120),
             event(t, 3, 150),
@@ -636,7 +649,7 @@ mod callback_history_scheduler_tests {
         );
         // A fast-forward past a recorded event the replay never ran moves the
         // record's position on by the events it drops.
-        let mut skipping = crate::scheduler::replayer::Replayer::new([
+        let mut skipping = lenient_replayer([
             event(t, 7, 70),
             event(t, 5, 120),
             event(t, 3, 150),
@@ -727,7 +740,7 @@ mod callback_history_scheduler_tests {
         };
         let mut scheduler = Scheduler::new(&Config::default());
         scheduler.replayer = Some(
-            crate::scheduler::replayer::Replayer::new(recorded.clone())
+            lenient_replayer(recorded.clone())
                 .with_background_starts(&[start(1, b, 2)], true),
         );
         let replayer = scheduler.replayer.as_mut().unwrap();
@@ -1186,7 +1199,7 @@ mod callback_history_scheduler_tests {
         let mut s = Scheduler::new(&Config::default());
         let mut a_post = SchedEvent::syscall(a, Sysno::close, SyscallPhase::Posthook);
         a_post.end_time = Some(LogicalTime::ZERO);
-        s.replayer = Some(crate::scheduler::replayer::Replayer::new([
+        s.replayer = Some(lenient_replayer([
             a_post.clone(),
             a_post,
         ]));
