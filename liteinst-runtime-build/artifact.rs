@@ -910,6 +910,7 @@ pub(crate) mod native {
             let mut args = common.iter().map(|s| s.to_string()).collect::<Vec<_>>();
             args.extend([
                 "-mcmodel=large".into(),
+                "-fno-jump-tables".into(),
                 "-fno-pic".into(),
                 "-fno-pie".into(),
                 "-DEXEC_PRIVATE_BOOTSTRAP_IMAGE".into(),
