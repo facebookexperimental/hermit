@@ -92,11 +92,27 @@ const MIN_DISTINCT_OUTCOMES: usize = 12;
 /// per-test wall bound still ends the test.
 const SKID_ATTEMPTS: u32 = detcore_model::SKID_RETRY_MAX_ATTEMPTS;
 
-/// Per-run timeout. A healthy run finishes in well under a second; a starved
-/// run would otherwise spin forever. It stays well inside validation's 22 CPU-s
-/// per-test budget, so a hang fails with this test's message naming the seed
-/// rather than with the budget's bare exit 124.
-const TIMEOUT_SECONDS: u64 = 10;
+/// Per-run wall backstop for a hung tracer, not the starvation bound: a
+/// healthy run finishes in well under a second of guest work, but Hermit
+/// startup under validation load can take seconds of host wall before the
+/// guest's first turn, and a wall bound cannot tell that host latency from
+/// a starved schedule (dh-urzwf: seed 4 timed out at 10 s under load with
+/// only 21 scheduler turns of guest progress). The turn bound below is
+/// expected to name a guest-progress hang long before this backstop; at a
+/// deliberate 25%-of-one-core quota shared with busy spinners, healthy
+/// fixed-form invocations still took a median 24.6 s and at most 65.3 s
+/// of wall, so 90 s is about 1.4 times that observed maximum.
+const TIMEOUT_SECONDS: u64 = 90;
+
+/// The scheduler-turn bound that actually names starvation, passed to
+/// every chaos run as `--stop-after-turn`. Turns are deterministic guest
+/// progress, so the bound does not move with host load: across the 98
+/// invocations these tests make (every seed, mode and heuristic in this
+/// file, measured with `--summary-json` at this head), a healthy run
+/// takes at most 83 turns, so 1,000 is about twelve times the largest
+/// healthy run, while a starved yield loop commits turns without bound
+/// and trips it directly.
+const TURN_BOUND: u64 = 1000;
 
 /// Per-run timeout for the strict `--verify`, preemption-replay and vfork
 /// runs, which run the guest two or three times and took 1.9-8 s in a review.
@@ -203,6 +219,7 @@ fn chaos_output(
         ])
         .args(chaos_args)
         .arg(format!("--seed={seed}"))
+        .arg(format!("--stop-after-turn={TURN_BOUND}"))
         .arg("--")
         .arg(guest)
         .args(guest_args);
@@ -213,14 +230,23 @@ fn chaos_output(
     (output, rendered)
 }
 
-/// Require that a chaos run exited cleanly within the timeout.
+/// Require that a chaos run exited cleanly inside the turn bound.
 fn checked_chaos_output(output: Output, seed: u64, rendered: &str) -> Output {
-    // `timeout` exits 124 when it has to kill the child; that is exactly the
-    // starvation symptom this test guards against.
+    // The turn bound names starvation directly: Hermit early-exits with
+    // this warning once the scheduler commits past it, at whatever pace
+    // the host runs those turns.
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("due to --stop-after-turn"),
+        "sched_yield loop starved (past {TURN_BOUND} scheduler turns) under chaos \
+         with seed {seed}: {rendered}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    // `timeout` exits 124 when it has to kill the child: the wall
+    // backstop fired, so the tracer itself hung rather than scheduling.
     assert_ne!(
         output.status.code(),
         Some(124),
-        "sched_yield loop starved (timed out) under chaos with seed {seed}: {rendered}"
+        "chaos run hit the wall backstop under chaos with seed {seed}: {rendered}"
     );
     assert!(
         output.status.success(),
