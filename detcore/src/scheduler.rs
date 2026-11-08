@@ -23670,6 +23670,15 @@ impl Scheduler {
             None
         };
 
+        // Phase-only resyncs are not desyncs, but they are not silent
+        // either (owner ruling, issue 5285): name the count.
+        let phase_only_total = total_desync_stats.phase_only_resyncs;
+        if phase_only_total > 0 {
+            desync_descrip.get_or_insert_with(String::new).push_str(&format!(
+                "  Phase-only resyncs (Polling vs Posthook, identical thread/syscall/RIPs/time): {phase_only_total}\n"
+            ));
+        }
+
         // A released schedule is not a faithful replay of it: say so, with
         // what the release left unreplayed, so a reader of the summary (and
         // `hermit analyze`, which keeps each trial's) can tell.

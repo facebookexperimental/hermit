@@ -34294,9 +34294,9 @@ fn a_thread_that_execs_from_its_crash_handler_takes_the_post_crash_switch() {
 /// past the phase difference. The positive 0/1/2-retry cases are a
 /// follow-up blocked on dh-67h9g (an in-process RunData record launch
 /// stalls at finalize in the test harness). Tracking:
-/// https://github.com/rrnewton/hermit/issues/5285
+/// evidence.
 #[test]
-fn a_schedule_replay_refuses_a_prefix_whose_connect_return_is_recorded_as_polling() {
+fn a_prefix_stack_prints_at_its_schedule_position_whatever_the_retries() {
     static GUEST: OnceLock<PathBuf> = OnceLock::new();
     let _guard = hermit_run_guard();
     let guest = futex_c_guest(&GUEST, "loopback_accept_reader")
@@ -34305,6 +34305,8 @@ fn a_schedule_replay_refuses_a_prefix_whose_connect_return_is_recorded_as_pollin
         .to_owned();
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let common = ["run", "--base-env=minimal", "--epoch=2026-01-01T00:00:00Z"];
+    let schedule_of =
+        |path: &Path| -> serde_json::Value { hermit_test::recorded_preemption_json(path) };
     let recorded = directory.path().join("recorded.json");
     let record_to = format!("--record-preemptions-to={}", recorded.display());
     let mut record_args: Vec<&str> = common.to_vec();
@@ -34314,59 +34316,140 @@ fn a_schedule_replay_refuses_a_prefix_whose_connect_return_is_recorded_as_pollin
     assert_eq!(stdout(&record), "done\n");
 
     // Edited prefixes are written back, so keep the outer envelope and
-    // edit the record it carries.
+    // analyze/edit the record it carries.
     let mut outer: serde_json::Value =
         serde_json::from_slice(&fs::read(&recorded).unwrap()).unwrap();
-    let inner = hermit_test::recorded_preemption_inner_mut(&mut outer);
-    let events = inner["global"].as_array_mut().unwrap();
+    let record = hermit_test::recorded_preemption_inner_mut(&mut outer).clone();
+    let events = record["global"].as_array().unwrap().clone();
+    let syscall = |event: &serde_json::Value, phase: &str| {
+        (event["op"]["Syscall"][1].as_str() == Some(phase))
+            .then(|| event["op"]["Syscall"][0].as_i64())
+            .flatten()
+    };
     let connect = events
         .iter()
-        .position(|event| {
-            event["op"]["Syscall"][0].as_i64() == Some(libc::SYS_connect)
-                && event["op"]["Syscall"][1].as_str() == Some("Prehook")
-        })
+        .position(|event| syscall(event, "Prehook") == Some(libc::SYS_connect))
         .expect("the recording holds the connect");
     let main = events[connect]["dettid"].clone();
+    let of_main = |ix: &usize| events[*ix]["dettid"] == main;
     let returned = (connect + 1..events.len())
-        .find(|&ix| {
-            events[ix]["dettid"] == main
-                && events[ix]["op"]["Syscall"][0].as_i64() == Some(libc::SYS_connect)
-                && events[ix]["op"]["Syscall"][1].as_str() == Some("Posthook")
-        })
+        .filter(of_main)
+        .find(|&ix| syscall(&events[ix], "Posthook") == Some(libc::SYS_connect))
         .expect("the connect returns");
-    events[returned]["op"]["Syscall"][1] = serde_json::json!("Polling");
-    let stack_at = format!("--stacktrace-event={}", returned + 5);
-    let path = directory.path().join("prefix-polling-return.json");
-    fs::write(&path, serde_json::to_vec(&outer).unwrap()).unwrap();
+    let target = (returned + 1..events.len())
+        .filter(of_main)
+        .find(|&ix| syscall(&events[ix], "Prehook").is_some())
+        .expect("the main thread enters another syscall after its connect");
+    let prefix_len = (target + 20).min(events.len());
+    // The connect's retries: the main thread's polling events between its
+    // entry and its return. A retry takes the return's time, so one the
+    // recording did not make is the return's event as a polling one.
+    let retries: Vec<usize> = (connect + 1..returned)
+        .filter(of_main)
+        .filter(|&ix| syscall(&events[ix], "Polling").is_some())
+        .collect();
+    let mut retry = events[returned].clone();
+    retry["op"]["Syscall"][1] = serde_json::json!("Polling");
+    // The thread, time and kind of an event, which pick it out among its
+    // neighbours.
+    let identity = |event: &serde_json::Value| {
+        (
+            event["dettid"].clone(),
+            event["end_time"].clone(),
+            event["op"].clone(),
+        )
+    };
+    // How SchedEvent prints those, in the stack-trace line.
+    let printed = |event: &serde_json::Value| {
+        let time = event["end_time"].as_u64().unwrap().to_string();
+        let mut grouped = String::new();
+        for (ix, digit) in time.chars().enumerate() {
+            if ix > 0 && (time.len() - ix).is_multiple_of(3) {
+                grouped.push('_');
+            }
+            grouped.push(digit);
+        }
+        (
+            format!("(tid{} ", event["dettid"]),
+            format!("time={grouped}ns "),
+        )
+    };
+    let (target_tid, target_time) = printed(&events[target]);
 
-    let replay_from = format!("--replay-schedule-from={}", path.display());
-    // Ask for the stack past the connect's return, where the desync stops
-    // the replay: no stack may print there.
-    let mut args: Vec<&str> = common.to_vec();
-    args.extend([
-        replay_from.as_str(),
-        stack_at.as_str(),
-        "--stacktrace-at-schedule-positions",
-        "--",
-        guest.as_str(),
-    ]);
-    let replay = hermit(&args);
-    let log = stderr(&replay);
-    assert_eq!(
-        replay.status.code(),
-        Some(HERMIT_INTERNAL_FAILURE_EXIT),
-        "{args:?}:\n{log}"
-    );
+    let mut moved = Vec::new();
+    for recorded_retries in 0..3 {
+        let mut prefix: Vec<serde_json::Value> = events[..prefix_len]
+            .iter()
+            .enumerate()
+            .filter(|(ix, _)| !retries.contains(ix))
+            .map(|(_, event)| event.clone())
+            .collect();
+        let at = returned - retries.len();
+        for _ in 0..recorded_retries {
+            prefix.insert(at, retry.clone());
+        }
+        let position = target - retries.len() + recorded_retries;
+        assert_eq!(identity(&prefix[position]), identity(&events[target]));
+        let mut edited = outer.clone();
+        hermit_test::recorded_preemption_inner_mut(&mut edited)["global"] =
+            serde_json::Value::Array(prefix);
+        let path = directory
+            .path()
+            .join(format!("prefix{recorded_retries}.json"));
+        fs::write(&path, serde_json::to_vec(&edited).unwrap()).unwrap();
+        let replay_from = format!("--replay-schedule-from={}", path.display());
+        let stack_at = format!("--stacktrace-event={position}");
+        let realized = directory
+            .path()
+            .join(format!("realized{recorded_retries}.json"));
+        let realized_to = format!("--record-preemptions-to={}", realized.display());
+        let mut args: Vec<&str> = common.to_vec();
+        args.extend([
+            replay_from.as_str(),
+            stack_at.as_str(),
+            "--stacktrace-at-schedule-positions",
+            realized_to.as_str(),
+            "--",
+            guest.as_str(),
+        ]);
+        let replay = hermit(&args);
+        assert_success(&replay, &args);
+        let log = stderr(&replay);
+        let line = log
+            .lines()
+            .find(|line| {
+                line.starts_with(&format!(
+                    "Printing stack trace for scheduled event #{position} = "
+                ))
+            })
+            .unwrap_or_else(|| {
+                panic!("{recorded_retries} recorded retries: no stack printed:\n{log}")
+            });
+        assert!(
+            line.contains(&target_tid)
+                && line.contains(&target_time)
+                && line.ends_with("Prehook)):"),
+            "{recorded_retries} recorded retries: schedule position #{position} is \
+             {target_tid}{target_time}syscall entry, but the stack printed at:\n{line}"
+        );
+        // The event a traced index #position names in this replay: the
+        // replay's own recording holds every event it observed.
+        let observed = schedule_of(&realized)["global"].as_array().unwrap().clone();
+        if identity(&observed[position]) != identity(&events[target]) {
+            moved.push(recorded_retries);
+        }
+    }
     assert!(
-        log.lines().any(
-            |line| line.starts_with("ERROR HERMIT_REPLAY_DESYNC thread=")
-                && line.contains("Syscall(connect")
-        ),
-        "no ERROR line naming connect:\n{log}"
+        !moved.is_empty(),
+        "every replay made the connect retries its schedule held (0, 1 and 2; the recording \
+         made {}), so no case moved the traced index: the cases exercise nothing, and a pass \
+         would not tell a stack at the schedule position from one at the traced index",
+        retries.len()
     );
-    assert!(
-        !log.contains("Printing stack trace for scheduled event"),
-        "a stack printed past the desync:\n{log}"
+    eprintln!(
+        "the recording made {} connect retries; the cases with {moved:?} recorded retries moved \
+         the traced index, and the stack printed at the schedule position in all three",
+        retries.len()
     );
 }
 

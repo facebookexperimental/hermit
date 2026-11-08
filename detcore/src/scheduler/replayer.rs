@@ -182,6 +182,11 @@ pub struct DesyncStats {
     pub resync_deletions: u64,
     /// How many times did we fast-forward to resync.
     pub fast_forwards: u64,
+    /// Phase-only resyncs (owner ruling on issue 5285): the observed and
+    /// recorded events differed only as Polling vs Posthook of the same
+    /// syscall, with thread, count, RIPs, instruction offset and logical
+    /// time identical. Not a desync; counted and reported, never silent.
+    pub phase_only_resyncs: u64,
 
     /// A bit of statefulness: true when the last event processed was a desync.
     pub last_was_desync: bool,
@@ -198,6 +203,7 @@ impl Add for DesyncStats {
             resync_insertions: self.resync_insertions + rhs.resync_insertions,
             resync_deletions: self.resync_deletions + rhs.resync_deletions,
             fast_forwards: self.fast_forwards + rhs.fast_forwards,
+            phase_only_resyncs: self.phase_only_resyncs + rhs.phase_only_resyncs,
 
             // Not commutative!
             last_was_desync: rhs.last_was_desync,
@@ -344,6 +350,38 @@ fn hard_desync_fields(observed: &SchedEvent, expected: &SchedEvent) -> Vec<&'sta
         fields.push("instruction_offset");
     }
     fields
+}
+
+/// A phase-only difference (owner ruling, issue 5285): the same thread's
+/// same syscall observed at Polling where the recording has Posthook (or
+/// the reverse), with count, start/end RIPs, instruction offset, logical
+/// time and the stopless bit all identical. The number of polling
+/// operations a host makes is not guest-observable state, so this is not
+/// a desync: the replay consumes the recorded event and goes on. Every
+/// other difference remains a desync.
+fn is_phase_only_desync(observed: &SchedEvent, expected: &SchedEvent) -> bool {
+    if observed.dettid != expected.dettid
+        || observed.count != expected.count
+        || observed.start_rip != expected.start_rip
+        || observed.end_rip != expected.end_rip
+        || expected.end_rip.is_none()
+        || observed.instruction_offset != expected.instruction_offset
+        || observed.stopless != expected.stopless
+    {
+        return false;
+    }
+    if expected.end_time.is_none() || observed.end_time != expected.end_time {
+        return false;
+    }
+    let phases = |op: &Op| match op {
+        Op::Syscall(sysno, phase) => Some((*sysno, *phase)),
+        _ => None,
+    };
+    match (phases(&observed.op), phases(&expected.op)) {
+        (Some((a, SyscallPhase::Polling)), Some((b, SyscallPhase::Posthook)))
+        | (Some((a, SyscallPhase::Posthook)), Some((b, SyscallPhase::Polling))) => a == b,
+        _ => false,
+    }
 }
 
 fn is_hard_desync(observed: &SchedEvent, expected: &SchedEvent) -> bool {
@@ -844,7 +882,7 @@ impl Replayer {
 
     fn next_replay_matches(&self, observed: &SchedEvent) -> bool {
         if let Some(expected) = self.cursor.peek() {
-            !is_hard_desync(observed, expected)
+            !is_hard_desync(observed, expected) || is_phase_only_desync(observed, expected)
         } else {
             false
         }
@@ -931,7 +969,32 @@ impl Replayer {
                 );
             }
 
-            let is_desync = is_desync(observed, &expected);
+            let phase_only =
+                is_desync(observed, &expected) && is_phase_only_desync(observed, &expected);
+            // An observed Polling against a recorded Posthook is an extra
+            // host retry the recording did not make: it consumes nothing.
+            // The reverse (observed Posthook, recorded Polling) retires
+            // the recorded retry below, before the matching pop.
+            let phase_only_insertion =
+                phase_only && matches!(observed.op, Op::Syscall(_, SyscallPhase::Polling));
+            if phase_only {
+                // Not a desync (owner ruling, issue 5285): count and
+                // report the resync, go on.
+                if !phase_only_insertion {
+                    let _ = self.pop_next();
+                }
+                self.desync_counts
+                    .entry(mytid)
+                    .or_default()
+                    .phase_only_resyncs += 1;
+                tracing::info!(
+                    "[tracereplay] phase-only resync at event #{}: observed {} vs recorded {}                      (Polling/Posthook only; thread, syscall, RIPs and time identical)",
+                    current_ix,
+                    observed,
+                    expected,
+                );
+            }
+            let is_desync = is_desync(observed, &expected) && !phase_only;
             let mut in_hard_desync_mode = false;
             if is_desync {
                 if self.first_desync.is_none() {
@@ -1016,16 +1079,20 @@ impl Replayer {
                 }
             } else {
                 // Whether naturally or by fast forward, we should end up in this state before we pop:
-                if !self.next_replay_matches(observed) {
+                if !phase_only_insertion && !self.next_replay_matches(observed) {
                     tracing::warn!(
                         "Expected match before pop, observed: {}\n Cursor at: {}",
                         observed,
                         self.cursor.display_first_n(10)
                     );
                 }
-                self.last_consumed = Some(self.schedule_len - self.cursor.len() as u64);
-                let _ = self.pop_next();
-                self.unmatched_run = 0;
+                if phase_only_insertion {
+                    self.unmatched_run = 0;
+                } else {
+                    self.last_consumed = Some(self.schedule_len - self.cursor.len() as u64);
+                    let _ = self.pop_next();
+                    self.unmatched_run = 0;
+                }
             }
 
             let action = self.check_context_switch(observed, !in_hard_desync_mode);
@@ -1370,6 +1437,62 @@ mod tests {
             replayer.observe_event(&missed),
             ReplayAction::Stop(StopReason::FatalDesync)
         );
+    }
+    /// Owner ruling (issue 5285): a phase-only difference — same thread,
+    /// same syscall, same end RIP and logical time, Polling vs Posthook —
+    /// resyncs and is counted, while the same phase difference with a
+    /// different RIP, time or syscall still stops strict replay.
+    #[test]
+    fn a_phase_only_difference_resyncs_and_others_still_stop() {
+        let mut b = builder::SchedTestBuilder::new();
+        let recorded = b.syscall_post(Sysno::connect, SOME_RIP, tid(3));
+        let polling = SchedEvent {
+            op: Op::Syscall(Sysno::connect, SyscallPhase::Polling),
+            ..recorded.clone()
+        };
+        assert!(is_phase_only_desync(&polling, &recorded));
+        assert!(is_phase_only_desync(&recorded, &polling));
+
+        // Resyncs: an extra observed Polling consumes nothing, then the
+        // recorded Posthook is consumed by its own observed twin.
+        let mut replayer = Replayer::new(vec![recorded.clone(), b.branch(1, tid(5))]);
+        replayer.die_on_desync = true;
+        assert_ne!(
+            replayer.observe_event(&polling),
+            ReplayAction::Stop(StopReason::FatalDesync)
+        );
+        assert_eq!(replayer.desync_counts[&tid(3)].phase_only_resyncs, 1);
+        assert_eq!(replayer.desync_counts[&tid(3)].hard, 0);
+        assert_eq!(replayer.desync_counts[&tid(3)].soft, 0);
+        assert_ne!(
+            replayer.observe_event(&recorded),
+            ReplayAction::Stop(StopReason::FatalDesync)
+        );
+        assert_eq!(replayer.desync_counts[&tid(3)].phase_only_resyncs, 1);
+
+        // Different RIP, time or syscall: still a hard stop.
+        for observed in [
+            SchedEvent {
+                end_rip: InstructionPointer::new(SOME_RIP + 1),
+                ..polling.clone()
+            },
+            SchedEvent {
+                end_time: Some(recorded.end_time.unwrap() + LogicalTime::from_nanos(1)),
+                ..polling.clone()
+            },
+            SchedEvent {
+                op: Op::Syscall(Sysno::accept, SyscallPhase::Polling),
+                ..polling.clone()
+            },
+        ] {
+            assert!(!is_phase_only_desync(&observed, &recorded));
+            let mut replayer = Replayer::new(vec![recorded.clone(), b.branch(1, tid(5))]);
+            replayer.die_on_desync = true;
+            assert_eq!(
+                replayer.observe_event(&observed),
+                ReplayAction::Stop(StopReason::FatalDesync)
+            );
+        }
     }
 
     /// A recorded preemption's instruction offset comes with the timeslice
@@ -2587,6 +2710,7 @@ mod tests {
                     resync_insertions: 0,
                     resync_deletions: 0,
                     fast_forwards: 0,
+                    phase_only_resyncs: 0,
                     last_was_desync: true,
                 }
             );
@@ -2605,6 +2729,7 @@ mod tests {
                     resync_insertions: 1,
                     resync_deletions: 0,
                     fast_forwards: 0,
+                    phase_only_resyncs: 0,
                     last_was_desync: false,
                 }
             );
