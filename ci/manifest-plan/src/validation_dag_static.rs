@@ -3384,7 +3384,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // walk, #5278): 3785 + 2 = 3787. And
     // a_nosymfollow_mount_refuses_to_follow_its_links (#5283 review): 3788.
     // And a_protected_symlink_with_projected_owners_is_the_kernels: 3789.
-    ("test.detcore_unit", 3789),
+    // And a_failed_security_module_probe_is_not_kept: 3790.
+    ("test.detcore_unit", 3790),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -6173,8 +6174,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same three system_directory_link_tests units: 3782 + 3 = 3785.
     // The same two units of Detcore's own link walk (#5278): 3785 + 2 = 3787,
     // and its nosymfollow unit (#5283 review): 3788, and its
-    // projected-owners protected_symlinks unit: 3789.
-    ("test.detcore_unit_on_host", 3789),
+    // projected-owners protected_symlinks unit: 3789, and its
+    // security-module probe unit: 3790.
+    ("test.detcore_unit_on_host", 3790),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

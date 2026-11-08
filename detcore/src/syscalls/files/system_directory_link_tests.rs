@@ -668,6 +668,60 @@ fn a_protected_symlink_with_projected_owners_is_the_kernels() {
     assert_stage_passed(child.wait_with_output().unwrap(), "outer");
 }
 
+/// An errno other than ENOENT from a security-module probe (here EMFILE,
+/// as from a full descriptor table) says nothing about the modules: the
+/// lookup that met it leaves the follow to the kernel, and nothing is kept,
+/// so that a later probe that finds SELinux active is honored.
+#[test]
+fn a_failed_security_module_probe_is_not_kept() {
+    use super::rendered_procfs::security_module_answer;
+    use super::rendered_procfs::security_modules_allow_the_walk;
+    let cache = std::sync::OnceLock::new();
+    let full_table = |path: &[u8]| {
+        if path == b"/proc/self/attr" {
+            Ok(())
+        } else {
+            Err(Errno::EMFILE)
+        }
+    };
+    let answer = security_module_answer(&cache, &full_table);
+    assert_eq!(answer, None);
+    assert!(
+        !security_modules_allow_the_walk(answer),
+        "the kernel decides"
+    );
+    assert_eq!(cache.get(), None, "nothing is kept");
+    let selinux = |path: &[u8]| {
+        if path == b"/proc/self/attr" || path == b"/proc/self/attr/selinux" {
+            Ok(())
+        } else {
+            Err(Errno::ENOENT)
+        }
+    };
+    assert_eq!(security_module_answer(&cache, &selinux), Some(true));
+    assert_eq!(cache.get(), Some(&true));
+    assert!(!security_modules_allow_the_walk(Some(true)));
+    // An unreadable /proc/self/attr is as unknown, and none at all (ENOENT
+    // for every module) is a definite answer that is kept.
+    let unknown = std::sync::OnceLock::new();
+    assert_eq!(
+        security_module_answer(&unknown, &|_| Err(Errno::EACCES)),
+        None
+    );
+    assert_eq!(unknown.get(), None);
+    let none = std::sync::OnceLock::new();
+    let absent = |path: &[u8]| {
+        if path == b"/proc/self/attr" {
+            Ok(())
+        } else {
+            Err(Errno::ENOENT)
+        }
+    };
+    assert_eq!(security_module_answer(&none, &absent), Some(false));
+    assert_eq!(none.get(), Some(&false));
+    assert!(security_modules_allow_the_walk(Some(false)));
+}
+
 /// Set in the child that [`a_bind_over_proc_sys_keeps_its_links`] runs in
 /// its own user and mount namespaces.
 const BIND_CHILD: &str = "DETCORE_SYSTEM_DIRECTORY_BIND_CHILD";

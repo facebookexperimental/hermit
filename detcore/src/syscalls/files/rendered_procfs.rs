@@ -529,20 +529,65 @@ fn protected_symlinks() -> Option<bool> {
     }
 }
 
-/// Whether a security module that can refuse to follow a symbolic link
-/// (`security_inode_follow_link`) may be active, or `None` if Detcore cannot
-/// tell: each of SELinux, Smack and AppArmor has its own directory below
-/// `/proc/self/attr` when it is active.
+/// The security modules that can refuse to follow a symbolic link
+/// (`security_inode_follow_link`) and that each have their own directory
+/// below `/proc/self/attr` when active.
+const LINK_FOLLOWING_SECURITY_MODULES: [&[u8]; 3] = [b"selinux", b"smack", b"apparmor"];
+
+/// Whether a security module that can refuse to follow a symbolic link may
+/// be active ([`LINK_FOLLOWING_SECURITY_MODULES`]), or `None` if Detcore
+/// cannot tell now, read through `probe`, which opens a path (`Ok`) or gives
+/// the errno, and kept in `cache` once definite.
+///
+/// Only a definite answer is kept: a directory that opens is an active
+/// module; ENOENT is an absent one, and ENOENT for `/proc/self/attr` itself
+/// is a kernel with none. Any other errno (EMFILE, ENFILE, EACCES, EIO, ...)
+/// says nothing about the modules: that lookup is `None`, and nothing is
+/// kept, so that the next one asks again.
+pub(super) fn security_module_answer(
+    cache: &std::sync::OnceLock<bool>,
+    probe: &dyn Fn(&[u8]) -> Result<(), Errno>,
+) -> Option<bool> {
+    if let Some(active) = cache.get() {
+        return Some(*active);
+    }
+    let answer = match probe(b"/proc/self/attr") {
+        Err(Errno::ENOENT) => Some(false),
+        Err(_) => None,
+        Ok(()) => {
+            let mut answer = Some(false);
+            for module in LINK_FOLLOWING_SECURITY_MODULES {
+                let mut path = b"/proc/self/attr/".to_vec();
+                path.extend_from_slice(module);
+                match probe(&path) {
+                    Ok(()) => {
+                        answer = Some(true);
+                        break;
+                    }
+                    Err(Errno::ENOENT) => {}
+                    Err(_) => answer = None,
+                }
+            }
+            answer
+        }
+    };
+    if let Some(active) = answer {
+        let _ = cache.set(active);
+    }
+    answer
+}
+
+/// Whether the security modules let Detcore's walk follow a link itself:
+/// only a definite "none active". An active module, or an answer Detcore
+/// cannot have now, leaves the lookup to the kernel.
+pub(super) fn security_modules_allow_the_walk(answer: Option<bool>) -> bool {
+    answer == Some(false)
+}
+
+/// [`security_module_answer`] for this process.
 fn link_following_security_module() -> Option<bool> {
-    static ACTIVE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-    *ACTIVE.get_or_init(|| {
-        let (attr, _) = walk_open(libc::AT_FDCWD, b"/proc/self/attr").ok()?;
-        Some(
-            [b"selinux".as_slice(), b"smack", b"apparmor"]
-                .iter()
-                .any(|module| walk_open(attr.0, module).is_ok()),
-        )
-    })
+    static ACTIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    security_module_answer(&ACTIVE, &|path| walk_open(libc::AT_FDCWD, path).map(|_| ()))
 }
 
 /// What Linux's `pick_link` decides before it follows the symbolic link
@@ -586,7 +631,9 @@ fn may_follow(link: i32, dir: &WalkStat, trailing: bool, links: usize) -> Result
         Some(false) => {}
         None => return Ok(false),
     }
-    Ok(link_following_security_module() == Some(false))
+    Ok(security_modules_allow_the_walk(
+        link_following_security_module(),
+    ))
 }
 
 /// The bytes of the symbolic link `fd` (`O_PATH`) holds, or the kernel's name
