@@ -6277,8 +6277,27 @@ mod tests {
         let record: PreemptionRecord = PreemptionReader::try_new(&record_path)
             .unwrap()
             .into_inner();
-        let recorded: serde_json::Value = serde_json::to_value(&record).unwrap();
-        let events = recorded["global"].as_array().unwrap().clone();
+        // Edit the record as it stands on disk, envelope and all, and read
+        // it back through PreemptionReader: a serde round-trip of the typed
+        // record drops its RCB identity (serde(skip)), and admission
+        // refuses an identity-less legacy record in any mode.
+        let mut outer: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+        fn inner_mut(mut value: &mut serde_json::Value) -> &mut serde_json::Value {
+            loop {
+                if value.get("rcb_history").is_some() {
+                    value = value["rcb_history"]
+                        .get_mut("recording")
+                        .expect("an enveloped recording carries its record");
+                } else if value.get("slice_boundary_recording").is_some() {
+                    return &mut value["slice_boundary_recording"]["preemptions"];
+                } else {
+                    return value;
+                }
+            }
+        }
+        let recorded_inner = inner_mut(&mut outer).clone();
+        let events = recorded_inner["global"].as_array().unwrap().clone();
         let syscall = |event: &serde_json::Value, phase: &str| {
             (event["op"]["Syscall"][1].as_str() == Some(phase))
                 .then(|| event["op"]["Syscall"][0].as_i64())
@@ -6342,9 +6361,20 @@ mod tests {
             }
             let position = target - retries.len() + recorded_retries;
             assert_eq!(identity(&prefix[position]), identity(&events[target]));
-            let mut edited = recorded.clone();
-            edited["global"] = serde_json::Value::Array(prefix);
-            let edited: PreemptionRecord = serde_json::from_value(edited).unwrap();
+            let mut edited_outer = outer.clone();
+            inner_mut(&mut edited_outer)["global"] = serde_json::Value::Array(prefix);
+            let edited_path = directory
+                .path()
+                .join(format!("edited{recorded_retries}.json"));
+            std::fs::write(&edited_path, serde_json::to_vec(&edited_outer).unwrap()).unwrap();
+            let edited: PreemptionRecord = PreemptionReader::try_new(&edited_path)
+                .unwrap()
+                .into_inner();
+            assert_eq!(
+                edited.identity(),
+                record.identity(),
+                "the edited prefix lost the recording's RCB identity"
+            );
             let (mut run, stack_path) = options
                 .prefix_stack_trial(
                     &format!("prefix_stack_{recorded_retries}"),
