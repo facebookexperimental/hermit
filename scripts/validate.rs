@@ -39119,6 +39119,24 @@ mod fail_fast_tests {
             }
         }
         assert_eq!(deps_of(&finished.cfg), before);
+        // The env map alone does not reach a pinned root: its wrapper only
+        // forwards the --env names baked into the committed command. Every
+        // pinned-root step must forward both keep-going markers, or nextest
+        // and the e2e harness inside it fail fast despite -k.
+        let mut pinned = 0;
+        for step in &finished.cfg.steps {
+            if step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ") {
+                pinned += 1;
+                for name in ["HERMIT_NEXTEST_FAIL_FAST", "HERMIT_E2E_FAIL_FAST"] {
+                    assert!(
+                        step.cmd.contains(&format!(" --env {name} ")),
+                        "{} does not forward {name} into its pinned root",
+                        step.tag()
+                    );
+                }
+            }
+        }
+        assert!(pinned > 50, "expected many pinned-root steps, got {pinned}");
     }
 }
 

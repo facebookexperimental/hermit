@@ -671,6 +671,12 @@ const PINNED_ROOT_FORWARDED_ENV: &[&str] = &[
     crate::timeouts::TEST_CPU_TIMEOUT_MULTIPLIER_ENV,
     crate::timeouts::TEST_WALL_TIMEOUT_MULTIPLIER_ENV,
     "HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT",
+    // validate --keep-going sets these to 0 on every step; forwarded only
+    // when set, they carry the run-past-the-first-failure opt-in into the
+    // pinned root, where the counted nextest wrapper and the e2e harness
+    // read them. Without forwarding, pinned-root nodes always fail fast.
+    "HERMIT_E2E_FAIL_FAST",
+    "HERMIT_NEXTEST_FAIL_FAST",
     // validate --tests sets this on case-selected nextest steps; forwarded
     // only when set, it carries the case filter into the pinned root.
     "HERMIT_NEXTEST_FILTER_EXPR",
@@ -6092,6 +6098,8 @@ sys.exit(completed.returncode)
             br#"import json, os, pathlib, sys
 pathlib.Path('capture.json').write_text(json.dumps({
     'args': sys.argv[1:], 'width': os.environ.get('NEXTEST_TEST_THREADS'),
+    'nextest_fail_fast': os.environ.get('HERMIT_NEXTEST_FAIL_FAST'),
+    'e2e_fail_fast': os.environ.get('HERMIT_E2E_FAIL_FAST'),
     'affinity': sorted(os.sched_getaffinity(0))
 }))
 print('literal-payload-status-37')
@@ -6129,6 +6137,14 @@ sys.exit(37)
             .env("NEXTEST_TEST_THREADS", "99");
         if let Some((name, value)) = env_with_inner_jobs(&command_step, "", Some(width)) {
             command.env(name, value);
+        }
+        // dagrun exports a step's env map to its command; mirror that for the
+        // keep-going markers so the fake Podman can only deliver them to the
+        // payload when the wrapper forwards their names.
+        for name in ["HERMIT_NEXTEST_FAIL_FAST", "HERMIT_E2E_FAIL_FAST"] {
+            if let Some(value) = step.env.get(name) {
+                command.env(name, value);
+            }
         }
         let output = command.output().unwrap();
         assert_eq!(
@@ -6448,6 +6464,54 @@ sys.exit(37)
                 step.tag()
             );
         }
+    }
+
+    #[test]
+    fn every_committed_pinned_root_node_forwards_the_keep_going_markers() {
+        // validate.rs --keep-going sets HERMIT_NEXTEST_FAIL_FAST=0 and
+        // HERMIT_E2E_FAIL_FAST=0 in every step's env map; a pinned-root node
+        // sees them only if its wrapper command forwards their names.
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let pinned: Vec<_> = committed
+            .steps
+            .iter()
+            .filter(|step| step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh "))
+            .collect();
+        assert_eq!(pinned.len(), 87, "pinned-root step count changed");
+        for step in pinned {
+            for name in ["HERMIT_NEXTEST_FAIL_FAST", "HERMIT_E2E_FAIL_FAST"] {
+                assert!(
+                    step.cmd.contains(&format!(" --env {name} ")),
+                    "{} does not forward {name}",
+                    step.tag()
+                );
+                assert!(
+                    pinned_root_command(step).contains(&format!(" --env {name} ")),
+                    "{} loses {name} when its command is rebuilt",
+                    step.tag()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_wrapper_delivers_keep_going_markers_to_the_payload() {
+        // The fake Podman reconstructs the payload environment only from the
+        // wrapper's forwarded names, so a marker reaches the payload inside
+        // the pinned root only when the command forwards it. With no marker
+        // in the step env the payload sees none, preserving fail-fast default.
+        let mut step = owner(Vec::new());
+        step.cmd = "true".to_string();
+        let unmarked = renderer_wrapper_capture(&step, 1, true);
+        assert_eq!(unmarked["nextest_fail_fast"], serde_json::Value::Null);
+        assert_eq!(unmarked["e2e_fail_fast"], serde_json::Value::Null);
+        step.env
+            .insert("HERMIT_NEXTEST_FAIL_FAST".to_string(), "0".to_string());
+        step.env
+            .insert("HERMIT_E2E_FAIL_FAST".to_string(), "0".to_string());
+        let marked = renderer_wrapper_capture(&step, 1, true);
+        assert_eq!(marked["nextest_fail_fast"], "0");
+        assert_eq!(marked["e2e_fail_fast"], "0");
     }
 
     #[test]
