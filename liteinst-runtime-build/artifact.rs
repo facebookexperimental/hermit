@@ -136,6 +136,69 @@ pub(crate) fn liteinst_cdylib_from_cargo_messages(
     Ok(artifacts.remove(0))
 }
 
+/// Actual native artifact selection is separate from the ordinary preload.
+#[cfg(any(feature = "native-exec", test))]
+pub(crate) fn native_cdylib_from_cargo_messages(
+    messages: &str,
+    package_id: &str,
+    manifest: &Path,
+) -> Result<PathBuf, String> {
+    let mut selected = None;
+    let mut finished = false;
+    for line in messages.lines().filter(|line| !line.is_empty()) {
+        let value: Value =
+            serde_json::from_str(line).map_err(|e| format!("native Cargo JSON: {e}"))?;
+        if finished {
+            return Err("native Cargo stream has trailing messages after build-finished".into());
+        }
+        if value["reason"] == "build-finished" {
+            if value["success"] != true {
+                return Err("native Cargo build did not finish successfully".into());
+            }
+            finished = true;
+        } else if value["reason"] == "compiler-artifact"
+            && value["target"]["name"] == "detcore_liteinst"
+        {
+            if selected.is_some()
+                || value["package_id"] != package_id
+                || value["manifest_path"].as_str().map(Path::new) != Some(manifest)
+                || value["target"]["kind"] != serde_json::json!(["cdylib"])
+                || value["target"]["crate_types"] != serde_json::json!(["cdylib"])
+                || value["features"]
+                    != serde_json::json!(["exec-native-injection", "exec-private-init"])
+            {
+                return Err("native Detcore artifact has ambiguous package/target/features".into());
+            }
+            // Native Detcore uses the same checked validate code generation
+            // as the maintained allocator producer, independent of the host
+            // CLI/producer profile. Authenticate the actual Cargo artifact.
+            if value["profile"]
+                != serde_json::json!({"opt_level": "3", "debuginfo": 0,
+                    "debug_assertions": true, "overflow_checks": true, "test": false})
+            {
+                return Err(
+                    "native Detcore artifact differs from the exact validate profile".into(),
+                );
+            }
+            let filenames = value["filenames"]
+                .as_array()
+                .ok_or("native artifact filenames absent")?;
+            if filenames.len() != 1 {
+                return Err("native Detcore must emit one current cdylib".into());
+            }
+            let path = PathBuf::from(filenames[0].as_str().ok_or("native filename is not text")?);
+            if path.file_name().and_then(|s| s.to_str()) != Some("libdetcore_liteinst.so") {
+                return Err("native Detcore filename differs".into());
+            }
+            selected = Some(path);
+        }
+    }
+    if !finished {
+        return Err("native Cargo stream lacks actual successful build-finished".into());
+    }
+    selected.ok_or_else(|| "current native Detcore artifact absent".into())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,69 +600,6 @@ mod tests {
             );
         }
     }
-}
-
-/// Actual native artifact selection is separate from the ordinary preload.
-#[cfg(any(feature = "native-exec", test))]
-pub(crate) fn native_cdylib_from_cargo_messages(
-    messages: &str,
-    package_id: &str,
-    manifest: &Path,
-) -> Result<PathBuf, String> {
-    let mut selected = None;
-    let mut finished = false;
-    for line in messages.lines().filter(|line| !line.is_empty()) {
-        let value: Value =
-            serde_json::from_str(line).map_err(|e| format!("native Cargo JSON: {e}"))?;
-        if finished {
-            return Err("native Cargo stream has trailing messages after build-finished".into());
-        }
-        if value["reason"] == "build-finished" {
-            if value["success"] != true {
-                return Err("native Cargo build did not finish successfully".into());
-            }
-            finished = true;
-        } else if value["reason"] == "compiler-artifact"
-            && value["target"]["name"] == "detcore_liteinst"
-        {
-            if selected.is_some()
-                || value["package_id"] != package_id
-                || value["manifest_path"].as_str().map(Path::new) != Some(manifest)
-                || value["target"]["kind"] != serde_json::json!(["cdylib"])
-                || value["target"]["crate_types"] != serde_json::json!(["cdylib"])
-                || value["features"]
-                    != serde_json::json!(["exec-native-injection", "exec-private-init"])
-            {
-                return Err("native Detcore artifact has ambiguous package/target/features".into());
-            }
-            // Native Detcore uses the same checked validate code generation
-            // as the maintained allocator producer, independent of the host
-            // CLI/producer profile. Authenticate the actual Cargo artifact.
-            if value["profile"]
-                != serde_json::json!({"opt_level": "3", "debuginfo": 0,
-                    "debug_assertions": true, "overflow_checks": true, "test": false})
-            {
-                return Err(
-                    "native Detcore artifact differs from the exact validate profile".into(),
-                );
-            }
-            let filenames = value["filenames"]
-                .as_array()
-                .ok_or("native artifact filenames absent")?;
-            if filenames.len() != 1 {
-                return Err("native Detcore must emit one current cdylib".into());
-            }
-            let path = PathBuf::from(filenames[0].as_str().ok_or("native filename is not text")?);
-            if path.file_name().and_then(|s| s.to_str()) != Some("libdetcore_liteinst.so") {
-                return Err("native Detcore filename differs".into());
-            }
-            selected = Some(path);
-        }
-    }
-    if !finished {
-        return Err("native Cargo stream lacks actual successful build-finished".into());
-    }
-    selected.ok_or_else(|| "current native Detcore artifact absent".into())
 }
 
 #[cfg(all(feature = "native-exec", not(test)))]
