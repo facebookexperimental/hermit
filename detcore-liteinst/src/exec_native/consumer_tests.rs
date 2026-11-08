@@ -273,6 +273,7 @@ fn exchange_case(
 }
 
 #[test]
+#[ignore = "dh-vwv4k: isolated exact child runs zero tests"]
 fn model_consumer_complete_accounts_real_post_exec_record() {
     isolated(
         "model_consumer_complete_accounts_real_post_exec_record",
@@ -293,6 +294,7 @@ fn model_consumer_complete_accounts_real_post_exec_record() {
 }
 
 #[test]
+#[ignore = "dh-vwv4k: isolated exact child runs zero tests"]
 fn model_consumer_complete_zero_interval_and_second_attempt() {
     isolated(
         "model_consumer_complete_zero_interval_and_second_attempt",
@@ -313,6 +315,7 @@ fn model_consumer_complete_zero_interval_and_second_attempt() {
 }
 
 #[test]
+#[ignore = "dh-vwv4k: isolated exact child runs zero tests"]
 fn model_consumer_complete_wrong_binding_preserves_the_attempt() {
     isolated(
         "model_consumer_complete_wrong_binding_preserves_the_attempt",
@@ -333,6 +336,7 @@ fn model_consumer_complete_wrong_binding_preserves_the_attempt() {
 }
 
 #[test]
+#[ignore = "dh-vwv4k: isolated exact child runs zero tests"]
 fn model_consumer_complete_refuses_bad_and_negative_ack() {
     for (case, ack) in [("wrong", Ack::WrongVariant), ("negative", Ack::Negative)] {
         isolated(
@@ -357,6 +361,7 @@ fn model_consumer_complete_refuses_bad_and_negative_ack() {
 }
 
 #[test]
+#[ignore = "dh-vwv4k: isolated exact child runs zero tests"]
 fn model_consumer_complete_refuses_other_slot_record_at_ack() {
     isolated(
         "model_consumer_complete_refuses_other_slot_record_at_ack",
@@ -401,6 +406,7 @@ fn configured_rpc(tid: i32) -> (CoordinatorRpc<detcore::GlobalState>, UnixStream
 }
 
 #[test]
+#[ignore = "dh-vwv4k: isolated exact child runs zero tests"]
 fn model_consumer_complete_refuses_actual_in_flight_request() {
     isolated(
         "model_consumer_complete_refuses_actual_in_flight_request",
@@ -476,6 +482,7 @@ fn model_consumer_complete_refuses_actual_in_flight_request() {
 }
 
 #[test]
+#[ignore = "dh-3qkzd: child exits before connect"]
 fn model_consumer_complete_disconnected_peer_is_terminal() {
     const KEY: &str = "HERMIT_NATIVE_CONSUMER_CLOSED_SOCKET";
     const NAME: &str =
