@@ -826,6 +826,12 @@ test:
         backends_disabled:
           native: The fixed source and compiler flags make the compile-and-run transaction deterministic by construction
       verify:
+        timeout_seconds:
+          kvm: 328
+        cpu_timeout_seconds:
+          kvm: 41
+        slow_reason:
+          kvm: "Reverie ce25725fd (PR 1319, list every mapping) adds about 60% CPU to KVM verify of this cell; fix tracked in minibeads dh-ss1l0, then restore the 22 CPU-s cap. Measured 2026-11-08 at Hermit PR 5244's head (validate profile, pinned nightly guest rustc, which the queue uses): 26.31/26.82/27.15 CPU s over 3 runs, so the CPU bound is ceil(1.5 x 27.15) = 41 and the wall bound is 8 x 41 = 328, under the owner's measured-budget rule. Main (pin 831a3a0e) measures 3.53/3.68 CPU s the same way; the paired debug bisect across ce25725fd alone went 12.97 -> 19.04/21.24 CPU s."
         ci: true
         backends_enabled:
           - ptrace

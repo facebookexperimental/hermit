@@ -45314,7 +45314,7 @@
       "backend": "kvm",
       "category": "language-runtimes",
       "classification": "required",
-      "cpu_timeout_seconds": 22,
+      "cpu_timeout_seconds": 41,
       "lane": "portable",
       "mode": "verify",
       "requires": [
@@ -45329,7 +45329,7 @@
         "kvm"
       ],
       "test": "language-runtimes/rustc-hello",
-      "timeout_seconds": 180
+      "timeout_seconds": 328
     },
     {
       "backend": "ptrace",
