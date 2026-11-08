@@ -1877,6 +1877,27 @@ mod tests {
         context().validate().unwrap();
     }
 
+    /// The v1 contract predates this kind too: its contexts may not
+    /// carry it. Without this gate a v1 context carrying a queue-base
+    /// floor would pass `AdmissionIdentity::validate` (the shape arm
+    /// makes no contract distinction) and surface through the legacy
+    /// v1 reader, so the kind string in the gate is load-bearing.
+    #[test]
+    fn queue_base_floor_is_refused_under_the_v1_contract() {
+        let v2 = queue_base_context();
+        v2.validate().unwrap();
+        let mut v1 = context();
+        v1.floor = v2.floor.clone();
+        let e = v1.validate().unwrap_err();
+        assert!(
+            e.contains("requires the v2 admission context contract"),
+            "{e}"
+        );
+        assert!(admission_context_bytes(&v1).is_err());
+        // The other kinds are unchanged under v1.
+        context().validate().unwrap();
+    }
+
     #[test]
     fn admission_context_canonical_golden_bytes() {
         let basic = context();
