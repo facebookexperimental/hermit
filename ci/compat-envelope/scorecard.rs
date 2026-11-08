@@ -11776,17 +11776,21 @@ fn project_observations(root: &Path, series_root: &Path, refreshed_at: &str) -> 
                 .into(),
         );
     }
-    let rows = read_series_rows(&snapshot)?;
+    let source = snapshot.source.clone();
+    let source_repository = snapshot.source_repository.clone();
+    let source_commit = snapshot.source_commit.clone();
+    let source_tree = snapshot.source_tree.clone();
+    let rows = read_series_rows_owned(snapshot)?;
     project_observation_rows(
         root,
         &derived,
         tracked,
         &rows,
         &ObservationRowSource {
-            source: &snapshot.source,
-            repository: snapshot.source_repository.as_deref(),
-            commit: &snapshot.source_commit,
-            tree: &snapshot.source_tree,
+            source: &source,
+            repository: source_repository.as_deref(),
+            commit: &source_commit,
+            tree: &source_tree,
         },
         refreshed_at,
         || Ok(()),
@@ -17323,6 +17327,32 @@ fn snapshot_series_source(series_root: &Path) -> Result<SeriesSourceSnapshot, St
 /// are contradictory evidence and refuse instead of depending on traversal
 /// order.
 fn read_series_rows(snapshot: &SeriesSourceSnapshot) -> Result<Vec<SeriesRow>, String> {
+    read_series_rows_impl(
+        &snapshot.source_commit,
+        snapshot
+            .shards
+            .iter()
+            .map(|shard| (shard.display_path.clone(), std::borrow::Cow::Borrowed(shard.bytes.as_slice()))),
+    )
+}
+
+/// Like `read_series_rows`, but consumes the snapshot: each shard's bytes
+/// are dropped as soon as its rows are parsed, so a render over the full
+/// corpus never holds every shard's bytes beside every parsed row.
+fn read_series_rows_owned(snapshot: SeriesSourceSnapshot) -> Result<Vec<SeriesRow>, String> {
+    let SeriesSourceSnapshot { source_commit, shards, .. } = snapshot;
+    read_series_rows_impl(
+        &source_commit,
+        shards
+            .into_iter()
+            .map(|shard| (shard.display_path, std::borrow::Cow::Owned(shard.bytes))),
+    )
+}
+
+fn read_series_rows_impl<'a>(
+    source_commit: &str,
+    shards: impl Iterator<Item = (PathBuf, std::borrow::Cow<'a, [u8]>)>,
+) -> Result<Vec<SeriesRow>, String> {
     // A repeated event_id must carry an identical body. That used to be checked
     // by keeping every row's JsonValue: about 12 GB of a 23.7 GB render for the
     // 1,140,698 rows of 2026-10-11. A Value serializes with its object keys in
@@ -17340,26 +17370,28 @@ fn read_series_rows(snapshot: &SeriesSourceSnapshot) -> Result<Vec<SeriesRow>, S
     // The source text is rebuilt only for the returned rows and for a
     // conflicting-duplicate error, exactly as it was formatted before.
     let mut canonical: BTreeMap<String, ([u8; 32], SeriesRow, u32, u32)> = BTreeMap::new();
-    for (shard_index, shard) in snapshot.shards.iter().enumerate() {
-        if !shard.bytes.is_empty() && !shard.bytes.ends_with(b"\n") {
+    let mut display_paths: Vec<PathBuf> = Vec::new();
+    for (shard_index, (display_path, bytes)) in shards.enumerate() {
+        display_paths.push(display_path.clone());
+        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
             return Err(format!(
                 "series shard {} in source commit {} is truncated: every nonempty shard must end in a newline",
-                shard.display_path.display(),
-                snapshot.source_commit
+                display_path.display(),
+                source_commit
             ));
         }
-        let text = std::str::from_utf8(&shard.bytes).map_err(|e| {
+        let text = std::str::from_utf8(&bytes).map_err(|e| {
             format!(
                 "series shard {} in source commit {} is not UTF-8: {e}",
-                shard.display_path.display(),
-                snapshot.source_commit
+                display_path.display(),
+                source_commit
             )
         })?;
         for (index, line) in text.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
-            let source = format!("{}:{}", shard.display_path.display(), index + 1);
+            let source = format!("{}:{}", display_path.display(), index + 1);
             let value: JsonValue = serde_json::from_str(line)
                 .map_err(|why| format!("malformed series row at {source}: {why}"))?;
             let row = SeriesRow::deserialize(&value)
@@ -17380,7 +17412,7 @@ fn read_series_rows(snapshot: &SeriesSourceSnapshot) -> Result<Vec<SeriesRow>, S
                 }
                 let previous_source = format!(
                     "{}:{}",
-                    snapshot.shards[*previous_shard as usize].display_path.display(),
+                    display_paths[*previous_shard as usize].display(),
                     previous_line + 1
                 );
                 return Err(format!(
@@ -17399,7 +17431,7 @@ fn read_series_rows(snapshot: &SeriesSourceSnapshot) -> Result<Vec<SeriesRow>, S
         .map(|(_, mut row, shard_index, line)| {
             row.source = format!(
                 "{}:{}",
-                snapshot.shards[shard_index as usize].display_path.display(),
+                display_paths[shard_index as usize].display(),
                 line + 1
             );
             row
