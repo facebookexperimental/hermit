@@ -6350,6 +6350,20 @@ mod tests {
                     .any(|event| identity(event) == identity(&events[target])),
                 "{recorded_retries} recorded retries: the realized schedule lost the target event"
             );
+            // The stack was requested at schedule position `position`,
+            // whose numbering does not count polling retries: the event
+            // at that position in the realized schedule must be the
+            // target itself, which binds the captured stack to it.
+            let nonpolling: Vec<&serde_json::Value> = observed
+                .iter()
+                .filter(|event| syscall(event, "Polling").is_none())
+                .collect();
+            assert_eq!(
+                identity(nonpolling[position]),
+                identity(&events[target]),
+                "{recorded_retries} recorded retries: schedule position {position} \
+                 in the realized schedule is not the target the stack was taken at"
+            );
             if identity(&observed[position]) != identity(&events[target]) {
                 moved.push(recorded_retries);
             }
