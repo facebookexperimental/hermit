@@ -320,11 +320,11 @@ mod tests {
         // A recording without offsets states main's format below the offsets
         // format, the timing format the recording with them shares.
         let mut good = search_record(vec![batch(20, None), batch(5, None)]);
-        good["format_version"] =
+        good["rcb_history"]["recording"]["format_version"] =
             serde_json::json!(detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT - 1);
         let bad = search_record(vec![batch(22, Some(offset)), batch(3, None)]);
         assert_eq!(
-            bad["format_version"],
+            bad["rcb_history"]["recording"]["format_version"],
             detcore::preemptions::INSTRUCTION_OFFSET_FORMAT,
             "{bad}"
         );
@@ -366,8 +366,8 @@ mod tests {
         // with main's `validate_format` message, before its epoch is read.
         let newer_format = detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX + 1;
         let mut newer = bad.clone();
-        newer["format_version"] = serde_json::json!(newer_format);
-        newer["epoch"] = serde_json::json!("2001-02-03T04:05:06Z");
+        newer["rcb_history"]["recording"]["format_version"] = serde_json::json!(newer_format);
+        newer["rcb_history"]["recording"]["epoch"] = serde_json::json!("2001-02-03T04:05:06Z");
         let newer_path = dir.path().join("newer.json");
         fs::write(&newer_path, newer.to_string()).unwrap();
         let Err(error) = prepare(&newer_path) else {

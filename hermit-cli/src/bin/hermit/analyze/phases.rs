@@ -8851,7 +8851,11 @@ mod tests {
             SchedEvent::branches(tid, 22).with_instruction_offset(offset)
         };
         let record = |name: &str, offset: Option<InstructionOffset>| {
-            let mut writer = PreemptionWriter::new(None);
+            let mut writer = PreemptionWriter::new(None).with_identity(
+                detcore::preemptions::HistoryIdentity::Known(
+                    reverie::pmu_config::RcbMetric::ConditionalBranchesRetiredUserV1,
+                ),
+            );
             writer.register_thread(tid, detcore::DEFAULT_PRIORITY);
             writer.insert_reprioritization(
                 tid,
@@ -8870,7 +8874,9 @@ mod tests {
             let path = record(name, Some(offset));
             let mut json: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-            edit(&mut json);
+            // The fixture states its identity in the envelope; edits name
+            // fields of the record it carries.
+            edit(&mut json["rcb_history"]["recording"]);
             std::fs::write(&path, json.to_string()).unwrap();
             path
         };
