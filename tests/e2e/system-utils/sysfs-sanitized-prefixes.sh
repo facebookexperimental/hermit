@@ -11,6 +11,15 @@
 # make both runs agree, because it succeeds identically when both runs see the
 # same unsanitized host value.
 #
+# The node prefix is the one exception to "readable": Hermit presents a
+# kernel without NUMA (https://github.com/rrnewton/hermit/issues/5269), so
+# in run mode /sys/devices/system/node does not exist and the probe
+# requires exactly that absence. Record mode leaves sysfs lookups alone
+# by design, so a recording still reads the sanitized node vmstat; when
+# the directory is there, the leaf must be readable and stable as
+# before. Each mode prints its own line (node=absent or
+# node=readable-and-stable) and is self-consistent.
+#
 # The preparation self-test proves that these assertions fail for an
 # unreadable leaf and for a value that changes between reads. It deliberately
 # uses a synthetic sysfs root. A native run also fails when a live node vmstat
@@ -91,6 +100,14 @@ probe_prefix() {
         fi
     done
 
+    # Run mode on the no-NUMA platform: the node directory itself is
+    # absent, which is the assertion. A directory that exists without a
+    # readable leaf still fails below.
+    if [[ $label == node && ! -e $root/sys/devices/system/node ]]; then
+        printf 'node=absent\n'
+        return 0
+    fi
+
     printf 'sysfs-sanitized-prefixes FAIL: %s has no readable sanitized leaf\n' "$label" >&2
     return 1
 }
@@ -130,6 +147,22 @@ self_test() {
         return 1
     }
 
+    # With no node directory at all, the node probe reports its absence
+    # and the rest still pass.
+    rm -rf "$fixture/sys/devices/system/node"
+    if ! output=$(check_all_prefixes "$fixture" 2>&1); then
+        printf 'sysfs-sanitized-prefixes self-test rejected an absent node directory: %s\n' "$output" >&2
+        rm -rf "$fixture"
+        return 1
+    fi
+    [[ $output == *'node=absent'* ]] || {
+        printf 'sysfs-sanitized-prefixes self-test did not report the absent node directory: %s\n' "$output" >&2
+        rm -rf "$fixture"
+        return 1
+    }
+    mkdir -p "$fixture/sys/devices/system/node/node0"
+    printf 'nr_free_pages 0\n' >"$fixture/sys/devices/system/node/node0/vmstat"
+
     rm -f "$fixture/sys/class/rtc/rtc0/since_epoch"
     mkdir "$fixture/sys/class/rtc/rtc0/since_epoch"
     if output=$(check_all_prefixes "$fixture" 2>&1); then
@@ -168,7 +201,7 @@ self_test() {
         return 1
     fi
     local label_value label value
-    for label_value in rtc:1767225602 rtc:1767225599 rtc:changed module:1; do
+    for label_value in rtc:1767225602 rtc:1767225599 rtc:changed module:1 node:changed; do
         label=${label_value%%:*}
         value=${label_value#*:}
         if output=$(self_test_step "$label" "$value" "$fixture" 2>&1); then
@@ -193,6 +226,7 @@ self_test_step() {
     local label=$1 value=$2 fixture=$3
     printf '1767225600\n' >"$fixture/sys/class/rtc/rtc0/since_epoch"
     printf '0\n' >"$fixture/sys/module/example/refcnt"
+    printf 'nr_free_pages 0\n' >"$fixture/sys/devices/system/node/node0/vmstat"
     SYSFS_PROBE_MUTATE_LABEL=$label SYSFS_PROBE_MUTATE_VALUE=$value check_all_prefixes "$fixture"
 }
 
