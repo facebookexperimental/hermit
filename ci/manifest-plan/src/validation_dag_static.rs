@@ -2046,8 +2046,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And tests::the_library_entry_points_refuse_untrapping_without_its_prerequisites
     // (the same pull request's post-facto review): 1384 + 1 = 1385.
     // The portable all-rewrite summary control adds one native test; main +1 only.
-    // PR 5275's relocated prefix-stack analyze test: 1389 + 1 = 1390.
-    ("test.hermit_unit", 1390),
+    ("test.hermit_unit", 1389),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6629,7 +6628,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR #4746: the same 37 hermit-run units: 1327 + 37 = 1364.
     // PR #4764: the same three hermit-run untrap units: 1376 + 3 = 1379.
     // The portable all-rewrite summary control adds one native test; main +1 only.
-    ("test.hermit_unit_on_host", 1384),
+    ("test.hermit_unit_on_host", 1383),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
