@@ -876,7 +876,7 @@ fn parity_references_in(
             .ok_or_else(|| {
                 format!(
                     "{} has no parity cell {}@{backend}; regenerate it with {}",
-                    parity::PARITY_CELLS_PATH,
+                    parity::PARITY_CELLS_DIR,
                     cell.id.test,
                     parity::PARITY_CELLS_REGENERATE
                 )

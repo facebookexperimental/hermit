@@ -33479,11 +33479,8 @@ sys.exit(2)
         let root = test_source_root();
         let steps = validate_plan::validation_config(&root).unwrap().steps;
         let expected = validate_parity_expected_scope(&root, steps.iter(), &[]).unwrap();
-        let snapshot: hermit_manifest_plan::parity::ParityCells = serde_json::from_str(
-            &std::fs::read_to_string(root.join(hermit_manifest_plan::parity::PARITY_CELLS_PATH))
-                .unwrap(),
-        )
-        .unwrap();
+        let snapshot: hermit_manifest_plan::parity::ParityCells =
+            hermit_manifest_plan::parity::load_snapshot(&root).unwrap();
         let committed = snapshot
             .cells
             .iter()
