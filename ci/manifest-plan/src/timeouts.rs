@@ -20,7 +20,7 @@ pub const TEST_WALL_TIMEOUT_MULTIPLIER_ENV: &str = "HERMIT_TEST_WALL_TIMEOUT_MUL
 
 /// Frozen retained-data census used to calibrate the per-test policy.
 pub const TIMEOUT_CALIBRATION_CUTOFF_UTC: &str = "2026-09-03T02:18:30Z";
-pub const CALIBRATED_CI_CELL_COUNT: usize = 493;
+pub const CALIBRATED_CI_CELL_COUNT: usize = 494;
 pub const DEFAULT_COVERED_CI_CELL_COUNT: usize = 487;
 pub const NON_CI_CELL_COUNT: usize = 173;
 /// Additional selected cells covered by the KVM qualification evidence.
@@ -256,7 +256,7 @@ pub struct TimeoutCalibration {
 
 /// The only selected cells whose retained p90-derived bounds exceed at least
 /// one ordinary default at [`TIMEOUT_CALIBRATION_CUTOFF_UTC`].
-pub const EXPLICIT_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 6] = [
+pub const EXPLICIT_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 7] = [
     // The gVisor batch-2 qualification allowance (2026-11-07): the only
     // selected cell whose measured bound exceeds a default. Samples are
     // the low-concurrency retries in the pinned hermetic image; the
@@ -297,6 +297,26 @@ pub const EXPLICIT_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 6] = [
         required_wall_seconds: 91,
         configured_cpu_seconds: 32,
         configured_wall_seconds: 91,
+    },
+    // The identical user-facing example workload (dh-1j6br, 2026-11-08):
+    // 291 completed retained verify/ptrace rows from the seven days
+    // before the fix give the p90 below, while loaded attempts were
+    // censored at the ordinary 22 CPU-s cap (maximum recorded value
+    // 22.073927 CPU-s). The configured CPU bound follows the censored
+    // allowance pattern, ceil(1.5 x 22.07) = 34, and configured wall is
+    // the owner policy's 8x that CPU bound. Required bounds remain the
+    // ordinary p90 formulas.
+    TimeoutCalibration {
+        test: "applications/example-timed-progress-bar",
+        mode: "verify",
+        backend: "ptrace",
+        samples: 291,
+        p90_cpu_usec: 15_707_994,
+        p90_wall_millis: 18_619,
+        required_cpu_seconds: 24,
+        required_wall_seconds: 75,
+        configured_cpu_seconds: 34,
+        configured_wall_seconds: 272,
     },
     TimeoutCalibration {
         test: "c-programs/fp-reduction-nondeterminism",
