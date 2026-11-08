@@ -20694,7 +20694,10 @@ mod nextest_timeout_tests {
                 // 2995 with system-utils/ps-proc-table verify/KVM (Detcore renders
                 // /proc/1 of Hermit's init; 3 of 3 strict verify runs in the
                 // pinned root).
-                assert_eq!(all.len(), 2995, "the original all-owner population is retained");
+                // 2994 after system-utils/procfs-sanitized-paths verify/KVM
+                // left under dh-9j8ue (this PR; Detcore refuses smaps VmFlags
+                // for file mappings while MappingFact carries none).
+                assert_eq!(all.len(), 2994, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");
