@@ -10,10 +10,10 @@
     "all": {
       "cells": 1105,
       "applicable": 762,
-      "selectable": 533,
+      "selectable": 534,
       "population": 1060,
-      "population_candidate_selected": 533,
-      "population_candidate_not_selected": 212,
+      "population_candidate_selected": 534,
+      "population_candidate_not_selected": 211,
       "population_candidate_disabled": 315
     },
     "by_backend": {
@@ -38,10 +38,10 @@
       "kvm": {
         "cells": 221,
         "applicable": 214,
-        "selectable": 206,
+        "selectable": 207,
         "population": 212,
-        "population_candidate_selected": 206,
-        "population_candidate_not_selected": 3,
+        "population_candidate_selected": 207,
+        "population_candidate_not_selected": 2,
         "population_candidate_disabled": 3
       },
       "liteinst": {
@@ -1032,7 +1032,7 @@
     {"test_id":"compat/timeout","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/top","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/top","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Its first verify run on in-guest-trap failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
-    {"test_id":"compat/top","backend":"kvm","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: kvm verify is not selected by full validation: Dropped under DROP-7: no passing run at 930ece78 or later (CANCELLED, not dispatched, after sysctl fail-fast in the drop-6 targeted run); named with shred and sysctl-random-uuid in the pre-flip KVM crash-error block deleted by 1258b8ad"},
+    {"test_id":"compat/top","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/top","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Its first verify run on liteinst failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
     {"test_id":"compat/top","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: The guest starts a second program image, and each image after the first makes 33 raw system calls in ld-linux and libc, which SaBRe's execution-path contract refuses (trusted_shared_object_sites > 0)"},
     {"test_id":"compat/touch","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

@@ -15329,6 +15329,13 @@
           "category": "compat",
           "test": "compat/top",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/top",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -19962,6 +19969,13 @@
           "test": "compat/top",
           "mode": "replay",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/top",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -59005,6 +59019,13 @@
           "test": "compat/top",
           "mode": "replay",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/top",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
