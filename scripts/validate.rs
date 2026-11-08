@@ -20684,9 +20684,10 @@ mod nextest_timeout_tests {
                 // 0.29.2 in the pinned root emits -D before -I).
                 // 2992 after compat/shred verify/KVM left under DROP-6
                 // (unsupported KVM zero-count read on guest fd 3).
-                // 2990 after compat/sysctl-random-uuid and compat/top
-                // verify/KVM left under DROP-7.
-                assert_eq!(all.len(), 2990, "the original all-owner population is retained");
+                // 2991 after compat/top verify@kvm was restored by the top-only
+                // flip; compat/sysctl-random-uuid verify/KVM is still left under
+                // DROP-7.
+                assert_eq!(all.len(), 2991, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");
