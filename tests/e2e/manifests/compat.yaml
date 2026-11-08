@@ -125,7 +125,7 @@ corpus:
           arch, b2sum, base32, base64, basename, bash, bracket, cal, cat, cksum,
           curl, date, df-direct, dirname, du, echo, expr, findmnt, free, getopt,
           groups, head, hostname, id, kill, ls, lsirq, lsmod,
-          lua-direct, md5sum, mpstat-softirqs, nproc, numactl-hardware, numastat, numfmt,
+          lua-direct, md5sum, mpstat-softirqs, nproc, numastat, numfmt,
           openssl, perl-direct, pidstat-disk, pinky, pr, printf, ps, pwd, readlink, realpath,
           sha1sum, sha224sum, sha256sum, sha384sum, sha512sum, sleep, stat, sum,
           sysctl-random-uuid, test, "true", uname, uptime, users, vmstat,
@@ -155,6 +155,16 @@ corpus:
           hermit 16f99cd0, reverie 2f10ec67). It passed before only because
           that exec failed with EOPNOTSUPP in both runs, so the row printed
           logname:no-login-record without running logname.
+        numactl-hardware: >-
+          Its verify runs end as a named policy refusal on liteinst: since
+          Hermit presents a kernel without NUMA
+          (https://github.com/rrnewton/hermit/issues/5269), the row's shell
+          runs /usr/bin/numactl in a command substitution — to require its
+          exit 1 with "No NUMA available on this system" — a forked child
+          that execs it, and the in-guest runtime refuses exec with a typed
+          refusal that ends the run (HERMIT_POLICY_REFUSAL, execveat;
+          measured in the full validation of 834b862aee). The ptrace and
+          KVM cells prove the no-NUMA answer.
         seq: >-
           Its first verify run on liteinst failed in the second local survey
           of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared):
@@ -802,7 +812,7 @@ corpus:
           arch, b2sum, base32, base64, basename, bash, bracket, cal, cat, cksum,
           curl, date, df-direct, dirname, du, echo, expr, findmnt, free, getopt,
           groups, head, hostname, id, kill, ls, lsirq, lsmod,
-          lua-direct, md5sum, nproc, numactl-hardware, numastat, numfmt,
+          lua-direct, md5sum, nproc, numastat, numfmt,
           openssl, perl-direct, pinky, pr, printf, ps, pwd, readlink, realpath,
           sha1sum, sha224sum, sha256sum, sha384sum, sha512sum, sleep, stat, sum,
           sysctl-random-uuid, test, "true", uname, uptime, users, vmstat,
@@ -822,6 +832,16 @@ corpus:
           hermit 16f99cd0, reverie 2f10ec67). It passed before only because
           that exec failed with EOPNOTSUPP in both runs, so the row printed
           logname:no-login-record without running logname.
+        numactl-hardware: >-
+          Its verify runs end as a named policy refusal on in-guest-trap: since
+          Hermit presents a kernel without NUMA
+          (https://github.com/rrnewton/hermit/issues/5269), the row's shell
+          runs /usr/bin/numactl in a command substitution — to require its
+          exit 1 with "No NUMA available on this system" — a forked child
+          that execs it, and the in-guest runtime refuses exec with a typed
+          refusal that ends the run (HERMIT_POLICY_REFUSAL, execveat;
+          measured in the full validation of 834b862aee). The ptrace and
+          KVM cells prove the no-NUMA answer.
         seq: >-
           Its first verify run on in-guest-trap failed in the second local
           survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures
