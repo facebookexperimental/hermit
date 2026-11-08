@@ -20813,7 +20813,12 @@ mod nextest_timeout_tests {
                 // 2994 after system-utils/procfs-sanitized-paths verify/KVM
                 // left under dh-9j8ue (this PR; Detcore refuses smaps VmFlags
                 // for file mappings while MappingFact carries none).
-                assert_eq!(all.len(), 2994, "the original all-owner population is retained");
+                // 2990 after compat/numactl-hardware and compat/numastat left
+                // liteinst and in-guest-trap (four cells) with the no-NUMA
+                // platform (https://github.com/rrnewton/hermit/issues/5269):
+                // their shell wrappers exec, which the in-guest backends
+                // refuse; ptrace and KVM keep proving the new answers.
+                assert_eq!(all.len(), 2990, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");

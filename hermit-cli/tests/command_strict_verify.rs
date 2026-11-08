@@ -616,6 +616,11 @@ fn kernel_activity_commands_are_deterministic_under_strict_verify() {
     }
 }
 
+/// The NUMA tools on the kernel without NUMA that Hermit presents
+/// (https://github.com/rrnewton/hermit/issues/5269): libnuma's probe
+/// answers ENOSYS and the sysfs node directory does not exist, so each
+/// tool prints its no-NUMA line and exits 1, deterministically. The
+/// shell wrapper requires exactly that answer, as the compat cells do.
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-865): Review NUMA and sensor command coverage.
 #[test]
@@ -625,14 +630,24 @@ fn hardware_accounting_commands_are_deterministic_under_strict_verify() {
     let cases = [
         StrictCommandCase {
             name: "numastat",
-            candidates: &["/usr/bin/numastat"],
-            args: &[],
+            candidates: &["/bin/bash", "/usr/bin/bash"],
+            args: &[
+                "-c",
+                "output=$(/usr/bin/numastat 2>&1); rc=$?; test \"$rc\" -eq 1 && \
+                 test \"$output\" = \"sysfs not mounted or system not NUMA aware: \
+                 No such file or directory\" && printf \"numastat-no-numa\\n\"",
+            ],
             stdin: None,
         },
         StrictCommandCase {
             name: "numactl hardware",
-            candidates: &["/usr/bin/numactl"],
-            args: &["--hardware"],
+            candidates: &["/bin/bash", "/usr/bin/bash"],
+            args: &[
+                "-c",
+                "output=$(/usr/bin/numactl --hardware 2>&1); rc=$?; test \"$rc\" -eq 1 && \
+                 test \"$output\" = \"No NUMA available on this system\" && \
+                 printf \"numactl-no-numa\\n\"",
+            ],
             stdin: None,
         },
     ];

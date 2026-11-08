@@ -52784,11 +52784,14 @@ fn cpu_directory_reads_list_only_cpu0_on_every_path() {
     assert_eq!(report["bitwise_parity"], true, "{report}");
 }
 
-/// The CPUs and NUMA nodes other than number 0 that the sysfs listings leave
-/// out are not found by a lookup either, however it is spelled: absolutely,
-/// below the entry, relative to a directory descriptor, through
-/// `/sys/bus/cpu/devices`, with stat, access and readlink. cpu0 and node0 stay
-/// found, under the default policy at bitwise parity and under
+/// The CPUs other than number 0 that the sysfs listings leave out, and
+/// every NUMA node — Hermit presents a kernel without NUMA, so the node
+/// directory itself does not exist
+/// (https://github.com/rrnewton/hermit/issues/5269) — are not found by a
+/// lookup either, however it is spelled: absolutely, below the entry,
+/// relative to a directory descriptor, through `/sys/bus/cpu/devices`,
+/// with stat, access and readlink. cpu0 stays found, under the default
+/// policy at bitwise parity and under
 /// `--allow-unsupported-syscalls` too. Under the default policy rseq fails
 /// with ENOSYS and leaves its area untouched; under
 /// `--allow-unsupported-syscalls` its registration result matches the same
@@ -52802,7 +52805,7 @@ fn absent_cpus_and_nodes_are_not_found_and_rseq_is_refused() {
     let expected = "/sys/devices/system/node/node1/cpulist: ENOENT\n\
                     /sys/devices/system/cpu/cpu1/topology/core_id: ENOENT\n\
                     /sys/devices/system/cpu/cpu0/topology/core_id: ok\n\
-                    /sys/devices/system/node/node0/cpulist: ok\n\
+                    /sys/devices/system/node/node0/cpulist: ENOENT\n\
                     stat /sys/devices/system/cpu/cpu1: ENOENT\n\
                     access /sys/devices/system/node/node1: ENOENT\n\
                     readlink /sys/bus/cpu/devices/cpu1: ENOENT\n\
@@ -52928,8 +52931,12 @@ fn absent_cpus_and_nodes_are_not_found_and_rseq_is_refused() {
     fs::create_dir(&bound).unwrap();
     fs::write(bound.join("cpu1"), "guest-owned CPU name").unwrap();
     fs::write(bound.join("node1"), "guest-owned node name").unwrap();
+    // (Not /sys/devices/system/node/node0, the original first target: on
+    // the kernel without NUMA that Hermit presents the node directory
+    // does not exist, so there is no sysfs path there to bind over, as
+    // for an absent CPU.)
     for (target, name) in [
-        ("/sys/devices/system/node/node0", "cpu1"),
+        ("/sys/devices/system/cpu/cpu0", "cpu1"),
         ("/sys/bus/cpu/drivers/processor", "cpu1"),
         ("/sys/devices/system/memory/memory0", "node1"),
     ] {

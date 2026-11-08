@@ -85,12 +85,12 @@ enum ProcfsKind {
     ProcessIo,
     Uptime,
     BlockStat,
-    /// A node's `meminfo`, from when Detcore presented one virtual node.
-    /// No path is classified as it now that the node directory is absent
-    /// (https://github.com/rrnewton/hermit/issues/5269); retained so every
-    /// other kind keeps its serialized number.
+    /// A node's `meminfo`. Classified for record mode, which leaves sysfs
+    /// lookups alone; in run mode the node directory is absent
+    /// (https://github.com/rrnewton/hermit/issues/5269), so no lookup
+    /// reaches it.
     NodeMeminfo,
-    /// A node's `numastat`, retained as [`Self::NodeMeminfo`] is.
+    /// A node's `numastat`, classified as [`Self::NodeMeminfo`] is.
     NodeNumastat,
     HwmonInput,
     ScalingCurFreq,
@@ -172,8 +172,8 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-941): Review transparent-hugepage counter normalization.
     ThpCounter,
-    /// A node's `vmstat`, retained as [`Self::NodeMeminfo`] is: no path is
-    /// classified as it now.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-939): Review NUMA node VM accounting normalization.
     NodeVmstat,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-950): Review ACPI CPPC feedback normalization.
@@ -206,14 +206,14 @@ enum ProcfsKind {
     // TODO-HUMAN-REVIEW(PR-958): Review host-global uevent sequence normalization.
     UeventSeqnum,
     /// A CPU list in `/sys` (`/sys/devices/system/cpu/{online,possible,
-    /// present,enabled}`, a CPU's topology lists and cache sharing lists),
-    /// reported for the virtual CPUs it names.
+    /// present,enabled}`, a CPU's topology lists and cache sharing lists,
+    /// the node lists), reported for the virtual CPUs it names.
     CpuList(CpuFileSet),
-    /// A CPU mask in `/sys` (a CPU's topology and cache sharing masks),
-    /// reported for the virtual CPUs it names.
+    /// A CPU mask in `/sys` (a CPU's topology and cache sharing masks,
+    /// `node0/cpumap`), reported for the virtual CPUs it names.
     CpuMask(CpuFileSet),
-    /// A CPU file whose contents are fixed for the virtual CPUs (see
-    /// [`CpuConstantFile`]).
+    /// A CPU or node file whose contents are fixed for the virtual CPUs on a
+    /// single node (see [`CpuConstantFile`]).
     CpuConstant(CpuConstantFile),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-957): Review Btrfs reservation normalization.
@@ -2016,6 +2016,13 @@ impl ProcfsFile {
             other if let Some(file) = CpuConstantFile::from_path(other) => {
                 ProcfsKind::CpuConstant(file)
             }
+            // In run mode no lookup reaches a node file — the directory
+            // itself is absent (is_absent_cpu_entry). These kinds serve
+            // record mode, which leaves sysfs lookups alone by design, so
+            // a recording's node accounting is sanitized and stable.
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-939): Review NUMA node VM accounting normalization.
+            other if is_node_vmstat_path(other) => ProcfsKind::NodeVmstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-928): Review per-process host scheduler normalization.
             other if is_process_file_path(other, "sched") => ProcfsKind::SelfSched,
@@ -2049,7 +2056,9 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-909): Review softnet counter normalization.
             "/proc/net/softnet_stat" => ProcfsKind::SoftnetStat,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-865): Review deterministic hwmon snapshots.
+            // TODO-HUMAN-REVIEW(PR-865): Review deterministic NUMA and hwmon snapshots.
+            other if is_numa_node_file(other, "meminfo") => ProcfsKind::NodeMeminfo,
+            other if is_numa_node_file(other, "numastat") => ProcfsKind::NodeNumastat,
             other if is_hwmon_input_file(other) => ProcfsKind::HwmonInput,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-916): Review live protocol allocation counter normalization.
@@ -3831,18 +3840,20 @@ const CPU_TOPOLOGY_ATTRIBUTES: [&str; 6] = [
 ];
 
 /// What a CPU-list or CPU-mask file in `/sys` names, on the machine
-/// `--virtual-cpus` describes: single-core sockets, and no NUMA node
-/// directory at all (https://github.com/rrnewton/hermit/issues/5269), so
-/// no file below `/sys/devices/system/node` is ever classified. Each set
-/// below is a set of CPU numbers.
+/// `--virtual-cpus` describes: single-core sockets on one node. In run
+/// mode the node directory itself is absent, as on a kernel built
+/// without NUMA (https://github.com/rrnewton/hermit/issues/5269), so the
+/// node entries below classify only what record mode — which leaves
+/// sysfs lookups alone by design — can still open. Each is a set of CPU
+/// numbers, except the node lists', which number nodes and print the
+/// same way.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum CpuFileSet {
-    /// Every CPU: `cpu/{online,possible,present,enabled}`.
+    /// Every CPU: `cpu/{online,possible,present,enabled}` and `node0`'s
+    /// CPUs.
     Every,
-    /// The node lists' `{0}` of node numbers, from when Detcore presented
-    /// one virtual node. No path names it now that the node directory is
-    /// absent; the variant stays so a serialized `ProcfsFile` keeps the
-    /// numbers it had.
+    /// Node 0, the only node, as the node lists ([`NODE_LISTS`]) name it: the
+    /// set `{0}` of node numbers.
     Node0,
     /// CPU `n` alone: every topology list of `cpuN` (its socket has one core
     /// of one thread) and the CPUs sharing each of its caches (its socket's
@@ -3857,7 +3868,14 @@ impl CpuFileSet {
             "/sys/devices/system/cpu/online"
             | "/sys/devices/system/cpu/possible"
             | "/sys/devices/system/cpu/present"
-            | "/sys/devices/system/cpu/enabled" => Some(Self::Every),
+            | "/sys/devices/system/cpu/enabled"
+            | "/sys/devices/system/node/node0/cpulist" => Some(Self::Every),
+            _ if path
+                .strip_prefix("/sys/devices/system/node/")
+                .is_some_and(|list| NODE_LISTS.contains(&list)) =>
+            {
+                Some(Self::Node0)
+            }
             _ => {
                 let (cpu, attribute) = cpu_file(path)?;
                 let named = cpu_cache_attribute(attribute) == Some("shared_cpu_list")
@@ -3873,6 +3891,9 @@ impl CpuFileSet {
     /// The set a CPU-mask file at `path` names: the mask forms of
     /// [`Self::of_list`]'s files.
     fn of_mask(path: &str) -> Option<Self> {
+        if path == "/sys/devices/system/node/node0/cpumap" {
+            return Some(Self::Every);
+        }
         let (cpu, attribute) = cpu_file(path)?;
         let named = cpu_cache_attribute(attribute) == Some("shared_cpu_map")
             || attribute
@@ -3917,8 +3938,19 @@ fn cpu_cache_attribute(within_cpu: &str) -> Option<&str> {
     (!index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())).then_some(attribute)
 }
 
-/// CPU files whose contents Hermit fixes for its virtual CPUs, whatever
-/// the host reports. There are no node files: the node directory is absent.
+/// The node lists in `/sys/devices/system/node` that name nodes: those that
+/// are online, possible, or have CPUs or memory. Hermit's single virtual node
+/// is node 0, which has both.
+const NODE_LISTS: &[&str] = &[
+    "online",
+    "possible",
+    "has_cpu",
+    "has_memory",
+    "has_normal_memory",
+];
+
+/// CPU and node files whose contents Hermit fixes for the virtual CPUs on
+/// its single node, whatever the host reports.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum CpuConstantFile {
     /// `cpu/kernel_max`, the highest CPU number the kernel supports
@@ -3943,11 +3975,11 @@ enum CpuConstantFile {
     /// `cpuN`'s core and die IDs: 0, its socket's only core and die, as
     /// `/proc/cpuinfo`'s `core id` numbers it.
     CoreId(u32),
-    /// `node/has_generic_initiator` as it read when Detcore presented one
-    /// virtual node. No path names it now that the node directory is
-    /// absent; retained so a serialized `ProcfsFile` keeps its numbers.
+    /// `node/has_generic_initiator`: empty, as on a machine without generic
+    /// initiators.
     GenericInitiators,
-    /// `node0/distance` likewise: retained, unnamed by any path.
+    /// `node0/distance`: one distance per node, so only node 0's to itself,
+    /// which Linux reports as 10.
     Node0Distance,
     /// cpufreq's `boost`, the global switch and each policy's: 0, off. The
     /// virtual CPU cannot boost: its CPUID shows neither Intel's turbo
@@ -3964,6 +3996,8 @@ impl CpuConstantFile {
             "/sys/devices/system/cpu/kernel_max" => Self::KernelMax,
             "/sys/devices/system/cpu/smt/active" => Self::SmtActive,
             "/sys/devices/system/cpu/smt/control" => Self::SmtControl,
+            "/sys/devices/system/node/has_generic_initiator" => Self::GenericInitiators,
+            "/sys/devices/system/node/node0/distance" => Self::Node0Distance,
             "/sys/devices/system/cpu/cpufreq/boost" => Self::CpufreqBoost,
             _ if cpufreq_policy_attribute(Path::new(path)) == Some("boost") => Self::CpufreqBoost,
             _ => {
@@ -4077,6 +4111,14 @@ pub(crate) fn absent_cpu_entry_prefix(path: &Path, cpus: u32) -> Option<PathBuf>
         prefix.push(name);
     }
     None
+}
+
+fn is_numa_node_file(path: &str, filename: &str) -> bool {
+    path.strip_prefix("/sys/devices/system/node/node")
+        .and_then(|path| path.split_once('/'))
+        .is_some_and(|(node, leaf)| {
+            !node.is_empty() && node.bytes().all(|byte| byte.is_ascii_digit()) && leaf == filename
+        })
 }
 
 fn is_hwmon_input_file(path: &str) -> bool {
@@ -4497,7 +4539,7 @@ fn cpuinfo_block_for(block: &[u8], cpu: u32) -> Vec<u8> {
 }
 
 /// Reports a kernel CPU mask (comma-separated groups of hex digits, as in
-/// `cpu0/topology/thread_siblings`) as naming `named`, of a
+/// `cpu0/topology/thread_siblings` or `node0/cpumap`) as naming `named`, of a
 /// machine with `cpus` CPUs, which the kernel prints with `nr_cpu_ids`
 /// (`cpus`) bits: `1` for CPU 0 of one CPU. Anything that is not a
 /// newline-terminated hex mask is returned unchanged.
@@ -4952,6 +4994,19 @@ fn sanitize_pty_nr(contents: &[u8], virtual_count: usize) -> Vec<u8> {
         return Vec::new();
     }
     format!("{virtual_count}\n").into_bytes()
+}
+
+fn is_node_vmstat_path(path: &str) -> bool {
+    let relative = path
+        .strip_prefix("/sys/devices/system/node/")
+        .unwrap_or(path);
+    let Some(node) = relative.strip_suffix("/vmstat") else {
+        return false;
+    };
+    let Some(index) = node.strip_prefix("node") else {
+        return false;
+    };
+    !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -7865,25 +7920,24 @@ Rss:                   4 kB\n" as &[u8];
     }
 
     #[test]
-    fn no_numa_node_path_is_classified() {
-        // The node directory is absent on the kernel Detcore presents, so
-        // no spelling of a file below it names a procfs file at all; the
-        // lookup itself is refused by the absent-entry gate.
-        for path in [
-            "/sys/devices/system/node/node0/vmstat",
-            "/sys/devices/system/node/node0/numastat",
-            "/sys/devices/system/node/node12/meminfo",
-            "/sys/devices/system/node/node0/cpulist",
-            "/sys/devices/system/node/node0/cpumap",
-            "/sys/devices/system/node/node0/distance",
-            "/sys/devices/system/node/has_generic_initiator",
-            "/sys/devices/system/node/online",
-            "node12/vmstat",
-            "node/vmstat",
-            "node0/meminfo",
-        ] {
-            assert!(ProcfsFile::from_path(Path::new(path)).is_none(), "{path}");
-        }
+    fn recognizes_only_numa_node_vmstat_paths() {
+        // Classified for record mode, which leaves sysfs lookups alone; in
+        // run mode the absent-entry gate refuses every lookup below the
+        // missing node directory before classification is consulted.
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/sys/devices/system/node/node0/vmstat"))
+                .unwrap()
+                .kind,
+            ProcfsKind::NodeVmstat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("node12/vmstat"))
+                .unwrap()
+                .kind,
+            ProcfsKind::NodeVmstat
+        );
+        assert!(ProcfsFile::from_path(Path::new("node/vmstat")).is_none());
+        assert!(ProcfsFile::from_path(Path::new("node0/meminfo")).is_none());
         // /proc/vmstat is now recognized as ProcfsKind::Fixed(FixedProcfsFile::Vmstat) (PR-938).
     }
 
@@ -7906,12 +7960,27 @@ Rss:                   4 kB\n" as &[u8];
     }
 
     #[test]
-    fn recognizes_hwmon_accounting_paths() {
+    fn recognizes_numa_and_hwmon_accounting_paths() {
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/sys/devices/system/node/node0/numastat"))
+                .unwrap()
+                .kind,
+            ProcfsKind::NodeNumastat
+        );
+        assert_eq!(
+            ProcfsFile::from_path(Path::new("/sys/devices/system/node/node12/meminfo"))
+                .unwrap()
+                .kind,
+            ProcfsKind::NodeMeminfo
+        );
         assert_eq!(
             ProcfsFile::from_path(Path::new("/sys/class/hwmon/hwmon4/power1_input"))
                 .unwrap()
                 .kind,
             ProcfsKind::HwmonInput
+        );
+        assert!(
+            ProcfsFile::from_path(Path::new("/sys/devices/system/node/nodeX/numastat")).is_none()
         );
         assert!(ProcfsFile::from_path(Path::new("/sys/class/hwmon/hwmon4/power1_cap")).is_none());
     }
@@ -8731,7 +8800,7 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
     }
 
     #[test]
-    fn cpu_topology_reports_single_core_sockets() {
+    fn cpu_topology_and_node0_report_single_core_sockets() {
         let kind = |path: &str| ProcfsFile::from_path(Path::new(path)).map(|file| file.kind);
         for (path, set) in [
             (
@@ -8750,6 +8819,7 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
                 "/sys/devices/system/cpu/cpu5/cache/index3/shared_cpu_list",
                 CpuFileSet::Cpu(5),
             ),
+            ("/sys/devices/system/node/node0/cpulist", CpuFileSet::Every),
         ] {
             assert_eq!(kind(path), Some(ProcfsKind::CpuList(set)), "{path}");
         }
@@ -8766,14 +8836,13 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
                 "/sys/devices/system/cpu/cpu0/cache/index0/shared_cpu_map",
                 CpuFileSet::Cpu(0),
             ),
+            ("/sys/devices/system/node/node0/cpumap", CpuFileSet::Every),
         ] {
             assert_eq!(kind(path), Some(ProcfsKind::CpuMask(set)), "{path}");
         }
-        // The absent node directory's files, other topology attributes and
-        // other spellings are untouched.
+        // Other nodes, other topology attributes and other spellings are
+        // untouched.
         for path in [
-            "/sys/devices/system/node/node0/cpulist",
-            "/sys/devices/system/node/node0/cpumap",
             "/sys/devices/system/node/node1/cpulist",
             "/sys/devices/system/cpu/cpu0/cache/index3/size",
             "/sys/devices/system/cpu/cpu0/topology/ppin",
@@ -8830,7 +8899,7 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
     }
 
     #[test]
-    fn kernel_max_smt_and_topology_ids_describe_the_virtual_cpus() {
+    fn kernel_max_smt_topology_ids_and_nodes_describe_one_cpu_and_node() {
         let kind = |path: &str| ProcfsFile::from_path(Path::new(path)).map(|file| file.kind);
         let constant = |path: &str| match kind(path) {
             Some(ProcfsKind::CpuConstant(file)) => file.contents(),
@@ -8869,17 +8938,27 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
                 "{attribute}"
             );
         }
-        // No file of the absent node directory is a constant or a CPU list:
-        // its lookup finds nothing, as on a kernel without NUMA. cpu0's
-        // PPIN is left to the host.
+        assert_eq!(
+            constant("/sys/devices/system/node/has_generic_initiator"),
+            b"\n"
+        );
+        assert_eq!(constant("/sys/devices/system/node/node0/distance"), b"10\n");
         for path in [
-            "/sys/devices/system/node/has_generic_initiator",
-            "/sys/devices/system/node/node0/distance",
             "/sys/devices/system/node/online",
             "/sys/devices/system/node/possible",
             "/sys/devices/system/node/has_cpu",
             "/sys/devices/system/node/has_memory",
             "/sys/devices/system/node/has_normal_memory",
+        ] {
+            assert_eq!(
+                kind(path),
+                Some(ProcfsKind::CpuList(CpuFileSet::Node0)),
+                "{path}"
+            );
+        }
+        // Another node's distances and cpu0's PPIN are left to the directory
+        // listing or the host.
+        for path in [
             "/sys/devices/system/node/node1/distance",
             "/sys/devices/system/cpu/cpu0/topology/ppin",
             "/sys/devices/system/node/has_cpu_extra",
