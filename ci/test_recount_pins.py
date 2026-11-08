@@ -26,3 +26,25 @@ def test_inventory_loss_refused(tmp_path):
     receipt = tmp_path / "r.json"; receipt.write_text(json.dumps({"inventories": {"s": ["a"]}}))
     r = subprocess.run([sys.executable, str(tmp_path / "ci/recount-pins"), str(receipt)], capture_output=True, text=True)
     assert r.returncode == 1 and "-b" in r.stdout + r.stderr
+
+
+if __name__ == "__main__":
+    import tempfile
+    _tests = [(n, f) for n, f in sorted(globals().items())
+              if n.startswith("test_") and callable(f)]
+    if not _tests:
+        print("recount-pins test runner: ERROR: zero tests collected "
+              "(no test_* functions found)", file=sys.stderr)
+        sys.exit(2)
+    _failed = 0
+    for _name, _fn in _tests:
+        try:
+            with tempfile.TemporaryDirectory(prefix="test-recount-pins-") as _td:
+                _fn(Path(_td))
+        except Exception as _exc:
+            _failed += 1
+            print(f"FAIL {_name}: {_exc!r}", file=sys.stderr)
+        else:
+            print(f"PASS {_name}")
+    print(f"{len(_tests) - _failed}/{len(_tests)} tests passed")
+    sys.exit(1 if _failed else 0)
