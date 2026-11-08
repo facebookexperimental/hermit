@@ -29814,13 +29814,50 @@ fn a_schedule_replay_refuses_a_stdio_kind_changed_since_the_recording() {
     );
 
     // The refused piped replay writes no summary (the fatal path exits
-    // before it is filled), so the positive summary wiring the old piped
-    // assertions covered is kept here instead: a fresh recording made
-    // with a piped stderr records the pipe kind in its summary.
-    let piped_record = directory.path().join("piped-record.json");
-    let piped_record_arg = format!("--record-preemptions-to={}", piped_record.display());
-    let (_piped_out, _piped_err, piped_summary) = run(&piped_record_arg, "record-pipe", false);
-    assert_eq!(piped_summary["host_inputs"]["stdio"]["stderr"], "pipe");
+    // before it is filled), so the positive changed-input summary wiring
+    // is kept on a guest that never checks the changed kind: record it
+    // with stderr a file, replay it with stderr a pipe, and the completed
+    // replay's summary names the change.
+    let quiet = branch_free_race_guest().to_str().unwrap().to_owned();
+    let quiet_schedule = directory.path().join("quiet-schedule.json");
+    let quiet_record_arg = format!("--record-preemptions-to={}", quiet_schedule.display());
+    let quiet_replay_arg = format!("--replay-schedule-from={}", quiet_schedule.display());
+    let quiet_run = |schedule_arg: &str, name: &str, stderr_file: bool| {
+        let summary = directory.path().join(format!("{name}.summary.json"));
+        let summary_arg = format!("--summary-json={}", summary.display());
+        let args = [
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+            "--chaos",
+            "--sched-seed=1",
+            "--max-timeslice=200000",
+            schedule_arg,
+            summary_arg.as_str(),
+            "--",
+            &quiet,
+            "25000",
+        ];
+        let mut command = hermit_command(&args);
+        command.stdin(Stdio::null());
+        if stderr_file {
+            let path = directory.path().join(format!("{name}.stderr"));
+            command.stderr(fs::File::create(&path).unwrap());
+        }
+        let output = hermit_test::hermit_output(name, &mut command);
+        assert_success(&output, &args);
+        let summary: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
+        summary
+    };
+    let _ = quiet_run(&quiet_record_arg, "quiet-record", true);
+    let quiet_summary = quiet_run(&quiet_replay_arg, "quiet-replay", false);
+    assert_eq!(quiet_summary["host_inputs"]["stdio"]["stderr"], "pipe");
+    assert_eq!(
+        quiet_summary["stdio_changed"],
+        serde_json::json!([{"fd": 2, "recorded": "file", "now": "pipe"}])
+    );
 }
 
 /// A plain `hermit run`, which runs its guest in a container, records the
