@@ -56030,9 +56030,12 @@ fn a_parents_sigchld_is_not_held_behind_a_sibling_that_never_blocks() {
 /// the sleep is still queued or once it has parked (the `late-` modes, whose
 /// child exits after 100 ms). Before, a blocked or default `SIGCHLD` ended the
 /// sleep with EINTR (https://github.com/rrnewton/hermit/issues/4126; the Claude
-/// review of https://github.com/rrnewton/hermit/pull/4131).
+/// review of https://github.com/rrnewton/hermit/pull/4131). The yield and
+/// two-children modes are the two tests below; the case is split in three
+/// so each stays inside the validation per-test CPU budget under load
+/// (dh-b6k1g).
 #[test]
-fn a_childs_sigchld_ends_a_sleep_only_when_caught_and_unblocked() {
+fn a_childs_sigchld_leaves_pause_and_nanosleep_as_linux_does() {
     let guest = pause_sigchld_guest().to_str().unwrap().to_owned();
     for (mode, expected) in [
         (
@@ -56075,6 +56078,16 @@ fn a_childs_sigchld_ends_a_sleep_only_when_caught_and_unblocked() {
             assert_eq!(stdout, expected, "{argument}: stderr:\n{log}");
         }
     }
+}
+
+/// The yield and private-copy modes of the child-exit `SIGCHLD` sleep
+/// behaviour above, beside a worker thread that keeps running. One test
+/// of the three this case is split across so each stays inside the
+/// validation per-test CPU budget under load (dh-b6k1g): the same
+/// invocations and assertions, grouped by mode family.
+#[test]
+fn a_childs_sigchld_ends_a_sleep_beside_a_yielding_worker() {
+    let guest = pause_sigchld_guest().to_str().unwrap().to_owned();
     // With a worker thread that keeps running, the queued sleep woken for that
     // SIGCHLD still runs its turn. Ignored, the signal leaves it to sleep again
     // to its deadline and return 0: deferred behind the worker, it never reached
@@ -56199,6 +56212,24 @@ fn a_childs_sigchld_ends_a_sleep_only_when_caught_and_unblocked() {
             "{flags:?} {mode}: {stdout:?} is none of {expected:?}\nstderr:\n{log}"
         );
     }
+}
+
+/// The two-children chaos modes of the child-exit `SIGCHLD` sleep
+/// behaviour above. One test of the three this case is split across so
+/// each stays inside the validation per-test CPU budget under load
+/// (dh-b6k1g): the same invocations and assertions, grouped by mode
+/// family.
+#[test]
+fn a_childs_sigchld_ends_a_sleep_beside_a_yielding_worker_under_chaos() {
+    let guest = pause_sigchld_guest().to_str().unwrap().to_owned();
+    let chaos = [
+        "--chaos",
+        "--sched-seed",
+        "18",
+        "--chaos-target-races",
+        "--fuzz-seed",
+        "18",
+    ];
     // Two children while another thread spins: each child-exit copy the
     // scheduler sends admits only the thread that takes it, so neither the
     // sibling's delivery of the first nor the sleeper's of the second waits

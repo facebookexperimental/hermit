@@ -4798,7 +4798,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_schedule_replay_ends_each_recorded_slice_once_at_seed_{1,2,3}
     // (PR #4614): 839 + 3 = 842, skipped by exact name here and run in
     // privileged-test.pmu_cli_cases: 842 - 3 = 839, listed.
-    ("test.cli", 839),
+    // The dh-b6k1g split of a_childs_sigchld_ends_a_sleep_only_when_
+    // caught_and_unblocked into three tests, same invocations: 839 + 2 = 841.
+    ("test.cli", 841),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5530,7 +5532,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the 2b-3 other-process cmdline ptrace twin: 754 + 1 = 755.
     // And the same three chaos-follows seeds (PR #4614): 755 + 3 = 758.
     // And the same three slice-once seeds (PR #4614): 758 + 3 - 3 = 758.
-    ("test.cli_on_host", 758),
+    // The same dh-b6k1g sigchld-sleep split (one test becomes three,
+    // same invocations, none skipped here): 758 + 2 = 760.
+    ("test.cli_on_host", 760),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
