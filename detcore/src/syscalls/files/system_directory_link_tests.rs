@@ -292,7 +292,17 @@ fn the_walk_takes_each_step_by_the_object_reached() {
     std::fs::create_dir_all(fixture.join("proc/self")).unwrap();
     std::os::unix::fs::symlink("/proc/sys", fixture.join("proc/self/cwd")).unwrap();
     std::os::unix::fs::symlink("/proc/sys/kernel/random", fixture.join("to-random")).unwrap();
+    // A sticky world-writable directory whose owner owns the link: Linux's
+    // `fs.protected_symlinks` lets anyone follow it (`may_follow_link`).
+    std::fs::create_dir(fixture.join("sticky")).unwrap();
+    std::fs::set_permissions(
+        fixture.join("sticky"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o1777),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("/proc/sys", fixture.join("sticky/to-sys")).unwrap();
     for path in [
+        fixture.join("sticky/to-sys/"),
         fixture.join("proc/self/cwd/kernel"),
         fixture.join("to-random/../random"),
         Path::new("/proc/self/../sys").to_path_buf(),
@@ -310,6 +320,127 @@ fn the_walk_takes_each_step_by_the_object_reached() {
             assert!(forwarded.is_empty(), "{forwarded:?}");
         }
     }
+}
+
+/// Set in the child that [`a_nosymfollow_mount_refuses_to_follow_its_links`]
+/// runs in its own user and mount namespaces.
+const NOSYMFOLLOW_CHILD: &str = "DETCORE_SYSTEM_DIRECTORY_NOSYMFOLLOW_CHILD";
+
+/// A mount with `nosymfollow` holding `to-sys -> /proc/sys`: Linux reads the
+/// link itself (9 bytes, from the kernel) but refuses to follow it, ELOOP,
+/// whether a name follows it or a final `/` or `/.` does (`pick_link`,
+/// `MNT_NOSYMFOLLOW`, fs/namei.c v6.12), and Detcore's walk answers ELOOP
+/// as well. The test runs again in a child of its own, in new user and
+/// mount namespaces, with the fixture bound over itself and remounted
+/// `nosymfollow`.
+#[test]
+fn a_nosymfollow_mount_refuses_to_follow_its_links() {
+    if let Some(mount) = std::env::var_os(NOSYMFOLLOW_CHILD) {
+        let mount = std::path::PathBuf::from(mount);
+        let spell = |rest: &str| {
+            let mut path = mount.as_os_str().as_bytes().to_vec();
+            path.extend_from_slice(rest.as_bytes());
+            path
+        };
+        assert_native(&spell("/to-sys"), Ok(9), "to-sys");
+        for (result, forwarded) in readlinks(&spell("/to-sys"), Ok(9)) {
+            assert_eq!(result, Ok(9), "to-sys");
+            assert_eq!(forwarded.len(), 1, "{forwarded:?}");
+        }
+        for rest in ["/to-sys/kernel", "/to-sys/", "/to-sys/."] {
+            assert_native(&spell(rest), Err(Errno::ELOOP), rest);
+            for (result, forwarded) in readlinks(&spell(rest), Err(Errno::EACCES)) {
+                assert_eq!(result, Err(Errno::ELOOP), "{rest}");
+                assert!(forwarded.is_empty(), "{rest}: {forwarded:?}");
+            }
+        }
+        return;
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    let mount = crate::util::canonicalize(fixture.path()).unwrap();
+    std::os::unix::fs::symlink("/proc/sys", mount.join("to-sys")).unwrap();
+    let target = CString::new(mount.as_os_str().as_bytes()).unwrap();
+    // The flags of the mount the fixture is on that a user namespace may not
+    // drop (`MNT_LOCK_*`), kept by the remount.
+    let mut vfs = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    // SAFETY: a NUL-terminated path and a writable structure.
+    assert_eq!(
+        unsafe { libc::statvfs(target.as_ptr(), vfs.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: the call succeeded and initialized the structure.
+    let kept = unsafe { vfs.assume_init() }.f_flag;
+    let locked = [
+        (libc::ST_RDONLY, libc::MS_RDONLY),
+        (libc::ST_NOSUID, libc::MS_NOSUID),
+        (libc::ST_NODEV, libc::MS_NODEV),
+        (libc::ST_NOEXEC, libc::MS_NOEXEC),
+        (libc::ST_NOATIME, libc::MS_NOATIME),
+        (libc::ST_NODIRATIME, libc::MS_NODIRATIME),
+        (libc::ST_RELATIME, libc::MS_RELATIME),
+    ]
+    .into_iter()
+    .filter(|(st, _)| kept & st != 0)
+    .fold(0, |flags, (_, ms)| flags | ms);
+    let name = module_path!()
+        .split_once("::")
+        .map_or(module_path!(), |(_, rest)| rest)
+        .to_owned()
+        + "::a_nosymfollow_mount_refuses_to_follow_its_links";
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args([name.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+        .env(NOSYMFOLLOW_CHILD, &mount);
+    // SAFETY: the hook makes only raw system calls on memory prepared before
+    // the fork.
+    unsafe {
+        child.pre_exec(move || {
+            let check = |result: libc::c_int| {
+                if result == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            };
+            check(libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS))?;
+            check(libc::mount(
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                libc::MS_REC | libc::MS_PRIVATE,
+                std::ptr::null(),
+            ))?;
+            check(libc::mount(
+                target.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND,
+                std::ptr::null(),
+            ))?;
+            check(libc::mount(
+                std::ptr::null(),
+                target.as_ptr(),
+                std::ptr::null(),
+                libc::MS_REMOUNT | libc::MS_BIND | libc::MS_NOSYMFOLLOW | locked,
+                std::ptr::null(),
+            ))
+        });
+    }
+    let output = child
+        .output()
+        .expect("the child in its own namespaces must start");
+    assert!(
+        output.status.success(),
+        "the child failed: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "the child ran the test: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
 }
 
 /// Set in the child that [`a_bind_over_proc_sys_keeps_its_links`] runs in

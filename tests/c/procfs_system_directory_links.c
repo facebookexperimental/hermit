@@ -19,6 +19,8 @@
  *   procfs_system_directory_links --bind
  *                                       the two names a bind over /proc/sys
  *                                       holding kernel -> /dev/null changes
+ *   procfs_system_directory_links --nosymfollow DIR
+ *                                       a link on DIR, a nosymfollow mount
  *   procfs_system_directory_links --magic DIR
  *                                       spellings through the caller's own
  *                                       /proc/self/cwd magic link
@@ -151,6 +153,26 @@ static int magic(const char *dir) {
     return 0;
 }
 
+/* DIR, a mount with nosymfollow: DIR/to-sys -> /proc/sys reads as a link
+ * (9 bytes), but Linux refuses to follow it (pick_link, MNT_NOSYMFOLLOW). */
+static int nosymfollow(const char *dir) {
+    char link[PATH_MAX];
+    snprintf(link, sizeof(link), "%s/to-sys", dir);
+    if (symlink("/proc/sys", link) != 0) {
+        perror("symlink to-sys");
+        return 1;
+    }
+    char path[2 * PATH_MAX];
+    both("DIR/to-sys", link);
+    snprintf(path, sizeof(path), "%s/kernel", link);
+    both("DIR/to-sys/kernel", path);
+    snprintf(path, sizeof(path), "%s/", link);
+    both("DIR/to-sys/", path);
+    snprintf(path, sizeof(path), "%s/.", link);
+    both("DIR/to-sys/.", path);
+    return 0;
+}
+
 /* "/proc/", then `slashes` slashes, then "sys"; or "/proc/sys" padded with
  * "/." to `length` bytes. */
 static char *spelling(size_t slashes, size_t length) {
@@ -174,6 +196,9 @@ static char *spelling(size_t slashes, size_t length) {
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "--magic") == 0) {
         return magic(argv[2]);
+    }
+    if (argc == 3 && strcmp(argv[1], "--nosymfollow") == 0) {
+        return nosymfollow(argv[2]);
     }
     if (argc == 3 && strcmp(argv[2], "--native-settle") == 0) {
         native_settle = true;

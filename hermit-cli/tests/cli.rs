@@ -63623,6 +63623,10 @@ fn settled_native_reference(output: &str) -> String {
 /// through the link `EACCES`; at eaf0feb6 the 41-link spellings through the
 /// descriptor were `EINVAL`.
 ///
+/// A link on a `nosymfollow` mount (`--nosymfollow`, in user and mount
+/// namespaces of its own) reads as a link but is ELOOP to follow, on KVM and
+/// ptrace as natively (at bb068f9a KVM followed it: EINVAL).
+///
 /// The caller's own magic links (`--magic`) are not Detcore's to follow on
 /// KVM, whose guest tasks are no host tasks: a path below `/proc/self/cwd`
 /// stays as LinuxEmu answers it (ELOOP, #4717; `chdir("/proc/sys")` is
@@ -63705,6 +63709,70 @@ fn run_kvm_procfs_system_directory_links_answer_as_linux() {
         let output = hermit(&args);
         assert_success(&output, &args);
         assert_eq!(stdout(&output), expected, "{backend} --magic");
+    }
+
+    // A link on a nosymfollow mount (`--nosymfollow`), in new user and mount
+    // namespaces of its own: Linux reads it (9 bytes) but refuses to follow
+    // it, ELOOP (`pick_link`, `MNT_NOSYMFOLLOW`). At bb068f9a KVM followed
+    // it, EINVAL.
+    let nosymfollow = |command: &Command, dir: &std::path::Path| {
+        let mut wrapped = Command::new("unshare");
+        wrapped
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--",
+                "/bin/sh",
+                "-c",
+                "mount --make-rprivate / && mount --bind \"$0\" \"$0\" && \
+                 mount -o remount,bind,nosymfollow \"$0\" && exec \"$@\"",
+            ])
+            .arg(dir)
+            .arg(command.get_program())
+            .args(command.get_args())
+            .stdin(Stdio::null());
+        for (name, value) in command.get_envs() {
+            match value {
+                Some(value) => wrapped.env(name, value),
+                None => wrapped.env_remove(name),
+            };
+        }
+        wrapped
+    };
+    let native_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut native_command = Command::new(&guest);
+    native_command.arg("--nosymfollow").arg(native_dir.path());
+    let native = nosymfollow(&native_command, native_dir.path())
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(native.status.success(), "natively: {native:?}");
+    let native = String::from_utf8(native.stdout).expect("native stdout is UTF-8");
+    assert!(
+        native.contains("DIR/to-sys: readlink=9:/proc/sys readlinkat=9:/proc/sys")
+            && native.contains("DIR/to-sys/kernel: readlink=ELOOP readlinkat=ELOOP"),
+        "natively: {native}"
+    );
+    for backend in ["--backend=kvm", "--backend=ptrace"] {
+        let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let dir_arg = dir.path().to_str().expect("UTF-8 path").to_owned();
+        let args = [
+            backend,
+            "run",
+            "--strict",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--base-env=minimal",
+            "--",
+            guest.as_str(),
+            "--nosymfollow",
+            dir_arg.as_str(),
+        ];
+        let output = hermit_test::hermit_output(
+            &format!("hermit {args:?} in a nosymfollow namespace"),
+            &mut nosymfollow(&hermit_command(&args), dir.path()),
+        );
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), native, "{backend} --nosymfollow");
     }
 }
 

@@ -385,8 +385,27 @@ impl Drop for WalkFd {
     }
 }
 
-/// `openat(dirfd, name, O_PATH | O_NOFOLLOW)`, and the object's `stat`.
-fn walk_open(dirfd: i32, name: &[u8]) -> Result<(WalkFd, libc::stat), Errno> {
+/// What the walk below reads of an object it opened (`statx`).
+#[derive(Clone, Copy)]
+struct WalkStat {
+    dev: u64,
+    ino: u64,
+    mode: u32,
+    uid: u32,
+    /// An automount point (`STATX_ATTR_AUTOMOUNT`): Linux's walk mounts on
+    /// it and charges the mount to the link budget (`follow_automount`).
+    automount: bool,
+}
+
+impl WalkStat {
+    fn kind(&self) -> u32 {
+        self.mode & libc::S_IFMT
+    }
+}
+
+/// `openat(dirfd, name, O_PATH | O_NOFOLLOW)`, and what [`WalkStat`] keeps
+/// of the object.
+fn walk_open(dirfd: i32, name: &[u8]) -> Result<(WalkFd, WalkStat), Errno> {
     let name = std::ffi::CString::new(name).map_err(|_| Errno::ENOENT)?;
     // SAFETY: the name is NUL-terminated; the descriptor is owned below.
     let fd = raw_errno(unsafe {
@@ -403,16 +422,171 @@ fn walk_open(dirfd: i32, name: &[u8]) -> Result<(WalkFd, libc::stat), Errno> {
         )
     })? as i32;
     let fd = WalkFd(fd);
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
-    // SAFETY: `fd` is open and `stat` is writable.
+    let mut stat = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    // SAFETY: `fd` is open, the empty path is NUL-terminated and `stat` is
+    // writable.
     raw_errno(unsafe {
         raw_syscall(
-            libc::SYS_fstat,
-            [fd.0 as u64, stat.as_mut_ptr() as u64, 0, 0, 0, 0],
+            libc::SYS_statx,
+            [
+                fd.0 as u64,
+                c"".as_ptr() as u64,
+                (libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT) as u64,
+                (libc::STATX_TYPE | libc::STATX_MODE | libc::STATX_INO | libc::STATX_UID) as u64,
+                stat.as_mut_ptr() as u64,
+                0,
+            ],
         )
     })?;
     // SAFETY: the call succeeded and initialized the structure.
-    Ok((fd, unsafe { stat.assume_init() }))
+    let stat = unsafe { stat.assume_init() };
+    Ok((
+        fd,
+        WalkStat {
+            dev: libc::makedev(stat.stx_dev_major, stat.stx_dev_minor),
+            ino: stat.stx_ino,
+            mode: u32::from(stat.stx_mode),
+            uid: stat.stx_uid,
+            automount: stat.stx_attributes & libc::STATX_ATTR_AUTOMOUNT as u64 != 0,
+        },
+    ))
+}
+
+/// `ST_NOSYMFOLLOW` in `statfs`'s `f_flags` (`MNT_NOSYMFOLLOW`).
+const ST_NOSYMFOLLOW: u64 = 0x2000;
+
+/// Whether the mount the symbolic link `fd` (`O_PATH`) is on refuses to
+/// follow symbolic links (`nosymfollow`), or `None` if `fstatfs` fails.
+fn on_nosymfollow_mount(fd: i32) -> Option<bool> {
+    /// The kernel's `struct statfs` on x86_64 (include/uapi/asm-generic/
+    /// statfs.h), whose `f_flags` libc keeps private.
+    #[repr(C)]
+    struct KernelStatfs {
+        f_type: i64,
+        f_bsize: i64,
+        f_blocks: u64,
+        f_bfree: u64,
+        f_bavail: u64,
+        f_files: u64,
+        f_ffree: u64,
+        f_fsid: [i32; 2],
+        f_namelen: i64,
+        f_frsize: i64,
+        f_flags: i64,
+        f_spare: [i64; 4],
+    }
+    let mut stat = std::mem::MaybeUninit::<KernelStatfs>::zeroed();
+    // SAFETY: `fd` is open and `stat` is writable.
+    raw_errno(unsafe {
+        raw_syscall(
+            libc::SYS_fstatfs,
+            [fd as u64, stat.as_mut_ptr() as u64, 0, 0, 0, 0],
+        )
+    })
+    .ok()?;
+    // SAFETY: the call succeeded and initialized the structure.
+    let stat = unsafe { stat.assume_init() };
+    Some(stat.f_flags as u64 & ST_NOSYMFOLLOW != 0)
+}
+
+/// Linux's `fs.protected_symlinks`, read now, or `None` if unreadable.
+fn protected_symlinks() -> Option<bool> {
+    let mut bytes = [0u8; 16];
+    // SAFETY: the path is NUL-terminated; the descriptor is owned below.
+    let fd = WalkFd(
+        raw_errno(unsafe {
+            raw_syscall(
+                libc::SYS_openat,
+                [
+                    libc::AT_FDCWD as u64,
+                    c"/proc/sys/fs/protected_symlinks".as_ptr() as u64,
+                    (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        })
+        .ok()? as i32,
+    );
+    // SAFETY: `fd` is open and `bytes` is writable for its length.
+    let length = raw_errno(unsafe {
+        raw_syscall(
+            libc::SYS_read,
+            [
+                fd.0 as u64,
+                bytes.as_mut_ptr() as u64,
+                bytes.len() as u64,
+                0,
+                0,
+                0,
+            ],
+        )
+    })
+    .ok()? as usize;
+    match bytes[..length].trim_ascii() {
+        b"0" => Some(false),
+        b"" => None,
+        _ => Some(true),
+    }
+}
+
+/// Whether a security module that can refuse to follow a symbolic link
+/// (`security_inode_follow_link`) may be active, or `None` if Detcore cannot
+/// tell: each of SELinux, Smack and AppArmor has its own directory below
+/// `/proc/self/attr` when it is active.
+fn link_following_security_module() -> Option<bool> {
+    static ACTIVE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *ACTIVE.get_or_init(|| {
+        let (attr, _) = walk_open(libc::AT_FDCWD, b"/proc/self/attr").ok()?;
+        Some(
+            [b"selinux".as_slice(), b"smack", b"apparmor"]
+                .iter()
+                .any(|module| walk_open(attr.0, module).is_ok()),
+        )
+    })
+}
+
+/// What Linux's `pick_link` decides before it follows the symbolic link
+/// `link` (`stat`) in the directory `dir`, the link costing one of `links`
+/// (fs/namei.c v6.12): `Err(ELOOP)` past [`MAXSYMLINKS`] (`reserve_stack`)
+/// or on a `nosymfollow` mount (`MNT_NOSYMFOLLOW`); and `Ok(false)` where
+/// the answer depends on what Detcore cannot see for the guest, so that the
+/// walk is [`Walked::Unclassified`]:
+/// - `may_follow_link`, for a final link followed only for a final `/`
+///   (`trailing`), under `fs.protected_symlinks`, in a sticky
+///   world-writable directory whose owner does not own the link, where
+///   Linux compares the link's owner with the guest's own fsuid;
+/// - a security module that can refuse the follow
+///   ([`link_following_security_module`]).
+///
+/// The link's atime, which Linux touches (`touch_atime`), is touched as
+/// well by Detcore's `readlinkat` of it, and is no guest-visible fact:
+/// Detcore answers the guest's `stat` times itself.
+fn may_follow(
+    link: i32,
+    stat: &WalkStat,
+    dir: &WalkStat,
+    trailing: bool,
+    links: usize,
+) -> Result<bool, Errno> {
+    if links > MAXSYMLINKS {
+        return Err(Errno::ELOOP);
+    }
+    if trailing && stat.uid != dir.uid {
+        let sticky_world_writable = libc::S_ISVTX | libc::S_IWOTH;
+        if dir.mode & sticky_world_writable == sticky_world_writable
+            && protected_symlinks() != Some(false)
+        {
+            return Ok(false);
+        }
+    }
+    match on_nosymfollow_mount(link) {
+        Some(true) => return Err(Errno::ELOOP),
+        Some(false) => {}
+        None => return Ok(false),
+    }
+    Ok(link_following_security_module() == Some(false))
 }
 
 /// The bytes of the symbolic link `fd` (`O_PATH`) holds, or the kernel's name
@@ -447,24 +621,26 @@ fn kernel_name(fd: i32) -> Option<Vec<u8>> {
     )
 }
 
-/// The names of `path` to walk, as `link_path_walk` takes them (fs/namei.c):
-/// empty names and `.` change nothing and are dropped, except that a final
-/// `/` or `.` makes the last name one the lookup follows and requires to be
-/// a directory (`LOOKUP_FOLLOW | LOOKUP_DIRECTORY`), kept as a final `.`.
-fn walk_names(path: &[u8]) -> std::collections::VecDeque<Vec<u8>> {
+/// The names of `path` to walk, as `link_path_walk` takes them (fs/namei.c),
+/// and whether a `/` follows the last: empty names and `.` change nothing and
+/// are dropped, except a final `.`, which is kept, being the last name; a
+/// final `/` after another name makes that name one the lookup follows, as
+/// the trailing link (`WALK_TRAILING`), and requires the object reached to
+/// be a directory (`LOOKUP_FOLLOW | LOOKUP_DIRECTORY`, `lookup_last`).
+fn walk_names(path: &[u8]) -> (std::collections::VecDeque<Vec<u8>>, bool) {
+    let last = path
+        .split(|byte| *byte == b'/')
+        .rfind(|name| !name.is_empty());
     let mut names: std::collections::VecDeque<Vec<u8>> = path
         .split(|byte| *byte == b'/')
         .filter(|name| !name.is_empty() && *name != b".")
         .map(<[u8]>::to_vec)
         .collect();
-    if path
-        .rsplit(|byte| *byte == b'/')
-        .next()
-        .is_some_and(|last| last.is_empty() || last == b".")
-    {
+    if last == Some(b".".as_slice()) {
         names.push_back(b".".to_vec());
     }
-    names
+    let trailing = path.ends_with(b"/") && last.is_some_and(|last| last != b".");
+    (names, trailing)
 }
 
 /// Where Detcore's own walk of a path ends.
@@ -508,18 +684,23 @@ enum Walked {
 /// walk can only climb back out by `..`. Any other step into or below a task
 /// directory, a magic link above all, and any other procfs link, is
 /// [`Walked::Unclassified`].
+///
+/// Before it follows a link the walk decides what `pick_link` does
+/// ([`may_follow`]): the budget, `fs.protected_symlinks` for a trailing link
+/// and `nosymfollow` mounts. An automount point, which Linux mounts on and
+/// charges to the budget (`follow_automount`, from `handle_mounts`), is
+/// [`Walked::Unclassified`] too.
 fn walk_counting_links(path: &[u8], mut links: usize) -> Result<Option<Walked>, Errno> {
     if !path.starts_with(b"/") {
         return Ok(Some(Walked::Unclassified));
     }
     let procfs = proc_device();
-    let is_procfs_root =
-        |stat: &libc::stat| Some(stat.st_dev) == procfs && stat.st_ino == PROC_ROOT_INO;
+    let is_procfs_root = |stat: &WalkStat| Some(stat.dev) == procfs && stat.ino == PROC_ROOT_INO;
     let Ok((root, root_stat)) = walk_open(libc::AT_FDCWD, b"/") else {
         return Ok(None);
     };
-    let mut current: Option<(WalkFd, libc::stat)> = None;
-    let mut names = walk_names(path);
+    let mut current: Option<(WalkFd, WalkStat)> = None;
+    let (mut names, mut trailing) = walk_names(path);
     // How deep below `current`, a procfs root, the walk is in the caller's
     // own task directory, entered by `self` or `thread-self`.
     let mut task_depth = 0usize;
@@ -539,16 +720,20 @@ fn walk_counting_links(path: &[u8], mut links: usize) -> Result<Option<Walked>, 
         let Ok((fd, stat)) = walk_open(dirfd, &name) else {
             return Ok(None);
         };
-        let kind = stat.st_mode & libc::S_IFMT;
-        if kind == libc::S_IFLNK && !names.is_empty() {
+        if stat.automount {
+            return Ok(Some(Walked::Unclassified));
+        }
+        let kind = stat.kind();
+        let last = names.is_empty();
+        if kind == libc::S_IFLNK && (!last || trailing) {
             links += 1;
-            if links > MAXSYMLINKS {
-                return Err(Errno::ELOOP);
+            if !may_follow(fd.0, &stat, dir_stat, last, links)? {
+                return Ok(Some(Walked::Unclassified));
             }
             let Some(target) = walk_readlink(fd.0, c"") else {
                 return Ok(None);
             };
-            if Some(stat.st_dev) == procfs {
+            if Some(stat.dev) == procfs {
                 let numbers: Vec<&[u8]> = target.split(|byte| *byte == b'/').collect();
                 let number = |name: &[u8]| !name.is_empty() && name.iter().all(u8::is_ascii_digit);
                 let own_task = match numbers.as_slice() {
@@ -568,7 +753,11 @@ fn walk_counting_links(path: &[u8], mut links: usize) -> Result<Option<Walked>, 
             if target.starts_with(b"/") {
                 current = None;
             }
-            for linked in walk_names(&target).into_iter().rev() {
+            let (linked, linked_trailing) = walk_names(&target);
+            // A `/` ending the link's text, with nothing after the link,
+            // makes the text's last name the trailing one too.
+            trailing |= linked_trailing && last;
+            for linked in linked.into_iter().rev() {
                 names.push_front(linked);
             }
             continue;
@@ -587,10 +776,12 @@ fn walk_counting_links(path: &[u8], mut links: usize) -> Result<Option<Walked>, 
     if task_depth > 0 {
         return Ok(None);
     }
-    Ok(Some(Walked::Reached(match current {
-        Some((fd, _)) => fd,
-        None => root,
-    })))
+    let (fd, stat) = current.unwrap_or((root, root_stat));
+    if trailing && stat.kind() != libc::S_IFDIR {
+        // `LOOKUP_DIRECTORY`: ENOTDIR, which the backend answers.
+        return Ok(None);
+    }
+    Ok(Some(Walked::Reached(fd)))
 }
 
 /// The kernel's lookup of the whole of the absolute path `path`, without
