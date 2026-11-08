@@ -56658,3 +56658,58 @@ mod strict_boundary_admission_tests {
 
 #[cfg(test)]
 include!("scheduler/callback_history_tests.rs");
+
+#[cfg(test)]
+mod reviewer_phase_summary {
+    use detcore_model::schedule::InstructionPointer;
+    use detcore_model::schedule::Op;
+    use detcore_model::schedule::SchedEvent;
+    use detcore_model::schedule::SyscallPhase;
+    use reverie::syscalls::Sysno;
+
+    use super::*;
+
+    #[test]
+    fn phase_only_resyncs_are_summed_and_reported_without_desyncs() {
+        let post = |tid, nanos| SchedEvent {
+            dettid: DetTid::from_raw(tid),
+            count: 1,
+            start_rip: None,
+            end_rip: InstructionPointer::new(0x401000),
+            instruction_offset: None,
+            end_time: Some(LogicalTime::from_nanos(nanos)),
+            stopless: false,
+            op: Op::Syscall(Sysno::connect, SyscallPhase::Posthook),
+        };
+        let first = post(3, 10000);
+        let second = post(5, 20000);
+        let mut r = replayer::Replayer::new(vec![first.clone(), second.clone()]);
+        r.die_on_desync = true;
+        for event in [&first, &second] {
+            let poll = SchedEvent {
+                op: Op::Syscall(Sysno::connect, SyscallPhase::Polling),
+                ..event.clone()
+            };
+            assert_ne!(
+                r.observe_event(&poll),
+                replayer::ReplayAction::Stop(replayer::StopReason::FatalDesync)
+            );
+            assert_ne!(
+                r.observe_event(event),
+                replayer::ReplayAction::Stop(replayer::StopReason::FatalDesync)
+            );
+        }
+        assert_eq!(r.desync_counts[&DetTid::from_raw(3)].phase_only_resyncs, 1);
+        assert_eq!(r.desync_counts[&DetTid::from_raw(5)].phase_only_resyncs, 1);
+        let mut sched = Scheduler::new(&Config::default());
+        sched.replayer = Some(r);
+        let summary = sched.generate_partial_run_summary(None).unwrap();
+        assert_eq!(summary.schedevent_desynced, 0);
+        let expected =
+            "  Phase-only resyncs (Polling vs Posthook, identical thread/syscall/RIPs/time): 2\n";
+        assert_eq!(summary.desync_descrip.as_deref(), Some(expected));
+        let json = serde_json::to_value(&summary).unwrap();
+        assert_eq!(json["desync_descrip"], expected);
+        assert_eq!(json["schedevent_desynced"], 0);
+    }
+}
