@@ -14190,6 +14190,39 @@ fn validate_attempt_bindings(
     tracked: &TrackedCells,
     rows: Option<&[SeriesRow]>,
 ) -> Result<ValidatedComparisonAttempts, String> {
+    // Every event a binding names is found by lookup; scanning all snapshot
+    // rows once per bound event cost 9,568 scans of 241,357 rows per call.
+    let rows_by_event = rows.map(|rows| {
+        let mut index = BTreeMap::<&str, Vec<&SeriesRow>>::new();
+        for row in rows {
+            index.entry(row.event_id.as_str()).or_default().push(row);
+        }
+        index
+    });
+    let lookup = |event_id: &str| -> Result<Vec<SeriesRow>, String> {
+        let Some(index) = &rows_by_event else {
+            return Ok(Vec::new());
+        };
+        Ok(index
+            .get(event_id)
+            .map(|matching| matching.iter().map(|row| (*row).clone()).collect())
+            .unwrap_or_default())
+    };
+    validate_attempt_bindings_by(
+        tracked,
+        rows.is_some()
+            .then_some(&lookup as &dyn Fn(&str) -> Result<Vec<SeriesRow>, String>),
+    )
+}
+
+/// [`validate_attempt_bindings`] with bound-event rows supplied by lookup:
+/// every row whose `event_id` is the argument, in row order. The snapshot
+/// projection rebuilds only bound rows from its held payload instead of
+/// holding every typed row for this check.
+fn validate_attempt_bindings_by(
+    tracked: &TrackedCells,
+    event_rows: Option<&dyn Fn(&str) -> Result<Vec<SeriesRow>, String>>,
+) -> Result<ValidatedComparisonAttempts, String> {
     let Some(envelope) = comparison_attempt_bindings(tracked) else {
         return Ok(ValidatedComparisonAttempts::new());
     };
@@ -14239,15 +14272,6 @@ fn validate_attempt_bindings(
         }
         retired.insert(key, comparison);
     }
-    // Every event a binding names is found by lookup; scanning all snapshot
-    // rows once per bound event cost 9,568 scans of 241,357 rows per call.
-    let rows_by_event = rows.map(|rows| {
-        let mut index = BTreeMap::<&str, Vec<&SeriesRow>>::new();
-        for row in rows {
-            index.entry(row.event_id.as_str()).or_default().push(row);
-        }
-        index
-    });
     let cells = CellsById::new(tracked);
     let mut attempts = ValidatedComparisonAttempts::new();
     let mut unique_attempts = BTreeSet::new();
@@ -14320,12 +14344,9 @@ fn validate_attempt_bindings(
             {
                 return Err("comparison-attempt binding repeats or corrupts an event".into());
             }
-            if let Some(rows_by_event) = &rows_by_event {
-                let matching = rows_by_event
-                    .get(event.event_id.as_str())
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                let [row] = matching else {
+            if let Some(event_rows) = event_rows {
+                let matching = event_rows(&event.event_id)?;
+                let [row] = matching.as_slice() else {
                     return Err("comparison-attempt binding requires its original event".into());
                 };
                 if !binding_matches_event(binding, row)
@@ -15268,6 +15289,24 @@ fn current_comparison_representation(
     current: &ValidatedComparisonAttempts,
     direct_counts: &BTreeMap<DirectEvidenceKey, usize>,
 ) -> Result<(BTreeSet<String>, BTreeSet<DirectEvidenceKey>), String> {
+    let bound = current_bound_attempts(tracked, current, direct_counts)?;
+    let bound_by_run = bound_by_run_index(&bound);
+    current_comparison_representation_rows(
+        tracked,
+        &bound_by_run,
+        direct_counts,
+        rows.iter().map(|row| Ok::<&SeriesRow, String>(row)),
+    )
+}
+
+/// The tracked direct comparisons bound to a validated outer attempt, by
+/// base identity. Reads only the tracked history and the current census;
+/// the snapshot projection uses it to select which held rows to rebuild.
+fn current_bound_attempts(
+    tracked: &TrackedCells,
+    current: &ValidatedComparisonAttempts,
+    direct_counts: &BTreeMap<DirectEvidenceKey, usize>,
+) -> Result<BTreeMap<DirectEvidenceBase, BTreeMap<u64, DirectEvidenceKey>>, String> {
     let mut bound = BTreeMap::<DirectEvidenceBase, BTreeMap<u64, DirectEvidenceKey>>::new();
     for cell in &tracked.cells {
         for observation in &cell.observations {
@@ -15370,10 +15409,19 @@ fn current_comparison_representation(
             }
         }
     }
-    // Each event looks up the validate bases sharing its cell, source and
-    // run, in `bound`'s order, instead of rescanning every bound base.
+    Ok(bound)
+}
+
+/// Validate bound bases by (cell, Hermit commit, run), in `bound`'s order,
+/// so each event looks up its bases instead of rescanning every bound base.
+fn bound_by_run_index<'a>(
+    bound: &'a BTreeMap<DirectEvidenceBase, BTreeMap<u64, DirectEvidenceKey>>,
+) -> BTreeMap<
+    (&'a str, &'a str, &'a str),
+    Vec<(&'a DirectEvidenceBase, &'a BTreeMap<u64, DirectEvidenceKey>)>,
+> {
     let mut bound_by_run = BTreeMap::<(&str, &str, &str), Vec<_>>::new();
-    for (base, attempts) in &bound {
+    for (base, attempts) in bound {
         if base.provenance == ObservationProvenance::Validate {
             bound_by_run
                 .entry((
@@ -15385,11 +15433,28 @@ fn current_comparison_representation(
                 .push((base, attempts));
         }
     }
+    bound_by_run
+}
+
+/// The row pass of [`current_comparison_representation`]: which current
+/// validate events the bound comparisons already represent. Rows arrive
+/// from any rebuildable source in snapshot order.
+fn current_comparison_representation_rows<R: std::borrow::Borrow<SeriesRow>>(
+    tracked: &TrackedCells,
+    bound_by_run: &BTreeMap<
+        (&str, &str, &str),
+        Vec<(&DirectEvidenceBase, &BTreeMap<u64, DirectEvidenceKey>)>,
+    >,
+    direct_counts: &BTreeMap<DirectEvidenceKey, usize>,
+    rows: impl Iterator<Item = Result<R, String>>,
+) -> Result<(BTreeSet<String>, BTreeSet<DirectEvidenceKey>), String> {
     let cells = SeriesCellIndex::new(tracked);
     let mut events = BTreeSet::new();
     let mut covered = BTreeSet::new();
     let mut represented_counts = BTreeMap::<DirectEvidenceKey, usize>::new();
     for row in rows {
+        let row = row?;
+        let row: &SeriesRow = row.borrow();
         if row.producer != SeriesProducer::Validate {
             continue;
         }
@@ -15547,13 +15612,36 @@ fn direct_representation(
             row.series.num_runs,
         ));
     }
+    finish_direct_representation(
+        &direct,
+        opaque,
+        represented_event_ids,
+        represented_direct,
+        &bound_attempts,
+        &source,
+    )
+}
 
+/// The direct-key reconciliation over the collected source candidates,
+/// shared by the typed-slice and held-snapshot row sources. `source` holds,
+/// per base, every non-represented row that produced that base.
+fn finish_direct_representation(
+    direct: &BTreeMap<DirectEvidenceKey, usize>,
+    opaque: bool,
+    mut represented_event_ids: BTreeSet<String>,
+    mut represented_direct: BTreeSet<DirectEvidenceKey>,
+    bound_attempts: &BTreeMap<DirectEvidenceKey, BTreeSet<u64>>,
+    source: &BTreeMap<
+        DirectEvidenceBase,
+        Vec<(Option<DirectEvidenceKey>, String, Option<u64>, u64)>,
+    >,
+) -> Result<DirectRepresentation, String> {
     // A verdict belonging to another current attempt can be ignored here only
     // when that exact event has a unique, independently bound direct record.
     // An event's claimed attempt alone cannot authorize the legacy projector
     // to absorb it into an unrelated compact result.
     let mut represented_verdict_attempts = BTreeMap::new();
-    for (key, count) in &direct {
+    for (key, count) in direct {
         if !matches!(key.kind, DirectEvidenceKind::Result(_)) || *count != 1 {
             continue;
         }
@@ -15578,7 +15666,7 @@ fn direct_representation(
         }
     }
 
-    for (direct_key, direct_count) in &direct {
+    for (direct_key, direct_count) in direct {
         if represented_direct.contains(direct_key) {
             continue;
         }
@@ -16067,6 +16155,20 @@ fn remove_replaceable_projected_observations<R: std::borrow::Borrow<SeriesRow>>(
     rows: &[R],
     projection_source: Option<&str>,
 ) -> Result<usize, String> {
+    let current_event_ids = rows
+        .iter()
+        .map(|row| row.borrow().event_id.as_str())
+        .collect::<BTreeSet<_>>();
+    remove_replaceable_projected_observations_with(tracked, &current_event_ids, projection_source)
+}
+
+/// [`remove_replaceable_projected_observations`] over a caller-built event
+/// set (the held snapshot's row index), so the check needs no typed rows.
+fn remove_replaceable_projected_observations_with(
+    tracked: &mut TrackedCells,
+    current_event_ids: &BTreeSet<&str>,
+    projection_source: Option<&str>,
+) -> Result<usize, String> {
     let owned = tracked
         .cells
         .iter()
@@ -16099,10 +16201,6 @@ fn remove_replaceable_projected_observations<R: std::borrow::Borrow<SeriesRow>>(
             projection.source
         ));
     }
-    let current_event_ids = rows
-        .iter()
-        .map(|row| row.borrow().event_id.as_str())
-        .collect::<BTreeSet<_>>();
     if let Some((cell, event_id)) = tracked.cells.iter().find_map(|cell| {
         cell.observations.iter().find_map(|observation| {
             observation
