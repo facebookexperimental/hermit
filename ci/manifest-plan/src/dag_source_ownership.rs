@@ -157,6 +157,35 @@ pub const POST_SPLIT_CORE_NODES: &[ExtensionNode] = &[
         deps: &["gate.manifest"],
         populations: &[],
     },
+    ExtensionNode {
+        tag: "build.hermit_native_exec_compile_in_pinned_root",
+        labels: &["full", "portable"],
+        deps: &["pre.reverie_pin", "setup.pinned_root_fetch"],
+        populations: &[],
+    },
+    ExtensionNode {
+        tag: "build.hermit_native_exec_in_pinned_root",
+        labels: &["full", "portable"],
+        deps: &[
+            "build.hermit_native_exec_compile_in_pinned_root",
+            "build.rust_scripts_in_pinned_root",
+            "pre.reverie_pin",
+            "setup.pinned_root_fetch",
+        ],
+        populations: &[],
+    },
+    ExtensionNode {
+        tag: "test.hermit_native_exec",
+        labels: &["full", "portable"],
+        deps: &[
+            "build.hermit_native_exec_in_pinned_root",
+            "build.rust_scripts_in_pinned_root",
+            "gate.manifest",
+            "pre.reverie_pin",
+            "setup.pinned_root_fetch",
+        ],
+        populations: &[],
+    },
 ];
 
 /// Tags admitted by `extension`, after validating it against `source`.

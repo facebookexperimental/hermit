@@ -487,6 +487,45 @@ if [[ -n "$cargo_home" ]]; then
     done
 fi
 
+# A prepared cohort (HERMIT_PREPARED_NEXTEST_COHORT forwarded with a
+# value) declares its own Cargo target directory so its artifacts never
+# share the default cohort's target. The declaration is the forwarded
+# CARGO_TARGET_DIR: repository-relative (target/<subdir>, resolved under
+# the workspace mount) or already inside the mounted default target.
+# Anything else is refused: silently keeping the default target would
+# let the cohorts overwrite each other's artifacts while their records
+# check only the target Cargo happened to report. Without a cohort
+# marker the historical forced default below applies untouched.
+effective_target_in=$target_in
+cohort_declared=false
+target_declared=false
+declared_target=""
+for name in "${pass_env[@]}"; do
+    case "$name" in
+        HERMIT_PREPARED_NEXTEST_COHORT)
+            if [[ -v $name && -n ${!name} ]]; then cohort_declared=true; fi ;;
+        CARGO_TARGET_DIR)
+            if [[ -v $name ]]; then
+                target_declared=true
+                declared_target=${!name}
+            fi ;;
+    esac
+done
+if "$cohort_declared" && "$target_declared"; then
+    case "$declared_target" in
+        ""|..|../*|*/..|*/../*)
+            echo "run-in-pinned-root: cohort CARGO_TARGET_DIR '$declared_target' is empty or escapes its directory" >&2
+            exit 2 ;;
+    esac
+    case "$declared_target" in
+        target|target/*) effective_target_in=$workdir_in/$declared_target ;;
+        "$target_in"|"$target_in"/*) effective_target_in=$declared_target ;;
+        *)
+            echo "run-in-pinned-root: cohort CARGO_TARGET_DIR '$declared_target' is outside the mounted target $target_in" >&2
+            exit 2 ;;
+    esac
+fi
+
 env_args=()
 extra_mounts=()
 device_args=()
@@ -566,6 +605,12 @@ for name in "${pass_env[@]}"; do
             mkdir -p "${!name}"
             extra_mounts+=(--mount "type=bind,source=${!name},destination=/dagrun-artifact-ready")
             env_args+=(-e DAGRUN_ARTIFACT_READY_DIR=/dagrun-artifact-ready)
+            ;;
+        CARGO_TARGET_DIR)
+            # The final -e at exec is the single CARGO_TARGET_DIR
+            # assignment: the mounted default, or the cohort declaration
+            # translated above. Forwarding the name here too would emit
+            # a second, overridden assignment.
             ;;
         *) env_args+=(--env "$name") ;;
     esac
@@ -736,7 +781,7 @@ exec podman run --rm \
     "${env_args[@]}" \
     -e HOME=/build \
     -e CARGO_HOME="$cargo_home_in" \
-    -e "CARGO_TARGET_DIR=$target_in" \
+    -e "CARGO_TARGET_DIR=$effective_target_in" \
     -w "$workdir_in" \
     "$digest" \
     /bin/taskset --cpu-list "$caller_affinity" \

@@ -29,6 +29,18 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--lib",
             "--bins",
         ]),
+        // The hermit_unit selection plus native-exec, prepared in its own
+        // cohort (nextest_binaries::NATIVE_EXEC_COHORT) so the feature never
+        // enters the default workspace union or the production binary. The
+        // node's filters own exactly the cases this feature adds.
+        "test.hermit_native_exec" => Some(&[
+            "-p",
+            "hermit-run",
+            "--features",
+            "liteinst,kvm-native-test-support,native-exec",
+            "--lib",
+            "--bins",
+        ]),
         "test.detcore_unit" => Some(&["-p", "hermit-detcore", "--lib", "--bins"]),
         "test.inherited_terminal_read" => Some(&[
             "-p",
@@ -692,9 +704,14 @@ pub(super) fn assert_command_selection(step: &dagrun::model::Step) -> Result<(),
 
 // `prepare` is one fixed command; only its fixed, profile-matched packaging
 // finalizer may follow it, plus, for the pinned workspace prepare node
-// alone, its fixed early-artifact gate after that finalizer. Never truncate
-// an arbitrary shell command at `&&`.
-fn preparation_profile<'a>(tag: &str, command: &'a str) -> Result<Option<&'a str>, String> {
+// alone, its fixed early-artifact gate after that finalizer. A non-default
+// cohort's prepare is the one other fixed form (`cohort_prepare_command`):
+// prepare under the run's build mode, then assert, with no finalizer.
+// Never truncate an arbitrary shell command at `&&`.
+fn preparation_profile<'a>(
+    tag: &str,
+    command: &'a str,
+) -> Result<Option<(&'a str, crate::nextest_binaries::PreparedCohort)>, String> {
     let marker = "./ci/nextest-binaries.rs prepare ";
     let Some((_, rest)) = command.split_once(marker) else {
         return Ok(None);
@@ -703,6 +720,13 @@ fn preparation_profile<'a>(tag: &str, command: &'a str) -> Result<Option<&'a str
         return Err(format!("{tag} has duplicate prepared commands"));
     }
     let profile = rest.split_whitespace().next().unwrap_or("");
+    for cohort in [crate::nextest_binaries::NATIVE_EXEC_COHORT] {
+        if let Ok(expected) = crate::nextest_binaries::cohort_prepare_command(profile, cohort) {
+            if expected.strip_prefix(marker) == Some(rest) {
+                return Ok(Some((profile, cohort)));
+            }
+        }
+    }
     // The full producer appends `--build-mode "${HERMIT_VALIDATE_BUILD_MODE:-cargo}"`
     // before its finalizer; the bare and mode-less finalized forms stay exact.
     let tails: Vec<String> = crate::nextest_binaries::cargo_profile_for(profile)
@@ -737,7 +761,7 @@ fn preparation_profile<'a>(tag: &str, command: &'a str) -> Result<Option<&'a str
             "{tag} has an ambiguous prepared profile or finalizer"
         ));
     }
-    Ok(Some(profile))
+    Ok(Some((profile, crate::nextest_binaries::DEFAULT_COHORT)))
 }
 
 /// A producer of a unifying profile (`nextest_binaries::unifies`) must end
@@ -758,9 +782,23 @@ pub(super) fn assert_producers_build_the_unified_selection(
         } else {
             execution_command(step)?
         };
-        let Some(profile) = preparation_profile(&step.tag(), &command)? else {
+        let Some((profile, cohort)) = preparation_profile(&step.tag(), &command)? else {
             continue;
         };
+        if !cohort.is_default() {
+            // A cohort producer builds nothing in its prepare node: its
+            // compile node built the executables, and widening this payload
+            // to the workspace union is exactly what the cohort exists to
+            // prevent. Its one fixed form is `cohort_prepare_command`.
+            let expected = crate::nextest_binaries::cohort_prepare_command(profile, cohort)?;
+            if !command.ends_with(&expected) || command.contains("--workspace") {
+                return Err(format!(
+                    "{} must end with its cohort prepare `{expected}` and build no workspace selection",
+                    step.tag()
+                ));
+            }
+            continue;
+        }
         if !crate::nextest_binaries::unifies(profile) {
             continue;
         }
@@ -790,8 +828,10 @@ pub(super) fn assert_preparation_dependencies(
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
 
+    use crate::nextest_binaries::COHORT_ENV;
+    use crate::nextest_binaries::PreparedCohort;
     use crate::nextest_binaries::SELECTION_ENV;
-    use crate::nextest_binaries::config_selections;
+    use crate::nextest_binaries::config_selections_in_cohort;
     use crate::nextest_binaries::selection_key;
     let by_tag = cfg
         .steps
@@ -801,12 +841,13 @@ pub(super) fn assert_preparation_dependencies(
     let mut producers = BTreeMap::new();
     for step in &cfg.steps {
         let command = execution_command(step)?;
-        if let Some(profile) = preparation_profile(&step.tag(), &command)? {
+        if let Some((profile, cohort)) = preparation_profile(&step.tag(), &command)? {
             producers.insert(
                 step.tag(),
                 (
                     step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh "),
-                    config_selections(cfg, profile)?,
+                    cohort,
+                    config_selections_in_cohort(cfg, profile, cohort)?,
                 ),
             );
         }
@@ -815,6 +856,9 @@ pub(super) fn assert_preparation_dependencies(
         let Some(raw) = step.env.get(SELECTION_ENV) else {
             continue;
         };
+        let consumer_cohort =
+            PreparedCohort::from_slug(step.env.get(COHORT_ENV).map(String::as_str))
+                .map_err(|e| format!("{}: {e}", step.tag()))?;
         let args: Vec<String> = serde_json::from_str(raw).map_err(|e| e.to_string())?;
         let key = selection_key(&args);
         let mut ancestors = BTreeSet::new();
@@ -828,14 +872,16 @@ pub(super) fn assert_preparation_dependencies(
             }
         }
         if !ancestors.iter().any(|tag| {
-            producers.get(tag).is_some_and(|(pinned, selections)| {
+            producers.get(tag).is_some_and(|(pinned, cohort, selections)| {
                 *pinned == step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ")
+                    && *cohort == consumer_cohort
                     && selections.get(&key) == Some(&args)
             })
         }) {
             return Err(format!(
-                "{} can run before any producer in the same filesystem root of its exact Cargo selection {args:?}",
-                step.tag()
+                "{} can run before any producer in the same filesystem root and cohort {} of its exact Cargo selection {args:?}",
+                step.tag(),
+                consumer_cohort.name()
             ));
         }
     }
@@ -1111,7 +1157,7 @@ mod tests {
             for command in [&bare, &finalized] {
                 assert_eq!(
                     preparation_profile("producer", command).unwrap(),
-                    Some(profile)
+                    Some((profile, crate::nextest_binaries::DEFAULT_COHORT))
                 );
             }
             for refused in [
@@ -1137,14 +1183,44 @@ mod tests {
         assert_eq!(
             preparation_profile(crate::validation_dag::PINNED_WORKSPACE_PREPARE_TAG, &gated)
                 .unwrap(),
-            Some("full")
+            Some(("full", crate::nextest_binaries::DEFAULT_COHORT))
         );
         assert!(preparation_profile("producer", &gated).is_err());
+        // A non-default cohort's prepare is the one other exact form:
+        // prepare under the run's build mode, then assert, no finalizer.
+        let cohort_command = format!(
+            "prefix && {}",
+            crate::nextest_binaries::cohort_prepare_command(
+                "full",
+                crate::nextest_binaries::NATIVE_EXEC_COHORT
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            preparation_profile("producer", &cohort_command).unwrap(),
+            Some(("full", crate::nextest_binaries::NATIVE_EXEC_COHORT))
+        );
+        for refused in [
+            // Without its assert half.
+            "prefix && ./ci/nextest-binaries.rs prepare full --build-mode \"${HERMIT_VALIDATE_BUILD_MODE:-cargo}\" --cohort native-exec"
+                .to_string(),
+            // With the default cohort's finalizer appended.
+            format!("{cohort_command} && target/validate/stage-detcore-liteinst --git target"),
+            // An unregistered slug.
+            cohort_command.replace("native-exec", "bogus"),
+            // A non-unifying profile has no cohort prepare form.
+            cohort_command.replace("prepare full", "prepare quick"),
+        ] {
+            assert!(
+                preparation_profile("producer", &refused).is_err(),
+                "{refused}"
+            );
+        }
         for profile in ["quick", "super"] {
             let bare = format!("./ci/nextest-binaries.rs prepare {profile}");
             assert_eq!(
                 preparation_profile("producer", &bare).unwrap(),
-                Some(profile)
+                Some((profile, crate::nextest_binaries::DEFAULT_COHORT))
             );
             for directory in ["debug", "validate"] {
                 let refused =

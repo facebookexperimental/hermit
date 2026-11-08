@@ -247,13 +247,15 @@ SHA_B = "b" * 40
 
 
 def _check_stamped(tmp_path, base_ids, cand_ids, commit=SHA_A, declared=None,
-                   expected=SHA_A, require=True):
+                   expected=SHA_A, require=True, first_base=False):
     import uuid
     root = tmp_path / uuid.uuid4().hex
     root.mkdir(parents=True)
     n = len(base_ids) if declared is None else declared
+    marker = (f"# census-first-base: suite=mysuite base={commit} "
+              f"head={SHA_B}\n" if first_base else "")
     (root / "base.listed-ids").write_text(
-        f"# census-base: commit={commit} count={n}\n"
+        f"# census-base: commit={commit} count={n}\n" + marker
         + "".join(f"{i}\n" for i in base_ids))
     (root / "cand.listed-ids").write_text("".join(f"{i}\n" for i in cand_ids))
     args = ["bash", str(CHECK), "--base-listed", str(root / "base.listed-ids"),
@@ -304,13 +306,15 @@ def test_wired_require_base_without_provenance_refused(tmp_path):
 
 
 def _check_base_dir(tmp_path, suite, base_ids, cand_ids, commit=SHA_A,
-                    declared=None, expected=SHA_A):
+                    declared=None, expected=SHA_A, first_base=False):
     import uuid
     root = tmp_path / uuid.uuid4().hex
     (root / "base-dir").mkdir(parents=True)
     n = len(base_ids) if declared is None else declared
+    marker = (f"# census-first-base: suite={suite} base={commit} "
+              f"head={SHA_B}\n" if first_base else "")
     (root / "base-dir" / f"{suite}.listed-ids").write_text(
-        f"# census-base: commit={commit} count={n}\n"
+        f"# census-base: commit={commit} count={n}\n" + marker
         + "".join(f"{i}\n" for i in base_ids))
     (root / "cand.listed-ids").write_text("".join(f"{i}\n" for i in cand_ids))
     args = ["bash", str(CHECK), "--base-dir", str(root / "base-dir"),
@@ -360,6 +364,47 @@ def test_wired_base_dir_missing_suite_refused_by_name(tmp_path):
         capture_output=True, text=True)
     assert r.returncode == 2 and "census-base-suite-missing" in r.stderr
     assert "nosuchsuite" in r.stderr
+
+
+def test_wired_first_base_empty_passes_and_is_named(tmp_path):
+    # A legitimate first base is empty: every candidate ID is an addition
+    # through the normal comparator, and the check names the treatment.
+    r = _check_base_dir(tmp_path, "mysuite", [], ["pkg/bin/a"],
+                        first_base=True)
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+    assert "first base recorded from candidate" in r.stderr
+    assert "added=1" in r.stdout
+
+
+def test_wired_first_base_nonempty_vanished_fails(tmp_path):
+    # The marker explains an empty baseline; it does not exempt a marked
+    # baseline carrying IDs from the disappearance check.
+    r = _check_base_dir(tmp_path, "mysuite",
+                        ["pkg/bin/a", "pkg/bin/gone_test"],
+                        ["pkg/bin/a"], first_base=True)
+    assert r.returncode == 1 and "gone_test" in r.stderr and "MISSING" in r.stderr
+
+
+def test_wired_first_base_duplicate_candidate_fails(tmp_path):
+    r = _check_base_dir(tmp_path, "mysuite", [],
+                        ["pkg/bin/a", "pkg/bin/a"], first_base=True)
+    assert r.returncode == 1 and "duplicate" in r.stderr
+
+
+def test_wired_first_base_malformed_outcomes_fails(tmp_path):
+    import uuid
+    root = tmp_path / uuid.uuid4().hex
+    root.mkdir(parents=True)
+    (root / "base.listed-ids").write_text(
+        f"# census-base: commit={SHA_A} count=0\n"
+        f"# census-first-base: suite=mysuite base={SHA_A} head={SHA_B}\n")
+    (root / "cand.outcomes.json").write_text("{not json")
+    r = subprocess.run(
+        ["bash", str(CHECK), "--base-listed", str(root / "base.listed-ids"),
+         "--candidate-outcomes", str(root / "cand.outcomes.json"),
+         "--require-base", "--expected-base-commit", SHA_A],
+        capture_output=True, text=True)
+    assert r.returncode == 1 and "malformed" in r.stderr
 
 
 def test_wired_case_selected_is_named_not_refused(tmp_path):

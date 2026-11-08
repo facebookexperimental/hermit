@@ -160,6 +160,29 @@ if [[ -n $dropped && ! -f $dropped ]]; then
     exit 2
 fi
 
+# A stamped first base (census_base.py, for a suite with no prior base)
+# names itself with a `# census-first-base:` marker as its second line.
+# The adapter pre-creates that file in the supply directory only for a
+# suite absent from the base DAG, so reaching here means the suite is
+# genuinely new: the candidate's own listing becomes its first base
+# when the landing gate records it, and there is no prior population
+# to disappear from. Report it by name, then run the normal comparator
+# below regardless: the marker explains an empty baseline, it does not
+# exempt candidate or baseline integrity, so a marked baseline carrying
+# IDs, duplicate candidate IDs, or malformed outcomes refuse exactly as
+# they would unmarked. A suite that already existed at the base gets no
+# such file from the adapter: its missing base already refused above as
+# census-base-suite-missing (directory supply) or the require-base
+# could-not-run, never as a first base.
+if grep -q '^# census-first-base:' "$base_listed"; then
+    marker=$(grep -m1 '^# census-first-base:' "$base_listed")
+    count=0
+    if [[ -n $candidate_listed ]]; then
+        count=$(grep -cv '^#' "$candidate_listed" || true)
+    fi
+    printf 'census %s: first base recorded from candidate (%s; candidate ids=%s; no prior base)\n' "$suite" "$marker" "$count" >&2
+fi
+
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 mkdir "$scratch/base" "$scratch/candidate"

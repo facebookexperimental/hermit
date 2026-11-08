@@ -29,7 +29,15 @@ pub const REQUIRED_ENV: &str = "HERMIT_PREPARED_NEXTEST_REQUIRED";
 /// Version 6 added `prepared_for` and `cargo_profile`, which `assert` reads to
 /// refuse a record built in the wrong Cargo profile (see
 /// [`check_prepared_cargo_profile`]).
-const RECORD_SCHEMA: u32 = 6;
+/// Version 7 added `build_mode` and `feature_set`, the prepared-cohort key
+/// consumers check before any selection lookup (see [`check_prepared_cohort`]).
+const RECORD_SCHEMA: u32 = 7;
+/// The prepared cohort a node consumes, attached only by the DAG generator's
+/// `materialize` (absent means the default cohort). See [`PreparedCohort`].
+pub const COHORT_ENV: &str = "HERMIT_PREPARED_NEXTEST_COHORT";
+/// The whole-run build mode a prepared record must name. The `full`
+/// producer's command interpolates the same variable for `prepare`.
+pub const BUILD_MODE_ENV: &str = "HERMIT_VALIDATE_BUILD_MODE";
 pub const PROJECT_ENV: &str = "HERMIT_NEXTEST_PROJECT";
 pub const GUESTS_ENV: &str = "HERMIT_PREPARED_CARGO_GUESTS";
 pub const LIT_GUESTS_ENV: &str = "HERMIT_PREPARED_LIT_GUESTS";
@@ -41,6 +49,123 @@ const CPU_WRAPPER_TARGET: &str = "nextest-cpu-wrapper";
 /// carries the wrapper between jobs at target/debug/nextest-cpu-wrapper, and
 /// ci/check-shard-coverage.sh pins that path.
 const UNIFIED_CPU_WRAPPER_PROFILES: &[&str] = &["full"];
+
+/// One prepared-executables cohort: a set of selections built together under
+/// one `(build_mode, feature_set)` key, with its own record, lock, and Cargo
+/// target directory. Not the cgroup launch cohort of `nextest_cohort`.
+///
+/// The default cohort keeps the historical store layout (`current.json` and
+/// `lock` in `target/ci/nextest-binaries`) and the checkout's default Cargo
+/// target. Every other cohort lives under `cohorts/` in that store and
+/// builds into its own target directory, so its producer can neither replace
+/// nor block the default generation: two cohorts are live in one validation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreparedCohort {
+    slug: Option<&'static str>,
+}
+
+pub const DEFAULT_COHORT: PreparedCohort = PreparedCohort { slug: None };
+pub const NATIVE_EXEC_COHORT: PreparedCohort = PreparedCohort {
+    slug: Some("native-exec"),
+};
+
+impl PreparedCohort {
+    pub fn from_slug(slug: Option<&str>) -> Result<Self, String> {
+        match slug {
+            None | Some("default") => Ok(DEFAULT_COHORT),
+            Some("native-exec") => Ok(NATIVE_EXEC_COHORT),
+            Some(other) => Err(format!(
+                "unknown prepared Nextest cohort {other:?}; known cohorts are the default and \"native-exec\""
+            )),
+        }
+    }
+
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_slug(std::env::var(COHORT_ENV).ok().as_deref())
+    }
+
+    pub fn is_default(self) -> bool {
+        self.slug.is_none()
+    }
+
+    /// The slug `materialize` records in [`COHORT_ENV`]; `None` (the variable
+    /// stays absent) for the default cohort.
+    pub fn env_value(self) -> Option<&'static str> {
+        self.slug
+    }
+
+    /// The cohort's name in refusal messages.
+    pub fn name(self) -> &'static str {
+        self.slug.unwrap_or("default")
+    }
+
+    /// The record path inside the artifact store.
+    fn record_path(self, store: &Path) -> PathBuf {
+        match self.slug {
+            None => store.join("current.json"),
+            Some(slug) => store.join("cohorts").join(format!("{slug}.json")),
+        }
+    }
+
+    /// The lock path inside the artifact store.
+    fn lock_path(self, store: &Path) -> PathBuf {
+        match self.slug {
+            None => store.join("lock"),
+            Some(slug) => store.join("cohorts").join(format!("lock.{slug}")),
+        }
+    }
+
+    /// The `CARGO_TARGET_DIR` value every producer and consumer of this
+    /// cohort must carry (`verify_record` compares the recorded build
+    /// environment exactly). The default cohort sets none. Relative, so the
+    /// same string resolves inside and outside the pinned root.
+    pub fn target_dir(self) -> Option<&'static str> {
+        match self.slug {
+            None => None,
+            Some("native-exec") => Some("target/cohort-native-exec"),
+            Some(_) => unreachable!("from_slug admits only registered cohorts"),
+        }
+    }
+
+    /// The exact `feature_set` this cohort's record must name, for a closed
+    /// cohort whose selections are fixed in code. The default cohort's union
+    /// is open (it grows with the graph), so `assert` recomputes it from the
+    /// graph instead; `run` binds each consumer through its selection key.
+    pub fn expected_feature_set(self) -> Option<&'static str> {
+        match self.slug {
+            None => None,
+            Some("native-exec") => Some(
+                "hermit-run/kvm-native-test-support,hermit-run/liteinst,hermit-run/native-exec",
+            ),
+            Some(_) => unreachable!("from_slug admits only registered cohorts"),
+        }
+    }
+}
+
+/// The cohort whose producer and consumer nodes `materialize` marks, by tag.
+/// Every other node consumes the default cohort.
+pub fn cohort_for_step(tag: &str) -> PreparedCohort {
+    match tag {
+        "build.hermit_native_exec_compile_in_pinned_root"
+        | "build.hermit_native_exec_in_pinned_root"
+        | "test.hermit_native_exec" => NATIVE_EXEC_COHORT,
+        _ => DEFAULT_COHORT,
+    }
+}
+
+/// The build mode this run's prepared records must name: the whole-run
+/// [`BUILD_MODE_ENV`] switch, defaulting to Cargo like the producer command.
+/// `build_environment` deliberately does not capture that variable, so this
+/// check is what refuses a record the other mode's producer rewrote.
+pub fn expected_build_mode() -> Result<String, String> {
+    match std::env::var(BUILD_MODE_ENV) {
+        Ok(mode) if mode == "cargo" || mode == "buck" => Ok(mode),
+        Ok(other) => Err(format!(
+            "unknown {BUILD_MODE_ENV} {other:?}; expected cargo or buck"
+        )),
+        Err(_) => Ok("cargo".into()),
+    }
+}
 
 #[cfg_attr(not(buck_build), path = "../../cargo-guest-binaries.rs")]
 #[cfg_attr(buck_build, path = "../mapped/ci/cargo-guest-binaries.rs")]
@@ -535,6 +660,13 @@ struct PreparedRecord {
     /// The Cargo profile that built every recorded executable, as
     /// [`recorded_cargo_profile`] names it.
     cargo_profile: String,
+    /// The whole-run build mode (`cargo` or `buck`) whose `prepare` wrote
+    /// this record. Half of the cohort key; see [`PreparedCohort`].
+    build_mode: String,
+    /// The canonical sorted qualified feature list of this record's
+    /// selections (`prepared_feature_set`); empty when none name features.
+    /// The other half of the cohort key.
+    feature_set: String,
 }
 
 /// A neutral second Cargo project consumes an already-produced core tool
@@ -662,7 +794,9 @@ fn project_tools(project: Option<&PreparedProject>) -> Result<Option<LockedArtif
     let Some(project) = project else {
         return Ok(None);
     };
-    let locked = LockedArtifacts::open(&project.tools_root, false)?;
+    // The core tool cohort is the default cohort by construction; the
+    // record check below refuses a project record in its place.
+    let locked = LockedArtifacts::open(&project.tools_root, false, DEFAULT_COHORT)?;
     check_identity(&project.core_preparation, false)?;
     let record = locked.current()?;
     if record.schema != RECORD_SCHEMA
@@ -844,12 +978,13 @@ fn prepare_cpu_wrapper(
 }
 
 /// Explicit standalone preparation. Official test consumers never call this.
+/// Standalone preparation owns the default cohort's store files only.
 pub fn build_cpu_wrapper(root: &Path) -> Result<PathBuf, PreparationError> {
     if std::env::var(REQUIRED_ENV).as_deref() == Ok("1") {
         return Err("an official consumer cannot build a CPU wrapper".into());
     }
     let root = root.canonicalize().map_err(|e| e.to_string())?;
-    let artifacts = LockedArtifacts::open(&root, true)?;
+    let artifacts = LockedArtifacts::open(&root, true, DEFAULT_COHORT)?;
     let cargo_path = artifacts.root.join("standalone-cargo.json");
     cargo_output(
         &root,
@@ -869,8 +1004,10 @@ pub fn build_cpu_wrapper(root: &Path) -> Result<PathBuf, PreparationError> {
 
 pub fn cpu_wrapper(root: &Path) -> Result<PathBuf, String> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
-    let artifacts = LockedArtifacts::open(&root, false)?;
+    let cohort = PreparedCohort::from_env()?;
+    let artifacts = LockedArtifacts::open(&root, false, cohort)?;
     let record = artifacts.current()?;
+    check_cohort_target(&root, cohort, &record.target, "prepared CPU wrapper lookup")?;
     verify_record(&root, &record)?;
     Ok(record.cpu_wrapper.executable.path)
 }
@@ -901,8 +1038,9 @@ pub fn budget_context(
     if parsed.build != regular {
         return Ok("null".into());
     }
+    // The regular selection belongs to the default cohort.
     let root = root.canonicalize().map_err(|e| e.to_string())?;
-    let artifacts = LockedArtifacts::open(&root, false)?;
+    let artifacts = LockedArtifacts::open(&root, false, DEFAULT_COHORT)?;
     let record = artifacts.current()?;
     let cargo = verify_record(&root, &record)?;
     verify_selection(&record, &cargo, &parsed.build)?;
@@ -1240,6 +1378,14 @@ pub fn profile_selections(
     root: &Path,
     profile: &str,
 ) -> Result<BTreeMap<String, Vec<String>>, String> {
+    profile_selections_in_cohort(root, profile, DEFAULT_COHORT)
+}
+
+pub fn profile_selections_in_cohort(
+    root: &Path,
+    profile: &str,
+    cohort: PreparedCohort,
+) -> Result<BTreeMap<String, Vec<String>>, String> {
     let prepared_project = project(root)?;
     let graph_path = prepared_project
         .as_ref()
@@ -1253,20 +1399,32 @@ pub fn profile_selections(
         prepared_project
             .as_ref()
             .map(|project| project.descriptor.path.as_path()),
+        cohort,
     )
 }
 
+/// The default cohort's selections of `profile`: every prepared selection
+/// the graph does not mark for another cohort.
 pub fn config_selections(
     graph: &dagrun::model::DagConfig,
     profile: &str,
 ) -> Result<BTreeMap<String, Vec<String>>, String> {
-    config_selections_for_project(graph, profile, None)
+    config_selections_in_cohort(graph, profile, DEFAULT_COHORT)
+}
+
+pub fn config_selections_in_cohort(
+    graph: &dagrun::model::DagConfig,
+    profile: &str,
+    cohort: PreparedCohort,
+) -> Result<BTreeMap<String, Vec<String>>, String> {
+    config_selections_for_project(graph, profile, None, cohort)
 }
 
 fn config_selections_for_project(
     graph: &dagrun::model::DagConfig,
     profile: &str,
     project: Option<&Path>,
+    cohort: PreparedCohort,
 ) -> Result<BTreeMap<String, Vec<String>>, String> {
     let selected =
         dagrun::select_steps_by_labels(graph, &[profile.into()]).map_err(|e| e.to_string())?;
@@ -1285,6 +1443,17 @@ fn config_selections_for_project(
             // project's selections; a different project must provide its own
             // required preparation record rather than enter the core union.
             if owner != project {
+                continue;
+            }
+            // Cohorts partition one project's selections the same way: this
+            // producer compiles exactly its own cohort's, so a feature-gated
+            // cohort never enters the default union (or the reverse). An
+            // unknown slug refuses here, in every producer, not silently in
+            // none of them.
+            let step_cohort =
+                PreparedCohort::from_slug(step.env.get(COHORT_ENV).map(String::as_str))
+                    .map_err(|e| format!("{}: {e}", step.tag()))?;
+            if step_cohort != cohort {
                 continue;
             }
             if step.env.get(REQUIRED_ENV).map(String::as_str) != Some("1") {
@@ -1306,28 +1475,41 @@ fn config_selections_for_project(
         }
     }
     if selections.is_empty() {
-        return Err(format!(
-            "profile {profile} has no prepared Nextest selections"
-        ));
+        return Err(if cohort.is_default() {
+            format!("profile {profile} has no prepared Nextest selections")
+        } else {
+            format!(
+                "profile {profile} has no prepared Nextest selections in cohort {}",
+                cohort.name()
+            )
+        });
     }
     Ok(selections)
 }
 
 struct LockedArtifacts {
+    /// The artifact store; generation staging directories live here for
+    /// every cohort.
     root: PathBuf,
+    /// This cohort's published record inside the store.
+    record: PathBuf,
     _lock: fs::File,
 }
 
 impl LockedArtifacts {
-    fn open(root: &Path, exclusive: bool) -> Result<Self, String> {
+    fn open(root: &Path, exclusive: bool, cohort: PreparedCohort) -> Result<Self, String> {
         let root = root.join("target/ci/nextest-binaries");
         fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+        let record = cohort.record_path(&root);
+        if let Some(parent) = record.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
         let lock = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(root.join("lock"))
+            .open(cohort.lock_path(&root))
             .map_err(|e| e.to_string())?;
         // Keep this file open across verification and the entire Nextest child.
         // A later producer cannot replace a generation beneath a running test.
@@ -1347,20 +1529,28 @@ impl LockedArtifacts {
                 std::io::Error::last_os_error()
             ));
         }
-        Ok(Self { root, _lock: lock })
+        Ok(Self {
+            root,
+            record,
+            _lock: lock,
+        })
     }
 
     fn current(&self) -> Result<PreparedRecord, String> {
-        serde_json::from_value(self.current_value()?).map_err(|e| {
+        self.record_from(self.current_value()?)
+    }
+
+    fn record_from(&self, value: Value) -> Result<PreparedRecord, String> {
+        serde_json::from_value(value).map_err(|e| {
             format!(
                 "invalid prepared record {}: {e}",
-                self.root.join("current.json").display()
+                self.record.display()
             )
         })
     }
 
     fn current_value(&self) -> Result<Value, String> {
-        let path = self.root.join("current.json");
+        let path = self.record.clone();
         let _: FileIdentity = file_identity(&path, false)?;
         serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?)
             .map_err(|e| format!("invalid prepared record {}: {e}", path.display()))
@@ -1518,6 +1708,21 @@ fn verify_record(root: &Path, record: &PreparedRecord) -> Result<Value, String> 
         || record.project != project(root)?
     {
         return Err("prepared record has the wrong schema or repository".into());
+    }
+    // Self-consistency of the cohort key: a record that names a mode no
+    // producer writes, or a feature set its own selections do not derive,
+    // was not published by `prepare` as read. Whether the mode is this
+    // run's is `check_prepared_cohort`'s question, answered before here.
+    if record.build_mode != "cargo" && record.build_mode != "buck" {
+        return Err("prepared record names an unknown build mode".into());
+    }
+    let recorded_selections = record
+        .selections
+        .iter()
+        .map(|(key, selection)| (key.clone(), selection.build_args.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if prepared_feature_set(&recorded_selections)? != record.feature_set {
+        return Err("prepared record feature set does not match its selections".into());
     }
     check_identity(&record.cargo_metadata, false)?;
     let cargo = read_json(&record.cargo_metadata.path)?;
@@ -1973,10 +2178,113 @@ pub fn check_prepared_cargo_profile(
     Ok(())
 }
 
+/// Refuse when Cargo's effective target is not the cohort's declared one.
+///
+/// The declaration is what keeps cohorts' artifacts apart; the wrapper in
+/// the pinned root historically overrode it with the default target, so a
+/// record could verify against the very target another cohort owned.
+/// Checking the declaration here (producer, from Cargo's own report) and
+/// on every consumer read means a wrapper or payload that drops the
+/// declaration fails by name instead of silently sharing artifacts. The
+/// default cohort declares no target and keeps its historical behavior.
+fn check_cohort_target(
+    root: &Path,
+    cohort: PreparedCohort,
+    actual: &Path,
+    context: &str,
+) -> Result<(), String> {
+    let Some(declared) = cohort.target_dir() else {
+        return Ok(());
+    };
+    let expected = root.join(declared);
+    if actual != expected {
+        return Err(format!(
+            "{context} refused: cohort {} declares Cargo target {declared:?} ({} under this checkout), but Cargo reports {}; the declaration was overridden before Cargo ran, so this run would share artifacts with another cohort. Rerun with the cohort target in force (the pinned wrapper translates the declaration; a payload must not re-export the default target).",
+            cohort.name(),
+            expected.display(),
+            actual.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a prepared record whose cohort key is not this run's.
+///
+/// `record` is the raw record of `cohort`'s store file, read before any
+/// selection lookup so a refusal names the cohort mismatch (and its
+/// re-prepare remedy), never a missing selection. The record must be
+/// schema 7, name `expected_mode` as its `build_mode`, and, when
+/// `expected_feature_set` is given (a closed cohort's constant, or the
+/// default union `assert` recomputed from the graph), name exactly it as
+/// its `feature_set`. A pre-7 record names neither field and is refused
+/// rather than guessed, like the Cargo profile before schema 6.
+pub fn check_prepared_cohort(
+    record: &Value,
+    context: &str,
+    cohort: PreparedCohort,
+    expected_mode: &str,
+    expected_feature_set: Option<&str>,
+) -> Result<(), String> {
+    let prepared_for = record
+        .get("prepared_for")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let remedy = match (prepared_for, cohort.env_value()) {
+        (Some(producer), Some(slug)) => format!(
+            "Rerun `./ci/nextest-binaries.rs prepare {producer} --cohort {slug}` in this checkout in {expected_mode} mode, then rerun this step."
+        ),
+        (Some(producer), None) => format!(
+            "Rerun `./ci/nextest-binaries.rs prepare {producer}` in this checkout in {expected_mode} mode, then rerun this step."
+        ),
+        _ => format!(
+            "Rerun the {} cohort's producer in this checkout in {expected_mode} mode, then rerun this step.",
+            cohort.name()
+        ),
+    };
+    let schema = record.get("schema").and_then(Value::as_u64);
+    if schema != Some(u64::from(RECORD_SCHEMA)) {
+        let found = schema.map_or_else(
+            || "has no schema".to_string(),
+            |schema| format!("is schema {schema}"),
+        );
+        return Err(format!(
+            "{context} refused: the prepared record {found}, not schema {RECORD_SCHEMA}, so it does not name the build mode or feature set that built its executables. {remedy}"
+        ));
+    }
+    let named = |key: &str| {
+        record
+            .get(key)
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{context} refused: the prepared record has no {key}. {remedy}"))
+    };
+    let found_mode = named("build_mode")?;
+    if found_mode != "cargo" && found_mode != "buck" {
+        return Err(format!(
+            "{context} refused: the prepared record names unknown build mode {found_mode:?}. {remedy}"
+        ));
+    }
+    if found_mode != expected_mode {
+        return Err(format!(
+            "{context} refused: the prepared executables were prepared in {found_mode} build mode, but this run is in {expected_mode} mode ({BUILD_MODE_ENV}). The {} cohort's record is shared between modes, and the other mode's producer rewrote it last. {remedy}",
+            cohort.name()
+        ));
+    }
+    let found_features = named("feature_set")?;
+    if let Some(expected) = expected_feature_set {
+        if found_features != expected {
+            return Err(format!(
+                "{context} refused: the prepared executables were built with feature set {found_features:?}, but cohort {} requires {expected:?}. {remedy}",
+                cohort.name()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// The graph nodes in `producer`'s lane that run `prepare producer`, read from
 /// the committed graph for an `assert` refusal message. A graph that cannot be
 /// read yields no names; the refusal then names only the command.
-fn producer_nodes(root: &Path, producer: &str) -> Vec<String> {
+fn producer_nodes(root: &Path, producer: &str, cohort: PreparedCohort) -> Vec<String> {
     let graph_path = match project(root) {
         Ok(Some(project)) => project.graph.path,
         Ok(None) => root.join("ci/dag/validate.json"),
@@ -1996,10 +2304,18 @@ fn producer_nodes(root: &Path, producer: &str) -> Vec<String> {
         .steps
         .iter()
         .filter(|step| {
-            step.cmd.match_indices(&marker).any(|(at, _)| {
-                !step.cmd[at + marker.len()..]
-                    .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            })
+            // A cohort producer's command carries its `--cohort` flag; the
+            // default producer's never does. The remedy names only the
+            // nodes that prepare the asserted cohort.
+            let prepares_cohort = match cohort.env_value() {
+                Some(slug) => step.cmd.contains(&format!("--cohort {slug}")),
+                None => !step.cmd.contains("--cohort "),
+            };
+            prepares_cohort
+                && step.cmd.match_indices(&marker).any(|(at, _)| {
+                    !step.cmd[at + marker.len()..]
+                        .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                })
         })
         .map(|step| step.tag())
         .collect()
@@ -2038,6 +2354,46 @@ fn listings(
         .collect())
 }
 
+/// Every feature the selections name, qualified by its selection's sole
+/// package: the qualification [`unified_selection`] unions under, shared
+/// with the record's `feature_set` so producer, `assert`, and the record
+/// can never derive different sets from the same selections.
+fn qualified_features(
+    selections: &BTreeMap<String, Vec<String>>,
+) -> Result<BTreeSet<String>, String> {
+    let mut features = BTreeSet::new();
+    for selection in selections.values() {
+        let parsed = CargoSelection::parse(selection)?;
+        if parsed.unqualified_features.is_empty() {
+            continue;
+        }
+        let [package] = parsed.packages.as_slice() else {
+            return Err(format!(
+                "{selection:?} names features without naming exactly one package, so the union cannot qualify them"
+            ));
+        };
+        features.extend(
+            parsed
+                .unqualified_features
+                .iter()
+                .map(|feature| format!("{package}/{feature}")),
+        );
+    }
+    Ok(features)
+}
+
+/// The canonical `feature_set` a record prepared from `selections` names:
+/// [`qualified_features`] sorted and comma-joined, empty when no selection
+/// names features.
+pub fn prepared_feature_set(
+    selections: &BTreeMap<String, Vec<String>>,
+) -> Result<String, String> {
+    Ok(qualified_features(selections)?
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(","))
+}
+
 /// The one Cargo selection that compiles every prepared selection of a profile.
 ///
 /// Separate Cargo invocations resolve dependency features separately, so each
@@ -2058,24 +2414,7 @@ pub fn unified_selection(
         (Some(only), None) => return Ok(only.clone()),
         _ => {}
     }
-    let mut features = BTreeSet::new();
-    for selection in selections.values() {
-        let parsed = CargoSelection::parse(selection)?;
-        if parsed.unqualified_features.is_empty() {
-            continue;
-        }
-        let [package] = parsed.packages.as_slice() else {
-            return Err(format!(
-                "{selection:?} names features without naming exactly one package, so the union cannot qualify them"
-            ));
-        };
-        features.extend(
-            parsed
-                .unqualified_features
-                .iter()
-                .map(|feature| format!("{package}/{feature}")),
-        );
-    }
+    let features = qualified_features(selections)?;
     // The first-party installer is a workspace member. Extension payloads
     // have their own producers and never enter this feature union.
     let mut union = vec!["--workspace".to_string(), "--all-targets".to_string()];
@@ -2112,6 +2451,27 @@ pub fn unified_prebuild_command(
     Ok(format!(
         "cargo build --locked{cargo_profile} {} && ./ci/nextest-binaries.rs prepare {profile}{build_mode} && target/validate/stage-detcore-liteinst --git target",
         unified.join(" ")
+    ))
+}
+
+/// The exact payload a non-default cohort's prepare node runs: prepare the
+/// cohort under the run's build mode, then assert the published record, so
+/// every consumer's ancestry contains the cohort check by construction.
+/// The cohort's compile node built its test executables first (the prepare
+/// listings then compile only the test harnesses), mirroring the workspace
+/// compile/prepare split without the unified workspace build: a cohort
+/// selection must never widen to the workspace union.
+pub fn cohort_prepare_command(profile: &str, cohort: PreparedCohort) -> Result<String, String> {
+    let Some(slug) = cohort.env_value() else {
+        return Err("the default cohort has no cohort prepare command".into());
+    };
+    if !unifies(profile) {
+        return Err(format!(
+            "profile {profile} lists each selection separately and has no cohort prepare command"
+        ));
+    }
+    Ok(format!(
+        "./ci/nextest-binaries.rs prepare {profile} --build-mode \"${{HERMIT_VALIDATE_BUILD_MODE:-cargo}}\" --cohort {slug} && ./ci/nextest-binaries.rs assert {profile} --cohort {slug}"
     ))
 }
 
@@ -2624,18 +2984,42 @@ fn apply_harvest(
 /// selection really consumes Buck-built executables (follow-up dh-iz46e).
 pub const BUCK_BUILD_REFUSAL: &str = "HERMIT_VALIDATE_BUILD_MODE=buck is refused: no prepared Nextest selection consumes Buck-built executables yet; cargo is the only build mode (follow-up dh-iz46e)";
 
-pub fn prepare(root: &Path, profile: &str, build_mode: &str) -> Result<(), PreparationError> {
+pub fn prepare(
+    root: &Path,
+    profile: &str,
+    build_mode: &str,
+    cohort: PreparedCohort,
+) -> Result<(), PreparationError> {
     if build_mode == "buck" {
         return Err(PreparationError::from(BUCK_BUILD_REFUSAL.to_string()));
     }
+    if build_mode != "cargo" {
+        return Err(PreparationError::from(format!(
+            "unknown build mode {build_mode:?} in nextest prepare"
+        )));
+    }
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let prepared_project = project(&root)?;
+    if prepared_project.is_some() && !cohort.is_default() {
+        return Err(PreparationError::from(
+            "a prepared project prepares only the default cohort".to_string(),
+        ));
+    }
     let tool_owner = project_tools(prepared_project.as_ref())?;
-    let selections = profile_selections(&root, profile)?;
+    let selections = profile_selections_in_cohort(&root, profile, cohort)?;
+    let feature_set = prepared_feature_set(&selections)?;
+    if let Some(expected) = cohort.expected_feature_set() {
+        if feature_set != expected {
+            return Err(PreparationError::from(format!(
+                "cohort {} selections derive feature set {feature_set:?}, but the cohort requires {expected:?}; update the selection and the cohort table together",
+                cohort.name()
+            )));
+        }
+    }
     // Each extension selection is listed in its own Cargo project. Core
     // workspace union/installer requirements remain the unchanged core path.
     let cargo_profile = build_cargo_profile(profile, prepared_project.is_some());
-    let artifacts = LockedArtifacts::open(&root, true)?;
+    let artifacts = LockedArtifacts::open(&root, true, cohort)?;
     let generation = artifacts.root.join(format!(
         "generation-{}-{}",
         std::process::id(),
@@ -2670,6 +3054,7 @@ pub fn prepare(root: &Path, profile: &str, build_mode: &str) -> Result<(), Prepa
     if !target.is_absolute() || target.canonicalize().map_err(|e| e.to_string())? != target {
         return Err("Cargo reported a noncanonical target directory".into());
     }
+    check_cohort_target(&root, cohort, &target, &format!("prepare {profile}"))?;
     // A validate-profile profile compiles every selection in ONE listing; the
     // others list each selection by itself. Either way each selection's
     // binaries-metadata is the part of its listing that its Cargo selectors
@@ -2883,6 +3268,8 @@ pub fn prepare(root: &Path, profile: &str, build_mode: &str) -> Result<(), Prepa
         cpu_wrapper,
         prepared_for: profile.to_string(),
         cargo_profile: recorded_cargo_profile(cargo_profile).to_string(),
+        build_mode: build_mode.to_string(),
+        feature_set,
     };
     let checked_cargo = verify_record(&root, &record)?;
     for selection in record.selections.values() {
@@ -2900,9 +3287,9 @@ pub fn prepare(root: &Path, profile: &str, build_mode: &str) -> Result<(), Prepa
     // A single rename publishes all selections together. Failure leaves the
     // previous record in place; it remains usable only while its recorded
     // inputs still match, since earlier Cargo commands may have changed them.
-    fs::rename(staging, artifacts.root.join("current.json")).map_err(|e| e.to_string())?;
+    fs::rename(staging, &artifacts.record).map_err(|e| e.to_string())?;
     eprintln!(
-        "prepared-nextest: published {} selections, {} hermit_modes Cargo guests, {} lit guests and {} record workloads for {profile} in Cargo profile {}",
+        "prepared-nextest: published {} selections, {} hermit_modes Cargo guests, {} lit guests and {} record workloads for {profile} in Cargo profile {} ({} mode, {} cohort)",
         record.selections.len(),
         record.guests.len(),
         record.lit_guests.len(),
@@ -2911,6 +3298,8 @@ pub fn prepare(root: &Path, profile: &str, build_mode: &str) -> Result<(), Prepa
             .as_ref()
             .map_or(0, |w| w.workloads.len()),
         record.cargo_profile,
+        record.build_mode,
+        cohort.name(),
     );
     Ok(())
 }
@@ -2968,8 +3357,25 @@ pub fn run(
     } else if std::env::var(REQUIRED_ENV).as_deref() == Ok("1") {
         return Err(format!("official Nextest consumer has no {SELECTION_ENV}"));
     }
-    let artifacts = LockedArtifacts::open(&root, false)?;
-    let record = artifacts.current()?;
+    let cohort = PreparedCohort::from_env()?;
+    let artifacts = LockedArtifacts::open(&root, false, cohort)?;
+    // Refuse a record from the wrong mode or feature set before any
+    // selection lookup, so the refusal names the cohort mismatch.
+    let value = artifacts.current_value()?;
+    check_prepared_cohort(
+        &value,
+        &format!("prepared Nextest {operation}"),
+        cohort,
+        &expected_build_mode()?,
+        cohort.expected_feature_set(),
+    )?;
+    let record = artifacts.record_from(value)?;
+    check_cohort_target(
+        &root,
+        cohort,
+        &record.target,
+        &format!("prepared Nextest {operation}"),
+    )?;
     let tool_owner = project_tools(record.project.as_ref())?;
     let cargo = verify_record(&root, &record)?;
     let selection = verify_selection(&record, &cargo, &parsed.build)?;
@@ -3048,25 +3454,59 @@ pub fn run(
 
 /// Verify that the prepared record holds `profile`'s selections, unchanged, as
 /// built by `producer`'s `prepare` (by default `profile`'s own) in the Cargo
-/// profile that producer builds in.
-pub fn assert_profile(root: &Path, profile: &str, producer: Option<&str>) -> Result<(), String> {
+/// profile that producer builds in, in this run's build mode and `cohort`'s
+/// feature set.
+pub fn assert_profile(
+    root: &Path,
+    profile: &str,
+    producer: Option<&str>,
+    cohort: PreparedCohort,
+) -> Result<(), String> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let producer = producer.unwrap_or(profile);
-    // Refuse an unknown producer before reading the record.
-    profile_selections(&root, producer)?;
-    let artifacts = LockedArtifacts::open(&root, false)?;
+    // Refuse an unknown producer before reading the record. The producer's
+    // selections also derive the expected feature set for an open cohort:
+    // the same qualification `prepare` recorded, recomputed from the graph.
+    let producer_selections = profile_selections_in_cohort(&root, producer, cohort)?;
+    let expected_feature_set = match cohort.expected_feature_set() {
+        Some(expected) => expected.to_string(),
+        None => prepared_feature_set(&producer_selections)?,
+    };
+    let artifacts = LockedArtifacts::open(&root, false, cohort)?;
     // Read the profile from the raw record first: a record from before schema
     // 6 does not deserialize, and its refusal must still say what to rerun.
+    let value = artifacts.current_value()?;
     check_prepared_cargo_profile(
-        &artifacts.current_value()?,
+        &value,
         profile,
         producer,
         project(&root)?.is_some(),
-        &producer_nodes(&root, producer),
+        &producer_nodes(&root, producer, cohort),
     )?;
-    let record = artifacts.current()?;
+    check_prepared_cohort(
+        &value,
+        &if profile == producer {
+            format!("assert {profile}")
+        } else {
+            format!("assert {profile} --prepared-by {producer}")
+        },
+        cohort,
+        &expected_build_mode()?,
+        Some(&expected_feature_set),
+    )?;
+    let record = artifacts.record_from(value)?;
+    check_cohort_target(
+        &root,
+        cohort,
+        &record.target,
+        &if profile == producer {
+            format!("assert {profile}")
+        } else {
+            format!("assert {profile} --prepared-by {producer}")
+        },
+    )?;
     let cargo = verify_record(&root, &record)?;
-    for args in profile_selections(&root, profile)?.values() {
+    for args in profile_selections_in_cohort(&root, profile, cohort)?.values() {
         verify_selection(&record, &cargo, args)?;
     }
     verify_guests(&record)?;
@@ -3077,8 +3517,18 @@ pub fn assert_profile(root: &Path, profile: &str, producer: Option<&str>) -> Res
 
 pub fn executable(root: &Path, package: &str, name: &str) -> Result<PathBuf, String> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
-    let artifacts = LockedArtifacts::open(&root, false)?;
-    let record = artifacts.current()?;
+    let cohort = PreparedCohort::from_env()?;
+    let artifacts = LockedArtifacts::open(&root, false, cohort)?;
+    let value = artifacts.current_value()?;
+    check_prepared_cohort(
+        &value,
+        "prepared executable lookup",
+        cohort,
+        &expected_build_mode()?,
+        cohort.expected_feature_set(),
+    )?;
+    let record = artifacts.record_from(value)?;
+    check_cohort_target(&root, cohort, &record.target, "prepared executable lookup")?;
     let cargo = verify_record(&root, &record)?;
     let ids = cargo["packages"]
         .as_array()
@@ -3576,6 +4026,8 @@ mod tests {
                     cpu_wrapper,
                     prepared_for: "fixture".into(),
                     cargo_profile: "dev".into(),
+                    build_mode: "cargo".into(),
+                    feature_set: String::new(),
                 },
                 args,
             )
@@ -3826,7 +4278,7 @@ mod tests {
     #[test]
     fn record_workload_generation_lock_remains_held_until_consumer_returns() {
         let fixture = Fixture::new();
-        let consumer = LockedArtifacts::open(&fixture.root, false).unwrap();
+        let consumer = LockedArtifacts::open(&fixture.root, false, DEFAULT_COHORT).unwrap();
         let competing = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -3845,7 +4297,7 @@ mod tests {
         let (locked_tx, locked_rx) = std::sync::mpsc::channel();
         let producer = std::thread::spawn(move || {
             starting_tx.send(()).unwrap();
-            let _lock = LockedArtifacts::open(&root, true).unwrap();
+            let _lock = LockedArtifacts::open(&root, true, DEFAULT_COHORT).unwrap();
             locked_tx.send(()).unwrap();
         });
         starting_rx
@@ -4190,21 +4642,28 @@ mod tests {
             .insert(PROJECT_ENV.into(), owner.to_str().unwrap().into());
         graph.steps = vec![step];
         assert!(config_selections(&graph, "full").is_err());
-        assert!(config_selections_for_project(&graph, "full", Some(owner)).is_ok());
+        assert!(
+            config_selections_for_project(&graph, "full", Some(owner), DEFAULT_COHORT).is_ok()
+        );
         assert!(
             config_selections_for_project(
                 &graph,
                 "full",
-                Some(Path::new("/different/project.json"))
+                Some(Path::new("/different/project.json")),
+                DEFAULT_COHORT
             )
             .is_err()
         );
         graph.steps[0].env.remove(REQUIRED_ENV);
-        assert!(config_selections_for_project(&graph, "full", Some(owner)).is_err());
+        assert!(
+            config_selections_for_project(&graph, "full", Some(owner), DEFAULT_COHORT).is_err()
+        );
         graph.steps[0]
             .env
             .insert(PROJECT_ENV.into(), "relative/project.json".into());
-        assert!(config_selections_for_project(&graph, "full", Some(owner)).is_err());
+        assert!(
+            config_selections_for_project(&graph, "full", Some(owner), DEFAULT_COHORT).is_err()
+        );
     }
 
     #[test]
@@ -4305,6 +4764,8 @@ mod tests {
             },
             prepared_for: "fixture".into(),
             cargo_profile: "dev".into(),
+            build_mode: "cargo".into(),
+            feature_set: String::new(),
         };
         let current = BTreeMap::from([(root.clone(), "changed".to_string())]);
         let detail = |after: SourcePart| {
@@ -4949,5 +5410,253 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+    }
+
+    #[test]
+    fn prepared_cohort_paths_keep_the_default_and_key_the_native_cohort() {
+        let store = Path::new("/fixture/target/ci/nextest-binaries");
+        assert_eq!(
+            DEFAULT_COHORT.record_path(store),
+            store.join("current.json")
+        );
+        assert_eq!(DEFAULT_COHORT.lock_path(store), store.join("lock"));
+        assert_eq!(DEFAULT_COHORT.target_dir(), None);
+        assert_eq!(DEFAULT_COHORT.expected_feature_set(), None);
+        assert_eq!(
+            NATIVE_EXEC_COHORT.record_path(store),
+            store.join("cohorts/native-exec.json")
+        );
+        assert_eq!(
+            NATIVE_EXEC_COHORT.lock_path(store),
+            store.join("cohorts/lock.native-exec")
+        );
+        assert_eq!(
+            NATIVE_EXEC_COHORT.target_dir(),
+            Some("target/cohort-native-exec")
+        );
+        assert_eq!(
+            PreparedCohort::from_slug(None).unwrap(),
+            DEFAULT_COHORT
+        );
+        assert_eq!(
+            PreparedCohort::from_slug(Some("native-exec")).unwrap(),
+            NATIVE_EXEC_COHORT
+        );
+        assert!(PreparedCohort::from_slug(Some("bogus")).is_err());
+        // The closed cohort's constant is the feature set its selection
+        // derives, so the table and the selection cannot drift apart.
+        let native = selections(&[
+            "-p hermit-run --features liteinst,kvm-native-test-support,native-exec --lib --bins",
+        ]);
+        assert_eq!(
+            prepared_feature_set(&native).unwrap(),
+            NATIVE_EXEC_COHORT.expected_feature_set().unwrap()
+        );
+    }
+
+    #[test]
+    fn cohort_locks_and_records_neither_block_nor_replace_each_other() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-prepared-cohorts-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        // A default generation is already published.
+        let store = root.join("target/ci/nextest-binaries");
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("current.json"), "{\"schema\":7}").unwrap();
+        // The native producer holds its exclusive lock and publishes its
+        // record; the default cohort's lock stays takeable and its record
+        // byte-identical throughout.
+        let native = LockedArtifacts::open(&root, true, NATIVE_EXEC_COHORT).unwrap();
+        let probe = |path: PathBuf| {
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap();
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            (rc, file)
+        };
+        let (native_rc, native_probe) = probe(store.join("cohorts/lock.native-exec"));
+        assert_eq!(native_rc, -1, "the native lock must be held");
+        drop(native_probe);
+        let (default_rc, default_probe) = probe(store.join("lock"));
+        assert_eq!(default_rc, 0, "the default lock must stay free");
+        // Release the probe's lock before the consumer takes its shared one.
+        drop(default_probe);
+        let staging = native.root.join("staging.json");
+        fs::write(&staging, "{\"schema\":7,\"cohort\":\"native-exec\"}").unwrap();
+        fs::rename(staging, &native.record).unwrap();
+        assert_eq!(
+            fs::read_to_string(store.join("current.json")).unwrap(),
+            "{\"schema\":7}"
+        );
+        let consumer = LockedArtifacts::open(&root, false, DEFAULT_COHORT).unwrap();
+        assert_eq!(
+            consumer.current_value().unwrap(),
+            serde_json::json!({"schema": 7})
+        );
+        drop(native);
+        drop(consumer);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn cohort_check_refuses_wrong_mode_feature_set_and_pre7_records() {
+        let native_features = NATIVE_EXEC_COHORT.expected_feature_set().unwrap();
+        let good = serde_json::json!({
+            "schema": RECORD_SCHEMA, "prepared_for": "full",
+            "cargo_profile": "validate", "build_mode": "cargo",
+            "feature_set": native_features,
+        });
+        check_prepared_cohort(
+            &good,
+            "prepared Nextest run",
+            NATIVE_EXEC_COHORT,
+            "cargo",
+            Some(native_features),
+        )
+        .unwrap();
+        let buck = serde_json::json!({
+            "schema": RECORD_SCHEMA, "prepared_for": "full",
+            "cargo_profile": "validate", "build_mode": "buck",
+            "feature_set": native_features,
+        });
+        let error = check_prepared_cohort(
+            &buck,
+            "prepared Nextest run",
+            NATIVE_EXEC_COHORT,
+            "cargo",
+            Some(native_features),
+        )
+        .unwrap_err();
+        assert!(error.contains("buck build mode"), "{error}");
+        assert!(error.contains("--cohort native-exec"), "{error}");
+        let wrong_features = serde_json::json!({
+            "schema": RECORD_SCHEMA, "prepared_for": "full",
+            "cargo_profile": "validate", "build_mode": "cargo",
+            "feature_set": "hermit-run/liteinst",
+        });
+        let error = check_prepared_cohort(
+            &wrong_features,
+            "prepared Nextest run",
+            NATIVE_EXEC_COHORT,
+            "cargo",
+            Some(native_features),
+        )
+        .unwrap_err();
+        assert!(error.contains("feature set"), "{error}");
+        let pre7 = serde_json::json!({
+            "schema": 6, "prepared_for": "full", "cargo_profile": "validate",
+        });
+        let error = check_prepared_cohort(
+            &pre7,
+            "prepared Nextest run",
+            NATIVE_EXEC_COHORT,
+            "cargo",
+            Some(native_features),
+        )
+        .unwrap_err();
+        assert!(error.contains("not schema 7"), "{error}");
+        // The default cohort without an expected set still refuses a record
+        // from the wrong mode, and accepts its own mode with any union.
+        let default_record = serde_json::json!({
+            "schema": RECORD_SCHEMA, "prepared_for": "full",
+            "cargo_profile": "validate", "build_mode": "cargo",
+            "feature_set": "hermit-run/liteinst",
+        });
+        check_prepared_cohort(&default_record, "run", DEFAULT_COHORT, "cargo", None).unwrap();
+        assert!(
+            check_prepared_cohort(&default_record, "run", DEFAULT_COHORT, "buck", None).is_err()
+        );
+    }
+
+    #[test]
+    fn cohort_target_declaration_is_enforced_against_cargos_report() {
+        let root = Path::new("/fixture");
+        // The declared cohort target is the only target a native record
+        // or build may name; the historically forced default target (the
+        // pinned-wrapper override) refuses by name.
+        check_cohort_target(
+            root,
+            NATIVE_EXEC_COHORT,
+            Path::new("/fixture/target/cohort-native-exec"),
+            "prepare full",
+        )
+        .unwrap();
+        let error = check_cohort_target(
+            root,
+            NATIVE_EXEC_COHORT,
+            Path::new("/fixture/target"),
+            "prepare full",
+        )
+        .unwrap_err();
+        assert!(error.contains("declares Cargo target"), "{error}");
+        assert!(error.contains("cohort-native-exec"), "{error}");
+        // The default cohort declares no target and keeps any target
+        // Cargo reports, as before cohorts existed.
+        check_cohort_target(root, DEFAULT_COHORT, Path::new("/fixture/target"), "run").unwrap();
+        check_cohort_target(
+            root,
+            DEFAULT_COHORT,
+            Path::new("/elsewhere/target"),
+            "run",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn config_selections_partition_by_cohort() {
+        let mut graph =
+            dagrun::io::dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let template = graph
+            .steps
+            .iter()
+            .find(|step| step.env.contains_key(SELECTION_ENV))
+            .unwrap()
+            .clone();
+        let mut default_step = template.clone();
+        default_step.deps.clear();
+        default_step.labels = vec!["full".into()];
+        default_step.env.insert(
+            SELECTION_ENV.into(),
+            serde_json::to_string(&args("-p hermit-run --features liteinst --lib")).unwrap(),
+        );
+        default_step.env.remove(COHORT_ENV);
+        let mut native_step = template;
+        native_step.deps.clear();
+        native_step.labels = vec!["full".into()];
+        native_step.env.insert(
+            SELECTION_ENV.into(),
+            serde_json::to_string(&args(
+                "-p hermit-run --features liteinst,kvm-native-test-support,native-exec --lib --bins",
+            ))
+            .unwrap(),
+        );
+        native_step
+            .env
+            .insert(COHORT_ENV.into(), "native-exec".into());
+        graph.steps = vec![default_step, native_step];
+        let default = config_selections(&graph, "full").unwrap();
+        assert_eq!(
+            default.values().collect::<Vec<_>>(),
+            vec![&args("-p hermit-run --features liteinst --lib")]
+        );
+        let native = config_selections_in_cohort(&graph, "full", NATIVE_EXEC_COHORT).unwrap();
+        assert_eq!(
+            native.values().collect::<Vec<_>>(),
+            vec![&args(
+                "-p hermit-run --features liteinst,kvm-native-test-support,native-exec --lib --bins"
+            )]
+        );
+        graph.steps[1]
+            .env
+            .insert(COHORT_ENV.into(), "bogus".into());
+        assert!(config_selections(&graph, "full").is_err());
+        assert!(config_selections_in_cohort(&graph, "full", NATIVE_EXEC_COHORT).is_err());
     }
 }
