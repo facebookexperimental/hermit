@@ -34291,16 +34291,9 @@ fn a_thread_that_execs_from_its_crash_handler_takes_the_post_crash_switch() {
 /// edited prefix whose connect return is recorded as Polling can never be
 /// followed faithfully (the live connect returns with a Posthook), so
 /// `hermit run --replay-schedule-from` refuses it instead of resyncing
-/// past the phase difference. The positive 0/1/2-retry cases live on the
-/// analysis path (analyze_prefix_stack_prints_at_its_schedule_position_whatever_the_retries),
-/// where edited schedule replays are best-effort by design. Tracking:
-/// The strict CLI half of the prefix-stack coverage (dh-mvz7y): the same
-/// edited prefix whose connect return is recorded as Polling can never be
-/// followed faithfully (the live connect returns with a Posthook), so
-/// `hermit run --replay-schedule-from` refuses it instead of resyncing
-/// past the phase difference. The positive 0/1/2-retry cases live on the
-/// analysis path (analyze_prefix_stack_prints_at_its_schedule_position_whatever_the_retries),
-/// where edited schedule replays are best-effort by design. Tracking:
+/// past the phase difference. The positive 0/1/2-retry cases are a
+/// follow-up blocked on dh-67h9g (an in-process RunData record launch
+/// stalls at finalize in the test harness). Tracking:
 /// https://github.com/rrnewton/hermit/issues/5285
 #[test]
 fn a_schedule_replay_refuses_a_prefix_whose_connect_return_is_recorded_as_polling() {
