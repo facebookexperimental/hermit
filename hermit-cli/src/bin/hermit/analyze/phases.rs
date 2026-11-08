@@ -6213,7 +6213,6 @@ mod tests {
         );
     }
 
-
     /// A candidate's check keeps the callback checkpoints of the unchanged
     /// events it replays, and refuses an edit they do not fit instead of
     /// replaying a bare schedule.
