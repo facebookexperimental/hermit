@@ -31476,15 +31476,18 @@ fn a_schedule_replay_keeps_the_clock_of_a_thread_that_yields_beside_a_computing_
         let summary = dir.path().join(format!("{max_timeslice}.summary.json"));
         let bound = format!("--max-timeslice={max_timeslice}");
         let summary_arg = format!("--summary-json={}", summary.display());
+        // One base argument list for both legs, so a future edit cannot
+        // desynchronise the record leg from the replay leg.
+        let base_args = [
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--seed=1",
+            bound.as_str(),
+        ];
         let run = |extra: &[&str]| {
-            let mut args = vec![
-                "run",
-                "--strict",
-                "--base-env=minimal",
-                "--epoch=2026-01-01T00:00:00Z",
-                "--seed=1",
-                bound.as_str(),
-            ];
+            let mut args = base_args.to_vec();
             args.extend_from_slice(extra);
             // Second task's work: 500_000 loop iterations, down from
             // 1_500_000 (dh-boh41). It only has to outlast the main
@@ -31499,45 +31502,31 @@ fn a_schedule_replay_keeps_the_clock_of_a_thread_that_yields_beside_a_computing_
         // A recording whose record leg reported a skid overshoot is
         // tainted for strict replay: its slice ends sit past where the
         // PMU timer meant to stop them, and the replay desyncs on them.
-        // Discard it and re-record, bounded and counted like SKID-RETRY
-        // (dh-qono7), so only a clean recording reaches the replay.
-        let mut recorded = None;
-        for attempt in 1..=SKID_RETRY_MAX_ATTEMPTS {
-            let attempt_record = dir
-                .path()
-                .join(format!("{max_timeslice}-attempt-{attempt}.json"));
-            let attempt_arg = format!("--record-preemptions-to={}", attempt_record.display());
-            let attempt_args = vec![
-                "run",
-                "--strict",
-                "--base-env=minimal",
-                "--epoch=2026-01-01T00:00:00Z",
-                "--seed=1",
-                bound.as_str(),
-                attempt_arg.as_str(),
-                "--",
-                program,
-                "40",
-                "300",
-                "500000",
-            ];
-            let output = hermit(&attempt_args);
-            if let Some(refusal) = skid_overshoot_refusal(output.status.code(), &stderr(&output)) {
-                eprintln!(
-                    "SKID-RETRY a_schedule_replay_keeps_the_clock_of_a_thread_that_yields_beside_a_computing_one: \
-                     record attempt {attempt} of at most {SKID_RETRY_MAX_ATTEMPTS} exited {} with `{refusal}`; \
-                     discarding the recording and re-recording",
-                    HERMIT_POLICY_REFUSAL_EXIT
-                );
-                if attempt < SKID_RETRY_MAX_ATTEMPTS {
-                    continue;
-                }
-            }
-            assert_success(&output, &attempt_args);
-            recorded = Some((attempt_record, stdout(&output)));
-            break;
-        }
-        let (record_file, recorded) = recorded.expect("the record loop returns an attempt");
+        // Drive the record leg through the shared skid-retry mechanism
+        // exactly ONCE (hermit_output_with): each attempt makes one raw
+        // run with a fresh record path, a typed skid refusal discards
+        // that attempt's recording, and only the surviving recording
+        // reaches the replay (dh-qono7). The total record cap is the
+        // shared SKID_RETRY_MAX_ATTEMPTS, and SKID-INFRA at exhaustion
+        // stays terminal.
+        let mut attempt = 0;
+        let (record_output, record_file) =
+            hermit_test::hermit_output_with("a_schedule_replay_keeps_the_clock record", || {
+                attempt += 1;
+                let attempt_record = dir
+                    .path()
+                    .join(format!("{max_timeslice}-attempt-{attempt}.json"));
+                let attempt_arg = format!("--record-preemptions-to={}", attempt_record.display());
+                let mut args = base_args.to_vec();
+                args.push(attempt_arg.as_str());
+                args.extend(["--", program, "40", "300", "500000"]);
+                let output = hermit_command(&args)
+                    .output()
+                    .expect("failed to run hermit for the record leg");
+                (output, attempt_record)
+            });
+        assert_success(&record_output, &["record leg"]);
+        let recorded = stdout(&record_output);
         let replay_arg = format!("--replay-schedule-from={}", record_file.display());
         assert!(
             recorded.starts_with("second=")
