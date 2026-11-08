@@ -391,7 +391,6 @@ struct WalkStat {
     dev: u64,
     ino: u64,
     mode: u32,
-    uid: u32,
     /// An automount point (`STATX_ATTR_AUTOMOUNT`): Linux's walk mounts on
     /// it and charges the mount to the link budget (`follow_automount`).
     automount: bool,
@@ -432,7 +431,7 @@ fn walk_open(dirfd: i32, name: &[u8]) -> Result<(WalkFd, WalkStat), Errno> {
                 fd.0 as u64,
                 c"".as_ptr() as u64,
                 (libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT) as u64,
-                (libc::STATX_TYPE | libc::STATX_MODE | libc::STATX_INO | libc::STATX_UID) as u64,
+                (libc::STATX_TYPE | libc::STATX_MODE | libc::STATX_INO) as u64,
                 stat.as_mut_ptr() as u64,
                 0,
             ],
@@ -446,7 +445,6 @@ fn walk_open(dirfd: i32, name: &[u8]) -> Result<(WalkFd, WalkStat), Errno> {
             dev: libc::makedev(stat.stx_dev_major, stat.stx_dev_minor),
             ino: stat.stx_ino,
             mode: u32::from(stat.stx_mode),
-            uid: stat.stx_uid,
             automount: stat.stx_attributes & libc::STATX_ATTR_AUTOMOUNT as u64 != 0,
         },
     ))
@@ -554,32 +552,34 @@ fn link_following_security_module() -> Option<bool> {
 /// the answer depends on what Detcore cannot see for the guest, so that the
 /// walk is [`Walked::Unclassified`]:
 /// - `may_follow_link`, for a final link followed only for a final `/`
-///   (`trailing`), under `fs.protected_symlinks`, in a sticky
-///   world-writable directory whose owner does not own the link, where
-///   Linux compares the link's owner with the guest's own fsuid;
+///   (`trailing`), under `fs.protected_symlinks`, in any sticky
+///   world-writable directory: Linux compares the link's owner with the
+///   directory's and with the guest's own fsuid, as the kernel maps them,
+///   and the owners the tool reads can be projections that differ from
+///   those (two owners outside a user namespace's map both read as the
+///   overflow uid), so Detcore decides from none of them;
 /// - a security module that can refuse the follow
 ///   ([`link_following_security_module`]).
+///
+/// Known limit: a host BPF LSM program on `inode_follow_link` is not
+/// consulted by Detcore's walk on KVM; main's kernel lookup consults it.
+/// The walk only decides a `readlink` answer: it opens nothing for the
+/// guest, whose own opens and stats of the path the backend takes through
+/// the host kernel's lookup and its permission and `file_open` hooks.
 ///
 /// The link's atime, which Linux touches (`touch_atime`), is touched as
 /// well by Detcore's `readlinkat` of it, and is no guest-visible fact:
 /// Detcore answers the guest's `stat` times itself.
-fn may_follow(
-    link: i32,
-    stat: &WalkStat,
-    dir: &WalkStat,
-    trailing: bool,
-    links: usize,
-) -> Result<bool, Errno> {
+fn may_follow(link: i32, dir: &WalkStat, trailing: bool, links: usize) -> Result<bool, Errno> {
     if links > MAXSYMLINKS {
         return Err(Errno::ELOOP);
     }
-    if trailing && stat.uid != dir.uid {
-        let sticky_world_writable = libc::S_ISVTX | libc::S_IWOTH;
-        if dir.mode & sticky_world_writable == sticky_world_writable
-            && protected_symlinks() != Some(false)
-        {
-            return Ok(false);
-        }
+    let sticky_world_writable = libc::S_ISVTX | libc::S_IWOTH;
+    if trailing
+        && dir.mode & sticky_world_writable == sticky_world_writable
+        && protected_symlinks() != Some(false)
+    {
+        return Ok(false);
     }
     match on_nosymfollow_mount(link) {
         Some(true) => return Err(Errno::ELOOP),
@@ -689,7 +689,9 @@ enum Walked {
 /// ([`may_follow`]): the budget, `fs.protected_symlinks` for a trailing link
 /// and `nosymfollow` mounts. An automount point, which Linux mounts on and
 /// charges to the budget (`follow_automount`, from `handle_mounts`), is
-/// [`Walked::Unclassified`] too.
+/// [`Walked::Unclassified`] too. Known limit: a host BPF LSM program on
+/// `inode_follow_link` is not consulted by Detcore's walk on KVM; main's
+/// kernel lookup consults it ([`may_follow`]).
 fn walk_counting_links(path: &[u8], mut links: usize) -> Result<Option<Walked>, Errno> {
     if !path.starts_with(b"/") {
         return Ok(Some(Walked::Unclassified));
@@ -727,7 +729,7 @@ fn walk_counting_links(path: &[u8], mut links: usize) -> Result<Option<Walked>, 
         let last = names.is_empty();
         if kind == libc::S_IFLNK && (!last || trailing) {
             links += 1;
-            if !may_follow(fd.0, &stat, dir_stat, last, links)? {
+            if !may_follow(fd.0, dir_stat, last, links)? {
                 return Ok(Some(Walked::Unclassified));
             }
             let Some(target) = walk_readlink(fd.0, c"") else {

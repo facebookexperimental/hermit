@@ -443,6 +443,231 @@ fn a_nosymfollow_mount_refuses_to_follow_its_links() {
     );
 }
 
+/// Which stage of [`a_protected_symlink_with_projected_owners_is_the_kernels`]
+/// a child runs: "outer" builds the fixture, "inner" checks it.
+const PROJECTED_OWNERS_STAGE: &str = "DETCORE_PROJECTED_OWNERS_STAGE";
+
+/// The fixture directory of [`a_protected_symlink_with_projected_owners_is_the_kernels`].
+const PROJECTED_OWNERS_FIXTURE: &str = "DETCORE_PROJECTED_OWNERS_FIXTURE";
+
+/// This test's own name, for a child that runs only it.
+fn projected_owners_test_name() -> String {
+    module_path!()
+        .split_once("::")
+        .map_or(module_path!(), |(_, rest)| rest)
+        .to_owned()
+        + "::a_protected_symlink_with_projected_owners_is_the_kernels"
+}
+
+/// A command that runs this test again as `stage`.
+fn projected_owners_stage(stage: &str, fixture: &Path) -> std::process::Command {
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args([
+            projected_owners_test_name().as_str(),
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(PROJECTED_OWNERS_STAGE, stage)
+        .env(PROJECTED_OWNERS_FIXTURE, fixture);
+    child
+}
+
+/// `child`'s output, which must be a pass of this one test.
+fn assert_stage_passed(output: std::process::Output, stage: &str) {
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "the {stage} stage failed: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A link under `fs.protected_symlinks` in a sticky world-writable directory
+/// whose owner (uid 1) does not own the link (uid 2), both outside the map
+/// of the user namespace that looks at them, where each reads as the
+/// overflow uid: Linux compares the owners as it maps them and refuses to
+/// follow `x/` (EACCES, `may_follow_link`). Detcore decides from no owner
+/// the tool reads, which can be such projections: it leaves every trailing
+/// link in a sticky world-writable directory to the kernel's lookup, so
+/// `x/` is the kernel's EACCES; `x/.`, which follows `x` before its last
+/// name and is no trailing link, is EINVAL; and `x` reads its 9 bytes.
+///
+/// The outer stage, in a user namespace that maps uids 0 to 2 (as root, or
+/// with `newuidmap` and the caller's subordinate range) and a mount
+/// namespace of its own, builds the fixture on a tmpfs; the inner stage,
+/// in a nested user namespace without a map, checks it.
+#[test]
+fn a_protected_symlink_with_projected_owners_is_the_kernels() {
+    let stage = std::env::var(PROJECTED_OWNERS_STAGE).ok();
+    if stage.as_deref() == Some("inner") {
+        let fixture = std::path::PathBuf::from(std::env::var_os(PROJECTED_OWNERS_FIXTURE).unwrap());
+        let sticky = fixture.join("sticky");
+        let link = sticky.join("x");
+        let link_stat = std::fs::symlink_metadata(&link).unwrap();
+        let sticky_stat = std::fs::symlink_metadata(&sticky).unwrap();
+        assert_eq!(
+            (
+                std::os::unix::fs::MetadataExt::uid(&sticky_stat),
+                std::os::unix::fs::MetadataExt::uid(&link_stat)
+            ),
+            (65534, 65534),
+            "both owners read as the overflow uid"
+        );
+        let spell = |rest: &str| {
+            let mut path = link.as_os_str().as_bytes().to_vec();
+            path.extend_from_slice(rest.as_bytes());
+            path
+        };
+        assert_native(&spell(""), Ok(9), "x");
+        for (result, forwarded) in readlinks(&spell(""), Ok(9)) {
+            assert_eq!(result, Ok(9), "x");
+            assert_eq!(forwarded.len(), 1, "{forwarded:?}");
+        }
+        assert_native(&spell("/"), Err(Errno::EACCES), "x/");
+        for (result, forwarded) in readlinks(&spell("/"), Err(Errno::EACCES)) {
+            assert_eq!(result, Err(Errno::EACCES), "x/");
+            assert_eq!(forwarded.len(), 1, "x/ is the kernel's: {forwarded:?}");
+        }
+        assert_native(&spell("/."), Err(Errno::EINVAL), "x/.");
+        for (result, forwarded) in readlinks(&spell("/."), Err(Errno::EACCES)) {
+            assert_eq!(result, Err(Errno::EINVAL), "x/.");
+            assert!(forwarded.is_empty(), "x/.: {forwarded:?}");
+        }
+        return;
+    }
+    if stage.as_deref() == Some("mapping") {
+        // Wait for the map, then run again: an exec as uid 0 of the user
+        // namespace gives the outer stage its capabilities there.
+        let fixture = std::path::PathBuf::from(std::env::var_os(PROJECTED_OWNERS_FIXTURE).unwrap());
+        let mut go = String::new();
+        std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut go).unwrap();
+        let error = projected_owners_stage("outer", &fixture).exec();
+        panic!("exec of the outer stage: {error}");
+    }
+    if stage.as_deref() == Some("outer") {
+        let fixture = std::path::PathBuf::from(std::env::var_os(PROJECTED_OWNERS_FIXTURE).unwrap());
+        let fixture_c = CString::new(fixture.as_os_str().as_bytes()).unwrap();
+        // SAFETY: NUL-terminated strings and null data.
+        unsafe {
+            assert_eq!(
+                libc::mount(
+                    std::ptr::null(),
+                    c"/".as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_REC | libc::MS_PRIVATE,
+                    std::ptr::null(),
+                ),
+                0,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+            assert_eq!(
+                libc::mount(
+                    c"tmpfs".as_ptr(),
+                    fixture_c.as_ptr(),
+                    c"tmpfs".as_ptr(),
+                    0,
+                    c"mode=0755".as_ptr().cast(),
+                ),
+                0,
+                "{}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let sticky = fixture.join("sticky");
+        std::fs::create_dir(&sticky).unwrap();
+        std::os::unix::fs::chown(&sticky, Some(1), Some(0)).unwrap();
+        std::fs::set_permissions(
+            &sticky,
+            std::os::unix::fs::PermissionsExt::from_mode(0o1777),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("/proc/sys", sticky.join("x")).unwrap();
+        std::os::unix::fs::lchown(sticky.join("x"), Some(2), Some(0)).unwrap();
+        let mut inner = projected_owners_stage("inner", &fixture);
+        // SAFETY: the hook makes one raw system call.
+        unsafe {
+            inner.pre_exec(|| {
+                if libc::unshare(libc::CLONE_NEWUSER) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        assert_stage_passed(inner.output().unwrap(), "inner");
+        return;
+    }
+    let mut enabled = String::new();
+    std::io::Read::read_to_string(
+        &mut std::fs::File::open("/proc/sys/fs/protected_symlinks").unwrap(),
+        &mut enabled,
+    )
+    .unwrap();
+    assert_eq!(enabled.trim(), "1", "the test needs fs.protected_symlinks");
+    let fixture = tempfile::tempdir().unwrap();
+    let fixture = crate::util::canonicalize(fixture.path()).unwrap();
+    // SAFETY: no arguments.
+    let root = unsafe { libc::geteuid() } == 0;
+    let mut outer = projected_owners_stage("mapping", &fixture);
+    outer
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let flags = if root {
+        libc::CLONE_NEWNS
+    } else {
+        libc::CLONE_NEWUSER | libc::CLONE_NEWNS
+    };
+    // SAFETY: the hook makes one raw system call.
+    unsafe {
+        outer.pre_exec(move || {
+            if libc::unshare(flags) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+    let mut child = outer.spawn().unwrap();
+    if !root {
+        // Map uids and gids 0 to 2: 0 to the caller, 1 and 2 to the first of
+        // its subordinate range, as newuidmap allows an unprivileged user.
+        // SAFETY: no arguments.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let user = std::env::var("USER").unwrap_or_default();
+        let first = |file: &str| {
+            std::fs::read_to_string(file)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| {
+                    let mut fields = line.split(':');
+                    let name = fields.next()?;
+                    let start = fields.next()?;
+                    (name == user || name == uid.to_string()).then(|| start.to_owned())
+                })
+                .next()
+                .unwrap_or_else(|| panic!("no subordinate range for {user} in {file}"))
+        };
+        let pid = child.id().to_string();
+        for (helper, own, file) in [
+            ("newuidmap", uid, "/etc/subuid"),
+            ("newgidmap", gid, "/etc/subgid"),
+        ] {
+            let status = std::process::Command::new(helper)
+                .args([&pid, "0", &own.to_string(), "1", "1", &first(file), "2"])
+                .status()
+                .unwrap_or_else(|error| panic!("{helper}: {error}"));
+            assert!(status.success(), "{helper} failed: {status:?}");
+        }
+    }
+    std::io::Write::write_all(child.stdin.as_mut().unwrap(), b"go\n").unwrap();
+    assert_stage_passed(child.wait_with_output().unwrap(), "outer");
+}
+
 /// Set in the child that [`a_bind_over_proc_sys_keeps_its_links`] runs in
 /// its own user and mount namespaces.
 const BIND_CHILD: &str = "DETCORE_SYSTEM_DIRECTORY_BIND_CHILD";
