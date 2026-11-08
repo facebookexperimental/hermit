@@ -3370,7 +3370,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_pre_exec_cpu_publication_after_a_transferred_exec_is_dropped: 3665.
     // Four census provenance units plus the non-PROGBITS control: 3665 + 5.
     // PR #4614's fifteen schedule-replay slice-end units: 3766 + 15 = 3781.
-    ("test.detcore_unit", 3781),
+    // procfs::levels::tests::system_directories_follow_the_table (KVM readlink
+    // of procfs system directories): 3781 + 1 = 3782 (head - base, nextest list
+    // --profile ci -p hermit-detcore --lib --bins at base b8f5c623 and head).
+    ("test.detcore_unit", 3782),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -6140,7 +6143,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same six 2b-1 units: 3659 + 6 = 3665.
     // Four census provenance units plus the non-PROGBITS control: 3665 + 5.
     // The same fifteen PR #4614 units (same growth as test.detcore_unit): 3766 + 15 = 3781.
-    ("test.detcore_unit_on_host", 3781),
+    // The same system_directories_follow_the_table unit (same growth as
+    // test.detcore_unit): 3781 + 1 = 3782.
+    ("test.detcore_unit_on_host", 3782),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

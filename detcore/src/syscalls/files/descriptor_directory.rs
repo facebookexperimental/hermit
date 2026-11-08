@@ -5762,6 +5762,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// truncated to the buffer and without a NUL, as `do_readlinkat` copies
     /// it. The placeholder's own path never reaches the guest. The walk to
     /// the link keeps the lookup's whole link budget ([`Self::readlink_walk`]).
+    /// Where the guest's procfs is not the kernel's, a system-wide directory
+    /// of the `--proc` level the walk reaches is answered too: `EINVAL`.
     pub(crate) async fn answer_descriptor_directory_link<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -5776,7 +5778,23 @@ impl<T: RecordOrReplay> Detcore<T> {
             Ok((decided, _)) => PathBuf::from(std::ffi::OsString::from_vec(decided)),
             Err(errno) => return Some(Err(errno.into())),
         };
-        let target = Self::own_link_directory(guest, &decided)?.canonical();
+        let Some(directory) = Self::own_link_directory(guest, &decided) else {
+            // A system-wide directory of the level (`/proc/sys`,
+            // `/proc/sys/kernel/random`) is no link, so its `readlink` is
+            // EINVAL, as Linux's of any object that is not one
+            // (`do_readlinkat`). Detcore answers it where the guest's procfs
+            // is not the kernel's ([`Self::serves_task_directories`]): KVM's
+            // executor serves no procfs directory and refuses a procfs object
+            // with EACCES, which procps 4's `sysctl` takes for a refusal
+            // when it checks each component of a key's path.
+            if Self::serves_task_directories(guest)
+                && crate::procfs::levels::names_system_directory(&decided, self.cfg.proc_level)
+            {
+                return Some(Err(Errno::EINVAL.into()));
+            }
+            return None;
+        };
+        let target = directory.canonical();
         let size = match crate::syscalls::namespace::readlink_size(buf_len) {
             Ok(size) => size,
             Err(errno) => return Some(Err(errno.into())),

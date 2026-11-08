@@ -456,6 +456,38 @@ pub(crate) fn system_entries(names: &[&[u8]], level: ProcLevel) -> Option<Vec<(V
     found.then_some(entries)
 }
 
+/// Whether the absolute path `path` names one of the system-wide directories
+/// below `/proc` that the table gives `level` ([`system_entries`]):
+/// `/proc/sys`, `/proc/sys/kernel/random`, and so on. Not `/proc` itself,
+/// procfs's root, nor a name in or below a process's or thread's directory
+/// (`self`, `thread-self`, a number), nor a spelling with a `..` component,
+/// which the kernel resolves (see [`procfs_name`]'s callers).
+pub(crate) fn names_system_directory(path: &Path, level: ProcLevel) -> bool {
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir) {
+        return false;
+    }
+    match components.next() {
+        Some(Component::Normal(name)) if name == "proc" => {}
+        _ => return false,
+    }
+    let mut names = Vec::new();
+    for component in components {
+        match component {
+            Component::Normal(name) => names.push(name.as_bytes()),
+            Component::CurDir => {}
+            _ => return false,
+        }
+    }
+    let Some(first) = names.first() else {
+        return false;
+    };
+    if *first == b"self" || *first == b"thread-self" || first.iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    system_entries(&names, level).is_some()
+}
+
 /// The names in a process's directory, or a thread's (`thread`), at
 /// `level`, each with its `d_type`: the level's names and the kernel's
 /// ([`PROCESS_KERNEL`]), less `task` and `timerslack_ns` in a thread's
@@ -738,6 +770,48 @@ mod tests {
                 !leader_thread_file_is_process_file(name.as_bytes()),
                 "{name}"
             );
+        }
+    }
+
+    /// The system-wide directories the table holds at each level, by any
+    /// spelling without `..`; not procfs's root, a file, a link (`net`,
+    /// `mounts`) or what is below one, a process's or thread's name, a name
+    /// the level omits, or a path outside `/proc`.
+    #[test]
+    fn system_directories_follow_the_table() {
+        use ProcLevel::*;
+        for (path, minimal, standard) in [
+            ("/proc/sys", true, true),
+            ("/proc/sys/", true, true),
+            ("/proc//sys/./kernel", true, true),
+            ("/proc/sys/kernel/random", true, true),
+            ("/proc/sys/vm", true, true),
+            ("/proc/sys/fs", false, true),
+            ("/proc/sys/net/ipv4", false, true),
+            ("/proc/pressure", false, true),
+            ("/proc/driver", false, true),
+            ("/proc", false, false),
+            ("/proc/", false, false),
+            ("/proc/sys/kernel/random/uuid", false, false),
+            ("/proc/version", false, false),
+            ("/proc/net", false, false),
+            ("/proc/net/dev", false, false),
+            ("/proc/mounts", false, false),
+            ("/proc/self", false, false),
+            ("/proc/self/task", false, false),
+            ("/proc/thread-self/fd", false, false),
+            ("/proc/1/fd", false, false),
+            ("/proc/sys/crypto", false, false),
+            ("/proc/fs", false, false),
+            ("/proc/sys/../sys", false, false),
+            ("/proc/sys/kernel/..", false, false),
+            ("proc/sys", false, false),
+            ("/sys/kernel", false, false),
+            ("/procfs/sys", false, false),
+        ] {
+            let path = Path::new(path);
+            assert_eq!(names_system_directory(path, Minimal), minimal, "{path:?}");
+            assert_eq!(names_system_directory(path, Standard), standard, "{path:?}");
         }
     }
 }
