@@ -6248,10 +6248,15 @@ mod tests {
         let mut options = AnalyzeOpts::try_parse_from([
             "analyze",
             tmp_dir.as_str(),
+            "--target-exit-code=0",
             "--",
             guest.to_str().unwrap(),
         ])
         .unwrap();
+        // The trial log at INFO holds the scheduler's stack-capture marker
+        // ("Now output stack trace for scheduled event #... = ..."), which
+        // names the event the captured frames were produced at.
+        options.trial_log = Some(crate::app::analyze::types::TrialLog::Info);
         let _workspace = options.phase0_initialize(Retention::Remove).unwrap();
 
         // Record the guest once.
@@ -6259,6 +6264,15 @@ mod tests {
             .unwrap()
             .with_schedule_recording();
         record_run.launch().unwrap();
+        assert!(
+            record_run.is_a_match(),
+            "the recording run did not meet the exit-0 target"
+        );
+        assert_eq!(
+            std::fs::read(record_run.root_path().with_extension("stdout")).unwrap(),
+            b"done\n",
+            "the recording run's guest output is not exactly done"
+        );
         let record_path = record_run.sched_path_out().to_path_buf();
         let record: PreemptionRecord = PreemptionReader::try_new(&record_path)
             .unwrap()
@@ -6298,6 +6312,22 @@ mod tests {
                 event["op"].clone(),
             )
         };
+        // How SchedEvent prints the target's thread and time, in the
+        // scheduler's stack-capture marker.
+        let printed = |event: &serde_json::Value| {
+            let time = event["end_time"].as_u64().unwrap().to_string();
+            let mut grouped = String::new();
+            for (ix, digit) in time.chars().enumerate() {
+                if ix > 0 && (time.len() - ix).is_multiple_of(3) {
+                    grouped.push('_');
+                }
+                grouped.push(digit);
+            }
+            (
+                format!("(tid{} ", event["dettid"]),
+                format!("time={grouped}ns "),
+            )
+        };
         let mut moved = Vec::new();
         for recorded_retries in 0..3 {
             let mut prefix: Vec<serde_json::Value> = events[..prefix_len]
@@ -6325,9 +6355,38 @@ mod tests {
                 )
                 .unwrap();
             run = run.with_schedule_recording();
-            options
+            let met = options
                 .launch_prefix_trial(&mut run, RunData::launch)
                 .unwrap();
+            assert!(
+                met,
+                "{recorded_retries} recorded retries: the prefix trial did not meet the exit-0 target"
+            );
+            // The captured stack's own marker: the scheduler logs the
+            // requested position and the actual event it captured at, in
+            // the trial's INFO log.
+            let log = std::fs::read_to_string(run.log_path().unwrap()).unwrap();
+            let marker = log
+                .lines()
+                .find(|line| {
+                    line.contains(&format!(
+                        "Now output stack trace for scheduled event #{position} = "
+                    ))
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{recorded_retries} recorded retries: no stack-capture marker \
+                         for schedule position {position} in the trial log:\n{log}"
+                    )
+                });
+            let (target_tid, target_time) = printed(&events[target]);
+            assert!(
+                marker.contains(&target_tid)
+                    && marker.contains(&target_time)
+                    && marker.contains("Prehook"),
+                "{recorded_retries} recorded retries: the stack at schedule position \
+                 {position} was not captured at the target event: {marker}"
+            );
             let stack: serde_json::Value =
                 serde_json::from_reader(File::open(&stack_path).unwrap()).unwrap();
             assert!(
@@ -6336,6 +6395,16 @@ mod tests {
                     .is_some_and(|frames| !frames.is_empty()),
                 "{recorded_retries} recorded retries: stack at schedule position \
                  {position} has no frames: {stack}"
+            );
+            assert!(
+                stack["frames"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|frame| frame["symbol"]["name"]
+                        .as_str()
+                        .is_some_and(|name| name.contains("main"))),
+                "{recorded_retries} recorded retries: the captured stack does not                  reach the guest's main: {stack}"
             );
             let realized: PreemptionRecord = PreemptionReader::try_new(run.sched_path_out())
                 .unwrap()
@@ -6349,20 +6418,6 @@ mod tests {
                     .iter()
                     .any(|event| identity(event) == identity(&events[target])),
                 "{recorded_retries} recorded retries: the realized schedule lost the target event"
-            );
-            // The stack was requested at schedule position `position`,
-            // whose numbering does not count polling retries: the event
-            // at that position in the realized schedule must be the
-            // target itself, which binds the captured stack to it.
-            let nonpolling: Vec<&serde_json::Value> = observed
-                .iter()
-                .filter(|event| syscall(event, "Polling").is_none())
-                .collect();
-            assert_eq!(
-                identity(nonpolling[position]),
-                identity(&events[target]),
-                "{recorded_retries} recorded retries: schedule position {position} \
-                 in the realized schedule is not the target the stack was taken at"
             );
             if identity(&observed[position]) != identity(&events[target]) {
                 moved.push(recorded_retries);
