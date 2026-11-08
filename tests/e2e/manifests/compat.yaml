@@ -125,7 +125,7 @@ corpus:
           arch, b2sum, base32, base64, basename, bash, bracket, cal, cat, cksum,
           curl, date, df-direct, dirname, du, echo, expr, findmnt, free, getopt,
           groups, head, hostname, id, kill, ls, lsirq, lsmod,
-          lua-direct, md5sum, mpstat-softirqs, nproc, numastat, numfmt,
+          lua-direct, md5sum, mpstat-softirqs, nproc, numfmt,
           openssl, perl-direct, pidstat-disk, pinky, pr, printf, ps, pwd, readlink, realpath,
           sha1sum, sha224sum, sha256sum, sha384sum, sha512sum, sleep, stat, sum,
           sysctl-random-uuid, test, "true", uname, uptime, users, vmstat,
@@ -155,6 +155,16 @@ corpus:
           hermit 16f99cd0, reverie 2f10ec67). It passed before only because
           that exec failed with EOPNOTSUPP in both runs, so the row printed
           logname:no-login-record without running logname.
+        numastat: >-
+          Its verify runs end as a named policy refusal on liteinst: since
+          Hermit presents a kernel without NUMA
+          (https://github.com/rrnewton/hermit/issues/5269), the row's shell
+          runs /usr/bin/numastat in a command substitution — to accept its
+          exit 1 when the sysfs node directory is absent — a forked child
+          that execs it, and the in-guest runtime refuses exec with a typed
+          refusal that ends the run (HERMIT_POLICY_REFUSAL, execveat;
+          measured in the full validations of 834b862aee and 7d6c94023b).
+          The ptrace and KVM cells prove the no-NUMA answer.
         numactl-hardware: >-
           Its verify runs end as a named policy refusal on liteinst: since
           Hermit presents a kernel without NUMA
@@ -812,7 +822,7 @@ corpus:
           arch, b2sum, base32, base64, basename, bash, bracket, cal, cat, cksum,
           curl, date, df-direct, dirname, du, echo, expr, findmnt, free, getopt,
           groups, head, hostname, id, kill, ls, lsirq, lsmod,
-          lua-direct, md5sum, nproc, numastat, numfmt,
+          lua-direct, md5sum, nproc, numfmt,
           openssl, perl-direct, pinky, pr, printf, ps, pwd, readlink, realpath,
           sha1sum, sha224sum, sha256sum, sha384sum, sha512sum, sleep, stat, sum,
           sysctl-random-uuid, test, "true", uname, uptime, users, vmstat,
@@ -832,6 +842,16 @@ corpus:
           hermit 16f99cd0, reverie 2f10ec67). It passed before only because
           that exec failed with EOPNOTSUPP in both runs, so the row printed
           logname:no-login-record without running logname.
+        numastat: >-
+          Its verify runs end as a named policy refusal on in-guest-trap: since
+          Hermit presents a kernel without NUMA
+          (https://github.com/rrnewton/hermit/issues/5269), the row's shell
+          runs /usr/bin/numastat in a command substitution — to accept its
+          exit 1 when the sysfs node directory is absent — a forked child
+          that execs it, and the in-guest runtime refuses exec with a typed
+          refusal that ends the run (HERMIT_POLICY_REFUSAL, execveat;
+          measured in the full validations of 834b862aee and 7d6c94023b).
+          The ptrace and KVM cells prove the no-NUMA answer.
         numactl-hardware: >-
           Its verify runs end as a named policy refusal on in-guest-trap: since
           Hermit presents a kernel without NUMA
@@ -2149,7 +2169,14 @@ corpus:
     - {label: "lsirq", argv: ["/usr/bin/lsirq", "--noheadings", "--output", "IRQ,TOTAL,NAME"], proc: standard}
     - {label: "mpstat-softirqs", argv: ["/usr/bin/mpstat", "-I", "SCPU", "1", "1"], proc: standard}
     - {label: "lsmod", argv: ["/usr/sbin/lsmod"]}
-    - {label: "numastat", argv: ["/usr/bin/numastat"]}
+    # Run mode hides the sysfs node directory (no-NUMA platform, issue
+    # 5269), so numastat's opendir fails and it exits 1 with the line
+    # below, as on a kernel without NUMA; record/replay leaves sysfs
+    # lookups alone, so a recording sees the host's nodes and numastat
+    # succeeds. Each branch prints its own marker: each mode is
+    # self-consistent, and sysfs absence itself is pinned by the
+    # procfs_determinism and node_vmstat CLI suites.
+    - {label: "numastat", argv: ["bash", "-c", "output=$(/usr/bin/numastat 2>&1); rc=$?; if test \"$rc\" -eq 0; then printf \"numastat-ok\\n\"; elif test \"$rc\" -eq 1 && test \"$output\" = \"sysfs not mounted or system not NUMA aware: No such file or directory\"; then printf \"numastat-no-numa\\n\"; else printf \"numastat-unexpected\\n\"; exit 1; fi"]}
     # Hermit presents a kernel without NUMA (issue 5269), so libnuma's
     # probe answers unavailable: numactl prints exactly this and exits 1,
     # as it does on such a kernel natively.
