@@ -42,6 +42,96 @@ def test_new_test_appears_and_passes(tmp_path):
     assert r.returncode == 0 and "+brand_new" in r.stdout and "added=1" in r.stdout
 
 
+def _run_raw(tmp_path, base, cand_raw, report_only=False):
+    import uuid
+    root = tmp_path / uuid.uuid4().hex
+    b, c = root / "base", root / "cand"
+    b.mkdir(parents=True); c.mkdir()
+    for suite, ids in base.items():
+        (b / f"{suite}.listed-ids").write_text("".join(f"{i}\n" for i in ids))
+    for suite, raw in cand_raw.items():
+        (c / f"{suite}.outcomes.json").write_text(raw)
+    args = [sys.executable, str(TOOL), "--base", str(b), "--candidate", str(c)]
+    if report_only:
+        args.append("--report-only")
+    return subprocess.run(args, capture_output=True, text=True)
+
+
+def _assert_named_failure(r, *needles, returncode=1):
+    assert r.returncode == returncode, (r.returncode, r.stdout, r.stderr)
+    assert "census FAIL:" in r.stderr and "Traceback" not in r.stderr
+    for needle in needles:
+        assert needle in r.stderr
+
+
+def test_duplicate_candidate_id_failed_then_passed_fails(tmp_path):
+    r = _run(tmp_path, {"s": ["a"]},
+             {"s": [_row("a", "failed"), _row("a", "passed")]})
+    _assert_named_failure(r, "duplicate", "a")
+
+
+def test_duplicate_candidate_id_passed_then_failed_fails(tmp_path):
+    r = _run(tmp_path, {"s": ["a"]},
+             {"s": [_row("a", "passed"), _row("a", "failed")]})
+    _assert_named_failure(r, "duplicate", "a")
+
+
+def test_duplicate_base_id_fails(tmp_path):
+    r = _run(tmp_path, {"s": ["a", "a"]}, {"s": [_row("a")]})
+    _assert_named_failure(r, "duplicate", "a")
+
+
+def test_malformed_candidate_json_is_named_failure(tmp_path):
+    r = _run_raw(tmp_path, {"s": ["a"]}, {"s": "{not json"})
+    _assert_named_failure(r, "malformed", "s")
+
+
+def test_missing_outcomes_key_is_named_failure(tmp_path):
+    r = _run_raw(tmp_path, {"s": ["a"]}, {"s": json.dumps({"rows": []})})
+    _assert_named_failure(r, "outcomes", "s")
+
+
+def test_malformed_candidate_json_report_only_reports(tmp_path):
+    r = _run_raw(tmp_path, {"s": ["a"]}, {"s": "{not json"}, report_only=True)
+    _assert_named_failure(r, "malformed", "s", returncode=0)
+    assert "report-only" in r.stderr
+
+
+def test_missing_outcomes_key_report_only_reports(tmp_path):
+    r = _run_raw(tmp_path, {"s": ["a"]}, {"s": json.dumps({"rows": []})},
+                 report_only=True)
+    _assert_named_failure(r, "outcomes", "s", returncode=0)
+    assert "report-only" in r.stderr
+
+
+def test_duplicate_candidate_report_only_reports(tmp_path):
+    import uuid
+    root = tmp_path / uuid.uuid4().hex
+    b, c = root / "base", root / "cand"
+    b.mkdir(parents=True); c.mkdir()
+    (b / "s.listed-ids").write_text("a\n")
+    (c / "s.outcomes.json").write_text(json.dumps(
+        {"outcomes": [_row("a", "failed"), _row("a", "passed")]}))
+    r = subprocess.run([sys.executable, str(TOOL), "--base", str(b),
+                        "--candidate", str(c), "--report-only"],
+                       capture_output=True, text=True)
+    _assert_named_failure(r, "duplicate", "a", returncode=0)
+    assert "report-only" in r.stderr
+
+
+def test_whitespace_only_skip_reason_fails(tmp_path):
+    import uuid
+    root = tmp_path / uuid.uuid4().hex
+    b, c = root / "base", root / "cand"
+    b.mkdir(parents=True); c.mkdir()
+    (b / "s.listed-ids").write_text("a\n")
+    (c / "s.outcomes.json").write_text(json.dumps(
+        {"outcomes": [{"id": "a", "outcome": "skipped", "reason": "   "}]}))
+    r = subprocess.run([sys.executable, str(TOOL), "--base", str(b),
+                        "--candidate", str(c)], capture_output=True, text=True)
+    _assert_named_failure(r, "without a reason", "a")
+
+
 def test_declared_drop_passes_and_unreasoned_skip_fails(tmp_path):
     r = _run(tmp_path, {"s": ["a", "old"]}, {"s": [_row("a")]},
              dropped="Test-Dropped: old -- removed with its backend, #999\n")

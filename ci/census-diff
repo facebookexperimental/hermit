@@ -29,6 +29,10 @@ from pathlib import Path
 OUTCOMES = {"passed", "failed", "skipped", "omitted"}
 
 
+class CensusInputError(ValueError):
+    """Malformed or ambiguous census input, reported as a named failure."""
+
+
 def base_populations(base: Path) -> dict[str, list[str]]:
     pops: dict[str, list[str]] = {}
     for f in sorted(base.iterdir()):
@@ -38,7 +42,15 @@ def base_populations(base: Path) -> dict[str, list[str]]:
                 if suite.endswith(suf):
                     suite = suite[: -len(suf)]
                     break
-            pops[suite] = [ln.strip() for ln in f.read_text().splitlines() if ln.strip()]
+            ids = [ln.strip() for ln in f.read_text().splitlines() if ln.strip()]
+            seen: set[str] = set()
+            for ident in ids:
+                if ident in seen:
+                    raise CensusInputError(
+                        f"{suite}: duplicate base id {ident!r} in {f.name}"
+                    )
+                seen.add(ident)
+            pops[suite] = ids
     return pops
 
 
@@ -47,12 +59,41 @@ def candidate_outcomes(cand: Path) -> dict[str, dict[str, tuple[str, str]]]:
     for f in sorted(cand.iterdir()):
         if f.name.endswith(".outcomes.json"):
             suite = f.name[: -len(".outcomes.json")]
-            data = json.loads(f.read_text())
-            rows = data["outcomes"] if isinstance(data, dict) else data
-            out[suite] = {
-                str(r["id"]): (str(r["outcome"]), str(r.get("reason", "")))
-                for r in rows
-            }
+            try:
+                data = json.loads(f.read_text())
+            except json.JSONDecodeError as e:
+                raise CensusInputError(
+                    f"{suite}: malformed candidate JSON in {f.name}: {e}"
+                ) from e
+            if isinstance(data, dict):
+                if "outcomes" not in data:
+                    raise CensusInputError(
+                        f'{suite}: candidate {f.name} missing "outcomes" key'
+                    )
+                rows = data["outcomes"]
+            else:
+                rows = data
+            if not isinstance(rows, list):
+                raise CensusInputError(
+                    f"{suite}: candidate {f.name} outcomes is not a list"
+                )
+            suite_out: dict[str, tuple[str, str]] = {}
+            for r in rows:
+                if not isinstance(r, dict) or "id" not in r or "outcome" not in r:
+                    raise CensusInputError(
+                        f"{suite}: malformed candidate outcome row in {f.name}: {r!r}"
+                    )
+                ident = str(r["id"])
+                if ident in suite_out:
+                    raise CensusInputError(
+                        f"{suite}: duplicate candidate id {ident!r} in {f.name}"
+                    )
+                reason = r.get("reason", "")
+                suite_out[ident] = (
+                    str(r["outcome"]),
+                    "" if reason is None else str(reason),
+                )
+            out[suite] = suite_out
     for f in sorted(cand.iterdir()):
         if f.name.endswith(".listed-ids") or f.suffix == ".txt":
             suite = f.name
@@ -63,7 +104,11 @@ def candidate_outcomes(cand: Path) -> dict[str, dict[str, tuple[str, str]]]:
             ids = [ln.strip() for ln in f.read_text().splitlines() if ln.strip()]
             out.setdefault(suite, {})
             for i in ids:
-                out[suite].setdefault(i, ("passed", ""))
+                if i in out[suite]:
+                    raise CensusInputError(
+                        f"{suite}: duplicate candidate id {i!r} in {f.name}"
+                    )
+                out[suite][i] = ("passed", "")
     return out
 
 
@@ -92,7 +137,15 @@ def main(argv: list[str]) -> int:
         return 2
     report_only = "--report-only" in argv
     dropped = dropped_records(Path(arg("--dropped")) if arg("--dropped") else None)
-    base, cand = base_populations(Path(base_s)), candidate_outcomes(Path(cand_s))
+    try:
+        base, cand = base_populations(Path(base_s)), candidate_outcomes(Path(cand_s))
+    except CensusInputError as e:
+        print(f"census FAIL: {e}", file=sys.stderr)
+        if report_only:
+            print("census-diff: report-only, not failing", file=sys.stderr)
+            return 0
+        print("census-diff: 1 unrecorded disappearance(s)/bad outcome(s)", file=sys.stderr)
+        return 1
     failures: list[str] = []
     totals = {"passed": 0, "failed": 0, "skipped": 0, "omitted": 0, "added": 0}
     for suite in sorted(set(base) | set(cand)):
@@ -103,7 +156,7 @@ def main(argv: list[str]) -> int:
                 outcome, reason = c[ident]
                 if outcome not in OUTCOMES:
                     failures.append(f"{suite}: {ident}: unknown outcome {outcome!r}")
-                elif outcome in ("skipped", "omitted") and not reason:
+                elif outcome in ("skipped", "omitted") and not reason.strip():
                     failures.append(f"{suite}: {ident}: {outcome} without a reason")
                 else:
                     totals[outcome] += 1
