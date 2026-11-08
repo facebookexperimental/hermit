@@ -1,21 +1,18 @@
 /*
- * Backend-parity fixture: deterministic default NUMA memory policy.
+ * Backend-parity fixture: no NUMA memory policy at all.
  *
- * A freshly started process has the MPOL_DEFAULT memory policy on every Linux
- * host, regardless of NUMA topology. get_mempolicy(2) with a mode pointer and
- * no flags reports that policy mode; with MPOL_F_ADDR it reports the policy
- * governing a given address. set_mempolicy(MPOL_DEFAULT, NULL, 0) resets the
- * process policy to the default and needs no node mask.
+ * Hermit presents a kernel built without NUMA
+ * (https://github.com/rrnewton/hermit/issues/5269). Linux compiles
+ * mm/mempolicy.o only under CONFIG_NUMA and the memory-policy entry points
+ * are cond_syscall stubs (kernel/sys_ni.c), so get_mempolicy(2) and
+ * set_mempolicy(2) fail with ENOSYS before any argument is looked at --
+ * even set_mempolicy(MPOL_DEFAULT, NULL, 0), which needs no node mask on a
+ * NUMA kernel. Every backend therefore agrees, host-independently: each
+ * call below returns -1 with errno ENOSYS, and writes nothing.
  *
- * This contract deliberately queries only the *default policy mode*. It never
- * requests MPOL_F_MEMS_ALLOWED and never supplies or inspects a node mask, so
- * no host-specific NUMA node identity or topology can leak into the result.
- * All three Hermit backends and native execution therefore agree on the same
- * process-local, host-independent MPOL_DEFAULT round-trip.
- *
- * The fixture prints only a count of satisfied checks (mode values are
- * asserted against MPOL_DEFAULT, not printed), so the output is invariant
- * across runs, backends, and hosts.
+ * The fixture prints only a count of satisfied checks, so the output is
+ * invariant across runs, backends, and hosts. (Run natively on a NUMA
+ * host it fails by design: it pins Hermit's platform, not the host's.)
  */
 
 #define _GNU_SOURCE
@@ -39,34 +36,30 @@
 #define MPOL_F_ADDR (1 << 1)
 #endif
 
-static long get_mode(int* mode, void* addr, unsigned long flags) {
-  *mode = -1;
+/* Whether a get_mempolicy answered ENOSYS and left *mode untouched. */
+static int get_mode_enosys(void* addr, unsigned long flags) {
+  int mode = -777;
   errno = 0;
-  return syscall(SYS_get_mempolicy, mode, (void*)0, 0UL, addr, flags);
+  long rc = syscall(SYS_get_mempolicy, &mode, (void*)0, 0UL, addr, flags);
+  return rc == -1 && errno == ENOSYS && mode == -777;
 }
 
 int main(void) {
   enum { EXPECTED_CHECKS = 4 };
   int ok = 0;
-  int mode;
-  int probe = 7; /* an address whose governing policy we query */
+  int probe = 7; /* an address whose governing policy we would query */
 
-  /* Default process policy mode is MPOL_DEFAULT. */
-  if (get_mode(&mode, (void*)0, 0UL) == 0 && mode == MPOL_DEFAULT)
+  if (get_mode_enosys((void*)0, 0UL))
+    ok += 1;
+  if (get_mode_enosys(&probe, (unsigned long)MPOL_F_ADDR))
     ok += 1;
 
-  /* Policy governing a specific address is also the default. */
-  if (get_mode(&mode, &probe, (unsigned long)MPOL_F_ADDR) == 0 &&
-      mode == MPOL_DEFAULT)
-    ok += 1;
-
-  /* Resetting to the default policy requires no node mask. */
   errno = 0;
-  if (syscall(SYS_set_mempolicy, MPOL_DEFAULT, (void*)0, 0UL) == 0)
+  if (syscall(SYS_set_mempolicy, MPOL_DEFAULT, (void*)0, 0UL) == -1 &&
+      errno == ENOSYS)
     ok += 1;
 
-  /* The policy remains the default after the reset. */
-  if (get_mode(&mode, (void*)0, 0UL) == 0 && mode == MPOL_DEFAULT)
+  if (get_mode_enosys((void*)0, 0UL))
     ok += 1;
 
   printf("mempolicy ok=%d\n", ok);

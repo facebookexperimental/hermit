@@ -6,7 +6,15 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! End-to-end coverage for live NUMA VM accounting exposed through sysfs.
+//! End-to-end coverage for the absent NUMA node directory in sysfs.
+//!
+//! Hermit presents a kernel built without NUMA
+//! (https://github.com/rrnewton/hermit/issues/5269): Linux registers no
+//! node subsystem then, so `/sys/devices/system/node` and `/sys/bus/node`
+//! do not exist at all — not even as empty directories — and no lookup
+//! below them finds anything, whatever the host's sysfs holds. (This file
+//! used to pin the zeroed counters of the one virtual node's `vmstat`;
+//! its name is kept because the validation selections name the binary.)
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
@@ -97,19 +105,33 @@ fn node_vmstat_consumers_are_deterministic_under_strict_verify() {
 
     let cases = [
         ProgramCase {
-            name: "cat",
-            candidates: &["/usr/bin/cat", "/bin/cat"],
-            args: &[NODE_VMSTAT],
+            name: "node directories absent",
+            candidates: &["/bin/sh", "/usr/bin/sh"],
+            args: &[
+                "-c",
+                "test ! -e /sys/devices/system/node && test ! -e /sys/bus/node && \
+                 test ! -e /sys/devices/system/node/node0/vmstat && \
+                 test ! -e /sys/bus/node/devices/node0",
+            ],
         },
         ProgramCase {
-            name: "awk",
-            candidates: &["/usr/bin/awk", "/bin/awk"],
-            args: &["{print $1, $2}", NODE_VMSTAT],
+            name: "system listing omits node",
+            candidates: &["/bin/sh", "/usr/bin/sh"],
+            args: &[
+                "-c",
+                "! ls /sys/devices/system | grep -qx node && \
+                 ls /sys/devices/system | grep -qx cpu && \
+                 ! ls /sys/bus | grep -qx node && ls /sys/bus | grep -qx cpu",
+            ],
         },
         ProgramCase {
-            name: "sed",
-            candidates: &["/usr/bin/sed", "/bin/sed"],
-            args: &["-n", "1,40p", NODE_VMSTAT],
+            name: "cat node vmstat fails",
+            candidates: &["/bin/sh", "/usr/bin/sh"],
+            args: &[
+                "-c",
+                "if cat /sys/devices/system/node/node0/vmstat 2>/dev/null; then exit 1; fi; \
+                 if cat /sys/devices/system/node/node0/numastat 2>/dev/null; then exit 1; fi",
+            ],
         },
     ];
 

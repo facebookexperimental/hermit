@@ -85,7 +85,12 @@ enum ProcfsKind {
     ProcessIo,
     Uptime,
     BlockStat,
+    /// A node's `meminfo`, from when Detcore presented one virtual node.
+    /// No path is classified as it now that the node directory is absent
+    /// (https://github.com/rrnewton/hermit/issues/5269); retained so every
+    /// other kind keeps its serialized number.
     NodeMeminfo,
+    /// A node's `numastat`, retained as [`Self::NodeMeminfo`] is.
     NodeNumastat,
     HwmonInput,
     ScalingCurFreq,
@@ -93,6 +98,11 @@ enum ProcfsKind {
     PtyNr,
     SelfSched,
     Fdinfo,
+    /// `/proc/<pid>/numa_maps`, from when Detcore presented one virtual
+    /// NUMA node. No path is classified as it now: the kernel Detcore
+    /// presents is built without NUMA and registers no such file
+    /// (https://github.com/rrnewton/hermit/issues/5269). Retained so every
+    /// other kind keeps its serialized number.
     NumaMaps,
     SmapsRollup,
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -162,8 +172,8 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-941): Review transparent-hugepage counter normalization.
     ThpCounter,
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-939): Review NUMA node VM accounting normalization.
+    /// A node's `vmstat`, retained as [`Self::NodeMeminfo`] is: no path is
+    /// classified as it now.
     NodeVmstat,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-950): Review ACPI CPPC feedback normalization.
@@ -196,14 +206,14 @@ enum ProcfsKind {
     // TODO-HUMAN-REVIEW(PR-958): Review host-global uevent sequence normalization.
     UeventSeqnum,
     /// A CPU list in `/sys` (`/sys/devices/system/cpu/{online,possible,
-    /// present,enabled}`, a CPU's topology lists and cache sharing lists,
-    /// the node lists), reported for the virtual CPUs it names.
+    /// present,enabled}`, a CPU's topology lists and cache sharing lists),
+    /// reported for the virtual CPUs it names.
     CpuList(CpuFileSet),
-    /// A CPU mask in `/sys` (a CPU's topology and cache sharing masks,
-    /// `node0/cpumap`), reported for the virtual CPUs it names.
+    /// A CPU mask in `/sys` (a CPU's topology and cache sharing masks),
+    /// reported for the virtual CPUs it names.
     CpuMask(CpuFileSet),
-    /// A CPU or node file whose contents are fixed for the virtual CPUs on a
-    /// single node (see [`CpuConstantFile`]).
+    /// A CPU file whose contents are fixed for the virtual CPUs (see
+    /// [`CpuConstantFile`]).
     CpuConstant(CpuConstantFile),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-957): Review Btrfs reservation normalization.
@@ -1022,10 +1032,10 @@ pub(crate) struct RenderedFiles {
     /// (`procfs_inode::tool_can_name_guest_descriptors`, KVM), so there is no
     /// kernel file to keep the guest's rows of.
     pub(crate) locks: bool,
-    /// Whether Detcore renders every process's `smaps`, `smaps_rollup` and
-    /// `numa_maps` from the backend's memory map (`memory_map::smaps`,
-    /// package K slice N4): exactly where the guest's procfs is not the
-    /// kernel's (KVM), so there is no kernel file to sanitize.
+    /// Whether Detcore renders every process's `smaps` and `smaps_rollup`
+    /// from the backend's memory map (`memory_map::smaps`, package K slice
+    /// N4): exactly where the guest's procfs is not the kernel's (KVM), so
+    /// there is no kernel file to sanitize.
     pub(crate) address_space: bool,
 }
 
@@ -1077,8 +1087,6 @@ pub(crate) enum AddressSpaceFile {
     Smaps,
     /// `/proc/<pid>/smaps_rollup`.
     SmapsRollup,
-    /// `/proc/<pid>/numa_maps`.
-    NumaMaps,
 }
 
 impl AddressSpaceFile {
@@ -1087,7 +1095,6 @@ impl AddressSpaceFile {
         match self {
             Self::Smaps => "smaps",
             Self::SmapsRollup => "smaps_rollup",
-            Self::NumaMaps => "numa_maps",
         }
     }
 }
@@ -1195,8 +1202,7 @@ pub(crate) fn maps_task_at(path: &Path, pid: i32, tid: i32) -> Option<BoundTask>
     let normalized = normalize_observed_path(path)?;
     let path = normalized.to_str()?;
     ProcfsTask::parse(path, "maps")
-        .or_else(|| ProcfsTask::parse(path, "smaps"))
-        .or_else(|| ProcfsTask::parse(path, "numa_maps"))?
+        .or_else(|| ProcfsTask::parse(path, "smaps"))?
         .bound_to(pid, tid)
         .bound()
 }
@@ -1444,7 +1450,7 @@ pub(crate) struct ProcfsFile {
     /// one that task held at the open, which was the opener's own
     /// ([`ProcfsFile::bind_memory_map`]). `None` where the open bound none;
     /// the file is then read from the kernel's, as before. For a process's
-    /// `smaps`, `smaps_rollup` and `numa_maps` Detcore opened as rendered,
+    /// `smaps` and `smaps_rollup` Detcore opened as rendered,
     /// the same; `None` there is a task of another process, or one that held
     /// no address space at the open (`Detcore::render_address_space_file`).
     #[serde(default)]
@@ -2011,17 +2017,11 @@ impl ProcfsFile {
                 ProcfsKind::CpuConstant(file)
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-939): Review NUMA node VM accounting normalization.
-            other if is_node_vmstat_path(other) => ProcfsKind::NodeVmstat,
-            // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-928): Review per-process host scheduler normalization.
             other if is_process_file_path(other, "sched") => ProcfsKind::SelfSched,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-931): Review fdinfo backing-identity normalization.
             _ if target_fd.is_some() => ProcfsKind::Fdinfo,
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-934): Review host NUMA observation normalization.
-            other if is_process_file_path(other, "numa_maps") => ProcfsKind::NumaMaps,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-937): Review smaps rollup accounting normalization.
             other if is_process_file_path(other, "smaps_rollup") => ProcfsKind::SmapsRollup,
@@ -2049,9 +2049,7 @@ impl ProcfsFile {
             // TODO-HUMAN-REVIEW(PR-909): Review softnet counter normalization.
             "/proc/net/softnet_stat" => ProcfsKind::SoftnetStat,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-865): Review deterministic NUMA and hwmon snapshots.
-            other if is_numa_node_file(other, "meminfo") => ProcfsKind::NodeMeminfo,
-            other if is_numa_node_file(other, "numastat") => ProcfsKind::NodeNumastat,
+            // TODO-HUMAN-REVIEW(PR-865): Review deterministic hwmon snapshots.
             other if is_hwmon_input_file(other) => ProcfsKind::HwmonInput,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-916): Review live protocol allocation counter normalization.
@@ -2247,16 +2245,16 @@ impl ProcfsFile {
     /// The per-process files Detcore renders, and their names. `mountinfo`
     /// and `mounts` only in a session with a container mount table
     /// ([`RenderedFiles::mounts`]), `arch_status` only in a session that
-    /// renders `/proc/cpuinfo` ([`RenderedFiles::cpuinfo`]), and `smaps`,
-    /// `smaps_rollup` and `numa_maps` only where the guest's procfs is not
-    /// the kernel's ([`RenderedFiles::address_space`]). A name's index
+    /// renders `/proc/cpuinfo` ([`RenderedFiles::cpuinfo`]), and `smaps`
+    /// and `smaps_rollup` only where the guest's procfs is not the kernel's
+    /// ([`RenderedFiles::address_space`]). A name's index
     /// numbers its files' inodes (`procfs_inode::per_process_inode`), so a new
     /// name goes last. A task's `status` (package K item 2b slice 2b-2) is
     /// rendered only where Detcore renders it
     /// (`Detcore::kernel_serves_every_status`, `kept_by_kernel`); every
     /// other open of one stays the kernel's. So is a process's `environ`
     /// (package K item 2b slice 2b-3: `Detcore::kernel_serves_every_environ`).
-    const PER_PROCESS_KINDS: [(ProcfsKind, &'static str); 15] = [
+    const PER_PROCESS_KINDS: [(ProcfsKind, &'static str); 14] = [
         (ProcfsKind::ProcessCgroup, "cgroup"),
         (ProcfsKind::ProcessAuxv, "auxv"),
         (ProcfsKind::Mountinfo, "mountinfo"),
@@ -2269,13 +2267,12 @@ impl ProcfsFile {
         (ProcfsKind::ArchStatus, "arch_status"),
         (ProcfsKind::Smaps, "smaps"),
         (ProcfsKind::SmapsRollup, "smaps_rollup"),
-        (ProcfsKind::NumaMaps, "numa_maps"),
         (ProcfsKind::ProcessStatus, "status"),
         (ProcfsKind::ProcessEnviron, "environ"),
     ];
 
     /// The names of the per-process files Detcore renders.
-    pub(crate) const PER_PROCESS_NAMES: [&'static str; 15] = [
+    pub(crate) const PER_PROCESS_NAMES: [&'static str; 14] = [
         "cgroup",
         "auxv",
         "mountinfo",
@@ -2288,7 +2285,6 @@ impl ProcfsFile {
         "arch_status",
         "smaps",
         "smaps_rollup",
-        "numa_maps",
         "status",
         "environ",
     ];
@@ -2385,7 +2381,7 @@ impl ProcfsFile {
     /// Nor `cmdline`, whose every read reads the process's memory again
     /// ([`Self::renders_at_every_read`]).
     ///
-    /// Nor `smaps`, `smaps_rollup` and `numa_maps`, whose snapshot Detcore
+    /// Nor `smaps` and `smaps_rollup`, whose snapshot Detcore
     /// takes at the first read and keeps, whether it renders the file
     /// (package K slice N4) or the kernel opened it, so that every backend
     /// serves them alike ([`Self::lists_address_space`]).
@@ -2401,20 +2397,19 @@ impl ProcfsFile {
             && (self.rendered || !self.is_task_status())
     }
 
-    /// Whether this is a process's `smaps`, `smaps_rollup` or `numa_maps`,
+    /// Whether this is a process's `smaps` or `smaps_rollup`,
     /// the per-process files Detcore renders from the backend's memory map
     /// where it renders them (`RenderedFiles::address_space`).
     pub(crate) fn lists_rendered_address_space(&self) -> bool {
         self.address_space_file().is_some()
     }
 
-    /// Which of a process's `smaps`, `smaps_rollup` and `numa_maps` this is,
-    /// if it is one.
+    /// Which of a process's `smaps` and `smaps_rollup` this is, if it is
+    /// one.
     pub(crate) fn address_space_file(&self) -> Option<AddressSpaceFile> {
         match self.kind {
             ProcfsKind::Smaps => Some(AddressSpaceFile::Smaps),
             ProcfsKind::SmapsRollup => Some(AddressSpaceFile::SmapsRollup),
-            ProcfsKind::NumaMaps => Some(AddressSpaceFile::NumaMaps),
             _ => None,
         }
     }
@@ -2679,14 +2674,10 @@ impl ProcfsFile {
             ProcfsKind::Diskstats => Some(Path::new("/proc/diskstats")),
             ProcfsKind::Fixed(file) => Some(file.path()),
             ProcfsKind::Mountinfo | ProcfsKind::ProcessMounts if !files.mounts => None,
-            // A process's `smaps`, `smaps_rollup` and `numa_maps`, rendered
-            // from the backend's memory map where there is no kernel file to
+            // A process's `smaps` and `smaps_rollup`, rendered from the
+            // backend's memory map where there is no kernel file to
             // sanitize (`memory_map::smaps`).
-            ProcfsKind::Smaps | ProcfsKind::SmapsRollup | ProcfsKind::NumaMaps
-                if !files.address_space =>
-            {
-                None
-            }
+            ProcfsKind::Smaps | ProcfsKind::SmapsRollup if !files.address_space => None,
             // A task's `arch_status` describes the CPU the guest's CPUID
             // instruction reports, so Detcore renders it exactly where it
             // renders `/proc/cpuinfo`, from the same table.
@@ -2899,7 +2890,7 @@ impl ProcfsFile {
             // The text is the address space's mappings as the backend's
             // memory map lists them at the first read
             // (`Detcore::render_address_space_file`).
-            ProcfsKind::Smaps | ProcfsKind::SmapsRollup | ProcfsKind::NumaMaps => b"",
+            ProcfsKind::Smaps | ProcfsKind::SmapsRollup => b"",
             _ => unreachable!("{:?} has no rendered path", self.kind),
         }
     }
@@ -2920,8 +2911,6 @@ impl ProcfsFile {
             Some(private_maps::Format::Maps)
         } else if self.kind == ProcfsKind::Smaps {
             Some(private_maps::Format::Smaps)
-        } else if self.kind == ProcfsKind::NumaMaps {
-            Some(private_maps::Format::NumaMaps)
         } else {
             None
         }
@@ -2939,10 +2928,10 @@ impl ProcfsFile {
     /// Bind a process's `maps` to the task its open found and the address
     /// space that task held then, as Linux takes the task's memory map at the
     /// open (`proc_maps_open`). Only for a task of the opener's own process,
-    /// whose address space is the opener's. So too a process's `smaps`,
-    /// `smaps_rollup` and `numa_maps` Detcore opened as rendered (package K
-    /// slice N4), whose opens take the memory map the same way
-    /// (`pid_smaps_open`, `smaps_rollup_open`, `pid_numa_maps_open`).
+    /// whose address space is the opener's. So too a process's `smaps` and
+    /// `smaps_rollup` Detcore opened as rendered (package K slice N4),
+    /// whose opens take the memory map the same way (`pid_smaps_open`,
+    /// `smaps_rollup_open`).
     pub(crate) fn bind_memory_map(&mut self, binding: memory_map::Binding) {
         assert!(
             self.is_maps() || self.lists_rendered_address_space(),
@@ -2977,7 +2966,7 @@ impl ProcfsFile {
     pub(crate) fn lists_address_space(&self) -> bool {
         matches!(
             self.kind,
-            ProcfsKind::Maps | ProcfsKind::Smaps | ProcfsKind::NumaMaps | ProcfsKind::SmapsRollup
+            ProcfsKind::Maps | ProcfsKind::Smaps | ProcfsKind::SmapsRollup
         )
     }
 
@@ -3842,16 +3831,18 @@ const CPU_TOPOLOGY_ATTRIBUTES: [&str; 6] = [
 ];
 
 /// What a CPU-list or CPU-mask file in `/sys` names, on the machine
-/// `--virtual-cpus` describes: single-core sockets on one node. Each is a
-/// set of CPU numbers, except the node lists', which number nodes and print
-/// the same way.
+/// `--virtual-cpus` describes: single-core sockets, and no NUMA node
+/// directory at all (https://github.com/rrnewton/hermit/issues/5269), so
+/// no file below `/sys/devices/system/node` is ever classified. Each set
+/// below is a set of CPU numbers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum CpuFileSet {
-    /// Every CPU: `cpu/{online,possible,present,enabled}` and `node0`'s
-    /// CPUs.
+    /// Every CPU: `cpu/{online,possible,present,enabled}`.
     Every,
-    /// Node 0, the only node, as the node lists ([`NODE_LISTS`]) name it: the
-    /// set `{0}` of node numbers.
+    /// The node lists' `{0}` of node numbers, from when Detcore presented
+    /// one virtual node. No path names it now that the node directory is
+    /// absent; the variant stays so a serialized `ProcfsFile` keeps the
+    /// numbers it had.
     Node0,
     /// CPU `n` alone: every topology list of `cpuN` (its socket has one core
     /// of one thread) and the CPUs sharing each of its caches (its socket's
@@ -3866,14 +3857,7 @@ impl CpuFileSet {
             "/sys/devices/system/cpu/online"
             | "/sys/devices/system/cpu/possible"
             | "/sys/devices/system/cpu/present"
-            | "/sys/devices/system/cpu/enabled"
-            | "/sys/devices/system/node/node0/cpulist" => Some(Self::Every),
-            _ if path
-                .strip_prefix("/sys/devices/system/node/")
-                .is_some_and(|list| NODE_LISTS.contains(&list)) =>
-            {
-                Some(Self::Node0)
-            }
+            | "/sys/devices/system/cpu/enabled" => Some(Self::Every),
             _ => {
                 let (cpu, attribute) = cpu_file(path)?;
                 let named = cpu_cache_attribute(attribute) == Some("shared_cpu_list")
@@ -3889,9 +3873,6 @@ impl CpuFileSet {
     /// The set a CPU-mask file at `path` names: the mask forms of
     /// [`Self::of_list`]'s files.
     fn of_mask(path: &str) -> Option<Self> {
-        if path == "/sys/devices/system/node/node0/cpumap" {
-            return Some(Self::Every);
-        }
         let (cpu, attribute) = cpu_file(path)?;
         let named = cpu_cache_attribute(attribute) == Some("shared_cpu_map")
             || attribute
@@ -3936,19 +3917,8 @@ fn cpu_cache_attribute(within_cpu: &str) -> Option<&str> {
     (!index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())).then_some(attribute)
 }
 
-/// The node lists in `/sys/devices/system/node` that name nodes: those that
-/// are online, possible, or have CPUs or memory. Hermit's single virtual node
-/// is node 0, which has both.
-const NODE_LISTS: &[&str] = &[
-    "online",
-    "possible",
-    "has_cpu",
-    "has_memory",
-    "has_normal_memory",
-];
-
-/// CPU and node files whose contents Hermit fixes for the virtual CPUs on
-/// its single node, whatever the host reports.
+/// CPU files whose contents Hermit fixes for its virtual CPUs, whatever
+/// the host reports. There are no node files: the node directory is absent.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum CpuConstantFile {
     /// `cpu/kernel_max`, the highest CPU number the kernel supports
@@ -3973,11 +3943,11 @@ enum CpuConstantFile {
     /// `cpuN`'s core and die IDs: 0, its socket's only core and die, as
     /// `/proc/cpuinfo`'s `core id` numbers it.
     CoreId(u32),
-    /// `node/has_generic_initiator`: empty, as on a machine without generic
-    /// initiators.
+    /// `node/has_generic_initiator` as it read when Detcore presented one
+    /// virtual node. No path names it now that the node directory is
+    /// absent; retained so a serialized `ProcfsFile` keeps its numbers.
     GenericInitiators,
-    /// `node0/distance`: one distance per node, so only node 0's to itself,
-    /// which Linux reports as 10.
+    /// `node0/distance` likewise: retained, unnamed by any path.
     Node0Distance,
     /// cpufreq's `boost`, the global switch and each policy's: 0, off. The
     /// virtual CPU cannot boost: its CPUID shows neither Intel's turbo
@@ -3994,8 +3964,6 @@ impl CpuConstantFile {
             "/sys/devices/system/cpu/kernel_max" => Self::KernelMax,
             "/sys/devices/system/cpu/smt/active" => Self::SmtActive,
             "/sys/devices/system/cpu/smt/control" => Self::SmtControl,
-            "/sys/devices/system/node/has_generic_initiator" => Self::GenericInitiators,
-            "/sys/devices/system/node/node0/distance" => Self::Node0Distance,
             "/sys/devices/system/cpu/cpufreq/boost" => Self::CpufreqBoost,
             _ if cpufreq_policy_attribute(Path::new(path)) == Some("boost") => Self::CpufreqBoost,
             _ => {
@@ -4030,26 +3998,36 @@ impl CpuConstantFile {
 }
 
 /// Whether `name`, an entry of the directory at the canonical path
-/// `directory`, is a CPU or cpufreq policy numbered `cpus` or more, or a node
-/// other than number 0, which a machine with `cpus` CPUs on one node does not
-/// have: in the CPU and node directories and their `/sys/bus` counterparts, and
-/// as the links node0, the processor driver and a memory block hold to them.
-/// glibc's `get_nprocs_conf` (`sysconf(_SC_NPROCESSORS_CONF)`, `nproc
-/// --all`) counts the `cpuN` entries of `/sys/devices/system/cpu`, and
-/// libnuma counts them and the `nodeN` entries of `/sys/devices/system/node`.
+/// `directory`, is absent from the machine Detcore presents: a CPU or
+/// cpufreq policy numbered `cpus` or more, which a machine with `cpus`
+/// CPUs does not have, and every NUMA node name, because that machine is
+/// a kernel built without NUMA (https://github.com/rrnewton/hermit/issues/5269).
+/// Without `drivers/base/node.o` Linux registers no node subsystem, so the
+/// `node` directory itself is missing from `/sys/devices/system` and from
+/// `/sys/bus` — not an empty directory — and no memory block holds a link
+/// to a node. glibc's `get_nprocs_conf` (`sysconf(_SC_NPROCESSORS_CONF)`,
+/// `nproc --all`) counts the `cpuN` entries of `/sys/devices/system/cpu`,
+/// and libnuma counts them and probes `/sys/devices/system/node`, which a
+/// kernel without NUMA does not have.
 pub(crate) fn is_absent_cpu_entry(directory: &Path, name: &[u8], cpus: u32) -> bool {
+    // The node directory itself, in each of its two parents.
+    match directory.to_str() {
+        Some("/sys/devices/system" | "/sys/bus") if name == b"node" => return true,
+        _ => {}
+    }
     let (prefix, present): (&[u8], u32) = match directory.to_str() {
         Some(
             "/sys/devices/system/cpu"
             | "/sys/bus/cpu/devices"
-            // node0's link to each of its CPUs, and the processor driver's
-            // link to each CPU it binds.
-            | "/sys/devices/system/node/node0"
+            // The processor driver's link to each CPU it binds. (A node's
+            // links to its CPUs went with the node directory.)
             | "/sys/bus/cpu/drivers/processor",
         ) => (b"cpu", cpus),
-        Some("/sys/devices/system/node" | "/sys/bus/node/devices") => (b"node", 1),
+        // Inside the node directories themselves, should a listing of one
+        // ever be filtered: no node is present.
+        Some("/sys/devices/system/node" | "/sys/bus/node/devices") => (b"node", 0),
         Some("/sys/devices/system/cpu/cpufreq") => (b"policy", cpus),
-        // A memory block's link to the node it belongs to.
+        // A memory block's link to the node it belongs to: none, without NUMA.
         Some(directory)
             if directory
                 .strip_prefix("/sys/devices/system/memory/memory")
@@ -4057,7 +4035,7 @@ pub(crate) fn is_absent_cpu_entry(directory: &Path, name: &[u8], cpus: u32) -> b
                     !block.is_empty() && block.bytes().all(|byte| byte.is_ascii_digit())
                 }) =>
         {
-            (b"node", 1)
+            (b"node", 0)
         }
         _ => return false,
     };
@@ -4074,12 +4052,12 @@ pub(crate) fn is_absent_cpu_entry(directory: &Path, name: &[u8], cpus: u32) -> b
 
 /// The prefix of the absolute `path` that ends at the first component
 /// [`is_absent_cpu_entry`] leaves out of its directory, walking `path`'s
-/// normal components from the left: `/sys/devices/system/node/node1` for
-/// `/sys/devices/system/node/node1/cpulist`. `None` where no component is
+/// normal components from the left: `/sys/devices/system/node` for
+/// `/sys/devices/system/node/node0/cpulist`. `None` where no component is
 /// absent, for a relative path, and at a `..` (the kernel's to resolve,
 /// through any link before it). A lookup of the prefix, or of a name below
-/// it, finds nothing, as on the machine with `cpus` CPUs on one node that the
-/// listings, `online` and `sched_getaffinity` describe.
+/// it, finds nothing, as on the machine with `cpus` CPUs and no NUMA that
+/// the listings, `online` and `sched_getaffinity` describe.
 pub(crate) fn absent_cpu_entry_prefix(path: &Path, cpus: u32) -> Option<PathBuf> {
     let mut components = path.components();
     if components.next() != Some(Component::RootDir) {
@@ -4099,14 +4077,6 @@ pub(crate) fn absent_cpu_entry_prefix(path: &Path, cpus: u32) -> Option<PathBuf>
         prefix.push(name);
     }
     None
-}
-
-fn is_numa_node_file(path: &str, filename: &str) -> bool {
-    path.strip_prefix("/sys/devices/system/node/node")
-        .and_then(|path| path.split_once('/'))
-        .is_some_and(|(node, leaf)| {
-            !node.is_empty() && node.bytes().all(|byte| byte.is_ascii_digit()) && leaf == filename
-        })
 }
 
 fn is_hwmon_input_file(path: &str) -> bool {
@@ -4295,10 +4265,10 @@ fn sanitize_status_held(
     const SIGBLK: &[u8] = b"SigBlk:";
     const CPUS_ALLOWED: &[u8] = b"Cpus_allowed:";
     const CPUS_ALLOWED_LIST: &[u8] = b"Cpus_allowed_list:";
-    // The nodes the task may allocate from: Hermit's single virtual node, as
-    // the node lists in /sys/devices/system/node report
-    // (https://github.com/rrnewton/hermit/issues/4160). The mask has 64 bits,
-    // a fixed width, as Cpus_allowed's 128 bits are.
+    // The nodes the task may allocate from: node 0 alone, the one node a
+    // kernel built without NUMA has (`MAX_NUMNODES` 1), which prints these
+    // lines exactly so. The mask has 64 bits, a fixed width, as
+    // Cpus_allowed's 128 bits are.
     const MEMS_ALLOWED: &[u8] = b"Mems_allowed:";
     const MEMS_ALLOWED_LIST: &[u8] = b"Mems_allowed_list:";
     const VOLUNTARY: &[u8] = b"voluntary_ctxt_switches:";
@@ -4527,7 +4497,7 @@ fn cpuinfo_block_for(block: &[u8], cpu: u32) -> Vec<u8> {
 }
 
 /// Reports a kernel CPU mask (comma-separated groups of hex digits, as in
-/// `cpu0/topology/thread_siblings` or `node0/cpumap`) as naming `named`, of a
+/// `cpu0/topology/thread_siblings`) as naming `named`, of a
 /// machine with `cpus` CPUs, which the kernel prints with `nr_cpu_ids`
 /// (`cpus`) bits: `1` for CPU 0 of one CPU. Anything that is not a
 /// newline-terminated hex mask is returned unchanged.
@@ -4982,19 +4952,6 @@ fn sanitize_pty_nr(contents: &[u8], virtual_count: usize) -> Vec<u8> {
         return Vec::new();
     }
     format!("{virtual_count}\n").into_bytes()
-}
-
-fn is_node_vmstat_path(path: &str) -> bool {
-    let relative = path
-        .strip_prefix("/sys/devices/system/node/")
-        .unwrap_or(path);
-    let Some(node) = relative.strip_suffix("/vmstat") else {
-        return false;
-    };
-    let Some(index) = node.strip_prefix("node") else {
-        return false;
-    };
-    !index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -6818,12 +6775,8 @@ mod tests {
                 .kind,
             ProcfsKind::Fixed(FixedProcfsFile::AioMaxNr)
         );
-        assert_eq!(
-            ProcfsFile::from_path(Path::new("/proc/self/numa_maps"))
-                .unwrap()
-                .kind,
-            ProcfsKind::NumaMaps
-        );
+        // No NUMA: the kernel Detcore presents registers no `numa_maps`.
+        assert!(ProcfsFile::from_path(Path::new("/proc/self/numa_maps")).is_none());
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/self/smaps_rollup"))
                 .unwrap()
@@ -7048,21 +7001,16 @@ mod tests {
                 .kind,
             ProcfsKind::Maps
         );
-        // Sibling names must NOT collide with it: `numa_maps` and `smaps` are
-        // their own kinds and `is_process_file_path` compares the final
-        // component exactly, which this pins.
+        // Sibling names must NOT collide with it: `smaps` is its own kind
+        // and `is_process_file_path` compares the final component exactly,
+        // which this pins; `numa_maps` names no file at all now.
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/self/smaps"))
                 .unwrap()
                 .kind,
             ProcfsKind::Smaps
         );
-        assert_eq!(
-            ProcfsFile::from_path(Path::new("/proc/self/numa_maps"))
-                .unwrap()
-                .kind,
-            ProcfsKind::NumaMaps
-        );
+        assert!(ProcfsFile::from_path(Path::new("/proc/self/numa_maps")).is_none());
         for path in [
             "/proc/self/maps",
             "/proc/123/maps",
@@ -7917,21 +7865,25 @@ Rss:                   4 kB\n" as &[u8];
     }
 
     #[test]
-    fn recognizes_only_numa_node_vmstat_paths() {
-        assert_eq!(
-            ProcfsFile::from_path(Path::new("/sys/devices/system/node/node0/vmstat"))
-                .unwrap()
-                .kind,
-            ProcfsKind::NodeVmstat
-        );
-        assert_eq!(
-            ProcfsFile::from_path(Path::new("node12/vmstat"))
-                .unwrap()
-                .kind,
-            ProcfsKind::NodeVmstat
-        );
-        assert!(ProcfsFile::from_path(Path::new("node/vmstat")).is_none());
-        assert!(ProcfsFile::from_path(Path::new("node0/meminfo")).is_none());
+    fn no_numa_node_path_is_classified() {
+        // The node directory is absent on the kernel Detcore presents, so
+        // no spelling of a file below it names a procfs file at all; the
+        // lookup itself is refused by the absent-entry gate.
+        for path in [
+            "/sys/devices/system/node/node0/vmstat",
+            "/sys/devices/system/node/node0/numastat",
+            "/sys/devices/system/node/node12/meminfo",
+            "/sys/devices/system/node/node0/cpulist",
+            "/sys/devices/system/node/node0/cpumap",
+            "/sys/devices/system/node/node0/distance",
+            "/sys/devices/system/node/has_generic_initiator",
+            "/sys/devices/system/node/online",
+            "node12/vmstat",
+            "node/vmstat",
+            "node0/meminfo",
+        ] {
+            assert!(ProcfsFile::from_path(Path::new(path)).is_none(), "{path}");
+        }
         // /proc/vmstat is now recognized as ProcfsKind::Fixed(FixedProcfsFile::Vmstat) (PR-938).
     }
 
@@ -7954,27 +7906,12 @@ Rss:                   4 kB\n" as &[u8];
     }
 
     #[test]
-    fn recognizes_numa_and_hwmon_accounting_paths() {
-        assert_eq!(
-            ProcfsFile::from_path(Path::new("/sys/devices/system/node/node0/numastat"))
-                .unwrap()
-                .kind,
-            ProcfsKind::NodeNumastat
-        );
-        assert_eq!(
-            ProcfsFile::from_path(Path::new("/sys/devices/system/node/node12/meminfo"))
-                .unwrap()
-                .kind,
-            ProcfsKind::NodeMeminfo
-        );
+    fn recognizes_hwmon_accounting_paths() {
         assert_eq!(
             ProcfsFile::from_path(Path::new("/sys/class/hwmon/hwmon4/power1_input"))
                 .unwrap()
                 .kind,
             ProcfsKind::HwmonInput
-        );
-        assert!(
-            ProcfsFile::from_path(Path::new("/sys/devices/system/node/nodeX/numastat")).is_none()
         );
         assert!(ProcfsFile::from_path(Path::new("/sys/class/hwmon/hwmon4/power1_cap")).is_none());
     }
@@ -8794,7 +8731,7 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
     }
 
     #[test]
-    fn cpu_topology_and_node0_report_single_core_sockets() {
+    fn cpu_topology_reports_single_core_sockets() {
         let kind = |path: &str| ProcfsFile::from_path(Path::new(path)).map(|file| file.kind);
         for (path, set) in [
             (
@@ -8813,7 +8750,6 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
                 "/sys/devices/system/cpu/cpu5/cache/index3/shared_cpu_list",
                 CpuFileSet::Cpu(5),
             ),
-            ("/sys/devices/system/node/node0/cpulist", CpuFileSet::Every),
         ] {
             assert_eq!(kind(path), Some(ProcfsKind::CpuList(set)), "{path}");
         }
@@ -8830,13 +8766,14 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
                 "/sys/devices/system/cpu/cpu0/cache/index0/shared_cpu_map",
                 CpuFileSet::Cpu(0),
             ),
-            ("/sys/devices/system/node/node0/cpumap", CpuFileSet::Every),
         ] {
             assert_eq!(kind(path), Some(ProcfsKind::CpuMask(set)), "{path}");
         }
-        // Other nodes, other topology attributes and other spellings are
-        // untouched.
+        // The absent node directory's files, other topology attributes and
+        // other spellings are untouched.
         for path in [
+            "/sys/devices/system/node/node0/cpulist",
+            "/sys/devices/system/node/node0/cpumap",
             "/sys/devices/system/node/node1/cpulist",
             "/sys/devices/system/cpu/cpu0/cache/index3/size",
             "/sys/devices/system/cpu/cpu0/topology/ppin",
@@ -8893,7 +8830,7 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
     }
 
     #[test]
-    fn kernel_max_smt_topology_ids_and_nodes_describe_one_cpu_and_node() {
+    fn kernel_max_smt_and_topology_ids_describe_the_virtual_cpus() {
         let kind = |path: &str| ProcfsFile::from_path(Path::new(path)).map(|file| file.kind);
         let constant = |path: &str| match kind(path) {
             Some(ProcfsKind::CpuConstant(file)) => file.contents(),
@@ -8932,27 +8869,17 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
                 "{attribute}"
             );
         }
-        assert_eq!(
-            constant("/sys/devices/system/node/has_generic_initiator"),
-            b"\n"
-        );
-        assert_eq!(constant("/sys/devices/system/node/node0/distance"), b"10\n");
+        // No file of the absent node directory is a constant or a CPU list:
+        // its lookup finds nothing, as on a kernel without NUMA. cpu0's
+        // PPIN is left to the host.
         for path in [
+            "/sys/devices/system/node/has_generic_initiator",
+            "/sys/devices/system/node/node0/distance",
             "/sys/devices/system/node/online",
             "/sys/devices/system/node/possible",
             "/sys/devices/system/node/has_cpu",
             "/sys/devices/system/node/has_memory",
             "/sys/devices/system/node/has_normal_memory",
-        ] {
-            assert_eq!(
-                kind(path),
-                Some(ProcfsKind::CpuList(CpuFileSet::Node0)),
-                "{path}"
-            );
-        }
-        // Another node's distances and cpu0's PPIN are left to the directory
-        // listing or the host.
-        for path in [
             "/sys/devices/system/node/node1/distance",
             "/sys/devices/system/cpu/cpu0/topology/ppin",
             "/sys/devices/system/node/has_cpu_extra",
@@ -9014,17 +8941,20 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
                 ][..],
             ),
             ("/sys/bus/cpu/devices", &["cpu7"], &["cpu0"]),
+            // The node directory itself is absent from each parent, as on a
+            // kernel without NUMA; its neighbours stay.
+            (
+                "/sys/devices/system",
+                &["node"],
+                &["cpu", "memory", "node0", "nodes"],
+            ),
+            ("/sys/bus", &["node"], &["cpu", "node0"]),
             (
                 "/sys/devices/system/node",
-                &["node1", "node12"],
-                &["node0", "online", "has_cpu", "node"],
+                &["node0", "node1", "node12"],
+                &["online", "has_cpu", "node"],
             ),
-            ("/sys/bus/node/devices", &["node1"], &["node0"]),
-            (
-                "/sys/devices/system/node/node0",
-                &["cpu1", "cpu57"],
-                &["cpu0", "cpulist", "meminfo", "memory12"],
-            ),
+            ("/sys/bus/node/devices", &["node0", "node1"], &["cpu0"]),
             (
                 "/sys/bus/cpu/drivers/processor",
                 &["cpu3"],
@@ -9032,8 +8962,8 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             ),
             (
                 "/sys/devices/system/memory/memory12",
-                &["node1"],
-                &["node0", "online"],
+                &["node0", "node1"],
+                &["online"],
             ),
             (
                 "/sys/devices/system/cpu/cpufreq",
@@ -9055,7 +8985,7 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             }
         }
         // A machine of 4 CPUs lists cpu0 to cpu3 and policy0 to policy3, and
-        // still one node.
+        // still no node.
         for (directory, name, absent) in [
             ("/sys/devices/system/cpu", "cpu3", false),
             ("/sys/devices/system/cpu", "cpu4", true),
@@ -9089,12 +9019,12 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
         for (path, prefix) in [
             (
                 "/sys/devices/system/node/node1/cpulist",
-                "/sys/devices/system/node/node1",
+                "/sys/devices/system/node",
             ),
-            (
-                "/sys/devices/system/node/node1",
-                "/sys/devices/system/node/node1",
-            ),
+            ("/sys/devices/system/node/node1", "/sys/devices/system/node"),
+            ("/sys/devices/system/node", "/sys/devices/system/node"),
+            ("/sys/bus/node", "/sys/bus/node"),
+            ("/sys/bus/node/devices/node0/numastat", "/sys/bus/node"),
             (
                 "/sys/devices/system/cpu/cpu1/topology/core_id",
                 "/sys/devices/system/cpu/cpu1",
@@ -9104,17 +9034,14 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
                 "/sys/devices/system/cpu/cpu12",
             ),
             ("/sys/bus/cpu/devices/cpu3", "/sys/bus/cpu/devices/cpu3"),
-            (
-                "/sys/bus/node/devices/node1/meminfo",
-                "/sys/bus/node/devices/node1",
-            ),
+            ("/sys/bus/node/devices/node1/meminfo", "/sys/bus/node"),
             (
                 "/sys/devices/system/cpu/cpufreq/policy2/scaling_cur_freq",
                 "/sys/devices/system/cpu/cpufreq/policy2",
             ),
             (
                 "/sys/devices/system/node/node0/cpu1/topology/core_id",
-                "/sys/devices/system/node/node0/cpu1",
+                "/sys/devices/system/node",
             ),
             (
                 "/sys/bus/cpu/drivers/processor/cpu1/online",
@@ -9132,7 +9059,6 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             );
         }
         for path in [
-            "/sys/devices/system/node/node0/cpulist",
             "/sys/devices/system/cpu/cpu0/topology/core_id",
             "/sys/devices/system/cpu/online",
             "/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq",
@@ -11605,7 +11531,7 @@ total_commit_ms 0\n"
         assert!(rendered.rendering_template().is_empty());
         assert!(rendered.reads_memory_at_every_read());
         assert_eq!(rendered.rendered_snapshot(), None);
-        assert_eq!(ProcfsFile::PER_PROCESS_NAMES[14], "environ");
+        assert_eq!(ProcfsFile::PER_PROCESS_NAMES[13], "environ");
     }
 
     /// A new image's argument and environment areas, from its initial stack,
@@ -11991,25 +11917,25 @@ total_commit_ms 0\n"
         );
     }
 
-    /// A task's `smaps`, `smaps_rollup` and `numa_maps` are per-process files
+    /// A task's `smaps` and `smaps_rollup` are per-process files
     /// Detcore renders only where the guest's procfs is not the kernel's
     /// (package K slice N4); elsewhere the kernel opens them and Detcore
     /// sanitizes its bytes, as before. Either way the snapshot is taken at
     /// the first read and kept, with no `show` at each rewind, so that every
     /// backend serves them alike.
     #[test]
-    fn a_task_smaps_rollup_and_numa_maps_are_rendered_only_where_procfs_is_not_the_kernels() {
+    fn a_task_smaps_and_rollup_are_rendered_only_where_procfs_is_not_the_kernels() {
         assert_eq!(
-            ProcfsFile::PER_PROCESS_NAMES[10..13],
-            ["smaps", "smaps_rollup", "numa_maps"]
+            ProcfsFile::PER_PROCESS_NAMES[10..12],
+            ["smaps", "smaps_rollup"]
         );
+        assert!(!ProcfsFile::PER_PROCESS_NAMES.contains(&"numa_maps"));
         // KVM's session, and ptrace's (the kernel's procfs).
         let backend_procfs = RenderedFiles::of(true, true, false, true);
         let kernel_procfs = RenderedFiles::of(true, true, false, false);
         for (name, file) in [
             ("smaps", AddressSpaceFile::Smaps),
             ("smaps_rollup", AddressSpaceFile::SmapsRollup),
-            ("numa_maps", AddressSpaceFile::NumaMaps),
         ] {
             assert_eq!(file.name(), name);
             for (spelling, path) in [

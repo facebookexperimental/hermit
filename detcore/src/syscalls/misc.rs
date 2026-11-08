@@ -372,26 +372,6 @@ fn deterministic_syslog_result(action: i32, len: usize) -> Result<i64, Errno> {
     }
 }
 
-/// Write get_mempolicy's output as Linux's `put_user`/`copy_to_user` do:
-/// through the guest's page protections, so a buffer that cannot take all the
-/// bytes is `EFAULT`. Any other failure is the backend's, not a guest fault,
-/// and is reported as a tool error rather than handed to the guest as an
-/// errno get_mempolicy never returns (Claude re-check of
-/// https://github.com/rrnewton/hermit/pull/4249).
-fn write_get_mempolicy_output<M: MemoryAccess>(
-    memory: &mut M,
-    address: AddrMut<'_, u8>,
-    bytes: &[u8],
-) -> Result<(), Error> {
-    match memory.write_with_user_access(address, bytes) {
-        Ok(written) if written == bytes.len() => Ok(()),
-        Ok(_) | Err(Errno::EFAULT) => Err(Errno::EFAULT.into()),
-        Err(errno) => Err(Error::Tool(anyhow::anyhow!(
-            "get_mempolicy output write failed: {errno}"
-        ))),
-    }
-}
-
 fn from_str(s: &str) -> [libc::c_char; 65] {
     let mut ret: [libc::c_char; 65] = [0; 65];
     for (i, ch) in s.bytes().take(64).enumerate() {
@@ -1346,108 +1326,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         Ok(0)
     }
-
-    /// get_mempolicy under Hermit. The container exposes a single virtual NUMA
-    /// node, so the effective policy is always the default and every address
-    /// resolves to node 0. The result is fully emulated (never injected), so it
-    /// is bitwise-identical across the two --verify runs and under record/replay,
-    /// removing the host-NUMA-topology dependence a passthrough would introduce.
-    ///
-    /// It follows Linux's `kernel_get_mempolicy` and `do_get_mempolicy`
-    /// (mm/mempolicy.c) for a kernel with one node (`nr_node_ids` 1):
-    /// - a node mask with `maxnode` below 1 is EINVAL;
-    /// - an unknown flag (any bit beyond `MPOL_F_NODE`, `MPOL_F_ADDR` and
-    ///   `MPOL_F_MEMS_ALLOWED`, including those above bit 31 of the raw
-    ///   argument, which Reverie's typed call drops), `MPOL_F_MEMS_ALLOWED`
-    ///   with `MPOL_F_NODE` or `MPOL_F_ADDR`, and an address without
-    ///   `MPOL_F_ADDR` are EINVAL;
-    /// - `*policy` is 0: `MPOL_DEFAULT`, or node 0 for `MPOL_F_NODE`;
-    /// - the node mask is written as `copy_nodes_to_user` writes it: node 0
-    ///   alone for `MPOL_F_MEMS_ALLOWED`, as `/proc/<pid>/status` reports
-    ///   `Mems_allowed_list` (<https://github.com/rrnewton/hermit/issues/4214>),
-    ///   and no node for the default policy, in `ALIGN(maxnode - 1, 64) / 8`
-    ///   bytes (none for a `maxnode` of 1), EINVAL beyond a page;
-    /// - both are written with the guest's own access rights, so a read-only or
-    ///   unmapped buffer is EFAULT, as from `put_user` and `copy_to_user`.
-    ///
-    /// Limits: `set_mempolicy` and `mbind` succeed without recording a policy,
-    /// so this always reports the default policy, where Linux reports, say,
-    /// `MPOL_INTERLEAVE` after `set_mempolicy(MPOL_INTERLEAVE)`. For the same
-    /// reason `MPOL_F_NODE` without `MPOL_F_ADDR` answers node 0, as Linux does
-    /// for an interleave policy (libnuma's `numa_get_interleave_node`), where
-    /// it refuses it under the default policy. `MPOL_F_ADDR` does not check
-    /// that the address is mapped, where Linux answers EFAULT for an unmapped
-    /// one.
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#720)
-    pub async fn handle_get_mempolicy<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        call: syscalls::GetMempolicy,
-    ) -> Result<i64, Error> {
-        const MPOL_F_NODE: u64 = 1;
-        const MPOL_F_ADDR: u64 = 2;
-        const MPOL_F_MEMS_ALLOWED: u64 = 4;
-        // `copy_nodes_to_user` refuses a mask longer than a page.
-        let page = crate::page::page_size();
-        let mask = call.nodemask();
-        if mask.is_some() && call.maxnode() < 1 {
-            return Err(Errno::EINVAL.into());
-        }
-        // The flags argument is an unsigned long; Reverie decodes it as u32.
-        let flags = crate::arch::syscall_arguments(&guest.regs().await)[4];
-        if flags & !(MPOL_F_NODE | MPOL_F_ADDR | MPOL_F_MEMS_ALLOWED) != 0 {
-            return Err(Errno::EINVAL.into());
-        }
-        let mems_allowed = flags & MPOL_F_MEMS_ALLOWED != 0;
-        if mems_allowed {
-            if flags & (MPOL_F_NODE | MPOL_F_ADDR) != 0 {
-                return Err(Errno::EINVAL.into());
-            }
-        } else if flags & MPOL_F_ADDR == 0 && call.addr().is_some() {
-            return Err(Errno::EINVAL.into());
-        }
-        if let Some(policy) = call.policy() {
-            let policy = AddrMut::<u8>::from_raw(policy.as_raw()).ok_or(Errno::EFAULT)?;
-            write_get_mempolicy_output(&mut guest.memory(), policy, &0i32.to_ne_bytes())?;
-        }
-        if let Some(mask) = mask {
-            let bytes = (call.maxnode() - 1).div_ceil(64) * 8;
-            if bytes > page.max(8) {
-                return Err(Errno::EINVAL.into());
-            }
-            let mut words = vec![0u8; bytes as usize];
-            if mems_allowed && !words.is_empty() {
-                words[0] = 1;
-            }
-            if !words.is_empty() {
-                let mask = AddrMut::<u8>::from_raw(mask.as_raw()).ok_or(Errno::EFAULT)?;
-                write_get_mempolicy_output(&mut guest.memory(), mask, &words)?;
-            }
-        }
-        Ok(0)
-    }
-
-    /// move_pages under Hermit. On a single virtual NUMA node nothing can be
-    /// relocated, so report every page as residing on node 0 and succeed. The
-    /// answer is a fixed constant, so it is deterministic across --verify and
-    /// record/replay.
-    // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#720)
-    pub async fn handle_move_pages<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        call: syscalls::MovePages,
-    ) -> Result<i64, Error> {
-        // When a status buffer is supplied (either a real move request or a
-        // location query with nodes == NULL), report node 0 for every page.
-        if let Some(status) = call.status() {
-            let count = call.nr_pages() as usize;
-            let zeros = vec![0i32; count];
-            guest.memory().write_values(status, &zeros)?;
-        }
-        Ok(0)
-    }
 }
 
 #[cfg(test)]
@@ -1970,27 +1848,6 @@ mod tests {
             })
             .collect();
         fill_canonical_random_iovecs(memory, &vectors, 0, offset, &mut DefaultHasher::new())
-    }
-
-    #[test]
-    fn get_mempolicy_output_faults_are_efault_and_backend_errors_are_tool_errors() {
-        let address = AddrMut::<u8>::from_raw(0x1000).unwrap();
-        let write = |outcome| {
-            write_get_mempolicy_output(&mut ScatterMemory::new(8, [outcome]), address, &[1; 8])
-        };
-        assert!(write(Ok(8)).is_ok());
-        for fault in [Ok(0), Ok(3), Err(Errno::EFAULT)] {
-            assert!(
-                matches!(write(fault), Err(Error::Errno(Errno::EFAULT))),
-                "{fault:?}"
-            );
-        }
-        for errno in [Errno::ENOSYS, Errno::ESRCH, Errno::EIO] {
-            assert!(
-                matches!(write(Err(errno)), Err(Error::Tool(_))),
-                "{errno:?}"
-            );
-        }
     }
 
     #[test]

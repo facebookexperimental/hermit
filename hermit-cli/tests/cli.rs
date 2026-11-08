@@ -9941,7 +9941,8 @@ fn smaps_and_numa_maps_guest() -> &'static Path {
 }
 
 /// What `smaps_and_numa_maps.c` prints in `mode` under Hermit on `backend`
-/// at `--proc=standard`, which lists `numa_maps` and `smaps_rollup`: at L2
+/// at `--proc=standard`, which lists `smaps_rollup` (and, since the
+/// no-NUMA policy, no `numa_maps` at any level): at L2
 /// where `l2` (two runs at bitwise parity under `--verify-strict`, with the
 /// same nonzero number of INFO records compared, exit 0), else in one run.
 /// Hermit's exit status, the guest's stdout and Hermit's stderr.
@@ -9995,8 +9996,8 @@ fn address_space_listing_with(
 }
 
 /// The part of `smaps_and_numa_maps.c`'s output about the stack: from its
-/// line `blocks ok` on, the stack's field labels, `numa_maps` row without
-/// page counts, and `smaps` block without its range and size, which the
+/// line `blocks ok` on, the `numa absent` line, the stack's field labels
+/// and its `smaps` block without its range and size, which the
 /// backend's layout decides (KVM's stack window is LinuxEmu's 8188 kB one,
 /// a native stack about 132 kB), as are the spaces that pad the name to its
 /// column. The guest prints the range on a line before `blocks ok`.
@@ -10137,29 +10138,29 @@ const KVM_SPLIT_SMAPS_REFUSAL: &str = "they are not in the backend's memory map"
 const KVM_ADVISED_SMAPS_REFUSAL: &str = "madvise advice or mlock that reached the backend may have \
     set flags on";
 
-/// Why KVM refuses a process's `numa_maps` once advice that discards pages
-/// reached LinuxEmu for the stack: whether it still holds a resident page,
-/// which decides `kernelpagesize_kB`, is not a fact.
-const KVM_DISCARDED_NUMA_MAPS_REFUSAL: &str = "madvise advice that discards pages reached the \
-    backend for";
-
-/// A process's `smaps`, `smaps_rollup` and `numa_maps`, as
-/// `tests/c/smaps_and_numa_maps.c` checks them against what Linux prints
-/// (fs/proc/task_mmu.c), for a mapping of each kind: anonymous memory, a
-/// file, the stack, the heap and the vDSO.
+/// A process's `smaps` and `smaps_rollup`, and the absence of its
+/// `numa_maps`, as `tests/c/smaps_and_numa_maps.c` checks them: the smaps
+/// files against what Linux prints (fs/proc/task_mmu.c), for a mapping of
+/// each kind (anonymous memory, a file, the stack, the heap and the vDSO),
+/// and `numa_maps` against the kernel built without NUMA that Hermit
+/// presents, which registers no such file
+/// (https://github.com/rrnewton/hermit/issues/5269). The guest reports
+/// `numa absent` where it found none and `numa present` where it did, so
+/// the native run below still gives the smaps lines; Hermit must say
+/// `absent` on both backends, also after the guest discards every page of
+/// its initial stack (the discard that used to make a rendered row
+/// unanswerable on KVM).
 ///
 /// On ptrace the kernel's files, sanitized: every kind is listed, the
-/// stack's flags, `THPeligible`, `ProtectionKey` and `numa_maps` row are the
-/// native run's, and every page count is zero; the rollup, a split stack,
-/// access-pattern advice and advice on another mapping read too, and after
-/// the guest discards every page of its initial stack, the row lacks
-/// `kernelpagesize_kB`, as natively.
+/// stack's flags, `THPeligible` and `ProtectionKey` are the native run's,
+/// and every page count is zero; the rollup, a split stack, access-pattern
+/// advice and advice on another mapping read too.
 ///
 /// On KVM, where Detcore renders the files from the backend's memory map
 /// (package K slice N4 of <https://github.com/rrnewton/hermit/issues/4213>),
 /// the stack alone is listed, as in `maps` (the memory map lists the stack
 /// window only, <https://github.com/rrnewton/reverie/issues/1211>). Its
-/// block and row are compared with ptrace's, each exemption named:
+/// block is compared with ptrace's, each exemption named:
 /// - the range and `Size` are left out by the guest, and the name's padding,
 ///   all of which LinuxEmu's stack window decides;
 /// - `ProtectionKey` is left out of ptrace's: KVM's kernel enables no
@@ -10173,10 +10174,9 @@ const KVM_DISCARDED_NUMA_MAPS_REFUSAL: &str = "madvise advice that discards page
 ///   stack; elsewhere it is 0 on both and compared with the rest.
 ///
 /// What the memory map cannot tell is refused by name: the rollup's range,
-/// the flags of a part a split left of the stack, the flags advice set on
-/// the stack, and the residency of a stack whose pages were discarded.
-/// Advice on a mapping the memory map does not list changes nothing KVM's
-/// files show, and refuses nothing.
+/// the flags of a part a split left of the stack, and the flags advice set
+/// on the stack. Advice on a mapping the memory map does not list changes
+/// nothing KVM's files show, and refuses nothing.
 fn list_the_address_space_in_smaps_and_numa_maps(backend: &str) {
     let kvm = backend == "kvm";
     let (_, files, _) = address_space_listing(backend, "files", true);
@@ -10186,7 +10186,7 @@ fn list_the_address_space_in_smaps_and_numa_maps(backend: &str) {
     }
     assert!(listed("stack"), "{files}");
     assert!(
-        files.contains("blocks ok\nnuma ok\naccounting nonzero 0\nnuma counts 0\n"),
+        files.contains("blocks ok\nnuma absent\naccounting nonzero 0\n"),
         "{files}"
     );
     if kvm {
@@ -10213,14 +10213,17 @@ fn list_the_address_space_in_smaps_and_numa_maps(backend: &str) {
         assert!(!nocpuid.contains("ProtectionKey"), "{nocpuid}");
         assert_eq!(stack_listing(&nocpuid), stack_listing(&files));
         // Advice on the anonymous mapping, which the memory map does not
-        // list, leaves the stack's block and row as they were.
+        // list, leaves the stack's block as it was.
         let (_, other, _) = address_space_listing(backend, "other", true);
         assert_eq!(stack_listing(&other), stack_listing(&files));
+        // Discarding every page of the initial stack refuses nothing now:
+        // there is no numa_maps row whose residency it would decide.
+        let (_, discard, _) = address_space_listing(backend, "discard", true);
+        assert_eq!(discard, "discard ok\nnuma absent\n");
         for (mode, refusal) in [
             ("rollup", KVM_ROLLUP_REFUSAL),
             ("split", KVM_SPLIT_SMAPS_REFUSAL),
             ("advise", KVM_ADVISED_SMAPS_REFUSAL),
-            ("discard", KVM_DISCARDED_NUMA_MAPS_REFUSAL),
         ] {
             let (code, stdout, stderr) = address_space_listing(backend, mode, false);
             // EXIT-CLASS: hermit
@@ -10247,7 +10250,6 @@ fn list_the_address_space_in_smaps_and_numa_maps(backend: &str) {
                 .lines()
                 .filter(|line| {
                     line.starts_with("stack labels ")
-                        || line.starts_with("stack numa ")
                         || line.starts_with("THPeligible:")
                         || line.starts_with("ProtectionKey:")
                         || line.starts_with("VmFlags:")
@@ -10262,16 +10264,15 @@ fn list_the_address_space_in_smaps_and_numa_maps(backend: &str) {
         for mode in ["split", "advise", "other"] {
             let (_, output, _) = address_space_listing(backend, mode, true);
             assert!(
-                output.contains("blocks ok\nnuma ok\naccounting nonzero 0\nnuma counts 0\n"),
+                output.contains("blocks ok\nnuma absent\naccounting nonzero 0\n"),
                 "{mode}:\n{output}"
             );
         }
-        // Every page of the initial stack discarded: no kernelpagesize_kB,
-        // natively and through the sanitizer.
-        let native_discard = native_main_stack_output(&guest, &["discard"]);
-        assert_eq!(native_discard, "discard ok\nstack numa default stack\n");
+        // Every page of the initial stack discarded: still no numa_maps.
+        // (No native comparison: the host kernel has the file, so its run
+        // reports `numa present` by design.)
         let (_, discard, _) = address_space_listing(backend, "discard", true);
-        assert_eq!(discard, native_discard);
+        assert_eq!(discard, "discard ok\nnuma absent\n");
     }
 }
 
@@ -53048,22 +53049,19 @@ fn a_vfork_child_waiting_for_another_thread_completes_at_bitwise_parity() {
     }
 }
 
-/// get_mempolicy answers the questions libnuma asks as a Linux machine with one
-/// NUMA node does (https://github.com/rrnewton/hermit/issues/4214):
-/// `MPOL_F_MEMS_ALLOWED` fills the node mask with node 0 alone, as
-/// `/proc/<pid>/status` reports `Mems_allowed_list: 0`, where Detcore left the
-/// guest's buffer as it was; the default policy's mask is empty; flag
-/// combinations Linux refuses, including a flag above bit 31, are EINVAL; a
-/// `maxnode` of 1, which is enough for one node, leaves the mask unwritten, as
-/// Linux's `copy_nodes_to_user` does for it; a read-only or unmapped mask is
-/// EFAULT (Claude review of https://github.com/rrnewton/hermit/pull/4249); and
-/// `MPOL_F_NODE` alone answers node 0, as Linux does after
-/// `set_mempolicy(MPOL_INTERLEAVE)` (Detcore records no policy, so it answers
-/// so under the default policy too, where Linux says EINVAL). On this two-node
-/// host natively the allowed mask reads 0x3 and a `maxnode` of 1 is EINVAL,
-/// which is the host showing through.
+/// Every memory-policy syscall answers ENOSYS, as on the kernel built
+/// without NUMA that Hermit presents
+/// (https://github.com/rrnewton/hermit/issues/5269): get_mempolicy in
+/// every form libnuma asks it — including the flag combinations and bad
+/// buffers a NUMA kernel would answer EINVAL or EFAULT, which the stub
+/// never reaches — and set_mempolicy, mbind, migrate_pages, move_pages
+/// (leaving its status buffer untouched) and set_mempolicy_home_node.
+/// On this multi-node host natively they succeed or fail on their
+/// arguments, which is the host showing through; the one-node emulation
+/// this guest was written for
+/// (https://github.com/rrnewton/hermit/issues/4214) is gone.
 #[test]
-fn get_mempolicy_answers_as_a_one_node_machine() {
+fn memory_policy_syscalls_answer_enosys_as_without_numa() {
     let guest = futex_c_guest(&GET_MEMPOLICY_ONE_NODE_GUEST, "get_mempolicy_one_node")
         .to_str()
         .unwrap()
@@ -53097,20 +53095,25 @@ fn get_mempolicy_answers_as_a_one_node_machine() {
     );
     assert_eq!(
         stdout,
-        "mems_allowed: rc=0 policy=0 mask=0x1\n\
-         default policy: rc=0 policy=0 mask=0\n\
-         mems_allowed with node: Invalid argument\n\
-         node without addr: rc=0 policy=0 mask=0xffffffffffffffff\n\
-         addr without flag: Invalid argument\n\
-         unknown flag: Invalid argument\n\
-         maxnode 0: Invalid argument\n\
-         maxnode 1: rc=0 policy=0 mask=0xffffffffffffffff\n\
-         node of addr: rc=0 policy=0 mask=0xffffffffffffffff\n\
-         flag above bit 31: Invalid argument\n\
-         read-only mask: Bad address\n\
-         unmapped mask: Bad address\n\
-         set interleave: rc=0\n\
-         interleave node: rc=0 policy=0 mask=0xffffffffffffffff\n",
+        "mems_allowed: Function not implemented\n\
+         default policy: Function not implemented\n\
+         mems_allowed with node: Function not implemented\n\
+         node without addr: Function not implemented\n\
+         addr without flag: Function not implemented\n\
+         unknown flag: Function not implemented\n\
+         maxnode 0: Function not implemented\n\
+         maxnode 1: Function not implemented\n\
+         node of addr: Function not implemented\n\
+         flag above bit 31: Function not implemented\n\
+         read-only mask: Function not implemented\n\
+         unmapped mask: Function not implemented\n\
+         set interleave: Function not implemented\n\
+         interleave node: Function not implemented\n\
+         mbind: Function not implemented\n\
+         migrate_pages: Function not implemented\n\
+         move_pages: Function not implemented\n\
+         move_pages status untouched: 1\n\
+         set_mempolicy_home_node: Function not implemented\n",
         "stderr:\n{log}"
     );
     let report: serde_json::Value =
@@ -73915,7 +73918,6 @@ fn run_kvm_the_callers_own_proc_directories_answer_as_linux() {
         "cmdline/r",
         "stat/r",
         "statm/r",
-        "numa_maps/r",
         "mounts/r",
         "mountinfo/r",
         "smaps/r",

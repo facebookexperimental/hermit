@@ -2467,7 +2467,7 @@ impl DetFd {
         })
     }
 
-    /// Which of a process's `smaps`, `smaps_rollup` and `numa_maps` this
+    /// Which of a process's `smaps` and `smaps_rollup` this
     /// descriptor is, where Detcore opened it as rendered and renders its
     /// snapshot from the backend's memory map
     /// (`Detcore::render_address_space_file`).

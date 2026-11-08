@@ -22,7 +22,7 @@ populate_fixture() {
     printf '0 0 0 0 0 0 0\n' >"$root/proc/self/statm"
     printf 'rchar: 0\nwchar: 0\nsyscr: 0\nsyscw: 0\nread_bytes: 0\nwrite_bytes: 0\ncancelled_write_bytes: 0\n' >"$root/proc/self/io"
     printf '1 0 0:1 /tmpvol/.hermit / rw - tmpfs tmpfs rw\n' >"$root/proc/self/mountinfo"
-    printf '400000 default file=/guest kernelpagesize_kB=4\n' >"$root/proc/self/numa_maps"
+    # No numa_maps: the kernel Hermit presents is built without NUMA.
     printf 'AVX512_elapsed_ms:\t0\n' >"$root/proc/self/arch_status"
     printf 'cpu 0 0 0\nintr 0\nctxt 0\nprocesses 0\nprocs_running 0\nprocs_blocked 0\nsoftirq 0\nbtime 0\n' >"$root/proc/stat"
     printf 'nr_free_pages 0\n' >"$root/proc/vmstat"
@@ -106,6 +106,18 @@ self_test() {
     fi
     [[ $output == *'self-arch-status retained positive AVX-512 elapsed time'* ]] || {
         printf 'procfs-sanitized-paths self-test got the wrong arch_status failure: %s\n' "$output" >&2
+        return 1
+    }
+
+    # A numa_maps that exists is refused: no kernel without NUMA has one.
+    populate_fixture "$work/root"
+    printf '400000 default file=/guest kernelpagesize_kB=4\n' >"$work/root/proc/self/numa_maps"
+    if output=$("$work/probe" --fixture-root "$work/root" 2>&1); then
+        echo 'procfs-sanitized-paths self-test accepted an existing numa_maps' >&2
+        return 1
+    fi
+    [[ $output == *'self-numa-maps exists, but a kernel without NUMA has none'* ]] || {
+        printf 'procfs-sanitized-paths self-test got the wrong numa_maps failure: %s\n' "$output" >&2
         return 1
     }
 

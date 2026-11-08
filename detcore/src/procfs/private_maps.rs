@@ -666,17 +666,17 @@ mod tests {
     }
 
     #[test]
-    fn private_projection_binds_exact_maps_smaps_and_coherent_numa_leaves() {
+    fn private_projection_binds_exact_maps_and_smaps_leaves() {
         use crate::procfs::ProcfsFile;
-        for (leaf, format) in [
-            ("maps", Format::Maps),
-            ("smaps", Format::Smaps),
-            ("numa_maps", Format::NumaMaps),
-        ] {
+        for (leaf, format) in [("maps", Format::Maps), ("smaps", Format::Smaps)] {
             let path = format!("/proc/self/{leaf}");
             let file = ProcfsFile::from_path(std::path::Path::new(&path)).unwrap();
             assert_eq!(file.private_mapping_format(), Some(format));
         }
+        // No NUMA: `numa_maps` names no file, so nothing binds it to the
+        // coherent-capture projection below, which stays for the capture
+        // protocol's own tests.
+        assert!(ProcfsFile::from_path(std::path::Path::new("/proc/self/numa_maps")).is_none());
         {
             let path = std::path::Path::new("/proc/self/smaps_rollup");
             let file = ProcfsFile::from_path(path).unwrap();

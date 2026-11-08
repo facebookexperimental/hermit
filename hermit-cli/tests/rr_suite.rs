@@ -419,7 +419,7 @@ rr_test!(rr_munmap_segv, "munmap_segv", 0, &[]);
 rr_test!(rr_netlink_mmap_disable, "netlink_mmap_disable", 0, &[]);
 rr_test!(rr_no_mask_timeslice, "no_mask_timeslice", 0, &[]);
 rr_test!(
-    #[ignore = "gap: mbind and set_mempolicy succeed, but get_mempolicy reports MPOL_DEFAULT; https://github.com/rrnewton/hermit/issues/4257"]
+    #[ignore = "gap: Hermit presents a kernel without NUMA, so every memory-policy syscall answers ENOSYS where this test drives a NUMA kernel's policy round-trip; https://github.com/rrnewton/hermit/issues/5269"]
     rr_numa,
     "numa",
     0,

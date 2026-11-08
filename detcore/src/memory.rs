@@ -93,15 +93,15 @@ pub(crate) struct MemoryMetadata {
     #[serde(default)]
     pub(crate) mapping_flags_changed: bool,
     /// Whether a call that discards a mapping's pages reached the backend for
-    /// a range overlapping a mapping the backend's memory map lists, in a
-    /// session that renders a process's `numa_maps` from it: `madvise(2)`
-    /// with `MADV_DONTNEED`, `MADV_DONTNEED_LOCKED` or `MADV_GUARD_INSTALL`,
-    /// and `MADV_WIPEONFORK`, which leaves the copy a later fork makes with
-    /// none. Whether that mapping still holds a resident page is then not a
-    /// fact, and Linux's `numa_maps` prints `kernelpagesize_kB` only for a
-    /// mapping that holds one (`show_numa_map`), so a rendered `numa_maps` is
-    /// refused (`procfs::memory_map::smaps`). A fork copies it; an exec
-    /// replaces the address space.
+    /// a range overlapping a mapping the backend's memory map lists:
+    /// `madvise(2)` with `MADV_DONTNEED`, `MADV_DONTNEED_LOCKED` or
+    /// `MADV_GUARD_INSTALL`, and `MADV_WIPEONFORK`, which leaves the copy a
+    /// later fork makes with none. Whether that mapping still holds a
+    /// resident page is then not a fact the memory map carries; it decided
+    /// `kernelpagesize_kB` in the rendered `numa_maps` Detcore no longer
+    /// serves, and the record is kept as an address-space fact (it still
+    /// counts against native-exec freshness below). A fork copies it; an
+    /// exec replaces the address space.
     #[serde(default)]
     pub(crate) pages_discarded: bool,
     /// aarch64: the file-backed ranges `crate::store_exclusive` has seen in

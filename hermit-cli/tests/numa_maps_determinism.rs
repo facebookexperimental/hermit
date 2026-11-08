@@ -6,7 +6,16 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! End-to-end coverage for host observations in /proc/self/numa_maps.
+//! End-to-end coverage for the absent `/proc/self/numa_maps`.
+//!
+//! Hermit presents a kernel built without NUMA
+//! (https://github.com/rrnewton/hermit/issues/5269): Linux registers
+//! `numa_maps` in a task's directory only under `CONFIG_NUMA`
+//! (fs/proc/base.c), so the file does not exist at any `--proc` level —
+//! every lookup is ENOENT and no listing names it, whatever the host's
+//! procfs holds. (This file used to pin the sanitized contents of the
+//! file; its name is kept because the validation selections name the
+//! binary.)
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
@@ -83,7 +92,9 @@ fn assert_l2(case: &ProgramCase) {
     );
 }
 
-fn read_numa_maps() -> String {
+/// One plain run: `cat /proc/self/numa_maps` fails, with ENOENT's text,
+/// at the standard level (the level that used to list the file).
+fn assert_cat_fails_with_enoent() {
     let mut command = Command::new(hermit_test::hermit_binary());
     command.args([
         "--log",
@@ -102,58 +113,55 @@ fn read_numa_maps() -> String {
     let rendered = format!("{command:?}");
     let output = hermit_test::hermit_output(&rendered, &mut command);
     assert!(
-        output.status.success(),
-        "numa_maps read failed ({rendered})\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        !output.status.success(),
+        "numa_maps read succeeded ({rendered})\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
-    String::from_utf8(output.stdout).expect("numa_maps should be UTF-8")
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("No such file or directory"),
+        "numa_maps read did not fail with ENOENT ({rendered}):\n{combined}"
+    );
 }
 
 #[test]
 fn numa_maps_consumers_are_deterministic_under_strict_verify() {
     let _guard = hermit_run_lock();
-    let numa_maps = read_numa_maps();
-    assert!(!numa_maps.is_empty(), "numa_maps should contain mappings");
-    const HOST_PAGE_COUNTERS: &[&str] = &[
-        "active=",
-        "anon=",
-        "dirty=",
-        "mapped=",
-        "mapmax=",
-        "swapcache=",
-        "writeback=",
-    ];
-    assert!(
-        !numa_maps.split_whitespace().any(|field| {
-            HOST_PAGE_COUNTERS
-                .iter()
-                .any(|prefix| field.starts_with(prefix))
-                || field.split_once('=').is_some_and(|(name, _)| {
-                    name.strip_prefix('N').is_some_and(|node| {
-                        !node.is_empty() && node.bytes().all(|byte| byte.is_ascii_digit())
-                    })
-                })
-        }),
-        "numa_maps retained host observation fields:\n{numa_maps}"
-    );
+    assert_cat_fails_with_enoent();
 
     let cases = [
         ProgramCase {
-            name: "cat numa maps",
-            candidates: &["/bin/cat", "/usr/bin/cat"],
-            args: &["/proc/self/numa_maps"],
+            name: "numa_maps absent by every spelling",
+            candidates: &["/bin/sh", "/usr/bin/sh"],
+            args: &[
+                "-c",
+                "test ! -e /proc/self/numa_maps && test ! -e /proc/thread-self/numa_maps && \
+                 test ! -e /proc/$$/numa_maps && test -e /proc/self/smaps",
+            ],
         },
         ProgramCase {
-            name: "awk numa maps",
-            candidates: &["/usr/bin/awk", "/bin/awk"],
-            args: &["{ print }", "/proc/self/numa_maps"],
+            name: "process listing omits numa_maps",
+            candidates: &["/bin/sh", "/usr/bin/sh"],
+            args: &[
+                "-c",
+                "! ls /proc/self | grep -qx numa_maps && ls /proc/self | grep -qx smaps && \
+                 ls /proc/self | grep -qx smaps_rollup",
+            ],
         },
         ProgramCase {
-            name: "sed numa maps",
-            candidates: &["/bin/sed", "/usr/bin/sed"],
-            args: &["-n", "p", "/proc/self/numa_maps"],
+            name: "awk and sed find no numa_maps",
+            candidates: &["/bin/sh", "/usr/bin/sh"],
+            args: &[
+                "-c",
+                "if awk '{ print }' /proc/self/numa_maps 2>/dev/null; then exit 1; fi; \
+                 if sed -n p /proc/self/numa_maps 2>/dev/null; then exit 1; fi",
+            ],
         },
     ];
 

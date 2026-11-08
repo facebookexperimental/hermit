@@ -37,7 +37,7 @@
 //! the backends that report them.
 //!
 //! The page is left out of the file this module renders, and nowhere else: it
-//! still shows in `smaps` and `numa_maps`, in another process's `maps`, and in
+//! still shows in `smaps`, in another process's `maps`, and in
 //! a `maps` that is read from the kernel's file (by another process that
 //! inherited the descriptor, or after an `exec`). Nor is the page's effect on
 //! the rest of the map hidden: the kernel asks for it one page below the top

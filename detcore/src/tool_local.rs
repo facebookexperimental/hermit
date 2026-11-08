@@ -8499,6 +8499,10 @@ impl<T> ThreadState<T> {
     }
 
     /// Whether such a call reached the backend for the address space.
+    /// Test-only now: its last production reader was the rendered
+    /// `numa_maps`, which the no-NUMA platform no longer serves; the
+    /// record itself still counts against native-exec freshness.
+    #[cfg(test)]
     pub(crate) fn pages_may_have_been_discarded(&self) -> bool {
         self.memory_metadata
             .lock()

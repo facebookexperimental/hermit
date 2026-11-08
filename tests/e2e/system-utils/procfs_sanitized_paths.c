@@ -400,64 +400,24 @@ static bool check_mountinfo(const char* root) {
       failf("self-mountinfo did not expose the normalized Hermit root");
 }
 
-static bool is_numa_counter(const char* field) {
-  const char* equal = strchr(field, '=');
-  if (equal == NULL) {
-    return false;
+/* Hermit presents a kernel built without NUMA, which registers no
+ * numa_maps in any task's directory: opening it is ENOENT, at every
+ * --proc level (https://github.com/rrnewton/hermit/issues/5269). */
+static bool check_numa_maps(const char* root) {
+  char path[4096];
+  if (!rooted_path(path, sizeof(path), root, "/proc/self/numa_maps")) {
+    return failf("self-numa-maps path was too long");
   }
-  size_t length = (size_t)(equal - field);
-  static const char* names[] = {
-      "active", "anon", "dirty", "mapped", "mapmax", "swapcache", "writeback"};
-  for (size_t index = 0; index < sizeof(names) / sizeof(names[0]); ++index) {
-    if (strlen(names[index]) == length &&
-        strncmp(field, names[index], length) == 0) {
-      return true;
-    }
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd >= 0) {
+    close(fd);
+    return failf("self-numa-maps exists, but a kernel without NUMA has none");
   }
-  if (length < 2 || field[0] != 'N') {
-    return false;
-  }
-  for (size_t index = 1; index < length; ++index) {
-    if (!isdigit((unsigned char)field[index])) {
-      return false;
-    }
+  if (errno != ENOENT) {
+    return failf(
+        "self-numa-maps open failed with %s, expected ENOENT", strerror(errno));
   }
   return true;
-}
-
-static bool check_numa_maps(const char* root) {
-  size_t length = 0;
-  char* contents =
-      read_required(root, "self-numa-maps", "/proc/self/numa_maps", &length);
-  if (contents == NULL) {
-    return false;
-  }
-  size_t rows = 0;
-  char* save_line = NULL;
-  for (char* line = strtok_r(contents, "\n", &save_line); line != NULL;
-       line = strtok_r(NULL, "\n", &save_line)) {
-    char* save_field = NULL;
-    char* field = strtok_r(line, " ", &save_field);
-    if (field == NULL) {
-      free(contents);
-      return failf("self-numa-maps contained an empty row");
-    }
-    char* end = NULL;
-    (void)strtoull(field, &end, 16);
-    if (end == field || *end != '\0') {
-      free(contents);
-      return failf("self-numa-maps contained a malformed mapping address");
-    }
-    while ((field = strtok_r(NULL, " ", &save_field)) != NULL) {
-      if (is_numa_counter(field)) {
-        free(contents);
-        return failf("self-numa-maps retained host page accounting");
-      }
-    }
-    ++rows;
-  }
-  free(contents);
-  return rows != 0 || failf("self-numa-maps contained no mapping rows");
 }
 
 static bool check_arch_status(const char* root) {

@@ -8202,7 +8202,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(rendered)
     }
 
-    /// The text of a process's `smaps`, `smaps_rollup` or `numa_maps` that
+    /// The text of a process's `smaps` or `smaps_rollup` that
     /// Detcore opened as rendered (`procfs::RenderedFiles::address_space`,
     /// package K slice N4 of <https://github.com/rrnewton/hermit/issues/4213>)
     /// at a read that takes its snapshot: the address space its open bound
@@ -8214,7 +8214,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// `show_smaps_rollup`): ESRCH once it is reaped, whichever task holds
     /// its number by then. It then reads the memory map the open took: none
     /// for a task that held none at the open (a leader that exited while its
-    /// other threads run on), which `smaps` and `numa_maps` read as nothing
+    /// other threads run on), which `smaps` reads as nothing
     /// and `smaps_rollup` answers with ESRCH. Detcore renders the memory map
     /// the backend gives the reader, so it renders the bound address space
     /// only while the reader holds it, and a task of another process binds
@@ -8303,9 +8303,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Err(refusal) => Err(refusal),
             },
             AddressSpaceFile::SmapsRollup => smaps::render_smaps_rollup(&map),
-            AddressSpaceFile::NumaMaps => {
-                smaps::render_numa_maps(&map, guest.thread_state().pages_may_have_been_discarded())
-            }
         };
         match rendered {
             Ok(rendered) => {
@@ -8432,7 +8429,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    /// Refuse a read of a rendered `smaps`, `smaps_rollup` or `numa_maps` by
+    /// Refuse a read of a rendered `smaps` or `smaps_rollup` by
     /// name (`reason`) through the unsupported-operation policy, as another
     /// process's procfs files are refused (`other_process_procfs`): the reason
     /// goes to the log and, where the run ends, to stderr, which `--log=off`
@@ -8565,7 +8562,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Capture a file that lists the address space (`maps`, `smaps`,
-    /// `numa_maps`, `smaps_rollup`) through the guest stack scratch. A
+    /// `smaps_rollup`) through the guest stack scratch. A
     /// capture mapping would be listed in the snapshot, or merged into a
     /// neighbouring row, and then be unmapped before the guest sees it. The
     /// stack scratch changes no mapping; its original bytes are put back, so
@@ -9413,7 +9410,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                             ))
                         })?
                 } else if let Some(file) = address_space {
-                    // A process's `smaps`, `smaps_rollup` or `numa_maps` Detcore
+                    // A process's `smaps` or `smaps_rollup` Detcore
                     // renders: the address space its open bound, from the
                     // backend's memory map (package K slice N4).
                     Box::pin(self.render_address_space_file(guest, call.fd(), file)).await?

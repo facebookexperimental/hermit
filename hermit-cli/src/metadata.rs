@@ -2213,6 +2213,17 @@ mod tests {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x147)));
     }
 
+    /// A recording older than 0x19e was made when the memory-policy
+    /// syscalls answered as a one-node machine, the standard /proc level
+    /// listed numa_maps, and the sysfs node files read as one node's;
+    /// Detcore now presents a kernel without NUMA
+    /// (https://github.com/rrnewton/hermit/issues/5269).
+    #[test]
+    fn record_version_rejects_streams_from_before_the_no_numa_platform() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x19d)));
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+    }
+
     /// A recording older than 0x149 was made when /proc/cpuinfo showed the
     /// host's CPU while CPUID showed the virtual one
     /// (https://github.com/rrnewton/hermit/issues/4161).

@@ -6,15 +6,15 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! A process's `smaps`, `smaps_rollup` and `numa_maps` rendered from the
-//! backend's memory map (`reverie::Guest::memory_map`), where Detcore renders
-//! them (`procfs::RenderedFiles::address_space`: where the guest's procfs is
-//! not the kernel's, KVM). Each is the text Linux prints for the listed
-//! mappings (`show_smap`, `__show_smap`, `show_smaps_rollup` and
-//! `show_numa_map` in `fs/proc/task_mmu.c`, v6.17), which the sanitizer that
-//! serves the kernel's file of the same name on the other backends then
-//! normalizes (`procfs::sanitize_smaps`, `sanitize_smaps_rollup`,
-//! `sanitize_numa_maps`). So for every mapping it lists, the guest reads the
+//! A process's `smaps` and `smaps_rollup` rendered from the backend's
+//! memory map (`reverie::Guest::memory_map`), where Detcore renders them
+//! (`procfs::RenderedFiles::address_space`: where the guest's procfs is not
+//! the kernel's, KVM). Each is the text Linux prints for the listed mappings
+//! (`show_smap`, `__show_smap` and `show_smaps_rollup` in
+//! `fs/proc/task_mmu.c`, v6.17), which the sanitizer that serves the
+//! kernel's file of the same name on the other backends then normalizes
+//! (`procfs::sanitize_smaps`, `sanitize_smaps_rollup`). So for every mapping
+//! it lists, the guest reads the
 //! bytes the sanitizer gives the kernel's file for that mapping on ptrace,
 //! but for `ProtectionKey`, which follows the kernel serving the process
 //! (below).
@@ -76,29 +76,6 @@
 //!   the memory map does not list changes nothing the file shows. Any other mapping's flags depend on how it was made
 //!   (`MAP_GROWSDOWN`, `MAP_NORESERVE`, the file's open mode and mount, the
 //!   history of VM_ACCOUNT), which the memory map does not say, so `smaps`
-//!   refuses any mapping but the initial stack.
-//!
-//! `numa_maps` prints, for each mapping:
-//!
-//! - its policy: `default`. Detcore answers every memory-policy call itself,
-//!   for one virtual NUMA node, and records no policy (`mbind` and
-//!   `set_mempolicy` change nothing; `get_mempolicy` answers `MPOL_DEFAULT`),
-//!   so the policy Linux prints, the mapping's or else the task's
-//!   (`__get_vma_policy`, `get_task_policy`), is the default, which
-//!   `mpol_to_str` prints as `default`;
-//! - its name: `stack` for the initial stack;
-//! - its page counts (`anon=`, `dirty=`, ..., `N<node>=`), which the sanitizer
-//!   drops, rendered as none;
-//! - `kernelpagesize_kB=4`, which Linux prints only for a mapping that holds
-//!   at least one resident page (`if (!md->pages) goto out`). The initial
-//!   stack does from exec on: its top page holds the arguments, the
-//!   environment and the auxiliary vector exec wrote. Until advice that
-//!   discards pages reaches it (`MADV_DONTNEED`, `MADV_DONTNEED_LOCKED`,
-//!   `MADV_GUARD_INSTALL`, or `MADV_WIPEONFORK` for a later fork's copy:
-//!   `MemoryMetadata::pages_discarded`): a thread running on another stack can
-//!   discard all of it, and then nothing says whether a page came back, so
-//!   `numa_maps` is refused. Whether any other mapping holds a page is the
-//!   host's residency, which is no fact Detcore has, so `numa_maps` too
 //!   refuses any mapping but the initial stack.
 //!
 //! `smaps_rollup` prints one header for the whole address space, from its
@@ -535,47 +512,6 @@ pub(crate) fn render_smaps_rollup(map: &MemoryMap) -> Result<Vec<u8>, Refusal> {
     Ok(out)
 }
 
-/// The text of a process's `numa_maps` for `map`, as Linux prints it
-/// (`show_numa_map`, the module's docs), or the refusal that names why
-/// Detcore cannot give a row: in an address space where advice that discards
-/// pages reached a listed mapping (`pages_discarded`,
-/// `MemoryMetadata::pages_discarded`), whether it still holds a resident
-/// page, which decides `kernelpagesize_kB`, is not a fact.
-pub(crate) fn render_numa_maps(map: &MemoryMap, pages_discarded: bool) -> Result<Vec<u8>, Refusal> {
-    refuse_empty_incomplete(map, "numa_maps")?;
-    let mut out = Vec::new();
-    for mapping in &map.mappings {
-        // The gate area has no memory map of its own: no row (`if (!mm)`).
-        if is_gate_area(mapping) {
-            continue;
-        }
-        if !matches!(mapping.backing, MappingBacking::Stack) {
-            return Err(format!(
-                "Linux's numa_maps says of each mapping whether it holds a resident page, \
-                 and for {} that is the host's residency, not in the backend's memory map",
-                named(mapping)
-            ));
-        }
-        if pages_discarded {
-            return Err(format!(
-                "Linux's numa_maps says of each mapping whether it holds a resident page, and \
-                 madvise advice that discards pages reached the backend for {}, so whether it \
-                 still holds one is not a fact",
-                named(mapping)
-            ));
-        }
-        out.extend_from_slice(
-            format!(
-                "{:08x} default stack kernelpagesize_kB={}\n",
-                mapping.start,
-                PAGE_SIZE >> 10
-            )
-            .as_bytes(),
-        );
-    }
-    Ok(out)
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -866,7 +802,6 @@ mod tests {
         .unwrap();
         let refusal = render_smaps(&split, &HOST).unwrap_err();
         assert!(refusal.contains("7fffff7f0000-7fffff800000"), "{refusal}");
-        assert!(render_numa_maps(&split, false).is_err());
         let lone = MemoryMap::new(
             vec![stack(0x7fff_ff80_0000, 0x7fff_ffff_f000, read_write())],
             false,
@@ -899,38 +834,8 @@ mod tests {
         // is the empty file of a task without an address space.
         let none = MemoryMap::new(Vec::new(), false).unwrap();
         assert!(render_smaps(&none, &HOST).is_err());
-        assert!(render_numa_maps(&none, false).is_err());
         let empty = MemoryMap::new(Vec::new(), true).unwrap();
         assert_eq!(render_smaps(&empty, &HOST).unwrap(), b"");
-        assert_eq!(render_numa_maps(&empty, false).unwrap(), b"");
-    }
-
-    /// The stack's row is Linux's, through the sanitizer too; once advice
-    /// that discards pages reached the stack, whether it holds one, which
-    /// decides `kernelpagesize_kB`, is not a fact, and the file is refused.
-    #[test]
-    fn the_stack_numa_maps_row_is_linuxs() {
-        let map = MemoryMap::new(
-            vec![stack(0x7ffc_ec80_f000, 0x7ffc_ec83_3000, read_write())],
-            false,
-        )
-        .unwrap();
-        let rendered = render_numa_maps(&map, false).unwrap();
-        assert_eq!(
-            rendered,
-            b"7ffcec80f000 default stack kernelpagesize_kB=4\n"
-        );
-        let linux =
-            b"7ffcec80f000 default stack anon=6 dirty=6 active=2 N0=6 kernelpagesize_kB=4\n";
-        assert_eq!(
-            crate::procfs::sanitize_numa_maps(&rendered),
-            crate::procfs::sanitize_numa_maps(linux)
-        );
-        let refusal = render_numa_maps(&map, true).unwrap_err();
-        assert!(
-            refusal.contains("discards pages") && refusal.contains("[stack]"),
-            "{refusal}"
-        );
     }
 
     /// A complete map's rollup spans its first mapping to its last but the
@@ -993,10 +898,9 @@ mod tests {
     }
 
     /// This test process's own `[stack]`, as the host kernel prints it in
-    /// `smaps` and `numa_maps`, is what Detcore renders from its `maps` line
-    /// with this host's facts, through the sanitizers: the derived fields
-    /// (`THPeligible`, `ProtectionKey`, `VmFlags`, `kernelpagesize_kB`) are
-    /// the kernel's. Another thread of the process may change its mappings
+    /// `smaps`, is what Detcore renders from its `maps` line with this
+    /// host's facts, through the sanitizer: the derived fields
+    /// (`THPeligible`, `ProtectionKey`, `VmFlags`) are the kernel's. Another thread of the process may change its mappings
     /// while a file is read, so a read that finds no stack is read again.
     #[test]
     fn this_process_stack_renders_as_the_host_kernel_prints_it() {
@@ -1027,7 +931,6 @@ mod tests {
             .unwrap()
             .mappings
             .remove(0);
-        let start = fact.start;
         let map = MemoryMap::new(vec![fact], false).unwrap();
         let table = BTreeMap::new();
         assert_eq!(
@@ -1037,19 +940,6 @@ mod tests {
             ))
             .unwrap(),
             String::from_utf8(crate::procfs::sanitize_smaps(kernel.as_bytes(), &table)).unwrap()
-        );
-        let row = std::fs::read_to_string("/proc/self/numa_maps")
-            .unwrap()
-            .lines()
-            .find(|line| line.starts_with(&format!("{start:08x} ")))
-            .map(|line| format!("{line}\n"))
-            .expect("the stack's row");
-        assert_eq!(
-            String::from_utf8(crate::procfs::sanitize_numa_maps(
-                &render_numa_maps(&map, false).unwrap()
-            ))
-            .unwrap(),
-            String::from_utf8(crate::procfs::sanitize_numa_maps(row.as_bytes())).unwrap()
         );
     }
 }

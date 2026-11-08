@@ -161,11 +161,13 @@ const _: () = assert!(TAG_BITS + 2 * PID_BITS + 2 * INCARNATION_BITS == 64);
 /// with index 0) is every fdinfo's ([`fdinfo_inode`]). A tag of 1 or more
 /// puts a per-process number at 2^60 or above, out of the range of a
 /// system-wide rendered file's number (below 2^32) and of every number
-/// Detcore's inode pool mints (counting up from a few thousand). The
-/// fifteenth file, `environ` (package K item 2b slice 2b-3), takes the one
-/// tag left, 0: its number is its task's fields alone, at 2^38 or above (a
-/// task's pid is at least 1), out of both ranges too, and below every other
-/// per-process number.
+/// Detcore's inode pool mints (counting up from a few thousand). A
+/// fifteenth file would take the one tag left, 0: its number would be its
+/// task's fields alone, at 2^38 or above (a task's pid is at least 1), out
+/// of both ranges too, and below every other per-process number.
+/// (`environ` (package K item 2b slice 2b-3) was that fifteenth file
+/// until the no-NUMA policy removed `numa_maps`; it is the fourteenth
+/// now and takes tag 7.)
 fn per_process_tag(index: usize) -> u64 {
     const SECOND_LAYOUT_FILES: usize = 7;
     if index < FIRST_LAYOUT_FILES {
@@ -1214,17 +1216,17 @@ mod tests {
 
     /// The first seven per-process files keep the numbers they had when the
     /// field above the pid was bit 63 and a 3-bit index from 1 (tags 9 to
-    /// 15); the next seven take tags 1 to 7 below them, and `environ` the
-    /// last tag, 0, below fdinfo's 8; and every file of one task has a number
-    /// of its own, at 2^38 or above, and at 2^60 or above for all but
-    /// `environ`.
+    /// 15); the next seven take tags 1 to 7 below them, below fdinfo's 8;
+    /// and every file of one task has a number of its own, at 2^60 or above.
+    /// (`environ` took tag 0 as the fifteenth file until the no-NUMA policy
+    /// removed `numa_maps` ahead of it.)
     #[test]
     fn per_process_files_take_tags_that_keep_the_first_seven_numbers() {
         assert_eq!(
             (0..crate::procfs::ProcfsFile::PER_PROCESS_NAMES.len())
                 .map(per_process_tag)
                 .collect::<Vec<_>>(),
-            [9, 10, 11, 12, 13, 14, 15, 1, 2, 3, 4, 5, 6, 7, 0]
+            [9, 10, 11, 12, 13, 14, 15, 1, 2, 3, 4, 5, 6, 7]
         );
         let task = 3 << (PID_BITS + 2 * INCARNATION_BITS) | 1 << INCARNATION_BITS;
         let inode = |name: &str| {
@@ -1247,9 +1249,10 @@ mod tests {
         assert_eq!(inode("arch_status"), 3 << 60 | task);
         assert_eq!(inode("smaps"), 4 << 60 | task);
         assert_eq!(inode("smaps_rollup"), 5 << 60 | task);
-        assert_eq!(inode("numa_maps"), 6 << 60 | task);
-        assert_eq!(inode("status"), 7 << 60 | task);
-        assert_eq!(inode("environ"), task);
+        // `numa_maps` held tag 6 until the no-NUMA policy removed the file;
+        // the names after it take the next tags in order.
+        assert_eq!(inode("status"), 6 << 60 | task);
+        assert_eq!(inode("environ"), 7 << 60 | task);
         let numbers = crate::procfs::ProcfsFile::PER_PROCESS_NAMES
             .iter()
             .map(|name| inode(name))
