@@ -55,7 +55,7 @@ fn emit_record() {
 const ISOLATED_CASE_ENV: &str = "HERMIT_NATIVE_CONSUMER_COMPLETE_TEST";
 const CASE_COMPLETED: &str = "NATIVE_CONSUMER_CASE_COMPLETED";
 
-fn isolated_cases(name: &str, cases: &[&str], body: impl FnOnce(&str)) {
+fn dispatch_isolated_case(name: &str, cases: &[&str], body: impl FnOnce(&str)) -> bool {
     assert!(
         !cases.is_empty(),
         "isolated consumer cases must not be empty"
@@ -71,17 +71,31 @@ fn isolated_cases(name: &str, cases: &[&str], body: impl FnOnce(&str)) {
                 )
             });
         body(case);
+        return true;
+    }
+    false
+}
+
+fn isolated_command(name: &str, case: &str) -> std::process::Command {
+    let full_name = format!("app::native_exec_consumer::tests::{name}");
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", &full_name, "--nocapture", "--test-threads=1"])
+        .env(ISOLATED_CASE_ENV, format!("{name}:{case}"));
+    command
+}
+
+fn isolated_cases(name: &str, cases: &[&str], body: impl FnOnce(&str)) {
+    if dispatch_isolated_case(name, cases, |case| {
+        body(case);
         eprintln!("{CASE_COMPLETED} {name}:{case}");
+    }) {
         return;
     }
     let full_name = format!("app::native_exec_consumer::tests::{name}");
     for case in cases {
         let key = format!("{name}:{case}");
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &full_name, "--nocapture", "--test-threads=1"])
-            .env(ISOLATED_CASE_ENV, &key)
-            .output()
-            .unwrap();
+        let output = isolated_command(name, case).output().unwrap();
         assert!(
             output.status.success(),
             "{full_name} ({case}): {:?}\n{}\n{}",
@@ -591,12 +605,11 @@ fn model_consumer_complete_refuses_actual_in_flight_request() {
 }
 
 #[test]
-#[ignore = "dh-3qkzd: child exits before connect"]
 fn model_consumer_complete_disconnected_peer_is_terminal() {
     const KEY: &str = "HERMIT_NATIVE_CONSUMER_CLOSED_SOCKET";
-    const NAME: &str =
-        "native_exec_consumer::tests::model_consumer_complete_disconnected_peer_is_terminal";
-    if let Some(path) = std::env::var_os(KEY) {
+    const NAME: &str = "model_consumer_complete_disconnected_peer_is_terminal";
+    if dispatch_isolated_case(NAME, &["closed"], |_| {
+        let path = std::env::var_os(KEY).expect("disconnected child socket path is absent");
         let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
         let mut consumer = modeled_consumer(tid);
         let stream = UnixStream::connect(path).unwrap();
@@ -618,13 +631,14 @@ fn model_consumer_complete_disconnected_peer_is_terminal() {
         let _ = consumer.complete(&rpc, consumer.admitted);
         // A returned result cannot masquerade as the expected real fatal123.
         unsafe { libc::_exit(73) };
+    }) {
+        return;
     }
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("complete.sock");
     let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
     listener.set_nonblocking(true).unwrap();
-    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+    let mut child = isolated_command(NAME, "closed")
         .env(KEY, &path)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
