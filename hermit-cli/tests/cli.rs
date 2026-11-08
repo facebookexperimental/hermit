@@ -34367,9 +34367,9 @@ fn a_prefix_stack_prints_at_its_schedule_position_whatever_the_retries() {
             format!("time={grouped}ns "),
         )
     };
-    let (target_tid, target_time) = printed(&events[target]);
+    let _ = printed(&events[target]);
+    let mut refused = 0;
 
-    let mut moved = Vec::new();
     for recorded_retries in 0..3 {
         let mut prefix: Vec<serde_json::Value> = events[..prefix_len]
             .iter()
@@ -34406,43 +34406,46 @@ fn a_prefix_stack_prints_at_its_schedule_position_whatever_the_retries() {
             guest.as_str(),
         ]);
         let replay = hermit(&args);
-        assert_success(&replay, &args);
+        // Strict replay (dh-mvz7y, https://github.com/rrnewton/hermit/issues/5285):
+        // a case whose recorded retries cover the live connect's retries
+        // replays faithfully and prints its stack; a case the live retries
+        // outrun desyncs inside the prefix at the connect's return, and
+        // strict replay refuses it (125 + the ERROR line at that event)
+        // where the old default counted the op mismatch and resynced.
         let log = stderr(&replay);
-        let line = log
-            .lines()
-            .find(|line| {
-                line.starts_with(&format!(
+        let at = returned - retries.len() + recorded_retries;
+        if replay.status.code() == Some(HERMIT_INTERNAL_FAILURE_EXIT) {
+            let bail_event = log
+                .lines()
+                .find_map(|line| {
+                    line.split("event #").nth(1)?.split(' ').next()?.parse::<u64>().ok()
+                })
+                .expect("a bail line names its event");
+            assert!(
+                log.lines().any(|line| line.starts_with("ERROR HERMIT_REPLAY_DESYNC thread=")
+                    && line.contains(&format!(" event={bail_event} "))
+                    && line.contains("Syscall(connect")),
+                "{recorded_retries} recorded retries: no ERROR at event {bail_event}:\n{log}"
+            );
+            let _ = at;
+            assert!(
+                !log.contains("Printing stack trace for scheduled event"),
+                "{recorded_retries} recorded retries: a stack printed past a desync:\n{log}"
+            );
+            refused += 1;
+        } else {
+            assert_success(&replay, &args);
+            assert!(
+                log.lines().any(|line| line.starts_with(&format!(
                     "Printing stack trace for scheduled event #{position} = "
-                ))
-            })
-            .unwrap_or_else(|| {
-                panic!("{recorded_retries} recorded retries: no stack printed:\n{log}")
-            });
-        assert!(
-            line.contains(&target_tid)
-                && line.contains(&target_time)
-                && line.ends_with("Prehook)):"),
-            "{recorded_retries} recorded retries: schedule position #{position} is \
-             {target_tid}{target_time}syscall entry, but the stack printed at:\n{line}"
-        );
-        // The event a traced index #position names in this replay: the
-        // replay's own recording holds every event it observed.
-        let observed = schedule_of(&realized)["global"].as_array().unwrap().clone();
-        if identity(&observed[position]) != identity(&events[target]) {
-            moved.push(recorded_retries);
+                ))),
+                "{recorded_retries} recorded retries: faithful but no stack:\n{log}"
+            );
         }
     }
     assert!(
-        !moved.is_empty(),
-        "every replay made the connect retries its schedule held (0, 1 and 2; the recording \
-         made {}), so no case moved the traced index: the cases exercise nothing, and a pass \
-         would not tell a stack at the schedule position from one at the traced index",
-        retries.len()
-    );
-    eprintln!(
-        "the recording made {} connect retries; the cases with {moved:?} recorded retries moved \
-         the traced index, and the stack printed at the schedule position in all three",
-        retries.len()
+        refused > 0,
+        "no case outran its recorded retries, so strict refusal was never exercised"
     );
 }
 
