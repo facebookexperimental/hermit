@@ -14,7 +14,15 @@
  *
  * Usage: procfs_system_directories DIR, where DIR is a writable directory for
  * a symbolic link to /proc/sys. Inode numbers are not printed, only whether
- * the listing's agree with stat's. */
+ * the listing's agree with stat's.
+ *
+ * procfs_system_directories --pair A B: the line of each of the two
+ * directories, then whether they are one object, as a bind mount of one on
+ * the other makes them: six CHECK lines and a RESULT line that the KVM cli
+ * test requires to equal Linux's own, run outside Hermit in user and mount
+ * namespaces of its own, as well as ptrace's
+ * (run_kvm_procfs_bind_mounts_are_the_directory_they_show). The exit status
+ * is 1 when a check fails. */
 
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -94,6 +102,10 @@ static int list(DIR *directory, const char *path, ino_t own, char *names, size_t
     return errno ? -1 : 0;
 }
 
+static int compare_names(const void *a, const void *b) {
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
 static void directory_line(const char *path) {
     struct stat st, lst, fst;
     int s = stat(path, &st);
@@ -169,9 +181,87 @@ static void spelling_line(const char *label, const char *path) {
     }
 }
 
+/* The sorted names and types of the directory at `path`, one string, or
+ * NULL when it cannot be read. */
+static char *sorted_names(const char *path) {
+    static char names[16384];
+    DIR *directory = opendir(path);
+    if (!directory) {
+        return NULL;
+    }
+    int agree = 1;
+    int failed = list(directory, path, 0, names, sizeof(names), &agree) < 0;
+    closedir(directory);
+    if (failed) {
+        return NULL;
+    }
+    char *entries[512];
+    size_t count = 0;
+    for (char *name = strtok(names, " "); name; name = strtok(NULL, " ")) {
+        if (count == sizeof(entries) / sizeof(entries[0])) {
+            return NULL;
+        }
+        entries[count++] = name;
+    }
+    qsort(entries, count, sizeof(entries[0]), compare_names);
+    static char sorted[2][16384];
+    static int which;
+    char *out = sorted[which ^= 1];
+    out[0] = '\0';
+    for (size_t i = 0; i < count; i++) {
+        strcat(out, i ? " " : "");
+        strcat(out, entries[i]);
+    }
+    return out;
+}
+
+static int checks, failures;
+
+static void check(const char *label, int ok) {
+    checks++;
+    failures += !ok;
+    printf("CHECK %s %d\n", label, ok);
+}
+
+/* Whether `a` and `b` are one directory: stat, fstat of an open descriptor
+ * and the listing of each agree. */
+static int pair(const char *a, const char *b) {
+    const char *paths[2] = {a, b};
+    struct stat st[2], fst[2];
+    int rc[2], opened[2];
+    for (int i = 0; i < 2; i++) {
+        directory_line(paths[i]);
+        rc[i] = stat(paths[i], &st[i]);
+        int fd = open(paths[i], O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        opened[i] = fd >= 0;
+        char label[16];
+        snprintf(label, sizeof(label), "fstat_%d", i);
+        check(label, fd >= 0 && fstat(fd, &fst[i]) == 0 && rc[i] == 0 &&
+                         fst[i].st_dev == st[i].st_dev && fst[i].st_ino == st[i].st_ino &&
+                         fst[i].st_mode == st[i].st_mode);
+        if (fd >= 0) {
+            close(fd);
+        }
+    }
+    check("both_stat_directory",
+          rc[0] == 0 && rc[1] == 0 && S_ISDIR(st[0].st_mode) && S_ISDIR(st[1].st_mode));
+    check("same_object_stat",
+          rc[0] == 0 && rc[1] == 0 && st[0].st_dev == st[1].st_dev && st[0].st_ino == st[1].st_ino);
+    check("both_open_directory", opened[0] && opened[1]);
+    const char *first = sorted_names(a);
+    const char *second = sorted_names(b);
+    check("same_object_listing", first && second && strcmp(first, second) == 0);
+    printf("RESULT checks=%d failures=%d\n", checks, failures);
+    return failures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 4 && strcmp(argv[1], "--pair") == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        return pair(argv[2], argv[3]);
+    }
     if (argc != 2) {
-        fprintf(stderr, "usage: %s DIR\n", argv[0]);
+        fprintf(stderr, "usage: %s DIR | --pair A B\n", argv[0]);
         return 2;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);

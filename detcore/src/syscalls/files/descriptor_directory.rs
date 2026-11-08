@@ -6058,12 +6058,16 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// refused (ENAMETOOLONG, `getname_flags`) before any lookup, so it is
     /// left to the backend. The rest is decided by the object the lookup
     /// reaches in the guest's mount namespace, which the tool shares, and by
-    /// the kernel's name for it (`rendered_procfs::procfs_directory_reached`),
-    /// never by the spelling, as [`Self::own_link_directory`] answers from
-    /// the descriptor's own identity: a user mount over part of `/proc`
-    /// (`--mount ...,target=/proc/sys`) keeps its own objects, and a spelling
-    /// through a symbolic link to `/proc/sys` reaches the procfs directory it
-    /// names. `links` counts the symbolic links the guest's lookup followed
+    /// the procfs mount it was reached through: that mount's root within
+    /// procfs and the path below its mount point
+    /// (`rendered_procfs::procfs_directory_reached`, by ptrace's
+    /// `procfs_inode::path_within`), never by the spelling, as
+    /// [`Self::own_link_directory`] answers from the descriptor's own
+    /// identity: a user mount over part of `/proc` (`--mount
+    /// ...,target=/proc/sys`) keeps its own objects, a bind mount of
+    /// `/proc/sys/vm` over `/proc/sys/kernel` or onto a directory outside
+    /// `/proc` is `/proc/sys/vm`, and a spelling through a symbolic link to
+    /// `/proc/sys` reaches the procfs directory it names. `links` counts the symbolic links the guest's lookup followed
     /// before it reached `decided` (the descriptor links Detcore replaced,
     /// [`Self::decided_path`], [`Self::readlink_walk`]), so that one
     /// `MAXSYMLINKS` budget covers the whole lookup; an `Err` is the lookup's
@@ -6159,7 +6163,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         Some(match super::rendered_procfs::open_flags_refused(flags) {
             Some(errno) => Err(errno),
-            None => opened,
+            // `do_tmpfile` asks the mount for write access (`mnt_want_write`)
+            // before `vfs_tmpfile` checks the directory's permission
+            // (fs/namei.c): EROFS where the directory was reached through a
+            // read-only mount, a read-only bind of it included.
+            None => opened.and_then(|opened| {
+                let tmpfile = matches!(opened, OpenedDirectory::System(_))
+                    && flags.contains(OFlag::O_TMPFILE);
+                if tmpfile && super::rendered_procfs::on_read_only_mount(&decided) {
+                    Err(Errno::EROFS)
+                } else {
+                    Ok(opened)
+                }
+            }),
         })
     }
 

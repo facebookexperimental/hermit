@@ -64061,6 +64061,145 @@ fn run_kvm_procfs_system_directories_answer_as_on_ptrace() {
     }
 }
 
+/// The CHECK and RESULT lines of tests/c/procfs_system_directories.c's
+/// `--pair` mode, which do not depend on the listing's contents or the
+/// device's number.
+fn pair_checks(output: &str) -> Vec<&str> {
+    output
+        .lines()
+        .filter(|line| line.starts_with("CHECK ") || line.starts_with("RESULT "))
+        .collect()
+}
+
+/// A bind mount is the directory it shows, on KVM as on Linux, because
+/// Detcore names a system-wide procfs directory by the procfs mount it was
+/// reached through (its root within procfs and the path below its mount
+/// point, as ptrace names a procfs file, `procfs_inode::path_within`), not
+/// by the mount point's spelling. tests/c/procfs_system_directories.c
+/// `--pair SOURCE TARGET` checks that the two are one directory (stat and
+/// fstat of each, the same device and inode, and the same listing), for
+/// three shapes: `/proc/sys/vm` bound over `/proc/sys/kernel`,
+/// `/proc/sys/net` bound onto a directory outside `/proc`, and a directory
+/// outside procfs bound over `/proc/tty`. Linux's own answers come from the
+/// guest run outside Hermit with the bind in user and mount namespaces of
+/// its own; each Hermit run has its own too, with the bind read-only, as
+/// `--mount` makes it. Every check line on KVM must equal Linux's, and where
+/// ptrace's also does, KVM's whole output must equal ptrace's. At 16f0f11b
+/// KVM listed the nine entries of `/proc/sys/kernel` and gave it its own
+/// inode under the bind of `/proc/sys/vm` (two checks failed), and refused
+/// the directory outside `/proc` with EACCES (five).
+///
+/// ptrace is not compared for the bind onto a directory outside `/proc`:
+/// its listing filter takes only a descriptor opened by a spelling of a
+/// `/proc` directory (`Detcore::modeled_directory_snapshot`), so it lists the
+/// kernel's whole directory there and its own `/proc/sys/net` filtered,
+/// which Linux's check (`same_object_listing`) refuses.
+#[test]
+fn run_kvm_procfs_bind_mounts_are_the_directory_they_show() {
+    if kvm_unavailable("run_kvm_procfs_bind_mounts_are_the_directory_they_show") {
+        return;
+    }
+    let guest = futex_c_guest(
+        &PROCFS_SYSTEM_DIRECTORIES_GUEST,
+        "procfs_system_directories",
+    )
+    .to_str()
+    .unwrap()
+    .to_owned();
+    let outside_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let foreign_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    fs::create_dir(foreign_directory.path().join("directory")).unwrap();
+    fs::write(foreign_directory.path().join("file"), b"").unwrap();
+    let outside = outside_directory.path().to_str().unwrap();
+    let foreign = foreign_directory.path().to_str().unwrap();
+    let _guard = hermit_run_guard();
+    for (source, target, ptrace_agrees) in [
+        ("/proc/sys/vm", "/proc/sys/kernel", true),
+        ("/proc/sys/net", outside, false),
+        (foreign, "/proc/tty", true),
+    ] {
+        let shape = format!("{source} bound to {target}");
+        let source_c = std::ffi::CString::new(source).unwrap();
+        let target_c = std::ffi::CString::new(target).unwrap();
+        let mut native = Command::new(&guest);
+        native.args(["--pair", source, target]);
+        // SAFETY: the hook makes only raw system calls on memory prepared
+        // before the fork.
+        unsafe {
+            native.pre_exec(move || {
+                let check = |result: libc::c_int| {
+                    if result == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                };
+                check(libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS))?;
+                check(libc::mount(
+                    std::ptr::null(),
+                    c"/".as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_REC | libc::MS_PRIVATE,
+                    std::ptr::null(),
+                ))?;
+                check(libc::mount(
+                    source_c.as_ptr(),
+                    target_c.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND,
+                    std::ptr::null(),
+                ))
+            });
+        }
+        let native = native.output().unwrap();
+        let native_stdout = String::from_utf8_lossy(&native.stdout).into_owned();
+        assert!(
+            native.status.success(),
+            "{shape}: Linux's run: {:?}\n{native_stdout}{}",
+            native.status,
+            String::from_utf8_lossy(&native.stderr)
+        );
+        let linux = pair_checks(&native_stdout);
+        assert_eq!(linux.len(), 7, "{shape}: Linux's run:\n{native_stdout}");
+        assert_eq!(linux.last(), Some(&"RESULT checks=6 failures=0"), "{shape}");
+        let mount = format!("--mount=type=bind,source={source},target={target},readonly");
+        let mut outputs = Vec::new();
+        let backends: &[&str] = if ptrace_agrees {
+            &["--backend=ptrace", "--backend=kvm"]
+        } else {
+            &["--backend=kvm"]
+        };
+        for backend in backends {
+            let args = [
+                *backend,
+                "run",
+                "--strict",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--base-env=minimal",
+                "--proc=standard",
+                mount.as_str(),
+                "--",
+                guest.as_str(),
+                "--pair",
+                source,
+                target,
+            ];
+            let output = hermit(&args);
+            let text = stdout(&output);
+            assert_eq!(
+                pair_checks(&text),
+                linux,
+                "{shape}: {backend} against Linux:\n{text}"
+            );
+            assert_success(&output, &args);
+            outputs.push(text);
+        }
+        if let [ptrace, kvm] = outputs.as_slice() {
+            assert_eq!(kvm, ptrace, "{shape}: KVM against ptrace");
+        }
+    }
+}
+
 /// A yield loop beside a call that only the yielder or an alarm can end
 /// completes without chaos too. `signal`: the worker yields 20000 times and
 /// then signals main's sigsuspend. `alarm`: main's sigsuspend waits for

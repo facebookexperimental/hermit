@@ -198,3 +198,148 @@ fn a_system_directory_lists_the_levels_names() {
     assert!(!kernel.contains(&"pty/4".to_string()), "{kernel:?}");
     assert!(names(ProcLevel::Standard, "/proc/sys/kernel").contains(&"pty/4".to_string()));
 }
+
+/// Set in the child that [`a_bind_mount_is_the_procfs_directory_it_shows`]
+/// runs in its own user and mount namespaces, to the directory bound to
+/// `/proc/sys/net`.
+const BIND_CHILD: &str = "DETCORE_SYSTEM_DIRECTORY_MOUNT_ROOT_CHILD";
+
+/// A lookup reaches the procfs directory a mount shows, named by that
+/// mount's root within procfs, as ptrace names a procfs file
+/// (`procfs_inode::path_within`), never by the mount point's spelling:
+/// `/proc/sys/vm` bound over `/proc/sys/kernel` is `/proc/sys/vm` there,
+/// listed and numbered as `/proc/sys/vm`; `/proc/sys/net` bound onto a
+/// directory outside `/proc` is `/proc/sys/net` there, at the level that
+/// has it; and a directory of another file system bound over `/proc/tty`
+/// is no procfs directory. The test runs again in a child of its own with
+/// the three mounts in new user and mount namespaces, which the child's
+/// lookups and Detcore's share, as they share the guest's on KVM.
+#[test]
+fn a_bind_mount_is_the_procfs_directory_it_shows() {
+    use ProcLevel::*;
+    if let Some(outside) = std::env::var_os(BIND_CHILD) {
+        let outside = outside.into_encoded_bytes();
+        for level in [Minimal, Standard] {
+            assert_eq!(
+                reached(level, b"/proc/sys/kernel", true).as_deref(),
+                Some("/proc/sys/vm")
+            );
+            assert_eq!(
+                reached(level, b"/proc/sys/kernel/", false).as_deref(),
+                Some("/proc/sys/vm")
+            );
+            assert_eq!(
+                reached(level, b"/proc/sys/vm", true).as_deref(),
+                Some("/proc/sys/vm")
+            );
+            assert_eq!(
+                reached(level, b"/proc/sys/kernel/..", true).as_deref(),
+                Some("/proc/sys")
+            );
+            assert_eq!(reached(level, b"/proc/sys/kernel/random", true), None);
+            assert_eq!(reached(level, b"/proc/tty", true), None);
+        }
+        assert_eq!(reached(Minimal, &outside, true), None);
+        assert_eq!(
+            reached(Standard, &outside, true).as_deref(),
+            Some("/proc/sys/net")
+        );
+        let directory = detcore_at(Minimal)
+            .system_directory_reached(
+                &kvm_thread(),
+                Path::new("/proc/sys/kernel"),
+                Path::new("/proc/sys/kernel"),
+                0,
+                true,
+            )
+            .unwrap();
+        let Some(crate::procfs::fd_directory::PlaceholderDirectory::System(directory)) = directory
+        else {
+            panic!("a system directory: {directory:?}");
+        };
+        assert_eq!(
+            Some(directory),
+            SystemDirectory::named(Path::new("/proc/sys/vm"), Minimal)
+        );
+        let (entries, _, _) = detcore_at(Minimal)
+            .system_placeholder_snapshot(&kvm_thread(), &directory)
+            .unwrap();
+        let names: Vec<_> = entries
+            .iter()
+            .map(|entry| String::from_utf8_lossy(&entry.name).into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ".",
+                "..",
+                "max_map_count",
+                "mmap_min_addr",
+                "overcommit_memory"
+            ]
+        );
+        return;
+    }
+    let outside = tempfile::tempdir().unwrap();
+    let outside = crate::util::canonicalize(outside.path()).unwrap();
+    let foreign = tempfile::tempdir().unwrap();
+    let outside_c = std::ffi::CString::new(outside.as_os_str().as_encoded_bytes()).unwrap();
+    let foreign_c = std::ffi::CString::new(foreign.path().as_os_str().as_encoded_bytes()).unwrap();
+    let name = module_path!()
+        .split_once("::")
+        .map_or(module_path!(), |(_, rest)| rest)
+        .to_owned()
+        + "::a_bind_mount_is_the_procfs_directory_it_shows";
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args([name.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+        .env(BIND_CHILD, &outside);
+    // SAFETY: the hook makes only raw system calls on memory prepared before
+    // the fork.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut child, move || {
+            let check = |result: libc::c_int| {
+                if result == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            };
+            let bind = |source: &std::ffi::CStr, target: &std::ffi::CStr| {
+                check(libc::mount(
+                    source.as_ptr(),
+                    target.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND,
+                    std::ptr::null(),
+                ))
+            };
+            check(libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS))?;
+            check(libc::mount(
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                libc::MS_REC | libc::MS_PRIVATE,
+                std::ptr::null(),
+            ))?;
+            bind(c"/proc/sys/vm", c"/proc/sys/kernel")?;
+            bind(c"/proc/sys/net", &outside_c)?;
+            bind(&foreign_c, c"/proc/tty")
+        });
+    }
+    let output = child
+        .output()
+        .expect("the child in its own namespaces must start");
+    assert!(
+        output.status.success(),
+        "the child failed: {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "the child ran the test: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}

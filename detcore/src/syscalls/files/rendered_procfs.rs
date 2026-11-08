@@ -52,7 +52,6 @@
 use std::ffi::OsStr;
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -844,12 +843,14 @@ fn kernel_lookup(path: &[u8]) -> Option<WalkFd> {
 
 /// The name of the procfs directory that a lookup of the absolute path `path`
 /// reaches, without following a final symbolic link, if it reaches one: a
-/// directory on the guest's procfs mount ([`proc_device`]), named as the
-/// kernel names the object it holds open (its `/proc/self/fd` link), with
-/// every symbolic link and `..` on the way resolved. The tool runs in the
-/// guest's mount namespace ([`GuestProcfs`]), so this is the object, and the
-/// name, the guest's own lookup reaches: a user mount over part of `/proc`
-/// reaches its own objects, on another device, and a symbolic link is no
+/// directory on the guest's procfs mount ([`proc_device`]), named by the
+/// mount it was reached through ([`procfs_directory_named`], as ptrace
+/// names a procfs file), with every symbolic link and `..` on the way
+/// resolved. The tool runs in the guest's mount namespace ([`GuestProcfs`]),
+/// so this is the object the guest's own lookup reaches: a user mount over
+/// part of `/proc` reaches its own objects, on another device; a bind mount
+/// of one procfs directory over another, or onto a directory outside
+/// `/proc`, reaches the directory it shows; and a symbolic link is no
 /// directory. `Ok(None)` for any other object, or one the lookup does not
 /// reach.
 ///
@@ -889,7 +890,30 @@ pub(super) fn procfs_directory_reached(
     if stat.st_mode & libc::S_IFMT != libc::S_IFDIR || proc_device() != Some(stat.st_dev) {
         return Ok(None);
     }
-    Ok(kernel_name(fd.0).map(|name| PathBuf::from(std::ffi::OsString::from_vec(name))))
+    Ok(procfs_directory_named(fd.0, &stat))
+}
+
+/// The guest path (`/proc` and the path within procfs) of the procfs
+/// directory the tool's descriptor `fd` holds, whose metadata is `stat`:
+/// named by the mount it was reached through, as ptrace names a procfs file
+/// (`procfs_inode::descriptor_procfs_path`, `path_within`): that mount's
+/// root within procfs joined to the path below its mount point. So a bind
+/// mount of `/proc/sys/vm` over `/proc/sys/kernel`, or onto a directory
+/// outside `/proc`, reaches `/proc/sys/vm`, the object it shows, as Linux's
+/// lookup does, not the directory its mount point is spelled as. The tool
+/// shares the guest's mount namespace and root ([`GuestProcfs`]), so its
+/// own task view (`/proc/thread-self`) reads the guest's mount table. `None`
+/// where the mount table does not place the object, which Detcore then does
+/// not serve.
+fn procfs_directory_named(fd: i32, stat: &libc::stat) -> Option<PathBuf> {
+    let within = crate::procfs_inode::descriptor_procfs_path(
+        Path::new("/proc/thread-self"),
+        fd,
+        stat.st_dev,
+        stat.st_ino,
+    )
+    .ok()??;
+    Some(Path::new("/proc").join(within.strip_prefix("/").unwrap_or(&within)))
 }
 
 /// The kernel's metadata of the procfs object at the absolute path `path`,
@@ -902,6 +926,28 @@ pub(super) fn procfs_directory_reached(
 /// their entries.
 pub(super) fn procfs_object_stat(path: &Path) -> Result<libc::stat, Errno> {
     kernel_stat(path, false)
+}
+
+/// Whether the object at the absolute path `path`, followed, is reached
+/// through a read-only mount (`statfs`'s `ST_RDONLY`) in the guest's mount
+/// namespace, which the tool shares ([`GuestProcfs`]). `false` where the
+/// kernel's `statfs` fails, which leaves the call's other answers to decide.
+pub(super) fn on_read_only_mount(path: &Path) -> bool {
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // The kernel's `struct statfs` on x86_64, as `GuestProcfs::statfs` reads
+    // it: fifteen 64-bit words, of which the eleventh is `f_flags`.
+    let mut words = [0_u64; 15];
+    // SAFETY: the path is NUL-terminated and `words` is writable and as large
+    // as the kernel's structure.
+    let result = unsafe {
+        raw_syscall(
+            libc::SYS_statfs,
+            [path.as_ptr() as u64, words.as_mut_ptr() as u64, 0, 0, 0, 0],
+        )
+    };
+    raw_errno(result).is_ok() && words[10] & libc::ST_RDONLY != 0
 }
 
 /// The kernel's `stat` of the absolute path `path` in the guest's mount
