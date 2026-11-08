@@ -22,7 +22,23 @@
  * test requires to equal Linux's own, run outside Hermit in user and mount
  * namespaces of its own, as well as ptrace's
  * (run_kvm_procfs_bind_mounts_are_the_directory_they_show). The exit status
- * is 1 when a check fails. */
+ * is 1 when a check fails.
+ *
+ * procfs_system_directories --open-flags DIR: eight legacy open and openat
+ * calls of DIR, a directory on a read-only procfs bind: O_PATH with
+ * O_TMPFILE, with and without O_RDWR, opens the directory path-only (Linux
+ * keeps only O_PATH_FLAGS); O_TMPFILE|O_RDWR is EROFS; O_TMPFILE|O_RDONLY
+ * is EINVAL.
+ *
+ * procfs_system_directories --overmount ALIAS SOURCE: ALIAS holds a bind
+ * of the sysctl directory SOURCE, over which another directory was then
+ * mounted; ALIAS must still report the procfs directory's own metadata
+ * (mode 0555, one link, size 0), by stat and fstat, and list its entries
+ * and not the other directory's foreign_marker.
+ *
+ * Both print CHECK lines and a RESULT line and exit 1 when a check fails;
+ * the KVM cli test requires them to pass and to equal ptrace's
+ * (run_kvm_procfs_bind_mount_objects_answer_as_on_ptrace). */
 
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -34,6 +50,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 static const char *DIRECTORIES[] = {
@@ -255,13 +272,106 @@ static int pair(const char *a, const char *b) {
     return failures ? 1 : 0;
 }
 
+/* The eight legacy opens of `--open-flags`. */
+static int open_flags(const char *path) {
+    const struct {
+        const char *name;
+        int flags;
+        int expected_errno;
+    } shapes[] = {
+        {"path_tmpfile", O_PATH | O_TMPFILE, 0},
+        {"path_tmpfile_rdwr", O_PATH | O_TMPFILE | O_RDWR, 0},
+        {"tmpfile_rdwr", O_TMPFILE | O_RDWR, EROFS},
+        {"tmpfile_rdonly", O_TMPFILE | O_RDONLY, EINVAL},
+    };
+    for (int at = 0; at < 2; at++) {
+        for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+            errno = 0;
+            long fd = at ? syscall(SYS_openat, AT_FDCWD, path, shapes[i].flags, 0600)
+                         : syscall(SYS_open, path, shapes[i].flags, 0600);
+            int call_errno = fd < 0 ? errno : 0;
+            int directory = 0, path_only = 0, no_create = 0, read_only = 0;
+            if (fd >= 0) {
+                struct stat st;
+                directory = fstat((int)fd, &st) == 0 && S_ISDIR(st.st_mode);
+                int status = fcntl((int)fd, F_GETFL);
+                if (status >= 0) {
+                    path_only = (status & O_PATH) != 0;
+                    no_create = (status & (O_TMPFILE & ~O_DIRECTORY)) == 0;
+                    read_only = (status & O_ACCMODE) == O_RDONLY;
+                }
+                close((int)fd);
+            }
+            int ok = shapes[i].expected_errno == 0
+                         ? fd >= 0 && directory && path_only && no_create && read_only
+                         : fd < 0 && call_errno == shapes[i].expected_errno;
+            char label[64];
+            snprintf(label, sizeof(label), "%s_%s errno=%s", at ? "openat" : "open",
+                     shapes[i].name, call_errno ? strerrorname_np(call_errno) : "0");
+            check(label, ok);
+        }
+    }
+    printf("RESULT checks=%d failures=%d\n", checks, failures);
+    return failures ? 1 : 0;
+}
+
+/* The ten checks of `--overmount`. */
+static int overmount(const char *alias, const char *source) {
+    struct stat st, fst, covered;
+    struct statfs fs, covered_fs;
+    int a = stat(alias, &st), af = statfs(alias, &fs);
+    int b = stat(source, &covered), bf = statfs(source, &covered_fs);
+    printf("OBJECT %s mode=%o nlink=%lu size=%ld blocks=%ld\n", alias,
+           a == 0 ? st.st_mode & 07777 : 0, a == 0 ? (unsigned long)st.st_nlink : 0,
+           a == 0 ? (long)st.st_size : -1, a == 0 ? (long)st.st_blocks : -1);
+    check("alias_is_procfs_directory", a == 0 && S_ISDIR(st.st_mode) && af == 0 && fs.f_type == 0x9fa0);
+    check("source_is_now_foreign", b == 0 && S_ISDIR(covered.st_mode) && bf == 0 && covered_fs.f_type != 0x9fa0);
+    check("mode_is_the_objects", a == 0 && (st.st_mode & 07777) == 0555);
+    check("links_are_the_objects", a == 0 && st.st_nlink == 1);
+    check("size_is_the_objects", a == 0 && st.st_size == 0);
+    int fd = open(alias, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    check("open_alias", fd >= 0);
+    check("fstat_is_the_objects", fd >= 0 && fstat(fd, &fst) == 0 && S_ISDIR(fst.st_mode) &&
+                                      (fst.st_mode & 07777) == 0555 && fst.st_nlink == 1 &&
+                                      fst.st_size == 0);
+    if (fd >= 0) {
+        close(fd);
+    }
+    DIR *directory = opendir(alias);
+    check("list_alias", directory != NULL);
+    int wanted = 0, marker = 0;
+    if (directory) {
+        struct dirent *entry;
+        while ((entry = readdir(directory)) != NULL) {
+            wanted += strcmp(entry->d_name, "max_map_count") == 0 ||
+                      strcmp(entry->d_name, "mmap_min_addr") == 0 ||
+                      strcmp(entry->d_name, "overcommit_memory") == 0;
+            marker += strcmp(entry->d_name, "foreign_marker") == 0;
+        }
+        closedir(directory);
+    }
+    check("lists_the_objects_entries", wanted == 3);
+    check("does_not_list_the_covering_directory", marker == 0);
+    printf("RESULT checks=%d failures=%d\n", checks, failures);
+    return failures ? 1 : 0;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 3 && strcmp(argv[1], "--open-flags") == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        return open_flags(argv[2]);
+    }
+    if (argc == 4 && strcmp(argv[1], "--overmount") == 0) {
+        setvbuf(stdout, NULL, _IOLBF, 0);
+        return overmount(argv[2], argv[3]);
+    }
     if (argc == 4 && strcmp(argv[1], "--pair") == 0) {
         setvbuf(stdout, NULL, _IOLBF, 0);
         return pair(argv[2], argv[3]);
     }
     if (argc != 2) {
-        fprintf(stderr, "usage: %s DIR | --pair A B\n", argv[0]);
+        fprintf(stderr, "usage: %s DIR | --pair A B | --open-flags DIR | --overmount ALIAS SOURCE\n",
+                argv[0]);
         return 2;
     }
     setvbuf(stdout, NULL, _IOLBF, 0);

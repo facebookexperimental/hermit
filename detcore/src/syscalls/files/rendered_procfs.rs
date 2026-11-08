@@ -863,7 +863,7 @@ fn kernel_lookup(path: &[u8]) -> Option<WalkFd> {
 pub(super) fn procfs_directory_reached(
     path: &Path,
     links: usize,
-) -> Result<Option<PathBuf>, Errno> {
+) -> Result<Option<ReachedDirectory>, Errno> {
     let bytes = path.as_os_str().as_bytes();
     let fd = match walk_counting_links(bytes, links)? {
         None => return Ok(None),
@@ -890,7 +890,59 @@ pub(super) fn procfs_directory_reached(
     if stat.st_mode & libc::S_IFMT != libc::S_IFDIR || proc_device() != Some(stat.st_dev) {
         return Ok(None);
     }
-    Ok(procfs_directory_named(fd.0, &stat))
+    Ok(procfs_directory_named(fd.0, &stat).map(|name| ReachedDirectory { fd, stat, name }))
+}
+
+/// A procfs directory a lookup reached ([`procfs_directory_reached`]): its
+/// name, and the object itself, held open, so that what Detcore reports of
+/// it is read from it rather than from whatever a lookup of its name would
+/// reach now (another mount can cover that name).
+pub(super) struct ReachedDirectory {
+    /// The descriptor the lookup ended with (`O_PATH`).
+    fd: WalkFd,
+    /// The object's metadata, from `fstat` of that descriptor, as the
+    /// guest's user namespace sees it (the tool shares it, [`GuestProcfs`]).
+    stat: libc::stat,
+    /// Its name ([`procfs_directory_named`]).
+    name: PathBuf,
+}
+
+impl ReachedDirectory {
+    /// The directory's guest path by its name (`/proc/sys/vm`).
+    pub(super) fn name(&self) -> &Path {
+        &self.name
+    }
+
+    /// The object's metadata, from its own descriptor.
+    pub(super) fn stat(&self) -> &libc::stat {
+        &self.stat
+    }
+
+    /// Whether the object has no entry `name`: Linux's lookup of the name in
+    /// it (`fstatat` of the descriptor, not following a link) finds none
+    /// (ENOENT).
+    pub(super) fn lacks(&self, name: &[u8]) -> bool {
+        let Ok(name) = std::ffi::CString::new(name) else {
+            return true;
+        };
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: the name is NUL-terminated, the descriptor is open, and
+        // `stat` is writable.
+        let result = unsafe {
+            raw_syscall(
+                libc::SYS_newfstatat,
+                [
+                    self.fd.0 as u64,
+                    name.as_ptr() as u64,
+                    stat.as_mut_ptr() as u64,
+                    (libc::AT_SYMLINK_NOFOLLOW | libc::AT_NO_AUTOMOUNT) as u64,
+                    0,
+                    0,
+                ],
+            )
+        };
+        raw_errno(result) == Err(Errno::ENOENT)
+    }
 }
 
 /// The guest path (`/proc` and the path within procfs) of the procfs
@@ -914,18 +966,6 @@ fn procfs_directory_named(fd: i32, stat: &libc::stat) -> Option<PathBuf> {
     )
     .ok()??;
     Some(Path::new("/proc").join(within.strip_prefix("/").unwrap_or(&within)))
-}
-
-/// The kernel's metadata of the procfs object at the absolute path `path`,
-/// without following a final symbolic link, as the guest's own `lstat` of it
-/// finds it on the kernel's procfs (ptrace): the tool runs in the guest's
-/// mount and user namespaces ([`GuestProcfs`]), so the owner is the one the
-/// guest's user namespace sees (global root unmapped, a network namespace's
-/// sysctl directories its owner's root). For the system-wide directories
-/// Detcore serves where the guest's procfs is not the kernel's (KVM), and
-/// their entries.
-pub(super) fn procfs_object_stat(path: &Path) -> Result<libc::stat, Errno> {
-    kernel_stat(path, false)
 }
 
 /// Whether the object at the absolute path `path`, followed, is reached

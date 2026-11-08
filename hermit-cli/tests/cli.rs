@@ -64094,6 +64094,23 @@ fn pair_checks(output: &str) -> Vec<&str> {
 /// `/proc` directory (`Detcore::modeled_directory_snapshot`), so it lists the
 /// kernel's whole directory there and its own `/proc/sys/net` filtered,
 /// which Linux's check (`same_object_listing`) refuses.
+///
+/// Two more shapes compare KVM with ptrace (their Linux column is the unit
+/// test `a_bind_mount_is_the_procfs_directory_it_shows`), each must pass
+/// every check, and KVM's output must equal ptrace's:
+/// - `--open-flags` on `/proc/sys/vm` bound read-only over
+///   `/proc/sys/kernel`: legacy open and openat with `O_PATH|O_TMPFILE`,
+///   with and without `O_RDWR`, open the directory path-only (Linux keeps
+///   only `O_PATH_FLAGS`), `O_TMPFILE|O_RDWR` is EROFS and
+///   `O_TMPFILE|O_RDONLY` EINVAL (8 checks; at a5025e23 KVM failed the four
+///   `O_PATH` ones with EROFS, and at 16f0f11b two with EACCES);
+/// - `--overmount`: the same bind, with a directory of mode 0700 then
+///   mounted over `/proc/sys/vm`, so that `/proc/sys/kernel` still holds the
+///   procfs directory named `/proc/sys/vm` and that name reaches the other
+///   directory: stat and fstat of `/proc/sys/kernel` report the procfs
+///   directory's mode, links and size, and its listing the directory's
+///   entries (10 checks; at a5025e23 KVM failed three, reporting the
+///   covering directory's mode and size).
 #[test]
 fn run_kvm_procfs_bind_mounts_are_the_directory_they_show() {
     if kvm_unavailable("run_kvm_procfs_bind_mounts_are_the_directory_they_show") {
@@ -64197,6 +64214,47 @@ fn run_kvm_procfs_bind_mounts_are_the_directory_they_show() {
         if let [ptrace, kvm] = outputs.as_slice() {
             assert_eq!(kvm, ptrace, "{shape}: KVM against ptrace");
         }
+    }
+    let covering_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    fs::write(covering_directory.path().join("foreign_marker"), b"").unwrap();
+    fs::set_permissions(covering_directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let bind = "--mount=type=bind,source=/proc/sys/vm,target=/proc/sys/kernel,readonly";
+    let cover = format!(
+        "--mount=type=bind,source={},target=/proc/sys/vm,readonly",
+        covering_directory.path().display()
+    );
+    for (mounts, mode, operands, checks) in [
+        (vec![bind], "--open-flags", vec!["/proc/sys/kernel"], 8),
+        (
+            vec![bind, cover.as_str()],
+            "--overmount",
+            vec!["/proc/sys/kernel", "/proc/sys/vm"],
+            10,
+        ),
+    ] {
+        let mut outputs = Vec::new();
+        for backend in ["--backend=ptrace", "--backend=kvm"] {
+            let mut args = vec![
+                backend,
+                "run",
+                "--strict",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--base-env=minimal",
+                "--proc=standard",
+            ];
+            args.extend(mounts.iter().copied());
+            args.extend(["--", guest.as_str(), mode]);
+            args.extend(operands.iter().copied());
+            let output = hermit(&args);
+            let text = stdout(&output);
+            assert!(
+                text.ends_with(&format!("RESULT checks={checks} failures=0\n")),
+                "{mode} on {backend}:\n{text}"
+            );
+            assert_success(&output, &args);
+            outputs.push(text);
+        }
+        assert_eq!(outputs[1], outputs[0], "{mode}: KVM against ptrace");
     }
 }
 

@@ -154,8 +154,9 @@ pub enum PlaceholderDirectory {
     Task(TaskDirectoryBinding),
     /// One of the system-wide directories below `/proc` that the `--proc`
     /// level table holds (`/proc/sys`, `/proc/sys/kernel/random`, ...), the
-    /// same directory for every task. Last, as [`Self::Task`] is.
-    System(SystemDirectory),
+    /// same directory for every task, with the facts of the object the
+    /// lookup reached ([`SystemPlaceholder`]). Last, as [`Self::Task`] is.
+    System(SystemPlaceholder),
 }
 
 impl PlaceholderDirectory {
@@ -204,7 +205,7 @@ impl PlaceholderDirectory {
                 thread: (binding.kind == TaskDirectoryKind::Thread)
                     .then_some((binding.tid, binding.thread_incarnation)),
             },
-            Self::System(directory) => PlaceholderLockKey::System(*directory),
+            Self::System(placeholder) => PlaceholderLockKey::System(placeholder.directory),
         }
     }
 }
@@ -267,6 +268,64 @@ impl SystemDirectory {
                 .map(|name| name.as_bytes().to_vec())
                 .collect(),
         )
+    }
+}
+
+/// A system-wide directory as a lookup reached it: its name
+/// ([`SystemDirectory`], which [`std::ops::Deref`] gives) and the facts of the
+/// procfs object the lookup held ([`SystemObject`]). The facts are read from
+/// that object, never by looking its name up again: a bind of `/proc/sys/vm`
+/// over `/proc/sys/kernel`, with another directory then mounted over
+/// `/proc/sys/vm`, still reaches the procfs directory at
+/// `/proc/sys/kernel`, whose name is `/proc/sys/vm`, and a lookup of that
+/// name would reach the other directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemPlaceholder {
+    /// Which directory.
+    pub(crate) directory: SystemDirectory,
+    /// What the object reached holds.
+    pub(crate) object: SystemObject,
+}
+
+impl std::ops::Deref for SystemPlaceholder {
+    type Target = SystemDirectory;
+
+    fn deref(&self) -> &SystemDirectory {
+        &self.directory
+    }
+}
+
+/// The facts of the procfs directory object a lookup reached, read from the
+/// object itself (`fstat` and `fstatat` of the descriptor the lookup held):
+/// its mode, links, owner as the guest's user namespace sees it, size and
+/// blocks, and which of the names the level table lists in it, by their
+/// position in `listing::entries`, the object lacks (a name this kernel
+/// does not have). Fixed for the run: a system-wide directory's metadata
+/// and the names its kernel has do not change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemObject {
+    /// `st_mode`.
+    pub(crate) mode: u32,
+    /// `st_nlink`.
+    pub(crate) nlink: u64,
+    /// `st_uid`, in the guest's user namespace.
+    pub(crate) uid: u32,
+    /// `st_gid`, in the guest's user namespace.
+    pub(crate) gid: u32,
+    /// `st_size`.
+    pub(crate) size: i64,
+    /// `st_blocks`.
+    pub(crate) blocks: i64,
+    /// Bit `i`: the `i`-th name `listing::entries` lists for the directory
+    /// at the run's level is not in the object.
+    pub(crate) absent: u64,
+}
+
+impl SystemObject {
+    /// Whether the object lacks the `index`-th name the level table lists in
+    /// it.
+    pub(crate) fn lacks(&self, index: usize) -> bool {
+        index < 64 && self.absent & (1 << index) != 0
     }
 }
 

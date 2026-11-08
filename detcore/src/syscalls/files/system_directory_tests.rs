@@ -13,6 +13,7 @@
 //! The tool's own lookups run on the test host's procfs, as Detcore's run in
 //! the guest's mount namespace.
 
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use detcore_model::config::ProcLevel;
@@ -148,7 +149,13 @@ fn a_system_directory_is_the_object_a_lookup_reaches() {
 #[test]
 fn a_system_directory_lists_the_levels_names() {
     let names = |level: ProcLevel, path: &str| {
-        let directory = SystemDirectory::named(Path::new(path), level).expect("a system directory");
+        let reached = detcore_at(level)
+            .system_directory_reached(&kvm_thread(), Path::new(path), Path::new(path), 0, true)
+            .unwrap();
+        let Some(crate::procfs::fd_directory::PlaceholderDirectory::System(directory)) = reached
+        else {
+            panic!("{path}: a system directory: {reached:?}");
+        };
         let (entries, _, order) = detcore_at(level)
             .system_placeholder_snapshot(&kvm_thread(), &directory)
             .unwrap();
@@ -204,19 +211,69 @@ fn a_system_directory_lists_the_levels_names() {
 /// `/proc/sys/net`.
 const BIND_CHILD: &str = "DETCORE_SYSTEM_DIRECTORY_MOUNT_ROOT_CHILD";
 
+/// Detcore's answer to an open of `path` with `flags` at `level` where it
+/// serves the directory (`Ok(true)`), or the errno it answers with, as the
+/// same open on Linux (`Ok(true)` for a descriptor).
+fn opened(level: ProcLevel, path: &str, flags: nix::fcntl::OFlag) -> Result<bool, Errno> {
+    let path = Path::new(path);
+    match detcore_at(level).system_directory_opened(&kvm_thread(), path, path, flags) {
+        Some(Ok(super::descriptor_directory::OpenedDirectory::System(_))) => Ok(true),
+        Some(Ok(_)) | None => Ok(false),
+        Some(Err(errno)) => Err(errno),
+    }
+}
+
+/// Linux's answer to the legacy `openat` of `path` with `flags`
+/// (`Ok(true)` for a descriptor, which is closed).
+fn linux_opened(path: &str, flags: nix::fcntl::OFlag) -> Result<bool, Errno> {
+    let path = std::ffi::CString::new(path).unwrap();
+    // SAFETY: the path is NUL-terminated; a descriptor returned is closed.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            flags.bits(),
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(Errno::last());
+    }
+    // SAFETY: the descriptor is the call's own.
+    unsafe { libc::close(fd as i32) };
+    Ok(true)
+}
+
 /// A lookup reaches the procfs directory a mount shows, named by that
 /// mount's root within procfs, as ptrace names a procfs file
-/// (`procfs_inode::path_within`), never by the mount point's spelling:
-/// `/proc/sys/vm` bound over `/proc/sys/kernel` is `/proc/sys/vm` there,
-/// listed and numbered as `/proc/sys/vm`; `/proc/sys/net` bound onto a
-/// directory outside `/proc` is `/proc/sys/net` there, at the level that
-/// has it; and a directory of another file system bound over `/proc/tty`
-/// is no procfs directory. The test runs again in a child of its own with
-/// the three mounts in new user and mount namespaces, which the child's
-/// lookups and Detcore's share, as they share the guest's on KVM.
+/// (`procfs_inode::path_within`), never by the mount point's spelling, and
+/// Detcore reports that object's own facts, never those of whatever its
+/// name reaches now:
+/// - `/proc/sys/vm` bound read-only over `/proc/sys/kernel`, and another
+///   directory (mode 0700) then mounted over `/proc/sys/vm`, is
+///   `/proc/sys/vm` at `/proc/sys/kernel`, listed and numbered as
+///   `/proc/sys/vm`, with the mode, links, owner, size and blocks Linux
+///   reports for `/proc/sys/kernel` there, while `/proc/sys/vm` is no
+///   procfs directory any more;
+/// - an open of it answers as Linux's legacy `openat` there: `O_PATH` with
+///   `O_TMPFILE`, with or without `O_RDWR`, is a path-only open (Linux keeps
+///   only `O_PATH_FLAGS`), `O_TMPFILE|O_RDWR` is EROFS on the read-only
+///   mount, and `O_TMPFILE|O_RDONLY` stays EINVAL;
+/// - `/proc/sys/net` bound onto a directory outside `/proc` is
+///   `/proc/sys/net` there, at the level that has it, and on a mount that
+///   is not read-only a real `O_TMPFILE` open is no EROFS;
+/// - a directory of another file system bound over `/proc/tty` is no
+///   procfs directory.
+///
+/// The test runs again in a child of its own with the mounts in new user
+/// and mount namespaces, which the child's lookups and Detcore's share, as
+/// they share the guest's on KVM, so Linux's answers there are the native
+/// column.
 #[test]
 fn a_bind_mount_is_the_procfs_directory_it_shows() {
     use ProcLevel::*;
+    use nix::fcntl::OFlag;
     if let Some(outside) = std::env::var_os(BIND_CHILD) {
         let outside = outside.into_encoded_bytes();
         for level in [Minimal, Standard] {
@@ -229,13 +286,10 @@ fn a_bind_mount_is_the_procfs_directory_it_shows() {
                 Some("/proc/sys/vm")
             );
             assert_eq!(
-                reached(level, b"/proc/sys/vm", true).as_deref(),
-                Some("/proc/sys/vm")
-            );
-            assert_eq!(
                 reached(level, b"/proc/sys/kernel/..", true).as_deref(),
                 Some("/proc/sys")
             );
+            assert_eq!(reached(level, b"/proc/sys/vm", true), None);
             assert_eq!(reached(level, b"/proc/sys/kernel/random", true), None);
             assert_eq!(reached(level, b"/proc/tty", true), None);
         }
@@ -258,9 +312,34 @@ fn a_bind_mount_is_the_procfs_directory_it_shows() {
             panic!("a system directory: {directory:?}");
         };
         assert_eq!(
-            Some(directory),
+            Some(directory.directory),
             SystemDirectory::named(Path::new("/proc/sys/vm"), Minimal)
         );
+        // Linux's own metadata of the object at /proc/sys/kernel, and of the
+        // directory now at /proc/sys/vm, which is another.
+        let linux = std::fs::metadata("/proc/sys/kernel").unwrap();
+        let covering = std::fs::metadata("/proc/sys/vm").unwrap();
+        assert_eq!(covering.mode() & 0o7777, 0o700, "/proc/sys/vm is covered");
+        let object = directory.object;
+        assert_eq!(
+            (
+                object.mode,
+                object.nlink,
+                object.uid,
+                object.gid,
+                object.size,
+                object.blocks
+            ),
+            (
+                linux.mode(),
+                linux.nlink(),
+                linux.uid(),
+                linux.gid(),
+                linux.size() as i64,
+                linux.blocks() as i64
+            )
+        );
+        assert_eq!(object.mode & 0o7777, 0o555);
         let (entries, _, _) = detcore_at(Minimal)
             .system_placeholder_snapshot(&kvm_thread(), &directory)
             .unwrap();
@@ -278,13 +357,66 @@ fn a_bind_mount_is_the_procfs_directory_it_shows() {
                 "overcommit_memory"
             ]
         );
+        for flags in [
+            OFlag::O_PATH | OFlag::O_TMPFILE,
+            OFlag::O_PATH | OFlag::O_TMPFILE | OFlag::O_RDWR,
+            OFlag::O_TMPFILE | OFlag::O_RDWR,
+            OFlag::O_TMPFILE | OFlag::O_RDONLY,
+        ] {
+            let linux = linux_opened("/proc/sys/kernel", flags);
+            assert_eq!(
+                opened(Minimal, "/proc/sys/kernel", flags),
+                linux,
+                "{flags:?}"
+            );
+        }
+        assert_eq!(
+            linux_opened("/proc/sys/kernel", OFlag::O_TMPFILE | OFlag::O_RDWR),
+            Err(Errno::EROFS)
+        );
+        let outside = std::str::from_utf8(&outside).unwrap();
+        assert_eq!(
+            opened(Standard, outside, OFlag::O_TMPFILE | OFlag::O_RDWR),
+            Ok(true),
+            "no EROFS on a mount that is not read-only"
+        );
         return;
     }
     let outside = tempfile::tempdir().unwrap();
     let outside = crate::util::canonicalize(outside.path()).unwrap();
     let foreign = tempfile::tempdir().unwrap();
+    let covering = tempfile::tempdir().unwrap();
+    std::fs::write(covering.path().join("foreign_marker"), b"").unwrap();
+    std::fs::set_permissions(
+        covering.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
     let outside_c = std::ffi::CString::new(outside.as_os_str().as_encoded_bytes()).unwrap();
     let foreign_c = std::ffi::CString::new(foreign.path().as_os_str().as_encoded_bytes()).unwrap();
+    let covering_c =
+        std::ffi::CString::new(covering.path().as_os_str().as_encoded_bytes()).unwrap();
+    // A read-only remount of a bind in a user namespace must keep the flags
+    // the source mount locks (nosuid, nodev, noexec, atime).
+    let mut vfs = std::mem::MaybeUninit::<libc::statvfs>::zeroed();
+    // SAFETY: the path is NUL-terminated and `vfs` is writable.
+    assert_eq!(
+        unsafe { libc::statvfs(c"/proc/sys/vm".as_ptr(), vfs.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: the call succeeded and initialized the structure.
+    let kept = unsafe { vfs.assume_init() }.f_flag;
+    let locked = [
+        (libc::ST_NOSUID, libc::MS_NOSUID),
+        (libc::ST_NODEV, libc::MS_NODEV),
+        (libc::ST_NOEXEC, libc::MS_NOEXEC),
+        (libc::ST_NOATIME, libc::MS_NOATIME),
+        (libc::ST_NODIRATIME, libc::MS_NODIRATIME),
+        (libc::ST_RELATIME, libc::MS_RELATIME),
+    ]
+    .into_iter()
+    .filter(|(st, _)| kept & st != 0)
+    .fold(0, |flags, (_, ms)| flags | ms);
     let name = module_path!()
         .split_once("::")
         .map_or(module_path!(), |(_, rest)| rest)
@@ -305,12 +437,12 @@ fn a_bind_mount_is_the_procfs_directory_it_shows() {
                     Err(std::io::Error::last_os_error())
                 }
             };
-            let bind = |source: &std::ffi::CStr, target: &std::ffi::CStr| {
+            let mount = |source: &std::ffi::CStr, target: &std::ffi::CStr, flags| {
                 check(libc::mount(
                     source.as_ptr(),
                     target.as_ptr(),
                     std::ptr::null(),
-                    libc::MS_BIND,
+                    flags,
                     std::ptr::null(),
                 ))
             };
@@ -322,9 +454,15 @@ fn a_bind_mount_is_the_procfs_directory_it_shows() {
                 libc::MS_REC | libc::MS_PRIVATE,
                 std::ptr::null(),
             ))?;
-            bind(c"/proc/sys/vm", c"/proc/sys/kernel")?;
-            bind(c"/proc/sys/net", &outside_c)?;
-            bind(&foreign_c, c"/proc/tty")
+            mount(c"/proc/sys/vm", c"/proc/sys/kernel", libc::MS_BIND)?;
+            mount(
+                c"/proc/sys/kernel",
+                c"/proc/sys/kernel",
+                libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | locked,
+            )?;
+            mount(c"/proc/sys/net", &outside_c, libc::MS_BIND)?;
+            mount(&foreign_c, c"/proc/tty", libc::MS_BIND)?;
+            mount(&covering_c, c"/proc/sys/vm", libc::MS_BIND)
         });
     }
     let output = child

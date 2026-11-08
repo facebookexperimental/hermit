@@ -141,6 +141,8 @@ use crate::procfs::fd_directory::DescriptorDirectoryBinding;
 use crate::procfs::fd_directory::DescriptorDirectoryTable;
 use crate::procfs::fd_directory::PlaceholderDirectory;
 use crate::procfs::fd_directory::SystemDirectory;
+use crate::procfs::fd_directory::SystemObject;
+use crate::procfs::fd_directory::SystemPlaceholder;
 use crate::procfs::fd_directory::TaskDirectoryBinding;
 use crate::procfs::fd_directory::TaskDirectoryKind;
 use crate::procfs_inode;
@@ -210,8 +212,8 @@ pub(super) enum OpenedDirectory {
     SelectorLink { thread: bool },
     /// One of the system-wide directories of the `--proc` level
     /// (`/proc/sys`, ...), by the object a lookup reaches
-    /// ([`Detcore::system_directory_reached`]).
-    System(SystemDirectory),
+    /// ([`Detcore::system_directory_reached`]), with that object's facts.
+    System(SystemPlaceholder),
 }
 
 /// The calls whose path operands are each looked up relative to a directory
@@ -3218,17 +3220,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// (`procfs::listing`, at the run's `--proc` level), in the same order
     /// (`DirectoryOrder::NameBytes`), with the same entries left out: one
     /// the kernel's procfs does not have (a name the level lists that this
-    /// kernel lacks, `rendered_procfs::procfs_object_stat`'s ENOENT), unless
-    /// Detcore renders it. A system-wide entry is the same for every task,
-    /// so the tool's own lookup in the guest's namespaces finds what the
-    /// guest's would. No kernel cookies (the stream's positions are the
+    /// kernel lacks: the object the guest's lookup reached has no such
+    /// entry, `SystemObject::lacks`, read in that object when it was
+    /// reached), unless Detcore renders it. A system-wide entry is the same
+    /// for every task. No kernel cookies (the stream's positions are the
     /// guest's), and each entry numbered by its path's key on the procfs key
     /// device ([`Self::procfs_key_device`]), as a stat of a directory below
     /// numbers it ([`Self::system_directory_metadata`]).
     pub(super) fn system_placeholder_snapshot<G: Guest<Self>>(
         &self,
         guest: &G,
-        directory: &SystemDirectory,
+        directory: &SystemPlaceholder,
     ) -> Result<(Vec<DirEntry>, DirectoryInodes, DirectoryOrder), Error> {
         use crate::procfs::listing;
         let names = listing::entries(
@@ -3243,7 +3245,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let session_files = self.rendered_files(guest);
         let entries = names
             .into_iter()
-            .filter_map(|(name, ty)| {
+            .enumerate()
+            .filter_map(|(index, (name, ty))| {
                 let entry = match name.as_slice() {
                     b"." => within.clone(),
                     b".." => within.parent().unwrap_or(&within).to_path_buf(),
@@ -3253,10 +3256,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         // has.
                         let rendered = crate::procfs::ProcfsFile::from_path(&path)
                             .is_some_and(|file| file.rendered_path(session_files).is_some());
-                        if !rendered
-                            && super::rendered_procfs::procfs_object_stat(&path).err()
-                                == Some(Errno::ENOENT)
-                        {
+                        if !rendered && directory.object.lacks(index) {
                             return None;
                         }
                         within.join(OsStr::from_bytes(name))
@@ -3702,7 +3702,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// stat of it reports it where the kernel serves it (ptrace,
     /// `Detcore::determinize_stat` of a procfs directory): the kernel's mode,
     /// links, owner, size and blocks, as the guest's user namespace sees them
-    /// (`rendered_procfs::procfs_object_stat`: global root unmapped, the
+    /// (`SystemObject`, from the object the lookup reached: global root unmapped, the
     /// network namespace owner's root for `/proc/sys/net`, and on a
     /// `proc_dir_entry` directory such as `/proc/tty` two links and one per
     /// subdirectory), procfs's 1024-byte blocks and device, the inode number
@@ -3711,9 +3711,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     async fn system_directory_metadata<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        directory: &SystemDirectory,
+        directory: &SystemPlaceholder,
     ) -> Result<DetStat, Error> {
-        let kernel = super::rendered_procfs::procfs_object_stat(&directory.canonical())?;
+        let kernel = directory.object;
         let device = Self::procfs_key_device(guest);
         let mark = crate::tool_global::directory_snapshot_mark(guest).await;
         let ino = self
@@ -3722,9 +3722,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         let epoch = super::rendered_procfs::epoch_time(guest.config().epoch);
         Ok(DetStat {
             mask: StatxMask::STATX_BASIC_STATS | StatxMask::STATX_MNT_ID,
-            mode: libc::S_IFDIR | (kernel.st_mode & 0o7777),
-            uid: kernel.st_uid,
-            gid: kernel.st_gid,
+            mode: libc::S_IFDIR | (kernel.mode & 0o7777),
+            uid: kernel.uid,
+            gid: kernel.gid,
             attributes: StatxAttributes::empty(),
             attributes_mask: StatxAttributes::STATX_ATTR_AUTOMOUNT
                 | StatxAttributes::STATX_ATTR_MOUNT_ROOT
@@ -3732,10 +3732,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             dev: Self::reported_procfs_device(guest),
             rdev: 0,
             inode: ino,
-            nlink: kernel.st_nlink,
-            size: kernel.st_size,
+            nlink: kernel.nlink,
+            size: kernel.size,
             blksize: procfs_inode::PROC_BLOCK_SIZE,
-            blocks: kernel.st_blocks,
+            blocks: kernel.blocks,
             atime: epoch,
             btime: epoch,
             ctime: epoch,
@@ -6124,11 +6124,54 @@ impl<T: RecordOrReplay> Detcore<T> {
         else {
             return Ok(None);
         };
-        Ok(if reached == Path::new("/proc") {
-            Some(PlaceholderDirectory::Root)
-        } else {
-            SystemDirectory::named(&reached, self.cfg.proc_level).map(PlaceholderDirectory::System)
-        })
+        if reached.name() == Path::new("/proc") {
+            return Ok(Some(PlaceholderDirectory::Root));
+        }
+        Ok(
+            SystemDirectory::named(reached.name(), self.cfg.proc_level).map(|directory| {
+                PlaceholderDirectory::System(SystemPlaceholder {
+                    directory,
+                    object: self.system_object(&reached, directory),
+                })
+            }),
+        )
+    }
+
+    /// The facts of the procfs directory object `reached`, which a lookup
+    /// reached and named `directory` ([`SystemObject`]), read from the
+    /// object itself: its metadata from its own descriptor, and which of the
+    /// names the level table lists in it the object lacks, by Linux's lookup
+    /// of each in it. Never by looking the directory's name up again, which
+    /// can reach another object (a mount over the name).
+    fn system_object(
+        &self,
+        reached: &super::rendered_procfs::ReachedDirectory,
+        directory: SystemDirectory,
+    ) -> SystemObject {
+        use crate::procfs::listing;
+        let names = listing::entries(
+            &directory.modeled(),
+            self.cfg.proc_level,
+            &listing::ListingFacts::default(),
+        )
+        .unwrap_or_default();
+        let absent = names
+            .iter()
+            .enumerate()
+            .filter(|(index, (name, _))| {
+                *index < 64 && name != b"." && name != b".." && reached.lacks(name)
+            })
+            .fold(0_u64, |absent, (index, _)| absent | 1 << index);
+        let stat = reached.stat();
+        SystemObject {
+            mode: stat.st_mode,
+            nlink: stat.st_nlink,
+            uid: stat.st_uid,
+            gid: stat.st_gid,
+            size: stat.st_size,
+            blocks: stat.st_blocks,
+            absent,
+        }
     }
 
     /// The system-wide procfs directory an open of `observed`, the guest's
@@ -6165,11 +6208,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             Some(errno) => Err(errno),
             // `do_tmpfile` asks the mount for write access (`mnt_want_write`)
             // before `vfs_tmpfile` checks the directory's permission
-            // (fs/namei.c): EROFS where the directory was reached through a
-            // read-only mount, a read-only bind of it included.
+            // (fs/namei.c v6.17, do_tmpfile): EROFS where the directory was
+            // reached through a read-only mount, a read-only bind of it
+            // included. Only for a real `O_TMPFILE` open: with `O_PATH` the
+            // legacy `open` and `openat` keep only `O_PATH_FLAGS`
+            // (fs/open.c v6.17, `build_open_how`, which `do_sys_open` applies
+            // before `build_open_flags`), so `O_TMPFILE` and the access mode
+            // are dropped and the open is a path-only one.
             None => opened.and_then(|opened| {
                 let tmpfile = matches!(opened, OpenedDirectory::System(_))
-                    && flags.contains(OFlag::O_TMPFILE);
+                    && flags.contains(OFlag::O_TMPFILE)
+                    && !flags.contains(OFlag::O_PATH);
                 if tmpfile && super::rendered_procfs::on_read_only_mount(&decided) {
                     Err(Errno::EROFS)
                 } else {
@@ -6479,7 +6528,7 @@ const RWH_WRITE_LIFE_EXTREME: u64 = 5;
 /// of `/proc` shows (`guest_procfs_root`: an unmapped owner reads as the
 /// overflow ID, which no mapped caller has); a system-wide directory is its
 /// owner's as the kernel reports it in the guest's user namespace
-/// (`rendered_procfs::procfs_object_stat`: global root, or the root of the
+/// (`SystemObject`, from the object the lookup reached: global root, or the root of the
 /// network namespace's owner for `/proc/sys/net`).
 fn placeholder_owner_or_capable(directory: &PlaceholderDirectory) -> Result<bool, Errno> {
     const OVERFLOW_ID: u32 = 65534;
@@ -6490,8 +6539,7 @@ fn placeholder_owner_or_capable(directory: &PlaceholderDirectory) -> Result<bool
             Ok(uid != OVERFLOW_ID && gid != OVERFLOW_ID)
         }
         PlaceholderDirectory::System(system) => {
-            let stat = super::rendered_procfs::procfs_object_stat(&system.canonical())?;
-            Ok(stat.st_uid != OVERFLOW_ID && stat.st_gid != OVERFLOW_ID)
+            Ok(system.object.uid != OVERFLOW_ID && system.object.gid != OVERFLOW_ID)
         }
     }
 }
@@ -6503,7 +6551,7 @@ fn placeholder_owner_or_capable(directory: &PlaceholderDirectory) -> Result<bool
 /// descriptor directory (`rendered_file_owner`), and owns `/proc` only where
 /// global root is the guest's root, as the guest's own stat of `/proc` shows
 /// (`guest_procfs_root`: uid 0), and a system-wide directory where its owner
-/// is (`rendered_procfs::procfs_object_stat`). Read from the same facts as
+/// is (`SystemObject`). Read from the same facts as
 /// [`placeholder_owner_or_capable`], which also lets a caller act as an owner
 /// its user namespace maps, as `inode_owner_or_capable` does and
 /// `vfs_setlease` does not.
@@ -6514,10 +6562,7 @@ fn placeholder_lease_owner(directory: &PlaceholderDirectory) -> Result<bool, Err
             let (_, uid, _) = super::rendered_procfs::guest_procfs_root()?;
             Ok(uid == 0)
         }
-        PlaceholderDirectory::System(system) => {
-            let stat = super::rendered_procfs::procfs_object_stat(&system.canonical())?;
-            Ok(stat.st_uid == 0)
-        }
+        PlaceholderDirectory::System(system) => Ok(system.object.uid == 0),
     }
 }
 
