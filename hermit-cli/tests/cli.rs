@@ -29812,6 +29812,15 @@ fn a_schedule_replay_refuses_a_stdio_kind_changed_since_the_recording() {
         again_summary.get("stdio_changed").is_none(),
         "{again_summary}"
     );
+
+    // The refused piped replay writes no summary (the fatal path exits
+    // before it is filled), so the positive summary wiring the old piped
+    // assertions covered is kept here instead: a fresh recording made
+    // with a piped stderr records the pipe kind in its summary.
+    let piped_record = directory.path().join("piped-record.json");
+    let piped_record_arg = format!("--record-preemptions-to={}", piped_record.display());
+    let (_piped_out, _piped_err, piped_summary) = run(&piped_record_arg, "record-pipe", false);
+    assert_eq!(piped_summary["host_inputs"]["stdio"]["stderr"], "pipe");
 }
 
 /// A plain `hermit run`, which runs its guest in a container, records the
