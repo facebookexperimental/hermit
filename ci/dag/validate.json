@@ -2794,6 +2794,13 @@
           "category": "c-programs",
           "test": "c-programs/flock-lifecycle",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/flock-lifecycle",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -13971,6 +13978,13 @@
           "category": "compat",
           "test": "compat/pgrep",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pgrep",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -14042,6 +14056,13 @@
           "test": "compat/pkill",
           "mode": "replay",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pkill",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -18862,6 +18883,13 @@
           "category": "compat",
           "test": "compat/pgrep",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pgrep",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -18912,6 +18940,13 @@
           "test": "compat/pkill",
           "mode": "replay",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pkill",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -46506,6 +46541,13 @@
           "category": "c-programs",
           "test": "c-programs/flock-lifecycle",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/flock-lifecycle",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -57667,6 +57709,13 @@
           "category": "compat",
           "test": "compat/pgrep",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pgrep",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -57738,6 +57787,13 @@
           "test": "compat/pkill",
           "mode": "replay",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pkill",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",

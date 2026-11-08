@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 1105,
-      "applicable": 762,
-      "selectable": 534,
+      "applicable": 764,
+      "selectable": 536,
       "population": 1060,
-      "population_candidate_selected": 534,
+      "population_candidate_selected": 536,
       "population_candidate_not_selected": 211,
-      "population_candidate_disabled": 315
+      "population_candidate_disabled": 313
     },
     "by_backend": {
       "dbt": {
@@ -37,12 +37,12 @@
       },
       "kvm": {
         "cells": 221,
-        "applicable": 214,
-        "selectable": 207,
+        "applicable": 216,
+        "selectable": 209,
         "population": 212,
-        "population_candidate_selected": 207,
+        "population_candidate_selected": 209,
         "population_candidate_not_selected": 2,
-        "population_candidate_disabled": 3
+        "population_candidate_disabled": 1
       },
       "liteinst": {
         "cells": 221,
@@ -752,7 +752,7 @@
     {"test_id":"compat/perl-direct","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/pgrep","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/pgrep","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Its first verify run on in-guest-trap failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
-    {"test_id":"compat/pgrep","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: pgrep opens each /proc/<pid> directory and reads its stat, status and cmdline. At Hermit 26eb116d the opens answered EACCES (another guest process's /proc was not served: https://github.com/rrnewton/hermit/issues/4564), so pgrep matched nothing and exited 1 in 3 of 3 KVM verify runs. Package K item 2b slices 2b-1 to 2b-3 serve those files; at slice 2b-3 a host probe of this row's command with procps 4.0.6 (the pinned root's) and 3.3.17 passes on KVM at L2. It stays off KVM until the pinned-root compat cell itself is measured"},
+    {"test_id":"compat/pgrep","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/pgrep","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Its first verify run on liteinst failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
     {"test_id":"compat/pgrep","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: The guest starts a second program image, and each image after the first makes 33 raw system calls in ld-linux and libc, which SaBRe's execution-path contract refuses (trusted_shared_object_sites > 0)"},
     {"test_id":"compat/pidstat-disk","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
@@ -772,7 +772,7 @@
     {"test_id":"compat/pkg-config","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":false,"reason":"outside the population: ptrace verify is not selected by full validation: Dropped under dh-jn0hh part 2: in the pinned root, pkg-config 0.29.2 emits -D before -I where the workload asserts freedesktop pkg-config's file-order output"},
     {"test_id":"compat/pkill","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/pkill","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Its first verify run on in-guest-trap failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
-    {"test_id":"compat/pkill","backend":"kvm","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: pkill opens each /proc/<pid> directory and reads its stat, status and cmdline. At Hermit 26eb116d the opens answered EACCES (another guest process's /proc was not served: https://github.com/rrnewton/hermit/issues/4564), so pkill matched nothing and exited 1 in 3 of 3 KVM verify runs. Package K item 2b slices 2b-1 to 2b-3 serve those files; at slice 2b-3 a host probe of this row's command with procps 4.0.6 (the pinned root's) and 3.3.17 passes on KVM at L2. It stays off KVM until the pinned-root compat cell itself is measured"},
+    {"test_id":"compat/pkill","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/pkill","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Its first verify run on liteinst failed in the second local survey of 2026-10-08 (release Hermit 81f3e50d, compat fixtures prepared): execve of a further program image returned EOPNOTSUPP (exec refused) (https://github.com/rrnewton/hermit/issues/3745)"},
     {"test_id":"compat/pkill","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: The guest starts a second program image, and each image after the first makes 33 raw system calls in ld-linux and libc, which SaBRe's execution-path contract refuses (trusted_shared_object_sites > 0)"},
     {"test_id":"compat/pr","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

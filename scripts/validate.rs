@@ -20687,7 +20687,10 @@ mod nextest_timeout_tests {
                 // 2991 after compat/top verify@kvm was restored by the top-only
                 // flip; compat/sysctl-random-uuid verify/KVM is still left under
                 // DROP-7.
-                assert_eq!(all.len(), 2991, "the original all-owner population is retained");
+                // 2994 with the KVM verify cells of compat/pgrep, compat/pkill
+                // and c-programs/flock-lifecycle (3 of 3 strict verify runs
+                // each in the pinned root at 61eac51c).
+                assert_eq!(all.len(), 2994, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");

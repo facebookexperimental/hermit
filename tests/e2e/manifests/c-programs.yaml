@@ -14135,19 +14135,17 @@ test:
     modes:
       verify:
         ci: true
+        # KVM flock-lifecycle: Detcore's flock model (b14a3af7) decides every
+        # flock on every backend; 3/3 strict verify runs in the pinned root at
+        # 61eac51c, bitwise parity, 124 INFO records each side.
         backends_enabled:
           - ptrace
           - sabre
           - dbt
+          - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled:
-          kvm: >-
-            KVM refuses every flock lock operation by name (ENOSYS with the
-            typed refusal UnsupportedOperation::Flock): it cannot keep a host
-            lock's lifetime equal to the guest description's. This cell passed
-            only because KVM flock used to be a silent no-op
-            (https://github.com/rrnewton/reverie/issues/1069)
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled

@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 1525,
-      "applicable": 1253,
-      "selectable": 1013,
+      "applicable": 1254,
+      "selectable": 1014,
       "population": 1515,
-      "population_candidate_selected": 1013,
+      "population_candidate_selected": 1014,
       "population_candidate_not_selected": 240,
-      "population_candidate_disabled": 262
+      "population_candidate_disabled": 261
     },
     "by_backend": {
       "dbt": {
@@ -37,12 +37,12 @@
       },
       "kvm": {
         "cells": 305,
-        "applicable": 294,
-        "selectable": 294,
+        "applicable": 295,
+        "selectable": 295,
         "population": 303,
-        "population_candidate_selected": 294,
+        "population_candidate_selected": 295,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 9
+        "population_candidate_disabled": 8
       },
       "liteinst": {
         "cells": 305,
@@ -312,7 +312,7 @@
     {"test_id":"c-programs/file-io-roundtrip","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"c-programs/flock-lifecycle","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/flock-lifecycle","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"c-programs/flock-lifecycle","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: KVM refuses every flock lock operation by name (ENOSYS with the typed refusal UnsupportedOperation::Flock): it cannot keep a host lock's lifetime equal to the guest description's. This cell passed only because KVM flock used to be a silent no-op (https://github.com/rrnewton/reverie/issues/1069)"},
+    {"test_id":"c-programs/flock-lifecycle","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/flock-lifecycle","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/flock-lifecycle","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"c-programs/fork-exec-pipeline","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
