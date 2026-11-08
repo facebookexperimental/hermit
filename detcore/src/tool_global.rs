@@ -27453,6 +27453,7 @@ mod record_format_installer_tests {
             "malformed" => "{not json".to_owned(),
             "current" => crate::preemptions::PreemptionWriter::new(None)
                 .with_format(Some(newest))
+                .with_identity(crate::clock_identity::test_sources::known())
                 .into_string(),
             other => panic!("unknown case {other}"),
         }
@@ -27471,12 +27472,12 @@ mod record_format_installer_tests {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("history.json");
             std::fs::write(&path, record(&case)).unwrap();
-            let config = Config {
+            let config = crate::clock_identity::test_sources::qualified(Config {
                 sequentialize_threads: true,
                 replay_preemptions_from: Some(path),
                 replay_edited_preemptions: case == "marked",
                 ..Config::default()
-            };
+            });
             let _state = GlobalState::for_tests(&config);
             return;
         }
