@@ -979,6 +979,7 @@ impl Replayer {
             // completion is always compared under the strict rule.
             let mut phase_only_insertion = false;
             let mut retired_retry = false;
+            let mut start_boundary = false;
             let mut expected = expected;
             while is_desync(observed, &expected) && is_phase_only_desync(observed, &expected) {
                 self.desync_counts
@@ -997,12 +998,21 @@ impl Replayer {
                 }
                 retired_retry = true;
                 let _ = self.pop_next();
+                if !self.pending_starts.is_empty() {
+                    // Retiring this retry made a recorded background start
+                    // due before the completion it precedes: do not consume
+                    // the completion across that boundary. The observed
+                    // event is classified strictly from here.
+                    start_boundary = true;
+                    break;
+                }
                 let Some(next) = self.peek_next() else { break };
                 expected = next;
             }
-            let phase_only = phase_only_insertion
-                || retired_retry && !is_desync(observed, &expected)
-                || retired_retry && self.cursor.is_empty();
+            let phase_only = !start_boundary
+                && (phase_only_insertion
+                    || retired_retry && !is_desync(observed, &expected)
+                    || retired_retry && self.cursor.is_empty());
             let is_desync = is_desync(observed, &expected) && !phase_only;
             let mut in_hard_desync_mode = false;
             if is_desync {
@@ -1095,7 +1105,10 @@ impl Replayer {
                         self.cursor.display_first_n(10)
                     );
                 }
-                if phase_only_insertion {
+                if phase_only_insertion || self.cursor.is_empty() {
+                    // An extra observed retry consumes nothing; an
+                    // exhausted cursor has nothing to consume either, and
+                    // must not fabricate a consumed position.
                     self.unmatched_run = 0;
                 } else {
                     self.last_consumed = Some(self.schedule_len - self.cursor.len() as u64);
@@ -1398,6 +1411,376 @@ mod builder {
                 time: Default::default(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(test)]
+mod reviewer_phase_resync {
+    use detcore_model::schedule::InstructionOffset;
+    use detcore_model::schedule::InstructionPointer;
+
+    use super::*;
+
+    fn events() -> (SchedEvent, SchedEvent, SchedEvent) {
+        let mut b = builder::SchedTestBuilder::new();
+        let post = b.syscall_post(Sysno::connect, 0x401000, DetTid::from_raw(3));
+        let poll = SchedEvent {
+            op: Op::Syscall(Sysno::connect, SyscallPhase::Polling),
+            ..post.clone()
+        };
+        let next = b.syscall_pre(Sysno::getpid, 0x402000, DetTid::from_raw(3));
+        (post, poll, next)
+    }
+
+    fn strict(schedule: Vec<SchedEvent>) -> Replayer {
+        let mut r = Replayer::new(schedule);
+        r.die_on_desync = true;
+        r
+    }
+
+    fn count(r: &Replayer) -> DesyncStats {
+        r.desync_counts
+            .get(&DetTid::from_raw(3))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn exact_posthook_has_no_phase_resync() {
+        let (post, _, next) = events();
+        let mut r = strict(vec![post.clone(), next.clone()]);
+        assert_ne!(
+            r.observe_event(&post),
+            ReplayAction::Stop(StopReason::FatalDesync)
+        );
+        assert_eq!(r.peek_next(), Some(next));
+        assert_eq!(r.record_position(), 1);
+        assert_eq!(r.last_consumed, Some(0));
+        assert_eq!(count(&r).phase_only_resyncs, 0);
+        assert!(r.fatal_desync.is_none());
+    }
+
+    #[test]
+    fn extra_observed_polling_preserves_recorded_completion() {
+        for repeats in [1, 2] {
+            let (post, poll, next) = events();
+            let mut r = strict(vec![post.clone(), next.clone()]);
+            for seen in 1..=repeats {
+                assert_ne!(
+                    r.observe_event(&poll),
+                    ReplayAction::Stop(StopReason::FatalDesync)
+                );
+                assert_eq!(r.record_position(), 0);
+                assert_eq!(r.peek_next(), Some(post.clone()));
+                assert_eq!(r.last_consumed, None);
+                assert_eq!(count(&r).phase_only_resyncs, seen);
+            }
+            assert_ne!(
+                r.observe_event(&post),
+                ReplayAction::Stop(StopReason::FatalDesync)
+            );
+            assert_eq!(r.peek_next(), Some(next));
+            assert_eq!(r.record_position(), 1);
+            assert_eq!(r.last_consumed, Some(0));
+            assert_eq!(count(&r).phase_only_resyncs, repeats);
+            assert_eq!((count(&r).hard, count(&r).soft), (0, 0));
+        }
+    }
+
+    #[test]
+    fn one_recorded_retry_retires_only_matching_completion() {
+        let (post, poll, next) = events();
+        let mut r = strict(vec![poll, post.clone(), next.clone()]);
+        assert_ne!(
+            r.observe_event(&post),
+            ReplayAction::Stop(StopReason::FatalDesync)
+        );
+        assert_eq!(r.peek_next(), Some(next.clone()));
+        assert_eq!(r.record_position(), 2);
+        assert_eq!(r.last_consumed, Some(1));
+        assert_eq!(count(&r).phase_only_resyncs, 1);
+        assert_eq!((count(&r).hard, count(&r).soft), (0, 0));
+        assert_ne!(
+            r.observe_event(&next),
+            ReplayAction::Stop(StopReason::FatalDesync)
+        );
+        assert_eq!(r.record_position(), 3);
+        assert!(r.fatal_desync.is_none());
+    }
+
+    #[test]
+    fn two_recorded_retries_reach_the_matching_completion() {
+        let (post, poll, next) = events();
+        let mut r = strict(vec![poll.clone(), poll, post.clone(), next.clone()]);
+        assert_ne!(
+            r.observe_event(&post),
+            ReplayAction::Stop(StopReason::FatalDesync)
+        );
+        assert_eq!(
+            r.peek_next(),
+            Some(next.clone()),
+            "observed completion must retire both equivalent retries and its matching Posthook, leaving the next event"
+        );
+        assert_eq!(r.record_position(), 3);
+        assert_eq!(r.last_consumed, Some(2));
+        assert_eq!(count(&r).phase_only_resyncs, 2);
+        assert_ne!(
+            r.observe_event(&next),
+            ReplayAction::Stop(StopReason::FatalDesync)
+        );
+        assert_eq!(r.record_position(), 4);
+        assert!(r.fatal_desync.is_none());
+    }
+
+    #[test]
+    fn recorded_retry_cannot_hide_changed_posthook_time() {
+        let (post, poll, next) = events();
+        let changed = SchedEvent {
+            end_time: Some(post.end_time.unwrap() + LogicalTime::from_nanos(1)),
+            ..post.clone()
+        };
+        let mut r = strict(vec![poll, changed, next]);
+        let action = r.observe_event(&post);
+        assert_eq!(
+            action,
+            ReplayAction::Stop(StopReason::FatalDesync),
+            "the recorded completion differs by one logical nanosecond; a matching retry must not excuse it"
+        );
+        assert!(r.fatal_desync.is_some());
+    }
+
+    #[test]
+    fn recorded_retry_cannot_swallow_different_next_operation() {
+        let (post, poll, next) = events();
+        let mut r = strict(vec![poll, next.clone()]);
+        let action = r.observe_event(&post);
+        assert!(
+            action == ReplayAction::Stop(StopReason::FatalDesync) || r.peek_next() == Some(next),
+            "an unrelated next syscall must remain pending or cause strict refusal, not be silently consumed: action={action:?}, cursor={:?}, position={}",
+            r.peek_next(),
+            r.record_position()
+        );
+    }
+
+    #[test]
+    fn phase_pair_with_each_other_field_changed_is_fatal() {
+        let (post, poll, next) = events();
+        let mut cases = Vec::new();
+        let mut add = |label, observed: SchedEvent, expected: SchedEvent| {
+            cases.push((label, observed, expected))
+        };
+        add(
+            "thread",
+            SchedEvent {
+                dettid: DetTid::from_raw(7),
+                ..poll.clone()
+            },
+            post.clone(),
+        );
+        add(
+            "syscall",
+            SchedEvent {
+                op: Op::Syscall(Sysno::accept, SyscallPhase::Polling),
+                ..poll.clone()
+            },
+            post.clone(),
+        );
+        add(
+            "count",
+            SchedEvent {
+                count: poll.count + 1,
+                ..poll.clone()
+            },
+            post.clone(),
+        );
+        add(
+            "start_rip",
+            SchedEvent {
+                start_rip: InstructionPointer::new(0x400100),
+                ..poll.clone()
+            },
+            post.clone(),
+        );
+        add(
+            "end_rip",
+            SchedEvent {
+                end_rip: InstructionPointer::new(0x401001),
+                ..poll.clone()
+            },
+            post.clone(),
+        );
+        add(
+            "offset",
+            SchedEvent {
+                instruction_offset: Some(InstructionOffset {
+                    rcb_target: 1,
+                    instructions: 1,
+                }),
+                ..poll.clone()
+            },
+            post.clone(),
+        );
+        add(
+            "time",
+            SchedEvent {
+                end_time: Some(poll.end_time.unwrap() + LogicalTime::from_nanos(1)),
+                ..poll.clone()
+            },
+            post.clone(),
+        );
+        add(
+            "stopless",
+            SchedEvent {
+                stopless: true,
+                ..poll.clone()
+            },
+            post.clone(),
+        );
+        add(
+            "observed_end_rip_missing",
+            SchedEvent {
+                end_rip: None,
+                ..poll.clone()
+            },
+            post.clone(),
+        );
+        add(
+            "expected_end_rip_missing",
+            poll.clone(),
+            SchedEvent {
+                end_rip: None,
+                ..post.clone()
+            },
+        );
+        add(
+            "observed_time_missing",
+            SchedEvent {
+                end_time: None,
+                ..poll.clone()
+            },
+            post.clone(),
+        );
+        add(
+            "expected_time_missing",
+            poll,
+            SchedEvent {
+                end_time: None,
+                ..post
+            },
+        );
+        assert_eq!(cases.len(), 12);
+        for (label, observed, expected) in cases {
+            let mut r = strict(vec![expected, next.clone()]);
+            assert_eq!(
+                r.observe_event(&observed),
+                ReplayAction::Stop(StopReason::FatalDesync),
+                "case {label}"
+            );
+            assert!(r.fatal_desync.is_some(), "case {label}");
+            assert_eq!(r.record_position(), 0, "case {label}");
+            assert_eq!(count(&r).phase_only_resyncs, 0, "case {label}");
+        }
+    }
+
+    #[test]
+    fn other_phase_pairs_are_fatal() {
+        let (post, _, next) = events();
+        for (observed_phase, expected_phase) in [
+            (SyscallPhase::Prehook, SyscallPhase::Posthook),
+            (SyscallPhase::Posthook, SyscallPhase::Prehook),
+            (SyscallPhase::Prehook, SyscallPhase::Polling),
+            (SyscallPhase::Polling, SyscallPhase::Prehook),
+        ] {
+            let observed = SchedEvent {
+                op: Op::Syscall(Sysno::connect, observed_phase),
+                ..post.clone()
+            };
+            let expected = SchedEvent {
+                op: Op::Syscall(Sysno::connect, expected_phase),
+                ..post.clone()
+            };
+            let mut r = strict(vec![expected, next.clone()]);
+            assert_eq!(
+                r.observe_event(&observed),
+                ReplayAction::Stop(StopReason::FatalDesync)
+            );
+            assert_eq!(r.record_position(), 0);
+            assert_eq!(count(&r).phase_only_resyncs, 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod reviewer_phase_boundaries {
+    use super::*;
+
+    fn events() -> (SchedEvent, SchedEvent, SchedEvent) {
+        let mut b = builder::SchedTestBuilder::new();
+        let post = b.syscall_post(Sysno::connect, 0x401000, DetTid::from_raw(3));
+        let poll = SchedEvent {
+            op: Op::Syscall(Sysno::connect, SyscallPhase::Polling),
+            ..post.clone()
+        };
+        let next = b.syscall_pre(Sysno::getpid, 0x402000, DetTid::from_raw(3));
+        (post, poll, next)
+    }
+
+    #[test]
+    fn retry_only_prefix_does_not_fabricate_a_consumed_completion() {
+        let mut failures = Vec::new();
+        for len in [1, 2] {
+            let (post, poll, _) = events();
+            let mut r = Replayer::new(vec![poll; len]);
+            r.die_on_desync = true;
+            assert!(!r.replay_exhausted_panic);
+            let action = r.observe_event(&post);
+            let valid = r.record_position() <= len as u64
+                && r.events_popped <= len as u64
+                && r.last_consumed.is_none_or(|position| position < len as u64);
+            if !valid {
+                failures.push(format!(
+                    "{len}-event prefix: action={action:?}, events_popped={}, record_position={}, last_consumed={:?}, phase_count={}",
+                    r.events_popped,
+                    r.record_position(),
+                    r.last_consumed,
+                    r.desync_counts[&DetTid::from_raw(3)].phase_only_resyncs,
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "EOF may continue, but cannot consume nonexistent recorded events: {}",
+            failures.join("; ")
+        );
+    }
+
+    #[test]
+    fn recorded_background_start_stays_before_the_completion_after_a_retry() {
+        let (post, poll, next) = events();
+        let caller = DetTid::from_raw(7);
+        let start = crate::preemptions::BackgroundStart {
+            after: 1,
+            thread: caller,
+            call: 1,
+        };
+        let mut r =
+            Replayer::new(vec![poll, post.clone(), next]).with_background_starts(&[start], true);
+        r.die_on_desync = true;
+        assert_eq!(r.record_position(), 0);
+        assert_eq!(r.pending_background_start(), None);
+        let action = r.observe_event(&post);
+        let preserved_before_completion = r.record_position() == 1
+            && r.peek_next() == Some(post)
+            && r.pending_background_start() == Some((caller, 1));
+        assert!(
+            action == ReplayAction::Stop(StopReason::FatalDesync) || preserved_before_completion,
+            "retiring the retry must not move its due background start behind the already-consumed completion: action={action:?}, record_position={}, next={:?}, pending_start={:?}, last_consumed={:?}",
+            r.record_position(),
+            r.peek_next(),
+            r.pending_background_start(),
+            r.last_consumed,
+        );
     }
 }
 
