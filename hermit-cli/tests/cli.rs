@@ -28449,8 +28449,7 @@ fn an_instruction_offset_record_replays_from_its_schedule_and_analyze_verifies_i
         let recorded = run(branch_free_race_offset_args(&seed_arg, &[&record_arg]));
         let lost = parse_branch_free_race(&recorded);
         assert_eq!(lost == 0, fixed, "{label} seed {SEED}: {recorded}");
-        let json: serde_json::Value =
-            serde_json::from_slice(&fs::read(&record).expect("no preemption record")).unwrap();
+        let json = hermit_test::recorded_preemption_json(&record);
         // Both guests record offset decisions, so each record states the
         // offsets format; a record without one states the format below it.
         assert_eq!(
@@ -33883,7 +33882,7 @@ fn check_schedule_callback_slowdown_and_control() {
         for (round, line) in output.lines().enumerate() {
             assert!(line.starts_with(&format!("{round} ")), "{label}: {line}");
         }
-        let json: serde_json::Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+        let json = hermit_test::recorded_preemption_json(&record);
         let events = json["global"].as_array().expect("recorded global events");
         let rcbs: u64 = events
             .iter()
