@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# Harvest the Reverie validate test set from a Buck build (M2 Cut 3).
+# Harvest Hermit's own Buck-built detcore test binaries (dh-iz46e).
 #
-# Builds the Reverie integration-test targets with buck2, copies ONLY the
-# files readers read into the existing target/validate paths, executes each
-# harvested binary with --list so the cohort is proven to run, and writes
-# the harvested-file manifest at target/validate/harvested-files.json.
+# Builds the detcore rust_unittest targets (tests_misc, tests_parallelism,
+# tests_time in detcore/BUCK; Cargo twins in detcore/tests/Cargo.toml) with
+# buck2, copies ONLY the files readers read into the existing
+# target/validate paths, executes each harvested binary with --list so the
+# cohort is proven to run, and writes the harvested-file manifest at
+# target/validate/harvested-files.json. Nextest prepare substitutes these
+# binaries into the test.detcore_misc/parallel/time selections only after
+# exact name-set and Cargo-twin case-set equality checks.
 #
 # Placement is buck-harvest-only by default: binaries land in
 # target/validate/buck-harvest/<name>, and nextest prepare repoints the
@@ -46,16 +50,9 @@ fi
 
 # target| harvested name (the Cargo test-binary stem)
 TARGETS=(
-  "reverie//:generic-basics|basics"
-  "reverie//:generic-exit|exit"
-  "reverie//:generic-stat|stat"
-  "reverie//:generic-vdso|vdso"
-  "reverie//:generic-inject-then-tail|inject_then_tail"
-  "reverie//:generic-thread-start|thread_start"
-  "reverie//:generic-initial-stack-pointer|initial_stack_pointer"
-  "reverie//:generic-at-random|at_random"
-  "reverie//:generic-stack|stack"
-  "reverie//:generic-suppression|suppression"
+  "hermit//detcore:tests_misc|tests_misc"
+  "hermit//detcore:tests_parallelism|tests_parallelism"
+  "hermit//detcore:tests_time|tests_time"
 )
 
 if [[ ! -f shim/third-party/rust/BUCK ]]; then
@@ -63,9 +60,10 @@ if [[ ! -f shim/third-party/rust/BUCK ]]; then
 fi
 
 mkdir -p target/validate/buck-harvest
-# Never bind a stale sibling library: this run's copy is recreated below
-# only when the Buck output actually provides one.
-rm -f target/validate/buck-harvest/libreverie_examples.so
+# The harvest directory is producer-owned: clear prior-run artifacts (in
+# particular binaries from a previous target set) so prepare's
+# no-undeclared-files check sees exactly this run's manifest.
+find target/validate/buck-harvest -maxdepth 1 -type f -delete
 BUILD_LOG=$(mktemp target/validate/buck-harvest/build.XXXXXX.log)
 trap 'rm -f "$BUILD_LOG"' EXIT
 
@@ -74,7 +72,7 @@ for entry in "${TARGETS[@]}"; do
   BUCK_TARGETS+=("${entry%%|*}")
 done
 
-echo "harvest-reverie-buck: building ${#BUCK_TARGETS[@]} Reverie targets with $BUCK2" >&2
+echo "harvest-reverie-buck: building ${#BUCK_TARGETS[@]} detcore targets with $BUCK2" >&2
 "$BUCK2" build --show-output "${BUCK_TARGETS[@]}" > "$BUILD_LOG" 2>&1 || {
   tail -n 30 "$BUILD_LOG" >&2
   echo "harvest-reverie-buck: buck build failed" >&2
@@ -117,13 +115,6 @@ for entry in "${TARGETS[@]}"; do
   cp -- "$src" "$dest"
   chmod 755 "$dest"
   touch "$dest"
-  # The sibling shared library readers resolve beside the binary (and in
-  # deps/ when the binary itself lives there).
-  src_dir=$(dirname -- "$src")
-  if [[ -f $src_dir/libreverie_examples.so ]]; then
-    cp -- "$src_dir/libreverie_examples.so" "$(dirname -- "$dest")/libreverie_examples.so"
-    touch "$(dirname -- "$dest")/libreverie_examples.so"
-  fi
   # Prove the cohort runs: list its cases from the harvested path itself.
   listed=$("$dest" --list 2>/dev/null | grep -c ': test$' || true)
   if [[ $listed -lt 1 ]]; then
@@ -137,7 +128,7 @@ for entry in "${TARGETS[@]}"; do
 done
 
 printf '%s' "$ENTRIES" | python3 -c '
-import hashlib, json, os, sys
+import json, sys
 files = []
 for line in sys.stdin:
     line = line.rstrip("\n")
@@ -156,20 +147,10 @@ for line in sys.stdin:
     })
 manifest = {
     "schema": 1,
-    "producer": "build.reverie_buck (M2 Cut 3)",
+    "producer": "build.reverie_buck (dh-iz46e detcore harvest)",
     "cohort": "oss-unsanitized (shim reports no sanitizer); fbcode builds the same targets under asan-ubsan-dev",
     "files": files,
 }
-so_path = "target/validate/buck-harvest/libreverie_examples.so"
-if os.path.exists(so_path):
-    digest = hashlib.sha256()
-    with open(so_path, "rb") as fh:
-        digest.update(fh.read())
-    manifest["shared_library"] = {
-        "harvested_to": so_path,
-        "sha256": digest.hexdigest(),
-        "bytes": os.path.getsize(so_path),
-    }
 with open("target/validate/harvested-files.json", "w") as fh:
     json.dump(manifest, fh, indent=2)
     fh.write("\n")
@@ -194,9 +175,5 @@ printf '%s' "$ENTRIES" | while IFS='|' read -r _target name _src dest _placed _s
       ;;
   esac
 done
-if [[ -f target/validate/buck-harvest/libreverie_examples.so ]]; then
-  cp -- target/validate/buck-harvest/libreverie_examples.so \
-    "$PINNED_VALIDATE/buck-harvest/libreverie_examples.so"
-fi
 echo "harvest-reverie-buck: staged manifest and buck-harvest into $PINNED_VALIDATE" >&2
 echo "harvest-reverie-buck: done" >&2

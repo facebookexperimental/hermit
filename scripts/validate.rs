@@ -1153,9 +1153,12 @@ const FROZEN_RUN_WITHHELD_ISSUE: &str = "https://github.com/rrnewton/dev-hermit/
 /// The selection mode of a plan that `--frozen-run` withheld a node from.
 const FROZEN_RUN_SELECTION_MODE: &str = "frozen";
 const RELEASE_BUILD_MODE_ENV: &str = "HERMIT_VALIDATE_RELEASE_BUILD_MODE";
-/// How tests are compiled: `cargo` (today's nextest-binaries staging).
-/// `buck` is refused by name: no prepared Nextest selection consumes
-/// Buck-built executables yet (follow-up dh-iz46e).
+/// How tests are compiled: `cargo` (today's nextest-binaries staging) or
+/// `buck` (the host harvest substitutes Buck-built detcore test binaries
+/// into the test.detcore_* selections under exact name-set and Cargo-twin
+/// case-set equality; every other selection stays Cargo-built in the same
+/// prepared record, whose build_mode names the switch). A buck run is
+/// supplemental evidence and never mints a receipt.
 const BUILD_MODE_ENV: &str = "HERMIT_VALIDATE_BUILD_MODE";
 const BUILD_MODE_CARGO: &str = "cargo";
 const BUILD_MODE_BUCK: &str = "buck";
@@ -1436,28 +1439,25 @@ fn ambient_mode_value(
                 )
             } else {
                 format!(
-                    "{name} has a non-UTF-8 value: cargo is the only supported build mode (buck is refused by name, follow-up dh-iz46e)"
+                    "{name} has a non-UTF-8 value: cargo and buck are the supported build modes"
                 )
             }
         }),
     }
 }
 
-/// Refuse an ambient build/run mode this cut cannot honour: buck is
-/// refused by name (no prepared Nextest selection consumes Buck-built
-/// executables yet, follow-up dh-iz46e), any unknown value is refused,
-/// and neither is ever a silent fallback to cargo.
+/// Refuse an ambient build/run mode this cut cannot honour: build mode
+/// is `cargo` or `buck` (buck substitutes Buck-built detcore binaries into
+/// the test.detcore_* selections; see [`BUILD_MODE_ENV`]), any unknown
+/// value is refused, and neither is ever a silent fallback to cargo.
 fn check_ambient_build_modes(
     ambient_build: Option<&str>,
     ambient_run: Option<&str>,
 ) -> Result<(), String> {
     if let Some(value) = ambient_build {
-        if value == BUILD_MODE_BUCK {
-            return Err(hermit_manifest_plan::nextest_binaries::BUCK_BUILD_REFUSAL.to_string());
-        }
-        if value != BUILD_MODE_CARGO {
+        if !BUILD_MODES.contains(&value) {
             return Err(format!(
-                "unknown {BUILD_MODE_ENV} {value:?}: cargo is the only supported build mode (buck is refused by name, follow-up dh-iz46e)"
+                "unknown {BUILD_MODE_ENV} {value:?}: cargo and buck are the supported build modes"
             ));
         }
     }
@@ -1474,19 +1474,20 @@ fn check_ambient_build_modes(
 /// Establish the Reverie build/run modes, like
 /// [`establish_release_build_environment`]: ambient values never survive.
 /// The ambient values are captured by the caller before stripping and are
-/// refused here when unsupported (see [`check_ambient_build_modes`]); a
-/// supported or unset ambient value establishes cargo.
+/// refused here when unsupported (see [`check_ambient_build_modes`]); an
+/// unset ambient value establishes cargo. Returns the established build
+/// mode so the receipt gate reads the same value the nodes ran under.
 fn establish_build_mode_environment(
     ambient_build: Option<String>,
     ambient_run: Option<String>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     check_ambient_build_modes(ambient_build.as_deref(), ambient_run.as_deref())?;
-    let build_mode = ambient_build.as_deref().unwrap_or(BUILD_MODES[0]);
+    let build_mode = ambient_build.unwrap_or_else(|| BUILD_MODES[0].to_string());
     std::env::remove_var(BUILD_MODE_ENV);
     std::env::remove_var(RUN_MODE_ENV);
-    std::env::set_var(BUILD_MODE_ENV, build_mode);
+    std::env::set_var(BUILD_MODE_ENV, &build_mode);
     std::env::set_var(RUN_MODE_ENV, RUN_MODE_CARGO);
-    Ok(())
+    Ok(build_mode)
 }
 
 #[cfg(test)]
@@ -1497,25 +1498,25 @@ mod build_mode_environment_tests {
     fn build_and_run_modes_default_to_cargo_over_ambient_values() {
         // Unset and explicit cargo both establish cargo.
         for ambient in [None, Some(BUILD_MODE_CARGO.to_string())] {
-            establish_build_mode_environment(ambient, None).unwrap();
+            let established = establish_build_mode_environment(ambient, None).unwrap();
+            assert_eq!(established, BUILD_MODE_CARGO);
             assert_eq!(std::env::var(BUILD_MODE_ENV).unwrap(), BUILD_MODE_CARGO);
             assert_eq!(std::env::var(RUN_MODE_ENV).unwrap(), RUN_MODE_CARGO);
         }
-        // Buck build mode is refused by name: no prepared Nextest
-        // selection consumes Buck-built executables yet (dh-iz46e).
-        let error =
-            establish_build_mode_environment(Some(BUILD_MODE_BUCK.into()), None).unwrap_err();
-        assert!(
-            error.contains("HERMIT_VALIDATE_BUILD_MODE=buck is refused"),
-            "{error}"
-        );
-        assert!(error.contains("dh-iz46e"), "{error}");
+        // Buck build mode establishes buck (dh-iz46e): the prepared detcore
+        // selections consume Buck-built executables, and the established
+        // value is what the receipt gate refuses on.
+        let established =
+            establish_build_mode_environment(Some(BUILD_MODE_BUCK.into()), None).unwrap();
+        assert_eq!(established, BUILD_MODE_BUCK);
+        assert_eq!(std::env::var(BUILD_MODE_ENV).unwrap(), BUILD_MODE_BUCK);
+        assert_eq!(std::env::var(RUN_MODE_ENV).unwrap(), RUN_MODE_CARGO);
         // An unknown build mode is refused by name too.
         let error =
             establish_build_mode_environment(Some("banana".into()), None).unwrap_err();
         assert!(error.contains(BUILD_MODE_ENV), "{error}");
         assert!(
-            error.contains("cargo is the only supported build mode"),
+            error.contains("cargo and buck are the supported build modes"),
             "{error}"
         );
         // An unsupported run mode is refused too.
@@ -1550,7 +1551,7 @@ mod build_mode_environment_tests {
                     );
                 } else {
                     assert!(
-                        error.contains("cargo is the only supported build mode"),
+                        error.contains("cargo and buck are the supported build modes"),
                         "{error}"
                     );
                 }
@@ -1666,21 +1667,23 @@ fn usage() -> &'static str {
      \x20 --label-pr       Publish a receipt and label the PR after a full green (default).\n\
      \x20 --no-label-pr    Disable the non-fatal receipt publication and label update.\n\
      \x20 --ignore-cache   Force a real run even on a tree-keyed cache hit.\n\
-     \x20 --build-mode cargo\n\
+     \x20 --build-mode cargo|buck\n\
      \x20                  Select how tests are compiled (default cargo, or\n\
-     \x20                  HERMIT_VALIDATE_BUILD_MODE). buck is refused by name:\n\
-     \x20                  no prepared Nextest selection consumes Buck-built\n\
-     \x20                  executables yet (follow-up dh-iz46e). Admission paths\n\
-     \x20                  that forward no environment use this flag.\n\
+     \x20                  HERMIT_VALIDATE_BUILD_MODE). buck substitutes Buck-built\n\
+     \x20                  detcore test binaries into the test.detcore_* selections\n\
+     \x20                  (exact name-set and Cargo-twin case-set equality enforced\n\
+     \x20                  in prepare); a buck run never mints a receipt. Admission\n\
+     \x20                  paths that forward no environment use this flag.\n\
      \x20 --buck-release DOTSLASH\n\
      \x20                  Build release Hermit with Buck2 through the named absolute\n\
      \x20                  public DotSlash launcher. Cargo remains the default. Buck\n\
      \x20                  mode refuses unsupported plans and never falls back.\n\
-     \x20 HERMIT_VALIDATE_BUILD_MODE=cargo\n\
+     \x20 HERMIT_VALIDATE_BUILD_MODE=cargo|buck\n\
      \x20                  How tests are compiled. cargo (default) stages through\n\
-     \x20                  nextest-binaries. buck is refused by name (follow-up\n\
-     \x20                  dh-iz46e). Any other value is refused with a nonzero\n\
-     \x20                  exit, never silently replaced by cargo.\n\
+     \x20                  nextest-binaries. buck harvests Buck-built detcore test\n\
+     \x20                  binaries for the test.detcore_* selections. Any other\n\
+     \x20                  value is refused with exit 2, never silently replaced\n\
+     \x20                  by cargo.\n\
      \x20 HERMIT_VALIDATE_RUN_MODE=cargo\n\
      \x20                  Who executes the tests (environment only). cargo is the\n\
      \x20                  only supported run mode until the deferred RUN switch;\n\
@@ -1986,14 +1989,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
             "--build-mode" => {
                 i += 1;
                 match argv.get(i) {
-                    Some(v) if v == BUILD_MODE_BUCK => {
-                        eprintln!(
-                            "validate: {}",
-                            hermit_manifest_plan::nextest_binaries::BUCK_BUILD_REFUSAL
-                        );
-                        return Err(2);
-                    }
-                    Some(v) if v == BUILD_MODE_CARGO && args.build_mode.is_none() => {
+                    Some(v) if BUILD_MODES.contains(&v.as_str()) && args.build_mode.is_none() => {
                         args.build_mode = Some(v.clone());
                     }
                     Some(_) if args.build_mode.is_some() => {
@@ -2001,7 +1997,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
                         return Err(2);
                     }
                     _ => {
-                        eprintln!("validate: --build-mode needs cargo (buck is refused by name)");
+                        eprintln!("validate: --build-mode needs cargo or buck");
                         return Err(2);
                     }
                 }
@@ -5336,8 +5332,11 @@ fn self_test() -> Result<(), String> {
     if cargo_default.build_mode.is_some() {
         return Err("build mode: Cargo is not the default".into());
     }
-    // Buck build mode is refused by name at parse time (dh-iz46e).
-    if parse_argv(&["full".into(), "--build-mode".into(), "buck".into()]).is_ok()
+    // Buck build mode parses as an explicit opt-in (dh-iz46e); an unknown
+    // mode or a second --build-mode still refuses at parse time.
+    let buck_mode = parse_argv(&["full".into(), "--build-mode".into(), "buck".into()])
+        .map_err(|code| format!("build mode: explicit buck opt-in refused with exit {code}"))?;
+    if buck_mode.build_mode.as_deref() != Some(BUILD_MODE_BUCK)
         || parse_argv(&["full".into(), "--build-mode".into(), "banana".into()]).is_ok()
         || parse_argv(&[
             "full".into(),
@@ -6697,6 +6696,7 @@ fn checkout_attribution_bracket() -> Result<(), String> {
         in_place_attribution.tree_dirty,
         "full",
         RELEASE_BUILDER_CARGO,
+        BUILD_MODE_CARGO,
     )
     .is_ok()
     {
@@ -6782,6 +6782,7 @@ fn checkout_attribution_bracket() -> Result<(), String> {
             disposable_attribution.tree_dirty,
             "full",
             RELEASE_BUILDER_CARGO,
+            BUILD_MODE_CARGO,
         )
         .is_err()
     {
@@ -6928,7 +6929,7 @@ fn default_mode_bracket() -> Result<(), String> {
     {
         return Err("default mode: a selective pass answered a full cache lookup".into());
     }
-    if validate_receipt::eligible(0, 0, true, true, false, "selective", RELEASE_BUILDER_CARGO)
+    if validate_receipt::eligible(0, 0, true, true, false, "selective", RELEASE_BUILDER_CARGO, BUILD_MODE_CARGO)
         .is_ok()
     {
         return Err("default mode: a selective pass could mint a full receipt".into());
@@ -30140,12 +30141,15 @@ fn run(
     if let Err(error) = establish_e2e_runner_environment(&args) {
         return RunSummary::refused(2, args.level.name(), "E2E runner", vec![error]);
     }
-    if let Err(error) = establish_build_mode_environment(
+    let build_mode = match establish_build_mode_environment(
         args.build_mode.clone().or(ambient_build_mode),
         ambient_run_mode,
     ) {
-        return RunSummary::refused(2, args.level.name(), "build mode", vec![error]);
-    }
+        Ok(build_mode) => build_mode,
+        Err(error) => {
+            return RunSummary::refused(2, args.level.name(), "build mode", vec![error]);
+        }
+    };
 
     let level_name = args.level.name().to_string();
     let root = repo_root();
@@ -32416,6 +32420,7 @@ fn run(
         attribution_tree_dirty,
         &plan.profile,
         release_builder,
+        &build_mode,
     ) {
         Ok(()) => {
             let _ = validate_receipt::publish();
@@ -37189,7 +37194,7 @@ mod scorecard_cutover_tests {
                 "{builder} green against a Cargo cache key"
             );
             assert_eq!(
-                validate_receipt::eligible(0, 0, true, true, false, "full", builder).is_ok(),
+                validate_receipt::eligible(0, 0, true, true, false, "full", builder, BUILD_MODE_CARGO).is_ok(),
                 cargo_reusable,
                 "{builder} green as a full-suite receipt"
             );
