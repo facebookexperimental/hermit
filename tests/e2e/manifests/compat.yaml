@@ -2130,7 +2130,10 @@ corpus:
     - {label: "mpstat-softirqs", argv: ["/usr/bin/mpstat", "-I", "SCPU", "1", "1"], proc: standard}
     - {label: "lsmod", argv: ["/usr/sbin/lsmod"]}
     - {label: "numastat", argv: ["/usr/bin/numastat"]}
-    - {label: "numactl-hardware", argv: ["/usr/bin/numactl", "--hardware"]}
+    # Hermit presents a kernel without NUMA (issue 5269), so libnuma's
+    # probe answers unavailable: numactl prints exactly this and exits 1,
+    # as it does on such a kernel natively.
+    - {label: "numactl-hardware", argv: ["bash", "-c", "output=$(/usr/bin/numactl --hardware 2>&1); rc=$?; test \"$rc\" -eq 1 && test \"$output\" = \"No NUMA available on this system\" && printf \"numactl-no-numa\\n\""]}
     - {label: "ps", argv: ["/usr/bin/ps", "aux"]}
     - {label: "vmstat", argv: ["/usr/bin/vmstat", "-s"], proc: standard}
     - {label: "top", argv: ["/usr/bin/env", "HOME={{VALIDATE_RUN_STATE}}/strict-compat/top-home", "XDG_CONFIG_HOME={{VALIDATE_RUN_STATE}}/strict-compat/top-home/.config", "/bin/bash", "-c", "set -euo pipefail; LC_ALL=C /usr/bin/top -b -n 1 -p $$ -w 80 >/dev/null; printf \"top-ok\\n\""]}
