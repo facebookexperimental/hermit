@@ -1,7 +1,7 @@
 #!/usr/bin/env -S rust-script --force
 //! ```cargo
 //! [dependencies]
-//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "a7bd1a1cc769b4bb3f0dc1ea4035b09d239e0101" }
+//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "a0eeb67d196817a59805dc3760caafd6d3172d78" }
 //! detcore-model = { path = "../detcore-model" }
 //! hermit-manifest-plan = { path = "../ci/manifest-plan" }
 //! flate2 = "=1.1.10"
