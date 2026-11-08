@@ -65116,7 +65116,6 @@ fn the_pipe_wake_hand_off_is_deterministic() {
 /// or another `L`, and a record made without the option replayed with it,
 /// are refused before launch, under both replay kinds.
 #[test]
-#[ignore = "known failure: hidden schedule desync exposed by strict replay, dh-ds5i3, issue 5285 §4"]
 fn a_schedule_recorded_with_the_pipe_wake_latency_replays_only_with_it() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let run = |latency: Option<&str>, extra: &[&str], without_pmu: bool| {
@@ -65152,18 +65151,6 @@ fn a_schedule_recorded_with_the_pipe_wake_latency_replays_only_with_it() {
         }
     }
 
-    // A FIFO's hand-off under schedule replay: the replay reproduces the
-    // recorded run with the hand-off left to the trace.
-    let fifo_record = directory.path().join("fifo.json");
-    let flag = format!("--record-preemptions-to={}", fifo_record.display());
-    let recorded = pipe_wake_run("wake-fifo", Some("0"), &[&flag], &[]);
-    assert_success(&recorded, &[&flag]);
-    assert_eq!(stdout(&recorded), PIPE_WAKE_AT_ONCE);
-    let replay = format!("--replay-schedule-from={}", fifo_record.display());
-    let replayed = pipe_wake_run("wake-fifo", Some("0"), &[&replay], &[]);
-    assert_success(&replayed, &[&replay]);
-    assert_eq!(stdout(&replayed), stdout(&recorded), "{replay}");
-
     let with = directory.path().join("zero.json");
     let (without, _) = record("without.json", None, false);
     assert!(
@@ -65197,6 +65184,25 @@ fn a_schedule_recorded_with_the_pipe_wake_latency_replays_only_with_it() {
             );
         }
     }
+}
+
+/// A FIFO's hand-off under schedule replay: the replay reproduces the
+/// recorded run with the hand-off left to the trace. This is the one
+/// pipe-wake case strict replay exposes as a hidden desync (a different
+/// thread runs the openat, about 31 us earlier at the same RIP).
+#[test]
+#[ignore = "known failure: hidden schedule desync exposed by strict replay, dh-ds5i3, issue 5285 §4"]
+fn a_fifo_handoff_replays_its_schedule_with_the_pipe_wake_latency() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let fifo_record = directory.path().join("fifo.json");
+    let flag = format!("--record-preemptions-to={}", fifo_record.display());
+    let recorded = pipe_wake_run("wake-fifo", Some("0"), &[&flag], &[]);
+    assert_success(&recorded, &[&flag]);
+    assert_eq!(stdout(&recorded), PIPE_WAKE_AT_ONCE);
+    let replay = format!("--replay-schedule-from={}", fifo_record.display());
+    let replayed = pipe_wake_run("wake-fifo", Some("0"), &[&replay], &[]);
+    assert_success(&replayed, &[&replay]);
+    assert_eq!(stdout(&replayed), stdout(&recorded), "{replay}");
 }
 
 /// The hand-off verifies on every channel kind: the strict verifier finds
