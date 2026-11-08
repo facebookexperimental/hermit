@@ -70,7 +70,7 @@ def verify(install, *, core=False):
     require(digest == record["installed"]["sha256"] == qualification["artifact"]["sha256"], "installed runtime differs from qualified bytes")
     args = record["cargo_argv"]
     require(args == ["build", "--locked", "--offline", "--manifest-path", sources["manifest"]["path"],
-                     "-p", "detcore-liteinst", "--lib", "--profile", "liteinst-runtime", "--target-dir",
+                     "-p", "detcore-liteinst", "--lib", "--no-default-features", "--profile", "liteinst-runtime", "--target-dir",
                      str(Path(artifact["reported_path"]).parent.parent), "--message-format=json-render-diagnostics"],
             "receipt does not identify the fixed ordinary runtime build")
     commands = record["commands"]

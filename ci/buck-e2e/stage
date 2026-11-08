@@ -254,7 +254,7 @@ hermit_build=$!
 # stage's other builds are still fetching the git dependencies when it starts, and
 # Cargo's fingerprints do not include --offline. A cold build of it took 97-100 s of
 # the finalizer's 107-110 s at eight jobs (main 359ab376).
-setsid -w "$retry" cargo build --manifest-path "$root/Cargo.toml" --locked -p detcore-liteinst --lib --profile liteinst-runtime \
+setsid -w "$retry" cargo build --manifest-path "$root/Cargo.toml" --locked -p detcore-liteinst --lib --no-default-features --profile liteinst-runtime \
     --target-dir "$target_dir" >"$tmp/liteinst-runtime-build.log" 2>&1 &
 liteinst_build=$!
 # hermit-install stages only the core resources. The ordinary LiteInst resource

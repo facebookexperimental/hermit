@@ -23,7 +23,7 @@ def fixture_receipt(install, pin, *, core=False):
                "kind": ["cdylib"], "crate_types": ["cdylib"]}
     artifact = "/fixture/target/liteinst-runtime/libdetcore_liteinst.so"
     args = ["build", "--locked", "--offline", "--manifest-path", source["path"],
-            "-p", "detcore-liteinst", "--lib", "--profile", "liteinst-runtime",
+            "-p", "detcore-liteinst", "--lib", "--no-default-features", "--profile", "liteinst-runtime",
             "--target-dir", "/fixture/target", "--message-format=json-render-diagnostics"]
     # Shape-only transport fixtures, not actual emitted machine-code evidence.
     backing = {name: {"fixture": True} for name in ("descriptor", "fixed_backing_record", "tls_boundary", "compiler_routes")}

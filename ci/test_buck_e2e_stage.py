@@ -432,7 +432,7 @@ class StageCargoOverlapTest(unittest.TestCase):
             "hermit-install+detcore-liteinst": common + [
                 "--profile", "validate", "-p", "hermit-install", "-p", "detcore-liteinst",
                 "--target-dir", target],
-            "detcore-liteinst": common + ["-p", "detcore-liteinst", "--lib", "--profile", "liteinst-runtime",
+            "detcore-liteinst": common + ["-p", "detcore-liteinst", "--lib", "--no-default-features", "--profile", "liteinst-runtime",
                                           "--target-dir", target],
         })
 
