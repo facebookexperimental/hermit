@@ -231,6 +231,7 @@ static TIMER_SIGNAL_MASKED_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHAOS_LAST_BAND_ADMISSION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static YIELD_LOOP_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DIRECTORY_SIZE_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PROCFS_SYSTEM_DIRECTORY_LINKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUSE_DIRECTORY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LAST_BAND_BACKGROUND_CALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHAOS_POLLER_BESIDE_SLEEPERS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -63508,6 +63509,109 @@ fn run_kvm_a_procfs_directory_keeps_its_size() {
     }
     let _guard = hermit_run_guard();
     assert_procfs_directory_keeps_its_size("kvm");
+}
+
+/// tests/c/procfs_system_directory_links.c, the readlinks of the
+/// system-wide procfs directories by many spellings.
+fn procfs_system_directory_links_guest() -> String {
+    futex_c_guest(
+        &PROCFS_SYSTEM_DIRECTORY_LINKS_GUEST,
+        "procfs_system_directory_links",
+    )
+    .to_str()
+    .unwrap()
+    .to_owned()
+}
+
+/// On KVM, whose executor serves no procfs directory and refuses every
+/// procfs object with `EACCES`, Detcore answers `readlink` and `readlinkat`
+/// of the system-wide procfs directories as Linux does, by every spelling
+/// the guest prints: redundant separators and `.` components, a name below
+/// a `/proc` descriptor, a spelling through a symbolic link to `/proc/sys`,
+/// the longest pathname Linux takes (4095 bytes, `EINVAL`), and one longer
+/// (4105 bytes), which Linux refuses with `ENAMETOOLONG` before any lookup.
+/// Each line must match the guest's own native run. Before the fix the
+/// directories were `EACCES`; at 1aa06612 the overlong spelling was `EINVAL`
+/// and the spelling through the link `EACCES`.
+#[test]
+fn run_kvm_procfs_system_directory_links_answer_as_linux() {
+    if kvm_unavailable("run_kvm_procfs_system_directory_links_answer_as_linux") {
+        return;
+    }
+    let guest = procfs_system_directory_links_guest();
+    let native_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let native = Command::new(&guest)
+        .arg(native_dir.path())
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(native.status.success(), "natively: {native:?}");
+    let native = String::from_utf8(native.stdout).expect("native stdout is UTF-8");
+    assert!(
+        native.contains("(4105 bytes) /proc/ + slashes + sys: readlink=ENAMETOOLONG"),
+        "natively: {native}"
+    );
+    let _guard = hermit_run_guard();
+    let args = [
+        "--backend=kvm",
+        "run",
+        "--strict",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--base-env=minimal",
+        "--",
+        guest.as_str(),
+        "/tmp",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), native, "KVM against native Linux");
+}
+
+/// A user mount over `/proc/sys` keeps its own objects: with a fixture bound
+/// there that holds `kernel -> /dev/null` (and the port range Hermit reads
+/// at start), `readlink` and `readlinkat` of `/proc/sys/kernel` read the
+/// link's 9 bytes on KVM, as on ptrace, because Detcore decides by the
+/// object the lookup reaches, not by the spelling; and `/proc/sys`, now the
+/// fixture's directory, is `EINVAL` from the kernel. At 1aa06612 KVM
+/// answered `/proc/sys/kernel` with `EINVAL` by its spelling.
+#[test]
+fn run_kvm_a_user_mount_over_proc_sys_keeps_its_links() {
+    if kvm_unavailable("run_kvm_a_user_mount_over_proc_sys_keeps_its_links") {
+        return;
+    }
+    let guest = procfs_system_directory_links_guest();
+    let fixture = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    std::os::unix::fs::symlink("/dev/null", fixture.path().join("kernel")).unwrap();
+    fs::create_dir_all(fixture.path().join("net/ipv4")).unwrap();
+    fs::write(
+        fixture.path().join("net/ipv4/ip_local_port_range"),
+        fs::read("/proc/sys/net/ipv4/ip_local_port_range").unwrap(),
+    )
+    .unwrap();
+    let mount = format!(
+        "--mount=type=bind,source={},target=/proc/sys,readonly",
+        fixture.path().display()
+    );
+    let expected = "/proc/sys/kernel: readlink=9:/dev/null readlinkat=9:/dev/null\n\
+                    /proc/sys: readlink=EINVAL readlinkat=EINVAL\n";
+    let _guard = hermit_run_guard();
+    for backend in ["--backend=ptrace", "--backend=kvm"] {
+        let args = [
+            backend,
+            "run",
+            "--strict",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--base-env=minimal",
+            "--proc=standard",
+            mount.as_str(),
+            "--",
+            guest.as_str(),
+            "--bind",
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{backend}");
+    }
 }
 
 /// A yield loop beside a call that only the yielder or an alarm can end

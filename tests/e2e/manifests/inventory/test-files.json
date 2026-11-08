@@ -2179,6 +2179,12 @@
       "why": "tests/c/procfs_positioned_probe.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/procfs_system_directory_links.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/procfs_system_directory_links.c is owned by hermit-cli/tests/cli.rs: run_kvm_procfs_system_directory_links_answer_as_linux runs it natively and under hermit --backend=kvm run --strict and requires byte-identical output: readlink and readlinkat of the system-wide procfs directories by many spellings (redundant separators and . components, a name below a /proc descriptor, a symbolic link to /proc/sys, a 4095-byte pathname that Linux takes and a 4105-byte one it refuses with ENAMETOOLONG), and run_kvm_a_user_mount_over_proc_sys_keeps_its_links runs its --bind mode on ptrace and KVM with a fixture bound over /proc/sys whose kernel -> /dev/null link must read its 9 bytes (https://github.com/rrnewton/hermit/pull/5273); it stays a fixture because a generic manifest cannot compare a run with the same program's native output or bind a fixture over /proc/sys."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/prodcons_determinism.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

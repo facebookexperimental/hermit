@@ -94,6 +94,8 @@ pub(crate) mod procfs_levels;
 pub(crate) mod procfs_numbers;
 mod rendered_fdinfo;
 pub(crate) mod rendered_procfs;
+#[cfg(test)]
+mod system_directory_link_tests;
 
 /// A conversion from SOCK_* flags to O_* flags which makes unsafe (but checked during testing) assumptions.
 fn oflag_from_sock_bits(s_bits: i32) -> OFlag {

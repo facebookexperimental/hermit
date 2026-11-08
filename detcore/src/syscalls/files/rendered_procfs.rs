@@ -52,7 +52,9 @@
 use std::ffi::OsStr;
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
+use std::path::PathBuf;
 
 use nix::fcntl::OFlag;
 use reverie::Error;
@@ -364,6 +366,73 @@ static NOT_RENDERED: std::sync::Mutex<std::collections::BTreeSet<(u64, u64)>> =
 pub(super) fn proc_device() -> Option<u64> {
     static PROC_DEVICE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *PROC_DEVICE.get_or_init(|| GuestProcfs::stat(c"/proc").ok().map(|stat| stat.st_dev))
+}
+
+/// The name of the procfs directory that a lookup of the absolute path `path`
+/// reaches, without following a final symbolic link, if it reaches one: a
+/// directory on the guest's procfs mount ([`proc_device`]), named as the
+/// kernel names the object it holds open (its `/proc/self/fd` link), with
+/// every symbolic link and `..` on the way resolved. The tool runs in the
+/// guest's mount namespace ([`GuestProcfs`]), so this is the object, and the
+/// name, the guest's own lookup reaches: a user mount over part of `/proc`
+/// reaches its own objects, on another device, and a symbolic link is no
+/// directory. `None` for any other object, or one the lookup does not reach.
+pub(super) fn procfs_directory_reached(path: &Path) -> Option<PathBuf> {
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: the path is NUL-terminated; the descriptor is closed below.
+    let fd = raw_errno(unsafe {
+        raw_syscall(
+            libc::SYS_openat,
+            [
+                libc::AT_FDCWD as u64,
+                path.as_ptr() as u64,
+                (libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64,
+                0,
+                0,
+                0,
+            ],
+        )
+    })
+    .ok()? as i32;
+    let reached = (|| {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+        // SAFETY: `fd` is open and `stat` is writable.
+        raw_errno(unsafe {
+            raw_syscall(
+                libc::SYS_fstat,
+                [fd as u64, stat.as_mut_ptr() as u64, 0, 0, 0, 0],
+            )
+        })
+        .ok()?;
+        // SAFETY: the call succeeded and initialized the structure.
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR || proc_device() != Some(stat.st_dev) {
+            return None;
+        }
+        let link = std::ffi::CString::new(format!("/proc/self/fd/{fd}")).ok()?;
+        let mut name = vec![0u8; libc::PATH_MAX as usize];
+        // SAFETY: the link is NUL-terminated and `name` is writable for its
+        // length.
+        let length = raw_errno(unsafe {
+            raw_syscall(
+                libc::SYS_readlinkat,
+                [
+                    libc::AT_FDCWD as u64,
+                    link.as_ptr() as u64,
+                    name.as_mut_ptr() as u64,
+                    name.len() as u64,
+                    0,
+                    0,
+                ],
+            )
+        })
+        .ok()? as usize;
+        name.truncate(length);
+        Some(PathBuf::from(std::ffi::OsString::from_vec(name)))
+    })();
+    // SAFETY: `fd` is the descriptor opened above, closed once.
+    let _ = unsafe { raw_syscall(libc::SYS_close, [fd as u64, 0, 0, 0, 0, 0]) };
+    reached
 }
 
 /// The rendered file among `paths` that the kernel's procfs inode

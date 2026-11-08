@@ -21706,9 +21706,11 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // #5221 review round's sigsuspend and masked-ppoll SIGALRM tests: 155.
         // And slice 2b-2's run_kvm_another_processs_status_answers_as_linux: 156.
         // And slice 2b-3's
-        // run_kvm_another_processs_cmdline_and_environ_answer_as_linux: 157,
+        // run_kvm_another_processs_cmdline_and_environ_answer_as_linux: 157.
+        // And PR #5273's run_kvm_procfs_system_directory_links_answer_as_linux
+        // and run_kvm_a_user_mount_over_proc_sys_keeps_its_links: 159,
         // matching the DAG pin in validation_dag_static.
-        ("privileged-only-test.cli_kvm", 157usize),
+        ("privileged-only-test.cli_kvm", 159usize),
     ] {
         let step = privileged
             .steps

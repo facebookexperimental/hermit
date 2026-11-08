@@ -2267,7 +2267,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Answer a `readlink` of `path` from `dirfd` if it is a descriptor link
     /// of the caller's to a placeholder directory
     /// ([`Self::placeholder_link_spelling`],
-    /// `Detcore::answer_descriptor_directory_link`). Boxed by its callers, so
+    /// `Detcore::answer_descriptor_directory_link`), or a system-wide procfs
+    /// directory where the guest's procfs is not the kernel's
+    /// (`Detcore::answer_system_directory_link`). Boxed by its callers, so
     /// that the spelling it holds does not grow every system call's future.
     async fn answer_placeholder_link_at<G: Guest<Self>>(
         &self,
@@ -2279,8 +2281,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Option<Result<i64, Error>> {
         Self::prepare_guest_cwd(guest, dirfd, path).await;
         let spelled = self.placeholder_link_spelling(guest, dirfd, path)?;
-        self.answer_descriptor_directory_link(guest, &spelled, buf, buf_len)
+        match self
+            .answer_descriptor_directory_link(guest, &spelled, buf, buf_len)
             .await
+        {
+            Some(answer) => Some(answer),
+            None => self.answer_system_directory_link(guest, path, &spelled),
+        }
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

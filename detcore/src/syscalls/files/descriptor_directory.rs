@@ -5762,8 +5762,6 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// truncated to the buffer and without a NUL, as `do_readlinkat` copies
     /// it. The placeholder's own path never reaches the guest. The walk to
     /// the link keeps the lookup's whole link budget ([`Self::readlink_walk`]).
-    /// Where the guest's procfs is not the kernel's, a system-wide directory
-    /// of the `--proc` level the walk reaches is answered too: `EINVAL`.
     pub(crate) async fn answer_descriptor_directory_link<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -5778,23 +5776,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Ok((decided, _)) => PathBuf::from(std::ffi::OsString::from_vec(decided)),
             Err(errno) => return Some(Err(errno.into())),
         };
-        let Some(directory) = Self::own_link_directory(guest, &decided) else {
-            // A system-wide directory of the level (`/proc/sys`,
-            // `/proc/sys/kernel/random`) is no link, so its `readlink` is
-            // EINVAL, as Linux's of any object that is not one
-            // (`do_readlinkat`). Detcore answers it where the guest's procfs
-            // is not the kernel's ([`Self::serves_task_directories`]): KVM's
-            // executor serves no procfs directory and refuses a procfs object
-            // with EACCES, which procps 4's `sysctl` takes for a refusal
-            // when it checks each component of a key's path.
-            if Self::serves_task_directories(guest)
-                && crate::procfs::levels::names_system_directory(&decided, self.cfg.proc_level)
-            {
-                return Some(Err(Errno::EINVAL.into()));
-            }
-            return None;
-        };
-        let target = directory.canonical();
+        let target = Self::own_link_directory(guest, &decided)?.canonical();
         let size = match crate::syscalls::namespace::readlink_size(buf_len) {
             Ok(size) => size,
             Err(errno) => return Some(Err(errno.into())),
@@ -5811,6 +5793,46 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .map(|()| length as i64)
                 .map_err(Into::into),
         )
+    }
+
+    /// Answer a `readlink` of `original`, the guest's own pathname, spelled
+    /// absolutely as `spelled` ([`Self::answer_descriptor_directory_link`]'s
+    /// path), where it reaches one of the system-wide procfs directories of
+    /// the `--proc` level (`/proc/sys`, `/proc/sys/kernel/random`): no link,
+    /// so EINVAL, as Linux's `do_readlinkat` answers for any object that is
+    /// not one. Only where the guest's procfs is not the kernel's
+    /// ([`Self::serves_task_directories`]): KVM's executor serves no procfs
+    /// directory and refuses every procfs object with EACCES, which procps
+    /// 4's `sysctl` takes for a refusal when it checks each component of a
+    /// key's path.
+    ///
+    /// In the kernel's order: a pathname of `PATH_MAX` bytes or more is
+    /// refused (ENAMETOOLONG, `getname_flags`) before any lookup, so it is
+    /// left to the kernel's path. And the answer is decided by the object the
+    /// lookup reaches in the guest's mount namespace, which the tool shares,
+    /// and by the kernel's name for it
+    /// (`rendered_procfs::procfs_directory_reached`), never by the spelling,
+    /// as [`Self::own_link_directory`] answers from the descriptor's own
+    /// identity: a user mount over part of `/proc` (`--mount
+    /// ...,target=/proc/sys`) leaves its own objects, links included, to the
+    /// kernel, and a spelling through a symbolic link to `/proc/sys` reaches
+    /// the procfs directory it names.
+    pub(crate) fn answer_system_directory_link<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        original: &Path,
+        spelled: &Path,
+    ) -> Option<Result<i64, Error>> {
+        if original.as_os_str().len() >= libc::PATH_MAX as usize
+            || !Self::serves_task_directories(guest)
+        {
+            return None;
+        }
+        let (decided, _) = Self::readlink_walk(guest, spelled.as_os_str().as_bytes()).ok()?;
+        let decided = PathBuf::from(std::ffi::OsString::from_vec(decided));
+        let reached = super::rendered_procfs::procfs_directory_reached(&decided)?;
+        crate::procfs::levels::names_system_directory(&reached, self.cfg.proc_level)
+            .then(|| Err(Errno::EINVAL.into()))
     }
 
     /// Whether the absolute guest path `observed`, followed, names a
