@@ -132,6 +132,62 @@ def test_whitespace_only_skip_reason_fails(tmp_path):
     _assert_named_failure(r, "without a reason", "a")
 
 
+CHECK = Path(__file__).parent / "census-check.sh"
+
+
+def _check(tmp_path, base_ids, cand_ids=None, cand_outcomes=None,
+           dropped=None, report_only=False):
+    import uuid
+    root = tmp_path / uuid.uuid4().hex
+    root.mkdir(parents=True)
+    (root / "base.listed-ids").write_text("".join(f"{i}\n" for i in base_ids))
+    args = ["bash", str(CHECK), "--base-listed", str(root / "base.listed-ids")]
+    if cand_outcomes is not None:
+        (root / "cand.outcomes.json").write_text(
+            json.dumps({"outcomes": cand_outcomes}))
+        args += ["--candidate-outcomes", str(root / "cand.outcomes.json")]
+    else:
+        (root / "cand.listed-ids").write_text(
+            "".join(f"{i}\n" for i in (cand_ids or [])))
+        args += ["--candidate-listed", str(root / "cand.listed-ids")]
+    if dropped is not None:
+        (root / "dropped.txt").write_text(dropped)
+        args += ["--dropped", str(root / "dropped.txt")]
+    if report_only:
+        args.append("--report-only")
+    return subprocess.run(args, capture_output=True, text=True)
+
+
+def test_wired_listed_removal_fails_naming_it(tmp_path):
+    # (a)+(d): a test removed from the suite's listed population on the
+    # wired census-check path fails naming it -- the failure mode the
+    # deleted count pins used to catch, now with the ID.
+    r = _check(tmp_path, ["pkg/bin/kept", "pkg/bin/gone_test"],
+               cand_ids=["pkg/bin/kept"])
+    assert r.returncode == 1 and "gone_test" in r.stderr and "MISSING" in r.stderr
+
+
+def test_wired_skip_with_reason_passes_and_is_reported(tmp_path):
+    # (b): skipped with a reason passes and is reported in the totals.
+    r = _check(tmp_path, ["pkg/bin/a", "pkg/bin/b"],
+               cand_outcomes=[_row("pkg/bin/a"),
+                              _row("pkg/bin/b", "skipped", "flaky on KVM, #1234")])
+    assert r.returncode == 0 and "skipped=1" in r.stdout
+
+
+def test_wired_new_test_passes(tmp_path):
+    # (c): a newly added test passes and is reported as an addition.
+    r = _check(tmp_path, ["pkg/bin/a"],
+               cand_ids=["pkg/bin/a", "pkg/bin/brand_new"])
+    assert r.returncode == 0 and "+pkg/bin/brand_new" in r.stdout and "added=1" in r.stdout
+
+
+def test_wired_no_base_is_report_only_and_passes(tmp_path):
+    r = subprocess.run(["bash", str(CHECK), "--candidate-listed", "/dev/null"],
+                       capture_output=True, text=True)
+    assert r.returncode == 0 and "report-only" in r.stderr
+
+
 def test_declared_drop_passes_and_unreasoned_skip_fails(tmp_path):
     r = _run(tmp_path, {"s": ["a", "old"]}, {"s": [_row("a")]},
              dropped="Test-Dropped: old -- removed with its backend, #999\n")

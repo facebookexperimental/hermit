@@ -328,6 +328,23 @@ function run_nextest {
             cleanup_nextest_config
             return 2
         fi
+        # Census gate (phase 2): diff this run's listed population against
+        # the base (last landed main) population the queue adapter cached.
+        # HERMIT_CENSUS_BASE_LISTED_IDS names that base .listed-ids file;
+        # HERMIT_CENSUS_DROPPED_FILE names Test-Dropped records dumped from
+        # `git log base..head`; HERMIT_CENSUS_REPORT_ONLY=1 downgrades an
+        # unrecorded disappearance to a report. With no base supplied the
+        # check is report-only and passes: the adapter integration point is
+        # exactly these variables, and no count pin is consulted either way.
+        local -a census_args=(--candidate-listed "${DAGRUN_TEST_COUNTS_PATH}.listed-ids")
+        [[ -n ${HERMIT_CENSUS_BASE_LISTED_IDS:-} ]] && census_args+=(--base-listed "$HERMIT_CENSUS_BASE_LISTED_IDS")
+        [[ -n ${HERMIT_CENSUS_DROPPED_FILE:-} ]] && census_args+=(--dropped "$HERMIT_CENSUS_DROPPED_FILE")
+        [[ ${HERMIT_CENSUS_REPORT_ONLY:-} == 1 ]] && census_args+=(--report-only)
+        if ! "$SCRIPT_DIR/census-check.sh" "${census_args[@]}"; then
+            printf 'run-nextest-counted: census gate refused this listed population (see census FAIL lines above)\n' >&2
+            cleanup_nextest_config
+            return 1
+        fi
     fi
 
     # Prepared consumers can bind calibration to the exact checked build and
