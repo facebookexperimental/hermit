@@ -3869,8 +3869,42 @@ where
     })
 }
 
+/// Measurement only: with SCORECARD_PHASE_LOG set, print one stderr line per
+/// phase with elapsed seconds and this process's resident/high-water sizes.
+fn phase_mark(phase: &str) {
+    use std::sync::OnceLock;
+    static START: OnceLock<Instant> = OnceLock::new();
+    if env::var_os("SCORECARD_PHASE_LOG").is_none() {
+        return;
+    }
+    let start = START.get_or_init(Instant::now);
+    let (mut rss_kib, mut hwm_kib) = (0u64, 0u64);
+    if let Ok(status) = fs::read_to_string("/proc/self/status") {
+        for line in status.lines() {
+            let kib = |value: &str| {
+                value
+                    .trim()
+                    .trim_end_matches(" kB")
+                    .trim()
+                    .parse::<u64>()
+                    .unwrap_or(0)
+            };
+            if let Some(value) = line.strip_prefix("VmRSS:") {
+                rss_kib = kib(value);
+            } else if let Some(value) = line.strip_prefix("VmHWM:") {
+                hwm_kib = kib(value);
+            }
+        }
+    }
+    eprintln!(
+        "phase {phase} elapsed_s={:.3} vmrss_kib={rss_kib} vmhwm_kib={hwm_kib}",
+        start.elapsed().as_secs_f64()
+    );
+}
+
 fn main() -> ExitCode {
     rust_script_prelude::init();
+    phase_mark("main:start");
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
@@ -11781,6 +11815,7 @@ fn project_observations(root: &Path, series_root: &Path, refreshed_at: &str) -> 
     let source_commit = snapshot.source_commit.clone();
     let source_tree = snapshot.source_tree.clone();
     let rows = read_series_rows_owned(snapshot)?;
+    phase_mark("series:after-read-rows");
     project_observation_rows(
         root,
         &derived,
@@ -11858,8 +11893,11 @@ where
         ));
     }
     let derived = check_tracked(root)?;
+    phase_mark("snap:after-check-tracked");
     let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
+    phase_mark("snap:after-load-existing");
     reconcile_history_catalogue(root, &mut tracked)?;
+    phase_mark("snap:after-reconcile");
     project_observation_rows(
         root,
         &derived,
@@ -11904,17 +11942,23 @@ fn project_observation_rows<VerifySource>(
 where
     VerifySource: FnOnce() -> Result<(), String>,
 {
+    phase_mark("rows:entry");
     let before = tracked.clone();
+    phase_mark("rows:after-clone");
     let source = row_source.source.to_string();
     let attempts = validate_attempt_bindings(&tracked, Some(rows))?;
+    phase_mark("rows:after-attempt-bindings");
     let representation = direct_representation(&tracked, rows, &attempts)?;
+    phase_mark("rows:after-direct-representation");
     remove_replaceable_projected_observations(&mut tracked, rows, Some(&source))?;
+    phase_mark("rows:after-remove-replaceable");
     let unrepresented = rows
         .iter()
         .filter(|row| !representation.represented_event_ids.contains(&row.event_id))
         .collect::<Vec<&SeriesRow>>();
     let mut projection =
         apply_series_rows_in_place(root, &mut tracked, &unrepresented, Some(&source))?;
+    phase_mark("rows:after-apply");
     projection.represented_rows += representation.represented_event_ids.len();
     let skipped = &projection.skipped;
 
@@ -11933,13 +11977,16 @@ where
     });
     cap_observations(&mut tracked);
     refresh_measurement(&mut tracked);
+    phase_mark("rows:after-cap-refresh");
 
     // The guard runs BEFORE the write, not after. A projection that has already
     // hit the disk is a projection someone has to notice and revert.
     enforce_projection_preserves_evidence(&before, &tracked, rows_read)?;
     enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
     verify_source()?;
+    phase_mark("rows:after-guards");
     write_observation_files(root, derived, &tracked)?;
+    phase_mark("rows:after-write");
 
     println!(
         "compatibility scorecard: projected {} cell(s) from {} evidence row(s), including {} \
@@ -13391,22 +13438,21 @@ struct ProjectObservationsOutcome {
     pre_series_corpus: bool,
 }
 
+/// One admitted row, by index into the caller's row slice. Only the facts
+/// the projection computes are stored; everything the row already carries
+/// (event/run identity, depth, coordinates, canonical order) is read from
+/// the row itself. Copying those into a second per-row record — seven
+/// strings, a depth map, coordinates, and a three-string order tuple, then
+/// cloned again by the preserved-evidence filter — held gigabytes beside
+/// the rows at full-corpus scale for no second purpose.
 #[derive(Clone, Debug)]
 struct PreparedSeriesRow {
+    row_index: usize,
     cell_index: usize,
     observation_identity: SeriesObservationIdentity,
     provenance: ObservationProvenance,
-    event_id: String,
-    hermit_sha: String,
-    run_id: String,
-    attempt: u64,
     result: Option<ObservedResult>,
     no_verdict: bool,
-    num_runs: u64,
-    main_ancestry: Option<bool>,
-    depth: BTreeMap<String, SourceDepth>,
-    coordinates: Option<SeriesCoordinates>,
-    order: (String, String, u64, String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -16028,10 +16074,6 @@ fn should_replace_last_tested_at(
     }
 }
 
-fn should_replace_last_tested(previous: Option<&LastTested>, row: &PreparedSeriesRow) -> bool {
-    should_replace_last_tested_at(previous, &row.hermit_sha, row.main_ancestry, &row.depth)
-}
-
 fn remove_replaceable_projected_observations<R: std::borrow::Borrow<SeriesRow>>(
     tracked: &mut TrackedCells,
     rows: &[R],
@@ -16138,7 +16180,7 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
 
     let mut prepared = Vec::new();
     let mut skipped = Vec::new();
-    for row in rows {
+    for (row_index, row) in rows.iter().enumerate() {
         let row: &SeriesRow = row.borrow();
         let label = row.label();
         if let Err(why) = row.validate_for_projection() {
@@ -16193,28 +16235,16 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
             }
         };
         prepared.push(PreparedSeriesRow {
+            row_index,
             cell_index,
             observation_identity,
             provenance,
-            event_id: row.event_id.clone(),
-            hermit_sha: row.series.tree.clone(),
-            run_id: row.run_id.clone(),
-            attempt: row.series.attempt.unwrap_or(1),
             result: evidence.result,
             no_verdict: evidence.no_verdict,
-            num_runs: row.series.num_runs,
-            main_ancestry: row.series.main_ancestry,
-            depth: row.series.depth.clone(),
-            coordinates: row.series.coordinates.clone(),
-            order: (
-                row.emitted_at.clone(),
-                row.run_id.clone(),
-                row.series.run_index,
-                row.event_id.clone(),
-            ),
         });
     }
 
+    phase_mark("apply:after-prepared");
     if !rows.is_empty() && prepared.is_empty() {
         return Err(format!(
             "every one of the {} readable series row(s) determined nothing for the legacy projection, so the projection was not written:\n{}",
@@ -16229,18 +16259,27 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
 
     let admitted_rows = prepared.len();
     let no_verdict_rows = prepared.iter().filter(|row| row.no_verdict).count();
-    let admitted_runs = prepared.iter().map(|row| row.num_runs).sum();
+    let admitted_runs = prepared
+        .iter()
+        .map(|row| rows[row.row_index].borrow().series.num_runs)
+        .sum();
     let admitted_cells = prepared
         .iter()
         .map(|row| row.cell_index)
         .collect::<BTreeSet<_>>();
-    let mut preserved = BTreeMap::new();
+    // Both maps key on borrowed identities — from the tracked observations
+    // and from the caller's rows — and are dropped before the grouped fold
+    // mutates TRACKED. Owning each key cloned two strings per row.
+    let mut preserved = BTreeMap::<
+        (usize, ObservationProvenance, &str, &str),
+        (usize, BTreeSet<ObservedResult>),
+    >::new();
     for (cell_index, cell) in tracked.cells.iter().enumerate() {
         for observation in &cell.observations {
             if !observation.event_ids.is_empty() {
                 continue;
             }
-            let mut runs = BTreeMap::<(String, String), BTreeSet<ObservedResult>>::new();
+            let mut runs = BTreeMap::<(&str, &str), BTreeSet<ObservedResult>>::new();
             for (hermit_sha, run_id, result) in observation
                 .canonical_comparisons
                 .iter()
@@ -16250,7 +16289,7 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
                         .map(|result| (&row.hermit_sha, &row.run_id, result))
                 }))
             {
-                runs.entry((hermit_sha.clone(), run_id.clone()))
+                runs.entry((hermit_sha.as_str(), run_id.as_str()))
                     .or_default()
                     .insert(result);
             }
@@ -16263,20 +16302,21 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
             }
         }
     }
-    let source_counts = prepared.iter().fold(BTreeMap::new(), |mut counts, row| {
-        *counts
+    let mut source_counts = BTreeMap::<(usize, ObservationProvenance, &str, &str), usize>::new();
+    for row in &prepared {
+        let source = rows[row.row_index].borrow();
+        *source_counts
             .entry((
                 row.cell_index,
                 row.provenance,
-                row.hermit_sha.clone(),
-                row.run_id.clone(),
+                source.series.tree.as_str(),
+                source.run_id.as_str(),
             ))
             .or_insert(0usize) += 1;
-        counts
-    });
+    }
     let mut represented_rows = 0usize;
     let mut to_project = Vec::new();
-    for row in prepared.iter().cloned() {
+    for row in prepared {
         // Projector-owned no-verdict rows carry immutable event IDs instead of
         // the direct writer's literal invocation. Do not conflate the two
         // storage forms or suppress the series event by a run-level match.
@@ -16284,33 +16324,35 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
             to_project.push(row);
             continue;
         }
+        let source = rows[row.row_index].borrow();
         let key = (
             row.cell_index,
             row.provenance,
-            row.hermit_sha.clone(),
-            row.run_id.clone(),
+            source.series.tree.as_str(),
+            source.run_id.as_str(),
         );
         let Some((matches, results)) = preserved.get(&key) else {
             to_project.push(row);
             continue;
         };
-        if row.attempt != 1 {
+        let attempt = source.series.attempt.unwrap_or(1);
+        if attempt != 1 {
             return Err(format!(
                 "series event {} maps to existing run {} at Hermit {}, but records outer attempt {}; preserved evidence does not retain that attempt identity",
-                row.event_id, row.run_id, row.hermit_sha, row.attempt
+                source.event_id, source.run_id, source.series.tree, attempt
             ));
         }
         let source_rows = source_counts[&key];
-        if *matches != 1 || source_rows != 1 || row.num_runs != 1 {
+        if *matches != 1 || source_rows != 1 || source.series.num_runs != 1 {
             return Err(format!(
                 "source event {} cannot map one-to-one to preserved run {} attempt {} at Hermit {}: source_rows={} matching_observations={} num_runs={}",
-                row.event_id,
-                row.run_id,
-                row.attempt,
-                row.hermit_sha,
+                source.event_id,
+                source.run_id,
+                attempt,
+                source.series.tree,
                 source_rows,
                 matches,
-                row.num_runs
+                source.series.num_runs
             ));
         }
         let result = row
@@ -16319,14 +16361,32 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
         if results != &BTreeSet::from([result]) {
             return Err(format!(
                 "series event {} maps to existing run {} at Hermit {}, but results {results:?} disagree with {:?}",
-                row.event_id, row.run_id, row.hermit_sha, result
+                source.event_id, source.run_id, source.series.tree, result
             ));
         }
         represented_rows += 1;
     }
+    drop(preserved);
+    drop(source_counts);
     let mut prepared = to_project;
+    phase_mark("apply:after-preserved-filter");
 
-    prepared.sort_by(|left, right| left.order.cmp(&right.order));
+    prepared.sort_by(|left, right| {
+        let left_row = rows[left.row_index].borrow();
+        let right_row = rows[right.row_index].borrow();
+        (
+            left_row.emitted_at.as_str(),
+            left_row.run_id.as_str(),
+            left_row.series.run_index,
+            left_row.event_id.as_str(),
+        )
+            .cmp(&(
+                right_row.emitted_at.as_str(),
+                right_row.run_id.as_str(),
+                right_row.series.run_index,
+                right_row.event_id.as_str(),
+            ))
+    });
     let mut grouped =
         BTreeMap::<(usize, SeriesObservationIdentity, ObservationProvenance), Observation>::new();
     let mut latest_by_cell: BTreeMap<usize, usize> = BTreeMap::new();
@@ -16351,30 +16411,39 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
                 first_divergent_record: ObservedPositions::default(),
                 first_divergent_syscall: ObservedPositions::default(),
             });
-        observation.event_ids.insert(row.event_id.clone());
-        observation.depth = row.depth.clone();
-        observation.hermit_shas.insert(row.hermit_sha.clone());
+        let source = rows[row.row_index].borrow();
+        observation.event_ids.insert(source.event_id.clone());
+        observation.depth = source.series.depth.clone();
+        observation.hermit_shas.insert(source.series.tree.clone());
         if let Some(result) = row.result {
             observation.results.insert(result);
         }
-        for _ in 0..row.num_runs {
+        for _ in 0..source.series.num_runs {
             observation.first_divergent_scheduler_turn.record(
-                row.coordinates
+                source
+                    .series
+                    .coordinates
                     .as_ref()
                     .and_then(|coordinates| coordinates.first_divergent_scheduler_turn),
             );
             observation.first_divergent_virtual_nanoseconds.record(
-                row.coordinates
+                source
+                    .series
+                    .coordinates
                     .as_ref()
                     .and_then(|coordinates| coordinates.first_divergent_virtual_nanoseconds),
             );
             observation.first_divergent_record.record(
-                row.coordinates
+                source
+                    .series
+                    .coordinates
                     .as_ref()
                     .and_then(|coordinates| coordinates.first_divergent_record),
             );
             observation.first_divergent_syscall.record(
-                row.coordinates
+                source
+                    .series
+                    .coordinates
                     .as_ref()
                     .and_then(|coordinates| coordinates.first_divergent_syscall),
             );
@@ -16393,16 +16462,23 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
         });
     }
 
+    phase_mark("apply:after-grouped-push");
     for (cell_index, prepared_index) in latest_by_cell {
         let row = &prepared[prepared_index];
+        let source = rows[row.row_index].borrow();
         let Some(detcore_tree) = row.observation_identity.detcore_tree() else {
             continue;
         };
-        if should_replace_last_tested(tracked.cells[cell_index].last_tested.as_ref(), row) {
+        if should_replace_last_tested_at(
+            tracked.cells[cell_index].last_tested.as_ref(),
+            &source.series.tree,
+            source.series.main_ancestry,
+            &source.series.depth,
+        ) {
             tracked.cells[cell_index].last_tested = Some(LastTested {
-                hermit_sha: row.hermit_sha.clone(),
+                hermit_sha: source.series.tree.clone(),
                 detcore_tree: detcore_tree.to_string(),
-                depth: row.depth.clone(),
+                depth: source.series.depth.clone(),
                 // Projected from historical series rows. Neither the check
                 // identity nor the applicability AT THAT TIME survives in the
                 // row, and today's applicability is not evidence about then, so
@@ -16448,14 +16524,31 @@ struct SeriesSourceShard {
     bytes: Vec<u8>,
 }
 
+/// What a held snapshot keeps after validation: the source identity and row
+/// accounting every later phase reads. The rows themselves live, typed, in
+/// [`HeldScorecardSeriesSnapshot::rows`].
+#[derive(Debug)]
+struct ScorecardSeriesSnapshotMeta {
+    source: ScorecardSeriesSnapshotSource,
+    rows_read: u64,
+    rows_sha256: String,
+}
+
+/// The parse-time form of a scorecard snapshot: rows borrow the payload
+/// bytes instead of copying them into one `Box<RawValue>` each. At
+/// full-corpus scale the owned copy is a second snapshot-sized allocation
+/// held beside the payload and the typed rows; the borrowed rows are
+/// validated and converted before the payload is released, and only the
+/// metadata above is kept.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ScorecardSeriesSnapshot {
+struct BorrowedScorecardSeriesSnapshot<'a> {
     schema: String,
     source: ScorecardSeriesSnapshotSource,
     rows_read: u64,
     rows_sha256: String,
-    rows: Vec<Box<RawValue>>,
+    #[serde(borrow)]
+    rows: Vec<&'a RawValue>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -16546,7 +16639,7 @@ struct HeldScorecardSeriesSnapshot {
     parent_identity: SnapshotDirectoryIdentity,
     file_identity: SnapshotPathIdentity,
     sha256: String,
-    snapshot: ScorecardSeriesSnapshot,
+    snapshot: ScorecardSeriesSnapshotMeta,
     rows: Vec<SeriesRow>,
 }
 
@@ -16636,6 +16729,34 @@ fn snapshot_path_identity(path: &Path, kind: &str) -> Result<SnapshotPathIdentit
     Ok(SnapshotPathIdentity::from_metadata(&metadata))
 }
 
+/// The held snapshot's sha256, read in chunks: the same size-change refusals
+/// as [`read_held_snapshot_file`], without holding the whole payload again.
+/// `verify` runs while the typed rows and tracked history are all alive, so
+/// a whole-payload buffer there set the render's peak.
+fn held_snapshot_sha256(file: &File, identity: SnapshotPathIdentity) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    let mut chunk = vec![0u8; 1 << 20];
+    let mut offset = 0u64;
+    while offset < identity.size {
+        let wanted = ((identity.size - offset) as usize).min(chunk.len());
+        let read = UnixFileExt::read_at(file, &mut chunk[..wanted], offset)
+            .map_err(|error| format!("cannot read held scorecard snapshot: {error}"))?;
+        if read == 0 {
+            return Err("scorecard snapshot changed size while being read".into());
+        }
+        hasher.update(&chunk[..read]);
+        offset += read as u64;
+    }
+    let mut extra = [0u8; 1];
+    if UnixFileExt::read_at(file, &mut extra, identity.size)
+        .map_err(|error| format!("cannot finish reading held scorecard snapshot: {error}"))?
+        != 0
+    {
+        return Err("scorecard snapshot changed size while being read".into());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn read_held_snapshot_file(file: &File, identity: SnapshotPathIdentity) -> Result<Vec<u8>, String> {
     let size = usize::try_from(identity.size)
         .map_err(|_| "scorecard snapshot is too large to address".to_string())?;
@@ -16669,15 +16790,6 @@ fn canonical_snapshot_rows_bytes(rows: &[JsonValue]) -> Result<Vec<u8>, String> 
     Ok(bytes)
 }
 
-fn canonical_snapshot_raw_rows_bytes(rows: &[Box<RawValue>]) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    for row in rows {
-        bytes.extend_from_slice(row.get().as_bytes());
-        bytes.push(b'\n');
-    }
-    bytes
-}
-
 fn require_exact_object_keys(
     value: &JsonValue,
     expected: &[&str],
@@ -16695,7 +16807,7 @@ fn require_exact_object_keys(
 }
 
 fn validate_scorecard_snapshot(
-    snapshot: &ScorecardSeriesSnapshot,
+    snapshot: &BorrowedScorecardSeriesSnapshot<'_>,
     display: &Path,
 ) -> Result<Vec<SeriesRow>, String> {
     if snapshot.schema != SCORECARD_SERIES_SNAPSHOT_SCHEMA {
@@ -16806,8 +16918,15 @@ fn validate_scorecard_snapshot(
     // bytes, one row plus one newline. Preserve those bytes through RawValue:
     // reserializing through Rust would silently change valid Python spellings
     // such as exponent-form floats and would verify a different contract.
-    let rows_bytes = canonical_snapshot_raw_rows_bytes(&snapshot.rows);
-    let rows_sha256 = format!("{:x}", Sha256::digest(&rows_bytes));
+    // Feed the hasher row by row: materializing every row's bytes first held
+    // a second snapshot-sized buffer beside the payload for no other purpose.
+    let mut hasher = Sha256::new();
+    for row in &snapshot.rows {
+        hasher.update(row.get().as_bytes());
+        hasher.update(b"\n");
+    }
+    let rows_sha256 = format!("{:x}", hasher.finalize());
+    phase_mark("validate:rows-digest");
     if rows_sha256 != snapshot.rows_sha256 {
         return Err(format!(
             "scorecard snapshot {} row digest does not match its rows",
@@ -16985,18 +17104,32 @@ impl HeldScorecardSeriesSnapshot {
         // Validate original bytes before any Value conversion can collapse
         // duplicate row, series, or nested detail fields. RawValue still owns
         // the producer's exact byte spelling for the canonical-row digest.
+        phase_mark("open:payload-read+digest");
         serde_json::from_slice::<UniqueJsonFields>(&payload)
             .map_err(|error| format!("scorecard snapshot is not valid strict JSON: {error}"))?;
-        let mut snapshot: ScorecardSeriesSnapshot = serde_json::from_slice(&payload)
+        phase_mark("open:unique-fields");
+        // Rows borrow the payload: converting them to owned RawValues first
+        // duplicated the snapshot's whole size beside the payload itself.
+        // Validation and the typed conversion finish here, while the payload
+        // is alive; only the metadata is kept, with no raw rows.
+        let borrowed: BorrowedScorecardSeriesSnapshot<'_> = serde_json::from_slice(&payload)
             .map_err(|error| format!("scorecard snapshot is not valid strict JSON: {error}"))?;
-        // Each RawValue owns its bytes, and the digest above already bound the
-        // payload: it is the snapshot's whole size, so release it now.
+        phase_mark("open:snapshot-parsed");
+        let rows = validate_scorecard_snapshot(&borrowed, path)?;
+        phase_mark("open:rows-typed");
+        let BorrowedScorecardSeriesSnapshot {
+            schema: _schema,
+            source,
+            rows_read,
+            rows_sha256,
+            rows: _borrowed_rows,
+        } = borrowed;
+        let snapshot = ScorecardSeriesSnapshotMeta {
+            source,
+            rows_read,
+            rows_sha256,
+        };
         drop(payload);
-        let rows = validate_scorecard_snapshot(&snapshot, path)?;
-        // The raw rows exist for that validation's canonical-byte digest. Only
-        // the typed rows are read after it; holding both kept another copy of
-        // every row through the render.
-        snapshot.rows = Vec::new();
         let held = Self {
             path: path.to_path_buf(),
             parent,
@@ -17009,6 +17142,7 @@ impl HeldScorecardSeriesSnapshot {
             rows,
         };
         held.verify()?;
+        phase_mark("open:verified");
         Ok(held)
     }
 
@@ -17041,14 +17175,14 @@ impl HeldScorecardSeriesSnapshot {
                 self.path.display()
             ));
         }
-        let payload = read_held_snapshot_file(&self.file, self.file_identity)?;
-        let actual_sha256 = format!("{:x}", Sha256::digest(&payload));
+        let actual_sha256 = held_snapshot_sha256(&self.file, self.file_identity)?;
         if actual_sha256 != self.sha256 {
             return Err(format!(
                 "scorecard snapshot content changed while held: {}",
                 self.path.display()
             ));
         }
+        phase_mark("verify:payload-reread+digest");
         Ok(())
     }
 }
@@ -46054,7 +46188,7 @@ mod series_comparison_tests {
             "rows": rows,
         });
         let text = serde_json::to_string(&value).map_err(|error| error.to_string())?;
-        let snapshot: ScorecardSeriesSnapshot =
+        let snapshot: BorrowedScorecardSeriesSnapshot<'_> =
             serde_json::from_str(&text).map_err(|error| error.to_string())?;
         validate_scorecard_snapshot(&snapshot, Path::new("fixture-snapshot"))
     }
