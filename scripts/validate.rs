@@ -20690,7 +20690,10 @@ mod nextest_timeout_tests {
                 // 2994 with the KVM verify cells of compat/pgrep, compat/pkill
                 // and c-programs/flock-lifecycle (3 of 3 strict verify runs
                 // each in the pinned root at 61eac51c).
-                assert_eq!(all.len(), 2994, "the original all-owner population is retained");
+                // 2995 with system-utils/ps-proc-table verify/KVM (Detcore renders
+                // /proc/1 of Hermit's init; 3 of 3 strict verify runs in the
+                // pinned root).
+                assert_eq!(all.len(), 2995, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");
@@ -21711,9 +21714,10 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // And slice 2b-3's
         // run_kvm_another_processs_cmdline_and_environ_answer_as_linux: 157.
         // And PR #5273's run_kvm_procfs_system_directory_links_answer_as_linux
-        // and run_kvm_a_user_mount_over_proc_sys_keeps_its_links: 159,
+        // and run_kvm_a_user_mount_over_proc_sys_keeps_its_links: 159.
+        // And run_kvm_hermit_init_stat_and_comm_answer_as_on_ptrace: 160,
         // matching the DAG pin in validation_dag_static.
-        ("privileged-only-test.cli_kvm", 159usize),
+        ("privileged-only-test.cli_kvm", 160usize),
     ] {
         let step = privileged
             .steps

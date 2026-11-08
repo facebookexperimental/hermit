@@ -114,7 +114,11 @@
 //!
 //! The one task Linux's lookup finds that no guest process holds is Hermit's
 //! own init, pid 1 where no guest holds it (`procfs::listing::task_exists`).
-//! Its files are left to the backend, as before, apart from a descriptor's
+//! Its `stat` and `comm` Detcore renders itself where the name's source is
+//! its record (KVM), from a fixed model of that process
+//! (`procfs::task_stat::with_hermit_init`), so procps lists it as on ptrace;
+//! the rest of its files this module leaves to the backend, as before,
+//! apart from a descriptor's
 //! fdinfo (`/proc/1[/task/1]/fdinfo/<N>`), which is refused by name: the
 //! backend has no fdinfo of its own any more, and its procfs would answer
 //! from the supervisor's descriptor table. The rest is a KNOWN LIMITATION,

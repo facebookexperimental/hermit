@@ -73910,6 +73910,42 @@ fn run_kvm_another_processs_stat_and_comm_answer_as_linux() {
     assert_eq!(proc_other_process_stat_at_l2("kvm"), native, "kvm");
 }
 
+/// What a guest reads of Hermit's own init, pid 1 of the run's PID
+/// namespace: the first eight fields of `/proc/1/stat` and
+/// `/proc/1/task/1/stat` (pid, name, state, parent, process group, session,
+/// terminal and its group, the fields procps shows), then both `comm` files.
+/// The other fields are left out because ptrace's are the real init's,
+/// sanitized, and carry host facts (its `nice` under a niced harness, the
+/// host's `PF_RANDOMIZE`, its own thread count); Detcore's unit test
+/// `hermit_init_is_rendered_from_its_model_where_the_record_names_tasks`
+/// pins KVM's whole line.
+const HERMIT_INIT_PROCFS_SCRIPT: &str = "cut -d ' ' -f 1-8 /proc/1/stat /proc/1/task/1/stat \
+     && cat /proc/1/comm /proc/1/task/1/comm";
+
+/// [`HERMIT_INIT_PROCFS_SCRIPT`]'s transcript on every backend.
+const HERMIT_INIT_PROCFS_TRANSCRIPT: &str =
+    "1 (hermit) S 0 0 0 0 -1\n1 (hermit) S 0 0 0 0 -1\nhermit\nhermit\n";
+
+/// `/proc/1/stat` and `/proc/1/comm` of Hermit's own init on KVM, at L2,
+/// as ptrace answers them at L2, which is the kernel's own file of that
+/// process, sanitized: so procps lists pid 1 on KVM as on ptrace
+/// (`system-utils/ps-proc-table`). Before this every read failed with the
+/// KVM provider's EACCES, because Detcore's process table holds no guest
+/// for pid 1 and left its files to the backend; Detcore now renders them
+/// from its fixed model of Hermit's init (`procfs::task_stat::with_hermit_init`).
+#[test]
+fn run_kvm_hermit_init_stat_and_comm_answer_as_on_ptrace() {
+    let test = "run_kvm_hermit_init_stat_and_comm_answer_as_on_ptrace";
+    if kvm_unavailable(test) {
+        return;
+    }
+    let script = ["-c", HERMIT_INIT_PROCFS_SCRIPT];
+    let ptrace = guest_transcript_at_l2("ptrace", Path::new("/bin/sh"), &script);
+    assert_eq!(ptrace, HERMIT_INIT_PROCFS_TRANSCRIPT, "ptrace");
+    let kvm = guest_transcript_at_l2("kvm", Path::new("/bin/sh"), &script);
+    assert_eq!(kvm, ptrace, "kvm");
+}
+
 static PROC_OTHER_PROCESS_STATUS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 
 /// `tests/c/proc_other_process_status.c`'s guest.

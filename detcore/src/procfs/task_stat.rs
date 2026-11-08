@@ -346,6 +346,66 @@ pub(crate) fn renders_task_comm(facts: &TaskStatFacts, source: CommSource) -> bo
     source == CommSource::Record && facts.process.is_some() && facts.comm.is_some()
 }
 
+/// The name of Hermit's own init, pid 1 of the run's PID namespace where no
+/// guest holds it: Hermit's process, forked by Hermit without an exec, so
+/// its `comm` is Hermit's (`hermit`), as the container contract pins it
+/// (the isolation matrix's `pid.private_init`, hermit-cli's
+/// `dbt_guest_runs_in_the_common_container`).
+pub(crate) const HERMIT_INIT_COMM: &[u8] = b"hermit";
+
+/// The facts of the task `task` names for its `stat` and `comm`
+/// (package K item 2b, pid 1): Detcore's process table's (`facts`), except
+/// for Hermit's own init where the name's source is Detcore's record
+/// (`source`, KVM's capability), whose files Detcore then renders from a
+/// fixed model of that process instead of leaving them to the kernel
+/// beneath, whose `/proc/1` there is not Hermit's init (KVM's provider
+/// refuses every procfs object, so procps left pid 1 out of its table).
+///
+/// Hermit's init is the task `procfs::listing::task_exists` finds for pid 1
+/// and its one thread 1 where no process of the table holds the number
+/// (`facts.process` is `None`); `Scheduler::procfs_task` already models it
+/// as live. Its model, every field a constant or Linux's rule for that
+/// process, nothing read from the host or the supervisor:
+///
+/// - name [`HERMIT_INIT_COMM`], parent 0 (its parent is outside the PID
+///   namespace), the contract's `PID1 name=hermit, pid=1, parent=0`;
+/// - process group and session 0: both are outside the namespace, which
+///   numbers them 0 (`pid_vnr`);
+/// - one thread, the listing's (`/proc/1/task` lists 1 alone);
+/// - forked without an exec (`PF_FORKNOEXEC`), exit signal `SIGCHLD`, the
+///   default `RLIMIT_RSS`, and no CPU time: it runs no guest code, and
+///   Detcore accounts virtual CPU time to guest tasks only.
+///
+/// Where the source is the kernel's (ptrace, DBT, SaBRe, LiteInst) the
+/// kernel beneath's `/proc/1` is Hermit's init itself, whose sanitized file
+/// stays as before: `facts` unchanged.
+pub(crate) fn with_hermit_init(
+    task: crate::procfs::BoundTask,
+    facts: TaskStatFacts,
+    source: CommSource,
+) -> TaskStatFacts {
+    let names_init = task.process == 1 && task.thread.is_none_or(|thread| thread == 1);
+    if source != CommSource::Record || facts.process.is_some() || !names_init {
+        return facts;
+    }
+    TaskStatFacts {
+        comm: Some(TaskComm::new(HERMIT_INIT_COMM)),
+        cpus: facts.cpus,
+        exited: false,
+        leads: true,
+        process_exit_signal: libc::SIGCHLD,
+        forked_without_exec: true,
+        process_group: 0,
+        session: 0,
+        num_threads: 1,
+        process: Some(1),
+        parent: Some(0),
+        rsslim: RLIM_INFINITY,
+        cpu: TaskCpuTimes::default(),
+        exit_code: 0,
+    }
+}
+
 /// A task's `comm` file (fs/proc/base.c:1750-1765 `comm_show` in 6.17): its
 /// name as `proc_task_name(m, p, false)` prints it, raw, through its first
 /// NUL (fs/proc/array.c:99-118, `seq_printf(m, "%.64s", tcomm)`), and a
@@ -598,6 +658,86 @@ mod tests {
     /// The rendered line has Linux's 52 fields, in `do_task_stat`'s order,
     /// with Detcore's values where it owns them and the documented fixed
     /// values elsewhere.
+    /// Hermit's own init (pid 1, which no process of the table holds) is
+    /// rendered from its fixed model where the name's source is Detcore's
+    /// record, as `/proc/1/stat` and `/proc/1/task/1/stat` show it on ptrace
+    /// in every field ps reads (`1 (hermit) S 0 0 0 0 -1`); any other number
+    /// no process holds, a thread of pid 1 but 1, a guest that holds pid 1,
+    /// and every task where the source is the kernel keep the table's facts.
+    #[test]
+    fn hermit_init_is_rendered_from_its_model_where_the_record_names_tasks() {
+        use crate::procfs::BoundTask;
+        let absent = TaskStatFacts {
+            comm: None,
+            process: None,
+            parent: None,
+            num_threads: 0,
+            ..facts()
+        };
+        let init = BoundTask {
+            process: 1,
+            thread: None,
+        };
+        let init_thread = BoundTask {
+            process: 1,
+            thread: Some(1),
+        };
+        for task in [init, init_thread] {
+            let modeled = with_hermit_init(task, absent, CommSource::Record);
+            assert!(renders_task_stat(&modeled, CommSource::Record), "{task:?}");
+            assert!(renders_task_comm(&modeled, CommSource::Record), "{task:?}");
+            let stat = TaskStat {
+                pid: 1,
+                comm: modeled.comm.unwrap(),
+                facts: modeled,
+                reader_is_task: false,
+                ppid: modeled.parent.unwrap(),
+                rsslim: modeled.rsslim,
+                processor: 0,
+                cpu: modeled.cpu,
+                permitted: true,
+            };
+            assert_eq!(
+                String::from_utf8(render_stat(&stat)).unwrap(),
+                "1 (hermit) S 0 0 0 0 -1 64 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 \
+                 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 \
+                 0 0 0 0\n",
+                "{task:?}"
+            );
+            assert_eq!(render_comm(&modeled.comm.unwrap()), b"hermit\n");
+            assert_eq!(
+                with_hermit_init(task, absent, CommSource::Kernel),
+                absent,
+                "the kernel's own init stays the kernel's: {task:?}"
+            );
+        }
+        for other in [
+            BoundTask {
+                process: 2,
+                thread: None,
+            },
+            BoundTask {
+                process: 1,
+                thread: Some(2),
+            },
+        ] {
+            assert_eq!(
+                with_hermit_init(other, absent, CommSource::Record),
+                absent,
+                "{other:?}"
+            );
+        }
+        let guest_init = TaskStatFacts {
+            process: Some(1),
+            ..facts()
+        };
+        assert_eq!(
+            with_hermit_init(init, guest_init, CommSource::Record),
+            guest_init,
+            "a guest holding pid 1 is the table's"
+        );
+    }
+
     #[test]
     fn stat_has_linuxs_52_fields_in_order() {
         let stat = TaskStat {

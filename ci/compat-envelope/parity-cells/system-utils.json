@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 205,
-      "applicable": 120,
-      "selectable": 108,
+      "applicable": 121,
+      "selectable": 109,
       "population": 205,
-      "population_candidate_selected": 108,
+      "population_candidate_selected": 109,
       "population_candidate_not_selected": 12,
-      "population_candidate_disabled": 85
+      "population_candidate_disabled": 84
     },
     "by_backend": {
       "dbt": {
@@ -37,12 +37,12 @@
       },
       "kvm": {
         "cells": 41,
-        "applicable": 40,
-        "selectable": 40,
+        "applicable": 41,
+        "selectable": 41,
         "population": 41,
-        "population_candidate_selected": 40,
+        "population_candidate_selected": 41,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 1
+        "population_candidate_disabled": 0
       },
       "liteinst": {
         "cells": 41,
@@ -197,7 +197,7 @@
     {"test_id":"system-utils/procfs-sanitized-paths","backend":"sabre","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Under SaBRe this guest's verify matches, but the harness refuses the run because SaBRe used fallback or native sites for bash and the utilities it runs (https://github.com/rrnewton/hermit/issues/4477)"},
     {"test_id":"system-utils/ps-proc-table","backend":"dbt","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"system-utils/ps-proc-table","backend":"in-guest-trap","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Under in-guest-trap, /usr/bin/env cannot exec bash (EOPNOTSUPP), so the guest never starts (https://github.com/rrnewton/hermit/issues/4476)"},
-    {"test_id":"system-utils/ps-proc-table","backend":"kvm","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: Needs the rest of package K item 2b (https://github.com/rrnewton/hermit/issues/5063). Slice 2b-1 serves another process's /proc/<pid> directory, stat and comm, so ps lists every guest process (host procps 3.3.17), and slice 2b-2 renders every process's status, and slice 2b-3 serves every process's cmdline and environ, which the pinned root's procps 4.0.6 also reads (measured with that procps at slice 2b-3: ps lists every guest process on KVM at L2); but /proc/1/stat, the namespace init's (Hermit's own process, not a guest), is still EACCES on KVM, so ps leaves out the row ptrace shows for pid 1. The O_PATH /proc/self EACCES once named here (https://github.com/rrnewton/hermit/issues/5039) is gone since slice K10."},
+    {"test_id":"system-utils/ps-proc-table","backend":"kvm","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"system-utils/ps-proc-table","backend":"liteinst","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Under in-guest LiteInst, /usr/bin/env cannot exec bash (EOPNOTSUPP), so the guest never starts (https://github.com/rrnewton/hermit/issues/4476)"},
     {"test_id":"system-utils/ps-proc-table","backend":"sabre","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Under SaBRe this guest's verify matches, but the harness refuses the run because SaBRe used fallback or native sites for bash and the utilities it runs (https://github.com/rrnewton/hermit/issues/4477)"},
     {"test_id":"system-utils/random-device","backend":"dbt","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},

@@ -4538,7 +4538,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             if self.kernel_serves_every_comm(file) {
                 return true;
             }
-            let facts = crate::tool_global::task_stat_facts(guest, task).await;
+            let facts = self.task_stat_facts_of(guest, task).await;
             return !crate::procfs::task_stat::renders_task_comm(&facts, self.comm_source());
         }
         // A task's `status` (package K item 2b slice 2b-2): where Detcore
@@ -4559,7 +4559,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
         }
         if file.is_task_stat() {
-            let facts = crate::tool_global::task_stat_facts(guest, task).await;
+            let facts = self.task_stat_facts_of(guest, task).await;
             let own = self.own_detpid(guest).as_raw();
             let rendered = crate::procfs::task_stat::renders_task_stat(&facts, self.comm_source());
             // The guest-visible parent of a process whose real parent is
@@ -4623,6 +4623,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         crate::procfs::task_stat::CommSource::of_backend(
             crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend),
         )
+    }
+
+    /// The facts a task's `stat` and `comm` render
+    /// (`procfs::task_stat::TaskStatFacts`): the process table's
+    /// (`tool_global::task_stat_facts`), with Hermit's own init's fixed model
+    /// for pid 1 where no guest holds it and the name's source is Detcore's
+    /// record (`procfs::task_stat::with_hermit_init`): there the kernel
+    /// beneath's `/proc/1` is not Hermit's init, so a reader of
+    /// `/proc/1/stat` and `/proc/1/comm` gets the pid, name, state and parent
+    /// the kernel's own file gives where it is. A `status` keeps the table's
+    /// facts: Detcore renders no `status` of Hermit's init.
+    async fn task_stat_facts_of<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        task: crate::procfs::BoundTask,
+    ) -> crate::procfs::task_stat::TaskStatFacts {
+        let facts = crate::tool_global::task_stat_facts(guest, task).await;
+        crate::procfs::task_stat::with_hermit_init(task, facts, self.comm_source())
     }
 
     /// Whether `file` is a task's `comm` and the name's source on this
@@ -5011,7 +5029,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             Some((_, true)) => {}
             _ => return Err(Errno::ESRCH.into()),
         }
-        let facts = crate::tool_global::task_stat_facts(guest, task).await;
+        let facts = if file.is_task_status() {
+            crate::tool_global::task_stat_facts(guest, task).await
+        } else {
+            self.task_stat_facts_of(guest, task).await
+        };
         let source = self.comm_source();
         let kernel = if source == crate::procfs::task_stat::CommSource::Kernel {
             self.kernel_task_comm(guest, task).await
