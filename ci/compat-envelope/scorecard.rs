@@ -11895,11 +11895,12 @@ where
     let derived = check_tracked(root)?;
     let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
     reconcile_history_catalogue(root, &mut tracked)?;
+    let rows = snapshot.materialize_rows()?;
     project_observation_rows(
         root,
         &derived,
         tracked,
-        &snapshot.rows,
+        &rows,
         &ObservationRowSource {
             source: &source.path,
             repository: source.repository.as_deref(),
@@ -12707,7 +12708,7 @@ where
     // Validate and hold caller-owned operands before unrelated catalogue work.
     // A malformed or nonregular snapshot must not wait for history decoding or
     // manifest generation. The held file is still rechecked before publication.
-    let mut snapshot = HeldScorecardSeriesSnapshot::open(snapshot_path, snapshot_sha256)?;
+    let snapshot = HeldScorecardSeriesSnapshot::open(snapshot_path, snapshot_sha256)?;
     let worktree = observation_worktree_state(root)?;
     let head = worktree.head.clone();
     if head != *expected_head {
@@ -12757,13 +12758,14 @@ where
         Ok(history)
     };
     let tracked = reconciled_history(true)?;
+    let rows = snapshot.materialize_rows()?;
     let custom_retention = retain_selected_custom_results(
         &tracked,
         &derived.selected_custom,
         &result_rows,
-        &snapshot.rows,
+        &rows,
     )?;
-    reconcile_declared_guest_exits(&result_rows, &snapshot.rows)?;
+    reconcile_declared_guest_exits(&result_rows, &rows)?;
     // The complete census and finalized proof above still cover every raw row.
     // Only comparable cells enter the existing grade/observation projection.
     let result_rows = result_rows
@@ -12794,22 +12796,21 @@ where
         },
     )?;
     let current_attempts = merge_attempt_maps(
-        validate_attempt_bindings(&preview, Some(&snapshot.rows))?,
+        validate_attempt_bindings(&preview, Some(&rows))?,
         current_result_attempts(&preview, &result_rows, &detcore_tree)?,
     )?;
     let preview_representation =
-        direct_representation(&preview, &snapshot.rows, &current_attempts)?;
+        direct_representation(&preview, &rows, &current_attempts)?;
     // Both results above are owned. Release the preview, a whole copy of the
     // history, before the projection below starts from a fresh copy of it.
     drop(preview);
     let mut tracked = reconciled_history(false)?;
     remove_replaceable_projected_observations(
         &mut tracked,
-        &snapshot.rows,
+        &rows,
         Some(&snapshot.snapshot.source.path),
     )?;
-    let initial_rows = snapshot
-        .rows
+    let initial_rows = rows
         .iter()
         .filter(|row| {
             !preview_representation
@@ -12895,14 +12896,13 @@ where
     // its stored representation. Exactly represented events are suppressed in
     // favour of the richer direct invocation; zero matches remain explicit
     // pre-series evidence, while conflicting or multiple matches refuse.
-    let representation = direct_representation(&tracked, &snapshot.rows, &current_attempts)?;
+    let representation = direct_representation(&tracked, &rows, &current_attempts)?;
     remove_replaceable_projected_observations(
         &mut tracked,
-        &snapshot.rows,
+        &rows,
         Some(&snapshot.snapshot.source.path),
     )?;
-    let projected_rows = snapshot
-        .rows
+    let projected_rows = rows
         .iter()
         .filter(|row| {
             !representation.represented_event_ids.contains(&row.event_id)
@@ -12945,7 +12945,7 @@ where
         AttemptBindingContext {
             producer: &git_head(manifest_tool_root()?)?,
             snapshot: &AttemptBindingSnapshot::from_held(&snapshot)?,
-            events: &snapshot.rows,
+            events: &rows,
             kind: AttemptBindingKind::Current,
             selected_lines: None,
         },
@@ -12955,7 +12955,7 @@ where
     // and written (with the other cuts in 06142e8fb897, the write-back's peak
     // RSS went from 23,850 MB to 15,464 MB on real inputs). After here the
     // snapshot is read only for its held identity (verify).
-    snapshot.rows = Vec::new();
+    drop(rows);
     let before = reconciled_history(false)?;
     enforce_projection_preserves_evidence(&before, &tracked, rows_read)?;
     cap_observations(&mut tracked);
@@ -16625,7 +16625,13 @@ struct HeldScorecardSeriesSnapshot {
     file_identity: SnapshotPathIdentity,
     sha256: String,
     snapshot: ScorecardSeriesSnapshotMeta,
-    rows: Vec<SeriesRow>,
+    /// The whole snapshot file, held so rows can be rebuilt on demand. At
+    /// full-corpus scale this is 7.6 GiB against about 17 GiB of typed rows.
+    payload: Vec<u8>,
+    /// `(offset, len)` of each row's exact JSON text inside `payload`, in
+    /// snapshot (canonical emitted_at/event_id) order.
+    row_ranges: Vec<(usize, u32)>,
+    index: Vec<SnapshotRowIndex>,
 }
 
 struct UniqueJsonFields;
@@ -16791,10 +16797,106 @@ fn require_exact_object_keys(
     Ok(())
 }
 
+/// The per-row facts a held snapshot keeps beside its payload: everything
+/// later passes need to select, order, and look up rows without parsing
+/// them. The typed row itself is rebuilt on demand from the payload bytes
+/// (`HeldScorecardSeriesSnapshot::parse_row`); holding every typed row
+/// instead cost about 17 GiB at full-corpus scale.
+#[derive(Debug)]
+struct SnapshotRowIndex {
+    event_id: String,
+    emitted_at: String,
+    run_id: String,
+    run_index: u64,
+    /// [`series_row_cell`], resolved (retired ids mapped to successors).
+    cell: String,
+    /// The row's Hermit commit (`series.tree`).
+    tree: String,
+    producer: SeriesProducer,
+}
+
+const SNAPSHOT_ROW_FIELDS: &[&str] = &[
+    "schema",
+    "event_id",
+    "event_type",
+    "emitted_at",
+    "team",
+    "host",
+    "producer",
+    "run_id",
+    "series",
+];
+
+const SNAPSHOT_SERIES_FIELDS: &[&str] = &[
+    "cell",
+    "tree",
+    "detcore_tree",
+    "outcome",
+    "result",
+    "failure_class",
+    "no_verdict_evidence",
+    "pressure_evidence",
+    "declared_guest_exit",
+    // Typed by `SeriesComparison`, whose own deny_unknown_fields refuses an
+    // unknown key inside it; `validate_for_read` refuses any value but the
+    // stripped, non-bitwise comparison the writer records.
+    "comparison",
+    "run_index",
+    "attempt",
+    "num_runs",
+    "last_run_index",
+    "main_ancestry",
+    "runtime",
+    "source_tree_dirty",
+    "depth",
+    "coordinates",
+    "first_divergent_messages",
+    "machine_shortname",
+    "kernel_version",
+    "host_capabilities",
+    // How the cell ran (`CellStrictness`, whose own deny_unknown_fields
+    // refuses an unknown key inside it). The series writer copies it from
+    // the cell's results row when the harness recorded one.
+    "strictness",
+    // A verify cell's first divergence (`SeriesDivergence`, whose structs
+    // all deny unknown fields; `validate_for_read` checks it). dev-hermit's
+    // series writer has written it on verify rows since 2026-10-21. Every
+    // scorecard render from then on refused the snapshot here until this
+    // entry existed, so scorecard/parity.json stopped advancing.
+    "divergence",
+];
+
+fn allowed_snapshot_series_fields() -> &'static BTreeSet<&'static str> {
+    static FIELDS: std::sync::OnceLock<BTreeSet<&'static str>> = std::sync::OnceLock::new();
+    FIELDS.get_or_init(|| SNAPSHOT_SERIES_FIELDS.iter().copied().collect())
+}
+
+/// One snapshot row's exact text to a typed row, with the field-set refusals
+/// the snapshot validation has always made. `validate_for_read` is the
+/// caller's business: the validation pass applies it; later re-parses of
+/// already-validated bytes do not repeat it.
+fn parse_snapshot_row_text(text: &str, label: &str) -> Result<SeriesRow, String> {
+    let value: JsonValue =
+        serde_json::from_str(text).map_err(|error| format!("{label} is malformed: {error}"))?;
+    require_exact_object_keys(&value, SNAPSHOT_ROW_FIELDS, label)?;
+    let series = value
+        .get("series")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| format!("{label} series must be an object"))?;
+    if series
+        .keys()
+        .map(String::as_str)
+        .any(|field| !allowed_snapshot_series_fields().contains(field))
+    {
+        return Err(format!("{label} series has an unknown field"));
+    }
+    serde_json::from_value(value).map_err(|error| format!("{label} is malformed: {error}"))
+}
+
 fn validate_scorecard_snapshot(
     snapshot: &BorrowedScorecardSeriesSnapshot<'_>,
     display: &Path,
-) -> Result<Vec<SeriesRow>, String> {
+) -> Result<Vec<SnapshotRowIndex>, String> {
     if snapshot.schema != SCORECARD_SERIES_SNAPSHOT_SCHEMA {
         return Err(format!(
             "scorecard snapshot {} has schema {:?}, expected {SCORECARD_SERIES_SNAPSHOT_SCHEMA}",
@@ -16918,77 +17020,12 @@ fn validate_scorecard_snapshot(
         ));
     }
 
-    const ROW_FIELDS: &[&str] = &[
-        "schema",
-        "event_id",
-        "event_type",
-        "emitted_at",
-        "team",
-        "host",
-        "producer",
-        "run_id",
-        "series",
-    ];
-    const SERIES_FIELDS: &[&str] = &[
-        "cell",
-        "tree",
-        "detcore_tree",
-        "outcome",
-        "result",
-        "failure_class",
-        "no_verdict_evidence",
-        "pressure_evidence",
-        "declared_guest_exit",
-        // Typed by `SeriesComparison`, whose own deny_unknown_fields refuses an
-        // unknown key inside it; `validate_for_read` refuses any value but the
-        // stripped, non-bitwise comparison the writer records.
-        "comparison",
-        "run_index",
-        "attempt",
-        "num_runs",
-        "last_run_index",
-        "main_ancestry",
-        "runtime",
-        "source_tree_dirty",
-        "depth",
-        "coordinates",
-        "first_divergent_messages",
-        "machine_shortname",
-        "kernel_version",
-        "host_capabilities",
-        // How the cell ran (`CellStrictness`, whose own deny_unknown_fields
-        // refuses an unknown key inside it). The series writer copies it from
-        // the cell's results row when the harness recorded one.
-        "strictness",
-        // A verify cell's first divergence (`SeriesDivergence`, whose structs
-        // all deny unknown fields; `validate_for_read` checks it). dev-hermit's
-        // series writer has written it on verify rows since 2026-10-21. Every
-        // scorecard render from then on refused the snapshot here until this
-        // entry existed, so scorecard/parity.json stopped advancing.
-        "divergence",
-    ];
-    let allowed_series_fields = SERIES_FIELDS.iter().copied().collect::<BTreeSet<_>>();
     let mut rows = Vec::with_capacity(snapshot.rows.len());
     let mut event_ids = BTreeSet::new();
     let mut previous_order: Option<(String, String)> = None;
     for (index, raw) in snapshot.rows.iter().enumerate() {
         let label = format!("scorecard snapshot {} row {}", display.display(), index + 1);
-        let value: JsonValue = serde_json::from_str(raw.get())
-            .map_err(|error| format!("{label} is malformed: {error}"))?;
-        require_exact_object_keys(&value, ROW_FIELDS, &label)?;
-        let series = value
-            .get("series")
-            .and_then(JsonValue::as_object)
-            .ok_or_else(|| format!("{label} series must be an object"))?;
-        if series
-            .keys()
-            .map(String::as_str)
-            .any(|field| !allowed_series_fields.contains(field))
-        {
-            return Err(format!("{label} series has an unknown field"));
-        }
-        let mut row: SeriesRow = serde_json::from_value(value)
-            .map_err(|error| format!("{label} is malformed: {error}"))?;
+        let row = parse_snapshot_row_text(raw.get(), &label)?;
         row.validate_for_read()
             .map_err(|error| format!("{label} is invalid: {error}"))?;
         if !event_ids.insert(row.event_id.clone()) {
@@ -17009,8 +17046,15 @@ fn validate_scorecard_snapshot(
             ));
         }
         previous_order = Some(order);
-        row.source = format!("{}:rows[{}]", display.display(), index);
-        rows.push(row);
+        rows.push(SnapshotRowIndex {
+            cell: series_row_cell(&row).into_owned(),
+            event_id: row.event_id,
+            emitted_at: row.emitted_at,
+            run_id: row.run_id,
+            run_index: row.series.run_index,
+            tree: row.series.tree,
+            producer: row.producer,
+        });
     }
     Ok(rows)
 }
@@ -17092,11 +17136,21 @@ impl HeldScorecardSeriesSnapshot {
             .map_err(|error| format!("scorecard snapshot is not valid strict JSON: {error}"))?;
         // Rows borrow the payload: converting them to owned RawValues first
         // duplicated the snapshot's whole size beside the payload itself.
-        // Validation and the typed conversion finish here, while the payload
-        // is alive; only the metadata is kept, with no raw rows.
+        // Validation finishes here, while the payload is alive; the held
+        // snapshot keeps the payload, each row's byte range in it, and the
+        // small per-row index, and rebuilds typed rows on demand.
         let borrowed: BorrowedScorecardSeriesSnapshot<'_> = serde_json::from_slice(&payload)
             .map_err(|error| format!("scorecard snapshot is not valid strict JSON: {error}"))?;
-        let rows = validate_scorecard_snapshot(&borrowed, path)?;
+        let index = validate_scorecard_snapshot(&borrowed, path)?;
+        let payload_base = payload.as_ptr() as usize;
+        let mut row_ranges = Vec::with_capacity(borrowed.rows.len());
+        for raw in &borrowed.rows {
+            let text = raw.get();
+            let offset = text.as_ptr() as usize - payload_base;
+            let len = u32::try_from(text.len())
+                .map_err(|_| "scorecard snapshot row is too large to index".to_string())?;
+            row_ranges.push((offset, len));
+        }
         let BorrowedScorecardSeriesSnapshot {
             schema: _schema,
             source,
@@ -17109,7 +17163,6 @@ impl HeldScorecardSeriesSnapshot {
             rows_read,
             rows_sha256,
         };
-        drop(payload);
         let held = Self {
             path: path.to_path_buf(),
             parent,
@@ -17119,10 +17172,54 @@ impl HeldScorecardSeriesSnapshot {
             file_identity,
             sha256: actual_sha256,
             snapshot,
-            rows,
+            payload,
+            row_ranges,
+            index,
         };
         held.verify()?;
         Ok(held)
+    }
+
+    fn row_count(&self) -> usize {
+        self.index.len()
+    }
+
+    fn row_label(&self, row_index: usize) -> String {
+        format!("scorecard snapshot {} row {}", self.path.display(), row_index + 1)
+    }
+
+    fn row_text(&self, row_index: usize) -> Result<&str, String> {
+        let (offset, len) = self.row_ranges[row_index];
+        std::str::from_utf8(&self.payload[offset..offset + len as usize]).map_err(|error| {
+            format!("{} is malformed: {error}", self.row_label(row_index))
+        })
+    }
+
+    /// Rebuild one typed row exactly as the validation pass built it
+    /// (field-set checks included; `validate_for_read` already ran there).
+    fn parse_row(&self, row_index: usize) -> Result<SeriesRow, String> {
+        let label = self.row_label(row_index);
+        let mut row = parse_snapshot_row_text(self.row_text(row_index)?, &label)?;
+        row.source = format!("{}:rows[{}]", self.path.display(), row_index);
+        Ok(row)
+    }
+
+    /// Rebuild one typed row by direct typed deserialization, skipping the
+    /// intermediate `JsonValue`. Only for rows the validation pass already
+    /// accepted: the same bytes deserialize to the same typed row, faster.
+    fn parse_row_typed(&self, row_index: usize) -> Result<SeriesRow, String> {
+        let label = self.row_label(row_index);
+        let mut row: SeriesRow = serde_json::from_str(self.row_text(row_index)?)
+            .map_err(|error| format!("{label} is malformed: {error}"))?;
+        row.source = format!("{}:rows[{}]", self.path.display(), row_index);
+        Ok(row)
+    }
+
+    /// Every typed row, for consumers that still take a slice (the combined
+    /// write-back). The snapshot projection itself rebuilds rows on demand
+    /// and never holds this vector.
+    fn materialize_rows(&self) -> Result<Vec<SeriesRow>, String> {
+        (0..self.row_count()).map(|index| self.parse_row(index)).collect()
     }
 
     fn verify(&self) -> Result<(), String> {
@@ -46168,7 +46265,18 @@ mod series_comparison_tests {
         let text = serde_json::to_string(&value).map_err(|error| error.to_string())?;
         let snapshot: BorrowedScorecardSeriesSnapshot<'_> =
             serde_json::from_str(&text).map_err(|error| error.to_string())?;
-        validate_scorecard_snapshot(&snapshot, Path::new("fixture-snapshot"))
+        validate_scorecard_snapshot(&snapshot, Path::new("fixture-snapshot"))?;
+        snapshot
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(index, raw)| {
+                let label = format!("scorecard snapshot fixture-snapshot row {}", index + 1);
+                let mut row = parse_snapshot_row_text(raw.get(), &label)?;
+                row.source = format!("fixture-snapshot:rows[{index}]");
+                Ok(row)
+            })
+            .collect()
     }
 
     fn tracked_fixture_cell() -> TrackedCells {
