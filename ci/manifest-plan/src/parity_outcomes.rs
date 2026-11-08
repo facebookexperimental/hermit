@@ -564,7 +564,7 @@ mod tests {
 
     #[test]
     fn compare_names_manifest_and_result_differences_against_the_real_manifests() {
-        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let repo = crate::compiled_manifest_dir().join("../..");
         let manifests = ManifestSet::load(&repo).unwrap();
         let selected: BTreeSet<(String, String)> = manifests
             .select(&Selection {

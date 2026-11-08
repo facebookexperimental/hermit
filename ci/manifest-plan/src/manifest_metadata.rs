@@ -482,7 +482,7 @@ mod tests {
     use super::*;
 
     fn root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        crate::compiled_manifest_dir()
             .join("../..")
             .canonicalize()
             .unwrap()

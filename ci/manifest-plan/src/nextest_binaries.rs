@@ -42,13 +42,16 @@ const CPU_WRAPPER_TARGET: &str = "nextest-cpu-wrapper";
 /// ci/check-shard-coverage.sh pins that path.
 const UNIFIED_CPU_WRAPPER_PROFILES: &[&str] = &["full"];
 
-#[path = "../../cargo-guest-binaries.rs"]
+#[cfg_attr(not(buck_build), path = "../../cargo-guest-binaries.rs")]
+#[cfg_attr(buck_build, path = "../mapped/ci/cargo-guest-binaries.rs")]
 mod cargo_guests;
 
-#[path = "../../lit-guest-binaries.rs"]
+#[cfg_attr(not(buck_build), path = "../../lit-guest-binaries.rs")]
+#[cfg_attr(buck_build, path = "../mapped/ci/lit-guest-binaries.rs")]
 mod lit_guests;
 
-#[path = "../../record-replay-workloads.rs"]
+#[cfg_attr(not(buck_build), path = "../../record-replay-workloads.rs")]
+#[cfg_attr(buck_build, path = "../mapped/ci/record-replay-workloads.rs")]
 pub mod record_workloads;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -4517,7 +4520,7 @@ mod tests {
     /// all still have passed. Resolving by `.git` and then cross-checking
     /// against git's own answer removes the guess.
     fn repository_root() -> PathBuf {
-        let candidate = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let candidate = crate::compiled_manifest_dir()
             .ancestors()
             .find(|candidate| candidate.join(".git").exists())
             .expect("locating the repository root by .git")

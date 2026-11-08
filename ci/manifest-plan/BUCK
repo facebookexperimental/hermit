@@ -1,0 +1,159 @@
+load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
+load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
+
+oncall("hermit")
+
+# The Validate DAG planner and test harness (Cargo: hermit-manifest-plan).
+# Buck pilot for setup.manifest_plan (dh-cqlkz): same library and bins
+# Cargo builds with `cargo build -p hermit-manifest-plan --bins`.
+# The library includes eleven files verbatim via #[path] modules from
+# sibling packages; they arrive through mapped_srcs export_file targets
+# so both builders compile identical sources. Bins only for now: the
+# crate's unit/integration tests (which embed ci/dag/validate.json and
+# need the toml dev-dependency) remain Cargo-run.
+_DEPS = [
+    "fbsource//third-party/rust:chrono",
+    "fbsource//third-party/rust:dagrun",
+    "fbsource//third-party/rust:libc",
+    "fbsource//third-party/rust:serde",
+    "fbsource//third-party/rust:serde_json",
+    "fbsource//third-party/rust:serde_yaml",
+    "fbsource//third-party/rust:sha2",
+    "fbsource//third-party/rust:shell-words",
+    "//hermetic_infra/hermit/detcore-model:detcore-model",
+]
+
+rust_library(
+    name = "manifest-plan",
+    srcs = glob(
+        ["src/**/*.rs"],
+        exclude = [
+            "src/bin/**",
+            "src/main.rs",
+        ],
+    ),
+    autocargo = {
+        "cargo_toml_dir": ".",
+        "cargo_toml_config": {
+            "package": {
+                "name": "hermit-manifest-plan",
+                "version": "0.5.4",
+                "publish": False,
+            },
+            "lib": {
+                "name": "hermit_manifest_plan",
+            },
+        },
+    },
+    crate = "hermit_manifest_plan",
+    edition = "2021",
+    mapped_srcs = {
+        "//hermetic_infra/hermit/ci:dag-source-ownership.json": "dag-source-ownership.json",
+        "//hermetic_infra/hermit/ci:cargo-guest-binaries.rs": "mapped/ci/cargo-guest-binaries.rs",
+        "//hermetic_infra/hermit/ci:lit-guest-binaries.rs": "mapped/ci/lit-guest-binaries.rs",
+        "//hermetic_infra/hermit/ci:record-replay-workloads.rs": "mapped/ci/record-replay-workloads.rs",
+        "//hermetic_infra/hermit/hermit-cli:canonical_verdict.rs": "mapped/hermit-cli/canonical_verdict.rs",
+        "//hermetic_infra/hermit/hermit-cli:logdiff_report.rs": "mapped/hermit-cli/logdiff_report.rs",
+        "//hermetic_infra/hermit/hermit-cli:proc_locks_lease.rs": "mapped/hermit-cli/proc_locks_lease.rs",
+        "//hermetic_infra/hermit/hermit-cli:verify_run_record.rs": "mapped/hermit-cli/verify_run_record.rs",
+        "//hermetic_infra/hermit/scripts:validate_corpus.rs": "mapped/scripts/validate_corpus.rs",
+        "//hermetic_infra/hermit/scripts:validate_generator.rs": "mapped/scripts/validate_generator.rs",
+        "//hermetic_infra/hermit/scripts:validate_plan.rs": "mapped/scripts/validate_plan.rs",
+        "//hermetic_infra/hermit/scripts:validate_super.rs": "mapped/scripts/validate_super.rs",
+        "//hermetic_infra/hermit/detcore-model:canonical_test_epoch.rs": "detcore-model/src/canonical_test_epoch.rs",
+    },
+    deps = _DEPS,
+)
+
+rust_binary(
+    name = "hermit-manifest-plan",
+    # main.rs recompiles manifest_value directly (mod decl), as under Cargo.
+    srcs = [
+        "src/main.rs",
+        "src/manifest_value.rs",
+    ],
+    crate = "hermit_manifest_plan_bin",
+    edition = "2021",
+    deps = [":manifest-plan"] + _DEPS,
+)
+
+rust_binary(
+    name = "test-harness",
+    srcs = ["src/bin/test-harness.rs"],
+    crate_root = "src/bin/test-harness.rs",
+    crate = "test_harness",
+    edition = "2021",
+    deps = [":manifest-plan"] + _DEPS,
+)
+
+rust_binary(
+    name = "bind-executable",
+    srcs = ["src/bin/bind-executable.rs"],
+    crate_root = "src/bin/bind-executable.rs",
+    crate = "bind_executable",
+    edition = "2021",
+    deps = [":manifest-plan"] + _DEPS,
+)
+
+rust_binary(
+    name = "generate-parity-cells",
+    srcs = ["src/bin/generate-parity-cells.rs"],
+    crate_root = "src/bin/generate-parity-cells.rs",
+    crate = "generate_parity_cells",
+    edition = "2021",
+    deps = [":manifest-plan"] + _DEPS,
+)
+
+rust_binary(
+    name = "generate-test-footprints",
+    srcs = ["src/bin/generate-test-footprints.rs"],
+    crate_root = "src/bin/generate-test-footprints.rs",
+    crate = "generate_test_footprints",
+    edition = "2021",
+    deps = [":manifest-plan"] + _DEPS,
+)
+
+rust_binary(
+    name = "generate-validation-dag",
+    srcs = ["src/bin/generate-validation-dag.rs"],
+    crate_root = "src/bin/generate-validation-dag.rs",
+    crate = "generate_validation_dag",
+    edition = "2021",
+    deps = [":manifest-plan"] + _DEPS,
+)
+
+rust_binary(
+    name = "manifest-metadata",
+    srcs = ["src/bin/manifest-metadata.rs"],
+    crate_root = "src/bin/manifest-metadata.rs",
+    crate = "manifest_metadata",
+    edition = "2021",
+    deps = [":manifest-plan"] + _DEPS,
+)
+
+rust_binary(
+    name = "nextest-cpu-wrapper",
+    srcs = ["src/bin/nextest-cpu-wrapper.rs"],
+    crate_root = "src/bin/nextest-cpu-wrapper.rs",
+    crate = "nextest_cpu_wrapper",
+    edition = "2021",
+    deps = [":manifest-plan"] + _DEPS,
+)
+
+rust_binary(
+    name = "strict-green-authority",
+    srcs = ["src/bin/strict-green-authority.rs"],
+    crate_root = "src/bin/strict-green-authority.rs",
+    crate = "strict_green_authority",
+    edition = "2021",
+    deps = [":manifest-plan"] + _DEPS,
+)
+
+rust_binary(
+    name = "with-bound-command",
+    srcs = ["src/bin/with-bound-command.rs"],
+    crate_root = "src/bin/with-bound-command.rs",
+    crate = "with_bound_command",
+    edition = "2021",
+    deps = [":manifest-plan"] + _DEPS,
+)

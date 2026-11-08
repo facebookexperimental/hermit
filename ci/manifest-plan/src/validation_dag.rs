@@ -6038,7 +6038,7 @@ mod tests {
         fs::create_dir_all(root.join("tools")).unwrap();
         fs::create_dir_all(root.join("ignored/hermetic/split/cargo/registry")).unwrap();
         let actual_wrapper =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../hermetic/run-in-pinned-root.sh");
+            crate::compiled_manifest_dir().join("../hermetic/run-in-pinned-root.sh");
         write_executable(
             &root.join("ci/hermetic/run-in-pinned-root.sh"),
             &fs::read(actual_wrapper).unwrap(),

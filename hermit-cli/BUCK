@@ -5,6 +5,7 @@
 # WILL BE DELETED. UNLESS THERE IS AN ONCALL ADDED THIS FILE WILL BE
 
 # DELETED WITHOUT NOTICE - DO NOT DEPEND ON IT.
+load("@fbcode_macros//build_defs:export_files.bzl", "export_file")
 load("@fbcode_macros//build_defs:native_rules.bzl", "buck_sh_test")
 load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
@@ -403,4 +404,27 @@ buck_sh_test(
         "/dev/urandom",
     ],
     test = ":hermit",
+)
+
+# Included verbatim by ci/manifest-plan via #[path] modules
+# (ci/manifest-plan/src/lib.rs). Exported so the manifest-plan Buck
+# library can name them in mapped_srcs.
+export_file(
+    name = "canonical_verdict.rs",
+    src = "src/canonical_verdict.rs",
+)
+
+export_file(
+    name = "logdiff_report.rs",
+    src = "src/logdiff_report.rs",
+)
+
+export_file(
+    name = "verify_run_record.rs",
+    src = "src/verify_run_record.rs",
+)
+
+export_file(
+    name = "proc_locks_lease.rs",
+    src = "tests/common/proc_locks_lease.rs",
 )

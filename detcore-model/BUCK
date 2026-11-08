@@ -1,3 +1,4 @@
+load("@fbcode_macros//build_defs:export_files.bzl", "export_file")
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 
 oncall("hermit")
@@ -45,4 +46,12 @@ rust_library(
         "//hermetic_infra/reverie:reverie",
         "//hermetic_infra/reverie:reverie-syscalls",
     ],
+)
+
+# Included verbatim by scripts/lib/validate_plan.rs via a #[path] module;
+# exported so the manifest-plan Buck library (which maps validate_plan.rs
+# in turn) can name it in mapped_srcs.
+export_file(
+    name = "canonical_test_epoch.rs",
+    src = "src/canonical_test_epoch.rs",
 )

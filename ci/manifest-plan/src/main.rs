@@ -167,7 +167,9 @@ enum TestPopulation {
 
 fn parse_options(arguments: Vec<String>) -> Option<(Format, PathBuf, TestPopulation)> {
     let mut format = Format::Text;
-    let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    // Resolved after parsing so --help and explicit --root never touch
+    // the compiled-in default (absent under Buck; see compiled_manifest_dir).
+    let mut root: Option<PathBuf> = None;
     let mut population = TestPopulation::Git;
     if matches!(arguments.as_slice(), [flag] if is_help_flag(flag)) {
         println!("{HELP}");
@@ -180,14 +182,14 @@ fn parse_options(arguments: Vec<String>) -> Option<(Format, PathBuf, TestPopulat
             if path.is_empty() {
                 die("--root requires a path");
             }
-            root = PathBuf::from(path);
+            root = Some(PathBuf::from(path));
             continue;
         }
         if let Some(path) = arg.strip_prefix("--root=") {
             if path.is_empty() {
                 die("--root requires a path");
             }
-            root = PathBuf::from(path);
+            root = Some(PathBuf::from(path));
             continue;
         }
         if arg == "--source-snapshot" {
@@ -211,6 +213,7 @@ fn parse_options(arguments: Vec<String>) -> Option<(Format, PathBuf, TestPopulat
             _ => die(format!("unknown format: {value}")),
         };
     }
+    let root = root.unwrap_or_else(|| hermit_manifest_plan::compiled_manifest_dir().join("../.."));
     Some((format, root, population))
 }
 
@@ -2065,7 +2068,8 @@ mod tests {
         // NON-VACUITY. A bracket that passed against an empty corpus would prove
         // nothing, and this also pins the blast radius: if a future manifest edit
         // makes a second cell withholdable, a reviewer has to see it.
-        let manifests = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/e2e/manifests");
+        let manifests =
+            hermit_manifest_plan::compiled_manifest_dir().join("../../tests/e2e/manifests");
         let mut documents = Vec::new();
         let mut paths: Vec<PathBuf> = std::fs::read_dir(&manifests)
             .expect("shipped manifests must be readable")
@@ -2230,7 +2234,7 @@ in-guest-trap = "unsupported"
     /// The first committed util-c test with `labels` added, through the
     /// front door's own test validation.
     fn expand_util_c_with(extra: &str) {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = hermit_manifest_plan::compiled_manifest_dir().join("../..");
         let text = std::fs::read_to_string(root.join("tests/e2e/manifests/util-c.yaml")).unwrap();
         let (head, tail) = text.split_once("\n    lane: ").unwrap();
         let document: Value = format!("{head}\n    {extra}\n    lane: {tail}")
@@ -3316,7 +3320,7 @@ mod runtime_root_tests {
         let (_, default, _) = parse_options(vec![]).unwrap();
         assert_eq!(
             default,
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+            hermit_manifest_plan::compiled_manifest_dir().join("../..")
         );
         let missing = temporary.join("missing");
         assert!(

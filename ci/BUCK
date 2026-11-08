@@ -1,1 +1,27 @@
 # Package marker: lets ci/buck-e2e load() expected-e2e-plan.json from here.
+load("@fbcode_macros//build_defs:export_files.bzl", "export_file")
+
+oncall("hermit")
+
+# Included verbatim by ci/manifest-plan via #[path] modules
+# (ci/manifest-plan/src/nextest_binaries.rs). Exported so the
+# manifest-plan Buck library can name them in mapped_srcs.
+export_file(
+    name = "dag-source-ownership.json",
+    src = "dag-source-ownership.json",
+)
+
+export_file(
+    name = "cargo-guest-binaries.rs",
+    src = "cargo-guest-binaries.rs",
+)
+
+export_file(
+    name = "lit-guest-binaries.rs",
+    src = "lit-guest-binaries.rs",
+)
+
+export_file(
+    name = "record-replay-workloads.rs",
+    src = "record-replay-workloads.rs",
+)

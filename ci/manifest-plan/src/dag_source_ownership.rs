@@ -387,8 +387,17 @@ fn parse_contract(bytes: &[u8]) -> Result<Document, String> {
     Ok(source)
 }
 fn contract() -> Document {
-    parse_contract(include_bytes!("../../dag-source-ownership.json"))
-        .expect("source-owned DAG node contract")
+    parse_contract(contract_bytes()).expect("source-owned DAG node contract")
+}
+
+#[cfg(not(buck_build))]
+fn contract_bytes() -> &'static [u8] {
+    include_bytes!("../../dag-source-ownership.json")
+}
+
+#[cfg(buck_build)]
+fn contract_bytes() -> &'static [u8] {
+    include_bytes!("../dag-source-ownership.json")
 }
 pub fn assert_producer_resources(
     step: &dagrun::model::Step,
