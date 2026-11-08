@@ -52,33 +52,145 @@ fn emit_record() {
 
 // Global forwarding state/OnceLock cannot be reset to manufacture a fresh cut.
 // Each case runs in a fresh copy of the maintained CLI test executable.
-fn isolated(name: &str, case: &str, body: impl FnOnce()) {
-    const KEY: &str = "HERMIT_NATIVE_CONSUMER_COMPLETE_TEST";
-    let key = format!("{name}:{case}");
-    if let Ok(active) = std::env::var(KEY) {
-        if active == key {
-            body();
-        }
+const ISOLATED_CASE_ENV: &str = "HERMIT_NATIVE_CONSUMER_COMPLETE_TEST";
+const CASE_COMPLETED: &str = "NATIVE_CONSUMER_CASE_COMPLETED";
+
+fn isolated_cases(name: &str, cases: &[&str], body: impl FnOnce(&str)) {
+    assert!(
+        !cases.is_empty(),
+        "isolated consumer cases must not be empty"
+    );
+    if let Some(active) = std::env::var_os(ISOLATED_CASE_ENV) {
+        let case = cases
+            .iter()
+            .copied()
+            .find(|case| active.as_os_str() == std::ffi::OsStr::new(&format!("{name}:{case}")))
+            .unwrap_or_else(|| {
+                panic!(
+                    "invalid native consumer isolation marker: {active:?} for {name}; expected {cases:?}"
+                )
+            });
+        body(case);
+        eprintln!("{CASE_COMPLETED} {name}:{case}");
         return;
     }
-    let full_name = format!("native_exec_consumer::tests::{name}");
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", &full_name, "--nocapture", "--test-threads=1"])
-        .env(KEY, key)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{full_name} ({case}): {:?}\n{}\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("running 1 test") && stdout.contains("1 passed; 0 failed"),
-        "the exact child test must execute: {stdout}"
-    );
+    let full_name = format!("app::native_exec_consumer::tests::{name}");
+    for case in cases {
+        let key = format!("{name}:{case}");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &full_name, "--nocapture", "--test-threads=1"])
+            .env(ISOLATED_CASE_ENV, &key)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{full_name} ({case}): {:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("running 1 test") && stdout.contains("1 passed; 0 failed"),
+            "the exact child test must execute: {stdout}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let completed = format!("{CASE_COMPLETED} {key}");
+        assert_eq!(
+            stderr
+                .lines()
+                .filter(|line| *line == completed.as_str())
+                .count(),
+            1,
+            "the exact child case must complete once: {key}\n{stderr}"
+        );
+        eprintln!("{completed}");
+    }
+}
+
+fn isolated(name: &str, case: &str, body: impl FnOnce()) {
+    isolated_cases(name, &[case], |_| body());
+}
+
+#[test]
+fn isolated_case_dispatch_requires_a_known_marker_and_completed_body() {
+    use std::ffi::OsStr;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    const NAME: &str = "isolated_case_dispatch_requires_a_known_marker_and_completed_body";
+    const BODY: &str = "NATIVE_CONSUMER_ISOLATION_GUARD_BODY";
+    const CASES: &[&str] = &["wrong", "negative"];
+    if std::env::var_os(ISOLATED_CASE_ENV).is_some() {
+        isolated_cases(NAME, CASES, |case| eprintln!("{BODY} {case}"));
+        return;
+    }
+    let full_name = format!("app::native_exec_consumer::tests::{NAME}");
+    let run = |marker: &OsStr| {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &full_name, "--nocapture", "--test-threads=1"])
+            .env(ISOLATED_CASE_ENV, marker)
+            .output()
+            .unwrap()
+    };
+    for case in CASES {
+        let marker = OsString::from(format!("{NAME}:{case}"));
+        let output = run(&marker);
+        assert!(output.status.success(), "{case}: {output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("running 1 test") && stdout.contains("1 passed; 0 failed"),
+            "the guard child must execute: {stdout}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for (prefix, expected) in [
+            (BODY, format!("{BODY} {case}")),
+            (CASE_COMPLETED, format!("{CASE_COMPLETED} {NAME}:{case}")),
+        ] {
+            assert_eq!(
+                stderr
+                    .lines()
+                    .filter(|line| line.starts_with(prefix))
+                    .count(),
+                1,
+                "one body and completion are required: {stderr}"
+            );
+            assert_eq!(
+                stderr
+                    .lines()
+                    .filter(|line| *line == expected.as_str())
+                    .count(),
+                1,
+                "the selected case must execute: {stderr}"
+            );
+        }
+    }
+    for (label, marker) in [
+        ("empty", OsString::new()),
+        ("malformed", OsString::from("wrong")),
+        (
+            "foreign",
+            OsString::from("model_consumer_complete_zero_interval_and_second_attempt:zero"),
+        ),
+        ("unknown case", OsString::from(format!("{NAME}:unknown"))),
+        ("non-UTF8", OsString::from_vec(vec![0xff])),
+    ] {
+        let output = run(&marker);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "{label} marker passed: {output:?}"
+        );
+        assert!(
+            stderr.contains("invalid native consumer isolation marker:"),
+            "{label} marker failed for a different reason: {stderr}"
+        );
+        assert!(!stderr.contains(BODY), "{label} reached the body: {stderr}");
+        assert!(
+            !stderr.contains(CASE_COMPLETED),
+            "{label} reached completion: {stderr}"
+        );
+    }
 }
 
 fn seqpacket() -> (OwnedFd, OwnedFd) {
@@ -273,7 +385,6 @@ fn exchange_case(
 }
 
 #[test]
-#[ignore = "dh-vwv4k: isolated exact child runs zero tests"]
 fn model_consumer_complete_accounts_real_post_exec_record() {
     isolated(
         "model_consumer_complete_accounts_real_post_exec_record",
@@ -294,7 +405,6 @@ fn model_consumer_complete_accounts_real_post_exec_record() {
 }
 
 #[test]
-#[ignore = "dh-vwv4k: isolated exact child runs zero tests"]
 fn model_consumer_complete_zero_interval_and_second_attempt() {
     isolated(
         "model_consumer_complete_zero_interval_and_second_attempt",
@@ -315,7 +425,6 @@ fn model_consumer_complete_zero_interval_and_second_attempt() {
 }
 
 #[test]
-#[ignore = "dh-vwv4k: isolated exact child runs zero tests"]
 fn model_consumer_complete_wrong_binding_preserves_the_attempt() {
     isolated(
         "model_consumer_complete_wrong_binding_preserves_the_attempt",
@@ -336,32 +445,33 @@ fn model_consumer_complete_wrong_binding_preserves_the_attempt() {
 }
 
 #[test]
-#[ignore = "dh-vwv4k: isolated exact child runs zero tests"]
 fn model_consumer_complete_refuses_bad_and_negative_ack() {
-    for (case, ack) in [("wrong", Ack::WrongVariant), ("negative", Ack::Negative)] {
-        isolated(
-            "model_consumer_complete_refuses_bad_and_negative_ack",
-            case,
-            || {
-                let (result, _, observed) = exchange_case(0, ack, |consumer, rpc| {
-                    let result = consumer.complete(rpc, consumer.admitted);
-                    assert!(consumer.completion_attempted);
-                    assert!(consumer.complete(rpc, consumer.admitted).is_err());
-                    result
-                });
-                assert!(observed.request_seen);
-                assert!(observed.drained.is_empty());
-                assert_eq!(
-                    result.unwrap_err().to_string(),
-                    "native successor completion ACK differs"
-                );
-            },
-        );
-    }
+    isolated_cases(
+        "model_consumer_complete_refuses_bad_and_negative_ack",
+        &["wrong", "negative"],
+        |case| {
+            let ack = match case {
+                "wrong" => Ack::WrongVariant,
+                "negative" => Ack::Negative,
+                _ => unreachable!("isolated_cases validated the ACK case"),
+            };
+            let (result, _, observed) = exchange_case(0, ack, |consumer, rpc| {
+                let result = consumer.complete(rpc, consumer.admitted);
+                assert!(consumer.completion_attempted);
+                assert!(consumer.complete(rpc, consumer.admitted).is_err());
+                result
+            });
+            assert!(observed.request_seen);
+            assert!(observed.drained.is_empty());
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "native successor completion ACK differs"
+            );
+        },
+    );
 }
 
 #[test]
-#[ignore = "dh-vwv4k: isolated exact child runs zero tests"]
 fn model_consumer_complete_refuses_other_slot_record_at_ack() {
     isolated(
         "model_consumer_complete_refuses_other_slot_record_at_ack",
@@ -406,7 +516,6 @@ fn configured_rpc(tid: i32) -> (CoordinatorRpc<detcore::GlobalState>, UnixStream
 }
 
 #[test]
-#[ignore = "dh-vwv4k: isolated exact child runs zero tests"]
 fn model_consumer_complete_refuses_actual_in_flight_request() {
     isolated(
         "model_consumer_complete_refuses_actual_in_flight_request",
