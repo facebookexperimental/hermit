@@ -116,6 +116,7 @@ impl Record {
         metadata.schedule.apply(&mut config);
 
         crate::cpu_profile_admission::refuse_unadmitted_launch(&config, true)?;
+        crate::install_fatal_core_register_reader();
         let tracer = hermit_record::spawn_tracer(command, config).await?;
 
         metadata.proc_readonly = crate::proc_mount::guest_proc_readonly(tracer.guest_pid());

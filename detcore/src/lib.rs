@@ -176,6 +176,8 @@ pub use consts::ROOT_DETPID;
 pub use detcore_model::cpu_profile::CpuProfile;
 pub use detcore_model::pid::GuestIds;
 pub use digest::Digest;
+pub use fatal_core::RegisterReader as FatalCoreRegisterReader;
+pub use fatal_core::install_register_reader as install_fatal_core_register_reader;
 pub use finalization::FinalizationFailure;
 pub use finalization::PriorityHistoryRefusal;
 pub use finalization::ReplayDepartureError;

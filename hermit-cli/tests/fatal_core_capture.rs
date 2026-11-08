@@ -15,6 +15,8 @@ mod hermit_test;
 
 use std::fs;
 use std::io::Read;
+use std::ops::Range;
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -34,6 +36,10 @@ const NT_AUXV: u32 = 6;
 const NT_X86_XSTATE: u32 = 0x202;
 const NT_FILE: u32 = 0x4649_4c45;
 const MIB: u64 = 1 << 20;
+/// Reverie's private page, where its ptrace backend runs the syscalls it
+/// injects for a guest thread (reverie-ptrace `cp::PRIVATE_PAGE_OFFSET`, one
+/// page). No guest code runs there.
+const REVERIE_PRIVATE_PAGE: Range<u64> = 0x7100_0000..0x7100_1000;
 
 /// Builds the guest once per test into its own directory and returns it with
 /// that directory.
@@ -534,8 +540,70 @@ fn relro_address(guest: &Path, notes: &[(String, u32, Vec<u8>)]) -> u64 {
     at_phdr - vaddr_of(6) + vaddr_of(0x6474_e552) // PT_PHDR, PT_GNU_RELRO
 }
 
+/// The address ranges of `guest`'s code in a core: each mapping `NT_FILE`
+/// lists under the guest's file name that an executable `PT_LOAD` covers.
+fn guest_code(guest: &Path, core: &[u8], notes: &[(String, u32, Vec<u8>)]) -> Vec<Range<u64>> {
+    let (_, _, files) = notes
+        .iter()
+        .find(|(_, kind, _)| *kind == NT_FILE)
+        .expect("the core has no NT_FILE note");
+    // The count and the page size, a (start, end, page offset) triple per
+    // file, then the names, each ending in a NUL.
+    let count = u64_at(files, 0) as usize;
+    let names = files[16 + count * 24..].split(|&byte| byte == 0);
+    let name = guest.file_name().unwrap().as_bytes();
+    let loads = loads(core);
+    (0..count)
+        .zip(names)
+        .filter(|(_, path)| path.rsplit(|&byte| byte == b'/').next() == Some(name))
+        .map(|(i, _)| u64_at(files, 16 + i * 24)..u64_at(files, 16 + i * 24 + 8))
+        .filter(|range| {
+            loads.iter().any(|&(flags, vaddr, _, memsz)| {
+                flags & 1 != 0 && vaddr <= range.start && range.end <= vaddr + memsz
+            })
+        })
+        .collect()
+}
+
+/// Checks that `core` holds each thread's own general registers, not those
+/// of a syscall the backend ran for it on Reverie's private page: no thread's
+/// rip, nor its rcx, which a `syscall` instruction sets to the address after
+/// it, lies in [`REVERIE_PRIVATE_PAGE`], and each parked thread's rip lies in
+/// the guest executable's code, where its `park_forever` loop issues its
+/// syscall. Unlike a comparison of two cores, this fails on one wrong core
+/// whichever thread the backend offered first.
+fn assert_threads_hold_their_own_registers(guest: &Path, tids: &ParkedTids, core: &[u8]) {
+    let notes = notes(core);
+    let code = guest_code(guest, core, &notes);
+    assert!(
+        !code.is_empty(),
+        "the core maps no code of {}",
+        guest.display()
+    );
+    for CoreThread { status, .. } in &threads(&notes) {
+        let tid = i32_at(status, 32);
+        // elf_prstatus's registers start at 112, in user_regs_struct's order:
+        // rcx is the twelfth and rip the seventeenth.
+        let (rcx, rip) = (u64_at(status, 112 + 11 * 8), u64_at(status, 112 + 16 * 8));
+        for (name, value) in [("rip", rip), ("rcx", rcx)] {
+            assert!(
+                !REVERIE_PRIVATE_PAGE.contains(&value),
+                "thread {tid}'s {name} {value:#x} is in Reverie's private page: the core holds \
+                 the registers of a syscall the backend ran for the thread, not its own"
+            );
+        }
+        if tids.parked.contains(&tid) {
+            assert!(
+                code.iter().any(|range| range.contains(&rip)),
+                "parked thread {tid}'s rip {rip:#x} is not in the guest's code {code:x?}"
+            );
+        }
+    }
+}
+
 /// Runs `guest` in `parked` mode with `--fatal-core-dir=<cores>` and returns
-/// its TIDs and its one decompressed core.
+/// its TIDs and its one decompressed core, after checking that the core holds
+/// every thread's own registers ([`assert_threads_hold_their_own_registers`]).
 fn parked_core(guest: &Path, cores: &Path) -> (ParkedTids, Vec<u8>) {
     let output = hermit(
         &["--fatal-core-dir", cores.to_str().unwrap()],
@@ -565,7 +633,9 @@ fn parked_core(guest: &Path, cores: &Path) -> (ParkedTids, Vec<u8>) {
         "expected {report:?}:\n{}",
         stderr(&output)
     );
-    (tids, decode_core(&cores.join(&kept[0].0)))
+    let core = decode_core(&cores.join(&kept[0].0));
+    assert_threads_hold_their_own_registers(guest, &tids, &core);
+    (tids, core)
 }
 
 /// A process a core-dumping signal ends keeps one core holding every thread,

@@ -4156,6 +4156,27 @@ pub fn launched_image(command: &Command) -> Option<detcore::LaunchImage> {
     })
 }
 
+/// Before a ptrace tracer hosting Detcore starts: has a fatal core read each
+/// thread's general registers through safeptrace, as Reverie's ptrace backend
+/// holds them, instead of from the kernel
+/// (`detcore::install_fatal_core_register_reader`).
+///
+/// safeptrace serves a thread's registers from Reverie's register cache for
+/// its current stop when the cache holds them, and from the kernel otherwise,
+/// which is where the offered thread's registers come from too. The core reads
+/// a thread only once a ptrace request of it has succeeded at its exit stop,
+/// which proves that it is stopped and traced by the calling thread, as
+/// `Stopped::new_unchecked` requires. The read changes no register: on a cache
+/// miss it keeps the kernel's registers as clean cache contents, as Reverie's
+/// own next read at that stop would.
+pub(crate) fn install_fatal_core_register_reader() {
+    let _ = detcore::install_fatal_core_register_reader(|tid| {
+        safeptrace::Stopped::new_unchecked(safeptrace::Pid::from_raw(tid))
+            .getregs()
+            .ok()
+    });
+}
+
 async fn dispatch_backend(
     command: Command,
     mut config: DetConfig,
@@ -4309,6 +4330,7 @@ async fn dispatch_backend(
     let stats_request = backend_stats::request(print_summary_to_json_file);
     let control = control
         .ok_or_else(|| Error::msg("ordinary ptrace requires its retained operation owner"))?;
+    install_fatal_core_register_reader();
     // A sequentialized guest tells gdbserver not to serialize its threads;
     // see hermit_run_ptrace::spawn_tracer.
     let tracer = hermit_run_ptrace::spawn_tracer(
@@ -4708,6 +4730,7 @@ async fn dispatch_output_backend(
     command.stderr(Stdio::piped());
     let control = control
         .ok_or_else(|| Error::msg("ordinary ptrace requires its retained operation owner"))?;
+    install_fatal_core_register_reader();
     // A sequentialized guest tells gdbserver not to serialize its threads;
     // see hermit_run_ptrace::spawn_tracer.
     let tracer = hermit_run_ptrace::spawn_tracer(

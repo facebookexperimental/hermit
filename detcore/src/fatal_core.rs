@@ -19,7 +19,9 @@
 //! It is one ELF core, compressed as a sequence of zstd frames, in
 //! [`FatalCoreCapture::dir`]. The capture only reads the stopped guest,
 //! through procfs and ptrace register reads, so the guest observes nothing and
-//! its exit status is already fixed.
+//! its exit status is already fixed. Each thread's general registers are the
+//! ones the backend's tracer holds for it ([`install_register_reader`]), which
+//! can be newer than the kernel's copy.
 //!
 //! The thread's memory is normally still mapped at the exit stop, but nothing
 //! pins it: it can be reaped before or during the capture. A page that cannot
@@ -64,6 +66,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::PoisonError;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -96,6 +99,35 @@ fn core_page() -> u64 {
 /// it, which the x86-64 System V ABI calls the red zone.
 const RED_ZONE: u64 = 128;
 static ZEROS: [u8; CHUNK] = [0; CHUNK];
+
+/// Reads the general registers of the traced thread `tid`, held at a ptrace
+/// stop, as the backend's tracer holds them, or returns `None` when it cannot.
+pub type RegisterReader = fn(tid: i32) -> Option<libc::user_regs_struct>;
+
+static REGISTER_READER: OnceLock<RegisterReader> = OnceLock::new();
+
+/// Installs `read`, which gives a core the general registers of each of its
+/// threads but the offered one as the backend's tracer holds them. Returns
+/// false if one was installed already. Without one, a core holds the kernel's
+/// copy of those registers.
+///
+/// The two can differ. Reverie's ptrace backend keeps a register write it
+/// makes at a stop in its own cache, and hands it to the kernel only when the
+/// thread runs again or a request reads the kernel's copy. A thread that
+/// Detcore parks after Reverie ran a syscall for it on Reverie's private page
+/// keeps that syscall's registers in the kernel, with its instruction pointer
+/// in that page, while its own registers wait in the cache; a fatal signal
+/// takes it to its exit stop without the write. The offered thread's
+/// registers ([`FatalSignalExit::regs`]) already come from that cache. Read
+/// from the kernel, every other parked thread's would not, and which thread
+/// is offered first is decided by host timing, so two runs of one guest could
+/// keep different cores.
+///
+/// The crate that hosts Detcore on the ptrace backend calls this before the
+/// tracer starts.
+pub fn install_register_reader(read: RegisterReader) -> bool {
+    REGISTER_READER.set(read).is_ok()
+}
 
 /// What one [`capture`] did.
 #[derive(Debug, PartialEq, Eq)]
@@ -586,16 +618,19 @@ struct RegsetNote {
 /// answer. The dumping thread wakes the others from that wait
 /// (`coredump_finish`, fs/coredump.c) and goes on to exit, so each of them
 /// reaches its exit stop without the tracer, and none leaves it while the
-/// tracer is held here: their registers are read there. Another thread not
-/// held by `deadline` is left out, and so is a regset ptrace refuses, as the
-/// kernel leaves out an inactive one. A dumping thread not held by then fails
-/// the capture: without it the core would name another thread as the one that
-/// took the signal.
+/// tracer is held here: their registers are read there. Their general
+/// registers come from the same source as the offered thread's, the backend's
+/// tracer ([`install_register_reader`]), so the core does not depend on which
+/// thread was offered. Another thread not held by `deadline` is left out, and
+/// so is a regset ptrace refuses, as the kernel leaves out an inactive one. A
+/// dumping thread not held by then fails the capture: without it the core
+/// would name another thread as the one that took the signal.
 fn gather(
     exit: &FatalSignalExit,
     death: &Death,
     deadline: Instant,
 ) -> anyhow::Result<Vec<ThreadNotes>> {
+    let read = REGISTER_READER.get().copied();
     let offered = exit.tid.as_raw();
     let mut tids: Vec<i32> = thread_ids(death.tgid)
         .into_iter()
@@ -610,7 +645,7 @@ fn gather(
             let regs = if tid == offered {
                 exit.regs
             } else {
-                regs_at_exit_stop(tid, deadline)?
+                regs_at_exit_stop(tid, deadline, read)?
             };
             let status = Process::new(tid).and_then(|thread| thread.status()).ok();
             Some(ThreadNotes {
@@ -658,13 +693,18 @@ fn task_flags(tid: i32) -> Option<u32> {
     Some(Process::new(tid).ok()?.stat().ok()?.flags)
 }
 
-/// `tid`'s general registers once it is held at its exit stop, or `None`
-/// when it is gone or still not held at `deadline`. Until it stops, a ptrace
-/// request of it fails, as of any thread that is not stopped.
-fn regs_at_exit_stop(tid: i32, deadline: Instant) -> Option<libc::user_regs_struct> {
+/// `tid`'s general registers once it is held at its exit stop, as
+/// [`tracer_view`] gives them, or `None` when it is gone or still not held at
+/// `deadline`. Until it stops, a ptrace request of it fails, as of any thread
+/// that is not stopped, so a read of the kernel's copy tells when it is held.
+fn regs_at_exit_stop(
+    tid: i32,
+    deadline: Instant,
+    read: Option<RegisterReader>,
+) -> Option<libc::user_regs_struct> {
     loop {
-        if let Ok(regs) = general_regs(tid) {
-            return Some(regs);
+        if let Ok(kernel) = general_regs(tid) {
+            return Some(tracer_view(tid, kernel, read));
         }
         let gone = Process::new(tid)
             .and_then(|thread| thread.stat())
@@ -674,6 +714,17 @@ fn regs_at_exit_stop(tid: i32, deadline: Instant) -> Option<libc::user_regs_stru
         }
         std::thread::sleep(Duration::from_micros(100));
     }
+}
+
+/// The general registers of `tid`, held at a ptrace stop, as `read` (see
+/// [`install_register_reader`]) gives them, or `kernel`, the kernel's copy,
+/// when there is no `read` or it cannot read them.
+fn tracer_view(
+    tid: i32,
+    kernel: libc::user_regs_struct,
+    read: Option<RegisterReader>,
+) -> libc::user_regs_struct {
+    read.and_then(|read| read(tid)).unwrap_or(kernel)
 }
 
 /// Bytes [`getregset`] offers the kernel: more than any x86-64 regset needs,
@@ -2076,6 +2127,45 @@ mod tests {
         assert_eq!(threads.len(), 1);
         assert_eq!(threads[0].tid, exit.tid.as_raw());
         assert_eq!(threads[0].regs.r12, 0x1234);
+    }
+
+    /// The thread whose registers [`cached_for_7`] holds.
+    #[cfg(target_arch = "x86_64")]
+    const CACHED_TID: i32 = 7;
+
+    /// A tracer that holds registers, r12 = 0xcace, for thread
+    /// [`CACHED_TID`] alone.
+    #[cfg(target_arch = "x86_64")]
+    fn cached_for_7(tid: i32) -> Option<libc::user_regs_struct> {
+        (tid == CACHED_TID).then(|| {
+            // SAFETY: user_regs_struct is plain old data; all zeros is valid.
+            let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+            regs.r12 = 0xcace;
+            regs
+        })
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_held_thread_keeps_the_registers_its_tracer_holds() {
+        // SAFETY: user_regs_struct is plain old data; all zeros is valid.
+        let mut kernel: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        // The private page's syscall return address, as the kernel's copy of
+        // a parked thread can still hold it.
+        kernel.rip = 0x7100_0002;
+        kernel.r12 = 0xdead;
+        let view = tracer_view(CACHED_TID, kernel, Some(cached_for_7));
+        assert_eq!(
+            (view.r12, view.rip),
+            (0xcace, 0),
+            "the tracer's view was not kept"
+        );
+        // The tracer cannot read another thread, and there may be no tracer
+        // at all: the kernel's copy is all there is.
+        let other = tracer_view(CACHED_TID + 1, kernel, Some(cached_for_7));
+        assert_eq!((other.r12, other.rip), (0xdead, 0x7100_0002));
+        let without = tracer_view(CACHED_TID, kernel, None);
+        assert_eq!((without.r12, without.rip), (0xdead, 0x7100_0002));
     }
 
     #[test]

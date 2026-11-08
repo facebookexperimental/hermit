@@ -197,6 +197,7 @@ impl Replay {
         // A sequentialized replay tells gdbserver not to serialize guests,
         // because Detcore already does.
         let gdbserver = gdbserver.map(crate::gdbserver::connection).transpose()?;
+        crate::install_fatal_core_register_reader();
         let tracer =
             hermit_replay::spawn_tracer(command, config, gdbserver, sequentialize_threads).await?;
         let proc_readonly = crate::proc_mount::guest_proc_readonly(tracer.guest_pid());
