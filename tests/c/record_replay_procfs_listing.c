@@ -9,7 +9,9 @@
 /* Which names a raw getdents64 of each spelling of the caller's own task
  * directories lists, and of an ordinary directory given as argv[1]. It
  * prints only whether each looked-for name is present, so a recording and
- * its replay print the same lines.
+ * its replay print the same lines. argv[2] may name a symlink to the
+ * caller's task directory and argv[3] a bind mount of one; a fifth
+ * argument "fill" first takes every free descriptor slot but one.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -79,7 +81,7 @@ static int report_task(const char *label, const char *path, int process) {
 }
 
 int main(int argc, char **argv) {
-  if (argc != 2 && argc != 3) {
+  if (argc < 2 || argc > 5 || (argc == 5 && strcmp(argv[4], "fill") != 0)) {
     return 2;
   }
   char path[128];
@@ -109,8 +111,36 @@ int main(int argc, char **argv) {
   // The same task directory reached through an ordinary symlink: the
   // listing is the object's, not the spelling's, so it omits the name
   // exactly as the direct spellings do.
-  if (argc == 3) {
+  if (argc >= 3) {
     failed |= report_task("alias", argv[2], 1);
+  }
+  // And through a bind mount at an ordinary path, whose canonical link
+  // names the bind, not the task: still the task directory's listing.
+  // With "fill", first take every free descriptor slot and release
+  // exactly one, so the bind open succeeds with no slot to spare: the
+  // listing must not depend on auxiliary opens the tool cannot make
+  // then either.
+  if (argc >= 4) {
+    static int held[65536];
+    int held_count = 0;
+    if (argc == 5) {
+      int slot;
+      while (
+          held_count < 65536 &&
+          (slot = open("/dev/null", O_RDONLY | O_CLOEXEC)) >= 0) {
+        held[held_count++] = slot;
+      }
+      if (errno != EMFILE || held_count == 0) {
+        printf("fill error=%s\n", strerrorname_np(errno));
+        failed = 1;
+      } else {
+        close(held[--held_count]);
+      }
+    }
+    failed |= report_task("bind", argv[3], 1);
+    while (held_count > 0) {
+      close(held[--held_count]);
+    }
   }
 
   errno = 0;

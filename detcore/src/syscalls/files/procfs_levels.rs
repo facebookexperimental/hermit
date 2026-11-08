@@ -1265,17 +1265,154 @@ impl<T: RecordOrReplay> Detcore<T> {
         )
     }
 
+    /// The mount `fd` was reached through, its filesystem's device and
+    /// the descriptor's mode, as the descriptor said in the recording
+    /// (`statx(fd, "", AT_EMPTY_PATH)` through the recording, into a
+    /// transient page: the empty path is the fresh page's first, zero,
+    /// byte, and the result buffer follows it), so record and replay
+    /// decide alike. `None` where there is no page for the question, the
+    /// call failed, or it reported no mount ID or type. Under record and
+    /// replay, where the descriptor's link names a bind mount at an
+    /// ordinary path instead of the object it reaches.
+    pub(super) async fn recorded_descriptor_mount_identity<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Option<(u64, u64, u32)> {
+        // `struct statx` (256 bytes) at the page's second half.
+        const STATX_SIZE: usize = 256;
+        const LENGTH: usize = 2 * STATX_SIZE;
+        const MASK_OFFSET: usize = 0;
+        const MODE_OFFSET: usize = 28;
+        const DEV_MAJOR_OFFSET: usize = 136;
+        const DEV_MINOR_OFFSET: usize = 140;
+        const MNT_ID_OFFSET: usize = 144;
+        let page = map_transient(guest, LENGTH).await?;
+        let buffer = page.as_raw() + STATX_SIZE;
+        let mut contents = [0u8; STATX_SIZE];
+        let answered = self
+            .record_or_replay(
+                guest,
+                Syscall::from_raw(
+                    Sysno::statx,
+                    raw_args([
+                        fd as usize,
+                        page.as_raw(),
+                        libc::AT_EMPTY_PATH as usize,
+                        (libc::STATX_BASIC_STATS | reverie::syscalls::linux_abi::STATX_MNT_ID)
+                            as usize,
+                        buffer,
+                        0,
+                    ]),
+                ),
+            )
+            .await
+            .is_ok()
+            && AddrMut::<u8>::from_raw(buffer)
+                .is_some_and(|buffer| guest.memory().read_exact(buffer, &mut contents).is_ok());
+        unmap_transient(guest, page, LENGTH).await;
+        if !answered {
+            return None;
+        }
+        let field_u32 = |offset: usize| {
+            u32::from_ne_bytes(contents[offset..offset + 4].try_into().expect("4 bytes"))
+        };
+        let field_u64 = |offset: usize| {
+            u64::from_ne_bytes(contents[offset..offset + 8].try_into().expect("8 bytes"))
+        };
+        let field_u16 = |offset: usize| {
+            u16::from_ne_bytes(contents[offset..offset + 2].try_into().expect("2 bytes"))
+        };
+        let mask = field_u32(MASK_OFFSET);
+        (mask & reverie::syscalls::linux_abi::STATX_MNT_ID != 0 && mask & libc::STATX_TYPE != 0)
+            .then(|| {
+                (
+                    field_u64(MNT_ID_OFFSET),
+                    libc::makedev(field_u32(DEV_MAJOR_OFFSET), field_u32(DEV_MINOR_OFFSET)),
+                    u32::from(field_u16(MODE_OFFSET)),
+                )
+            })
+    }
+
+    /// Whether the directory `fd` holds procfs's `root` link, as the
+    /// descriptor said in the recording (`statx(fd, "root",
+    /// AT_SYMLINK_NOFOLLOW)` through the recording, into a transient
+    /// page, consuming no descriptor of the guest's), so record and
+    /// replay decide alike. A process's and a thread's directory are
+    /// the only procfs directories that hold that link, and `lstat`
+    /// answers for it where a `readlink` would want ptrace access, so
+    /// on a descriptor already shown to be a procfs directory this
+    /// authenticates a task directory reached by any name — in
+    /// particular a bind of one that took the guest's last free
+    /// descriptor, where reading the mount table, which must open it,
+    /// fails `EMFILE` in the recording and names nothing. `None` where
+    /// there is no page for the question or it reported no type.
+    pub(super) async fn recorded_descriptor_has_root_link<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Option<bool> {
+        // The name `root` in the page's first half, the `struct statx`
+        // (256 bytes) in the second, as in
+        // [`Self::recorded_descriptor_mount_identity`].
+        const STATX_SIZE: usize = 256;
+        const LENGTH: usize = 2 * STATX_SIZE;
+        const MASK_OFFSET: usize = 0;
+        const MODE_OFFSET: usize = 28;
+        let page = map_transient(guest, LENGTH).await?;
+        let buffer = page.as_raw() + STATX_SIZE;
+        let mut contents = [0u8; STATX_SIZE];
+        let answered = guest.memory().write_exact(page, b"root\0").is_ok()
+            && self
+                .record_or_replay(
+                    guest,
+                    Syscall::from_raw(
+                        Sysno::statx,
+                        raw_args([
+                            fd as usize,
+                            page.as_raw(),
+                            libc::AT_SYMLINK_NOFOLLOW as usize,
+                            libc::STATX_TYPE as usize,
+                            buffer,
+                            0,
+                        ]),
+                    ),
+                )
+                .await
+                .is_ok()
+            && AddrMut::<u8>::from_raw(buffer)
+                .is_some_and(|buffer| guest.memory().read_exact(buffer, &mut contents).is_ok());
+        unmap_transient(guest, page, LENGTH).await;
+        if !answered {
+            return Some(false);
+        }
+        let mask = u32::from_ne_bytes(
+            contents[MASK_OFFSET..MASK_OFFSET + 4]
+                .try_into()
+                .expect("4 bytes"),
+        );
+        let mode = u32::from(u16::from_ne_bytes(
+            contents[MODE_OFFSET..MODE_OFFSET + 2]
+                .try_into()
+                .expect("2 bytes"),
+        ));
+        (mask & libc::STATX_TYPE != 0).then_some(mode & libc::S_IFMT == libc::S_IFLNK)
+    }
+
     /// Whether `fd` was authenticated at its open as a real procfs task
     /// directory under record and replay: a placeholder bound to a process
     /// or thread directory is one by construction, and a real descriptor
     /// carries the authentication its open recorded
     /// (`OpenFileDescription::recordreplay_task_directory`, from the
-    /// recorded descriptor link naming a task directory and the
-    /// descriptor itself answering procfs to a recorded `fstatfs`). The
-    /// identity comes from the opened object, not the guest's spelling,
-    /// so an ordinary symlink to the directory carries it and a user bind
-    /// over a task spelling does not. A link itself and a missing
-    /// descriptor are not one.
+    /// recorded descriptor link naming a task directory — or, where the
+    /// link names a bind of one at an ordinary path, from the
+    /// directory's recorded `root` link or its recorded mount identity
+    /// taken through the recorded mount table — and the descriptor
+    /// itself answering procfs to a recorded `fstatfs`). The identity
+    /// comes from the opened object,
+    /// not the guest's spelling, so an ordinary symlink or a bind mount
+    /// of the directory carries it and a user bind over a task spelling
+    /// does not. A link itself and a missing descriptor are not one.
     pub(crate) fn recordreplay_task_directory<G: Guest<Self>>(&self, guest: &G, fd: RawFd) -> bool {
         if !self.cfg.recordreplay_modes {
             return false;

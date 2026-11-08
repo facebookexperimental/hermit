@@ -23875,6 +23875,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         violated.declared_stdout = Some(hermit_manifest_plan::runner::DeclaredStdout {
             exact: Some("skid-control-ok\n".into()),
             contains: None,
+            stderr_exact: None,
         });
         if skid_overshoot_only_reports(&violated).is_some() {
             return Err("a skid attempt breaking its declared stdout read as skid-only".into());
@@ -24194,6 +24195,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         declared_skid.declared_stdout = Some(hermit_manifest_plan::runner::DeclaredStdout {
             exact: Some(String::new()),
             contains: None,
+            stderr_exact: None,
         });
         let unexpected_stdout = "unexpected\n";
         let unexpected_stdout_pass = rewrite_report(&retry_pass, &|report| {
@@ -24213,6 +24215,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         misrecorded_pass.declared_stdout = Some(hermit_manifest_plan::runner::DeclaredStdout {
             exact: Some("other\n".into()),
             contains: None,
+            stderr_exact: None,
         });
         // A skid row declaring only `expected_stdout_contains`, which its
         // compared runs printed, and a PASS whose compared runs printed it
@@ -24235,6 +24238,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         contains_skid.declared_stdout = Some(hermit_manifest_plan::runner::DeclaredStdout {
             exact: None,
             contains: Some("skid-marker".into()),
+            stderr_exact: None,
         });
         let marker_pass = print_marker(&retry_pass)?;
         // A cell declaring guest exit 7: its skid row and its PASS, a PASS
@@ -25001,14 +25005,18 @@ fn self_test(root: &Path) -> Result<(), String> {
         // declaration, and the PASS that violates it would earn recovery
         // credit like the undeclared control. The row is refused instead, so
         // the repetition is never CLEAN, earns no credit, and its evidence
-        // error names the missing member. The controls that keep both members
-        // are verdicts-skid-recovered (both explicitly null) and the declared
-        // and contains-declared cases above.
+        // error names the missing member. The controls that keep the members
+        // are verdicts-skid-recovered (each explicitly null) and the declared
+        // and contains-declared cases above. (`stderr_exact` is the one
+        // member an old row may omit, reading as no declaration, so it has
+        // no omitted-member case here.)
         let explicit_null =
             serde_json::to_value(&skid).map_err(|e| format!("cannot encode skid fixture: {e}"))?;
-        if explicit_null["declared_stdout"] != json!({"exact": null, "contains": null}) {
+        if explicit_null["declared_stdout"]
+            != json!({"exact": null, "contains": null, "stderr_exact": null})
+        {
             return Err(format!(
-                "the undeclared skid control does not record both members as null: {explicit_null}"
+                "the undeclared skid control does not record every member as null: {explicit_null}"
             ));
         }
         for (name, earlier, later, omitted) in [

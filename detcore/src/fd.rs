@@ -946,12 +946,16 @@ struct OpenFileDescription {
     placeholder: Option<PlaceholderState>,
     /// Under record and replay, this open file was authenticated at its
     /// open as a real procfs task directory: the descriptor link the
-    /// recording read named a process or thread directory and the
-    /// descriptor itself answered procfs to a recorded `fstatfs`. The
-    /// identity comes from the opened object, not the guest's spelling,
-    /// so a symlink alias to the directory carries it and a user bind
-    /// over a task spelling does not. Its listings omit `numa_maps` in
-    /// both phases (`Detcore::recordreplay_task_directory`).
+    /// recording read named a process or thread directory — or, where
+    /// the link names a bind of one at an ordinary path, the
+    /// directory's recorded `root` link, or its recorded mount
+    /// identity placed in the recorded mount table, named it one —
+    /// and the descriptor itself answered procfs
+    /// to a recorded `fstatfs`. The identity comes from the opened
+    /// object, not the guest's spelling, so a symlink alias or a bind
+    /// mount of the directory carries it and a user bind over a task
+    /// spelling does not. Its listings omit `numa_maps` in both phases
+    /// (`Detcore::recordreplay_task_directory`).
     #[serde(default)]
     recordreplay_task_directory: bool,
     /// File status flags shared by dup and fork aliases.

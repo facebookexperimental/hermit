@@ -7281,25 +7281,69 @@ impl<T: RecordOrReplay> Detcore<T> {
                         return Err(Errno::ENOENT.into());
                     }
                     // Authenticate the opened object itself as a task
-                    // directory for the record/replay listing filter: the
-                    // recorded link names a process or thread directory
-                    // and the descriptor answers procfs through the
-                    // recording. An ordinary symlink to the directory
-                    // carries it; a user bind over that spelling, on
-                    // another filesystem, does not.
-                    if self.cfg.recordreplay_modes
-                        && resolved.as_deref().is_some_and(|resolved| {
+                    // directory for the record/replay listing filter. The
+                    // recorded link may name it directly; a bind of it at
+                    // an ordinary path names the bind instead, so then
+                    // ask the directory itself, through the recording:
+                    // its `root` link, which no other procfs directory
+                    // holds and which costs the guest no descriptor, or
+                    // its own mount identity placed in the recorded mount
+                    // table. Either way the descriptor itself must answer
+                    // procfs through the recording, so a user bind of an
+                    // ordinary directory over a task spelling never
+                    // authenticates, and record and replay decide alike
+                    // from the recording alone.
+                    if self.cfg.recordreplay_modes && resolved.is_some() {
+                        let on_procfs =
+                            self.recorded_descriptor_on_procfs(guest, fd).await == Some(true);
+                        let is_task_directory = |path: &Path| {
                             matches!(
-                                crate::procfs::listing::classify(resolved, 0, 0),
+                                crate::procfs::listing::classify(path, 0, 0),
                                 Some(
                                     crate::procfs::listing::ModeledDirectory::Process(_)
                                         | crate::procfs::listing::ModeledDirectory::Thread(..)
                                 )
                             )
-                        })
-                    {
-                        recordreplay_task_directory =
-                            self.recorded_descriptor_on_procfs(guest, fd).await == Some(true);
+                        };
+                        let link_names_task = resolved.as_deref().is_some_and(is_task_directory);
+                        recordreplay_task_directory = on_procfs && link_names_task;
+                        if on_procfs
+                            && !link_names_task
+                            && crate::procfs_inode::tool_can_name_guest_descriptors(
+                                &self.cfg.backend,
+                            )
+                            && let Some((mount_id, device, mode)) =
+                                self.recorded_descriptor_mount_identity(guest, fd).await
+                            && mode & libc::S_IFMT == libc::S_IFDIR
+                        {
+                            // The directory's own `root` link first: it
+                            // costs the guest no descriptor, so it still
+                            // answers where this open took the last free
+                            // one and reading the mount table, which must
+                            // open it, fails `EMFILE` in the recording.
+                            recordreplay_task_directory =
+                                self.recorded_descriptor_has_root_link(guest, fd).await
+                                    == Some(true);
+                            if !recordreplay_task_directory
+                                && let Some(mountinfo) = self.recorded_mountinfo(guest).await
+                            {
+                                recordreplay_task_directory = resolved
+                                    .as_deref()
+                                    .and_then(|resolved| {
+                                        crate::procfs_inode::mount_internal_path(
+                                            resolved, mount_id, device, &mountinfo,
+                                        )
+                                    })
+                                    .is_some_and(|within| {
+                                        // `within` is absolute within its
+                                        // procfs mount ("/1" for a bind of
+                                        // /proc/1), so join it under /proc
+                                        // by hand: Path::join would replace.
+                                        let relative = within.strip_prefix("/").unwrap_or(&within);
+                                        is_task_directory(&Path::new("/proc").join(relative))
+                                    });
+                            }
+                        }
                     }
                     if procfs.is_none() {
                         procfs = resolved
@@ -14411,6 +14455,51 @@ impl<T: RecordOrReplay> Detcore<T> {
         })
     }
 
+    /// The calling thread's mount table, read through the recording (the
+    /// staged sequence [`Self::read_own_fdinfo`] reads an fdinfo through,
+    /// for `thread-self/mountinfo`), so record and replay name a
+    /// bind-mounted object by the same table. `None` where the backend
+    /// gives no procfs anchor, the page it stages through cannot be
+    /// mapped, or any step of the sequence fails: the caller then keeps
+    /// the answer it had without the table.
+    async fn recorded_mountinfo<G: Guest<Self>>(&self, guest: &mut G) -> Option<Vec<u8>> {
+        if !procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend) {
+            return None;
+        }
+        let mapped = guest
+            .inject_with_retry(Syscall::Mmap(
+                syscalls::Mmap::new()
+                    .with_addr(None)
+                    .with_len(FDINFO_PAGE)
+                    .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                    .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
+                    .with_fd(-1)
+                    .with_offset(0),
+            ))
+            .await;
+        let page = mapped
+            .ok()
+            .and_then(|mapped| usize::try_from(mapped).ok())
+            .filter(|page| *page != 0)?;
+        let result = self
+            .read_staged_procfs_text(guest, page, "thread-self/mountinfo")
+            .await;
+        if let Err(errno) = guest
+            .inject_with_retry(Syscall::Munmap(
+                syscalls::Munmap::new()
+                    .with_addr(Addr::from_raw(page))
+                    .with_len(FDINFO_PAGE),
+            ))
+            .await
+        {
+            warn!(
+                "[detcore] could not unmap the transient mountinfo page: {}",
+                errno
+            );
+        }
+        result.ok()?.ok()
+    }
+
     /// Whether the lock ledger takes the backend's `descriptor_status` fact
     /// for a description's locks (package K slice K8-h): where the guest's
     /// procfs is not the kernel's, so no fdinfo can be read through it
@@ -14551,17 +14640,29 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await
     }
 
-    /// [`Self::read_own_fdinfo`]'s recorded sequence, in the mapped `page`
-    /// (layout: the path at [`FDINFO_PATH`], `openat2`'s `struct open_how` at
-    /// [`FDINFO_HOW`], `fstatfs` and `fstat` buffers at [`FDINFO_STAT`], the
-    /// read buffer from [`FDINFO_READ`]): open the anchor, prove it procfs,
-    /// open the entry beneath it on its mount, compare devices, read, and
-    /// close both descriptors.
+    /// [`Self::read_own_fdinfo`]'s recorded sequence for `fd`'s entry.
     async fn read_staged_fdinfo<G: Guest<Self>>(
         &self,
         guest: &mut G,
         page: usize,
         fd: RawFd,
+    ) -> Result<Result<Vec<u8>, FdinfoFailure>, Error> {
+        self.read_staged_procfs_text(guest, page, &format!("thread-self/fdinfo/{fd}"))
+            .await
+    }
+
+    /// The recorded sequence that reads the procfs entry at `relative`,
+    /// beneath a `/proc` anchor, in the mapped `page` (layout: the path at
+    /// [`FDINFO_PATH`], `openat2`'s `struct open_how` at [`FDINFO_HOW`],
+    /// `fstatfs` and `fstat` buffers at [`FDINFO_STAT`], the read buffer
+    /// from [`FDINFO_READ`]): open the anchor, prove it procfs, open the
+    /// entry beneath it on its mount, compare devices, read, and close
+    /// both descriptors.
+    async fn read_staged_procfs_text<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        page: usize,
+        relative: &str,
     ) -> Result<Result<Vec<u8>, FdinfoFailure>, Error> {
         // A backend whose `/proc` is its own (KVM) gives no procfs anchor:
         // nothing is opened there, and the description is untrackable, as an
@@ -14583,7 +14684,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             Ok(anchor) => anchor as RawFd,
             Err(errno) => return Ok(Err(FdinfoFailure::Failed("open", errno))),
         };
-        let result = self.read_beneath_anchor(guest, page, anchor, fd).await;
+        let result = self
+            .read_beneath_anchor(guest, page, anchor, relative)
+            .await;
         if let Err(errno) = self
             .record_or_replay(guest, syscalls::Close::new().with_fd(anchor))
             .await
@@ -14593,19 +14696,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         result
     }
 
-    /// [`Self::read_staged_fdinfo`] once its `anchor` is open.
+    /// [`Self::read_staged_procfs_text`] once its `anchor` is open.
     async fn read_beneath_anchor<G: Guest<Self>>(
         &self,
         guest: &mut G,
         page: usize,
         anchor: RawFd,
-        fd: RawFd,
+        relative: &str,
     ) -> Result<Result<Vec<u8>, FdinfoFailure>, Error> {
         let anchor_device = match self.recorded_procfs_device(guest, page, anchor).await? {
             Ok(device) => device,
             Err(failure) => return Ok(Err(failure)),
         };
-        self.write_fdinfo_path(guest, page, &format!("thread-self/fdinfo/{fd}"))?;
+        self.write_fdinfo_path(guest, page, relative)?;
         // struct open_how { u64 flags; u64 mode; u64 resolve; }
         let how = (libc::O_RDONLY | libc::O_CLOEXEC) as u64;
         let mut open_how = [0u8; FDINFO_HOW_SIZE];

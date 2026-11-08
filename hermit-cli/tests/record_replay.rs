@@ -1108,6 +1108,70 @@ fn record_replay_command_with_policy(
     }
 }
 
+/// [`record_replay_command_with_policy`] under strict verification, with
+/// the Hermit command itself run at a real descriptor limit of 64, which
+/// the guest inherits: a guest cannot lower its real limit (Detcore
+/// virtualizes `RLIMIT_NOFILE`), so the limit is set in the child before
+/// it execs Hermit, as `hermit_at_descriptor_limit` does for the cli
+/// tests.
+fn record_replay_command_at_descriptor_limit(
+    name: &str,
+    program: &Path,
+    args: &[&OsStr],
+    record_args: &[&str],
+) {
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let verdict = data_dir.path().join("verdict.json");
+    let mut command = Command::new("timeout");
+    command
+        .env("HERMIT_MODE", "record")
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "start", "--verify"])
+        .args(record_args)
+        .args(["--strict", "--verify-strict"])
+        .arg(format!("--verify-json={}", verdict.display()))
+        .arg("--record-timeout=30")
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg("--")
+        .arg(program)
+        .args(args);
+    // SAFETY: setrlimit only lowers this child's descriptor limit, which
+    // Hermit and its guest inherit; it allocates nothing and is
+    // async-signal-safe.
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 64,
+                rlim_max: 64,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command_output(command, &format!("record/replay for {name}"));
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined_output.contains("Success: replay matched recording."),
+        "Hermit did not report deterministic replay for {name}:\n{combined_output}"
+    );
+    let report: serde_json::Value = serde_json::from_slice(
+        &fs::read(&verdict).expect("strict record/replay verdict was not written"),
+    )
+    .expect("strict record/replay verdict is valid JSON");
+    assert_eq!(report["verified"], true, "record/replay did not verify");
+    assert_eq!(
+        report["bitwise_parity"], true,
+        "record/replay did not establish canonical parity"
+    );
+}
+
 fn canonical_record_replay_command(name: &str, program: &Path, args: &[&OsStr]) -> String {
     canonical_record_replay_command_retrying_skid(name, program, args, 1, &[])
 }
@@ -3418,6 +3482,43 @@ fn record_replay_omits_numa_maps_from_task_directory_listings() {
         "procfs task-directory listing",
         &guest,
         &[ordinary.as_os_str(), alias.as_os_str()],
+    );
+    // The same guest again with the task directory bind-mounted at an
+    // ordinary path: the mount is a record-start option, which the
+    // canonical helper has no slot for, so this run goes through the
+    // policy helper (strict verification and bitwise parity as usual;
+    // the guest's own assertions make its exit status the verdict).
+    let bind_target = ordinary.join("task-bind");
+    fs::create_dir(&bind_target).expect("failed to create the bind mount target");
+    let mount = format!(
+        "--mount=type=bind,source=/proc/1,target={}",
+        bind_target.display()
+    );
+    record_replay_command_with_policy(
+        "procfs task-directory listing through a bind",
+        &guest,
+        &[
+            ordinary.as_os_str(),
+            alias.as_os_str(),
+            bind_target.as_os_str(),
+        ],
+        true,
+        &[&mount],
+    );
+    // And again at a real descriptor limit of 64, with the guest taking
+    // every free slot but one before it opens the bind: authentication
+    // of the reached task directory must not depend on auxiliary opens
+    // the guest has no slot left for.
+    record_replay_command_at_descriptor_limit(
+        "procfs task-directory listing through a bind at the descriptor limit",
+        &guest,
+        &[
+            ordinary.as_os_str(),
+            alias.as_os_str(),
+            bind_target.as_os_str(),
+            "fill".as_ref(),
+        ],
+        &[&mount],
     );
     let expected = "self numa_maps=0 stat=1 task=1\n\
         thread-self numa_maps=0 stat=1 task=1\n\

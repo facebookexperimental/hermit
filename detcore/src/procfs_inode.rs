@@ -685,6 +685,70 @@ fn procfs_mounts_in(mountinfo: &[u8], device: u64, guest_root: &Path) -> Vec<Pro
         .collect()
 }
 
+/// The path within its procfs mount of the object at `canonical`, reached
+/// through the mount `mount_id` of the device `device`, as one `mountinfo`
+/// table names them: the table's one row for that mount, whose device and
+/// `proc` file system type must agree, gives the mount's root within
+/// procfs and its mount point, and the object's path below the mount point
+/// is carried below the root, as in [`path_within`]. `None` where the
+/// table has no such row or `canonical` is not at or below the row's mount
+/// point. Every name here is in the guest's view, which is the view a
+/// recorded descriptor link and a recorded mount table share, so a caller
+/// under record and replay, which can read neither the guest's own table
+/// through a task view of its own nor a live mount root, still names the
+/// object by its recording alone.
+pub(crate) fn mount_internal_path(
+    canonical: &Path,
+    mount_id: u64,
+    device: u64,
+    mountinfo: &[u8],
+) -> Option<PathBuf> {
+    let canonical = canonical.as_os_str().as_bytes();
+    if !canonical.starts_with(b"/") {
+        return None;
+    }
+    let wanted_device = format!("{}:{}", libc::major(device), libc::minor(device));
+    let line = mountinfo.split(|byte| *byte == b'\n').find(|line| {
+        line.split(|byte| *byte == b' ')
+            .next()
+            .and_then(|id| std::str::from_utf8(id).ok())
+            .and_then(|id| id.parse::<u64>().ok())
+            == Some(mount_id)
+    })?;
+    let fields: Vec<&[u8]> = line.split(|byte| *byte == b' ').collect();
+    if fields.get(2).copied() != Some(wanted_device.as_bytes()) {
+        return None;
+    }
+    let separator = 6 + fields.get(6..)?.iter().position(|field| *field == b"-")?;
+    if fields.get(separator + 1).copied() != Some(b"proc".as_slice()) {
+        return None;
+    }
+    let root = unescape(fields.get(3).copied()?);
+    let point = unescape(fields.get(4).copied()?);
+    if !root.as_os_str().as_bytes().starts_with(b"/")
+        || !point.as_os_str().as_bytes().starts_with(b"/")
+    {
+        return None;
+    }
+    let root = root.as_os_str().as_bytes();
+    let point = point.as_os_str().as_bytes();
+    let suffix = if point == b"/" {
+        canonical
+    } else {
+        let suffix = canonical.strip_prefix(point)?;
+        if !suffix.is_empty() && !suffix.starts_with(b"/") {
+            return None;
+        }
+        suffix
+    };
+    let mut internal = root.to_vec();
+    if internal.ends_with(b"/") && suffix.starts_with(b"/") {
+        internal.pop();
+    }
+    internal.extend_from_slice(suffix);
+    Some(PathBuf::from(OsString::from_vec(internal)))
+}
+
 /// A `mountinfo` path with its octal escapes (`\040` for a space) decoded.
 fn unescape(field: &[u8]) -> PathBuf {
     let mut path = Vec::with_capacity(field.len());
@@ -1153,6 +1217,43 @@ mod tests {
     use std::os::fd::AsRawFd;
 
     use super::*;
+
+    /// A recorded mount table names a bind-mounted task directory by its
+    /// root within procfs: the bind's own row, matched by mount ID and
+    /// device, carries a task opened at the bind or below it to its
+    /// procfs-internal path, while another mount's ID, another device, a
+    /// non-proc row and a merely prefixed path name nothing.
+    #[test]
+    fn a_mount_internal_path_follows_the_mounts_root() {
+        let device = libc::makedev(0, 23);
+        let mountinfo = b"26 25 0:23 / /proc rw - proc proc rw\n\
+            42 26 0:23 /1 /ordinary/task\\040bind rw - proc proc rw\n\
+            43 26 0:23 /sys /ordinary/sys-bind rw - proc proc rw\n"
+            .as_slice();
+        let at = |path: &str, id, dev| mount_internal_path(Path::new(path), id, dev, mountinfo);
+        assert_eq!(
+            at("/ordinary/task bind", 42, device),
+            Some(PathBuf::from("/1"))
+        );
+        assert_eq!(
+            at("/ordinary/task bind/fd", 42, device),
+            Some(PathBuf::from("/1/fd"))
+        );
+        assert_eq!(
+            at("/proc/self/stat", 26, device),
+            Some(PathBuf::from("/self/stat"))
+        );
+        assert_eq!(at("/ordinary/task bind", 26, device), None);
+        assert_eq!(at("/ordinary/task bind", 42, libc::makedev(0, 24)), None);
+        assert_eq!(at("/ordinary/task bind", 99, device), None);
+        assert_eq!(at("/ordinary/task binder", 42, device), None);
+        assert_eq!(at("ordinary/task bind", 42, device), None);
+        let not_proc = b"42 26 0:23 /1 /ordinary/task\\040bind rw - tmpfs tmpfs rw\n".as_slice();
+        assert_eq!(
+            mount_internal_path(Path::new("/ordinary/task bind"), 42, device, not_proc),
+            None
+        );
+    }
 
     /// A rendered fdinfo's inode number (package K slice K8-h) is a
     /// per-process file's (bit 63) whose file index is 0, which no other
