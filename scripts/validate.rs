@@ -23905,6 +23905,36 @@ fn receipt_evidence(
     admitted_receipt_evidence(tool_root, root, log, commit, None).unwrap_or_default()
 }
 
+/// Whether a parent helper's base_observation distinguishes its
+/// measurement. Both contracts are accepted during the integration
+/// cutover transition (S27): v1 names the main measurement, v2 names
+/// any other landing ref and must carry that ref and its SHA -- a v2
+/// without them is indistinguishable from an unproven helper claim.
+fn base_observation_distinguished(value: &serde_json::Value) -> bool {
+    let Some(observation) = value.get("base_observation") else {
+        return false;
+    };
+    let text = |name: &str| {
+        observation
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|field| !field.is_empty())
+    };
+    match observation
+        .get("contract")
+        .and_then(serde_json::Value::as_str)
+    {
+        // v1 acceptance is unchanged from before v2 existed (the
+        // contract string alone distinguishes it); only v2, whose
+        // whole point is naming another ref, must carry that ref.
+        Some("post-run-local-main-merge-base/v1") => true,
+        Some("post-run-local-main-merge-base/v2") => {
+            text("observed_base_ref") && text("observed_base_sha")
+        }
+        _ => false,
+    }
+}
+
 fn admitted_receipt_evidence(
     tool_root: Option<&Path>,
     root: &Path,
@@ -23969,12 +23999,7 @@ fn admitted_receipt_evidence(
                 "parent receipt context differs from original in-memory admission proof".into(),
             );
         }
-        if value
-            .get("base_observation")
-            .and_then(|v| v.get("contract"))
-            .and_then(serde_json::Value::as_str)
-            != Some("post-run-local-main-merge-base/v1")
-        {
+        if !base_observation_distinguished(&value) {
             return Err("parent helper did not distinguish post-run base observation".into());
         }
     }

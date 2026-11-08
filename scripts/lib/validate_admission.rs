@@ -2730,6 +2730,25 @@ for entry in Path('/proc/self/fd').iterdir():
         };
         install(&echo);
         assert!(call().is_ok());
+        // The v2 base-observation contract (S27) is accepted during the
+        // transition, but only with its named ref and SHA: a v2 missing
+        // either is indistinguishable from an unproven helper claim.
+        let mut v2 = echo.clone();
+        v2["base_observation"] = serde_json::json!({
+            "contract": "post-run-local-main-merge-base/v2",
+            "observed_base_ref": "refs/remotes/origin/integration",
+            "observed_base_sha": "a".repeat(40),
+        });
+        install(&v2);
+        assert!(call().is_ok());
+        let mut bad_v2 = v2.clone();
+        bad_v2["base_observation"]
+            .as_object_mut()
+            .unwrap()
+            .remove("observed_base_ref");
+        install(&bad_v2);
+        assert!(call().is_err());
+        install(&echo);
         let mut altered = evidence.clone();
         let AdmissionEvidence::V2(ref mut changed) = altered else {
             panic!("new emission must be v2")
