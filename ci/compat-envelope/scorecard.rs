@@ -17334,8 +17334,13 @@ fn read_series_rows(snapshot: &SeriesSourceSnapshot) -> Result<Vec<SeriesRow>, S
     // are refused as conflicting now. That is the safe direction: the two
     // copies were not written from the same bytes, and nothing writes a
     // negative zero into a series row on purpose.
-    let mut canonical: BTreeMap<String, ([u8; 32], SeriesRow, String)> = BTreeMap::new();
-    for shard in &snapshot.shards {
+    // The dedup map keeps, per distinct event_id, the body digest, the row,
+    // and its source as (shard, line) indices into this snapshot - not a
+    // formatted source String per row (about 50 bytes each at corpus scale).
+    // The source text is rebuilt only for the returned rows and for a
+    // conflicting-duplicate error, exactly as it was formatted before.
+    let mut canonical: BTreeMap<String, ([u8; 32], SeriesRow, u32, u32)> = BTreeMap::new();
+    for (shard_index, shard) in snapshot.shards.iter().enumerate() {
         if !shard.bytes.is_empty() && !shard.bytes.ends_with(b"\n") {
             return Err(format!(
                 "series shard {} in source commit {} is truncated: every nonempty shard must end in a newline",
@@ -17367,22 +17372,36 @@ fn read_series_rows(snapshot: &SeriesSourceSnapshot) -> Result<Vec<SeriesRow>, S
             )
             .into();
             drop(value);
-            if let Some((previous_body, _, previous_source)) = canonical.get(&row.event_id) {
+            if let Some((previous_body, _, previous_shard, previous_line)) =
+                canonical.get(&row.event_id)
+            {
                 if previous_body == &body {
                     continue;
                 }
+                let previous_source = format!(
+                    "{}:{}",
+                    snapshot.shards[*previous_shard as usize].display_path.display(),
+                    previous_line + 1
+                );
                 return Err(format!(
                     "conflicting series rows share event_id {:?}: {previous_source} and {source}",
                     row.event_id
                 ));
             }
-            canonical.insert(row.event_id.clone(), (body, row, source));
+            canonical.insert(
+                row.event_id.clone(),
+                (body, row, shard_index as u32, index as u32),
+            );
         }
     }
     Ok(canonical
         .into_values()
-        .map(|(_, mut row, source)| {
-            row.source = source;
+        .map(|(_, mut row, shard_index, line)| {
+            row.source = format!(
+                "{}:{}",
+                snapshot.shards[shard_index as usize].display_path.display(),
+                line + 1
+            );
             row
         })
         .collect())
