@@ -3869,42 +3869,8 @@ where
     })
 }
 
-/// Measurement only: with SCORECARD_PHASE_LOG set, print one stderr line per
-/// phase with elapsed seconds and this process's resident/high-water sizes.
-fn phase_mark(phase: &str) {
-    use std::sync::OnceLock;
-    static START: OnceLock<Instant> = OnceLock::new();
-    if env::var_os("SCORECARD_PHASE_LOG").is_none() {
-        return;
-    }
-    let start = START.get_or_init(Instant::now);
-    let (mut rss_kib, mut hwm_kib) = (0u64, 0u64);
-    if let Ok(status) = fs::read_to_string("/proc/self/status") {
-        for line in status.lines() {
-            let kib = |value: &str| {
-                value
-                    .trim()
-                    .trim_end_matches(" kB")
-                    .trim()
-                    .parse::<u64>()
-                    .unwrap_or(0)
-            };
-            if let Some(value) = line.strip_prefix("VmRSS:") {
-                rss_kib = kib(value);
-            } else if let Some(value) = line.strip_prefix("VmHWM:") {
-                hwm_kib = kib(value);
-            }
-        }
-    }
-    eprintln!(
-        "phase {phase} elapsed_s={:.3} vmrss_kib={rss_kib} vmhwm_kib={hwm_kib}",
-        start.elapsed().as_secs_f64()
-    );
-}
-
 fn main() -> ExitCode {
     rust_script_prelude::init();
-    phase_mark("main:start");
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
@@ -11815,7 +11781,6 @@ fn project_observations(root: &Path, series_root: &Path, refreshed_at: &str) -> 
     let source_commit = snapshot.source_commit.clone();
     let source_tree = snapshot.source_tree.clone();
     let rows = read_series_rows_owned(snapshot)?;
-    phase_mark("series:after-read-rows");
     project_observation_rows(
         root,
         &derived,
@@ -11893,11 +11858,8 @@ where
         ));
     }
     let derived = check_tracked(root)?;
-    phase_mark("snap:after-check-tracked");
     let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
-    phase_mark("snap:after-load-existing");
     reconcile_history_catalogue(root, &mut tracked)?;
-    phase_mark("snap:after-reconcile");
     project_observation_rows(
         root,
         &derived,
@@ -11942,23 +11904,17 @@ fn project_observation_rows<VerifySource>(
 where
     VerifySource: FnOnce() -> Result<(), String>,
 {
-    phase_mark("rows:entry");
     let before = tracked.clone();
-    phase_mark("rows:after-clone");
     let source = row_source.source.to_string();
     let attempts = validate_attempt_bindings(&tracked, Some(rows))?;
-    phase_mark("rows:after-attempt-bindings");
     let representation = direct_representation(&tracked, rows, &attempts)?;
-    phase_mark("rows:after-direct-representation");
     remove_replaceable_projected_observations(&mut tracked, rows, Some(&source))?;
-    phase_mark("rows:after-remove-replaceable");
     let unrepresented = rows
         .iter()
         .filter(|row| !representation.represented_event_ids.contains(&row.event_id))
         .collect::<Vec<&SeriesRow>>();
     let mut projection =
         apply_series_rows_in_place(root, &mut tracked, &unrepresented, Some(&source))?;
-    phase_mark("rows:after-apply");
     projection.represented_rows += representation.represented_event_ids.len();
     let skipped = &projection.skipped;
 
@@ -11977,16 +11933,13 @@ where
     });
     cap_observations(&mut tracked);
     refresh_measurement(&mut tracked);
-    phase_mark("rows:after-cap-refresh");
 
     // The guard runs BEFORE the write, not after. A projection that has already
     // hit the disk is a projection someone has to notice and revert.
     enforce_projection_preserves_evidence(&before, &tracked, rows_read)?;
     enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
     verify_source()?;
-    phase_mark("rows:after-guards");
     write_observation_files(root, derived, &tracked)?;
-    phase_mark("rows:after-write");
 
     println!(
         "compatibility scorecard: projected {} cell(s) from {} evidence row(s), including {} \
@@ -16244,7 +16197,6 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
         });
     }
 
-    phase_mark("apply:after-prepared");
     if !rows.is_empty() && prepared.is_empty() {
         return Err(format!(
             "every one of the {} readable series row(s) determined nothing for the legacy projection, so the projection was not written:\n{}",
@@ -16369,7 +16321,6 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
     drop(preserved);
     drop(source_counts);
     let mut prepared = to_project;
-    phase_mark("apply:after-preserved-filter");
 
     prepared.sort_by(|left, right| {
         let left_row = rows[left.row_index].borrow();
@@ -16462,7 +16413,6 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
         });
     }
 
-    phase_mark("apply:after-grouped-push");
     for (cell_index, prepared_index) in latest_by_cell {
         let row = &prepared[prepared_index];
         let source = rows[row.row_index].borrow();
@@ -16926,7 +16876,6 @@ fn validate_scorecard_snapshot(
         hasher.update(b"\n");
     }
     let rows_sha256 = format!("{:x}", hasher.finalize());
-    phase_mark("validate:rows-digest");
     if rows_sha256 != snapshot.rows_sha256 {
         return Err(format!(
             "scorecard snapshot {} row digest does not match its rows",
@@ -17104,19 +17053,15 @@ impl HeldScorecardSeriesSnapshot {
         // Validate original bytes before any Value conversion can collapse
         // duplicate row, series, or nested detail fields. RawValue still owns
         // the producer's exact byte spelling for the canonical-row digest.
-        phase_mark("open:payload-read+digest");
         serde_json::from_slice::<UniqueJsonFields>(&payload)
             .map_err(|error| format!("scorecard snapshot is not valid strict JSON: {error}"))?;
-        phase_mark("open:unique-fields");
         // Rows borrow the payload: converting them to owned RawValues first
         // duplicated the snapshot's whole size beside the payload itself.
         // Validation and the typed conversion finish here, while the payload
         // is alive; only the metadata is kept, with no raw rows.
         let borrowed: BorrowedScorecardSeriesSnapshot<'_> = serde_json::from_slice(&payload)
             .map_err(|error| format!("scorecard snapshot is not valid strict JSON: {error}"))?;
-        phase_mark("open:snapshot-parsed");
         let rows = validate_scorecard_snapshot(&borrowed, path)?;
-        phase_mark("open:rows-typed");
         let BorrowedScorecardSeriesSnapshot {
             schema: _schema,
             source,
@@ -17142,7 +17087,6 @@ impl HeldScorecardSeriesSnapshot {
             rows,
         };
         held.verify()?;
-        phase_mark("open:verified");
         Ok(held)
     }
 
@@ -17182,7 +17126,6 @@ impl HeldScorecardSeriesSnapshot {
                 self.path.display()
             ));
         }
-        phase_mark("verify:payload-reread+digest");
         Ok(())
     }
 }
