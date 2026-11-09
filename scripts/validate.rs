@@ -1499,12 +1499,22 @@ fn establish_build_mode_environment(
 /// buck run's consumers would then refuse late and obscurely. Buck in
 /// those selections earns admission by threading the mode through their
 /// producers, not by falling through to cargo here.
+///
+/// Plan-only invocations (`show_plan`: --show-plan, --show-plan-json,
+/// --write-constructed-dag, --write-generated-plan) are exempt: they
+/// print a plan and execute no node, and the validation's own tooling
+/// (run-split-validate's fetch phase, check-shard-coverage) probes the
+/// hosted-portable plan this way from inside a buck run's nodes, where
+/// the ambient build mode is buck. Refusing there would kill the full
+/// buck run at setup.pinned_root_fetch — observed as exit 75 with an
+/// empty detail block — without protecting any prepare.
 fn check_build_mode_selection(
     build_mode: &str,
     level: Level,
     focused: Option<&Focused>,
+    show_plan: bool,
 ) -> Result<(), String> {
-    if build_mode != BUILD_MODE_BUCK {
+    if build_mode != BUILD_MODE_BUCK || show_plan {
         return Ok(());
     }
     match (level, focused) {
@@ -1567,50 +1577,74 @@ mod build_mode_environment_tests {
         // focused profile refuses by name, and cargo is admitted in
         // every selection.
         for level in [Level::Quick, Level::PortableOnly, Level::Super] {
-            let error = check_build_mode_selection(BUILD_MODE_BUCK, level, None).unwrap_err();
+            let error = check_build_mode_selection(BUILD_MODE_BUCK, level, None, false).unwrap_err();
             assert!(error.contains(level.name()), "{error}");
             assert!(error.contains("only at the full level"), "{error}");
-            check_build_mode_selection(BUILD_MODE_CARGO, level, None).unwrap();
+            check_build_mode_selection(BUILD_MODE_CARGO, level, None, false).unwrap();
         }
-        check_build_mode_selection(BUILD_MODE_BUCK, Level::Full, None).unwrap();
-        check_build_mode_selection(BUILD_MODE_CARGO, Level::Full, None).unwrap();
+        check_build_mode_selection(BUILD_MODE_BUCK, Level::Full, None, false).unwrap();
+        check_build_mode_selection(BUILD_MODE_CARGO, Level::Full, None, false).unwrap();
         for focused in [Focused::PrivilegedOnly, Focused::HostedPortable] {
             let error =
-                check_build_mode_selection(BUILD_MODE_BUCK, Level::Full, Some(&focused))
+                check_build_mode_selection(BUILD_MODE_BUCK, Level::Full, Some(&focused), false)
                     .unwrap_err();
             assert!(error.contains(focused.cli_name()), "{error}");
             assert!(error.contains("unfocused full"), "{error}");
-            check_build_mode_selection(BUILD_MODE_CARGO, Level::Full, Some(&focused)).unwrap();
+            check_build_mode_selection(BUILD_MODE_CARGO, Level::Full, Some(&focused), false)
+                .unwrap();
+            // A plan-only probe of the same selection executes nothing and
+            // is admitted in either mode: run-split-validate's fetch phase
+            // and check-shard-coverage probe the hosted plan this way from
+            // inside a buck run's own nodes.
+            check_build_mode_selection(BUILD_MODE_BUCK, Level::Full, Some(&focused), true)
+                .unwrap();
         }
         // Parser to policy: the focused flags parse with the default full
         // level, so the refusal must come from the focused selection, not
-        // the level.
-        for argv in [
-            vec!["--privileged-only", "--build-mode", "buck"],
-            // Hosted selections are off-record shard modes; under the
-            // parser guard they require --show-plan (or the off-record
-            // opt-in). --show-plan reaches the build-mode policy without
-            // executing, as the reviewer's probe ran it.
-            vec![
-                "--hosted-portable-only",
-                "--show-plan",
-                "--build-mode",
-                "buck",
-            ],
-        ] {
-            let parsed =
-                parse_argv(&argv.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
-                    .expect("focused buck argv parses; policy refuses it");
-            assert_eq!(parsed.level, Level::Full);
-            assert_eq!(parsed.build_mode.as_deref(), Some(BUILD_MODE_BUCK));
-            let error = check_build_mode_selection(
-                BUILD_MODE_BUCK,
-                parsed.level,
-                parsed.focused.as_ref(),
-            )
-            .unwrap_err();
-            assert!(error.contains("unfocused full"), "{error}");
-        }
+        // the level. --privileged-only executes, so it refuses; the
+        // hosted probe carries --show-plan (its parser guard requires it
+        // or the off-record opt-in), so the same policy admits it as a
+        // plan print and still refuses it as a run (show_plan forced off).
+        let privileged = parse_argv(&[
+            "--privileged-only".into(),
+            "--build-mode".into(),
+            "buck".into(),
+        ])
+        .expect("privileged buck argv parses; policy refuses it");
+        assert_eq!(privileged.level, Level::Full);
+        assert!(!privileged.show_plan);
+        let error = check_build_mode_selection(
+            BUILD_MODE_BUCK,
+            privileged.level,
+            privileged.focused.as_ref(),
+            privileged.show_plan,
+        )
+        .unwrap_err();
+        assert!(error.contains("unfocused full"), "{error}");
+        let hosted_probe = parse_argv(&[
+            "--hosted-portable-only".into(),
+            "--show-plan".into(),
+            "--build-mode".into(),
+            "buck".into(),
+        ])
+        .expect("hosted buck plan argv parses");
+        assert_eq!(hosted_probe.level, Level::Full);
+        assert!(hosted_probe.show_plan);
+        assert_eq!(hosted_probe.build_mode.as_deref(), Some(BUILD_MODE_BUCK));
+        check_build_mode_selection(
+            BUILD_MODE_BUCK,
+            hosted_probe.level,
+            hosted_probe.focused.as_ref(),
+            hosted_probe.show_plan,
+        )
+        .unwrap();
+        assert!(check_build_mode_selection(
+            BUILD_MODE_BUCK,
+            hosted_probe.level,
+            hosted_probe.focused.as_ref(),
+            false,
+        )
+        .is_err());
         // A non-UTF-8 ambient value refuses by variable name for both
         // variables, instead of collapsing to unset.
         #[cfg(unix)]
@@ -30248,7 +30282,12 @@ fn run(
         }
     };
     if let Err(error) =
-        check_build_mode_selection(&build_mode, args.level, args.focused.as_ref())
+check_build_mode_selection(
+            &build_mode,
+            args.level,
+            args.focused.as_ref(),
+            args.show_plan,
+        )
     {
         return RunSummary::refused(2, args.level.name(), "build mode", vec![error]);
     }
