@@ -1,12 +1,99 @@
 # Hermit
 
-Notable changes for users. Versions 0.5.0 and 0.5.2 describe crate releases;
-0.5.1 and 0.5.3 describe selected development snapshots. The 0.5.2 release
-branches from 0.5.0.
+Notable changes for users. Versions 0.5.0, 0.5.2 and 0.5.5 describe crate
+releases; 0.5.1 and 0.5.3 describe selected development snapshots, and 0.5.4
+is a package-version alignment. The 0.5.2 release branches from 0.5.0.
 
-## 0.5.3 (Unreleased)
+## 0.5.5
 
-- Removed `scripts/update_spreadsheet.rs`: its inputs no longer exist (no `hermit_syscalls.csv` in the tree, and the v1 `../detcore` layout it assumed is gone), and nothing referenced it. Restore with `git show 37ac767f2fe0529eb936bf6771c760fbd3a1185c^:scripts/update_spreadsheet.rs`.
+Release for the 2026-11-09 fbsource import. It pins Reverie 0.5.5
+(`e39f78dd`) and summarizes the changes since the 0.5.4 alignment.
+
+- Packaging: the core keeps the ptrace, KVM, LiteInst and in-guest-trap
+  backends. DynamoRIO (DBT) moved to hermit-dynamorio, and SaBRe and e9patch
+  to hermit-3rdparty-patching. `--backend` refuses their names instead of
+  substituting another backend, and an outside crate can register a backend
+  through `hermit::app::backend_hook`.
+- Record/replay: replay is strict by default. A schedule replay stops at its
+  first desync with `ERROR HERMIT_REPLAY_DESYNC` and exit 125. A difference
+  only in polling phase, with matching guest state, resyncs. Schedules and
+  preemption records name their branch-counter identity, and they are refused
+  before the guest starts where the run cannot execute them. A replay names
+  the host files that changed since the recording.
+- ptrace and Detcore: programs that contend priority-inheritance mutexes or
+  signal a multithreaded process now run instead of being refused.
+  Descriptors received over `SCM_RIGHTS` are tracked, recorded and replayed
+  instead of failing with `EBADF`. The CPU-time clocks and `clock()` report
+  Detcore's CPU accounting instead of virtual wall time.
+- Isolation and /proc: every run gets a private `/dev/shm`, its own IPC
+  namespace and a private `/dev/mqueue` (`--bind /dev/shm` keeps the host's).
+  `/proc/<pid>/stat` and `schedstat` show Detcore's CPU accounting instead of
+  zeros, and Detcore renders `statm`, `io`, `arch_status` and
+  `/proc/diskstats` itself on every backend.
+- KVM: the preemption timer is on, and a late timer event refuses the run, as
+  on ptrace. Detcore serves other guest processes' `/proc/<pid>` directories,
+  `stat`, `comm`, `cmdline` and `environ`, so `ps`, `pgrep` and `pkill` see
+  them. Detcore now decides `flock(2)` itself on every backend: KVM no longer
+  refuses it, and a blocking `flock` waits instead of being refused.
+- CPU profile: `--cpu-profile` defaults to `auto`. That presents x86-64-v2
+  unless the executable or its program interpreter declares x86-64-v3, and
+  then v3 on a host that qualifies. A guest that declares more than its
+  profile presents is refused (exit 122). Replays and manifest reruns use the
+  recorded profile.
+- Chaos: `hermit record start --chaos --seed=N` records chaos schedules.
+  `--chaos-timeslice-range=MIN..MAX` draws each slice's mean log-uniformly
+  from a range, `--chaos-instruction-offset=N` lets a preemption land inside
+  straight-line code, and `--virtual-cpus=N` (1 to 128) presents N CPUs so
+  that thread pools start N workers.
+- `hermit analyze`: `--prefix-search` localizes failures that depend on
+  events only the failing run made, and the report names the racing system
+  calls whose order flips. `--time-budget` and `--trial-budget` stop with a
+  partial report that `--resume` continues. The workspace is removed on exit
+  unless `--keep-tmp` is given.
+- OCI images: `hermit run --image` reads images from podman's local store
+  instead of pulling them through buildah, and takes the default program from
+  the image's Entrypoint and Cmd. It runs on KVM as well as ptrace, and it
+  accepts digest-verified `oci-dir:` layouts and `docker-archive:` tarballs.
+  `hermit oci prune` removes unreferenced rootfs caches.
+- aarch64 and Android: Hermit builds and runs on aarch64 Linux with the
+  ptrace backend. `--rewrite-exclusives` rewrites load/store-exclusive retry
+  loops into single LSE atomics, whose retries would otherwise shift
+  preemption points. As root, a `--no-namespace` run chooses its guest
+  process IDs from a base (`--pid-base`), and an Android guest reads a frozen
+  copy of the system property area.
+- Removed `scripts/update_spreadsheet.rs`: its inputs no longer exist (no
+  `hermit_syscalls.csv` in the tree, and the v1 `../detcore` layout it assumed
+  is gone), and nothing referenced it. Restore with `git show
+  37ac767f2fe0529eb936bf6771c760fbd3a1185c^:scripts/update_spreadsheet.rs`.
+- Align every first-party package and internal requirement at 0.5.5, and pin
+  Reverie 0.5.5.
+
+Incompatible changes:
+
+- Recordings: the record format moves from `0x186` to `0x19e` and must match
+  exactly, so 0.5.4 recordings are refused. So are schedule and preemption
+  files that carry no branch-counter identity.
+- Replay: the first desync, including a soft one, ends the replay with exit
+  125. `--die-on-desync` is now a hidden no-op that prints a warning.
+- `--backend=dbt`, `sabre` and `e9patch` are refused, and the `dbt`, `sabre`,
+  `e9patch` and `third-party-backends` Cargo features are gone.
+- A guest that talks to host processes through `/dev/shm` now needs
+  `--bind /dev/shm`. `--namespace-only` guests no longer reach host System V
+  and POSIX message-queue objects.
+- The CPU profile default, for the CLI and for `Config::default()`, is `auto`
+  instead of x86-64-v2.
+- `hermit run --image` never pulls. Fetch first with `hermit oci pull` or
+  `podman pull`.
+
+## 0.5.4
+
+- Package-version alignment for the native import
+  ([5f53234f](https://github.com/rrnewton/hermit/commit/5f53234fbb0129114a34de8cb06dfdd7cde5d194)).
+  Changes made between the 0.5.3 snapshot and this alignment have no entries
+  of their own.
+
+## 0.5.3 (Development snapshot)
+
 - Read the calling process's `/proc/.../cmdline` from its current argument
   memory on ptrace and KVM, including rewritten arguments, thread aliases and
   positioned reads. Reading another process's command line remains a KVM gap.

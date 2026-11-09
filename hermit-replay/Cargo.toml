@@ -1,19 +1,19 @@
 [package]
 name = "hermit-replay"
 description = "Hermit's ptrace replay tool, compiled apart from the hermit library so its Detcore instantiation builds in parallel."
-version = "0.5.4"
+version = "0.5.5"
 edition = "2024"
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
 publish = false
 
 [dependencies]
-hermit-record-format = { version = "0.5.4", path = "../hermit-record-format" }
+hermit-record-format = { version = "0.5.5", path = "../hermit-record-format" }
 anyhow = "1.0.103"
-detcore = { package = "hermit-detcore", version = "0.5.4", path = "../detcore" }
+detcore = { package = "hermit-detcore", version = "0.5.5", path = "../detcore" }
 libc = "0.2.186"
-reverie = { package = "reverie-core", version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "78d41ebd4befc6ba364ca695e168cb8656223545" }
-reverie-ptrace = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "78d41ebd4befc6ba364ca695e168cb8656223545" }
+reverie = { package = "reverie-core", version = "0.5.5", git = "https://github.com/rrnewton/reverie.git", rev = "e39f78dd604e4761b5eeea024001b9c1e26af901" }
+reverie-ptrace = { version = "0.5.5", git = "https://github.com/rrnewton/reverie.git", rev = "e39f78dd604e4761b5eeea024001b9c1e26af901" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 tempfile = "3.27.0"
 tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"] }
