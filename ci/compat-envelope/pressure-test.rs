@@ -4993,6 +4993,7 @@ fn run() -> Result<(), String> {
                 env::remove_var(name);
             }
             REUSE_BUDGETS.store(true, std::sync::atomic::Ordering::Relaxed);
+            IN_SELF_TEST.store(true, std::sync::atomic::Ordering::Relaxed);
             self_test(&root)?;
         }
         _ => return Err(format!("unknown command `{command}`\n\n{USAGE}")),
@@ -6584,23 +6585,60 @@ struct CheckedScorecard<'a> {
     memory_budget_override: Option<i64>,
 }
 
+/// Which scorecard write-back lock a spawned `scorecard.rs check` takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScorecardCheckLock {
+    /// The checkout's real lock: the Git common directory's, shared by every
+    /// worktree of the primary checkout. Production plan generation takes
+    /// this, so a check cannot read the tracked scorecard while a write-back
+    /// is rewriting it.
+    Real,
+    /// A per-invocation private lock. A self-test never writes the scorecard
+    /// back, so it must not serialize on the real lock: the validation DAG
+    /// runs two copies of this self-test concurrently in one checkout, and
+    /// the loser of that race used to wait the check's full 30 s lock
+    /// timeout and fail (super-nightly 2026-11-09, Hermit 7d2eabd9).
+    Private,
+}
+
+/// The `HERMIT_SCORECARD_WRITEBACK_LOCK` override for `lock`, if any. The
+/// real lock needs no override: `scorecard.rs` derives it from the checkout.
+fn scorecard_check_lock_override(lock: ScorecardCheckLock) -> Option<PathBuf> {
+    match lock {
+        ScorecardCheckLock::Real => None,
+        ScorecardCheckLock::Private => Some(env::temp_dir().join(format!(
+            "hermit-pressure-test-scorecard-lock-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))),
+    }
+}
+
 fn check_scorecard(root: &Path) -> Result<CheckedScorecard<'_>, String> {
+    // A unit test never takes the checkout's real write-back lock either:
+    // that lock is shared by every worktree of the primary checkout, so a
+    // live write-back elsewhere on the host would hold the test for the
+    // check's 30 s lock timeout and then fail it.
+    let lock = if IN_SELF_TEST.load(std::sync::atomic::Ordering::Relaxed) || cfg!(test) {
+        ScorecardCheckLock::Private
+    } else {
+        ScorecardCheckLock::Real
+    };
+    check_scorecard_with_lock(root, lock)
+}
+
+fn check_scorecard_with_lock(
+    root: &Path,
+    lock: ScorecardCheckLock,
+) -> Result<CheckedScorecard<'_>, String> {
     let mut command = Command::new(root.join("ci/compat-envelope/scorecard.rs"));
-    // A unit test never takes the checkout's real write-back lock. That lock
-    // is the Git common directory's, shared by every worktree of the primary
-    // checkout, so a live write-back elsewhere on the host would hold the
-    // test for the check's 30 s lock timeout and then fail it.
-    #[cfg(test)]
-    let private_lock = env::temp_dir().join(format!(
-        "hermit-pressure-test-scorecard-lock-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    #[cfg(test)]
-    command.env("HERMIT_SCORECARD_WRITEBACK_LOCK", &private_lock);
+    let private_lock = scorecard_check_lock_override(lock);
+    if let Some(path) = &private_lock {
+        command.env("HERMIT_SCORECARD_WRITEBACK_LOCK", path);
+    }
     let output = command
         .arg("check")
         .current_dir(root)
@@ -6608,8 +6646,9 @@ fn check_scorecard(root: &Path) -> Result<CheckedScorecard<'_>, String> {
         .stderr(Stdio::piped())
         .output()
         .map_err(|e| format!("cannot run scorecard check: {e}"));
-    #[cfg(test)]
-    let _ = fs::remove_file(&private_lock);
+    if let Some(path) = &private_lock {
+        let _ = fs::remove_file(path);
+    }
     let output = output?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     eprint!("{stderr}");
@@ -7149,6 +7188,12 @@ type Budgets = BTreeMap<(String, String, String), CellBudget>;
 /// off, so a `summarize` that checks `run.json` against the tree reads the
 /// tree as it is then, not as an earlier step in the same process saw it.
 static REUSE_BUDGETS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set only by `self-test`, in the same dispatch place as `REUSE_BUDGETS`.
+/// It makes the self-test's spawned scorecard checks take a private
+/// write-back lock instead of the checkout's real one (see
+/// [`ScorecardCheckLock::Private`]); every other command keeps the real lock.
+static IN_SELF_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static LOADED_BUDGETS: std::sync::Mutex<BTreeMap<PathBuf, Budgets>> =
     std::sync::Mutex::new(BTreeMap::new());
 
@@ -26750,6 +26795,91 @@ mod typed_termination_tests {
         fs::create_dir(&path).unwrap();
         let guard = SelfTestDirectory::new(path.clone());
         retained_termination_self_test(&path).unwrap();
+        guard.remove().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod scorecard_check_lock_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    /// Pin the lock each check path takes: production plan generation keeps
+    /// the checkout's real (Git-common-dir) write-back lock, while the
+    /// self-test's check takes a per-invocation private lock, so the two
+    /// concurrent self-test copies in one checkout cannot time each other
+    /// out on it (super-nightly 2026-11-09, Hermit 7d2eabd9).
+    #[test]
+    fn production_check_uses_real_lock_self_test_check_uses_private() {
+        assert_eq!(
+            scorecard_check_lock_override(ScorecardCheckLock::Real),
+            None
+        );
+        let first = scorecard_check_lock_override(ScorecardCheckLock::Private).unwrap();
+        let second = scorecard_check_lock_override(ScorecardCheckLock::Private).unwrap();
+        assert_ne!(first, second, "each private lock must be per-invocation");
+        for private in [&first, &second] {
+            assert_eq!(private.parent(), Some(env::temp_dir().as_path()));
+            assert!(
+                private
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("hermit-pressure-test-scorecard-lock-"),
+                "{private:?}"
+            );
+        }
+
+        // A stand-in scorecard that records the lock it was handed.
+        let root = env::temp_dir().join(format!(
+            "hermit-pressure-self-test-lock-fixture-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let guard = SelfTestDirectory::at(
+            root.clone(),
+            env::temp_dir(),
+            "hermit-pressure-self-test-lock-fixture-",
+        );
+        let script_dir = root.join("ci/compat-envelope");
+        fs::create_dir_all(&script_dir).unwrap();
+        let script = script_dir.join("scorecard.rs");
+        fs::write(
+            &script,
+            "#!/bin/sh\n\
+             printf '%s' \"${HERMIT_SCORECARD_WRITEBACK_LOCK-}\" > observed-lock.txt\n\
+             [ -z \"${HERMIT_SCORECARD_WRITEBACK_LOCK-}\" ] || : > \"$HERMIT_SCORECARD_WRITEBACK_LOCK\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        check_scorecard_with_lock(&root, ScorecardCheckLock::Private).unwrap();
+        let observed = fs::read_to_string(root.join("observed-lock.txt")).unwrap();
+        assert!(
+            observed.starts_with(
+                &env::temp_dir()
+                    .join("hermit-pressure-test-scorecard-lock-")
+                    .to_string_lossy()
+                    .into_owned()
+            ),
+            "self-test check must be handed a private lock, got {observed:?}"
+        );
+        assert!(
+            !Path::new(&observed).exists(),
+            "the private lock file is removed after the check"
+        );
+
+        check_scorecard_with_lock(&root, ScorecardCheckLock::Real).unwrap();
+        let observed = fs::read_to_string(root.join("observed-lock.txt")).unwrap();
+        assert_eq!(
+            observed,
+            env::var("HERMIT_SCORECARD_WRITEBACK_LOCK").unwrap_or_default(),
+            "production check must not override the real lock path"
+        );
         guard.remove().unwrap();
     }
 }
