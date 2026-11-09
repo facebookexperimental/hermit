@@ -15480,7 +15480,7 @@ fn current_comparison_representation(
         tracked,
         &bound_by_run,
         direct_counts,
-        rows.iter().map(|row| Ok::<&SeriesRow, String>(row)),
+        rows.iter().map(Ok::<&SeriesRow, String>),
     )
 }
 
@@ -15599,12 +15599,9 @@ fn current_bound_attempts(
 
 /// Validate bound bases by (cell, Hermit commit, run), in `bound`'s order,
 /// so each event looks up its bases instead of rescanning every bound base.
-fn bound_by_run_index<'a>(
-    bound: &'a BTreeMap<DirectEvidenceBase, BTreeMap<u64, DirectEvidenceKey>>,
-) -> BTreeMap<
-    (&'a str, &'a str, &'a str),
-    Vec<(&'a DirectEvidenceBase, &'a BTreeMap<u64, DirectEvidenceKey>)>,
-> {
+fn bound_by_run_index(
+    bound: &BTreeMap<DirectEvidenceBase, BTreeMap<u64, DirectEvidenceKey>>,
+) -> BTreeMap<(&str, &str, &str), Vec<(&DirectEvidenceBase, &BTreeMap<u64, DirectEvidenceKey>)>> {
     let mut bound_by_run = BTreeMap::<(&str, &str, &str), Vec<_>>::new();
     for (base, attempts) in bound {
         if base.provenance == ObservationProvenance::Validate {
@@ -15957,15 +15954,18 @@ fn direct_representation_held(
         tracked,
         &bound_by_run,
         &direct,
-        held.index.iter().enumerate().filter_map(|(index, row)| {
-            (row.producer == SeriesProducer::Validate
-                && bound_by_run.contains_key(&(
-                    held.index_cell(row),
-                    held.index_tree(row),
-                    held.index_run(row),
-                )))
-            .then(|| held.parse_row_typed(index))
-        }),
+        held.index
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                row.producer == SeriesProducer::Validate
+                    && bound_by_run.contains_key(&(
+                        held.index_cell(row),
+                        held.index_tree(row),
+                        held.index_run(row),
+                    ))
+            })
+            .map(|(index, _)| held.parse_row_typed(index)),
     )?;
     let bound_attempts = bound_direct_attempts(tracked, current_attempts)?;
     let cells = SeriesCellIndex::new(tracked);
