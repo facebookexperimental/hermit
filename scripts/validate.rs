@@ -1490,6 +1490,23 @@ fn establish_build_mode_environment(
     Ok(build_mode)
 }
 
+/// Refuse buck build mode outside the full level, by name and before any
+/// node runs. Only the full producer carries the build-mode segment into
+/// prepare (`prepare full --build-mode`); the quick, super,
+/// portable-only, privileged and hosted-portable prepares stamp cargo
+/// records, which a buck run's consumers would then refuse late and
+/// obscurely. Buck at those levels earns admission by threading the mode
+/// through their producers, not by falling through to cargo here.
+fn check_build_mode_level(build_mode: &str, level: Level) -> Result<(), String> {
+    if build_mode == BUILD_MODE_BUCK && level != Level::Full {
+        return Err(format!(
+            "--build-mode buck is supported only at the full level; level {} prepares its Nextest selections with cargo and has no buck harvest. Rerun at the full level, or drop --build-mode buck.",
+            level.name()
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod build_mode_environment_tests {
     use super::*;
@@ -1532,6 +1549,16 @@ mod build_mode_environment_tests {
         // buck mode into unrelated fixture prepares.
         establish_build_mode_environment(None, None).unwrap();
         assert_eq!(std::env::var(BUILD_MODE_ENV).unwrap(), BUILD_MODE_CARGO);
+        // Buck is a full-level mode: every other level refuses by name,
+        // and cargo is admitted at every level.
+        for level in [Level::Quick, Level::PortableOnly, Level::Super] {
+            let error = check_build_mode_level(BUILD_MODE_BUCK, level).unwrap_err();
+            assert!(error.contains(level.name()), "{error}");
+            assert!(error.contains("only at the full level"), "{error}");
+            check_build_mode_level(BUILD_MODE_CARGO, level).unwrap();
+        }
+        check_build_mode_level(BUILD_MODE_BUCK, Level::Full).unwrap();
+        check_build_mode_level(BUILD_MODE_CARGO, Level::Full).unwrap();
         // A non-UTF-8 ambient value refuses by variable name for both
         // variables, instead of collapsing to unset.
         #[cfg(unix)]
@@ -1672,8 +1699,11 @@ fn usage() -> &'static str {
      \x20                  HERMIT_VALIDATE_BUILD_MODE). buck substitutes Buck-built\n\
      \x20                  detcore test binaries into the test.detcore_* selections\n\
      \x20                  (exact name-set and Cargo-twin case-set equality enforced\n\
-     \x20                  in prepare); a buck run never mints a receipt. Admission\n\
-     \x20                  paths that forward no environment use this flag.\n\
+     \x20                  in prepare); a buck run never mints a receipt. Full level\n\
+     \x20                  only; other levels refuse buck by name. A buck run is\n\
+     \x20                  mixed-mode: the native-exec cohort stays cargo-built\n\
+     \x20                  (the ledger names every cohort's mode). Admission paths\n\
+     \x20                  that forward no environment use this flag.\n\
      \x20 --buck-release DOTSLASH\n\
      \x20                  Build release Hermit with Buck2 through the named absolute\n\
      \x20                  public DotSlash launcher. Cargo remains the default. Buck\n\
@@ -1681,9 +1711,9 @@ fn usage() -> &'static str {
      \x20 HERMIT_VALIDATE_BUILD_MODE=cargo|buck\n\
      \x20                  How tests are compiled. cargo (default) stages through\n\
      \x20                  nextest-binaries. buck harvests Buck-built detcore test\n\
-     \x20                  binaries for the test.detcore_* selections. Any other\n\
-     \x20                  value is refused with exit 2, never silently replaced\n\
-     \x20                  by cargo.\n\
+     \x20                  binaries for the test.detcore_* selections (full level\n\
+     \x20                  only; native-exec stays cargo). Any other value is\n\
+     \x20                  refused with exit 2, never silently replaced by cargo.\n\
      \x20 HERMIT_VALIDATE_RUN_MODE=cargo\n\
      \x20                  Who executes the tests (environment only). cargo is the\n\
      \x20                  only supported run mode until the deferred RUN switch;\n\
@@ -23708,6 +23738,11 @@ struct LedgerCtx {
     /// runner's cells execute the same validate-profile target/validate/hermit,
     /// built on the host by `ci/buck-e2e/stage --from-cargo`.
     e2e_runner: &'static str,
+    /// `cargo` or `buck`: the whole-run build mode ([`BUILD_MODE_ENV`]).
+    /// The ledger row pairs it with `prepared_cohort_modes`, the per-cohort
+    /// resolved modes, so a mixed-mode buck run (native-exec pinned to
+    /// cargo) is never read as pure buck.
+    build_mode: String,
     cache_state: String,
     commit: String,
     tree: String,
@@ -27469,6 +27504,13 @@ fn write_ledger_with_snapshot(
         "selection_mode": ctx.selection_mode,
         "release_builder": ctx.release_builder,
         "e2e_runner": ctx.e2e_runner,
+        "build_mode": ctx.build_mode,
+        "prepared_cohort_modes": hermit_manifest_plan::nextest_binaries::cohort_build_modes(
+            &ctx.build_mode,
+        )
+        .into_iter()
+        .map(|(cohort, mode)| (cohort.to_string(), serde_json::Value::String(mode)))
+        .collect::<serde_json::Map<String, serde_json::Value>>(),
         "e2e_payload": e2e_payload_identity(ctx.release_builder),
         "cache_state": ctx.cache_state,
         "commit": ctx.commit,
@@ -30153,6 +30195,9 @@ fn run(
             return RunSummary::refused(2, args.level.name(), "build mode", vec![error]);
         }
     };
+    if let Err(error) = check_build_mode_level(&build_mode, args.level) {
+        return RunSummary::refused(2, args.level.name(), "build mode", vec![error]);
+    }
 
     let level_name = args.level.name().to_string();
     let root = repo_root();
@@ -31887,6 +31932,7 @@ fn run(
         selection_mode: plan.selection_mode.into(),
         release_builder,
         e2e_runner: args.e2e_runner,
+        build_mode: build_mode.clone(),
         cache_state: cache.into(),
         commit: commit.clone(),
         tree: admitted_context
@@ -32795,6 +32841,7 @@ fn stop_test_seam(
         selection_mode: "full".into(),
         release_builder: RELEASE_BUILDER_CARGO,
         e2e_runner: E2E_RUNNER_CARGO,
+        build_mode: BUILD_MODE_CARGO.into(),
         cache_state: cache_state(root).into(),
         commit,
         tree: git_tree(),
@@ -37567,6 +37614,7 @@ with (root/'calls.jsonl').open('a') as out:
             selection_mode: "selected".into(),
             release_builder: RELEASE_BUILDER_CARGO,
             e2e_runner: E2E_RUNNER_CARGO,
+            build_mode: BUILD_MODE_CARGO.into(),
             cache_state: "cold".into(),
             commit,
             tree,
