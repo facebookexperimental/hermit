@@ -1587,11 +1587,13 @@ mod build_mode_environment_tests {
         // the level.
         for argv in [
             vec!["--privileged-only", "--build-mode", "buck"],
-            // Hosted selections are off-record shard modes; the parser
-            // requires the explicit off-record opt-in beside them.
+            // Hosted selections are off-record shard modes; under the
+            // parser guard they require --show-plan (or the off-record
+            // opt-in). --show-plan reaches the build-mode policy without
+            // executing, as the reviewer's probe ran it.
             vec![
                 "--hosted-portable-only",
-                "--allow-local-off-the-record-run",
+                "--show-plan",
                 "--build-mode",
                 "buck",
             ],
