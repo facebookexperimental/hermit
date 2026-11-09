@@ -1093,8 +1093,47 @@ fn counted_run(
     paths: &RunPaths,
 ) -> Command {
     let mut command = Command::new(root.join("ci/run-nextest-counted.sh"));
-    command
-        .args(nextest_args)
+    // The counted wrapper's census compares the listed population
+    // against the queue adapter's per-suite base, keyed by the suite
+    // its counts report is named for; this run's report is named for
+    // the node (`RunPaths::all`), so the key is the node's own. Arm
+    // that census only when the supplied base actually holds this
+    // node's row: no landed base records it yet (the inner listing
+    // was scratch-only until now), and an armed census with no row
+    // refuses census-base-suite-missing before any test executes.
+    // Until a base records the row, scrub the supply and keep only
+    // the explicit named opt-out, as the nextest fixture does; the
+    // ledger's own name-by-name check of the listed population
+    // against the suite source and its gap rows still applies.
+    let census_armed = env::var_os("HERMIT_CENSUS_BASE_DIR")
+        .filter(|dir| !dir.is_empty())
+        .is_some_and(|dir| {
+            Path::new(&dir)
+                .join(format!("{}.listed-ids", declaration.node))
+                .is_file()
+        });
+    if census_armed {
+        println!(
+            "kvm-gap-ledger: census armed for suite {} (base holds its row)",
+            declaration.node
+        );
+    } else {
+        println!(
+            "kvm-gap-ledger: census not armed for suite {} (supplied base holds no row for it yet); inner run uses HERMIT_CENSUS_ALLOW_NO_BASE=1",
+            declaration.node
+        );
+        for variable in [
+            "HERMIT_CENSUS_BASE_COMMIT",
+            "HERMIT_CENSUS_BASE_DIR",
+            "HERMIT_CENSUS_BASE_LISTED_IDS",
+            "HERMIT_CENSUS_DROPPED_FILE",
+            "HERMIT_CENSUS_EXPECTED_BASE_COMMIT",
+        ] {
+            command.env_remove(variable);
+        }
+        command.env("HERMIT_CENSUS_ALLOW_NO_BASE", "1");
+    }
+    command.args(nextest_args)
         .env("HERMIT_TEST_BACKEND", declaration.backend)
         .env(known_gaps::BACKEND_PROOF_ENV, &paths.proof)
         .env("NEXTEST_RETRIES", "0")
@@ -1206,7 +1245,11 @@ fn run(nextest_args: &[String]) -> Result<bool, String> {
     // output, so they stay beside its results (in the scratch directory without a results path).
     let evidence_base = counts.clone().unwrap_or_else(|| scratch.join("node.json"));
     let paths = RunPaths {
-        all: scratch.join("all-tests.json"),
+        // Named for the node, not a generic scratch name: the counted
+        // wrapper keys its census (and the retained listing) by the
+        // suite its counts report is named for, which must be the
+        // node's own suite key — the key the census publisher records.
+        all: scratch.join(format!("{}.json", declaration.node)),
         cpu_report: with_suffix(&evidence_base, ".cpu.json"),
         events: with_suffix(&evidence_base, ".events.jsonl"),
         proof: with_suffix(&evidence_base, ".backend-proof"),
@@ -1239,6 +1282,20 @@ fn run(nextest_args: &[String]) -> Result<bool, String> {
             )
         })
     };
+    // Retain the counted run's listed population beside this node's own
+    // results, under the node's counts name, so the landing census
+    // records this suite (keyed by that name) from this run on. The
+    // scratch original is deleted with the scratch directory below.
+    if let Some(counts) = &counts {
+        let listed = with_suffix(&paths.all, ".listed-ids");
+        let retained = with_suffix(counts, ".listed-ids");
+        fs::copy(&listed, &retained).map_err(|error| {
+            format!(
+                "cannot retain the counted run's listed population {} beside the node's results: {error}",
+                listed.display()
+            )
+        })?;
+    }
     let all = read(&paths.all, "results").and_then(|bytes| TestResults::from_json_slice(&bytes));
     let ends = read(&paths.cpu_report, "CPU report").and_then(|bytes| {
         serde_json::from_slice::<serde_json::Value>(&bytes)

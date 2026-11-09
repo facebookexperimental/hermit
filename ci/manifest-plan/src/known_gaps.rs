@@ -156,9 +156,9 @@ pub fn declaration_for_ledger(ledger: &str) -> Option<&'static Declaration> {
 }
 
 /// A declaration's required tests are derived, never pinned: the suite's
-/// listed population less its run gap rows (see `required`). The node's
-/// listed population as a whole is census-guarded against the last landed
-/// population by ci/census-check.sh.
+/// listed population less its run gap rows (see `required`). The ledger
+/// checks that listed population name-by-name against the suite source,
+/// and retains it beside the node's results for the landing census.
 /// How a gap row's failing attempt must end, or that the node does not run it.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Outcome {
