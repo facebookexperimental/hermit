@@ -2379,8 +2379,8 @@ fn qualified_features(
 }
 
 /// The canonical `feature_set` a record prepared from `selections` names:
-/// [`qualified_features`] sorted and comma-joined, empty when no selection
-/// names features.
+/// the `qualified_features` output sorted and comma-joined, empty when no
+/// selection names features.
 pub fn prepared_feature_set(selections: &BTreeMap<String, Vec<String>>) -> Result<String, String> {
     Ok(qualified_features(selections)?
         .into_iter()
