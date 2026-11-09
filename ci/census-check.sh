@@ -4,14 +4,25 @@
 #
 # Usage: ci/census-check.sh --candidate-listed FILE [--base-listed FILE]
 #          [--candidate-outcomes FILE] [--dropped FILE] [--report-only]
-#          [--require-base] [--allow-no-base] [--suite NAME]
+#          [--require-base] [--allow-no-base]
+#          [--expected-base-commit SHA] [--suite NAME]
 #
 # Base contract (queue-adapter-owned, recorded here as the review point):
 # the base is the .listed-ids of a full counted run at the last landed
-# main commit, cached under that commit and never mutated in place. A
-# base cast from an older or partial run is stale: this gate cannot tell
-# a short base from a complete one, so freshness is the adapter's duty
-# and a stale base is an adapter bug, not a pass. --report-only is a
+# main commit, cached under that commit and never mutated in place. The
+# producer that caches a base stamps it with a provenance header as the
+# first line of the file:
+#
+#   # census-base: commit=<full sha of that main commit> count=<id count>
+#
+# Freshness is enforced here, not assumed: with --require-base (every
+# counted node) a base without that header is refused
+# (census-base-provenance), a header whose count disagrees with the IDs
+# actually in the file is refused as truncated/short
+# (census-base-truncated), and a header commit that differs from
+# --expected-base-commit (the counted wrapper derives it from the
+# checkout's merge-base with origin/main, or HERMIT_CENSUS_BASE_COMMIT)
+# is refused as stale (census-base-stale). --report-only is a
 # manual/local debugging aid only; the counted wrapper never passes it.
 #
 # With no --base-listed there is no base population in-node (the queue
@@ -29,6 +40,7 @@ readonly SCRIPT_DIR
 
 base_listed= candidate_listed= candidate_outcomes= dropped= suite=nextest
 report_only=0 require_base=0 allow_no_base=0
+expected_base_commit=${HERMIT_CENSUS_EXPECTED_BASE_COMMIT:-${HERMIT_CENSUS_BASE_COMMIT:-}}
 while (($#)); do
     case $1 in
         --base-listed) base_listed=$2; shift 2 ;;
@@ -39,6 +51,7 @@ while (($#)); do
         --report-only) report_only=1; shift ;;
         --require-base) require_base=1; shift ;;
         --allow-no-base) allow_no_base=1; shift ;;
+        --expected-base-commit) expected_base_commit=$2; shift 2 ;;
         *) printf 'census-check: unknown argument %s\n' "$1" >&2; exit 2 ;;
     esac
 done
@@ -61,6 +74,35 @@ if [[ ! -s $base_listed ]]; then
     printf 'census-check: base population %s is missing or empty; refusing (a supplied base must name the last landed population)\n' "$base_listed" >&2
     exit 2
 fi
+# Freshness: the base must prove which commit it was listed at and how
+# many IDs that listing held. A counted node (--require-base) refuses a
+# base with no provenance at all; any stamped base whose declared count
+# disagrees with the file is truncated/short, and one stamped with a
+# different commit than expected is stale. All refusals name the file
+# and the check that failed; none degrades to a pass.
+base_commit= base_declared_count=
+base_header=$(head -n 1 -- "$base_listed")
+base_header_re='^# census-base: commit=([0-9a-f]{7,40}) count=([0-9]+)$'
+if [[ $base_header =~ $base_header_re ]]; then
+    base_commit=${BASH_REMATCH[1]}
+    base_declared_count=${BASH_REMATCH[2]}
+fi
+if ((require_base)) && [[ -z $base_commit ]]; then
+    printf 'census-check: census-base-provenance: base population %s has no provenance header ("# census-base: commit=<sha> count=<n>"); counted nodes require a stamped base; refusing\n' "$base_listed" >&2
+    exit 2
+fi
+if [[ -n $base_commit ]]; then
+    base_actual_count=$(grep -Ev '^[[:space:]]*$|^#' -- "$base_listed" | wc -l)
+    base_actual_count=${base_actual_count//[[:space:]]/}
+    if [[ $base_actual_count != "$base_declared_count" ]]; then
+        printf 'census-check: census-base-truncated: base population %s declares count=%s but holds %s ids; a short/truncated base is refused by name\n' "$base_listed" "$base_declared_count" "$base_actual_count" >&2
+        exit 2
+    fi
+    if [[ -n $expected_base_commit && $base_commit != "$expected_base_commit" ]]; then
+        printf 'census-check: census-base-stale: base population %s was listed at commit %s, expected base commit %s; refusing a base from the wrong commit\n' "$base_listed" "$base_commit" "$expected_base_commit" >&2
+        exit 2
+    fi
+fi
 if [[ -n $candidate_listed && ! -s $candidate_listed ]]; then
     printf 'census-check: candidate population %s is missing or empty; refusing\n' "$candidate_listed" >&2
     exit 2
@@ -77,7 +119,7 @@ fi
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 mkdir "$scratch/base" "$scratch/candidate"
-cp -- "$base_listed" "$scratch/base/$suite.listed-ids"
+grep -Ev '^#' -- "$base_listed" >"$scratch/base/$suite.listed-ids"
 if [[ -n $candidate_outcomes ]]; then
     cp -- "$candidate_outcomes" "$scratch/candidate/$suite.outcomes.json"
 elif [[ -n $candidate_listed ]]; then

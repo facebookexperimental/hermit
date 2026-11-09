@@ -334,20 +334,32 @@ function run_nextest {
         # file; HERMIT_CENSUS_DROPPED_FILE names Test-Dropped records dumped
         # from `git log base..head`. Base contract (adapter-owned): cached
         # from a full counted run at the last landed main commit, keyed by
-        # that commit, never mutated in place; a stale/short base is an
-        # adapter bug this gate cannot detect. Since the count pins were
-        # deleted the census is the only disappearance guard, so a counted
-        # node REQUIRES its base: with none supplied this node fails,
-        # unless HERMIT_CENSUS_ALLOW_NO_BASE=1 marks an explicit local/
-        # standalone run with no adapter. HERMIT_CENSUS_REPORT_ONLY is
-        # retired in counted nodes (phase-2 rollout lever): it is ignored
-        # here so a stale adapter setting cannot silently downgrade
-        # enforcement; --report-only remains a manual ci/census-check.sh
-        # debugging aid only.
+        # that commit, never mutated in place, and stamped by its producer
+        # with a "# census-base: commit=<sha> count=<n>" first line.
+        # Freshness is checked hermit-side in ci/census-check.sh: the
+        # expected base commit is HERMIT_CENSUS_BASE_COMMIT when the
+        # adapter declares one, else this checkout's merge-base with
+        # origin/main; a base stamped with another commit, a short/
+        # truncated base, or an unstamped base is refused by name. Since
+        # the count pins were deleted the census is the only disappearance
+        # guard, so a counted node REQUIRES its base: with none supplied
+        # this node fails, unless HERMIT_CENSUS_ALLOW_NO_BASE=1 marks an
+        # explicit local/standalone run with no adapter.
+        # HERMIT_CENSUS_REPORT_ONLY is retired in counted nodes (phase-2
+        # rollout lever): it is ignored here so a stale adapter setting
+        # cannot silently downgrade enforcement; --report-only remains a
+        # manual ci/census-check.sh debugging aid only.
         local -a census_args=(--candidate-listed "${DAGRUN_TEST_COUNTS_PATH}.listed-ids" --require-base)
         [[ -n ${HERMIT_CENSUS_BASE_LISTED_IDS:-} ]] && census_args+=(--base-listed "$HERMIT_CENSUS_BASE_LISTED_IDS")
         [[ -n ${HERMIT_CENSUS_DROPPED_FILE:-} ]] && census_args+=(--dropped "$HERMIT_CENSUS_DROPPED_FILE")
         [[ ${HERMIT_CENSUS_ALLOW_NO_BASE:-} == 1 ]] && census_args+=(--allow-no-base)
+        local expected_base_commit=${HERMIT_CENSUS_EXPECTED_BASE_COMMIT:-${HERMIT_CENSUS_BASE_COMMIT:-}}
+        if [[ -z $expected_base_commit ]]; then
+            expected_base_commit=$(git -C "$SCRIPT_DIR/.." merge-base HEAD origin/main 2>/dev/null || true)
+            [[ -n $expected_base_commit ]] || \
+                expected_base_commit=$(git -C "$SCRIPT_DIR/.." rev-parse origin/main 2>/dev/null || true)
+        fi
+        [[ -n $expected_base_commit ]] && census_args+=(--expected-base-commit "$expected_base_commit")
         if [[ ${HERMIT_CENSUS_REPORT_ONLY:-} == 1 ]]; then
             printf 'run-nextest-counted: HERMIT_CENSUS_REPORT_ONLY=1 is ignored in counted nodes since the count pins were deleted (census stays enforced)\n' >&2
         fi

@@ -214,6 +214,73 @@ def test_wired_require_base_without_base_fails(tmp_path):
     assert r2.returncode == 0 and "report-only" in r2.stderr
 
 
+SHA_A = "a" * 40
+SHA_B = "b" * 40
+
+
+def _check_stamped(tmp_path, base_ids, cand_ids, commit=SHA_A, declared=None,
+                   expected=SHA_A, require=True):
+    import uuid
+    root = tmp_path / uuid.uuid4().hex
+    root.mkdir(parents=True)
+    n = len(base_ids) if declared is None else declared
+    (root / "base.listed-ids").write_text(
+        f"# census-base: commit={commit} count={n}\n"
+        + "".join(f"{i}\n" for i in base_ids))
+    (root / "cand.listed-ids").write_text("".join(f"{i}\n" for i in cand_ids))
+    args = ["bash", str(CHECK), "--base-listed", str(root / "base.listed-ids"),
+            "--candidate-listed", str(root / "cand.listed-ids")]
+    if require:
+        args.append("--require-base")
+    if expected is not None:
+        args += ["--expected-base-commit", expected]
+    return subprocess.run(args, capture_output=True, text=True)
+
+
+def test_wired_stamped_fresh_base_passes(tmp_path):
+    r = _check_stamped(tmp_path, ["pkg/bin/a", "pkg/bin/b"],
+                       ["pkg/bin/a", "pkg/bin/b"])
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+
+
+def test_wired_stale_base_commit_refused_by_name(tmp_path):
+    # A base listed at the wrong commit must not pass as if current.
+    r = _check_stamped(tmp_path, ["pkg/bin/a"], ["pkg/bin/a"], commit=SHA_B)
+    assert r.returncode == 2 and "census-base-stale" in r.stderr
+    assert SHA_B in r.stderr and SHA_A in r.stderr
+
+
+def test_wired_truncated_base_refused_by_name(tmp_path):
+    # Header declares 3 IDs, file holds 2: a short/truncated base.
+    r = _check_stamped(tmp_path, ["pkg/bin/a", "pkg/bin/b"],
+                       ["pkg/bin/a", "pkg/bin/b"], declared=3)
+    assert r.returncode == 2 and "census-base-truncated" in r.stderr
+    assert "count=3" in r.stderr and "holds 2" in r.stderr
+
+
+def test_wired_require_base_without_provenance_refused(tmp_path):
+    # The plain (unstamped) wired path still works manually, but a counted
+    # node requiring its base refuses a base with no provenance header.
+    r = _check(tmp_path, ["pkg/bin/a"], cand_ids=["pkg/bin/a"])
+    assert r.returncode == 0
+    import uuid
+    root = tmp_path / uuid.uuid4().hex
+    root.mkdir(parents=True)
+    (root / "base.listed-ids").write_text("pkg/bin/a\n")
+    (root / "cand.listed-ids").write_text("pkg/bin/a\n")
+    r2 = subprocess.run(
+        ["bash", str(CHECK), "--base-listed", str(root / "base.listed-ids"),
+         "--candidate-listed", str(root / "cand.listed-ids"), "--require-base"],
+        capture_output=True, text=True)
+    assert r2.returncode == 2 and "census-base-provenance" in r2.stderr
+
+
+def test_provenance_header_is_not_a_base_id(tmp_path):
+    # census-diff fed a stamped base directly must not diff the header.
+    r = _check_stamped(tmp_path, ["a"], ["a"], require=False, expected=None)
+    assert r.returncode == 0 and "added=0" in r.stdout
+
+
 def test_wired_no_base_is_report_only_and_passes(tmp_path):
     r = subprocess.run(["bash", str(CHECK), "--candidate-listed", "/dev/null"],
                        capture_output=True, text=True)

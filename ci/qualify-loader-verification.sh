@@ -40,7 +40,10 @@ run_one() {
     shift 2
     # The official wrapper owns typed results, per-test CPU/wall bounds and
     # CPU reconciliation. Every selected test must really execute once.
+    # Standalone qualification run: no queue adapter supplies a census
+    # base here, so opt out of the counted-node base requirement by name.
     DAGRUN_TEST_COUNTS_PATH="$output/$label.counts.json" \
+        HERMIT_CENSUS_ALLOW_NO_BASE=1 \
         HERMIT_NEXTEST_CPU_REPORT_PATH="$output/$label.cpu.json" \
         NEXTEST_EXPECTED_EXECUTED=1 \
         env -C "$ROOT_DIR" "$ROOT_DIR/ci/run-nextest-counted.sh" --locked "$@" \

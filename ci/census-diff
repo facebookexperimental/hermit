@@ -42,7 +42,12 @@ def base_populations(base: Path) -> dict[str, list[str]]:
                 if suite.endswith(suf):
                     suite = suite[: -len(suf)]
                     break
-            ids = [ln.strip() for ln in f.read_text().splitlines() if ln.strip()]
+            # A base file may carry a provenance header written by the
+            # producer that cached it ("# census-base: commit=<sha>
+            # count=<n>", see ci/census-check.sh); it is metadata, never an
+            # ID. Freshness itself is checked by census-check.sh.
+            ids = [ln.strip() for ln in f.read_text().splitlines()
+                   if ln.strip() and not ln.startswith("#")]
             seen: set[str] = set()
             for ident in ids:
                 if ident in seen:
