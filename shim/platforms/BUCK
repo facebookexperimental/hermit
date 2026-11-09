@@ -14,5 +14,5 @@ oncall("open_source")
         use_case = read_root_config("hermit", "re_use_case", "buck2-default"),
         visibility = ["PUBLIC"],
     )
-    for mode in ["local", "hybrid", "remote"]
+    for mode in ["local", "local-cache", "hybrid", "remote"]
 ]

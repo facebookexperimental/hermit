@@ -48,6 +48,19 @@ hermit_input_rust_toolchain = rule(
 def _executor(mode, use_case):
     if mode == "local":
         return CommandExecutorConfig(local_enabled = True, remote_enabled = False)
+    if mode == "local-cache":
+        # Local execution only, backed by the shared REAPI action cache named
+        # by [buck2_re_client] (host config): check the cache first, run
+        # locally on a miss, and upload the result so other checkouts on the
+        # host hit it. Unlike hybrid/remote this never attempts remote
+        # execution, so a cache service without an Execution endpoint (a
+        # localhost CAS) costs no failed RPC per action.
+        return CommandExecutorConfig(
+            local_enabled = True,
+            remote_enabled = False,
+            remote_cache_enabled = True,
+            allow_cache_uploads = True,
+        )
     return CommandExecutorConfig(
         # Limited hybrid: every action that can run remotely does, and only local-only
         # actions (e.g. pkg-config probes of the host) run locally. "hybrid" also falls
@@ -77,7 +90,7 @@ hermit_execution_platforms = rule(
     impl = _platforms_impl,
     attrs = {
         "cpu_configuration": attrs.dep(providers = [ConfigurationInfo]),
-        "mode": attrs.enum(["local", "hybrid", "remote"]),
+        "mode": attrs.enum(["local", "local-cache", "hybrid", "remote"]),
         "os_configuration": attrs.dep(providers = [ConfigurationInfo]),
         "use_case": attrs.string(),
     },
