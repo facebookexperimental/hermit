@@ -12828,7 +12828,7 @@ where
     // Validate and hold caller-owned operands before unrelated catalogue work.
     // A malformed or nonregular snapshot must not wait for history decoding or
     // manifest generation. The held file is still rechecked before publication.
-    let snapshot = HeldScorecardSeriesSnapshot::open(snapshot_path, snapshot_sha256)?;
+    let mut snapshot = HeldScorecardSeriesSnapshot::open(snapshot_path, snapshot_sha256)?;
     let worktree = observation_worktree_state(root)?;
     let head = worktree.head.clone();
     if head != *expected_head {
@@ -12879,6 +12879,11 @@ where
     };
     let tracked = reconciled_history(true)?;
     let rows = snapshot.materialize_rows()?;
+    // The materialized rows are fully owned; nothing below rebuilds from
+    // the held payload (verify and the binding snapshot read only file
+    // identity and metadata), so release it before the preview and final
+    // folds instead of holding both copies for the whole write-back.
+    snapshot.release_row_storage();
     let custom_retention =
         retain_selected_custom_results(&tracked, &derived.selected_custom, &result_rows, &rows)?;
     reconcile_declared_guest_exits(&result_rows, &rows)?;
@@ -17754,6 +17759,17 @@ impl HeldScorecardSeriesSnapshot {
         Ok(row)
     }
 
+    /// Drop everything rows are rebuilt from. Callers that have
+    /// materialized (or finished rebuilding) their rows release the
+    /// payload and index here; `verify` and the snapshot metadata need
+    /// none of them. `row_count` answers 0 afterwards.
+    fn release_row_storage(&mut self) {
+        self.payload = Vec::new();
+        self.row_ranges = Vec::new();
+        self.index = Vec::new();
+        self.tables = SnapshotIndexTables::default();
+    }
+
     /// Every typed row, for consumers that still take a slice (the combined
     /// write-back). The snapshot projection itself rebuilds rows on demand
     /// and never holds this vector.
@@ -17841,10 +17857,7 @@ impl PreparedRowSource for HeldRowSubset<'_> {
     }
 
     fn release(&mut self) {
-        self.held.payload = Vec::new();
-        self.held.row_ranges = Vec::new();
-        self.held.index = Vec::new();
-        self.held.tables = SnapshotIndexTables::default();
+        self.held.release_row_storage();
     }
 }
 
@@ -26124,8 +26137,30 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
         let row_snapshot_path = snapshot_root.join("with-current-row.json");
         let row_snapshot_sha =
             write_scorecard_snapshot_fixture(&row_snapshot_path, &row_snapshot_value)?;
-        HeldScorecardSeriesSnapshot::open(&row_snapshot_path, &row_snapshot_sha)
+        let mut held = HeldScorecardSeriesSnapshot::open(&row_snapshot_path, &row_snapshot_sha)
             .map_err(|error| format!("valid row-bearing combined snapshot was refused: {error}"))?;
+        // The combined write-back materializes its rows, then must release
+        // the held payload before its folds: the materialized rows stay
+        // intact and verify still passes on identity and digest alone.
+        let materialized = held.materialize_rows()?;
+        if materialized.len() != 1 || materialized[0].event_id != series_row.event_id {
+            return Err("materialized row-bearing snapshot lost its row".into());
+        }
+        held.release_row_storage();
+        if !held.payload.is_empty()
+            || !held.row_ranges.is_empty()
+            || !held.index.is_empty()
+            || !held.tables.cells.is_empty()
+            || !held.tables.trees.is_empty()
+            || !held.tables.runs.is_empty()
+            || !held.tables.emitted.is_empty()
+        {
+            return Err("release_row_storage kept held row storage".into());
+        }
+        if materialized.len() != 1 || materialized[0].series.cell != series_row.series.cell {
+            return Err("release_row_storage disturbed materialized rows".into());
+        }
+        held.verify()?;
 
         // A row whose series records how the cell ran is admitted, in the exact
         // bytes the harness writes and the series writer copies: a timeslice in
