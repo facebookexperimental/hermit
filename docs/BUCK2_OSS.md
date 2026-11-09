@@ -707,7 +707,10 @@ How it fits together:
 - The service is any REAPI ActionCache+CAS on localhost. Team hosts run
   `bazel-remote` (single static binary, built-in LRU with a hard GiB cap)
   as a user systemd unit with its own CPU/memory bounds; the cap (20 GiB on
-  current hosts) and data directory are host config values.
+  current hosts) and data directory are host config values. With the link
+  present and the service down, builds fail fast (the RE client's
+  capabilities query is refused; measured) — remove the link to opt a
+  checkout out; there is no silent local fallback.
 - Checkouts that share a cache must agree on the action-digest inputs:
   the same isolation-dir name (the default `v2` — a custom name changes
   output paths embedded in commands and defeats reuse), the same pinned
