@@ -380,8 +380,10 @@ fn fixtures(root: &Path) -> Vec<PathBuf> {
 fn every_lit_fixture_is_within_the_supported_subset() {
     let root = lit_root();
     let fixtures = fixtures(&root);
-    // 26 main.{rs,c,go} files, 46 .lit, 6 .test and 2 scheduler scripts.
-    assert_eq!(fixtures.len(), 80, "{fixtures:#?}");
+    // 29 main.{rs,c,go} files, 48 .lit, 6 .test and 2 scheduler scripts.
+    // fifo_jump_replay (main.c + hermit-run.lit) joined with the guest-poll
+    // replay work: 82 + 2 = 84. PR 4614's chaos_schedule_replay fixture: 85.
+    assert_eq!(fixtures.len(), 85, "{fixtures:#?}");
     let placeholder = Path::new("/placeholder");
     let substitutions = [
         ("hermit", placeholder),
@@ -400,8 +402,9 @@ fn every_lit_fixture_is_within_the_supported_subset() {
             checked += 1;
         }
     }
-    // `grep -o '\bFileCheck\b'` over the same files' RUN: lines also counts 36.
-    assert_eq!(checked, 36);
+    // `grep -o '\bFileCheck\b'` over the same files' RUN: lines also counts
+    // 47 (fifo_jump_replay adds two).
+    assert_eq!(checked, 47);
 }
 
 /// The `%me` of FIXTURE: its directory's `main.c`, compiled into DIRECTORY
@@ -541,6 +544,8 @@ lit_cases! {
     lit_hello_world_c_main => "hello_world_c/main.c",
     lit_hello_world_c_hermit_run => "hello_world_c/hermit-run.lit",
     lit_hello_world_c_hermit_run_strict => "hello_world_c/hermit-run-strict.lit",
+    lit_guest_held_polls_main => "guest_held_polls/main.c",
+    lit_guest_held_polls_hermit_run => "guest_held_polls/hermit-run.lit",
     lit_networking_main => "networking/main.c",
     lit_networking_hermit_run => "networking/hermit-run.lit",
     lit_rt_sigaction_main => "rt_sigaction/main.c",
@@ -549,6 +554,7 @@ lit_cases! {
     lit_rt_sigprocmask_hermit_run => "rt_sigprocmask/hermit-run.lit",
     lit_timerfd_virtual_time_main => "timerfd_virtual_time/main.c",
     lit_timerfd_virtual_time_hermit_run_strict => "timerfd_virtual_time/hermit-run-strict.lit",
+    lit_chaos_schedule_replay_main => "chaos_schedule_replay/main.rs",
     lit_child_should_inherit_fds_hermit_run => "child_should_inherit_fds/hermit-run.lit",
     lit_child_should_inherit_fds_main => "child_should_inherit_fds/main.rs",
     lit_close_on_exec_hermit_run => "close_on_exec/hermit-run.lit",
@@ -565,6 +571,8 @@ lit_cases! {
     lit_fcntl_getfd_setfd_hermit_run_strict => "fcntl_getfd_setfd/hermit-run-strict.lit",
     lit_fcntl_getfd_setfd_hermit_run => "fcntl_getfd_setfd/hermit-run.lit",
     lit_fcntl_getfd_setfd_main => "fcntl_getfd_setfd/main.rs",
+    lit_fifo_jump_replay_hermit_run => "fifo_jump_replay/hermit-run.lit",
+    lit_fifo_jump_replay_main => "fifo_jump_replay/main.c",
     lit_file_race_openwrite_hermit_run_strict => "file_race_openwrite/hermit-run-strict.lit",
     lit_file_race_openwrite_hermit_run => "file_race_openwrite/hermit-run.lit",
     lit_file_race_openwrite_main => "file_race_openwrite/main.rs",

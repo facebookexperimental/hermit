@@ -18,13 +18,20 @@ other run failure, it stays failed. Nothing here needs podman, /test or capabili
 A diverging verify cell's artifacts also go through ci/buck-e2e/ingest.py, as Tpx
 would list them, to check that both run logs come back to this host from a cell that
 ran remotely (fetched with testx) and from one that ran locally (read from buck-out).
+The same round trip checks the import boundary: ingest.py refuses, from both places, every
+execution whose harness output cell.sh rejected (a pass followed by a failed exit, a
+malformed, contradictory or duplicated record, a skip that is not an excused FAIL, a
+withheld pair beside a row) or whose completion was never published (a normalizer or
+publication that failed at any point), and still accepts a pass, a guest failure, an
+excused diagnostic skip, a withheld cell and a cell that returned no result.
 
 ContainerChoiceTest evaluates defs.bzl's hermit_e2e_cells over the real
 ci/expected-e2e-plan.json with stand-ins for the Buck builtins and checks which cells
 get the pinned-root container in hybrid and local routing. ParityRouteTest and
-InGuestRouteTest evaluate the same plan for each candidate backend's route: every
-liteinst and in-guest-trap cell runs locally, and each parity candidate shares its
-ptrace reference's route.
+InGuestRouteTest evaluate the same plan for each candidate backend's route with
+-c hermit_e2e.cpuid_on_re off (the default): every liteinst and in-guest-trap cell
+runs locally, and each parity candidate shares its ptrace reference's route.
+CpuidOnReRouteTest evaluates the same plan with that switch on.
 """
 
 from __future__ import annotations
@@ -111,14 +118,44 @@ outcome = os.environ.get("FAKE_OUTCOME", "PASS")
 results, tpx = host(flag("--results")), host(flag("--tpx-json"))
 os.makedirs(os.path.dirname(results), exist_ok=True)
 test, mode, backend = flag("--test"), flag("--mode"), flag("--backend")
+# FAKE_HANG_PID_FILE: start a child, record its pid there, and never finish, like a
+# harness whose guest hangs past the cell's deadline.
+if os.environ.get("FAKE_HANG_PID_FILE"):
+    import subprocess, time
+    child = subprocess.Popen(["sleep", "1000"])
+    with open(os.environ["FAKE_HANG_PID_FILE"], "w") as f:
+        f.write(str(child.pid))
+    time.sleep(1000)
+if outcome == "NO-RESULT":
+    # Like the harness when its one cell returned no result: no row, the cell's test_done
+    # failed with a null outcome, and a failed run-verdict record for the missing result.
+    open(results, "w").close()
+    with open(host(flag("--junit")), "w") as f:
+        f.write("<testsuite/>\n")
+    with open(tpx, "w") as f:
+        f.write(json.dumps({"op": "test_done", "test": test + "/" + mode + "@" + backend, "status": "failed",
+                            "details": json.dumps({"outcome": None, "reason": "the selected cell returned no result"})}) + "\n")
+        f.write(json.dumps({"op": "test_done", "test": "test-harness/run-verdict", "status": "failed",
+                            "details": json.dumps({"run_failures": ["only 0 of 1 selected cells returned a result"]})}) + "\n")
+        f.write(json.dumps({"op": "all_done"}) + "\n")
+    sys.exit(1)
 if outcome == "HOST-INAPPLICABLE":
     # Like the harness withholding its one cell: no row, the cell's test_done skipped, and
     # a failed run-verdict record because the run executed nothing. FAKE_RUN_FAILURES adds
     # further run failures; FAKE_RUN_FAILURES_ONLY replaces them all. FAKE_WITHHELD_TEST,
-    # FAKE_WITHHELD_STATUS and FAKE_WITHHELD_OUTCOME change the withheld record.
-    open(results, "w").close()
+    # FAKE_WITHHELD_STATUS and FAKE_WITHHELD_OUTCOME change the withheld record,
+    # FAKE_RUN_VERDICT_STATUS the run-verdict record's status, and FAKE_WITHHELD_ROW adds
+    # a row with that outcome, which a withheld cell never writes.
+    with open(results, "w") as f:
+        if os.environ.get("FAKE_WITHHELD_ROW"):
+            f.write(json.dumps({"test": test, "mode": mode, "backend": backend,
+                                "outcome": os.environ["FAKE_WITHHELD_ROW"], "attempt": 1,
+                                "run_id": os.environ["E2E_RUN_ID"]}) + "\n")
     with open(host(flag("--junit")), "w") as f:
         f.write("<testsuite/>\n")
+    with open(os.path.join(os.path.dirname(results), "summary.json"), "w") as f:
+        f.write(json.dumps({"schema": 1, "host_inapplicable_cells": [
+            {"test": test, "mode": mode, "backend": None if backend == "native" else backend}]}) + "\n")
     failures = ["every one of the 1 selected cell(s) was host-inapplicable; "
                 "a run that executed no cell is not a pass"]
     failures += json.loads(os.environ.get("FAKE_RUN_FAILURES") or "[]")
@@ -130,13 +167,17 @@ if outcome == "HOST-INAPPLICABLE":
                             "status": os.environ.get("FAKE_WITHHELD_STATUS", "skipped"),
                             "details": json.dumps({"outcome": os.environ.get("FAKE_WITHHELD_OUTCOME", "HOST-INAPPLICABLE"),
                                                    "reason": "NOT RUN, NOT a pass, no coverage: this machine lacks exact-branch-counter"})}) + "\n")
-        f.write(json.dumps({"op": "test_done", "test": "test-harness/run-verdict", "status": "failed",
+        f.write(json.dumps({"op": "test_done", "test": "test-harness/run-verdict",
+                            "status": os.environ.get("FAKE_RUN_VERDICT_STATUS", "failed"),
                             "details": json.dumps({"run_failures": failures})}) + "\n")
         f.write(json.dumps({"op": "all_done"}) + "\n")
+    if "FAKE_RESULTS_RAW" in os.environ:
+        with open(results, "w") as f:
+            f.write(os.environ["FAKE_RESULTS_RAW"])
     sys.exit(1)
 with open(results, "w") as f:
     f.write(json.dumps({"test": test, "mode": mode, "backend": backend, "outcome": outcome,
-                        "run_id": os.environ["E2E_RUN_ID"]}) + "\n")
+                        "attempt": 1, "run_id": os.environ["E2E_RUN_ID"]}) + "\n")
 with open(host(flag("--junit")), "w") as f:
     f.write("<testsuite/>\n")
 status = "passed" if outcome == "PASS" else "failed"
@@ -159,13 +200,48 @@ if verify_json != "missing":
 for n in os.environ.get("FAKE_DETLOGS", "1" if verdict == "matched" else "12"):
     with open(os.path.join(logs, "run%s_log_detlog" % n), "w") as f:
         f.write("".join("run %s detlog line %d\n" % (n, i) for i in range(int(os.environ.get("FAKE_DETLOG_LINES", "1")))))
-sys.exit(0 if outcome == "PASS" else 1)
+# FAKE_SECOND_ATTEMPT: the harness retried this cell in the same execution.
+# Like the real harness (runner.rs cell_artifact_path), attempt 2 gets its
+# own artifact directory, "<slug>-attempt-2", and the verify evidence inside
+# it is numbered from 1 again. Attempt 1's row gets FAKE_ATTEMPT1_OUTCOME,
+# its verdict file FAKE_VERDICT_1 and its logs FAKE_DETLOGS; attempt 2's
+# verdict is FAKE_VERDICT_2 and its logs FAKE_DETLOGS_2.
+if os.environ.get("FAKE_SECOND_ATTEMPT"):
+    with open(results) as f:
+        row = json.loads(f.readline())
+    row["attempt"] = 2
+    with open(results, "w") as f:
+        f.write(json.dumps(dict(row, outcome=os.environ.get("FAKE_ATTEMPT1_OUTCOME", "FAIL"),
+                                attempt=1)) + "\n")
+        f.write(json.dumps(row) + "\n")
+    celldir2 = celldir + "-attempt-2"
+    logs2 = os.path.join(celldir2, "verify-logs", "verify-1")
+    os.makedirs(logs2, exist_ok=True)
+    with open(os.path.join(celldir2, "verify-1.json"), "w") as f:
+        f.write(json.dumps({"verdict": os.environ.get("FAKE_VERDICT_2", verdict)}) + "\n")
+    with open(os.path.join(celldir, "verify-1.json"), "w") as f:
+        f.write(json.dumps({"verdict": os.environ.get("FAKE_VERDICT_1", "")}) + "\n")
+    for n in os.environ.get("FAKE_DETLOGS_2", "1"):
+        with open(os.path.join(logs2, "run%s_log_detlog" % n), "w") as f:
+            f.write("run %s detlog line 0\n" % n)
+# FAKE_TPX_RAW replaces the payload with exactly these bytes, after the row and the
+# evidence are written, FAKE_RESULTS_RAW the rows; FAKE_EXIT replaces the exit status.
+if "FAKE_TPX_RAW" in os.environ:
+    with open(tpx, "w") as f:
+        f.write(os.environ["FAKE_TPX_RAW"])
+if "FAKE_RESULTS_RAW" in os.environ:
+    with open(results, "w") as f:
+        f.write(os.environ["FAKE_RESULTS_RAW"])
+sys.exit(int(os.environ["FAKE_EXIT"]) if "FAKE_EXIT" in os.environ else 0 if outcome == "PASS" else 1)
 """
 
 # ci/hermetic/run-in-pinned-root.sh. `--check-image` exits FAKE_IMAGE_RC. A run records
-# its options, the --env values it was asked to forward, and the mountpoints present in
-# --src, then runs the command after `--` with /src, /results and /validate-run-state
-# mapped to --src, $E2E_RESULT_ROOT and $VALIDATE_RUN_STATE, the way podman would.
+# its options, the --env values it was asked to forward, the mountpoints present in
+# --src, and the largest link count of a file in the staged bundle ($HERMIT_E2E_BUNDLE)
+# while the container would run, then
+# runs the command after `--` with /src, /results, /validate-run-state and /bundle-lower
+# mapped to --src, $E2E_RESULT_ROOT, $VALIDATE_RUN_STATE and --bundle-lower, the way
+# podman would.
 FAKE_WRAPPER = r"""#!/usr/bin/env python3
 import json, os, subprocess, sys
 args = sys.argv[1:]
@@ -185,11 +261,16 @@ forwarded = {n: os.environ[n] for n in (opts[i + 1] for i, o in enumerate(opts) 
              if n in os.environ}
 mountpoints = sorted(p for p in ("target", "agent-utils/rs/target", "agent-utils/rs/.agent-utils-locks",
                                  "agent-utils/rs/.agent-utils-snapshots") if os.path.isdir(os.path.join(src, p)))
+lower = opts[opts.index("--bundle-lower") + 1] if "--bundle-lower" in opts else None
+bundle_max_nlink = max(os.lstat(os.path.join(d, n)).st_nlink
+                       for d, _, names in os.walk(os.environ["HERMIT_E2E_BUNDLE"]) for n in names)
 with open(calls, "a") as f:
     f.write(json.dumps({"who": "wrapper", "opts": opts, "command": command, "forwarded": forwarded,
-                        "mountpoints": mountpoints}) + "\n")
+                        "mountpoints": mountpoints, "bundle_max_nlink": bundle_max_nlink}) + "\n")
 mapping = {"/src": src, "/results": os.environ["E2E_RESULT_ROOT"],
            "/validate-run-state": os.environ["VALIDATE_RUN_STATE"]}
+if lower is not None:
+    mapping["/bundle-lower"] = lower
 env = {k: v for k, v in os.environ.items() if k not in forwarded}
 env.update({"E2E_RESULT_ROOT": "/results", "VALIDATE_RUN_STATE": "/validate-run-state",
             "HARNESS_ROOT_MAP": json.dumps(mapping)})
@@ -197,7 +278,8 @@ env.update({k: v for k, v in forwarded.items() if k not in ("E2E_RESULT_ROOT", "
 # The command is `sh -c SCRIPT NAME /src/bundle/.../rsrcs env NAME=VALUE... timeout ...
 # /src/bundle/bin/test-harness ...`: run it with the container paths among its arguments
 # mapped to the host.
-command = [mapping["/src"] + c[len("/src"):] if c.startswith("/src/bundle/") else c for c in command]
+command = [mapping["/src"] + c[len("/src"):] if c.startswith("/src/bundle/")
+           else mapping[c] if c == "/bundle-lower" else c for c in command]
 sys.exit(subprocess.run(command, env=env).returncode)
 """
 
@@ -230,6 +312,29 @@ import json, os, sys
 with open(os.environ["FAKE_CALLS"], "a") as f:
     f.write(json.dumps({"who": "timeout", "argv": sys.argv[1:]}) + "\n")
 os.execv("/usr/bin/timeout", ["timeout"] + sys.argv[1:])
+"""
+
+# python3, ahead of the real one (REAL_PYTHON) on PATH: FAKE_NORMALIZER=crash makes cell.sh's
+# verdict normalizer (`python3 - .../tpx.jsonl ...`) die before it does anything, and
+# FAKE_NORMALIZER=finish-then-crash lets it finish and then die without printing;
+# FAKE_PUBLISHER does the same to the step that writes the finished copy of result.json
+# (`python3 - .../result.json CANDIDATE ...`). Anything else runs.
+FAKE_PYTHON = r"""#!/bin/bash
+knob=
+[[ ${1:-} == - && ${2:-} == */tpx.jsonl ]] && knob=${FAKE_NORMALIZER:-}
+[[ ${1:-} == - && ${2:-} == */result.json ]] && knob=${FAKE_PUBLISHER:-}
+case $knob in
+crash) exit 3 ;;
+finish-then-crash) "$REAL_PYTHON" "$@" >/dev/null; exit 3 ;;
+esac
+exec "$REAL_PYTHON" "$@"
+"""
+
+# mv, ahead of the real one on PATH: with FAKE_MV=fail, any move to or from a path
+# containing result.json fails without moving anything.
+FAKE_MV = r"""#!/bin/bash
+[[ ${FAKE_MV:-} == fail && $* == *result*.json* ]] && exit 1
+exec /usr/bin/mv "$@"
 """
 
 # The links the container's image libraries get in the private copy's client directory.
@@ -280,6 +385,10 @@ class CellTest(unittest.TestCase):
             "TEST_RESULT_ARTIFACT_ANNOTATIONS_DIR": str(annotations),
             "HERMIT_E2E_BUNDLE": str(self.bundle),
             "HERMIT_E2E_ROUTE": "local",
+            # A local KVM cell flocks one of the host's shared KVM slots; without a private
+            # slot directory the test waits behind every real KVM cell a concurrent validate
+            # runs, and times out once all 16 slots stay held.
+            "HERMIT_E2E_KVM_SLOT_DIR": str(self.tmp / "kvm-slots"),
             "FAKE_CALLS": str(self.calls),
             "FAKE_SLUG": "{}-{}-{}".format(cell_test.replace("/", "-"), cell_mode, backend),
         }
@@ -325,7 +434,8 @@ class CellTest(unittest.TestCase):
                          "the wrapper would replace E2E_BUILD_ROOT with /src/target/e2e-build")
         self.assertNotIn("HERMIT_EPOCH", wrapper["forwarded"], "an unset HERMIT_EPOCH is not forwarded")
         self.assertEqual(command[:2], ["sh", "-c"])
-        self.assertEqual(command[3:6], ["link-dbt-runtime", "/src/bundle/hermit/install/rsrcs", "env"])
+        self.assertEqual(command[3:7], ["bundle-setup", "/bundle-lower", "/src/bundle/", BACKEND])
+        self.assertEqual(opts[opts.index("--bundle-lower") + 1], str(self.bundle))
         for assignment in ("E2E_BUILD_ROOT=/src/bundle/build", "HERMIT_BIN=/src/bundle/hermit/hermit",
                            "HERMIT_INSTALL_DIR=/src/bundle/hermit/install"):
             self.assertIn(assignment, command)
@@ -356,6 +466,50 @@ class CellTest(unittest.TestCase):
         self.assertEqual((self.bundle / "hermit" / "hermit").read_text(), "hermit\n",
                          "a write in the container reached the bundle: the copy shares its inodes")
         self.assertEqual(list(self.tmp.joinpath("tpx").glob("hermit-cell.*")), [], "scratch left behind")
+
+    def test_shared_bundle_prep_is_journaled_and_never_writes_the_bundle(self) -> None:
+        done, result = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root")
+        self.assertEqual(done["status"], "passed", done)
+        self.assertEqual(result["bundle_mode"], "shared")
+        self.assertIsInstance(result["bundle_prep_ns"], int)
+        self.assertGreaterEqual(result["bundle_prep_ns"], 0)
+        stderr = (self.tmp / "tpx" / "artifacts" / "harness.stderr").read_text()
+        self.assertIn("CELL_BUNDLE_MODE=shared", stderr)
+        self.assertIn("CELL_BUNDLE_PREP_NS=", stderr)
+        self.assertEqual((self.bundle / "hermit" / "hermit").read_text(), "hermit\n")
+
+    def test_shared_bundle_adds_no_link_to_a_bundle_file(self) -> None:
+        # A guest's stat of a bundle file reports its link count, which Detcore passes
+        # through for a regular file. A hard-linked copy per cell made that count
+        # 1 + the cells alive at that moment, so run 1 and run 2 of one cell differed
+        # (nlink=164 vs 167) as other cells started. The bundle is bound read-only
+        # instead: while the container runs, every bundle file still has one link.
+        done, _ = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root")
+        self.assertEqual(done["status"], "passed", done)
+        [wrapper] = self.calls_by("wrapper")
+        self.assertEqual(wrapper["bundle_max_nlink"], 1, "a cell hard-linked the shared bundle")
+        for path in self.bundle.rglob("*"):
+            if path.is_file():
+                self.assertEqual(path.stat().st_nlink, 1, path)
+
+    def test_copy_bundle_mode_keeps_the_reflink_copy_and_journals_it(self) -> None:
+        done, result = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root", CELL_BUNDLE_MODE="copy")
+        self.assertEqual(done["status"], "passed", done)
+        [wrapper] = self.calls_by("wrapper")
+        self.assertEqual(wrapper["command"][3:6],
+                         ["link-dbt-runtime", "/src/bundle/hermit/install/rsrcs", "env"])
+        self.assertNotIn("--bundle-lower", wrapper["opts"])
+        self.assertEqual(wrapper["bundle_max_nlink"], 1)
+        self.assertEqual(result["bundle_mode"], "copy")
+        self.assertIsInstance(result["bundle_prep_ns"], int)
+        stderr = (self.tmp / "tpx" / "artifacts" / "harness.stderr").read_text()
+        self.assertIn("CELL_BUNDLE_MODE=copy", stderr)
+        self.assertIn("CELL_BUNDLE_PREP_NS=", stderr)
+        self.assertEqual((self.bundle / "hermit" / "hermit").read_text(), "hermit\n")
+
+    def test_unknown_bundle_mode_is_an_error_not_a_run(self) -> None:
+        done, _ = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root", CELL_BUNDLE_MODE="bogus")
+        self.assert_error(done, "CELL_BUNDLE_MODE must be copy or shared")
 
     def test_hermit_epoch_reaches_the_harness_in_and_out_of_the_container(self) -> None:
         # Backend parity compares a ptrace reference with its candidates only under one guest
@@ -394,7 +548,8 @@ class CellTest(unittest.TestCase):
         done, result = self.run_cell("ptrace", HERMIT_E2E_CONTAINER="pinned-root", FAKE_LDD_RC="1")
         self.assertEqual(done["status"], "passed", done)
         [wrapper] = self.calls_by("wrapper")
-        self.assertEqual(wrapper["command"][0], "env", wrapper["command"])
+        self.assertEqual(wrapper["command"][:2], ["sh", "-c"], wrapper["command"])
+        self.assertEqual(wrapper["command"][3:7], ["bundle-setup", "/bundle-lower", "/src/bundle/", "ptrace"])
         [harness] = self.calls_by("harness")
         self.assertEqual(harness["rsrcs"], {"libshipped.so": None})
         self.assertEqual(result["harness_rc"], 0)
@@ -426,9 +581,23 @@ class CellTest(unittest.TestCase):
 
     def test_missing_image_is_an_error_not_a_host_run(self) -> None:
         done, result = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root", FAKE_IMAGE_RC="2")
-        self.assert_error(done, "pinned-root image unavailable", "is not present", "ci/hermetic/build-image.sh")
+        self.assert_error(done, "pinned-root image unavailable", "infra probe")
         self.assertEqual(self.calls_by("wrapper"), [])
-        self.assertIsNone(result)
+        # A probe failure is an explicit infra ERROR row for the cell (plus a
+        # result.json with a producer completion), not a missing cell.
+        self.assertIsNotNone(result)
+        self.assertEqual(result["outcome"], "ERROR")
+        self.assertEqual(result["harness_rc"], 2)
+        self.assertEqual(result["producer_completion"]["status"], "valid")
+        rows = [json.loads(l) for l in (self.tmp / "tpx" / "artifacts" / "results.jsonl").read_text().splitlines()]
+        self.assertEqual([r["outcome"] for r in rows], ["ERROR"])
+
+    def test_image_probe_timeout_is_an_infra_row_not_a_missing_cell(self) -> None:
+        done, result = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root", FAKE_IMAGE_RC="124")
+        self.assert_error(done, "pinned-root image unavailable", "rc=124")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["outcome"], "ERROR")
+        self.assertEqual(result["harness_rc"], 124)
 
     def test_missing_wrapper_is_an_error(self) -> None:
         (self.bundle / "src" / "ci" / "hermetic" / "run-in-pinned-root.sh").unlink()
@@ -707,6 +876,22 @@ class CellTest(unittest.TestCase):
         self.assert_evidence(True, FAKE_VERDICT="diverged", FAKE_DETLOGS="12")
         self.assert_evidence(False, FAKE_VERDICT="diverged", FAKE_DETLOGS="1")
 
+    def test_retried_verify_is_judged_on_its_final_attempt(self) -> None:
+        # Attempt 1 skid-overshot: no comparison, no verdict, only its
+        # run 1 log. Attempt 2 matched and kept only the golden log.
+        # The execution is complete on its final attempt's evidence,
+        # exactly as a one-attempt matched pass is.
+        self.assert_evidence(True, FAKE_SECOND_ATTEMPT="1", FAKE_VERDICT_1="",
+                             FAKE_DETLOGS="1", FAKE_DETLOGS_2="1")
+        # A final attempt that kept nothing is still incomplete.
+        self.assert_evidence(False, FAKE_SECOND_ATTEMPT="1", FAKE_VERDICT_1="",
+                             FAKE_DETLOGS="1", FAKE_DETLOGS_2="")
+        # And a final unmatched attempt still needs both of its logs.
+        self.assert_evidence(False, FAKE_SECOND_ATTEMPT="1", FAKE_VERDICT_1="",
+                             FAKE_VERDICT_2="diverged", FAKE_DETLOGS_2="1")
+        self.assert_evidence(True, FAKE_SECOND_ATTEMPT="1", FAKE_VERDICT_1="",
+                             FAKE_VERDICT_2="diverged", FAKE_DETLOGS_2="12")
+
     def test_passing_verify_without_a_readable_verdict_file_is_an_error(self) -> None:
         # Both logs present, so only the verdict file itself can make these incomplete.
         for verify_json in ("missing", "garbage"):
@@ -736,6 +921,90 @@ class CellTest(unittest.TestCase):
         self.assertEqual(done["status"], "failed", done)
         self.assertIn("produced 2 test_done records", json.loads(done["details"])["reason"])
 
+    # The verdict normalizer: whatever the harness wrote or however it exited, cell.sh
+    # prints exactly one record named for the cell (run_cell checks the count), and only a
+    # well-formed passing record from a harness that exited 0 with complete evidence passes.
+    def record(self, **fields) -> str:
+        base = {"op": "test_done", "test": CELL, "status": "passed", "details": json.dumps({"outcome": "PASS"})}
+        base.update(fields)
+        return json.dumps({k: v for k, v in base.items() if v is not None}) + "\n"
+
+    def assert_normalized_failure(self, needle: str, **env: str) -> dict:
+        done, result = self.run_cell(**env)
+        self.assertEqual(done["test"], CELL)
+        self.assertEqual(done["status"], "failed", done)
+        details = json.loads(done["details"])
+        self.assertEqual(details["outcome"], "ERROR")
+        self.assertIn(needle, details["reason"])
+        return result
+
+    def test_a_passing_record_from_a_failed_harness_exit_fails(self) -> None:
+        result = self.assert_normalized_failure("harness rc=1 after a passing record", FAKE_EXIT="1")
+        self.assertEqual(result["harness_rc"], 1)
+        self.assertTrue(result["evidence_complete"], "only the exit status fails this cell")
+
+    def test_an_unreadable_payload_is_one_failed_record(self) -> None:
+        self.assert_normalized_failure("unreadable tpx.jsonl", FAKE_TPX_RAW="{not json\n")
+
+    def test_a_payload_line_that_is_not_an_object_is_one_failed_record(self) -> None:
+        self.assert_normalized_failure("a record is not a JSON object", FAKE_TPX_RAW="[1, 2]\n")
+
+    def test_a_record_without_a_valid_status_fails(self) -> None:
+        for status in (None, 1, "ok"):
+            with self.subTest(status=status):
+                self.assert_normalized_failure("reported status", FAKE_TPX_RAW=self.record(status=status))
+
+    def test_a_passing_record_without_object_details_fails(self) -> None:
+        for details in (None, 7, json.dumps([1]), "not json"):
+            with self.subTest(details=details):
+                self.assert_normalized_failure("without JSON-object details",
+                                               FAKE_TPX_RAW=self.record(details=details))
+
+    def test_malformed_details_with_incomplete_evidence_fail(self) -> None:
+        self.assert_normalized_failure("without JSON-object details", FAKE_VERIFY_JSON="missing",
+                                       FAKE_TPX_RAW=self.record(details="not json"))
+
+    def test_a_failed_record_with_malformed_details_stays_failed(self) -> None:
+        self.assert_normalized_failure("without JSON-object details",
+                                       FAKE_TPX_RAW=self.record(status="failed", details="not json"))
+
+    def test_a_record_for_another_cell_fails_under_this_cells_name(self) -> None:
+        self.assert_normalized_failure("reported test 'other/verify@ptrace'",
+                                       FAKE_TPX_RAW=self.record(test="other/verify@ptrace"))
+
+    def test_duplicate_records_for_the_cell_fail(self) -> None:
+        self.assert_normalized_failure("produced 2 test_done records", FAKE_TPX_RAW=self.record() * 2)
+
+    def test_a_withheld_pair_with_malformed_run_failures_fails(self) -> None:
+        self.assert_normalized_failure("produced 2 test_done records", FAKE_OUTCOME="HOST-INAPPLICABLE",
+                                       FAKE_RUN_FAILURES_ONLY="5")
+
+    def test_a_withheld_pair_with_non_object_details_fails(self) -> None:
+        run = json.dumps({"op": "test_done", "test": "test-harness/run-verdict", "status": "failed",
+                          "details": json.dumps({"run_failures": [
+                              "every one of the 1 selected cell(s) was host-inapplicable; nothing ran"]})}) + "\n"
+        self.assert_normalized_failure("produced 2 test_done records", FAKE_EXIT="1",
+                                       FAKE_TPX_RAW=self.record(status="skipped", details=json.dumps([])) + run)
+
+    def test_a_guest_failure_with_valid_details_stays_a_failure(self) -> None:
+        done, result = self.run_cell(FAKE_OUTCOME="FAIL")
+        self.assertEqual(done["status"], "failed")
+        self.assertEqual(json.loads(done["details"])["outcome"], "FAIL")
+        self.assertEqual(result["harness_rc"], 1)
+
+    def test_the_deadline_kills_the_harness_and_its_children(self) -> None:
+        pid_file = self.tmp / "hang.pid"
+        done, result = self.run_cell(FAKE_HANG_PID_FILE=str(pid_file), CELL_DEADLINE_S="11")
+        self.assertEqual(done["status"], "failed")
+        # timeout(1) exits 124 when its SIGTERM ended the harness's process group and 137
+        # when the SIGKILL after --kill-after did; either is the deadline.
+        self.assertIn(result["harness_rc"], (124, 137))
+        child = int(pid_file.read_text())
+        alive = Path(f"/proc/{child}").exists()
+        if alive:
+            os.kill(child, 9)
+        self.assertFalse(alive, "the harness's child outlived the cell's deadline")
+
     # Each of these changes one part of the withheld pair; each must stay a plain failure,
     # not a skip, so every clause of cell.sh's withheld_here predicate is pinned.
     def assert_withheld_variant_fails(self, **env: str) -> None:
@@ -756,6 +1025,346 @@ class CellTest(unittest.TestCase):
     def test_a_single_run_failure_other_than_the_vacuity_refusal_still_fails(self) -> None:
         self.assert_withheld_variant_fails(
             FAKE_RUN_FAILURES_ONLY=json.dumps(["cannot write the test-count file"]))
+
+    # The import boundary: cell.sh's artifacts, as testx lists an execution that ran
+    # remotely and as Buck leaves one that ran locally in buck-out, go through ingest.py,
+    # which accepts an execution only when result.json records that cell.sh accepted the
+    # harness output (producer_completion), whatever evidence_complete says.
+    def ingest(self, *extra: str, executions: list[Path] | None = None) -> dict[str, subprocess.CompletedProcess]:
+        """Run ingest.py over this cell's executions (default: the last run_cell's
+        artifacts), in Tpx order, fetched with testx and read locally."""
+        executions = executions or [self.tmp / "tpx" / "artifacts"]
+        fake = self.tmp / "testx"
+        buck_out = self.tmp / "buck-out-test-execution"
+        for d in (fake, buck_out):
+            shutil.rmtree(d, ignore_errors=True)
+        listing = []
+        for i, artifacts in enumerate(executions, 1):
+            shutil.copytree(artifacts, fake / "art" / f"RUN.{i}.{100 * i}")
+            listing.append({"test_details": {"name": f"//ci/buck-e2e:cell - {CELL}", "id": i}, "end_time": 100 * i,
+                            "artifacts": [{"name": p.name} for p in sorted(artifacts.iterdir())]})
+            shutil.copytree(artifacts, buck_out / "c" / f"t{i}" / "default" / "artifacts_directory")
+        (fake / "list-RUN.json").write_text(json.dumps({"results": {"test_results": listing}}))
+        write_exe(self.tmp / "bin" / "testx", ingest_test.FAKE_TESTX)
+        plan = self.tmp / "plan.json"
+        plan.write_text(json.dumps({"cells": [{"test": TEST, "mode": MODE, "backend": BACKEND,
+                                               "lane": "portable", "category": "cat"}]}))
+        procs = {}
+        for route, local in (("remote", []), ("local", ["--local-artifacts", str(buck_out)])):
+            top = self.tmp / "ingest" / route
+            shutil.rmtree(top, ignore_errors=True)
+            procs[route] = subprocess.run(
+                [sys.executable, str(CI / "buck-e2e" / "ingest.py"), "--plan", str(plan),
+                 "--out", str(top / "import"), "--work", str(top / "work"), *local,
+                 *(a.replace("{route}", route) for a in extra), "RUN"],
+                capture_output=True, text=True, timeout=120,
+                env=dict(os.environ, TESTX=str(self.tmp / "bin" / "testx"), FAKE_TESTX_DIR=str(fake)))
+        return procs
+
+    def assert_ingest_refuses(self, *needles: str) -> None:
+        for route, proc in self.ingest().items():
+            with self.subTest(ingest=route):
+                self.assertNotEqual(proc.returncode, 0, proc.stdout)
+                if "unreadable results.jsonl" in needles:
+                    # ingest.py parses the rows before it reads result.json, and refuses there.
+                    self.assertIn("json.decoder.JSONDecodeError", proc.stderr)
+                    expected = ()
+                else:
+                    self.assertIn("without a valid producer completion", proc.stderr)
+                    expected = needles
+                for needle in expected:
+                    self.assertIn(needle, proc.stderr)
+                self.assertFalse((self.tmp / "ingest" / route / "import").exists(), "nothing is imported")
+
+    def assert_ingest_accepts(self, source_count: int = 1, executions: list[Path] | None = None) -> dict[str, dict]:
+        summaries = {}
+        for route, proc in self.ingest(executions=executions).items():
+            with self.subTest(ingest=route):
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                summaries[route] = json.loads(proc.stdout)
+                self.assertEqual(summaries[route]["sources"],
+                                 {"testx" if route == "remote" else "local": source_count})
+        return summaries
+
+    def assert_rejected_everywhere(self, needle: str, **env: str) -> None:
+        """cell.sh reports the cell failed and records why it rejected the harness output,
+        and ingest.py refuses the execution from both places."""
+        result = self.assert_normalized_failure(needle, **env)
+        completion = result["producer_completion"]
+        self.assertEqual(completion["version"], 1)
+        self.assertEqual(completion["status"], "invalid", result)
+        self.assertIn(needle, completion["reason"])
+        self.assert_ingest_refuses(needle)
+
+    def test_control_1_a_pass_then_a_failed_exit_is_refused_by_tpx_and_ingest(self) -> None:
+        self.assert_rejected_everywhere("harness rc=1 after a passing record", FAKE_EXIT="1")
+        result = json.loads((self.tmp / "tpx" / "artifacts" / "result.json").read_text())
+        self.assertTrue(result["evidence_complete"], "only the exit status rejects these complete logs")
+        self.assertEqual(result["outcome"], "PASS")
+        # Refused, but its logs are kept as a failed execution's evidence first.
+        for route, proc in self.ingest("--failed-verify-logs", str(self.tmp / "kept-{route}")).items():
+            with self.subTest(ingest=route, kept="logs"):
+                self.assertNotEqual(proc.returncode, 0, proc.stdout)
+                kept = self.tmp / f"kept-{route}"
+                files = {str(p.relative_to(kept)): p.read_bytes() for p in kept.rglob("*")
+                         if p.is_file() and p.name != "index.jsonl" and p.name != "hermit-stderr.tail"}
+                self.assertEqual(files, {f"{result['run_id']}/verify-logs/verify-1/run1_log_detlog": b"run 1 detlog line 0\n"})
+        with self.subTest("a passing row and no record"):
+            self.assert_rejected_everywhere("harness rc=1 produced 0 test_done records",
+                                            FAKE_EXIT="1", FAKE_TPX_RAW="")
+        # The withheld pair with rows it never writes: whatever the route, not a skip.
+        pair = self.record(status="skipped", details=json.dumps({"outcome": "HOST-INAPPLICABLE", "reason": "probe"}))
+        pair += json.dumps({"op": "test_done", "test": "test-harness/run-verdict", "status": "failed",
+                            "details": json.dumps({"run_failures": [
+                                "every one of the 1 selected cell(s) was host-inapplicable; "
+                                "a run that executed no cell is not a pass"]})}) + "\n"
+        for route in ("local", "re"):
+            with self.subTest(f"a withheld pair over a passing row with complete evidence on {route}"):
+                self.assert_rejected_everywhere("harness rc=1 produced 2 test_done records", HERMIT_E2E_ROUTE=route,
+                                                FAKE_TPX_RAW=pair, FAKE_EXIT="1")
+                result = json.loads((self.tmp / "tpx" / "artifacts" / "result.json").read_text())
+                self.assertEqual((result["outcome"], result["evidence_complete"]), ("PASS", True))
+            for row in ("PASS", "FAIL"):
+                with self.subTest(f"a withheld pair with a {row} row on {route}"):
+                    self.assert_rejected_everywhere("harness rc=1 produced 2 test_done records",
+                                                    FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE=route,
+                                                    FAKE_WITHHELD_ROW=row)
+            with self.subTest(f"a withheld pair with unreadable rows on {route}"):
+                self.assert_rejected_everywhere("unreadable results.jsonl", FAKE_OUTCOME="HOST-INAPPLICABLE",
+                                                HERMIT_E2E_ROUTE=route, FAKE_RESULTS_RAW="{not json\n")
+            with self.subTest(f"a withheld pair whose run verdict passed on {route}"):
+                self.assert_rejected_everywhere("harness rc=1 produced 2 test_done records",
+                                                FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE=route,
+                                                FAKE_RUN_VERDICT_STATUS="passed")
+
+    def test_control_2_a_malformed_passing_payload_is_refused_by_tpx_and_ingest(self) -> None:
+        cases = [
+            ("unreadable", "unreadable tpx.jsonl", {"FAKE_TPX_RAW": "{not json\n"}),
+            ("no outcome", "a passing record with outcome None",
+             {"FAKE_TPX_RAW": self.record(details=json.dumps({"reason": "ok"}))}),
+            ("a non-string outcome", "a passing record with outcome 7",
+             {"FAKE_TPX_RAW": self.record(details=json.dumps({"outcome": 7}))}),
+            ("a contradictory outcome", "a passing record with outcome 'FAIL'",
+             {"FAKE_TPX_RAW": self.record(details=json.dumps({"outcome": "FAIL"}))}),
+            ("a row that contradicts it", "reported outcome 'PASS' but its rows say 'FAIL'",
+             {"FAKE_OUTCOME": "FAIL", "FAKE_EXIT": "0", "FAKE_TPX_RAW": self.record()}),
+            ("duplicate records", "produced 2 test_done records", {"FAKE_TPX_RAW": self.record() * 2}),
+            ("no record from a harness that exited 0", "harness rc=0 produced 0 test_done records",
+             {"FAKE_OUTCOME": "FAIL", "FAKE_EXIT": "0", "FAKE_TPX_RAW": ""}),
+            ("unreadable rows", "unreadable results.jsonl", {"FAKE_RESULTS_RAW": "{not json\n"}),
+            ("no row", "reported outcome 'PASS' but its rows say 'nothing'", {"FAKE_RESULTS_RAW": ""}),
+        ]
+        for name, needle, env in cases:
+            with self.subTest(name):
+                self.assert_rejected_everywhere(needle, **env)
+
+    def test_control_2_the_no_result_pair_is_recognized_exactly(self) -> None:
+        def pair(own_test=CELL, own_status="failed", own_details=None, run_status="failed",
+                 failures=("only 0 of 1 selected cells returned a result",), extra=""):
+            own = own_details if own_details is not None else {"outcome": None, "reason": "the selected cell returned no result"}
+            return (json.dumps({"op": "test_done", "test": own_test, "status": own_status, "details": json.dumps(own)}) + "\n"
+                    + json.dumps({"op": "test_done", "test": "test-harness/run-verdict", "status": run_status,
+                                  "details": json.dumps({"run_failures": list(failures)})}) + "\n" + extra)
+        with self.subTest("the harness's own pair: a valid failure"):
+            done, result = self.run_cell(FAKE_OUTCOME="NO-RESULT")
+            self.assertEqual(done["status"], "failed", done)
+            self.assertEqual(json.loads(done["details"]), {"outcome": None, "reason": "the selected cell returned no result"})
+            self.assertEqual(result["producer_completion"], {"version": 1, "status": "valid", "reason": None})
+        with self.subTest("the same pair from the raw payload: a valid failure"):
+            done, result = self.run_cell(FAKE_TPX_RAW=pair(), FAKE_RESULTS_RAW="", FAKE_EXIT="1")
+            self.assertEqual((done["status"], result["producer_completion"]["status"]), ("failed", "valid"))
+        no_row = {"FAKE_RESULTS_RAW": "", "FAKE_EXIT": "1"}
+        cases = [
+            ("exit 0", "harness rc=0 produced 2 test_done records", dict(no_row, FAKE_EXIT="0", FAKE_TPX_RAW=pair())),
+            ("beside a row", "harness rc=1 produced 2 test_done records",
+             {"FAKE_OUTCOME": "FAIL", "FAKE_TPX_RAW": pair()}),
+            ("an additional run failure", "produced 2 test_done records",
+             dict(no_row, FAKE_TPX_RAW=pair(failures=("only 0 of 1 selected cells returned a result",
+                                                      "cannot write the test-count file")))),
+            ("another run failure", "produced 2 test_done records",
+             dict(no_row, FAKE_TPX_RAW=pair(failures=("only 0 of 2 selected cells returned a result",)))),
+            ("another cell's record", "produced 2 test_done records",
+             dict(no_row, FAKE_TPX_RAW=pair(own_test="other/verify@ptrace"))),
+            ("a skipped own record", "produced 2 test_done records", dict(no_row, FAKE_TPX_RAW=pair(own_status="skipped"))),
+            ("an own record with an outcome", "produced 2 test_done records",
+             dict(no_row, FAKE_TPX_RAW=pair(own_details={"outcome": "ERROR"}))),
+            ("an own record without an outcome", "produced 2 test_done records",
+             dict(no_row, FAKE_TPX_RAW=pair(own_details={"reason": "the selected cell returned no result"}))),
+            ("a run verdict that passed", "produced 2 test_done records", dict(no_row, FAKE_TPX_RAW=pair(run_status="passed"))),
+            ("a third record", "produced 3 test_done records",
+             dict(no_row, FAKE_TPX_RAW=pair(extra=self.record(test="other/verify@ptrace", status="failed",
+                                                              details=json.dumps({"outcome": "FAIL"}))))),
+            ("the cell's record alone", "a failed record with outcome None",
+             dict(no_row, FAKE_TPX_RAW=pair().splitlines(keepends=True)[0])),
+        ]
+        for name, needle, env in cases:
+            with self.subTest(name):
+                self.assert_rejected_everywhere(needle, **env)
+
+    def diagnostic_skip(self, **details) -> str:
+        """The record the harness writes for an excused diagnostic failure."""
+        return self.record(status="skipped", details=json.dumps(dict({"outcome": "FAIL", "reason": "excused"}, **details)))
+
+    def test_control_3_a_valid_diagnostic_skip_survives_and_a_malformed_one_does_not(self) -> None:
+        done, result = self.run_cell(FAKE_OUTCOME="FAIL", FAKE_EXIT="0", FAKE_TPX_RAW=self.diagnostic_skip())
+        self.assertEqual(done["status"], "skipped", done)
+        self.assertEqual(json.loads(done["details"])["outcome"], "FAIL")
+        self.assertEqual(result["producer_completion"], {"version": 1, "status": "valid", "reason": None})
+        self.assert_ingest_accepts()
+        with self.subTest("a failed ERROR with its ERROR row stays a valid failure"):
+            done, result = self.run_cell(FAKE_OUTCOME="ERROR")
+            self.assertEqual((done["status"], json.loads(done["details"])["outcome"]), ("failed", "ERROR"))
+            self.assertEqual(result["producer_completion"], {"version": 1, "status": "valid", "reason": None})
+            self.assert_ingest_accepts()
+        # (name, reason, payload, the row's outcome[, raw rows]): only an excused FAIL is a lone skip.
+        cases = [
+            ("a PASS outcome", "a skipped record with outcome 'PASS'", self.diagnostic_skip(outcome="PASS"), "FAIL"),
+            ("a non-string outcome", "a skipped record with outcome 7", self.diagnostic_skip(outcome=7), "FAIL"),
+            ("an ERROR outcome with its ERROR row", "a skipped record with outcome 'ERROR'",
+             self.diagnostic_skip(outcome="ERROR"), "ERROR"),
+            ("a lone HOST-INAPPLICABLE and no row", "a skipped record with outcome 'HOST-INAPPLICABLE'",
+             self.diagnostic_skip(outcome="HOST-INAPPLICABLE"), "FAIL", ""),
+            ("a row that contradicts it", "reported outcome 'FAIL' but its rows say 'ERROR'",
+             self.diagnostic_skip(), "ERROR"),
+            ("non-object details", "reported skipped without JSON-object details",
+             self.record(status="skipped", details="not json"), "FAIL"),
+            ("duplicate records", "produced 2 test_done records", self.diagnostic_skip() * 2, "FAIL"),
+        ]
+        for name, needle, raw, row, *rows_raw in cases:
+            with self.subTest(name):
+                self.assert_rejected_everywhere(needle, FAKE_OUTCOME=row, FAKE_EXIT="0", FAKE_TPX_RAW=raw,
+                                                **({"FAKE_RESULTS_RAW": rows_raw[0]} if rows_raw else {}))
+
+    def test_control_4_valid_outcomes_keep_their_meaning_through_ingest(self) -> None:
+        valid = {"version": 1, "status": "valid", "reason": None}
+        with self.subTest("PASS, rc 0"):
+            done, result = self.run_cell()
+            self.assertEqual(done["status"], "passed", done)
+            self.assertEqual(result["producer_completion"], valid)
+            self.assertEqual(self.assert_ingest_accepts()["remote"]["evidence_complete_executions"], 1)
+        with self.subTest("a guest FAIL, rc 1"):
+            done, result = self.run_cell(FAKE_OUTCOME="FAIL")
+            self.assertEqual((done["status"], json.loads(done["details"])["outcome"]), ("failed", "FAIL"))
+            self.assertEqual((result["harness_rc"], result["producer_completion"]), (1, valid))
+            self.assert_ingest_accepts()
+        with self.subTest("withheld locally, rc 1"):
+            done, result = self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="local")
+            self.assertEqual(done["status"], "skipped", done)
+            self.assertEqual((result["harness_rc"], result["producer_completion"]), (1, valid))
+            self.assert_ingest_accepts()
+        with self.subTest("withheld on RE, rc 1"):
+            # Failed, so Tpx retries it; ingest.py names it for a local rerun.
+            done, result = self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="re")
+            self.assertEqual(done["status"], "failed", done)
+            self.assertIn("produced 2 test_done records", json.loads(done["details"])["reason"])
+            self.assertEqual((result["harness_rc"], result["producer_completion"]), (1, valid))
+            for route, proc in self.ingest("--withheld-on-re", str(self.tmp / "{route}-rerun.txt")).items():
+                with self.subTest(ingest=route):
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertEqual(json.loads(proc.stdout)["withheld_on_re_every_execution"], 1)
+                    self.assertEqual((self.tmp / f"{route}-rerun.txt").read_text(), SLUG + "\n")
+
+    def snapshot(self, name: str) -> Path:
+        """A copy of the last run_cell's artifacts: one execution of the cell, for ingest."""
+        return Path(shutil.copytree(self.tmp / "tpx" / "artifacts", self.tmp / "executions" / name))
+
+    def test_control_4_retry_history_keeps_every_attempt_through_ingest(self) -> None:
+        valid = {"version": 1, "status": "valid", "reason": None}
+        with self.subTest("a deadline kill, then a pass"):
+            pid_file = self.tmp / "hang.pid"
+            done, result = self.run_cell(FAKE_HANG_PID_FILE=str(pid_file), CELL_DEADLINE_S="11")
+            child = int(pid_file.read_text())
+            if Path(f"/proc/{child}").exists():
+                os.kill(child, 9)
+            self.assertEqual(done["status"], "failed", done)
+            self.assertIn("produced 0 test_done records", json.loads(done["details"])["reason"])
+            self.assertEqual(result["producer_completion"], valid, "a harness death is a failure, not invalid output")
+            killed = self.snapshot("killed")
+            self.run_cell()
+            for summary in self.assert_ingest_accepts(2, [killed, self.snapshot("passed")]).values():
+                self.assertEqual((summary["no_row_executions"], summary["final_outcomes"]), (1, {"PASS": 1}))
+                self.assertEqual(summary["attempts"], {"2": 1}, "the pass shows the attempt before it")
+        with self.subTest("no result, then a pass"):
+            done, result = self.run_cell(FAKE_OUTCOME="NO-RESULT")
+            self.assertEqual((done["status"], result["producer_completion"]), ("failed", valid))
+            lost = self.snapshot("no-result")
+            self.run_cell()
+            for summary in self.assert_ingest_accepts(2, [lost, self.snapshot("passed-after-no-result")]).values():
+                self.assertEqual((summary["no_row_executions"], summary["final_outcomes"]), (1, {"PASS": 1}))
+                self.assertEqual(summary["attempts"], {"2": 1}, "the pass shows the attempt before it")
+        with self.subTest("withheld on RE, then a pass"):
+            self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="re")
+            withheld = self.snapshot("withheld")
+            self.run_cell()
+            for summary in self.assert_ingest_accepts(2, [withheld, self.snapshot("passed-after-re")]).values():
+                self.assertEqual((summary["withheld_on_re_executions"], summary["final_outcomes"]), (1, {"PASS": 1}))
+                self.assertEqual(summary["attempts"], {"1": 1}, "a withheld execution takes no attempt number")
+
+    def test_control_5_an_unfinished_normalizer_leaves_nothing_ingest_accepts(self) -> None:
+        bin_dir = self.tmp / "python-bin"
+        write_exe(bin_dir / "python3", FAKE_PYTHON)
+        write_exe(bin_dir / "mv", FAKE_MV)
+        env = {"PATH": f"{bin_dir}:{self.tmp / 'image-bin'}:{os.environ['PATH']}", "REAL_PYTHON": sys.executable}
+        artifacts = self.tmp / "tpx" / "artifacts"
+        with self.subTest("the stand-ins alone change nothing"):
+            done, result = self.run_cell(**env)
+            self.assertEqual(done["status"], "passed", done)
+            self.assertEqual(result["producer_completion"], {"version": 1, "status": "valid", "reason": None})
+            self.assert_ingest_accepts()
+        # Each failure leaves result.json as cell.sh first wrote it: complete evidence, a
+        # PASS outcome and no producer_completion, and no scratch copy behind.
+        failures = [
+            ("the normalizer crashes", "verdict normalizer exited 3", {"FAKE_NORMALIZER": "crash"}),
+            ("the normalizer finishes, then crashes", "verdict normalizer exited 3",
+             {"FAKE_NORMALIZER": "finish-then-crash"}),
+            ("the normalizer finishes then crashes, and publication would fail too", "verdict normalizer exited 3",
+             {"FAKE_NORMALIZER": "finish-then-crash", "FAKE_PUBLISHER": "crash", "FAKE_MV": "fail"}),
+            ("publication crashes", "cannot publish the producer completion", {"FAKE_PUBLISHER": "crash"}),
+            ("publication finishes its copy, then crashes", "cannot publish the producer completion",
+             {"FAKE_PUBLISHER": "finish-then-crash"}),
+            ("the move fails", "cannot publish the producer completion", {"FAKE_MV": "fail"}),
+        ]
+        for name, needle, knobs in failures:
+            with self.subTest(name):
+                result = self.assert_normalized_failure(needle, **env, **knobs)
+                self.assertNotIn("producer_completion", result)
+                self.assertTrue(result["evidence_complete"], result)
+                self.assertEqual(result["outcome"], "PASS")
+                self.assertEqual(sorted(p.name for p in (self.tmp / "tpx").iterdir()), ["annotations", "artifacts"])
+                self.assert_ingest_refuses("without producer_completion")
+        # A passing execution whose result.json lost, garbled or never had the completion.
+        mutations = [
+            ("no producer_completion", "without producer_completion",
+             lambda r: r.pop("producer_completion")),
+            ("a malformed one", "malformed producer_completion",
+             lambda r: r.update(producer_completion="valid")),
+            ("an extra field", "malformed producer_completion",
+             lambda r: r["producer_completion"].update(extra=1)),
+            ("a valid status with a reason", "malformed producer_completion",
+             lambda r: r["producer_completion"].update(reason="x")),
+            ("an unknown version", "producer_completion version 2",
+             lambda r: r["producer_completion"].update(version=2)),
+            ("a boolean version", "producer_completion version True",
+             lambda r: r["producer_completion"].update(version=True)),
+            ("a float version", "producer_completion version 1.0",
+             lambda r: r["producer_completion"].update(version=1.0)),
+            ("a string version", "producer_completion version '1'",
+             lambda r: r["producer_completion"].update(version="1")),
+            ("an unknown status", "malformed producer_completion",
+             lambda r: r["producer_completion"].update(status="done")),
+        ]
+        for name, needle, mutate in mutations:
+            with self.subTest(name):
+                done, result = self.run_cell()
+                self.assertEqual(done["status"], "passed", done)
+                self.assertTrue(result["evidence_complete"], "evidence_complete never stands in for it")
+                mutate(result)
+                (artifacts / "result.json").write_text(json.dumps(result))
+                self.assert_ingest_refuses(needle)
+        with self.subTest("no result.json"):
+            self.run_cell()
+            (artifacts / "result.json").unlink()
+            self.assert_ingest_refuses("has no result.json")
 
     def test_a_diverged_cells_run_logs_come_back_through_ingest(self) -> None:
         # Run 2's log is over cell.sh's 256 KiB compression threshold, as a real DETLOG is.
@@ -803,8 +1412,14 @@ class _Anything:
         return self
 
 
-def evaluate_cells(routing: str, pmu_on_re: str = "true") -> dict[str, dict]:
-    """Runs defs.bzl's hermit_e2e_cells over the real plan; returns each target's attrs by name."""
+def evaluate_cells(routing: str, pmu_on_re: str = "true", cpuid_on_re: str | None = None) -> dict[str, dict]:
+    """Runs defs.bzl's hermit_e2e_cells over the real plan; returns each target's attrs by name.
+
+    cpuid_on_re=None leaves the key unset, so defs.bzl's own default applies; any
+    other value is supplied as -c hermit_e2e.cpuid_on_re. The stand-in rule only
+    captures target kwargs: _cell_test_impl never runs here, so executor
+    properties are checked through those kwargs, not an executed executor.
+    """
     targets: dict[str, dict] = {}
     rule_calls = []
 
@@ -815,6 +1430,8 @@ def evaluate_cells(routing: str, pmu_on_re: str = "true") -> dict[str, dict]:
         return _Anything()
 
     config = {("hermit_e2e", "routing"): routing, ("hermit_e2e", "pmu_on_re"): pmu_on_re}
+    if cpuid_on_re is not None:
+        config[("hermit_e2e", "cpuid_on_re")] = cpuid_on_re
     namespace = {
         "rule": rule,
         "attrs": _Anything(),
@@ -825,6 +1442,25 @@ def evaluate_cells(routing: str, pmu_on_re: str = "true") -> dict[str, dict]:
     assert "_cell_test_impl" in rule_calls, rule_calls
     namespace["hermit_e2e_cells"](json.loads(PLAN.read_text()), json.loads(RE_EXCLUSIONS.read_text()))
     return targets
+
+
+def load_defs() -> tuple[dict, list[str]]:
+    """Execs defs.bzl with Buck stand-ins; returns (namespace, cell rule attr names)."""
+    attr_names: list[str] = []
+
+    def rule(impl, attrs):
+        if impl.__name__ == "_cell_test_impl":
+            attr_names.extend(attrs)
+        return _Anything()
+
+    namespace = {
+        "rule": rule,
+        "attrs": _Anything(),
+        "read_root_config": lambda section, key, default=None: default,
+        "native": _Anything(),
+    }
+    exec(compile(DEFS.read_text(), str(DEFS), "exec"), namespace)
+    return namespace, attr_names
 
 
 class ContainerChoiceTest(unittest.TestCase):
@@ -844,6 +1480,8 @@ class ContainerChoiceTest(unittest.TestCase):
             self.assertEqual(env["HERMIT_E2E_ROUTE"], target["route"], target["name"])
             expected = target["route"] == "local" and (
                 cell["lane"] == "privileged"
+                or cell.get("category") == "compat"
+                or cell.get("category") == "system-utils"
                 or cell["test"] == "c-programs/environment-and-workdir")
             self.assertEqual(env["HERMIT_E2E_CONTAINER"], "pinned-root" if expected else "", target["name"])
             self.assertEqual(bool(env["HERMIT_E2E_CONTAINER_REASON"]), expected, target["name"])
@@ -861,28 +1499,33 @@ class ContainerChoiceTest(unittest.TestCase):
         self.assertLessEqual(privileged, chosen)
         self.assertIn("c-programs-environment-and-workdir-custom-ptrace", chosen)
         self.assertIn("c-programs-environment-and-workdir-verify-ptrace", chosen)
-        # The DBT adapter takes its own user namespace for its mounts, so a DBT cell needs no
-        # container and no particular route: a kvm test's DBT verify cell runs locally with
-        # its parity reference, and the others go to RE.
-        self.assertEqual(targets["c-programs-cpuid-probe-verify-dbt"]["route"], "local")
-        dbt = {self.slug(c) for c in self.plan if c["backend"] == "dbt" and c["lane"] != "privileged"}
-        self.assertTrue(dbt)
-        self.assertFalse(dbt & chosen)
-        self.assertTrue(any(targets[name]["route"] == "re" for name in dbt))
+        # DBT left core with the third-party split (2026-11-02): its cells, and the
+        # container/route checks this test made of them, belong to the external
+        # DynamoRIO owner, so the core plan has none.
+        self.assertFalse([c for c in self.plan if c["backend"] == "dbt"])
         # The test's KVM verify cell (enabled 2026-10-08) also runs locally, so it gets the
         # same pinned-root /test workdir its guest asserts, and so do its in-guest LiteInst
         # verify cells (liteinst and in-guest-trap, enabled the same day).
-        self.assertEqual(chosen, privileged | {"c-programs-environment-and-workdir-custom-ptrace",
+        compat = {self.slug(c) for c in self.plan if c.get("category") == "compat"}
+        self.assertTrue(compat, "the plan has compat-lane cells")
+        system_utils = {self.slug(c) for c in self.plan if c.get("category") == "system-utils"}
+        self.assertTrue(system_utils, "the plan has system-utils cells")
+        self.assertEqual(chosen, privileged | compat | system_utils | {"c-programs-environment-and-workdir-custom-ptrace",
                                                "c-programs-environment-and-workdir-verify-ptrace",
                                                "c-programs-environment-and-workdir-verify-kvm",
                                                "c-programs-environment-and-workdir-verify-liteinst",
-                                               "c-programs-environment-and-workdir-verify-in-guest-trap"})
+                                               "c-programs-environment-and-workdir-verify-in-guest-trap",
+                                               "c-programs-environment-and-workdir-replay-ptrace"})
 
     def test_local(self) -> None:
         chosen = self.containerized(self.check("local"))
-        dbt = {self.slug(c) for c in self.plan if c["backend"] == "dbt" and c["lane"] != "privileged"}
-        self.assertTrue(dbt)
-        self.assertFalse(dbt & chosen)
+        # check() pins each cell's container to its local route; the plan's
+        # privileged cells are among those it containerizes. (The DBT cells
+        # this test also checked left core with DBT in the third-party split.)
+        privileged = {self.slug(c) for c in self.plan if c["lane"] == "privileged"}
+        self.assertTrue(privileged)
+        self.assertLessEqual(privileged, chosen)
+        self.assertFalse([c for c in self.plan if c["backend"] == "dbt"])
 
 
 class ParityRouteTest(unittest.TestCase):
@@ -890,17 +1533,20 @@ class ParityRouteTest(unittest.TestCase):
     only when both ran on one route and container (ci/manifest-plan/src/parity.rs
     shares_route), so each pair must be routed alike."""
 
-    # Every routing configuration defs.bzl accepts: hybrid with the PMU allowed on RE or
-    # not (-c hermit_e2e.pmu_on_re), and all-local.
+    # Every routing configuration defs.bzl accepts with cpuid_on_re at its default
+    # (off): hybrid with the PMU allowed on RE or not (-c hermit_e2e.pmu_on_re), and
+    # all-local. Each tuple is (routing, pmu_on_re[, cpuid_on_re]) for evaluate_cells.
     CONFIGS = (("hybrid", "true"), ("hybrid", "false"), ("local", "true"))
+    # The same configurations with -c hermit_e2e.cpuid_on_re=true.
+    CPUID_ON_CONFIGS = (("hybrid", "true", "true"), ("hybrid", "false", "true"), ("local", "true", "true"))
 
-    def routes(self, routing: tuple[str, str]) -> dict[tuple[str, str], tuple[str, str]]:
+    def routes(self, routing: tuple[str, ...]) -> dict[tuple[str, str], tuple[str, str]]:
         targets = evaluate_cells(*routing)
         return {(t["args"][0], t["args"][2]): (t["route"], t["env"]["HERMIT_E2E_CONTAINER"])
                 for t in targets.values() if t["args"][1] == "verify"}
 
     def test_every_kvm_cells_ptrace_reference_shares_its_route(self) -> None:
-        for routing in self.CONFIGS:
+        for routing in self.CONFIGS + self.CPUID_ON_CONFIGS:
             routes = self.routes(routing)
             kvm = sorted(test for test, backend in routes if backend == "kvm")
             self.assertGreater(len(kvm), 250, routing)
@@ -911,10 +1557,12 @@ class ParityRouteTest(unittest.TestCase):
     def test_every_sabre_cell_shares_its_references_route(self) -> None:
         # Moving a reference to the kvm cell's route must not leave the test's sabre cell,
         # compared with the same reference, on another route.
-        for routing in self.CONFIGS:
+        for routing in self.CONFIGS + self.CPUID_ON_CONFIGS:
             routes = self.routes(routing)
             sabre = sorted(test for test, backend in routes if backend == "sabre")
-            self.assertGreater(len(sabre), 200, routing)
+            # SaBRe is archived (ci/manifest-plan/src/archived.rs): its cells left
+            # per-commit validation for the nightly sweep, so no Buck cell remains.
+            self.assertEqual(len(sabre), 0, routing)
             for test in sabre:
                 if (test, "ptrace") in routes:
                     self.assertEqual(routes[(test, "sabre")], routes[(test, "ptrace")], (routing, test))
@@ -922,17 +1570,21 @@ class ParityRouteTest(unittest.TestCase):
     def test_every_dbt_cell_shares_its_references_route(self) -> None:
         # A DBT verify cell is compared with its test's ptrace verify cell like any other
         # candidate, so it runs on that cell's route and container, local or RE.
-        for routing in self.CONFIGS:
+        for routing in self.CONFIGS + self.CPUID_ON_CONFIGS:
             routes = self.routes(routing)
             dbt = sorted(test for test, backend in routes if backend == "dbt")
-            self.assertGreater(len(dbt), 20, routing)
+            # DBT left core with the third-party split (2026-11-02): its cells
+            # belong to the external DynamoRIO owner, so no Buck cell remains.
+            self.assertEqual(len(dbt), 0, routing)
             for test in dbt:
                 if (test, "ptrace") in routes:
                     self.assertEqual(routes[(test, "dbt")], routes[(test, "ptrace")], (routing, test))
 
     def test_every_in_guest_cells_ptrace_reference_shares_its_route(self) -> None:
-        # A liteinst or in-guest-trap verify cell always runs locally (InGuestRouteTest), so
-        # its ptrace reference must run there too, or parity never credits the pair.
+        # With cpuid_on_re off (CONFIGS) a liteinst or in-guest-trap verify cell always
+        # runs locally (InGuestRouteTest), so its ptrace reference must run there too,
+        # or parity never credits the pair. With the switch on the moved pairs split
+        # on purpose; the next test pins that split instead of this equality.
         for routing in self.CONFIGS:
             routes = self.routes(routing)
             for backend in IN_GUEST_BACKENDS:
@@ -942,6 +1594,26 @@ class ParityRouteTest(unittest.TestCase):
                     if (test, "ptrace") in routes:
                         self.assertEqual(routes[(test, "ptrace")], routes[(test, backend)],
                                          (routing, backend, test))
+
+    def test_cpuid_on_splits_moved_in_guest_pairs_from_their_local_reference(self) -> None:
+        # With cpuid_on_re on, a moved in-guest verify cell runs on RE while its ptrace
+        # reference stays local (HOST_LEVEL), so parity.rs shares_route gives the pair
+        # no clean credit until RE guarantees an exact branch counter. The pairs that
+        # did not move still share their reference's route.
+        routes = self.routes(("hybrid", "true", "true"))
+        moved = 0
+        for backend in IN_GUEST_BACKENDS:
+            tests = sorted(test for test, b in routes if b == backend)
+            self.assertGreater(len(tests), 250, backend)
+            for test in tests:
+                if routes[(test, backend)][0] == "re":
+                    moved += 1
+                    if (test, "ptrace") in routes:
+                        self.assertEqual(routes[(test, "ptrace")][0], "local", (backend, test))
+                elif (test, "ptrace") in routes:
+                    self.assertEqual(routes[(test, "ptrace")], routes[(test, backend)],
+                                     (backend, test))
+        self.assertEqual(moved, 469)
 
 
 # The two backends that run the in-guest LiteInst runtime.
@@ -964,7 +1636,11 @@ class InGuestRouteTest(unittest.TestCase):
             self.assertIn("cpuid-faulting", row.get("requires_host_capabilities", []), row)
 
     def test_every_in_guest_cell_runs_locally_under_every_config(self) -> None:
-        for routing in ParityRouteTest.CONFIGS:
+        # ParityRouteTest.CONFIGS leaves cpuid_on_re at its default (off), which is
+        # the scope of this all-local assertion; CpuidOnReRouteTest covers the
+        # switch on. With the switch on but pmu_on_re off or routing local, every
+        # in-guest cell still runs locally, so those configs are in scope here too.
+        for routing in ParityRouteTest.CONFIGS + (("hybrid", "false", "true"), ("local", "true", "true")):
             targets = evaluate_cells(*routing)
             for backend in IN_GUEST_BACKENDS:
                 cells = [t for t in targets.values() if t["args"][2] == backend]
@@ -981,13 +1657,137 @@ class HostLevelRouteTest(unittest.TestCase):
     keeps every such cell on the validation host."""
 
     def test_every_host_level_verify_cell_runs_locally_under_every_config(self) -> None:
-        for routing in ParityRouteTest.CONFIGS:
+        # cpuid_on_re never moves a ptrace or e9patch cell, so the cpuid-on
+        # configurations are in scope for this all-local assertion too.
+        for routing in ParityRouteTest.CONFIGS + ParityRouteTest.CPUID_ON_CONFIGS:
             targets = evaluate_cells(*routing)
             cells = [t for t in targets.values()
                      if t["args"][1] == "verify" and t["args"][2] in ("ptrace", "e9patch")]
             self.assertGreater(len(cells), 500, routing)
             remote = sorted(t["name"] for t in cells if t["route"] != "local")
             self.assertEqual(remote, [], routing)
+
+
+class CpuidOnReRouteTest(unittest.TestCase):
+    """-c hermit_e2e.cpuid_on_re=true lets an in-guest (liteinst, in-guest-trap) verify
+    cell that needs only cpuid-faulting run on an RE worker advertising
+    cpuid_faulting=true, through every later _route veto. evaluate_cells captures
+    target kwargs only (_cell_test_impl never runs), so the executor properties are
+    checked as the re_properties, route, labels and route-reason kwargs, not as an
+    executed executor."""
+
+    plan = json.loads(PLAN.read_text())["cells"]
+
+    def slug(self, cell: dict) -> str:
+        return "{}-{}-{}".format(cell["test"].replace("/", "-"), cell["mode"], cell["backend"])
+
+    def candidate_cells(self) -> list[dict]:
+        return [c for c in self.plan if c["backend"] in IN_GUEST_BACKENDS and c["mode"] == "verify"
+                and "cpuid-faulting" in (c.get("requires_host_capabilities") or [])
+                and "kvm" not in (c.get("requires_host_capabilities") or [])]
+
+    def expected_re_slugs(self) -> set[str]:
+        # The candidates that also clear every later veto, derived from the plan rows
+        # and defs.bzl's own veto data; pmu_on_re=true lifts the PMU veto, and the
+        # parity-reference veto moves ptrace cells only.
+        defs, _ = load_defs()
+        re_exclusions = json.loads(RE_EXCLUSIONS.read_text())["tests"]
+        expected = set()
+        for cell in self.candidate_cells():
+            if cell.get("category") in ("compat", "system-utils"):
+                continue
+            if cell["lane"] == "privileged":
+                continue
+            if any(t in defs["RE_MISSING_TOOLS"] for t in cell.get("requires", [])):
+                continue
+            if "{}/{}".format(cell["test"], cell["mode"]) in defs["PINNED_ROOT_ONLY"]:
+                continue
+            if cell["test"] in defs["LOCAL_TESTS"] or cell["test"] in re_exclusions:
+                continue
+            if cell["backend"] in defs["HOST_LEVEL_BACKENDS"]:
+                continue
+            expected.add(self.slug(cell))
+        return expected
+
+    def assert_no_re_and_no_cpuid_property(self, targets: dict[str, dict], config) -> None:
+        remote = sorted(n for n, t in targets.items() if t["route"] == "re")
+        self.assertEqual(remote, [], config)
+        for name, target in targets.items():
+            self.assertEqual(target.get("re_properties"), {}, (config, name))
+            self.assertNotIn("hermit_e2e_re_cpuid_faulting", target["labels"], (config, name))
+
+    def test_cell_rule_declares_re_properties(self) -> None:
+        _, attr_names = load_defs()
+        self.assertIn("re_properties", attr_names)
+
+    def test_cpuid_off_is_todays_routing_and_carries_no_cpuid_property(self) -> None:
+        # Unset exercises defs.bzl's default; explicit "false" must agree with it. At
+        # the current plan every cell runs locally under either.
+        for config in (("hybrid", "true"), ("hybrid", "true", "false"), ("hybrid", "false", "false")):
+            self.assert_no_re_and_no_cpuid_property(evaluate_cells(*config), config)
+
+    def test_cpuid_on_with_pmu_off_still_routes_nothing_to_re(self) -> None:
+        config = ("hybrid", "false", "true")
+        self.assert_no_re_and_no_cpuid_property(evaluate_cells(*config), config)
+
+    def test_cpuid_on_with_routing_local_routes_nothing_to_re(self) -> None:
+        config = ("local", "true", "true")
+        targets = evaluate_cells(*config)
+        self.assert_no_re_and_no_cpuid_property(targets, config)
+        # The forced-local override must not keep _route's RE audit reason: the
+        # cells that would run on RE under hybrid run here, and say so.
+        expected = self.expected_re_slugs()
+        self.assertEqual(len(expected), 469)
+        for name, target in targets.items():
+            self.assertNotIn("routes to RE", target["env"]["HERMIT_E2E_ROUTE_REASON"], (config, name))
+        for name in sorted(expected):
+            self.assertEqual(
+                targets[name]["env"]["HERMIT_E2E_ROUTE_REASON"],
+                "needs host capability cpuid-faulting; runs locally under -c hermit_e2e.routing=local",
+                name,
+            )
+
+    def test_cpuid_on_moves_exactly_the_eligible_in_guest_verify_cells(self) -> None:
+        targets = evaluate_cells("hybrid", "true", "true")
+        expected = self.expected_re_slugs()
+        self.assertEqual(len(expected), 469, "derived RE set at the current plan")
+        remote = {n for n, t in targets.items() if t["route"] == "re"}
+        self.assertEqual(remote, expected)
+        self.assertEqual(len(remote), 469)
+        by_slug = {self.slug(c): c for c in self.plan}
+        for name, target in targets.items():
+            cell = by_slug[name]
+            self.assertEqual(target["env"]["HERMIT_E2E_ROUTE"], target["route"], name)
+            if name in expected:
+                self.assertIn(cell["backend"], IN_GUEST_BACKENDS, name)
+                self.assertEqual(cell["mode"], "verify", name)
+                self.assertEqual(target.get("re_properties"), {"cpuid_faulting": "true"}, name)
+                self.assertIn("hermit_e2e_re_cpuid_faulting", target["labels"], name)
+                reason = target["env"]["HERMIT_E2E_ROUTE_REASON"]
+                self.assertIn("cpuid-faulting", reason, name)
+                self.assertIn("cpuid_faulting=true", reason, name)
+            else:
+                self.assertEqual(target.get("re_properties"), {}, name)
+                self.assertNotIn("hermit_e2e_re_cpuid_faulting", target["labels"], name)
+                if target["route"] == "re":
+                    self.assertEqual(target["env"]["HERMIT_E2E_ROUTE_REASON"], "", name)
+        self.assertFalse([n for n in remote if by_slug[n]["backend"] in ("ptrace", "kvm")])
+        defs, _ = load_defs()
+        subsets = {
+            "compat": [c for c in self.candidate_cells() if c.get("category") == "compat"],
+            "system-utils": [c for c in self.candidate_cells() if c.get("category") == "system-utils"],
+            "privileged": [c for c in self.candidate_cells() if c["lane"] == "privileged"],
+            "pinned-root-only": [c for c in self.candidate_cells()
+                                 if "{}/{}".format(c["test"], c["mode"]) in defs["PINNED_ROOT_ONLY"]],
+        }
+        for label, cells in subsets.items():
+            self.assertTrue(cells, label)
+            for cell in cells:
+                self.assertEqual(targets[self.slug(cell)]["route"], "local", (label, cell))
+        dual = targets["c-programs-cpuid-probe-verify-kvm"]
+        self.assertEqual(dual["route"], "local")
+        self.assertEqual(dual.get("re_properties"), {})
+        self.assertNotIn("hermit_e2e_re_cpuid_faulting", dual["labels"])
 
 
 if __name__ == "__main__":

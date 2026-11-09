@@ -555,48 +555,50 @@ pub struct HbThreadCounters {
 /// anchor on; an `fd` on any other syscall is refused when the spec is loaded
 /// rather than matched against an argument that is not a descriptor.
 pub fn syscall_takes_fd_first(sysno: Sysno) -> bool {
-    matches!(
-        sysno,
+    match sysno {
         Sysno::read
-            | Sysno::write
-            | Sysno::readv
-            | Sysno::writev
-            | Sysno::pread64
-            | Sysno::pwrite64
-            | Sysno::preadv
-            | Sysno::pwritev
-            | Sysno::preadv2
-            | Sysno::pwritev2
-            | Sysno::close
-            | Sysno::fsync
-            | Sysno::fdatasync
-            | Sysno::ioctl
-            | Sysno::fcntl
-            | Sysno::lseek
-            | Sysno::fstat
-            | Sysno::ftruncate
-            | Sysno::fallocate
-            | Sysno::flock
-            | Sysno::getdents64
-            | Sysno::sendto
-            | Sysno::recvfrom
-            | Sysno::sendmsg
-            | Sysno::recvmsg
-            | Sysno::sendmmsg
-            | Sysno::recvmmsg
-            | Sysno::accept
-            | Sysno::accept4
-            | Sysno::connect
-            | Sysno::bind
-            | Sysno::listen
-            | Sysno::shutdown
-            | Sysno::epoll_wait
-            | Sysno::epoll_pwait
-            | Sysno::epoll_ctl
-            | Sysno::dup
-            | Sysno::dup2
-            | Sysno::dup3
-    )
+        | Sysno::write
+        | Sysno::readv
+        | Sysno::writev
+        | Sysno::pread64
+        | Sysno::pwrite64
+        | Sysno::preadv
+        | Sysno::pwritev
+        | Sysno::preadv2
+        | Sysno::pwritev2
+        | Sysno::close
+        | Sysno::fsync
+        | Sysno::fdatasync
+        | Sysno::ioctl
+        | Sysno::fcntl
+        | Sysno::lseek
+        | Sysno::fstat
+        | Sysno::ftruncate
+        | Sysno::fallocate
+        | Sysno::flock
+        | Sysno::getdents64
+        | Sysno::sendto
+        | Sysno::recvfrom
+        | Sysno::sendmsg
+        | Sysno::recvmsg
+        | Sysno::sendmmsg
+        | Sysno::recvmmsg
+        | Sysno::accept
+        | Sysno::accept4
+        | Sysno::connect
+        | Sysno::bind
+        | Sysno::listen
+        | Sysno::shutdown
+        | Sysno::epoll_pwait
+        | Sysno::epoll_ctl
+        | Sysno::dup
+        | Sysno::dup3 => true,
+        // aarch64, like every newer Linux port, has only the generic table,
+        // which leaves out these legacy calls.
+        #[cfg(target_arch = "x86_64")]
+        Sysno::epoll_wait | Sysno::dup2 => true,
+        _ => false,
+    }
 }
 
 /// A normalized happens-before edge between two anchors.

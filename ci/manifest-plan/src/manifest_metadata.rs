@@ -482,7 +482,7 @@ mod tests {
     use super::*;
 
     fn root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        crate::compiled_manifest_dir!()
             .join("../..")
             .canonicalize()
             .unwrap()
@@ -710,6 +710,9 @@ mod tests {
             fs::create_dir(&alias).unwrap();
             let alias = Self(alias);
             std::os::unix::fs::symlink(root.join("tests"), alias.path().join("tests")).unwrap();
+            // rr manifest programs live in the vendored submodule.
+            std::os::unix::fs::symlink(root.join("third-party"), alias.path().join("third-party"))
+                .unwrap();
             alias
         }
 
@@ -1474,7 +1477,7 @@ test:
     }
 
     /// A cell's published reproducer selects exactly that cell through the
-    /// harness's own selection: a cell of a focused run type (compat/java
+    /// harness's own selection: a cell of a focused run type (compat/java-run
     /// verify on ptrace carries the test-level label sabre-compat-only) needs
     /// `--label`, and a `full` cell's reproducer keeps its exact form. The
     /// argv is parsed the way test-harness parses it.
@@ -1532,9 +1535,9 @@ test:
                 .collect::<Vec<_>>()
         };
         for (test, mode, backend) in [
-            ("compat/java", "verify", "ptrace"),
+            ("compat/java-run", "verify", "ptrace"),
             ("compat/comm", "verify", "sabre"),
-            ("compat/java", "verify", "dbt"),
+            ("compat/java-run", "verify", "dbt"),
             ("compat/comm", "verify", "ptrace"),
         ] {
             let argv = &reproducer(test, mode, backend).argv;

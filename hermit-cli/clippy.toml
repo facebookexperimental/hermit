@@ -1,0 +1,12 @@
+# Every Container method that clones a child process. This package clones a
+# container only through src/bin/hermit/container_clone.rs (CheckedClone),
+# which, in a test build, first checks that the cloning test runs in a process
+# of its own (test_isolation::rerun_alone): a clone beside other threads can
+# start its child holding their locks and pipes, which hung plain `cargo test`.
+disallowed-methods = [
+    { path = "reverie_process::Container::run", reason = "clone through container_clone::CheckedClone::checked_run, which checks that a test's clone runs alone in its process" },
+    { path = "reverie_process::Container::run_with_startup", reason = "clone through container_clone::CheckedClone (add a checked method there), which checks that a test's clone runs alone in its process" },
+    { path = "reverie_process::Container::run_with_startup_owned", reason = "clone through container_clone::CheckedClone (add a checked method there), which checks that a test's clone runs alone in its process" },
+    { path = "reverie_process::Container::run_with_deferred_drop", reason = "clone through container_clone::CheckedClone (add a checked method there), which checks that a test's clone runs alone in its process" },
+    { path = "reverie_process::Container::run_with_deferred_drop_owned", reason = "clone through container_clone::CheckedClone::checked_run_with_deferred_drop_owned, which checks that a test's clone runs alone in its process" },
+]

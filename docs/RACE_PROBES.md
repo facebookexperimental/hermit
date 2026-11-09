@@ -60,10 +60,38 @@ Hermit removes all three from the guest's environment, as it does for its own
 | `fifo_staging_mapped` | async wait | `detcore/src/syscalls/files.rs`, `open_waited_on_fifo`, after the staging page's `mmap` returns and before the path is written | a host process that kills the task in this wait leaves the page mapped and empty, as a kill during the `mmap` does |
 | `fifo_staging_reclaim` | async wait | `detcore/src/syscalls/files.rs`, `unmap_orphaned_staging_pages`, before a task unmaps a staging page that a killed task left | a host process that kills this task too leaves the page to the next task of the address space |
 | `procfs_spelling_resolved` | async wait | `detcore/src/syscalls/files.rs`, `handle_openat`, after Detcore names the directory a relative lookup starts from and before the kernel's open | without sequentialized threads, another guest thread can replace that directory's descriptor before the kernel uses it |
+| `exit_hook_tail` | async wait, debug assertions only | `detcore/src/lib.rs`, `on_exit_thread`, after the hook's last call to the global state and before the backend releases the thread's state | the exiting thread's state is released late, as when the backend runs the hook's tail late (KVM runs it after the parent can already wait for the child): a descriptor table Detcore did not let go at the exit (one that more than one thread held, or of a process a signal killed) goes late with it |
+| `receipt_decision` | async wait, debug assertions only | `detcore/src/syscalls/scm_rights.rs`, `record_received_facts`, before the receipt decides how to record a descriptor received over `SCM_RIGHTS` | exited senders' exit hooks finish first, as they can while the receive's probes wait for the host |
 
 The waits are `tokio::time::sleep`. They delay only the task that owns the call;
 the scheduler keeps running. A blocking sleep at these points would stall the
 scheduler as well and hide the race.
+
+`exit_hook_tail` and `receipt_decision` are in Detcore code every backend runs,
+so they wait through `race_probe::delay_on_any_backend`: on Tokio's timer where
+the calling task runs on a Tokio runtime (ptrace's tracer), and otherwise by
+blocking the calling thread, which then serves that task alone (KVM drives each
+guest process's and thread's tool on a thread of its own, without a Tokio
+runtime). Where the tool runs inside the guest's process (DBT, SaBRe, LiteInst,
+in-guest-trap), whose threads must not touch thread-local state a runtime keeps,
+they always block the calling thread and never ask for a Tokio runtime; disabled,
+they read only the probes' initialized `OnceLock`.
+
+`exit_hook_tail` and `receipt_decision` exist only in builds with debug
+assertions (the debug and validate profiles): release builds compile neither
+call. Together they force both orders of the race behind
+https://github.com/rrnewton/hermit/issues/4930, a receipt over `SCM_RIGHTS`
+against the release of an exited sender's descriptor table; the CLI tests
+`scm_rights_receipt_is_the_same_whichever_finishes_first` (ptrace) and
+`run_kvm_scm_rights_receipt_is_the_same_whichever_finishes_first` (KVM) run
+both. The exit that leaves a descriptor table to no holder (a thread's `exit`,
+or an `exit_group`, which ends its whole process) lets the table go in the
+exiting thread's turn (`Detcore::release_table_at_exit`), and guest calls alone
+count a table's holders (`FileMetadata::holders`), so `exit_hook_tail` cannot
+move that release, also where several threads held the table;
+`scm_rights_exited_receivers_queue_goes_with_its_exit` (ptrace) and
+`run_kvm_scm_rights_exited_receivers_queue_goes_with_its_exit` (KVM) require
+the same port decisions with and without it.
 
 ## Why an outcome under a probe is a real outcome
 

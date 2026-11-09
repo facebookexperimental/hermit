@@ -64,8 +64,7 @@ function require_runtime_closure {
         fail "runtime bundle contains files outside the exact unwind closure: $runtime"
 }
 
-# The SaBRe plugin (https://github.com/rrnewton/hermit/issues/3652) and the
-# in-guest LiteInst runtime (https://github.com/rrnewton/hermit/issues/3967) are
+# The in-guest LiteInst runtime (https://github.com/rrnewton/hermit/issues/3967) are
 # guest preloads: each guest's own dynamic loader loads them, against the libc
 # that guest already has. The bundle also ships Reverie's plain LiteInst preload
 # (https://github.com/rrnewton/reverie/issues/980), which no Hermit run path has
@@ -75,8 +74,8 @@ function require_runtime_closure {
 # build-root directory to find them in, and may require no glibc symbol version
 # newer than the oldest supported host's: glibc 2.34, measured on the host
 # recorded for GUEST_PRELOAD_GLIBC_MINOR_FLOOR in docs/TESTING_ENVIRONMENTS.md
-# under "Named measurement hosts". detcore-sabre/build.rs,
-# detcore-liteinst/build.rs, detcore-sabre/src/glibc_compat.rs and Reverie's
+# under "Named measurement hosts". detcore-liteinst/build.rs,
+# common/inguest/glibc_compat.rs and Reverie's
 # reverie-liteinst/build.rs build them that way. ci/test_guest_preload_gate.py
 # runs this gate on real ELF files and checks that both scripts apply it to all
 # three.
@@ -107,26 +106,32 @@ function require_portable_guest_preload {
     done < <(sed -n 's/.*Name: \([^ ]*\) *Flags:.*/\1/p' <<<"$versions")
 }
 
-function require_complete_resources {
-    local install=$1 require_runtime=$2 path
-    [[ -d $install/rsrcs ]] || fail "resource bundle has no rsrcs directory: $install"
-    for path in libdetcore_dbt.so libdetcore_sabre.so libdetcore_liteinst.so libreverie_dbt_client.so libreverie_liteinst.so; do
-        [[ -f $install/rsrcs/$path && -s $install/rsrcs/$path ]] ||
-            fail "resource bundle is missing or empty: $install/rsrcs/$path"
+function require_core_resources {
+    local install=$1 require_runtime=$2 path actual expected
+    [[ -d $install/rsrcs ]] || fail "core resource bundle has no rsrcs directory: $install"
+    for path in LICENSE README.txt hermit licenses/LICENSE \
+        rsrcs/libreverie_liteinst.so rsrcs/libreverie_liteinst.so.revision \
+        rsrcs/libdetcore_liteinst.so rsrcs/libdetcore_liteinst.package.json; do
+        [[ -f $install/$path && -s $install/$path ]] ||
+            fail "core resource is missing or empty: $install/$path"
     done
-    for path in dynamorio/bin64/drrun sabre e9patch e9tool; do
-        [[ -f $install/rsrcs/$path && -s $install/rsrcs/$path && -x $install/rsrcs/$path ]] ||
-            fail "resource bundle executable is missing, empty, or non-executable: $install/rsrcs/$path"
-    done
-    require_portable_guest_preload "SaBRe plugin" "$install/rsrcs/libdetcore_sabre.so"
+    [[ -x $install/hermit ]] || fail "core installed Hermit is not executable: $install/hermit"
     require_portable_guest_preload "In-guest LiteInst runtime" "$install/rsrcs/libdetcore_liteinst.so"
     require_portable_guest_preload "LiteInst preload" "$install/rsrcs/libreverie_liteinst.so"
-    "$ROOT_DIR/ci/verify-packaged-detcore.py" "$install" || fail "ordinary Detcore packaging qualification is missing or stale"
+    "$ROOT_DIR/ci/verify-packaged-detcore.py" --core "$install" ||
+        fail "ordinary core Detcore packaging qualification is missing or stale"
     if [[ $require_runtime == true ]]; then
         require_runtime_closure "$install/rsrcs/hermit-runtime"
     elif [[ -e $install/rsrcs/hermit-runtime ]]; then
-        fail "resource bundle carries an undeclared Hermit runtime closure: $install/rsrcs/hermit-runtime"
+        fail "core resource bundle carries an undeclared Hermit runtime closure: $install/rsrcs/hermit-runtime"
     fi
+    expected=$'LICENSE\nREADME.txt\nhermit\nlicenses/LICENSE\nrsrcs/libdetcore_liteinst.package.json\nrsrcs/libdetcore_liteinst.so\nrsrcs/libreverie_liteinst.so\nrsrcs/libreverie_liteinst.so.revision'
+    if [[ $require_runtime == true ]]; then
+        expected+=$'\nrsrcs/hermit-runtime/libunwind-x86_64.so.8\nrsrcs/hermit-runtime/libunwind.so.8'
+    fi
+    expected=$(printf '%s\n' "$expected" | LC_ALL=C sort)
+    actual=$(cd "$install" && find -L . -type f -printf '%P\n' | LC_ALL=C sort)
+    [[ $actual == "$expected" ]] || fail "core resource inventory differs from the maintained first-party installer/finalizer: $install"
 }
 
 function require_runtime_resources {
@@ -137,8 +142,8 @@ function require_runtime_resources {
         fail "runtime bundle contains files outside the exact unwind closure: $install"
 }
 
-[[ $# == 3 || $# == 4 || $# == 5 || $# == 6 ]] ||
-    fail "usage: $0 SOURCE-BINARY BUNDLE-ROOT POINTER [SOURCE-INSTALL-DIR | --runtime-only SOURCE-INSTALL-DIR | SOURCE-INSTALL-DIR --runtime-overlay RUNTIME-INSTALL-DIR]"
+[[ $# == 3 || $# == 4 || $# == 5 || $# == 6 || $# == 7 ]] ||
+    fail "usage: $0 SOURCE-BINARY BUNDLE-ROOT POINTER [SOURCE-INSTALL-DIR | --runtime-only SOURCE-INSTALL-DIR | --core-complete SOURCE-INSTALL-DIR [--runtime-overlay RUNTIME-INSTALL-DIR] | SOURCE-INSTALL-DIR --runtime-overlay RUNTIME-INSTALL-DIR]"
 source_binary=$1
 bundle_root=$2
 pointer=$3
@@ -147,16 +152,25 @@ runtime_overlay=""
 kind="binary-only"
 if [[ $# == 4 ]]; then
     source_install=$4
-    kind=complete
+    kind=core-complete
 elif [[ $# == 5 ]]; then
-    [[ $4 == --runtime-only ]] || fail "five-argument form requires --runtime-only"
     source_install=$5
-    kind=runtime
+    case $4 in
+        --runtime-only) kind=runtime ;;
+        --core-complete) kind=core-complete ;;
+        *) fail "five-argument form requires --runtime-only or --core-complete" ;;
+    esac
 elif [[ $# == 6 ]]; then
     [[ $5 == --runtime-overlay ]] || fail "six-argument form requires --runtime-overlay"
     source_install=$4
     runtime_overlay=$6
-    kind=complete
+    kind=core-complete
+elif [[ $# == 7 ]]; then
+    [[ $4 == --core-complete && $6 == --runtime-overlay ]] ||
+        fail "seven-argument form requires --core-complete and --runtime-overlay"
+    source_install=$5
+    runtime_overlay=$7
+    kind=core-complete
 fi
 
 [[ -f $source_binary && ! -L $source_binary && -s $source_binary && -x $source_binary ]] ||
@@ -192,7 +206,7 @@ printf '%s\n' "$kind" >"$stage/kind"
 
 resource_hash=none
 runtime_contract=none
-if [[ $kind == complete ]]; then
+if [[ $kind == core-complete ]]; then
     runtime_required=false
     source_runtime_required=false
     if [[ -n $runtime_overlay ]]; then
@@ -206,7 +220,7 @@ if [[ $kind == complete ]]; then
         source_runtime_required=true
         runtime_contract=elf-rpath-v1
     fi
-    require_complete_resources "$source_install" "$source_runtime_required"
+    require_core_resources "$source_install" "$source_runtime_required"
     tree_manifest "$source_install" >"$before_manifest"
     [[ -s $before_manifest ]] || fail "source install bundle contains no regular files: $source_install"
     mkdir -p "$stage/install"
@@ -234,7 +248,7 @@ if [[ $kind == complete ]]; then
         cmp -s "$overlay_before_manifest" <(awk '$2 ~ /^rsrcs\/hermit-runtime\//' "$stage/resources.sha256") ||
             fail "published runtime overlay bytes do not match the overlay: $runtime_overlay"
     fi
-    require_complete_resources "$stage/install" "$runtime_required"
+    require_core_resources "$stage/install" "$runtime_required"
     [[ -z $(find "$stage/install" -type l -print -quit) ]] ||
         fail "published resource bundle retained a symlink instead of an immutable copy: $stage/install"
     special=$(find "$stage/install" -mindepth 1 ! -type f ! -type d -print -quit)

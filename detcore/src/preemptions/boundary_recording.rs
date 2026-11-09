@@ -10,21 +10,208 @@
 //! The scheduler consumes the complete stream; legacy editors must refuse it.
 //! History-only replay and read-only inspection never rewrite that stream.
 
+use std::fs::File;
+use std::io::Cursor;
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::path::Path;
 
 use anyhow::Context;
 use anyhow::bail;
+use detcore_model::schedule::boundary::BorrowedSchedule;
 use detcore_model::schedule::boundary::Schedule;
 use serde::Deserialize;
 use serde::Serialize;
 
+use super::HistoryIdentity;
 use super::PreemptionRecord;
+
+/// The only format of a history that states the identity of its RCB
+/// coordinates. Its sole top-level key replaces the required legacy
+/// `per_thread`/`global` and the `slice_boundary_recording` marker, so a
+/// reader built before it refuses the file instead of reading coordinates
+/// in another unit.
+const RCB_HISTORY_FORMAT: u32 = 2;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentityEnvelope<R> {
+    rcb_history: IdentityBody<R>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentityBody<R> {
+    format: u32,
+    identity: IdentityWire,
+    /// The legacy record, or the `slice_boundary_recording` envelope.
+    recording: R,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum IdentityWire {
+    Known(String),
+    BackendLocal(BackendLocalWire),
+    Unqualified(UnqualifiedWire),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BackendLocalWire {
+    backend_local: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnqualifiedWire {
+    unqualified: String,
+}
+
+impl From<&HistoryIdentity> for IdentityWire {
+    fn from(identity: &HistoryIdentity) -> Self {
+        match identity {
+            HistoryIdentity::Known(metric) => Self::Known(metric.id().to_owned()),
+            HistoryIdentity::BackendLocal(token) => Self::BackendLocal(BackendLocalWire {
+                backend_local: token.clone(),
+            }),
+            HistoryIdentity::Unqualified(reason) => Self::Unqualified(UnqualifiedWire {
+                unqualified: reason.clone(),
+            }),
+        }
+    }
+}
+
+impl TryFrom<IdentityWire> for HistoryIdentity {
+    type Error = anyhow::Error;
+
+    fn try_from(wire: IdentityWire) -> anyhow::Result<Self> {
+        match wire {
+            IdentityWire::Known(id) => reverie::pmu_config::RcbMetric::from_id(&id)
+                .map(Self::Known)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unknown RCB coordinate identity {id:?}; replay it with the Hermit \
+                         build that wrote it, or record it again with this build"
+                    )
+                }),
+            IdentityWire::BackendLocal(BackendLocalWire { backend_local }) => {
+                if backend_local.trim().is_empty() {
+                    bail!(
+                        "empty backend-local RCB coordinate identity; record the history \
+                         again with this build"
+                    );
+                }
+                Ok(Self::BackendLocal(backend_local))
+            }
+            IdentityWire::Unqualified(UnqualifiedWire { unqualified }) => {
+                Ok(Self::Unqualified(unqualified))
+            }
+        }
+    }
+}
+
+/// The JSON form of `identity` in an `rcb_history` envelope, for stores
+/// that embed the same identity beside another recording format (full
+/// record/replay metadata).
+pub fn history_identity_to_json(identity: &HistoryIdentity) -> serde_json::Value {
+    serde_json::to_value(IdentityWire::from(identity))
+        .expect("an identity wire value always serializes")
+}
+
+/// Parses the JSON form written by [`history_identity_to_json`]. An
+/// identity this build does not know is an error naming the working path,
+/// exactly as envelope decoding reports it.
+pub fn history_identity_from_json(value: &serde_json::Value) -> anyhow::Result<HistoryIdentity> {
+    let wire: IdentityWire = serde_json::from_value(value.clone())?;
+    HistoryIdentity::try_from(wire)
+}
+
+/// `recording` inside the `rcb_history` envelope stating `identity`.
+fn identity_envelope<R>(identity: &HistoryIdentity, recording: R) -> IdentityEnvelope<R> {
+    IdentityEnvelope {
+        rcb_history: IdentityBody {
+            format: RCB_HISTORY_FORMAT,
+            identity: identity.into(),
+            recording,
+        },
+    }
+}
+
+/// Serializes `record` alone: in the `rcb_history` envelope if it states an
+/// identity, otherwise in the legacy format.
+pub(super) fn encode_record(record: &PreemptionRecord) -> serde_json::Result<String> {
+    match record.identity() {
+        None => serde_json::to_string(record),
+        Some(identity) => serde_json::to_string(&identity_envelope(identity, record)),
+    }
+}
+
+/// Streams `record` alone to `path` as [`encode_record`] serializes it,
+/// without allocating its complete serialization. Writing the record's
+/// own `Serialize` form instead would drop the envelope, because the
+/// identity travels around the record rather than inside it.
+pub(super) fn write_record(path: &Path, record: &PreemptionRecord) -> anyhow::Result<()> {
+    match record.identity() {
+        None => super::streaming::write_file(path, record),
+        Some(identity) => super::streaming::write_file(path, &identity_envelope(identity, record)),
+    }
+}
+
+/// Streams a borrowed boundary recording to `path`, in the identity
+/// envelope when its record states `identity`.
+pub(super) fn write_borrowed(
+    path: &Path,
+    identity: Option<&HistoryIdentity>,
+    output: &BorrowedEnvelope<'_>,
+) -> anyhow::Result<()> {
+    match identity {
+        None => super::streaming::write_file(path, output),
+        Some(identity) => super::streaming::write_file(path, &identity_envelope(identity, output)),
+    }
+}
+
+/// Serializes a borrowed boundary recording, in the identity envelope
+/// when its record states `identity`.
+pub(super) fn borrowed_string(
+    identity: Option<&HistoryIdentity>,
+    output: &BorrowedEnvelope<'_>,
+) -> serde_json::Result<String> {
+    match identity {
+        None => serde_json::to_string(output),
+        Some(identity) => serde_json::to_string(&identity_envelope(identity, output)),
+    }
+}
+
+/// The INFO-projection digest of `record` alone: its exact serialization,
+/// identity envelope included, minus the host-observed store-exclusive
+/// count (`record_serde::InfoProjection`).
+pub(super) fn info_digest(record: &PreemptionRecord) -> anyhow::Result<[u8; 32]> {
+    let projected = super::record_serde::InfoProjection(record);
+    match record.identity() {
+        None => super::streaming::digest_json(&projected),
+        Some(identity) => super::streaming::digest_json(&identity_envelope(identity, &projected)),
+    }
+}
+
+/// The INFO-projection digest of a borrowed boundary recording, as
+/// [`info_digest`] digests a record alone.
+pub(super) fn borrowed_info_digest(
+    identity: Option<&HistoryIdentity>,
+    output: &BorrowedInfoEnvelope<'_>,
+) -> anyhow::Result<[u8; 32]> {
+    match identity {
+        None => super::streaming::digest_json(output),
+        Some(identity) => super::streaming::digest_json(&identity_envelope(identity, output)),
+    }
+}
 
 /// Keep the preemption history and every existing run setting alongside the
 /// complete boundary stream. No public access returns its legacy component:
 /// doing so would let an editor silently discard the protocol and markers.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(try_from = "BoundaryWire", into = "BoundaryWire")]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(try_from = "BoundaryWire")]
 pub struct BoundaryRecording {
     preemptions: PreemptionRecord,
     schedule: Schedule,
@@ -45,43 +232,380 @@ struct Envelope {
     slice_boundary_recording: BoundaryRecording,
 }
 
-#[derive(Deserialize)]
-struct MetadataProbe {
-    // A present null must not look like an absent protocol marker.
-    #[serde(default, deserialize_with = "present_boundary")]
-    slice_boundary_recording: Option<serde_json::Value>,
+#[derive(Serialize)]
+#[serde(rename = "BoundaryWire")]
+struct BorrowedBoundary<'a> {
+    preemptions: &'a PreemptionRecord,
+    schedule: BorrowedSchedule<'a>,
 }
 
-fn present_boundary<'de, D: serde::Deserializer<'de>>(
+#[derive(Serialize)]
+#[serde(rename = "Envelope")]
+pub(super) struct BorrowedEnvelope<'a> {
+    slice_boundary_recording: BorrowedBoundary<'a>,
+}
+
+impl<'a> BorrowedEnvelope<'a> {
+    pub(super) fn new(
+        preemptions: &'a PreemptionRecord,
+        records: &'a [detcore_model::schedule::boundary::Record],
+    ) -> anyhow::Result<Self> {
+        preemptions.validate().map_err(anyhow::Error::msg)?;
+        if !preemptions.global.is_empty() {
+            bail!("slice-boundary recording has a second, legacy global event stream");
+        }
+        Ok(Self {
+            slice_boundary_recording: BorrowedBoundary {
+                preemptions,
+                schedule: Schedule::borrow_records(records)?,
+            },
+        })
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename = "BoundaryWire")]
+struct BorrowedInfoBoundary<'a> {
+    preemptions: super::record_serde::InfoProjection<'a>,
+    schedule: BorrowedSchedule<'a>,
+}
+
+/// A borrowed envelope as the INFO comparison sees it: the exact boundary
+/// serialization with the preemption history projected through
+/// `record_serde::InfoProjection` (no host-observed store-exclusive count).
+#[derive(Serialize)]
+#[serde(rename = "Envelope")]
+pub(super) struct BorrowedInfoEnvelope<'a> {
+    slice_boundary_recording: BorrowedInfoBoundary<'a>,
+}
+
+impl<'a> BorrowedInfoEnvelope<'a> {
+    pub(super) fn new(
+        preemptions: &'a PreemptionRecord,
+        records: &'a [detcore_model::schedule::boundary::Record],
+    ) -> anyhow::Result<Self> {
+        let envelope = BorrowedEnvelope::new(preemptions, records)?;
+        Ok(Self {
+            slice_boundary_recording: BorrowedInfoBoundary {
+                preemptions: super::record_serde::InfoProjection(preemptions),
+                schedule: envelope.slice_boundary_recording.schedule,
+            },
+        })
+    }
+}
+
+impl Serialize for BoundaryRecording {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        #[serde(rename = "BoundaryWire")]
+        struct Wire<'a> {
+            preemptions: &'a PreemptionRecord,
+            schedule: &'a Schedule,
+        }
+        Wire {
+            preemptions: &self.preemptions,
+            schedule: &self.schedule,
+        }
+        .serialize(serializer)
+    }
+}
+
+#[cfg(test)]
+impl FormatProbe {
+    fn is_boundary_recording(bytes: &[u8]) -> serde_json::Result<bool> {
+        serde_json::from_slice::<Self>(bytes).map(|probe| probe.slice_boundary_recording)
+    }
+
+    fn has_rcb_history(bytes: &[u8]) -> serde_json::Result<bool> {
+        serde_json::from_slice::<Self>(bytes).map(|probe| probe.rcb_history)
+    }
+}
+
+/// Which protocol markers a record carries. The probe builds none of the
+/// record: it skips every value, so reading the format of a schedule of
+/// millions of events does not cost a JSON tree of it, several times the
+/// size of its text.
+#[derive(Deserialize)]
+struct FormatProbe {
+    // A present null must not look like an absent protocol marker.
+    #[serde(default, deserialize_with = "marker_present")]
+    slice_boundary_recording: bool,
+    #[serde(default, deserialize_with = "marker_present")]
+    incomplete_preemption_record: bool,
+    #[serde(default, deserialize_with = "marker_present")]
+    rcb_history: bool,
+}
+
+fn marker_present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    serde::de::IgnoredAny::deserialize(deserializer).map(|_| true)
+}
+
+/// A `format_version` as [`probe_format`] reads it: a format number, or
+/// `None` for anything else, which the record's ordinary decoding reports.
+struct StatedFormat(Option<u32>);
+
+impl<'de> Deserialize<'de> for StatedFormat {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(Self(
+            value.as_u64().and_then(|format| u32::try_from(format).ok()),
+        ))
+    }
+}
+
+/// The envelope field, present (even as null) or absent, so that a null
+/// envelope is not taken for a legacy record.
+fn present_envelope<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     deserializer: D,
-) -> Result<Option<serde_json::Value>, D::Error> {
-    serde_json::Value::deserialize(deserializer).map(Some)
+) -> Result<Option<Option<T>>, D::Error> {
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+/// What [`probe_format`] reads of a record: the format it states (`None`
+/// when absent or not a number) and how many jumps of global time it lists.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ProbedFormat {
+    pub(super) format: Option<u32>,
+    pub(super) time_skips: usize,
+}
+
+/// The format a preemption record states (`PreemptionRecord::format_version`),
+/// and the number of its time skips, read from its bytes without decoding the
+/// record: at the top level of a legacy record, and only in the preemptions of
+/// a slice-boundary one (a field beside the envelope is the envelope decoder's
+/// to refuse). [`Recording::decode`] consults it only when the record cannot
+/// be decoded, so that a record of a format this Hermit does not read is
+/// refused as such ([`super::RecordFormatRefusal`]) even when its body is one
+/// this Hermit cannot read; a record it can decode is refused, or not, by
+/// `validate_format` alone. The probe is typed, so a duplicated
+/// `format_version` or `preemptions` is an error here, as in the strict
+/// decoders, never a format; every other field is skipped unread. A format
+/// that is not a number, or a null envelope, reads as none, and an envelope
+/// that is not an object is an error, each left to the record's ordinary
+/// decoding to report. A record marked incomplete
+/// (`PreemptionRecord::replay_departed_at`) is written inside an
+/// `incomplete_preemption_record` envelope, as a legacy record or as a
+/// slice-boundary recording's preemptions, and states its format only in that
+/// envelope's record.
+pub(super) fn probe_format(bytes: &[u8]) -> Result<ProbedFormat, serde_json::Error> {
+    #[derive(Deserialize)]
+    struct Payload {
+        #[serde(default)]
+        format_version: Option<StatedFormat>,
+        #[serde(default)]
+        time_skips: Option<Vec<serde::de::IgnoredAny>>,
+    }
+    #[derive(Deserialize)]
+    struct Marked {
+        #[serde(default)]
+        record: Option<Payload>,
+    }
+    #[derive(Deserialize)]
+    struct Preemptions {
+        #[serde(default)]
+        format_version: Option<StatedFormat>,
+        #[serde(default)]
+        time_skips: Option<Vec<serde::de::IgnoredAny>>,
+        #[serde(default, deserialize_with = "present_envelope")]
+        incomplete_preemption_record: Option<Option<Marked>>,
+    }
+    type Stated = (Option<StatedFormat>, Option<Vec<serde::de::IgnoredAny>>);
+    impl Preemptions {
+        // A field beside the incomplete-record envelope is the decoder's to
+        // refuse, as one beside the slice-boundary envelope is.
+        fn stated(self) -> Stated {
+            match self.incomplete_preemption_record {
+                Some(marked) => marked
+                    .and_then(|marked| marked.record)
+                    .map_or((None, None), |record| {
+                        (record.format_version, record.time_skips)
+                    }),
+                None => (self.format_version, self.time_skips),
+            }
+        }
+    }
+    #[derive(Deserialize)]
+    struct Envelope {
+        #[serde(default)]
+        preemptions: Option<Preemptions>,
+    }
+    #[derive(Deserialize)]
+    struct Probe {
+        #[serde(default)]
+        format_version: Option<StatedFormat>,
+        #[serde(default)]
+        time_skips: Option<Vec<serde::de::IgnoredAny>>,
+        #[serde(default, deserialize_with = "present_envelope")]
+        incomplete_preemption_record: Option<Option<Marked>>,
+        #[serde(default, deserialize_with = "present_envelope")]
+        slice_boundary_recording: Option<Option<Envelope>>,
+    }
+    let probe: Probe = serde_json::from_slice(bytes)?;
+    let (stated, skips) = match probe.slice_boundary_recording {
+        Some(envelope) => envelope
+            .and_then(|envelope| envelope.preemptions)
+            .map_or((None, None), Preemptions::stated),
+        None => Preemptions {
+            format_version: probe.format_version,
+            time_skips: probe.time_skips,
+            incomplete_preemption_record: probe.incomplete_preemption_record,
+        }
+        .stated(),
+    };
+    Ok(ProbedFormat {
+        format: stated.and_then(|format| format.0),
+        time_skips: skips.map_or(0, |skips| skips.len()),
+    })
+}
+
+/// The error for a record that `serde` could not decode: a refusal by its
+/// format (`super::RecordFormatRefusal`, with `validate_format`'s message) when
+/// it states a format this Hermit does not read, else `error` itself.
+fn refuse_undecodable_format(bytes: &[u8], error: anyhow::Error) -> anyhow::Error {
+    match probe_format(bytes) {
+        Ok(probed) if !super::reads_format(probed.format) => {
+            anyhow::Error::new(super::RecordFormatRefusal(super::unread_format_message(
+                probed.format,
+                probed.time_skips,
+            )))
+        }
+        _ => error,
+    }
 }
 
 pub(super) fn read_settings<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| format!("cannot read preemption record {}: {}", path.display(), e))?;
-    let probe: MetadataProbe = serde_json::from_slice(&bytes)
-        .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e))?;
-    if probe.slice_boundary_recording.is_none() {
-        // Each old metadata reader still deserializes only its own field,
-        // from the original bytes, preserving its legacy acceptance contract.
-        return serde_json::from_slice(&bytes)
-            .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e));
+    fn seekable<T: serde::de::DeserializeOwned, R: Read + Seek>(
+        input: &mut R,
+    ) -> anyhow::Result<T> {
+        let start = input.stream_position()?;
+        let (probe, digest) = super::streaming::parse_pass::<FormatProbe, _>(&mut *input)?;
+        input.seek(SeekFrom::Start(start))?;
+        if !probe.slice_boundary_recording
+            && !probe.incomplete_preemption_record
+            && !probe.rcb_history
+        {
+            // Each old metadata reader still deserializes only its own field,
+            // preserving its legacy acceptance contract.
+            let (settings, typed_digest) = super::streaming::parse_pass(&mut *input)?;
+            require_same_input(digest, typed_digest)?;
+            return Ok(settings);
+        }
+        // Settings do not depend on the record's format, which the replay
+        // itself checks and refuses (`Recording::decode`), with the
+        // refusal's exit status.
+        let (recording, typed_digest) = Recording::read_fingerprinted(input, false)?;
+        require_same_input(digest, typed_digest)?;
+        Ok(serde_json::from_value(
+            super::record_serde::settings_value(recording.metadata())
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+        )?)
     }
-    let recording = Recording::decode(&bytes)
-        .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e))?;
-    serde_json::from_value(serde_json::to_value(recording.metadata()).map_err(|e| e.to_string())?)
-        .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e))
+    let mut file = File::open(path)
+        .map_err(|e| format!("cannot read preemption record {}: {}", path.display(), e))?;
+    let rewindable = file
+        .stream_position()
+        .and_then(|start| file.seek(SeekFrom::Start(start)))
+        .is_ok();
+    let parsed = if rewindable {
+        seekable(&mut file)
+    } else {
+        // Preserve FIFO/pipe compatibility. Only this unseekable path retains
+        // the historical whole-byte buffer; regular histories do not use it.
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(anyhow::Error::from)
+            .and_then(|_| seekable(&mut Cursor::new(bytes)))
+    };
+    parsed.map_err(|e| format!("cannot parse preemption record {}: {e}", path.display()))
+}
+
+/// A well-formed history in a format this Hermit cannot execute, typed so
+/// callers classify it as the policy refusal (exit 122) rather than a
+/// malformed-file parse error.
+fn format_refusal(message: String) -> anyhow::Error {
+    anyhow::Error::new(super::RecordFormatRefusal(message))
+}
+
+fn require_same_input(probe: [u8; 32], typed: [u8; 32]) -> anyhow::Result<()> {
+    if probe != typed {
+        bail!("schedule input changed between complete parsing passes");
+    }
+    Ok(())
+}
+
+/// [`read_settings`] over `bytes` already read from `path`, which only names
+/// them in errors.
+pub(super) fn settings_in<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<T, String> {
+    let mut input = Cursor::new(bytes);
+    let parsed = (|| -> anyhow::Result<T> {
+        let start = input.stream_position()?;
+        let (probe, digest) = super::streaming::parse_pass::<FormatProbe, _>(&mut input)?;
+        input.seek(SeekFrom::Start(start))?;
+        if !probe.slice_boundary_recording
+            && !probe.incomplete_preemption_record
+            && !probe.rcb_history
+        {
+            let (settings, typed_digest) = super::streaming::parse_pass::<T, _>(&mut input)?;
+            require_same_input(digest, typed_digest)?;
+            return Ok(settings);
+        }
+        let (recording, typed_digest) = Recording::read_fingerprinted(&mut input, false)?;
+        require_same_input(digest, typed_digest)?;
+        Ok(serde_json::from_value(
+            super::record_serde::settings_value(recording.metadata())
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+        )?)
+    })();
+    parsed.map_err(|e| format!("cannot parse preemption record {}: {e}", path.display()))
 }
 
 impl BoundaryRecording {
     /// Combine a validated preemption history with the sole global record
-    /// stream. The legacy history must not contain another global stream.
+    /// stream. The legacy history must not contain another global stream, nor
+    /// background starts (`BackgroundStart`), which only the legacy schedule
+    /// replayer takes. The history's format is checked by
+    /// [`Recording::decode`], which refuses it as a policy refusal
+    /// (`RecordFormatRefusal`): a deserializer would lose that error's type.
     pub fn new(preemptions: PreemptionRecord, schedule: Schedule) -> anyhow::Result<Self> {
-        preemptions.validate().map_err(anyhow::Error::msg)?;
+        preemptions
+            .validate_contents()
+            .map_err(anyhow::Error::msg)?;
         if !preemptions.global.is_empty() {
             bail!("slice-boundary recording has a second, legacy global event stream");
+        }
+        if !preemptions.background_starts.is_empty() {
+            bail!(
+                "slice-boundary recording notes background starts, which a boundary replay does \
+                 not take; only a legacy schedule records and replays them"
+            );
+        }
+        // --chaos-instruction-offset refuses --strict-schedule-boundaries, so
+        // no slice-boundary recording holds an offset decision, in a thread's
+        // rows or in its events.
+        if let Some((tid, _)) = preemptions
+            .per_thread
+            .iter()
+            .find(|(_, history)| history.has_instruction_offsets())
+        {
+            bail!(
+                "slice-boundary recording thread {tid}'s rows carry instruction offsets, which a \
+                 slice-boundary recording cannot hold; the record is malformed"
+            );
+        }
+        if let Some(index) = schedule.records().iter().position(|record| {
+            matches!(
+                record,
+                detcore_model::schedule::boundary::Record::Event(event)
+                    if event.instruction_offset.is_some()
+            )
+        }) {
+            bail!(
+                "slice-boundary recording record {index} carries an instruction offset, which a \
+                 slice-boundary recording cannot hold; the record is malformed"
+            );
         }
         Ok(Self {
             preemptions,
@@ -111,15 +635,6 @@ impl TryFrom<BoundaryWire> for BoundaryRecording {
     }
 }
 
-impl From<BoundaryRecording> for BoundaryWire {
-    fn from(recording: BoundaryRecording) -> Self {
-        Self {
-            preemptions: recording.preemptions,
-            schedule: recording.schedule,
-        }
-    }
-}
-
 /// A recording whose format remains explicit through file transformations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Recording {
@@ -129,7 +644,90 @@ pub enum Recording {
     Boundaries(BoundaryRecording),
 }
 
+impl Serialize for Recording {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Envelope<'a> {
+            slice_boundary_recording: &'a BoundaryRecording,
+        }
+        match (self, self.metadata().identity()) {
+            (Self::Legacy(record), None) => record.serialize(serializer),
+            (Self::Legacy(record), Some(identity)) => IdentityEnvelope {
+                rcb_history: IdentityBody {
+                    format: RCB_HISTORY_FORMAT,
+                    identity: identity.into(),
+                    recording: record,
+                },
+            }
+            .serialize(serializer),
+            (Self::Boundaries(record), None) => Envelope {
+                slice_boundary_recording: record,
+            }
+            .serialize(serializer),
+            (Self::Boundaries(record), Some(identity)) => IdentityEnvelope {
+                rcb_history: IdentityBody {
+                    format: RCB_HISTORY_FORMAT,
+                    identity: identity.into(),
+                    recording: Envelope {
+                        slice_boundary_recording: record,
+                    },
+                },
+            }
+            .serialize(serializer),
+        }
+    }
+}
+
+/// A passive summary of stored rows, not a replay/terminal certificate. Its
+/// memory is proportional to thread count, rather than event/history rows.
+#[derive(Debug, Serialize)]
+pub struct Inspection {
+    /// The stored format: `legacy` or `slice_boundaries`.
+    pub format: &'static str,
+    /// The structural validation performed, without certifying replay completion.
+    pub structural_validation: &'static str,
+    /// All rows in the stored global stream, including any boundary markers.
+    pub stored_global_rows: usize,
+    /// Scheduling-event rows in the stored global stream.
+    pub event_rows: usize,
+    /// None means the legacy format has no boundary protocol, not zero proof.
+    pub boundary_rows: Option<usize>,
+    /// The recorded virtual-time epoch, if the history stores one.
+    pub epoch: Option<chrono::DateTime<chrono::Utc>>,
+    /// Recorded `--pipe-wake-latency` in nanoseconds, or absent/off as `None`.
+    pub pipe_wake_latency: Option<u64>,
+    /// The recorded signal-state-copy setting, or `None` when unspecified.
+    pub signal_state_copy: Option<bool>,
+    /// Stored per-thread history counts, keyed by deterministic thread identity.
+    pub threads: std::collections::BTreeMap<crate::types::DetTid, ThreadInspection>,
+}
+
+/// Counts and the final priority stored in one thread's history.
+#[derive(Debug, Serialize)]
+pub struct ThreadInspection {
+    /// Stored priority-change rows.
+    pub priority_rows: usize,
+    /// Stored retired-conditional-branch preemption counts.
+    pub rcb_rows: usize,
+    /// Stored chaos-epoch transitions.
+    pub chaos_epoch_rows: usize,
+    /// Stored callback checkpoints for this deterministic thread.
+    pub callback_rows: usize,
+    /// The history's recorded final priority.
+    pub final_priority: crate::scheduler::runqueue::Priority,
+}
+
 impl Recording {
+    /// Refuse a known omitted change point in either stored format.
+    pub fn require_faithful_replay(&self) -> anyhow::Result<()> {
+        self.metadata().require_faithful_replay()
+    }
+
+    /// A retained source observation of an omitted replay change point.
+    pub fn replay_departed_at(&self) -> Option<u64> {
+        self.metadata().replay_departed_at()
+    }
+
     /// Require an explicit matching execution policy. The strict verifier must
     /// not silently fall back to an incomplete legacy stream, and ordinary
     /// recovery must not silently acquire strict EOF/desync semantics.
@@ -147,44 +745,251 @@ impl Recording {
 
     /// Validate and parse either format without a malformed-new-to-legacy
     /// fallback.
+    /// A record whose format this Hermit refuses fails with a
+    /// `RecordFormatRefusal` in its chain, whichever format it is in.
     pub fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
-        let value: serde_json::Value = serde_json::from_slice(bytes)?;
-        // Inspect only to dispatch. Deserialize the ORIGINAL bytes again so
-        // duplicate fields in the envelope are rejected, not overwritten by
-        // Value. A malformed new recording never falls back to legacy.
-        if value.get("slice_boundary_recording").is_some() {
-            let envelope: Envelope = serde_json::from_slice(bytes)?;
-            Ok(Self::Boundaries(envelope.slice_boundary_recording))
-        } else {
-            let legacy: PreemptionRecord = serde_json::from_slice(bytes)?;
-            legacy.validate().map_err(anyhow::Error::msg)?;
-            Ok(Self::Legacy(legacy))
+        // A record that cannot be decoded is still refused by a format this
+        // Hermit does not read (`probe_format`); one that can is refused, or
+        // not, by `validate_format` below.
+        Self::read_from(&mut Cursor::new(bytes)).map_err(|error| {
+            if error.chain().any(|cause| cause.is::<serde_json::Error>()) {
+                refuse_undecodable_format(bytes, error)
+            } else {
+                error
+            }
+        })
+    }
+
+    /// Stream a seekable input with no raw-byte or Value-tree copy. Every pass
+    /// reaches EOF, and hashes must match before the typed result is exposed.
+    /// This rejects inconsistent passes; it is not a filesystem snapshot.
+    /// A record whose format this Hermit refuses fails with a
+    /// `RecordFormatRefusal` in its chain, whichever format it is in.
+    pub fn read_from<R: Read + Seek>(input: &mut R) -> anyhow::Result<Self> {
+        let start = input.stream_position()?;
+        let (recording, _) = Self::read_fingerprinted(input, true).map_err(|error| {
+            if error.chain().any(|cause| cause.is::<serde_json::Error>()) {
+                // As in `decode`: a record that cannot be decoded is still
+                // refused by a format this Hermit does not read, probed from
+                // its bytes, rather than reporting the decoding error.
+                let probed = (|| {
+                    input.seek(SeekFrom::Start(start))?;
+                    let mut bytes = Vec::new();
+                    input.read_to_end(&mut bytes)?;
+                    anyhow::Ok(bytes)
+                })();
+                match probed {
+                    Ok(bytes) => refuse_undecodable_format(&bytes, error),
+                    Err(_) => error,
+                }
+            } else {
+                error
+            }
+        })?;
+        recording
+            .metadata()
+            .validate_format()
+            .map_err(|refusal| anyhow::Error::new(super::RecordFormatRefusal(refusal)))?;
+        Ok(recording)
+    }
+
+    /// [`Self::read_from`] without the format check, for readers that take a
+    /// recording whose format the replay itself refuses (settings).
+    /// Inspect only to dispatch. Deserialize the complete input again so
+    /// duplicate fields in the envelope are rejected. A malformed new
+    /// recording never falls back to legacy. With `check_identity` false
+    /// (settings readers only), an unsupported envelope format or identity
+    /// is not converted or refused here -- the replay's own admission
+    /// refuses it by name with the policy exit, after settings are read.
+    fn read_fingerprinted<R: Read + Seek>(
+        input: &mut R,
+        check_identity: bool,
+    ) -> anyhow::Result<(Self, [u8; 32])> {
+        let start = input.stream_position()?;
+        let (probe, digest) = super::streaming::parse_pass::<FormatProbe, _>(&mut *input)?;
+        input.seek(SeekFrom::Start(start))?;
+        if probe.rcb_history {
+            // Probe only the envelope head and the inner recording's format
+            // markers first. The inner recording is then parsed typed from
+            // the same seekable input, so no raw copy of it is retained.
+            let (head, head_digest) =
+                super::streaming::parse_pass::<IdentityEnvelope<FormatProbe>, _>(&mut *input)?;
+            require_same_input(digest, head_digest)?;
+            let identity = if check_identity {
+                if head.rcb_history.format != RCB_HISTORY_FORMAT {
+                    return Err(format_refusal(format!(
+                        "unsupported rcb_history format {}: this Hermit reads format {}; \
+                         replay it with the Hermit build that wrote it, or record it again \
+                         with this build",
+                        head.rcb_history.format, RCB_HISTORY_FORMAT
+                    )));
+                }
+                let identity = HistoryIdentity::try_from(head.rcb_history.identity)
+                    .map_err(|error| format_refusal(error.to_string()))?;
+                if head.rcb_history.recording.rcb_history {
+                    return Err(format_refusal(
+                        "nested rcb_history envelope: record the history again with this build"
+                            .to_owned(),
+                    ));
+                }
+                Some(identity)
+            } else {
+                None
+            };
+            input.seek(SeekFrom::Start(start))?;
+            let (mut recording, typed_digest) =
+                if head.rcb_history.recording.slice_boundary_recording {
+                    let (envelope, typed_digest) =
+                        super::streaming::parse_pass::<IdentityEnvelope<Envelope>, _>(&mut *input)?;
+                    (
+                        Self::Boundaries(envelope.rcb_history.recording.slice_boundary_recording),
+                        typed_digest,
+                    )
+                } else {
+                    let (envelope, typed_digest) = super::streaming::parse_pass::<
+                        IdentityEnvelope<PreemptionRecord>,
+                        _,
+                    >(&mut *input)?;
+                    envelope
+                        .rcb_history
+                        .recording
+                        .validate_contents()
+                        .map_err(anyhow::Error::msg)?;
+                    (Self::Legacy(envelope.rcb_history.recording), typed_digest)
+                };
+            require_same_input(digest, typed_digest)?;
+            recording.metadata_mut().identity = identity;
+            return Ok((recording, typed_digest));
         }
+        let (recording, typed_digest) = if probe.slice_boundary_recording {
+            let (envelope, digest) = super::streaming::parse_pass::<Envelope, _>(&mut *input)?;
+            (Self::Boundaries(envelope.slice_boundary_recording), digest)
+        } else {
+            let (legacy, digest) =
+                super::streaming::parse_pass::<PreemptionRecord, _>(&mut *input)?;
+            legacy.validate_contents().map_err(anyhow::Error::msg)?;
+            (Self::Legacy(legacy), digest)
+        };
+        require_same_input(digest, typed_digest)?;
+        Ok((recording, typed_digest))
     }
 
     /// Read a complete recording, preserving errors as failures.
     pub fn read(path: &Path) -> anyhow::Result<Self> {
-        Self::decode(&std::fs::read(path).with_context(|| format!("reading {}", path.display()))?)
-            .with_context(|| format!("reading schedule {}", path.display()))
+        let mut file = File::open(path).with_context(|| format!("reading {}", path.display()))?;
+        let rewindable = file
+            .stream_position()
+            .and_then(|start| file.seek(SeekFrom::Start(start)))
+            .is_ok();
+        let recording = if rewindable {
+            Self::read_from(&mut file)
+        } else {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            Self::decode(&bytes)
+        };
+        recording.with_context(|| format!("reading schedule {}", path.display()))
+    }
+
+    /// Decode `bytes` already read from `path`, which names them in errors as
+    /// [`Self::read`] does.
+    pub fn decode_from(path: &Path, bytes: &[u8]) -> anyhow::Result<Self> {
+        Self::decode(bytes).with_context(|| format!("reading schedule {}", path.display()))
     }
 
     /// Serialize the same format with the conventional terminal newline.
     pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
-        let mut bytes = match self {
-            Self::Legacy(record) => serde_json::to_vec(record)?,
-            Self::Boundaries(record) => serde_json::to_vec(&Envelope {
+        let mut bytes = match (self, self.metadata().identity()) {
+            (Self::Legacy(record), _) => encode_record(record)?.into_bytes(),
+            (Self::Boundaries(record), None) => serde_json::to_vec(&Envelope {
                 slice_boundary_recording: record.clone(),
+            })?,
+            (Self::Boundaries(record), Some(identity)) => serde_json::to_vec(&IdentityEnvelope {
+                rcb_history: IdentityBody {
+                    format: RCB_HISTORY_FORMAT,
+                    identity: identity.into(),
+                    recording: Envelope {
+                        slice_boundary_recording: record.clone(),
+                    },
+                },
             })?,
         };
         bytes.push(b'\n');
         Ok(bytes)
     }
 
+    /// The same recording, stating `identity` for its coordinates.
+    pub fn with_identity(mut self, identity: Option<HistoryIdentity>) -> Self {
+        self.metadata_mut().identity = identity;
+        self
+    }
+
+    /// The identity of the recording's RCB coordinates; `None` for a legacy
+    /// file, whose producer is unknown.
+    pub fn identity(&self) -> Option<&HistoryIdentity> {
+        self.metadata().identity()
+    }
+
     /// Write the complete serialized recording, without changing its format.
     pub fn write(&self, path: &Path) -> anyhow::Result<()> {
-        // Complete validation/serialization precedes opening the destination.
-        let bytes = self.encode()?;
-        std::fs::write(path, bytes).with_context(|| format!("writing {}", path.display()))
+        super::streaming::write_file(path, self)
+    }
+
+    /// Count every stored row by borrowing the fully parsed history. This
+    /// repeats the existing metadata validator, never loads/clones its tape.
+    pub fn inspect(&self) -> anyhow::Result<Inspection> {
+        let metadata = self.metadata();
+        metadata.validate().map_err(anyhow::Error::msg)?;
+        let (format, stored_global_rows, event_rows, boundary_rows) = match self {
+            Self::Legacy(record) => ("legacy", record.global.len(), record.global.len(), None),
+            Self::Boundaries(record) => {
+                if !metadata.global.is_empty() {
+                    bail!("slice-boundary recording has a second, legacy global event stream");
+                }
+                let records = record.schedule.records();
+                let events = records
+                    .iter()
+                    .filter(|row| {
+                        matches!(row, detcore_model::schedule::boundary::Record::Event(_))
+                    })
+                    .count();
+                (
+                    "slice_boundaries",
+                    records.len(),
+                    events,
+                    Some(records.len() - events),
+                )
+            }
+        };
+        Ok(Inspection {
+            format,
+            structural_validation: "existing format and history validators passed; not replay certification",
+            stored_global_rows,
+            event_rows,
+            boundary_rows,
+            epoch: metadata.epoch(),
+            pipe_wake_latency: metadata.pipe_wake_latency(),
+            signal_state_copy: metadata.signal_state_copy(),
+            threads: metadata
+                .per_thread
+                .iter()
+                .map(|(tid, history)| {
+                    (
+                        *tid,
+                        ThreadInspection {
+                            priority_rows: history.prio_changes.len(),
+                            rcb_rows: history.preemption_rcbs.len(),
+                            chaos_epoch_rows: history.chaos_epochs.len(),
+                            callback_rows: metadata
+                                .callback_checkpoints
+                                .get(tid)
+                                .map_or(0, Vec::len),
+                            final_priority: history.final_prio,
+                        },
+                    )
+                })
+                .collect(),
+        })
     }
 
     /// Give a legacy-only operation its input, or refuse a boundary format
@@ -209,6 +1014,26 @@ impl Recording {
         }
     }
 
+    /// Check the full decoded input that this loader will install. The
+    /// standalone metadata remains outside every returned ThreadHistory.
+    pub fn validate_replay_inputs(
+        &self,
+        source: &str,
+        guest_ids: detcore_model::pid::GuestIds,
+    ) -> Result<(), super::RecordAdmissionRefusal> {
+        self.metadata().validate_replay_inputs(source, guest_ids)
+    }
+
+    /// The opaque private-input metadata, without flattening this envelope.
+    pub fn reserved_input(&self) -> &super::ReservedInputMetadata {
+        self.metadata().reserved_input()
+    }
+
+    /// Numbering stored alongside either complete event representation.
+    pub fn guest_ids(&self) -> detcore_model::pid::GuestIds {
+        self.metadata().guest_ids().unwrap_or_default()
+    }
+
     /// The recorded virtual-time epoch, if the recording states one.
     pub fn epoch(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         self.metadata().epoch()
@@ -224,10 +1049,64 @@ impl Recording {
         self.metadata().signal_state_copy()
     }
 
+    /// The host files the recorded run's guest opened, if the recording says.
+    pub fn host_inputs(&self) -> Option<&detcore_model::host_input::HostInputSet> {
+        self.metadata().host_inputs()
+    }
+
+    /// The recorded jumps of global time (`PreemptionRecord::time_skips`).
+    pub fn time_skips(&self) -> Option<&[super::TimeSkip]> {
+        self.metadata().time_skips()
+    }
+
+    /// Whether the recording lists every jump of global time its run made
+    /// (`PreemptionRecord::lists_its_time_skips`), by its timing format
+    /// ([`Self::timing_format`]).
+    pub fn lists_its_time_skips(&self) -> bool {
+        super::lists_time_skips_in(self.timing_format())
+    }
+
+    /// Whether a replay of this recording charges a replayed switch-in under
+    /// which guest code runs (`PreemptionRecord::charges_replayed_switch_ins`),
+    /// by its timing format ([`Self::timing_format`]).
+    pub fn charges_replayed_switch_ins(&self) -> bool {
+        super::charges_replayed_switch_ins_in(self.timing_format())
+    }
+
+    /// The format whose timing rules the recording follows
+    /// (`PreemptionRecord::timing_format`). A slice-boundary recording keeps
+    /// its schedule trace in its boundary stream, not in its rows' record, so
+    /// it follows its stated format whatever that record says of its rows.
+    pub fn timing_format(&self) -> Option<u32> {
+        match self {
+            Self::Legacy(record) => record.timing_format(),
+            Self::Boundaries(record) => record.preemptions.format_version(),
+        }
+    }
+
+    /// The recording's format (`PreemptionRecord::format_version`).
+    pub fn format_version(&self) -> Option<u32> {
+        self.metadata().format_version()
+    }
+
+    /// What the recording states about its run's exclusive-loop
+    /// rewrite, for replay admission
+    /// (`super::reserved_input::validate_config_replay_inputs`).
+    pub(super) fn recorded_rewrite_exclusives(&self) -> super::RecordedRewriteExclusives {
+        self.metadata().recorded_rewrite_exclusives()
+    }
+
     fn metadata(&self) -> &PreemptionRecord {
         match self {
             Self::Legacy(record) => record,
             Self::Boundaries(record) => &record.preemptions,
+        }
+    }
+
+    fn metadata_mut(&mut self) -> &mut PreemptionRecord {
+        match self {
+            Self::Legacy(record) => record,
+            Self::Boundaries(record) => &mut record.preemptions,
         }
     }
 }
@@ -238,14 +1117,54 @@ impl Recording {
 pub(crate) struct HistoryReader(Recording);
 
 impl HistoryReader {
+    // Production installs only histories admitted for the actual numbering
+    // policy. Format/serialization tests also exercise the raw reader.
+    #[cfg(test)]
     pub(crate) fn read(path: &Path) -> anyhow::Result<Self> {
         Recording::read(path).map(Self)
+    }
+
+    /// Read and admit the same bytes used for priority replay. A policy error
+    /// retains its RecordAdmissionRefusal type for the pre-start exit-122 path.
+    pub(crate) fn read_for_replay(
+        path: &Path,
+        guest_ids: detcore_model::pid::GuestIds,
+    ) -> anyhow::Result<Self> {
+        let recording = Recording::read(path)?;
+        recording.validate_replay_inputs(
+            &format!("--replay-preemptions-from {}", path.display()),
+            guest_ids,
+        )?;
+        Ok(Self(recording))
+    }
+
+    /// The host files the recorded run's guest opened, if the recording says.
+    pub(crate) fn host_inputs(&self) -> Option<&detcore_model::host_input::HostInputSet> {
+        self.0.host_inputs()
     }
 
     /// History-only replay cannot honor boundary records. Admission must not
     /// silently project a new-format recording into legacy priorities/RCBs.
     pub(crate) fn require_legacy_mode(&self) -> anyhow::Result<()> {
         self.0.require_strict_mode(false)
+    }
+
+    /// Only explicit edited history exploration may consume known omissions.
+    pub(crate) fn require_replay_mode(&self, edited: bool) -> anyhow::Result<()> {
+        self.require_legacy_mode()?;
+        if !edited {
+            self.0.require_faithful_replay()?;
+        }
+        Ok(())
+    }
+
+    /// The recording this history reads, for admission.
+    pub(crate) fn recording(&self) -> &Recording {
+        &self.0
+    }
+
+    pub(crate) fn replay_departed_at(&self) -> Option<u64> {
+        self.0.replay_departed_at()
     }
 
     pub(crate) fn thread_initial_priority(
@@ -265,17 +1184,250 @@ impl HistoryReader {
     ) -> Option<super::ThreadHistory> {
         self.0.metadata().per_thread.get(tid).cloned()
     }
+
+    /// The validated callback checkpoints of this history, per thread, in
+    /// row order (`PreemptionRecord::validate`).
+    pub(crate) fn callback_checkpoints(
+        &self,
+    ) -> &std::collections::BTreeMap<crate::types::DetTid, Vec<super::callback_history::Checkpoint>>
+    {
+        self.0.metadata().callback_checkpoints()
+    }
+
+    /// The store-exclusives that failed in the recorded run.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn store_exclusive_failures(&self) -> u64 {
+        self.0.metadata().store_exclusive_failures()
+    }
 }
 
 impl std::fmt::Display for HistoryReader {
     fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let bytes = self.0.encode().map_err(|_| std::fmt::Error)?;
-        output.write_str(std::str::from_utf8(&bytes).map_err(|_| std::fmt::Error)?)
+        super::streaming::fmt_json(&self.0, output, true)
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
+
+    /// Strict slice boundaries refuse --chaos-instruction-offset, so a
+    /// slice-boundary recording whose events hold an offset is malformed:
+    /// refused when built and when read, as an error rather than a format
+    /// refusal. The same recording without the offset is accepted.
+    #[test]
+    fn a_boundary_recording_holding_an_instruction_offset_is_malformed() {
+        let metadata = || -> PreemptionRecord {
+            serde_json::from_str(
+                &PreemptionWriter::new(None)
+                    .with_epoch("2001-02-03T04:05:06Z".parse().unwrap())
+                    .with_pipe_wake_latency(Some(0))
+                    .with_signal_state_copy(false)
+                    .into_string(),
+            )
+            .unwrap()
+        };
+        let offset = crate::resources::InstructionOffset {
+            rcb_target: 40,
+            instructions: 5,
+        };
+        let plain = SchedEvent::branches(DetTid::from_raw(3), 3);
+        let with = plain.clone().with_instruction_offset(Some(offset));
+        let error = BoundaryRecording::new(
+            metadata(),
+            Schedule::new(vec![Record::Event(with.clone())]).unwrap(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("malformed"), "{error:#}");
+
+        let text = String::from_utf8(
+            Recording::Boundaries(
+                BoundaryRecording::new(
+                    metadata(),
+                    Schedule::new(vec![Record::Event(plain.clone())]).unwrap(),
+                )
+                .unwrap(),
+            )
+            .encode()
+            .unwrap(),
+        )
+        .unwrap();
+        Recording::decode(text.as_bytes()).unwrap();
+        let plain_json = serde_json::to_string(&plain).unwrap();
+        assert!(text.contains(&plain_json), "{text}");
+        let spliced = text.replacen(&plain_json, &serde_json::to_string(&with).unwrap(), 1);
+        let error = Recording::decode(spliced.as_bytes()).unwrap_err();
+        assert!(format!("{error:#}").contains("malformed"), "{error:#}");
+        assert!(
+            !error
+                .chain()
+                .any(|cause| cause.is::<crate::preemptions::RecordFormatRefusal>()),
+            "{error:#}"
+        );
+
+        // An offset in a thread's rows (a slice whose timer stopped it at a
+        // syscall or trap leaves no offset on an event): refused when built
+        // and when read, and the boundary writer refuses to record one.
+        let tid = DetTid::from_raw(3);
+        let priority = crate::scheduler::runqueue::DEFAULT_PRIORITY;
+        let at = LogicalTime::from_nanos;
+        let mut writer = PreemptionWriter::new(None)
+            .with_epoch("2001-02-03T04:05:06Z".parse().unwrap())
+            .with_pipe_wake_latency(Some(0))
+            .with_signal_state_copy(false);
+        writer.register_thread(tid, priority);
+        writer.insert_reprioritization(tid, at(100), 41, priority, 5, Some(offset));
+        let rows: PreemptionRecord = serde_json::from_str(&writer.into_string()).unwrap();
+        let error =
+            BoundaryRecording::new(rows.clone(), Schedule::new(vec![]).unwrap()).unwrap_err();
+        assert!(format!("{error:#}").contains("malformed"), "{error:#}");
+        let mut envelope: serde_json::Value = serde_json::from_str(&text).unwrap();
+        envelope["slice_boundary_recording"]["preemptions"] = serde_json::to_value(&rows).unwrap();
+        let error = Recording::decode(envelope.to_string().as_bytes()).unwrap_err();
+        assert!(format!("{error:#}").contains("malformed"), "{error:#}");
+        assert!(
+            !error
+                .chain()
+                .any(|cause| cause.is::<crate::preemptions::RecordFormatRefusal>()),
+            "{error:#}"
+        );
+        let boundary_writer = std::panic::catch_unwind(|| {
+            let mut writer = PreemptionWriter::new(None).with_slice_boundaries().unwrap();
+            writer.register_thread(tid, priority);
+            writer.insert_reprioritization(tid, at(100), 41, priority, 5, Some(offset));
+        });
+        assert!(boundary_writer.is_err());
+    }
+
+    /// A record marked incomplete states its format inside main's
+    /// `incomplete_preemption_record` envelope, as a legacy record and as a
+    /// slice-boundary recording's preemptions. The probe reads it there, so a
+    /// newer format is refused as such, typed, by `validate_format` and, for a
+    /// record that cannot be decoded, by the probe; a format this Hermit
+    /// reads decodes as before.
+    #[test]
+    fn a_marked_record_states_its_format_inside_its_envelope() {
+        let refused = |bytes: &[u8]| {
+            Recording::decode(bytes).err().is_some_and(|error| {
+                error
+                    .chain()
+                    .any(|cause| cause.is::<crate::preemptions::RecordFormatRefusal>())
+            })
+        };
+        let marked = |format: u32| {
+            serde_json::json!({"incomplete_preemption_record": {
+                "version": 1,
+                "replay_departed_at": 7,
+                "record": {"per_thread": {}, "global": [], "format_version": format},
+            }})
+        };
+        let legacy = marked(99).to_string();
+        assert_eq!(probe_format(legacy.as_bytes()).unwrap().format, Some(99));
+        assert!(refused(legacy.as_bytes()));
+        let boundary = serde_json::json!({"slice_boundary_recording": {
+            "preemptions": marked(99),
+            "schedule": [],
+        }})
+        .to_string();
+        assert_eq!(probe_format(boundary.as_bytes()).unwrap().format, Some(99));
+        assert!(refused(boundary.as_bytes()));
+        let newest = crate::preemptions::PREEMPTION_RECORD_FORMAT_MAX;
+        let mut undecodable = marked(99);
+        undecodable["incomplete_preemption_record"]["record"]["global"] = serde_json::json!(5);
+        assert!(refused(undecodable.to_string().as_bytes()));
+        undecodable["incomplete_preemption_record"]["record"]["format_version"] = newest.into();
+        assert!(Recording::decode(undecodable.to_string().as_bytes()).is_err());
+        assert!(!refused(undecodable.to_string().as_bytes()));
+        let current = marked(newest).to_string();
+        assert_eq!(
+            probe_format(current.as_bytes()).unwrap().format,
+            Some(newest)
+        );
+        let Recording::Legacy(record) = Recording::decode(current.as_bytes()).unwrap() else {
+            panic!("a marked legacy record decodes as one");
+        };
+        assert_eq!(record.replay_departed_at(), Some(7));
+    }
+
+    /// A slice-boundary recording states its format inside its envelope
+    /// alone: a `format_version` beside the envelope is the envelope
+    /// decoder's to refuse, not a format refusal, and a null or malformed
+    /// envelope reaches ordinary decoding. A legacy record states it at the
+    /// top level.
+    #[test]
+    fn an_envelope_states_its_format_only_inside_it() {
+        let refused = |bytes: &[u8]| {
+            Recording::decode(bytes).err().is_some_and(|error| {
+                error
+                    .chain()
+                    .any(|cause| cause.is::<crate::preemptions::RecordFormatRefusal>())
+            })
+        };
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&sample(false).encode().unwrap()).unwrap();
+        // Beside the envelope: read as none, refused by the envelope decoder.
+        let mut beside = envelope.clone();
+        beside["format_version"] = serde_json::json!(99);
+        let beside = beside.to_string();
+        assert_eq!(probe_format(beside.as_bytes()).unwrap().format, None);
+        let error = Recording::decode(beside.as_bytes()).unwrap_err();
+        assert!(!refused(beside.as_bytes()), "{error:#}");
+        // Inside it: refused by format.
+        let mut inside = envelope.clone();
+        inside["slice_boundary_recording"]["preemptions"]["format_version"] = serde_json::json!(99);
+        let inside = inside.to_string();
+        assert_eq!(probe_format(inside.as_bytes()).unwrap().format, Some(99));
+        assert!(refused(inside.as_bytes()));
+        // A null or malformed envelope: ordinary decoding reports it, never
+        // a format refusal (the probe reads none, or cannot read it at all).
+        for broken in [
+            serde_json::json!({"slice_boundary_recording": null, "format_version": 99}),
+            serde_json::json!({"slice_boundary_recording": 7, "format_version": 99}),
+            serde_json::json!({"slice_boundary_recording": {"preemptions": {"format_version": "x"}}}),
+        ] {
+            let broken = broken.to_string();
+            assert_eq!(
+                probe_format(broken.as_bytes()).map_or(None, |probed| probed.format),
+                None,
+                "{broken}"
+            );
+            assert!(Recording::decode(broken.as_bytes()).is_err(), "{broken}");
+            assert!(!refused(broken.as_bytes()), "{broken}");
+        }
+        // A duplicated `format_version` (top level or in the envelope's
+        // preemptions) or `preemptions`, in either order: an error of the
+        // strict decoders, never a format refusal.
+        let preemptions = |format: u32| {
+            format!(r#""preemptions":{{"per_thread":{{}},"global":[],"format_version":{format}}}"#)
+        };
+        let mut duplicated = Vec::new();
+        for (first, second) in [(99, 1), (1, 99)] {
+            let (a, b) = (
+                format!(r#""format_version":{first}"#),
+                format!(r#""format_version":{second}"#),
+            );
+            duplicated.push(format!(r#"{{"per_thread":{{}},"global":[],{a},{b}}}"#));
+            duplicated.push(format!(
+                r#"{{"slice_boundary_recording":{{"preemptions":{{"per_thread":{{}},"global":[],{a},{b}}},"schedule":[]}}}}"#
+            ));
+            duplicated.push(format!(
+                r#"{{"slice_boundary_recording":{{{},{},"schedule":[]}}}}"#,
+                preemptions(first),
+                preemptions(second)
+            ));
+        }
+        for record in duplicated {
+            assert!(probe_format(record.as_bytes()).is_err(), "{record}");
+            assert!(Recording::decode(record.as_bytes()).is_err(), "{record}");
+            assert!(!refused(record.as_bytes()), "{record}");
+        }
+        // A legacy record: the top level.
+        let legacy = serde_json::json!({"per_thread": {}, "global": [], "format_version": 99});
+        assert_eq!(
+            probe_format(legacy.to_string().as_bytes()).unwrap().format,
+            Some(99)
+        );
+        assert!(refused(legacy.to_string().as_bytes()));
+    }
     use detcore_model::schedule::boundary::Boundary;
     use detcore_model::schedule::boundary::Cause;
     use detcore_model::schedule::boundary::Entry;
@@ -293,12 +1445,14 @@ mod tests {
     use crate::types::LogicalTime;
     use crate::types::SchedEvent;
 
-    fn sample(markers: bool) -> Recording {
+    pub fn sample(markers: bool) -> Recording {
         let metadata: PreemptionRecord = serde_json::from_str(
             &PreemptionWriter::new(None)
                 .with_epoch("2001-02-03T04:05:06Z".parse().unwrap())
                 .with_pipe_wake_latency(Some(0))
                 .with_signal_state_copy(false)
+                .with_expired_wait_runs_charged_once(true)
+                .with_queued_sleeps_registered_at_first_pass(true)
                 .into_string(),
         )
         .unwrap();
@@ -334,6 +1488,297 @@ mod tests {
         Recording::Boundaries(
             BoundaryRecording::new(metadata, Schedule::new(records).unwrap()).unwrap(),
         )
+    }
+
+    #[test]
+    fn streaming_dispatch_preserves_the_original_value_and_typed_contracts() {
+        fn original(bytes: &[u8]) -> anyhow::Result<Recording> {
+            // The parent dispatch was the derived two-marker struct probe,
+            // followed by typed parsing and the format check. In particular,
+            // unknown values are skipped as IgnoredAny rather than first
+            // being materialized as serde_json::Value.
+            let recording =
+                if serde_json::from_slice::<FormatProbe>(bytes)?.slice_boundary_recording {
+                    let envelope: Envelope = serde_json::from_slice(bytes)?;
+                    Recording::Boundaries(envelope.slice_boundary_recording)
+                } else {
+                    let record: PreemptionRecord = serde_json::from_slice(bytes)?;
+                    record.validate_contents().map_err(anyhow::Error::msg)?;
+                    Recording::Legacy(record)
+                };
+            recording.metadata().validate_format().map_err(|refusal| {
+                anyhow::Error::new(crate::preemptions::RecordFormatRefusal(refusal))
+            })?;
+            Ok(recording)
+        }
+        let mut inputs: Vec<Vec<u8>> = [
+            r#"{"per_thread":{},"global":[]}"#,
+            r#"[{},[],null,null,null,false]"#,
+            r#"{"per_thread":{},"global":[],"extra":{"slice_boundary_recording":null}}"#,
+            r#"{"per_thread":{},"global":[],"extra":1,"extra":2}"#,
+            r#"{"per_thread":{},"global":[],"epoch":null,"epoch":null}"#,
+            r#"{"per_thread":{},"global":[],"slice_boundary_recording":null}"#,
+            r#"{"per_thread":{},"global":[],"slice_boundary_recording":null,"slice_boundary_recording":{}}"#,
+            r#"{"per_thread":{},"global":[],"extra":1e999}"#,
+            r#"{"per_thread":{},"global":[],"extra":"\ud800"}"#,
+            r#"{"per_thread":{},"global":[],"extra":{"$serde_json::private::RawValue":"null"}}"#,
+            r#"{"per_thread":{},"global":[],"extra":{"$serde_json::private::RawValue":"bad"}}"#,
+            r#"{"per_thread":{},"global":[],"extra":{"$serde_json::private::RawValue":7}}"#,
+            r#"{"$serde_json::private::RawValue":"null","per_thread":{},"global":[]}"#,
+            r#"{"per_thread":{},"global":[]} true"#,
+            r#"{"per_thread":{},"global":[]} trailing"#,
+            "null", "[]", "false", "3", "\"text\"", "",
+        ].into_iter().map(|text| text.as_bytes().to_vec()).collect();
+        inputs.push(
+            format!(
+                "{{\"per_thread\":{{}},\"global\":[],\"extra\":{}0{}}}",
+                "[".repeat(160),
+                "]".repeat(160)
+            )
+            .into_bytes(),
+        );
+        inputs.push(sample(false).encode().unwrap());
+        inputs.push(sample(true).encode().unwrap());
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("record.json");
+        for bytes in &inputs {
+            let expected = original(bytes);
+            std::fs::write(&path, bytes).unwrap();
+            for actual in [Recording::decode(bytes), Recording::read(&path)] {
+                match (&expected, &actual) {
+                    (Ok(expected), Ok(actual)) => assert_eq!(actual, expected),
+                    (Err(_), Err(_)) => {}
+                    (expected, actual) => {
+                        panic!("changed acceptance for {bytes:?}: {expected:?} / {actual:?}")
+                    }
+                }
+            }
+        }
+        assert!(Recording::decode(br#"[{},[],null,null,null,false]"#).is_err());
+        assert!(Recording::decode(br#"{"per_thread":{},"global":[],"extra":1e999}"#).is_ok());
+    }
+
+    #[test]
+    fn short_reads_full_eof_and_changed_passes_use_the_actual_reader() {
+        struct Short {
+            input: Cursor<Vec<u8>>,
+            maximum: usize,
+            largest_request: usize,
+        }
+        impl Read for Short {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                self.largest_request = self.largest_request.max(bytes.len());
+                let count = self.maximum.min(bytes.len());
+                self.input.read(&mut bytes[..count])
+            }
+        }
+        impl Seek for Short {
+            fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+                self.input.seek(position)
+            }
+        }
+        for recording in [Recording::Legacy(PreemptionRecord::default()), sample(true)] {
+            let mut bytes = recording.encode().unwrap();
+            bytes.extend_from_slice(b" \r\n\t");
+            for maximum in 1..=7 {
+                let mut input = Short {
+                    input: Cursor::new(bytes.clone()),
+                    maximum,
+                    largest_request: 0,
+                };
+                assert_eq!(Recording::read_from(&mut input).unwrap(), recording);
+                assert!(input.largest_request <= 8192);
+            }
+            assert!(Recording::decode(&bytes[..bytes.len() - 8]).is_err());
+        }
+        struct Changed {
+            input: Cursor<Vec<u8>>,
+            second: Vec<u8>,
+        }
+        impl Read for Changed {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                self.input.read(bytes)
+            }
+        }
+        impl Seek for Changed {
+            fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+                if matches!(position, SeekFrom::Start(0)) {
+                    self.input = Cursor::new(self.second.clone());
+                }
+                self.input.seek(position)
+            }
+        }
+        let first = b"{\"per_thread\":{},\"global\":[]} ".to_vec();
+        let mut input = Changed {
+            input: Cursor::new(first),
+            second: b"{\"per_thread\":{},\"global\":[]}\n".to_vec(),
+        };
+        assert!(
+            Recording::read_from(&mut input)
+                .unwrap_err()
+                .to_string()
+                .contains("changed between")
+        );
+    }
+
+    #[test]
+    fn nonseekable_path_and_independent_metadata_reads_remain_supported() {
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("history.fifo");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let bytes = Recording::Legacy(PreemptionRecord::default())
+            .encode()
+            .unwrap();
+        let writer_path = fifo.clone();
+        let writer = std::thread::spawn(move || std::fs::write(writer_path, bytes).unwrap());
+        assert_eq!(
+            Recording::read(&fifo).unwrap(),
+            Recording::Legacy(PreemptionRecord::default())
+        );
+        writer.join().unwrap();
+        // Metadata has always ignored unrelated legacy fields, even where the
+        // full Recording Value probe rejects their numeric representation.
+        let path = directory.path().join("settings.json");
+        std::fs::write(
+            &path,
+            br#"{"epoch":null,"extra":1e999,"pipe_wake_latency":"bad"}"#,
+        )
+        .unwrap();
+        assert_eq!(super::super::read_recorded_epoch(&path), Ok(None));
+        assert!(super::super::read_recorded_pipe_wake_latency(&path).is_err());
+        assert_eq!(
+            super::super::read_recorded_signal_state_copy(&path),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn inspection_counts_rows_and_keeps_legacy_boundary_capabilities_distinct() {
+        let legacy = Recording::Legacy(PreemptionRecord::default());
+        let summary = legacy.inspect().unwrap();
+        assert_eq!(summary.format, "legacy");
+        assert_eq!(summary.boundary_rows, None);
+        let summary = sample(true).inspect().unwrap();
+        assert_eq!(summary.format, "slice_boundaries");
+        assert_eq!(summary.stored_global_rows, 1);
+        assert_eq!(summary.event_rows, 0);
+        assert_eq!(summary.boundary_rows, Some(1));
+        assert_eq!(summary.pipe_wake_latency, Some(0));
+        assert_eq!(summary.signal_state_copy, Some(false));
+    }
+
+    #[test]
+    fn streamed_boundary_files_match_the_original_owned_envelope_bytes() {
+        #[derive(Serialize)]
+        struct OriginalEnvelope {
+            slice_boundary_recording: BoundaryWire,
+        }
+        let directory = tempfile::tempdir().unwrap();
+        for markers in [false, true] {
+            let recording = sample(markers);
+            let Recording::Boundaries(boundary) = &recording else {
+                unreachable!()
+            };
+            let mut expected = serde_json::to_vec(&OriginalEnvelope {
+                slice_boundary_recording: BoundaryWire {
+                    preemptions: boundary.preemptions.clone(),
+                    schedule: boundary.schedule.clone(),
+                },
+            })
+            .unwrap();
+            expected.push(b'\n');
+            let path = directory.path().join(format!("{markers}.json"));
+            recording.write(&path).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), expected);
+            assert_eq!(recording.encode().unwrap(), expected);
+        }
+    }
+
+    /// Main's admission of a record it can decode is unchanged: a newer
+    /// format, a stated 0 and an explicit 1 are refused with
+    /// `validate_format`'s message, byte for byte, and a newer record that
+    /// fails another check reports that check, as main does. The format probe
+    /// fires only when a record cannot be decoded: a newer one is then refused
+    /// by its format, and a current one keeps its decoding error. Applying the
+    /// probe before decoding fails this test: the empty list of time skips
+    /// and the zero-step offset would be reported as a format refusal.
+    #[test]
+    fn the_format_probe_fires_only_when_a_record_cannot_be_decoded() {
+        let newest = crate::preemptions::PREEMPTION_RECORD_FORMAT_MAX;
+        let refusal = |bytes: &[u8]| {
+            Recording::decode(bytes)
+                .unwrap_err()
+                .downcast_ref::<crate::preemptions::RecordFormatRefusal>()
+                .map(|refusal| refusal.0.clone())
+        };
+        for format in [newest + 1, 0, 1] {
+            let main = format!(
+                "record format Some({format}) with 0 time skips: this Hermit reads formats 1 to \
+                 {newest}, and time skips need format 2 or later"
+            );
+            let legacy =
+                serde_json::json!({"per_thread": {}, "global": [], "format_version": format});
+            assert_eq!(refusal(legacy.to_string().as_bytes()), Some(main.clone()));
+            let boundary = serde_json::json!({"slice_boundary_recording": {
+                "preemptions": legacy, "schedule": [],
+            }});
+            assert_eq!(refusal(boundary.to_string().as_bytes()), Some(main));
+        }
+        // Decodable, newer, and refused for another reason first: main's
+        // message for that reason, not a format refusal.
+        let empty_skips = serde_json::json!({
+            "per_thread": {}, "global": [], "format_version": newest + 1, "time_skips": [],
+        });
+        assert_eq!(
+            refusal(empty_skips.to_string().as_bytes()),
+            Some("an empty list of time skips is written as no list".to_owned())
+        );
+        let mut zero_steps = serde_json::to_value(PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(DetTid::from_raw(3), 20).with_instruction_offset(Some(
+                crate::resources::InstructionOffset {
+                    rcb_target: 18,
+                    instructions: 0,
+                },
+            )),
+        ]))
+        .unwrap();
+        zero_steps["format_version"] = (newest + 1).into();
+        let error = Recording::decode(zero_steps.to_string().as_bytes()).unwrap_err();
+        assert!(
+            !error.is::<crate::preemptions::RecordFormatRefusal>(),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").contains("zero steps"), "{error:#}");
+        // Undecodable: refused by its format when it states a newer one, with
+        // the same message `validate_format` gives a decodable record; a
+        // current one keeps its decoding error.
+        for (format, refused) in [(newest + 1, true), (newest, false)] {
+            let broken =
+                serde_json::json!({"per_thread": {}, "global": 5, "format_version": format});
+            assert!(
+                serde_json::from_slice::<PreemptionRecord>(broken.to_string().as_bytes()).is_err()
+            );
+            let boundary = serde_json::json!({"slice_boundary_recording": {
+                "preemptions": broken, "schedule": [],
+            }});
+            for bytes in [broken.to_string(), boundary.to_string()] {
+                let error = Recording::decode(bytes.as_bytes()).unwrap_err();
+                match error.downcast_ref::<crate::preemptions::RecordFormatRefusal>() {
+                    Some(refusal) => {
+                        assert!(refused, "{bytes}: {error:#}");
+                        assert_eq!(
+                            refusal.0,
+                            crate::preemptions::unread_format_message(Some(format), 0)
+                        );
+                    }
+                    None => assert!(!refused, "{bytes}: {error:#}"),
+                }
+            }
+        }
     }
 
     #[test]
@@ -376,12 +1821,50 @@ mod tests {
                 super::super::read_recorded_signal_state_copy(&output).unwrap(),
                 Some(false)
             );
+            assert_eq!(
+                super::super::read_recorded_expired_wait_runs_charged_once(&output),
+                Ok(true)
+            );
+            assert_eq!(
+                super::super::read_recorded_queued_sleeps_registered_at_first_pass(&output),
+                Ok(true)
+            );
             assert!(PreemptionReader::try_new(&output).is_err());
             assert!(
                 serde_json::from_slice::<PreemptionRecord>(&std::fs::read(output).unwrap())
                     .is_err()
             );
         }
+    }
+
+    /// The format is the presence of the top-level marker, null included,
+    /// read without building any value.
+    #[test]
+    fn the_format_is_the_presence_of_the_top_level_marker() {
+        let probe = |text: &str| FormatProbe::is_boundary_recording(text.as_bytes()).unwrap();
+        assert!(!probe(r#"{"per_thread": {}, "global": []}"#));
+        assert!(probe(r#"{"slice_boundary_recording": {"preemptions": 1}}"#));
+        assert!(probe(r#"{"slice_boundary_recording": null}"#));
+        assert!(!probe(
+            r#"{"per_thread": {"3": {"slice_boundary_recording": 1}}, "global": []}"#
+        ));
+        assert!(
+            FormatProbe::is_boundary_recording(
+                br#"{"slice_boundary_recording": null, "slice_boundary_recording": null}"#
+            )
+            .is_err()
+        );
+        assert!(FormatProbe::is_boundary_recording(b"{\"global\": [").is_err());
+        let identity_probe = |text: &str| FormatProbe::has_rcb_history(text.as_bytes()).unwrap();
+        assert!(!identity_probe(r#"{"per_thread": {}, "global": []}"#));
+        assert!(identity_probe(r#"{"rcb_history": {"format": 2}}"#));
+        assert!(identity_probe(r#"{"rcb_history": null}"#));
+        assert!(!identity_probe(
+            r#"{"per_thread": {"3": {"rcb_history": 1}}, "global": []}"#
+        ));
+        assert!(
+            FormatProbe::has_rcb_history(br#"{"rcb_history": null, "rcb_history": null}"#).is_err()
+        );
     }
 
     #[test]
@@ -406,6 +1889,31 @@ mod tests {
         assert!(super::super::read_recorded_epoch(&path).is_err());
         assert!(super::super::read_recorded_pipe_wake_latency(&path).is_err());
         assert!(super::super::read_recorded_signal_state_copy(&path).is_err());
+    }
+
+    /// A record of a format this Hermit refuses is refused as a policy
+    /// refusal (`RecordFormatRefusal`) in either envelope, while its settings
+    /// stay readable, so the replay itself refuses it with that exit status.
+    #[test]
+    fn a_refused_format_is_a_refusal_in_either_envelope() {
+        let refused = |value: &serde_json::Value| {
+            Recording::decode(&serde_json::to_vec(value).unwrap())
+                .unwrap_err()
+                .chain()
+                .any(|cause| cause.is::<super::super::RecordFormatRefusal>())
+        };
+        let mut boundary: serde_json::Value =
+            serde_json::from_slice(&sample(false).encode().unwrap()).unwrap();
+        boundary["slice_boundary_recording"]["preemptions"]["format_version"] =
+            serde_json::json!(99);
+        assert!(refused(&boundary));
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("refused.json");
+        std::fs::write(&path, serde_json::to_vec(&boundary).unwrap()).unwrap();
+        assert!(super::super::read_recorded_epoch(&path).unwrap().is_some());
+        let mut plain = serde_json::to_value(PreemptionRecord::default()).unwrap();
+        plain["format_version"] = serde_json::json!(99);
+        assert!(refused(&plain));
     }
 
     #[test]
@@ -436,19 +1944,106 @@ mod tests {
         assert_ne!(std::fs::read(&path).unwrap(), before);
     }
 
+    /// A boundary replay takes no background starts, so a boundary recording
+    /// that notes any is refused by name, by the constructor and by the reader
+    /// of a serialized one, beside a valid boundary schedule. A legacy record
+    /// keeps a start at either end of its events. The slice-boundary writer
+    /// states no format that claims the starts' list, keeps one this Hermit
+    /// does not read as stated, and refuses to start after noting a start.
+    #[test]
+    fn a_boundary_recording_with_background_starts_is_refused_by_name() {
+        use crate::preemptions::BACKGROUND_STARTS_FORMAT;
+        use crate::preemptions::BackgroundStart;
+        use crate::preemptions::PREEMPTION_RECORD_FORMAT_MAX;
+        use crate::preemptions::format_without_background_starts;
+        let Recording::Boundaries(valid) = sample(true) else {
+            unreachable!()
+        };
+        let start = BackgroundStart {
+            after: 0,
+            thread: DetTid::from_raw(3),
+            call: 1,
+        };
+        let mut metadata = valid.preemptions.clone();
+        metadata.format_version = Some(BACKGROUND_STARTS_FORMAT);
+        metadata.background_starts.push(start);
+        metadata.validate_contents().unwrap();
+        let error = BoundaryRecording::new(metadata, valid.schedule.clone()).unwrap_err();
+        assert!(
+            error.to_string().contains("notes background starts"),
+            "{error}"
+        );
+        let mut wire: serde_json::Value =
+            serde_json::from_slice(&sample(true).encode().unwrap()).unwrap();
+        let preemptions = &mut wire["slice_boundary_recording"]["preemptions"];
+        preemptions["format_version"] = BACKGROUND_STARTS_FORMAT.into();
+        preemptions["background_starts"] = serde_json::to_value(vec![start]).unwrap();
+        let error = Recording::decode(&serde_json::to_vec(&wire).unwrap()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("notes background starts"),
+            "{error:#}"
+        );
+        let events = vec![SchedEvent::branches(DetTid::from_raw(3), 1)];
+        for after in [0, 1] {
+            let mut legacy = PreemptionRecord::from_sched_events(events.clone())
+                .with_format(Some(BACKGROUND_STARTS_FORMAT));
+            legacy
+                .background_starts
+                .push(BackgroundStart { after, ..start });
+            let bytes = Recording::Legacy(legacy.clone()).encode().unwrap();
+            assert_eq!(
+                Recording::decode(&bytes).unwrap(),
+                Recording::Legacy(legacy)
+            );
+        }
+        let boundary_format = |writer: PreemptionWriter| writer.inner.format_version;
+        for format in [
+            BACKGROUND_STARTS_FORMAT,
+            PREEMPTION_RECORD_FORMAT_MAX + 1,
+            0,
+        ] {
+            let expected = format_without_background_starts(Some(format));
+            let before = PreemptionWriter::new(None)
+                .with_format(Some(format))
+                .with_slice_boundaries()
+                .unwrap();
+            assert_eq!(boundary_format(before), expected, "format {format}");
+            let after = PreemptionWriter::new(None)
+                .with_slice_boundaries()
+                .unwrap()
+                .with_format(Some(format));
+            assert_eq!(boundary_format(after), expected, "format {format}");
+        }
+        let noting = PreemptionWriter::new(None)
+            .with_slice_boundaries()
+            .unwrap()
+            .noting_background_starts();
+        assert_eq!(
+            boundary_format(noting),
+            format_without_background_starts(Some(PREEMPTION_RECORD_FORMAT_MAX))
+        );
+        let mut noted = PreemptionWriter::new(None).noting_background_starts();
+        noted.insert_background_start(DetTid::from_raw(3), 1);
+        assert!(noted.with_slice_boundaries().is_err());
+    }
+
     #[test]
     fn a_second_event_stream_is_not_accepted_as_metadata() {
-        let metadata =
-            PreemptionRecord::from_sched_events(vec![SchedEvent::branches(DetTid::from_raw(3), 1)]);
+        let metadata = PreemptionRecord::from_sched_events_with_identity(
+            vec![SchedEvent::branches(DetTid::from_raw(3), 1)],
+            None,
+        );
         assert!(BoundaryRecording::new(metadata, Schedule::new(vec![]).unwrap()).is_err());
     }
 
     #[test]
     fn legacy_bytes_and_editor_access_remain_legacy() {
-        let legacy =
-            PreemptionRecord::from_sched_events(vec![SchedEvent::branches(DetTid::from_raw(3), 2)])
-                .with_pipe_wake_latency(Some(7))
-                .with_signal_state_copy(Some(true));
+        let legacy = PreemptionRecord::from_sched_events_with_identity(
+            vec![SchedEvent::branches(DetTid::from_raw(3), 2)],
+            None,
+        )
+        .with_pipe_wake_latency(Some(7))
+        .with_signal_state_copy(Some(true));
         let mut expected = serde_json::to_vec(&legacy).unwrap();
         expected.push(b'\n');
         let record = Recording::Legacy(legacy.clone());
@@ -545,15 +2140,33 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"retained original");
     }
 
+    /// The default writer emits the legacy form, never the boundary envelope.
+    /// It also says that its run logged readmissions, none here
+    /// (`rejoins: []`), which a record built from events alone does not.
     #[test]
     fn writer_default_still_emits_exact_legacy_bytes() {
         let mut writer = PreemptionWriter::new(None);
         let event = SchedEvent::branches(DetTid::from_raw(3), 7);
         writer.insert_schedevent(event.clone());
-        assert_eq!(
-            writer.into_string(),
-            PreemptionRecord::from_sched_events(vec![event]).to_string()
-        );
+        let mut legacy = PreemptionRecord::from_sched_events_with_identity(vec![event], None);
+        legacy.rejoins = Some(Vec::new());
+        assert_eq!(writer.into_string(), legacy.to_string());
+    }
+
+    /// A slice-boundary recording stops at every timeslice end, so it marks
+    /// no event `stopless`: an event so marked is refused on read, as an
+    /// invalid event, whatever else it holds.
+    #[test]
+    fn a_stopless_mark_is_rejected_on_new_format_read() {
+        let event = SchedEvent::branches(DetTid::from_raw(3), 1).taken_without_stop();
+        assert!(Schedule::new(vec![Record::Event(event.clone())]).is_err());
+        let mut wire: serde_json::Value =
+            serde_json::from_slice(&sample(false).encode().unwrap()).unwrap();
+        let schedule = &mut wire["slice_boundary_recording"]["schedule"];
+        schedule["record_count"] = 1.into();
+        schedule["records"] = serde_json::json!([Record::Event(event)]);
+        let error = Recording::decode(&serde_json::to_vec(&wire).unwrap()).unwrap_err();
+        assert!(format!("{error:#}").contains("`stopless`"), "{error:#}");
     }
 
     #[test]
@@ -615,5 +2228,357 @@ mod explicit_mode_tests {
             };
             assert!(std::panic::catch_unwind(|| crate::GlobalState::for_tests(&cfg)).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::tests::sample;
+    use super::*;
+    use crate::types::DetTid;
+    use crate::types::SchedEvent;
+
+    fn known() -> HistoryIdentity {
+        HistoryIdentity::Known(reverie::pmu_config::RcbMetric::ConditionalBranchesRetiredUserV1)
+    }
+
+    /// The legacy reader of the base build: `PreemptionRecord`'s own serde
+    /// shape, and the boundary dispatch that falls back to it.
+    fn base_build_decode(bytes: &[u8]) -> anyhow::Result<()> {
+        let value: serde_json::Value = serde_json::from_slice(bytes)?;
+        if value.get("slice_boundary_recording").is_some() {
+            serde_json::from_slice::<Envelope>(bytes)?;
+        } else {
+            serde_json::from_slice::<PreemptionRecord>(bytes)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_identity_recording_round_trips_with_its_identity() {
+        for identity in [
+            known(),
+            HistoryIdentity::BackendLocal("test:local-rcb:v1".into()),
+            HistoryIdentity::Unqualified("claim-unset".into()),
+        ] {
+            assert_eq!(
+                history_identity_from_json(&history_identity_to_json(&identity)).unwrap(),
+                identity
+            );
+            let legacy = PreemptionRecord::from_sched_events_with_identity(
+                vec![SchedEvent::branches(DetTid::from_raw(3), 7)],
+                Some(identity.clone()),
+            )
+            .with_pipe_wake_latency(Some(0));
+            let encoded = legacy.to_string();
+            assert!(
+                encoded.starts_with("{\"rcb_history\":{\"format\":2,"),
+                "{encoded}"
+            );
+            let decoded = Recording::decode(encoded.as_bytes()).unwrap();
+            assert_eq!(decoded.identity(), Some(&identity));
+            assert_eq!(decoded, Recording::Legacy(legacy.clone()));
+            assert_eq!(
+                decoded.encode().unwrap(),
+                format!("{encoded}\n").into_bytes()
+            );
+
+            let Recording::Boundaries(mut boundaries) = sample(true) else {
+                unreachable!()
+            };
+            boundaries.preemptions.identity = Some(identity.clone());
+            let boundaries = Recording::Boundaries(boundaries);
+            let bytes = boundaries.encode().unwrap();
+            let again = Recording::decode(&bytes).unwrap();
+            assert_eq!(again.identity(), Some(&identity));
+            assert_eq!(again, boundaries);
+            assert!(again.require_strict_mode(true).is_ok());
+        }
+    }
+
+    /// The streamed disk writers state the identity too: a record alone
+    /// and a boundary writer written to disk (or serialized to a string)
+    /// decode stating the identity, never as a legacy file whose
+    /// producer is unknown.
+    #[test]
+    fn disk_writers_state_the_identity_they_write() {
+        use crate::preemptions::PreemptionWriter;
+
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("legacy.json");
+        PreemptionRecord::from_sched_events_with_identity(
+            vec![SchedEvent::branches(DetTid::from_raw(3), 7)],
+            Some(known()),
+        )
+        .write_to_disk(&legacy_path)
+        .unwrap();
+        assert_eq!(
+            Recording::read(&legacy_path).unwrap().identity(),
+            Some(&known())
+        );
+
+        let boundary_path = dir.path().join("boundary.json");
+        let mut writer = PreemptionWriter::new(Some(boundary_path.clone()))
+            .with_slice_boundaries()
+            .unwrap()
+            .with_identity(known());
+        writer.register_thread(
+            DetTid::from_raw(3),
+            crate::scheduler::runqueue::DEFAULT_PRIORITY,
+        );
+        writer.flush().unwrap();
+        let written = Recording::read(&boundary_path).unwrap();
+        assert_eq!(written.identity(), Some(&known()));
+        assert!(written.require_strict_mode(true).is_ok());
+
+        let text = PreemptionWriter::new(None)
+            .with_slice_boundaries()
+            .unwrap()
+            .with_identity(known())
+            .into_string();
+        assert_eq!(
+            Recording::decode(text.as_bytes()).unwrap().identity(),
+            Some(&known())
+        );
+    }
+
+    #[test]
+    fn the_base_builds_reader_refuses_every_identity_recording() {
+        let empty = PreemptionRecord::from_sched_events_with_identity(vec![], Some(known()));
+        let Recording::Boundaries(mut boundaries) = sample(false) else {
+            unreachable!()
+        };
+        boundaries.preemptions.identity = Some(known());
+        for bytes in [
+            empty.to_string().into_bytes(),
+            Recording::Boundaries(boundaries).encode().unwrap(),
+        ] {
+            assert!(
+                base_build_decode(&bytes).is_err(),
+                "{}",
+                String::from_utf8_lossy(&bytes)
+            );
+            assert!(Recording::decode(&bytes).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_legacy_file_states_no_identity() {
+        for recording in [
+            Recording::Legacy(PreemptionRecord::from_sched_events_with_identity(
+                vec![],
+                None,
+            )),
+            sample(true),
+        ] {
+            let decoded = Recording::decode(&recording.encode().unwrap()).unwrap();
+            assert_eq!(decoded.identity(), None);
+        }
+    }
+
+    #[test]
+    fn a_malformed_identity_recording_never_falls_back_to_legacy() {
+        let good: serde_json::Value = serde_json::from_str(
+            &PreemptionRecord::from_sched_events_with_identity(vec![], Some(known())).to_string(),
+        )
+        .unwrap();
+        let mutate = |f: &dyn Fn(&mut serde_json::Value)| {
+            let mut value = good.clone();
+            f(&mut value);
+            serde_json::to_vec(&value).unwrap()
+        };
+        // A well-formed envelope this build cannot execute -- a newer
+        // format, an identity it does not know, or a nested envelope -- is
+        // a typed format refusal (the policy exit), not a parse error.
+        for (bytes, cause, settings_readable) in [
+            (
+                mutate(&|v| v["rcb_history"]["format"] = 3.into()),
+                "unsupported rcb_history format 3",
+                true,
+            ),
+            (
+                mutate(&|v| v["rcb_history"]["identity"] = "rcb:cond-retired:user:v2".into()),
+                "unknown RCB coordinate identity",
+                true,
+            ),
+            (
+                mutate(&|v| {
+                    let inner = v["rcb_history"].clone();
+                    v["rcb_history"]["recording"] = serde_json::json!({ "rcb_history": inner });
+                }),
+                "nested rcb_history envelope",
+                false,
+            ),
+        ] {
+            // Settings stay readable for an unsupported format or identity,
+            // so a replay reaches its own identity admission and refuses
+            // there by name rather than failing as an opaque settings parse
+            // error first.
+            if settings_readable {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("unsupported.json");
+                std::fs::write(&path, &bytes).unwrap();
+                assert!(super::super::read_recorded_epoch(&path).is_ok());
+            }
+            let error = Recording::decode(&bytes).unwrap_err();
+            assert!(
+                error.is::<crate::preemptions::RecordFormatRefusal>(),
+                "{error:#}"
+            );
+            assert!(format!("{error:#}").contains(cause), "{error:#}");
+        }
+        for bytes in [
+            mutate(&|v| v["rcb_history"]["identity"] = serde_json::json!({"unqualified": 1})),
+            mutate(&|v| v["rcb_history"]["extra"] = 1.into()),
+            mutate(&|v| v["per_thread"] = serde_json::json!({})),
+            mutate(&|v| v["rcb_history"]["recording"] = serde_json::json!({"global": []})),
+        ] {
+            assert!(
+                Recording::decode(&bytes).is_err(),
+                "{}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+        let text =
+            PreemptionRecord::from_sched_events_with_identity(vec![], Some(known())).to_string();
+        let duplicated = text.replacen("\"format\":2,", "\"format\":2,\"format\":2,", 1);
+        assert_ne!(duplicated, text);
+        assert!(Recording::decode(duplicated.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn transformations_keep_the_identity() {
+        let record = PreemptionRecord::from_sched_events_with_identity(
+            vec![SchedEvent::branches(DetTid::from_raw(3), 7)],
+            Some(known()),
+        );
+        assert_eq!(record.clone_preemptions_only().identity(), Some(&known()));
+        assert_eq!(record.normalize().identity(), Some(&known()));
+        assert_eq!(
+            record.with_latest_preempt_removed().identity(),
+            Some(&known())
+        );
+        let mut recording = Recording::Legacy(record);
+        recording.strip_times();
+        let reread = Recording::decode(&recording.encode().unwrap()).unwrap();
+        assert_eq!(reread.identity(), Some(&known()));
+        assert_eq!(reread, recording);
+    }
+
+    /// A record with two priority rows of tid 7, the second ended by a write
+    /// prehook checkpoint at the retained SPR record's coordinates, and
+    /// RCB-bearing events, as a writer emits it with or without `identity`.
+    fn with_rows_and_checkpoint(identity: Option<HistoryIdentity>) -> PreemptionRecord {
+        use detcore_model::schedule::Op;
+        use reverie::syscalls::Sysno;
+
+        use crate::DEFAULT_PRIORITY;
+        use crate::preemptions::PreemptionWriter;
+        use crate::preemptions::callback_history::Origin;
+        use crate::preemptions::callback_history::Site;
+        use crate::slice_boundary::callbacks::Callback;
+        use crate::types::LogicalTime;
+
+        let tid = DetTid::from_raw(7);
+        let mut writer = PreemptionWriter::new(None);
+        if let Some(identity) = identity {
+            writer = writer.with_identity(identity);
+        }
+        writer.register_thread(tid, DEFAULT_PRIORITY);
+        writer.insert_schedevent(SchedEvent::branches(tid, 2_459_579));
+        let first = LogicalTime::from_nanos(1_792_852_217_000_000_000);
+        writer.insert_reprioritization(
+            tid,
+            first,
+            2_459_579,
+            DEFAULT_PRIORITY,
+            DEFAULT_PRIORITY,
+            None,
+        );
+        writer.insert_schedevent(SchedEvent::branches(tid, 8_299_750));
+        // Progress counts events, so the write prehook's endpoint is 154
+        // past the raw RCB count.
+        writer.insert_schedevent(SchedEvent {
+            op: Op::OtherInstructions,
+            count: 154,
+            ..SchedEvent::branches(tid, 0)
+        });
+        let second = LogicalTime::from_nanos(1_792_852_217_684_087_955);
+        writer.insert_reprioritization(
+            tid,
+            second,
+            10_759_329,
+            DEFAULT_PRIORITY,
+            DEFAULT_PRIORITY,
+            None,
+        );
+        writer.insert_callback_checkpoint(
+            tid,
+            Origin {
+                callback: Callback::Syscall(Sysno::write),
+                site: Site::Prehook,
+                progress: 10_759_483,
+                last_op: Some(Op::OtherInstructions),
+                time: second,
+                rcbs: 10_759_329,
+            },
+        );
+        Recording::decode(writer.into_string().as_bytes())
+            .unwrap()
+            .into_legacy("test")
+            .unwrap()
+    }
+
+    /// Every transformation carries the identity and otherwise produces
+    /// exactly what it produces from the same record without one: every
+    /// per-thread row, callback checkpoint, event and RCB is unchanged.
+    #[test]
+    fn transformations_change_nothing_but_carry_the_identity() {
+        let with = with_rows_and_checkpoint(Some(known()));
+        let without = with_rows_and_checkpoint(None);
+        let tid = DetTid::from_raw(7);
+        assert_eq!(with.per_thread[&tid].prio_changes.len(), 2);
+        assert_eq!(with.callback_checkpoints[&tid].len(), 1);
+        assert_eq!(with.global.len(), 3);
+        assert_eq!(with.identity(), Some(&known()));
+        assert_eq!(with.clone().with_identity(None), without);
+        type Transformation = fn(&PreemptionRecord) -> PreemptionRecord;
+        let transformations: [(&str, Transformation); 3] = [
+            (
+                "clone_preemptions_only",
+                PreemptionRecord::clone_preemptions_only,
+            ),
+            ("normalize", PreemptionRecord::normalize),
+            (
+                "with_latest_preempt_removed",
+                PreemptionRecord::with_latest_preempt_removed,
+            ),
+        ];
+        for (name, transform) in transformations {
+            let carried = transform(&with);
+            assert_eq!(carried.identity(), Some(&known()), "{name}");
+            assert_eq!(carried.with_identity(None), transform(&without), "{name}");
+        }
+        let reloaded = |record: &PreemptionRecord| {
+            let mut recording = Recording::Legacy(record.clone());
+            recording.strip_times();
+            Recording::decode(&recording.encode().unwrap()).unwrap()
+        };
+        let carried = reloaded(&with);
+        assert_eq!(carried.identity(), Some(&known()));
+        assert_eq!(carried.with_identity(None), reloaded(&without));
+        let Recording::Boundaries(sampled) = sample(true) else {
+            panic!("not a boundary recording")
+        };
+        let wrapped = |record: &PreemptionRecord| {
+            let recording = Recording::Boundaries(
+                BoundaryRecording::new(record.clone_preemptions_only(), sampled.schedule().clone())
+                    .unwrap(),
+            );
+            Recording::decode(&recording.encode().unwrap()).unwrap()
+        };
+        let carried = wrapped(&with);
+        assert_eq!(carried.identity(), Some(&known()));
+        assert_eq!(carried.with_identity(None), wrapped(&without));
     }
 }

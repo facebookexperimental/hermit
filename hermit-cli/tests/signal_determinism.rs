@@ -304,173 +304,6 @@ fn sigsuspend_invalid_arguments_preserve_linux_error_order() {
     );
 }
 
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_sigsuspend_invalid_pointer_does_not_fault_in_the_tool() {
-    run_signal_scenario_on_backend(
-        Some("dbt"),
-        "sigsuspend-invalid-arguments",
-        "rt_sigsuspend invalid size=EINVAL invalid pointer=EFAULT\n",
-        1,
-    );
-}
-
-/// On DBT, a guest's SIGKILL of another process ends every thread of that
-/// process, as Linux does: the parent's waitpid reports the child killed by
-/// SIGKILL, with one thread and with a second thread paused, whether the kill
-/// is sent with kill(2) or with tgkill(2) to the child's main thread. Before,
-/// a kill(2) to a two-threaded process was refused (Detcore does not choose a
-/// process signal's recipient thread), the kill notice retired only the
-/// thread it named, and a tgkill(2) SIGKILL retired nothing
-/// (https://github.com/rrnewton/hermit/issues/4362).
-///
-/// The sender's kill also returns only once the victim is gone, as ptrace's
-/// SIGKILL fence makes it: the parent's SIGCHLD handler has run and the pipe
-/// the child held is at EOF before the parent's next instruction, so each
-/// count is 0 in every run. Before the fence these counts varied from run to
-/// run (Claude review of https://github.com/rrnewton/hermit/pull/4400, F1).
-/// The same holds for a pidfd SIGKILL to a process whose leader thread has
-/// exited, which stopped with a false deadlock and then a named refusal: the
-/// kill notice now finds the victim through a surviving thread. A pidfd
-/// SIGKILL to a zombie leaves the parent its child's own exit status
-/// (https://github.com/rrnewton/hermit/issues/4411).
-/// These are plain runs: `--verify` of a run whose child is SIGKILLed fails
-/// DBT's evidence check, which requires a FINAL frame that a killed process
-/// cannot write (https://github.com/rrnewton/hermit/issues/4396).
-#[cfg(feature = "dbt")]
-mod dbt_sigkill_ends_every_thread_of_the_target {
-    use super::*;
-
-    // Each scenario retains all five runs and its exact output comparison,
-    // while the per-test CPU limit applies to one scenario at a time.
-    fn run_scenario(index: usize) {
-        let (scenario, expected) = SIGKILL_SCENARIOS[index];
-        run_signal_scenario_on_backend(Some("dbt"), scenario, expected, DETERMINISM_RUNS);
-    }
-
-    #[test]
-    fn kill_single_thread() {
-        run_scenario(0);
-    }
-
-    #[test]
-    fn kill_multiple_threads() {
-        run_scenario(1);
-    }
-
-    #[test]
-    fn tgkill_single_thread() {
-        run_scenario(2);
-    }
-
-    #[test]
-    fn tgkill_multiple_threads() {
-        run_scenario(3);
-    }
-
-    #[test]
-    fn kill_sigchld_fence() {
-        run_scenario(4);
-    }
-
-    #[test]
-    fn kill_threaded_sigchld_fence() {
-        run_scenario(5);
-    }
-
-    #[test]
-    fn kill_pipe_eof_fence() {
-        run_scenario(6);
-    }
-
-    #[test]
-    fn kill_threaded_pipe_eof_fence() {
-        run_scenario(7);
-    }
-
-    #[test]
-    fn pidfd_after_leader_exit() {
-        run_scenario(8);
-    }
-
-    #[test]
-    fn pidfd_zombie() {
-        run_scenario(9);
-    }
-}
-
-/// On DBT, a tgkill SIGKILL that names a child's leader after that thread has
-/// exited, while a sibling runs on, does not end the group on Linux: the
-/// child is still alive. Hermit cannot find the victim's host process from
-/// that thread, and a thread-directed kill gets no fallback through a
-/// sibling, so the run is refused by name before the sender is answered,
-/// never ended as if the group had been killed (Claude review of
-/// https://github.com/rrnewton/hermit/pull/4439, R1). The same holds for a
-/// pidfd SIGKILL with PIDFD_SIGNAL_THREAD, which also names one thread
-/// (Claude re-check of 4439, N1), and for tkill and rt_tgsigqueueinfo (N4).
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_refuses_a_thread_directed_sigkill_to_an_exited_thread() {
-    let _guard = hermit_signal_lock();
-    for (mode, seed) in [
-        ("sigkill-tgkill-exited-leader", None),
-        ("sigkill-tgkill-exited-leader", Some(1)),
-        ("sigkill-tgkill-exited-leader", Some(2)),
-        ("sigkill-tgkill-exited-leader", Some(3)),
-        ("sigkill-pidfd-thread-exited-leader", None),
-        ("sigkill-pidfd-thread-exited-leader", Some(1)),
-        ("sigkill-tkill-exited-leader", None),
-        ("sigkill-tkill-exited-leader", Some(1)),
-        ("sigkill-tgsigqueue-exited-leader", None),
-        ("sigkill-tgsigqueue-exited-leader", Some(1)),
-    ] {
-        let mut command = Command::new(hermit_test::hermit_binary());
-        command.args([
-            "--backend=dbt",
-            "run",
-            "--strict",
-            "--base-env=minimal",
-            "--no-virtualize-cpuid",
-        ]);
-        match seed {
-            Some(seed) => command.args(["--chaos", &format!("--sched-seed={seed}")]),
-            None => command.arg("--max-timeslice=disabled"),
-        };
-        command.arg("--");
-        command.arg(signal_guest()).arg(mode);
-        let label = format!("DBT {mode}, chaos seed {seed:?}");
-        // This is policy margin over censored five-second failures under load,
-        // not a measured completion bound or a fix for the unresolved stall.
-        // Other deadlock probes keep five seconds; per-test CPU/wall caps stay.
-        let (output, timed_out, elapsed) =
-            bounded_command_output(command, &label, Duration::from_secs(8));
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            !timed_out,
-            "{label} hit the host bound after {elapsed:?}\n{stderr}"
-        );
-        assert_eq!(
-            output.status.code(),
-            Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
-            "{label} was not refused\nstdout:\n{}\nstderr:\n{stderr}",
-            String::from_utf8_lossy(&output.stdout),
-        );
-        for expected in [
-            "cannot be held until it is gone",
-            "a SIGKILL to that thread alone does not end its group",
-        ] {
-            assert!(
-                stderr.contains(expected),
-                "{label} missing {expected:?}:\n{stderr}"
-            );
-        }
-        assert!(
-            !stderr.contains("HERMIT_DEADLOCK"),
-            "{label} reached the kill notice's false deadlock:\n{stderr}"
-        );
-    }
-}
-
 /// The ptrace control for `dbt_sigkill_ends_every_thread_of_the_target`.
 #[test]
 fn ptrace_sigkill_ends_every_thread_of_the_target() {
@@ -568,7 +401,7 @@ fn sigsuspend_without_signal_reports_terminal_deadlock() {
         );
         assert_eq!(
             output.status.code(),
-            Some(HERMIT_INTERNAL_FAILURE_EXIT),
+            Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
             "{label} did not exit with the scheduler deadlock status in {elapsed:?}\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
@@ -582,6 +415,7 @@ fn sigsuspend_without_signal_reports_terminal_deadlock() {
             "Deadlock detected: thread(s) waiting in rt_sigsuspend with no possible signal, but no runnable threads left.",
             "external IO blockers: none",
             "rt_sigsuspend blockers (1), by dettid:",
+            detcore_model::HERMIT_MODEL_DEADLOCK_LINE,
         ] {
             assert!(
                 stderr.contains(expected),

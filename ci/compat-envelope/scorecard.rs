@@ -42,6 +42,7 @@ use fs2::FileExt;
 use hermit_manifest_plan::canonical_verdict;
 use hermit_manifest_plan::ledger::HistoryRow;
 use hermit_manifest_plan::parity::LedgerVerdict;
+use hermit_manifest_plan::parity::PARITY_CELLS_DIR;
 use hermit_manifest_plan::parity::PARITY_CELLS_PATH;
 use hermit_manifest_plan::parity::ParityBackend;
 use hermit_manifest_plan::parity::ParityLedgerRow;
@@ -58,11 +59,12 @@ use hermit_manifest_plan::runner::ExpectedGuestExit;
 use hermit_manifest_plan::runner::ExpectedOutputFailureReason;
 use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::ObservedResult;
+use hermit_manifest_plan::runner::invocation_admits_declared_guest_exit;
 use hermit_manifest_plan::runner::parse_expected_output_failure_reason;
 use hermit_manifest_plan::runner::records_stripped_comparator;
 use hermit_manifest_plan::runner::require_stripped_comparison;
 use hermit_manifest_plan::runner::terminal_diagnostic_reason;
-use hermit_manifest_plan::runner::validate_expected_guest_exit;
+use hermit_manifest_plan::runner::validate_result_expected_guest_exit;
 use hermit_manifest_plan::stress_series::HostCapability;
 use hermit_manifest_plan::stress_series::HostCapabilityVerdict;
 use hermit_manifest_plan::stress_series::SeriesAttemptDisposition;
@@ -88,6 +90,7 @@ use tempfile::NamedTempFile;
 
 const SCORECARD: &str = "SCORECARD.md";
 const CELLS: &str = "ci/compat-envelope/cells.json";
+const KNOWN_GAPS: &str = "ci/compat-envelope/known-gaps.json";
 const EXPECTED_PLAN: &str = "ci/expected-e2e-plan.json";
 const SCHEMA: u64 = 8;
 const CATALOGUE_SCHEMA: u64 = 9;
@@ -102,7 +105,7 @@ const TEST_LEDGER_REPOSITORY: &str = "https://github.com/rrnewton/hermit_test_le
 /// and the compatibility website read. See
 /// <https://github.com/rrnewton/hermit/issues/3301>. Version 2 adds each
 /// row's source tree state, and only a run from a clean source tree can be a
-/// headline (<https://github.com/rrnewton/dev-hermit/issues/463>). Version 3
+/// headline (part of <https://github.com/rrnewton/hermit/issues/3301>). Version 3
 /// floors dbt's cells like every other backend's, now that dbt is compared;
 /// the website still reads version 2, whose dbt cells are in no floor.
 /// Version 4 drops the rows a `parity.retraction` withdraws and counts them
@@ -198,6 +201,14 @@ Commands:
       supplied no rows: reading nothing is what an unpopulated series looks
       like, not a finding that a cell has no evidence. An unreachable root is
       refused outright rather than read as empty.
+  project-observations-snapshot --snapshot FILE --snapshot-sha256 HEX \
+      --refreshed-at STAMP
+      The same projection as project-observations, reading one immutable
+      scorecard-series-snapshot/v1 file instead of a series worktree. The
+      ledger publisher uses it once retention has moved original series files
+      to its archive: the snapshot then carries the authenticated rows while
+      its source commit and tree stay the real published ones. The file must
+      match the digest and name the hermit_test_ledger repository.
   project-and-observe-results --snapshot FILE --snapshot-sha256 HEX \
       --results DIR --expected-head SHA --refreshed-at STAMP
       In one locked transaction, project one immutable canonical series
@@ -563,9 +574,10 @@ fn default_measurement() -> MeasurementState {
 
 /// The part of a cell's evidence that outlives its capped observations.
 ///
-/// The document keeps only each provenance's LATEST observation (cap 1,
-/// <https://github.com/rrnewton/dev-hermit/issues/563>); the full history lives
-/// in the series and the validation history. Before older observations are
+/// The document keeps only each provenance's LATEST observation (cap 1: the
+/// document holds each cell's latest state; d4a43db3c31 measured 1.56 GB ->
+/// 40.7 MB on that day's ledger); the full history lives in the series and
+/// the validation history. Before older observations are
 /// dropped, what they said is folded in here, so [`derive_measurement`] keeps
 /// its meaning: a cell that ever diverged still reads `diverged`.
 ///
@@ -651,8 +663,8 @@ impl CellAggregate {
 }
 
 /// Keep each cell's latest observation per provenance and comparison domain,
-/// and fold the rest into its [`CellAggregate`] (cap 1,
-/// <https://github.com/rrnewton/dev-hermit/issues/563>).
+/// and fold the rest into its [`CellAggregate`] (cap 1: the document holds each
+/// cell's latest state, and the full history lives in the series).
 ///
 /// The two domains are an observation that carries canonical comparisons and
 /// one that carries none (a below-L2 stripped pass, or a projected series
@@ -880,8 +892,9 @@ impl ObservationProvenance {
 /// `measured-and-passed`, while `measurement_state` requires every row to be
 /// `passed` (series.py:730) and otherwise says `measured-no-verdict`. Until
 /// series.py changes, do not treat its state as a second copy of this one.
-/// Aligning the two definitions is tracked in
-/// <https://github.com/rrnewton/dev-hermit/issues/469>.
+/// The two definitions disagree for a cell with a pass beside a parity
+/// failure; aligning them is undecided, with two options: count a parity
+/// failure as a divergence here too, or stop counting it in series.py.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum MeasurementState {
@@ -2276,7 +2289,7 @@ impl ResultRow {
         // the identity: removing or changing it cannot keep the accepted row's
         // hash. Undeclared rows keep their historical identity.
         if let Some(declared) = &self.expected_guest_exit {
-            validate_expected_guest_exit("result row", &self.mode, Some(declared))?;
+            validate_result_expected_guest_exit("result row", &self.mode, Some(declared))?;
             evidence["expected_guest_exit"] = serde_json::json!({
                 "code": declared.code,
                 "reason": declared.reason,
@@ -2497,7 +2510,8 @@ impl ResultRow {
     ///
     /// `check_expected_stdout` and `check_expected_stdout_contains` in
     /// ci/manifest-plan/src/runner.rs fail a matched verify attempt whose two
-    /// runs agree on other bytes than the cell declares, and record why only
+    /// runs agree on other bytes than the cell declares (a replay cell
+    /// inherits the declaration), and record why only
     /// in the attempt's reason. `Ok(None)`: the reason is not one of those
     /// texts. `Ok(Some)`: it is, and the attempt's evidence bears it out, so
     /// the attempt is that red and the record says what it failed. `Err`: the
@@ -2528,9 +2542,12 @@ impl ResultRow {
                 index + 1
             )
         };
-        if self.mode != "verify" {
+        // A replay cell inherits its verify recipe's declarations
+        // (runner::expectation_recipe), so it declares expected stdout
+        // exactly as verify does.
+        if !matches!(self.mode.as_str(), "verify" | "replay") {
             return Err(contradiction(&format!(
-                "only a verify cell declares expected stdout, and this is a {} cell",
+                "only a verify or replay cell declares expected stdout, and this is a {} cell",
                 self.mode
             )));
         }
@@ -3412,11 +3429,13 @@ impl ResultRow {
                 ) => true,
                 Some(ObservedResult::Timeout) => timed_out,
                 Some(ObservedResult::Oom) => !retained_crash,
+                // A chaos-floor failure's attempts all passed and matched.
                 Some(
                     ObservedResult::Pass
                     | ObservedResult::DeterminismFailure
                     | ObservedResult::ParityFailure
-                    | ObservedResult::ReplayFailure,
+                    | ObservedResult::ReplayFailure
+                    | ObservedResult::ChaosFloorFailure,
                 ) => false,
             };
             if !consistent {
@@ -3495,6 +3514,8 @@ struct Derived {
     /// Selected verify cells that declare the stripped comparator: below L2,
     /// counted as selected but never as canonical.
     stripped_selected: BTreeSet<CellId>,
+    /// The validation nodes held to a known-gap ledger, reported outside every count.
+    known_gaps: Vec<KnownGapNode>,
 }
 
 /// The cells a retained import reads: the applicable ones. Disabled
@@ -3708,6 +3729,53 @@ where
     Ok((summaries, retained))
 }
 
+#[derive(Debug)]
+struct ProjectObservationsSnapshotArgs {
+    snapshot: PathBuf,
+    snapshot_sha256: String,
+    refreshed_at: String,
+}
+
+fn parse_project_observations_snapshot_args<I>(
+    mut args: I,
+) -> Result<ProjectObservationsSnapshotArgs, String>
+where
+    I: Iterator<Item = String>,
+{
+    let mut snapshot = None;
+    let mut snapshot_sha256 = None;
+    let mut refreshed_at = None;
+    while let Some(arg) = args.next() {
+        let slot = match arg.as_str() {
+            "--snapshot" => &mut snapshot,
+            "--snapshot-sha256" => &mut snapshot_sha256,
+            "--refreshed-at" => &mut refreshed_at,
+            _ => {
+                return Err(format!(
+                    "unknown project-observations-snapshot option `{arg}`\n\n{USAGE}"
+                ));
+            }
+        };
+        if slot.is_some() {
+            return Err(format!(
+                "project-observations-snapshot accepts {arg} only once"
+            ));
+        }
+        *slot = Some(
+            args.next()
+                .ok_or_else(|| format!("project-observations-snapshot {arg} requires a value"))?,
+        );
+    }
+    let required = |value: Option<String>, option: &str| {
+        value.ok_or_else(|| format!("project-observations-snapshot requires {option}\n\n{USAGE}"))
+    };
+    Ok(ProjectObservationsSnapshotArgs {
+        snapshot: PathBuf::from(required(snapshot, "--snapshot FILE")?),
+        snapshot_sha256: required(snapshot_sha256, "--snapshot-sha256 HEX")?,
+        refreshed_at: required(refreshed_at, "--refreshed-at STAMP")?,
+    })
+}
+
 fn set_project_and_observe_arg(
     slot: &mut Option<String>,
     option: &str,
@@ -3830,6 +3898,7 @@ fn run() -> Result<(), String> {
             | "import-results"
             | "update-observations"
             | "project-observations"
+            | "project-observations-snapshot"
             | "project-and-observe-results"
             | "export-legacy"
     ) && env::var_os("DEV_HERMIT_TEST_LEDGER_PUBLISH_LOCK_FD").is_none()
@@ -3931,6 +4000,15 @@ fn run() -> Result<(), String> {
                 // produce the same file. A refresh timestamp the tool invents is
                 // a diff on every run that says nothing changed.
                 &refreshed_at.ok_or("project-observations requires --refreshed-at STAMP")?,
+            )?;
+        }
+        "project-observations-snapshot" => {
+            let options = parse_project_observations_snapshot_args(args)?;
+            project_observations_snapshot(
+                &root,
+                &options.snapshot,
+                &options.snapshot_sha256,
+                &options.refreshed_at,
             )?;
         }
         "project-and-observe-results" => {
@@ -4801,7 +4879,203 @@ fn derive(root: &Path) -> Result<Derived, String> {
         green,
         selected_custom,
         stripped_selected,
+        known_gaps: known_gap_nodes(root)?,
     })
+}
+
+/// One validation node held to a known-gap ledger (ci/manifest-plan/src/known_gaps.rs), as the
+/// scorecard reports it: outside every count, each gap a failing test.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct KnownGapNode {
+    node: String,
+    backend: String,
+    ledger: String,
+    required_tests: u64,
+    rows: Vec<hermit_manifest_plan::known_gaps::Row>,
+}
+
+/// Every declared known-gap ledger, read from `root`.
+fn known_gap_nodes(root: &Path) -> Result<Vec<KnownGapNode>, String> {
+    use hermit_manifest_plan::known_gaps;
+    known_gaps::DECLARATIONS
+        .iter()
+        .map(|declaration| {
+            let text = fs::read_to_string(root.join(declaration.ledger))
+                .map_err(|e| format!("cannot read known-gap ledger {}: {e}", declaration.ledger))?;
+            let rows = known_gaps::parse(&text)
+                .map_err(|e| format!("known-gap ledger {}: {e}", declaration.ledger))?;
+            // Required tests are derived, never pinned: the suite's listed
+            // population (from its source) less its ledger rows, exactly as
+            // known_gaps::required defines it.
+            let source = fs::read_to_string(root.join(declaration.suite_source)).map_err(|e| {
+                format!("cannot read suite source {}: {e}", declaration.suite_source)
+            })?;
+            let tests = known_gaps::suite_tests(&source)
+                .map_err(|e| format!("suite source {}: {e}", declaration.suite_source))?;
+            let required_tests = known_gaps::required(declaration, &rows, &tests).len() as u64;
+            Ok(KnownGapNode {
+                node: declaration.node.to_string(),
+                backend: declaration.backend.to_string(),
+                ledger: declaration.ledger.to_string(),
+                required_tests,
+                rows,
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod known_gap_nodes_tests {
+    use super::*;
+
+    #[test]
+    fn required_tests_are_derived_from_suite_less_ledger_rows() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        let tests_dir = root.join("hermit-cli/tests");
+        fs::create_dir_all(&tests_dir).unwrap();
+        fs::write(
+            tests_dir.join("deadline_slice_cap.kvm-gaps.tsv"),
+            "id\tgap\tissue\toutcome\tsignature\tapproval\n\
+             hermit-run::deadline_slice_cap$gap_one\tC\thttps://github.com/rrnewton/hermit/issues/4929\tfailed\tboom\tbaseline\n",
+        )
+        .unwrap();
+        fs::write(
+            tests_dir.join("deadline_slice_cap.rs"),
+            "#[test]\nfn required_one() {}\n\
+             #[test]\nfn gap_one() {}\n\
+             #[test]\n#[ignore]\nfn ignored_one() {}\n",
+        )
+        .unwrap();
+        let nodes = known_gap_nodes(root).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].rows.len(), 1);
+        // Non-ignored suite tests {required_one, gap_one} less the ledger
+        // row {gap_one}: one required test, derived with no pinned count.
+        assert_eq!(nodes[0].required_tests, 1);
+    }
+}
+
+/// The scorecard's section for the known gaps: every row of every declared ledger, outside every
+/// count above it. Empty when there is no ledger.
+fn render_known_gaps(nodes: &[KnownGapNode]) -> String {
+    if nodes.is_empty() {
+        return String::new();
+    }
+    let total = nodes.iter().map(|node| node.rows.len()).sum::<usize>();
+    let mut out = format!(
+        "\n## Known gaps of validation nodes, outside every count above\n\n\
+Each row below is a test that a validation node does not yet require on its backend: a known \
+gap, listed with its tracking issue in the node's known-gap ledger. The node runs a known gap and \
+expects it to FAIL, or, when its row says skipped, leaves it out of the run by name. These \
+**{total}** rows are not manifest cells, so they are in none of the counts or percentages above. \
+Each one counts as a failing test, never as a pass and never as not applicable. The node records \
+a known gap it runs as `diagnostic_fail` when it fails the way its row says, and fails outright \
+when it passes (promote it to required) or fails some other way; a skipped one is not run, so \
+nothing shows whether it still fails until its row is deleted. In a signature, `\\n` is a newline \
+and `<N>` any run of digits. The same rows, with their tracking URLs, are in `{KNOWN_GAPS}`.\n"
+    );
+    for node in nodes {
+        let skipped = node.rows.iter().filter(|row| !row.outcome.is_run()).count();
+        let skipped = if skipped == 0 {
+            String::new()
+        } else {
+            format!(" ({skipped} skipped, not run)")
+        };
+        out.push_str(&format!(
+            "\n### `{}` (`--backend={}`)\n\n**{}** required tests must pass; **{}** known gaps{skipped}, \
+from `{}`:\n\n| Test | Gap | Tracking issue | Must fail with | Status |\n| --- | --- | --- | --- | --- |\n",
+            node.node,
+            node.backend,
+            node.required_tests,
+            node.rows.len(),
+            node.ledger
+        ));
+        for row in &node.rows {
+            let test = row
+                .id
+                .split_once('$')
+                .map_or(row.id.as_str(), |(_, test)| test);
+            let (expected, status) = match (&row.signature, row.outcome.is_run()) {
+                (Some(signature), _) => (
+                    format!(
+                        "output showing `{}`",
+                        signature.replace('|', "\\|").replace('`', "'")
+                    ),
+                    "failing (known gap)",
+                ),
+                (None, true) => (
+                    "a stop by its CPU budget".to_string(),
+                    "failing (known gap)",
+                ),
+                (None, false) => ("not run".to_string(), "skipped (known gap)"),
+            };
+            out.push_str(&format!(
+                "| `{test}` | {} | {} | {expected} | {status} |\n",
+                row.gap, row.issue
+            ));
+        }
+    }
+    out
+}
+
+/// `ci/compat-envelope/known-gaps.json`: the machine-readable form of [`render_known_gaps`].
+fn encoded_known_gaps(nodes: &[KnownGapNode]) -> Result<String, String> {
+    let value = serde_json::json!({
+        "schema": 1,
+        "description": "Known gaps of validation nodes: tests a node does not yet require on its backend, each with its tracking issue (ci/manifest-plan/src/known_gaps.rs). The node runs a known gap and expects it to fail (status known-gap), or leaves it out of the run by name (status skipped). They are outside every E2E count and percentage. A known gap is a failing test: never a pass and never not applicable.",
+        "generated_by": "./ci/compat-envelope/scorecard.rs update",
+        "nodes": nodes.iter().map(|node| serde_json::json!({
+            "node": node.node,
+            "backend": node.backend,
+            "ledger": node.ledger,
+            "required_tests": node.required_tests,
+            "known_gaps": node.rows.iter().map(|row| serde_json::json!({
+                "id": row.id,
+                "gap": row.gap,
+                "issue": row.issue,
+                "outcome": row.outcome.value(),
+                "signature": row.signature,
+                "status": if row.outcome.is_run() { "known-gap" } else { "skipped" },
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    });
+    let mut text = serde_json::to_string_pretty(&value)
+        .map_err(|e| format!("cannot encode {KNOWN_GAPS}: {e}"))?;
+    text.push('\n');
+    Ok(text)
+}
+
+/// The archived execution paths ([`hermit_manifest_plan::archived::ARCHIVED`]),
+/// so the scorecard says why an archived backend has no cell selected by full.
+fn archived_paragraph() -> String {
+    use hermit_manifest_plan::archived::ARCHIVED;
+    use hermit_manifest_plan::archived::ARCHIVED_RUN_TYPE;
+    use hermit_manifest_plan::archived::ArchivedKind;
+    let entries: Vec<String> = ARCHIVED
+        .iter()
+        .map(|entry| {
+            let kind = match entry.kind {
+                ArchivedKind::Backend => "backend",
+                ArchivedKind::PreprocessingWithPtrace => "preprocessing with ptrace, not a backend",
+            };
+            format!(
+                "`{}` ({kind}, archived {}, {})",
+                entry.name, entry.since, entry.schedule
+            )
+        })
+        .collect();
+    if entries.is_empty() {
+        return String::new();
+    }
+    format!(
+        "**Archived:** {}. They get no feature work and their tests left per-commit validation. \
+An archived backend's cells that would be selected by full belong to the `{ARCHIVED_RUN_TYPE}` \
+run type instead, so the table counts them as not selected by full, and the nightly pressure \
+sweep runs them as red cells. `ci/manifest-plan/src/archived.rs` records what still runs per \
+commit.\n\n",
+        entries.join(" and ")
+    )
 }
 
 /// How many selected verify cells declare the stripped comparator, by
@@ -5112,8 +5386,10 @@ fn declared_guest_exit_matches(
 /// on a result row can be recomputed, so a declaration whose report says
 /// otherwise would otherwise still hash coherently.
 ///
-/// Hermit ran in verify mode with `--verify-allow=failure` before the guest
-/// separator; Hermit's status reports the declared disposition (a signal death
+/// Hermit ran an invocation the runner writes for a declared exit before the
+/// guest separator (`invocation_admits_declared_guest_exit`: verify mode with
+/// `--verify-allow=failure`, or a replay cell's `record start`, which inherits
+/// its verify recipe's declaration); Hermit's status reports the declared disposition (a signal death
 /// either as that signal or as `128 + signo`); and the report's guest
 /// disposition and both compared outputs name exactly the declared code or
 /// signal.
@@ -5138,7 +5414,7 @@ fn declared_failure_matches(
         .iter()
         .position(|arg| *arg == "--")
         .map_or(&argv[..], |separator| &argv[..separator]);
-    if mode != "verify" || !hermit_args.contains(&"--verify-allow=failure") {
+    if !invocation_admits_declared_guest_exit(mode, hermit_args) {
         return false;
     }
     let disposition = |name: &str| match attempt.get(name) {
@@ -5327,6 +5603,7 @@ cross-backend parity.\n\n\
         "| **Total** | **{selected_total}** | **{}** | **{na_total}** | **{total}** |\n\n",
         total - selected_total - na_total
     ));
+    out.push_str(&archived_paragraph());
     // DENOMINATOR PROVENANCE. Emitted from the derived population, never
     // hand-written, so it cannot go stale and cannot be forgotten.
     //
@@ -5516,6 +5793,7 @@ for by either this table or the comparable green cells above.\n\n\
             ));
         }
     }
+    out.push_str(&render_known_gaps(&derived.known_gaps));
     out
 }
 
@@ -5880,19 +6158,96 @@ impl ParityCommitFacts {
         if shas.is_empty() {
             return Self::default();
         }
-        Self::from_answers(
+        let objects = git_cat_file_batch(root, &Self::batch_names(shas));
+        let mut facts = Self::from_answers(
             shas,
-            git_cat_file_batch(root, &Self::batch_names(shas)),
+            objects.clone(),
             |commits| git_commit_depths(root, commits),
             |names| main.and_then(|main| git_commits_off_main(main, names)),
-        )
+        );
+        // Commits at or after the sharded layout answer the single file as a
+        // tree (or missing) and the directory as a tree of shard blobs: read
+        // those blobs in a second batch and union their selections.
+        if let Ok(Some(answers)) = &objects {
+            let mut shard_oids: Vec<(String, String, String)> = Vec::new();
+            for (sha, triple) in shas.iter().zip(answers.chunks(3)) {
+                if let Some((kind, bytes)) = &triple[2] {
+                    if kind == "tree" {
+                        if let Ok(entries) = parse_git_tree(bytes) {
+                            for (name, oid) in entries {
+                                if name.ends_with(".json") {
+                                    shard_oids.push((sha.clone(), name, oid));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !shard_oids.is_empty() {
+                let names: Vec<String> =
+                    shard_oids.iter().map(|(_, _, oid)| oid.clone()).collect();
+                if let Ok(Some(blobs)) = git_cat_file_batch(root, &names) {
+                    let mut texts: BTreeMap<String, BTreeMap<String, String>> =
+                        BTreeMap::new();
+                    for ((sha, name, _), blob) in shard_oids.iter().zip(blobs.iter()) {
+                        if let Some((_, bytes)) = blob {
+                            if let Ok(text) = std::str::from_utf8(bytes) {
+                                texts
+                                    .entry(sha.clone())
+                                    .or_default()
+                                    .insert(name.clone(), text.to_string());
+                            }
+                        }
+                    }
+                    for (sha, shards) in texts {
+                        let mut selected = CommittedParityCells::new();
+                        let mut error: Option<String> = None;
+                        for (name, text) in &shards {
+                            match committed_parity_cells(text) {
+                                Ok(cells) => {
+                                    for cell in cells {
+                                        if !selected.insert(cell.clone()) && error.is_none() {
+                                            error = Some(format!(
+                                                "{sha}:{PARITY_CELLS_DIR}/{name} selects {}@{} twice across shards",
+                                                cell.0, cell.1
+                                            ));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    error = Some(format!(
+                                        "{sha}:{PARITY_CELLS_DIR}/{name}: {e}"
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                        facts.committed.insert(
+                            sha.clone(),
+                            error.map(Err).unwrap_or(Ok(Some(selected))),
+                        );
+                    }
+                }
+            }
+        }
+        facts
     }
 
     /// The `cat-file --batch` request for `shas`: each commit, then its
-    /// [`PARITY_CELLS_PATH`], in `shas` order.
+    /// [`PARITY_CELLS_PATH`] single file and its [`PARITY_CELLS_DIR`]
+    /// directory, in `shas` order. A pre-shard commit answers the file as a
+    /// blob and the directory missing; a sharded commit answers the file
+    /// missing (or a tree at that path in no layout) and the directory as a
+    /// tree whose shard blobs [`Self::read`] then fetches.
     fn batch_names(shas: &BTreeSet<String>) -> Vec<String> {
         shas.iter()
-            .flat_map(|sha| [sha.clone(), format!("{sha}:{PARITY_CELLS_PATH}")])
+            .flat_map(|sha| {
+                [
+                    sha.clone(),
+                    format!("{sha}:{PARITY_CELLS_PATH}"),
+                    format!("{sha}:{PARITY_CELLS_DIR}"),
+                ]
+            })
             .collect()
     }
 
@@ -5931,7 +6286,7 @@ impl ParityCommitFacts {
             }
         };
         let mut commits = Vec::new();
-        for (sha, pair) in shas.iter().zip(objects.chunks(2)) {
+        for (sha, pair) in shas.iter().zip(objects.chunks(3)) {
             if matches!(&pair[0], Some((kind, _)) if kind == "commit") {
                 commits.push(sha.as_str());
             }
@@ -5969,6 +6324,39 @@ impl ParityCommitFacts {
             ))
         })
     }
+}
+
+/// One git tree object's entries, from its raw `cat-file` bytes:
+/// (`<mode> <name>\0<20-byte object id>`)*. Names are returned with their
+/// hex object ids; a malformed entry refuses the whole tree.
+fn parse_git_tree(bytes: &[u8]) -> Result<Vec<(String, String)>, String> {
+    let mut entries = Vec::new();
+    let mut rest = bytes;
+    while !rest.is_empty() {
+        let space = rest
+            .iter()
+            .position(|byte| *byte == b' ')
+            .ok_or_else(|| "git tree entry without a mode".to_string())?;
+        let nul = rest[space..]
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|at| space + at)
+            .ok_or_else(|| "git tree entry without a name terminator".to_string())?;
+        let name = std::str::from_utf8(&rest[space + 1..nul])
+            .map_err(|_| "git tree entry name is not UTF-8".to_string())?
+            .to_string();
+        let oid_end = nul + 1 + 20;
+        if rest.len() < oid_end {
+            return Err("git tree entry without a full object id".into());
+        }
+        let oid: String = rest[nul + 1..oid_end]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        entries.push((name, oid));
+        rest = &rest[oid_end..];
+    }
+    Ok(entries)
 }
 
 /// Every name's object in the checkout at `root`, from one
@@ -7128,7 +7516,7 @@ fn attribute_refused_parity_row(
 
 /// A parity row's source tree state, by the rule of section 7 of the parity
 /// summary format, version 3
-/// (<https://github.com/rrnewton/dev-hermit/issues/463>).
+/// (part of <https://github.com/rrnewton/hermit/issues/3301>).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ParityRowTree {
     /// `"source_tree_dirty": false`.
@@ -7182,7 +7570,7 @@ fn with_source_tree_state_added(text: &str) -> Option<String> {
 }
 
 /// Classify one line of the store (section 7 of the parity summary format,
-/// version 3, <https://github.com/rrnewton/dev-hermit/issues/463>):
+/// version 3, part of <https://github.com/rrnewton/hermit/issues/3301>):
 ///
 /// - it passes [`parity_row_check`] with `"source_tree_dirty": false`: clean;
 /// - it passes with `true`: dirty;
@@ -7328,7 +7716,7 @@ impl ParityRunAccumulator {
 /// ([`classify_parity_row`]), by the rule of section 7 of the parity summary
 /// format, version 3 (sha256
 /// 2cf28f143ff8d4a45b8cfc4d69b6fcb35454a8a8f61501c0d9babf0bb8bfb6f8,
-/// <https://github.com/rrnewton/dev-hermit/issues/463>). The rule is stated
+/// part of <https://github.com/rrnewton/hermit/issues/3301>). The rule is stated
 /// per row, because the value is stored on each row and the summary reads
 /// only rows: `source_tree_dirty_rows` and `source_tree_unreported_rows`
 /// count every classified line, duplicates and rows a conflicting commit
@@ -7758,7 +8146,7 @@ Credit pools clean credit (inputs equalized) with unequalized credit only under 
     // Each producer with runs in the store leads with its headline, which is
     // always a run from a clean source tree, or says that it has none
     // (section 7 of the parity summary format, version 3,
-    // https://github.com/rrnewton/dev-hermit/issues/463).
+    // part of https://github.com/rrnewton/hermit/issues/3301).
     let producers_with_runs = summary
         .runs
         .iter()
@@ -9029,6 +9417,22 @@ fn encoded_cells(cells: &TrackedCells) -> Result<String, String> {
     // is the size of the diff. Anyone reaching for a JSON walker here because
     // the typed traversal below looks tedious will get a clean-looking green run
     // and a 34k-line review. Keep the traversal typed.
+    // Most encodes rewrite nothing (every invocation already carries the
+    // recorded root); only then is the clone below needed at all. The scan
+    // mirrors normalise_invocation_root's early return exactly.
+    let needs_normalisation = cells.cells.iter().any(|cell| {
+        cell.observations.iter().any(|observation| {
+            observation.invocations.iter().any(|invocation| {
+                invocation.cwd.starts_with('/') && invocation.cwd != RECORDED_ROOT
+            })
+        })
+    });
+    if !needs_normalisation {
+        let mut text = serde_json::to_string(cells)
+            .map_err(|e| format!("cannot serialize tracked cells: {e}"))?;
+        text.push('\n');
+        return Ok(text);
+    }
     let mut normalised = cells.clone();
     for cell in &mut normalised.cells {
         for observation in &mut cell.observations {
@@ -9081,7 +9485,24 @@ fn wait_for_scorecard_write_lock(
     }
 }
 
-fn acquire_scorecard_write_lock(root: &Path) -> Result<File, String> {
+/// An absolute path that replaces the repository's scorecard write-back lock.
+/// Only tests set it: a worktree's lock is its Git common directory's, which
+/// every worktree of the primary checkout shares, so a test running `check`
+/// would otherwise wait the full timeout behind a live write-back elsewhere on
+/// the host.
+const WRITEBACK_LOCK_ENV: &str = "HERMIT_SCORECARD_WRITEBACK_LOCK";
+
+fn scorecard_write_lock_path(root: &Path) -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os(WRITEBACK_LOCK_ENV).filter(|path| !path.is_empty()) {
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(format!(
+                "{WRITEBACK_LOCK_ENV} must be an absolute path: {}",
+                path.display()
+            ));
+        }
+        return Ok(path);
+    }
     let output = Command::new("git")
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .current_dir(root)
@@ -9090,12 +9511,16 @@ fn acquire_scorecard_write_lock(root: &Path) -> Result<File, String> {
     if !output.status.success() {
         return Err("git rev-parse failed while locating the scorecard write-back lock".into());
     }
-    let path = PathBuf::from(
+    Ok(PathBuf::from(
         std::str::from_utf8(&output.stdout)
             .map_err(|e| format!("scorecard write-back lock path is not UTF-8: {e}"))?
             .trim(),
     )
-    .join("scorecard-writeback.lock");
+    .join("scorecard-writeback.lock"))
+}
+
+fn acquire_scorecard_write_lock(root: &Path) -> Result<File, String> {
+    let path = scorecard_write_lock_path(root)?;
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -9297,6 +9722,10 @@ fn check_tracked(root: &Path) -> Result<Derived, String> {
         )?;
         compare_file(&root.join(CELLS), &encoded_cells(&cells)?)?;
     }
+    compare_file(
+        &root.join(KNOWN_GAPS),
+        &encoded_known_gaps(&derived.known_gaps)?,
+    )?;
     Ok(derived)
 }
 
@@ -9343,6 +9772,11 @@ fn update_tracked(
         .map_err(|e| format!("cannot write {SCORECARD}: {e}"))?;
     fs::write(root.join(CELLS), encoded_catalogue(&cells)?)
         .map_err(|e| format!("cannot write {CELLS}: {e}"))?;
+    fs::write(
+        root.join(KNOWN_GAPS),
+        encoded_known_gaps(&derived.known_gaps)?,
+    )
+    .map_err(|e| format!("cannot write {KNOWN_GAPS}: {e}"))?;
     // NOT APPLICABLE IS REPORTED SEPARATELY, NOT FOLDED INTO RED. This line is
     // the number people quote; leaving it as "population minus green" is exactly
     // how 4,940 never-applicable cells were read as failures.
@@ -9634,8 +10068,8 @@ fn render_provenance_disagreements(tracked: &TrackedCells) -> Result<String, Str
 /// prints it. A receipt (a canonical or backend-parity comparison) is one
 /// run. An invocation is one run unless it is the plain copy of a receipt
 /// ([`receipt_covers_plain_invocation`]): writers stored that copy beside
-/// every canonical pass until
-/// https://github.com/rrnewton/dev-hermit/issues/540, and still store it
+/// every canonical pass until the ledger slimming change dropped that copy,
+/// and still store it
 /// beside a canonical divergence and a parity row. So a canonical pass is
 /// one run in either storage form, and any other invocation counts once, as
 /// it did when the report printed the invocation count.
@@ -10507,7 +10941,7 @@ fn apply_validate_results_from(
             // skip a plain invocation that a receipt covers, and a pass has no
             // divergence position to sample. The plain copy cost about 8 MB of
             // cells.json per full run and nothing read it
-            // (https://github.com/rrnewton/dev-hermit/issues/540). Its argv,
+            // (so the ledger slimming change stopped writing it). Its argv,
             // environment and attempt records stay in the retained run named by
             // run_id. Divergences, stripped passes and no-verdict rows keep
             // their invocations.
@@ -11382,7 +11816,6 @@ fn project_observations(root: &Path, series_root: &Path, refreshed_at: &str) -> 
     let derived = check_tracked(root)?;
     let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
     reconcile_history_catalogue(root, &mut tracked)?;
-    let before = tracked.clone();
 
     // Resolve and verify the source once, then parse only the captured commit
     // bytes. A later worktree mutation cannot change the rows while leaving the
@@ -11394,29 +11827,263 @@ fn project_observations(root: &Path, series_root: &Path, refreshed_at: &str) -> 
                 .into(),
         );
     }
-    let rows = read_series_rows(&snapshot)?;
-    let attempts = validate_attempt_bindings(&tracked, Some(&rows))?;
-    let representation = direct_representation(&tracked, &rows, &attempts)?;
-    remove_replaceable_projected_observations(&mut tracked, &rows, Some(&snapshot.source))?;
+    let source = snapshot.source.clone();
+    let source_repository = snapshot.source_repository.clone();
+    let source_commit = snapshot.source_commit.clone();
+    let source_tree = snapshot.source_tree.clone();
+    let rows = read_series_rows_owned(snapshot)?;
+    project_observation_rows(
+        root,
+        &derived,
+        tracked,
+        &rows,
+        &ObservationRowSource {
+            source: &source,
+            repository: source_repository.as_deref(),
+            commit: &source_commit,
+            tree: &source_tree,
+        },
+        refreshed_at,
+        || Ok(()),
+    )
+}
+
+/// The same projection as `project_observations`, from one held
+/// scorecard-series-snapshot/v1 file rather than a series worktree.
+///
+/// The ledger publisher needs this once retention has moved original series
+/// files out of the published tree: the snapshot then holds the authenticated
+/// union of active and archived rows, and still names the real published
+/// commit and `series` tree. A series worktree cannot express that, because its
+/// committed-file guard requires every row to be in a committed shard. The
+/// snapshot must hold published rows only (no local sources), exactly the
+/// population `project_observations` reads; it is rechecked against its
+/// digest and identity immediately before the write.
+fn project_observations_snapshot(
+    root: &Path,
+    snapshot_path: &Path,
+    snapshot_sha256: &str,
+    refreshed_at: &str,
+) -> Result<(), String> {
+    project_observations_snapshot_with(
+        root,
+        snapshot_path,
+        snapshot_sha256,
+        refreshed_at,
+        || Ok(()),
+    )
+}
+
+/// `project_observations_snapshot` with a hook that runs after every guard and
+/// immediately before the held snapshot's final recheck; tests use it to
+/// change the file while it is held.
+fn project_observations_snapshot_with<BeforeVerify>(
+    root: &Path,
+    snapshot_path: &Path,
+    snapshot_sha256: &str,
+    refreshed_at: &str,
+    before_verify: BeforeVerify,
+) -> Result<(), String>
+where
+    BeforeVerify: FnOnce() -> Result<(), String>,
+{
+    if refreshed_at.trim().is_empty() {
+        return Err("--refreshed-at requires a nonempty deterministic stamp".into());
+    }
+    let _lock = acquire_history_write_lock(root)?;
+    // Validate and hold the caller's operand before unrelated catalogue work,
+    // as project-and-observe-results does.
+    let mut snapshot = HeldScorecardSeriesSnapshot::open(snapshot_path, snapshot_sha256)?;
+    let source = &snapshot.snapshot.source;
+    if source.repository.as_deref() != Some(TEST_LEDGER_REPOSITORY) {
+        return Err(
+            "new observation projections must read the existing hermit_test_ledger repository"
+                .into(),
+        );
+    }
+    if !source.local_sources.is_empty() || source.published_rows != snapshot.snapshot.rows_read {
+        return Err(format!(
+            "scorecard snapshot {} holds unpublished local rows; an observation projection \
+             reads published rows only",
+            snapshot_path.display()
+        ));
+    }
+    // Owned copies free the snapshot for the mutable pipeline borrow below.
+    let source_path = source.path.clone();
+    let source_repository = source.repository.clone();
+    let source_commit = source.commit.clone();
+    let source_tree = source.tree.clone();
+    let derived = check_tracked(root)?;
+    let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
+    reconcile_history_catalogue(root, &mut tracked)?;
+    project_observation_rows_held(
+        root,
+        &derived,
+        tracked,
+        &mut snapshot,
+        &ObservationRowSource {
+            source: &source_path,
+            repository: source_repository.as_deref(),
+            commit: &source_commit,
+            tree: &source_tree,
+        },
+        refreshed_at,
+        before_verify,
+    )
+}
+
+/// The identity a projection records for the rows it read.
+struct ObservationRowSource<'a> {
+    source: &'a str,
+    repository: Option<&'a str>,
+    commit: &'a str,
+    tree: &'a str,
+}
+
+/// Project canonical series rows onto the reconciled history and write it.
+///
+/// Both projection commands share this body, so the same rows and source
+/// identity produce the same files whichever way they were read.
+/// `verify_source` runs after every guard and immediately before the write.
+fn project_observation_rows<VerifySource>(
+    root: &Path,
+    derived: &Derived,
+    mut tracked: TrackedCells,
+    rows: &[SeriesRow],
+    row_source: &ObservationRowSource<'_>,
+    refreshed_at: &str,
+    verify_source: VerifySource,
+) -> Result<(), String>
+where
+    VerifySource: FnOnce() -> Result<(), String>,
+{
+    let before = tracked.clone();
+    let source = row_source.source.to_string();
+    let attempts = validate_attempt_bindings(&tracked, Some(rows))?;
+    let representation = direct_representation(&tracked, rows, &attempts)?;
+    remove_replaceable_projected_observations(&mut tracked, rows, Some(&source))?;
     let unrepresented = rows
         .iter()
         .filter(|row| !representation.represented_event_ids.contains(&row.event_id))
         .collect::<Vec<&SeriesRow>>();
     let mut projection =
-        apply_series_rows_in_place(root, &mut tracked, &unrepresented, Some(&snapshot.source))?;
+        apply_series_rows_in_place(root, &mut tracked, &unrepresented, Some(&source))?;
     projection.represented_rows += representation.represented_event_ids.len();
-    let skipped = &projection.skipped;
+    finish_projection(
+        root,
+        derived,
+        &before,
+        tracked,
+        projection,
+        representation.has_unrepresented_direct_evidence,
+        rows.len() as u64,
+        row_source,
+        refreshed_at,
+        verify_source,
+    )
+}
 
-    let rows_read = rows.len() as u64;
+/// The held-snapshot twin of [`project_observation_rows`]: same guards, same
+/// outcome accounting, same written files, but rows are rebuilt from the
+/// held payload pass by pass instead of held typed throughout.
+fn project_observation_rows_held<BeforeVerify>(
+    root: &Path,
+    derived: &Derived,
+    mut tracked: TrackedCells,
+    held: &mut HeldScorecardSeriesSnapshot,
+    row_source: &ObservationRowSource<'_>,
+    refreshed_at: &str,
+    before_verify: BeforeVerify,
+) -> Result<(), String>
+where
+    BeforeVerify: FnOnce() -> Result<(), String>,
+{
+    let before = tracked.clone();
+    let source = row_source.source.to_string();
+    // Snapshot validation refused a repeated event_id, so one index per event.
+    let by_event = held
+        .index
+        .iter()
+        .enumerate()
+        .map(|(index, row)| (row.event_id.as_ref(), index))
+        .collect::<BTreeMap<_, _>>();
+    let lookup = |event_id: &str| -> Result<Vec<SeriesRow>, String> {
+        by_event
+            .get(event_id)
+            .map(|index| held.parse_row(*index).map(|row| vec![row]))
+            .unwrap_or_else(|| Ok(Vec::new()))
+    };
+    let attempts = validate_attempt_bindings_by(&tracked, Some(&lookup))?;
+    drop(by_event);
+    let representation = direct_representation_held(&tracked, held, &attempts)?;
+    remove_replaceable_projected_observations_with(
+        &mut tracked,
+        || held.index.iter().map(|row| row.event_id.as_ref()).collect(),
+        Some(&source),
+    )?;
+    let rows_read = held.row_count() as u64;
+    let indices = (0..held.row_count())
+        .filter(|index| {
+            !representation
+                .represented_event_ids
+                .contains(held.index[*index].event_id.as_ref())
+        })
+        .collect();
+    let mut projection = {
+        let mut subset = HeldRowSubset {
+            held: &mut *held,
+            indices,
+        };
+        apply_series_rows_inner(root, &mut tracked, &mut subset, Some(&source))?
+    };
+    projection.represented_rows += representation.represented_event_ids.len();
+    finish_projection(
+        root,
+        derived,
+        &before,
+        tracked,
+        projection,
+        representation.has_unrepresented_direct_evidence,
+        rows_read,
+        row_source,
+        refreshed_at,
+        || {
+            before_verify()?;
+            held.verify()
+        },
+    )
+}
+
+/// Stamp, cap, guard, verify, write, and report one finished projection.
+/// Shared by the typed-slice and held-snapshot row sources so both produce
+/// the same files and the same summary from the same outcome.
+#[allow(clippy::too_many_arguments)]
+fn finish_projection<VerifySource>(
+    root: &Path,
+    derived: &Derived,
+    before: &TrackedCells,
+    mut tracked: TrackedCells,
+    projection: ProjectObservationsOutcome,
+    has_unrepresented_direct_evidence: bool,
+    rows_read: u64,
+    row_source: &ObservationRowSource<'_>,
+    refreshed_at: &str,
+    verify_source: VerifySource,
+) -> Result<(), String>
+where
+    VerifySource: FnOnce() -> Result<(), String>,
+{
+    let skipped = &projection.skipped;
+    let source = row_source.source;
     tracked.schema = SCHEMA;
     tracked.projection = Some(ObservationProjection {
-        source: snapshot.source.clone(),
-        source_repository: snapshot.source_repository.clone(),
-        source_commit: Some(snapshot.source_commit.clone()),
-        source_tree: Some(snapshot.source_tree.clone()),
+        source: source.to_string(),
+        source_repository: row_source.repository.map(str::to_string),
+        source_commit: Some(row_source.commit.to_string()),
+        source_tree: Some(row_source.tree.to_string()),
         refreshed_at: refreshed_at.to_string(),
         rows_read,
-        pre_series_corpus: rows.is_empty() || representation.has_unrepresented_direct_evidence,
+        pre_series_corpus: rows_read == 0 || has_unrepresented_direct_evidence,
         comparison_attempt_bindings_v1: comparison_attempt_bindings(&tracked).cloned(),
         observations_capped: false,
     });
@@ -11425,9 +12092,10 @@ fn project_observations(root: &Path, series_root: &Path, refreshed_at: &str) -> 
 
     // The guard runs BEFORE the write, not after. A projection that has already
     // hit the disk is a projection someone has to notice and revert.
-    enforce_projection_preserves_evidence(&before, &tracked, rows_read)?;
-    enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
-    write_observation_files(root, &derived, &tracked)?;
+    enforce_projection_preserves_evidence(before, &tracked, rows_read)?;
+    enforce_writer_boundary(before, &tracked, Writer::Observations)?;
+    verify_source()?;
+    write_observation_files(root, derived, &tracked)?;
 
     println!(
         "compatibility scorecard: projected {} cell(s) from {} evidence row(s), including {} \
@@ -11437,9 +12105,9 @@ fn project_observations(root: &Path, series_root: &Path, refreshed_at: &str) -> 
         projection.rows,
         projection.no_verdict_rows,
         projection.runs,
-        snapshot.source,
-        snapshot.source_commit,
-        snapshot.source_tree
+        source,
+        row_source.commit,
+        row_source.tree
     );
     println!(
         "  {} row(s) were already represented by one exact recorded run/attempt; \
@@ -11475,9 +12143,10 @@ fn verify_combined_write_state(
     }
     // Compared in chunks, not by reading the files: cells.json is 1.27 GB, and
     // a whole copy of it per check, beside the original and the generated
-    // bytes, set the write-back's peak
-    // (https://github.com/rrnewton/dev-hermit/issues/554). The parity file is
-    // still read, as before, so an unreadable one still refuses.
+    // bytes, set the write-back's peak. With the rebuilt history below, this
+    // cut the write-back's peak RSS from 15,464 MB to 12,684 MB on real inputs
+    // (measured in 49fa9f99eb95). The parity file is still read, as before, so
+    // an unreadable one still refuses.
     let (scorecard, cells) = history_files(root, false)?;
     let parity = history_parity_file(root, false)?;
     if !file_holds_exactly(&scorecard, expected_scorecard)? {
@@ -12198,7 +12867,7 @@ where
 
     // The reconciled history as read, rebuilt from the held bytes whenever a
     // fresh copy of it is needed, instead of keeping a 2.7 GB clone (`before`)
-    // from here to the end (https://github.com/rrnewton/dev-hermit/issues/554).
+    // from here to the end (49fa9f99eb95 measured the pair of changes here).
     // Parsing and reconciling the same bytes against the same checkout gives
     // the same history; only the first reconciliation checks the committed
     // document and announces retirements.
@@ -12209,13 +12878,15 @@ where
         Ok(history)
     };
     let tracked = reconciled_history(true)?;
-    let custom_retention = retain_selected_custom_results(
-        &tracked,
-        &derived.selected_custom,
-        &result_rows,
-        &snapshot.rows,
-    )?;
-    reconcile_declared_guest_exits(&result_rows, &snapshot.rows)?;
+    let rows = snapshot.materialize_rows()?;
+    // The materialized rows are fully owned; nothing below rebuilds from
+    // the held payload (verify and the binding snapshot read only file
+    // identity and metadata), so release it before the preview and final
+    // folds instead of holding both copies for the whole write-back.
+    snapshot.release_row_storage();
+    let custom_retention =
+        retain_selected_custom_results(&tracked, &derived.selected_custom, &result_rows, &rows)?;
+    reconcile_declared_guest_exits(&result_rows, &rows)?;
     // The complete census and finalized proof above still cover every raw row.
     // Only comparable cells enter the existing grade/observation projection.
     let result_rows = result_rows
@@ -12246,22 +12917,20 @@ where
         },
     )?;
     let current_attempts = merge_attempt_maps(
-        validate_attempt_bindings(&preview, Some(&snapshot.rows))?,
+        validate_attempt_bindings(&preview, Some(&rows))?,
         current_result_attempts(&preview, &result_rows, &detcore_tree)?,
     )?;
-    let preview_representation =
-        direct_representation(&preview, &snapshot.rows, &current_attempts)?;
+    let preview_representation = direct_representation(&preview, &rows, &current_attempts)?;
     // Both results above are owned. Release the preview, a whole copy of the
     // history, before the projection below starts from a fresh copy of it.
     drop(preview);
     let mut tracked = reconciled_history(false)?;
     remove_replaceable_projected_observations(
         &mut tracked,
-        &snapshot.rows,
+        &rows,
         Some(&snapshot.snapshot.source.path),
     )?;
-    let initial_rows = snapshot
-        .rows
+    let initial_rows = rows
         .iter()
         .filter(|row| {
             !preview_representation
@@ -12347,14 +13016,13 @@ where
     // its stored representation. Exactly represented events are suppressed in
     // favour of the richer direct invocation; zero matches remain explicit
     // pre-series evidence, while conflicting or multiple matches refuse.
-    let representation = direct_representation(&tracked, &snapshot.rows, &current_attempts)?;
+    let representation = direct_representation(&tracked, &rows, &current_attempts)?;
     remove_replaceable_projected_observations(
         &mut tracked,
-        &snapshot.rows,
+        &rows,
         Some(&snapshot.snapshot.source.path),
     )?;
-    let projected_rows = snapshot
-        .rows
+    let projected_rows = rows
         .iter()
         .filter(|row| {
             !representation.represented_event_ids.contains(&row.event_id)
@@ -12397,16 +13065,17 @@ where
         AttemptBindingContext {
             producer: &git_head(manifest_tool_root()?)?,
             snapshot: &AttemptBindingSnapshot::from_held(&snapshot)?,
-            events: &snapshot.rows,
+            events: &rows,
             kind: AttemptBindingKind::Current,
             selected_lines: None,
         },
     )?;
     // Each of the history's large copies is released as soon as nothing below
     // reads it, so they are not all held while the generated files are built
-    // and written (https://github.com/rrnewton/dev-hermit/issues/554). After
-    // here the snapshot is read only for its held identity (verify).
-    snapshot.rows = Vec::new();
+    // and written (with the other cuts in 06142e8fb897, the write-back's peak
+    // RSS went from 23,850 MB to 15,464 MB on real inputs). After here the
+    // snapshot is read only for its held identity (verify).
+    drop(rows);
     let before = reconciled_history(false)?;
     enforce_projection_preserves_evidence(&before, &tracked, rows_read)?;
     cap_observations(&mut tracked);
@@ -12877,22 +13546,86 @@ struct ProjectObservationsOutcome {
     pre_series_corpus: bool,
 }
 
+/// One admitted row, by index into the caller's row slice. Only the facts
+/// the projection computes are stored; everything the row already carries
+/// (event/run identity, depth, coordinates, canonical order) is read from
+/// the row itself. Copying those into a second per-row record — seven
+/// strings, a depth map, coordinates, and a three-string order tuple, then
+/// cloned again by the preserved-evidence filter — held gigabytes beside
+/// the rows at full-corpus scale for no second purpose.
 #[derive(Clone, Debug)]
 struct PreparedSeriesRow {
+    row_index: usize,
     cell_index: usize,
     observation_identity: SeriesObservationIdentity,
     provenance: ObservationProvenance,
-    event_id: String,
-    hermit_sha: String,
-    run_id: String,
-    attempt: u64,
     result: Option<ObservedResult>,
     no_verdict: bool,
     num_runs: u64,
+    // Everything the grouped fold and the last-tested stamp read, copied at
+    // prepare time so the row source can release its backing store (the
+    // held snapshot drops its 7.6 GiB payload) before the fold runs. The
+    // Hermit commit and depth map repeat across rows, so prepare interns
+    // them and prepared rows share one allocation per distinct value.
+    event_id: String,
+    hermit_sha: std::rc::Rc<str>,
+    attempt: u64,
     main_ancestry: Option<bool>,
-    depth: BTreeMap<String, SourceDepth>,
+    depth: std::rc::Rc<BTreeMap<String, SourceDepth>>,
     coordinates: Option<SeriesCoordinates>,
-    order: (String, String, u64, String),
+}
+
+/// Random access to the rows one projection applies, so the fold can run
+/// over a typed slice or over rows rebuilt on demand from a held snapshot
+/// payload. `order_key` and `identity_key` answer from data held beside the
+/// rows (the typed row's own fields, or the snapshot's row index), never by
+/// rebuilding a row: the sort and the per-row count maps call them per row.
+trait PreparedRowSource {
+    fn row_count(&self) -> usize;
+    fn row(&self, index: usize) -> Result<std::borrow::Cow<'_, SeriesRow>, String>;
+    /// Canonical apply order: emitted_at, run_id, run_index, event_id.
+    fn order_key(&self, index: usize) -> (&str, &str, u64, &str);
+    /// (Hermit commit, run_id) for the preserved-evidence maps.
+    fn identity_key(&self, index: usize) -> (&str, &str);
+    fn event_id(&self, index: usize) -> &str;
+    /// Release the backing store rows are rebuilt from. Called once the
+    /// prepared rows carry everything the fold reads; `row`, `order_key`,
+    /// `identity_key`, and `event_id` must not be called afterwards
+    /// (`row_count` still answers).
+    fn release(&mut self) {}
+}
+
+struct TypedRows<'a, R> {
+    rows: &'a [R],
+}
+
+impl<R: std::borrow::Borrow<SeriesRow>> PreparedRowSource for TypedRows<'_, R> {
+    fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn row(&self, index: usize) -> Result<std::borrow::Cow<'_, SeriesRow>, String> {
+        Ok(std::borrow::Cow::Borrowed(self.rows[index].borrow()))
+    }
+
+    fn order_key(&self, index: usize) -> (&str, &str, u64, &str) {
+        let row = self.rows[index].borrow();
+        (
+            row.emitted_at.as_str(),
+            row.run_id.as_str(),
+            row.series.run_index,
+            row.event_id.as_str(),
+        )
+    }
+
+    fn identity_key(&self, index: usize) -> (&str, &str) {
+        let row = self.rows[index].borrow();
+        (row.series.tree.as_str(), row.run_id.as_str())
+    }
+
+    fn event_id(&self, index: usize) -> &str {
+        self.rows[index].borrow().event_id.as_str()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -13599,7 +14332,7 @@ fn binding_matches_event(binding: &ComparisonAttemptBinding, row: &SeriesRow) ->
 }
 
 /// Refuse a stored [`ExpectedOutputFailure`] the validate fold could not have
-/// written: one outside a validate observation of a verify cell, on an attempt
+/// written: one outside a validate observation of a verify or replay cell, on an attempt
 /// the runner did not FAIL without a timeout, under an invocation whose result
 /// is a pass or a divergence, or one the runner's reason could not state.
 fn validate_expected_output_failures(tracked: &TrackedCells) -> Result<(), String> {
@@ -13610,8 +14343,8 @@ fn validate_expected_output_failures(tracked: &TrackedCells) -> Result<(), Strin
                     let Some(failure) = &attempt.expected_output_failure else {
                         continue;
                     };
-                    let why = if cell.id.mode != "verify" {
-                        Some("only a verify cell declares expected output")
+                    let why = if !matches!(cell.id.mode.as_str(), "verify" | "replay") {
+                        Some("only a verify or replay cell declares expected output")
                     } else if observation.provenance != ObservationProvenance::Validate {
                         Some("only a validate observation verifies one")
                     } else if attempt.outcome != "FAIL" || attempt.timed_out {
@@ -13641,6 +14374,39 @@ fn validate_expected_output_failures(tracked: &TrackedCells) -> Result<(), Strin
 fn validate_attempt_bindings(
     tracked: &TrackedCells,
     rows: Option<&[SeriesRow]>,
+) -> Result<ValidatedComparisonAttempts, String> {
+    // Every event a binding names is found by lookup; scanning all snapshot
+    // rows once per bound event cost 9,568 scans of 241,357 rows per call.
+    let rows_by_event = rows.map(|rows| {
+        let mut index = BTreeMap::<&str, Vec<&SeriesRow>>::new();
+        for row in rows {
+            index.entry(row.event_id.as_str()).or_default().push(row);
+        }
+        index
+    });
+    let lookup = |event_id: &str| -> Result<Vec<SeriesRow>, String> {
+        let Some(index) = &rows_by_event else {
+            return Ok(Vec::new());
+        };
+        Ok(index
+            .get(event_id)
+            .map(|matching| matching.iter().map(|row| (*row).clone()).collect())
+            .unwrap_or_default())
+    };
+    validate_attempt_bindings_by(
+        tracked,
+        rows.is_some()
+            .then_some(&lookup as &dyn Fn(&str) -> Result<Vec<SeriesRow>, String>),
+    )
+}
+
+/// [`validate_attempt_bindings`] with bound-event rows supplied by lookup:
+/// every row whose `event_id` is the argument, in row order. The snapshot
+/// projection rebuilds only bound rows from its held payload instead of
+/// holding every typed row for this check.
+fn validate_attempt_bindings_by(
+    tracked: &TrackedCells,
+    event_rows: Option<&dyn Fn(&str) -> Result<Vec<SeriesRow>, String>>,
 ) -> Result<ValidatedComparisonAttempts, String> {
     let Some(envelope) = comparison_attempt_bindings(tracked) else {
         return Ok(ValidatedComparisonAttempts::new());
@@ -13691,15 +14457,6 @@ fn validate_attempt_bindings(
         }
         retired.insert(key, comparison);
     }
-    // Every event a binding names is found by lookup; scanning all snapshot
-    // rows once per bound event cost 9,568 scans of 241,357 rows per call.
-    let rows_by_event = rows.map(|rows| {
-        let mut index = BTreeMap::<&str, Vec<&SeriesRow>>::new();
-        for row in rows {
-            index.entry(row.event_id.as_str()).or_default().push(row);
-        }
-        index
-    });
     let cells = CellsById::new(tracked);
     let mut attempts = ValidatedComparisonAttempts::new();
     let mut unique_attempts = BTreeSet::new();
@@ -13772,12 +14529,9 @@ fn validate_attempt_bindings(
             {
                 return Err("comparison-attempt binding repeats or corrupts an event".into());
             }
-            if let Some(rows_by_event) = &rows_by_event {
-                let matching = rows_by_event
-                    .get(event.event_id.as_str())
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                let [row] = matching else {
+            if let Some(event_rows) = event_rows {
+                let matching = event_rows(&event.event_id)?;
+                let [row] = matching.as_slice() else {
                     return Err("comparison-attempt binding requires its original event".into());
                 };
                 if !binding_matches_event(binding, row)
@@ -14720,6 +15474,24 @@ fn current_comparison_representation(
     current: &ValidatedComparisonAttempts,
     direct_counts: &BTreeMap<DirectEvidenceKey, usize>,
 ) -> Result<(BTreeSet<String>, BTreeSet<DirectEvidenceKey>), String> {
+    let bound = current_bound_attempts(tracked, current, direct_counts)?;
+    let bound_by_run = bound_by_run_index(&bound);
+    current_comparison_representation_rows(
+        tracked,
+        &bound_by_run,
+        direct_counts,
+        rows.iter().map(Ok::<&SeriesRow, String>),
+    )
+}
+
+/// The tracked direct comparisons bound to a validated outer attempt, by
+/// base identity. Reads only the tracked history and the current census;
+/// the snapshot projection uses it to select which held rows to rebuild.
+fn current_bound_attempts(
+    tracked: &TrackedCells,
+    current: &ValidatedComparisonAttempts,
+    direct_counts: &BTreeMap<DirectEvidenceKey, usize>,
+) -> Result<BTreeMap<DirectEvidenceBase, BTreeMap<u64, DirectEvidenceKey>>, String> {
     let mut bound = BTreeMap::<DirectEvidenceBase, BTreeMap<u64, DirectEvidenceKey>>::new();
     for cell in &tracked.cells {
         for observation in &cell.observations {
@@ -14822,10 +15594,16 @@ fn current_comparison_representation(
             }
         }
     }
-    // Each event looks up the validate bases sharing its cell, source and
-    // run, in `bound`'s order, instead of rescanning every bound base.
+    Ok(bound)
+}
+
+/// Validate bound bases by (cell, Hermit commit, run), in `bound`'s order,
+/// so each event looks up its bases instead of rescanning every bound base.
+fn bound_by_run_index(
+    bound: &BTreeMap<DirectEvidenceBase, BTreeMap<u64, DirectEvidenceKey>>,
+) -> BTreeMap<(&str, &str, &str), Vec<(&DirectEvidenceBase, &BTreeMap<u64, DirectEvidenceKey>)>> {
     let mut bound_by_run = BTreeMap::<(&str, &str, &str), Vec<_>>::new();
-    for (base, attempts) in &bound {
+    for (base, attempts) in bound {
         if base.provenance == ObservationProvenance::Validate {
             bound_by_run
                 .entry((
@@ -14837,11 +15615,28 @@ fn current_comparison_representation(
                 .push((base, attempts));
         }
     }
+    bound_by_run
+}
+
+/// The row pass of [`current_comparison_representation`]: which current
+/// validate events the bound comparisons already represent. Rows arrive
+/// from any rebuildable source in snapshot order.
+fn current_comparison_representation_rows<R: std::borrow::Borrow<SeriesRow>>(
+    tracked: &TrackedCells,
+    bound_by_run: &BTreeMap<
+        (&str, &str, &str),
+        Vec<(&DirectEvidenceBase, &BTreeMap<u64, DirectEvidenceKey>)>,
+    >,
+    direct_counts: &BTreeMap<DirectEvidenceKey, usize>,
+    rows: impl Iterator<Item = Result<R, String>>,
+) -> Result<(BTreeSet<String>, BTreeSet<DirectEvidenceKey>), String> {
     let cells = SeriesCellIndex::new(tracked);
     let mut events = BTreeSet::new();
     let mut covered = BTreeSet::new();
     let mut represented_counts = BTreeMap::<DirectEvidenceKey, usize>::new();
     for row in rows {
+        let row = row?;
+        let row: &SeriesRow = row.borrow();
         if row.producer != SeriesProducer::Validate {
             continue;
         }
@@ -14977,7 +15772,7 @@ fn direct_representation(
     current_attempts: &ValidatedComparisonAttempts,
 ) -> Result<DirectRepresentation, String> {
     let (direct, opaque) = direct_evidence_keys(tracked)?;
-    let (mut represented_event_ids, mut represented_direct) =
+    let (represented_event_ids, represented_direct) =
         current_comparison_representation(tracked, rows, current_attempts, &direct)?;
     let bound_attempts = bound_direct_attempts(tracked, current_attempts)?;
     let cells = SeriesCellIndex::new(tracked);
@@ -14999,13 +15794,36 @@ fn direct_representation(
             row.series.num_runs,
         ));
     }
+    finish_direct_representation(
+        &direct,
+        opaque,
+        represented_event_ids,
+        represented_direct,
+        &bound_attempts,
+        &source,
+    )
+}
 
+/// The direct-key reconciliation over the collected source candidates,
+/// shared by the typed-slice and held-snapshot row sources. `source` holds,
+/// per base, every non-represented row that produced that base.
+fn finish_direct_representation(
+    direct: &BTreeMap<DirectEvidenceKey, usize>,
+    opaque: bool,
+    mut represented_event_ids: BTreeSet<String>,
+    mut represented_direct: BTreeSet<DirectEvidenceKey>,
+    bound_attempts: &BTreeMap<DirectEvidenceKey, BTreeSet<u64>>,
+    source: &BTreeMap<
+        DirectEvidenceBase,
+        Vec<(Option<DirectEvidenceKey>, String, Option<u64>, u64)>,
+    >,
+) -> Result<DirectRepresentation, String> {
     // A verdict belonging to another current attempt can be ignored here only
     // when that exact event has a unique, independently bound direct record.
     // An event's claimed attempt alone cannot authorize the legacy projector
     // to absorb it into an unrelated compact result.
     let mut represented_verdict_attempts = BTreeMap::new();
-    for (key, count) in &direct {
+    for (key, count) in direct {
         if !matches!(key.kind, DirectEvidenceKind::Result(_)) || *count != 1 {
             continue;
         }
@@ -15030,7 +15848,7 @@ fn direct_representation(
         }
     }
 
-    for (direct_key, direct_count) in &direct {
+    for (direct_key, direct_count) in direct {
         if represented_direct.contains(direct_key) {
             continue;
         }
@@ -15114,6 +15932,87 @@ fn direct_representation(
         represented_event_ids,
         has_unrepresented_direct_evidence: opaque || represented_direct.len() != direct.len(),
     })
+}
+
+/// [`direct_representation`] over a held snapshot, rebuilding only the rows
+/// that can matter: validate rows whose (cell, Hermit commit, run) a bound
+/// comparison claims, and rows whose (cell, Hermit commit, run) a tracked
+/// direct key claims. The source map is read back only by exact direct
+/// base, so a row producing no claimed base cannot change the outcome;
+/// the one error a skipped row could have raised (a non-object-id tree or
+/// detcore_tree in `series_observation_identity`) is already refused by
+/// `validate_for_read` in the held snapshot's validation pass.
+fn direct_representation_held(
+    tracked: &TrackedCells,
+    held: &HeldScorecardSeriesSnapshot,
+    current_attempts: &ValidatedComparisonAttempts,
+) -> Result<DirectRepresentation, String> {
+    let (direct, opaque) = direct_evidence_keys(tracked)?;
+    let bound = current_bound_attempts(tracked, current_attempts, &direct)?;
+    let bound_by_run = bound_by_run_index(&bound);
+    let (represented_event_ids, represented_direct) = current_comparison_representation_rows(
+        tracked,
+        &bound_by_run,
+        &direct,
+        held.index
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                row.producer == SeriesProducer::Validate
+                    && bound_by_run.contains_key(&(
+                        held.index_cell(row),
+                        held.index_tree(row),
+                        held.index_run(row),
+                    ))
+            })
+            .map(|(index, _)| held.parse_row_typed(index)),
+    )?;
+    let bound_attempts = bound_direct_attempts(tracked, current_attempts)?;
+    let cells = SeriesCellIndex::new(tracked);
+    let direct_bases = direct
+        .keys()
+        .map(|key| {
+            (
+                key.base.cell.as_str(),
+                key.base.hermit_sha.as_str(),
+                key.base.run_id.as_str(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let mut source = BTreeMap::<
+        DirectEvidenceBase,
+        Vec<(Option<DirectEvidenceKey>, String, Option<u64>, u64)>,
+    >::new();
+    for (index, row_index) in held.index.iter().enumerate() {
+        if represented_event_ids.contains(row_index.event_id.as_ref()) {
+            continue;
+        }
+        if !direct_bases.contains(&(
+            held.index_cell(row_index),
+            held.index_tree(row_index),
+            held.index_run(row_index),
+        )) {
+            continue;
+        }
+        let row = held.parse_row_typed(index)?;
+        let Some((base, key)) = source_direct_evidence_key(&row, &cells)? else {
+            continue;
+        };
+        source.entry(base).or_default().push((
+            key,
+            row.event_id.clone(),
+            row.series.attempt,
+            row.series.num_runs,
+        ));
+    }
+    finish_direct_representation(
+        &direct,
+        opaque,
+        represented_event_ids,
+        represented_direct,
+        &bound_attempts,
+        &source,
+    )
 }
 
 fn is_object_id(value: &str) -> bool {
@@ -15407,11 +16306,14 @@ fn series_evidence(row: &SeriesRow, id: &CellId) -> Option<SeriesEvidence> {
     }
     if row.schema == SeriesSchema::V3 {
         return match row.series.result {
+            // A chaos-floor failure is a product result over attempts that each
+            // matched: an observation of its cell, as a divergence is.
             Some(
                 result @ (ObservedResult::Pass
                 | ObservedResult::DeterminismFailure
                 | ObservedResult::ParityFailure
-                | ObservedResult::ReplayFailure),
+                | ObservedResult::ReplayFailure
+                | ObservedResult::ChaosFloorFailure),
             ) => Some(SeriesEvidence {
                 result: Some(result),
                 no_verdict: false,
@@ -15511,13 +16413,28 @@ fn should_replace_last_tested_at(
     }
 }
 
-fn should_replace_last_tested(previous: Option<&LastTested>, row: &PreparedSeriesRow) -> bool {
-    should_replace_last_tested_at(previous, &row.hermit_sha, row.main_ancestry, &row.depth)
-}
-
 fn remove_replaceable_projected_observations<R: std::borrow::Borrow<SeriesRow>>(
     tracked: &mut TrackedCells,
     rows: &[R],
+    projection_source: Option<&str>,
+) -> Result<usize, String> {
+    remove_replaceable_projected_observations_with(
+        tracked,
+        || {
+            rows.iter()
+                .map(|row| row.borrow().event_id.as_str())
+                .collect::<BTreeSet<_>>()
+        },
+        projection_source,
+    )
+}
+
+/// [`remove_replaceable_projected_observations`] over a caller-built event
+/// set (the held snapshot's row index), so the check needs no typed rows.
+/// The set is built only once there is projector-owned evidence to check.
+fn remove_replaceable_projected_observations_with<'a>(
+    tracked: &mut TrackedCells,
+    current_event_ids: impl FnOnce() -> BTreeSet<&'a str>,
     projection_source: Option<&str>,
 ) -> Result<usize, String> {
     let owned = tracked
@@ -15552,10 +16469,7 @@ fn remove_replaceable_projected_observations<R: std::borrow::Borrow<SeriesRow>>(
             projection.source
         ));
     }
-    let current_event_ids = rows
-        .iter()
-        .map(|row| row.borrow().event_id.as_str())
-        .collect::<BTreeSet<_>>();
+    let current_event_ids = current_event_ids();
     if let Some((cell, event_id)) = tracked.cells.iter().find_map(|cell| {
         cell.observations.iter().find_map(|observation| {
             observation
@@ -15584,7 +16498,12 @@ fn apply_series_rows<R: std::borrow::Borrow<SeriesRow>>(
     projection_source: Option<&str>,
 ) -> Result<ProjectObservationsOutcome, String> {
     let mut updated = tracked.clone();
-    let outcome = apply_series_rows_inner(ambient_git_root, &mut updated, rows, projection_source)?;
+    let outcome = apply_series_rows_inner(
+        ambient_git_root,
+        &mut updated,
+        &mut TypedRows { rows },
+        projection_source,
+    )?;
     *tracked = updated;
     Ok(outcome)
 }
@@ -15599,18 +16518,30 @@ fn apply_series_rows_in_place<R: std::borrow::Borrow<SeriesRow>>(
     rows: &[R],
     projection_source: Option<&str>,
 ) -> Result<ProjectObservationsOutcome, String> {
-    apply_series_rows_inner(ambient_git_root, tracked, rows, projection_source)
+    apply_series_rows_inner(
+        ambient_git_root,
+        tracked,
+        &mut TypedRows { rows },
+        projection_source,
+    )
 }
 
-fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
+fn apply_series_rows_inner<S: PreparedRowSource>(
     _ambient_git_root: &Path,
     tracked: &mut TrackedCells,
-    rows: &[R],
+    rows: &mut S,
     projection_source: Option<&str>,
 ) -> Result<ProjectObservationsOutcome, String> {
     validate_observation_identity_namespace(tracked)?;
-    let replaced_observations =
-        remove_replaceable_projected_observations(tracked, rows, projection_source)?;
+    let replaced_observations = remove_replaceable_projected_observations_with(
+        tracked,
+        || {
+            (0..rows.row_count())
+                .map(|index| rows.event_id(index))
+                .collect()
+        },
+        projection_source,
+    )?;
     let mut cell_indices: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (index, cell) in tracked.cells.iter().enumerate() {
         cell_indices
@@ -15621,25 +16552,35 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
 
     let mut prepared = Vec::new();
     let mut skipped = Vec::new();
-    for row in rows {
-        let row: &SeriesRow = row.borrow();
-        let label = row.label();
+    let mut hermit_interned = std::collections::HashMap::<String, std::rc::Rc<str>>::new();
+    // SourceDepth is Eq but not Ord/Hash, so bucket depth maps by a content
+    // hash and confirm equality inside the bucket.
+    let mut depth_interned =
+        std::collections::HashMap::<u64, Vec<std::rc::Rc<BTreeMap<String, SourceDepth>>>>::new();
+    for row_index in 0..rows.row_count() {
+        let row = rows.row(row_index)?;
+        let row: &SeriesRow = &row;
+        // Built only on the error/skip paths below; formatting a label for
+        // every admitted row allocated millions of strings nobody read.
+        let label = || row.label();
         if let Err(why) = row.validate_for_projection() {
             if row.series.no_verdict_evidence.is_some() {
-                return Err(format!("{label}: {why}"));
+                return Err(format!("{}: {why}", label()));
             }
-            skipped.push(format!("{label}: {why}"));
+            skipped.push(format!("{}: {why}", label()));
             continue;
         }
         let Some(indices) = cell_indices.get(series_row_cell(row).as_ref()) else {
             skipped.push(format!(
-                "{label}: no exact test/mode/backend match in the tracked manifest"
+                "{}: no exact test/mode/backend match in the tracked manifest",
+                label()
             ));
             continue;
         };
         if indices.len() != 1 {
             skipped.push(format!(
-                "{label}: test/mode/backend matches {} tracked cells instead of exactly one",
+                "{}: test/mode/backend matches {} tracked cells instead of exactly one",
+                label(),
                 indices.len()
             ));
             continue;
@@ -15652,16 +16593,19 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
             None => {
                 if is_naked_native(&cell.id) {
                     skipped.push(format!(
-                        "{label}: naked/native evidence is canonical-series-only and is not projected into legacy cells.json observations"
+                        "{}: naked/native evidence is canonical-series-only and is not projected into legacy cells.json observations",
+                        label()
                     ));
                 } else if let Some(entry) = no_comparison_verify(row, &cell.id) {
                     skipped.push(format!(
-                        "{label}: labelled \"diverged\", but its verify report ({}, sha256 {}) says the first run was rejected and nothing was compared",
+                        "{}: labelled \"diverged\", but its verify report ({}, sha256 {}) says the first run was rejected and nothing was compared",
+                        label(),
                         entry.report_path, entry.report_sha256
                     ));
                 } else {
                     skipped.push(format!(
-                        "{label}: outcome {:?} produced no comparison and carries no exact no-verdict evidence",
+                        "{}: outcome {:?} produced no comparison and carries no exact no-verdict evidence",
+                        label(),
                         row.series.outcome.as_str()
                     ));
                 }
@@ -15671,37 +16615,55 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
         let observation_identity = match series_observation_identity(row) {
             Ok(identity) => identity,
             Err(why) => {
-                skipped.push(format!("{label}: {why}"));
+                skipped.push(format!("{}: {why}", label()));
                 continue;
             }
         };
+        let hermit_sha = match hermit_interned.get(row.series.tree.as_str()) {
+            Some(interned) => interned.clone(),
+            None => {
+                let interned: std::rc::Rc<str> = std::rc::Rc::from(row.series.tree.as_str());
+                hermit_interned.insert(row.series.tree.clone(), interned.clone());
+                interned
+            }
+        };
+        let depth = {
+            let bucket = depth_interned
+                .entry(depth_map_hash(&row.series.depth))
+                .or_default();
+            match bucket
+                .iter()
+                .find(|interned| ***interned == row.series.depth)
+            {
+                Some(interned) => interned.clone(),
+                None => {
+                    let interned = std::rc::Rc::new(row.series.depth.clone());
+                    bucket.push(interned.clone());
+                    interned
+                }
+            }
+        };
         prepared.push(PreparedSeriesRow {
+            row_index,
             cell_index,
             observation_identity,
             provenance,
-            event_id: row.event_id.clone(),
-            hermit_sha: row.series.tree.clone(),
-            run_id: row.run_id.clone(),
-            attempt: row.series.attempt.unwrap_or(1),
             result: evidence.result,
             no_verdict: evidence.no_verdict,
             num_runs: row.series.num_runs,
+            event_id: row.event_id.clone(),
+            hermit_sha,
+            attempt: row.series.attempt.unwrap_or(1),
             main_ancestry: row.series.main_ancestry,
-            depth: row.series.depth.clone(),
+            depth,
             coordinates: row.series.coordinates.clone(),
-            order: (
-                row.emitted_at.clone(),
-                row.run_id.clone(),
-                row.series.run_index,
-                row.event_id.clone(),
-            ),
         });
     }
 
-    if !rows.is_empty() && prepared.is_empty() {
+    if rows.row_count() != 0 && prepared.is_empty() {
         return Err(format!(
             "every one of the {} readable series row(s) determined nothing for the legacy projection, so the projection was not written:\n{}",
-            rows.len(),
+            rows.row_count(),
             skipped
                 .iter()
                 .map(|line| format!("  skipped {line}"))
@@ -15717,13 +16679,19 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
         .iter()
         .map(|row| row.cell_index)
         .collect::<BTreeSet<_>>();
-    let mut preserved = BTreeMap::new();
+    // Both maps key on borrowed identities — from the tracked observations
+    // and from the caller's rows — and are dropped before the grouped fold
+    // mutates TRACKED. Owning each key cloned two strings per row.
+    let mut preserved = BTreeMap::<
+        (usize, ObservationProvenance, &str, &str),
+        (usize, BTreeSet<ObservedResult>),
+    >::new();
     for (cell_index, cell) in tracked.cells.iter().enumerate() {
         for observation in &cell.observations {
             if !observation.event_ids.is_empty() {
                 continue;
             }
-            let mut runs = BTreeMap::<(String, String), BTreeSet<ObservedResult>>::new();
+            let mut runs = BTreeMap::<(&str, &str), BTreeSet<ObservedResult>>::new();
             for (hermit_sha, run_id, result) in observation
                 .canonical_comparisons
                 .iter()
@@ -15733,7 +16701,7 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
                         .map(|result| (&row.hermit_sha, &row.run_id, result))
                 }))
             {
-                runs.entry((hermit_sha.clone(), run_id.clone()))
+                runs.entry((hermit_sha.as_str(), run_id.as_str()))
                     .or_default()
                     .insert(result);
             }
@@ -15746,20 +16714,16 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
             }
         }
     }
-    let source_counts = prepared.iter().fold(BTreeMap::new(), |mut counts, row| {
-        *counts
-            .entry((
-                row.cell_index,
-                row.provenance,
-                row.hermit_sha.clone(),
-                row.run_id.clone(),
-            ))
+    let mut source_counts = BTreeMap::<(usize, ObservationProvenance, &str, &str), usize>::new();
+    for row in &prepared {
+        let (tree, run_id) = rows.identity_key(row.row_index);
+        *source_counts
+            .entry((row.cell_index, row.provenance, tree, run_id))
             .or_insert(0usize) += 1;
-        counts
-    });
+    }
     let mut represented_rows = 0usize;
     let mut to_project = Vec::new();
-    for row in prepared.iter().cloned() {
+    for row in prepared {
         // Projector-owned no-verdict rows carry immutable event IDs instead of
         // the direct writer's literal invocation. Do not conflate the two
         // storage forms or suppress the series event by a run-level match.
@@ -15767,12 +16731,8 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
             to_project.push(row);
             continue;
         }
-        let key = (
-            row.cell_index,
-            row.provenance,
-            row.hermit_sha.clone(),
-            row.run_id.clone(),
-        );
+        let (tree, run_id) = rows.identity_key(row.row_index);
+        let key = (row.cell_index, row.provenance, tree, run_id);
         let Some((matches, results)) = preserved.get(&key) else {
             to_project.push(row);
             continue;
@@ -15780,7 +16740,7 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
         if row.attempt != 1 {
             return Err(format!(
                 "series event {} maps to existing run {} at Hermit {}, but records outer attempt {}; preserved evidence does not retain that attempt identity",
-                row.event_id, row.run_id, row.hermit_sha, row.attempt
+                row.event_id, run_id, row.hermit_sha, row.attempt
             ));
         }
         let source_rows = source_counts[&key];
@@ -15788,7 +16748,7 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
             return Err(format!(
                 "source event {} cannot map one-to-one to preserved run {} attempt {} at Hermit {}: source_rows={} matching_observations={} num_runs={}",
                 row.event_id,
-                row.run_id,
+                run_id,
                 row.attempt,
                 row.hermit_sha,
                 source_rows,
@@ -15802,24 +16762,48 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
         if results != &BTreeSet::from([result]) {
             return Err(format!(
                 "series event {} maps to existing run {} at Hermit {}, but results {results:?} disagree with {:?}",
-                row.event_id, row.run_id, row.hermit_sha, result
+                row.event_id, run_id, row.hermit_sha, result
             ));
         }
         represented_rows += 1;
     }
+    drop(preserved);
+    drop(source_counts);
     let mut prepared = to_project;
 
-    prepared.sort_by(|left, right| left.order.cmp(&right.order));
+    // Cell-major, canonical within each cell: the fold below flushes one
+    // cell at a time, so only that cell's grouped observations are live at
+    // once. Holding every cell's groups until the end cost about 9 GiB at
+    // full-corpus scale. Within a cell the order is exactly the canonical
+    // order the fold has always used.
+    prepared.sort_by(|left, right| {
+        left.cell_index.cmp(&right.cell_index).then_with(|| {
+            rows.order_key(left.row_index)
+                .cmp(&rows.order_key(right.row_index))
+        })
+    });
+    // Prepared rows now carry everything the fold reads; release the row
+    // source's backing store (for a held snapshot, its payload and index)
+    // before the fold grows the tracked observations.
+    rows.release();
     let mut grouped =
-        BTreeMap::<(usize, SeriesObservationIdentity, ObservationProvenance), Observation>::new();
-    let mut latest_by_cell: BTreeMap<usize, usize> = BTreeMap::new();
-    for (prepared_index, row) in prepared.iter().enumerate() {
+        BTreeMap::<(SeriesObservationIdentity, ObservationProvenance), Observation>::new();
+    let mut current_cell: Option<usize> = None;
+    let mut latest_in_cell: Option<PreparedSeriesRow> = None;
+    for row in prepared {
+        if current_cell != Some(row.cell_index) {
+            if let Some(cell_index) = current_cell {
+                flush_projected_cell(
+                    tracked,
+                    cell_index,
+                    std::mem::take(&mut grouped),
+                    latest_in_cell.take(),
+                );
+            }
+            current_cell = Some(row.cell_index);
+        }
         let observation = grouped
-            .entry((
-                row.cell_index,
-                row.observation_identity.clone(),
-                row.provenance,
-            ))
+            .entry((row.observation_identity.clone(), row.provenance))
             .or_insert_with(|| Observation {
                 detcore_tree: row.observation_identity.detcore_tree().map(str::to_string),
                 event_ids: BTreeSet::new(),
@@ -15835,8 +16819,10 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
                 first_divergent_syscall: ObservedPositions::default(),
             });
         observation.event_ids.insert(row.event_id.clone());
-        observation.depth = row.depth.clone();
-        observation.hermit_shas.insert(row.hermit_sha.clone());
+        observation.depth = (*row.depth).clone();
+        if !observation.hermit_shas.contains(row.hermit_sha.as_ref()) {
+            observation.hermit_shas.insert(row.hermit_sha.to_string());
+        }
         if let Some(result) = row.result {
             observation.results.insert(result);
         }
@@ -15862,42 +16848,13 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
                     .and_then(|coordinates| coordinates.first_divergent_syscall),
             );
         }
-        latest_by_cell.insert(row.cell_index, prepared_index);
+        latest_in_cell = Some(row);
+    }
+    if let Some(cell_index) = current_cell {
+        flush_projected_cell(tracked, cell_index, grouped, latest_in_cell);
     }
 
-    for ((cell_index, _, _), observation) in grouped {
-        let cell = &mut tracked.cells[cell_index];
-        cell.observations.push(observation);
-        cell.observations.sort_by(|left, right| {
-            left.detcore_tree
-                .cmp(&right.detcore_tree)
-                .then(left.provenance.cmp(&right.provenance))
-                .then(left.event_ids.cmp(&right.event_ids))
-        });
-    }
-
-    for (cell_index, prepared_index) in latest_by_cell {
-        let row = &prepared[prepared_index];
-        let Some(detcore_tree) = row.observation_identity.detcore_tree() else {
-            continue;
-        };
-        if should_replace_last_tested(tracked.cells[cell_index].last_tested.as_ref(), row) {
-            tracked.cells[cell_index].last_tested = Some(LastTested {
-                hermit_sha: row.hermit_sha.clone(),
-                detcore_tree: detcore_tree.to_string(),
-                depth: row.depth.clone(),
-                // Projected from historical series rows. Neither the check
-                // identity nor the applicability AT THAT TIME survives in the
-                // row, and today's applicability is not evidence about then, so
-                // both stay unrecorded. This is the case the type exists for.
-                check: None,
-                applicable_when_tested: None,
-                comparison_verdict: None,
-            });
-        }
-    }
-
-    let pre_series_corpus = rows.is_empty()
+    let pre_series_corpus = rows.row_count() == 0
         || tracked.cells.iter().any(|cell| {
             cell.observations
                 .iter()
@@ -15916,6 +16873,54 @@ fn apply_series_rows_inner<R: std::borrow::Borrow<SeriesRow>>(
     })
 }
 
+/// Push one cell's folded observations, order them, and advance the cell's
+/// last-tested stamp from its latest prepared row. Projected observations
+/// have pairwise-distinct sort keys (their event_ids sets are nonempty and
+/// disjoint), so one stable sort here gives the order the previous
+/// sort-after-every-push produced.
+fn flush_projected_cell(
+    tracked: &mut TrackedCells,
+    cell_index: usize,
+    grouped: BTreeMap<(SeriesObservationIdentity, ObservationProvenance), Observation>,
+    latest: Option<PreparedSeriesRow>,
+) {
+    let cell = &mut tracked.cells[cell_index];
+    for (_, observation) in grouped {
+        cell.observations.push(observation);
+    }
+    cell.observations.sort_by(|left, right| {
+        left.detcore_tree
+            .cmp(&right.detcore_tree)
+            .then(left.provenance.cmp(&right.provenance))
+            .then(left.event_ids.cmp(&right.event_ids))
+    });
+    let Some(row) = latest else {
+        return;
+    };
+    let Some(detcore_tree) = row.observation_identity.detcore_tree() else {
+        return;
+    };
+    if should_replace_last_tested_at(
+        tracked.cells[cell_index].last_tested.as_ref(),
+        &row.hermit_sha,
+        row.main_ancestry,
+        &row.depth,
+    ) {
+        tracked.cells[cell_index].last_tested = Some(LastTested {
+            hermit_sha: row.hermit_sha.to_string(),
+            detcore_tree: detcore_tree.to_string(),
+            depth: (*row.depth).clone(),
+            // Projected from historical series rows. Neither the check
+            // identity nor the applicability AT THAT TIME survives in the
+            // row, and today's applicability is not evidence about then, so
+            // both stay unrecorded. This is the case the type exists for.
+            check: None,
+            applicable_when_tested: None,
+            comparison_verdict: None,
+        });
+    }
+}
+
 #[derive(Debug)]
 struct SeriesSourceSnapshot {
     source: String,
@@ -15931,14 +16936,31 @@ struct SeriesSourceShard {
     bytes: Vec<u8>,
 }
 
+/// What a held snapshot keeps after validation: the source identity and row
+/// accounting every later phase reads. The rows themselves live, typed, in
+/// [`HeldScorecardSeriesSnapshot::rows`].
+#[derive(Debug)]
+struct ScorecardSeriesSnapshotMeta {
+    source: ScorecardSeriesSnapshotSource,
+    rows_read: u64,
+    rows_sha256: String,
+}
+
+/// The parse-time form of a scorecard snapshot: rows borrow the payload
+/// bytes instead of copying them into one `Box<RawValue>` each. At
+/// full-corpus scale the owned copy is a second snapshot-sized allocation
+/// held beside the payload and the typed rows; the borrowed rows are
+/// validated and converted before the payload is released, and only the
+/// metadata above is kept.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ScorecardSeriesSnapshot {
+struct BorrowedScorecardSeriesSnapshot<'a> {
     schema: String,
     source: ScorecardSeriesSnapshotSource,
     rows_read: u64,
     rows_sha256: String,
-    rows: Vec<Box<RawValue>>,
+    #[serde(borrow)]
+    rows: Vec<&'a RawValue>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -16005,12 +17027,18 @@ struct SnapshotDirectoryIdentity {
 impl SnapshotDirectoryIdentity {
     fn from_path_identity(identity: SnapshotPathIdentity) -> Self {
         // Creating or renaming a sibling output changes directory timestamps
-        // and size without replacing the held directory. The snapshot file
-        // itself still uses the complete metadata identity and byte digest.
+        // and size without replacing the held directory. So does a chmod:
+        // the held directories include every ancestor of an evidence file,
+        // `/` among them, and other actors on a shared host change their
+        // permission bits (a host's `/` has been seen switching between 0555
+        // and 0755), which failed the check with "evidence directory changed:
+        // /". Only the file type stays in the identity, beside the device and
+        // inode that name the directory. The snapshot file itself still uses
+        // the complete metadata identity and byte digest.
         Self {
             device: identity.device,
             inode: identity.inode,
-            mode: identity.mode,
+            mode: identity.mode & libc::S_IFMT,
         }
     }
 }
@@ -16023,8 +17051,16 @@ struct HeldScorecardSeriesSnapshot {
     parent_identity: SnapshotDirectoryIdentity,
     file_identity: SnapshotPathIdentity,
     sha256: String,
-    snapshot: ScorecardSeriesSnapshot,
-    rows: Vec<SeriesRow>,
+    snapshot: ScorecardSeriesSnapshotMeta,
+    /// The whole snapshot file, held so rows can be rebuilt on demand. At
+    /// full-corpus scale this is 7.6 GiB against about 17 GiB of typed rows;
+    /// the apply fold releases it once prepared rows carry their fold data.
+    payload: Vec<u8>,
+    /// `(offset, len)` of each row's exact JSON text inside `payload`, in
+    /// snapshot (canonical emitted_at/event_id) order.
+    row_ranges: Vec<(usize, u32)>,
+    index: Vec<SnapshotRowIndex>,
+    tables: SnapshotIndexTables,
 }
 
 struct UniqueJsonFields;
@@ -16072,13 +17108,17 @@ impl<'de> serde::de::Visitor<'de> for UniqueJsonFields {
     }
 
     fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self, A::Error> {
-        let mut fields = BTreeSet::new();
+        // Objects here hold at most a few dozen fields; a linear scan over a
+        // small Vec beats a BTreeSet node allocation per field name. This
+        // walk visits every object in a multi-gigabyte snapshot.
+        let mut fields: Vec<String> = Vec::new();
         while let Some(field) = map.next_key::<String>()? {
-            if !fields.insert(field.clone()) {
+            if fields.contains(&field) {
                 return Err(serde::de::Error::custom(format!(
                     "duplicate JSON field {field:?}"
                 )));
             }
+            fields.push(field);
             map.next_value::<Self>()?;
         }
         Ok(self)
@@ -16111,6 +17151,34 @@ fn snapshot_path_identity(path: &Path, kind: &str) -> Result<SnapshotPathIdentit
         ));
     }
     Ok(SnapshotPathIdentity::from_metadata(&metadata))
+}
+
+/// The held snapshot's sha256, read in chunks: the same size-change refusals
+/// as [`read_held_snapshot_file`], without holding the whole payload again.
+/// `verify` runs while the typed rows and tracked history are all alive, so
+/// a whole-payload buffer there set the render's peak.
+fn held_snapshot_sha256(file: &File, identity: SnapshotPathIdentity) -> Result<String, String> {
+    let mut hasher = Sha256::new();
+    let mut chunk = vec![0u8; 1 << 20];
+    let mut offset = 0u64;
+    while offset < identity.size {
+        let wanted = ((identity.size - offset) as usize).min(chunk.len());
+        let read = UnixFileExt::read_at(file, &mut chunk[..wanted], offset)
+            .map_err(|error| format!("cannot read held scorecard snapshot: {error}"))?;
+        if read == 0 {
+            return Err("scorecard snapshot changed size while being read".into());
+        }
+        hasher.update(&chunk[..read]);
+        offset += read as u64;
+    }
+    let mut extra = [0u8; 1];
+    if UnixFileExt::read_at(file, &mut extra, identity.size)
+        .map_err(|error| format!("cannot finish reading held scorecard snapshot: {error}"))?
+        != 0
+    {
+        return Err("scorecard snapshot changed size while being read".into());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn read_held_snapshot_file(file: &File, identity: SnapshotPathIdentity) -> Result<Vec<u8>, String> {
@@ -16146,35 +17214,174 @@ fn canonical_snapshot_rows_bytes(rows: &[JsonValue]) -> Result<Vec<u8>, String> 
     Ok(bytes)
 }
 
-fn canonical_snapshot_raw_rows_bytes(rows: &[Box<RawValue>]) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    for row in rows {
-        bytes.extend_from_slice(row.get().as_bytes());
-        bytes.push(b'\n');
-    }
-    bytes
+/// The per-row facts a held snapshot keeps beside its payload: everything
+/// later passes need to select, order, and look up rows without parsing
+/// them. The typed row itself is rebuilt on demand from the payload bytes
+/// (`HeldScorecardSeriesSnapshot::parse_row`); holding every typed row
+/// instead cost about 17 GiB at full-corpus scale.
+#[derive(Debug)]
+struct SnapshotRowIndex {
+    event_id: std::rc::Rc<str>,
+    /// Indices into the held snapshot's intern tables. Cells, Hermit
+    /// commits, run ids, and emission stamps repeat across rows; storing
+    /// each string per row cost gigabytes beside the payload.
+    emitted: u32,
+    run: u32,
+    run_index: u64,
+    /// [`series_row_cell`], resolved (retired ids mapped to successors).
+    cell: u32,
+    /// The row's Hermit commit (`series.tree`).
+    tree: u32,
+    producer: SeriesProducer,
 }
 
-fn require_exact_object_keys(
-    value: &JsonValue,
-    expected: &[&str],
-    label: &str,
-) -> Result<(), String> {
+/// Distinct index strings, interned during snapshot validation. Each
+/// distinct string is allocated once and shared with the lookup map that
+/// built the table (dropped after validation).
+#[derive(Debug, Default)]
+struct SnapshotIndexTables {
+    cells: Vec<std::rc::Rc<str>>,
+    trees: Vec<std::rc::Rc<str>>,
+    runs: Vec<std::rc::Rc<str>>,
+    emitted: Vec<std::rc::Rc<str>>,
+}
+
+fn intern_index_string(
+    map: &mut std::collections::HashMap<std::rc::Rc<str>, u32>,
+    table: &mut Vec<std::rc::Rc<str>>,
+    value: String,
+) -> Result<u32, String> {
+    if let Some(&id) = map.get(value.as_str()) {
+        return Ok(id);
+    }
+    let id = u32::try_from(table.len())
+        .map_err(|_| "scorecard snapshot has too many distinct row identities".to_string())?;
+    let interned: std::rc::Rc<str> = std::rc::Rc::from(value.as_str());
+    map.insert(interned.clone(), id);
+    table.push(interned);
+    Ok(id)
+}
+
+/// FNV-1a bucket key for a depth map; equality is always confirmed
+/// against the stored map.
+fn depth_map_hash(depth: &BTreeMap<String, SourceDepth>) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for (name, entry) in depth {
+        for byte in name.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        for value in [entry.commits, entry.first_parent] {
+            hash ^= value;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash
+}
+
+/// FNV-1a over the event_id bytes. Only a bucket key for duplicate
+/// detection; a hit is always confirmed against the stored string.
+fn event_id_hash(event_id: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in event_id.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+const SNAPSHOT_ROW_FIELDS: &[&str] = &[
+    "schema",
+    "event_id",
+    "event_type",
+    "emitted_at",
+    "team",
+    "host",
+    "producer",
+    "run_id",
+    "series",
+];
+
+const SNAPSHOT_SERIES_FIELDS: &[&str] = &[
+    "cell",
+    "tree",
+    "detcore_tree",
+    "outcome",
+    "result",
+    "failure_class",
+    "no_verdict_evidence",
+    "pressure_evidence",
+    "declared_guest_exit",
+    // Typed by `SeriesComparison`, whose own deny_unknown_fields refuses an
+    // unknown key inside it; `validate_for_read` refuses any value but the
+    // stripped, non-bitwise comparison the writer records.
+    "comparison",
+    "run_index",
+    "attempt",
+    "num_runs",
+    "last_run_index",
+    "main_ancestry",
+    "runtime",
+    "source_tree_dirty",
+    "depth",
+    "coordinates",
+    "first_divergent_messages",
+    "machine_shortname",
+    "kernel_version",
+    "host_capabilities",
+    // How the cell ran (`CellStrictness`, whose own deny_unknown_fields
+    // refuses an unknown key inside it). The series writer copies it from
+    // the cell's results row when the harness recorded one.
+    "strictness",
+    // A verify cell's first divergence (`SeriesDivergence`, whose structs
+    // all deny unknown fields; `validate_for_read` checks it). dev-hermit's
+    // series writer has written it on verify rows since 2026-10-21. Every
+    // scorecard render from then on refused the snapshot here until this
+    // entry existed, so scorecard/parity.json stopped advancing.
+    "divergence",
+];
+
+fn allowed_snapshot_series_fields() -> &'static BTreeSet<&'static str> {
+    static FIELDS: std::sync::OnceLock<BTreeSet<&'static str>> = std::sync::OnceLock::new();
+    FIELDS.get_or_init(|| SNAPSHOT_SERIES_FIELDS.iter().copied().collect())
+}
+
+/// One snapshot row's exact text to a typed row, with the field-set refusals
+/// the snapshot validation has always made. `validate_for_read` is the
+/// caller's business: the validation pass applies it; later re-parses of
+/// already-validated bytes do not repeat it.
+fn parse_snapshot_row_text(text: &str, display: &Path, index: usize) -> Result<SeriesRow, String> {
+    // The label names the row in every refusal below; it is built only on
+    // those paths, never for an accepted row.
+    let label = || format!("scorecard snapshot {} row {}", display.display(), index + 1);
+    let value: JsonValue =
+        serde_json::from_str(text).map_err(|error| format!("{} is malformed: {error}", label()))?;
     let object = value
         .as_object()
-        .ok_or_else(|| format!("{label} must be an object"))?;
-    let actual = object.keys().map(String::as_str).collect::<BTreeSet<_>>();
-    let expected = expected.iter().copied().collect::<BTreeSet<_>>();
-    if actual != expected {
-        return Err(format!("{label} has an invalid field set"));
+        .ok_or_else(|| format!("{} must be an object", label()))?;
+    if object.keys().map(String::as_str).collect::<BTreeSet<_>>()
+        != SNAPSHOT_ROW_FIELDS.iter().copied().collect::<BTreeSet<_>>()
+    {
+        return Err(format!("{} has an invalid field set", label()));
     }
-    Ok(())
+    let series = value
+        .get("series")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| format!("{} series must be an object", label()))?;
+    if series
+        .keys()
+        .map(String::as_str)
+        .any(|field| !allowed_snapshot_series_fields().contains(field))
+    {
+        return Err(format!("{} series has an unknown field", label()));
+    }
+    serde_json::from_value(value).map_err(|error| format!("{} is malformed: {error}", label()))
 }
 
 fn validate_scorecard_snapshot(
-    snapshot: &ScorecardSeriesSnapshot,
+    snapshot: &BorrowedScorecardSeriesSnapshot<'_>,
     display: &Path,
-) -> Result<Vec<SeriesRow>, String> {
+) -> Result<(Vec<SnapshotRowIndex>, SnapshotIndexTables), String> {
     if snapshot.schema != SCORECARD_SERIES_SNAPSHOT_SCHEMA {
         return Err(format!(
             "scorecard snapshot {} has schema {:?}, expected {SCORECARD_SERIES_SNAPSHOT_SCHEMA}",
@@ -16283,8 +17490,14 @@ fn validate_scorecard_snapshot(
     // bytes, one row plus one newline. Preserve those bytes through RawValue:
     // reserializing through Rust would silently change valid Python spellings
     // such as exponent-form floats and would verify a different contract.
-    let rows_bytes = canonical_snapshot_raw_rows_bytes(&snapshot.rows);
-    let rows_sha256 = format!("{:x}", Sha256::digest(&rows_bytes));
+    // Feed the hasher row by row: materializing every row's bytes first held
+    // a second snapshot-sized buffer beside the payload for no other purpose.
+    let mut hasher = Sha256::new();
+    for row in &snapshot.rows {
+        hasher.update(row.get().as_bytes());
+        hasher.update(b"\n");
+    }
+    let rows_sha256 = format!("{:x}", hasher.finalize());
     if rows_sha256 != snapshot.rows_sha256 {
         return Err(format!(
             "scorecard snapshot {} row digest does not match its rows",
@@ -16292,95 +17505,82 @@ fn validate_scorecard_snapshot(
         ));
     }
 
-    const ROW_FIELDS: &[&str] = &[
-        "schema",
-        "event_id",
-        "event_type",
-        "emitted_at",
-        "team",
-        "host",
-        "producer",
-        "run_id",
-        "series",
-    ];
-    const SERIES_FIELDS: &[&str] = &[
-        "cell",
-        "tree",
-        "detcore_tree",
-        "outcome",
-        "result",
-        "failure_class",
-        "no_verdict_evidence",
-        "pressure_evidence",
-        "declared_guest_exit",
-        // Typed by `SeriesComparison`, whose own deny_unknown_fields refuses an
-        // unknown key inside it; `validate_for_read` refuses any value but the
-        // stripped, non-bitwise comparison the writer records.
-        "comparison",
-        "run_index",
-        "attempt",
-        "num_runs",
-        "last_run_index",
-        "main_ancestry",
-        "runtime",
-        "source_tree_dirty",
-        "depth",
-        "coordinates",
-        "first_divergent_messages",
-        "machine_shortname",
-        "kernel_version",
-        "host_capabilities",
-        // How the cell ran (`CellStrictness`, whose own deny_unknown_fields
-        // refuses an unknown key inside it). The series writer copies it from
-        // the cell's results row when the harness recorded one.
-        "strictness",
-    ];
-    let allowed_series_fields = SERIES_FIELDS.iter().copied().collect::<BTreeSet<_>>();
-    let mut rows = Vec::with_capacity(snapshot.rows.len());
-    let mut event_ids = BTreeSet::new();
-    let mut previous_order: Option<(String, String)> = None;
+    let mut rows: Vec<SnapshotRowIndex> = Vec::with_capacity(snapshot.rows.len());
+    let mut tables = SnapshotIndexTables::default();
+    let mut cell_ids = std::collections::HashMap::<std::rc::Rc<str>, u32>::new();
+    let mut tree_ids = std::collections::HashMap::<std::rc::Rc<str>, u32>::new();
+    let mut run_ids = std::collections::HashMap::<std::rc::Rc<str>, u32>::new();
+    let mut emitted_ids = std::collections::HashMap::<std::rc::Rc<str>, u32>::new();
+    // Duplicate detection by event_id hash, confirmed against the stored
+    // string: a BTreeSet<String> here cloned every event_id and held them
+    // all beside the index strings that keep them anyway. The map holds the
+    // first index per hash; further indices with the same hash (collisions
+    // or the duplicate itself) spill to the small overflow list.
+    let mut event_first = std::collections::HashMap::<u64, usize>::new();
+    let mut event_overflow: Vec<(u64, usize)> = Vec::new();
     for (index, raw) in snapshot.rows.iter().enumerate() {
-        let label = format!("scorecard snapshot {} row {}", display.display(), index + 1);
-        let value: JsonValue = serde_json::from_str(raw.get())
-            .map_err(|error| format!("{label} is malformed: {error}"))?;
-        require_exact_object_keys(&value, ROW_FIELDS, &label)?;
-        let series = value
-            .get("series")
-            .and_then(JsonValue::as_object)
-            .ok_or_else(|| format!("{label} series must be an object"))?;
-        if series
-            .keys()
-            .map(String::as_str)
-            .any(|field| !allowed_series_fields.contains(field))
-        {
-            return Err(format!("{label} series has an unknown field"));
-        }
-        let mut row: SeriesRow = serde_json::from_value(value)
-            .map_err(|error| format!("{label} is malformed: {error}"))?;
-        row.validate_for_read()
-            .map_err(|error| format!("{label} is invalid: {error}"))?;
-        if !event_ids.insert(row.event_id.clone()) {
+        let row = parse_snapshot_row_text(raw.get(), display, index)?;
+        row.validate_for_read().map_err(|error| {
+            format!(
+                "scorecard snapshot {} row {} is invalid: {error}",
+                display.display(),
+                index + 1
+            )
+        })?;
+        let hash = event_id_hash(&row.event_id);
+        let duplicate = match event_first.entry(hash) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(index);
+                false
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let first = *entry.get();
+                let duplicate = rows[first].event_id.as_ref() == row.event_id.as_str()
+                    || event_overflow.iter().any(|(overflow_hash, previous)| {
+                        *overflow_hash == hash
+                            && rows[*previous].event_id.as_ref() == row.event_id.as_str()
+                    });
+                if !duplicate {
+                    event_overflow.push((hash, index));
+                }
+                duplicate
+            }
+        };
+        if duplicate {
             return Err(format!(
                 "scorecard snapshot {} repeats event_id {:?}",
                 display.display(),
                 row.event_id
             ));
         }
-        let order = (row.emitted_at.clone(), row.event_id.clone());
-        if previous_order
-            .as_ref()
-            .is_some_and(|previous| previous >= &order)
-        {
-            return Err(format!(
-                "scorecard snapshot {} rows are not in canonical emitted_at/event_id order",
-                display.display()
-            ));
+        if let Some(previous) = rows.last() {
+            let previous: &SnapshotRowIndex = previous;
+            if (
+                tables.emitted[previous.emitted as usize].as_ref(),
+                previous.event_id.as_ref(),
+            ) >= (row.emitted_at.as_str(), row.event_id.as_str())
+            {
+                return Err(format!(
+                    "scorecard snapshot {} rows are not in canonical emitted_at/event_id order",
+                    display.display()
+                ));
+            }
         }
-        previous_order = Some(order);
-        row.source = format!("{}:rows[{}]", display.display(), index);
-        rows.push(row);
+        rows.push(SnapshotRowIndex {
+            cell: intern_index_string(
+                &mut cell_ids,
+                &mut tables.cells,
+                series_row_cell(&row).into_owned(),
+            )?,
+            tree: intern_index_string(&mut tree_ids, &mut tables.trees, row.series.tree)?,
+            run: intern_index_string(&mut run_ids, &mut tables.runs, row.run_id)?,
+            emitted: intern_index_string(&mut emitted_ids, &mut tables.emitted, row.emitted_at)?,
+            event_id: std::rc::Rc::from(row.event_id.as_str()),
+            run_index: row.series.run_index,
+            producer: row.producer,
+        });
     }
-    Ok(rows)
+    Ok((rows, tables))
 }
 
 impl HeldScorecardSeriesSnapshot {
@@ -16458,16 +17658,35 @@ impl HeldScorecardSeriesSnapshot {
         // the producer's exact byte spelling for the canonical-row digest.
         serde_json::from_slice::<UniqueJsonFields>(&payload)
             .map_err(|error| format!("scorecard snapshot is not valid strict JSON: {error}"))?;
-        let mut snapshot: ScorecardSeriesSnapshot = serde_json::from_slice(&payload)
+        // Rows borrow the payload: converting them to owned RawValues first
+        // duplicated the snapshot's whole size beside the payload itself.
+        // Validation finishes here, while the payload is alive; the held
+        // snapshot keeps the payload, each row's byte range in it, and the
+        // small per-row index, and rebuilds typed rows on demand.
+        let borrowed: BorrowedScorecardSeriesSnapshot<'_> = serde_json::from_slice(&payload)
             .map_err(|error| format!("scorecard snapshot is not valid strict JSON: {error}"))?;
-        // Each RawValue owns its bytes, and the digest above already bound the
-        // payload: it is the snapshot's whole size, so release it now.
-        drop(payload);
-        let rows = validate_scorecard_snapshot(&snapshot, path)?;
-        // The raw rows exist for that validation's canonical-byte digest. Only
-        // the typed rows are read after it; holding both kept another copy of
-        // every row through the render.
-        snapshot.rows = Vec::new();
+        let (index, tables) = validate_scorecard_snapshot(&borrowed, path)?;
+        let payload_base = payload.as_ptr() as usize;
+        let mut row_ranges = Vec::with_capacity(borrowed.rows.len());
+        for raw in &borrowed.rows {
+            let text = raw.get();
+            let offset = text.as_ptr() as usize - payload_base;
+            let len = u32::try_from(text.len())
+                .map_err(|_| "scorecard snapshot row is too large to index".to_string())?;
+            row_ranges.push((offset, len));
+        }
+        let BorrowedScorecardSeriesSnapshot {
+            schema: _schema,
+            source,
+            rows_read,
+            rows_sha256,
+            rows: _borrowed_rows,
+        } = borrowed;
+        let snapshot = ScorecardSeriesSnapshotMeta {
+            source,
+            rows_read,
+            rows_sha256,
+        };
         let held = Self {
             path: path.to_path_buf(),
             parent,
@@ -16477,10 +17696,87 @@ impl HeldScorecardSeriesSnapshot {
             file_identity,
             sha256: actual_sha256,
             snapshot,
-            rows,
+            payload,
+            row_ranges,
+            index,
+            tables,
         };
         held.verify()?;
         Ok(held)
+    }
+
+    fn row_count(&self) -> usize {
+        self.index.len()
+    }
+
+    fn row_label(&self, row_index: usize) -> String {
+        format!(
+            "scorecard snapshot {} row {}",
+            self.path.display(),
+            row_index + 1
+        )
+    }
+
+    fn row_text(&self, row_index: usize) -> Result<&str, String> {
+        let (offset, len) = self.row_ranges[row_index];
+        std::str::from_utf8(&self.payload[offset..offset + len as usize])
+            .map_err(|error| format!("{} is malformed: {error}", self.row_label(row_index)))
+    }
+
+    /// Rebuild one typed row exactly as the validation pass built it
+    /// (field-set checks included; `validate_for_read` already ran there).
+    fn parse_row(&self, row_index: usize) -> Result<SeriesRow, String> {
+        let mut row = parse_snapshot_row_text(self.row_text(row_index)?, &self.path, row_index)?;
+        row.source = format!("{}:rows[{}]", self.path.display(), row_index);
+        Ok(row)
+    }
+
+    fn index_cell(&self, row: &SnapshotRowIndex) -> &str {
+        &self.tables.cells[row.cell as usize]
+    }
+
+    fn index_tree(&self, row: &SnapshotRowIndex) -> &str {
+        &self.tables.trees[row.tree as usize]
+    }
+
+    fn index_run(&self, row: &SnapshotRowIndex) -> &str {
+        &self.tables.runs[row.run as usize]
+    }
+
+    fn index_emitted(&self, row: &SnapshotRowIndex) -> &str {
+        &self.tables.emitted[row.emitted as usize]
+    }
+    // &Rc<str> derefs to &str above; the tables own the one allocation.
+
+    /// Rebuild one typed row by direct typed deserialization, skipping the
+    /// intermediate `JsonValue`. Only for rows the validation pass already
+    /// accepted: the same bytes deserialize to the same typed row, faster.
+    fn parse_row_typed(&self, row_index: usize) -> Result<SeriesRow, String> {
+        let label = self.row_label(row_index);
+        let mut row: SeriesRow = serde_json::from_str(self.row_text(row_index)?)
+            .map_err(|error| format!("{label} is malformed: {error}"))?;
+        row.source = format!("{}:rows[{}]", self.path.display(), row_index);
+        Ok(row)
+    }
+
+    /// Drop everything rows are rebuilt from. Callers that have
+    /// materialized (or finished rebuilding) their rows release the
+    /// payload and index here; `verify` and the snapshot metadata need
+    /// none of them. `row_count` answers 0 afterwards.
+    fn release_row_storage(&mut self) {
+        self.payload = Vec::new();
+        self.row_ranges = Vec::new();
+        self.index = Vec::new();
+        self.tables = SnapshotIndexTables::default();
+    }
+
+    /// Every typed row, for consumers that still take a slice (the combined
+    /// write-back). The snapshot projection itself rebuilds rows on demand
+    /// and never holds this vector.
+    fn materialize_rows(&self) -> Result<Vec<SeriesRow>, String> {
+        (0..self.row_count())
+            .map(|index| self.parse_row(index))
+            .collect()
     }
 
     fn verify(&self) -> Result<(), String> {
@@ -16512,8 +17808,7 @@ impl HeldScorecardSeriesSnapshot {
                 self.path.display()
             ));
         }
-        let payload = read_held_snapshot_file(&self.file, self.file_identity)?;
-        let actual_sha256 = format!("{:x}", Sha256::digest(&payload));
+        let actual_sha256 = held_snapshot_sha256(&self.file, self.file_identity)?;
         if actual_sha256 != self.sha256 {
             return Err(format!(
                 "scorecard snapshot content changed while held: {}",
@@ -16521,6 +17816,48 @@ impl HeldScorecardSeriesSnapshot {
             ));
         }
         Ok(())
+    }
+}
+
+/// A selected subset of a held snapshot's rows (held indices, in snapshot
+/// order), rebuilt typed on demand for [`apply_series_rows_inner`].
+struct HeldRowSubset<'a> {
+    held: &'a mut HeldScorecardSeriesSnapshot,
+    indices: Vec<usize>,
+}
+
+impl PreparedRowSource for HeldRowSubset<'_> {
+    fn row_count(&self) -> usize {
+        self.indices.len()
+    }
+
+    fn row(&self, index: usize) -> Result<std::borrow::Cow<'_, SeriesRow>, String> {
+        Ok(std::borrow::Cow::Owned(
+            self.held.parse_row_typed(self.indices[index])?,
+        ))
+    }
+
+    fn order_key(&self, index: usize) -> (&str, &str, u64, &str) {
+        let row = &self.held.index[self.indices[index]];
+        (
+            self.held.index_emitted(row),
+            self.held.index_run(row),
+            row.run_index,
+            row.event_id.as_ref(),
+        )
+    }
+
+    fn identity_key(&self, index: usize) -> (&str, &str) {
+        let row = &self.held.index[self.indices[index]];
+        (self.held.index_tree(row), self.held.index_run(row))
+    }
+
+    fn event_id(&self, index: usize) -> &str {
+        self.held.index[self.indices[index]].event_id.as_ref()
+    }
+
+    fn release(&mut self) {
+        self.held.release_row_storage();
     }
 }
 
@@ -16798,6 +18135,32 @@ fn snapshot_series_source(series_root: &Path) -> Result<SeriesSourceSnapshot, St
 /// are contradictory evidence and refuse instead of depending on traversal
 /// order.
 fn read_series_rows(snapshot: &SeriesSourceSnapshot) -> Result<Vec<SeriesRow>, String> {
+    read_series_rows_impl(
+        &snapshot.source_commit,
+        snapshot
+            .shards
+            .iter()
+            .map(|shard| (shard.display_path.clone(), std::borrow::Cow::Borrowed(shard.bytes.as_slice()))),
+    )
+}
+
+/// Like `read_series_rows`, but consumes the snapshot: each shard's bytes
+/// are dropped as soon as its rows are parsed, so a render over the full
+/// corpus never holds every shard's bytes beside every parsed row.
+fn read_series_rows_owned(snapshot: SeriesSourceSnapshot) -> Result<Vec<SeriesRow>, String> {
+    let SeriesSourceSnapshot { source_commit, shards, .. } = snapshot;
+    read_series_rows_impl(
+        &source_commit,
+        shards
+            .into_iter()
+            .map(|shard| (shard.display_path, std::borrow::Cow::Owned(shard.bytes))),
+    )
+}
+
+fn read_series_rows_impl<'a>(
+    source_commit: &str,
+    shards: impl Iterator<Item = (PathBuf, std::borrow::Cow<'a, [u8]>)>,
+) -> Result<Vec<SeriesRow>, String> {
     // A repeated event_id must carry an identical body. That used to be checked
     // by keeping every row's JsonValue: about 12 GB of a 23.7 GB render for the
     // 1,140,698 rows of 2026-10-11. A Value serializes with its object keys in
@@ -16809,27 +18172,34 @@ fn read_series_rows(snapshot: &SeriesSourceSnapshot) -> Result<Vec<SeriesRow>, S
     // are refused as conflicting now. That is the safe direction: the two
     // copies were not written from the same bytes, and nothing writes a
     // negative zero into a series row on purpose.
-    let mut canonical: BTreeMap<String, ([u8; 32], SeriesRow, String)> = BTreeMap::new();
-    for shard in &snapshot.shards {
-        if !shard.bytes.is_empty() && !shard.bytes.ends_with(b"\n") {
+    // The dedup map keeps, per distinct event_id, the body digest, the row,
+    // and its source as (shard, line) indices into this snapshot - not a
+    // formatted source String per row (about 50 bytes each at corpus scale).
+    // The source text is rebuilt only for the returned rows and for a
+    // conflicting-duplicate error, exactly as it was formatted before.
+    let mut canonical: BTreeMap<String, ([u8; 32], SeriesRow, u32, u32)> = BTreeMap::new();
+    let mut display_paths: Vec<PathBuf> = Vec::new();
+    for (shard_index, (display_path, bytes)) in shards.enumerate() {
+        display_paths.push(display_path.clone());
+        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
             return Err(format!(
                 "series shard {} in source commit {} is truncated: every nonempty shard must end in a newline",
-                shard.display_path.display(),
-                snapshot.source_commit
+                display_path.display(),
+                source_commit
             ));
         }
-        let text = std::str::from_utf8(&shard.bytes).map_err(|e| {
+        let text = std::str::from_utf8(&bytes).map_err(|e| {
             format!(
                 "series shard {} in source commit {} is not UTF-8: {e}",
-                shard.display_path.display(),
-                snapshot.source_commit
+                display_path.display(),
+                source_commit
             )
         })?;
         for (index, line) in text.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
-            let source = format!("{}:{}", shard.display_path.display(), index + 1);
+            let source = format!("{}:{}", display_path.display(), index + 1);
             let value: JsonValue = serde_json::from_str(line)
                 .map_err(|why| format!("malformed series row at {source}: {why}"))?;
             let row = SeriesRow::deserialize(&value)
@@ -16842,22 +18212,36 @@ fn read_series_rows(snapshot: &SeriesSourceSnapshot) -> Result<Vec<SeriesRow>, S
             )
             .into();
             drop(value);
-            if let Some((previous_body, _, previous_source)) = canonical.get(&row.event_id) {
+            if let Some((previous_body, _, previous_shard, previous_line)) =
+                canonical.get(&row.event_id)
+            {
                 if previous_body == &body {
                     continue;
                 }
+                let previous_source = format!(
+                    "{}:{}",
+                    display_paths[*previous_shard as usize].display(),
+                    previous_line + 1
+                );
                 return Err(format!(
                     "conflicting series rows share event_id {:?}: {previous_source} and {source}",
                     row.event_id
                 ));
             }
-            canonical.insert(row.event_id.clone(), (body, row, source));
+            canonical.insert(
+                row.event_id.clone(),
+                (body, row, shard_index as u32, index as u32),
+            );
         }
     }
     Ok(canonical
         .into_values()
-        .map(|(_, mut row, source)| {
-            row.source = source;
+        .map(|(_, mut row, shard_index, line)| {
+            row.source = format!(
+                "{}:{}",
+                display_paths[shard_index as usize].display(),
+                line + 1
+            );
             row
         })
         .collect())
@@ -21429,6 +22813,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                     first_divergent_left_message: None,
                     first_divergent_right_message: None,
                     exact_branch_counter: None,
+                    store_exclusive_retries: None,
                 })
                 .unwrap();
                 serde_json::json!({
@@ -21992,6 +23377,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
         green,
         selected_custom: selected_custom.clone(),
         stripped_selected: BTreeSet::new(),
+        known_gaps: Vec::new(),
     };
     let rendered = render_scorecard(&selected_fixture);
     let status_prose = rendered
@@ -22079,6 +23465,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
         green: BTreeSet::new(),
         selected_custom: BTreeSet::new(),
         stripped_selected: BTreeSet::new(),
+        known_gaps: Vec::new(),
     };
     if !render_scorecard(&visible_red).contains("**1** are not selected by full") {
         return Err("scorecard prose did not derive its not-selected-by-full count".into());
@@ -22192,6 +23579,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
         green: BTreeSet::new(),
         selected_custom: BTreeSet::new(),
         stripped_selected: BTreeSet::new(),
+        known_gaps: Vec::new(),
     };
     let status_section = render_scorecard(&not_applicable);
     if !status_section.contains("**1** are **Not applicable**")
@@ -22224,6 +23612,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
         green: BTreeSet::new(),
         selected_custom: BTreeSet::new(),
         stripped_selected: BTreeSet::new(),
+        known_gaps: Vec::new(),
     };
     if tracked_from(&regressed, Some(old_green), None, false).is_ok() {
         return Err("negative ratchet bracket accepted green-to-red movement".into());
@@ -22276,6 +23665,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
         green: BTreeSet::from([id.clone()]),
         selected_custom: BTreeSet::new(),
         stripped_selected: BTreeSet::new(),
+        known_gaps: Vec::new(),
     };
     let recovered = tracked_from(&back_to_green, Some(overridden), None, false)
         .map_err(|e| format!("recovery after an override was refused: {e}"))?;
@@ -22357,6 +23747,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                 first_divergent_left_message: None,
                 first_divergent_right_message: None,
                 exact_branch_counter: None,
+                store_exclusive_retries: None,
                 runtime: None,
                 dbt_counted_branches: None,
                 guest_exit_code: Some(0),
@@ -23918,6 +25309,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
         green: BTreeSet::new(),
         selected_custom: BTreeSet::new(),
         stripped_selected: BTreeSet::new(),
+        known_gaps: Vec::new(),
     };
     if retained_import_cells(&red_import_fixture) != BTreeSet::from([validate_id.clone()]) {
         return Err(
@@ -24745,8 +26137,30 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
         let row_snapshot_path = snapshot_root.join("with-current-row.json");
         let row_snapshot_sha =
             write_scorecard_snapshot_fixture(&row_snapshot_path, &row_snapshot_value)?;
-        HeldScorecardSeriesSnapshot::open(&row_snapshot_path, &row_snapshot_sha)
+        let mut held = HeldScorecardSeriesSnapshot::open(&row_snapshot_path, &row_snapshot_sha)
             .map_err(|error| format!("valid row-bearing combined snapshot was refused: {error}"))?;
+        // The combined write-back materializes its rows, then must release
+        // the held payload before its folds: the materialized rows stay
+        // intact and verify still passes on identity and digest alone.
+        let materialized = held.materialize_rows()?;
+        if materialized.len() != 1 || materialized[0].event_id != series_row.event_id {
+            return Err("materialized row-bearing snapshot lost its row".into());
+        }
+        held.release_row_storage();
+        if !held.payload.is_empty()
+            || !held.row_ranges.is_empty()
+            || !held.index.is_empty()
+            || !held.tables.cells.is_empty()
+            || !held.tables.trees.is_empty()
+            || !held.tables.runs.is_empty()
+            || !held.tables.emitted.is_empty()
+        {
+            return Err("release_row_storage kept held row storage".into());
+        }
+        if materialized.len() != 1 || materialized[0].series.cell != series_row.series.cell {
+            return Err("release_row_storage disturbed materialized rows".into());
+        }
+        held.verify()?;
 
         // A row whose series records how the cell ran is admitted, in the exact
         // bytes the harness writes and the series writer copies: a timeslice in
@@ -25758,6 +27172,19 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                 "series has an unknown field",
             )?;
 
+            // `divergence` is a known series field: it passes the field check
+            // and is judged by the row's own validation, which writes it only on
+            // verify rows (this fixture's row is a replay cell).
+            let mut replay_divergence = row_snapshot_value.clone();
+            replay_divergence["rows"][0]["series"]["divergence"] =
+                serde_json::json!({"self": {"left_len": 3, "right_len": 3}});
+            recompute_snapshot_rows(&mut replay_divergence)?;
+            assert_snapshot_refused_unchanged(
+                "replay-row-divergence",
+                &replay_divergence,
+                "divergence is written only on verify rows",
+            )?;
+
             let mut duplicate_event_id = row_snapshot_value.clone();
             let mut duplicate_row = duplicate_event_id["rows"][0].clone();
             duplicate_row["emitted_at"] = serde_json::json!("2026-09-13T18:30:01Z");
@@ -26081,9 +27508,9 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                         .iter()
                         .any(|cell| cell.id.category == retired_import_id.category) =>
             {
-                // Every writer caps the document it writes back (cap 1,
-                // https://github.com/rrnewton/dev-hermit/issues/563), so the
-                // live cell holds only what the cap keeps of the resolved cell.
+                // Every writer caps the document it writes back (cap 1: each
+                // cell keeps only its latest state), so the live cell holds
+                // only what the cap keeps of the resolved cell.
                 let mut capped = TrackedCells {
                     schema: SCHEMA,
                     projection: None,
@@ -26158,7 +27585,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                         display_id(&import_id)
                     )
                 })?;
-            // Cap 1 (https://github.com/rrnewton/dev-hermit/issues/563) keeps
+            // Cap 1 (each cell keeps only its latest state) keeps
             // each provenance's latest observation and folds the rest into the
             // cell's aggregate; a folded observation is carried only if the
             // aggregate already says everything it said (cell_accounts_for).
@@ -27399,7 +28826,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
     let fold_fixture_row = |row: ResultRow| fold_fixture_rows(vec![row]);
 
     // A canonical PASS is stored once, as its receipt, with no plain
-    // invocation beside it (https://github.com/rrnewton/dev-hermit/issues/540).
+    // invocation beside it (since the ledger slimming change).
     // Its readers still get the run's result, pass count, measurement and
     // direct evidence key, through the stored form and a repeated import. A
     // canonical divergence keeps its plain invocation.
@@ -27502,8 +28929,8 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
     // Counting invocations made a receipt-only canonical pass read as zero
     // runs (post-facto review of d3c63548055e946eacf5c3fc1dd123ee1b5bfe94).
     // A canonical pass is one run whether it is stored as its receipt alone or
-    // beside the plain invocation copy that cells written before
-    // https://github.com/rrnewton/dev-hermit/issues/540 hold, and the legacy
+    // beside the plain invocation copy that cells written before the ledger
+    // slimming change hold, and the legacy
     // form prints what the invocation count printed.
     for runs in [1usize, 3] {
         let mut receipt_only = TrackedCells {
@@ -29887,7 +31314,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
         // Their omitted outer-attempt and evidence identities collapse to the same
         // compact run/result key even though the invocation payloads differ.
         //
-        // Cells written before https://github.com/rrnewton/dev-hermit/issues/540
+        // Cells written before the ledger slimming change
         // hold that plain invocation beside each canonical receipt. The
         // fixture's replay row is a canonical pass, so the current writer
         // stores only its receipt; the legacy invocation is rebuilt from the
@@ -30965,6 +32392,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
         green: BTreeSet::new(),
         selected_custom: BTreeSet::new(),
         stripped_selected: BTreeSet::new(),
+        known_gaps: Vec::new(),
     };
     let rederived = tracked_from(&derived_fixture, Some(stamped.clone()), None, false)?;
     if rederived.projection != stamped.projection {
@@ -32846,46 +34274,79 @@ mod post_verdict_transaction_tests {
         id: CellId,
     }
 
+    /// Clone this checkout into `directory/repo` for a fixture to measure.
+    /// `--shared` borrows its objects, so nothing is copied. The clone's
+    /// submodules stay uninitialized: no test here reads one. A recursive
+    /// `submodule update` of agent-utils used to clone that whole repository,
+    /// with its own submodule, from this checkout's object store, and failed
+    /// whenever the store lacked one of its objects (`unable to read sha1 file
+    /// of vibe-talk/...`), whatever the change under test.
+    fn clone_checkout(directory: &Path) -> PathBuf {
+        let source = Path::new(file!())
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let root = directory.join("repo");
+        git(
+            directory,
+            &[
+                "clone",
+                "--quiet",
+                "--shared",
+                source.to_str().unwrap(),
+                root.to_str().unwrap(),
+            ],
+        );
+        root
+    }
+
+    /// A fixture measures its clone of this checkout and nothing else: every
+    /// submodule of the clone stays an empty directory, so no fixture reads a
+    /// submodule's objects from this checkout's own store. (`submodule status`
+    /// cannot tell: an update given its URL by `-c` leaves the submodule
+    /// checked out but reported uninitialized.)
+    #[test]
+    fn a_fixture_clone_initializes_no_submodule_from_the_checkout() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = clone_checkout(directory.path());
+        let paths = git(
+            &root,
+            &[
+                "config",
+                "--file",
+                ".gitmodules",
+                "--get-regexp",
+                r"\.path$",
+            ],
+        );
+        let paths = paths
+            .lines()
+            .filter_map(|line| line.split_once(' ').map(|(_, path)| path))
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"agent-utils"), "{paths:?}");
+        let materialized = paths
+            .iter()
+            .filter(|path| {
+                fs::read_dir(root.join(path)).is_ok_and(|mut entries| entries.next().is_some())
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            materialized.is_empty(),
+            "the fixture clone checked out submodules from the checkout: {materialized:?}"
+        );
+        assert!(
+            !root.join(".git/modules").exists(),
+            "the fixture clone holds submodule repositories"
+        );
+    }
+
     impl Fixture {
         fn new() -> Self {
-            let source = Path::new(file!())
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .parent()
-                .unwrap();
             let directory = tempfile::tempdir().unwrap();
-            let root = directory.path().join("repo");
-            git(
-                directory.path(),
-                &[
-                    "clone",
-                    "--quiet",
-                    "--shared",
-                    source.to_str().unwrap(),
-                    root.to_str().unwrap(),
-                ],
-            );
-            let local_au = format!(
-                "submodule.agent-utils.url={}",
-                source.join("agent-utils").display()
-            );
-            git(
-                &root,
-                &[
-                    "-c",
-                    "protocol.file.allow=always",
-                    "-c",
-                    &local_au,
-                    "submodule",
-                    "update",
-                    "--init",
-                    "--recursive",
-                    "--",
-                    "agent-utils",
-                ],
-            );
+            let root = clone_checkout(directory.path());
             let measured = git(&root, &["rev-parse", "HEAD"]);
             fs::write(
                 root.join("detcore/scorecard-fixture-source"),
@@ -33697,7 +35158,7 @@ mod post_verdict_transaction_tests {
 
         // The supported current-only ingest route also emits authority. The
         // document keeps only the latest observation of each provenance and
-        // domain (cap 1, https://github.com/rrnewton/dev-hermit/issues/563),
+        // domain (cap 1: each cell keeps only its latest state),
         // so when the receiving head differs, the two previous heads'
         // observations are capped and their bindings leave with them: only
         // the current run's binding stays, and the writer boundary accepts
@@ -33712,6 +35173,238 @@ mod post_verdict_transaction_tests {
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[0].run_id, "direct-current-run");
         preserve_attempt_bindings(&successor, &current).unwrap();
+    }
+
+    /// One series row for the snapshot projection tests: real cell, tree and
+    /// depth of the fixture's measured source, distinct event and run ids.
+    fn snapshot_projection_row(
+        fixture: &Fixture,
+        event_id: &str,
+        run_id: &str,
+        emitted_at: &str,
+    ) -> SeriesRow {
+        let measured = fixture.options.results_head.clone().unwrap();
+        let row = SeriesRow {
+            source: String::new(),
+            schema: SeriesSchema::V3,
+            event_id: event_id.into(),
+            event_type: "series.observation".into(),
+            emitted_at: emitted_at.into(),
+            team: "hermit".into(),
+            host: "fixture-host".into(),
+            producer: SeriesProducer::Validate,
+            run_id: run_id.into(),
+            series: SeriesPayload {
+                cell: series_cell_key(&fixture.id),
+                tree: measured.clone(),
+                detcore_tree: Some(git(
+                    &fixture.root,
+                    &["rev-parse", &format!("{measured}:detcore")],
+                )),
+                outcome: SeriesOutcome::Passed,
+                result: Some(ObservedResult::Pass),
+                failure_class: None,
+                no_verdict_evidence: None,
+                pressure_evidence: None,
+                declared_guest_exit: None,
+                comparison: None,
+                run_index: 1,
+                attempt: Some(1),
+                num_runs: 1,
+                last_run_index: None,
+                main_ancestry: Some(true),
+                runtime: None,
+                source_tree_dirty: false,
+                depth: source_depths(&fixture.root, &measured).unwrap(),
+                coordinates: None,
+                first_divergent_messages: None,
+                machine_shortname: Some("fixture-host".into()),
+                kernel_version: Some("fixture-kernel".into()),
+                host_capabilities: Some(BTreeMap::from([
+                    (
+                        HostCapability::CpuidFaulting,
+                        HostCapabilityVerdict {
+                            present: true,
+                            evidence: "fixture cpuid probe".into(),
+                        },
+                    ),
+                    (
+                        HostCapability::Kvm,
+                        HostCapabilityVerdict {
+                            present: false,
+                            evidence: "fixture kvm probe".into(),
+                        },
+                    ),
+                ])),
+                strictness: None,
+                divergence: None,
+            },
+        };
+        row.validate_for_read().unwrap();
+        row
+    }
+
+    /// Ledger retention moves original series files to an archive, so the
+    /// publisher hands the authenticated rows over as a snapshot instead of a
+    /// series worktree. Reading the same rows at the same source commit and
+    /// tree must write byte-identical history either way.
+    #[test]
+    fn snapshot_projection_writes_what_the_series_worktree_projection_writes() {
+        let _fixture_lock = history_fixture_lock();
+        let fixture = Fixture::new();
+        fixture.publish().unwrap();
+        // Two rows whose emitted_at order is the reverse of their event_id
+        // order: the worktree reader and the snapshot list them differently.
+        let rows = [
+            snapshot_projection_row(
+                &fixture,
+                "fixture-snapshot-projection-a",
+                "snapshot-projection-run-a",
+                "2026-09-13T18:31:00Z",
+            ),
+            snapshot_projection_row(
+                &fixture,
+                "fixture-snapshot-projection-b",
+                "snapshot-projection-run-b",
+                "2026-09-13T18:30:00Z",
+            ),
+        ];
+        let shard = fixture.ledger.join("series/hermit/fixture/2026-09.jsonl");
+        fs::create_dir_all(shard.parent().unwrap()).unwrap();
+        let mut lines = Vec::new();
+        for row in &rows {
+            lines.extend(serde_json::to_vec(row).unwrap());
+            lines.push(b'\n');
+        }
+        fs::write(&shard, &lines).unwrap();
+        git(&fixture.ledger, &["add", "series", "scorecard"]);
+        let ledger_commit = commit(&fixture.ledger, "snapshot projection fixture");
+        let series_tree = git(&fixture.ledger, &["rev-parse", "HEAD:series"]);
+        let published = read_history_files(&fixture.root).unwrap();
+
+        project_observations(&fixture.root, &fixture.ledger.join("series"), "nightly").unwrap();
+        let from_worktree = read_history_files(&fixture.root).unwrap();
+        assert!(from_worktree != published);
+        let projection = fixture.cells().projection.unwrap();
+        assert_eq!(projection.rows_read, 2);
+        assert_eq!(
+            projection.source_commit.as_deref(),
+            Some(ledger_commit.as_str())
+        );
+        assert_eq!(
+            projection.source_tree.as_deref(),
+            Some(series_tree.as_str())
+        );
+        git(&fixture.ledger, &["checkout", "--quiet", "--", "scorecard"]);
+        assert!(read_history_files(&fixture.root).unwrap() == published);
+
+        // The archived form, committed: the ledger's HEAD no longer holds the
+        // shard, so neither its worktree nor HEAD:series has these rows. The
+        // snapshot names the earlier commit and tree that did, as the
+        // publisher's authenticated archive view does.
+        git(&fixture.ledger, &["rm", "--quiet", "-r", "series"]);
+        fs::create_dir_all(fixture.ledger.join("series")).unwrap();
+        fs::write(fixture.ledger.join("series/ARCHIVE.json"), b"{}\n").unwrap();
+        git(&fixture.ledger, &["add", "series"]);
+        commit(&fixture.ledger, "archive the series fixture");
+        let mut sorted = rows.to_vec();
+        sorted.sort_by(|left, right| {
+            (&left.emitted_at, &left.event_id).cmp(&(&right.emitted_at, &right.event_id))
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let value =
+            scorecard_snapshot_fixture_value(&ledger_commit, &series_tree, &sorted).unwrap();
+        let snapshot = directory.path().join("snapshot.json");
+        let snapshot_sha256 = write_scorecard_snapshot_fixture(&snapshot, &value).unwrap();
+        let write_variant = |name: &str, value: &JsonValue| {
+            let path = directory.path().join(name);
+            let sha256 = write_scorecard_snapshot_fixture(&path, value).unwrap();
+            (path, sha256)
+        };
+
+        // Refusals leave both history files byte-identical.
+        let error =
+            project_observations_snapshot(&fixture.root, &snapshot, &"0".repeat(64), "nightly")
+                .unwrap_err();
+        assert!(error.contains("digest mismatch"), "{error}");
+        let error = project_observations_snapshot(&fixture.root, &snapshot, &snapshot_sha256, " ")
+            .unwrap_err();
+        assert!(error.contains("--refreshed-at"), "{error}");
+        let mut no_repository = value.clone();
+        no_repository["source"]["repository"] = JsonValue::Null;
+        let (path, sha256) = write_variant("no-repository.json", &no_repository);
+        let error =
+            project_observations_snapshot(&fixture.root, &path, &sha256, "nightly").unwrap_err();
+        assert!(error.contains("hermit_test_ledger repository"), "{error}");
+        let mut unpublished = value.clone();
+        unpublished["source"]["published_rows"] = 1.into();
+        let (path, sha256) = write_variant("unpublished.json", &unpublished);
+        let error =
+            project_observations_snapshot(&fixture.root, &path, &sha256, "nightly").unwrap_err();
+        assert!(error.contains("published rows only"), "{error}");
+        // A local source with every row counted as published still names
+        // rows that are not in the ledger; the reader itself admits it.
+        let mut local = value.clone();
+        local["source"]["local_sources"] = serde_json::json!([{
+            "kind": "live", "path": "local.jsonl", "device": 1, "inode": 2,
+            "rows": 0, "size": 0, "sha256": "e".repeat(64),
+        }]);
+        let (path, sha256) = write_variant("local.json", &local);
+        HeldScorecardSeriesSnapshot::open(&path, &sha256).unwrap();
+        let error =
+            project_observations_snapshot(&fixture.root, &path, &sha256, "nightly").unwrap_err();
+        assert!(error.contains("published rows only"), "{error}");
+        // A snapshot changed after it was opened and checked is refused by
+        // the recheck immediately before the write.
+        let error = project_observations_snapshot_with(
+            &fixture.root,
+            &snapshot,
+            &snapshot_sha256,
+            "nightly",
+            || {
+                let mut changed = fs::read(&snapshot).unwrap();
+                changed.push(b'\n');
+                fs::write(&snapshot, &changed).map_err(|error| error.to_string())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("changed"), "{error}");
+        assert!(read_history_files(&fixture.root).unwrap() == published);
+
+        let snapshot_sha256 = write_scorecard_snapshot_fixture(&snapshot, &value).unwrap();
+        project_observations_snapshot(&fixture.root, &snapshot, &snapshot_sha256, "nightly")
+            .unwrap();
+        assert!(read_history_files(&fixture.root).unwrap() == from_worktree);
+    }
+
+    #[test]
+    fn snapshot_projection_arguments_are_exact() {
+        let parse = |args: &[&str]| {
+            parse_project_observations_snapshot_args(args.iter().map(|arg| arg.to_string()))
+        };
+        let parsed = parse(&[
+            "--snapshot",
+            "s.json",
+            "--snapshot-sha256",
+            "abc",
+            "--refreshed-at",
+            "stamp",
+        ])
+        .unwrap();
+        assert_eq!(parsed.snapshot, PathBuf::from("s.json"));
+        assert_eq!(parsed.snapshot_sha256, "abc");
+        assert_eq!(parsed.refreshed_at, "stamp");
+        let error = parse(&["--snapshot", "a", "--snapshot", "b"]).unwrap_err();
+        assert!(error.contains("only once"), "{error}");
+        let error = parse(&["--snapshot", "a", "--refreshed-at"]).unwrap_err();
+        assert!(error.contains("requires a value"), "{error}");
+        let error = parse(&["--series-root", "series"]).unwrap_err();
+        assert!(
+            error.contains("unknown project-observations-snapshot option"),
+            "{error}"
+        );
+        let error = parse(&["--snapshot", "a", "--refreshed-at", "stamp"]).unwrap_err();
+        assert!(error.contains("--snapshot-sha256 HEX"), "{error}");
     }
 
     #[test]
@@ -36545,7 +38238,7 @@ mod post_verdict_transaction_tests {
                 "{label}"
             );
             // A canonical pass stores its receipt and no invocation
-            // (https://github.com/rrnewton/dev-hermit/issues/540), so the green
+            // (since the ledger slimming change), so the green
             // sibling holds no attempt that could carry a failure record, and
             // its one receipt is the pass.
             assert_eq!(
@@ -36633,7 +38326,7 @@ mod post_verdict_transaction_tests {
     /// runner could not have failed that way.
     ///
     /// A canonical pass stores only its receipt
-    /// (https://github.com/rrnewton/dev-hermit/issues/540), so the record is
+    /// (since the ledger slimming change), so the record is
     /// also forged onto a stripped pass, which still stores its attempts.
     #[test]
     fn an_expected_output_failure_the_runner_could_not_have_found_is_not_published() {
@@ -36837,6 +38530,70 @@ mod post_verdict_transaction_tests {
                 declared_text: String::new(),
             });
         });
+    }
+
+    /// A replay cell inherits its verify recipe's declared stdout
+    /// (runner::expectation_recipe), so the runner's red for a failed
+    /// expectation on a replay attempt is retained exactly as on verify.
+    #[test]
+    fn a_replay_failed_stdout_expectation_is_retained_red() {
+        let _fixture_lock = history_fixture_lock();
+        let mut fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let (mut id, declared) = declared_exit_row(&measured);
+        id.mode = "replay".into();
+        let mut replay = with_matched_exit(&declared, 0);
+        replay
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_guest_exit");
+        replay["mode"] = "replay".into();
+        // A replay comparison leaves time real, and its declared exit is
+        // admitted by the record-start invocation compared with
+        // --verify-allow=both (runner::invocation_admits_declared_guest_exit).
+        let argv = vec![
+            "hermit-verify-pair",
+            "hermit",
+            "log-diff",
+            "--verify-allow=both",
+            "hermit",
+            "record",
+            "start",
+            "--",
+            "fixture",
+        ];
+        replay["argv"] = serde_json::json!(argv);
+        replay["attempts"][0]["argv"] = serde_json::json!(argv);
+        let shell_command = literal_shell_command(
+            "/repo",
+            &BTreeMap::from([("LC_ALL".into(), "C".into())]),
+            &argv.iter().map(|arg| (*arg).into()).collect::<Vec<_>>(),
+        );
+        replay["shell_command"] = shell_command.clone().into();
+        replay["attempts"][0]["shell_command"] = shell_command.into();
+        replay["effective_args"] = serde_json::json!(&argv[1..]);
+        let mut report: JsonValue =
+            serde_json::from_str(replay["attempts"][0]["verification_report"].as_str().unwrap())
+                .unwrap();
+        report["comparison"]["virtualize_time"] = false.into();
+        let report = serde_json::to_string(&report).unwrap();
+        replay["attempts"][0]["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(report.as_bytes())).into();
+        replay["attempts"][0]["verification_report"] = report.into();
+        let observed = "getrandom[0] 918fdb56\n";
+        let expected = "getrandom[0] a29a84d6\n";
+        let replay = with_captured_stdout(&replay, observed);
+        let exact = expected_stdout_reason("first", observed, expected);
+        let failed = expected_output_failure(&replay, &exact);
+        fixture.publish_rows(&[failed]);
+        let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+        match candidates[&id][0].evidence(&id, ResultInput::Current) {
+            Ok(ValidateRowEvidence::ExpectedOutputFailed { reason, result, .. }) => {
+                assert!(reason.contains("failed its declared expected output"), "{reason}");
+                assert_eq!(result, Some(ObservedResult::CrashError));
+            }
+            other => panic!("replay failed expectation was not retained: {other:?}"),
+        }
     }
 
     /// Only the runner's own expected-output red is retained. A FAIL whose
@@ -37317,6 +39074,62 @@ mod post_verdict_transaction_tests {
                 "{label} was accepted outside verify mode"
             );
         }
+        // A replay cell's row carries its verify recipe's declaration and is
+        // judged by the same exact match, from the replay's own invocation
+        // (`record start`, whose comparison takes --verify-allow=both).
+        const REPLAY: &[&str] = &[
+            "hermit-verify-pair",
+            "hermit",
+            "log-diff",
+            "--verify-allow=both",
+            "hermit",
+            "record",
+            "start",
+            "--",
+            "guest",
+        ];
+        for (label, declared, code, signal) in [
+            ("declared code", &code_3, Some(3), None),
+            ("signal death", &signal_11, None, Some(11)),
+        ] {
+            let expected = report(declared.code, declared.signal);
+            assert!(
+                declared_failure_matches(
+                    "replay",
+                    declared,
+                    &attempt(code, signal, REPLAY),
+                    &expected
+                ),
+                "replay {label} was refused"
+            );
+            assert!(
+                !declared_failure_matches(
+                    "replay",
+                    declared,
+                    &attempt(code, signal, ALLOW),
+                    &expected
+                ),
+                "replay {label} was accepted from a verify invocation"
+            );
+            assert!(
+                !declared_failure_matches(
+                    "verify",
+                    declared,
+                    &attempt(code, signal, REPLAY),
+                    &expected
+                ),
+                "verify {label} was accepted from a replay invocation"
+            );
+        }
+        assert!(
+            !declared_failure_matches(
+                "replay",
+                &code_3,
+                &attempt(Some(4), None, REPLAY),
+                &report(Some(4), None)
+            ),
+            "a replay that ended with another code was accepted"
+        );
         let mut one_output = report(Some(3), None);
         one_output
             .compared_outputs
@@ -37779,7 +39592,7 @@ mod post_verdict_transaction_tests {
         // A later invocation of an older measured tree preserves that newer
         // stamp. Its older observation is not the latest of its provenance, so
         // the cap folds it into the cell's aggregate rather than keeping it
-        // (https://github.com/rrnewton/dev-hermit/issues/563); the stamped
+        // (cap 1: each cell keeps only its latest state); the stamped
         // observation stays.
         fixture.row["hermit_sha"] = measured.clone().into();
         fixture.row["run_id"] = "later-old-source-run".into();
@@ -39294,6 +41107,32 @@ mod attempt_binding_tests {
         validate_attempt_bindings(&rewritten, Some(&events)).unwrap();
     }
 
+    /// A permission change on a held directory, as another actor's chmod of
+    /// an ancestor such as `/`, does not replace it, so verification still
+    /// passes; a directory replaced at the same path still fails it.
+    #[test]
+    fn a_held_directory_survives_a_chmod_but_not_a_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let held_directory = directory.path().join("evidence");
+        fs::create_dir(&held_directory).unwrap();
+        let path = held_directory.join("results.jsonl");
+        fs::write(&path, b"{}\n").unwrap();
+        let held = HeldEvidenceFile::open(&path, None).unwrap();
+        for mode in [0o555, 0o755] {
+            fs::set_permissions(&held_directory, fs::Permissions::from_mode(mode)).unwrap();
+            held.verify().unwrap();
+        }
+        fs::rename(&held_directory, directory.path().join("moved")).unwrap();
+        fs::create_dir(&held_directory).unwrap();
+        fs::copy(directory.path().join("moved/results.jsonl"), &path).unwrap();
+        assert_eq!(
+            held.verify().unwrap_err(),
+            format!("evidence directory changed: {}", held_directory.display())
+        );
+    }
+
     #[test]
     fn exact_input_hashes_and_duplicate_rows_are_not_optional() {
         let directory = tempfile::tempdir().unwrap();
@@ -39842,6 +41681,7 @@ mod retired_id_join_tests {
             green: selected,
             selected_custom: BTreeSet::new(),
             stripped_selected: BTreeSet::new(),
+            known_gaps: Vec::new(),
         };
         assert_eq!(
             super::stripped_selected_sentence(&derived),
@@ -39869,6 +41709,7 @@ mod retired_id_join_tests {
             green: BTreeSet::new(),
             selected_custom: BTreeSet::new(),
             stripped_selected: BTreeSet::new(),
+            known_gaps: Vec::new(),
         };
         let carried = tracked_from(&derived, Some(recorded.clone()), None, false).unwrap();
         assert_eq!(carried.cells.len(), 1);
@@ -43214,19 +45055,25 @@ mod parity_summary_tests {
             .collect::<BTreeSet<_>>();
         let names = ParityCommitFacts::batch_names(&shas);
         let at = |sha: &str| format!("{sha}:{PARITY_CELLS_PATH}");
+        let at_dir = |sha: &str| format!("{sha}:{PARITY_CELLS_DIR}");
         assert_eq!(
             names,
             [
                 without.clone(),
                 at(&without),
+                at_dir(&without),
                 good.clone(),
                 at(&good),
+                at_dir(&good),
                 broken.clone(),
                 at(&broken),
+                at_dir(&broken),
                 directory.clone(),
                 at(&directory),
+                at_dir(&directory),
                 absent.to_string(),
                 at(absent),
+                at_dir(absent),
             ]
         );
         // Git's answer to that request. Each commit, the selection and the
@@ -43240,14 +45087,19 @@ mod parity_summary_tests {
         for answer in [
             batch_answer(&without, "commit", commit),
             format!("{} missing\n", at(&without)).into_bytes(),
+            format!("{} missing\n", at_dir(&without)).into_bytes(),
             batch_answer(&good, "commit", commit),
             batch_answer(&at(&good), "blob", selection.as_bytes()),
+            format!("{} missing\n", at_dir(&good)).into_bytes(),
             batch_answer(&broken, "commit", commit),
             batch_answer(&at(&broken), "blob", b"{not json"),
+            format!("{} missing\n", at_dir(&broken)).into_bytes(),
             batch_answer(&directory, "commit", commit),
             batch_answer(&at(&directory), "tree", b"100644 inner\0\n\x01\x02"),
+            format!("{} missing\n", at_dir(&directory)).into_bytes(),
             format!("{absent} missing\n").into_bytes(),
             format!("{} missing\n", at(absent)).into_bytes(),
+            format!("{} missing\n", at_dir(absent)).into_bytes(),
         ] {
             stdout.extend(answer);
         }
@@ -43408,6 +45260,26 @@ mod parity_summary_tests {
     }
 
     #[test]
+    fn a_git_tree_parses_to_its_named_blob_ids() {
+        // Two entries in raw git tree form: "<mode> <name>\0<20-byte id>".
+        let mut tree = Vec::new();
+        tree.extend_from_slice(b"100644 gvisor.json\0");
+        tree.extend_from_slice(&[0xabu8; 20]);
+        tree.extend_from_slice(b"100644 compat.json\0");
+        tree.extend_from_slice(&[0xcdu8; 20]);
+        assert_eq!(
+            parse_git_tree(&tree).unwrap(),
+            [
+                ("gvisor.json".to_string(), "ab".repeat(20)),
+                ("compat.json".to_string(), "cd".repeat(20)),
+            ]
+        );
+        assert!(parse_git_tree(b"100644 truncated").is_err());
+        assert!(parse_git_tree(b"100644 x\0short").is_err());
+        assert_eq!(parse_git_tree(b"").unwrap(), Vec::new());
+    }
+
+    #[test]
     fn only_full_lowercase_commit_names_in_the_store_reach_git() {
         let named = |sha: &str| serde_json::json!({ "hermit_sha": sha }).to_string();
         let good = "0123456789abcdef0123456789abcdef01234567";
@@ -43478,6 +45350,7 @@ mod parity_summary_tests {
             green: BTreeSet::from([green.id.clone()]),
             selected_custom: BTreeSet::new(),
             stripped_selected: BTreeSet::new(),
+            known_gaps: Vec::new(),
         };
         (derived, tracked(vec![green, red]))
     }
@@ -44938,7 +46811,7 @@ mod parity_summary_tests {
 
 /// Series rows for a verify cell that declares `comparator: stripped` carry
 /// `series.comparison = {"strictness": "stripped", "bitwise_parity": false}`
-/// (<https://github.com/rrnewton/dev-hermit/issues/476>). The snapshot reader
+/// (a stripped pass is admitted, below bitwise parity). The snapshot reader
 /// must accept exactly that object, refuse anything else inside it, and count
 /// the row exactly as it counted the same row before the field existed.
 #[cfg(test)]
@@ -45011,9 +46884,20 @@ mod series_comparison_tests {
             "rows": rows,
         });
         let text = serde_json::to_string(&value).map_err(|error| error.to_string())?;
-        let snapshot: ScorecardSeriesSnapshot =
+        let snapshot: BorrowedScorecardSeriesSnapshot<'_> =
             serde_json::from_str(&text).map_err(|error| error.to_string())?;
-        validate_scorecard_snapshot(&snapshot, Path::new("fixture-snapshot"))
+        validate_scorecard_snapshot(&snapshot, Path::new("fixture-snapshot"))?;
+        snapshot
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(index, raw)| {
+                let mut row =
+                    parse_snapshot_row_text(raw.get(), Path::new("fixture-snapshot"), index)?;
+                row.source = format!("fixture-snapshot:rows[{index}]");
+                Ok(row)
+            })
+            .collect()
     }
 
     fn tracked_fixture_cell() -> TrackedCells {

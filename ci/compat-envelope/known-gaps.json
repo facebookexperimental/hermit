@@ -1,0 +1,31 @@
+{
+  "description": "Known gaps of validation nodes: tests a node does not yet require on its backend, each with its tracking issue (ci/manifest-plan/src/known_gaps.rs). The node runs a known gap and expects it to fail (status known-gap), or leaves it out of the run by name (status skipped). They are outside every E2E count and percentage. A known gap is a failing test: never a pass and never not applicable.",
+  "generated_by": "./ci/compat-envelope/scorecard.rs update",
+  "nodes": [
+    {
+      "backend": "kvm",
+      "known_gaps": [
+        {
+          "gap": "D",
+          "id": "hermit-run::deadline_slice_cap$itimer_a_private_descriptor_table_consumer_re_arms",
+          "issue": "https://github.com/rrnewton/hermit/issues/4485",
+          "outcome": "skipped",
+          "signature": null,
+          "status": "skipped"
+        },
+        {
+          "gap": "E+F'",
+          "id": "hermit-run::deadline_slice_cap$itimer_generation_discard_follows_the_wait_mask",
+          "issue": "https://github.com/rrnewton/hermit/issues/4995",
+          "outcome": "skipped",
+          "signature": null,
+          "status": "skipped"
+        }
+      ],
+      "ledger": "hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv",
+      "node": "privileged-test.deadline_slice_cap_kvm",
+      "required_tests": 43
+    }
+  ],
+  "schema": 1
+}

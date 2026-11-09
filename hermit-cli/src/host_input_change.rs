@@ -53,7 +53,9 @@
 //! is not a replacement, an incomplete log names nothing, an open whose finish
 //! record a log does not show exactly once is not placed, and paths below
 //! `/proc`, `/sys` and `/dev` are skipped: those are kernel objects whose
-//! metadata is not file content and which Hermit virtualizes separately.
+//! metadata is not file content and which Hermit virtualizes separately. So
+//! are the records of files the kernel opened for an exec
+//! (`HostInputRecord::exec`), which have no open in the log to place.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -63,6 +65,8 @@ use detcore_model::host_input::HostFileIdentity;
 use detcore_model::host_input::HostInputLogEnd;
 use detcore_model::host_input::HostInputRecord;
 use detcore_model::host_input::HostMutationRecord;
+use detcore_model::host_input::guest_rebound;
+use detcore_model::host_input::is_kernel_object;
 
 use crate::canonical_verdict::InfrastructureError;
 use crate::canonical_verdict::VerificationRun;
@@ -101,7 +105,12 @@ fn parse_host_inputs(text: &str) -> HostInputs {
     let mut parsed = true;
     for line in &lines {
         if let Ok(record) = serde_json::from_str::<HostInputRecord>(line) {
-            records.push(record);
+            // A file the kernel opened for an exec has no open in the log;
+            // the walk below sees exactly the opens it saw before such
+            // records existed.
+            if !record.exec {
+                records.push(record);
+            }
         } else if let Ok(mutation) = serde_json::from_str::<HostMutationRecord>(line) {
             mutated.push(mutation.mutated);
         } else {
@@ -114,29 +123,6 @@ fn parse_host_inputs(text: &str) -> HostInputs {
         mutated,
         complete,
     }
-}
-
-/// Whether the guest may have rebound `path`, or a directory above it, in its
-/// file namespace: one of `mutated` is `path` or an ancestor of it. Detcore
-/// reports `/`, the ancestor of every absolute path, for a change whose path
-/// it could not establish. An open whose path could not be made absolute
-/// cannot be matched against those changes at all, so it counts as rebound
-/// too.
-fn guest_rebound(mutated: &[String], path: &str) -> bool {
-    !Path::new(path).is_absolute()
-        || mutated
-            .iter()
-            .any(|rebound| Path::new(path).starts_with(Path::new(rebound)))
-}
-
-/// Kernel objects rather than host input files; see the module documentation.
-fn is_kernel_object(path: &str) -> bool {
-    ["/proc", "/sys", "/dev"].iter().any(|root| {
-        path == *root
-            || path
-                .strip_prefix(root)
-                .is_some_and(|rest| rest.starts_with('/'))
-    })
 }
 
 /// The opens one run has made so far: for each path, the distinct
@@ -213,11 +199,39 @@ pub fn find_pattern_difference(run1: &HostInputs, run2: &HostInputs) -> Option<P
         if (&left.path, left.dtid, left.syscall) != (&right.path, right.dtid, right.syscall) {
             return None;
         }
-        if is_kernel_object(&left.path) {
+        // A kernel object by its path, or by what the open reached (a FIFO,
+        // a socket or a device, whose times move with every write, so an
+        // open finding its same inode at another time would end the walk
+        // below before a real change at a later open). A snapshot copy
+        // (Android's property area, under /dev) is named by its contents,
+        // not by a kernel object's identity.
+        if (is_kernel_object(&left.path) && left.identity.content.is_none())
+            || left.kernel_object
+            || right.kernel_object
+        {
             continue;
         }
         let (new1, previous1) = pattern1.open(left);
         let (new2, previous2) = pattern2.open(right);
+        // A snapshot copy is the same input in both runs only if its
+        // contents are, even when each run reads it unchanged throughout.
+        if previous1.is_none()
+            && previous2.is_none()
+            && left.identity.content.is_some()
+            && left.identity != right.identity
+            && ![run1, run2]
+                .iter()
+                .any(|run| guest_rebound(&run.mutated, &right.path))
+        {
+            return Some(PatternDifference {
+                run: VerificationRun::Run2,
+                path: right.path.clone(),
+                dtid: right.dtid,
+                syscall: right.syscall,
+                before: left.identity,
+                after: right.identity,
+            });
+        }
         let (run, previous, record) = match (new1, new2) {
             (true, false) => (VerificationRun::Run1, previous1, left),
             (false, true) => (VerificationRun::Run2, previous2, right),
@@ -226,7 +240,13 @@ pub fn find_pattern_difference(run1: &HostInputs, run2: &HostInputs) -> Option<P
         // Both runs find a new identity at a path's first open, so only a
         // path seen before reaches this point.
         let before = previous?;
-        if (before.dev, before.ino) == (record.identity.dev, record.identity.ino) {
+        if (before.dev, before.ino, before.content)
+            == (
+                record.identity.dev,
+                record.identity.ino,
+                record.identity.content,
+            )
+        {
             return None;
         }
         // The guest may have replaced it itself, through operations whose
@@ -273,6 +293,27 @@ pub fn open_position(contents: &str, dtid: u64, syscall: u64) -> Option<usize> {
             if found.is_some() {
                 return None;
             }
+            found = Some(position);
+        }
+    }
+    found
+}
+
+/// Fallback placement by path and syscall number, for backends whose
+/// per-thread syscall numbering restarts across process images (DBT), so
+/// `(dtid, syscall)` names more than one finished open in the log. The
+/// open that found a new identity is the last finished open of `path`
+/// with that syscall number; without a match nothing is placed.
+pub fn open_position_for_path(contents: &str, syscall: u64, path: &str) -> Option<usize> {
+    let mut found = None;
+    for (position, human, event) in detcore::logdiff::log_record_events(contents).ok()? {
+        if !matches!(event, Some(DetLogEvent::SyscallResult { .. })) {
+            continue;
+        }
+        let Some((_, number)) = finished_open(human) else {
+            continue;
+        };
+        if number == syscall && human.contains(&format!("\"{path}\"")) {
             found = Some(position);
         }
     }
@@ -329,6 +370,7 @@ mod tests {
             size: 100,
             mtime_sec: 1_700_000_000,
             mtime_nsec: 0,
+            content: None,
         }
     }
 
@@ -343,6 +385,9 @@ mod tests {
                     dtid: 3,
                     syscall: index as u64 + 10,
                     identity: identity(*ino),
+                    content: None,
+                    exec: false,
+                    kernel_object: false,
                 })
                 .collect(),
             mutated: Vec::new(),
@@ -381,6 +426,44 @@ mod tests {
             named.into_infrastructure_error().to_string(),
             "host input changed during run 2: /etc/ld.so.cache (dev:ino 0:33:7 size 100 mtime 1700000000.000000000 -> dev:ino 0:33:8 size 100 mtime 1700000000.000000000)"
         );
+    }
+
+    /// A snapshot copy under /dev is compared by its contents: a property
+    /// file whose copy changed between two opens in run 1 only is named,
+    /// while a kernel object under /dev is still skipped.
+    #[test]
+    fn a_snapshot_copy_whose_contents_changed_is_named() {
+        let mut run1 = opens(&[
+            ("/dev/__properties__/properties_serial", 0),
+            ("/dev/null", 5),
+            ("/dev/__properties__/properties_serial", 0),
+        ]);
+        let mut run2 = opens(&[
+            ("/dev/__properties__/properties_serial", 0),
+            ("/dev/null", 6),
+            ("/dev/__properties__/properties_serial", 0),
+        ]);
+        for (records, contents) in [(&mut run1.records, [1, 2]), (&mut run2.records, [1, 1])] {
+            records[0].identity = HostFileIdentity::of_snapshot(4, contents[0]);
+            records[2].identity = HostFileIdentity::of_snapshot(4, contents[1]);
+        }
+        let named = find_pattern_difference(&run1, &run2).unwrap();
+        assert_eq!(
+            (named.run, named.path.as_str(), named.syscall),
+            (
+                VerificationRun::Run1,
+                "/dev/__properties__/properties_serial",
+                12
+            )
+        );
+        run1.records[2].identity = HostFileIdentity::of_snapshot(4, 1);
+        assert_eq!(find_pattern_difference(&run1, &run2), None);
+        // Each run reads its own snapshot unchanged, but the two differ.
+        for index in [0, 2] {
+            run2.records[index].identity = HostFileIdentity::of_snapshot(4, 7);
+        }
+        let named = find_pattern_difference(&run1, &run2).unwrap();
+        assert_eq!((named.run, named.syscall), (VerificationRun::Run2, 10));
     }
 
     /// A file the guest creates and replaces itself has new host inodes in
@@ -441,6 +524,32 @@ mod tests {
         run2.complete = false;
         assert_eq!(find_pattern_difference(&run1, &run2), None);
         assert_eq!(find_pattern_difference(&run2, &run1), None);
+    }
+
+    /// A FIFO the guest writes is recorded as a kernel object
+    /// ([`HostInputRecord::kernel_object`]), and passed over: its second open
+    /// finds the same inode at another time in one run, which would end the
+    /// walk, so a real change at a later open is still named.
+    #[test]
+    fn a_fifo_whose_times_moved_does_not_hide_a_later_change() {
+        let mut run1 = opens(&[("/tmp/f", 4), ("/tmp/f", 4), ("/etc/a", 1), ("/etc/a", 2)]);
+        let mut run2 = opens(&[("/tmp/f", 4), ("/tmp/f", 4), ("/etc/a", 1), ("/etc/a", 1)]);
+        run1.records[1].identity.mtime_sec += 1;
+        let flag = |runs: [&mut HostInputs; 2], kernel_object: bool| {
+            for run in runs {
+                run.records[0].kernel_object = kernel_object;
+                run.records[1].kernel_object = kernel_object;
+            }
+        };
+        flag([&mut run1, &mut run2], true);
+        let named = find_pattern_difference(&run1, &run2).expect("the change to /etc/a is named");
+        assert_eq!(
+            (named.run, named.path.as_str(), named.syscall),
+            (VerificationRun::Run1, "/etc/a", 13)
+        );
+        // Unflagged, the FIFO's moved time ends the walk first.
+        flag([&mut run1, &mut run2], false);
+        assert_eq!(find_pattern_difference(&run1, &run2), None);
     }
 
     #[test]
@@ -540,6 +649,22 @@ mod tests {
             assert_eq!(open_position(&log, 3, 12), Some(2), "{call}");
         }
         assert_eq!(open_position("not a Hermit log", 3, 12), None);
+    }
+
+    #[test]
+    fn path_fallback_places_the_last_open_of_that_path_and_syscall() {
+        let log = [
+            commit(4),
+            finish(3, 12),
+            commit(5),
+            finished(9, 12, "openat(-100, 0x1 -> \"/etc/a\", O_RDONLY)"),
+        ]
+        .join("\n");
+        // (dtid, syscall) is ambiguous here; the fallback names the last
+        // finished open of the changed path with that syscall number.
+        assert_eq!(open_position_for_path(&log, 12, "/etc/a"), Some(4));
+        assert_eq!(open_position_for_path(&log, 12, "/etc/b"), None);
+        assert_eq!(open_position_for_path(&log, 13, "/etc/a"), None);
     }
 
     /// Only a structured record of a finished open, read at Hermit's own

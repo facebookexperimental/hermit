@@ -315,8 +315,8 @@ them once made two boots write different Hermit logs:
 - Hermit creates the three empty mount points on the host; under a `/tmp`
   checkout they stay behind after the run.
 - `--base-env=minimal` gives the guest a fixed environment (`PATH`,
-  `HOSTNAME` and `HOME`) plus `PYTHONDONTWRITEBYTECODE`, instead of your shell's
-  environment.
+  `HOSTNAME`, `HOME`, `USER` and `LOGNAME`) plus `PYTHONDONTWRITEBYTECODE`,
+  instead of your shell's environment.
 - The guest's standard input is `/dev/null` and its standard output and error
   are a pipe. The demo copies the pipe into the Hermit log on a separate
   thread. When the guest wrote straight to the log file, the controller's

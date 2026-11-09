@@ -232,8 +232,53 @@ pub fn python_interpreter() -> std::path::PathBuf {
     std::path::PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
 }
 
+/// At most this many trailing bytes of hermit's stderr go into a failure.
+const STDERR_EXCERPT_BYTES: usize = 8192;
+
+/// Snapshot the command's status and a bounded tail of its captured stderr.
+fn hermit_state(child: &mut std::process::Child, stderr_path: &Path) -> String {
+    let status = match child.try_wait() {
+        Ok(Some(status)) => format!("hermit command exited: {status}"),
+        Ok(None) => "hermit command is still running".to_owned(),
+        Err(error) => format!("cannot poll hermit command: {error}"),
+    };
+    match stderr_tail(stderr_path) {
+        Ok((tail, total)) => format!(
+            "{status}\nhermit stderr (last {} of {total} bytes):\n{}",
+            tail.len(),
+            String::from_utf8_lossy(&tail)
+        ),
+        Err(error) => format!(
+            "{status}\ncannot read hermit stderr {}: {error}",
+            stderr_path.display()
+        ),
+    }
+}
+
+/// Read at most [`STDERR_EXCERPT_BYTES`] from the end of `path`, with its
+/// length at the time of the metadata query.
+fn stderr_tail(path: &Path) -> std::io::Result<(Vec<u8>, u64)> {
+    use std::io::Read;
+    use std::io::Seek;
+
+    let mut file = std::fs::File::open(path)?;
+    let total = file.metadata()?.len();
+    file.seek(std::io::SeekFrom::Start(
+        total.saturating_sub(STDERR_EXCERPT_BYTES as u64),
+    ))?;
+    let mut tail = Vec::with_capacity(STDERR_EXCERPT_BYTES);
+    file.take(STDERR_EXCERPT_BYTES as u64)
+        .read_to_end(&mut tail)?;
+    Ok((tail, total))
+}
+
 /// Open `fifo` for writing once a reader has it open, or panic at `deadline`.
-fn open_fifo_writer(fifo: &Path, deadline: std::time::Instant) -> std::fs::File {
+fn open_fifo_writer(
+    fifo: &Path,
+    deadline: std::time::Instant,
+    child: &mut std::process::Child,
+    stderr_path: &Path,
+) -> std::fs::File {
     use std::os::unix::fs::OpenOptionsExt;
     loop {
         match std::fs::OpenOptions::new()
@@ -245,8 +290,9 @@ fn open_fifo_writer(fifo: &Path, deadline: std::time::Instant) -> std::fs::File 
             Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "the guest never opened {} for reading",
-                    fifo.display()
+                    "the guest never opened {} for reading\n{}",
+                    fifo.display(),
+                    hermit_state(child, stderr_path)
                 );
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
@@ -320,7 +366,7 @@ pub fn verify_across_host_action_with(
     let report_path = root.join("verify.json");
     let stderr_path = root.join("stderr");
     let stderr_file = std::fs::File::create(&stderr_path).expect("create stderr file");
-    let child = Command::new("timeout")
+    let mut child = Command::new("timeout")
         .args(["--kill-after", "5s", "180s"])
         .arg(hermit)
         .args(global_args)
@@ -349,7 +395,7 @@ pub fn verify_across_host_action_with(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(170);
 
     // Run 1: once its guest waits on the FIFO it has opened F once.
-    let mut writer = open_fifo_writer(&fifo, deadline);
+    let mut writer = open_fifo_writer(&fifo, deadline, &mut child, &stderr_path);
     if replace_in_run1 {
         let copy = root.join("F.new");
         std::fs::copy(root.join("F"), &copy).expect("copy F");
@@ -363,10 +409,14 @@ pub fn verify_across_host_action_with(
         .unwrap_or_default()
         .contains("Run2")
     {
-        assert!(std::time::Instant::now() < deadline, "run 2 never started");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "run 2 never started\n{}",
+            hermit_state(&mut child, &stderr_path)
+        );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let mut writer = open_fifo_writer(&fifo, deadline);
+    let mut writer = open_fifo_writer(&fifo, deadline, &mut child, &stderr_path);
     writeln!(writer, "{}", lines[1]).expect("send run 2 its line");
     drop(writer);
 
@@ -439,7 +489,7 @@ pub fn verify_ended_in_run_1(
         .spawn()
         .expect("failed to start hermit");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(170);
-    let mut writer = open_fifo_writer(&fifo, deadline);
+    let mut writer = open_fifo_writer(&fifo, deadline, &mut child, &stderr_path);
     writeln!(writer, "{line}").expect("send run 1 its line");
     drop(writer);
     let status = loop {
@@ -452,7 +502,11 @@ pub fn verify_ended_in_run_1(
             let _ = child.wait();
             panic!("run 2 started after run 1 should have ended the run:\n{stderr}");
         }
-        assert!(std::time::Instant::now() < deadline, "hermit did not exit");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "hermit did not exit\n{}",
+            hermit_state(&mut child, &stderr_path)
+        );
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
     let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();

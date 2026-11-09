@@ -29,6 +29,16 @@ use crate::types::DetTid;
 
 pub(crate) const RANDOM_FILL_CHUNK_BYTES: usize = 4096;
 
+/// SplitMix64's output function (Steele, Lea and Flood, "Fast Splittable
+/// Pseudorandom Number Generators", OOPSLA 2014): every input bit changes
+/// about half of the output bits.
+pub(crate) fn splitmix64(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
 /// A user-access random copy failed for a reason other than a guest fault.
 ///
 /// Memory may already contain a copied prefix, or even the entire attempted
@@ -356,11 +366,9 @@ pub(crate) fn validate_getrandom_flags(flags: usize) -> Result<(), Errno> {
     }
 }
 
-// Linux's import_ubuf clamps getrandom requests to MAX_RW_COUNT on x86_64.
-pub(crate) const GETRANDOM_MAX_BYTES: usize = (i32::MAX as usize) & !4095;
-
+/// Linux's import_ubuf clamps a getrandom request to MAX_RW_COUNT.
 pub(crate) fn getrandom_request_len(requested: usize) -> usize {
-    requested.min(GETRANDOM_MAX_BYTES)
+    requested.min(crate::page::max_rw_count())
 }
 
 pub(crate) fn write_random_chunk(

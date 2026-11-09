@@ -9,6 +9,12 @@
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
 
+#[path = "scheduler_deadlock/escaped_descriptor.rs"]
+mod escaped_descriptor;
+
+#[path = "scheduler_deadlock/poll_self_pipe_signal.rs"]
+mod poll_self_pipe_signal;
+
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::fs;
@@ -31,13 +37,16 @@ use std::process::Stdio;
 use std::time::Duration;
 use std::time::Instant;
 
-use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
+use detcore_model::HERMIT_GUEST_DEADLOCK_EXIT;
 
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DEADLOCK_HEADLINE: &str =
     "Deadlock detected: thread(s) waiting on futex, but no runnable threads left.";
 const UNREACHABLE: &str = "UNREACHABLE: AB-BA deadlock resolved\n";
+const POLL_DEADLOCK_HEADLINE: &str = "Deadlock detected: thread(s) waiting on futex, and \
+     thread(s) retrying a pipe or socket-pair call no remaining thread can satisfy, but no \
+     runnable threads left.";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ProcessIdentity {
@@ -1042,8 +1051,8 @@ fn terminal_scheduler_deadlock_reports_and_tears_down_tracees() {
 
     assert_eq!(
         status.code(),
-        Some(HERMIT_INTERNAL_FAILURE_EXIT),
-        "terminal scheduler deadlock must exit exactly 1, not timeout/signal/success: {status}"
+        Some(HERMIT_GUEST_DEADLOCK_EXIT),
+        "terminal scheduler deadlock must exit the guest-deadlock status, not timeout/signal/success: {status}"
     );
     assert!(
         started.elapsed() < TOTAL_TIMEOUT,
@@ -1082,6 +1091,12 @@ fn terminal_scheduler_deadlock_reports_and_tears_down_tracees() {
     assert!(
         stderr_text
             .lines()
+            .any(|line| line == detcore_model::HERMIT_MODEL_DEADLOCK_LINE),
+        "missing the guest-deadlock class line\nstderr:\n{stderr_text}"
+    );
+    assert!(
+        stderr_text
+            .lines()
             .any(|line| line == "  run queue: 0 runnable"),
         "missing empty run-queue evidence\nstderr:\n{stderr_text}"
     );
@@ -1099,8 +1114,107 @@ fn terminal_scheduler_deadlock_reports_and_tears_down_tracees() {
     owned.disarm();
 
     eprintln!(
-        "scheduler deadlock rc=1 release_to_exit={:.3}s total={:.3}s; tracee roots 0/{root_process_count}; nested process descendants 0/{descendant_process_count}; all tracee processes 0/{process_count}; tracee tasks 0/{task_count}; 0 adopted child process roots at the post-exit observation",
+        "scheduler deadlock rc={HERMIT_GUEST_DEADLOCK_EXIT} release_to_exit={:.3}s total={:.3}s; tracee roots 0/{root_process_count}; nested process descendants 0/{descendant_process_count}; all tracee processes 0/{process_count}; tracee tasks 0/{task_count}; 0 adopted child process roots at the post-exit observation",
         release_elapsed.as_secs_f64(),
         started.elapsed().as_secs_f64()
     );
+}
+
+/// A reader polls a pipe whose only writer waits on a futex no thread wakes
+/// (`fixtures/poll_deadlock.c`). Natively both threads wait forever. Hermit
+/// granted the reader a retry forever, each one moving virtual time on, as
+/// the run's only queued thread; it now reports the deadlock, with the same
+/// report in every run.
+#[test]
+fn a_poll_with_no_possible_progress_reports_a_deadlock() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("poll-deadlock-{}", std::process::id()));
+    fs::create_dir_all(&build_root).expect("failed to create guest build directory");
+    let guest = build_root.join("poll_deadlock");
+    let mut compiler = Command::new("cc");
+    compiler
+        .args(["-O2", "-Wall", "-Wextra", "-Werror", "-pthread"])
+        .arg(repository.join("hermit-cli/tests/fixtures/poll_deadlock.c"))
+        .arg("-o")
+        .arg(&guest);
+    let compile = bounded_output(
+        &mut compiler,
+        TOTAL_TIMEOUT,
+        "poll-deadlock guest compilation",
+    )
+    .expect("failed to compile the poll-deadlock guest");
+    assert!(
+        compile.status.success(),
+        "poll-deadlock guest compilation failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compile.stdout),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let mut native_command = Command::new("timeout");
+    native_command
+        .args(["--kill-after", "1s", "1s"])
+        .arg(&guest)
+        .stdin(Stdio::null());
+    let native = bounded_output(
+        &mut native_command,
+        TOTAL_TIMEOUT,
+        "native poll-deadlock control",
+    )
+    .expect("failed to run the native poll-deadlock control");
+    assert_eq!(
+        native.status.code(),
+        Some(124),
+        "the native control must stay blocked until its one-second bound"
+    );
+    assert_eq!(String::from_utf8_lossy(&native.stdout), "ready\n");
+
+    let mut first_stderr = None;
+    for run in 1..=2 {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+        command
+            .args([
+                "--log=off",
+                "--backend=ptrace",
+                "run",
+                "--strict",
+                detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+                "--",
+            ])
+            .arg(&guest)
+            .stdin(Stdio::null());
+        let output = bounded_output(&mut command, TOTAL_TIMEOUT, "Hermit poll-deadlock run")
+            .unwrap_or_else(|error| panic!("run {run}: {error}"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_GUEST_DEADLOCK_EXIT),
+            "run {run} must end with the scheduler deadlock status\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "ready\n",
+            "run {run}"
+        );
+        assert!(
+            stderr.lines().any(|line| line == POLL_DEADLOCK_HEADLINE),
+            "run {run} is missing the deadlock headline\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.lines().any(|line| {
+                line.starts_with("  run queue: 1 polling with no possible progress: dtid ")
+            }),
+            "run {run} does not name the reader\nstderr:\n{stderr}"
+        );
+        match &first_stderr {
+            None => first_stderr = Some(output.stderr.clone()),
+            Some(first) => assert_eq!(
+                String::from_utf8_lossy(first),
+                stderr,
+                "the deadlock report differs between runs"
+            ),
+        }
+    }
 }

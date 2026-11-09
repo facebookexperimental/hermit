@@ -1,0 +1,129 @@
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <linux/capability.h>
+#include <sched.h>
+#include <sys/utsname.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstring>
+
+#include "gmock/gmock.h"
+#include "gtest/gtest.h"
+#include "absl/strings/string_view.h"
+#include "test/util/capability_util.h"
+#include "test/util/linux_capability_util.h"
+#include "test/util/posix_error.h"
+#include "test/util/test_util.h"
+#include "test/util/thread_util.h"
+
+namespace gvisor {
+namespace testing {
+
+namespace {
+
+TEST(UnameTest, Sanity) {
+  struct utsname buf;
+  ASSERT_THAT(uname(&buf), SyscallSucceeds());
+  EXPECT_NE(strlen(buf.release), 0);
+  EXPECT_NE(strlen(buf.version), 0);
+  EXPECT_NE(strlen(buf.machine), 0);
+  EXPECT_NE(strlen(buf.sysname), 0);
+  EXPECT_NE(strlen(buf.nodename), 0);
+  EXPECT_NE(strlen(buf.domainname), 0);
+}
+
+TEST(UnameTest, SetNames) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  char hostname[65];
+  ASSERT_THAT(sethostname("0123456789", 3), SyscallSucceeds());
+  EXPECT_THAT(gethostname(hostname, sizeof(hostname)), SyscallSucceeds());
+  EXPECT_EQ(absl::string_view(hostname), "012");
+
+  ASSERT_THAT(sethostname("0123456789\0xxx", 11), SyscallSucceeds());
+  EXPECT_THAT(gethostname(hostname, sizeof(hostname)), SyscallSucceeds());
+  EXPECT_EQ(absl::string_view(hostname), "0123456789");
+
+  ASSERT_THAT(sethostname("0123456789\0xxx", 12), SyscallSucceeds());
+  EXPECT_THAT(gethostname(hostname, sizeof(hostname)), SyscallSucceeds());
+  EXPECT_EQ(absl::string_view(hostname), "0123456789");
+
+  char domainname[65];
+  ASSERT_THAT(setdomainname("abcdefghij", 3), SyscallSucceeds());
+  EXPECT_THAT(getdomainname(domainname, sizeof(domainname)), SyscallSucceeds());
+  EXPECT_EQ(absl::string_view(domainname), "abc");
+
+  ASSERT_THAT(setdomainname("abcdefghij\0xxx", 11), SyscallSucceeds());
+  EXPECT_THAT(getdomainname(domainname, sizeof(domainname)), SyscallSucceeds());
+  EXPECT_EQ(absl::string_view(domainname), "abcdefghij");
+
+  ASSERT_THAT(setdomainname("abcdefghij\0xxx", 12), SyscallSucceeds());
+  EXPECT_THAT(getdomainname(domainname, sizeof(domainname)), SyscallSucceeds());
+  EXPECT_EQ(absl::string_view(domainname), "abcdefghij");
+
+  constexpr char kHostname[] = "wubbalubba";
+  ASSERT_THAT(sethostname(kHostname, sizeof(kHostname)), SyscallSucceeds());
+
+  constexpr char kDomainname[] = "dubdub.com";
+  ASSERT_THAT(setdomainname(kDomainname, sizeof(kDomainname)),
+              SyscallSucceeds());
+
+  struct utsname buf;
+  EXPECT_THAT(uname(&buf), SyscallSucceeds());
+  EXPECT_EQ(absl::string_view(buf.nodename), kHostname);
+  EXPECT_EQ(absl::string_view(buf.domainname), kDomainname);
+
+  // These should just be glibc wrappers that also call uname(2).
+  EXPECT_THAT(gethostname(hostname, sizeof(hostname)), SyscallSucceeds());
+  EXPECT_EQ(absl::string_view(hostname), kHostname);
+
+  EXPECT_THAT(getdomainname(domainname, sizeof(domainname)), SyscallSucceeds());
+  EXPECT_EQ(absl::string_view(domainname), kDomainname);
+}
+
+TEST(UnameTest, UnprivilegedSetNames) {
+  AutoCapability cap(CAP_SYS_ADMIN, false);
+
+  EXPECT_THAT(sethostname("", 0), SyscallFailsWithErrno(EPERM));
+  EXPECT_THAT(setdomainname("", 0), SyscallFailsWithErrno(EPERM));
+}
+
+TEST(UnameTest, UnshareUTS) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  struct utsname init;
+  ASSERT_THAT(uname(&init), SyscallSucceeds());
+
+  ScopedThread thread = ScopedThread([&]() {
+    EXPECT_THAT(unshare(CLONE_NEWUTS), SyscallSucceeds());
+
+    constexpr char kHostname[] = "wubbalubba";
+    EXPECT_THAT(sethostname(kHostname, sizeof(kHostname)), SyscallSucceeds());
+
+    char hostname[65];
+    EXPECT_THAT(gethostname(hostname, sizeof(hostname)), SyscallSucceeds());
+  });
+  thread.Join();
+
+  struct utsname after;
+  EXPECT_THAT(uname(&after), SyscallSucceeds());
+  EXPECT_EQ(absl::string_view(after.nodename), init.nodename);
+}
+
+}  // namespace
+
+}  // namespace testing
+}  // namespace gvisor

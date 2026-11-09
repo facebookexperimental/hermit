@@ -1,0 +1,5 @@
+UNSTAGED -- this placeholder stands in for a staged/ input that does not
+exist yet, so that `buck2 targets hermit//...` parses in a fresh checkout.
+Run ci/buck-e2e/stage (or ci/buck-e2e/validate-node --stage-only) to stage
+the real inputs before building :bundle or running any cell; validate-node
+--cells-only refuses to run without staged inputs for HEAD.

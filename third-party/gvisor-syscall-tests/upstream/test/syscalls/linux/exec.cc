@@ -1,0 +1,1874 @@
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "test/syscalls/linux/exec.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/capability.h>
+#include <linux/prctl.h>
+#include <sched.h>
+#include <signal.h>
+#include <string.h>
+#include <sys/eventfd.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/mount.h>
+#include <sys/prctl.h>
+#include <sys/ptrace.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/sysmacros.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+#include <sys/xattr.h>
+#include <unistd.h>
+
+#include <cassert>
+#include <csignal>
+#include <cstdint>
+#include <cstdlib>
+#include <iostream>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "gmock/gmock.h"
+#include "gtest/gtest.h"
+#include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
+#include "absl/strings/str_cat.h"
+#include "absl/strings/str_format.h"
+#include "absl/strings/str_split.h"
+#include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
+#include "absl/types/optional.h"
+#include "test/util/cleanup.h"
+#include "test/util/file_descriptor.h"
+#include "test/util/fs_util.h"
+#include "test/util/linux_capability_util.h"
+#include "test/util/logging.h"
+#include "test/util/memory_util.h"
+#include "test/util/mount_util.h"
+#include "test/util/multiprocess_util.h"
+#include "test/util/posix_error.h"
+#include "test/util/save_util.h"
+#include "test/util/temp_path.h"
+#include "test/util/test_util.h"
+#include "test/util/thread_util.h"
+
+namespace gvisor {
+namespace testing {
+
+namespace {
+
+#ifndef SUID_DUMP_DISABLE
+#define SUID_DUMP_DISABLE 0
+#endif /* SUID_DUMP_DISABLE */
+#ifndef SUID_DUMP_USER
+#define SUID_DUMP_USER 1
+#endif /* SUID_DUMP_USER */
+#ifndef SUID_DUMP_ROOT
+#define SUID_DUMP_ROOT 2
+#endif /* SUID_DUMP_ROOT */
+#ifndef PR_CAP_AMBIENT
+#define PR_CAP_AMBIENT 47
+#define PR_CAP_AMBIENT_RAISE 2
+#endif /* PR_CAP_AMBIENT */
+
+constexpr char kBasicWorkload[] = "test/syscalls/linux/exec_basic_workload";
+constexpr char kCheckEuidProgram[] = "test/syscalls/linux/exec_check_creds";
+constexpr char kExitScript[] = "test/syscalls/linux/exit_script";
+constexpr char kStateWorkload[] = "test/syscalls/linux/exec_state_workload";
+constexpr char kEtxtbsyWorkload[] = "test/syscalls/linux/exec_etxtbsy_workload";
+constexpr char kProcExeWorkload[] =
+    "test/syscalls/linux/exec_proc_exe_workload";
+constexpr char kAssertClosedWorkload[] =
+    "test/syscalls/linux/exec_assert_closed_workload";
+constexpr char kPriorityWorkload[] = "test/syscalls/linux/priority_execve";
+
+constexpr char kExit42[] = "--exec_exit_42";
+constexpr char kExecWithThread[] = "--exec_exec_with_thread";
+constexpr char kExecFromThread[] = "--exec_exec_from_thread";
+constexpr char kExecInParent[] = "--exec_exec_in_parent";
+constexpr char kWriteAndWaitForPid[] = "--exec_write_and_wait_for_pid";
+
+// Runs file specified by dirfd and pathname with argv and checks that the exit
+// status is expect_status and that stderr contains expect_stderr.
+void CheckExecHelper(const absl::optional<int32_t> dirfd,
+                     const std::string& pathname, const ExecveArray& argv,
+                     const ExecveArray& envv, const int flags,
+                     int expect_status, const std::string& expect_stderr) {
+  int pipe_fds[2];
+  ASSERT_THAT(pipe2(pipe_fds, O_CLOEXEC), SyscallSucceeds());
+
+  FileDescriptor read_fd(pipe_fds[0]);
+  FileDescriptor write_fd(pipe_fds[1]);
+
+  pid_t child;
+  int execve_errno;
+
+  const auto remap_stderr = [pipe_fds] {
+    // Remap stdin and stdout to /dev/null.
+    int fd = open("/dev/null", O_RDWR | O_CLOEXEC);
+    if (fd < 0) {
+      _exit(errno);
+    }
+
+    int ret = dup2(fd, 0);
+    if (ret < 0) {
+      _exit(errno);
+    }
+
+    ret = dup2(fd, 1);
+    if (ret < 0) {
+      _exit(errno);
+    }
+
+    // And stderr to the pipe.
+    ret = dup2(pipe_fds[1], 2);
+    if (ret < 0) {
+      _exit(errno);
+    }
+
+    // Here, we'd ideally close all other FDs inherited from the parent.
+    // However, that's not worth the effort and CloexecNormalFile and
+    // CloexecEventfd depend on that not happening.
+  };
+
+  Cleanup kill;
+  if (dirfd.has_value()) {
+    kill = ASSERT_NO_ERRNO_AND_VALUE(ForkAndExecveat(*dirfd, pathname, argv,
+                                                     envv, flags, remap_stderr,
+                                                     &child, &execve_errno));
+  } else {
+    kill = ASSERT_NO_ERRNO_AND_VALUE(
+        ForkAndExec(pathname, argv, envv, remap_stderr, &child, &execve_errno));
+  }
+
+  ASSERT_EQ(0, execve_errno);
+
+  // Not needed anymore.
+  write_fd.reset();
+
+  // Read stderr until the child exits.
+  std::string output;
+  constexpr int kSize = 128;
+  char buf[kSize];
+  int n;
+  do {
+    ASSERT_THAT(n = ReadFd(read_fd.get(), buf, kSize), SyscallSucceeds());
+    if (n > 0) {
+      output.append(buf, n);
+    }
+  } while (n > 0);
+
+  int status;
+  ASSERT_THAT(RetryEINTR(waitpid)(child, &status, 0), SyscallSucceeds());
+  EXPECT_EQ(status, expect_status) << output;
+
+  // Process cleanup no longer needed.
+  kill.Release();
+
+  EXPECT_TRUE(absl::StrContains(output, expect_stderr)) << output;
+}
+
+void CheckExec(const std::string& filename, const ExecveArray& argv,
+               const ExecveArray& envv, int expect_status,
+               const std::string& expect_stderr) {
+  CheckExecHelper(/*dirfd=*/absl::optional<int32_t>(), filename, argv, envv,
+                  /*flags=*/0, expect_status, expect_stderr);
+}
+
+void CheckExecveat(const int32_t dirfd, const std::string& pathname,
+                   const ExecveArray& argv, const ExecveArray& envv,
+                   const int flags, int expect_status,
+                   const std::string& expect_stderr) {
+  CheckExecHelper(absl::optional<int32_t>(dirfd), pathname, argv, envv, flags,
+                  expect_status, expect_stderr);
+}
+
+TEST(ExecTest, EmptyPath) {
+  int execve_errno;
+  ASSERT_NO_ERRNO_AND_VALUE(ForkAndExec("", {}, {}, nullptr, &execve_errno));
+  EXPECT_EQ(execve_errno, ENOENT);
+}
+
+TEST(ExecTest, Basic) {
+  CheckExec(RunfilePath(kBasicWorkload), {RunfilePath(kBasicWorkload)}, {},
+            ArgEnvExitStatus(0, 0),
+            absl::StrCat(RunfilePath(kBasicWorkload), "\n"));
+}
+
+TEST(ExecTest, OneArg) {
+  CheckExec(RunfilePath(kBasicWorkload), {RunfilePath(kBasicWorkload), "1"}, {},
+            ArgEnvExitStatus(1, 0),
+            absl::StrCat(RunfilePath(kBasicWorkload), "\n1\n"));
+}
+
+TEST(ExecTest, FiveArg) {
+  CheckExec(RunfilePath(kBasicWorkload),
+            {RunfilePath(kBasicWorkload), "1", "2", "3", "4", "5"}, {},
+            ArgEnvExitStatus(5, 0),
+            absl::StrCat(RunfilePath(kBasicWorkload), "\n1\n2\n3\n4\n5\n"));
+}
+
+TEST(ExecTest, OneEnv) {
+  CheckExec(RunfilePath(kBasicWorkload), {RunfilePath(kBasicWorkload)}, {"1"},
+            ArgEnvExitStatus(0, 1),
+            absl::StrCat(RunfilePath(kBasicWorkload), "\n1\n"));
+}
+
+TEST(ExecTest, FiveEnv) {
+  CheckExec(RunfilePath(kBasicWorkload), {RunfilePath(kBasicWorkload)},
+            {"1", "2", "3", "4", "5"}, ArgEnvExitStatus(0, 5),
+            absl::StrCat(RunfilePath(kBasicWorkload), "\n1\n2\n3\n4\n5\n"));
+}
+
+TEST(ExecTest, OneArgOneEnv) {
+  CheckExec(RunfilePath(kBasicWorkload), {RunfilePath(kBasicWorkload), "arg"},
+            {"env"}, ArgEnvExitStatus(1, 1),
+            absl::StrCat(RunfilePath(kBasicWorkload), "\narg\nenv\n"));
+}
+
+TEST(ExecTest, InterpreterScript) {
+  CheckExec(RunfilePath(kExitScript), {RunfilePath(kExitScript), "25"}, {},
+            ArgEnvExitStatus(25, 0), "");
+}
+
+std::string GetShortTestTmpdir() {
+#ifdef ANDROID
+  // Using GetAbsoluteTestTmpdir() can cause the tmp directory path to exceed
+  // the max length of the interpreter script path (127).
+  //
+  // However, existing systems that are built with the ANDROID configuration
+  // have their temp directory in a different location, and must respect the
+  // TEST_TMPDIR.
+  return GetAbsoluteTestTmpdir();
+#else
+  return "/tmp";
+#endif  // ANDROID
+}
+
+// Everything after the path in the interpreter script is a single argument.
+TEST(ExecTest, InterpreterScriptArgSplit) {
+  // Symlink through /tmp to ensure the path is short enough.
+  TempPath link = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateSymlinkTo(
+      GetShortTestTmpdir(), RunfilePath(kBasicWorkload)));
+
+  TempPath script = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetShortTestTmpdir(), absl::StrCat("#!", link.path(), " foo bar"), 0755));
+
+  CheckExec(script.path(), {script.path()}, {}, ArgEnvExitStatus(2, 0),
+            absl::StrCat(link.path(), "\nfoo bar\n", script.path(), "\n"));
+}
+
+// Original argv[0] is replaced with the script path.
+TEST(ExecTest, InterpreterScriptArgvZero) {
+  // Symlink through /tmp to ensure the path is short enough.
+  TempPath link = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateSymlinkTo(
+      GetShortTestTmpdir(), RunfilePath(kBasicWorkload)));
+
+  TempPath script = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetShortTestTmpdir(), absl::StrCat("#!", link.path()), 0755));
+
+  CheckExec(script.path(), {"REPLACED"}, {}, ArgEnvExitStatus(1, 0),
+            absl::StrCat(link.path(), "\n", script.path(), "\n"));
+}
+
+// Original argv[0] is replaced with the script path, exactly as passed to
+// execve.
+TEST(ExecTest, InterpreterScriptArgvZeroRelative) {
+  // Symlink through /tmp to ensure the path is short enough.
+  TempPath link = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateSymlinkTo(
+      GetShortTestTmpdir(), RunfilePath(kBasicWorkload)));
+
+  TempPath script = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetShortTestTmpdir(), absl::StrCat("#!", link.path()), 0755));
+
+  auto cwd = ASSERT_NO_ERRNO_AND_VALUE(GetCWD());
+  auto script_relative =
+      ASSERT_NO_ERRNO_AND_VALUE(GetRelativePath(cwd, script.path()));
+
+  CheckExec(script_relative, {"REPLACED"}, {}, ArgEnvExitStatus(1, 0),
+            absl::StrCat(link.path(), "\n", script_relative, "\n"));
+}
+
+// argv[0] is added as the script path, even if there was none.
+TEST(ExecTest, InterpreterScriptArgvZeroAdded) {
+  // Symlink through /tmp to ensure the path is short enough.
+  TempPath link = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateSymlinkTo(
+      GetShortTestTmpdir(), RunfilePath(kBasicWorkload)));
+
+  TempPath script = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetShortTestTmpdir(), absl::StrCat("#!", link.path()), 0755));
+
+  CheckExec(script.path(), {}, {}, ArgEnvExitStatus(1, 0),
+            absl::StrCat(link.path(), "\n", script.path(), "\n"));
+}
+
+// A NUL byte in the script line ends parsing.
+TEST(ExecTest, InterpreterScriptArgNUL) {
+  // Symlink through /tmp to ensure the path is short enough.
+  TempPath link = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateSymlinkTo(
+      GetShortTestTmpdir(), RunfilePath(kBasicWorkload)));
+
+  TempPath script = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetShortTestTmpdir(),
+      absl::StrCat("#!", link.path(), " foo", std::string(1, '\0'), "bar"),
+      0755));
+
+  CheckExec(script.path(), {script.path()}, {}, ArgEnvExitStatus(2, 0),
+            absl::StrCat(link.path(), "\nfoo\n", script.path(), "\n"));
+}
+
+// Trailing whitespace following interpreter path is ignored.
+TEST(ExecTest, InterpreterScriptTrailingWhitespace) {
+  // Symlink through /tmp to ensure the path is short enough.
+  TempPath link = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateSymlinkTo(
+      GetShortTestTmpdir(), RunfilePath(kBasicWorkload)));
+
+  TempPath script = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetShortTestTmpdir(), absl::StrCat("#!", link.path(), "  \n"), 0755));
+
+  CheckExec(script.path(), {script.path()}, {}, ArgEnvExitStatus(1, 0),
+            absl::StrCat(link.path(), "\n", script.path(), "\n"));
+}
+
+// Multiple whitespace characters between interpreter and arg allowed.
+TEST(ExecTest, InterpreterScriptArgWhitespace) {
+  // Symlink through /tmp to ensure the path is short enough.
+  TempPath link = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateSymlinkTo(
+      GetShortTestTmpdir(), RunfilePath(kBasicWorkload)));
+
+  TempPath script = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetShortTestTmpdir(), absl::StrCat("#!", link.path(), "  foo"), 0755));
+
+  CheckExec(script.path(), {script.path()}, {}, ArgEnvExitStatus(2, 0),
+            absl::StrCat(link.path(), "\nfoo\n", script.path(), "\n"));
+}
+
+TEST(ExecTest, InterpreterScriptNoPath) {
+  TempPath script = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetShortTestTmpdir(), "#!\n\n", 0755));
+
+  int execve_errno;
+  ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(script.path(), {script.path()}, {}, nullptr, &execve_errno));
+  EXPECT_EQ(execve_errno, ENOEXEC);
+}
+
+// AT_EXECFN is the path passed to execve.
+TEST(ExecTest, ExecFn) {
+  // Symlink through /tmp to ensure the path is short enough.
+  TempPath link = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateSymlinkTo(
+      GetShortTestTmpdir(), RunfilePath(kStateWorkload)));
+
+  TempPath script = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetShortTestTmpdir(), absl::StrCat("#!", link.path(), " PrintExecFn"),
+      0755));
+
+  // Pass the script as a relative path and assert that is what appears in
+  // AT_EXECFN.
+  auto cwd = ASSERT_NO_ERRNO_AND_VALUE(GetCWD());
+  auto script_relative =
+      ASSERT_NO_ERRNO_AND_VALUE(GetRelativePath(cwd, script.path()));
+
+  CheckExec(script_relative, {script_relative}, {}, ArgEnvExitStatus(0, 0),
+            absl::StrCat(script_relative, "\n"));
+}
+
+TEST(ExecTest, ExecName) {
+  std::string path = RunfilePath(kStateWorkload);
+
+  CheckExec(path, {path, "PrintExecName"}, {}, ArgEnvExitStatus(0, 0),
+            absl::StrCat(Basename(path).substr(0, 15), "\n"));
+}
+
+TEST(ExecTest, ExecNameScript) {
+  // Symlink through /tmp to ensure the path is short enough.
+  TempPath link = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateSymlinkTo(
+      GetShortTestTmpdir(), RunfilePath(kStateWorkload)));
+
+  TempPath script = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetShortTestTmpdir(), absl::StrCat("#!", link.path(), " PrintExecName"),
+      0755));
+
+  std::string script_path = script.path();
+
+  CheckExec(script_path, {script_path}, {}, ArgEnvExitStatus(0, 0),
+            absl::StrCat(Basename(script_path).substr(0, 15), "\n"));
+}
+
+// execve may be called by a multithreaded process.
+TEST(ExecTest, WithSiblingThread) {
+  CheckExec("/proc/self/exe", {"/proc/self/exe", kExecWithThread}, {},
+            W_EXITCODE(42, 0), "");
+}
+
+// execve may be called from a thread other than the leader of a multithreaded
+// process.
+TEST(ExecTest, FromSiblingThread) {
+  CheckExec("/proc/self/exe", {"/proc/self/exe", kExecFromThread}, {},
+            W_EXITCODE(42, 0), "");
+}
+
+TEST(ExecTest, NotFound) {
+  char* const argv[] = {nullptr};
+  char* const envp[] = {nullptr};
+  EXPECT_THAT(execve("/file/does/not/exist", argv, envp),
+              SyscallFailsWithErrno(ENOENT));
+}
+
+TEST(ExecTest, NoExecPerm) {
+  char* const argv[] = {nullptr};
+  char* const envp[] = {nullptr};
+  auto f = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  EXPECT_THAT(execve(f.path().c_str(), argv, envp),
+              SyscallFailsWithErrno(EACCES));
+}
+
+// A signal handler we never expect to be called.
+void SignalHandler(int signo) {
+  std::cerr << "Signal " << signo << " raised." << std::endl;
+  exit(1);
+}
+
+// Signal handlers are reset on execve(2), unless they have default or ignored
+// disposition.
+TEST(ExecStateTest, HandlerReset) {
+  struct sigaction sa;
+  sa.sa_handler = SignalHandler;
+  ASSERT_THAT(sigaction(SIGUSR1, &sa, nullptr), SyscallSucceeds());
+
+  ExecveArray args = {
+      RunfilePath(kStateWorkload),
+      "CheckSigHandler",
+      absl::StrCat(SIGUSR1),
+      absl::StrCat(absl::Hex(reinterpret_cast<uintptr_t>(SIG_DFL))),
+  };
+
+  CheckExec(RunfilePath(kStateWorkload), args, {}, W_EXITCODE(0, 0), "");
+}
+
+// Ignored signal dispositions are not reset.
+TEST(ExecStateTest, IgnorePreserved) {
+  struct sigaction sa;
+  sa.sa_handler = SIG_IGN;
+  ASSERT_THAT(sigaction(SIGUSR1, &sa, nullptr), SyscallSucceeds());
+
+  ExecveArray args = {
+      RunfilePath(kStateWorkload),
+      "CheckSigHandler",
+      absl::StrCat(SIGUSR1),
+      absl::StrCat(absl::Hex(reinterpret_cast<uintptr_t>(SIG_IGN))),
+  };
+
+  CheckExec(RunfilePath(kStateWorkload), args, {}, W_EXITCODE(0, 0), "");
+}
+
+// Signal masks are not reset on exec
+TEST(ExecStateTest, SignalMask) {
+  sigset_t s;
+  sigemptyset(&s);
+  sigaddset(&s, SIGUSR1);
+  ASSERT_THAT(sigprocmask(SIG_BLOCK, &s, nullptr), SyscallSucceeds());
+
+  ExecveArray args = {
+      RunfilePath(kStateWorkload),
+      "CheckSigBlocked",
+      absl::StrCat(SIGUSR1),
+  };
+
+  CheckExec(RunfilePath(kStateWorkload), args, {}, W_EXITCODE(0, 0), "");
+}
+
+// itimers persist across execve.
+// N.B. Timers created with timer_create(2) should not be preserved!
+TEST(ExecStateTest, ItimerPreserved) {
+  // The fork in ForkAndExec clears itimers, so only set them up after fork.
+  auto setup_itimer = [] {
+    // Ignore SIGALRM, as we don't actually care about timer
+    // expirations.
+    struct sigaction sa;
+    sa.sa_handler = SIG_IGN;
+    int ret = sigaction(SIGALRM, &sa, nullptr);
+    if (ret < 0) {
+      _exit(errno);
+    }
+
+    struct itimerval itv;
+    itv.it_interval.tv_sec = 1;
+    itv.it_interval.tv_usec = 0;
+    itv.it_value.tv_sec = 1;
+    itv.it_value.tv_usec = 0;
+    ret = setitimer(ITIMER_REAL, &itv, nullptr);
+    if (ret < 0) {
+      _exit(errno);
+    }
+  };
+
+  std::string filename = RunfilePath(kStateWorkload);
+  ExecveArray argv = {
+      filename,
+      "CheckItimerEnabled",
+      absl::StrCat(ITIMER_REAL),
+  };
+
+  pid_t child;
+  int execve_errno;
+  auto kill = ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(filename, argv, {}, setup_itimer, &child, &execve_errno));
+  ASSERT_EQ(0, execve_errno);
+
+  int status;
+  ASSERT_THAT(RetryEINTR(waitpid)(child, &status, 0), SyscallSucceeds());
+  EXPECT_EQ(0, status);
+
+  // Process cleanup no longer needed.
+  kill.Release();
+}
+
+TEST(ProcSelfExe, ChangesAcrossExecve) {
+  // See exec_proc_exe_workload for more details. We simply
+  // assert that the /proc/self/exe link changes across execve.
+  CheckExec(RunfilePath(kProcExeWorkload),
+            {RunfilePath(kProcExeWorkload),
+             ASSERT_NO_ERRNO_AND_VALUE(ProcessExePath(getpid()))},
+            {}, W_EXITCODE(0, 0), "");
+}
+
+TEST(ExecTest, CloexecNormalFile) {
+  TempPath tempFile = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), "bar", 0755));
+  const FileDescriptor fd_closed_on_exec =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(tempFile.path(), O_RDONLY | O_CLOEXEC));
+
+  CheckExec(RunfilePath(kAssertClosedWorkload),
+            {RunfilePath(kAssertClosedWorkload),
+             absl::StrCat(fd_closed_on_exec.get())},
+            {}, W_EXITCODE(0, 0), "");
+
+  // The assert closed workload exits with code 2 if the file still exists.  We
+  // can use this to do a negative test.
+  const FileDescriptor fd_open_on_exec =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(tempFile.path(), O_RDONLY));
+
+  CheckExec(
+      RunfilePath(kAssertClosedWorkload),
+      {RunfilePath(kAssertClosedWorkload), absl::StrCat(fd_open_on_exec.get())},
+      {}, W_EXITCODE(2, 0), "");
+}
+
+TEST(ExecTest, CloexecEventfd) {
+  int efd;
+  ASSERT_THAT(efd = eventfd(0, EFD_CLOEXEC), SyscallSucceeds());
+  FileDescriptor fd(efd);
+
+  CheckExec(RunfilePath(kAssertClosedWorkload),
+            {RunfilePath(kAssertClosedWorkload), absl::StrCat(fd.get())}, {},
+            W_EXITCODE(0, 0), "");
+}
+
+constexpr int kLinuxMaxSymlinks = 40;
+
+TEST(ExecTest, SymlinkLimitExceeded) {
+  std::string path = RunfilePath(kBasicWorkload);
+
+  // Hold onto TempPath objects so they are not destructed prematurely.
+  std::vector<TempPath> symlinks;
+  for (int i = 0; i < kLinuxMaxSymlinks + 1; i++) {
+    symlinks.push_back(ASSERT_NO_ERRNO_AND_VALUE(
+        TempPath::CreateSymlinkTo(GetAbsoluteTestTmpdir(), path)));
+    path = symlinks[i].path();
+  }
+
+  int execve_errno;
+  ASSERT_NO_ERRNO_AND_VALUE(
+      ForkAndExec(path, {path}, {}, /*child=*/nullptr, &execve_errno));
+  EXPECT_EQ(execve_errno, ELOOP);
+}
+
+TEST(ExecTest, SymlinkLimitRefreshedForInterpreter) {
+  std::string tmp_dir = GetAbsoluteTestTmpdir();
+  std::string interpreter_path = "/bin/echo";
+  TempPath script = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      tmp_dir, absl::StrCat("#!", interpreter_path), 0755));
+  std::string script_path = script.path();
+
+  // Hold onto TempPath objects so they are not destructed prematurely.
+  std::vector<TempPath> interpreter_symlinks;
+  std::vector<TempPath> script_symlinks;
+  // Replace both the interpreter and script paths with symlink chains of just
+  // over half the symlink limit each; this is the minimum required to test that
+  // the symlink limit applies separately to each traversal, while tolerating
+  // some symlinks in the resolution of (the original) interpreter_path and
+  // script_path.
+  for (int i = 0; i < (kLinuxMaxSymlinks / 2) + 1; i++) {
+    interpreter_symlinks.push_back(ASSERT_NO_ERRNO_AND_VALUE(
+        TempPath::CreateSymlinkTo(tmp_dir, interpreter_path)));
+    interpreter_path = interpreter_symlinks[i].path();
+    script_symlinks.push_back(ASSERT_NO_ERRNO_AND_VALUE(
+        TempPath::CreateSymlinkTo(tmp_dir, script_path)));
+    script_path = script_symlinks[i].path();
+  }
+
+  CheckExec(script_path, {script_path}, {}, ArgEnvExitStatus(0, 0), "");
+}
+
+TEST(ExecveatTest, BasicWithFDCWD) {
+  std::string path = RunfilePath(kBasicWorkload);
+  CheckExecveat(AT_FDCWD, path, {path}, {}, /*flags=*/0, ArgEnvExitStatus(0, 0),
+                absl::StrCat(path, "\n"));
+}
+
+TEST(ExecveatTest, Basic) {
+  std::string absolute_path = RunfilePath(kBasicWorkload);
+  std::string parent_dir = std::string(Dirname(absolute_path));
+  std::string base = std::string(Basename(absolute_path));
+  const FileDescriptor dirfd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(parent_dir, O_DIRECTORY));
+
+  CheckExecveat(dirfd.get(), base, {absolute_path}, {}, /*flags=*/0,
+                ArgEnvExitStatus(0, 0), absl::StrCat(absolute_path, "\n"));
+}
+
+TEST(ExecveatTest, FDNotADirectory) {
+  std::string absolute_path = RunfilePath(kBasicWorkload);
+  std::string base = std::string(Basename(absolute_path));
+  const FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(absolute_path, 0));
+
+  int execve_errno;
+  ASSERT_NO_ERRNO_AND_VALUE(ForkAndExecveat(fd.get(), base, {absolute_path}, {},
+                                            /*flags=*/0, /*child=*/nullptr,
+                                            &execve_errno));
+  EXPECT_EQ(execve_errno, ENOTDIR);
+}
+
+TEST(ExecveatTest, AbsolutePathWithFDCWD) {
+  std::string path = RunfilePath(kBasicWorkload);
+  CheckExecveat(AT_FDCWD, path, {path}, {}, ArgEnvExitStatus(0, 0), 0,
+                absl::StrCat(path, "\n"));
+}
+
+TEST(ExecveatTest, AbsolutePath) {
+  std::string path = RunfilePath(kBasicWorkload);
+  // File descriptor should be ignored when an absolute path is given.
+  const int32_t badFD = -1;
+  CheckExecveat(badFD, path, {path}, {}, ArgEnvExitStatus(0, 0), 0,
+                absl::StrCat(path, "\n"));
+}
+
+TEST(ExecveatTest, EmptyPathBasic) {
+  std::string path = RunfilePath(kBasicWorkload);
+  const FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(path, O_PATH));
+
+  CheckExecveat(fd.get(), "", {path}, {}, AT_EMPTY_PATH, ArgEnvExitStatus(0, 0),
+                absl::StrCat(path, "\n"));
+}
+
+TEST(ExecveatTest, EmptyPathWithDirFD) {
+  std::string path = RunfilePath(kBasicWorkload);
+  std::string parent_dir = std::string(Dirname(path));
+  const FileDescriptor dirfd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(parent_dir, O_DIRECTORY));
+
+  int execve_errno;
+  ASSERT_NO_ERRNO_AND_VALUE(ForkAndExecveat(dirfd.get(), "", {path}, {},
+                                            AT_EMPTY_PATH,
+                                            /*child=*/nullptr, &execve_errno));
+  EXPECT_EQ(execve_errno, EACCES);
+}
+
+TEST(ExecveatTest, EmptyPathWithoutEmptyPathFlag) {
+  std::string path = RunfilePath(kBasicWorkload);
+  const FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(path, O_PATH));
+
+  int execve_errno;
+  ASSERT_NO_ERRNO_AND_VALUE(ForkAndExecveat(
+      fd.get(), "", {path}, {}, /*flags=*/0, /*child=*/nullptr, &execve_errno));
+  EXPECT_EQ(execve_errno, ENOENT);
+}
+
+TEST(ExecveatTest, AbsolutePathWithEmptyPathFlag) {
+  std::string path = RunfilePath(kBasicWorkload);
+  const FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(path, O_PATH));
+
+  CheckExecveat(fd.get(), path, {path}, {}, AT_EMPTY_PATH,
+                ArgEnvExitStatus(0, 0), absl::StrCat(path, "\n"));
+}
+
+TEST(ExecveatTest, RelativePathWithEmptyPathFlag) {
+  std::string absolute_path = RunfilePath(kBasicWorkload);
+  std::string parent_dir = std::string(Dirname(absolute_path));
+  std::string base = std::string(Basename(absolute_path));
+  const FileDescriptor dirfd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(parent_dir, O_DIRECTORY));
+
+  CheckExecveat(dirfd.get(), base, {absolute_path}, {}, AT_EMPTY_PATH,
+                ArgEnvExitStatus(0, 0), absl::StrCat(absolute_path, "\n"));
+}
+
+TEST(ExecveatTest, SymlinkNoFollowWithRelativePath) {
+  std::string parent_dir = GetAbsoluteTestTmpdir();
+  TempPath link = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateSymlinkTo(parent_dir, RunfilePath(kBasicWorkload)));
+  const FileDescriptor dirfd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(parent_dir, O_DIRECTORY));
+  std::string base = std::string(Basename(link.path()));
+
+  int execve_errno;
+  ASSERT_NO_ERRNO_AND_VALUE(ForkAndExecveat(dirfd.get(), base, {base}, {},
+                                            AT_SYMLINK_NOFOLLOW,
+                                            /*child=*/nullptr, &execve_errno));
+  EXPECT_EQ(execve_errno, ELOOP);
+}
+
+TEST(ExecveatTest, UnshareFiles) {
+  TempPath tempFile = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), "bar", 0755));
+  const FileDescriptor fd_closed_on_exec =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(tempFile.path(), O_RDONLY | O_CLOEXEC));
+
+  ExecveArray argv = {"test"};
+  ExecveArray envp;
+  std::string child_path = RunfilePath(kBasicWorkload);
+  pid_t child =
+      syscall(__NR_clone, SIGCHLD | CLONE_VFORK | CLONE_FILES, 0, 0, 0, 0);
+  if (child == 0) {
+    execve(child_path.c_str(), argv.get(), envp.get());
+    _exit(1);
+  }
+  ASSERT_THAT(child, SyscallSucceeds());
+
+  int status;
+  ASSERT_THAT(RetryEINTR(waitpid)(child, &status, 0), SyscallSucceeds());
+  EXPECT_EQ(status, 0);
+
+  struct stat st;
+  EXPECT_THAT(fstat(fd_closed_on_exec.get(), &st), SyscallSucceeds());
+}
+
+TEST(ExecveatTest, SymlinkNoFollowWithAbsolutePath) {
+  std::string parent_dir = GetAbsoluteTestTmpdir();
+  TempPath link = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateSymlinkTo(parent_dir, RunfilePath(kBasicWorkload)));
+  std::string path = link.path();
+
+  int execve_errno;
+  ASSERT_NO_ERRNO_AND_VALUE(ForkAndExecveat(AT_FDCWD, path, {path}, {},
+                                            AT_SYMLINK_NOFOLLOW,
+                                            /*child=*/nullptr, &execve_errno));
+  EXPECT_EQ(execve_errno, ELOOP);
+}
+
+TEST(ExecveatTest, SymlinkNoFollowAndEmptyPath) {
+  TempPath link = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateSymlinkTo(
+      GetAbsoluteTestTmpdir(), RunfilePath(kBasicWorkload)));
+  std::string path = link.path();
+  const FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(path, 0));
+
+  CheckExecveat(fd.get(), "", {path}, {}, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW,
+                ArgEnvExitStatus(0, 0), absl::StrCat(path, "\n"));
+}
+
+TEST(ExecveatTest, SymlinkNoFollowIgnoreSymlinkAncestor) {
+  // System executables may themselves be symlinks. Use a regular file so only
+  // the ancestor is a symlink.
+  TempPath parent = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  std::string contents =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents(RunfilePath(kBasicWorkload)));
+  TempPath executable = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(parent.path(), contents, 0755));
+  TempPath parent_link = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateSymlinkTo(GetAbsoluteTestTmpdir(), parent.path()));
+  std::string path_with_symlink =
+      JoinPath(parent_link.path(), Basename(executable.path()));
+
+  CheckExecveat(AT_FDCWD, path_with_symlink, {path_with_symlink}, {},
+                AT_SYMLINK_NOFOLLOW, ArgEnvExitStatus(0, 0),
+                absl::StrCat(path_with_symlink, "\n"));
+}
+
+TEST(ExecveatTest, SymlinkNoFollowWithNormalFile) {
+  TempPath parent = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  std::string contents =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents(RunfilePath(kBasicWorkload)));
+  TempPath executable = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(parent.path(), contents, 0755));
+  const FileDescriptor dirfd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(parent.path(), O_DIRECTORY));
+  std::string name(Basename(executable.path()));
+
+  CheckExecveat(dirfd.get(), name, {name}, {}, AT_SYMLINK_NOFOLLOW,
+                ArgEnvExitStatus(0, 0), absl::StrCat(name, "\n"));
+}
+
+TEST(ExecveatTest, BasicWithCloexecFD) {
+  std::string path = RunfilePath(kBasicWorkload);
+  const FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(path, O_CLOEXEC));
+
+  CheckExecveat(fd.get(), "", {path}, {}, AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH,
+                ArgEnvExitStatus(0, 0), absl::StrCat(path, "\n"));
+}
+
+TEST(ExecveatTest, InterpreterScriptWithCloexecFD) {
+  std::string path = RunfilePath(kExitScript);
+  const FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(path, O_CLOEXEC));
+
+  int execve_errno;
+  ASSERT_NO_ERRNO_AND_VALUE(ForkAndExecveat(fd.get(), "", {path}, {},
+                                            AT_EMPTY_PATH, /*child=*/nullptr,
+                                            &execve_errno));
+  EXPECT_EQ(execve_errno, ENOENT);
+}
+
+TEST(ExecveatTest, InterpreterScriptWithCloexecDirFD) {
+  std::string absolute_path = RunfilePath(kExitScript);
+  std::string parent_dir = std::string(Dirname(absolute_path));
+  std::string base = std::string(Basename(absolute_path));
+  const FileDescriptor dirfd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(parent_dir, O_CLOEXEC | O_DIRECTORY));
+
+  int execve_errno;
+  ASSERT_NO_ERRNO_AND_VALUE(ForkAndExecveat(dirfd.get(), base, {base}, {},
+                                            /*flags=*/0, /*child=*/nullptr,
+                                            &execve_errno));
+  EXPECT_EQ(execve_errno, ENOENT);
+}
+
+TEST(ExecveatTest, InvalidFlags) {
+  int execve_errno;
+  ASSERT_NO_ERRNO_AND_VALUE(ForkAndExecveat(
+      /*dirfd=*/-1, "", {}, {}, /*flags=*/0xFFFF, /*child=*/nullptr,
+      &execve_errno));
+  EXPECT_EQ(execve_errno, EINVAL);
+}
+
+ExecveArray OversizedExecveArgv(const std::string& argv0) {
+  std::string long_arg(128 * 1024, 'A');
+  std::vector<std::string> argv;
+  argv.reserve(18);
+  argv.push_back(argv0);
+  // 17 * 128KB = 2176KB > 2MB.
+  for (int i = 0; i < 17; i++) {
+    argv.push_back(long_arg);
+  }
+  return ExecveArray(argv);
+}
+
+// Oversized argv is E2BIG on both Linux (stack-based cap) and gVisor (2MB).
+TEST(ExecTest, ExecveArgvE2BIG) {
+  int execve_errno = 0;
+  ASSERT_NO_ERRNO_AND_VALUE(ForkAndExec("/bin/true",
+                                        OversizedExecveArgv("/bin/true"), {},
+                                        /*child=*/nullptr, &execve_errno));
+  EXPECT_EQ(execve_errno, E2BIG);
+}
+
+// Oversized envv is E2BIG.
+TEST(ExecTest, ExecveEnvvE2BIG) {
+  std::string long_env(128 * 1024, 'B');
+  std::vector<std::string> envv;
+  envv.reserve(17);
+  for (int i = 0; i < 17; i++) {
+    envv.push_back("VAR=" + long_env);
+  }
+
+  int execve_errno = 0;
+  ASSERT_NO_ERRNO_AND_VALUE(ForkAndExec("/bin/true", {"/bin/true"},
+                                        ExecveArray(envv),
+                                        /*child=*/nullptr, &execve_errno));
+  EXPECT_EQ(execve_errno, E2BIG);
+}
+
+int memfd_create(const std::string& name, unsigned int flags) {
+  return syscall(__NR_memfd_create, name.c_str(), flags);
+}
+
+TEST(ExecveatTest, MemfdScript) {
+  int fd;
+  ASSERT_THAT(fd = memfd_create("test_script", 0), SyscallSucceeds());
+  FileDescriptor memfd(fd);
+
+  std::string script = "#!/bin/sh\necho $0 >&2\n";
+  ASSERT_THAT(WriteFd(memfd.get(), script.c_str(), script.size()),
+              SyscallSucceedsWithValue(script.size()));
+
+  std::string expected = absl::StrCat("/dev/fd/", memfd.get(), "\n");
+
+  CheckExecveat(memfd.get(), "", {"script_name"}, {}, AT_EMPTY_PATH,
+                W_EXITCODE(0, 0), expected);
+}
+
+// Priority consistent across calls to execve()
+TEST(GetpriorityTest, ExecveMaintainsPriority) {
+  int prio = 16;
+  ASSERT_THAT(setpriority(PRIO_PROCESS, getpid(), prio), SyscallSucceeds());
+
+  // To avoid trying to use negative exit values, check for
+  // 20 - prio. Since prio should always be in the range [-20, 19],
+  // this leave expected_exit_code in the range [1, 40].
+  int expected_exit_code = 20 - prio;
+
+  // Program run (priority_execve) will exit(X) where
+  // X=getpriority(PRIO_PROCESS,0). Check that this exit value is prio.
+  CheckExec(RunfilePath(kPriorityWorkload), {RunfilePath(kPriorityWorkload)},
+            {}, W_EXITCODE(expected_exit_code, 0), "");
+}
+
+// Test that setpgid() fails on child processes after they call execve().
+TEST(ExecTest, Setpgid) {
+  const pid_t pid = fork();
+  int status;
+  ASSERT_NE(pid, -1);
+  if (pid == 0) {
+    ASSERT_THAT(ptrace(PTRACE_TRACEME, 0, 0, 0), SyscallSucceeds());
+    raise(SIGSTOP);
+    char* argv[] = {nullptr};
+    char* envp[] = {nullptr};
+    ASSERT_THAT(execve("/proc/self/exe", argv, envp), SyscallSucceeds());
+  }
+
+  EXPECT_THAT(setpgid(pid, pid), SyscallSucceeds())
+      << "setpgid failed before execve";
+  ASSERT_THAT(waitpid(pid, &status, 0), SyscallSucceedsWithValue(pid))
+      << "waitpid failed";
+  ASSERT_THAT(WIFSTOPPED(status), 1);
+  ASSERT_THAT(WSTOPSIG(status), SIGSTOP);
+  ASSERT_THAT(
+      ptrace(PTRACE_SETOPTIONS, pid, 0, PTRACE_O_EXITKILL | PTRACE_O_TRACEEXEC),
+      SyscallSucceeds())
+      << "ptrace failed";
+  ASSERT_THAT(ptrace(PTRACE_CONT, pid, 0, 0), SyscallSucceeds())
+      << "ptrace (PTRACE_CONT) failed";
+  ASSERT_THAT(waitpid(pid, &status, 0), SyscallSucceedsWithValue(pid))
+      << "waitpid failed";
+  ASSERT_THAT(WIFSTOPPED(status), 1);
+  ASSERT_THAT(WSTOPSIG(status), SIGTRAP);
+  EXPECT_THAT(setpgid(pid, pid), SyscallFailsWithErrno(EACCES));
+  EXPECT_THAT(setpgid(pid, getpid()), SyscallFailsWithErrno(EACCES));
+  EXPECT_THAT(setpgid(getpid(), pid), SyscallSucceeds());
+}
+
+PosixErrorOr<TempPath> CreateSuidExecutable(std::string path) {
+  std::string exec_blob;
+  PosixError perr = GetContents(path, &exec_blob);
+  RETURN_IF_ERRNO(perr);
+
+  // Note that this wouldn't work if /tmp/ is mounted with nosuid.
+  mode_t mode = 0755 | S_ISUID;
+  return TempPath::CreateFileWith(GetShortTestTmpdir(), exec_blob, mode);
+}
+
+PosixErrorOr<TempPath> CreateSgidExecutable(std::string path) {
+  std::string exec_blob;
+  PosixError perr = GetContents(path, &exec_blob);
+  RETURN_IF_ERRNO(perr);
+
+  // Note that this wouldn't work if /tmp/ is mounted with nosuid.
+  mode_t mode = 0755 | S_ISGID;
+  return TempPath::CreateFileWith(GetShortTestTmpdir(), exec_blob, mode);
+}
+
+PosixErrorOr<TempPath> CreateExecuteOnlyExecutable(std::string path) {
+  std::string exec_blob;
+  PosixError perr = GetContents(path, &exec_blob);
+  RETURN_IF_ERRNO(perr);
+
+  return TempPath::CreateFileWith(GetShortTestTmpdir(), exec_blob, 0111);
+}
+
+constexpr int kUnprivilegedUid = 12345;
+constexpr int kUnprivilegedGid = 12345;
+
+TEST(ExecTest, SUIDExecGainsUID) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  TempPath suid_exe = ASSERT_NO_ERRNO_AND_VALUE(
+      CreateSuidExecutable(RunfilePath(kCheckEuidProgram)));
+
+  int privilegedUid = geteuid();
+  // Use a separate thread so as to not pollute the other tests with the
+  // unprivileged uid we're about to set.
+  ScopedThread([&] {
+    ASSERT_THAT(syscall(SYS_setresuid, kUnprivilegedUid, kUnprivilegedUid,
+                        kUnprivilegedUid),
+                SyscallSucceeds());
+    ASSERT_EQ(geteuid(), kUnprivilegedUid);
+
+    int dumpability;
+    ASSERT_THAT(prctl(PR_SET_DUMPABLE, SUID_DUMP_USER), SyscallSucceeds());
+    ASSERT_THAT(dumpability = prctl(PR_GET_DUMPABLE), SyscallSucceeds());
+    ASSERT_EQ(dumpability, SUID_DUMP_USER);
+
+    const ExecveArray argv = {
+        suid_exe.path(),
+        /*want_euid=*/absl::StrCat(privilegedUid),  // gained back original euid
+        /*want_egid=*/absl::StrCat(getegid()),
+        /*want_dumpability=*/absl::StrCat(SUID_DUMP_DISABLE)};  // but lost this
+    CheckExec(suid_exe.path(), argv, /*envv=*/{}, /*expect_status=*/0,
+              /*expect_stderr=*/"");
+  });
+}
+
+TEST(ExecTest, SGIDExecGainsGID) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  TempPath suid_exe = ASSERT_NO_ERRNO_AND_VALUE(
+      CreateSgidExecutable(RunfilePath(kCheckEuidProgram)));
+
+  int privilegedGid = getegid();
+  // Use a separate thread so as to not pollute the other tests with the
+  // unprivileged gid we're about to set.
+  ScopedThread([&] {
+    ASSERT_THAT(syscall(SYS_setresgid, kUnprivilegedGid, kUnprivilegedGid,
+                        kUnprivilegedGid),
+                SyscallSucceeds());
+    ASSERT_EQ(getegid(), kUnprivilegedGid);
+
+    int dumpability;
+    ASSERT_THAT(prctl(PR_SET_DUMPABLE, SUID_DUMP_USER), SyscallSucceeds());
+    ASSERT_THAT(dumpability = prctl(PR_GET_DUMPABLE), SyscallSucceeds());
+    ASSERT_EQ(dumpability, SUID_DUMP_USER);
+
+    const ExecveArray argv = {
+        suid_exe.path(),
+        /*want_euid=*/absl::StrCat(geteuid()),
+        /*want_egid=*/absl::StrCat(privilegedGid),  // gained back original gid
+        /*want_dumpability=*/absl::StrCat(SUID_DUMP_DISABLE)};  // but lost this
+    CheckExec(suid_exe.path(), argv, /*envv=*/{}, /*expect_status=*/0,
+              /*expect_stderr=*/"");
+  });
+}
+
+// Returns the expected dumpability of a task after an exec that enforces
+// non-dumpability: gVisor hardcodes SUID_DUMP_DISABLE, while Linux uses the
+// value of the fs.suid_dumpable sysctl (fs/exec.c:begin_new_exec() =>
+// set_dumpable(current->mm, suid_dumpable)).
+PosixErrorOr<int> WantNonDumpable() {
+  if (IsRunningOnGvisor()) {
+    return SUID_DUMP_DISABLE;
+  }
+  std::string contents;
+  RETURN_IF_ERRNO(GetContents("/proc/sys/fs/suid_dumpable", &contents));
+  return atoi(contents.c_str());
+}
+
+// Mirrors struct posix_acl_xattr_entry.
+struct ACLEntry {
+  uint16_t tag;
+  uint16_t perm;
+  uint32_t id;
+};
+
+// BuildACL builds the raw xattr representation for a POSIX ACL.
+std::string BuildACL(const std::vector<ACLEntry>& entries) {
+  uint32_t version = 2;
+  std::string buf(reinterpret_cast<const char*>(&version), sizeof(version));
+  for (const ACLEntry& e : entries) {
+    buf.append(reinterpret_cast<const char*>(&e), sizeof(e));
+  }
+  return buf;
+}
+
+// A binary whose mode bits permit reading but whose ACL denies it to the
+// executing user must still make the task non-dumpable.
+TEST(ExecTest, ACLExecuteOnlyBinary) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+
+  std::string exec_blob;
+  ASSERT_NO_ERRNO(GetContents(RunfilePath(kCheckEuidProgram), &exec_blob));
+  TempPath exe = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetShortTestTmpdir(), exec_blob, 0755));
+
+  // ACL: named user kUnprivilegedUid gets --x, so the named-user entry (not
+  // the readable "other" class) governs its access.
+  constexpr uint16_t kTagUserObj = 0x01, kTagUser = 0x02, kTagGroupObj = 0x04,
+                     kTagMask = 0x10, kTagOther = 0x20;
+  constexpr uint32_t kIdUndef = 0xffffffff;
+  const std::string acl = BuildACL({
+      {kTagUserObj, 7, kIdUndef},
+      {kTagUser, 1, kUnprivilegedUid},
+      {kTagGroupObj, 5, kIdUndef},
+      {kTagMask, 1, kIdUndef},
+      {kTagOther, 5, kIdUndef},
+  });
+  int ret = setxattr(exe.path().c_str(), "system.posix_acl_access", acl.data(),
+                     acl.size(), 0);
+  SKIP_IF(ret < 0 && (errno == ENOTSUP || errno == EOPNOTSUPP));
+  ASSERT_THAT(ret, SyscallSucceeds());
+
+  // Use a separate thread so as to not pollute the other tests with the
+  // unprivileged uid/gid we're about to set. The gid must also leave the
+  // file's group class so that only the named-user ACL entry (and not the
+  // group bits, which mirror the ACL mask) denies reading.
+  bool acl_enforced = true;
+  ScopedThread t([&] {
+    ASSERT_THAT(syscall(SYS_setgroups, 0, nullptr), SyscallSucceeds());
+    ASSERT_THAT(syscall(SYS_setresgid, kUnprivilegedGid, kUnprivilegedGid,
+                        kUnprivilegedGid),
+                SyscallSucceeds());
+    ASSERT_THAT(syscall(SYS_setresuid, kUnprivilegedUid, kUnprivilegedUid,
+                        kUnprivilegedUid),
+                SyscallSucceeds());
+
+    // The ACL must deny reading. Some filesystems (e.g. gVisor's overlay)
+    // accept the ACL xattr but do not enforce ACLs; skip on those.
+    int fd = open(exe.path().c_str(), O_RDONLY);
+    if (fd >= 0) {
+      close(fd);
+      acl_enforced = false;
+      return;
+    }
+    EXPECT_THAT(open(exe.path().c_str(), O_RDONLY),
+                SyscallFailsWithErrno(EACCES));
+
+    // ...but the ACL must permit executing, and the resulting task must be
+    // non-dumpable.
+    const int want_dumpability = ASSERT_NO_ERRNO_AND_VALUE(WantNonDumpable());
+    const ExecveArray argv = {
+        exe.path(),
+        /*want_euid=*/absl::StrCat(kUnprivilegedUid),
+        /*want_egid=*/absl::StrCat(kUnprivilegedGid),
+        /*want_dumpability=*/absl::StrCat(want_dumpability)};
+    CheckExec(exe.path(), argv, /*envv=*/{}, /*expect_status=*/0,
+              /*expect_stderr=*/"");
+  });
+  t.Join();
+  if (!acl_enforced) {
+    GTEST_SKIP() << "filesystem does not enforce POSIX ACLs";
+  }
+}
+
+// Only regular files may be executed: Linux's fs/namei.c:may_open() rejects
+// exec opens of special files with EACCES regardless of their permission
+// bits, before the open can block (e.g. on a FIFO with no writer). Execute
+// permission also does not make a special file readable.
+TEST(ExecTest, ExecuteOnlySpecialFiles) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+
+  const std::string dir = GetShortTestTmpdir();
+
+  const std::string fifo = absl::StrCat(dir, "/exec-only-fifo.", getpid());
+  ASSERT_THAT(mkfifo(fifo.c_str(), 0111), SyscallSucceeds());
+  // mkfifo's mode is affected by the umask.
+  ASSERT_THAT(chmod(fifo.c_str(), 0111), SyscallSucceeds());
+  const auto fifo_cleanup = Cleanup([&fifo] { unlink(fifo.c_str()); });
+
+  const std::string sock = absl::StrCat(dir, "/exec-only-sock.", getpid());
+  const FileDescriptor sock_fd(socket(AF_UNIX, SOCK_STREAM, 0));
+  ASSERT_THAT(sock_fd.get(), SyscallSucceeds());
+  struct sockaddr_un addr = {};
+  addr.sun_family = AF_UNIX;
+  ASSERT_LT(sock.size(), sizeof(addr.sun_path));
+  strncpy(addr.sun_path, sock.c_str(), sizeof(addr.sun_path) - 1);
+  ASSERT_THAT(bind(sock_fd.get(), reinterpret_cast<struct sockaddr*>(&addr),
+                   sizeof(addr)),
+              SyscallSucceeds());
+  ASSERT_THAT(chmod(sock.c_str(), 0111), SyscallSucceeds());
+  const auto sock_cleanup = Cleanup([&sock] { unlink(sock.c_str()); });
+
+  // A character device (a /dev/null clone). mknod of character devices
+  // requires privileges the environment may not have; skip it if so.
+  const std::string chr = absl::StrCat(dir, "/exec-only-chr.", getpid());
+  const bool have_chr =
+      mknod(chr.c_str(), S_IFCHR | 0111, makedev(1, 3)) == 0 &&
+      chmod(chr.c_str(), 0111) == 0;
+  const auto chr_cleanup = Cleanup([&chr, have_chr] {
+    if (have_chr) unlink(chr.c_str());
+  });
+
+  std::vector<std::string> paths = {fifo, sock};
+  if (have_chr) {
+    paths.push_back(chr);
+  }
+
+  // Use a separate thread so as to not pollute the other tests with the
+  // unprivileged uid we're about to set.
+  ScopedThread([&] {
+    ASSERT_THAT(syscall(SYS_setresuid, kUnprivilegedUid, kUnprivilegedUid,
+                        kUnprivilegedUid),
+                SyscallSucceeds());
+
+    for (const auto& path : paths) {
+      // Exec is rejected for non-regular files. Bound the exec with an alarm
+      // so that a regression to a blocking open (e.g. a FIFO waiting for a
+      // writer) fails promptly instead of hanging the test.
+      pid_t child;
+      int execve_errno;
+      const auto cleanup = ASSERT_NO_ERRNO_AND_VALUE(ForkAndExec(
+          path, {path}, {}, +[] { alarm(10); }, &child, &execve_errno));
+      EXPECT_EQ(execve_errno, EACCES) << path;
+
+      // Execute permission does not make the file readable...
+      EXPECT_THAT(open(path.c_str(), O_RDONLY | O_NONBLOCK),
+                  SyscallFailsWithErrno(EACCES))
+          << path;
+
+      // ...including via the exec-open path, also bounded by an alarm.
+      const FileDescriptor path_fd =
+          ASSERT_NO_ERRNO_AND_VALUE(Open(path, O_PATH));
+      pid_t at_child;
+      int execveat_errno;
+      const auto at_cleanup = ASSERT_NO_ERRNO_AND_VALUE(ForkAndExecveat(
+          path_fd.get(), "", {path}, {}, AT_EMPTY_PATH, +[] { alarm(10); },
+          &at_child, &execveat_errno));
+      EXPECT_EQ(execveat_errno, EACCES) << path;
+    }
+  });
+}
+
+// A failed exec of a PTY replica must not acquire it as the caller's
+// controlling terminal: the exec open is rejected before the device's open
+// handler can run (Linux's fs/namei.c:may_open()).
+TEST(ExecTest, ExecuteOnlyPtyReplicaAcquiresNoControllingTerminal) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  // Some test environments have no devpts mount, in which case /dev/ptmx may
+  // be missing or a dangling symlink to pts/ptmx.
+  PosixErrorOr<FileDescriptor> master_or = Open("/dev/ptmx", O_RDWR | O_NOCTTY);
+  SKIP_IF(!master_or.ok() && master_or.error().errno_value() == ENOENT);
+
+  const FileDescriptor master = ASSERT_NO_ERRNO_AND_VALUE(std::move(master_or));
+  int n;
+  ASSERT_THAT(ioctl(master.get(), TIOCGPTN, &n), SyscallSucceeds());
+  int unlock = 0;
+  ASSERT_THAT(ioctl(master.get(), TIOCSPTLCK, &unlock), SyscallSucceeds());
+  const std::string replica = absl::StrCat("/dev/pts/", n);
+  ASSERT_THAT(chmod(replica.c_str(), 0111), SyscallSucceeds());
+
+  pid_t child = fork();
+  if (child == 0) {
+    // Become a session leader with no controlling terminal, as an
+    // unprivileged user. No group change is needed: the 0111 fixture denies
+    // reading to every class, and changing groups would require CAP_SETGID.
+    if (setsid() < 0) _exit(10);
+    if (syscall(SYS_setresuid, kUnprivilegedUid, kUnprivilegedUid,
+                kUnprivilegedUid) != 0) {
+      _exit(13);
+    }
+    char* const argv[] = {const_cast<char*>(replica.c_str()), nullptr};
+    char* const envv[] = {nullptr};
+    if (execve(replica.c_str(), argv, envv) == 0 || errno != EACCES) {
+      _exit(14);
+    }
+    // The failed exec must not have acquired a controlling terminal.
+    errno = 0;
+    int tty = open("/dev/tty", O_RDONLY | O_NOCTTY | O_NONBLOCK);
+    if (tty >= 0 || errno != ENXIO) _exit(15);
+    _exit(0);
+  }
+  ASSERT_GT(child, 0);
+  int status;
+  ASSERT_THAT(RetryEINTR(waitpid)(child, &status, 0),
+              SyscallSucceedsWithValue(child));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << "child status: " << status;
+}
+
+// Linux requires only execute permission (not read) to execve a binary, but
+// marks the resulting task non-dumpable so that the binary's contents cannot
+// be recovered via ptrace or procfs. See gvisor.dev/issue/160.
+TEST(ExecTest, ExecuteOnlyBinary) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  TempPath exec_only_exe = ASSERT_NO_ERRNO_AND_VALUE(
+      CreateExecuteOnlyExecutable(RunfilePath(kCheckEuidProgram)));
+
+  // Use a separate thread so as to not pollute the other tests with the
+  // unprivileged uid we're about to set.
+  ScopedThread([&] {
+    ASSERT_THAT(syscall(SYS_setresuid, kUnprivilegedUid, kUnprivilegedUid,
+                        kUnprivilegedUid),
+                SyscallSucceeds());
+    ASSERT_EQ(geteuid(), kUnprivilegedUid);
+
+    // The binary must not be readable...
+    EXPECT_THAT(open(exec_only_exe.path().c_str(), O_RDONLY),
+                SyscallFailsWithErrno(EACCES));
+
+    // ...but must still be executable, and the resulting task must be
+    // non-dumpable.
+    const int want_dumpability = ASSERT_NO_ERRNO_AND_VALUE(WantNonDumpable());
+    const ExecveArray argv = {
+        exec_only_exe.path(),
+        /*want_euid=*/absl::StrCat(kUnprivilegedUid),
+        /*want_egid=*/absl::StrCat(getegid()),
+        /*want_dumpability=*/absl::StrCat(want_dumpability)};
+    CheckExec(exec_only_exe.path(), argv, /*envv=*/{}, /*expect_status=*/0,
+              /*expect_stderr=*/"");
+  });
+}
+
+TEST(ExecTest, SUIDExecDoesntGainUIDWithNoNewPrivs) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  TempPath suid_exe = ASSERT_NO_ERRNO_AND_VALUE(
+      CreateSuidExecutable(RunfilePath(kCheckEuidProgram)));
+
+  // Use a separate thread so as to not pollute the other tests with the
+  // unprivileged uid we're about to set.
+  ScopedThread([&] {
+    ASSERT_THAT(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), SyscallSucceeds());
+    ASSERT_THAT(syscall(SYS_setresuid, kUnprivilegedUid, kUnprivilegedUid,
+                        kUnprivilegedUid),
+                SyscallSucceeds());
+    ASSERT_EQ(geteuid(), kUnprivilegedUid);
+
+    const ExecveArray argv = {
+        suid_exe.path(),
+        /*want_euid=*/absl::StrCat(kUnprivilegedUid),  // remained unprivileged
+        /*want_egid=*/absl::StrCat(getegid()),
+        /*want_dumpability=*/absl::StrCat(SUID_DUMP_USER)};
+    CheckExec(suid_exe.path(), argv, /*envv=*/{}, /*expect_status=*/0,
+              /*expect_stderr=*/"");
+  });
+}
+
+// FileCapsExecutable is a copy of kCheckEuidProgram with file capabilities, on
+// a tmpfs mounted just for it. Members are destroyed in reverse order, so the
+// file is removed before the tmpfs is unmounted.
+struct FileCapsExecutable {
+  TempPath dir;
+  Cleanup mount;
+  TempPath file;
+};
+
+// Creates a FileCapsExecutable whose file permitted set is `permitted` and
+// whose file effective bit is set. A fresh tmpfs is used because the gofer
+// does not allow setting security.* xattrs.
+PosixErrorOr<FileCapsExecutable> CreateFileCapsExecutable(uint64_t permitted) {
+  std::string exec_blob;
+  RETURN_IF_ERRNO(GetContents(RunfilePath(kCheckEuidProgram), &exec_blob));
+
+  ASSIGN_OR_RETURN_ERRNO(TempPath dir,
+                         TempPath::CreateDirIn(GetShortTestTmpdir()));
+  ASSIGN_OR_RETURN_ERRNO(Cleanup mount, Mount("tmpfs", dir.path(), "tmpfs", 0,
+                                              "mode=0755", MNT_DETACH));
+  ASSIGN_OR_RETURN_ERRNO(TempPath file,
+                         TempPath::CreateFileWith(dir.path(), exec_blob, 0755));
+
+  struct vfs_cap_data cap_data = {};
+  cap_data.magic_etc = VFS_CAP_REVISION_2 | VFS_CAP_FLAGS_EFFECTIVE;
+  cap_data.data[0].permitted = static_cast<uint32_t>(permitted);
+  cap_data.data[1].permitted = static_cast<uint32_t>(permitted >> 32);
+  if (setxattr(file.path().c_str(), "security.capability", &cap_data,
+               sizeof(cap_data), 0) < 0) {
+    return PosixError(errno, "setxattr(security.capability)");
+  }
+  return FileCapsExecutable{std::move(dir), std::move(mount), std::move(file)};
+}
+
+// Execs a FileCapsExecutable with file permitted set `file_permitted` from a
+// thread running as kUnprivilegedUid with capability sets `caps` and ambient
+// set `ambient`, with NO_NEW_PRIVS set if `no_new_privs`. Checks the capability
+// sets after execve.
+void CheckFileCapsExec(CapSet caps, uint64_t ambient, bool no_new_privs,
+                       uint64_t file_permitted, CapSet want,
+                       uint64_t want_ambient) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETFCAP)));
+  FileCapsExecutable exe =
+      ASSERT_NO_ERRNO_AND_VALUE(CreateFileCapsExecutable(file_permitted));
+
+  // Use a separate thread so as to not pollute the other tests with the
+  // credentials we're about to set.
+  ScopedThread([&] {
+    ASSERT_THAT(prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0), SyscallSucceeds());
+    ASSERT_THAT(syscall(SYS_setresuid, kUnprivilegedUid, kUnprivilegedUid,
+                        kUnprivilegedUid),
+                SyscallSucceeds());
+    ASSERT_NO_ERRNO(SetCapabilitySets(caps));
+    for (int cap = 0; cap <= CAP_LAST_CAP; cap++) {
+      if (ambient & (1ULL << cap)) {
+        ASSERT_THAT(prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, cap, 0, 0),
+                    SyscallSucceeds());
+      }
+    }
+    if (no_new_privs) {
+      ASSERT_THAT(prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0), SyscallSucceeds());
+    }
+
+    const ExecveArray argv = {
+        exe.file.path(),
+        /*want_euid=*/absl::StrCat(kUnprivilegedUid),
+        /*want_egid=*/absl::StrCat(getegid()),
+        /*want_dumpability=*/absl::StrCat(SUID_DUMP_USER),
+        /*want_permitted=*/absl::StrCat(absl::Hex(want.permitted)),
+        /*want_effective=*/absl::StrCat(absl::Hex(want.effective)),
+        /*want_ambient=*/absl::StrCat(absl::Hex(want_ambient))};
+    CheckExec(exe.file.path(), argv, /*envv=*/{}, /*expect_status=*/0,
+              /*expect_stderr=*/"");
+  });
+}
+
+// NO_NEW_PRIVS does not make execve ignore file capabilities. Capabilities
+// the file grants that the task already holds are kept.
+TEST(ExecTest, FileCapsAlreadyHeldKeptWithNoNewPrivs) {
+  constexpr uint64_t kNetBind = 1ULL << CAP_NET_BIND_SERVICE;
+  CheckFileCapsExec(
+      /*caps=*/{.effective = kNetBind, .permitted = kNetBind},
+      /*ambient=*/0, /*no_new_privs=*/true, /*file_permitted=*/kNetBind,
+      /*want=*/{.effective = kNetBind, .permitted = kNetBind},
+      /*want_ambient=*/0);
+}
+
+// A file with capabilities is privileged, so execve clears the ambient set.
+void CheckFileCapsClearAmbient(bool no_new_privs) {
+  constexpr uint64_t kNetBind = 1ULL << CAP_NET_BIND_SERVICE;
+  constexpr uint64_t kChown = 1ULL << CAP_CHOWN;
+  CheckFileCapsExec(
+      /*caps=*/
+      {.effective = kNetBind | kChown,
+       .permitted = kNetBind | kChown,
+       .inheritable = kNetBind},
+      /*ambient=*/kNetBind, no_new_privs, /*file_permitted=*/kChown,
+      /*want=*/{.effective = kChown, .permitted = kChown},
+      /*want_ambient=*/0);
+}
+
+TEST(ExecTest, FileCapsClearAmbient) {
+  CheckFileCapsClearAmbient(/*no_new_privs=*/false);
+}
+
+// File capabilities still apply under NO_NEW_PRIVS, so the ambient set is
+// still cleared.
+TEST(ExecTest, FileCapsClearAmbientWithNoNewPrivs) {
+  CheckFileCapsClearAmbient(/*no_new_privs=*/true);
+}
+
+// NO_NEW_PRIVS stops file capabilities from adding to the permitted set.
+TEST(ExecTest, FileCapsNotGainedWithNoNewPrivs) {
+  constexpr uint64_t kNetBind = 1ULL << CAP_NET_BIND_SERVICE;
+  CheckFileCapsExec(
+      /*caps=*/{}, /*ambient=*/0, /*no_new_privs=*/true,
+      /*file_permitted=*/kNetBind, /*want=*/{}, /*want_ambient=*/0);
+}
+
+TEST(ExecTest, SUIDExecDoesntGainUIDForInterpreterScript) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  std::string contents = "#!/bin/sh\n[ \"$(id -u)\" -eq \"$1\" ]\n";
+
+  TempPath script = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetShortTestTmpdir(), contents, 0755));
+  TempPath suid_exe =
+      ASSERT_NO_ERRNO_AND_VALUE(CreateSuidExecutable(script.path()));
+
+  // Use a separate thread so as to not pollute the other tests with the
+  // unprivileged uid we're about to set.
+  ScopedThread([&] {
+    ASSERT_THAT(syscall(SYS_setresuid, kUnprivilegedUid, kUnprivilegedUid,
+                        kUnprivilegedUid),
+                SyscallSucceeds());
+    ASSERT_EQ(geteuid(), kUnprivilegedUid);
+
+    const ExecveArray argv = {
+        suid_exe.path(),
+        /*$1=*/absl::StrCat(kUnprivilegedUid),  // remained unprivileged
+    };
+    CheckExec(suid_exe.path(), argv, /*envv=*/{}, /*expect_status=*/0,
+              /*expect_stderr=*/"");
+  });
+}
+
+struct CloneExecArgs {
+  const char* path;
+  char* const* argv;
+};
+
+int DoExecveAfterClone(void* args_void) {
+  const CloneExecArgs* args = static_cast<const CloneExecArgs*>(args_void);
+  execve(args->path, args->argv, nullptr);
+  _exit(1);
+}
+
+// Clones a new process with CLONE_FS and execve's into the provided path, and
+// then checks that the child's exit status is as expected. This is a version
+// of CheckExec that uses clone(2) with CLONE_FS instead of fork(2).
+void CheckCloneFsExec(const std::string& path, const ExecveArray& argv,
+                      int want_status) {
+  CloneExecArgs args = {path.c_str(), argv.get()};
+  struct clone_arg {
+    char stack[1024] __attribute__((aligned(16)));
+    char stack_ptr[0];
+  } ca;
+  pid_t child_pid;
+  ASSERT_THAT(child_pid = clone(DoExecveAfterClone, ca.stack_ptr,
+                                CLONE_FS | SIGCHLD, (void*)&args),
+              SyscallSucceeds());
+
+  int status;
+  ASSERT_THAT(RetryEINTR(waitpid)(child_pid, &status, 0), SyscallSucceeds());
+  EXPECT_EQ(status, want_status);
+}
+
+TEST(ExecTest, SUIDExecDoesntGainUIDWithSharedFSContext) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  TempPath suid_exe = ASSERT_NO_ERRNO_AND_VALUE(
+      CreateSuidExecutable(RunfilePath(kCheckEuidProgram)));
+
+  // Use a separate thread so as to not pollute the other tests with the
+  // unprivileged uid we're about to set. ScopedThread will clone with CLONE_FS.
+  ScopedThread([&] {
+    ASSERT_THAT(syscall(SYS_setresuid, kUnprivilegedUid, kUnprivilegedUid,
+                        kUnprivilegedUid),
+                SyscallSucceeds());
+    ASSERT_EQ(geteuid(), kUnprivilegedUid);
+
+    const ExecveArray argv = {
+        suid_exe.path(),
+        /*want_euid=*/absl::StrCat(kUnprivilegedUid),  // remained unprivileged
+        /*want_egid=*/absl::StrCat(getegid()),
+        /*want_dumpability=*/absl::StrCat(SUID_DUMP_USER)};
+    CheckCloneFsExec(suid_exe.path(), argv, /*want_status=*/0);
+  });
+}
+
+TEST(ExecTest, SUIDExecDoesntGainUIDWithPtracerAttached) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+  TempPath suid_exe = ASSERT_NO_ERRNO_AND_VALUE(
+      CreateSuidExecutable(RunfilePath(kCheckEuidProgram)));
+
+  int sockets[2];  // Used to establish a ptrace_attach before an execve.
+  ASSERT_THAT(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), SyscallSucceeds());
+
+  const ExecveArray traceeArgv = {
+      suid_exe.path(),
+      /*want_euid=*/absl::StrCat(kUnprivilegedUid),  // remained unprivileged
+      /*want_egid=*/absl::StrCat(getegid()),
+      /*want_dumpability=*/absl::StrCat(SUID_DUMP_USER)};
+
+  const pid_t tracee_pid = fork();
+  if (tracee_pid == 0) {
+    TEST_PCHECK(close(sockets[1]) == 0);
+    // Earlier tests may have disabled dumpability. Allow same-user attachment
+    // without CAP_SYS_PTRACE before dropping our UID below.
+    TEST_PCHECK(prctl(PR_SET_DUMPABLE, SUID_DUMP_USER) == 0);
+    // PR_SET_PTRACER is a Yama extension. Without Yama the option is
+    // unrecognized (EINVAL); see prctl(2) and PR_SET_PTRACER(2const).
+    const int ret = prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY);
+    TEST_PCHECK(ret == 0 || (ret == -1 && errno == EINVAL));
+    // Let the tracer proceed after the optional Yama setup.
+    TEST_PCHECK(WriteFd(sockets[0], "x", 1) == 1);
+
+    // Wait until tracer has attached before execing.
+    char done;
+    TEST_PCHECK(ReadFd(sockets[0], &done, 1) == 1);
+
+    // Become an unprivileged user, to test whether execing into the privileged
+    // suid_exe will bestow the original uid.
+    TEST_PCHECK(syscall(SYS_setresuid, kUnprivilegedUid, kUnprivilegedUid,
+                        kUnprivilegedUid) == 0);
+    TEST_PCHECK(geteuid() == kUnprivilegedUid);
+    execve(traceeArgv.get()[0], traceeArgv.get(), nullptr);
+    TEST_PCHECK_MSG(false, "survived execve");
+  }
+  ASSERT_THAT(tracee_pid, SyscallSucceeds());
+  ASSERT_THAT(close(sockets[0]), SyscallSucceeds());
+
+  const pid_t tracer_pid = fork();
+  if (tracer_pid == 0) {
+    // Wait for the tracee to finish optional Yama setup.
+    char done;
+    TEST_PCHECK(ReadFd(sockets[1], &done, 1) == 1);
+
+    // Linux retains the tracer's credentials at attachment for exec permission
+    // checks (ptracer_capable). Drop this capability before they are captured.
+    TEST_PCHECK(SetCapability(CAP_SYS_PTRACE, false).ok());
+    TEST_PCHECK(ptrace(PTRACE_ATTACH, tracee_pid, 0, 0) == 0);
+    // Indicate that we have attached.
+    TEST_PCHECK(WriteFd(sockets[1], &done, 1) == 1);
+
+    // Block until tracee enters signal-delivery-stop as a result of the
+    // SIGSTOP sent by PTRACE_ATTACH. And then continue it.
+    int status;
+    TEST_PCHECK(waitpid(tracee_pid, &status, 0) == tracee_pid);
+    TEST_CHECK(WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP);
+    TEST_PCHECK(ptrace(PTRACE_CONT, tracee_pid, 0, 0) == 0);
+
+    // The tracee enters signal-delivery-stop as a result of the SIGTRAP sent
+    // by the kernel *after* execve returns. A waitpid() by the tracer will
+    // annul the SIGTRAP and cause the tracee to exit normally, allowing the
+    // parent's waitpid() to correctly judge the tracee's exit code.
+    TEST_PCHECK(waitpid(tracee_pid, &status, 0) == tracee_pid);
+    TEST_PCHECK(WIFSTOPPED(status) && WSTOPSIG(status) == SIGTRAP);
+    _exit(0);
+  }
+  ASSERT_THAT(tracer_pid, SyscallSucceeds());
+
+  int status;
+  // Verify the tracee's (exec_check_creds's) exit code
+  ASSERT_THAT(waitpid(tracee_pid, &status, 0), SyscallSucceeds());
+  EXPECT_EQ(status, 0);
+}
+
+TEST(ExecTest, ReadProcMemAfterExecFromChild) {
+  // Fork and exec in the parent process.
+  CheckExec("/proc/self/exe", {"/proc/self/exe", kExecInParent}, {},
+            W_EXITCODE(42, 0), "");
+}
+
+/*
+This function, along with writeAndWaitForPid, sets up the test case to verify
+that a /proc/self/mem file descriptor is not leaked across an execve similar to
+b/382136040.
+
+The setup is as follows:
+
+This function opens /proc/self/mem in a process we'll call P1.
+* P1 forks, creating a child process P2.
+* P1 (the parent) then execves to become a new process, P3, which runs
+writeAndWaitForPid.
+* P2 (the child) holds the memfd from P1. It waits for a
+signal from P3.
+* P3 maps some memory with a secret value and then signals P2 via
+a pipe.
+* P2, upon receiving the signal, tries to read from the secret's memory
+location using the memfd it inherited. The test asserts that this pread in P2
+fails, because the memfd should be tied to the (now defunct) address space of
+P1, not the new address space of P3.
+*/
+void execInParent() {
+  auto mem_fd = ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/self/mem", O_RDONLY));
+  int pipe_fd[2] = {};
+  TEST_PCHECK(pipe(pipe_fd) == 0);
+
+  const auto readSecret = [&] {
+    // Close writing end of the pipe.
+    close(pipe_fd[1]);
+    // Await parent OK to read the secret.
+    uintptr_t addr;
+    TEST_PCHECK_MSG(ReadFd(pipe_fd[0], &addr, sizeof(addr)) == sizeof(addr),
+                    "Failed to read mmap address from the pipe.");
+    // Close the reading end of the pipe.
+    TEST_PCHECK(close(pipe_fd[0]) == 0);
+    // Parent sent the signal. Read the secret.
+    // Use /proc/mem fd from parent to try to read the secret.
+    char secret[] = "secret";
+    char output[sizeof(secret)];
+    TEST_PCHECK_MSG(
+        pread(mem_fd.get(), output, sizeof(output), addr) != sizeof(secret),
+        "pread succeeded. It should have failed.");
+  };
+  pid_t pid = fork();
+  // In child process.
+  if (pid == 0) {
+    readSecret();
+    TEST_CHECK_MSG(!::testing::Test::HasFailure(),
+                   "EXPECT*/ASSERT* failed. These are not async-signal-safe "
+                   "and must not be called from fn.");
+    _exit(0);
+  }
+  // In parent process.
+  MaybeSave();
+  TEST_PCHECK(close(pipe_fd[0]) == 0);
+  TEST_CHECK(pid != -1);
+
+  // Execve with args{function name, child_pid, pipe_fd[1]}
+  const ExecveArray argv = {"/proc/self/exe", kWriteAndWaitForPid,
+                            absl::StrCat(pid) /*child_pid*/,
+                            absl::StrCat(pipe_fd[1])};
+  const ExecveArray envv;
+  execve("/proc/self/exe", argv.get(), envv.get());
+}
+/*
+This function is the new program image after execve in execInParent. It maps a
+"secret" value at a known address, signals the child of the original process to
+proceed, and then waits for it to exit.
+*/
+void writeAndWaitForPid(int child_pid, int pipe_fd) {
+  // mmap the same address that the child process will try to read.
+  const Mapping m = ASSERT_NO_ERRNO_AND_VALUE(
+      MmapAnon(kPageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE));
+  const char secret[] = "secret";
+  absl::SNPrintF((char*)m.addr(), sizeof(secret), "%s", secret);
+
+  // Tell the child process to read the secret location.
+  uintptr_t addr = m.addr();
+  TEST_PCHECK_MSG(WriteFd(pipe_fd, &addr, sizeof(addr)) == sizeof(addr),
+                  "Failed to write mmap address to the pipe.");
+  TEST_PCHECK(close(pipe_fd) == 0);
+
+  // Wait for child process to read before the exit.
+  int status;
+  TEST_PCHECK_MSG(waitpid(child_pid, &status, 0) == child_pid,
+                  "waitpid failed.");
+  TEST_CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  _exit(42);
+}
+
+void ExecWithThread() {
+  // Used to ensure that the thread has actually started.
+  absl::Mutex mu;
+  bool started = false;
+
+  ScopedThread t([&] {
+    mu.lock();
+    started = true;
+    mu.unlock();
+
+    while (true) {
+      pause();
+    }
+  });
+
+  mu.LockWhen(absl::Condition(&started));
+  mu.unlock();
+
+  const ExecveArray argv = {"/proc/self/exe", kExit42};
+  const ExecveArray envv;
+
+  execve("/proc/self/exe", argv.get(), envv.get());
+  _exit(errno);
+}
+
+void ExecFromThread() {
+  ScopedThread t([] {
+    const ExecveArray argv = {"/proc/self/exe", kExit42};
+    const ExecveArray envv;
+
+    execve("/proc/self/exe", argv.get(), envv.get());
+    _exit(errno);
+  });
+
+  while (true) {
+    pause();
+  }
+}
+
+bool ValidateProcCmdlineVsArgv(const int argc, const char* const* argv) {
+  auto contents_or = GetContents("/proc/self/cmdline");
+  if (!contents_or.ok()) {
+    std::cerr << "Unable to get /proc/self/cmdline: " << contents_or.error()
+              << std::endl;
+    return false;
+  }
+  auto contents = contents_or.ValueOrDie();
+  if (contents.back() != '\0') {
+    std::cerr << "Non-null terminated /proc/self/cmdline!" << std::endl;
+    return false;
+  }
+  contents.pop_back();
+  std::vector<std::string> procfs_cmdline = absl::StrSplit(contents, '\0');
+
+  if (static_cast<int>(procfs_cmdline.size()) != argc) {
+    std::cerr << "argc = " << argc << " != " << procfs_cmdline.size()
+              << std::endl;
+    return false;
+  }
+
+  for (int i = 0; i < argc; ++i) {
+    if (procfs_cmdline[i] != argv[i]) {
+      std::cerr << "Procfs command line argument " << i << " mismatch "
+                << procfs_cmdline[i] << " != " << argv[i] << std::endl;
+      return false;
+    }
+  }
+  return true;
+}
+
+// A binary that is being executed cannot be written, and becomes writable
+// again once it is not. See fs/exec.c:set_mm_exe_file().
+TEST(ExecTest, RunningBinaryIsNotWritable) {
+  // Copy the workload somewhere we own, so that we may attempt to write it.
+  const std::string blob =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents(RunfilePath(kEtxtbsyWorkload)));
+  const TempPath binary = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), blob, 0755));
+  const std::string path = binary.path();
+  EXPECT_NO_ERRNO(Open(path, O_WRONLY));
+
+  // The workload writes a byte to stdout once execve(2) has completed, so that
+  // we do not race against it.
+  int fds[2];
+  ASSERT_THAT(pipe(fds), SyscallSucceeds());
+  FileDescriptor rd(fds[0]);
+  FileDescriptor wr(fds[1]);
+
+  pid_t child;
+  int execve_errno;
+  const int wfd = wr.get();
+  Cleanup kill_child = ASSERT_NO_ERRNO_AND_VALUE(ForkAndExec(
+      path, {path}, {}, [wfd] { dup2(wfd, STDOUT_FILENO); }, &child,
+      &execve_errno));
+  ASSERT_EQ(execve_errno, 0);
+  wr.reset();
+  char c;
+  ASSERT_THAT(RetryEINTR(read)(rd.get(), &c, 1), SyscallSucceedsWithValue(1));
+
+  // Writing the contents must fail, whether by open(2) or truncate(2).
+  EXPECT_THAT(open(path.c_str(), O_WRONLY), SyscallFailsWithErrno(ETXTBSY));
+  EXPECT_THAT(open(path.c_str(), O_RDONLY | O_TRUNC),
+              SyscallFailsWithErrno(ETXTBSY));
+  EXPECT_THAT(truncate(path.c_str(), 0), SyscallFailsWithErrno(ETXTBSY));
+
+  // Reads and metadata changes are unaffected.
+  EXPECT_NO_ERRNO(Open(path, O_RDONLY));
+  EXPECT_THAT(chmod(path.c_str(), 0755), SyscallSucceeds());
+
+  // Killing the child reaps it, so the executable is released by the time this
+  // returns. A leaked denial would leave the file permanently unwritable.
+  kill_child.Release()();
+  EXPECT_NO_ERRNO(Open(path, O_WRONLY));
+}
+
+}  // namespace
+
+}  // namespace testing
+}  // namespace gvisor
+
+int main(int argc, char** argv) {
+  // Start by validating that the stack argv is consistent with procfs.
+  if (!gvisor::testing::ValidateProcCmdlineVsArgv(argc, argv)) {
+    return 1;
+  }
+
+  // Some of these tests require no background threads, so check for them before
+  // TestInit.
+  for (int i = 0; i < argc; i++) {
+    absl::string_view arg(argv[i]);
+
+    if (arg == gvisor::testing::kExit42) {
+      return 42;
+    }
+    if (arg == gvisor::testing::kExecWithThread) {
+      gvisor::testing::ExecWithThread();
+      return 1;
+    }
+    if (arg == gvisor::testing::kExecFromThread) {
+      gvisor::testing::ExecFromThread();
+      return 1;
+    }
+    if (arg == gvisor::testing::kExecInParent) {
+      gvisor::testing::execInParent();
+      return 1;
+    }
+    if (arg == gvisor::testing::kWriteAndWaitForPid) {
+      int pid;
+      if (!absl::SimpleAtoi(argv[i + 1], &pid)) {
+        return 1;
+      }
+      int fd;
+      if (!absl::SimpleAtoi(argv[i + 2], &fd)) {
+        return 1;
+      }
+      gvisor::testing::writeAndWaitForPid(pid, fd);
+      return 1;
+    }
+  }
+
+  gvisor::testing::TestInit(&argc, &argv);
+  return gvisor::testing::RunAllTests();
+}

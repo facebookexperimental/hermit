@@ -27,14 +27,6 @@ use crate::types::MmId;
 use crate::types::RcbTimeMultiplier;
 use crate::types::SigWrapper;
 
-/// Names the outer resource turn for a physically nonblocking, guest-internal pipe
-/// operation on a backend whose internal pipe turns are host-timed
-/// (`BackendCapabilities::internal_pipe_turns_are_host_timed`; today only SaBRe). Such a
-/// backend reports these inherited stdio pipes as device resources before Detcore's
-/// `InternalIOPolling` turn. The name is descriptive only: the log comparison counts these
-/// turns like any other.
-pub(crate) const HOST_TIMED_INTERNAL_PIPE_IO_FYI: &str = "sabre-internal-pipe-io";
-
 /// Identifies the strong one-turn yield issued before a task with a loopback peer performs
 /// a zero-timeout poll, on a backend whose loopback pollers yield to their peers
 /// (`BackendCapabilities::loopback_pollers_yield_to_peers`; today only SaBRe). The scheduler
@@ -52,6 +44,14 @@ pub(crate) const PAUSE_FYI: &str = "pause";
 /// which a cross-task signal that interrupts it ends before its deadline
 /// (`scheduler::sleep_signal`).
 pub(crate) const NANOSLEEP_FYI: &str = "nanosleep";
+
+/// Identifies the parked `rt_sigsuspend` of the in-guest delivery gate
+/// (`SleepUntil(INDEFINITE)`; A5 step 3c.1d, design D39): the scheduler ends
+/// it as it ends a `pause` (`scheduler::sleep_signal`), for a signal its
+/// temporary mask, which the request publishes (`blocked_signal_mask`), lets
+/// in. Phase 1's SIGALRM ledger never sees it: phase 1 refuses
+/// `rt_sigsuspend` in a process that handles SIGALRM.
+pub(crate) const RT_SIGSUSPEND_FYI: &str = "rt_sigsuspend";
 
 /// The SIGALRM action read in the owner turn of an emulated in-guest sleep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,6 +86,10 @@ pub struct ChaosEpochTransition {
     /// Exact fixed-point factor used for virtual-time progression.
     pub factor: RcbTimeMultiplier,
 }
+
+/// Where a chaos timeslice with `--chaos-instruction-offset` ends (defined
+/// beside the schedule events, which record it too).
+pub use detcore_model::schedule::InstructionOffset;
 
 /// Identity of one syscall executing outside Hermit's serialized guest turns.
 #[derive(
@@ -615,14 +619,37 @@ pub struct Resources {
     #[serde(default)]
     pub(crate) read_fd: Option<(detcore_model::fd::FilesId, i32)>,
     /// Set on a polling request whose attempts fail or succeed only through
-    /// guest actions: a retry on a container-internal descriptor (a pipe, a
-    /// socketpair end, or a FIFO polled as a pipe), or a FIFO open waiting for
+    /// guest actions: a retry on a guest-held socketpair end, a pipe or FIFO
+    /// classified as internal, or a FIFO open waiting for
     /// a guest peer. Such a poller cannot make progress on its own, which is
     /// what `Scheduler::nothing_else_can_run` asks
     /// (<https://github.com/rrnewton/hermit/issues/2203>). `false` for a poll
     /// whose outcome a host can change.
     #[serde(default)]
     pub(crate) polls_guest_state_only: bool,
+    /// Set beside `polls_guest_state_only` on a retry of a named FIFO that
+    /// joined internal polling (`DetFd::is_named_fifo`): a process outside
+    /// the container may hold its other end, so its attempts can succeed
+    /// without a guest action, and the poll never makes the run a deadlock
+    /// (`Scheduler::only_idle_guest_pollers_remain`). `false` for every other
+    /// request.
+    #[serde(default)]
+    pub(crate) polls_a_named_fifo: bool,
+    /// Set with `polls_guest_state_only` when that rests on guest-held marks
+    /// (`DetFd::is_guest_held`). Once a descriptor may have left the guest
+    /// (`passes_descriptors_out`), the scheduler no longer counts such a poll
+    /// as waiting on guest state only (`Scheduler::polls_only_guest_state`).
+    /// Retry loops also capture the actual operands and open file identities
+    /// and permanently clear this proof when a granted retry no longer names
+    /// the same guest-held targets (`GuestHeldPollProof`).
+    #[serde(default)]
+    pub(crate) relies_on_guest_held_marks: bool,
+    /// Set on a thread's first request after it may have passed descriptors
+    /// over `SCM_RIGHTS` on a socket that is not guest-held: to a process
+    /// outside Detcore's view, which could then make an object some guest
+    /// holds ready (`ThreadState::passed_descriptors_out_unreported`).
+    #[serde(default)]
+    pub(crate) passes_descriptors_out: bool,
     /// Set by a blocking FIFO open waiting for a guest peer. When this polling
     /// turn commits and nothing else can run (`Scheduler::nothing_else_can_run`),
     /// the answer is `ResumeStatus::NothingElseCanRun`, and the open then waits
@@ -630,10 +657,12 @@ pub struct Resources {
     #[serde(default)]
     pub(crate) waits_until_nothing_else_can_run: bool,
     /// Set on a retry (`poll_attempt > 0`) whose previous attempt moved data
-    /// (a partial pipe write). Every other retry follows an attempt that would
-    /// have blocked and moved nothing, which `Scheduler::nothing_else_can_run`
-    /// needs to know: a guest-state poll grant is progress unless the thread's
-    /// next request is a retry without this flag.
+    /// (a partial pipe write), or blocked again but woke other requests (a
+    /// waiting flock's retry, `Detcore::flock_wait_attempt`). Every other
+    /// retry follows an attempt that would have blocked and changed nothing,
+    /// which `Scheduler::nothing_else_can_run` needs to know: a guest-state
+    /// poll grant is progress unless the thread's next request is a retry
+    /// without this flag.
     #[serde(default)]
     pub(crate) previous_attempt_made_progress: bool,
     /// The `poll_attempt` a skipped retry had when the scheduler replaced it
@@ -749,6 +778,42 @@ pub struct Resources {
     /// Serde preserves the same positional and JSON payload bytes.
     #[serde(default)]
     pub(crate) callback_checkpoint: Option<Box<crate::preemptions::callback_history::Origin>>,
+    /// The recorded priority-history row a priority-change request ends,
+    /// under `Config::annotated_priority_replay`: the scheduler acknowledges
+    /// that row, and its checkpoint if it has one, when it selects the
+    /// request. `None` on every other request. Appended last, with no
+    /// skip_serializing_if, for the same positional RPCs.
+    #[serde(default)]
+    pub(crate) priority_row: Option<u64>,
+    /// Set on the request that ends a timeslice because the slice's time ran
+    /// out: its logical target, its PMU maximum, or a replayed slice end
+    /// (`Detcore::end_timeslice_with_checkpoint`). An explicit `sched_yield`
+    /// ends a slice too but is a syscall the guest asked for, so it is not
+    /// marked. Under `--cap-preemption-charge` the scheduler charges such a
+    /// turn at most the virtual time its thread ran since its previous turn
+    /// (`Scheduler::bump_global_time`). Appended last, like the fields above,
+    /// because `Resources` crosses positional RPCs.
+    #[serde(default)]
+    pub(crate) slice_expired: bool,
+    /// Set by `Detcore::sleep_request` on a relative sleep its caller asked to
+    /// last no time (`nanosleep` or `clock_nanosleep` of zero, `usleep(0)`): a
+    /// yield idiom whose deadline is the moment it was asked, not a wait for
+    /// time to pass (`scheduler::ends_a_due_sleep`). `false` for every other
+    /// request, including an absolute sleep whose deadline has already passed.
+    /// `handle_external_poll` also builds such a request for a `poll` of no
+    /// descriptors with a zero timeout, but it runs only without sequentialized
+    /// threads or under `hermit record`/`hermit replay` (`handle_poll`), where
+    /// no chaos hint applies. With sequentialized threads a zero-timeout `poll`
+    /// takes `zero_timeout_poll_request` instead, which is not a `SleepUntil`
+    /// and always counts toward a chaos slice.
+    /// Appended last because `Resources` travels in bincode RPCs, which decode
+    /// by position. `#[serde(default)]` does not let a payload without it
+    /// decode: bincode does not default a missing trailing field. A runtime
+    /// and a coordinator built on either side of this field refuse each other
+    /// before any request is decoded because of the global RPC revision in
+    /// the configuration fingerprint (revision 8 appended this field).
+    #[serde(default)]
+    pub(crate) zero_length_sleep: bool,
 }
 
 impl fmt::Debug for Resources {
@@ -777,8 +842,20 @@ impl fmt::Debug for Resources {
         if self.polls_guest_state_only {
             debug.field("polls_guest_state_only", &true);
         }
+        if self.polls_a_named_fifo {
+            debug.field("polls_a_named_fifo", &true);
+        }
+        if self.relies_on_guest_held_marks {
+            debug.field("relies_on_guest_held_marks", &true);
+        }
+        if self.passes_descriptors_out {
+            debug.field("passes_descriptors_out", &true);
+        }
         if self.waits_until_nothing_else_can_run {
             debug.field("waits_until_nothing_else_can_run", &true);
+        }
+        if self.zero_length_sleep {
+            debug.field("zero_length_sleep", &true);
         }
         if self.previous_attempt_made_progress {
             debug.field("previous_attempt_made_progress", &true);
@@ -812,6 +889,9 @@ impl fmt::Debug for Resources {
         }
         if let Some(mask) = self.guest_signal_mask {
             debug.field("guest_signal_mask", &mask);
+        }
+        if self.slice_expired {
+            debug.field("slice_expired", &true);
         }
         debug.finish()
     }
@@ -847,6 +927,9 @@ impl Resources {
             reads_signalfd: false,
             read_fd: None,
             polls_guest_state_only: false,
+            polls_a_named_fifo: false,
+            relies_on_guest_held_marks: false,
+            passes_descriptors_out: false,
             waits_until_nothing_else_can_run: false,
             previous_attempt_made_progress: false,
             upgraded_from_attempt: 0,
@@ -860,6 +943,9 @@ impl Resources {
             slice_boundary: None,
             guest_signal_mask: None,
             callback_checkpoint: None,
+            priority_row: None,
+            slice_expired: false,
+            zero_length_sleep: false,
         }
     }
 
@@ -913,7 +999,12 @@ impl Resources {
         self.private_sigchld_decides |= other.private_sigchld_decides;
         self.replay_served_from_log |= other.replay_served_from_log;
         self.polls_guest_state_only |= other.polls_guest_state_only;
+        self.polls_a_named_fifo |= other.polls_a_named_fifo;
+        self.relies_on_guest_held_marks |= other.relies_on_guest_held_marks;
+        self.passes_descriptors_out |= other.passes_descriptors_out;
         self.waits_until_nothing_else_can_run |= other.waits_until_nothing_else_can_run;
+        // A combined operation is a zero-length sleep only if both parts are.
+        self.zero_length_sleep &= other.zero_length_sleep;
         self.previous_attempt_made_progress |= other.previous_attempt_made_progress;
         self.upgraded_from_attempt = self.upgraded_from_attempt.max(other.upgraded_from_attempt);
         // A merged request waits for the earlier of two deadlines.

@@ -1,0 +1,40 @@
+load("@fbcode_macros//build_defs:native_rules.bzl", "buck_sh_test")
+load("@fbcode_macros//build_defs:sanitizers.bzl", "sanitizers")
+load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
+load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
+load("@fbsource//tools/build_defs:selects.bzl", "selects")
+
+oncall("hermit")
+
+# We don't play well with asan at all, because we allocate with mmap directly.
+sanitized_feature = selects.apply(
+    sanitizers.get_sanitizer_v2(),
+    lambda san: ["--cfg=sanitized"] if san else [],
+)
+
+rust_library(
+    name = "test-allocator",
+    srcs = glob(["src/**/*.rs"]),
+    autocargo = {"cargo_toml_dir": "."},
+    test_rustc_flags = sanitized_feature,
+    deps = [
+        "fbsource//third-party/rust:libc",
+    ],
+)
+
+rust_binary(
+    name = "test_bin",
+    srcs = ["src/test_bin.rs"],
+    allocator = "malloc",
+    autocargo = {"cargo_toml_dir": "."},
+    link_style = "static_pic",  # T196869422: [global_allocator] requires static linkage to function
+    deps = [
+        ":test-allocator",
+    ],
+)
+
+buck_sh_test(
+    name = "run_test_bin",
+    args = [],
+    test = ":test_bin",
+)

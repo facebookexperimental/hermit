@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use detcore::Digest;
 use detcore::preemptions::PreemptionRecord;
+use detcore::preemptions::boundary_recording::Recording;
 use detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
 use hermit::canonical_verdict::ComparedLogScope;
 use hermit::canonical_verdict::RecordEnvelopeReport;
@@ -61,6 +62,20 @@ const LOG_DIRECTIVES: &str = "reverie_ptrace::timer=debug";
 /// The text that starts every per-step record [`LOG_DIRECTIVES`] turns off.
 const SINGLE_STEP_DUMP: &str = "[instruction]";
 
+/// The preemption record in a recording's bytes, read through Detcore's own
+/// decoder: the record sits inside the `rcb_history` envelope that states the
+/// writer's RCB clock identity, which a recording must state.
+fn recorded_history(bytes: &[u8]) -> PreemptionRecord {
+    let recording = Recording::decode(bytes).unwrap();
+    assert!(
+        recording.identity().is_some(),
+        "the recording states no RCB coordinate identity"
+    );
+    recording
+        .into_legacy("the non-leader exec history reader")
+        .unwrap()
+}
+
 /// Fails if a retained log contains a per-step instruction and register dump.
 fn assert_no_single_step_dumps(log: &str, path: &Path) {
     assert!(
@@ -74,15 +89,17 @@ fn assert_no_single_step_dumps(log: &str, path: &Path) {
 
 /// The host CPU that Hermit runs started here must never be pinned to.
 ///
-/// Hermit pins the tracer and every guest thread of a run to one core, chosen
-/// uniformly from the mask it inherits (`choose_affinity_core` in
-/// `hermit-cli/src/bin/hermit/container.rs`). On the development hosts, ptrace
-/// stops on CPU 0 cost about ten times as much CPU as elsewhere:
+/// Hermit pins the tracer and every guest thread of a run to one core of the
+/// mask it inherits: one that was idle over a short sample, passing over the
+/// cores a PMU is bound to while another idle core remains (`pinned_cpu.rs` in
+/// `hermit-cli/src/bin/hermit/`). On the development hosts, ptrace stops on
+/// CPU 0 cost about ten times as much CPU as elsewhere:
 /// https://github.com/rrnewton/hermit/issues/3265 measured 1.6 s per execution
-/// on CPU 5 and 17.1 s on CPU 0. CPU 0 was in the mask, so each Hermit run had
-/// about a 1 in 316 chance of landing there. A single-step-heavy case that
-/// landed there exceeded its 22 CPU-second budget. Validation launches already
-/// leave CPU 0 out of their cpuset when they can, but a standalone
+/// on CPU 5 and 17.1 s on CPU 0. A single-step-heavy case that landed there
+/// exceeded its 22 CPU-second budget. Hermit still lands a run on CPU 0 when
+/// the sample finds no other idle core, or when sysfs names no PMU-bound
+/// core, so this keeps CPU 0 out of the mask outright. Validation launches
+/// already leave CPU 0 out of their cpuset when they can, but a standalone
 /// `cargo nextest` run and other runners do not.
 const AVOIDED_HOST_CPU: usize = 0;
 
@@ -413,7 +430,7 @@ fn run_fixture(scenario: Scenario) {
     // run in which another PMU case needed a skid retry
     // (https://github.com/rrnewton/hermit/issues/4397). Five attempts, as
     // 0d7f16f3 and ec49cdd7 allow.
-    const SKID_ATTEMPTS: u32 = 5;
+    const SKID_ATTEMPTS: u32 = detcore_model::SKID_RETRY_MAX_ATTEMPTS;
     for pair in 0..3 {
         let mut attempt = 0;
         let (_, output, (directory, report_path, run2_log)) =
@@ -504,6 +521,7 @@ fn run_fixture(scenario: Scenario) {
                     };
                     (output, (directory, report_path, run2_log))
                 },
+                &|_| {},
             );
         let status = output.status;
         let logs = directory.join("verify-logs");
@@ -680,8 +698,7 @@ fn assert_artifact_log(
         "the recorded and replayed prefix contains actual PMU preemption"
     );
     if let Some(path) = artifact_option.strip_prefix("--replay-preemptions-from=") {
-        let history: PreemptionRecord =
-            serde_json::from_slice(&bounded_read(Path::new(path), 4 * MIB)).unwrap();
+        let history = recorded_history(&bounded_read(Path::new(path), 4 * MIB));
         history.validate().unwrap();
         let (_, history) = history
             .extract_all()
@@ -898,7 +915,7 @@ pub(super) fn run_preemption_artifacts() {
         remaining(),
     );
     let recorded_bytes = bounded_read(&recording, 4 * MIB);
-    let history: PreemptionRecord = serde_json::from_slice(&recorded_bytes).unwrap();
+    let history = recorded_history(&recorded_bytes);
     history
         .validate()
         .expect("real completed recording is well formed");

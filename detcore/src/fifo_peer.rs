@@ -120,6 +120,28 @@ pub(crate) fn any_guest_made() -> bool {
     !GUEST_MADE.lock().unwrap().is_empty()
 }
 
+/// A set of guest-made FIFOs, as a removal consults it
+/// (`Detcore::guest_made_fifos_removed_from`).
+pub(crate) trait GuestMadeFifos {
+    /// Whether the set has any FIFO ([`any_guest_made`]).
+    fn any(&self) -> bool;
+    /// Whether the set has `fifo` ([`is_guest_made`]).
+    fn contains(&self, fifo: (u64, u64)) -> bool;
+}
+
+/// The run's guest-made FIFOs ([`GUEST_MADE`]).
+pub(crate) struct GuestMadeRegistry;
+
+impl GuestMadeFifos for GuestMadeRegistry {
+    fn any(&self) -> bool {
+        any_guest_made()
+    }
+
+    fn contains(&self, fifo: (u64, u64)) -> bool {
+        is_guest_made(fifo)
+    }
+}
+
 /// The guest blocking opens of each FIFO waiting, in polling turns, for the
 /// other end ([`PendingOpen`]). On Linux a blocking open counts as a reader
 /// or writer while it waits, so a waiting reader completes a writer's open
@@ -389,16 +411,50 @@ pub(crate) fn guest_descriptors_are_visible(
 /// descriptors are not visible ([`guest_descriptors_are_visible`]). (An
 /// absolute symlink is resolved from the tracer's root, which only a chrooted
 /// guest sees differently; a FIFO missed that way is opened as before.)
+///
+/// A path's leading `/proc/self` or `/proc/thread-self`, which the tracer's
+/// lookup would resolve for the tracer, is spelled with the guest's own
+/// numbers (`own`, its pid and tid as its `/proc` names them,
+/// `Detcore::procfs_caller_ids`), which the lookup through the guest's root
+/// finds in the guest's `/proc`: so the FIFO behind one of the guest's
+/// descriptor links (`/proc/self/fd/N`, the spelling a name below a
+/// descriptor directory takes, `syscalls::files::descriptor_directory`) is
+/// found, and its open waits in polling turns rather than in the kernel.
 pub(crate) fn fifo_at(
     backend: &reverie::BackendCapabilities,
     physical_tid: Option<i32>,
     tid: i32,
+    own: Option<(i32, i32)>,
     dirfd: i32,
     path: &Path,
 ) -> Option<((u64, u64), std::ffi::OsString)> {
     if !guest_descriptors_are_visible(backend, physical_tid) {
         return None;
     }
+    let respelled;
+    let path = match (own, path.strip_prefix("/proc")) {
+        (Some((pid, tid)), Ok(below)) => {
+            let mut components = below.components();
+            match components.next() {
+                Some(std::path::Component::Normal(name)) if name == "self" => {
+                    respelled = Path::new("/proc")
+                        .join(pid.to_string())
+                        .join(components.as_path());
+                    respelled.as_path()
+                }
+                Some(std::path::Component::Normal(name)) if name == "thread-self" => {
+                    respelled = Path::new("/proc")
+                        .join(pid.to_string())
+                        .join("task")
+                        .join(tid.to_string())
+                        .join(components.as_path());
+                    respelled.as_path()
+                }
+                _ => path,
+            }
+        }
+        _ => path,
+    };
     let base = if path.is_absolute() {
         format!("/proc/{tid}/root")
     } else if dirfd == libc::AT_FDCWD {
@@ -604,7 +660,12 @@ pub(crate) fn free_staging_address(tid: i32) -> Option<usize> {
 /// grows down into the gap below it), as the kernel's top-down allocator
 /// would place a page; `None` if `maps` has no such gap.
 fn pick_staging_address(maps: &str) -> Option<usize> {
-    const PAGE: usize = 4096;
+    pick_staging_address_with_page(maps, crate::page::page_size() as usize)
+}
+
+/// [`pick_staging_address`] on a host whose pages are `page` bytes; a mapping
+/// address must be a multiple of it.
+fn pick_staging_address_with_page(maps: &str, page: usize) -> Option<usize> {
     let mut ranges: Vec<(usize, usize, bool)> = maps
         .lines()
         .filter_map(|line| {
@@ -627,9 +688,9 @@ fn pick_staging_address(maps: &str) -> Option<usize> {
         .rev()
         .find(|pair| {
             let ((_, below_end, _), (start, _, is_stack)) = (pair[0], pair[1]);
-            start <= stack && !is_stack && start.saturating_sub(below_end) >= 3 * PAGE
+            start <= stack && !is_stack && start.saturating_sub(below_end) >= 3 * page
         })
-        .map(|pair| pair[1].0 - 2 * PAGE)
+        .map(|pair| pair[1].0 - 2 * page)
 }
 
 /// Pages a completing FIFO open mapped in a guest address space to stage a
@@ -711,6 +772,13 @@ fn leave_orphaned_page(page: OrphanedPage) {
     ANY_ORPHANED_PAGE.store(true, Ordering::SeqCst);
 }
 
+/// Whether a page may be left ([`ANY_ORPHANED_PAGE`]): the load
+/// [`take_orphaned_pages`] makes first, which answers no page while it is
+/// false.
+pub(crate) fn any_orphaned_page() -> bool {
+    ANY_ORPHANED_PAGE.load(Ordering::SeqCst)
+}
+
 /// The pages ([`ORPHANED_PAGES`]) left in the address space `mm`, each
 /// owned again by a [`StagedPage`], which the caller unmaps now; any it does
 /// not report unmapped, because its unmap did not run or the caller was
@@ -746,33 +814,53 @@ pub(crate) fn is_lone_staging_mapping(tid: i32, address: usize) -> bool {
 }
 
 fn maps_have_lone_staging_mapping(maps: &str, address: usize) -> bool {
+    lone_staging_mapping_with_page(maps, address, crate::page::page_size() as usize)
+}
+
+/// [`maps_have_lone_staging_mapping`] on a host whose pages are `page` bytes.
+fn lone_staging_mapping_with_page(maps: &str, address: usize, page: usize) -> bool {
     let wanted = format!(
         "{:08x}-{:08x} rw-p 00000000 00:00 0",
         address,
-        address + 4096
+        address + page
     );
     maps.lines().any(|line| line.trim_end() == wanted)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::maps_have_lone_staging_mapping;
-    use super::pick_staging_address;
+    use super::lone_staging_mapping_with_page;
+    use super::pick_staging_address_with_page;
+
+    /// The page size the fixtures below are written for.
+    const PAGE: usize = 4096;
 
     /// A page of zeros is taken for a staging page only where the maps show
     /// a standalone one-page anonymous `rw-p` mapping at its address.
     #[test]
     fn only_a_lone_anonymous_page_is_taken_for_a_staging_page() {
         let lone = "7ffff7fbe000-7ffff7fbf000 rw-p 00000000 00:00 0 \n";
-        assert!(maps_have_lone_staging_mapping(lone, 0x7ffff7fbe000));
+        assert!(lone_staging_mapping_with_page(lone, 0x7ffff7fbe000, PAGE));
         let larger = "7ffff7fbe000-7ffff7fc0000 rw-p 00000000 00:00 0\n";
-        assert!(!maps_have_lone_staging_mapping(larger, 0x7ffff7fbe000));
+        assert!(!lone_staging_mapping_with_page(
+            larger,
+            0x7ffff7fbe000,
+            PAGE
+        ));
         let covering = "7ffff7fbd000-7ffff7fbf000 rw-p 00000000 00:00 0\n";
-        assert!(!maps_have_lone_staging_mapping(covering, 0x7ffff7fbe000));
+        assert!(!lone_staging_mapping_with_page(
+            covering,
+            0x7ffff7fbe000,
+            PAGE
+        ));
         let file = "7ffff7fbe000-7ffff7fbf000 rw-p 00000000 00:20 7 /tmp/f\n";
-        assert!(!maps_have_lone_staging_mapping(file, 0x7ffff7fbe000));
+        assert!(!lone_staging_mapping_with_page(file, 0x7ffff7fbe000, PAGE));
         let read_only = "7ffff7fbe000-7ffff7fbf000 r--p 00000000 00:00 0\n";
-        assert!(!maps_have_lone_staging_mapping(read_only, 0x7ffff7fbe000));
+        assert!(!lone_staging_mapping_with_page(
+            read_only,
+            0x7ffff7fbe000,
+            PAGE
+        ));
     }
 
     /// The staging page goes two pages below the highest mapping under the
@@ -788,17 +876,42 @@ mod tests {
 7ffffffde000-7ffffffff000 rw-p 00000000 00:00 0 [stack]
 ffffffffff600000-ffffffffff601000 --xp 00000000 00:00 0 [vsyscall]
 ";
-        assert_eq!(pick_staging_address(maps), Some(0x7ffff7fbe000));
+        assert_eq!(
+            pick_staging_address_with_page(maps, PAGE),
+            Some(0x7ffff7fbe000)
+        );
         // Too little room below the vvar page: the next gap down.
         let tight = maps.replace(
             "00400000-00401000 r--p 00000000 00:20 1 /bin/guest",
             "00400000-00401000 r--p 00000000 00:20 1 /bin/guest\n7ffff7fbe000-7ffff7fc0000 rw-p 00000000 00:00 0",
         );
-        assert_eq!(pick_staging_address(&tight), Some(0x7ffff7fbc000));
         assert_eq!(
-            pick_staging_address("00400000-00401000 r--p 0 00:20 1 /bin/guest\n"),
+            pick_staging_address_with_page(&tight, PAGE),
+            Some(0x7ffff7fbc000)
+        );
+        assert_eq!(
+            pick_staging_address_with_page("00400000-00401000 r--p 0 00:20 1 /bin/guest\n", PAGE),
             None
         );
+    }
+
+    /// With 64 KiB pages the staging page and its gaps are 64 KiB pages, so
+    /// its address stays a multiple of the page size.
+    #[test]
+    fn a_staging_page_on_a_host_with_large_pages_is_page_aligned() {
+        const LARGE: usize = 0x10000;
+        let maps = "\
+aaaaaaaa0000-aaaaaaab0000 r--p 00000000 00:20 1 /bin/guest
+ffffb7fc0000-ffffb7fd0000 r--p 00000000 00:00 0 [vvar]
+ffffb7fd0000-ffffb7fe0000 r-xp 00000000 00:00 0 [vdso]
+fffffffd0000-1000000000000 rw-p 00000000 00:00 0 [stack]
+";
+        let address = pick_staging_address_with_page(maps, LARGE).unwrap();
+        assert_eq!(address, 0xffffb7fa0000);
+        assert_eq!(address % LARGE, 0);
+        let lone = "ffffb7fa0000-ffffb7fb0000 rw-p 00000000 00:00 0\n";
+        assert!(lone_staging_mapping_with_page(lone, address, LARGE));
+        assert!(!lone_staging_mapping_with_page(lone, address, PAGE));
     }
 
     use std::fs::File;

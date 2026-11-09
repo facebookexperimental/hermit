@@ -165,7 +165,7 @@ struct CorpusFocused {
 /// cell shares the corpus's environment, comparator and single-attempt reason,
 /// with optional environment additions for individual rows on this backend;
 /// its Hermit flags and their reason are its own, it has the global default
-/// budget, and it is never a diagnostic. In the expanded test the flags join
+/// budget unless a `slow` group names the row, and it is never a diagnostic. In the expanded test the flags join
 /// the verify mode's per-backend `hermit_args`, so the manifest validator's
 /// flag allowlist applies to them as to every other cell's, and a row whose
 /// flagged cells have different reasons gets a per-backend
@@ -174,6 +174,11 @@ struct CorpusFocused {
 #[serde(deny_unknown_fields)]
 struct CorpusAdditional {
     backend: String,
+    /// Rows on this backend with their own budget instead of the global
+    /// default, each group with the measurement behind it (same shape as
+    /// the replay section's `slow`).
+    #[serde(default)]
+    slow: Vec<CorpusReplaySlow>,
     #[serde(default)]
     hermit_args: Vec<String>,
     hermit_args_reason: Option<String>,
@@ -693,10 +698,22 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
             kind: CellKind::Lane,
             budget: Some((timeout, cpu_timeout, slow_reason)),
         })
-        .chain(additional.iter().map(|additional| CorpusCell {
-            backend: additional.backend.as_str(),
-            kind: CellKind::Additional,
-            budget: None,
+        .chain(additional.iter().map(|additional| {
+            CorpusCell {
+                backend: additional.backend.as_str(),
+                kind: CellKind::Additional,
+                budget: additional
+                    .slow
+                    .iter()
+                    .find(|group| group.rows.iter().any(|label| label == &row.label))
+                    .map(|group| {
+                        (
+                            group.timeout_seconds,
+                            group.cpu_timeout_seconds,
+                            group.slow_reason.as_str(),
+                        )
+                    }),
+            }
         }))
         .chain(focused.iter().map(|focused| CorpusCell {
             backend: focused.backend.as_str(),
@@ -1341,8 +1358,13 @@ mod tests {
     /// three-run survey on 2026-10-09, 76 of the 77 rows the rr lane never
     /// listed as passing. Each is the replay cell of its row's own test,
     /// carrying the full and rr run types (the full validation selects them
-    /// since 2026-10-20) and none of the verify cell's settings. 212 are
-    /// selected, and the 3 seen to fail stay enabled with `ci: false` and the
+    /// since 2026-10-20) and none of the verify cell's settings. 215 are
+    /// selected (214 plus compat/df, compat/lua and compat/perl, whose
+    /// replay cells the 338-cell flip of 2026-10-30 made required; the
+    /// java/javac compile+run split of 2026-11-05 took 215 to 217, logger's
+    /// 2026-11-06 pinned-root re-measurement took it to 216, and
+    /// pkg-config's 2026-11-06 drop under dh-jn0hh part 2 took it to 215),
+    /// and the 5 seen to fail stay enabled with `ci: false` and the
     /// issue of their failure (`UNSELECTED_REPLAY`).
     /// A row moved into or out of the run type, a second test for a program,
     /// the rr run type reaching a verify cell, or a cell quietly unselected or
@@ -1380,7 +1402,15 @@ mod tests {
             // The heavy compile and JVM rows' replay cells get a three-times
             // wall backstop (the section's `slow` group); every other row
             // keeps the section's 60 seconds.
-            let wall = if ["compat/java", "compat/javac", "compat/rustc"].contains(&id) {
+            let wall = if [
+                "compat/java-compile",
+                "compat/java-run",
+                "compat/javac-compile",
+                "compat/javac-run",
+                "compat/rustc",
+            ]
+            .contains(&id)
+            {
                 "{ptrace: 177}"
             } else {
                 "{ptrace: 60}"
@@ -1403,7 +1433,23 @@ mod tests {
                 }
             }
         }
-        assert_eq!((gated, refused), (212, UNSELECTED_REPLAY.len()));
+        // 214 gated and 6 refused on #5199 main: 212 on the pre-split base
+        // (215 on the flip-fixed base minus the three replay cells
+        // deselected with the pinned-image move: logger, pkg-config,
+        // mountpoint), plus two net rows from the java/javac compile+run
+        // split. The 2026-11-05 sweep flip (PR #5183) promoted the
+        // compat/logger, compat/pkg-config and compat/mountpoint replay
+        // cells to required, so gated is 214 + 3 = 217 and refused is
+        // 6 - 3 = 3. The cargo, gcov and rustc replay cells came back the
+        // day they left, once the issue-4997 fixture race was fixed
+        // (271ec81bd4). Logger's replay cell left again on 2026-11-06:
+        // re-measured red in the merge-queue pinned root (no /dev/log
+        // socket; sweep CLEAN was host-contaminated), so gated is
+        // 217 - 1 = 216 and refused is 3 + 1 = 4. Pkg-config's replay
+        // cell left the same day under dh-jn0hh part 2 (pkg-config 0.29.2
+        // in the pinned root emits -D before -I), so gated is
+        // 216 - 1 = 215 and refused is 4 + 1 = 5.
+        assert_eq!((gated, refused), (215, UNSELECTED_REPLAY.len()));
     }
 
     /// The replay cells seen to fail, each with its issue: lsof in the
@@ -1412,7 +1458,15 @@ mod tests {
     /// shared /tmp. compat/flex and compat/timeout are selected since their
     /// replay stall (https://github.com/rrnewton/hermit/issues/3964) and false
     /// deadlock (https://github.com/rrnewton/hermit/issues/3963) were fixed.
-    const UNSELECTED_REPLAY: [(&str, &str); 3] = [
+    const UNSELECTED_REPLAY: [(&str, &str); 5] = [
+        (
+            "compat/logger",
+            "https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md",
+        ),
+        (
+            "compat/pkg-config",
+            "https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md",
+        ),
         (
             "compat/lsof",
             "https://github.com/rrnewton/hermit/issues/3966",

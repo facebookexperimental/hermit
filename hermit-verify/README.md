@@ -18,3 +18,17 @@ policy, kernel qualification and performance-counter requirements.
 ## License
 
 BSD-3-Clause. See `LICENSE`.
+
+Schedule interpolation preserves a complete input record when the requested
+order is exactly that input's order. Both inputs must use the same timing
+format. A genuinely mixed order is refused when its recorded time jumps or
+callback checkpoints have no established mapping to the edited events, or
+when the remaining recording metadata differs. Replay an unchanged endpoint,
+or record compatible inputs before editing their order.
+
+Analyze and bisect likewise require all source schedules to use one timing
+format: legacy, format 2 and format 3 have different jump/switch-in charging
+rules. They refuse mixed formats before writing a trial instead of selecting
+an older format and silently changing its clock behavior. Record both inputs
+with the same Hermit version and timing format. Same-format legacy schedules
+without jumps and current-format schedules remain supported.

@@ -1,0 +1,76 @@
+load("@bazel_skylib//lib:paths.bzl", "paths")
+load("@fbcode_macros//build_defs:lit_unittest.bzl", "lit_unittest")
+load("build_defs.bzl", "cpp_lit_unittest", "go_lit_unittest", "rust_lit_unittest")
+
+oncall("hermit")
+
+# Pure lit tests. These have no dependencies on anything else except `hermit
+# run`.
+[
+    lit_unittest(
+        name = p.replace(".", "_"),
+        lit_args = ["--show-all"],
+        subs = [
+            ("hermit", "//hermetic_infra/hermit/hermit-cli:hermit"),
+        ],
+        test = p,
+    )
+    for p in glob([
+        "*.test",
+        "scheduler_strategies/*.sh",
+    ])
+]
+
+# C/C++ tests.
+[
+    [
+        cpp_lit_unittest(
+            name = paths.dirname(p).replace(".", "_"),
+            src = p,
+            compiler_flags = [
+                "-D_POSIX_C_SOURCE=20180920",
+                "-D_GNU_SOURCE=1",
+            ],
+            # Set NDEBUG to prevent `assert` macros from being compiled out.
+            preprocessor_flags = ["-UNDEBUG"],
+        ),
+    ]
+    for p in glob([
+        "*/main.c",
+        "*/main.cpp",
+    ])
+]
+
+# Rust lit tests.
+[
+    [
+        rust_lit_unittest(
+            name = paths.dirname(p).replace(".", "_"),
+            src = p,
+            deps = [
+                "fbsource//third-party/rust:close-err",
+                "fbsource//third-party/rust:libc",
+                "fbsource//third-party/rust:nix",
+                "fbsource//third-party/rust:syscalls",
+                "fbsource//third-party/rust:tempfile",
+            ],
+        ),
+    ]
+    for p in glob([
+        "*/main.rs",
+    ])
+]
+
+# Go lit tests
+[
+    [
+        go_lit_unittest(
+            name = paths.dirname(p).replace(".", "_"),
+            src = p,
+            deps = [],
+        ),
+    ]
+    for p in glob([
+        "*/main.go",
+    ])
+]

@@ -75,6 +75,16 @@ set -uo pipefail
 : "${HERMIT_APT_DOWNLOAD_TIMEOUT_SECONDS:=150}"
 # Grace between the timeout's SIGTERM and its SIGKILL.
 : "${HERMIT_APT_KILL_AFTER_SECONDS:=10}"
+# The hosted image's apt sources name this list (`mirror+file:`), one mirror
+# per line with a `priority:N` field. apt moves to the next mirror only when a
+# request FAILS, never because a mirror is slow, so a runner that draws a
+# crawling connection keeps it for every attempt: on 2026-10-27 a
+# hermit pull-request run fetched the index from azure.archive.ubuntu.com at
+# 8 MB/s and then got 19.5 MiB of .deb files in 450 s from the same host,
+# failing all three attempts. Each retry therefore rotates the list so a
+# different mirror is tried first (rotate_mirrors). The others stay listed, so
+# apt still falls back on a failure. No list at this path means no rotation.
+: "${HERMIT_APT_MIRROR_LIST:=/etc/apt/apt-mirrors.txt}"
 # Root of the cached directory. Deliberately NOT under the runner's home or the
 # workspace: apt fetches as the unprivileged `_apt` user, which must be able to
 # traverse every parent directory, and the workspace is wiped by checkout.
@@ -167,6 +177,38 @@ prepare_main() {
 }
 
 # deb_stats <dir> -> "<count> <bytes>"
+# Give the next mirror in priority order the first priority, moving the current
+# first to the end, and rewrite every `priority:N` to match the new order. Other
+# per-line fields are kept. Completed and partial .deb files are named by
+# package, not by mirror, so the next attempt keeps what earlier ones fetched.
+rotate_mirrors() {
+    local list=$HERMIT_APT_MIRROR_LIST rotated
+    [[ -f $list ]] || return 0
+    rotated=$(awk -F'\t' '
+        /^[[:space:]]*(#|$)/ { next }
+        {
+            prio = 1000000 + NR; rest = ""
+            for (i = 2; i <= NF; i++) {
+                if ($i ~ /^priority:[0-9]+$/) { prio = substr($i, 10) + 0 }
+                else { rest = rest "\t" $i }
+            }
+            printf "%d\t%d\t%s%s\n", prio, NR, $1, rest
+        }' "$list" | sort -n -k1,1 -k2,2 | cut -f3- |
+        awk -F'\t' '
+            { url[NR] = $1; rest[NR] = substr($0, length($1) + 1) }
+            END {
+                if (NR < 2) exit
+                for (i = 2; i <= NR; i++) printf "%s\tpriority:%d%s\n", url[i], i - 1, rest[i]
+                printf "%s\tpriority:%d%s\n", url[1], NR, rest[1]
+            }')
+    if [[ -z $rotated ]]; then
+        return 0
+    fi
+    printf '%s\n' "$rotated" | sudo tee "$list" >/dev/null ||
+        { echo "::warning title=apt mirror rotation failed::could not rewrite $list; retrying with the same mirror order"; return 0; }
+    echo "apt-cache: retrying with $(head -n1 <<<"$rotated" | cut -f1) as the first mirror ($list)"
+}
+
 deb_stats() {
     find "$1" -maxdepth 1 -type f -name '*.deb' -printf '%s\n' |
         awk '{ n += 1; b += $1 } END { printf "%d %d\n", n, b }'
@@ -272,6 +314,7 @@ install_from_mirror() {
         sleep_for=$(( HERMIT_APT_BACKOFF_SECONDS * attempt ))
         echo "::warning title=apt-get $FAILED_LABEL retried::attempt $attempt of $HERMIT_APT_ATTEMPTS failed ($FAILED_WHY); retrying from apt-get update in ${sleep_for}s. apt's output is above."
         sleep "$sleep_for"
+        rotate_mirrors
         attempt=$(( attempt + 1 ))
     done
     t0=$SECONDS

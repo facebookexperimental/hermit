@@ -7,6 +7,7 @@
  */
 
 use reverie::Errno;
+#[cfg(target_arch = "x86_64")]
 use reverie::RdtscResult;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::PollFd;
@@ -130,6 +131,11 @@ pub enum SyscallEvent {
     Stat(StatEvent),
     Statfs(Vec<u8>),
     Statx(StatxBuf),
+    /// x86 only: aarch64 has no `rdtsc`, so its recordings number every later
+    /// variant one lower, and a recording made on one architecture does not
+    /// decode on the other. Recordings do not yet carry their architecture, so
+    /// nothing refuses such a replay by name.
+    #[cfg(target_arch = "x86_64")]
     Rdtsc(RdtscResult),
     Ioctl(ioctl::Output),
     Timespec(TimespecEvent),
@@ -388,6 +394,29 @@ pub struct MmapEvent {
     /// The contents of the memory map. Note that this may be less than the
     /// requested `length`.
     pub buf: Vec<u8>,
+    /// For a `MAP_SHARED` mapping, the file it maps and where, so that replay
+    /// makes the mappings of one file share memory as they did here.
+    pub shared: Option<SharedMapping>,
+}
+/// The file a `MAP_SHARED` mapping maps, by its identity during recording,
+/// the mapping's offset in it, and the access mode of the descriptor it was
+/// mapped through. For a mapping of `/dev/zero` the file is the new shmem
+/// object Linux made for that mapping (`shmem_zero_setup`), as
+/// `/proc/<tid>/maps` names it, so no other mapping shares it but the
+/// mapping's copies in forked children. Recording refuses a mapping of that
+/// object's own file (`/proc/<pid>/map_files`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedMapping {
+    /// `st_dev` of the mapped file.
+    pub device: u64,
+    /// `st_ino` of the mapped file.
+    pub inode: u64,
+    /// Offset of the mapping in the file.
+    pub offset: u64,
+    /// The mapped descriptor's access mode (`O_RDONLY`, `O_WRONLY` or
+    /// `O_RDWR`), from its file status flags: replay opens the file's backing
+    /// with it, so a later `mprotect` is allowed or refused as it was.
+    pub access: i32,
 }
 
 /// Recorded outcome of a guest-semantic `madvise`.
@@ -474,6 +503,51 @@ pub struct PollEvent {
     pub fds: Option<Vec<PollFd>>,
 }
 
+/// A `poll` that a signal ended in the kernel with `ERESTART_RESTARTBLOCK`: its
+/// pollfd array and length. With no handler to run, Linux restarts such a poll
+/// through the guest's own `restart_syscall` (`do_restart_poll`), which writes
+/// the array's `revents` and returns as the poll would. The recorder runs that
+/// `restart_syscall` in place and records its outputs as a [`PollEvent`];
+/// replay serves them back. Each thread keeps one until its next syscall.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InterruptedPoll {
+    /// The guest's pollfd array address, 0 for none.
+    pub fds: u64,
+    /// Its length.
+    pub nfds: u64,
+}
+
+impl InterruptedPoll {
+    /// The poll `fds`/`nfds` ended with `result`, if a signal ended it in the
+    /// kernel with `ERESTART_RESTARTBLOCK`.
+    pub fn after(
+        fds: Option<AddrMut<'_, PollFd>>,
+        nfds: u64,
+        result: &Result<i64, Errno>,
+    ) -> Option<Self> {
+        matches!(result, Err(Errno::ERESTART_RESTARTBLOCK)).then(|| Self {
+            fds: fds.map_or(0, |fds| fds.as_raw() as u64),
+            nfds,
+        })
+    }
+
+    /// Whether `syscall` is the kernel's restart of this poll: a
+    /// `restart_syscall` whose argument registers still hold the poll's
+    /// array and length, as Linux leaves them when it restarts a call.
+    pub fn restarted_by(&self, syscall: &Syscall) -> bool {
+        use reverie::syscalls::SyscallInfo;
+        let (number, args) = syscall.into_parts();
+        number == reverie::syscalls::Sysno::restart_syscall
+            && args.arg0 as u64 == self.fds
+            && args.arg1 as u64 == self.nfds
+    }
+
+    /// The pollfd array address.
+    pub fn fds_address(&self) -> Option<AddrMut<'static, PollFd>> {
+        AddrMut::from_raw(self.fds as usize)
+    }
+}
+
 /// Records every guest-visible output of a raw `ppoll` call.
 ///
 /// Unlike `poll`, Linux treats the timeout as an in-out parameter. The pollfd
@@ -556,6 +630,40 @@ pub struct SockOptEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a poll a signal ended with `ERESTART_RESTARTBLOCK` is kept, and
+    /// only a `restart_syscall` that still names its array and length is its
+    /// restart.
+    #[test]
+    fn only_a_restart_naming_an_interrupted_poll_restarts_it() {
+        use reverie::syscalls::SyscallArgs;
+        use reverie::syscalls::Sysno;
+        let fds = AddrMut::<PollFd>::from_raw(0x7000);
+        assert_eq!(InterruptedPoll::after(fds, 2, &Ok(1)), None);
+        assert_eq!(InterruptedPoll::after(fds, 2, &Err(Errno::EINTR)), None);
+        let poll = InterruptedPoll::after(fds, 2, &Err(Errno::ERESTART_RESTARTBLOCK))
+            .expect("an interrupted poll is kept");
+        assert_eq!(
+            poll,
+            InterruptedPoll {
+                fds: 0x7000,
+                nfds: 2
+            }
+        );
+        assert_eq!(poll.fds_address().map(|fds| fds.as_raw()), Some(0x7000));
+        let call = |number, fds, nfds| {
+            Syscall::from_raw(number, SyscallArgs::new(fds, nfds, 300, 0, 0, 0))
+        };
+        assert!(poll.restarted_by(&call(Sysno::restart_syscall, 0x7000, 2)));
+        assert!(!poll.restarted_by(&call(Sysno::restart_syscall, 0x7000, 3)));
+        assert!(!poll.restarted_by(&call(Sysno::restart_syscall, 0x8000, 2)));
+        assert!(!poll.restarted_by(&call(Sysno::poll, 0x7000, 2)));
+        // A poll of no array keeps 0 for it.
+        let none = InterruptedPoll::after(None, 0, &Err(Errno::ERESTART_RESTARTBLOCK))
+            .expect("an interrupted poll is kept");
+        assert!(none.restarted_by(&call(Sysno::restart_syscall, 0, 0)));
+        assert_eq!(none.fds_address(), None);
+    }
 
     #[test]
     fn siocethtool_has_a_deterministic_error() {

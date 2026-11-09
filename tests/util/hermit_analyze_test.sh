@@ -38,6 +38,7 @@ set -eu
 HERMIT_ARGS="--analyze-seed=0 "
 HERMIT_ARGS+="--search "
 if [[ "$KEEP_LOGS" != "0" ]]; then
+    # Analyze keeps its workspace, with the trials' logs, under --verbose.
     HERMIT_ARGS+="--verbose "
 fi
 HERMIT_ARGS+=" -- "
@@ -46,10 +47,10 @@ HERMIT_ARGS+="--chaos "
 HERMIT_ARGS+="--summary "
 HERMIT_ARGS+="--max-timeslice=400000 "
 
-TEMP=$(mktemp -d /tmp/analyze_test_XXXXX)
+TEMP=$(mktemp -d -t analyze_test_XXXXX)
 echo ":: [analyze_test] Temporary workspace: $TEMP"
 TEMPLOG="${TEMP}/log.txt"
-HERMIT_ARGS="--report-file=${TEMP}/report.json $HERMIT_ARGS"
+HERMIT_ARGS="--report-file=${TEMP}/report.json --tmp-dir=${TEMP} $HERMIT_ARGS"
 
 trap cleanup EXIT
 

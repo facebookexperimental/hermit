@@ -148,6 +148,9 @@ fresh() {
     export HERMIT_APT_BACKOFF_SECONDS=0
     export HERMIT_APT_ATTEMPTS=3
     export ImageOS=ubuntu24 ImageVersion=20260928.1
+    # Never the runner's real list; a case that wants one writes this file.
+    export HERMIT_APT_MIRROR_LIST="$work/mirrors.txt"
+    rm -f "$HERMIT_APT_MIRROR_LIST"
     unset STUB_UPDATE STUB_DOWNLOAD STUB_INSTALL STUB_CACHEFILE STUB_CACHEFILE_SKIP \
         APT_CACHE_HIT HERMIT_APT_UPDATE_TIMEOUT_SECONDS \
         HERMIT_APT_DOWNLOAD_TIMEOUT_SECONDS HERMIT_APT_KILL_AFTER_SECONDS
@@ -239,6 +242,48 @@ check "transient download failure: download ran twice" "$(is "$(count download)"
 check "transient download failure: the retry starts again from update" \
     "$(is "$(cut -d' ' -f1 "$work/state/calls" | tr '\n' ' ')" "update download update download install ")"
 check "transient download failure: emits a retry warning naming the phase" "$(has "$work/log" "::warning title=apt-get download retried::attempt 1 of 3 failed (apt-get download exit 100)")"
+
+# --- retries: each retry puts a different mirror first -----------------------
+# The hosted image's list, in its own format (URL, a tab, priority:N), written
+# out of priority order to show that rotation follows the priorities, not the
+# line order.
+write_mirrors() {
+    printf '%s\n' \
+        $'https://archive.ubuntu.com/ubuntu/\tpriority:2' \
+        $'http://azure.archive.ubuntu.com/ubuntu/\tpriority:1' \
+        $'https://security.ubuntu.com/ubuntu/\tpriority:3\tarch:amd64' >"$HERMIT_APT_MIRROR_LIST"
+}
+first_mirror() { sort -t: -k3,3n "$HERMIT_APT_MIRROR_LIST" | grep -m1 'priority:1\b' | cut -f1; }
+fresh; write_mirrors; APT_PACKAGES=jq run prepare >/dev/null 2>&1; rc=0
+STUB_DOWNLOAD=fail-once:100 APT_PACKAGES=jq run install >"$work/log" 2>&1 || rc=$?
+check "mirror rotation: the retried install succeeds" "$(is "$rc" 0)"
+check "mirror rotation: the retry gives the next mirror priority 1" \
+    "$(is "$(first_mirror)" "https://archive.ubuntu.com/ubuntu/")"
+check "mirror rotation: the slow mirror stays listed, last" \
+    "$(hasf "$HERMIT_APT_MIRROR_LIST" $'http://azure.archive.ubuntu.com/ubuntu/\tpriority:3')"
+check "mirror rotation: other fields on a line are kept" \
+    "$(hasf "$HERMIT_APT_MIRROR_LIST" $'https://security.ubuntu.com/ubuntu/\tpriority:2\tarch:amd64')"
+check "mirror rotation: still exactly three mirrors" "$(is "$(wc -l <"$HERMIT_APT_MIRROR_LIST")" 3)"
+check "mirror rotation: the log names the new first mirror" \
+    "$(hasf "$work/log" "retrying with https://archive.ubuntu.com/ubuntu/ as the first mirror")"
+
+fresh; write_mirrors; cp "$HERMIT_APT_MIRROR_LIST" "$work/mirrors.before"
+APT_PACKAGES=jq run prepare >/dev/null 2>&1; rc=0
+APT_PACKAGES=jq run install >"$work/log" 2>&1 || rc=$?
+check "mirror rotation: a first-attempt success leaves the list untouched" \
+    "$(cmp -s "$work/mirrors.before" "$HERMIT_APT_MIRROR_LIST" && echo 0 || echo 1)"
+
+fresh; write_mirrors; APT_PACKAGES=jq run prepare >/dev/null 2>&1; rc=0
+STUB_DOWNLOAD=fail:100 APT_PACKAGES=jq run install >"$work/log" 2>&1 || rc=$?
+check "mirror rotation: two retries rotate twice" \
+    "$(is "$(first_mirror)" "https://security.ubuntu.com/ubuntu/")"
+check "mirror rotation: a persistent failure still keeps apt's own status" "$(is "$rc" 100)"
+
+fresh; APT_PACKAGES=jq run prepare >/dev/null 2>&1; rc=0
+STUB_DOWNLOAD=fail-once:100 APT_PACKAGES=jq run install >"$work/log" 2>&1 || rc=$?
+check "mirror rotation: no list means no rotation and no error" \
+    "$([[ $rc -eq 0 && ! -e $HERMIT_APT_MIRROR_LIST ]] && echo 0 || echo 1)"
+check "  ...and no rotation message" "$(lacks "$work/log" "as the first mirror")"
 
 # --- retries: persistent failure keeps its own status ------------------------
 fresh; APT_PACKAGES=jq run prepare >/dev/null 2>&1; rc=0

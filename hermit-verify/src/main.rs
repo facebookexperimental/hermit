@@ -45,7 +45,23 @@ pub enum Commands {
 }
 
 #[fbinit::main]
+/// A preemption record of a format this Hermit does not read is a policy
+/// refusal (`detcore::preemptions::RecordFormatRefusal`), so it exits with
+/// the policy-refusal status, as `hermit run` does; every other error exits 1.
 fn main() -> Result<()> {
+    let result = run();
+    if let Err(error) = &result
+        && error
+            .chain()
+            .any(|cause| cause.is::<detcore::preemptions::RecordFormatRefusal>())
+    {
+        eprintln!("Error: {error:#}");
+        std::process::exit(detcore_model::HERMIT_POLICY_REFUSAL_EXIT);
+    }
+    result
+}
+
+fn run() -> Result<()> {
     let Args {
         command,
         mut common_opts,

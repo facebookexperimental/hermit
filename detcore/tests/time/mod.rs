@@ -34,27 +34,65 @@ fn test_fn_with_config<T, F>(
 ) -> Result<(reverie::process::Output, T::GlobalState), reverie::Error>
 where
     T: reverie::Tool + 'static,
-    T::GlobalState: reverie::GlobalTool<Config = detcore::Config>,
-    F: FnOnce(),
+    T::GlobalState: reverie::GlobalTool<Config = detcore::Config> + Send,
+    F: FnOnce() + Send + 'static,
 {
-    reverie_ptrace::testing::test_fn_with_config::<T, F>(
-        f,
-        detcore_testutils::prepare_ptrace_timer_config(config),
-        capture_output,
-    )
+    on_session_stack(move || {
+        // In-process sessions from different tests wedge each other's tracers;
+        // hold the shared per-test serializer for the session (see testutils).
+        let _session = detcore_testutils::serialized_session();
+        reverie_ptrace::testing::test_fn_with_config::<T, F>(
+            f,
+            detcore_testutils::prepare_ptrace_timer_config(config),
+            capture_output,
+        )
+    })
 }
 
 fn check_fn_with_config<T, F>(f: F, config: detcore::Config, capture_output: bool) -> T::GlobalState
 where
     T: reverie::Tool + 'static,
-    T::GlobalState: reverie::GlobalTool<Config = detcore::Config>,
-    F: FnOnce(),
+    T::GlobalState: reverie::GlobalTool<Config = detcore::Config> + Send,
+    F: FnOnce() + Send + 'static,
 {
-    reverie_ptrace::testing::check_fn_with_config::<T, F>(
-        f,
-        detcore_testutils::prepare_ptrace_timer_config(config),
-        capture_output,
-    )
+    on_session_stack(move || {
+        let _session = detcore_testutils::serialized_session();
+        reverie_ptrace::testing::check_fn_with_config::<T, F>(
+            f,
+            detcore_testutils::prepare_ptrace_timer_config(config),
+            capture_output,
+        )
+    })
+}
+
+/// Run `run` on a thread with an explicit 16 MiB stack, named after the
+/// calling test thread so the session serializer still keys the hold to
+/// this test. A debug Detcore session overflows the test thread's default
+/// 2 MiB stack under plain `cargo test`; the allowance belongs to these
+/// test sessions, so it is set here in the test harness, not exported to
+/// every Cargo process.
+///
+/// The guest is forked from this thread, so in the guest glibc treats the
+/// test thread's stack as free and reuses it for the guest's threads: a guest
+/// closure owns what it uses (`'static`) rather than borrow the test thread's
+/// locals (detcore-testutils' `test_fn_with_logs`).
+fn on_session_stack<T>(run: impl FnOnce() -> T + Send) -> T
+where
+    T: Send,
+{
+    let name = std::thread::current()
+        .name()
+        .unwrap_or_default()
+        .to_string();
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name(name)
+            .stack_size(16 << 20)
+            .spawn_scoped(scope, run)
+            .unwrap()
+            .join()
+            .unwrap()
+    })
 }
 
 // Keep this synchronized with the clock-query category in `syscall_time`.
@@ -83,7 +121,7 @@ fn tod_from_epoch() {
     };
     let epoch = config.epoch;
     check_fn_with_config::<Detcore, _>(
-        || {
+        move || {
             let now = Utc::now();
             let delta_ms = diff_millis(epoch, now);
             // However exactly we compute logical time, this should be within a small
@@ -223,7 +261,7 @@ fn tod_gettimeofday() {
     };
     let epoch = config.epoch;
     check_fn_with_config::<Detcore, _>(
-        || {
+        move || {
             assert_eq!(
                 unsafe { libc::gettimeofday(tp.as_mut_ptr(), ptr::null_mut()) },
                 0
@@ -306,7 +344,7 @@ fn tod_gettimeofday_faulting_tz_writes_virtual_tv() {
     };
     let epoch_micros = config.epoch.timestamp_micros();
     check_fn_with_config::<Detcore, _>(
-        || {
+        move || {
             let (readonly, page_size) = map_pages(1);
             assert_eq!(
                 unsafe { libc::mprotect(readonly.cast(), page_size, libc::PROT_READ) },
@@ -465,7 +503,7 @@ fn tod_gettimeofday_misaligned_tv_stores_whole_words_only() {
     };
     let epoch_micros = config.epoch.timestamp_micros();
     check_fn_with_config::<Detcore, _>(
-        || {
+        move || {
             // Address 1 is below mmap_min_addr, so it can never be mapped.
             let unmapped = ptr::without_provenance_mut::<libc::c_void>(1);
             let read_write = libc::PROT_READ | libc::PROT_WRITE;
@@ -559,7 +597,7 @@ fn tod_gettimeofday_faulting_tz_write_only_tv_receives_virtual_time() {
     };
     let epoch_micros = config.epoch.timestamp_micros();
     check_fn_with_config::<Detcore, _>(
-        || {
+        move || {
             let unmapped = ptr::without_provenance_mut::<libc::c_void>(1);
             let read_write = libc::PROT_READ | libc::PROT_WRITE;
             let write_only = libc::PROT_WRITE;
@@ -629,7 +667,7 @@ fn tod_gettimeofday_faulting_tz_crossing_word_needs_both_pages_writable() {
     };
     let epoch_micros = config.epoch.timestamp_micros();
     check_fn_with_config::<Detcore, _>(
-        || {
+        move || {
             let unmapped = ptr::without_provenance_mut::<libc::c_void>(1);
             let read_write = libc::PROT_READ | libc::PROT_WRITE;
             // The first page's protection, the second page's, and how many
@@ -1083,7 +1121,7 @@ fn tod_time() {
     };
     let epoch = config.epoch;
     check_fn_with_config::<Detcore, _>(
-        || {
+        move || {
             let t = unsafe { libc::time(&mut tloc as *mut i64) };
             assert_eq!(t, tloc);
             let dt = DateTime::from_timestamp(t, 0).unwrap();
@@ -1106,7 +1144,7 @@ fn tod_clock_gettime() {
     };
     let epoch = config.epoch;
     check_fn_with_config::<Detcore, _>(
-        || {
+        move || {
             assert_eq!(
                 unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, tp.as_mut_ptr()) },
                 0
@@ -1124,6 +1162,85 @@ fn tod_clock_gettime() {
         config,
         true,
     );
+}
+
+/// Makes 200 `getppid` calls, reading `CLOCK_MONOTONIC` around each, and
+/// prints the virtual nanoseconds the loop took. Every read must be later than
+/// the one before.
+fn syscall_loop_elapsed() {
+    let read_time = || {
+        let mut now = MaybeUninit::<libc::timespec>::uninit();
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_clock_gettime,
+                libc::CLOCK_MONOTONIC,
+                now.as_mut_ptr(),
+            )
+        };
+        assert_eq!(result, 0);
+        let now = unsafe { now.assume_init() };
+        now.tv_sec as i128 * 1_000_000_000 + now.tv_nsec as i128
+    };
+    let start = read_time();
+    let mut last = start;
+    for _ in 0..200 {
+        unsafe { libc::syscall(libc::SYS_getppid) };
+        let now = read_time();
+        assert!(now > last, "the clock did not advance: {last} then {now}");
+        last = now;
+    }
+    let line = format!("elapsed_ns={}\n", last - start);
+    unsafe { libc::write(1, line.as_ptr().cast(), line.len()) };
+}
+
+/// The virtual nanoseconds [`syscall_loop_elapsed`] reports under a
+/// sequentializing scheduler without a PMU, with `target` as the logical
+/// `--target-timeslice` and `--cap-preemption-charge` as `cap`.
+fn syscall_loop_elapsed_with(target: Option<u64>, cap: bool) -> i128 {
+    let config = detcore::Config {
+        virtualize_time: true,
+        max_timeslice: None,
+        target_timeslice: target.and_then(std::num::NonZeroU64::new),
+        sequentialize_threads: true,
+        no_rcb_time: true,
+        // Without a PMU each syscall costs about 2.5 virtual ms here; a 5 ms
+        // turn charge makes the charge, not the syscall, the larger cost.
+        scheduler_turn_cost: std::num::NonZeroU64::new(5_000_000),
+        cap_preemption_charge: cap,
+        ..Default::default()
+    };
+    let (output, _) = test_fn_with_config::<Detcore, _>(syscall_loop_elapsed, config, true)
+        .expect("the syscall loop runs under Detcore");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .trim()
+        .strip_prefix("elapsed_ns=")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("unexpected output {stdout:?}"))
+}
+
+/// A logical timeslice shorter than one syscall's virtual cost ends a slice
+/// at every syscall, and each such turn pays the full scheduler charge (here
+/// 5 ms, twice a syscall's cost), so the loop's guest-visible time nearly
+/// triples (measured: 1025 ms unsliced, 3025 ms). With
+/// `--cap-preemption-charge` a slice's turn costs at most the slice, so the
+/// loop takes about twice its unsliced time (measured: 2055 ms), and two runs
+/// read the same time. No PMU is needed: the target is checked at syscalls.
+#[test]
+fn a_capped_preemption_charge_bounds_the_time_short_slices_add() {
+    let unsliced = syscall_loop_elapsed_with(None, false);
+    let full = syscall_loop_elapsed_with(Some(20_000), false);
+    let capped = syscall_loop_elapsed_with(Some(20_000), true);
+    assert!(
+        2 * full > 5 * unsliced,
+        "full charges: {full} ns against {unsliced} ns unsliced"
+    );
+    assert!(
+        capped > unsliced && 10 * capped <= 21 * unsliced,
+        "capped charges: {capped} ns against {unsliced} ns unsliced"
+    );
+    assert_eq!(capped, syscall_loop_elapsed_with(Some(20_000), true));
 }
 
 #[test]
@@ -1534,6 +1651,24 @@ fn guest_stdout(guest: fn(), config: detcore::Config) -> String {
 /// without the policy or at a wake that woke no one.
 #[test]
 fn a_futex_wake_yield_survives_a_preemption_record_and_replay() {
+    // Child mode: attempt only the replay of the parent's record. Admission
+    // of an unqualified history exits this process with the policy status
+    // before any guest runs, which is what the parent asserts.
+    const REPLAY_CHILD_RECORD: &str = "HERMIT_FUTEX_WAKE_YIELD_REPLAY_RECORD";
+    if let Ok(record) = std::env::var(REPLAY_CHILD_RECORD) {
+        let record = std::path::PathBuf::from(record);
+        let _ = guest_stdout(
+            || {},
+            detcore::Config {
+                virtualize_time: true,
+                sequentialize_threads: true,
+                futex_wake_yields: true,
+                replay_preemptions_from: Some(record),
+                ..Default::default()
+            },
+        );
+        panic!("an unqualified replay was admitted");
+    }
     let base = detcore::Config {
         virtualize_time: true,
         sequentialize_threads: true,
@@ -1549,6 +1684,36 @@ fn a_futex_wake_yield_survives_a_preemption_record_and_replay() {
             futex_wake_yields: yields,
             ..base.clone()
         };
+        // The identity this host's record must state, derived straight
+        // from the product's host table and the ptrace backend's stated
+        // contract, never from prepare_ptrace_timer_config. That helper
+        // launches the recording below, so deriving the expectation from
+        // it would let a helper that stops binding the contract or claim
+        // switch this test to the refusal branch silently. With an
+        // independent oracle the record states an unqualified identity
+        // instead, the assert below fails, and the test goes red on a
+        // qualified host.
+        let expected = {
+            let capabilities = <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities();
+            let mut oracle = config.clone();
+            oracle.backend.rcb_clock_contract = capabilities.rcb_clock_contract;
+            if matches!(oracle.rcb_clock_claim, detcore::RcbClockClaim::Unset) {
+                oracle.rcb_clock_claim = match (
+                    capabilities.rcb_clock_contract,
+                    reverie::pmu_config::resolve_host_clock(),
+                ) {
+                    (Some(_), Ok(host)) => detcore::RcbClockClaim::Known(host.key()),
+                    _ => detcore::RcbClockClaim::Unset,
+                };
+            }
+            detcore::clock_identity::validate_run_clock(
+                &oracle,
+                &detcore::clock_identity::ClockSources::process(),
+            )
+            .unwrap()
+            .producer()
+            .history_identity()
+        };
         let recorded = guest_stdout(
             guest,
             detcore::Config {
@@ -1556,6 +1721,48 @@ fn a_futex_wake_yield_survives_a_preemption_record_and_replay() {
                 record_preemptions_to: Some(record.clone()),
                 ..config.clone()
             },
+        );
+        // Branch on the identity this host's recorder stated, read back
+        // through Detcore's own decoder: a qualified (or backend-local)
+        // history must replay; an unqualified one must be refused before
+        // any guest runs, in a child process because the refusal exits
+        // the tracer process with the policy status.
+        let recording = detcore::preemptions::boundary_recording::Recording::read(&record).unwrap();
+        assert_eq!(
+            recording.identity(),
+            Some(&expected),
+            "the record does not state the host-table clock identity"
+        );
+        let unqualified = match &expected {
+            detcore::preemptions::HistoryIdentity::Unqualified(reason) => Some(format!(
+                "it was recorded with an unqualified RCB clock ({reason})"
+            )),
+            _ => None,
+        };
+        if let Some(expected) = unqualified {
+            eprintln!("unqualified branch: recording states {expected}; asserting replay refusal");
+            let case = std::thread::current()
+                .name()
+                .unwrap_or_default()
+                .to_string();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &case, "--nocapture", "--test-threads=1"])
+                .env(REPLAY_CHILD_RECORD, &record)
+                .output()
+                .unwrap();
+            std::fs::remove_file(&record).unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+                "{output:?}"
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(&expected), "child stderr: {stderr}");
+            return None;
+        }
+        eprintln!(
+            "qualified branch: recording states {:?}; replay must succeed",
+            recording.identity()
         );
         let replayed = guest_stdout(
             guest,
@@ -1566,20 +1773,20 @@ fn a_futex_wake_yield_survives_a_preemption_record_and_replay() {
         );
         std::fs::remove_file(&record).unwrap();
         assert_eq!(recorded, replayed, "yields={yields}");
-        recorded
+        Some(recorded)
     };
+    let Some(first) = round_trip(|| futex_wake_snapshot(true), true) else {
+        return;
+    };
+    assert_eq!(first, "wake=1 seen=1 sibling=1\n");
     assert_eq!(
-        round_trip(|| futex_wake_snapshot(true), true),
-        "wake=1 seen=1 sibling=1\n"
-    );
-    assert_eq!(
-        round_trip(|| futex_wake_snapshot(true), false),
+        round_trip(|| futex_wake_snapshot(true), false).expect("qualified host"),
         "wake=1 seen=0 sibling=0\n"
     );
     // The waiter was joined before this wake, so only `sibling` can show a
     // yield here.
     assert_eq!(
-        round_trip(|| futex_wake_snapshot(false), true),
+        round_trip(|| futex_wake_snapshot(false), true).expect("qualified host"),
         "wake=0 seen=1 sibling=0\n"
     );
 }
@@ -1715,7 +1922,7 @@ fn tod_clock_getres() {
         ..Default::default()
     };
     check_fn_with_config::<Detcore, _>(
-        || {
+        move || {
             assert_eq!(
                 unsafe { libc::clock_getres(libc::CLOCK_MONOTONIC, tp.as_mut_ptr()) },
                 0
@@ -1766,7 +1973,7 @@ fn tod_clock_getres_2() {
     let sequentialize = config.sequentialize_threads;
     let timeout_disabled = config.max_timeslice.is_none();
     check_fn_with_config::<Detcore, _>(
-        || {
+        move || {
             let now = time::Instant::now();
             // Spot check a single syscall clock delta (clock_gettime).
             let nanos = now.elapsed().as_nanos();

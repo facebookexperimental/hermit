@@ -28,6 +28,7 @@ use std::os::unix::fs::DirEntryExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 
 use detcore::Config;
 use detcore::Detcore;
@@ -316,7 +317,10 @@ fn numbers(stdout: &str, label: &str) -> BTreeSet<u64> {
 
 #[test]
 fn removing_a_last_name_retires_its_number_and_nothing_else() {
-    let root = tempfile::tempdir().unwrap();
+    // The guest closure owns what it uses (detcore-testutils'
+    // `test_fn_with_logs`); this test drops the directory after the run.
+    let root = Arc::new(tempfile::tempdir().unwrap());
+    let guest_root = Arc::clone(&root);
     let config = Config {
         sequentialize_threads: true,
         max_timeslice: None,
@@ -324,7 +328,7 @@ fn removing_a_last_name_retires_its_number_and_nothing_else() {
         ..Default::default()
     };
     let (output, state) = detcore_testutils::test_fn_with_config::<Detcore, _>(
-        || removals_guest(&root),
+        move || removals_guest(&guest_root),
         detcore_testutils::prepare_ptrace_timer_config(config),
         true,
     )
@@ -360,7 +364,8 @@ fn removing_a_last_name_retires_its_number_and_nothing_else() {
 /// retired (codex review of https://github.com/rrnewton/hermit/pull/3849, P2).
 #[test]
 fn nothing_is_retired_without_sequentialized_threads() {
-    let root = tempfile::tempdir().unwrap();
+    let root = Arc::new(tempfile::tempdir().unwrap());
+    let guest_root = Arc::clone(&root);
     let config = Config {
         sequentialize_threads: false,
         max_timeslice: None,
@@ -368,8 +373,8 @@ fn nothing_is_retired_without_sequentialized_threads() {
         ..Default::default()
     };
     let (output, state) = detcore_testutils::test_fn_with_config::<Detcore, _>(
-        || {
-            let path = root.path().join("removed");
+        move || {
+            let path = guest_root.path().join("removed");
             File::create(&path).unwrap();
             ino_of_path(&path);
             std::fs::remove_file(&path).unwrap();
@@ -581,8 +586,12 @@ fn run_reuse_guest(reach: FirstReach) -> u64 {
                 assert_eq!(unsafe { libc::write(done, b"d".as_ptr().cast(), 1) }, 1);
             }
         });
+        let (guest_mount, guest_fifos) = (
+            Arc::new(mount_point.to_path_buf()),
+            Arc::new(fifos.to_path_buf()),
+        );
         let run = detcore_testutils::test_fn_with_config::<Detcore, _>(
-            || reuse_guest(mount_point, fifos, reach),
+            move || reuse_guest(&guest_mount, &guest_fifos, reach),
             detcore_testutils::prepare_ptrace_timer_config(config),
             true,
         );

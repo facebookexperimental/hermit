@@ -1,0 +1,95 @@
+# (c) Facebook, Inc. and its affiliates. Confidential and proprietary.
+
+load("@fbcode_macros//build_defs:cpp_unittest.bzl", "cpp_unittest")
+load("@fbcode_macros//build_defs:native_rules.bzl", "buck_sh_test")
+load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
+load("@fbsource//tools/build_defs:testpilot_defs.bzl", "tpx_labels")
+load("@fbsource//tools/build_defs/testinfra:network_access_utils.bzl", "network_access_utils")
+
+oncall("hermit")
+
+cpp_unittest(
+    name = "bind_same",
+    srcs = [
+        "bind/bind_same.cpp",
+    ],
+    args = ["--gtest_catch_exceptions=1"],
+    labels = [tpx_labels.local_only],
+    deps = ["fbsource//third-party/googletest:gtest"],
+)
+
+cpp_unittest(
+    name = "bind_random",
+    srcs = [
+        "bind/bind_random.cpp",
+    ],
+    args = ["--gtest_catch_exceptions=1"],
+    labels = [tpx_labels.local_only],
+    deps = [
+        "fbsource//third-party/googletest:gtest",
+        "//folly:random",
+    ],
+)
+
+rust_binary(
+    name = "cas_sequence_easy_bin",
+    srcs = ["cas_sequence_easy.rs"],
+    crate_root = "cas_sequence_easy.rs",
+)
+
+buck_sh_test(
+    name = "run_hello_race",
+    args = [],
+    test = ":hello_race",
+)
+
+rust_binary(
+    name = "hello_race",
+    srcs = ["hello_race.rs"],
+    allocator = "malloc",
+    crate_root = "hello_race.rs",
+)
+
+rust_binary(
+    name = "hello_race_mini",
+    srcs = ["hello_race_mini.rs"],
+    allocator = "malloc",
+    crate_root = "hello_race_mini.rs",
+)
+
+buck_sh_test(
+    name = "run_flaky_cas_sequence",
+    args = [],
+    test = ":cas_sequence_easy_bin",
+)
+
+buck_sh_test(
+    name = "run_flaky_nanosleep-threads-simple",
+    args = [],
+    test = "//hermetic_infra/hermit/tests:nanosleep-threads-simple",
+)
+
+cpp_unittest(
+    name = "use_configurable_flaky_service",
+    srcs = [
+        "use_configurable_flaky_service.cpp",
+    ],
+    network_access = network_access_utils.all(),
+    deps = [
+        "fbsource//third-party/fmt:fmt",
+        "fbsource//third-party/googletest:gtest",
+        "//folly:format",
+    ],
+    external_deps = [
+        "curl",
+    ],
+)
+
+buck_sh_test(
+    name = "flaky_server_test",
+    args = [
+        "$(location //hermetic_infra/hermit/hermit-cli:hermit)",
+        "1",
+    ],
+    test = "external_flaky_service/flaky_server_test.sh",
+)

@@ -116,6 +116,10 @@ with open(args[args.index("--write-test-id") + 1], "w") as f:
 if os.environ.get("FAKE_BUCK2_TOUCH") and os.environ.get("FAKE_BUCK2_TOUCH_ONLY", target) == target:
     with open(os.environ["FAKE_BUCK2_TOUCH"], "a") as touched:
         touched.write("changed during the run\n")
+# FAKE_BUCK2_EMPTY names a group that runs no tests, as buck2 reports that.
+if os.environ.get("FAKE_BUCK2_EMPTY") == target.split(":", 1)[1]:
+    print("Tests finished: Pass 0. Fail 0. Timeout 0. Fatal 0. Skip 0. Omit 0. Infra Failure 0. Build failure 0")
+    print("NO TESTS RAN")
 if os.environ.get("FAKE_BUCK2_COMMIT"):
     subprocess.run(["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid",
                     "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null",
@@ -489,6 +493,31 @@ class RunTest(unittest.TestCase):
         self.assertEqual(calls[0]["env"]["E2E_IMPORT_RESULTS"], str(self.root / "import"))
         self.assertEqual(calls[0]["argv"][:3], ["run", "--repo-root", str(self.root / "checkout")])
 
+    def test_a_hybrid_group_that_ran_no_tests_gives_ingest_no_run_id(self):
+        # Since the third-party split no cell routes to RE: Tpx keeps no results for the
+        # RE invocation's test-run id, and listing them would fail ("Run ID ... not found").
+        runs = {"local": [ingest_test.execution(ingest_test.X, 100, "PASS", "rx1"), ingest_test.Y_PASSES]}
+        process = self.run_buck_e2e("hybrid", runs, buck2_status=0, FAKE_BUCK2_EMPTY="re")
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        self.assertIn("ci/buck-e2e/run: buck2 test (re) ran no tests; its test-run id re has no results to ingest",
+                      process.stderr)
+        self.assertEqual(len(calls_in(self.calls)), 1)
+
+    def test_an_empty_group_does_not_excuse_a_plan_cell_that_has_no_row(self):
+        runs = {"local": [ingest_test.Y_PASSES]}
+        process = self.run_buck_e2e("hybrid", runs, buck2_status=0, FAKE_BUCK2_EMPTY="re")
+        self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
+        self.assertIn("ingest: cells with neither a row nor a host-inapplicable claim from every execution: "
+                      "['t/x/custom@ptrace'] (1)", process.stderr)
+        self.assertIn("ingest.py could not turn the run's results into rows", process.stderr)
+        self.assertFalse(self.calls.exists() and calls_in(self.calls))
+
+    def test_a_run_in_which_no_invocation_ran_a_test_has_no_verdict(self):
+        process = self.run_buck_e2e("local", {}, buck2_status=0, FAKE_BUCK2_EMPTY="all")
+        self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
+        self.assertIn("ci/buck-e2e/run: no buck2 test invocation ran any test; the run has no verdict",
+                      process.stderr)
+
     def test_a_cell_withheld_on_every_re_worker_is_run_again_locally_and_judged(self):
         x_on_re = [ingest_test.withheld_on("re", ingest_test.X, 100, "rx1"),
                    ingest_test.withheld_on("re", ingest_test.X, 110, "rx2")]
@@ -775,14 +804,17 @@ sys.exit(int(os.environ.get("FAKE_RUN_RC", "0")))
 # buck2, for what validate-node asks of it: `log show FILE` prints FILE, which here holds the
 # JSON lines themselves (or fails, with FAKE_BUCK2_LOG_SHOW_FAILS, or never ends, with
 # FAKE_BUCK2_LOG_SHOW_HANGS), and `kill` appends a line to FAKE_BUCK2_KILLS, when set, and
-# exits FAKE_BUCK2_KILL_RC.
+# exits FAKE_BUCK2_KILL_RC. With FAKE_BUCK2_ORDER set, `log` and `kill` also append their
+# name to that file, so a test can see which the node asked for first.
 FAKE_NODE_BUCK2 = """#!/bin/sh
 case $1 in
     log)
+        if [ -n "${FAKE_BUCK2_ORDER:-}" ]; then echo log >>"$FAKE_BUCK2_ORDER"; fi
         if [ -n "${FAKE_BUCK2_LOG_SHOW_FAILS:-}" ]; then echo "buck2: cannot read $3" >&2; exit 3; fi
         if [ -n "${FAKE_BUCK2_LOG_SHOW_HANGS:-}" ]; then exec sleep 600; fi
         exec cat -- "$3" ;;
     kill)
+        if [ -n "${FAKE_BUCK2_ORDER:-}" ]; then echo kill >>"$FAKE_BUCK2_ORDER"; fi
         if [ -n "${FAKE_BUCK2_KILLS:-}" ]; then echo kill >>"$FAKE_BUCK2_KILLS"; fi
         exit "${FAKE_BUCK2_KILL_RC:-0}" ;;
 esac
@@ -1072,10 +1104,20 @@ class ValidateNodeTest(unittest.TestCase):
     def test_a_group_sigterm_is_recorded_as_a_signal_and_the_node_still_dies_of_it(self):
         results = self.root / "e2e-results"
         kills = self.root / "kills"
+        order = self.root / "order"
         for name, added in (("summaries that work", {}), ("a summary that stalls", {"FAKE_BUCK2_LOG_SHOW_HANGS": "1"})):
             with self.subTest(name):
                 kills.unlink(missing_ok=True)
-                process, elapsed = self.interrupt(results, FAKE_BUCK2_KILLS=str(kills), **added)
+                order.unlink(missing_ok=True)
+                process, elapsed = self.interrupt(results, FAKE_BUCK2_KILLS=str(kills),
+                                                   FAKE_BUCK2_ORDER=str(order), **added)
+                # The daemon stop comes before any record keeping (the stage
+                # summaries ask buck2 to `log show`): the DAG reaps the group
+                # 5 s after its SIGTERM, and record keeping under load once
+                # spent that whole window, leaving the daemon unstopped
+                # (dh-6aaks). This assertion fails on the old order.
+                self.assertEqual(order.read_text().splitlines()[0], "kill",
+                                 "the buck2 daemon was not stopped before keeping records")
                 stderr = (self.root / "node.stderr").read_text()
                 self.assertEqual(process.returncode, -signal.SIGTERM, stderr)
                 # The validation DAG reaps the group 5 s after its SIGTERM.

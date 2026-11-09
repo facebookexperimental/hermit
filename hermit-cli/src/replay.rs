@@ -75,8 +75,9 @@ impl Replay {
         let recording_version = &metadata.version;
         let replayer_version = &RECORD_VERSION;
         if !replayer_version.compatible_with(recording_version) {
-            return Err(anyhow::anyhow!(format!(
-                "Version mismatch, recording version {:?}, replayer version {:?}",
+            return Err(crate::metadata::record_format_refusal(format!(
+                "Version mismatch, recording version {:?}, replayer version {:?}; record it \
+                 again with this build, or replay it with the build that made it",
                 recording_version, replayer_version
             )));
         }
@@ -91,6 +92,11 @@ impl Replay {
 
         let mut config = record_or_replay_config(dir);
         config.replaying = true;
+        // The profile the recording ran, which `record` resolved before it
+        // started (absent in an old recording: x86-64-v2). Never the profile
+        // this invocation would choose, and never derived again from the
+        // program: a replay runs the CPU its recording saw.
+        config.cpu_profile = metadata.cpu_profile;
         // A v3 recording replays only on a host that qualifies with the same
         // host facts, under the same table
         // (https://github.com/rrnewton/hermit/issues/4243).
@@ -113,7 +119,6 @@ impl Replay {
                 ))
                 .into());
             }
-            config.cpu_profile = metadata.cpu_profile;
             config.cpu_profile_host = Some(recorded);
         }
         // Recorder events contain the raw bytes from the recording namespace.
@@ -129,6 +134,15 @@ impl Replay {
         // The recording's `/proc` level: a replay sees the names its recording
         // saw.
         config.proc_level = metadata.proc_level.unwrap_or_default();
+        // The recording's schedule: a chaos recording replays under its seed.
+        metadata.schedule.apply(&mut config);
+        // The RCB coordinates the event stream counts: admit only this
+        // replay's own identity, before the chroot or any guest exists.
+        crate::metadata::admit_recorded_rcb_identity(
+            &config,
+            &metadata,
+            &format!("hermit replay {}", dir.display()),
+        )?;
         let sequentialize_threads = config.sequentialize_threads;
 
         let (chroot, bootstrap_program, materialization_scope, replay_mounts) =
@@ -182,6 +196,8 @@ impl Replay {
         crate::cpu_profile_admission::refuse_unadmitted_launch(&config, true)?;
         // A sequentialized replay tells gdbserver not to serialize guests,
         // because Detcore already does.
+        let gdbserver = gdbserver.map(crate::gdbserver::connection).transpose()?;
+        crate::install_fatal_core_register_reader();
         let tracer =
             hermit_replay::spawn_tracer(command, config, gdbserver, sequentialize_threads).await?;
         let proc_readonly = crate::proc_mount::guest_proc_readonly(tracer.guest_pid());
@@ -205,8 +221,15 @@ impl Replay {
             _materialization_scope,
         } = self;
         let (exit_status, global_state) = crate::ptrace_completion::wait(tracer, control).await?;
+        let terminal_outcome = global_state.terminal_outcome();
         let finalized = global_state.clean_up(false, &None).await;
         finish_replay_chroot(finalized, chroot)?;
+        // A recording of a deadlocked guest replays to the same deadlock.
+        if let Some(outcome) = terminal_outcome {
+            return Err(crate::Error::new(crate::SchedulerEndedRun::new(
+                outcome, None,
+            )));
+        }
         Ok(exit_status)
     }
 
@@ -222,8 +245,15 @@ impl Replay {
         } = self;
         let (output, global_state) =
             crate::ptrace_completion::wait_with_output(tracer, control).await?;
+        let terminal_outcome = global_state.terminal_outcome();
         let finalized = global_state.clean_up(false, &None).await;
         finish_replay_chroot(finalized, chroot)?;
+        if let Some(outcome) = terminal_outcome {
+            return Err(crate::Error::new(crate::SchedulerEndedRun::new(
+                outcome,
+                Some(output),
+            )));
+        }
         Ok(output)
     }
 }
@@ -615,6 +645,96 @@ mod tests {
             error.contains("Version mismatch, recording version RecordVersion(290)"),
             "unexpected refusal: {error}"
         );
+    }
+
+    /// Conservative Unix pairing changes which SCM_RIGHTS fstat probes enter
+    /// a binary recording. The preceding epoch must be refused before any
+    /// guest or event stream is opened, not accepted until a later desync.
+    #[tokio::test]
+    async fn replay_refuses_recordings_from_before_conservative_unix_pairing() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = serde_json::json!({
+            "exe": "/hermit-version-regression/must-not-start",
+            "program": "must-not-start",
+            "arg0": "must-not-start",
+            "args": [],
+            "current_dir": "/",
+            "hostname": null,
+            "domainname": null,
+            "envs": {},
+            "version": 0x196,
+        });
+        fs::write(
+            dir.path().join(crate::consts::METADATA_NAME),
+            metadata.to_string(),
+        )
+        .unwrap();
+        let error = match Replay::spawn(dir.path(), false, None, &[]).await {
+            Ok(_) => panic!("replay accepted the pre-pairing 0x196 recording"),
+            Err(error) => error,
+        };
+        assert!(
+            error.is::<detcore::preemptions::RecordFormatRefusal>(),
+            "a version mismatch is the policy refusal, not an internal failure: {error:#}"
+        );
+        let error = error.to_string();
+        assert!(
+            error.contains("Version mismatch, recording version RecordVersion(406)"),
+            "the old epoch must be refused before guest startup: {error}"
+        );
+        assert!(
+            error.contains(&format!("replayer version {RECORD_VERSION:?}")),
+            "the refusal must identify this replayer's epoch: {error}"
+        );
+    }
+
+    /// A recording at the current epoch states the RCB identity its event
+    /// stream counts: none stated, one this build does not know, and one
+    /// for another (backend-local) clock are each the typed policy
+    /// refusal before the guest starts, not an internal failure.
+    #[tokio::test]
+    async fn replay_refuses_a_recording_without_this_runs_rcb_identity() {
+        for (identity, cause) in [
+            (None, "states no RCB coordinate identity"),
+            (
+                Some(serde_json::json!("rcb:cond-retired:user:v9")),
+                "unknown RCB coordinate identity",
+            ),
+            (
+                Some(serde_json::json!({"backend_local": "test:other-clock:v1"})),
+                "test:other-clock:v1",
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut metadata = serde_json::json!({
+                "exe": "/bin/true",
+                "program": "true",
+                "arg0": "true",
+                "args": [],
+                "current_dir": "/",
+                "hostname": null,
+                "domainname": null,
+                "envs": {},
+                "version": serde_json::to_value(RECORD_VERSION).unwrap(),
+            });
+            if let Some(identity) = identity {
+                metadata["rcb_identity"] = identity;
+            }
+            fs::write(
+                dir.path().join(crate::consts::METADATA_NAME),
+                metadata.to_string(),
+            )
+            .unwrap();
+            let error = match Replay::spawn(dir.path(), false, None, &[]).await {
+                Ok(_) => panic!("replay accepted a recording without this run's RCB identity"),
+                Err(error) => error,
+            };
+            assert!(
+                error.is::<detcore::preemptions::RecordFormatRefusal>(),
+                "{error:#}"
+            );
+            assert!(format!("{error:#}").contains(cause), "{error:#}");
+        }
     }
 
     /// A recording whose run recorded a replay refusal is refused before the

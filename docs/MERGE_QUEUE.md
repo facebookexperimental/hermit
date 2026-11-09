@@ -239,3 +239,5 @@ update atomic.
 
 GitHub's merge queue may still be used as a convenience, but it does not
 supersede the owner-authorized direct fast-forward path.
+
+> Landing a large chain? Run `ci/recount-pins RECEIPT.json` at the composed tip first and apply its diff, so pinned counts move with the measured run instead of by hand.

@@ -15,6 +15,8 @@ use std::time::Instant;
 
 use clap::Parser;
 use colored::Colorize;
+use detcore_model::HERMIT_GUEST_DEADLOCK_EXIT;
+use detcore_model::HERMIT_MODEL_DEADLOCK_LINE;
 use detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
 use rand::RngExt as _;
 
@@ -24,7 +26,7 @@ use crate::cli_wrapper::*;
 
 /// Attempts at one iteration while Hermit refuses its runs for PMU skid
 /// overshoot.
-const SKID_ATTEMPTS: u32 = 4;
+const SKID_ATTEMPTS: u32 = detcore_model::SKID_RETRY_MAX_ATTEMPTS;
 
 /// The prefix of the line Hermit prints when it refuses a run for PMU skid
 /// overshoot (`classify_failure` in hermit-cli/src/bin/hermit/main.rs).
@@ -34,11 +36,20 @@ const SKID_OVERSHOOT_REFUSAL_PREFIX: &str =
 /// Hermit's own outcomes that no guest produced, each the exit status from the
 /// allocation table in hermit-cli/src/lib.rs with the stderr marker that tells
 /// it apart from a guest choosing the same status. A run that ends in one of
-/// these says nothing about the guest.
-const HERMIT_OUTCOMES: [(i32, &str); 5] = [
+/// these says nothing certain about the guest. That includes a deadlock under
+/// Hermit's model: no wake Detcore models can reach the guest, which is a
+/// native hang only when that model is complete for the program. It includes
+/// a `--virtual-timeout` stop too (`class=virtual-timeout`, the status of
+/// `--timeout`'s `class=run-timeout`): the bound is Hermit's, the guest had
+/// not finished, and a gap in the model (a missed wake turned into a spin-poll)
+/// can be what ran the clock past it, so it ends the search as a deadlock does
+/// instead of counting as the guest failing under that schedule.
+const HERMIT_OUTCOMES: [(i32, &str); 7] = [
+    (HERMIT_GUEST_DEADLOCK_EXIT, HERMIT_MODEL_DEADLOCK_LINE),
     (HERMIT_POLICY_REFUSAL_EXIT, "HERMIT_POLICY_REFUSAL "),
     (123, "HERMIT_LOG_CAP "),
-    (124, "HERMIT_RUN_TIMEOUT "),
+    (124, "HERMIT_RUN_TIMEOUT class=run-timeout"),
+    (124, "HERMIT_RUN_TIMEOUT class=virtual-timeout "),
     (124, "HERMIT_RUN_TIMEOUT_FALLBACK"),
     (125, "HERMIT_INTERNAL_FAILURE "),
 ];
@@ -182,7 +193,8 @@ impl ChaosStressOpts {
                         attempt += 1;
                     }
                     RunOutcome::SkidRefused(refusal) => anyhow::bail!(
-                        "Hermit refused run #{i} for PMU skid overshoot on all {SKID_ATTEMPTS} attempts: {refusal}"
+                        "Hermit refused run #{i} for PMU skid overshoot on all {SKID_ATTEMPTS} attempts; verdict {} (not a test failure): {refusal}",
+                        detcore_model::SKID_INFRA_VERDICT
                     ),
                     outcome => break outcome,
                 }
@@ -235,6 +247,41 @@ mod tests {
             classify(exited(1), "HERMIT_INTERNAL_FAILURE class=cli-error\n").unwrap(),
             RunOutcome::Failed
         );
+        // A deadlock under Hermit's model is not counted as the guest
+        // failing: Hermit's model, not the guest, decided it. A guest that
+        // exits 121 itself, with no class line, still fails.
+        let deadlock = classify(
+            exited(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+            "Deadlock detected: thread(s) waiting on futex, but no runnable threads left.\n\
+             HERMIT_MODEL_DEADLOCK class=deadlock-under-hermit-model\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            deadlock.contains("HERMIT_MODEL_DEADLOCK class=deadlock-under-hermit-model"),
+            "{deadlock}"
+        );
+        assert_eq!(
+            classify(exited(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT), "").unwrap(),
+            RunOutcome::Failed
+        );
+        // Nor is a schedule that ran the guest past --virtual-timeout: the
+        // bound is Hermit's, and the guest had not finished. A guest that
+        // exits 124 itself, with no class line, still fails.
+        let virtual_timeout = classify(
+            exited(124),
+            "Virtual timeout: at scheduler turn 15, the run's virtual clock is 4004335665 ns \
+             past its start, beyond --virtual-timeout=3500000000; no further turn is \
+             granted.\nHERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns=3500000000\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            virtual_timeout
+                .contains("HERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns=3500000000"),
+            "{virtual_timeout}"
+        );
+        assert_eq!(classify(exited(124), "").unwrap(), RunOutcome::Failed);
     }
 
     #[test]
@@ -260,6 +307,7 @@ mod tests {
             (122, "HERMIT_POLICY_REFUSAL class=policy-refusal\n"),
             (123, "HERMIT_LOG_CAP class=log-cap\n"),
             (124, "HERMIT_RUN_TIMEOUT class=run-timeout\n"),
+            (124, "HERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns=1\n"),
             (125, "HERMIT_INTERNAL_FAILURE class=container-child-panic\n"),
         ] {
             let error = classify(exited(code), stderr).unwrap_err().to_string();

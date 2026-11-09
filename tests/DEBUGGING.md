@@ -155,6 +155,63 @@ source bytes.
 
 # compat
 
+## compat/javac
+
+### 2026-11-06T02:46:31-05:00 — portable / replay / ptrace — ERROR
+
+- Hermit: `3d0e7775bcdef3ef0ac58ed359b7ada452f77f6c`; tree:
+  `a67d4b36fe2f4354f59b130f75389fb509731cd1`; binary: the pinned-root
+  validate-profile build (`target/debug/hermit` sha256 prefix
+  `5b2a9ff03f9e9d54` for the companion local build).
+- Command: off-record `--requalify-cell compat/javac replay ptrace`
+  (`scripts/validate.rs --allow-local-off-the-record-run`); run
+  exit 0 only after retry: attempt 1 `ERROR`/`no_result`/`incomplete-verification-evidence`
+  (13,301 ms), attempt 2 `PASS` (22,630 ms), so the sample is `flaky`
+  (1 ERROR, 1 PASS). Same first-attempt signature as merge-queue run
+  `20261106T052002Z` batch `0010-batch` at `858629ebdbfa`, and as
+  5199's split-cell reds at `e0a711220e` (java-run twice,
+  javac-run and javac-compile once each, `/tmp/hsperfdata_root/15`).
+- Evidence:
+  `ignored/validate/e2e/validate-cell-requalification-3d0e7775bcde-20261106T072925Z-3808091-1793950165410082310/portable/manifest_compat/results.jsonl`
+  and the retained
+  `compat-javac-replay-ptrace/verify-runs/1/run1/run.log` (record) and
+  `run2/run.log` (replay) beside it.
+- Observed: replay refuses descriptor 6 at `flock(6, 6)`:
+  `recorded open of "/tmp/hsperfdata_root/9" does not resolve to a lockable object beneath the replay root ("/tmp/hsperfdata_root/9" cannot be resolved: No such file or directory (os error 2))`.
+  The record log shows why (dtid 11, javac pid 9): `getdents64` on
+  `/tmp/hsperfdata_root` lists a pre-existing `9`, then
+  `openat(AT_FDCWD, "9", O_CLOEXEC) = Ok(6)` (syscall 134),
+  `flock(6, 6) = Ok(0)` (137), `unlink("9") = Ok(0)` (139) — the JVM's
+  stale perf-data cleanup — before its own
+  `openat(..., "9", O_CREAT|O_RDWR) = Ok(6)` (158) and `flock` (164).
+- Current explanation: the stale file is external state in the shared
+  pinned-root `/tmp`, not anything the recording created. The record
+  leg deletes it for real, so at replay the recorded non-`O_CREAT`
+  open names an object that does not exist beneath the replay root,
+  and there is no replay-owned object to lock. Whether attempt 1
+  fails depends on whether another JVM has since recreated a stale
+  pid file in the shared `/tmp`; the split cells' concurrent JVMs
+  raise that rate. `-XX:-UsePerfData` makes the JVM neither
+  create nor clean perf-data files (verified natively on the pinned
+  OpenJDK 21.0.12: a planted stale file survives with the flag and
+  is deleted without it; `TMPDIR`/`-Djava.io.tmpdir` do not move
+  hsperfdata). The flag landed folded into the split
+  java/javac rows via 5199 (folded head
+  `be927c9a840333dad8ed51f39834367f3891f41a`, workload hunks from
+  5205 at `43f8bcc959`), at the measured cost of the discarded
+  second-JVM warm-ups and 28 lines / 39-40 regions of Hermit coverage
+  (measured in-slot pre/post-flag pair diffs at the rebased head (same instrumented binary and commands; pre-flag workload from be927c9a8^): java pair 29356 -> 29328 covered source lines (lost 28, gained 0) and 42296 -> 42258 regions (lost 39, gained 1); javac pair 29231 -> 29203 lines (lost 28) and 42092 -> 42052 regions (lost 40); lost lines are the perf-data startup path in detcore (lib.rs:7436, scheduler.rs:12599, syscalls/files.rs, descriptor_directory.rs, rendered_procfs.rs), identical in both pairs; reports target/hermit-code-coverage/diffs/{java,javac}-split-preflag-main-vs-{java,javac}-split-postflag-main.md in the museskid slot). Replay still refuses by named gate
+  rather than inventing an object for a recorded open it cannot
+  resolve.
+- Ruled out / next: not a scheduling or recorded-base divergence —
+  record and replay DETLOGs agree line-for-line through the flock
+  inbound. At the combined-row flag head `43f8bcc959`, five
+  `--requalify-cell compat/javac replay ptrace` runs passed on
+  attempt 1 (run ids `20261106T075303Z`, `T075911Z`, `T080403Z`,
+  `T080840Z`, `T081339Z`). Next: the queue first-attempt tally
+  (about five validations on a base containing `97bca3b00d`) for
+  dh-gg5uv before this entry is removed.
+
 ## compat/lsof
 
 ### 2026-10-07T16:46:19-04:00 — buck / verify / ptrace — FAIL
@@ -354,7 +411,7 @@ Reverie commit `1393db6279331feb4af2533220e4786ab104a1b9` was not reachable
 from then-current `reverie/main` `ab07a89239150df3726a036bee9f5e897893dfc1`.
 Only 2 nodes executed; 64 were dependency-skipped and 2 were host-inapplicable.
 No individual test ID ran. The durable full log is
-`/home/newton/work/dev-hermit/ignored/validate/validate-full-ff125248383e-validate-hermit-134-debug-guide-ff125248383e.log`
+`<dev-hermit>/ignored/validate/validate-full-ff125248383e-validate-hermit-134-debug-guide-ff125248383e.log`
 and the ledger event is `devbig014-1787831073-3959920`.
 
 A focused remeasurement of the 28 inherited IDs was therefore started at the
@@ -370,14 +427,14 @@ it cannot discover a newly failing ID outside the inherited 28-ID population.
 Primary retained evidence:
 
 - prior full log:
-  `/home/newton/work/dev-hermit/ignored/validate/validate-full-a6b0c37648df-validate-hermit-137-a6b0c37648df-1787798057339452591-387681-9a8a881f.log`
+  `<dev-hermit>/ignored/validate/validate-full-a6b0c37648df-validate-hermit-137-a6b0c37648df-1787798057339452591-387681-9a8a881f.log`
 - prior artifacts:
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-137-a6b0c37648df-1787798057339452591-387681-9a8a881f/`
+  `<dev-hermit>/ignored/validate/artifacts/validate-hermit-137-a6b0c37648df-1787798057339452591-387681-9a8a881f/`
 - prior ledger event: `devbig014-1787800082-538574`
 - focused current-main attempt 1 stderr:
-  `/home/newton/work/dev-hermit/ignored/validate/validate-hermit-134-focused-6172478eae28-5.stderr.log`
+  `<dev-hermit>/ignored/validate/validate-hermit-134-focused-6172478eae28-5.stderr.log`
 - focused current-main attempt 2 stderr:
-  `/home/newton/work/dev-hermit/ignored/validate/validate-hermit-134-focused-6172478eae28-6.stderr.log`
+  `<dev-hermit>/ignored/validate/validate-hermit-134-focused-6172478eae28-6.stderr.log`
 
 ## Focused observations at `6172478eae28`
 
@@ -468,9 +525,9 @@ from Reverie `ab07a89239150df3726a036bee9f5e897893dfc1`. It produced two
 passes, the three earlier test-specific failures described below, and one
 `simple_env_shebang` failure with a single process image missing `FINAL`; none
 of the six results contained `UnexpectedEnd`. The retained node log is
-`/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-141-4944fb5b3cc0-1787834650301238559-798721-c47ac7c9/dagrun/test.cli.log`,
+`<dev-hermit>/ignored/validate/artifacts/validate-hermit-141-4944fb5b3cc0-1787834650301238559-798721-c47ac7c9/dagrun/test.cli.log`,
 and the full validate log is
-`/home/newton/work/dev-hermit/ignored/validate/validate-hermit-141-4944fb5b3cc0-1787834650301238559-798721-c47ac7c9.log`.
+`<dev-hermit>/ignored/validate/validate-hermit-141-4944fb5b3cc0-1787834650301238559-798721-c47ac7c9.log`.
 Hermit source also changed between `6172478eae28` and `4944fb5b3cc0`, so this
 is not same-SHA causal proof that the stale client alone caused the earlier
 shared failure. Pull request 2731 only changes retained-log names and tightens
@@ -502,7 +559,7 @@ stated explicitly.
 - Last retained green: `PASS 9.984s` at Hermit
   `f77d7c44067a12ba11e75b5a85864ce0bc23e8f4`, run finished
   `2026-08-26T23:24:13.766596Z`; exact line in
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-105-f77d7c44067a-1787783997/dagrun/test.app_strict_verify.log`.
+  `<dev-hermit>/ignored/validate/artifacts/validate-hermit-105-f77d7c44067a-1787783997/dagrun/test.app_strict_verify.log`.
 - Findings: one attempt hit the cap and one produced a real L2 mismatch. Do not
   combine those as one cause. The retained failure does not yet localize the
   first divergent record.
@@ -526,7 +583,7 @@ stated explicitly.
   2026-07-25, in `hermit-cli/src/bin/hermit/run.rs`.
 - Last retained green before diagnosis: `PASS 0.004s` at
   `f77d7c44067a12ba11e75b5a85864ce0bc23e8f4`, in
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-105-f77d7c44067a-1787783997/dagrun/test.hermit_unit.log`.
+  `<dev-hermit>/ignored/validate/artifacts/validate-hermit-105-f77d7c44067a-1787783997/dagrun/test.hermit_unit.log`.
 - Findings: `NamedTempFile` follows `TMPDIR`, while validate redirects `TMPDIR`
   away from literal `/tmp`. This was a test environment assumption, not a
   product failure. Commit `e2d89097f1baa8af260c68994201121ac4c557da`
@@ -542,7 +599,7 @@ stated explicitly.
 - Last retained green: `PASS 28.818s` at
   `f630aef3d18e87e49a1e099a5bcf4d2bf43987d1`, run finished
   `2026-08-27T10:51:24.977917Z`, in
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-130-f630aef3d18e-1787825672660163077-1370230-b619c59f/dagrun/test.cli.log`.
+  `<dev-hermit>/ignored/validate/artifacts/validate-hermit-130-f630aef3d18e-1787825672660163077-1370230-b619c59f/dagrun/test.cli.log`.
   That overall run was a non-verdict; the individual PASS line remains direct
   evidence.
 - Findings: the green observation consumed 28.818 of its 30 seconds, so the
@@ -558,7 +615,7 @@ stated explicitly.
 - Last retained green: `PASS 1.989s` at
   `8e2579d4f0640414f563a3f9f5e6eb4c21a0c884`, run finished
   `2026-08-26T20:55:44.967642Z`, in
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-001-8e2579d4f064-1787774099/dagrun/test.cli.log`.
+  `<dev-hermit>/ignored/validate/artifacts/validate-hermit-001-8e2579d4f064-1787774099/dagrun/test.cli.log`.
 - Findings: this is a DBT copied-process path. Earlier apparent DBT failures
   caused by building without `third-party-backends` were separately fixed by
   `740cc656`; the failing a6 run did build those features, so that older
@@ -575,7 +632,7 @@ stated explicitly.
 - Last retained green: `PASS 0.455s` at
   `d19c112c7035672437b2a78d90a42fe7d690c6cb`, run finished
   `2026-08-25T11:26:31.756955Z`, in
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-014-d19c112c7035-1787655221/dagrun/test.cli.log`.
+  `<dev-hermit>/ignored/validate/artifacts/validate-hermit-014-d19c112c7035-1787655221/dagrun/test.cli.log`.
 - Findings: this is an ESRCH/self-signal failure, distinct from the missing
   backend build configuration fixed by `740cc656`. The clean matched run at
   `4944fb5b3cc029459056a3b9743f0d0df3ad0209` reached the same historical
@@ -647,7 +704,7 @@ stated explicitly.
   in `hermit-cli/tests/cli.rs`.
 - Last retained green: `PASS 2.572s` at Hermit
   `4944fb5b3cc029459056a3b9743f0d0df3ad0209`, in
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-141-4944fb5b3cc0-1787834650301238559-798721-c47ac7c9/dagrun/test.cli.log`.
+  `<dev-hermit>/ignored/validate/artifacts/validate-hermit-141-4944fb5b3cc0-1787834650301238559-798721-c47ac7c9/dagrun/test.cli.log`.
 - Findings: prior triage associates the failure with DBT process identity. The
   retained a6 failure does not isolate one identity syscall, so resume from the
   full stderr rather than assuming it is the same `prlimit64` failure. The
@@ -666,7 +723,7 @@ stated explicitly.
 - Last retained green: `PASS 0.012s` at
   `992b7eb5b7922d55233ceda5a29afedcace03242`, run finished
   `2026-08-25T15:21:08.052800Z`, in
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-005-992b7eb5b792-1787669771/dagrun/test.cli.log`.
+  `<dev-hermit>/ignored/validate/artifacts/validate-hermit-005-992b7eb5b792-1787669771/dagrun/test.cli.log`.
 - Findings: the expected-refusal test was itself rejected earlier than the
   assertion it meant to exercise. The dedicated staging fix was developed as
   `8f7b74095e57aaea73bd5e0539b92622a6a6003a`, but that commit is not an
@@ -705,7 +762,7 @@ stated explicitly.
   2026-07-27, in `hermit-cli/tests/command_strict_verify.rs`.
 - Last retained green: `PASS 1.735s` at
   `f77d7c44067a12ba11e75b5a85864ce0bc23e8f4`, in
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-105-f77d7c44067a-1787783997/dagrun/test.command_strict_verify.log`.
+  `<dev-hermit>/ignored/validate/artifacts/validate-hermit-105-f77d7c44067a-1787783997/dagrun/test.command_strict_verify.log`.
 - Findings: this is a strict-verification failure in `findmnt`, not a timeout.
   No narrower retained root cause was found.
 
@@ -719,7 +776,7 @@ stated explicitly.
 - Last retained green: `PASS 0.238s` at
   `55cb93a9fd76ddba7c9de853e2ce6bee012c1708`, run finished
   `2026-08-25T14:50:30Z`, in
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-004-55cb93a9fd76-1787667933/dagrun/test.hermit_modes.log`.
+  `<dev-hermit>/ignored/validate/artifacts/validate-hermit-004-55cb93a9fd76-1787667933/dagrun/test.hermit_modes.log`.
 - Findings: the onset was narrowed to `556efd6f9e` against parent
   `9f258c6c64`, each checked three times. The verifier correctly finds the
   intended exit-status divergence, but returns Hermit's internal-failure status
@@ -762,7 +819,7 @@ stated explicitly.
   2026-07-26, in `hermit-cli/tests/liteinst_advanced.rs`.
 - Last retained green: `PASS 6.618s` at
   `55cb93a9fd76ddba7c9de853e2ce6bee012c1708`, in
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-004-55cb93a9fd76-1787667933/dagrun/test.liteinst_strict.log`.
+  `<dev-hermit>/ignored/validate/artifacts/validate-hermit-004-55cb93a9fd76-1787667933/dagrun/test.liteinst_strict.log`.
 - Findings: reproduced with a matching release Hermit/runtime, so it is not the
   missing-revision staging problem. Activation succeeds, then the unsupported
   fork path reaches cancellation cleanup and that cleanup is not acknowledged.
@@ -807,16 +864,16 @@ stated explicitly.
   2026-07-31, in `hermit-cli/tests/sabre_examples.rs`.
 - Last retained green: `PASS 12.814s` at
   `55cb93a9fd76ddba7c9de853e2ce6bee012c1708`, in
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-004-55cb93a9fd76-1787667933/dagrun/test.sabre_examples.log`.
+  `<dev-hermit>/ignored/validate/artifacts/validate-hermit-004-55cb93a9fd76-1787667933/dagrun/test.sabre_examples.log`.
 - Findings: separate retained diagnosis shows a real SaBRe divergence in
   CPython shutdown/glibc arena trimming: the two runs had 2,989 versus 2,985
   syscall records and first differed at `madvise` address/length and virtual
   time. That rules out record loss, I/O-buffer content, native CPython, ptrace,
   and a minimal C allocator guest. A shared-address-space explanation remains
   unproved. Retained diagnosis directories are
-  `/home/newton/work/dev-hermit/ignored/sabre-verify`, `sv-bin`, `sv-run1`,
+  `<dev-hermit>/ignored/sabre-verify`, `sv-bin`, `sv-run1`,
   `sv-rep1`, `sv-rep2`, `sv-rep3`, `sv-noverify`, `sv-nv2`, `sv-c`, and
-  `sv-native` below `/home/newton/work/dev-hermit/ignored/`.
+  `sv-native` below `<dev-hermit>/ignored/`.
 
 ### `hermit::signal_determinism$sigsuspend_without_signal_reports_terminal_deadlock`
 
@@ -826,7 +883,7 @@ stated explicitly.
   2026-08-12, in `hermit-cli/tests/signal_determinism.rs`.
 - Last retained green before the failing observation: `PASS 0.181s` at
   `55cb93a9fd76ddba7c9de853e2ce6bee012c1708`, in
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-004-55cb93a9fd76-1787667933/dagrun/test.hermit_integration.log`.
+  `<dev-hermit>/ignored/validate/artifacts/validate-hermit-004-55cb93a9fd76-1787667933/dagrun/test.hermit_integration.log`.
 - Findings: the scheduler did not hang; the test had a stale exit-status literal
   after `556efd6f9e`. Commit `2dd8565bee2d13e7fa42edd1f5d6987f4e4191bf`
   replaced it with `HERMIT_INTERNAL_FAILURE_EXIT` and is on current main. No
@@ -857,7 +914,7 @@ stated explicitly.
   (author date 2026-08-06), in `hermit-cli/tests/cli.rs`.
 - Last retained green: `PASS 0.912s` at Hermit
   `4944fb5b3cc029459056a3b9743f0d0df3ad0209`, in
-  `/home/newton/work/dev-hermit/ignored/validate/artifacts/validate-hermit-141-4944fb5b3cc0-1787834650301238559-798721-c47ac7c9/dagrun/test.cli.log`.
+  `<dev-hermit>/ignored/validate/artifacts/validate-hermit-141-4944fb5b3cc0-1787834650301238559-798721-c47ac7c9/dagrun/test.cli.log`.
 - Findings: the comparator was stable. DBT `wait4`/`waitid` fell back to
   host-timed `InternalIOPolling`, so physical child readiness changed protected
   scheduler records while guest stdout and status agreed. The repair landed via

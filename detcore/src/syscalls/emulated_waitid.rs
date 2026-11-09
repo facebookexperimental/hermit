@@ -533,8 +533,9 @@ mod tests {
             &self,
             message: <GlobalState as GlobalTool>::Request,
         ) -> <GlobalState as GlobalTool>::Response {
-            let GlobalRequest::ConsumeChildWait(parent, child) = message.2 else {
-                panic!("unexpected RPC after private proof: {:?}", message.2);
+            let request = crate::tool_global::without_cpu_publication(message.2);
+            let GlobalRequest::ConsumeChildWait(parent, child) = request else {
+                panic!("unexpected RPC after private proof: {:?}", request);
             };
             assert_eq!(parent, DetPid::from_raw(3));
             assert_eq!(child, DetPid::from_raw(7));

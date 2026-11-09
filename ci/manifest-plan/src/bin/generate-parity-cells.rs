@@ -8,9 +8,10 @@ use std::fs;
 use std::process::ExitCode;
 
 use hermit_manifest_plan::cli_help::is_help_flag;
+use hermit_manifest_plan::parity::PARITY_CELLS_DIR;
 use hermit_manifest_plan::parity::PARITY_CELLS_PATH;
+use hermit_manifest_plan::parity::PARITY_CELLS_REGENERATE;
 use hermit_manifest_plan::parity::ParityCells;
-use hermit_manifest_plan::parity::canonical_text;
 use hermit_manifest_plan::parity::generate;
 use hermit_manifest_plan::parity::require_fresh;
 use hermit_manifest_plan::validation_dag::repo_root;
@@ -85,18 +86,67 @@ fn run() -> Result<(), String> {
     }
     let write = mode == Some("--write");
     let root = repo_root()?;
-    let path = root.join(PARITY_CELLS_PATH);
+    let dir = root.join(PARITY_CELLS_DIR);
     let snapshot = generate(&root)?;
-    let generated = canonical_text(&snapshot)?;
+    let shards = hermit_manifest_plan::parity::shard_texts(&snapshot)?;
     if write {
-        fs::write(&path, &generated)
-            .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
-        println!("wrote {} ({} bytes)", path.display(), generated.len());
+        fs::create_dir_all(&dir)
+            .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+        for entry in
+            fs::read_dir(&dir).map_err(|error| format!("cannot list {}: {error}", dir.display()))?
+        {
+            let entry = entry.map_err(|error| format!("cannot list {}: {error}", dir.display()))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".json") && !shards.contains_key(&name) {
+                fs::remove_file(entry.path()).map_err(|error| {
+                    format!(
+                        "cannot remove stale shard {}: {error}",
+                        entry.path().display()
+                    )
+                })?;
+            }
+        }
+        for (name, text) in &shards {
+            let path = dir.join(name);
+            fs::write(&path, text)
+                .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
+            println!("wrote {} ({} bytes)", path.display(), text.len());
+        }
+        let legacy = root.join(PARITY_CELLS_PATH);
+        if legacy.exists() {
+            fs::remove_file(&legacy)
+                .map_err(|error| format!("cannot remove {}: {error}", legacy.display()))?;
+            println!("removed superseded {}", legacy.display());
+        }
     } else {
-        let committed = fs::read_to_string(&path)
-            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-        require_fresh(&committed, &generated)?;
-        println!("{PARITY_CELLS_PATH} is canonical and fresh");
+        if root.join(PARITY_CELLS_PATH).exists() {
+            return Err(format!(
+                "{PARITY_CELLS_PATH} still exists beside the sharded {PARITY_CELLS_DIR}/; \
+                 regenerate with: {PARITY_CELLS_REGENERATE}"
+            ));
+        }
+        let mut committed_names: Vec<String> = fs::read_dir(&dir)
+            .map_err(|error| format!("cannot list {}: {error}", dir.display()))?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".json"))
+            .collect();
+        committed_names.sort();
+        let generated_names: Vec<String> = shards.keys().cloned().collect();
+        if committed_names != generated_names {
+            return Err(format!(
+                "{PARITY_CELLS_DIR} shard set differs (committed {committed_names:?}, generated \
+                 {generated_names:?}); regenerate with: {PARITY_CELLS_REGENERATE}"
+            ));
+        }
+        for (name, generated) in &shards {
+            let path = dir.join(name);
+            let committed = fs::read_to_string(&path)
+                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+            require_fresh(&committed, generated)
+                .map_err(|error| format!("{PARITY_CELLS_DIR}/{name}: {error}"))?;
+        }
+        println!("{PARITY_CELLS_DIR}/ is canonical and fresh");
     }
     println!("{}", summary(&snapshot));
     Ok(())

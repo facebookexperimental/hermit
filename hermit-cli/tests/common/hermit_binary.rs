@@ -21,11 +21,12 @@ use std::sync::OnceLock;
 pub mod skid_overshoot;
 
 /// Attempts a Hermit run gets when Hermit refuses it for a late PMU interrupt
-/// (exit 122, `cause=skid-overshoot`). A refusal measures the host's
-/// interrupt latency under load, not the guest
+/// (exit 122, `cause=skid-overshoot`): the one shared skid budget
+/// ([`detcore_model::SKID_RETRY_MAX_ATTEMPTS`]). A refusal measures the
+/// host's interrupt latency under load, not the guest
 /// (https://github.com/rrnewton/hermit/issues/1845).
 #[allow(dead_code)]
-pub const SKID_ATTEMPTS: u32 = 5;
+pub const SKID_ATTEMPTS: u32 = detcore_model::SKID_RETRY_MAX_ATTEMPTS;
 
 /// Run `command` (a direct or timeout-wrapped Hermit command), and run it
 /// again, up to [`SKID_ATTEMPTS`] in all, only after an attempt whose output
@@ -44,12 +45,17 @@ pub fn hermit_output(label: &str, command: &mut Command) -> Output {
 #[allow(dead_code)]
 pub fn hermit_output_attempts(label: &str, max_attempts: u32, command: &mut Command) -> Output {
     pin_canonical_epoch(command);
-    skid_overshoot::retry_typed_skid_refusal(label, max_attempts, || {
-        let output = command
-            .output()
-            .unwrap_or_else(|error| panic!("failed to start {label}: {command:?}: {error}"));
-        (output, ())
-    })
+    skid_overshoot::retry_typed_skid_refusal(
+        label,
+        max_attempts,
+        || {
+            let output = command
+                .output()
+                .unwrap_or_else(|error| panic!("failed to start {label}: {command:?}: {error}"));
+            (output, ())
+        },
+        &|_| {},
+    )
     .1
 }
 
@@ -59,7 +65,8 @@ pub fn hermit_output_attempts(label: &str, max_attempts: u32, command: &mut Comm
 /// the state of the attempt that is returned comes back with it.
 #[allow(dead_code)]
 pub fn hermit_output_with<T>(label: &str, attempt: impl FnMut() -> (Output, T)) -> (Output, T) {
-    let (_, output, kept) = skid_overshoot::retry_typed_skid_refusal(label, SKID_ATTEMPTS, attempt);
+    let (_, output, kept) =
+        skid_overshoot::retry_typed_skid_refusal(label, SKID_ATTEMPTS, attempt, &|_| {});
     (output, kept)
 }
 
@@ -196,6 +203,28 @@ pub fn pin_canonical_epoch(command: &mut Command) {
     {
         command.env("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH);
     }
+    isolate_cache_home(command);
+}
+
+/// Point a Hermit command's `XDG_CACHE_HOME` at a directory of this test
+/// process's own, unless the test set one itself, so that Hermit's host
+/// qualification cache (`~/.cache/hermit/`) never carries a verdict from one
+/// test, or from the developer's own runs, into another test
+/// (<https://github.com/rrnewton/hermit/issues/4515>). Nextest runs each test
+/// in its own process, so each test starts with an empty cache.
+pub fn isolate_cache_home(command: &mut Command) {
+    static CACHE_HOME: OnceLock<PathBuf> = OnceLock::new();
+    if command.get_envs().any(|(key, _)| key == "XDG_CACHE_HOME") {
+        return;
+    }
+    let home = CACHE_HOME.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("xdg-cache-")
+            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("create this test process's cache directory")
+            .keep()
+    });
+    command.env("XDG_CACHE_HOME", home);
 }
 
 /// Insert the validate v3 guest arguments into a direct or timeout-wrapped
@@ -256,4 +285,50 @@ pub fn configure_guest_execution_for(
     }
     *command = rebuilt;
     Ok(())
+}
+
+/// The preemption record in the recording at `path`, as the JSON it
+/// serializes to alone (`per_thread`, `global`, `epoch`, `pipe_wake_latency`,
+/// ...).
+///
+/// A recording wraps its record in the `rcb_history` envelope that states the
+/// writer's RCB clock identity, so the record is not the file's top level.
+/// This reads the file through Detcore's own decoder and requires the stated
+/// identity, so a file that is not such a recording fails here rather than as
+/// a missing field.
+///
+/// For inspection only: the returned JSON omits the identity (the record's
+/// identity field is not serialized), so it must never be written back as a
+/// history.
+#[allow(dead_code)]
+pub fn recorded_preemption_json(path: &Path) -> serde_json::Value {
+    let recording = detcore::preemptions::boundary_recording::Recording::read(path)
+        .unwrap_or_else(|error| panic!("{} is not a recording: {error:#}", path.display()));
+    assert!(
+        recording.identity().is_some(),
+        "{} states no RCB coordinate identity",
+        path.display()
+    );
+    let record = recording
+        .into_legacy("a test reading a preemption record")
+        .unwrap_or_else(|error| panic!("{}: {error:#}", path.display()));
+    serde_json::to_value(&record).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+}
+
+/// The preemption record inside a recording's parsed JSON, for a test
+/// editing a recording it then writes back: through the `rcb_history`
+/// envelope and the `slice_boundary_recording` envelope when present, so
+/// the edited file keeps the identity the recording stated.
+#[allow(dead_code)]
+pub fn recorded_preemption_inner_mut(record: &mut serde_json::Value) -> &mut serde_json::Value {
+    if record.get("rcb_history").is_some() {
+        let inner = record["rcb_history"]
+            .get_mut("recording")
+            .expect("an enveloped recording carries its record");
+        return recorded_preemption_inner_mut(inner);
+    }
+    if record.get("slice_boundary_recording").is_some() {
+        return &mut record["slice_boundary_recording"]["preemptions"];
+    }
+    record
 }

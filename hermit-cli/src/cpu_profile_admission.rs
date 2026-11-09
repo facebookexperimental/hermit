@@ -12,6 +12,9 @@
 //! Every class the v3 startup qualification cannot cover is refused by name.
 //! Neither nondefault profile silently falls back to v2 or native CPUID.
 
+use std::path::Path;
+use std::path::PathBuf;
+
 use detcore_model::cpu_profile::CpuProfile;
 use detcore_model::cpu_profile::HostXstate;
 use nix::sched::CpuSet;
@@ -19,7 +22,17 @@ use nix::sched::sched_getaffinity;
 use nix::sched::sched_setaffinity;
 use nix::unistd::Pid;
 
+#[cfg(target_arch = "x86_64")]
 use crate::xstate_probe;
+
+/// What a host qualification yields: the XSTATE probe's report and the host
+/// facts a v3 run binds.
+#[cfg(target_arch = "x86_64")]
+pub type Qualification = (xstate_probe::ProbeReport, HostXstate);
+/// What a host qualification yields. The XSTATE probe runs x86 instructions,
+/// so on other architectures no qualification exists.
+#[cfg(not(target_arch = "x86_64"))]
+pub type Qualification = (std::convert::Infallible, HostXstate);
 
 /// Why a profile is refused, after `--cpu-profile <profile> refused: `.
 pub type AdmissionRefusal = String;
@@ -183,6 +196,7 @@ pub fn check_host_no_rdrand_request(
     Ok(())
 }
 
+#[cfg(target_arch = "x86_64")]
 const CPUID_FAULTING_REMEDY: &str = "use a CPU and Linux kernel with CPUID faulting support (capable AMD CPUs need \
      Linux 6.17 or its CPUID-faulting backport)";
 
@@ -205,6 +219,7 @@ pub fn cpuid_faulting_vm_pointer(host: &dyn HostCpuid, release: &str) -> Option<
     })
 }
 
+#[cfg(target_arch = "x86_64")]
 fn native_cpuid_faulting_vm_pointer() -> Option<String> {
     let uname = nix::sys::utsname::uname().ok()?;
     cpuid_faulting_vm_pointer(&NativeCpuid, &uname.release().to_string_lossy())
@@ -228,6 +243,7 @@ pub fn missing_cpuid_faulting_note(messages: &[String]) -> Option<String> {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn check_host_no_rdrand_cpuid(host: &dyn HostCpuid) -> Result<(), AdmissionRefusal> {
     let intel_hybrid = host.cpuid(0, 0)[0] >= 7 && host.cpuid(7, 0)[3] & (1 << 15) != 0;
     // AMD advertises heterogeneous cores independently of Intel's hybrid bit:
@@ -248,6 +264,7 @@ fn check_host_no_rdrand_cpuid(host: &dyn HostCpuid) -> Result<(), AdmissionRefus
 /// tracer would also fault Rust's and libc's own feature detection, so only
 /// the forked child changes its state. After fork the child uses only libc
 /// syscalls and `_exit`, without allocation, locks or unwinding.
+#[cfg(target_arch = "x86_64")]
 pub fn qualify_host_no_rdrand() -> Result<(), AdmissionRefusal> {
     const ARCH_GET_CPUID: libc::c_int = 0x1011;
     const ARCH_SET_CPUID: libc::c_int = 0x1012;
@@ -383,6 +400,15 @@ fn admit_host_no_rdrand_with(
 /// CPUID snapshot. Refuse host mode before writing metadata or launching a
 /// guest rather than accidentally treating it as v3.
 pub fn check_record_or_replay(profile: CpuProfile) -> Result<(), CpuProfileRefusal> {
+    if profile == CpuProfile::Auto {
+        // `record start` resolves auto before this check, so a recording
+        // holds the profile that ran; one claiming auto was never written by
+        // Hermit, and replaying it would derive the profile again.
+        return Err(CpuProfileRefusal::new(
+            profile,
+            "a recording holds the named profile auto resolved to, never auto itself",
+        ));
+    }
     if profile == CpuProfile::HostNoRdrand {
         return Err(CpuProfileRefusal::new(
             profile,
@@ -391,6 +417,234 @@ pub fn check_record_or_replay(profile: CpuProfile) -> Result<(), CpuProfileRefus
              for repeated runs, or record with --cpu-profile=x86-64-v2 or x86-64-v3",
         ));
     }
+    Ok(())
+}
+
+/// How many script interpreters `--cpu-profile auto` follows before it
+/// refuses a chain as too long: the kernel bounds nested script
+/// interpretation too (`bprm` recursion in fs/exec.c), and an automatic
+/// consumer must not chase an unbounded chain either.
+const MAX_SCRIPT_HOPS: usize = 4;
+
+/// The named profile `--cpu-profile auto` resolves to for a guest program
+/// at host path `program`, with why ([`detcore::exec_record::auto_profile`]):
+/// from the declarations of the image it execs first and of that image's
+/// program interpreter, where `to_host` gives the host path of a path as
+/// the guest names it, or `None` where a mount with no source hides it in
+/// the launch view: a hidden interpreter refuses, rather than reading the
+/// host file its mount target shadows. `program` is the program in the
+/// launch's completed view (its mounts, binds and image rootfs already
+/// applied by the caller), and every script hop is mapped through
+/// `to_host` the same way. A script's interpreter is followed as the
+/// kernel follows it
+/// (Detcore's `script_interpreter`, the `load_script` rules: the line
+/// and the path end where the kernel ends them, at a newline and at a
+/// space, tab or NUL), through a bounded chain of scripts to the image
+/// the kernel would exec. Evidence is read strictly: a declaration
+/// beside a scan state that could not be decided refuses, rather than
+/// selecting from a lower bound. This chooses the profile before
+/// launch; Detcore's check of each executed image and interpreter
+/// (`Detcore::isa_refusal`) is still what refuses a run whose actual
+/// objects need more, so a pathname read here can never admit one.
+///
+/// On a host that is not x86-64 no CPU profile is presented: an ELF64 image
+/// built for the host's own machine declares no x86-64 ISA level, so auto
+/// names the default profile, which there serves nothing
+/// (`isa_needs_on`). Every other read and refusal is the same as on an
+/// x86-64 host.
+pub fn resolve_auto(
+    program: &Path,
+    to_host: impl Fn(&Path) -> Option<PathBuf>,
+) -> Result<(CpuProfile, String), String> {
+    resolve_auto_on(host_machine(), program, to_host)
+}
+
+/// `EM_X86_64`.
+const EM_X86_64: u16 = 62;
+/// `EM_AARCH64`.
+const EM_AARCH64: u16 = 183;
+
+/// This host's ELF machine (`e_machine`), or 0 for one auto does not know.
+fn host_machine() -> u16 {
+    match std::env::consts::ARCH {
+        "x86_64" => EM_X86_64,
+        "aarch64" => EM_AARCH64,
+        _ => 0,
+    }
+}
+
+/// The `e_machine` of the little-endian ELF64 image at `path`, or `None`
+/// for a file that is unreadable or not one.
+fn elf64_machine(path: &Path) -> Option<u16> {
+    use std::io::Read as _;
+    let mut header = [0_u8; 20];
+    std::fs::File::open(path)
+        .ok()?
+        .read_exact(&mut header)
+        .ok()?;
+    // ELFMAG, ELFCLASS64, ELFDATA2LSB.
+    (header[..4] == *b"\x7fELF" && header[4] == 2 && header[5] == 1)
+        .then(|| u16::from_le_bytes([header[18], header[19]]))
+}
+
+/// What the image at `path` declares for auto on a host of ELF machine
+/// `host`: its x86-64 ISA declaration, read strictly; and on a host that is
+/// not x86-64, where no CPU profile is presented, nothing (`Unmarked`) for
+/// an ELF64 image built for the host's own machine, which no x86-64 level
+/// applies to. Anything else unreadable or not x86-64 stays `None`, which
+/// auto refuses.
+fn isa_needs_on(host: u16, path: &Path) -> Option<detcore::exec_record::IsaNeeds> {
+    let needs = detcore::exec_record::IsaNeeds::read_path_strict(path);
+    if needs.is_none() && host != EM_X86_64 && host != 0 && elf64_machine(path) == Some(host) {
+        return Some(detcore::exec_record::IsaNeeds::Unmarked);
+    }
+    needs
+}
+
+/// Require the complete ELF64 header before the non-x86 interpreter fallback,
+/// just as the executable's `program_interpreter_of` read does. The existing
+/// ISA reader still owns all machine and ISA admission decisions.
+fn interpreter_isa_needs_on(host: u16, path: &Path) -> Option<detcore::exec_record::IsaNeeds> {
+    if host != EM_X86_64 && host != 0 {
+        use std::io::Read as _;
+        let mut header = [0_u8; 64];
+        std::fs::File::open(path)
+            .ok()?
+            .read_exact(&mut header)
+            .ok()?;
+    }
+    isa_needs_on(host, path)
+}
+
+/// [`resolve_auto`] on a host of ELF machine `host`.
+fn resolve_auto_on(
+    host: u16,
+    program: &Path,
+    to_host: impl Fn(&Path) -> Option<PathBuf>,
+) -> Result<(CpuProfile, String), String> {
+    use detcore::exec_record::IsaNeeds;
+    use detcore::exec_record::Script;
+    let mut image = program.to_path_buf();
+    for _ in 0..=MAX_SCRIPT_HOPS {
+        match detcore::exec_record::script_interpreter(&image) {
+            Script::Not => break,
+            Script::Interpreter(interpreter) => {
+                image = to_host(&interpreter)
+                    .ok_or_else(|| format!("{} is hidden by a mount", interpreter.display()))?;
+            }
+            Script::Declined => {
+                return Err(format!(
+                    "{} names no interpreter the kernel would run",
+                    image.display()
+                ));
+            }
+            Script::Unread => {
+                return Err(format!("{} is unreadable", image.display()));
+            }
+        }
+    }
+    if matches!(
+        detcore::exec_record::script_interpreter(&image),
+        Script::Interpreter(_)
+    ) {
+        return Err(format!(
+            "{} is a script chain longer than {MAX_SCRIPT_HOPS} interpreters",
+            program.display()
+        ));
+    }
+    let needs = isa_needs_on(host, &image);
+    let mut objects = vec![(format!("the executable {}", image.display()), needs)];
+    if matches!(needs, None | Some(IsaNeeds::Malformed(_))) {
+        // Refused as unreadable or malformed, before its interpreter.
+        return auto_profile_on(host, &objects);
+    }
+    // An image built for this host's own machine, on a host that is not
+    // x86-64, names its interpreter in the same `PT_INTERP`.
+    let machine = elf64_machine(&image)
+        .filter(|&machine| host != EM_X86_64 && machine == host)
+        .unwrap_or(EM_X86_64);
+    match detcore::exec_record::program_interpreter_of(&image, machine) {
+        Ok(None) => {}
+        Ok(Some(interpreter)) => {
+            let Some(interpreter_on_host) = to_host(&interpreter) else {
+                return Err(format!(
+                    "its program interpreter {} is hidden by a mount",
+                    interpreter.display()
+                ));
+            };
+            objects.push((
+                format!("its program interpreter {}", interpreter.display()),
+                interpreter_isa_needs_on(host, &interpreter_on_host),
+            ));
+        }
+        Err(why) => return Err(format!("{} cannot be read: {why}", image.display())),
+    }
+    auto_profile_on(host, &objects)
+}
+
+/// [`detcore::exec_record::auto_profile`] of `objects` on a host of ELF
+/// machine `host`, whose refusal of an object it could not read names what
+/// that host runs: on a host that is not x86-64, an image of the host's own
+/// machine or an x86-64 image, not an x86-64 image alone.
+fn auto_profile_on(
+    host: u16,
+    objects: &[(String, Option<detcore::exec_record::IsaNeeds>)],
+) -> Result<(CpuProfile, String), String> {
+    use detcore::exec_record::IsaNeeds;
+    if host != EM_X86_64 && host != 0 {
+        // The first object auto would refuse, in the order it refuses them.
+        let first = objects
+            .iter()
+            .find(|(_, needs)| matches!(needs, None | Some(IsaNeeds::Malformed(_))));
+        if let Some((what, None)) = first {
+            return Err(format!(
+                "{what} is unreadable, or neither a little-endian ELF64 image for this \
+                 {} host nor an x86-64 one",
+                if host == EM_AARCH64 {
+                    "aarch64"
+                } else {
+                    "non-x86-64"
+                }
+            ));
+        }
+    }
+    detcore::exec_record::auto_profile(objects)
+}
+
+/// Resolve a configuration's auto profile for a library launch of `command`
+/// ([`resolve_auto`] of the program it names, found as the launch finds it),
+/// before [`refuse_unadmitted_launch`]. `hermit run` and `hermit record
+/// start` resolve it earlier, before qualification; a configuration naming a
+/// profile is left as it is. A resolved x86-64-v3 is then admitted only as
+/// an explicit one is, so a library launch that never qualified the host
+/// refuses it by name.
+pub fn resolve_launch_auto(
+    command: &crate::Command,
+    config: &mut detcore::Config,
+) -> Result<(), CpuProfileRefusal> {
+    if config.cpu_profile != CpuProfile::Auto {
+        return Ok(());
+    }
+    let refuse = |why: String| CpuProfileRefusal::new(CpuProfile::Auto, why);
+    let Ok(program) = command.find_program() else {
+        // No program to read, so none for this launch to exec: its own
+        // error (or its backend's refusal) is the one to report, in its
+        // place. x86-64-v2 is named only so that nothing unresolved reaches
+        // the backend; should an exec succeed after all, Detcore's check of
+        // the executed objects still refuses one that needs more.
+        config.cpu_profile = CpuProfile::X86_64V2;
+        return Ok(());
+    };
+    // The pinned Reverie `Command` exposes no mounts or chroot to read
+    // back, so this library boundary cannot yet map the completed launch
+    // view: paths resolve as host paths. Detcore's per-exec ISA check of
+    // the objects actually executed still refuses one that needs more
+    // than the profile chosen here; resolving the mounted/chrooted view
+    // here waits on Reverie accessors for a command's mounts and chroot
+    // (revcodex on PR 4709).
+    let (profile, why) = resolve_auto(&program, |path| Some(path.to_path_buf())).map_err(refuse)?;
+    tracing::debug!("--cpu-profile auto resolved to {profile}: {why}");
+    config.cpu_profile = profile;
     Ok(())
 }
 
@@ -422,6 +676,7 @@ pub trait HostCpuid {
 /// The CPUID instruction of the host this process runs on.
 pub struct NativeCpuid;
 
+#[cfg(target_arch = "x86_64")]
 impl HostCpuid for NativeCpuid {
     fn cpuid(&self, leaf: u32, subleaf: u32) -> [u32; 4] {
         let r = std::arch::x86_64::__cpuid_count(leaf, subleaf);
@@ -495,13 +750,19 @@ pub fn check_host_cpuid(
 /// The user-dynamic xstate component (AMX TILEDATA): Linux enables it in XCR0
 /// while withholding process permission, so a permission request changes
 /// process state and the three XCOMP answers differ.
+#[cfg(target_arch = "x86_64")]
 const XFEATURE_TILEDATA: u64 = 1 << 18;
 
+#[cfg(target_arch = "x86_64")]
 const ARCH_GET_XCOMP_SUPP: libc::c_int = 0x1021;
+#[cfg(target_arch = "x86_64")]
 const ARCH_GET_XCOMP_PERM: libc::c_int = 0x1022;
+#[cfg(target_arch = "x86_64")]
 const ARCH_REQ_XCOMP_PERM: libc::c_int = 0x1023;
+#[cfg(target_arch = "x86_64")]
 const ARCH_GET_XCOMP_GUEST_PERM: libc::c_int = 0x1024;
 
+#[cfg(target_arch = "x86_64")]
 fn arch_prctl_mask(cmd: libc::c_int) -> Result<u64, AdmissionRefusal> {
     let mut mask = 0u64;
     // SAFETY: the GET commands write one u64 through the pointer.
@@ -519,6 +780,7 @@ fn arch_prctl_mask(cmd: libc::c_int) -> Result<u64, AdmissionRefusal> {
 /// index it answers EINVAL for. Every index below must answer EOPNOTSUPP; an
 /// index that is granted would mean a dynamic feature, which is refused
 /// before this runs.
+#[cfg(target_arch = "x86_64")]
 fn xfeature_max() -> Result<u32, AdmissionRefusal> {
     for index in 0..64u64 {
         // SAFETY: the request takes the component index by value.
@@ -539,6 +801,7 @@ fn xfeature_max() -> Result<u32, AdmissionRefusal> {
 }
 
 /// The host facts a qualified v3 run binds.
+#[cfg(target_arch = "x86_64")]
 fn capture(probe: &xstate_probe::ProbeReport) -> Result<HostXstate, AdmissionRefusal> {
     let host = host_facts(probe.cases as u32, probe.forced_exit)?;
     if host.xcr0 != probe.xcr0 {
@@ -552,6 +815,7 @@ fn capture(probe: &xstate_probe::ProbeReport) -> Result<HostXstate, AdmissionRef
 
 /// This host's facts, with the qualification fields given rather than probed.
 /// The caller has checked OSXSAVE.
+#[cfg(target_arch = "x86_64")]
 fn host_facts(probe_cases: u32, probe_forced_exit: bool) -> Result<HostXstate, AdmissionRefusal> {
     let host = NativeCpuid;
     let leaf0 = host.cpuid(0, 0);
@@ -586,6 +850,7 @@ fn host_facts(probe_cases: u32, probe_forced_exit: bool) -> Result<HostXstate, A
 /// one this replayer computes from them. The probe costs seconds of CPU, and a
 /// replay on a different CPU, or of an altered recording, needs none of it to
 /// be refused. Returns the recorded facts.
+#[cfg(target_arch = "x86_64")]
 pub fn precheck_replay(
     profile: CpuProfile,
     recorded: Option<&HostXstate>,
@@ -623,26 +888,23 @@ pub fn precheck_replay(
 /// in the CLI process, before its container child is forked, so the child
 /// reuses this result instead of probing again from inside the container,
 /// whose CPU affinity can be one busy CPU.
-static ADMITTED: std::sync::OnceLock<(xstate_probe::ProbeReport, HostXstate)> =
-    std::sync::OnceLock::new();
+static ADMITTED: std::sync::OnceLock<Qualification> = std::sync::OnceLock::new();
 
 /// Admits a v3 run on this host, or names why not. On success the probe report
 /// and the host facts to bind are returned, and this process's ptrace
 /// floating-point register writes are refused from then on. The request's own
 /// refusals are checked every time; the host qualification runs once per
 /// process.
-pub fn admit(
-    request: &AdmissionRequest<'_>,
-) -> Result<(xstate_probe::ProbeReport, HostXstate), AdmissionRefusal> {
-    admit_with(request, qualify_host)
+pub fn admit(request: &AdmissionRequest<'_>) -> Result<Qualification, AdmissionRefusal> {
+    admit_with(request, qualify_host_cached)
 }
 
 /// [`admit`] with its host qualification as a parameter, so that a test can
 /// admit without probing.
 fn admit_with(
     request: &AdmissionRequest<'_>,
-    qualify: impl FnOnce() -> Result<(xstate_probe::ProbeReport, HostXstate), AdmissionRefusal>,
-) -> Result<(xstate_probe::ProbeReport, HostXstate), AdmissionRefusal> {
+    qualify: impl FnOnce() -> Result<Qualification, AdmissionRefusal>,
+) -> Result<Qualification, AdmissionRefusal> {
     check_request(request)?;
     if let Some(admitted) = ADMITTED.get() {
         return Ok(admitted.clone());
@@ -672,6 +934,11 @@ pub fn refuse_unadmitted_launch(
         return Ok(());
     }
     let refuse = |why: &str| Err(CpuProfileRefusal::new(config.cpu_profile, why));
+    if config.cpu_profile == CpuProfile::Auto {
+        return refuse(
+            "auto was not resolved to a named profile before launch (resolve_launch_auto)",
+        );
+    }
     if config.cpu_profile == CpuProfile::HostNoRdrand {
         // Library callers can configure the network engine directly, without
         // passing through RunOpts or its early artifact-creation guard.
@@ -728,7 +995,138 @@ pub fn refuse_unadmitted_launch(
 /// The host half of [`admit`], run once per process: the kernel, the
 /// every-bit CPUID check, the dynamic-feature refusal, the probe and the host
 /// facts. `hermit host-capabilities --cpu-profile x86-64-v3` runs it alone.
-pub fn qualify_host() -> Result<(xstate_probe::ProbeReport, HostXstate), AdmissionRefusal> {
+/// It always measures and never reads or writes the cache [`admit`] uses.
+#[cfg(target_arch = "x86_64")]
+pub fn qualify_host() -> Result<Qualification, AdmissionRefusal> {
+    qualify_host_with(|_| xstate_probe::qualify(xstate_probe::ProbeOptions::default()))
+}
+
+/// [`admit`]'s host half: the same qualification, with the XINUSE probe
+/// through the per-host cache ([`cached_probe`]).
+#[cfg(target_arch = "x86_64")]
+fn qualify_host_cached() -> Result<Qualification, AdmissionRefusal> {
+    qualify_host_with(cached_probe)
+}
+
+/// The name of the XINUSE probe's file in the host qualification cache.
+#[cfg(target_arch = "x86_64")]
+const PROBE_CACHE_NAME: &str = "cpu-profile-x86-64-v3-probe";
+
+#[cfg(target_arch = "x86_64")]
+fn probe_cache_path() -> Option<std::path::PathBuf> {
+    crate::host_qualification::default_path(PROBE_CACHE_NAME)
+}
+
+/// The probe's inputs besides the host: its options. XCR0 is checked on the
+/// report itself ([`cached_report_matches`]).
+#[cfg(target_arch = "x86_64")]
+fn probe_cache_inputs() -> String {
+    format!("options={:?}", xstate_probe::ProbeOptions::default())
+}
+
+/// The XINUSE probe for [`admit`]: its passing report cached for this host
+/// (`crate::host_qualification`), or else a fresh probe, announced on stderr
+/// because it takes seconds, and cached if it passes. The probe certifies the
+/// CPU's and kernel's XSAVE behavior, which no sandbox changes, so the host
+/// key suffices; the checks that depend on the caller's sandbox run on every
+/// run (<https://github.com/rrnewton/hermit/issues/4515>). Under a hypervisor
+/// nothing is cached: a live migration keeps the boot, the kernel and CPUID
+/// but moves the guest to a host the forced-exit arm never certified.
+#[cfg(target_arch = "x86_64")]
+fn cached_probe(xcr0: u64) -> Result<xstate_probe::ProbeReport, AdmissionRefusal> {
+    let hypervisor = std::arch::x86_64::__cpuid(1).ecx & (1 << 31) != 0;
+    cached_probe_at(
+        cache_path_for(hypervisor).as_deref(),
+        &crate::host_qualification::HostKey::current(),
+        xcr0,
+        &mut |line: &str| eprint!("{line}"),
+        || xstate_probe::qualify(xstate_probe::ProbeOptions::default()),
+    )
+}
+
+/// The probe's cache file, or `None` under a hypervisor, where nothing is
+/// cached ([`cached_probe`]).
+#[cfg(target_arch = "x86_64")]
+fn cache_path_for(hypervisor: bool) -> Option<std::path::PathBuf> {
+    if hypervisor {
+        return None;
+    }
+    probe_cache_path()
+}
+
+/// Whether a cached report is one this host's probe would produce: it binds
+/// `cases` and `forced_exit` into a recording (`HostXstate::probe_cases` and
+/// `probe_forced_exit`), so they are derived again here, from XCR0 and from
+/// the cache's use only off a hypervisor, and a report that disagrees is a
+/// miss. Its repetitions and pair count must be the default probe's too.
+#[cfg(target_arch = "x86_64")]
+fn cached_report_matches(report: &xstate_probe::ProbeReport, xcr0: u64) -> bool {
+    let options = xstate_probe::ProbeOptions::default();
+    report.xcr0 == xcr0
+        && report.cases == xstate_probe::expected_case_count(xcr0)
+        && !report.forced_exit
+        && report.repetitions == options.repetitions
+        && report.certified_pairs == report.cells as u64 * u64::from(report.repetitions)
+}
+
+/// [`cached_probe`] with its cache path (`None`: no cache), host key, warning
+/// writer and probe as parameters, for the tests.
+#[cfg(target_arch = "x86_64")]
+fn cached_probe_at(
+    path: Option<&std::path::Path>,
+    host: &crate::host_qualification::HostKey,
+    xcr0: u64,
+    warn: &mut dyn FnMut(&str),
+    probe: impl FnOnce() -> Result<xstate_probe::ProbeReport, xstate_probe::ProbeRefusal>,
+) -> Result<xstate_probe::ProbeReport, AdmissionRefusal> {
+    let Some(path) = path else {
+        warn(
+            "WARNING: qualifying this host for --cpu-profile x86-64-v3, which takes seconds; \
+             with no cache to use it is measured again on every run.\n",
+        );
+        return probe();
+    };
+    let inputs = probe_cache_inputs();
+    let cached = || {
+        crate::host_qualification::load::<xstate_probe::ProbeReport>(path, host, &inputs)
+            .filter(|report| cached_report_matches(report, xcr0))
+    };
+    if let Some(report) = cached() {
+        return Ok(report);
+    }
+    // Checked again under the lock: another process that missed at the same
+    // time may have measured and stored a pass while this one waited.
+    crate::host_qualification::locked(path, || {
+        if let Some(report) = cached() {
+            return Ok(report);
+        }
+        warn(&if crate::host_qualification::writable(path) {
+            format!(
+                "WARNING: qualifying this host for --cpu-profile x86-64-v3, which takes \
+                 seconds; a pass is cached in {} until the kernel, CPU, microcode, boot or \
+                 Hermit binary changes.\n",
+                path.display()
+            )
+        } else {
+            format!(
+                "WARNING: qualifying this host for --cpu-profile x86-64-v3, which takes \
+                 seconds; {} cannot be written, so it is measured again on every run.\n",
+                path.display()
+            )
+        });
+        let report = probe()?;
+        crate::host_qualification::store(path, host, &inputs, &report);
+        Ok(report)
+    })
+}
+
+/// [`qualify_host`] with the XINUSE probe as a parameter, given XCR0: the
+/// kernel, the every-bit CPUID check and the dynamic-feature refusal run every
+/// time, and the host facts are captured from this host every time.
+#[cfg(target_arch = "x86_64")]
+fn qualify_host_with(
+    probe: impl FnOnce(u64) -> Result<xstate_probe::ProbeReport, AdmissionRefusal>,
+) -> Result<Qualification, AdmissionRefusal> {
     let release = nix::sys::utsname::uname()
         .map_err(|e| format!("uname failed: {e}"))?
         .release()
@@ -739,7 +1137,7 @@ pub fn qualify_host() -> Result<(xstate_probe::ProbeReport, HostXstate), Admissi
     // SAFETY: OSXSAVE was checked above.
     let xcr0 = unsafe { std::arch::x86_64::_xgetbv(0) };
     refuse_dynamic_features(xcr0, 0)?;
-    let probe = xstate_probe::qualify(xstate_probe::ProbeOptions::default())?;
+    let probe = probe(xcr0)?;
     let host = capture(&probe)?;
     Ok((probe, host))
 }
@@ -747,6 +1145,7 @@ pub fn qualify_host() -> Result<(xstate_probe::ProbeReport, HostXstate), Admissi
 /// Refuses a host with a user-dynamic xstate feature (AMX TILEDATA, bit 18) in
 /// XCR0 or in ARCH_GET_XCOMP_SUPP: a guest's permission request for it changes
 /// process state, which the profile cannot bind.
+#[cfg(target_arch = "x86_64")]
 fn refuse_dynamic_features(xcr0: u64, xcomp_supp: u64) -> Result<(), AdmissionRefusal> {
     if (xcr0 | xcomp_supp) & XFEATURE_TILEDATA != 0 {
         return Err(
@@ -758,9 +1157,245 @@ fn refuse_dynamic_features(xcr0: u64, xcomp_supp: u64) -> Result<(), AdmissionRe
     Ok(())
 }
 
+/// CPUID faulting is an x86 feature, so other architectures refuse the host
+/// profile.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn qualify_host_no_rdrand() -> Result<(), AdmissionRefusal> {
+    Err(non_x86_refusal())
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn native_cpuid_faulting_vm_pointer() -> Option<String> {
+    None
+}
+
+/// The v3 profile binds x86 XSTATE facts, so other architectures refuse it.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn precheck_replay(
+    profile: CpuProfile,
+    _recorded: Option<&HostXstate>,
+    _recorded_digest: Option<&str>,
+) -> Result<HostXstate, CpuProfileRefusal> {
+    check_record_or_replay(profile)?;
+    Err(CpuProfileRefusal::new(profile, non_x86_refusal()))
+}
+
+/// The v3 profile binds x86 XSTATE facts, so other architectures refuse it.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn qualify_host() -> Result<Qualification, AdmissionRefusal> {
+    Err(non_x86_refusal())
+}
+
+/// Why a nondefault profile is refused off x86: both describe x86 CPUs.
+#[cfg(not(target_arch = "x86_64"))]
+fn non_x86_refusal() -> AdmissionRefusal {
+    format!(
+        "the nondefault CPU profiles describe x86-64 CPUs, and this host is {}",
+        std::env::consts::ARCH
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+
+    /// A report the default probe could produce for `xcr0`.
+    fn probe_report(xcr0: u64) -> xstate_probe::ProbeReport {
+        let cases = xstate_probe::expected_case_count(xcr0);
+        let repetitions = xstate_probe::ProbeOptions::default().repetitions;
+        xstate_probe::ProbeReport {
+            cpu: 3,
+            xcr0,
+            cases,
+            cells: cases * 12,
+            repetitions,
+            certified_pairs: (cases * 12) as u64 * u64::from(repetitions),
+            forced_exit: false,
+            reload_bound: 0,
+            cpuid_min_cycles: 0,
+            calibration: "cached".into(),
+            retried_references: 0,
+            retried_reloads: 0,
+            retried_exits: 0,
+            counter_reopens: 0,
+        }
+    }
+
+    fn cache_host() -> crate::host_qualification::HostKey {
+        crate::host_qualification::HostKey {
+            kernel_release: "7.1.3".into(),
+            boot_id: "boot-a".into(),
+            cpu: "AuthenticAMD family 0x1a model 0x11 stepping 0x0".into(),
+            microcode: "0xb101054".into(),
+            hermit_binary: "64768:123:456:789.0".into(),
+        }
+    }
+
+    /// Runs [`cached_probe_at`] once and returns its result, whether the probe
+    /// ran and what it warned.
+    fn probe_through_cache(
+        path: Option<&std::path::Path>,
+        xcr0: u64,
+        answer: Result<xstate_probe::ProbeReport, xstate_probe::ProbeRefusal>,
+    ) -> (
+        Result<xstate_probe::ProbeReport, AdmissionRefusal>,
+        bool,
+        Vec<String>,
+    ) {
+        let mut ran = false;
+        let mut warnings = Vec::new();
+        let result = cached_probe_at(
+            path,
+            &cache_host(),
+            xcr0,
+            &mut |line: &str| warnings.push(line.to_owned()),
+            || {
+                ran = true;
+                answer
+            },
+        );
+        (result, ran, warnings)
+    }
+
+    /// The first v3 admission on a host measures, warning once on stderr, and
+    /// caches the passing report; later ones reuse it without measuring or
+    /// warning (<https://github.com/rrnewton/hermit/issues/4515>).
+    #[test]
+    fn a_passing_probe_is_measured_once_and_announced() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hermit").join("probe.json");
+        let (result, ran, warnings) =
+            probe_through_cache(Some(&path), 0x2e7, Ok(probe_report(0x2e7)));
+        assert_eq!(result, Ok(probe_report(0x2e7)));
+        assert!(ran);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].starts_with("WARNING: "), "{warnings:?}");
+        assert!(
+            warnings[0].contains(&path.display().to_string()),
+            "{warnings:?}"
+        );
+        assert_eq!(warnings[0].matches('\n').count(), 1, "{warnings:?}");
+        let (result, ran, warnings) =
+            probe_through_cache(Some(&path), 0x2e7, Err("must not probe".into()));
+        assert_eq!(result, Ok(probe_report(0x2e7)));
+        assert!(!ran);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// A refusal is not cached, and a different XCR0 measures again.
+    #[test]
+    fn a_refusal_or_a_new_xcr0_measures_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("probe.json");
+        let (result, ran, _) = probe_through_cache(Some(&path), 0x2e7, Err("refused".into()));
+        assert_eq!(result, Err("refused".into()));
+        assert!(ran);
+        let (result, ran, _) = probe_through_cache(Some(&path), 0x2e7, Ok(probe_report(0x2e7)));
+        assert!(ran && result.is_ok());
+        let (result, ran, _) = probe_through_cache(Some(&path), 0x207, Ok(probe_report(0x207)));
+        assert_eq!(result, Ok(probe_report(0x207)));
+        assert!(ran, "XCR0 is part of the key");
+    }
+
+    /// A cached report whose recorded fields this host's probe would not
+    /// produce is a miss: the case count and the forced-exit arm are bound
+    /// into recordings, so an edited or foreign file never supplies them.
+    #[test]
+    fn a_cached_report_that_disagrees_with_this_host_is_a_miss() {
+        type Edit = fn(&mut xstate_probe::ProbeReport);
+        let edits: [(&str, Edit); 5] = [
+            ("cases", |r| r.cases = 1),
+            ("forced exit", |r| r.forced_exit = true),
+            ("repetitions", |r| r.repetitions += 1),
+            ("certified pairs", |r| r.certified_pairs += 1),
+            ("xcr0", |r| r.xcr0 ^= 1 << 9),
+        ];
+        for (field, edit) in edits {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("probe.json");
+            let mut edited = probe_report(0x2e7);
+            edit(&mut edited);
+            crate::host_qualification::store(&path, &cache_host(), &probe_cache_inputs(), &edited);
+            let (result, ran, _) = probe_through_cache(Some(&path), 0x2e7, Ok(probe_report(0x2e7)));
+            assert!(ran, "{field}: a disagreeing report was reused");
+            assert_eq!(result, Ok(probe_report(0x2e7)), "{field}");
+        }
+    }
+
+    /// Under a hypervisor nothing is cached; elsewhere the cache file is used.
+    #[test]
+    fn nothing_is_cached_under_a_hypervisor() {
+        assert_eq!(cache_path_for(true), None);
+        assert_eq!(cache_path_for(false), probe_cache_path());
+    }
+
+    /// When the cache cannot be written the warning says it is measured again,
+    /// not that it is cached.
+    #[test]
+    fn an_unwritable_cache_is_announced_as_such() {
+        let directory = tempfile::tempdir().unwrap();
+        let blocker = directory.path().join("hermit");
+        std::fs::write(&blocker, b"a file where the directory would go").unwrap();
+        let path = blocker.join("probe.json");
+        let (result, ran, warnings) =
+            probe_through_cache(Some(&path), 0x2e7, Ok(probe_report(0x2e7)));
+        assert!(ran && result.is_ok());
+        assert!(warnings[0].contains("cannot be written"), "{warnings:?}");
+        assert!(!warnings[0].contains("is cached"), "{warnings:?}");
+    }
+
+    /// A process that misses while another holds the probe lock waits, finds
+    /// the other's verdict under the lock and does not measure: concurrent
+    /// cold runs measure once.
+    #[test]
+    fn a_miss_waits_for_the_lock_and_reuses_the_verdict_stored_meanwhile() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("probe.json");
+        let (holding_tx, holding_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                crate::host_qualification::locked(&path, || {
+                    holding_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    crate::host_qualification::store(
+                        &path,
+                        &cache_host(),
+                        &probe_cache_inputs(),
+                        &probe_report(0x2e7),
+                    );
+                })
+            })
+        };
+        holding_rx.recv().unwrap();
+        let waiter = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                probe_through_cache(Some(&path), 0x2e7, Err("must not measure".into()))
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let (result, ran, warnings) = waiter.join().unwrap();
+        assert_eq!(result, Ok(probe_report(0x2e7)));
+        assert!(!ran, "the waiter measured instead of reusing the verdict");
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    /// Without a cache directory every admission measures, and says so.
+    #[test]
+    fn without_a_cache_directory_every_admission_measures() {
+        for _ in 0..2 {
+            let (result, ran, warnings) = probe_through_cache(None, 0x2e7, Ok(probe_report(0x2e7)));
+            assert!(ran && result.is_ok());
+            assert!(
+                warnings[0].contains("measured again on every run"),
+                "{warnings:?}"
+            );
+        }
+    }
 
     /// A host with AMX TILEDATA in XCR0 or in the supported mask is refused by
     /// name; one without it is not.
@@ -1023,10 +1658,11 @@ mod tests {
             unadmitted.reason.contains("did not qualify"),
             "{unadmitted}"
         );
-        assert_eq!(
-            refuse_unadmitted_launch(&detcore::Config::default(), false),
-            Ok(())
-        );
+        let v2 = detcore::Config {
+            cpu_profile: CpuProfile::X86_64V2,
+            ..Default::default()
+        };
+        assert_eq!(refuse_unadmitted_launch(&v2, false), Ok(()));
 
         let refused = admit_with(&request("kvm"), || {
             panic!("a refused request probed the host")
@@ -1233,5 +1869,212 @@ mod tests {
                 .unwrap_err()
                 .contains("XSAVEERPTR")
         );
+    }
+
+    /// On a host that is not x86-64, `--cpu-profile auto` names the default
+    /// profile for an ELF64 image built for that host's machine, and for its
+    /// program interpreter, instead of refusing it as not x86-64. An x86-64
+    /// host still refuses such an image, every host still refuses a file
+    /// that is not an ELF64 image, and a missing interpreter is still
+    /// refused by name.
+    #[test]
+    fn auto_names_the_default_for_an_image_of_a_host_that_is_not_x86_64() {
+        let directory = tempfile::tempdir().unwrap();
+        // A little-endian ELF64 executable for `machine`, naming `interpreter`
+        // in a PT_INTERP right after its one program header, if any.
+        let image = |name: &str, machine: u16, interpreter: Option<&std::path::Path>| {
+            let mut bytes = vec![0_u8; 64];
+            bytes[..4].copy_from_slice(b"\x7fELF");
+            bytes[4] = 2; // ELFCLASS64
+            bytes[5] = 1; // ELFDATA2LSB
+            bytes[6] = 1; // EV_CURRENT
+            bytes[16..18].copy_from_slice(&2_u16.to_le_bytes()); // ET_EXEC
+            bytes[18..20].copy_from_slice(&machine.to_le_bytes());
+            bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+            bytes[52..54].copy_from_slice(&64_u16.to_le_bytes()); // e_ehsize
+            bytes[54..56].copy_from_slice(&56_u16.to_le_bytes()); // e_phentsize
+            if let Some(interpreter) = interpreter {
+                bytes[32..40].copy_from_slice(&64_u64.to_le_bytes()); // e_phoff
+                bytes[56..58].copy_from_slice(&1_u16.to_le_bytes()); // e_phnum
+                let mut name = interpreter.as_os_str().as_encoded_bytes().to_vec();
+                name.push(0);
+                let mut header = vec![0_u8; 56];
+                header[..4].copy_from_slice(&3_u32.to_le_bytes()); // PT_INTERP
+                header[8..16].copy_from_slice(&120_u64.to_le_bytes()); // p_offset
+                header[32..40].copy_from_slice(&(name.len() as u64).to_le_bytes());
+                bytes.extend(header);
+                bytes.extend(name);
+            }
+            let path = directory.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        let same = |path: &std::path::Path| Some(path.to_path_buf());
+        let loader = image("loader", super::EM_AARCH64, None);
+        let program = image("program", super::EM_AARCH64, Some(&loader));
+        let (profile, _) = super::resolve_auto_on(super::EM_AARCH64, &program, same)
+            .expect("an aarch64 image on an aarch64 host resolves");
+        assert_eq!(profile, super::CpuProfile::X86_64V2);
+        let why = super::resolve_auto_on(super::EM_X86_64, &program, same).unwrap_err();
+        assert!(why.contains("not an x86-64 ELF64 image"), "{why}");
+        let text = directory.path().join("text");
+        std::fs::write(&text, b"not an image\n").unwrap();
+        let why = super::resolve_auto_on(super::EM_X86_64, &text, same).unwrap_err();
+        assert!(why.contains("not an x86-64 ELF64 image"), "{why}");
+        let why = super::resolve_auto_on(super::EM_AARCH64, &text, same).unwrap_err();
+        assert!(why.contains("neither a little-endian ELF64 image"), "{why}");
+        let orphan = image(
+            "orphan",
+            super::EM_AARCH64,
+            Some(&directory.path().join("no-such-loader")),
+        );
+        let why = super::resolve_auto_on(super::EM_AARCH64, &orphan, same).unwrap_err();
+        assert!(why.contains("no-such-loader"), "{why}");
+    }
+
+    // Full little-endian ELF64 fixtures for the interpreter-only regressions.
+    fn auto_interpreter_image(
+        directory: &std::path::Path,
+        name: &str,
+        machine: u16,
+        interpreter: Option<&std::path::Path>,
+    ) -> std::path::PathBuf {
+        let mut bytes = vec![0_u8; 64];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2; // ELFCLASS64
+        bytes[5] = 1; // ELFDATA2LSB
+        bytes[6] = 1; // EV_CURRENT
+        bytes[16..18].copy_from_slice(&2_u16.to_le_bytes()); // ET_EXEC
+        bytes[18..20].copy_from_slice(&machine.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[52..54].copy_from_slice(&64_u16.to_le_bytes()); // e_ehsize
+        bytes[54..56].copy_from_slice(&56_u16.to_le_bytes()); // e_phentsize
+        if let Some(interpreter) = interpreter {
+            bytes[32..40].copy_from_slice(&64_u64.to_le_bytes()); // e_phoff
+            bytes[56..58].copy_from_slice(&1_u16.to_le_bytes()); // e_phnum
+            let mut name = interpreter.as_os_str().as_encoded_bytes().to_vec();
+            name.push(0);
+            let mut header = vec![0_u8; 56];
+            header[..4].copy_from_slice(&3_u32.to_le_bytes()); // PT_INTERP
+            header[8..16].copy_from_slice(&120_u64.to_le_bytes()); // p_offset
+            header[32..40].copy_from_slice(&(name.len() as u64).to_le_bytes());
+            bytes.extend(header);
+            bytes.extend(name);
+        }
+        let path = directory.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn auto_refuses_a_truncated_interpreter_on_a_host_that_is_not_x86_64() {
+        let directory = tempfile::tempdir().unwrap();
+        let loader = auto_interpreter_image(directory.path(), "loader", super::EM_AARCH64, None);
+        let program = auto_interpreter_image(
+            directory.path(),
+            "program",
+            super::EM_AARCH64,
+            Some(&loader),
+        );
+        let same = |path: &std::path::Path| Some(path.to_path_buf());
+        assert_eq!(
+            super::resolve_auto_on(super::EM_AARCH64, &program, same)
+                .unwrap()
+                .0,
+            super::CpuProfile::X86_64V2
+        );
+        let mut bytes = std::fs::read(&loader).unwrap();
+        assert_eq!(bytes.len(), 64);
+        bytes.truncate(20); // The machine word remains, but the ELF64 header does not.
+        std::fs::write(&loader, bytes).unwrap();
+        assert_eq!(
+            super::resolve_auto_on(super::EM_AARCH64, &program, same),
+            Err(format!(
+                "its program interpreter {} is unreadable, or neither a little-endian ELF64 image \
+                 for this aarch64 host nor an x86-64 one",
+                loader.display()
+            ))
+        );
+    }
+
+    #[test]
+    fn auto_refuses_a_foreign_interpreter_on_a_host_that_is_not_x86_64() {
+        let directory = tempfile::tempdir().unwrap();
+        let loader = auto_interpreter_image(directory.path(), "loader", super::EM_AARCH64, None);
+        let program = auto_interpreter_image(
+            directory.path(),
+            "program",
+            super::EM_AARCH64,
+            Some(&loader),
+        );
+        let same = |path: &std::path::Path| Some(path.to_path_buf());
+        assert_eq!(
+            super::resolve_auto_on(super::EM_AARCH64, &program, same)
+                .unwrap()
+                .0,
+            super::CpuProfile::X86_64V2
+        );
+        // A complete ELF64 header for RISC-V, not an unreadable or short file.
+        auto_interpreter_image(directory.path(), "loader", 243, None); // EM_RISCV
+        assert_eq!(std::fs::metadata(&loader).unwrap().len(), 64);
+        assert_eq!(
+            super::resolve_auto_on(super::EM_AARCH64, &program, same),
+            Err(format!(
+                "its program interpreter {} is unreadable, or neither a little-endian ELF64 image \
+                 for this aarch64 host nor an x86-64 one",
+                loader.display()
+            ))
+        );
+    }
+
+    /// `--cpu-profile auto` follows a valid script chain (script to
+    /// script to an ELF image) through every hop, and refuses a chain
+    /// longer than the bound and a `#!` line naming no interpreter.
+    #[test]
+    fn auto_follows_a_script_chain_and_refuses_an_unbounded_one() {
+        use std::io::Write as _;
+        let directory = tempfile::tempdir().unwrap();
+        let exe = std::env::current_exe().unwrap();
+        let script = |name: &str, interpreter: &std::path::Path| {
+            let path = directory.path().join(name);
+            let mut file = std::fs::File::create(&path).unwrap();
+            writeln!(file, "#!{}", interpreter.display()).unwrap();
+            path
+        };
+        // A -> B -> the test binary (an ELF image): both hops followed.
+        let b = script("b", &exe);
+        let a = script("a", &b);
+        let (profile, _) = super::resolve_auto(&a, |path| Some(path.to_path_buf()))
+            .expect("a valid chain resolves");
+        assert_eq!(profile, super::CpuProfile::X86_64V2);
+        // Every hop mapped through the caller's view: the same chain with
+        // its interpreter names mapped onto the files above (the image
+        // linked into the mapped view).
+        std::os::unix::fs::symlink(&exe, directory.path().join(exe.file_name().unwrap())).unwrap();
+        let (mapped, _) = super::resolve_auto(&a, |guest| {
+            // The view maps the chain's own names; system paths (the
+            // image's program interpreter) stay as they are.
+            if guest.starts_with("/tmp") || guest.parent() == exe.parent() {
+                Some(directory.path().join(guest.file_name().unwrap()))
+            } else {
+                Some(guest.to_path_buf())
+            }
+        })
+        .expect("a mapped chain resolves");
+        assert_eq!(mapped, super::CpuProfile::X86_64V2);
+        // A self-referring script is a chain past the bound, refused.
+        let loop_path = directory.path().join("loop");
+        std::fs::write(&loop_path, format!("#!{}\n", loop_path.display())).unwrap();
+        let why = super::resolve_auto(&loop_path, |path| Some(path.to_path_buf())).unwrap_err();
+        assert!(why.contains("script chain longer"), "{why}");
+        // A `#!` line naming no interpreter (NUL first) is declined.
+        let declined = directory.path().join("declined");
+        std::fs::write(&declined, b"#!\0/bin/sh\n").unwrap();
+        let why = super::resolve_auto(&declined, |path| Some(path.to_path_buf())).unwrap_err();
+        assert!(why.contains("names no interpreter"), "{why}");
+        // An interpreter hidden by a mount with no source refuses, rather
+        // than classifying the host file its target shadows.
+        let why = super::resolve_auto(&a, |_| None).unwrap_err();
+        assert!(why.contains("is hidden by a mount"), "{why}");
     }
 }

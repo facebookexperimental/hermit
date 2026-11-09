@@ -44,15 +44,12 @@ use std::path::Path;
 
 use detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
 use reverie::Guest;
-use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
-use reverie::syscalls::linux_abi::Mmsghdr;
-use reverie::syscalls::linux_abi::Msghdr;
 
 use crate::record_or_replay::RecordOrReplay;
-use crate::syscalls::received_descriptors;
+use crate::syscalls::scm_rights::delivered_descriptors;
 use crate::tool_global::unrecoverable_shutdown;
 use crate::tool_local::Detcore;
 
@@ -91,10 +88,6 @@ const CUSE_MINOR: u64 = 203;
 
 /// What `readlink` reports for a seccomp user-notification listener.
 pub const SECCOMP_NOTIFY_LINK: &str = "anon_inode:seccomp notify";
-
-/// The bytes of one received control buffer this module inspects; Linux caps a
-/// control buffer well below this.
-const MAX_CONTROL_BYTES: usize = 64 * 1024;
 
 /// The major and minor numbers of a `dev_t`, as glibc's `major` and `minor`.
 fn device_numbers(rdev: u64) -> (u64, u64) {
@@ -157,7 +150,7 @@ fn descriptor_exit_dependency_with(
     // Follows the descriptor to the file it refers to.
     let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
     let status = execute(
-        Sysno::newfstatat,
+        crate::arch::FSTATAT,
         [
             libc::AT_FDCWD as usize,
             link.as_ptr() as usize,
@@ -189,24 +182,69 @@ pub fn held_exit_dependency(
     })
 }
 
-/// The descriptors a `struct msghdr` at `address` received through
-/// `SCM_RIGHTS`, read after the call: Linux updates `msg_controllen` to what it
-/// wrote.
-fn received_through<G: MemoryAccess>(memory: &G, header: &Msghdr) -> Vec<RawFd> {
-    if header.msg_control.is_null() || header.msg_controllen == 0 {
-        return Vec::new();
+/// The descriptors `call`, which returned `ret`, gave the guest, and how:
+/// from an open (`open`, `creat`, which opens an existing device node as
+/// `open` does, `openat`, `openat2`, `open_by_handle_at`), through
+/// `SCM_RIGHTS` (`recvmsg`, `recvmmsg`) or through `pidfd_getfd`. `None` for
+/// a failed call or any other call. A descriptor a `dup`, `fcntl`, `fork` or
+/// `exec` carries over names a description that already arrived.
+pub(crate) fn arrived_descriptors<M: reverie::syscalls::MemoryAccess>(
+    memory: &M,
+    call: &Syscall,
+    ret: i64,
+) -> Option<(Vec<RawFd>, &'static str)> {
+    if ret < 0 {
+        return None;
     }
-    let Some(address) = reverie::syscalls::Addr::<u8>::from_raw(header.msg_control as usize) else {
-        return Vec::new();
-    };
-    let mut control = vec![0; header.msg_controllen.min(MAX_CONTROL_BYTES)];
-    if memory.read_exact(address, &mut control).is_err() {
-        return Vec::new();
+    match call {
+        Syscall::Openat(_) => Some((vec![ret as RawFd], "opened")),
+        #[cfg(target_arch = "x86_64")]
+        Syscall::Open(_) => Some((vec![ret as RawFd], "opened")),
+        #[cfg(target_arch = "x86_64")]
+        _ if call.number() == Sysno::creat => Some((vec![ret as RawFd], "opened")),
+        _ if call.number() == Sysno::openat2 || call.number() == Sysno::open_by_handle_at => {
+            Some((vec![ret as RawFd], "opened"))
+        }
+        _ if call.number() == Sysno::pidfd_getfd => {
+            Some((vec![ret as RawFd], "received through pidfd_getfd"))
+        }
+        Syscall::Recvmsg(_) | Syscall::Recvmmsg(_) => delivered_descriptors(memory, call, ret)
+            .map(|received| (received, "received through SCM_RIGHTS")),
+        _ => None,
     }
-    received_descriptors(&control)
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    /// The checks of a descriptor where it arrives
+    /// ([`arrived_descriptors`]): [`Self::refuse_exit_dependencies`], and
+    /// `--strict`'s refusal of a binder descriptor
+    /// (`Self::refuse_strict_binder_descriptors`). Each runs with the call's
+    /// memory as the kernel's view of it holds it
+    /// (`EntryImport::reinstate_returned`), when another thread has rewritten
+    /// it since (`ThreadState::entry_import`), and that rewrite restored
+    /// after: it reads a received message's descriptors from the call's
+    /// header. Fails only if the rewrite cannot be restored.
+    pub(crate) async fn refuse_arrived_descriptors_in_view<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &Syscall,
+        ret: i64,
+    ) -> Result<(), reverie::Error> {
+        if ret < 0
+            || !(self.cfg.backend.process_exits_complete_asynchronously || self.cfg.strict_binder)
+        {
+            return Ok(());
+        }
+        let entry = crate::entry_view(guest, call);
+        let view = entry
+            .as_deref()
+            .map(|entry| (entry, entry.reinstate_returned(&mut guest.memory())));
+        self.refuse_exit_dependencies(guest, call, ret).await;
+        self.refuse_strict_binder_descriptors(guest, call, ret)
+            .await;
+        crate::restore_entry_view(guest, view)
+    }
+
     /// Ends the run, by name, when `call`, which returned `ret`, gave the guest
     /// a descriptor that would make it serve another guest's exit; see the
     /// module documentation. Does nothing unless process exits complete
@@ -217,49 +255,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: &Syscall,
         ret: i64,
     ) {
-        if !self.cfg.backend.process_exits_complete_asynchronously || ret < 0 {
+        if !self.cfg.backend.process_exits_complete_asynchronously {
             return;
         }
-        let (arrived, how): (Vec<RawFd>, &str) = match call {
-            Syscall::Open(_) | Syscall::Openat(_) => (vec![ret as RawFd], "opened"),
-            _ if call.number() == Sysno::openat2 => (vec![ret as RawFd], "opened"),
-            _ if call.number() == Sysno::pidfd_getfd => {
-                (vec![ret as RawFd], "received through pidfd_getfd")
-            }
-            Syscall::Recvmsg(call) => {
-                let Some(address) = call.msg() else { return };
-                let Ok(header): Result<Msghdr, _> = guest.memory().read_value(address) else {
-                    return;
-                };
-                (
-                    received_through(&guest.memory(), &header),
-                    "received through SCM_RIGHTS",
-                )
-            }
-            Syscall::Recvmmsg(call) => {
-                let Some(address) = call.mmsg() else { return };
-                let count = (ret as usize).min(libc::UIO_MAXIOV as usize);
-                // SAFETY: `mmsghdr` is a plain C record; all-zero values are
-                // valid staging values that `read_values` overwrites.
-                let mut messages: Vec<Mmsghdr> =
-                    (0..count).map(|_| unsafe { std::mem::zeroed() }).collect();
-                if guest
-                    .memory()
-                    .read_values(address.into(), &mut messages)
-                    .is_err()
-                {
-                    return;
-                }
-                let memory = guest.memory();
-                (
-                    messages
-                        .iter()
-                        .flat_map(|message| received_through(&memory, &message.msg_hdr))
-                        .collect(),
-                    "received through SCM_RIGHTS",
-                )
-            }
-            _ => return,
+        let Some((arrived, how)) = arrived_descriptors(&guest.memory(), call, ret) else {
+            return;
         };
         let pid = guest.pid().as_raw();
         for fd in arrived {
@@ -286,6 +286,7 @@ mod tests {
     use std::os::fd::AsRawFd;
 
     use super::*;
+    use crate::syscalls::scm_rights::received_descriptors;
 
     /// glibc's `makedev`.
     fn makedev(major: u64, minor: u64) -> u64 {
@@ -413,7 +414,7 @@ mod tests {
                             }
                             Ok(bytes.len())
                         }
-                        Sysno::newfstatat => {
+                        crate::arch::FSTATAT => {
                             assert_eq!(calls, 2);
                             assert_eq!(args[3], 0, "follow the descriptor's target");
                             // Also fill on failure: a failed stat must not

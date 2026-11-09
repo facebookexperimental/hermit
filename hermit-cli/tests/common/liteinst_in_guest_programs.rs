@@ -585,8 +585,9 @@ fn liteinst_in_guest_heap_growth_avoids_trampoline_mappings() {
 /// is a sealed memfd: /proc/loadavg reads as on Linux, beside /proc/uptime,
 /// the phase's own admitted capture (the captured kernel loadavg was refused
 /// before https://github.com/rrnewton/hermit/issues/4213's package K
-/// rendered it), while a capture that may wait, /proc/diskstats, is still
-/// refused in the same process.
+/// rendered it), and so does /proc/diskstats, a capture that was refused
+/// until Detcore rendered it too (the kvm lane's slice N3), while a capture
+/// that may wait, /proc/net/sockstat, is still refused in the same process.
 #[test]
 fn liteinst_in_guest_sigalrm_handler_is_virtual_and_published() {
     let _guard = hermit_run_guard();
@@ -673,14 +674,21 @@ fn liteinst_in_guest_sigalrm_handler_is_virtual_and_published() {
         .arg("--env=REVERIE_LITEINST_SIGALRM_HANDLERS=1")
         .arg("--")
         .arg(&procfs_reader)
-        .args(["/proc/loadavg", "/proc/uptime", "/proc/diskstats"])
+        .args([
+            "/proc/loadavg",
+            "/proc/uptime",
+            "/proc/net/sockstat",
+            "/proc/diskstats",
+        ])
         .stdin(Stdio::null())
         .output()
         .expect("failed to run Hermit LiteInst");
     let output = assert_liteinst_in_guest_output(output);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines = stdout.lines().collect::<Vec<_>>();
-    assert_eq!(lines.len(), 3, "{stdout}");
+    // The reader prints at most 255 bytes of a file, so /proc/diskstats, read
+    // last, takes one line per block device it reaches.
+    assert!(lines.len() >= 4, "{stdout}");
     assert_eq!(lines[0], "/proc/loadavg: 0.00 0.00 0.00 1/1 1", "{stdout}");
     assert!(
         lines[1].starts_with("/proc/uptime: ") && !lines[1].contains("errno"),
@@ -688,7 +696,15 @@ fn liteinst_in_guest_sigalrm_handler_is_virtual_and_published() {
     );
     assert_eq!(
         lines[2],
-        format!("/proc/diskstats: read errno {}", libc::EOPNOTSUPP),
+        format!("/proc/net/sockstat: read errno {}", libc::EOPNOTSUPP),
+        "{stdout}"
+    );
+    // Its first row is a device with the sanitizer's fixed counters
+    // (`procfs::sanitize_diskstats`): an empty table would not do.
+    assert!(
+        lines[3].starts_with("/proc/diskstats: ")
+            && lines[3].contains(" 1 0 8 0 1 0 8 0")
+            && !lines[3..].iter().any(|line| line.contains("errno")),
         "{stdout}"
     );
 }
@@ -2210,7 +2226,7 @@ fn liteinst_in_guest_shell_and_entropy_consumer() {
     assert_liteinst_in_guest(
         Path::new("/usr/bin/hexdump"),
         &["/dev/urandom", "--length", "16"],
-        b"0000000 7229 04bb 964d 28df ba71 4c03 de95 7027\n0000010\n",
+        b"0000000 cba5 1dfe 5bc3 2d5e 03fd 5546 131b 75a6\n0000010\n",
     );
 }
 
@@ -3467,26 +3483,20 @@ const RESERVED_ARMINGS: [(&str, &str); 5] = [
 
 /// What `reserved_signal_send_probe sends` prints for `signals`. On Linux each
 /// send succeeds and kills the child with its signal. A send of a signal in
-/// `reserved` is refused: it returns EPERM and the child exits 0. Under ptrace
-/// (`ptrace_drops_sigtrap`) each send succeeds and kills the child, except that
-/// a SIGTRAP from another process never reaches the child, which exits 0: a
-/// known ptrace-backend deviation from Linux,
-/// https://github.com/rrnewton/hermit/issues/4555, measured at Hermit 1538d448
-/// before the reserved set existed and unrelated to it (ptrace's set is empty),
-/// pinned here at its current value so that this test shows the reserved-signal
-/// rule leaves ptrace unchanged.
-fn reserved_sends_expected(
-    signals: &[(&str, i32)],
-    reserved: &[i32],
-    ptrace_drops_sigtrap: bool,
-) -> String {
+/// `reserved` is refused: it returns EPERM and the child exits 0. Under ptrace,
+/// whose reserved set is empty, each send succeeds and kills the child as on
+/// Linux, SIGTRAP included: since Reverie a8e9d1d52b31 the ptrace backend
+/// delivers a sender-coded SIGTRAP that reaches an ordinary signal-delivery
+/// stop instead of dropping it (it dropped it before, and the child exited 0).
+/// https://github.com/rrnewton/hermit/issues/4555 stays open for the
+/// injection windows that can still drop one under `--chaos`; this probe's
+/// plain runs, under `--max-timeslice=disabled`, do not meet them.
+fn reserved_sends_expected(signals: &[(&str, i32)], reserved: &[i32]) -> String {
     let mut expected = String::new();
     for call in RESERVED_SEND_CALLS {
         for &(name, number) in signals {
             expected.push_str(&if reserved.contains(&number) {
                 format!("{call} {name}: rc=-1 errno=EPERM child=exit 0\n")
-            } else if ptrace_drops_sigtrap && number == libc::SIGTRAP {
-                format!("{call} {name}: rc=0 errno=0 child=exit 0\n")
             } else {
                 format!("{call} {name}: rc=0 errno=0 child=signal {number}\n")
             });
@@ -3789,11 +3799,12 @@ fn assert_unscheduled_probe_deaths(
 /// ones, which verify; arming SIGTRAP succeeds there and verifies. Each
 /// backend's guest also reads its own SigCgt (`router` mode), which shows
 /// SIGTRAP caught exactly where LiteInst installed its guard router: on
-/// `liteinst`, not on `in-guest-trap`, ptrace or natively. The same guest under ptrace, whose reserved set
-/// is empty, prints
-/// what it printed before the set existed (see `reserved_sends_expected` and
-/// `reserved_armings_expected` for its two named deviations from Linux) and
-/// Hermit warns of nothing.
+/// `liteinst`, not on `in-guest-trap`, ptrace or natively. The same guest
+/// under ptrace, whose reserved set is empty, prints Linux's answers for its
+/// sends, SIGTRAP from another process included (Reverie a8e9d1d52b31; see
+/// `reserved_sends_expected`), keeps one named deviation from Linux for its
+/// armings (see `reserved_armings_expected`), verifies bitwise, and Hermit
+/// warns of nothing.
 /// The loader route cannot run here (it needs a private musl runtime that no
 /// validation node builds); its set is empty whatever its input, pinned by
 /// `a_poisoned_reserved_signal_set_never_survives_preparation`.
@@ -3811,7 +3822,7 @@ fn liteinst_in_guest_reserved_signal_sends_and_armings_are_refused() {
     assert!(native.status.success(), "{native:?}");
     assert_eq!(
         String::from_utf8_lossy(&native.stdout),
-        reserved_sends_expected(&RESERVED_SIGNALS, &[], false),
+        reserved_sends_expected(&RESERVED_SIGNALS, &[]),
         "native"
     );
     let native = Command::new(guest)
@@ -3853,7 +3864,7 @@ fn liteinst_in_guest_reserved_signal_sends_and_armings_are_refused() {
             &[],
             "sends",
             selected,
-            &reserved_sends_expected(&verifiable, reserved, ptrace),
+            &reserved_sends_expected(&verifiable, reserved),
         );
         if refused {
             assert_eq!(
@@ -3888,7 +3899,7 @@ fn liteinst_in_guest_reserved_signal_sends_and_armings_are_refused() {
                 backend,
                 "sends",
                 &delivered,
-                &reserved_sends_expected(&delivered, &[], false),
+                &reserved_sends_expected(&delivered, &[]),
             );
         }
 
@@ -3963,7 +3974,7 @@ fn liteinst_in_guest_patching_off_by_environment_still_reserves_sigtrap() {
         &patching_off,
         "sends",
         &trap,
-        &reserved_sends_expected(&trap, &[libc::SIGTRAP], false),
+        &reserved_sends_expected(&trap, &[libc::SIGTRAP]),
     );
     assert_eq!(
         stderr
@@ -5293,20 +5304,16 @@ fn liteinst_in_guest_close_range_releases_ports_like_ptrace() {
     );
 }
 
-/// Under `--verify` a recvmsg whose buffers cannot be observed after the call
-/// still returns the kernel's result to the guest: the buffer digest records
-/// an explicit, compared `unobserved` entry instead of hashing, and the verify
-/// report counts it. A plain receive is hashed as before. In the overwritten
-/// mode the guest's iovec array is its own receive buffer, so the payload
-/// overwrites the iovec with one byte at an unmapped address; before the
-/// entry, the failed read turned the guest's completed recvmsg into EFAULT
-/// under --verify.
+/// A complete actual-attempt snapshot makes a self-overwriting iovec's
+/// received bytes observable. Verify must compare their exact digest, retain
+/// the kernel's return, and never hash restored metadata over the payload.
+/// Genuine unreadability remains covered by unchanged observer unit tests.
 #[test]
 fn verify_digest_records_an_unobservable_recvmsg_and_keeps_the_kernel_result() {
     let _guard = hermit_run_guard();
     let guest = c_guest(&IOV_OVERWRITTEN_GUEST, "recvmsg_iov_overwritten_by_payload");
     let logs = tempfile::tempdir().expect("failed to create the verify-log directory");
-    for (mode, unobservable) in [("plain", false), ("overwritten", true)] {
+    for (mode, overwritten) in [("plain", false), ("overwritten", true)] {
         let log_dir = logs.path().join(mode);
         fs::create_dir(&log_dir).expect("failed to create a verify-log directory");
         let output = super::hermit_test::hermit_output(
@@ -5338,14 +5345,31 @@ fn verify_digest_records_an_unobservable_recvmsg_and_keeps_the_kernel_result() {
             .split_whitespace()
             .find_map(|field| field.strip_prefix("buffer="))
             .unwrap_or_else(|| panic!("{mode}: {stdout}"));
+        let destination = stdout
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("destination="))
+            .unwrap_or_else(|| panic!("{mode}: {stdout}"));
+        let sent = stdout
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("sent="))
+            .unwrap_or_else(|| panic!("{mode}: {stdout}"));
+        assert_eq!(
+            sent.len(),
+            32,
+            "independent sent payload is exactly 16 bytes"
+        );
+        assert!(sent.is_ascii(), "{mode}: {stdout}");
+        let payload: Vec<u8> = (0..16)
+            .map(|index| u8::from_str_radix(&sent[index * 2..index * 2 + 2], 16).unwrap())
+            .collect();
+        assert_eq!(destination == buffer, !overwritten, "{mode}: {stdout}");
         let expected_stdout = format!(
-            "buffer={buffer} received=16 overwritten={}\n",
-            u8::from(unobservable)
+            "buffer={buffer} received=16 overwritten={}\ndestination={destination} sent={sent}\n",
+            u8::from(overwritten)
         );
         assert_eq!(stdout, expected_stdout, "{mode}");
-        let hashed = format!("recvmsg in fd=4 {buffer}+16->");
-        let marker = "recvmsg in fd=4 unobserved ret=16 reason=buffer-unreadable at=";
-        let counted = "unobservable after the call (compared as 'unobserved' buffer-digest entries): run1=1, run2=1";
+        let expected_digest = detcore::Digest::new(&payload).to_string();
+        let hashed = format!("recvmsg in fd=4 {destination}+16->{expected_digest}");
         let golden: Vec<PathBuf> = fs::read_dir(&log_dir)
             .expect("failed to read the retained verify logs")
             .map(|entry| entry.expect("failed to read a retained log").path())
@@ -5361,22 +5385,34 @@ fn verify_digest_records_an_unobservable_recvmsg_and_keeps_the_kernel_result() {
             .lines()
             .filter(|line| line.contains("[iobuf]") && line.contains("recvmsg in"))
             .collect();
-        if unobservable {
-            assert!(
-                digests.len() == 1 && digests[0].contains(marker),
-                "{mode}: expected one {marker:?} entry: {digests:?}"
-            );
-            assert!(stderr.contains(counted), "{mode}: {stderr}");
-        } else {
-            assert!(
-                digests.len() == 1 && digests[0].contains(&hashed),
-                "{mode}: expected {hashed:?}: {digests:?}"
-            );
-            assert!(
-                !stderr.contains("unobservable after the call"),
-                "{mode}: {stderr}"
-            );
-        }
+        assert_eq!(digests.len(), 1, "{mode}: {digests:?}");
+        let (message, metadata) = digests[0]
+            .rsplit_once(" DETLOG_RECORD=")
+            .unwrap_or_else(|| panic!("{mode}: missing structured record: {digests:?}"));
+        let metadata: serde_json::Value = serde_json::from_str(metadata).unwrap_or_else(|error| {
+            panic!("{mode}: invalid structured record: {error}: {digests:?}")
+        });
+        assert_eq!(
+            metadata,
+            serde_json::json!({"schema": 1, "event": {"kind": "other"}}),
+            "{mode}: {digests:?}"
+        );
+        let (_, record) = message
+            .split_once("DETLOG [iobuf][dtid ")
+            .unwrap_or_else(|| panic!("{mode}: invalid iobuf record: {digests:?}"));
+        let (dtid, payload) = record
+            .split_once("] ")
+            .unwrap_or_else(|| panic!("{mode}: invalid thread prefix: {digests:?}"));
+        assert!(dtid.parse::<u64>().is_ok(), "{mode}: {digests:?}");
+        assert_eq!(
+            payload, hashed,
+            "{mode}: expected exact payload digest: {digests:?}"
+        );
+        assert!(
+            !stderr.contains("unobservable after the call"),
+            "{mode}: {stderr}"
+        );
+        assert!(!digests[0].contains("unobserved"), "{mode}: {digests:?}");
     }
 }
 

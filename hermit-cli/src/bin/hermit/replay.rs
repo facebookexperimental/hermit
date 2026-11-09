@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use clap::Parser;
+use hermit::Context;
 use hermit::Error;
 use hermit::HermitData;
 use hermit::Id;
@@ -52,7 +53,9 @@ pub struct ReplayOpts {
     #[clap(long, value_name = "DIR", env = "HERMIT_DATA_DIR")]
     data_dir: Option<PathBuf>,
 
-    /// The port to use for the gdb server.
+    /// The loopback TCP port the replay's gdbserver serves on, bound in the
+    /// host's network namespace so the replay keeps the network its recording
+    /// used; 0 lets the system pick a free one.
     #[clap(long, default_value = "1234")]
     // FIXME: This shouldn't exist. It'd be better to use a Unix domain socket.
     gdbserver_port: u16,
@@ -83,8 +86,8 @@ pub struct ReplayOpts {
 
 impl ReplayOpts {
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
-        use crate::manifest::Kind;
-        use crate::manifest::Target;
+        use crate::app::manifest::Kind;
+        use crate::app::manifest::Target;
 
         if self.dap_listen.is_some() {
             // Before resolving the recording, so a missing adapter is named
@@ -99,10 +102,10 @@ impl ReplayOpts {
         // Every kind of recording has one name and one verb
         // (https://github.com/rrnewton/hermit/issues/4271): a syscall
         // recording replays here; any other reruns from its manifest.
-        let (hermit, id) = match crate::manifest::resolve(store.data_dir(), &spec)? {
+        let (hermit, id) = match crate::app::manifest::resolve(store.data_dir(), &spec)? {
             Target::Recording { data_dir, id } => (HermitData::with_dir(data_dir), id),
             Target::Manifest(path) => {
-                let manifest = crate::manifest::read(&path)?;
+                let manifest = crate::app::manifest::read(&path)?;
                 // Check the saved profile before dispatching any manifest
                 // kind: network/history reruns otherwise bypass the syscall
                 // metadata check below and use this host's unbound CPUID.
@@ -124,9 +127,9 @@ impl ReplayOpts {
                 }
                 // The directory named, as the replayer finds it: its parent
                 // and its name.
-                let directory = std::path::absolute(crate::manifest::directory_of(&path))?;
+                let directory = std::path::absolute(crate::app::manifest::directory_of(&path))?;
                 let (data_dir, id) =
-                    crate::manifest::recording_location(&directory, Some(&manifest.id))?;
+                    crate::app::manifest::recording_location(&directory, Some(&manifest.id))?;
                 (HermitData::with_dir(data_dir), id)
             }
         };
@@ -157,14 +160,33 @@ impl ReplayOpts {
                     .context(format!("--cpu-profile x86-64-v3 refused: {refusal}"))
             })?;
         }
-        let recorded_local = metadata.local_networking == Some(true);
-        let network = replay_network(self.autopilot, recorded_local);
-        if recorded_local && network == NetworkingMode::Host {
-            // Same override, and same warning, as `hermit run --gdbserver`.
+        let network = replay_network(metadata.local_networking);
+        // Bound here, in the host's network namespace, before the container
+        // exists, so the gdb client reaches it whatever network the replay
+        // has (`hermit::gdbserver`).
+        let gdbserver_port = (!self.autopilot)
+            .then(|| {
+                hermit::gdbserver::GdbPort::bind(self.gdbserver_port).with_context(|| {
+                    format!(
+                        "Hermit cannot serve gdb on 127.0.0.1:{}: pass another \
+                         --gdbserver-port, or --gdbserver-port=0 to let the system pick one",
+                        self.gdbserver_port
+                    )
+                })
+            })
+            .transpose()?;
+        // The port gdb attaches to, the one the system picked for 0.
+        let port = gdbserver_port
+            .as_ref()
+            .map_or(self.gdbserver_port, |bound| bound.port());
+        // The executable gdb reads the symbols from.
+        let exe = hermit.data_dir().join(format!("{}/exe", id));
+        let real_exe = Shebang::new(&exe).map_or(exe, |s| s.interpreter().into());
+        if self.serve_only {
             eprintln!(
-                "hermit replay: WARNING: recording {id} used --network local, but a \
-                 gdb-served replay runs on the host network; syscalls replayed by \
-                 re-execution may see different interfaces and ports"
+                "hermit replay: serving recording {id} to one gdb client on 127.0.0.1:{port}; \
+                 attach with: gdb -ex 'target remote 127.0.0.1:{port}' {}",
+                real_exe.display()
             );
         }
         if self.autopilot || self.serve_only {
@@ -175,20 +197,20 @@ impl ReplayOpts {
             let resources = format!("replay {} and identity mounts", hermit.data_dir().display());
             super::owned_container::run(
                 &mut container,
-                (identity, hermit),
+                (identity, hermit, gdbserver_port),
                 resources,
                 true,
                 "with_container",
                 None,
-                move |(_, hermit)| options.container_main(&global, options.autopilot, hermit, id),
+                move |(_, hermit, gdbserver_port)| {
+                    if let Some(port) = gdbserver_port.take() {
+                        port.serve_next_gdbserver();
+                    }
+                    options.container_main(&global, options.autopilot, hermit, id)
+                },
             )
             .map(|(value, _guards)| value)
         } else {
-            // Find the path to the executable so that GDB can use it to resolve
-            // symbols.
-            let exe = hermit.data_dir().join(format!("{}/exe", id));
-            let real_exe = Shebang::new(&exe).map_or(exe, |s| s.interpreter().into());
-
             // Run the gdb client outside of the PID namespace. This cannot be done
             // inside of the PID namespace because it would perturb the
             // deterministic PID allocation that is needed for the replay.
@@ -200,7 +222,7 @@ impl ReplayOpts {
                 // don't prompt (dialog) when breakpoint symbol doesn't exist.
                 .arg("set breakpoint pending on")
                 .arg("-ex")
-                .arg(format!("target remote :{}", self.gdbserver_port));
+                .arg(format!("target remote :{port}"));
             for ex in &self.gdbex {
                 gdb_command.arg("-ex").arg(ex);
             }
@@ -221,9 +243,10 @@ impl ReplayOpts {
             // leaked, and the merged description of hermit#2654 says otherwise.
             // Recorded rather than quietly deleted, because the claim is in a
             // landed commit message where it cannot be edited.
-            let gdb_watch = GdbClientWatch::spawn(gdb_command, self.gdbserver_port)?;
+            let gdb_watch = GdbClientWatch::spawn(gdb_command, port)?;
             let (mut container, identity) = deterministic_container()?;
-            let guards = Rc::new(RefCell::new((identity, hermit, gdb_watch)));
+            network.configure(&mut container, false);
+            let guards = Rc::new(RefCell::new((identity, hermit, gdb_watch, gdbserver_port)));
             let resources = format!(
                 "replay {}, identity mounts and GDB watcher",
                 guards.borrow().1.data_dir().display()
@@ -238,6 +261,9 @@ impl ReplayOpts {
                 "with_container",
                 None,
                 move |guards| {
+                    if let Some(port) = guards.borrow_mut().3.take() {
+                        port.serve_next_gdbserver();
+                    }
                     options.container_main(&global, options.autopilot, &guards.borrow().1, id)
                 },
             );
@@ -275,7 +301,7 @@ impl ReplayOpts {
         &self,
         global: &GlobalOpts,
         path: &Path,
-        manifest: &crate::manifest::Manifest,
+        manifest: &crate::app::manifest::Manifest,
         data_dir: &Path,
     ) -> Error {
         use std::os::unix::process::CommandExt;
@@ -364,6 +390,9 @@ impl ReplayOpts {
     ) -> Result<ExitStatus, Error> {
         let _guard = global.init_tracing();
 
+        // A recording of a deadlocked guest replays to the same deadlock,
+        // which returns `hermit::SchedulerEndedRun`: the deadlock under
+        // Hermit's model the recording ended on.
         if autopilot {
             hermit.replay(id)
         } else {
@@ -373,12 +402,12 @@ impl ReplayOpts {
 }
 
 /// The network a replay runs in. Syscalls the replayer does not serve from
-/// the recording are executed for real, so an autopilot replay uses the
-/// network the recording used; recordings that predate the stored choice ran
-/// on the host network. A replay served to gdb uses the host network so the
-/// gdb client can reach its gdbserver port, as `hermit run --gdbserver` does.
-fn replay_network(autopilot: bool, recorded_local: bool) -> NetworkingMode {
-    if autopilot && recorded_local {
+/// the recording are executed for real, so a replay uses the network the
+/// recording used, served to gdb or not: its gdbserver's port is bound in the
+/// host's network namespace either way. Recordings that predate the stored
+/// choice ran on the host network.
+fn replay_network(recorded_local: Option<bool>) -> NetworkingMode {
+    if recorded_local == Some(true) {
         NetworkingMode::Local
     } else {
         NetworkingMode::Host
@@ -390,10 +419,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_an_autopilot_replay_of_a_local_recording_is_local() {
-        assert_eq!(replay_network(true, true), NetworkingMode::Local);
-        assert_eq!(replay_network(true, false), NetworkingMode::Host);
-        assert_eq!(replay_network(false, true), NetworkingMode::Host);
-        assert_eq!(replay_network(false, false), NetworkingMode::Host);
+    fn a_replay_uses_the_recorded_network() {
+        assert_eq!(replay_network(Some(true)), NetworkingMode::Local);
+        assert_eq!(replay_network(Some(false)), NetworkingMode::Host);
+        assert_eq!(replay_network(None), NetworkingMode::Host);
     }
 }

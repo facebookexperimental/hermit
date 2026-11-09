@@ -147,8 +147,13 @@ pub(crate) fn progress_of(
     match call {
         Syscall::Write(write) => Some((write.fd(), Wants::Data)),
         Syscall::Writev(writev) => Some((writev.fd(), Wants::Data)),
+        // Only at the current position can these move bytes through a pipe
+        // (an explicit offset fails with ESPIPE there), where Detcore runs
+        // them as `writev` and `readv`.
+        Syscall::Pwritev2(pwritev2) => Some((pwritev2.fd(), Wants::Data)),
         Syscall::Read(read) => Some((read.fd(), Wants::Space)),
         Syscall::Readv(readv) => Some((readv.fd(), Wants::Space)),
+        Syscall::Preadv2(preadv2) => Some((preadv2.fd(), Wants::Space)),
         _ => None,
     }
 }

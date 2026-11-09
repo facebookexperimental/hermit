@@ -74,7 +74,7 @@ function require_runtime_closure {
 # newer than the oldest supported host's: glibc 2.34, measured on the host
 # recorded for GUEST_PRELOAD_GLIBC_MINOR_FLOOR in docs/TESTING_ENVIRONMENTS.md
 # under "Named measurement hosts". detcore-sabre/build.rs,
-# detcore-liteinst/build.rs, detcore-sabre/src/glibc_compat.rs and Reverie's
+# detcore-liteinst/build.rs, common/inguest/glibc_compat.rs and Reverie's
 # reverie-liteinst/build.rs build them that way. ci/test_guest_preload_gate.py
 # runs this gate on real ELF files and checks that both scripts apply it to all
 # three.
@@ -132,6 +132,42 @@ function require_complete_resources {
     fi
 }
 
+function require_core_resources {
+    local install=$1 require_runtime=$2 path actual expected
+    [[ -d $install/rsrcs ]] || fail "core resource bundle has no rsrcs directory: $install"
+    for path in LICENSE README.txt hermit licenses/LICENSE \
+        rsrcs/libreverie_liteinst.so rsrcs/libreverie_liteinst.so.revision \
+        rsrcs/libdetcore_liteinst.so rsrcs/libdetcore_liteinst.package.json; do
+        [[ -f $install/$path && -s $install/$path ]] ||
+            fail "core resource is missing or empty: $install/$path"
+    done
+    [[ -x $install/hermit ]] || fail "core installed Hermit is not executable: $install/hermit"
+    require_portable_guest_preload "In-guest LiteInst runtime" "$install/rsrcs/libdetcore_liteinst.so"
+    require_portable_guest_preload "LiteInst preload" "$install/rsrcs/libreverie_liteinst.so"
+    "$ROOT_DIR/ci/verify-packaged-detcore.py" --core "$install" ||
+        fail "ordinary core Detcore packaging qualification is missing or stale"
+    if [[ $require_runtime == true ]]; then
+        require_runtime_closure "$install/rsrcs/hermit-runtime"
+    elif [[ -e $install/rsrcs/hermit-runtime ]]; then
+        fail "core resource bundle carries an undeclared Hermit runtime closure: $install/rsrcs/hermit-runtime"
+    fi
+    expected=$'LICENSE\nREADME.txt\nhermit\nlicenses/LICENSE\nrsrcs/libdetcore_liteinst.package.json\nrsrcs/libdetcore_liteinst.so\nrsrcs/libreverie_liteinst.so\nrsrcs/libreverie_liteinst.so.revision'
+    if [[ $require_runtime == true ]]; then
+        expected+=$'\nrsrcs/hermit-runtime/libunwind-x86_64.so.8\nrsrcs/hermit-runtime/libunwind.so.8'
+    fi
+    expected=$(printf '%s\n' "$expected" | LC_ALL=C sort)
+    actual=$(cd "$install" && find -L . -type f -printf '%P\n' | LC_ALL=C sort)
+    [[ $actual == "$expected" ]] || fail "core resource inventory differs from the maintained first-party installer/finalizer: $install"
+}
+
+function require_selected_resources {
+    if [[ $kind == core-complete ]]; then
+        require_core_resources "$@"
+    else
+        require_complete_resources "$@"
+    fi
+}
+
 function require_runtime_resources {
     local install=$1 actual
     require_runtime_closure "$install/rsrcs/hermit-runtime"
@@ -154,7 +190,7 @@ fi
 [[ -d $bundle && ! -L $bundle ]] || fail "published artifact directory is missing or not a regular directory: $bundle"
 [[ -f $bundle/kind && -s $bundle/kind ]] || fail "published artifact has no kind marker: $bundle"
 kind=$(<"$bundle/kind")
-[[ $kind == complete || $kind == runtime || $kind == binary-only ]] || fail "unknown artifact kind '$kind': $bundle"
+[[ $kind == complete || $kind == core-complete || $kind == runtime || $kind == binary-only ]] || fail "unknown artifact kind '$kind': $bundle"
 [[ -f $bundle/hermit && ! -L $bundle/hermit && -s $bundle/hermit && -x $bundle/hermit ]] ||
     fail "published Hermit is missing, empty, or non-executable: $bundle/hermit"
 [[ -f $bundle/hermit.sha256 && -s $bundle/hermit.sha256 ]] ||
@@ -171,7 +207,7 @@ if [[ -e $bundle/runtime-contract ]]; then
         fail "published runtime contract is malformed: $bundle/runtime-contract"
     runtime_contract=$(<"$bundle/runtime-contract")
 fi
-if [[ $kind == complete ]]; then
+if [[ $kind == complete || $kind == core-complete ]]; then
     declared=false
     if binary_declares_runtime_resources "$bundle/hermit"; then
         declared=true
@@ -185,7 +221,7 @@ if [[ $kind == complete ]]; then
         none) [[ $declared == false ]] || fail "selected Hermit runtime contract marker is missing: $bundle" ;;
         *) fail "unknown complete-artifact runtime contract '$runtime_contract': $bundle" ;;
     esac
-    require_complete_resources "$bundle/install" "$declared"
+    require_selected_resources "$bundle/install" "$declared"
     # The manifest hashes regular files only, so anything else would ride along
     # unbound. The publisher copies without links; a special file never belongs.
     special=$(find "$bundle/install" -mindepth 1 ! -type f ! -type d -print -quit)

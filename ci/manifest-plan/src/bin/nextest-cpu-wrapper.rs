@@ -91,9 +91,10 @@ const DYNAMIC_LIBRARY_PATH_ENV: &str = "LD_LIBRARY_PATH";
 // than the retry running on what the refused attempt left over. Nextest's
 // per-test wall limit still bounds the whole test.
 const SKID_RETRY_CREDIT_ENV: &str = "HERMIT_SKID_RETRY_CREDIT";
-/// The helper makes at most five attempts, so at most four retries earn a
-/// budget.
-const MAX_SKID_RETRY_CREDITS: u64 = 4;
+/// Derived from the one shared skid budget
+/// ([`detcore_model::SKID_RETRY_MAX_ATTEMPTS`]): at most bound − 1
+/// retries earn a budget.
+const MAX_SKID_RETRY_CREDITS: u64 = detcore_model::SKID_RETRY_MAX_ATTEMPTS as u64 - 1;
 const INFRASTRUCTURE_EXIT: u8 = 70;
 const CPU_TIMEOUT_EXIT: u8 = 124;
 const NON_SIGNAL_CAUSE_RESERVED: i32 = -1;
@@ -1151,12 +1152,19 @@ fn reap_owned_cgroup_until_empty(
     reaped_cpu_usec: &mut u64,
     wait4: &mut Vec<Wait4Record>,
     deadline: Instant,
+    stop_after_direct_exit: bool,
 ) -> Result<bool, String> {
     loop {
         let population =
             reap_available_children(direct_pid, direct_status, reaped_cpu_usec, wait4)?;
         if population == ChildPopulation::Empty && !cgroup.populated()? && cgroup.procs_empty()? {
             return Ok(true);
+        }
+        // After external cancellation, the leader's real wait receipt ends
+        // its opportunity to unwind. Do not spend nextest's remaining grace
+        // waiting for descendants that the dead leader can no longer stop.
+        if stop_after_direct_exit && direct_status.is_some() {
+            return Ok(false);
         }
         if Instant::now() >= deadline {
             return Ok(false);
@@ -1172,12 +1180,16 @@ struct CleanupOutcome {
 fn terminate_owned_cgroup(
     direct_pidfd: &PidFd,
     cgroup: &OwnedAttemptCgroup,
-    signal: i32,
+    cause: &FirstCause,
     grace: Duration,
     direct_status: &mut Option<ExitStatus>,
     reaped_cpu_usec: &mut u64,
     wait4: &mut Vec<Wait4Record>,
 ) -> Result<CleanupOutcome, String> {
+    let signal = match cause {
+        FirstCause::ExternalSignal { signal } => *signal,
+        _ => libc::SIGTERM,
+    };
     let mut first_error = if env::var_os(CONTROL_ARM_ENV).is_some()
         && env::var_os(CONTROL_CLEANUP_ERROR_ENV).is_some()
     {
@@ -1195,6 +1207,7 @@ fn terminate_owned_cgroup(
             reaped_cpu_usec,
             wait4,
             Instant::now() + grace,
+            matches!(cause, FirstCause::ExternalSignal { .. }),
         ) {
             Ok(true) => return Ok(CleanupOutcome { error: None }),
             Ok(false) => {}
@@ -1300,6 +1313,7 @@ fn kill_owned_cgroup_and_reap(
         reaped_cpu_usec,
         wait4,
         Instant::now() + CHILD_REAP_DEADLINE,
+        false,
     )? {
         Ok(())
     } else {
@@ -1536,10 +1550,14 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
     let record_dir = PathBuf::from(required_env(CPU_RECORD_DIR_ENV)?);
     let run_id = required_env(RUN_ID_ENV)?;
     let identity = identity_from_command(program, child_args)?;
-    if let Some((path, digest)) = &invocation.budget_map {
-        invocation.cpu_budget_usec =
-            Some(ResolvedBudgets::read_bound(path, digest)?.cpu_budget_usec(&identity)?);
-    }
+    let mapped_wall_seconds = if let Some((path, digest)) = &invocation.budget_map {
+        let resolved = ResolvedBudgets::read_bound(path, digest)?;
+        let entry = resolved.entry(&identity)?;
+        invocation.cpu_budget_usec = Some(entry.cpu_seconds * 1_000_000);
+        Some(entry.wall_seconds)
+    } else {
+        None
+    };
     let started = Instant::now();
     RECEIVED_SIGNAL.store(0, Ordering::SeqCst);
     install_signal_handlers()?;
@@ -1904,17 +1922,13 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
     let base_budget_usec = invocation
         .cpu_budget_usec
         .expect("budgeted path requires an enabled CPU budget");
-    let cleanup_signal = match cause {
-        FirstCause::ExternalSignal { signal } => signal,
-        _ => libc::SIGTERM,
-    };
     let cgroup = attempt_cgroup
         .as_mut()
         .expect("budgeted path created an attempt cgroup");
     let cleanup = match terminate_owned_cgroup(
         &direct_pidfd,
         cgroup,
-        cleanup_signal,
+        &cause,
         invocation.termination_grace,
         &mut direct_status,
         &mut reaped_cpu_usec,
@@ -2027,6 +2041,17 @@ fn run_wrapper(args: Vec<OsString>) -> Result<WrapperOutcome, String> {
     )
     .with_wait4(wait4);
     write_attempt_atomic(&record_dir, &record)?;
+    // A supervisor signal does not prove a timeout; preserve its streams exactly.
+    // Only our CPU-timeout decision can add a diagnostic to the child output.
+    if matches!(&completion, AttemptCompletion::CpuTimeout { .. }) {
+        let wall = mapped_wall_seconds.map_or_else(
+            || "unknown (no resolved budget map)".to_string(),
+            |seconds| format!("{seconds} s"),
+        );
+        eprintln!(
+            "nextest-cpu-wrapper: CPU timeout; effective CPU budget: {cpu_budget_usec} us; Nextest wall backstop: {wall}"
+        );
+    }
     // Remove the credit file now: propagating a signal ends this process
     // without running destructors.
     drop(skid_credit);
@@ -2282,7 +2307,7 @@ fn control_child(mode: &str, args: &[OsString]) -> Result<ExitCode, String> {
                 thread::sleep(Duration::from_secs(60));
             }
         }
-        "escaped-burner" => {
+        "escaped-burner" | "escaped-sleeper" => {
             if unsafe { libc::setsid() } < 0 {
                 return Err(format!(
                     "cannot move stubborn control out of the original process group: {}",
@@ -2296,14 +2321,23 @@ fn control_child(mode: &str, args: &[OsString]) -> Result<ExitCode, String> {
             fs::write(&path, format!("{}\n", std::process::id()))
                 .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
             loop {
-                burn_cpu(500);
+                if mode == "escaped-sleeper" {
+                    thread::sleep(Duration::from_secs(60));
+                } else {
+                    burn_cpu(500);
+                }
             }
         }
-        "wait-for-escaped-burner" | "exit-after-escaped-burner" => {
+        "wait-for-escaped-burner" | "exit-after-escaped-burner" | "wait-for-escaped-sleeper" => {
             let executable = env::current_exe().map_err(|error| error.to_string())?;
             let pid_path = PathBuf::from(required_env(CONTROL_PID_FILE_ENV)?);
+            let descendant = if mode == "wait-for-escaped-sleeper" {
+                "escaped-sleeper"
+            } else {
+                "escaped-burner"
+            };
             let child = Command::new(executable)
-                .args(["--exact", "escaped-burner", "--nocapture"])
+                .args(["--exact", descendant, "--nocapture"])
                 .env(CONTROL_ARM_ENV, "1")
                 .spawn()
                 .map_err(|error| format!("cannot spawn stubborn CPU descendant: {error}"))?;
@@ -2314,6 +2348,13 @@ fn control_child(mode: &str, args: &[OsString]) -> Result<ExitCode, String> {
                     return Err("stubborn CPU descendant did not start".into());
                 }
                 thread::sleep(Duration::from_millis(2));
+            }
+            if mode == "wait-for-escaped-sleeper" {
+                fs::write(
+                    pid_path.with_extension("leader"),
+                    format!("{}\n", std::process::id()),
+                )
+                .map_err(|error| format!("cannot publish wall control leader: {error}"))?;
             }
             if mode == "exit-after-escaped-burner" {
                 Ok(ExitCode::SUCCESS)
@@ -2651,6 +2692,202 @@ fn catching_signal_control(
     fs::read(signal_file).map_err(|e| e.to_string())
 }
 
+fn external_signal_escaped_child_control(
+    executable: &Path,
+    test_binary: &Path,
+    scratch: &Path,
+) -> Result<(), String> {
+    use hermit_manifest_plan::invocation_cgroup::InvocationCgroup;
+
+    // This self-test owner survives the wrapper's process-group hard kill.
+    // Adopt escapees and always close the outer cgroup, including when the
+    // old implementation fails the assertion below. The maintained DAG
+    // cgroup remains the backstop if this self-test process is itself killed.
+    install_subreaper()?;
+    let root = scratch.join("external-wall-control");
+    fs::create_dir_all(root.join("attempts")).map_err(|error| error.to_string())?;
+    fs::copy(
+        scratch.join("binary-map.json"),
+        root.join("binary-map.json"),
+    )
+    .map_err(|error| error.to_string())?;
+    let descendant_file = root.join("descendant.pid");
+    let cgroup_file = root.join("attempt-cgroup.path");
+    let stdout_file = root.join("stdout");
+    let stderr_file = root.join("stderr");
+    let mut outer = InvocationCgroup::create().map_err(|error| error.message)?;
+    let mut command = control_command(
+        executable,
+        test_binary,
+        &root,
+        "wait-for-escaped-sleeper",
+        1,
+    );
+    command
+        .env(CONTROL_PID_FILE_ENV, &descendant_file)
+        .env(CONTROL_CGROUP_PATH_FILE_ENV, &cgroup_file)
+        // Files cannot keep wait_with_output blocked after the failed control
+        // leaves a pipe writer alive. Read them only after owned cleanup.
+        .stdout(File::create(&stdout_file).map_err(|error| error.to_string())?)
+        .stderr(File::create(&stderr_file).map_err(|error| error.to_string())?);
+    let enrollment_fd = outer.enrollment_fd();
+    unsafe {
+        command.pre_exec(move || {
+            loop {
+                let written = libc::write(enrollment_fd, b"0\n".as_ptr().cast(), 2);
+                if written == 2 {
+                    return Ok(());
+                }
+                if written < 0 {
+                    let error = *libc::__errno_location();
+                    if error == libc::EINTR {
+                        continue;
+                    }
+                    return Err(io::Error::from_raw_os_error(error));
+                }
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
+        });
+    }
+    let child = command
+        .spawn()
+        .map_err(|error| format!("cannot start external wall control: {error}"))?;
+    let wrapper_pid = child.id();
+    drop(child); // The subreaper below owns all actual wait4 receipts.
+    let observed = (|| -> Result<(), String> {
+        let wrapper_pidfd = PidFd::open(wrapper_pid)?;
+        wait_for_file(&descendant_file, "escaped wall descendant")?;
+        let leader_file = descendant_file.with_extension("leader");
+        wait_for_file(&leader_file, "external wall leader")?;
+        let leader_pid = read_pid(&leader_file)?;
+        let descendant_pid = read_pid(&descendant_file)?;
+        let attempt_path = PathBuf::from(
+            fs::read_to_string(&cgroup_file)
+                .map_err(|error| error.to_string())?
+                .trim(),
+        );
+        if attempt_path.parent() != Some(outer.path())
+            || unsafe { libc::getpgid(leader_pid) } != leader_pid
+            || unsafe { libc::getsid(descendant_pid) } != descendant_pid
+            || unsafe { libc::getpgid(descendant_pid) } != descendant_pid
+        {
+            return Err("external wall control did not establish its owned escaped subtree".into());
+        }
+        // Model nextest's real external TERM followed by its two-second
+        // process-group SIGKILL deadline. No shorter wrapper grace is used.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        if unsafe { libc::kill(-(wrapper_pid as i32), libc::SIGTERM) } != 0 {
+            return Err(format!(
+                "cannot cancel external wall control: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        let hard_deadline = loop {
+            if Instant::now() >= deadline {
+                // The wrapper has not been reaped, so its group identity has
+                // not been recycled. This deliberately does not kill the
+                // different group/session occupied by the fixture children.
+                if unsafe { libc::kill(-(wrapper_pid as i32), libc::SIGKILL) } != 0 {
+                    return Err(format!(
+                        "cannot enforce outer wall deadline: {}",
+                        io::Error::last_os_error()
+                    ));
+                }
+                break true;
+            }
+            if wrapper_pidfd.terminal_ready_for_control()? {
+                // A deschedule between the first deadline check and this
+                // readiness observation must not accept a late completion.
+                // A missed deadline takes the failure and owned-rescue path.
+                break Instant::now() >= deadline;
+            }
+            thread::sleep(Duration::from_millis(2));
+        };
+        // Observe the failure before the independent safety cleanup below.
+        let descendant_present = process_exists(descendant_pid);
+        let populated = outer.populated()?;
+        let records = read_attempt_records(&root.join("attempts"))?;
+        if hard_deadline || descendant_present || populated || records.len() != 1 {
+            return Err(format!(
+                "external wall cancellation lost owned cleanup: hard_deadline={hard_deadline}, descendant_present={descendant_present}, populated={populated}, attempt_records={}",
+                records.len()
+            ));
+        }
+        let record = find_record(&records, "wait-for-escaped-sleeper")?;
+        if !matches!(
+            record.completion,
+            AttemptCompletion::SupervisorSignal {
+                signal: libc::SIGTERM
+            }
+        ) || record.cpu_source != CPU_SOURCE_CGROUP_V2
+            || record.identity.attempt != 1
+            || record.identity.binary != "fixture::bin/fixture_name"
+            || record.wait4.len() != 2
+            || !record.wait4.iter().any(|receipt| {
+                receipt.pid == leader_pid as u32
+                    && ExitStatus::from_raw(receipt.status).signal() == Some(libc::SIGTERM)
+            })
+            || !record.wait4.iter().any(|receipt| {
+                receipt.pid == descendant_pid as u32
+                    && ExitStatus::from_raw(receipt.status).signal() == Some(libc::SIGKILL)
+            })
+            || attempt_path.exists()
+        {
+            return Err(format!(
+                "external wall cancellation lost real signal/reap/cgroup evidence: {record:?}"
+            ));
+        }
+        Ok(())
+    })();
+
+    // No assertion or error above bypasses this rescue. Killing the enclosing
+    // cgroup also reaches the old wrapper's abandoned nested attempt cgroup.
+    let kill = outer.kill();
+    let mut direct_status = None;
+    let mut reaped_cpu_usec = 0;
+    let mut wait4 = Vec::new();
+    let reaped = (|| -> Result<(), String> {
+        let deadline = Instant::now() + CHILD_REAP_DEADLINE;
+        loop {
+            let population = reap_available_children(
+                wrapper_pid,
+                &mut direct_status,
+                &mut reaped_cpu_usec,
+                &mut wait4,
+            )?;
+            if population == ChildPopulation::Empty && !outer.populated()? && outer.procs_empty()? {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(
+                    "external wall control rescue did not close and reap its subtree".into(),
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    })();
+    let finished = outer.finish();
+    if kill.is_err() || reaped.is_err() || finished.is_err() {
+        return Err(format!(
+            "external wall control result={observed:?}; rescue kill={kill:?}, reap={reaped:?}, finish={finished:?}"
+        ));
+    }
+    observed?;
+    if direct_status.and_then(|status| status.signal()) != Some(libc::SIGTERM)
+        || !fs::read(stdout_file)
+            .map_err(|error| error.to_string())?
+            .is_empty()
+        || !fs::read(stderr_file)
+            .map_err(|error| error.to_string())?
+            .is_empty()
+    {
+        return Err(format!(
+            "external wall control changed its actual wrapper status or streams: {direct_status:?}"
+        ));
+    }
+    Ok(())
+}
+
 fn exit_before_first_reap_control(
     mut command: Command,
     scratch: &Path,
@@ -2832,6 +3069,13 @@ fn budget_map_self_test(
     let stopped = run("exit-after-escaped-burner", &digest)?;
     if stopped.status.code() != Some(CPU_TIMEOUT_EXIT.into()) {
         return Err(format!("mapped CPU opponent did not stop: {stopped:?}"));
+    }
+    if !String::from_utf8_lossy(&stopped.stderr)
+        .contains("effective CPU budget: 1000000 us; Nextest wall backstop: 4 s")
+    {
+        return Err(format!(
+            "mapped CPU opponent omitted its effective CPU/wall limits: {stopped:?}"
+        ));
     }
     if process_exists(read_pid(&root.join("descendant.pid"))?) {
         return Err("mapped CPU opponent left its escaped descendant alive".into());
@@ -3552,6 +3796,7 @@ fn self_test() -> Result<(), String> {
             "catching control changed signal delivery: native={native_signals:?}, wrapped={wrapped_signals:?}"
         ));
     }
+    external_signal_escaped_child_control(&executable, &test_binary, &scratch.0)?;
     let records = read_attempt_records(&scratch.0.join("attempts"))?;
     let identities = records
         .iter()

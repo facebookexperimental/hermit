@@ -1,0 +1,710 @@
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/capability.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "gmock/gmock.h"
+#include "gtest/gtest.h"
+#include "absl/strings/string_view.h"
+#include "absl/time/clock.h"
+#include "absl/time/time.h"
+#include "test/syscalls/linux/file_base.h"
+#include "test/util/cleanup.h"
+#include "test/util/file_descriptor.h"
+#include "test/util/fs_util.h"
+#include "test/util/linux_capability_util.h"
+#include "test/util/posix_error.h"
+#include "test/util/save_util.h"
+#include "test/util/temp_path.h"
+#include "test/util/test_util.h"
+#include "test/util/thread_util.h"
+
+namespace gvisor {
+namespace testing {
+
+namespace {
+
+// This test is currently very rudimentary.
+//
+// There are plenty of extra cases to cover once the sentry supports them.
+//
+// Different types of opens:
+// * O_CREAT
+// * O_DIRECTORY
+// * O_NOFOLLOW
+// * O_PATH
+//
+// Special operations on open:
+// * O_EXCL
+//
+// Special files:
+// * Blocking behavior for a named pipe.
+//
+// Different errors:
+// * EACCES
+// * EEXIST
+// * ENAMETOOLONG
+// * ELOOP
+// * ENOTDIR
+// * EPERM
+class OpenTest : public FileTest {
+  void SetUp() override {
+    FileTest::SetUp();
+
+    ASSERT_THAT(
+        write(test_file_fd_.get(), test_data_.c_str(), test_data_.length()),
+        SyscallSucceedsWithValue(test_data_.length()));
+    EXPECT_THAT(lseek(test_file_fd_.get(), 0, SEEK_SET), SyscallSucceeds());
+  }
+
+ public:
+  const std::string test_data_ = "hello world\n";
+};
+
+TEST_F(OpenTest, OTrunc) {
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  ASSERT_THAT(open(dir.path().c_str(), O_TRUNC, 0666),
+              SyscallFailsWithErrno(EISDIR));
+}
+
+TEST_F(OpenTest, OTruncAndReadOnlyDir) {
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  ASSERT_THAT(open(dir.path().c_str(), O_TRUNC | O_RDONLY, 0666),
+              SyscallFailsWithErrno(EISDIR));
+}
+
+TEST_F(OpenTest, OTruncAndReadOnlyFile) {
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto path = JoinPath(dir.path(), "foo");
+  EXPECT_NO_ERRNO(Open(path, O_RDWR | O_CREAT, 0666));
+  EXPECT_NO_ERRNO(Open(path, O_TRUNC | O_RDONLY, 0666));
+}
+
+TEST_F(OpenTest, OCreateDirectory) {
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+
+  // Normal case: existing directory.
+  ASSERT_THAT(open(dir.path().c_str(), O_RDONLY | O_CREAT, 0666),
+              SyscallFailsWithErrno(EISDIR));
+  // Trailing separator on existing directory.
+  ASSERT_THAT(open((dir.path() + "/").c_str(), O_RDONLY | O_CREAT, 0666),
+              SyscallFailsWithErrno(EISDIR));
+  // Trailing separator on non-existing directory.
+  ASSERT_THAT(open((JoinPath(dir.path(), "non-existent") + "/").c_str(),
+                   O_RDONLY | O_CREAT, 0666),
+              SyscallFailsWithErrno(EISDIR));
+  // "." special case.
+  ASSERT_THAT(open(JoinPath(dir.path(), ".").c_str(), O_RDONLY | O_CREAT, 0666),
+              SyscallFailsWithErrno(EISDIR));
+}
+
+TEST_F(OpenTest, MustCreateExisting) {
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+
+  // Existing directory.
+  ASSERT_THAT(open(dir.path().c_str(), O_RDWR | O_CREAT | O_EXCL, 0666),
+              SyscallFailsWithErrno(EEXIST));
+
+  // Existing file.
+  auto newFile = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(dir.path()));
+  ASSERT_THAT(open(newFile.path().c_str(), O_RDWR | O_CREAT | O_EXCL, 0666),
+              SyscallFailsWithErrno(EEXIST));
+}
+
+TEST_F(OpenTest, ReadOnly) {
+  char buf = 0;
+  const FileDescriptor ro_file =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(test_file_name_, O_RDONLY));
+
+  EXPECT_THAT(read(ro_file.get(), &buf, 1), SyscallSucceedsWithValue(1));
+  EXPECT_THAT(lseek(ro_file.get(), 0, SEEK_SET), SyscallSucceeds());
+  EXPECT_THAT(write(ro_file.get(), &buf, 1), SyscallFailsWithErrno(EBADF));
+}
+
+TEST_F(OpenTest, WriteOnly) {
+  char buf = 0;
+  const FileDescriptor wo_file =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(test_file_name_, O_WRONLY));
+
+  EXPECT_THAT(read(wo_file.get(), &buf, 1), SyscallFailsWithErrno(EBADF));
+  EXPECT_THAT(lseek(wo_file.get(), 0, SEEK_SET), SyscallSucceeds());
+  EXPECT_THAT(write(wo_file.get(), &buf, 1), SyscallSucceedsWithValue(1));
+}
+
+TEST_F(OpenTest, CreateWithAppend) {
+  std::string data = "text";
+  std::string new_file = NewTempAbsPath();
+  const FileDescriptor file = ASSERT_NO_ERRNO_AND_VALUE(
+      Open(new_file, O_WRONLY | O_APPEND | O_CREAT, 0666));
+  EXPECT_THAT(write(file.get(), data.c_str(), data.size()),
+              SyscallSucceedsWithValue(data.size()));
+  EXPECT_THAT(lseek(file.get(), 0, SEEK_SET), SyscallSucceeds());
+  EXPECT_THAT(write(file.get(), data.c_str(), data.size()),
+              SyscallSucceedsWithValue(data.size()));
+
+  // Check that the size of the file is correct and that the offset has been
+  // incremented to that size.
+  struct stat s0;
+  EXPECT_THAT(fstat(file.get(), &s0), SyscallSucceeds());
+  EXPECT_EQ(s0.st_size, 2 * data.size());
+  EXPECT_THAT(lseek(file.get(), 0, SEEK_CUR),
+              SyscallSucceedsWithValue(2 * data.size()));
+}
+
+TEST_F(OpenTest, ReadWrite) {
+  char buf = 0;
+  const FileDescriptor rw_file =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(test_file_name_, O_RDWR));
+
+  EXPECT_THAT(read(rw_file.get(), &buf, 1), SyscallSucceedsWithValue(1));
+  EXPECT_THAT(lseek(rw_file.get(), 0, SEEK_SET), SyscallSucceeds());
+  EXPECT_THAT(write(rw_file.get(), &buf, 1), SyscallSucceedsWithValue(1));
+}
+
+TEST_F(OpenTest, RelPath) {
+  auto name = std::string(Basename(test_file_name_));
+
+  ASSERT_THAT(chdir(GetAbsoluteTestTmpdir().c_str()), SyscallSucceeds());
+  const FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open(name, O_RDONLY));
+}
+
+TEST_F(OpenTest, AbsPath) {
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(test_file_name_, O_RDONLY));
+}
+
+TEST_F(OpenTest, AtRelPath) {
+  auto name = std::string(Basename(test_file_name_));
+  const FileDescriptor dirfd = ASSERT_NO_ERRNO_AND_VALUE(
+      Open(GetAbsoluteTestTmpdir(), O_RDONLY | O_DIRECTORY));
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(OpenAt(dirfd.get(), name, O_RDONLY));
+}
+
+TEST_F(OpenTest, AtAbsPath) {
+  const FileDescriptor dirfd = ASSERT_NO_ERRNO_AND_VALUE(
+      Open(GetAbsoluteTestTmpdir(), O_RDONLY | O_DIRECTORY));
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(OpenAt(dirfd.get(), test_file_name_, O_RDONLY));
+}
+
+TEST_F(OpenTest, OpenNoFollowSymlink) {
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const std::string link_path = JoinPath(dir.path().c_str(), "link");
+  ASSERT_THAT(symlink(test_file_name_.c_str(), link_path.c_str()),
+              SyscallSucceeds());
+  auto cleanup = Cleanup([link_path]() {
+    EXPECT_THAT(unlink(link_path.c_str()), SyscallSucceeds());
+  });
+
+  // Open will succeed without O_NOFOLLOW and fails with O_NOFOLLOW.
+  const FileDescriptor fd2 =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(link_path, O_RDONLY));
+  ASSERT_THAT(open(link_path.c_str(), O_RDONLY | O_NOFOLLOW),
+              SyscallFailsWithErrno(ELOOP));
+}
+
+TEST_F(OpenTest, OpenNoFollowStillFollowsLinksInPath) {
+  // We will create the following structure:
+  // tmp_folder/real_folder/file
+  // tmp_folder/sym_folder -> tmp_folder/real_folder
+  //
+  // We will then open tmp_folder/sym_folder/file with O_NOFOLLOW and it
+  // should succeed as O_NOFOLLOW only applies to the final path component.
+  auto tmp_path = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto sym_path = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateSymlinkTo(GetAbsoluteTestTmpdir(), tmp_path.path()));
+  auto file_path =
+      ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileIn(tmp_path.path()));
+
+  auto path_via_symlink = JoinPath(sym_path.path(), Basename(file_path.path()));
+  const FileDescriptor fd2 =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(path_via_symlink, O_RDONLY | O_NOFOLLOW));
+}
+
+// Test that open(2) can follow symlinks that point back to the same tree.
+// Test sets up files as follows:
+//   root/child/symlink => redirects to ../..
+//   root/child/target => regular file
+//
+// open("root/child/symlink/root/child/file")
+TEST_F(OpenTest, SymlinkRecurse) {
+  auto root = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  auto child = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDirIn(root.path()));
+  auto symlink = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateSymlinkTo(child.path(), "../.."));
+  auto target = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(child.path(), "abc", 0644));
+  auto path_via_symlink =
+      JoinPath(symlink.path(), Basename(root.path()), Basename(child.path()),
+               Basename(target.path()));
+  const auto contents =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents(path_via_symlink));
+  ASSERT_EQ(contents, "abc");
+}
+
+TEST_F(OpenTest, Fault) {
+  char* totally_not_null = nullptr;
+  ASSERT_THAT(open(totally_not_null, O_RDONLY), SyscallFailsWithErrno(EFAULT));
+}
+
+TEST_F(OpenTest, AppendOnly) {
+  // First write some data to the fresh file.
+  const int64_t kBufSize = 1024;
+  std::vector<char> buf(kBufSize, 'a');
+
+  FileDescriptor fd0 = ASSERT_NO_ERRNO_AND_VALUE(Open(test_file_name_, O_RDWR));
+
+  std::fill(buf.begin(), buf.end(), 'a');
+  EXPECT_THAT(WriteFd(fd0.get(), buf.data(), buf.size()),
+              SyscallSucceedsWithValue(buf.size()));
+  fd0.reset();  // Close the file early.
+
+  // Next get two handles to the same file. We open two files because we want
+  // to make sure that appending is respected between them.
+  const FileDescriptor fd1 =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(test_file_name_, O_RDWR | O_APPEND));
+  EXPECT_THAT(lseek(fd1.get(), 0, SEEK_CUR), SyscallSucceedsWithValue(0));
+
+  const FileDescriptor fd2 =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(test_file_name_, O_RDWR | O_APPEND));
+  EXPECT_THAT(lseek(fd2.get(), 0, SEEK_CUR), SyscallSucceedsWithValue(0));
+
+  // Then try to write to the first fd and make sure the bytes are appended.
+  EXPECT_THAT(WriteFd(fd1.get(), buf.data(), buf.size()),
+              SyscallSucceedsWithValue(buf.size()));
+
+  // Check that the size of the file is correct and that the offset has been
+  // incremented to that size.
+  struct stat s0;
+  EXPECT_THAT(fstat(fd1.get(), &s0), SyscallSucceeds());
+  EXPECT_EQ(s0.st_size, kBufSize * 2);
+  EXPECT_THAT(lseek(fd1.get(), 0, SEEK_CUR),
+              SyscallSucceedsWithValue(kBufSize * 2));
+
+  // Then try to write to the second fd and make sure the bytes are appended.
+  EXPECT_THAT(WriteFd(fd2.get(), buf.data(), buf.size()),
+              SyscallSucceedsWithValue(buf.size()));
+
+  // Check that the size of the file is correct and that the offset has been
+  // incremented to that size.
+  struct stat s1;
+  EXPECT_THAT(fstat(fd2.get(), &s1), SyscallSucceeds());
+  EXPECT_EQ(s1.st_size, kBufSize * 3);
+  EXPECT_THAT(lseek(fd2.get(), 0, SEEK_CUR),
+              SyscallSucceedsWithValue(kBufSize * 3));
+}
+
+TEST_F(OpenTest, AppendConcurrentWrite) {
+  constexpr int kThreadCount = 5;
+  constexpr int kBytesPerThread = 10000;
+  std::unique_ptr<ScopedThread> threads[kThreadCount];
+
+  // In case of the uncached policy, we expect that a file system can be changed
+  // externally, so we create a new inode each time when we open a file and we
+  // can't guarantee that writes to files with O_APPEND will work correctly.
+  SKIP_IF(getenv("GVISOR_GOFER_UNCACHED"));
+  SKIP_IF(absl::NullSafeStringView(getenv("GVISOR_FUSE_TEST")) == "TRUE");
+
+  EXPECT_THAT(truncate(test_file_name_.c_str(), 0), SyscallSucceeds());
+
+  std::string filename = test_file_name_;
+  DisableSave ds;  // Too many syscalls.
+  // Start kThreadCount threads which will write concurrently into the same
+  // file.
+  for (int i = 0; i < kThreadCount; i++) {
+    threads[i] = std::make_unique<ScopedThread>([filename]() {
+      const FileDescriptor fd =
+          ASSERT_NO_ERRNO_AND_VALUE(Open(filename, O_RDWR | O_APPEND));
+
+      for (int j = 0; j < kBytesPerThread; j++) {
+        EXPECT_THAT(WriteFd(fd.get(), &j, 1), SyscallSucceedsWithValue(1));
+      }
+    });
+  }
+  for (int i = 0; i < kThreadCount; i++) {
+    threads[i]->Join();
+  }
+
+  // Check that the size of the file is correct.
+  struct stat st;
+  EXPECT_THAT(stat(test_file_name_.c_str(), &st), SyscallSucceeds());
+  EXPECT_EQ(st.st_size, kThreadCount * kBytesPerThread);
+}
+
+TEST_F(OpenTest, Truncate) {
+  {
+    // First write some data to the new file and close it.
+    FileDescriptor fd0 =
+        ASSERT_NO_ERRNO_AND_VALUE(Open(test_file_name_, O_WRONLY));
+    std::vector<char> orig(10, 'a');
+    EXPECT_THAT(WriteFd(fd0.get(), orig.data(), orig.size()),
+                SyscallSucceedsWithValue(orig.size()));
+  }
+
+  // Then open with truncate and verify that offset is set to 0.
+  const FileDescriptor fd1 =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(test_file_name_, O_RDWR | O_TRUNC));
+  EXPECT_THAT(lseek(fd1.get(), 0, SEEK_CUR), SyscallSucceedsWithValue(0));
+
+  // Then write less data to the file and ensure the old content is gone.
+  std::vector<char> want(5, 'b');
+  EXPECT_THAT(WriteFd(fd1.get(), want.data(), want.size()),
+              SyscallSucceedsWithValue(want.size()));
+
+  struct stat stat;
+  EXPECT_THAT(fstat(fd1.get(), &stat), SyscallSucceeds());
+  EXPECT_EQ(stat.st_size, want.size());
+  EXPECT_THAT(lseek(fd1.get(), 0, SEEK_CUR),
+              SyscallSucceedsWithValue(want.size()));
+
+  // Read the data and ensure only the latest write is in the file.
+  std::vector<char> got(want.size() + 1, 'c');
+  ASSERT_THAT(pread(fd1.get(), got.data(), got.size(), 0),
+              SyscallSucceedsWithValue(want.size()));
+  EXPECT_EQ(memcmp(want.data(), got.data(), want.size()), 0)
+      << "rbuf=" << got.data();
+  EXPECT_EQ(got.back(), 'c');  // Last byte should not have been modified.
+}
+
+TEST_F(OpenTest, NameTooLong) {
+  char buf[4097] = {};
+  memset(buf, 'a', 4097);
+  EXPECT_THAT(open(buf, O_RDONLY), SyscallFailsWithErrno(ENAMETOOLONG));
+}
+
+TEST_F(OpenTest, DotsFromRoot) {
+  const FileDescriptor rootfd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open("/", O_RDONLY | O_DIRECTORY));
+  const FileDescriptor other_rootfd =
+      ASSERT_NO_ERRNO_AND_VALUE(OpenAt(rootfd.get(), "..", O_RDONLY));
+}
+
+TEST_F(OpenTest, DirectoryWritableFails) {
+  ASSERT_THAT(open(GetAbsoluteTestTmpdir().c_str(), O_RDWR),
+              SyscallFailsWithErrno(EISDIR));
+}
+
+TEST_F(OpenTest, DirectoryDirectFails) {
+  ASSERT_THAT(open(GetAbsoluteTestTmpdir().c_str(), O_RDONLY | O_DIRECT),
+              SyscallFailsWithErrno(EINVAL));
+}
+
+TEST_F(OpenTest, FileNotDirectory) {
+  // Create a file and try to open it with O_DIRECTORY.
+  auto file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  ASSERT_THAT(open(file.path().c_str(), O_RDONLY | O_DIRECTORY),
+              SyscallFailsWithErrno(ENOTDIR));
+}
+
+TEST_F(OpenTest, SymlinkDirectory) {
+  auto dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  std::string link = NewTempAbsPath();
+  ASSERT_THAT(symlink(dir.path().c_str(), link.c_str()), SyscallSucceeds());
+  ASSERT_NO_ERRNO(Open(link, O_RDONLY | O_DIRECTORY));
+}
+
+TEST_F(OpenTest, Null) {
+  char c = '\0';
+  ASSERT_THAT(open(&c, O_RDONLY), SyscallFailsWithErrno(ENOENT));
+}
+
+// NOTE(b/119785738): While the man pages specify that this behavior should be
+// undefined, Linux truncates the file on opening read only if we have write
+// permission, so we will too.
+TEST_F(OpenTest, CanTruncateReadOnly) {
+  const FileDescriptor fd1 =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(test_file_name_, O_RDONLY | O_TRUNC));
+
+  struct stat stat;
+  EXPECT_THAT(fstat(fd1.get(), &stat), SyscallSucceeds());
+  EXPECT_EQ(stat.st_size, 0);
+  EXPECT_THAT(write(fd1.get(), "x", 1), SyscallFailsWithErrno(EBADF));
+}
+
+// If we don't have read permission on the file, opening with
+// O_TRUNC should fail.
+TEST_F(OpenTest, CanTruncateReadOnlyNoWritePermission) {
+  // Drop capabilities that allow us to override file permissions.
+  AutoCapability cap(CAP_DAC_OVERRIDE, false);
+
+  const DisableSave ds;  // Permissions are dropped.
+  ASSERT_THAT(chmod(test_file_name_.c_str(), S_IRUSR | S_IRGRP),
+              SyscallSucceeds());
+
+  ASSERT_THAT(open(test_file_name_.c_str(), O_RDONLY | O_TRUNC),
+              SyscallFailsWithErrno(EACCES));
+
+  const FileDescriptor fd1 =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(test_file_name_, O_RDONLY));
+
+  struct stat stat;
+  EXPECT_THAT(fstat(fd1.get(), &stat), SyscallSucceeds());
+  EXPECT_EQ(stat.st_size, test_data_.size());
+}
+
+// If we don't have read permission but have write permission, opening O_WRONLY
+// and O_TRUNC should succeed.
+TEST_F(OpenTest, CanTruncateWriteOnlyNoReadPermission) {
+  const DisableSave ds;  // Permissions are dropped.
+
+  EXPECT_THAT(fchmod(test_file_fd_.get(), S_IWUSR | S_IWGRP),
+              SyscallSucceeds());
+
+  const FileDescriptor fd1 =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(test_file_name_, O_WRONLY | O_TRUNC));
+
+  EXPECT_THAT(fchmod(test_file_fd_.get(), S_IRUSR | S_IRGRP),
+              SyscallSucceeds());
+
+  const FileDescriptor fd2 =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(test_file_name_, O_RDONLY));
+
+  struct stat stat;
+  EXPECT_THAT(fstat(fd2.get(), &stat), SyscallSucceeds());
+  EXPECT_EQ(stat.st_size, 0);
+}
+
+TEST_F(OpenTest, CanTruncateWithStrangePermissions) {
+  AutoCapability cap1(CAP_DAC_OVERRIDE, false);
+  AutoCapability cap2(CAP_DAC_READ_SEARCH, false);
+  const DisableSave ds;  // Permissions are dropped.
+  std::string path = NewTempAbsPath();
+  // Create a file without user permissions.
+  EXPECT_NO_ERRNO(Open(path, O_CREAT | O_TRUNC | O_WRONLY, 055));
+
+  // Cannot open file because we are owner and have no permissions set.
+  EXPECT_THAT(open(path.c_str(), O_RDONLY), SyscallFailsWithErrno(EACCES));
+
+  // We *can* chmod the file, because we are the owner.
+  EXPECT_THAT(chmod(path.c_str(), 0755), SyscallSucceeds());
+
+  // Now we can open the file again.
+  EXPECT_NO_ERRNO(Open(path, O_RDWR));
+}
+
+TEST_F(OpenTest, OpenNonDirectoryWithTrailingSlash) {
+  const TempPath file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  const std::string bad_path = file.path() + "/";
+  EXPECT_THAT(open(bad_path.c_str(), O_RDONLY), SyscallFailsWithErrno(ENOTDIR));
+}
+
+TEST_F(OpenTest, OpenWithStrangeFlags) {
+  const TempPath file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(file.path(), O_WRONLY | O_RDWR));
+  EXPECT_THAT(write(fd.get(), "x", 1), SyscallFailsWithErrno(EBADF));
+  char c;
+  EXPECT_THAT(read(fd.get(), &c, 1), SyscallFailsWithErrno(EBADF));
+}
+
+TEST_F(OpenTest, OpenWithOpath) {
+  AutoCapability cap1(CAP_DAC_OVERRIDE, false);
+  AutoCapability cap2(CAP_DAC_READ_SEARCH, false);
+  const DisableSave ds;  // Permissions are dropped.
+  std::string path = NewTempAbsPath();
+
+  // Create a file without user permissions.
+  const FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(
+      Open(path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 055));
+
+  // Cannot open file as read only because we are owner and have no permissions
+  // set.
+  EXPECT_THAT(open(path.c_str(), O_RDONLY), SyscallFailsWithErrno(EACCES));
+
+  // Can open file with O_PATH because don't need permissions on the object when
+  // opening with O_PATH.
+  ASSERT_NO_ERRNO(Open(path, O_PATH));
+}
+
+// NOTE(b/236445327): Regression test. Opening a non-directory with O_PATH and
+// O_DIRECTORY should fail with ENOTDIR.
+TEST_F(OpenTest, OPathWithODirectory) {
+  auto newFile = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  EXPECT_THAT(open(newFile.path().c_str(), O_RDONLY | O_DIRECTORY | O_PATH),
+              SyscallFailsWithErrno(ENOTDIR));
+}
+
+// Truncate operations that don't change file size should still update mtime
+// and ctime. Tests truncation via open(O_TRUNC), ftruncate(2), and truncate(2).
+TEST_F(OpenTest, TruncateNoSizeChangeUpdatesTimestamps) {
+  // Create three zero-length files and record their initial timestamps.
+  auto path1 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  auto path2 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  auto path3 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+
+  // When running on gVisor, only test on tmpfs. We don't know how the gofer
+  // server implements open(O_TRUNC), ftruncate(2), and truncate(2). If it
+  // uses truncate(2) under the hood and the underlying filesystem is host
+  // tmpfs, then this test will fail.
+  SKIP_IF(IsRunningOnGvisor() &&
+          !ASSERT_NO_ERRNO_AND_VALUE(IsTmpfs(path1.path())));
+
+  struct stat before1 = {}, before2 = {}, before3 = {};
+  ASSERT_THAT(stat(path1.path().c_str(), &before1), SyscallSucceeds());
+  ASSERT_THAT(stat(path2.path().c_str(), &before2), SyscallSucceeds());
+  ASSERT_THAT(stat(path3.path().c_str(), &before3), SyscallSucceeds());
+  EXPECT_EQ(before1.st_size, 0);
+  EXPECT_EQ(before2.st_size, 0);
+  EXPECT_EQ(before3.st_size, 0);
+
+  const auto ts_gt = [](const struct timespec& a, const struct timespec& b) {
+    return a.tv_sec > b.tv_sec ||
+           (a.tv_sec == b.tv_sec && a.tv_nsec > b.tv_nsec);
+  };
+
+  absl::SleepFor(absl::Milliseconds(10));
+
+  // Test 1: open(O_TRUNC) on zero-length file.
+  const FileDescriptor fd1 =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(path1.path(), O_WRONLY | O_TRUNC));
+  struct stat after1 = {};
+  ASSERT_THAT(fstat(fd1.get(), &after1), SyscallSucceeds());
+  EXPECT_EQ(after1.st_size, 0);
+  EXPECT_TRUE(ts_gt(after1.st_mtim, before1.st_mtim));
+  EXPECT_TRUE(ts_gt(after1.st_ctim, before1.st_ctim));
+
+  // Test 2: ftruncate(2) to same size (0).
+  const FileDescriptor fd2 =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(path2.path(), O_WRONLY));
+  ASSERT_THAT(ftruncate(fd2.get(), 0), SyscallSucceeds());
+  struct stat after2 = {};
+  ASSERT_THAT(fstat(fd2.get(), &after2), SyscallSucceeds());
+  EXPECT_EQ(after2.st_size, 0);
+  EXPECT_TRUE(ts_gt(after2.st_mtim, before2.st_mtim));
+  EXPECT_TRUE(ts_gt(after2.st_ctim, before2.st_ctim));
+
+  // Test 3: truncate(2) to same size (0). Note that Linux tmpfs does NOT
+  // update mtime/ctime for truncate(2) same-size, but ext4 does. gVisor
+  // unconditionally updates for simplicity. Do not test this on native tmpfs.
+  if (IsRunningOnGvisor() ||
+      !ASSERT_NO_ERRNO_AND_VALUE(IsTmpfs(path3.path()))) {
+    ASSERT_THAT(truncate(path3.path().c_str(), 0), SyscallSucceeds());
+    struct stat after3 = {};
+    ASSERT_THAT(stat(path3.path().c_str(), &after3), SyscallSucceeds());
+    EXPECT_EQ(after3.st_size, 0);
+    EXPECT_TRUE(ts_gt(after3.st_mtim, before3.st_mtim));
+    EXPECT_TRUE(ts_gt(after3.st_ctim, before3.st_ctim));
+  }
+}
+
+// Truncate operations that change file size should always update mtime and
+// ctime.  Tests truncation via open(O_TRUNC), ftruncate(2), and truncate(2).
+TEST_F(OpenTest, TruncateSizeChangeUpdatesTimestamps) {
+  auto path1 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetAbsoluteTestTmpdir(), "initial data 1", 0644));
+  auto path2 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetAbsoluteTestTmpdir(), "initial data 2", 0644));
+  auto path3 = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFileWith(
+      GetAbsoluteTestTmpdir(), "initial data 3", 0644));
+
+  struct stat before1 = {}, before2 = {}, before3 = {};
+  ASSERT_THAT(stat(path1.path().c_str(), &before1), SyscallSucceeds());
+  ASSERT_THAT(stat(path2.path().c_str(), &before2), SyscallSucceeds());
+  ASSERT_THAT(stat(path3.path().c_str(), &before3), SyscallSucceeds());
+  EXPECT_GT(before1.st_size, 0);
+  EXPECT_GT(before2.st_size, 0);
+  EXPECT_GT(before3.st_size, 0);
+
+  const auto ts_gt = [](const struct timespec& a, const struct timespec& b) {
+    return a.tv_sec > b.tv_sec ||
+           (a.tv_sec == b.tv_sec && a.tv_nsec > b.tv_nsec);
+  };
+
+  absl::SleepFor(absl::Milliseconds(10));
+
+  // Test 1: open(O_TRUNC) on non-zero-length file.
+  const FileDescriptor fd1 =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(path1.path(), O_WRONLY | O_TRUNC));
+  struct stat after1 = {};
+  ASSERT_THAT(fstat(fd1.get(), &after1), SyscallSucceeds());
+  EXPECT_EQ(after1.st_size, 0);
+  EXPECT_TRUE(ts_gt(after1.st_mtim, before1.st_mtim));
+  EXPECT_TRUE(ts_gt(after1.st_ctim, before1.st_ctim));
+
+  // Test 2: ftruncate(2) to smaller size.
+  const FileDescriptor fd2 =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(path2.path(), O_WRONLY));
+  ASSERT_THAT(ftruncate(fd2.get(), 5), SyscallSucceeds());
+  struct stat after2 = {};
+  ASSERT_THAT(fstat(fd2.get(), &after2), SyscallSucceeds());
+  EXPECT_EQ(after2.st_size, 5);
+  EXPECT_TRUE(ts_gt(after2.st_mtim, before2.st_mtim));
+  EXPECT_TRUE(ts_gt(after2.st_ctim, before2.st_ctim));
+
+  // Test 3: truncate(2) to 0.
+  ASSERT_THAT(truncate(path3.path().c_str(), 0), SyscallSucceeds());
+  struct stat after3 = {};
+  ASSERT_THAT(stat(path3.path().c_str(), &after3), SyscallSucceeds());
+  EXPECT_EQ(after3.st_size, 0);
+  EXPECT_TRUE(ts_gt(after3.st_mtim, before3.st_mtim));
+  EXPECT_TRUE(ts_gt(after3.st_ctim, before3.st_ctim));
+}
+
+#if defined(__aarch64__)
+// On arm64, if the first argument of a syscall equals one of the kernel's
+// internal restart codes (-513 / `-ERESTARTNOINTR`, etc.), the host kernel's
+// arch_do_signal_or_restart() must not cause the syscall to execute twice.
+// Under POSIX and Linux, openat(dirfd, pathname, ...) ignores dirfd when
+// pathname is an absolute path. This allows passing restart-code arguments in
+// dirfd while performing a real operation. With O_CREAT | O_EXCL, any second
+// execution would fail with EEXIST, verifying single execution without ptrace.
+// Running in a loop also verifies that the syscall fast path (syshandler)
+// handles restart arguments correctly if/when syscall patching is enabled.
+TEST_F(OpenTest, RestartArgumentNotExecutedTwiceLoop) {
+  for (int64_t arg : {-512, -513, -514, -516}) {
+    for (bool use_libc : {false, true}) {
+      for (int i = 0; i < 20; ++i) {
+        const std::string path = NewTempAbsPath();
+        int fd;
+        if (use_libc) {
+          fd = openat(static_cast<int>(arg), path.c_str(),
+                      O_CREAT | O_EXCL | O_RDWR, 0644);
+        } else {
+          fd = syscall(SYS_openat, arg, path.c_str(), O_CREAT | O_EXCL | O_RDWR,
+                       0644);
+        }
+        EXPECT_THAT(fd, SyscallSucceeds())
+            << "for arg " << arg << " (use_libc=" << use_libc << ", iter=" << i
+            << ")";
+        if (fd >= 0) {
+          EXPECT_THAT(close(fd), SyscallSucceeds());
+          EXPECT_THAT(unlink(path.c_str()), SyscallSucceeds());
+        }
+      }
+    }
+  }
+}
+#endif  // defined(__aarch64__)
+
+}  // namespace
+
+}  // namespace testing
+}  // namespace gvisor

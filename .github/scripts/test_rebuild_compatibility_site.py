@@ -548,8 +548,8 @@ class HostedAdapterTests(unittest.TestCase):
         with patch.dict(os.environ, env):
             self.assertEqual(ADAPTER.fetch_ledger(ledger, newest), 1)
 
-        # After a squash (https://github.com/rrnewton/dev-hermit/issues/562)
-        # main is a new root, and a summary written before it names a commit
+        # After a squash of the ledger's main to one snapshot commit, main is
+        # a new root, and a summary written before it names a commit
         # no deeper fetch reaches: the fetch stops once it has the whole
         # history instead of deepening to the limit.
         snapshot = sh(origin, "commit-tree", newest + "^{tree}", "-m", "ledger snapshot")
@@ -561,6 +561,47 @@ class HostedAdapterTests(unittest.TestCase):
         sh(origin, "update-ref", "refs/heads/main", squashed)
         with patch.dict(os.environ, env):
             self.assertEqual(ADAPTER.fetch_ledger(ledger, squashed), 51)
+
+        # A snapshot carrying the ledger's trailer folds the old tip in: a
+        # summary written before the squash names a commit folded into the
+        # snapshot, which the fetch treats as reachable. Without the trailer
+        # (above) it does not, and an unrelated commit never does.
+        folded = sh(origin, "commit-tree", newest + "^{tree}", "-m",
+                    "ledger snapshot\n\nLedger-Snapshot-Of: " + newest)
+        sh(origin, "checkout", "-q", "--detach", folded)
+        (origin / "scorecard/parity.json").write_text(
+            json.dumps({"generated_from": {"series_commit": summarized}}))
+        sh(origin, "commit", "-q", "-am", "scorecard after the folded squash")
+        folded_head = sh(origin, "rev-parse", "HEAD")
+        self.assertFalse(ADAPTER._is_ancestor(origin, summarized, folded_head))
+        self.assertTrue(ADAPTER._is_ancestor_or_folded(origin, summarized, folded_head))
+        self.assertFalse(ADAPTER._is_ancestor_or_folded(origin, folded_head, summarized))
+
+        # A cold checkout holds only post-squash history: fetching the
+        # squashed head must also acquire the detached old tip the trailer
+        # names, or the folding proof cannot be checked locally at all.
+        cold = self.root / "cold-ledger"
+        sh(self.root, "clone", "-q", "--depth", "1", f"file://{origin}", str(cold))
+        with patch.dict(os.environ, env):
+            ADAPTER.fetch_ledger(cold, folded_head)
+        self.assertTrue(ADAPTER._is_ancestor_or_folded(cold, summarized, folded_head))
+
+        # Two successive squashes: the proof chain follows the second
+        # trailer to the first tip, then the first trailer to the summary.
+        second = sh(origin, "commit-tree", folded_head + "^{tree}", "-m",
+                    "ledger snapshot\n\nLedger-Snapshot-Of: " + folded_head)
+        sh(origin, "checkout", "-q", "--detach", second)
+        (origin / "series.jsonl").write_text("second squash\n")
+        sh(origin, "add", "series.jsonl")
+        (origin / "scorecard/parity.json").write_text(
+            json.dumps({"generated_from": {"series_commit": summarized}}))
+        sh(origin, "commit", "-q", "-am", "scorecard after the second squash")
+        second_head = sh(origin, "rev-parse", "HEAD")
+        cold2 = self.root / "cold-ledger-2"
+        sh(self.root, "clone", "-q", "--depth", "1", f"file://{origin}", str(cold2))
+        with patch.dict(os.environ, env):
+            ADAPTER.fetch_ledger(cold2, second_head)
+        self.assertTrue(ADAPTER._is_ancestor_or_folded(cold2, summarized, second_head))
 
     def test_ledger_capture_is_exact_and_invocation_failures_refuse(self):
         captured = "a" * 40
@@ -718,6 +759,139 @@ class HostedAdapterTests(unittest.TestCase):
         ):
             ADAPTER.verify_public(receipt, timeout=1)
         self.assertFalse(json.loads(receipt.read_bytes())["deployed"])
+
+    def test_source_config_reads_the_saved_dispatched_pin(self):
+        # The workflow saves the dispatched commit's pin before the pin
+        # checkout moves the workspace; source-config must honor that
+        # file, or the rebuild silently uses the older pin recorded at
+        # hermit_commit (runs 41537071693 and 41666103898).
+        saved = copy.deepcopy(self.config)
+        saved["parent_commit"] = "a" * 40
+        saved["hermit_commit"] = "b" * 40
+        path = self.root / "dispatched-pin.json"
+        path.write_text(json.dumps(saved))
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                SCRIPT,
+                "source-config",
+                "--builder-config",
+                str(path),
+            ],
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        printed = json.loads(result.stdout)
+        self.assertEqual(printed["parent_commit"], "a" * 40)
+        self.assertEqual(printed["hermit_commit"], "b" * 40)
+
+    def test_pinned_adapter_still_knows_the_dispatched_pin(self):
+        # B2 layout: the workflow runs the WORKSPACE adapter (the
+        # dispatched commit's) with --builder-config naming the
+        # dispatched pin.  The pin checkout's older adapter is never on
+        # that command line — its --builder-config incompatibility is
+        # irrelevant because the checkout moved to a sibling worktree
+        # (_pin_source), not over the workspace.  This exercises the
+        # exact command line the workflow uses, from the workspace.
+        saved = copy.deepcopy(self.config)
+        saved_pin = self.root / "website-builder-pin.json"
+        saved_pin.write_text(json.dumps(saved))
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                SCRIPT,
+                "source-config",
+                "--builder-config",
+                str(saved_pin),
+            ],
+            cwd=SCRIPT.parents[2],
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        printed = json.loads(result.stdout)
+        self.assertEqual(printed["parent_commit"], saved["parent_commit"])
+        self.assertEqual(printed["hermit_commit"], saved["hermit_commit"])
+
+    def test_saved_adapter_layout_runs_against_an_older_workspace(self):
+        # B1 regression: the workflow snapshots the dispatched commit's
+        # adapter tree and runs THAT after the pin checkout moved the
+        # workspace.  Recreate the snapshot layout the workflow writes
+        # (adapter, publisher helper, pin, releases registry, scripts/)
+        # and drive the workflow's exact command line from a workspace
+        # directory whose own adapter is an older copy without
+        # --builder-config; the snapshot must still print the saved pin.
+        import shutil
+
+        workspace = self.root / "workspace"
+        (workspace / ".github" / "scripts").mkdir(parents=True)
+        old_adapter = (
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "if '--builder-config' in sys.argv:\n"
+            "    print('unrecognized arguments: --builder-config', file=sys.stderr)\n"
+            "    raise SystemExit(2)\n"
+            "raise SystemExit(0)\n"
+        )
+        (workspace / ".github" / "scripts" / "rebuild-compatibility-site.py").write_text(
+            old_adapter
+        )
+
+        snapshot = self.root / "dispatched"
+        (snapshot / ".github" / "scripts").mkdir(parents=True)
+        (snapshot / "scripts").mkdir(parents=True)
+        shutil.copy(SCRIPT, snapshot / ".github" / "scripts" / SCRIPT.name)
+        helper = SCRIPT.with_name("publish-compatibility-site.py")
+        shutil.copy(helper, snapshot / ".github" / "scripts" / helper.name)
+        releases = SCRIPT.parents[1] / "compatibility-site-releases.json"
+        shutil.copy(releases, snapshot / ".github" / releases.name)
+        saved = copy.deepcopy(self.config)
+        saved["parent_commit"] = "c" * 40
+        saved["hermit_commit"] = "d" * 40
+        saved_pin = snapshot / ".github" / "compatibility-site-builder.json"
+        saved_pin.write_text(json.dumps(saved))
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                str(snapshot / ".github" / "scripts" / SCRIPT.name),
+                "source-config",
+                "--builder-config",
+                str(saved_pin),
+            ],
+            cwd=workspace,
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        printed = json.loads(result.stdout)
+        self.assertEqual(printed["parent_commit"], "c" * 40)
+        self.assertEqual(printed["hermit_commit"], "d" * 40)
+
+        # Guard the premise: the older workspace adapter really would
+        # have rejected the same command line with exit 2.
+        old = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                str(workspace / ".github" / "scripts" / SCRIPT.name),
+                "source-config",
+                "--builder-config",
+                str(saved_pin),
+            ],
+            cwd=workspace,
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        self.assertEqual(old.returncode, 2, old.stdout + old.stderr)
 
     def test_public_help_is_readable_and_has_no_build_side_effect(self):
         for command in (

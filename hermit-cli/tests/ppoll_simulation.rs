@@ -204,55 +204,6 @@ fn ppoll_masked_waits_poll_under_their_mask() {
     }
 }
 
-/// On a backend whose kernel does not report the guest's signal state, Hermit
-/// cannot tell whether the backend holds a signal that should end a masked
-/// ppoll's wait, so under `run --strict` such a call that would block still
-/// fails closed with ENOSYS (`masked-fail-closed`), where the ptrace backend
-/// waits under the mask (`ppoll_masked_waits_poll_under_their_mask`).
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_masked_ppoll_that_would_block_fails_closed() {
-    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("ppoll-dbt-fail-closed-{}", std::process::id()));
-    fs::create_dir_all(&build_root).expect("failed to create ppoll guest build directory");
-    let guest = build_root.join("ppoll_simulation");
-    let mut compile = Command::new("cc");
-    compile
-        .args([
-            "-O0", "-g", "-pthread", "-std=c11", "-Wall", "-Wextra", "-Werror",
-        ])
-        .arg(repository.join("tests/c/ppoll_simulation.c"))
-        .arg("-o")
-        .arg(&guest);
-    command_output(compile, "ppoll guest compilation");
-
-    let mut run = Command::new("timeout");
-    run.args(["--kill-after", "5s", "60s"])
-        .arg(hermit_test::hermit_binary())
-        .args([
-            "--backend=dbt",
-            "run",
-            "--strict",
-            "--base-env=minimal",
-            "--",
-        ])
-        .arg(&guest)
-        .arg("masked-fail-closed");
-    // Validation runs guests in an empty working directory, which DBT needs
-    // named on its command line.
-    hermit_test::configure_guest_execution(&mut run);
-    let output = command_output(run, "strict dbt masked ppoll fail-closed run");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("ppoll-simulation-ok"),
-        "a blocking masked ppoll did not fail closed with ENOSYS under dbt\nstdout:\n{stdout}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stderr),
-    );
-}
-
 #[test]
 fn ppoll_nonsequentialized_kernel_wait_checks_mask_access() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))

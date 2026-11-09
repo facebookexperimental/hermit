@@ -26,7 +26,19 @@ use sha2::Sha256;
 
 pub const SELECTION_ENV: &str = "NEXTEST_PREPARED_BUILD_SELECTION";
 pub const REQUIRED_ENV: &str = "HERMIT_PREPARED_NEXTEST_REQUIRED";
-const RECORD_SCHEMA: u32 = 4;
+/// Version 6 added `prepared_for` and `cargo_profile`, which `assert` reads to
+/// refuse a record built in the wrong Cargo profile (see
+/// [`check_prepared_cargo_profile`]).
+/// Version 7 added `build_mode` and `feature_set`, the prepared-cohort key
+/// consumers check before any selection lookup (see [`check_prepared_cohort`]).
+const RECORD_SCHEMA: u32 = 7;
+/// The prepared cohort a node consumes, attached only by the DAG generator's
+/// `materialize` (absent means the default cohort). See [`PreparedCohort`].
+pub const COHORT_ENV: &str = "HERMIT_PREPARED_NEXTEST_COHORT";
+/// The whole-run build mode a prepared record must name. The `full`
+/// producer's command interpolates the same variable for `prepare`.
+pub const BUILD_MODE_ENV: &str = "HERMIT_VALIDATE_BUILD_MODE";
+pub const PROJECT_ENV: &str = "HERMIT_NEXTEST_PROJECT";
 pub const GUESTS_ENV: &str = "HERMIT_PREPARED_CARGO_GUESTS";
 pub const LIT_GUESTS_ENV: &str = "HERMIT_PREPARED_LIT_GUESTS";
 pub const CPU_WRAPPER_ENV: &str = "HERMIT_NEXTEST_CPU_WRAPPER_BIN";
@@ -38,13 +50,133 @@ const CPU_WRAPPER_TARGET: &str = "nextest-cpu-wrapper";
 /// ci/check-shard-coverage.sh pins that path.
 const UNIFIED_CPU_WRAPPER_PROFILES: &[&str] = &["full"];
 
-#[path = "../../cargo-guest-binaries.rs"]
+/// One prepared-executables cohort: a set of selections built together under
+/// one `(build_mode, feature_set)` key, with its own record, lock, and Cargo
+/// target directory. Not the cgroup launch cohort of `nextest_cohort`.
+///
+/// The default cohort keeps the historical store layout (`current.json` and
+/// `lock` in `target/ci/nextest-binaries`) and the checkout's default Cargo
+/// target. Every other cohort lives under `cohorts/` in that store and
+/// builds into its own target directory, so its producer can neither replace
+/// nor block the default generation: two cohorts are live in one validation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PreparedCohort {
+    slug: Option<&'static str>,
+}
+
+pub const DEFAULT_COHORT: PreparedCohort = PreparedCohort { slug: None };
+pub const NATIVE_EXEC_COHORT: PreparedCohort = PreparedCohort {
+    slug: Some("native-exec"),
+};
+
+impl PreparedCohort {
+    pub fn from_slug(slug: Option<&str>) -> Result<Self, String> {
+        match slug {
+            None | Some("default") => Ok(DEFAULT_COHORT),
+            Some("native-exec") => Ok(NATIVE_EXEC_COHORT),
+            Some(other) => Err(format!(
+                "unknown prepared Nextest cohort {other:?}; known cohorts are the default and \"native-exec\""
+            )),
+        }
+    }
+
+    pub fn from_env() -> Result<Self, String> {
+        Self::from_slug(std::env::var(COHORT_ENV).ok().as_deref())
+    }
+
+    pub fn is_default(self) -> bool {
+        self.slug.is_none()
+    }
+
+    /// The slug `materialize` records in [`COHORT_ENV`]; `None` (the variable
+    /// stays absent) for the default cohort.
+    pub fn env_value(self) -> Option<&'static str> {
+        self.slug
+    }
+
+    /// The cohort's name in refusal messages.
+    pub fn name(self) -> &'static str {
+        self.slug.unwrap_or("default")
+    }
+
+    /// The record path inside the artifact store.
+    fn record_path(self, store: &Path) -> PathBuf {
+        match self.slug {
+            None => store.join("current.json"),
+            Some(slug) => store.join("cohorts").join(format!("{slug}.json")),
+        }
+    }
+
+    /// The lock path inside the artifact store.
+    fn lock_path(self, store: &Path) -> PathBuf {
+        match self.slug {
+            None => store.join("lock"),
+            Some(slug) => store.join("cohorts").join(format!("lock.{slug}")),
+        }
+    }
+
+    /// The `CARGO_TARGET_DIR` value every producer and consumer of this
+    /// cohort must carry (`verify_record` compares the recorded build
+    /// environment exactly). The default cohort sets none. Relative, so the
+    /// same string resolves inside and outside the pinned root.
+    pub fn target_dir(self) -> Option<&'static str> {
+        match self.slug {
+            None => None,
+            Some("native-exec") => Some("target/cohort-native-exec"),
+            Some(_) => unreachable!("from_slug admits only registered cohorts"),
+        }
+    }
+
+    /// The exact `feature_set` this cohort's record must name, for a closed
+    /// cohort whose selections are fixed in code. The default cohort's union
+    /// is open (it grows with the graph), so `assert` recomputes it from the
+    /// graph instead; `run` binds each consumer through its selection key.
+    pub fn expected_feature_set(self) -> Option<&'static str> {
+        match self.slug {
+            None => None,
+            Some("native-exec") => Some(
+                "hermit-run/kvm-native-test-support,hermit-run/liteinst,hermit-run/native-exec",
+            ),
+            Some(_) => unreachable!("from_slug admits only registered cohorts"),
+        }
+    }
+}
+
+/// The cohort whose producer and consumer nodes `materialize` marks, by tag.
+/// Every other node consumes the default cohort.
+pub fn cohort_for_step(tag: &str) -> PreparedCohort {
+    match tag {
+        "build.hermit_native_exec_compile_in_pinned_root"
+        | "build.hermit_native_exec_in_pinned_root"
+        | "test.hermit_native_exec" => NATIVE_EXEC_COHORT,
+        _ => DEFAULT_COHORT,
+    }
+}
+
+/// The build mode this run's prepared records must name: the whole-run
+/// [`BUILD_MODE_ENV`] switch, defaulting to Cargo like the producer command.
+/// `build_environment` deliberately does not capture that variable, so this
+/// check is what refuses a record the other mode's producer rewrote.
+pub fn expected_build_mode() -> Result<String, String> {
+    match std::env::var(BUILD_MODE_ENV) {
+        Ok(mode) if mode == "cargo" || mode == "buck" => Ok(mode),
+        Ok(other) => Err(format!(
+            "unknown {BUILD_MODE_ENV} {other:?}; expected cargo or buck"
+        )),
+        Err(_) => Ok("cargo".into()),
+    }
+}
+
+#[cfg_attr(not(buck_build), path = "../../cargo-guest-binaries.rs")]
+#[cfg_attr(buck_build, path = "../mapped/ci/cargo-guest-binaries.rs")]
 mod cargo_guests;
 
-#[path = "../../lit-guest-binaries.rs"]
+#[cfg_attr(not(buck_build), path = "../../lit-guest-binaries.rs")]
+#[cfg_attr(buck_build, path = "../mapped/ci/lit-guest-binaries.rs")]
 mod lit_guests;
 
-#[path = "../../record-replay-workloads.rs"]
+#[cfg_attr(not(buck_build), path = "../../record-replay-workloads.rs")]
+#[cfg_attr(buck_build, path = "../mapped/ci/record-replay-workloads.rs")]
 pub mod record_workloads;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -285,9 +417,23 @@ fn git_bytes(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     Ok(result.stdout)
 }
 
-fn source_identity(root: &Path) -> Result<String, String> {
+/// The parts of one root's source identity, kept in the record so a
+/// stale refusal can name the root and the part that changed instead
+/// of reporting one opaque hash (dh-0pw53).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct SourcePart {
+    head: String,
+    tree: String,
+    diff_sha256: String,
+    untracked: Vec<(String, String, u32)>,
+}
+
+fn source_snapshot(root: &Path) -> Result<(String, SourcePart), String> {
     let mut hash = Sha256::new();
-    for args in [
+    let mut head = String::new();
+    let mut tree = String::new();
+    let mut diff_sha256 = String::new();
+    for (index, args) in [
         &["rev-parse", "HEAD", "HEAD^{tree}"][..],
         &[
             "diff",
@@ -298,13 +444,26 @@ fn source_identity(root: &Path) -> Result<String, String> {
             "HEAD",
             "--",
         ][..],
-    ] {
+    ]
+    .iter()
+    .enumerate()
+    {
         let bytes = git_bytes(root, args)?;
         hash.update((bytes.len() as u64).to_le_bytes());
-        hash.update(bytes);
+        hash.update(&bytes);
+        if index == 0 {
+            let text =
+                std::str::from_utf8(&bytes).map_err(|_| "git rev-parse output is not UTF-8")?;
+            let mut lines = text.lines();
+            head = lines.next().unwrap_or_default().to_string();
+            tree = lines.next().unwrap_or_default().to_string();
+        } else {
+            diff_sha256 = format!("{:x}", Sha256::digest(&bytes));
+        }
     }
-    let untracked = git_bytes(root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
-    for name in untracked
+    let untracked_bytes = git_bytes(root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    let mut untracked = Vec::new();
+    for name in untracked_bytes
         .split(|byte| *byte == 0)
         .filter(|name| !name.is_empty())
     {
@@ -315,8 +474,100 @@ fn source_identity(root: &Path) -> Result<String, String> {
         hash.update(name.as_bytes());
         hash.update(identity.sha256.as_bytes());
         hash.update(identity.mode.to_le_bytes());
+        untracked.push((name.to_string(), identity.sha256, identity.mode));
     }
-    Ok(format!("{:x}", hash.finalize()))
+    let part = SourcePart {
+        head,
+        tree,
+        diff_sha256,
+        untracked,
+    };
+    Ok((format!("{:x}", hash.finalize()), part))
+}
+
+fn source_identity(root: &Path) -> Result<String, String> {
+    Ok(source_snapshot(root)?.0)
+}
+
+/// Why CURRENT no longer matches RECORD, naming the first differing
+/// root and part (dh-0pw53): HEAD, tree, tracked diff, or the first
+/// added/removed/changed untracked file.
+fn stale_source_detail(
+    record: &PreparedRecord,
+    current: &BTreeMap<PathBuf, String>,
+    current_parts: &BTreeMap<PathBuf, SourcePart>,
+) -> String {
+    for (root, before_identity) in &record.sources {
+        if current.get(root) == Some(before_identity) {
+            continue;
+        }
+        let Some(before) = record.source_parts.get(root) else {
+            return format!("source identity changed at {}", root.display());
+        };
+        let Some(after) = current_parts.get(root) else {
+            return format!(
+                "source identity changed at {}: source root is gone",
+                root.display()
+            );
+        };
+        if after.head != before.head {
+            return format!(
+                "source identity changed at {}: HEAD moved {}..{}",
+                root.display(),
+                &before.head[..before.head.len().min(12)],
+                &after.head[..after.head.len().min(12)]
+            );
+        }
+        if after.tree != before.tree {
+            return format!(
+                "source identity changed at {}: HEAD tree changed",
+                root.display()
+            );
+        }
+        if after.diff_sha256 != before.diff_sha256 {
+            return format!(
+                "source identity changed at {}: tracked diff changed",
+                root.display()
+            );
+        }
+        let before_map: BTreeMap<&str, (&str, u32)> = before
+            .untracked
+            .iter()
+            .map(|(name, sha, mode)| (name.as_str(), (sha.as_str(), *mode)))
+            .collect();
+        let after_map: BTreeMap<&str, (&str, u32)> = after
+            .untracked
+            .iter()
+            .map(|(name, sha, mode)| (name.as_str(), (sha.as_str(), *mode)))
+            .collect();
+        for (name, value) in &after_map {
+            match before_map.get(name) {
+                None => {
+                    return format!(
+                        "source identity changed at {}: untracked file {name} was added",
+                        root.display()
+                    );
+                }
+                Some(old) if old != value => {
+                    return format!(
+                        "source identity changed at {}: untracked file {name} changed",
+                        root.display()
+                    );
+                }
+                _ => {}
+            }
+        }
+        for name in before_map.keys() {
+            if !after_map.contains_key(name) {
+                return format!(
+                    "source identity changed at {}: untracked file {name} was removed",
+                    root.display()
+                );
+            }
+        }
+        return format!("source identity changed at {}", root.display());
+    }
+    "source identity changed".to_string()
 }
 
 fn read_json(path: &Path) -> Result<Value, String> {
@@ -385,9 +636,15 @@ struct SelectionRecord {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct PreparedRecord {
     schema: u32,
+    project: Option<PreparedProject>,
     repository: PathBuf,
     target: PathBuf,
     sources: BTreeMap<PathBuf, String>,
+    /// Per-root identity parts, for stale refusals that name the
+    /// changed root and part (dh-0pw53). Defaulted so records
+    /// written before this field still read.
+    #[serde(default)]
+    source_parts: BTreeMap<PathBuf, SourcePart>,
     rustc: String,
     cargo_config: BTreeMap<PathBuf, Option<FileIdentity>>,
     build_environment: BTreeMap<String, String>,
@@ -398,6 +655,180 @@ struct PreparedRecord {
     lit_guests: Vec<FileIdentity>,
     record_workloads: Option<RecordWorkloads>,
     cpu_wrapper: CpuWrapperRecord,
+    /// The graph profile whose `prepare` wrote this record.
+    prepared_for: String,
+    /// The Cargo profile that built every recorded executable, as
+    /// [`recorded_cargo_profile`] names it.
+    cargo_profile: String,
+    /// The whole-run build mode (`cargo` or `buck`) whose `prepare` wrote
+    /// this record. Half of the cohort key; see [`PreparedCohort`].
+    build_mode: String,
+    /// The canonical sorted qualified feature list of this record's
+    /// selections (`prepared_feature_set`); empty when none name features.
+    /// The other half of the cohort key.
+    feature_set: String,
+}
+
+/// A neutral second Cargo project consumes an already-produced core tool
+/// cohort. It never claims the core CPU wrapper belongs to its own Cargo graph.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedProject {
+    descriptor: FileIdentity,
+    graph: FileIdentity,
+    tools_root: PathBuf,
+    core_preparation: FileIdentity,
+    shared_package: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectDescriptor {
+    schema: u32,
+    repository: PathBuf,
+    graph: PathBuf,
+    tools_root: PathBuf,
+    shared_package: String,
+}
+
+fn project(root: &Path) -> Result<Option<PreparedProject>, String> {
+    let Some(path) = std::env::var_os(PROJECT_ENV) else {
+        return Ok(None);
+    };
+    project_at(root, &PathBuf::from(path)).map(Some)
+}
+
+fn project_at(root: &Path, path: &Path) -> Result<PreparedProject, String> {
+    if !path.is_absolute() || path.canonicalize().map_err(|e| e.to_string())? != path {
+        return Err("prepared project descriptor must be an explicit canonical file".into());
+    }
+    let descriptor = file_identity(path, false)?;
+    if descriptor.size > 65536 {
+        return Err("prepared project descriptor exceeds its size bound".into());
+    }
+    let decoded: ProjectDescriptor =
+        serde_json::from_slice(&fs::read(path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    if decoded.schema != 1
+        || decoded.repository != root
+        || decoded.shared_package.is_empty()
+        || !decoded.tools_root.is_absolute()
+        || decoded
+            .tools_root
+            .canonicalize()
+            .map_err(|e| e.to_string())?
+            != decoded.tools_root
+        || decoded.tools_root == root
+        || !decoded.graph.is_absolute()
+        || decoded.graph.canonicalize().map_err(|e| e.to_string())? != decoded.graph
+    {
+        return Err(
+            "prepared project has an unknown schema, repository, graph, or tool owner".into(),
+        );
+    }
+    let relative = decoded
+        .graph
+        .strip_prefix(root)
+        .map_err(|_| "prepared project graph is outside its repository")?;
+    // The source identity includes the committed authored graph. A generated
+    // ignored scratch DAG cannot silently supply a second preparation population.
+    git_bytes(
+        root,
+        &[
+            "ls-files",
+            "--error-unmatch",
+            "--",
+            relative.to_str().ok_or("non-UTF-8 project graph")?,
+        ],
+    )?;
+    let graph = file_identity(&decoded.graph, false)?;
+    let core_preparation = file_identity(
+        &decoded
+            .tools_root
+            .join("target/ci/nextest-binaries/current.json"),
+        false,
+    )?;
+    check_identity(&descriptor, false)?;
+    Ok(PreparedProject {
+        descriptor,
+        graph,
+        tools_root: decoded.tools_root,
+        core_preparation,
+        shared_package: decoded.shared_package,
+    })
+}
+
+fn same_core_package(
+    project: &PreparedProject,
+    consumer: &Value,
+    core: &Value,
+) -> Result<(), String> {
+    fn owner(cargo: &Value, package: &str) -> Result<Vec<u8>, String> {
+        let matches = cargo["packages"]
+            .as_array()
+            .ok_or("missing Cargo package map")?
+            .iter()
+            .filter(|row| row["name"].as_str() == Some(package))
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err("shared core package is missing or ambiguous".into());
+        }
+        let manifest = Path::new(string(matches[0], "manifest_path")?);
+        git_bytes(
+            manifest
+                .parent()
+                .ok_or("core package manifest has no directory")?,
+            &["rev-parse", "HEAD", "HEAD^{tree}"],
+        )
+    }
+    if owner(consumer, &project.shared_package)? != owner(core, &project.shared_package)? {
+        return Err("consumer's core source pin/tree differs from its tool cohort".into());
+    }
+    Ok(())
+}
+
+/// Hold the original core producer's shared generation lock. Consumers retain
+/// this guard until their actual Nextest child has joined, alongside their own
+/// project lock. There is no fallback to building a wrapper in a test node.
+fn project_tools(project: Option<&PreparedProject>) -> Result<Option<LockedArtifacts>, String> {
+    let Some(project) = project else {
+        return Ok(None);
+    };
+    // The core tool cohort is the default cohort by construction; the
+    // record check below refuses a project record in its place.
+    let locked = LockedArtifacts::open(&project.tools_root, false, DEFAULT_COHORT)?;
+    check_identity(&project.core_preparation, false)?;
+    let record = locked.current()?;
+    if record.schema != RECORD_SCHEMA
+        || record.project.is_some()
+        || record.repository != project.tools_root
+    {
+        return Err("tool cohort is not the original core preparation owner".into());
+    }
+    check_identity(&record.cargo_metadata, false)?;
+    let cargo = read_json(&record.cargo_metadata.path)?;
+    let target = Path::new(string(&cargo, "target_directory")?);
+    if target != record.target
+        || target.canonicalize().map_err(|e| e.to_string())? != target
+        || record.sources != sources(&cargo, &project.tools_root)?
+        || record.rustc != rustc_identity()?
+    {
+        return Err("core tool cohort has changed source, compiler, or Cargo target".into());
+    }
+    // These are the producer's recorded config inputs, not a claim that two
+    // distinct Cargo projects have the same target-dir/build environment. The
+    // immutable core record retains its actual original build environment;
+    // the consumer's own environment is still checked by verify_record.
+    for (path, identity) in &record.cargo_config {
+        match identity {
+            Some(identity) => check_identity(identity, false)?,
+            None if !path.try_exists().map_err(|e| e.to_string())? => (),
+            None => return Err("core tool cohort Cargo configuration changed".into()),
+        }
+    }
+    verify_cpu_wrapper(&record, &cargo)?;
+    check_identity(&project.core_preparation, false)?;
+    Ok(Some(locked))
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -479,6 +910,20 @@ fn cpu_wrapper_artifact(
 }
 
 fn verify_cpu_wrapper(record: &PreparedRecord, cargo: &Value) -> Result<(), String> {
+    if let Some(project) = &record.project {
+        let tools = project_tools(Some(project))?.ok_or("missing prepared tool owner")?;
+        let core = tools.current()?;
+        same_core_package(project, cargo, &read_json(&core.cargo_metadata.path)?)?;
+        if core.cpu_wrapper != record.cpu_wrapper {
+            return Err("project CPU wrapper differs from its core tool cohort".into());
+        }
+        if let Some(configured) = std::env::var_os(CPU_WRAPPER_ENV) {
+            if Path::new(&configured) != record.cpu_wrapper.executable.path {
+                return Err("configured CPU wrapper differs from the prepared executable".into());
+            }
+        }
+        return Ok(());
+    }
     check_identity(&record.cpu_wrapper.metadata, false)?;
     let events =
         fs::read_to_string(&record.cpu_wrapper.metadata.path).map_err(|e| e.to_string())?;
@@ -533,12 +978,13 @@ fn prepare_cpu_wrapper(
 }
 
 /// Explicit standalone preparation. Official test consumers never call this.
+/// Standalone preparation owns the default cohort's store files only.
 pub fn build_cpu_wrapper(root: &Path) -> Result<PathBuf, PreparationError> {
     if std::env::var(REQUIRED_ENV).as_deref() == Ok("1") {
         return Err("an official consumer cannot build a CPU wrapper".into());
     }
     let root = root.canonicalize().map_err(|e| e.to_string())?;
-    let artifacts = LockedArtifacts::open(&root, true)?;
+    let artifacts = LockedArtifacts::open(&root, true, DEFAULT_COHORT)?;
     let cargo_path = artifacts.root.join("standalone-cargo.json");
     cargo_output(
         &root,
@@ -558,8 +1004,10 @@ pub fn build_cpu_wrapper(root: &Path) -> Result<PathBuf, PreparationError> {
 
 pub fn cpu_wrapper(root: &Path) -> Result<PathBuf, String> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
-    let artifacts = LockedArtifacts::open(&root, false)?;
+    let cohort = PreparedCohort::from_env()?;
+    let artifacts = LockedArtifacts::open(&root, false, cohort)?;
     let record = artifacts.current()?;
+    check_cohort_target(&root, cohort, &record.target, "prepared CPU wrapper lookup")?;
     verify_record(&root, &record)?;
     Ok(record.cpu_wrapper.executable.path)
 }
@@ -590,8 +1038,9 @@ pub fn budget_context(
     if parsed.build != regular {
         return Ok("null".into());
     }
+    // The regular selection belongs to the default cohort.
     let root = root.canonicalize().map_err(|e| e.to_string())?;
-    let artifacts = LockedArtifacts::open(&root, false)?;
+    let artifacts = LockedArtifacts::open(&root, false, DEFAULT_COHORT)?;
     let record = artifacts.current()?;
     let cargo = verify_record(&root, &record)?;
     verify_selection(&record, &cargo, &parsed.build)?;
@@ -839,7 +1288,27 @@ fn metadata_binaries(
     Ok((result, runtime_files))
 }
 
-fn sources(cargo: &Value, root: &Path) -> Result<BTreeMap<PathBuf, String>, String> {
+type SourceMap = BTreeMap<PathBuf, String>;
+type SourcePartMap = BTreeMap<PathBuf, SourcePart>;
+
+fn sources_and_parts(cargo: &Value, root: &Path) -> Result<(SourceMap, SourcePartMap), String> {
+    // One snapshot per root, never two: the identity and the parts must
+    // describe the same instant. Taking them in two passes lets an
+    // untracked file created (or removed) between the passes change the
+    // identity while the parts agree with the record, which degraded
+    // the stale refusal to a bare "source identity changed at <root>"
+    // naming neither part nor path (dh-j8eb7).
+    let mut sources = BTreeMap::new();
+    let mut parts = BTreeMap::new();
+    for root in source_roots(cargo, root)? {
+        let (identity, part) = source_snapshot(&root)?;
+        sources.insert(root.clone(), identity);
+        parts.insert(root, part);
+    }
+    Ok((sources, parts))
+}
+
+fn source_roots(cargo: &Value, root: &Path) -> Result<BTreeSet<PathBuf>, String> {
     let mut roots = BTreeSet::from([root.to_owned()]);
     for package in cargo["packages"]
         .as_array()
@@ -861,7 +1330,11 @@ fn sources(cargo: &Value, root: &Path) -> Result<BTreeMap<PathBuf, String>, Stri
             .trim();
         roots.insert(PathBuf::from(git_root));
     }
-    roots
+    Ok(roots)
+}
+
+fn sources(cargo: &Value, root: &Path) -> Result<BTreeMap<PathBuf, String>, String> {
+    source_roots(cargo, root)?
         .into_iter()
         .map(|root| source_identity(&root).map(|identity| (root, identity)))
         .collect()
@@ -905,20 +1378,84 @@ pub fn profile_selections(
     root: &Path,
     profile: &str,
 ) -> Result<BTreeMap<String, Vec<String>>, String> {
-    let graph = fs::read_to_string(root.join("ci/dag/validate.json")).map_err(|e| e.to_string())?;
-    let graph = dagrun::io::dag_from_json(&graph).map_err(|e| e.to_string())?;
-    config_selections(&graph, profile)
+    profile_selections_in_cohort(root, profile, DEFAULT_COHORT)
 }
 
+pub fn profile_selections_in_cohort(
+    root: &Path,
+    profile: &str,
+    cohort: PreparedCohort,
+) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let prepared_project = project(root)?;
+    let graph_path = prepared_project
+        .as_ref()
+        .map(|project| project.graph.path.clone())
+        .unwrap_or_else(|| root.join("ci/dag/validate.json"));
+    let graph = fs::read_to_string(graph_path).map_err(|e| e.to_string())?;
+    let graph = dagrun::io::dag_from_json(&graph).map_err(|e| e.to_string())?;
+    config_selections_for_project(
+        &graph,
+        profile,
+        prepared_project
+            .as_ref()
+            .map(|project| project.descriptor.path.as_path()),
+        cohort,
+    )
+}
+
+/// The default cohort's selections of `profile`: every prepared selection
+/// the graph does not mark for another cohort.
 pub fn config_selections(
     graph: &dagrun::model::DagConfig,
     profile: &str,
+) -> Result<BTreeMap<String, Vec<String>>, String> {
+    config_selections_in_cohort(graph, profile, DEFAULT_COHORT)
+}
+
+pub fn config_selections_in_cohort(
+    graph: &dagrun::model::DagConfig,
+    profile: &str,
+    cohort: PreparedCohort,
+) -> Result<BTreeMap<String, Vec<String>>, String> {
+    config_selections_for_project(graph, profile, None, cohort)
+}
+
+fn config_selections_for_project(
+    graph: &dagrun::model::DagConfig,
+    profile: &str,
+    project: Option<&Path>,
+    cohort: PreparedCohort,
 ) -> Result<BTreeMap<String, Vec<String>>, String> {
     let selected =
         dagrun::select_steps_by_labels(graph, &[profile.into()]).map_err(|e| e.to_string())?;
     let mut selections = BTreeMap::new();
     for step in selected.steps {
         if let Some(args) = step.env.get(SELECTION_ENV) {
+            let owner = step.env.get(PROJECT_ENV).map(Path::new);
+            if owner.is_some_and(|path| !path.is_absolute()) {
+                return Err(format!(
+                    "{} has a nonabsolute prepared project owner",
+                    step.tag()
+                ));
+            }
+            // The DAG still executes every selected row and enforces its full
+            // dependencies. This producer compiles exactly its own Cargo
+            // project's selections; a different project must provide its own
+            // required preparation record rather than enter the core union.
+            if owner != project {
+                continue;
+            }
+            // Cohorts partition one project's selections the same way: this
+            // producer compiles exactly its own cohort's, so a feature-gated
+            // cohort never enters the default union (or the reverse). An
+            // unknown slug refuses here, in every producer, not silently in
+            // none of them.
+            let step_cohort =
+                PreparedCohort::from_slug(step.env.get(COHORT_ENV).map(String::as_str))
+                    .map_err(|e| format!("{}: {e}", step.tag()))?;
+            if step_cohort != cohort {
+                continue;
+            }
             if step.env.get(REQUIRED_ENV).map(String::as_str) != Some("1") {
                 return Err(format!(
                     "{} does not require prepared executables",
@@ -938,28 +1475,41 @@ pub fn config_selections(
         }
     }
     if selections.is_empty() {
-        return Err(format!(
-            "profile {profile} has no prepared Nextest selections"
-        ));
+        return Err(if cohort.is_default() {
+            format!("profile {profile} has no prepared Nextest selections")
+        } else {
+            format!(
+                "profile {profile} has no prepared Nextest selections in cohort {}",
+                cohort.name()
+            )
+        });
     }
     Ok(selections)
 }
 
 struct LockedArtifacts {
+    /// The artifact store; generation staging directories live here for
+    /// every cohort.
     root: PathBuf,
+    /// This cohort's published record inside the store.
+    record: PathBuf,
     _lock: fs::File,
 }
 
 impl LockedArtifacts {
-    fn open(root: &Path, exclusive: bool) -> Result<Self, String> {
+    fn open(root: &Path, exclusive: bool, cohort: PreparedCohort) -> Result<Self, String> {
         let root = root.join("target/ci/nextest-binaries");
         fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+        let record = cohort.record_path(&root);
+        if let Some(parent) = record.parent() {
+            fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
         let lock = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(root.join("lock"))
+            .open(cohort.lock_path(&root))
             .map_err(|e| e.to_string())?;
         // Keep this file open across verification and the entire Nextest child.
         // A later producer cannot replace a generation beneath a running test.
@@ -979,11 +1529,24 @@ impl LockedArtifacts {
                 std::io::Error::last_os_error()
             ));
         }
-        Ok(Self { root, _lock: lock })
+        Ok(Self {
+            root,
+            record,
+            _lock: lock,
+        })
     }
 
     fn current(&self) -> Result<PreparedRecord, String> {
-        let path = self.root.join("current.json");
+        self.record_from(self.current_value()?)
+    }
+
+    fn record_from(&self, value: Value) -> Result<PreparedRecord, String> {
+        serde_json::from_value(value)
+            .map_err(|e| format!("invalid prepared record {}: {e}", self.record.display()))
+    }
+
+    fn current_value(&self) -> Result<Value, String> {
+        let path = self.record.clone();
         let _: FileIdentity = file_identity(&path, false)?;
         serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?)
             .map_err(|e| format!("invalid prepared record {}: {e}", path.display()))
@@ -1033,7 +1596,12 @@ fn preparation_build_jobs() -> String {
 
 fn cargo_output(root: &Path, args: &[String], destination: &Path) -> Result<(), PreparationError> {
     let output = fs::File::create(destination).map_err(|e| e.to_string())?;
-    let status = Command::new(root.join("ci/run-with-reverie-dbt-budget.sh"))
+    let prepared_project = project(root)?;
+    let wrapper_root = prepared_project
+        .as_ref()
+        .map(|project| project.tools_root.as_path())
+        .unwrap_or(root);
+    let status = Command::new(wrapper_root.join("ci/run-with-core-build.sh"))
         .arg("cargo")
         .args(args)
         .env("CARGO_BUILD_JOBS", preparation_build_jobs())
@@ -1052,7 +1620,7 @@ fn cargo_output(root: &Path, args: &[String], destination: &Path) -> Result<(), 
 
 /// Runs each `program` (Cargo) command of `listings` (arguments, output file), which
 /// must compile nothing, such as `nextest list` given both metadata files, up
-/// to [`preparation_build_jobs`] at a time and without
+/// to `jobs` at a time and without
 /// ci/run-with-reverie-dbt-budget.sh. That wrapper binds the Reverie DBT build
 /// budget to its pin with a pin check of about 0.8 s a call, and a command
 /// that builds nothing has no budget to bind; `run` already starts its
@@ -1064,11 +1632,9 @@ fn listing_outputs(
     root: &Path,
     program: &std::ffi::OsStr,
     listings: &[(Vec<String>, PathBuf)],
+    jobs: usize,
 ) -> Result<(), PreparationError> {
-    let jobs = preparation_build_jobs()
-        .parse::<usize>()
-        .unwrap_or(1)
-        .max(1);
+    let jobs = jobs.max(1);
     let next = std::sync::atomic::AtomicUsize::new(0);
     let failures = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|scope| {
@@ -1133,8 +1699,26 @@ fn check_identity(expected: &FileIdentity, executable: bool) -> Result<(), Strin
 }
 
 fn verify_record(root: &Path, record: &PreparedRecord) -> Result<Value, String> {
-    if record.schema != RECORD_SCHEMA || record.repository != root {
+    if record.schema != RECORD_SCHEMA
+        || record.repository != root
+        || record.project != project(root)?
+    {
         return Err("prepared record has the wrong schema or repository".into());
+    }
+    // Self-consistency of the cohort key: a record that names a mode no
+    // producer writes, or a feature set its own selections do not derive,
+    // was not published by `prepare` as read. Whether the mode is this
+    // run's is `check_prepared_cohort`'s question, answered before here.
+    if record.build_mode != "cargo" && record.build_mode != "buck" {
+        return Err("prepared record names an unknown build mode".into());
+    }
+    let recorded_selections = record
+        .selections
+        .iter()
+        .map(|(key, selection)| (key.clone(), selection.build_args.clone()))
+        .collect::<BTreeMap<_, _>>();
+    if prepared_feature_set(&recorded_selections)? != record.feature_set {
+        return Err("prepared record feature set does not match its selections".into());
     }
     check_identity(&record.cargo_metadata, false)?;
     let cargo = read_json(&record.cargo_metadata.path)?;
@@ -1142,8 +1726,12 @@ fn verify_record(root: &Path, record: &PreparedRecord) -> Result<Value, String> 
     if target != record.target || target.canonicalize().map_err(|e| e.to_string())? != target {
         return Err("prepared record has the wrong Cargo target directory".into());
     }
-    if record.sources != sources(&cargo, root)? {
-        return Err("prepared executables are stale: source identity changed".into());
+    let (current_sources, current_parts) = sources_and_parts(&cargo, root)?;
+    if record.sources != current_sources {
+        return Err(format!(
+            "prepared executables are stale: {}",
+            stale_source_detail(record, &current_sources, &current_parts)
+        ));
     }
     if record.rustc != rustc_identity()?
         || record.build_environment != build_environment()
@@ -1325,13 +1913,41 @@ fn has_test_selection<'a>(selections: impl Iterator<Item = &'a Vec<String>>, nam
         .any(|args| args.windows(2).any(|args| args == ["--test", name]))
 }
 
+// An explicit target override also owns retained executables. Metadata and the
+// preparation lock remain source-local. Preserve the old default when no
+// nonempty override was recorded, including targets selected only by Cargo config.
+fn record_workload_directory(
+    generation: &Path,
+    target: &Path,
+    cargo_target: Option<&str>,
+) -> Result<PathBuf, String> {
+    if !cargo_target.is_some_and(|value| !value.is_empty()) {
+        return Ok(generation.join("record-workloads"));
+    }
+    Ok(target
+        .join("ci/nextest-binaries")
+        .join(
+            generation
+                .file_name()
+                .ok_or("missing prepared generation name")?,
+        )
+        .join("record-workloads"))
+}
+
 fn prepare_record_workloads(
     root: &Path,
     generation: &Path,
     cargo: &Value,
     target: &Path,
+    environment: &BTreeMap<String, String>,
 ) -> Result<RecordWorkloads, PreparationError> {
-    let directory = generation.join("record-workloads");
+    let directory = record_workload_directory(
+        generation,
+        target,
+        environment.get("CARGO_TARGET_DIR").map(String::as_str),
+    )?;
+    fs::create_dir_all(directory.parent().expect("record workloads have a parent"))
+        .map_err(|e| e.to_string())?;
     fs::create_dir(&directory).map_err(|e| e.to_string())?;
     let compiler = file_identity(&record_workloads::c_compiler()?, true)?;
     let cargo_events = file_identity(&generation.join("guests.jsonl"), false)?;
@@ -1395,7 +2011,14 @@ fn verify_record_workloads(
         .path
         .parent()
         .ok_or("missing prepared generation")?;
-    let directory = generation.join("record-workloads");
+    let directory = record_workload_directory(
+        generation,
+        &record.target,
+        record
+            .build_environment
+            .get("CARGO_TARGET_DIR")
+            .map(String::as_str),
+    )?;
     if workloads.cargo_events.path != generation.join("guests.jsonl") {
         return Err("record workload Cargo events are outside the selected generation".into());
     }
@@ -1465,6 +2088,235 @@ pub fn cargo_profile_for(graph_profile: &str) -> Option<&'static str> {
     }
 }
 
+/// The Cargo profile `prepare` builds a graph profile's executables in: the
+/// profile's own [`cargo_profile_for`], except that a neutral second Cargo
+/// project always lists its selections in Cargo's default test profile.
+fn build_cargo_profile(graph_profile: &str, project: bool) -> Option<&'static str> {
+    if project {
+        None
+    } else {
+        cargo_profile_for(graph_profile)
+    }
+}
+
+/// The name a prepared record gives the Cargo profile that built it.
+/// `--cargo-profile` absent means Cargo's default test profile, whose
+/// executables are under `target/debug`; the record calls that `dev`.
+pub fn recorded_cargo_profile(cargo_profile: Option<&str>) -> &str {
+    cargo_profile.unwrap_or("dev")
+}
+
+/// Refuse a prepared record that `assert` must not accept for `producer`.
+///
+/// `record` is the raw prepared record (`target/ci/nextest-binaries/current.json`)
+/// and `producer` the graph profile whose `prepare` the asserting lane depends on.
+/// The record must name the Cargo profile `prepare producer` builds in. The
+/// shared record is rewritten by whichever producer ran last, so a focused lane's
+/// `prepare privileged` (dev profile) can leave a dev record behind for a later
+/// full-lane consumer that expects validate-profile executables; every
+/// selection is still present, so only the profile tells them apart.
+///
+/// A record older than schema 6 names no profile and is refused rather than
+/// guessed from its executable paths: a path under `target/<dir>/` names a Cargo
+/// output directory, not a profile (the default test profile writes
+/// `target/debug`, and a custom target directory moves the prefix), and the
+/// remedy, rerunning the producer, costs only that producer's run.
+///
+/// `selections` is the asserted selection profile and `producer_nodes` the
+/// graph nodes that run `prepare producer`; both only shape the message.
+pub fn check_prepared_cargo_profile(
+    record: &Value,
+    selections: &str,
+    producer: &str,
+    project: bool,
+    producer_nodes: &[String],
+) -> Result<(), String> {
+    let expected = recorded_cargo_profile(build_cargo_profile(producer, project));
+    let command = if selections == producer {
+        format!("assert {selections}")
+    } else {
+        format!("assert {selections} --prepared-by {producer}")
+    };
+    let remedy = if producer_nodes.is_empty() {
+        format!(
+            "Rerun `./ci/nextest-binaries.rs prepare {producer}` in this checkout after the {producer} lane's build, then rerun this step."
+        )
+    } else {
+        format!(
+            "Rerun the {producer} lane's producer ({}), which runs `./ci/nextest-binaries.rs prepare {producer}`, or run that command in this checkout after the lane's build, then rerun this step.",
+            producer_nodes.join(", ")
+        )
+    };
+    let schema = record.get("schema").and_then(Value::as_u64);
+    if schema != Some(u64::from(RECORD_SCHEMA)) {
+        let found = schema.map_or_else(
+            || "has no schema".to_string(),
+            |schema| format!("is schema {schema}"),
+        );
+        return Err(format!(
+            "{command} refused: the prepared record {found}, not schema {RECORD_SCHEMA}, so it does not name the Cargo profile that built its executables, and the {producer} lane expects Cargo profile {expected}. {remedy}"
+        ));
+    }
+    let named = |key: &str| {
+        record
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("{command} refused: the prepared record has no {key}. {remedy}"))
+    };
+    let found = named("cargo_profile")?;
+    let prepared_for = named("prepared_for")?;
+    if found != expected {
+        return Err(format!(
+            "{command} refused: the prepared executables were built in Cargo profile {found} by `prepare {prepared_for}`, but the {producer} lane expects Cargo profile {expected}. The record is shared, and another lane's producer rewrote it after the {producer} lane's. {remedy}"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse when Cargo's effective target is not the cohort's declared one.
+///
+/// The declaration is what keeps cohorts' artifacts apart; the wrapper in
+/// the pinned root historically overrode it with the default target, so a
+/// record could verify against the very target another cohort owned.
+/// Checking the declaration here (producer, from Cargo's own report) and
+/// on every consumer read means a wrapper or payload that drops the
+/// declaration fails by name instead of silently sharing artifacts. The
+/// default cohort declares no target and keeps its historical behavior.
+fn check_cohort_target(
+    root: &Path,
+    cohort: PreparedCohort,
+    actual: &Path,
+    context: &str,
+) -> Result<(), String> {
+    let Some(declared) = cohort.target_dir() else {
+        return Ok(());
+    };
+    let expected = root.join(declared);
+    if actual != expected {
+        return Err(format!(
+            "{context} refused: cohort {} declares Cargo target {declared:?} ({} under this checkout), but Cargo reports {}; the declaration was overridden before Cargo ran, so this run would share artifacts with another cohort. Rerun with the cohort target in force (the pinned wrapper translates the declaration; a payload must not re-export the default target).",
+            cohort.name(),
+            expected.display(),
+            actual.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a prepared record whose cohort key is not this run's.
+///
+/// `record` is the raw record of `cohort`'s store file, read before any
+/// selection lookup so a refusal names the cohort mismatch (and its
+/// re-prepare remedy), never a missing selection. The record must be
+/// schema 7, name `expected_mode` as its `build_mode`, and, when
+/// `expected_feature_set` is given (a closed cohort's constant, or the
+/// default union `assert` recomputed from the graph), name exactly it as
+/// its `feature_set`. A pre-7 record names neither field and is refused
+/// rather than guessed, like the Cargo profile before schema 6.
+pub fn check_prepared_cohort(
+    record: &Value,
+    context: &str,
+    cohort: PreparedCohort,
+    expected_mode: &str,
+    expected_feature_set: Option<&str>,
+) -> Result<(), String> {
+    let prepared_for = record
+        .get("prepared_for")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let remedy = match (prepared_for, cohort.env_value()) {
+        (Some(producer), Some(slug)) => format!(
+            "Rerun `./ci/nextest-binaries.rs prepare {producer} --cohort {slug}` in this checkout in {expected_mode} mode, then rerun this step."
+        ),
+        (Some(producer), None) => format!(
+            "Rerun `./ci/nextest-binaries.rs prepare {producer}` in this checkout in {expected_mode} mode, then rerun this step."
+        ),
+        _ => format!(
+            "Rerun the {} cohort's producer in this checkout in {expected_mode} mode, then rerun this step.",
+            cohort.name()
+        ),
+    };
+    let schema = record.get("schema").and_then(Value::as_u64);
+    if schema != Some(u64::from(RECORD_SCHEMA)) {
+        let found = schema.map_or_else(
+            || "has no schema".to_string(),
+            |schema| format!("is schema {schema}"),
+        );
+        return Err(format!(
+            "{context} refused: the prepared record {found}, not schema {RECORD_SCHEMA}, so it does not name the build mode or feature set that built its executables. {remedy}"
+        ));
+    }
+    let named = |key: &str| {
+        record
+            .get(key)
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{context} refused: the prepared record has no {key}. {remedy}"))
+    };
+    let found_mode = named("build_mode")?;
+    if found_mode != "cargo" && found_mode != "buck" {
+        return Err(format!(
+            "{context} refused: the prepared record names unknown build mode {found_mode:?}. {remedy}"
+        ));
+    }
+    if found_mode != expected_mode {
+        return Err(format!(
+            "{context} refused: the prepared executables were prepared in {found_mode} build mode, but this run is in {expected_mode} mode ({BUILD_MODE_ENV}). The {} cohort's record is shared between modes, and the other mode's producer rewrote it last. {remedy}",
+            cohort.name()
+        ));
+    }
+    let found_features = named("feature_set")?;
+    if let Some(expected) = expected_feature_set {
+        if found_features != expected {
+            return Err(format!(
+                "{context} refused: the prepared executables were built with feature set {found_features:?}, but cohort {} requires {expected:?}. {remedy}",
+                cohort.name()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The graph nodes in `producer`'s lane that run `prepare producer`, read from
+/// the committed graph for an `assert` refusal message. A graph that cannot be
+/// read yields no names; the refusal then names only the command.
+fn producer_nodes(root: &Path, producer: &str, cohort: PreparedCohort) -> Vec<String> {
+    let graph_path = match project(root) {
+        Ok(Some(project)) => project.graph.path,
+        Ok(None) => root.join("ci/dag/validate.json"),
+        Err(_) => return vec![],
+    };
+    let Some(graph) = fs::read_to_string(graph_path)
+        .ok()
+        .and_then(|graph| dagrun::io::dag_from_json(&graph).ok())
+    else {
+        return vec![];
+    };
+    let Ok(selected) = dagrun::select_steps_by_labels(&graph, &[producer.into()]) else {
+        return vec![];
+    };
+    let marker = format!("./ci/nextest-binaries.rs prepare {producer}");
+    selected
+        .steps
+        .iter()
+        .filter(|step| {
+            // A cohort producer's command carries its `--cohort` flag; the
+            // default producer's never does. The remedy names only the
+            // nodes that prepare the asserted cohort.
+            let prepares_cohort = match cohort.env_value() {
+                Some(slug) => step.cmd.contains(&format!("--cohort {slug}")),
+                None => !step.cmd.contains("--cohort "),
+            };
+            prepares_cohort
+                && step.cmd.match_indices(&marker).any(|(at, _)| {
+                    !step.cmd[at + marker.len()..]
+                        .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                })
+        })
+        .map(|step| step.tag())
+        .collect()
+}
+
 /// Whether `prepare` compiles this profile's selections as one unified listing.
 ///
 /// Only the validate-profile graph profiles do: their producers build the whole
@@ -1498,6 +2350,44 @@ fn listings(
         .collect())
 }
 
+/// Every feature the selections name, qualified by its selection's sole
+/// package: the qualification [`unified_selection`] unions under, shared
+/// with the record's `feature_set` so producer, `assert`, and the record
+/// can never derive different sets from the same selections.
+fn qualified_features(
+    selections: &BTreeMap<String, Vec<String>>,
+) -> Result<BTreeSet<String>, String> {
+    let mut features = BTreeSet::new();
+    for selection in selections.values() {
+        let parsed = CargoSelection::parse(selection)?;
+        if parsed.unqualified_features.is_empty() {
+            continue;
+        }
+        let [package] = parsed.packages.as_slice() else {
+            return Err(format!(
+                "{selection:?} names features without naming exactly one package, so the union cannot qualify them"
+            ));
+        };
+        features.extend(
+            parsed
+                .unqualified_features
+                .iter()
+                .map(|feature| format!("{package}/{feature}")),
+        );
+    }
+    Ok(features)
+}
+
+/// The canonical `feature_set` a record prepared from `selections` names:
+/// the `qualified_features` output sorted and comma-joined, empty when no
+/// selection names features.
+pub fn prepared_feature_set(selections: &BTreeMap<String, Vec<String>>) -> Result<String, String> {
+    Ok(qualified_features(selections)?
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(","))
+}
+
 /// The one Cargo selection that compiles every prepared selection of a profile.
 ///
 /// Separate Cargo invocations resolve dependency features separately, so each
@@ -1518,24 +2408,9 @@ pub fn unified_selection(
         (Some(only), None) => return Ok(only.clone()),
         _ => {}
     }
-    let mut features = BTreeSet::new();
-    for selection in selections.values() {
-        let parsed = CargoSelection::parse(selection)?;
-        if parsed.unqualified_features.is_empty() {
-            continue;
-        }
-        let [package] = parsed.packages.as_slice() else {
-            return Err(format!(
-                "{selection:?} names features without naming exactly one package, so the union cannot qualify them"
-            ));
-        };
-        features.extend(
-            parsed
-                .unqualified_features
-                .iter()
-                .map(|feature| format!("{package}/{feature}")),
-        );
-    }
+    let features = qualified_features(selections)?;
+    // The first-party installer is a workspace member. Extension payloads
+    // have their own producers and never enter this feature union.
     let mut union = vec!["--workspace".to_string(), "--all-targets".to_string()];
     if !features.is_empty() {
         union.push("--features".into());
@@ -1560,9 +2435,37 @@ pub fn unified_prebuild_command(
     let cargo_profile = cargo_profile_for(profile)
         .map(|name| format!(" --profile {name}"))
         .unwrap_or_default();
+    // Only the full producer carries the Reverie build-mode segment; the
+    // hosted twin's derivation strips it (its profile has no Buck build).
+    let build_mode = if profile == "full" {
+        " --build-mode \"${HERMIT_VALIDATE_BUILD_MODE:-cargo}\""
+    } else {
+        ""
+    };
     Ok(format!(
-        "cargo build --locked{cargo_profile} {} && ./ci/nextest-binaries.rs prepare {profile} && target/validate/stage-detcore-liteinst --git target",
+        "cargo build --locked{cargo_profile} {} && ./ci/nextest-binaries.rs prepare {profile}{build_mode} && target/validate/stage-detcore-liteinst --git target",
         unified.join(" ")
+    ))
+}
+
+/// The exact payload a non-default cohort's prepare node runs: prepare the
+/// cohort under the run's build mode, then assert the published record, so
+/// every consumer's ancestry contains the cohort check by construction.
+/// The cohort's compile node built its test executables first (the prepare
+/// listings then compile only the test harnesses), mirroring the workspace
+/// compile/prepare split without the unified workspace build: a cohort
+/// selection must never widen to the workspace union.
+pub fn cohort_prepare_command(profile: &str, cohort: PreparedCohort) -> Result<String, String> {
+    let Some(slug) = cohort.env_value() else {
+        return Err("the default cohort has no cohort prepare command".into());
+    };
+    if !unifies(profile) {
+        return Err(format!(
+            "profile {profile} lists each selection separately and has no cohort prepare command"
+        ));
+    }
+    Ok(format!(
+        "./ci/nextest-binaries.rs prepare {profile} --build-mode \"${{HERMIT_VALIDATE_BUILD_MODE:-cargo}}\" --cohort {slug} && ./ci/nextest-binaries.rs assert {profile} --cohort {slug}"
     ))
 }
 
@@ -1811,11 +2714,257 @@ fn selection_metadata(unified: &Value, cargo: &Value, args: &[String]) -> Result
     Ok(result)
 }
 
-pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
+/// Repoint matched selection binaries at buck-harvested files. The
+/// harvest script's default placement is buck-harvest-only (Cargo's
+/// target files are never written; overwriting a Cargo counterpart
+/// exists only behind the script's explicit legacy opt-in, which
+/// apply_harvest refuses). Fails closed when the manifest is missing.
+fn substitute_harvested_binaries(
+    root: &Path,
+    generation: &Path,
+    selections: &mut BTreeMap<String, SelectionRecord>,
+) -> Result<(), PreparationError> {
+    // Route (ii): the harvest runs in the host step (build.reverie_buck),
+    // which has DotSlash/reindeer access; prepare inside the pinned root
+    // never spawns it and stays network-free. Prepare reads ONLY the
+    // declared manifest and buck-harvest directory, verifying every file's
+    // sha256 against the manifest and refusing missing, mismatched, or
+    // extra files by name.
+    let manifest_path = root.join("target/validate/harvested-files.json");
+    let manifest = read_json(&manifest_path).map_err(|error| {
+        format!(
+            "buck mode requires the declared harvest manifest {} (produced by build.reverie_buck on the host): {error}",
+            manifest_path.display()
+        )
+    })?;
+    verify_harvest_manifest(&manifest, root)?;
+    apply_harvest(&manifest, root, generation, selections)
+}
+
+/// Verify the declared harvest input against the manifest: every named
+/// file exists with the recorded sha256, and buck-harvest/ contains
+/// nothing extra.
+fn verify_harvest_manifest(manifest: &Value, root: &Path) -> Result<(), PreparationError> {
+    let files = manifest
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or("harvest manifest has no files")?;
+    let harvest_dir = root.join("target/validate/buck-harvest");
+    let mut expected: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut check = |harvested_to: &str, sha256: &str| -> Result<(), PreparationError> {
+        let path = root.join(harvested_to);
+        if !path.is_file() {
+            return Err(format!("harvested file is missing: {harvested_to}").into());
+        }
+        let identity = file_identity(&path, false)?;
+        if identity.sha256 != sha256 {
+            return Err(format!("harvested file hash mismatch: {harvested_to}").into());
+        }
+        expected.insert(path);
+        Ok(())
+    };
+    for file in files {
+        check(string(file, "harvested_to")?, string(file, "sha256")?)?;
+    }
+    let mut actual: BTreeSet<PathBuf> = BTreeSet::new();
+    for entry in fs::read_dir(&harvest_dir).map_err(|error| error.to_string())? {
+        let path = entry.map_err(|error| error.to_string())?.path();
+        if path.is_file() {
+            actual.insert(path);
+        }
+    }
+    if actual != expected {
+        let extra: Vec<_> = actual.difference(&expected).collect();
+        return Err(format!("buck-harvest contains undeclared file(s): {extra:?}").into());
+    }
+    Ok(())
+}
+
+/// Enumerate one test binary's case names (`--list`, libtest format).
+fn listed_case_names(binary: &Path) -> Result<BTreeSet<String>, String> {
+    let output = std::process::Command::new(binary)
+        .arg("--list")
+        .output()
+        .map_err(|error| format!("could not list {}: {error}", binary.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "listing {} failed with {}",
+            binary.display(),
+            output.status
+        ));
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|_| format!("listing {} is not UTF-8", binary.display()))?;
+    Ok(text
+        .lines()
+        .filter_map(|line| line.strip_suffix(": test"))
+        .map(str::to_string)
+        .collect())
+}
+
+/// The substitution half of [`substitute_harvested_binaries`], split out so
+/// it can be tested without buck2: repoint, rehash, patch metadata.
+fn apply_harvest(
+    manifest: &Value,
+    root: &Path,
+    generation: &Path,
+    selections: &mut BTreeMap<String, SelectionRecord>,
+) -> Result<(), PreparationError> {
+    let files = manifest
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or("harvest manifest has no files")?;
+    let mut harvested: BTreeMap<String, PathBuf> = BTreeMap::new();
+    for file in files {
+        let name = string(file, "name")?;
+        let harvested_to = string(file, "harvested_to")?;
+        // Placement provenance is refused, not trusted: any manifest entry
+        // placed over a Cargo file, or landing outside buck-harvest/, is
+        // not a buck-harvest consumption record.
+        if file
+            .get("placed_over_cargo")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || !harvested_to.starts_with("target/validate/buck-harvest/")
+        {
+            return Err(format!(
+                "harvest manifest entry for {name} was placed over Cargo or outside buck-harvest: {harvested_to}"
+            )
+            .into());
+        }
+        harvested.insert(name.to_string(), root.join(harvested_to));
+    }
+    if harvested.is_empty() {
+        return Err("harvest manifest names no files".into());
+    }
+    let mut matched_names: BTreeSet<String> = BTreeSet::new();
+    for (key, record) in selections.iter_mut() {
+        let metadata_path = generation.join(format!("{key}.json"));
+        let mut metadata = read_json(&metadata_path)?;
+        let mut patched = false;
+        for binary in &record.binaries {
+            let Some(buck_path) = harvested.get(&binary.binary_name) else {
+                continue;
+            };
+            if !buck_path.is_file() {
+                return Err(format!(
+                    "harvested binary for {} is missing: {}",
+                    binary.binary_name,
+                    buck_path.display()
+                )
+                .into());
+            }
+            // Per-target case-set equality with the Cargo twin (names and
+            // count): a Buck binary enumerating fewer cases refuses here,
+            // in prepare, not in an external comparison.
+            let cargo_cases = listed_case_names(&binary.executable.path)?;
+            let buck_cases = listed_case_names(buck_path)?;
+            if cargo_cases != buck_cases {
+                return Err(format!(
+                    "buck case set for {} differs from its Cargo twin: cargo-only={:?} buck-only={:?}",
+                    binary.binary_name,
+                    cargo_cases.difference(&buck_cases).collect::<Vec<_>>(),
+                    buck_cases.difference(&cargo_cases).collect::<Vec<_>>(),
+                )
+                .into());
+            }
+            let binaries = metadata
+                .get_mut("rust-binaries")
+                .and_then(Value::as_object_mut)
+                .ok_or("Nextest metadata has no rust-binaries")?;
+            let entry = binaries
+                .get_mut(&binary.binary_id)
+                .ok_or_else(|| format!("Nextest metadata lost binary {}", binary.binary_id))?;
+            entry["binary-path"] = Value::String(buck_path.display().to_string());
+            matched_names.insert(binary.binary_name.clone());
+            patched = true;
+        }
+        if patched {
+            // Repoint the recorded binary identities at the Buck bytes
+            // (metadata_binaries in verify_selection recomputes these from
+            // the patched metadata, so record and metadata must agree).
+            // Runtime files are untouched: the detcore binaries are
+            // statically linked (static_pic) and load no sibling library.
+            for binary in &mut record.binaries {
+                if let Some(buck_path) = harvested.get(&binary.binary_name) {
+                    binary.executable = file_identity(buck_path, true)?;
+                }
+            }
+            fs::write(
+                &metadata_path,
+                serde_json::to_vec(&metadata).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            record.metadata = file_identity(&metadata_path, false)?;
+        }
+    }
+    // Exact name-set refusal: a manifest entry matching no selection
+    // binary (a drifted stem) must not silently stay Cargo in a buck run.
+    let manifest_names: BTreeSet<String> = harvested.keys().cloned().collect();
+    if matched_names != manifest_names {
+        return Err(format!(
+            "buck harvest name set differs from selection binaries: unmatched={:?}",
+            manifest_names
+                .difference(&matched_names)
+                .collect::<Vec<_>>()
+        )
+        .into());
+    }
+    if matched_names.is_empty() {
+        return Err(
+            "buck mode harvested no binary any selection records; refusing a Cargo record".into(),
+        );
+    }
+    eprintln!(
+        "buck prepare: substituted {} harvested binaries",
+        matched_names.len()
+    );
+    Ok(())
+}
+
+pub fn prepare(
+    root: &Path,
+    profile: &str,
+    build_mode: &str,
+    cohort: PreparedCohort,
+) -> Result<(), PreparationError> {
+    if !matches!(build_mode, "cargo" | "buck") {
+        return Err(PreparationError::from(format!(
+            "unknown build mode {build_mode:?} in nextest prepare: cargo and buck are the supported build modes"
+        )));
+    }
+    // The buck harvest names only the default cohort's detcore selections;
+    // no non-default cohort has harvest twins. Refuse by name rather than
+    // skip the substitution, which would publish a Cargo record under a
+    // buck build_mode.
+    if build_mode == "buck" && !cohort.is_default() {
+        return Err(PreparationError::from(format!(
+            "buck build mode prepares only the default cohort; cohort {} has no buck harvest",
+            cohort.name()
+        )));
+    }
     let root = root.canonicalize().map_err(|e| e.to_string())?;
-    let selections = profile_selections(&root, profile)?;
-    let cargo_profile = cargo_profile_for(profile);
-    let artifacts = LockedArtifacts::open(&root, true)?;
+    let prepared_project = project(&root)?;
+    if prepared_project.is_some() && !cohort.is_default() {
+        return Err(PreparationError::from(
+            "a prepared project prepares only the default cohort".to_string(),
+        ));
+    }
+    let tool_owner = project_tools(prepared_project.as_ref())?;
+    let selections = profile_selections_in_cohort(&root, profile, cohort)?;
+    let feature_set = prepared_feature_set(&selections)?;
+    if let Some(expected) = cohort.expected_feature_set() {
+        if feature_set != expected {
+            return Err(PreparationError::from(format!(
+                "cohort {} selections derive feature set {feature_set:?}, but the cohort requires {expected:?}; update the selection and the cohort table together",
+                cohort.name()
+            )));
+        }
+    }
+    // Each extension selection is listed in its own Cargo project. Core
+    // workspace union/installer requirements remain the unchanged core path.
+    let cargo_profile = build_cargo_profile(profile, prepared_project.is_some());
+    let artifacts = LockedArtifacts::open(&root, true, cohort)?;
     let generation = artifacts.root.join(format!(
         "generation-{}-{}",
         std::process::id(),
@@ -1837,7 +2986,11 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
         &cargo_path,
     )?;
     let cargo = read_json(&cargo_path)?;
-    let before_sources = sources(&cargo, &root)?;
+    if let (Some(project), Some(owner)) = (&prepared_project, &tool_owner) {
+        let core = owner.current()?;
+        same_core_package(project, &cargo, &read_json(&core.cargo_metadata.path)?)?;
+    }
+    let (before_sources, before_source_parts) = sources_and_parts(&cargo, &root)?;
     let before_rustc = rustc_identity()?;
     let before_environment = build_environment();
     let before_config = cargo_config(&root)?;
@@ -1846,12 +2999,21 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
     if !target.is_absolute() || target.canonicalize().map_err(|e| e.to_string())? != target {
         return Err("Cargo reported a noncanonical target directory".into());
     }
+    check_cohort_target(&root, cohort, &target, &format!("prepare {profile}"))?;
     // A validate-profile profile compiles every selection in ONE listing; the
     // others list each selection by itself. Either way each selection's
     // binaries-metadata is the part of its listing that its Cargo selectors
     // name, and a listing of one selection must keep every executable Cargo
     // listed for it, which checks the matcher against Cargo on every run.
-    for (index, (listing, keys)) in listings(profile, &selections)?.into_iter().enumerate() {
+    let planned_listings = if prepared_project.is_some() {
+        selections
+            .iter()
+            .map(|(key, args)| (args.clone(), vec![key.clone()]))
+            .collect::<Vec<_>>()
+    } else {
+        listings(profile, &selections)?
+    };
+    for (index, (listing, keys)) in planned_listings.into_iter().enumerate() {
         let mut args = vec![
             "nextest".into(),
             "list".into(),
@@ -1930,13 +3092,26 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
         }
         _ => None,
     };
-    prepare_cpu_wrapper(
-        &root,
-        &cpu_wrapper_path,
-        unified
-            .as_ref()
-            .map(|(cargo_profile, selection)| (*cargo_profile, selection.as_slice())),
-    )?;
+    if prepared_project.is_none() {
+        prepare_cpu_wrapper(
+            &root,
+            &cpu_wrapper_path,
+            unified
+                .as_ref()
+                .map(|(cargo_profile, selection)| (*cargo_profile, selection.as_slice())),
+        )?;
+    }
+    let cpu_wrapper = match &tool_owner {
+        Some(tool_owner) => tool_owner.current()?.cpu_wrapper,
+        None => CpuWrapperRecord {
+            executable: cpu_wrapper_artifact(
+                &fs::read_to_string(&cpu_wrapper_path).map_err(|e| e.to_string())?,
+                &cargo,
+                &target,
+            )?,
+            metadata: file_identity(&cpu_wrapper_path, false)?,
+        },
+    };
     // Hash only after every Cargo selection has completed. Shared paths may be
     // rebuilt by another selection; every published record names the final files.
     let mut recorded_selections = BTreeMap::new();
@@ -1967,9 +3142,26 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
             },
         );
     }
+    // In buck build mode, prepare consumes the buck-harvest directly. The
+    // harvest script buck-builds Hermit's own detcore test targets and
+    // writes target/validate/harvested-files.json; matched selection
+    // binaries (the test.detcore_* selections) are repointed at the
+    // harvested files in buck-harvest/ (Cargo's target files are never
+    // overwritten), their identities rehashed, and their selection
+    // metadata patched so the listing below enumerates the Buck
+    // binaries' own cases. Exact name-set and Cargo-twin case-set
+    // equality are enforced inside the substitution.
+    if build_mode == "buck" {
+        substitute_harvested_binaries(&root, &generation, &mut recorded_selections)?;
+    }
     // Nextest itself must accept every complete metadata pair after the final
     // build; this enumerates tests and never invokes the compiler.
-    listing_outputs(&root, "cargo".as_ref(), &listings)?;
+    listing_outputs(
+        &root,
+        "cargo".as_ref(),
+        &listings,
+        preparation_build_jobs().parse::<usize>().unwrap_or(1),
+    )?;
     let guests = if needs_guests {
         guest_executables(
             &fs::read_to_string(&guest_path).map_err(|e| e.to_string())?,
@@ -1996,15 +3188,18 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
             &generation,
             &cargo,
             &target,
+            &before_environment,
         )?)
     } else {
         None
     };
     let record = PreparedRecord {
         schema: RECORD_SCHEMA,
+        project: prepared_project,
         repository: root.clone(),
         target: target.clone(),
         sources: before_sources,
+        source_parts: before_source_parts,
         rustc: before_rustc,
         cargo_config: before_config,
         build_environment: before_environment,
@@ -2013,14 +3208,11 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
         guests,
         lit_guests,
         record_workloads,
-        cpu_wrapper: CpuWrapperRecord {
-            executable: cpu_wrapper_artifact(
-                &fs::read_to_string(&cpu_wrapper_path).map_err(|e| e.to_string())?,
-                &cargo,
-                &target,
-            )?,
-            metadata: file_identity(&cpu_wrapper_path, false)?,
-        },
+        cpu_wrapper,
+        prepared_for: profile.to_string(),
+        cargo_profile: recorded_cargo_profile(cargo_profile).to_string(),
+        build_mode: build_mode.to_string(),
+        feature_set,
     };
     let checked_cargo = verify_record(&root, &record)?;
     for selection in record.selections.values() {
@@ -2038,9 +3230,9 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
     // A single rename publishes all selections together. Failure leaves the
     // previous record in place; it remains usable only while its recorded
     // inputs still match, since earlier Cargo commands may have changed them.
-    fs::rename(staging, artifacts.root.join("current.json")).map_err(|e| e.to_string())?;
+    fs::rename(staging, &artifacts.record).map_err(|e| e.to_string())?;
     eprintln!(
-        "prepared-nextest: published {} selections, {} hermit_modes Cargo guests, {} lit guests and {} record workloads for {profile}",
+        "prepared-nextest: published {} selections, {} hermit_modes Cargo guests, {} lit guests and {} record workloads for {profile} in Cargo profile {} ({} mode, {} cohort)",
         record.selections.len(),
         record.guests.len(),
         record.lit_guests.len(),
@@ -2048,8 +3240,42 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
             .record_workloads
             .as_ref()
             .map_or(0, |w| w.workloads.len()),
+        record.cargo_profile,
+        record.build_mode,
+        cohort.name(),
     );
     Ok(())
+}
+
+/// The BudgetContext field names whose values differ between the resolved
+/// map and a fresh computation, for the context-changed refusal. Naming the
+/// field turns a bare "resolve again" into a diagnosis (a cpuset change, a
+/// dirtied tree, a refreshed prepared record each point at a different owner).
+fn changed_context_fields(
+    resolved: &crate::nextest_cpu::BudgetContext,
+    actual: Option<&crate::nextest_cpu::BudgetContext>,
+) -> String {
+    let Some(actual) = actual else {
+        return "context now absent".into();
+    };
+    let resolved = serde_json::to_value(resolved).unwrap_or_default();
+    let actual = serde_json::to_value(actual).unwrap_or_default();
+    let (Some(resolved), Some(actual)) = (resolved.as_object(), actual.as_object()) else {
+        return "context".into();
+    };
+    let fields: Vec<&str> = resolved
+        .keys()
+        .chain(actual.keys())
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|field| resolved.get(*field) != actual.get(*field))
+        .collect();
+    if fields.is_empty() {
+        "context".into()
+    } else {
+        fields.join(", ")
+    }
 }
 
 pub fn run(
@@ -2074,8 +3300,26 @@ pub fn run(
     } else if std::env::var(REQUIRED_ENV).as_deref() == Ok("1") {
         return Err(format!("official Nextest consumer has no {SELECTION_ENV}"));
     }
-    let artifacts = LockedArtifacts::open(&root, false)?;
-    let record = artifacts.current()?;
+    let cohort = PreparedCohort::from_env()?;
+    let artifacts = LockedArtifacts::open(&root, false, cohort)?;
+    // Refuse a record from the wrong mode or feature set before any
+    // selection lookup, so the refusal names the cohort mismatch.
+    let value = artifacts.current_value()?;
+    check_prepared_cohort(
+        &value,
+        &format!("prepared Nextest {operation}"),
+        cohort,
+        &expected_build_mode()?,
+        cohort.expected_feature_set(),
+    )?;
+    let record = artifacts.record_from(value)?;
+    check_cohort_target(
+        &root,
+        cohort,
+        &record.target,
+        &format!("prepared Nextest {operation}"),
+    )?;
+    let tool_owner = project_tools(record.project.as_ref())?;
     let cargo = verify_record(&root, &record)?;
     let selection = verify_selection(&record, &cargo, &parsed.build)?;
     let guests = verify_guests(&record)?;
@@ -2109,7 +3353,10 @@ pub fn run(
             serde_json::from_str(&budget_context(&root, args, launch)?)
                 .map_err(|e| e.to_string())?;
         if actual.as_ref() != Some(&map.context) {
-            return Err("Nextest source/build/launch context changed after budget resolution; resolve again before running".into());
+            return Err(format!(
+                "Nextest source/build/launch context changed after budget resolution ({}); resolve again before running",
+                changed_context_fields(&map.context, actual.as_ref()),
+            ));
         }
     }
     let mut command = Command::new("cargo");
@@ -2144,15 +3391,65 @@ pub fn run(
     // Keep the shared lock until the child has joined. Preserve Nextest's
     // status; a refusal never becomes an empty or successful test report.
     drop(artifacts);
+    drop(tool_owner);
     Ok(exit_code(status))
 }
 
-pub fn assert_profile(root: &Path, profile: &str) -> Result<(), String> {
+/// Verify that the prepared record holds `profile`'s selections, unchanged, as
+/// built by `producer`'s `prepare` (by default `profile`'s own) in the Cargo
+/// profile that producer builds in, in this run's build mode and `cohort`'s
+/// feature set.
+pub fn assert_profile(
+    root: &Path,
+    profile: &str,
+    producer: Option<&str>,
+    cohort: PreparedCohort,
+) -> Result<(), String> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
-    let artifacts = LockedArtifacts::open(&root, false)?;
-    let record = artifacts.current()?;
+    let producer = producer.unwrap_or(profile);
+    // Refuse an unknown producer before reading the record. The producer's
+    // selections also derive the expected feature set for an open cohort:
+    // the same qualification `prepare` recorded, recomputed from the graph.
+    let producer_selections = profile_selections_in_cohort(&root, producer, cohort)?;
+    let expected_feature_set = match cohort.expected_feature_set() {
+        Some(expected) => expected.to_string(),
+        None => prepared_feature_set(&producer_selections)?,
+    };
+    let artifacts = LockedArtifacts::open(&root, false, cohort)?;
+    // Read the profile from the raw record first: a record from before schema
+    // 6 does not deserialize, and its refusal must still say what to rerun.
+    let value = artifacts.current_value()?;
+    check_prepared_cargo_profile(
+        &value,
+        profile,
+        producer,
+        project(&root)?.is_some(),
+        &producer_nodes(&root, producer, cohort),
+    )?;
+    check_prepared_cohort(
+        &value,
+        &if profile == producer {
+            format!("assert {profile}")
+        } else {
+            format!("assert {profile} --prepared-by {producer}")
+        },
+        cohort,
+        &expected_build_mode()?,
+        Some(&expected_feature_set),
+    )?;
+    let record = artifacts.record_from(value)?;
+    check_cohort_target(
+        &root,
+        cohort,
+        &record.target,
+        &if profile == producer {
+            format!("assert {profile}")
+        } else {
+            format!("assert {profile} --prepared-by {producer}")
+        },
+    )?;
     let cargo = verify_record(&root, &record)?;
-    for args in profile_selections(&root, profile)?.values() {
+    for args in profile_selections_in_cohort(&root, profile, cohort)?.values() {
         verify_selection(&record, &cargo, args)?;
     }
     verify_guests(&record)?;
@@ -2163,8 +3460,18 @@ pub fn assert_profile(root: &Path, profile: &str) -> Result<(), String> {
 
 pub fn executable(root: &Path, package: &str, name: &str) -> Result<PathBuf, String> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
-    let artifacts = LockedArtifacts::open(&root, false)?;
-    let record = artifacts.current()?;
+    let cohort = PreparedCohort::from_env()?;
+    let artifacts = LockedArtifacts::open(&root, false, cohort)?;
+    let value = artifacts.current_value()?;
+    check_prepared_cohort(
+        &value,
+        "prepared executable lookup",
+        cohort,
+        &expected_build_mode()?,
+        cohort.expected_feature_set(),
+    )?;
+    let record = artifacts.record_from(value)?;
+    check_cohort_target(&root, cohort, &record.target, "prepared executable lookup")?;
     let cargo = verify_record(&root, &record)?;
     let ids = cargo["packages"]
         .as_array()
@@ -2263,9 +3570,7 @@ mod tests {
                 )
             })
             .collect();
-        // SAFETY: nextest runs each test in its own process.
-        unsafe { std::env::set_var("CARGO_BUILD_JOBS", "4") };
-        listing_outputs(&root, program.as_os_str(), &listings).unwrap();
+        listing_outputs(&root, program.as_os_str(), &listings, 4).unwrap();
         for index in 0..4 {
             assert_eq!(
                 fs::read_to_string(root.join(format!("{index}.json"))).unwrap(),
@@ -2280,7 +3585,7 @@ mod tests {
             "the listings never overlapped: {overlap:?}"
         );
         let failing = vec![(args("fail now"), root.join("fail.json"))];
-        let error = listing_outputs(&root, program.as_os_str(), &failing).unwrap_err();
+        let error = listing_outputs(&root, program.as_os_str(), &failing, 4).unwrap_err();
         assert!(
             error.message.contains("Cargo listing failed"),
             "{}",
@@ -2318,26 +3623,288 @@ mod tests {
     }
 
     #[test]
+    fn harvest_manifest_verification_refuses_tampered_missing_and_extra() {
+        let root = std::env::temp_dir().join(format!(
+            "harvest-verify-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let dir = root.join("target/validate/buck-harvest");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("tests_misc");
+        std::fs::write(&file, b"buck bytes").unwrap();
+        let sha = format!("{:x}", Sha256::digest(b"buck bytes"));
+        let manifest = serde_json::json!({
+            "files": [{
+                "name": "tests_misc",
+                "harvested_to": "target/validate/buck-harvest/tests_misc",
+                "sha256": sha,
+            }]
+        });
+        verify_harvest_manifest(&manifest, &root).unwrap();
+        // Tampered bytes refuse by name.
+        std::fs::write(&file, b"tampered").unwrap();
+        let error = verify_harvest_manifest(&manifest, &root).unwrap_err();
+        assert!(error.to_string().contains("hash mismatch"), "{error}");
+        std::fs::write(&file, b"buck bytes").unwrap();
+        // An undeclared extra file refuses.
+        std::fs::write(dir.join("stray"), b"stray").unwrap();
+        let error = verify_harvest_manifest(&manifest, &root).unwrap_err();
+        assert!(error.to_string().contains("undeclared"), "{error}");
+        std::fs::remove_file(dir.join("stray")).unwrap();
+        // A missing file refuses by name.
+        std::fs::remove_file(&file).unwrap();
+        let error = verify_harvest_manifest(&manifest, &root).unwrap_err();
+        assert!(error.to_string().contains("missing"), "{error}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Graph-derived buck-consumer test (dh-iz46e): the harvest target
+    /// set, the authored per-step Cargo selections, and the committed
+    /// full-profile preparation population must name the SAME three
+    /// detcore test binaries. Every fact is read from the committed
+    /// graph, the for_step table, or the harvest script itself, so
+    /// removing the build.reverie_buck node, a test.detcore_* node, or
+    /// a for_step arm fails here instead of silently reverting the buck
+    /// run's detcore selections to Cargo bytes under a buck label.
+    #[test]
+    fn buck_harvest_targets_are_the_committed_detcore_selections() {
+        let root = repository_root();
+        // tag -> (Cargo test target, buck target name). The harvested
+        // name apply_harvest matches on is the Cargo test-binary stem,
+        // which for these targets equals both names.
+        let detcore = [
+            ("test.detcore_misc", "tests_misc"),
+            ("test.detcore_parallel", "tests_parallelism"),
+            ("test.detcore_time", "tests_time"),
+        ];
+        // (1) Each for_step arm still authors the one-test Cargo
+        // selection for its node.
+        for (tag, test) in detcore {
+            let selection = crate::nextest_build_selections::for_step(tag)
+                .unwrap_or_else(|| panic!("{tag} lost its for_step build selection"));
+            assert_eq!(
+                selection,
+                ["-p", "hermit-detcore-tests", "--test", test].as_slice(),
+                "{tag}"
+            );
+        }
+        // (2) The committed full profile prepares exactly those
+        // selections (fails when a test.detcore_* node disappears from
+        // the generated graph).
+        let full = profile_selections(&root, "full").unwrap();
+        for (tag, test) in detcore {
+            let want = args(&format!("-p hermit-detcore-tests --test {test}"));
+            assert!(
+                full.values().any(|selection| *selection == want),
+                "full profile no longer prepares {tag}'s selection {want:?}"
+            );
+        }
+        // (3) The committed graph still carries the host harvest node.
+        let graph = fs::read_to_string(root.join("ci/dag/validate.json")).unwrap();
+        let graph = dagrun::io::dag_from_json(&graph).unwrap();
+        assert!(
+            graph
+                .steps
+                .iter()
+                .any(|step| step.tag() == "build.reverie_buck"),
+            "build.reverie_buck disappeared from the committed graph"
+        );
+        // (4) The harvest script builds exactly the buck twins of those
+        // selections, under the names apply_harvest matches.
+        let script = fs::read_to_string(root.join("ci/harvest-reverie-buck.sh")).unwrap();
+        let mut harvested: BTreeSet<(String, String)> = BTreeSet::new();
+        for line in script.lines() {
+            let line = line.trim().trim_matches('"');
+            if let Some((target, name)) = line.rsplit_once('|') {
+                if target.starts_with("hermit//") {
+                    harvested.insert((target.to_string(), name.to_string()));
+                }
+            }
+        }
+        let want: BTreeSet<(String, String)> = detcore
+            .iter()
+            .map(|(_, test)| (format!("hermit//detcore:{test}"), test.to_string()))
+            .collect();
+        assert_eq!(
+            harvested, want,
+            "harvest TARGETS drifted from the detcore selections"
+        );
+    }
+
+    /// One harvest fixture: a Cargo twin and a Buck twin as `--list`
+    /// scripts, one selection recording the Cargo twin, and a manifest
+    /// naming the Buck twin (plus any extra manifest-only names).
+    fn harvest_fixture(
+        cargo_cases: &[&str],
+        buck_cases: &[&str],
+        extra_manifest_names: &[&str],
+    ) -> (PathBuf, PathBuf, Value, BTreeMap<String, SelectionRecord>) {
+        fn listing_script(path: &Path, cases: &[&str]) {
+            let mut body = "#!/bin/sh\n".to_string();
+            for case in cases {
+                body.push_str(&format!("printf '%s: test\\n' '{case}'\n"));
+            }
+            fs::write(path, body).unwrap();
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let root = std::env::temp_dir().join(format!(
+            "harvest-cases-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let harvest_dir = root.join("target/validate/buck-harvest");
+        fs::create_dir_all(&harvest_dir).unwrap();
+        let generation = root.join("generation");
+        fs::create_dir_all(&generation).unwrap();
+        let cargo_bin = root.join("cargo-tests_misc");
+        listing_script(&cargo_bin, cargo_cases);
+        let buck_bin = harvest_dir.join("tests_misc");
+        listing_script(&buck_bin, buck_cases);
+        let metadata_path = generation.join("sel.json");
+        fs::write(
+            &metadata_path,
+            serde_json::to_vec(&serde_json::json!({
+                "rust-binaries": {"tests_misc-id": {"binary-path": cargo_bin.display().to_string()}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut files = vec![serde_json::json!({
+            "name": "tests_misc",
+            "harvested_to": "target/validate/buck-harvest/tests_misc",
+            "sha256": "unused-by-apply-harvest",
+        })];
+        for name in extra_manifest_names {
+            listing_script(&harvest_dir.join(name), &["orphan_case"]);
+            files.push(serde_json::json!({
+                "name": name,
+                "harvested_to": format!("target/validate/buck-harvest/{name}"),
+                "sha256": "unused-by-apply-harvest",
+            }));
+        }
+        let manifest = serde_json::json!({"files": files});
+        let selection = SelectionRecord {
+            build_args: args("-p hermit-detcore-tests --test tests_misc"),
+            metadata: file_identity(&metadata_path, false).unwrap(),
+            binaries: vec![BinaryIdentity {
+                binary_id: "tests_misc-id".into(),
+                package_id: "hermit-detcore-tests".into(),
+                binary_name: "tests_misc".into(),
+                kind: "test".into(),
+                build_platform: "target".into(),
+                executable: file_identity(&cargo_bin, true).unwrap(),
+            }],
+            runtime_files: vec![],
+        };
+        let selections = BTreeMap::from([("sel".to_string(), selection)]);
+        (root, generation, manifest, selections)
+    }
+
+    /// Violating cases for the harvest safety property: a Buck build that
+    /// silently skips, adds, or renames tests must refuse in prepare, and
+    /// a manifest entry no selection records must refuse instead of
+    /// staying Cargo under a buck label. Each arm is bracketed by the
+    /// identical-set control, which must substitute.
+    #[test]
+    fn apply_harvest_refuses_case_set_and_name_set_violations() {
+        // Control: identical case sets substitute and repoint.
+        let (root, generation, manifest, mut selections) =
+            harvest_fixture(&["alpha", "beta"], &["alpha", "beta"], &[]);
+        apply_harvest(&manifest, &root, &generation, &mut selections).unwrap();
+        assert!(
+            selections["sel"].binaries[0]
+                .executable
+                .path
+                .ends_with("target/validate/buck-harvest/tests_misc"),
+            "control did not substitute the Buck binary"
+        );
+        fs::remove_dir_all(&root).unwrap();
+
+        // (a) Missing a test, (b) an extra test, (c) a renamed test,
+        // (d) equal totals with different identities: all refuse with
+        // the differing names in the message.
+        for (label, buck_cases, expect) in [
+            ("missing", &["alpha"][..], "cargo-only=[\"beta\"]"),
+            (
+                "extra",
+                &["alpha", "beta", "gamma"][..],
+                "buck-only=[\"gamma\"]",
+            ),
+            (
+                "renamed",
+                &["alpha", "renamed"][..],
+                "cargo-only=[\"beta\"]",
+            ),
+            (
+                "disjoint",
+                &["xray", "yankee"][..],
+                "buck-only=[\"xray\", \"yankee\"]",
+            ),
+        ] {
+            let (root, generation, manifest, mut selections) =
+                harvest_fixture(&["alpha", "beta"], buck_cases, &[]);
+            let error = apply_harvest(&manifest, &root, &generation, &mut selections).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("buck case set for tests_misc differs"),
+                "{label}: {error}"
+            );
+            assert!(error.to_string().contains(expect), "{label}: {error}");
+            // The recorded identity still names the Cargo bytes: the
+            // refusal happens before any repointing of this binary.
+            assert!(
+                selections["sel"].binaries[0]
+                    .executable
+                    .path
+                    .ends_with("cargo-tests_misc"),
+                "{label}: refusal left a substituted identity behind"
+            );
+            fs::remove_dir_all(&root).unwrap();
+        }
+
+        // Name-set: a manifest entry matching no selection binary
+        // refuses even when the matched binary's cases are identical.
+        let (root, generation, manifest, mut selections) =
+            harvest_fixture(&["alpha", "beta"], &["alpha", "beta"], &["tests_time"]);
+        let error = apply_harvest(&manifest, &root, &generation, &mut selections).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("buck harvest name set differs from selection binaries"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("tests_time"), "{error}");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn one_selection_is_its_own_union() {
         let only = selections(&["-p hermit-detcore --lib"]);
         assert_eq!(
             unified_selection(&only).unwrap(),
             args("-p hermit-detcore --lib")
         );
+        let featured = selections(&["-p hermit-run --features liteinst --lib --bins"]);
+        assert_eq!(
+            unified_selection(&featured).unwrap(),
+            args("-p hermit-run --features liteinst --lib --bins")
+        );
     }
 
     #[test]
     fn several_selections_unify_to_the_workspace_with_qualified_features() {
         let several = selections(&[
-            "-p hermit-run --features third-party-backends,kvm-native-test-support --lib --bins",
+            "-p hermit-run --features liteinst,kvm-native-test-support --lib --bins",
             "-p hermit-detcore-tests --test tests_misc",
-            "-p hermit-run --features third-party-backends,kvm-execution-tests --lib --test cli",
+            "-p hermit-run --features liteinst,kvm-execution-tests --lib --test cli",
             "--workspace --exclude hermit-run",
         ]);
         assert_eq!(
             unified_selection(&several).unwrap(),
             args(
-                "--workspace --all-targets --features hermit-run/kvm-execution-tests,hermit-run/kvm-native-test-support,hermit-run/third-party-backends"
+                "--workspace --all-targets --features hermit-run/kvm-execution-tests,hermit-run/kvm-native-test-support,hermit-run/liteinst"
             )
         );
         let unfeatured = selections(&["-p a --lib", "-p b --test t"]);
@@ -2345,18 +3912,39 @@ mod tests {
             unified_selection(&unfeatured).unwrap(),
             args("--workspace --all-targets")
         );
+        let core = selections(&[
+            "-p hermit-run --features kvm-native-test-support --lib --bins",
+            "-p hermit-detcore-tests --test tests_misc",
+        ]);
+        assert_eq!(
+            unified_selection(&core).unwrap(),
+            args("--workspace --all-targets --features hermit-run/kvm-native-test-support")
+        );
+        let unrelated = selections(&[
+            "-p another-package --features third-party-backends --lib",
+            "-p hermit-run --lib --bins",
+        ]);
+        assert_eq!(
+            unified_selection(&unrelated).unwrap(),
+            args("--workspace --all-targets --features another-package/third-party-backends")
+        );
     }
 
     #[test]
     fn only_validate_profile_profiles_unify_their_listing() {
         let several = selections(&[
             "-p hermit-detcore-tests --test tests_misc",
-            "-p hermit-run --features third-party-backends --test hermit_modes",
+            "-p hermit-run --features liteinst --test hermit_modes",
         ]);
         for profile in ["full", "hosted-portable"] {
             let plan = listings(profile, &several).unwrap();
             assert_eq!(plan.len(), 1, "{profile}");
             assert_eq!(plan[0].0, unified_selection(&several).unwrap());
+            assert_eq!(
+                plan[0].0,
+                args("--workspace --all-targets --features hermit-run/liteinst"),
+                "{profile} must build the full installer with the CLI"
+            );
             assert_eq!(plan[0].1.len(), 2);
         }
         // The dev-profile producers build far less than the workspace, so
@@ -2585,9 +4173,11 @@ mod tests {
             (
                 PreparedRecord {
                     schema: RECORD_SCHEMA,
+                    project: None,
                     repository: self.root.clone(),
                     target: self.target.clone(),
                     sources: BTreeMap::new(),
+                    source_parts: BTreeMap::new(),
                     rustc: String::new(),
                     cargo_config: BTreeMap::new(),
                     build_environment: BTreeMap::new(),
@@ -2597,6 +4187,10 @@ mod tests {
                     lit_guests: vec![],
                     record_workloads: None,
                     cpu_wrapper,
+                    prepared_for: "fixture".into(),
+                    cargo_profile: "dev".into(),
+                    build_mode: "cargo".into(),
+                    feature_set: String::new(),
                 },
                 args,
             )
@@ -2648,7 +4242,16 @@ mod tests {
         let (mut record, _) = fixture.selection();
         record.selections.values_mut().next().unwrap().build_args =
             argv(&["-p", "hermit-run", "--test", "record_replay"]);
-        let directory = fixture.root.join("record-workloads");
+        record.build_environment.insert(
+            "CARGO_TARGET_DIR".into(),
+            fixture.target.to_str().unwrap().into(),
+        );
+        let directory = fixture
+            .target
+            .join("ci/nextest-binaries")
+            .join(fixture.root.file_name().unwrap())
+            .join("record-workloads");
+        fs::create_dir_all(directory.parent().unwrap()).unwrap();
         fs::create_dir(&directory).unwrap();
         let mut targets = Vec::new();
         let mut events = Vec::new();
@@ -2716,7 +4319,13 @@ mod tests {
         let population = record_workloads::consume_prepared(true, Some(&raw))
             .unwrap()
             .unwrap();
-        assert_eq!(population.len(), 73);
+        assert_eq!(population.len(), 76);
+        assert!(
+            population
+                .iter()
+                .any(|workload| workload.name == "c_record_replay_shared_mappings"),
+            "the shared-mapping workload must reach the prepared consumer"
+        );
         assert_eq!(
             population.iter().map(|w| w.name).collect::<BTreeSet<_>>(),
             record_workloads::names().collect()
@@ -2727,8 +4336,19 @@ mod tests {
                 .find(|w| w.name == "rs_clock_gettime")
                 .unwrap()
                 .path,
-            fixture.root.join("record-workloads/rs_clock_gettime")
+            fixture
+                .target
+                .join("ci/nextest-binaries")
+                .join(fixture.root.file_name().unwrap())
+                .join("record-workloads/rs_clock_gettime")
         );
+        assert!(!fixture.root.join("record-workloads").exists());
+        for cargo_target in [None, Some("")] {
+            assert_eq!(
+                record_workload_directory(&fixture.root, &fixture.target, cargo_target).unwrap(),
+                fixture.root.join("record-workloads")
+            );
+        }
         assert!(record.guests.is_empty());
         assert_eq!(cargo_guests::CARGO_GUEST_BINARIES.len(), 21);
     }
@@ -2791,6 +4411,14 @@ mod tests {
             .path = fixture.target.join("outside-generation");
         assert!(verify_record_workloads(&changed, &cargo).is_err());
         let mut changed = record.clone();
+        let workload = &mut changed.record_workloads.as_mut().unwrap().workloads[0];
+        workload.executable.path = fixture.root.join("record-workloads").join(&workload.name);
+        assert!(
+            verify_record_workloads(&changed, &cargo)
+                .unwrap_err()
+                .contains("retained path differs")
+        );
+        let mut changed = record.clone();
         changed
             .record_workloads
             .as_mut()
@@ -2813,7 +4441,7 @@ mod tests {
     #[test]
     fn record_workload_generation_lock_remains_held_until_consumer_returns() {
         let fixture = Fixture::new();
-        let consumer = LockedArtifacts::open(&fixture.root, false).unwrap();
+        let consumer = LockedArtifacts::open(&fixture.root, false, DEFAULT_COHORT).unwrap();
         let competing = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -2832,7 +4460,7 @@ mod tests {
         let (locked_tx, locked_rx) = std::sync::mpsc::channel();
         let producer = std::thread::spawn(move || {
             starting_tx.send(()).unwrap();
-            let _lock = LockedArtifacts::open(&root, true).unwrap();
+            let _lock = LockedArtifacts::open(&root, true, DEFAULT_COHORT).unwrap();
             locked_tx.send(()).unwrap();
         });
         starting_rx
@@ -3114,6 +4742,92 @@ mod tests {
     }
 
     #[test]
+    fn project_descriptor_binds_root_tracked_graph_and_original_tool_record() {
+        let f = Fixture::new();
+        let tools = Fixture::new();
+        fs::write(f.root.join("graph.json"), "{\"steps\":[]}").unwrap();
+        git_bytes(&f.root, &["init", "-q"]).unwrap();
+        git_bytes(&f.root, &["add", "graph.json"]).unwrap();
+        let preparation = tools.root.join("target/ci/nextest-binaries/current.json");
+        fs::create_dir_all(preparation.parent().unwrap()).unwrap();
+        fs::write(&preparation, "original fixture record").unwrap();
+        let path = f.root.join("project.json");
+        let mut descriptor = serde_json::json!({"schema":1,"repository":f.root,"graph":f.root.join("graph.json"),"tools_root":tools.root,"shared_package":"fixture"});
+        fs::write(&path, serde_json::to_vec(&descriptor).unwrap()).unwrap();
+        let actual = project_at(&f.root, &path).unwrap();
+        assert_eq!(actual.graph.path, f.root.join("graph.json"));
+        fs::write(&preparation, "changed fixture record").unwrap();
+        assert!(project_tools(Some(&actual)).is_err());
+        descriptor["repository"] = serde_json::json!(tools.root);
+        fs::write(&path, serde_json::to_vec(&descriptor).unwrap()).unwrap();
+        assert!(project_at(&f.root, &path).is_err());
+        descriptor["repository"] = serde_json::json!(f.root);
+        fs::write(f.root.join("untracked.json"), "{}").unwrap();
+        descriptor["graph"] = serde_json::json!(f.root.join("untracked.json"));
+        fs::write(&path, serde_json::to_vec(&descriptor).unwrap()).unwrap();
+        assert!(project_at(&f.root, &path).is_err());
+    }
+
+    #[test]
+    fn project_binding_never_makes_unrecorded_build_options_or_a_missing_core_package_valid() {
+        for option in [
+            "--manifest-path",
+            "--target-dir",
+            "--release",
+            "--cargo-profile",
+        ] {
+            assert!(split_arguments(&argv(&[option, "/different-project"])).is_err());
+        }
+        let f = Fixture::new();
+        let identity = file_identity(&f.root.join("cargo.json"), false);
+        assert!(identity.is_err());
+        let (record, _) = f.selection();
+        let project = PreparedProject {
+            descriptor: record.cargo_metadata.clone(),
+            graph: record.cargo_metadata.clone(),
+            tools_root: f.root.clone(),
+            core_preparation: record.cargo_metadata.clone(),
+            shared_package: "unprovided-core-owner".into(),
+        };
+        assert!(same_core_package(&project, &f.cargo, &f.cargo).is_err());
+        assert!(project_tools(Some(&project)).is_err());
+        let mut graph = dagrun::io::dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let mut step = graph
+            .steps
+            .iter()
+            .find(|step| step.env.contains_key(SELECTION_ENV))
+            .unwrap()
+            .clone();
+        step.deps.clear();
+        step.labels = vec!["full".into()];
+        let owner = Path::new("/extension/ci/project.json");
+        step.env
+            .insert(PROJECT_ENV.into(), owner.to_str().unwrap().into());
+        graph.steps = vec![step];
+        assert!(config_selections(&graph, "full").is_err());
+        assert!(config_selections_for_project(&graph, "full", Some(owner), DEFAULT_COHORT).is_ok());
+        assert!(
+            config_selections_for_project(
+                &graph,
+                "full",
+                Some(Path::new("/different/project.json")),
+                DEFAULT_COHORT
+            )
+            .is_err()
+        );
+        graph.steps[0].env.remove(REQUIRED_ENV);
+        assert!(
+            config_selections_for_project(&graph, "full", Some(owner), DEFAULT_COHORT).is_err()
+        );
+        graph.steps[0]
+            .env
+            .insert(PROJECT_ENV.into(), "relative/project.json".into());
+        assert!(
+            config_selections_for_project(&graph, "full", Some(owner), DEFAULT_COHORT).is_err()
+        );
+    }
+
+    #[test]
     fn changed_tracked_and_untracked_sources_change_the_identity() {
         let f = Fixture::new();
         fs::write(f.root.join(".gitignore"), "custom-target/\n").unwrap();
@@ -3159,6 +4873,191 @@ mod tests {
         )
         .unwrap();
         assert_ne!(sources(&f.cargo, &f.root).unwrap(), before);
+    }
+
+    /// The race from dh-0pw53: a root mutated between the record and
+    /// its verification must be named, with the differing part, so the
+    /// writer can be found from the refusal alone. Without the parts
+    /// in the record this detail cannot be produced.
+    #[test]
+    fn stale_source_detail_names_the_root_and_the_part() {
+        let root = PathBuf::from("/fixture/root");
+        let part = |head: &str, diff: &str, untracked: Vec<(String, String, u32)>| SourcePart {
+            head: head.into(),
+            tree: "tree".into(),
+            diff_sha256: diff.into(),
+            untracked,
+        };
+        let base = part("aaaa1111", "diff", vec![]);
+        let record = PreparedRecord {
+            schema: RECORD_SCHEMA,
+            project: None,
+            repository: root.clone(),
+            target: root.clone(),
+            sources: BTreeMap::from([(root.clone(), "identity".into())]),
+            source_parts: BTreeMap::from([(root.clone(), base.clone())]),
+            rustc: String::new(),
+            cargo_config: BTreeMap::new(),
+            build_environment: BTreeMap::new(),
+            cargo_metadata: FileIdentity {
+                path: root.join("cargo.json"),
+                size: 0,
+                mode: 0,
+                sha256: String::new(),
+            },
+            selections: BTreeMap::new(),
+            guests: vec![],
+            lit_guests: vec![],
+            record_workloads: None,
+            cpu_wrapper: CpuWrapperRecord {
+                metadata: FileIdentity {
+                    path: root.join("wrapper.json"),
+                    size: 0,
+                    mode: 0,
+                    sha256: String::new(),
+                },
+                executable: FileIdentity {
+                    path: root.join("wrapper"),
+                    size: 0,
+                    mode: 0,
+                    sha256: String::new(),
+                },
+            },
+            prepared_for: "fixture".into(),
+            cargo_profile: "dev".into(),
+            build_mode: "cargo".into(),
+            feature_set: String::new(),
+        };
+        let current = BTreeMap::from([(root.clone(), "changed".to_string())]);
+        let detail = |after: SourcePart| {
+            stale_source_detail(&record, &current, &BTreeMap::from([(root.clone(), after)]))
+        };
+        assert!(
+            detail(part("bbbb2222", "diff", vec![])).contains("HEAD moved"),
+            "HEAD change not named"
+        );
+        assert!(
+            detail(part("aaaa1111", "other", vec![])).contains("tracked diff changed"),
+            "diff change not named"
+        );
+        let added = detail(part(
+            "aaaa1111",
+            "diff",
+            vec![(".hermit-verify-summary-x".into(), "sha".into(), 0o644)],
+        ));
+        assert!(
+            added.contains("/fixture/root")
+                && added.contains("untracked file .hermit-verify-summary-x was added"),
+            "untracked addition not named: {added}"
+        );
+        let removed = stale_source_detail(
+            &PreparedRecord {
+                source_parts: BTreeMap::from([(
+                    root.clone(),
+                    part(
+                        "aaaa1111",
+                        "diff",
+                        vec![("gone".into(), "sha".into(), 0o644)],
+                    ),
+                )]),
+                ..record.clone()
+            },
+            &current,
+            &BTreeMap::from([(root.clone(), base)]),
+        );
+        assert!(
+            removed.contains("untracked file gone was removed"),
+            "untracked removal not named: {removed}"
+        );
+    }
+
+    /// The v7 shape behind dh-j8eb7: a test in a sibling node creates an
+    /// untracked directory inside the source root and removes it again
+    /// (property_snapshot's hermit-test-relative-copies-<pid>/). If the
+    /// identity and the parts of one verification come from two different
+    /// snapshots of that root, the refusal degrades to a bare "source
+    /// identity changed at <root>" naming neither part nor path, even
+    /// though the landed detail code could have named the file. Every
+    /// mismatch observed while the directory churns must name it.
+    #[test]
+    fn stale_detail_names_a_created_then_removed_untracked_directory() {
+        let f = Fixture::new();
+        fs::write(f.root.join(".gitignore"), "custom-target/\n").unwrap();
+        fs::write(f.root.join("Cargo.toml"), "[package]\nname='fixture'\n").unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "Cargo.toml", ".gitignore"],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        ] {
+            git_bytes(&f.root, &args).unwrap();
+        }
+        let (mut record, _) = f.selection();
+        let transient = f.root.join("hermit-test-relative-copies-1762");
+        let transient_file = "hermit-test-relative-copies-1762/u:object_r:test_prop:s0";
+        fs::create_dir(&transient).unwrap();
+        fs::write(transient.join("u:object_r:test_prop:s0"), "snapshot").unwrap();
+        let (before_sources, before_parts) = sources_and_parts(&f.cargo, &f.root).unwrap();
+        assert!(
+            before_parts[&f.root]
+                .untracked
+                .iter()
+                .any(|(name, _, _)| name == transient_file),
+            "fixture snapshot missed the transient file: {:?}",
+            before_parts[&f.root].untracked
+        );
+        record.sources = before_sources;
+        record.source_parts = before_parts;
+        fs::remove_dir_all(&transient).unwrap();
+        let (current_sources, current_parts) = sources_and_parts(&f.cargo, &f.root).unwrap();
+        assert_ne!(record.sources, current_sources);
+        let removed = stale_source_detail(&record, &current_sources, &current_parts);
+        assert!(
+            removed.contains(&f.root.display().to_string())
+                && removed.contains(&format!("untracked file {transient_file} was removed")),
+            "created-then-removed directory not named: {removed}"
+        );
+        // Churn the directory while snapshots are taken: any pair whose
+        // identity disagrees with the record must still name the file,
+        // never degrade to the bare root-only refusal.
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let churn_root = f.root.clone();
+        let churn_stop = stop.clone();
+        let churn = std::thread::spawn(move || {
+            let dir = churn_root.join("hermit-test-relative-copies-1762");
+            while !churn_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = fs::create_dir(&dir);
+                let _ = fs::write(dir.join("u:object_r:test_prop:s0"), "snapshot");
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let _ = fs::remove_dir_all(&dir);
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        });
+        let mut mismatches = 0;
+        for _ in 0..160 {
+            let Ok((sources, parts)) = sources_and_parts(&f.cargo, &f.root) else {
+                continue;
+            };
+            if sources == record.sources {
+                continue;
+            }
+            mismatches += 1;
+            let detail = stale_source_detail(&record, &sources, &parts);
+            assert!(
+                detail.contains(&format!("untracked file {transient_file}")),
+                "churned snapshot degraded to a bare refusal: {detail}"
+            );
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        churn.join().unwrap();
+        assert!(mismatches > 0, "churn never changed a snapshot identity");
     }
 
     /// A disposable run summary must not move source identity, and a stray one
@@ -3243,7 +5142,7 @@ mod tests {
     /// all still have passed. Resolving by `.git` and then cross-checking
     /// against git's own answer removes the guess.
     fn repository_root() -> PathBuf {
-        let candidate = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let candidate = crate::compiled_manifest_dir!()
             .ancestors()
             .find(|candidate| candidate.join(".git").exists())
             .expect("locating the repository root by .git")
@@ -3524,6 +5423,31 @@ mod tests {
     /// to the child only; this process never exports it, so concurrently
     /// running tests are unaffected.
     #[test]
+    fn changed_context_fields_name_only_the_differing_fields() {
+        let resolved = crate::nextest_cpu::BudgetContext {
+            source_sha256: "a".into(),
+            source_clean: true,
+            build_sha256: "b".into(),
+            machine: "x86_64:test".into(),
+            available_cpus: 8,
+            execution_cohort: None,
+            launch_proof: None,
+        };
+        let mut actual = resolved.clone();
+        assert_eq!(changed_context_fields(&resolved, Some(&actual)), "context");
+        actual.available_cpus = 4;
+        actual.source_clean = false;
+        assert_eq!(
+            changed_context_fields(&resolved, Some(&actual)),
+            "available_cpus, source_clean",
+        );
+        assert_eq!(
+            changed_context_fields(&resolved, None),
+            "context now absent"
+        );
+    }
+
+    #[test]
     fn scratch_repository_tests_ignore_inherited_git_location_variables() {
         const CHILD_TESTS: [&str; 3] = [
             "nextest_binaries::tests::changed_tracked_and_untracked_sources_change_the_identity",
@@ -3647,5 +5571,241 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+    }
+
+    #[test]
+    fn prepared_cohort_paths_keep_the_default_and_key_the_native_cohort() {
+        let store = Path::new("/fixture/target/ci/nextest-binaries");
+        assert_eq!(
+            DEFAULT_COHORT.record_path(store),
+            store.join("current.json")
+        );
+        assert_eq!(DEFAULT_COHORT.lock_path(store), store.join("lock"));
+        assert_eq!(DEFAULT_COHORT.target_dir(), None);
+        assert_eq!(DEFAULT_COHORT.expected_feature_set(), None);
+        assert_eq!(
+            NATIVE_EXEC_COHORT.record_path(store),
+            store.join("cohorts/native-exec.json")
+        );
+        assert_eq!(
+            NATIVE_EXEC_COHORT.lock_path(store),
+            store.join("cohorts/lock.native-exec")
+        );
+        assert_eq!(
+            NATIVE_EXEC_COHORT.target_dir(),
+            Some("target/cohort-native-exec")
+        );
+        assert_eq!(PreparedCohort::from_slug(None).unwrap(), DEFAULT_COHORT);
+        assert_eq!(
+            PreparedCohort::from_slug(Some("native-exec")).unwrap(),
+            NATIVE_EXEC_COHORT
+        );
+        assert!(PreparedCohort::from_slug(Some("bogus")).is_err());
+        // The closed cohort's constant is the feature set its selection
+        // derives, so the table and the selection cannot drift apart.
+        let native = selections(&[
+            "-p hermit-run --features liteinst,kvm-native-test-support,native-exec --lib --bins",
+        ]);
+        assert_eq!(
+            prepared_feature_set(&native).unwrap(),
+            NATIVE_EXEC_COHORT.expected_feature_set().unwrap()
+        );
+    }
+
+    #[test]
+    fn cohort_locks_and_records_neither_block_nor_replace_each_other() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-prepared-cohorts-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        // A default generation is already published.
+        let store = root.join("target/ci/nextest-binaries");
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("current.json"), "{\"schema\":7}").unwrap();
+        // The native producer holds its exclusive lock and publishes its
+        // record; the default cohort's lock stays takeable and its record
+        // byte-identical throughout.
+        let native = LockedArtifacts::open(&root, true, NATIVE_EXEC_COHORT).unwrap();
+        let probe = |path: PathBuf| {
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap();
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            (rc, file)
+        };
+        let (native_rc, native_probe) = probe(store.join("cohorts/lock.native-exec"));
+        assert_eq!(native_rc, -1, "the native lock must be held");
+        drop(native_probe);
+        let (default_rc, default_probe) = probe(store.join("lock"));
+        assert_eq!(default_rc, 0, "the default lock must stay free");
+        // Release the probe's lock before the consumer takes its shared one.
+        drop(default_probe);
+        let staging = native.root.join("staging.json");
+        fs::write(&staging, "{\"schema\":7,\"cohort\":\"native-exec\"}").unwrap();
+        fs::rename(staging, &native.record).unwrap();
+        assert_eq!(
+            fs::read_to_string(store.join("current.json")).unwrap(),
+            "{\"schema\":7}"
+        );
+        let consumer = LockedArtifacts::open(&root, false, DEFAULT_COHORT).unwrap();
+        assert_eq!(
+            consumer.current_value().unwrap(),
+            serde_json::json!({"schema": 7})
+        );
+        drop(native);
+        drop(consumer);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn cohort_check_refuses_wrong_mode_feature_set_and_pre7_records() {
+        let native_features = NATIVE_EXEC_COHORT.expected_feature_set().unwrap();
+        let good = serde_json::json!({
+            "schema": RECORD_SCHEMA, "prepared_for": "full",
+            "cargo_profile": "validate", "build_mode": "cargo",
+            "feature_set": native_features,
+        });
+        check_prepared_cohort(
+            &good,
+            "prepared Nextest run",
+            NATIVE_EXEC_COHORT,
+            "cargo",
+            Some(native_features),
+        )
+        .unwrap();
+        let buck = serde_json::json!({
+            "schema": RECORD_SCHEMA, "prepared_for": "full",
+            "cargo_profile": "validate", "build_mode": "buck",
+            "feature_set": native_features,
+        });
+        let error = check_prepared_cohort(
+            &buck,
+            "prepared Nextest run",
+            NATIVE_EXEC_COHORT,
+            "cargo",
+            Some(native_features),
+        )
+        .unwrap_err();
+        assert!(error.contains("buck build mode"), "{error}");
+        assert!(error.contains("--cohort native-exec"), "{error}");
+        let wrong_features = serde_json::json!({
+            "schema": RECORD_SCHEMA, "prepared_for": "full",
+            "cargo_profile": "validate", "build_mode": "cargo",
+            "feature_set": "hermit-run/liteinst",
+        });
+        let error = check_prepared_cohort(
+            &wrong_features,
+            "prepared Nextest run",
+            NATIVE_EXEC_COHORT,
+            "cargo",
+            Some(native_features),
+        )
+        .unwrap_err();
+        assert!(error.contains("feature set"), "{error}");
+        let pre7 = serde_json::json!({
+            "schema": 6, "prepared_for": "full", "cargo_profile": "validate",
+        });
+        let error = check_prepared_cohort(
+            &pre7,
+            "prepared Nextest run",
+            NATIVE_EXEC_COHORT,
+            "cargo",
+            Some(native_features),
+        )
+        .unwrap_err();
+        assert!(error.contains("not schema 7"), "{error}");
+        // The default cohort without an expected set still refuses a record
+        // from the wrong mode, and accepts its own mode with any union.
+        let default_record = serde_json::json!({
+            "schema": RECORD_SCHEMA, "prepared_for": "full",
+            "cargo_profile": "validate", "build_mode": "cargo",
+            "feature_set": "hermit-run/liteinst",
+        });
+        check_prepared_cohort(&default_record, "run", DEFAULT_COHORT, "cargo", None).unwrap();
+        assert!(
+            check_prepared_cohort(&default_record, "run", DEFAULT_COHORT, "buck", None).is_err()
+        );
+    }
+
+    #[test]
+    fn cohort_target_declaration_is_enforced_against_cargos_report() {
+        let root = Path::new("/fixture");
+        // The declared cohort target is the only target a native record
+        // or build may name; the historically forced default target (the
+        // pinned-wrapper override) refuses by name.
+        check_cohort_target(
+            root,
+            NATIVE_EXEC_COHORT,
+            Path::new("/fixture/target/cohort-native-exec"),
+            "prepare full",
+        )
+        .unwrap();
+        let error = check_cohort_target(
+            root,
+            NATIVE_EXEC_COHORT,
+            Path::new("/fixture/target"),
+            "prepare full",
+        )
+        .unwrap_err();
+        assert!(error.contains("declares Cargo target"), "{error}");
+        assert!(error.contains("cohort-native-exec"), "{error}");
+        // The default cohort declares no target and keeps any target
+        // Cargo reports, as before cohorts existed.
+        check_cohort_target(root, DEFAULT_COHORT, Path::new("/fixture/target"), "run").unwrap();
+        check_cohort_target(root, DEFAULT_COHORT, Path::new("/elsewhere/target"), "run").unwrap();
+    }
+
+    #[test]
+    fn config_selections_partition_by_cohort() {
+        let mut graph = dagrun::io::dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let template = graph
+            .steps
+            .iter()
+            .find(|step| step.env.contains_key(SELECTION_ENV))
+            .unwrap()
+            .clone();
+        let mut default_step = template.clone();
+        default_step.deps.clear();
+        default_step.labels = vec!["full".into()];
+        default_step.env.insert(
+            SELECTION_ENV.into(),
+            serde_json::to_string(&args("-p hermit-run --features liteinst --lib")).unwrap(),
+        );
+        default_step.env.remove(COHORT_ENV);
+        let mut native_step = template;
+        native_step.deps.clear();
+        native_step.labels = vec!["full".into()];
+        native_step.env.insert(
+            SELECTION_ENV.into(),
+            serde_json::to_string(&args(
+                "-p hermit-run --features liteinst,kvm-native-test-support,native-exec --lib --bins",
+            ))
+            .unwrap(),
+        );
+        native_step
+            .env
+            .insert(COHORT_ENV.into(), "native-exec".into());
+        graph.steps = vec![default_step, native_step];
+        let default = config_selections(&graph, "full").unwrap();
+        assert_eq!(
+            default.values().collect::<Vec<_>>(),
+            vec![&args("-p hermit-run --features liteinst --lib")]
+        );
+        let native = config_selections_in_cohort(&graph, "full", NATIVE_EXEC_COHORT).unwrap();
+        assert_eq!(
+            native.values().collect::<Vec<_>>(),
+            vec![&args(
+                "-p hermit-run --features liteinst,kvm-native-test-support,native-exec --lib --bins"
+            )]
+        );
+        graph.steps[1].env.insert(COHORT_ENV.into(), "bogus".into());
+        assert!(config_selections(&graph, "full").is_err());
+        assert!(config_selections_in_cohort(&graph, "full", NATIVE_EXEC_COHORT).is_err());
     }
 }

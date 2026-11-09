@@ -1,5 +1,22 @@
 # SaBRe backend compatibility
 
+Current SaBRe builds, static frontends, runtime packaging, and validation are
+owned by [hermit-3rdparty-patching](https://github.com/rrnewton/hermit-3rdparty-patching).
+The core Hermit executable and installer do not provide SaBRe. The dated
+validation layout and measurements below describe the historical core owner;
+they do not establish execution or support for the external frontend.
+
+> **Archived (nightly only) since 2026-10-25.** The owner archived the SaBRe
+> backend: it gets no feature work, and its tests left per-commit validation.
+> Its code still builds in every validation, `test.sabre_examples` runs two of
+> its tests as a smoke check, and its manifest cells belong to the
+> `archived-nightly` run type, which the nightly pressure sweep runs instead of
+> full validation. The suite's other 34 tests run in the SaBRe run type
+> (`scripts/validate.rs --sabre-compat-only`, node `sabrecompat.sabre_examples`),
+> which the sweep's `sabre-examples` part runs nightly
+> (`ci/manifest-plan/src/archived.rs`). The measurements below predate the
+> archival.
+
 [SaBRe](https://github.com/srg-imperial/SaBRe) is a load-time selective binary
 rewriter that intercepts a program's system calls from inside the process,
 rather than through the kernel-mediated tracing that `ptrace` uses. Hermit can
@@ -16,20 +33,15 @@ to ptrace.
 
 ## Build and run
 
-SaBRe is behind the non-default `third-party-backends` Cargo feature and needs
-the staged loader plus `libdetcore_sabre.so` beside the Hermit executable:
+Use the patching repository's maintained build and staging route. Its SaBRe
+frontend requires the staged loader and `libdetcore_sabre.so`; a core Cargo
+feature cannot enable those resources. Preserve the strict verified smoke
+obligation: `run --strict --epoch=2026-01-01T00:00:00Z --verify -- /bin/echo hello`
+through that actual static frontend and its qualified artifact closure.
 
-```bash
-cargo build --release --locked -p hermit-run \
-  --features third-party-backends -p detcore-sabre
-HERMIT_INSTALL_FORCE_RESTAGE=local-sabre \
-  cargo build --release --locked -p hermit-install
-
-target/release/hermit --backend sabre run --strict --epoch=2026-01-01T00:00:00Z --verify -- /bin/echo hello
-```
-
-An explicit SaBRe request fails closed if the feature or artifacts are absent.
-Hermit does not silently substitute ptrace.
+An explicit SaBRe request fails closed if its frontend or artifacts are absent.
+The core executable refuses the unavailable selection and never substitutes
+ptrace. The compatibility and execution-path obligations below still apply.
 
 ## What the backend actually executes
 

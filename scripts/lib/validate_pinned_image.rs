@@ -98,6 +98,10 @@ fn refusal(profile: &str, reason: String) -> Box<RunSummary> {
     );
     summary.executed_tests = Some(0);
     summary.passed_tests = Some(0);
+    // Nothing executed, so the diagnostic count is exactly zero too: a
+    // current (schema 8) result states it rather than omitting it.
+    summary.diagnostic_failed_tests = Some(0);
+    summary.skipped_tests = Some(0);
     Box::new(summary)
 }
 
@@ -149,6 +153,14 @@ mod tests {
     use std::process::Output;
 
     use super::*;
+
+    /// The wrapper bounds each of the exact-image probe's two attempts at
+    /// 120 s of WALL time and retries a timed-out first attempt once. The two
+    /// timed tests shorten the bound to PROBE_BOUND_S, so both attempts finish
+    /// in seconds: a probe that dies on TERM takes 2 x 5 = 10 s, and one that
+    /// ignores TERM takes 2 x (5 + 2 s forced-stop grace) = 14 s.
+    const PROBE_BOUND_ENV: &str = "HERMIT_PINNED_IMAGE_PROBE_BOUND_S";
+    const PROBE_BOUND_S: &str = "5";
 
     fn root() -> &'static Path {
         Path::new(file!())
@@ -376,13 +388,45 @@ exit 91
     }
 
     #[test]
+    fn invalid_probe_bound_never_reaches_podman() {
+        let f = Fixture::new();
+        for value in ["", "0", "05", "x"] {
+            let output = f
+                .command()
+                .arg("--check-image")
+                .env(PROBE_BOUND_ENV, value)
+                .output()
+                .unwrap();
+            let output = observed("invalid-probe-bound", output);
+            assert_eq!(output.status.code(), Some(2), "{value:?}: {output:?}");
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(stderr.contains(PROBE_BOUND_ENV), "{stderr}");
+            assert!(stderr.contains("positive integer"), "{stderr}");
+            assert!(f.calls().is_empty(), "{value:?}");
+        }
+        // The late caller refuses the same way, before the node's run.
+        let output = f
+            .command()
+            .args(["--src", ".", "--out", "out", "--", "true"])
+            .env(PROBE_BOUND_ENV, "0")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(f.calls().is_empty());
+        assert!(!f.dir.path().join("payload").exists());
+        assert!(!f.dir.path().join("out").exists());
+    }
+
+    #[test]
     fn hanging_inspection_is_bounded_and_never_runs_payload() {
         let f = Fixture::new();
         let started = std::time::Instant::now();
+        // Both attempts time out and the probe dies on TERM: 2 x 5 = 10 s.
         let output = f
             .command()
             .arg("--check-image")
             .env("PROBE_MODE", "hang")
+            .env(PROBE_BOUND_ENV, PROBE_BOUND_S)
             .output()
             .unwrap();
         let output = observed("hanging-query", output);
@@ -394,6 +438,7 @@ exit 91
         );
         assert!(elapsed >= std::time::Duration::from_secs(10), "{elapsed:?}");
         assert!(elapsed < std::time::Duration::from_secs(20), "{elapsed:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("retrying once"));
         assert!(String::from_utf8_lossy(&output.stderr).contains("inspection unavailable"));
         let saved = std::fs::read_to_string(f.dir.path().join("generation")).unwrap();
         eprintln!("PINNED_IMAGE_HANG_GENERATION {}", saved.trim());
@@ -433,11 +478,13 @@ exit 91
         let started = std::time::Instant::now();
         // The late caller: a query that only timed out says nothing about the
         // image, so after the forced stop the node's own run proceeds, and that
-        // run carries --pull=never, which refuses a missing image itself.
+        // run carries --pull=never, which refuses a missing image itself. Both
+        // attempts are forced to stop: 2 x (5 + 2) = 14 s.
         let output = f
             .command()
             .args(["--src", ".", "--out", "out", "--", "true"])
             .env("PROBE_MODE", "ignore-term")
+            .env(PROBE_BOUND_ENV, PROBE_BOUND_S)
             .env("LC_ALL", "C")
             .output()
             .unwrap();
@@ -454,12 +501,15 @@ exit 91
         assert!(stderr.contains("sending signal TERM"), "{stderr}");
         assert!(stderr.contains("sending signal KILL"), "{stderr}");
         assert!(stderr.contains("timed out (probe status 137"), "{stderr}");
+        assert!(stderr.contains("retrying once"), "{stderr}");
         assert!(f.dir.path().join("payload").exists());
         let calls = f.calls();
         let calls = calls.lines().collect::<Vec<_>>();
+        // The probe, its one retry, then the node's run.
+        assert_eq!(calls.len(), 3, "{calls:?}");
         assert_eq!(calls[0], format!("image exists {}", f.reference));
-        assert_eq!(calls.len(), 2, "{calls:?}");
-        assert!(calls[1].starts_with("run --rm --pull=never "), "{calls:?}");
+        assert_eq!(calls[1], calls[0], "{calls:?}");
+        assert!(calls[2].starts_with("run --rm --pull=never "), "{calls:?}");
 
         // Admission still refuses on the same forced stop.
         std::fs::remove_file(f.dir.path().join("payload")).unwrap();
@@ -467,6 +517,7 @@ exit 91
             .command()
             .arg("--check-image")
             .env("PROBE_MODE", "ignore-term")
+            .env(PROBE_BOUND_ENV, PROBE_BOUND_S)
             .output()
             .unwrap();
         let admission = observed("term-ignoring-admission-query", admission);
@@ -676,6 +727,8 @@ exit 91
             assert_eq!(read.executed_nodes, 0);
             assert_eq!(read.executed_tests, Some(0));
             assert_eq!(read.passed_tests, Some(0));
+            assert_eq!(read.diagnostic_failed_tests, Some(0));
+            assert_eq!(read.skipped_tests, Some(0));
             assert!(
                 read.detail
                     .unwrap()

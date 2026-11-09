@@ -11,6 +11,7 @@ use std::ffi::CString;
 use std::fs;
 use std::fs::File;
 use std::io;
+use std::io::Read;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
@@ -33,6 +34,8 @@ use detcore_model::container_mounts::Installation;
 use detcore_model::container_mounts::assign_installed_rows;
 use detcore_model::container_mounts::check_installed_rows;
 use detcore_model::container_mounts::owned_mounts;
+use detcore_model::host_input::HostFileIdentity;
+use detcore_model::host_input::HostInputSnapshot;
 use hermit::Context;
 use hermit::Error;
 use hermit::FailureKind;
@@ -63,6 +66,31 @@ const DETERMINISTIC_GROUP_ROOT: &[u8] = b"/tmpvol/.hermit/etc/group";
 const DETERMINISTIC_LD_SO_CACHE_ROOT: &[u8] = b"/tmpvol/.hermit/etc/ld.so.cache";
 const DETERMINISTIC_NSCD_ROOT: &[u8] = b"/tmpvol/.hermit/run/nscd";
 const DETERMINISTIC_TMP_ROOT: &[u8] = b"/tmpvol/.hermit/tmp";
+
+/// Where a container holds Detcore's placeholder directory
+/// (`DetConfig::directory_placeholder`): procfs's `/proc/fs/nfsd`, a
+/// directory every procfs has, empty and permanently so (`proc_root_init`
+/// makes it with `proc_create_mount_point`, there for the nfsd filesystem to
+/// be mounted on). Detcore's `--proc` level table hides `/proc/fs` from the
+/// guest at every level, so no guest path reaches it, and the guest's mount
+/// table leaves its mount out ([`PlannedMount::placeholder`]). Mounting on it
+/// creates nothing on the host or on an image, and a guest's own procfs mount
+/// stays permitted after it (`mnt_already_visible` accepts a submount on a
+/// permanently empty directory).
+pub(super) const DIRECTORY_PLACEHOLDER: &str = "/proc/fs/nfsd";
+
+/// The mount of Detcore's placeholder directory at `target`: a fresh tmpfs
+/// named `hermit`, read-only, holding nothing (one inode, its root, of mode
+/// 0555), with no set-user-ID, device or executable file possible on it. A
+/// fresh filesystem, not a bind of a host directory, so its mountinfo row
+/// names no host path, and nothing on the host has to outlive the run.
+pub(super) fn directory_placeholder_mount(target: impl AsRef<std::ffi::OsStr>) -> Mount {
+    Mount::tmpfs(target)
+        .source("hermit")
+        .readonly()
+        .flags(MountFlags::MS_NOSUID | MountFlags::MS_NODEV | MountFlags::MS_NOEXEC)
+        .data("mode=0555,size=4k,nr_inodes=1")
+}
 
 #[derive(Debug)]
 struct MountInfoRootSource {
@@ -313,6 +341,30 @@ impl InstallTimeTree {
     }
 }
 
+/// Whether a mount of `plan` after the one at `index` covers that one's
+/// mountpoint, as the container's setup installs them in order over the
+/// host's current tree ([`InstallTimeTree`]): its target resolves, when it
+/// is installed, to that mountpoint or one above it (`/`, `/proc`,
+/// `/proc/fs`, or the mountpoint itself, by any spelling that resolves to
+/// one: `/proc/fs/nfsd/../..`, a host symbolic link to `/proc`). A remount
+/// creates no mount and covers nothing.
+pub(super) fn later_mount_covers(plan: &[PlannedMount], index: usize) -> bool {
+    let mut tree = InstallTimeTree::default();
+    let mut covered = None;
+    for (position, planned) in plan.iter().enumerate() {
+        let (mountpoint, _) = tree.install(&planned.mount);
+        if position == index {
+            covered = mountpoint;
+        } else if position > index
+            && let (Some(covered), Some(mountpoint)) = (&covered, &mountpoint)
+            && covered.starts_with(mountpoint)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// What the kernel will list for each mount of `plan`, as the container's
 /// setup installs them in order over the host's current tree
 /// ([`InstallTimeTree`]), as installations with no rows yet.
@@ -449,7 +501,7 @@ impl UserBind {
 /// Say that a user bind's mountinfo rows keep the host source path as their
 /// root: Hermit could not identify them, so the guest can see that path.
 fn warn_unrewritten_bind(target: &Path) {
-    crate::tracing::diagnostic_eprintln!(
+    crate::app::tracing::diagnostic_eprintln!(
         "WARNING: /proc/self/mountinfo shows the host source path of the bind at {}: \
          Hermit could not identify its rows (https://github.com/rrnewton/hermit/issues/4266).",
         target.display()
@@ -569,6 +621,7 @@ impl MountInfoRootSource {
 pub(super) struct IdentityGuard {
     _group_file: Option<tempfile::NamedTempFile>,
     _ld_so_cache: Option<tempfile::NamedTempFile>,
+    ld_so_cache_origin: Option<HostInputSnapshot>,
     _nscd_dir: Option<tempfile::TempDir>,
     mountinfo_roots: Vec<MountInfoRootSource>,
     user_mount_targets: Vec<PathBuf>,
@@ -581,6 +634,9 @@ pub(super) struct IdentityGuard {
     /// recorded in the container's init before the guest starts
     /// ([`Self::record_plan`]).
     plan: MountPlan,
+    /// The guest path of the placeholder directory the plan mounts
+    /// ([`DIRECTORY_PLACEHOLDER`]), if it mounts one.
+    directory_placeholder: Option<PathBuf>,
 }
 
 /// One mount of the container's mount plan.
@@ -589,11 +645,13 @@ pub(super) struct PlannedMount {
     /// The mount, at the target it is installed at (a mount below guest
     /// `/tmp` is installed in Hermit's private tmp directory first).
     pub(super) mount: Mount,
-    /// Whether it is a backend's own mount (DBT's statistics bind, e9patch's
-    /// overlay of the rewritten program), which the guest's mount table leaves
-    /// out by this identity, not by its path. DBT's tmpfs at the test workdir
-    /// is not one: it is the guest's working directory, shown as the caller's
-    /// mount there is on every other backend.
+    /// Whether it is plumbing the guest's machine does not have, which the
+    /// guest's mount table leaves out by this identity, not by its path: a
+    /// backend's own mount (DBT's statistics bind, e9patch's overlay of the
+    /// rewritten program) or Detcore's placeholder directory
+    /// ([`PlannedMount::placeholder`]). DBT's tmpfs at the test workdir is not
+    /// one: it is the guest's working directory, shown as the caller's mount
+    /// there is on every other backend.
     pub(super) backend: bool,
 }
 
@@ -612,6 +670,14 @@ impl PlannedMount {
             mount,
             backend: true,
         }
+    }
+
+    /// Detcore's placeholder directory ([`directory_placeholder_mount`]):
+    /// plumbing, which the guest's mount table leaves out as it leaves out a
+    /// backend's own mounts. No path of the guest's reaches it either: it is
+    /// below `/proc/fs`, which Detcore's `--proc` level table hides.
+    pub(super) fn placeholder(mount: Mount) -> Self {
+        Self::backend(mount)
     }
 }
 
@@ -648,12 +714,62 @@ impl IdentityGuard {
         Self {
             _group_file: None,
             _ld_so_cache: None,
+            ld_so_cache_origin: None,
             _nscd_dir: None,
             mountinfo_roots: Vec::new(),
             user_mount_targets: Vec::new(),
             user_binds: Vec::new(),
             host_rows: Vec::new(),
             plan: MountPlan::Unrecorded,
+            directory_placeholder: None,
+        }
+    }
+
+    /// The guest path of the placeholder directory the container's setup
+    /// mounts, if it mounts one (`DetConfig::directory_placeholder`).
+    pub(super) fn directory_placeholder(&self) -> Option<&Path> {
+        self.directory_placeholder.as_deref()
+    }
+
+    /// The exact private cache object and the input from which it was copied.
+    /// A later user mount needs no pathname exception: its raw identity will
+    /// not match this still-owned file, even at `/etc/ld.so.cache`.
+    pub(super) fn host_input_snapshots(&self) -> Vec<HostInputSnapshot> {
+        self.ld_so_cache_origin.iter().cloned().collect()
+    }
+
+    /// Record that the container's setup mounts the placeholder directory at
+    /// guest path `path` (or none).
+    pub(super) fn set_directory_placeholder(&mut self, path: Option<PathBuf>) {
+        self.directory_placeholder = path;
+    }
+
+    /// In the container's init, once its setup installed every mount and
+    /// before the guest starts: keep the placeholder directory only where its
+    /// guest path still reaches the tmpfs the setup mounted there (its mount,
+    /// by the descriptor's mount ID, is that `hermit` tmpfs at that
+    /// mountpoint). A later mount that covers it by a spelling the plan
+    /// could not resolve before setup (through procfs's own links) leaves the
+    /// guest's `/proc` unknown to Detcore, which then serves no placeholder
+    /// directory, as without a container (`DetConfig::directory_placeholder`).
+    pub(super) fn confirm_directory_placeholder(&mut self) {
+        let Some(path) = self.directory_placeholder.clone() else {
+            return;
+        };
+        let reached = (|| {
+            let directory = open_path(&path).ok()?;
+            let id = mount_id_for_fd(directory.as_raw_fd()).ok()?;
+            let rows = namespace_rows().ok()?;
+            let row = rows.iter().find(|row| row.raw_mount_id == id)?;
+            Some(
+                row.fstype.as_slice() == b"tmpfs"
+                    && row.source.as_slice() == b"hermit"
+                    && row.mountpoint == mountinfo_escape_path(&path),
+            )
+        })()
+        .unwrap_or(false);
+        if !reached {
+            self.directory_placeholder = None;
         }
     }
 
@@ -675,25 +791,6 @@ impl IdentityGuard {
         container.mounts(plan.iter().map(|planned| planned.mount.clone()));
         let installations = installations_of(&plan);
         self.plan = MountPlan::Recorded(plan, installations, None);
-        Ok(())
-    }
-
-    /// Append `mounts`, a backend's own, to the plan and to `container`'s
-    /// setup. There must be a plan, not yet recorded: a backend's mount
-    /// dropped silently would run the guest without it.
-    pub(super) fn add_backend_mounts(
-        &mut self,
-        container: &mut Container,
-        mounts: impl IntoIterator<Item = Mount>,
-    ) -> Result<(), Error> {
-        let MountPlan::Recorded(plan, installations, None) = &mut self.plan else {
-            anyhow::bail!("a backend's own mounts need the container's mount plan");
-        };
-        for mount in mounts {
-            container.mount(mount.clone());
-            plan.push(PlannedMount::backend(mount));
-        }
-        *installations = installations_of(plan);
         Ok(())
     }
 
@@ -819,22 +916,59 @@ impl IdentityGuard {
         &self,
         current: Vec<detcore_model::container_mounts::ContainerMount>,
     ) -> Result<Option<ContainerMountTable>, Error> {
-        let (rows, installed, backend) = match &self.plan {
+        let (mut rows, installed, backend, fresh) = match &self.plan {
             MountPlan::Unrecorded => return Ok(None),
             MountPlan::Recorded(_, _, None) => {
                 anyhow::bail!(
                     "the container mount table was asked for before the plan was recorded"
                 )
             }
-            MountPlan::Recorded(_, installations, Some(rows)) => {
+            MountPlan::Recorded(plan, installations, Some(rows)) => {
                 let (installed, backend) = owned_mounts(rows, installations);
-                (current, installed, backend)
+                // The rows of the plan's fresh (not bind) mounts, one each.
+                let fresh = plan
+                    .iter()
+                    .zip(installations)
+                    .filter(|(planned, _)| !is_bind_mount(&planned.mount))
+                    .flat_map(|(_, installation)| installation.ids.iter().copied())
+                    .collect::<std::collections::BTreeSet<_>>();
+                (current, installed, backend, fresh)
             }
             MountPlan::ImageRoot => {
-                let installed = current.iter().map(|row| row.raw_mount_id).collect();
-                (current, installed, std::collections::BTreeSet::new())
+                // Every row under an image root is one the setup installed.
+                // The placeholder directory's (the one tmpfs at its path) is
+                // plumbing, which the table leaves out as it leaves out a
+                // backend's own mounts (`PlannedMount::placeholder`): not
+                // installed for rule 1, and never shown by rules 2 and 3.
+                let placeholder: std::collections::BTreeSet<u64> = current
+                    .iter()
+                    .filter(|row| {
+                        self.directory_placeholder.as_deref().is_some_and(|path| {
+                            row.mountpoint == mountinfo_escape_path(path)
+                                && row.fstype.as_slice() == b"tmpfs"
+                        })
+                    })
+                    .map(|row| row.raw_mount_id)
+                    .collect();
+                let installed = current
+                    .iter()
+                    .map(|row| row.raw_mount_id)
+                    .filter(|id| !placeholder.contains(id))
+                    .collect();
+                // No fresh mount of the plan here: an image root records none.
+                (
+                    current,
+                    installed,
+                    placeholder,
+                    std::collections::BTreeSet::new(),
+                )
             }
         };
+        for row in &mut rows {
+            if fresh.contains(&row.raw_mount_id) {
+                row.super_options = superblock_options_as_root(&row.super_options);
+            }
+        }
         let never = rows
             .iter()
             .filter(|row| row.is_ephemeral_host_seed() && !installed.contains(&row.raw_mount_id))
@@ -1101,21 +1235,108 @@ fn frozen_group_file() -> Result<tempfile::NamedTempFile, Error> {
 /// full validation. A copy taken when the container is set up, bound
 /// read-only over the path, keeps the cache one unchanging file for the
 /// guest's whole run, as the frozen `/etc/group` keeps group resolution.
-fn frozen_ld_so_cache() -> Result<Option<tempfile::NamedTempFile>, Error> {
-    let contents = match fs::read(LD_SO_CACHE) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        read => read.context("Failed to read the host dynamic-linker cache")?,
+///
+/// Both runs of one verification must see the same bytes too, so a caller
+/// that runs both passes the one [`LdSoCacheSnapshot`] it took for them
+/// (https://github.com/rrnewton/hermit/issues/4693); without one the host's
+/// cache is read now.
+fn frozen_ld_so_cache(
+    snapshot: Option<&LdSoCacheSnapshot>,
+) -> Result<Option<tempfile::NamedTempFile>, Error> {
+    let snapshot = match snapshot {
+        Some(snapshot) => snapshot.clone(),
+        None => LdSoCacheSnapshot::of_host()?,
+    };
+    let Some(captured) = snapshot.0 else {
+        return Ok(None);
     };
     let mut cache = tempfile::NamedTempFile::new()
         .context("Failed to create the frozen dynamic-linker cache for the guest")?;
     cache
-        .write_all(&contents)
+        .write_all(&captured.bytes)
         .context("Failed to populate the frozen dynamic-linker cache for the guest")?;
     cache
         .as_file()
         .set_permissions(fs::Permissions::from_mode(0o644))
         .context("Failed to set permissions on the frozen guest dynamic-linker cache")?;
     Ok(Some(cache))
+}
+
+/// The bytes of the host's `/etc/ld.so.cache` at one moment, or `None` when
+/// the host has none: what [`frozen_ld_so_cache`] gives the guest.
+///
+/// A package manager replaces the host's cache many times an hour. Two runs of
+/// one verification that each read it can see different caches -- the
+/// loader's `fstat` of it then differs, and the comparison reports a
+/// divergence no host-input check names
+/// (https://github.com/rrnewton/hermit/issues/4693) -- so the caller of both
+/// runs takes one snapshot and gives it to each.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct LdSoCacheSnapshot(Option<std::sync::Arc<CapturedLdSoCache>>);
+
+#[derive(Debug, PartialEq, Eq)]
+struct CapturedLdSoCache {
+    bytes: Vec<u8>,
+    origin: Option<HostFileIdentity>,
+}
+
+impl LdSoCacheSnapshot {
+    /// The host's cache now.
+    pub(super) fn of_host() -> Result<Self, Error> {
+        Self::of_path(Path::new(LD_SO_CACHE))
+    }
+
+    fn of_path(path: &Path) -> Result<Self, Error> {
+        match File::open(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self(None)),
+            opened => Self::capture(
+                opened.context("Failed to open the host dynamic-linker cache")?,
+                |file, bytes| {
+                    file.read_to_end(bytes)
+                        .context("Failed to read the host dynamic-linker cache")?;
+                    Ok(())
+                },
+            ),
+        }
+    }
+
+    fn capture(
+        mut file: File,
+        read: impl FnOnce(&mut File, &mut Vec<u8>) -> Result<(), Error>,
+    ) -> Result<Self, Error> {
+        let before = nix::sys::stat::fstat(&file)?;
+        let mut bytes = Vec::new();
+        read(&mut file, &mut bytes)?;
+        let after = nix::sys::stat::fstat(&file)?;
+        let origin = HostFileIdentity::from_stat(&before);
+        anyhow::ensure!(
+            origin == HostFileIdentity::from_stat(&after)
+                && (before.st_ctime, before.st_ctime_nsec) == (after.st_ctime, after.st_ctime_nsec)
+                && u64::try_from(origin.size).ok() == Some(bytes.len() as u64),
+            "the host dynamic-linker cache changed while it was captured"
+        );
+        Ok(Self::from_captured(bytes, origin))
+    }
+
+    /// Bytes with a known captured origin, including the authenticated sealed
+    /// descriptor supplied by `hermit verify-inputs`. A sealed holder's identity
+    /// is stable for its children, not across independently created holders;
+    /// it does not claim to be the current host pathname's identity.
+    pub(super) fn from_captured(bytes: Vec<u8>, origin: HostFileIdentity) -> Self {
+        Self(Some(std::sync::Arc::new(CapturedLdSoCache {
+            bytes,
+            origin: Some(origin),
+        })))
+    }
+
+    /// Synthetic test bytes have no host-file provenance to invent.
+    #[cfg(test)]
+    pub(super) fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(Some(std::sync::Arc::new(CapturedLdSoCache {
+            bytes,
+            origin: None,
+        })))
+    }
 }
 
 /// Deterministic identity-resolution mounts shared by `run`, `record`, and
@@ -1125,15 +1346,73 @@ fn frozen_ld_so_cache() -> Result<Option<tempfile::NamedTempFile>, Error> {
 /// state (the nscd cache and the systemd-userdb socket), so record/replay
 /// reproduce the same group/user resolution that `run` mode already enforces.
 /// Returns the mounts plus a guard that must outlive container setup.
-pub(super) fn identity_hardening_mounts() -> Result<(Vec<Mount>, IdentityGuard), Error> {
-    let group_file = frozen_group_file()?;
-    let mut mountinfo_roots = vec![MountInfoRootSource::new(
-        group_file.path(),
-        Path::new(GROUP_FILE),
-        DETERMINISTIC_GROUP_ROOT,
-    )?];
-    let mut mounts = vec![Mount::bind(group_file.path(), GROUP_FILE).readonly()];
-    let ld_so_cache = frozen_ld_so_cache()?;
+///
+/// `ld_so_cache`: the snapshot both runs of a verification share, or `None`
+/// to take the host's cache now.
+pub(super) fn identity_hardening_mounts(
+    ld_so_cache: Option<&LdSoCacheSnapshot>,
+) -> Result<(Vec<Mount>, IdentityGuard), Error> {
+    identity_hardening_mounts_on(HostLayout::of_host(), ld_so_cache)
+}
+
+/// The parts of the usual Linux layout that Hermit mounts over, and whether
+/// this host has them. Android has no `/tmp` (nor `/run` or `/var`), and its
+/// C library keeps no `/etc/group`, so a mount onto either fails with ENOENT
+/// at container setup, before the guest starts. Where the host has no such
+/// path the guest gets none either: there is nothing to freeze or hide.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct HostLayout {
+    /// `/tmp` is a directory, which Hermit's private `/tmp` goes over.
+    pub(super) tmp: bool,
+    /// `/etc/group` exists, which the frozen group database goes over.
+    pub(super) group_file: bool,
+}
+
+impl HostLayout {
+    pub(super) fn of_host() -> Self {
+        Self {
+            tmp: Path::new("/tmp").is_dir(),
+            group_file: Path::new(GROUP_FILE).exists(),
+        }
+    }
+}
+
+/// [`identity_hardening_mounts`] on a host with `layout`.
+pub(super) fn identity_hardening_mounts_on(
+    layout: HostLayout,
+    ld_so_cache: Option<&LdSoCacheSnapshot>,
+) -> Result<(Vec<Mount>, IdentityGuard), Error> {
+    let mut mountinfo_roots = Vec::new();
+    let mut mounts = Vec::new();
+    let group_file = if layout.group_file {
+        let group_file = frozen_group_file()?;
+        mountinfo_roots.push(MountInfoRootSource::new(
+            group_file.path(),
+            Path::new(GROUP_FILE),
+            DETERMINISTIC_GROUP_ROOT,
+        )?);
+        mounts.push(Mount::bind(group_file.path(), GROUP_FILE).readonly());
+        Some(group_file)
+    } else {
+        tracing::info!(
+            "[hermit] this host has no {GROUP_FILE}, so the guest has none either: there is no \
+             group database to freeze"
+        );
+        None
+    };
+    let snapshot = match ld_so_cache {
+        Some(snapshot) => snapshot.clone(),
+        None => LdSoCacheSnapshot::of_host()?,
+    };
+    let ld_so_cache = frozen_ld_so_cache(Some(&snapshot))?;
+    let ld_so_cache_origin = match (&ld_so_cache, snapshot.0.as_ref()) {
+        (Some(cache), Some(captured)) if captured.origin.is_some() => Some(HostInputSnapshot {
+            physical: HostFileIdentity::from_stat(&nix::sys::stat::fstat(cache)?),
+            origin: captured.origin.unwrap(),
+            content: detcore::Digest::new(&captured.bytes).to_string(),
+        }),
+        _ => None,
+    };
     if let Some(cache) = &ld_so_cache {
         mountinfo_roots.push(MountInfoRootSource::new(
             cache.path(),
@@ -1167,20 +1446,18 @@ pub(super) fn identity_hardening_mounts() -> Result<(Vec<Mount>, IdentityGuard),
     Ok((
         mounts,
         IdentityGuard {
-            _group_file: Some(group_file),
+            _group_file: group_file,
             _ld_so_cache: ld_so_cache,
+            ld_so_cache_origin,
             _nscd_dir: nscd_dir,
             mountinfo_roots,
             user_mount_targets: Vec::new(),
             user_binds: Vec::new(),
             host_rows: Vec::new(),
             plan: MountPlan::Unrecorded,
+            directory_placeholder: None,
         },
     ))
-}
-
-fn choose_affinity_core(allowed: &[usize]) -> Option<usize> {
-    (!allowed.is_empty()).then(|| allowed[rand::random_range(0..allowed.len())])
 }
 
 fn cpu_ids(affinity: &CpuSet) -> Vec<usize> {
@@ -1189,20 +1466,35 @@ fn cpu_ids(affinity: &CpuSet) -> Vec<usize> {
         .collect()
 }
 
-pub(super) fn apply_affinity(container: &mut Container, pin_threads: bool) {
+/// Pin the container to the CPU [`super::pinned_cpu::choose_for_run`] chooses
+/// and reserves, when `pin_threads`. `cpu_profile_source` is the CPU a
+/// `--cpu-profile host-no-rdrand` run verified CPUID faulting on
+/// (`Config::cpu_profile_source`): its launch guard pins the tracer there, so
+/// that CPU is the one chosen and reserved, not another the run never uses.
+pub(super) fn apply_affinity(
+    container: &mut Container,
+    pin_threads: bool,
+    cpu_profile_source: Option<usize>,
+) {
     if pin_threads {
         let affinity = sched_getaffinity(Pid::from_raw(0))
             .expect("failed to query the tracer's allowed CPU affinity mask");
-        let allowed = cpu_ids(&affinity);
-        let rand_core = choose_affinity_core(&allowed)
+        let mut allowed = cpu_ids(&affinity);
+        if let Some(source) = cpu_profile_source.filter(|cpu| allowed.contains(cpu)) {
+            allowed = vec![source];
+        }
+        let choice = super::pinned_cpu::choose_for_run(&allowed)
             .expect("the tracer's allowed CPU affinity mask is empty");
-        tracing::info!("Pinning tracer and guest threads to core {}", rand_core);
-        container.affinity(rand_core);
+        tracing::info!(
+            "Pinning tracer and guest threads to core {} ({choice})",
+            choice.cpu
+        );
+        container.affinity(choice.cpu);
     }
 }
 
 pub fn default_container(pin_threads: bool) -> Container {
-    let mut container = namespace_container(pin_threads);
+    let mut container = namespace_container(pin_threads, None);
     container.mount(container_proc_mount());
     container
 }
@@ -1210,10 +1502,13 @@ pub fn default_container(pin_threads: bool) -> Container {
 /// [`default_container`] without its `/proc`: the namespaces and the private
 /// `/`, for a container given a mount plan, `/proc` first, which its setup
 /// installs and its init records (`IdentityGuard::set_plan`).
-pub(super) fn namespace_container(pin_threads: bool) -> Container {
+pub(super) fn namespace_container(
+    pin_threads: bool,
+    cpu_profile_source: Option<usize>,
+) -> Container {
     let mut container = Container::new();
     container
-        .unshare(Namespace::PID)
+        .unshare(GUEST_NAMESPACES)
         .map_root()
         .hostname("hermetic-container.local")
         .domainname("local")
@@ -1222,13 +1517,200 @@ pub(super) fn namespace_container(pin_threads: bool) -> Container {
         // guest's mount table during a run. Cut that propagation first.
         .mount(Mount::new("/").rprivate());
 
-    apply_affinity(&mut container, pin_threads);
+    apply_affinity(&mut container, pin_threads, cpu_profile_source);
     container
 }
+
+/// The namespaces a guest's container makes besides the user, mount and UTS
+/// ones its setup adds (and the network one of `--network local`): its own
+/// PID namespace, and its own IPC namespace, empty, so that the guest shares
+/// System V IPC objects and POSIX message queues with neither the host nor
+/// another run. Every run of a program gets the same PIDs and random bytes,
+/// so a program that keys or names such objects after them chooses the same
+/// keys and names in every run. Detcore refuses the System V and `mq_*`
+/// calls (`is_unsupported_async_ipc_syscall`), but a guest still reaches the
+/// namespace's message queues through its mqueue filesystem
+/// ([`private_mqueue`]), and a `--namespace-only` guest reaches all of it.
+pub(super) const GUEST_NAMESPACES: Namespace = Namespace::PID.union(Namespace::IPC);
 
 /// The container's own `/proc`, a new procfs of its PID namespace.
 pub(super) fn container_proc_mount() -> Mount {
     Mount::proc().allow_readonly_fallback()
+}
+
+/// Where glibc's `shm_open` and `sem_open` keep POSIX shared memory objects
+/// and named semaphores.
+pub(super) const GUEST_DEV_SHM: &str = "/dev/shm";
+
+/// The guest's private `/dev/shm`, a fresh tmpfs over the host's, so that no
+/// two runs, and no run and the host, share POSIX shared memory objects or
+/// semaphores. Every run of a program gets the same PIDs and random bytes, so
+/// a program that names such objects after them chooses the same names in
+/// every run, and concurrent runs on the host's `/dev/shm` open, truncate and
+/// unlink each other's. It is mounted as Linux distributions mount
+/// `/dev/shm`: `nosuid`, `nodev` and `strictatime`, with tmpfs's default mode
+/// (1777) and size (half the host's RAM). It is not `noexec`, as theirs is
+/// not: SaBRe stages a program there.
+///
+/// A plan installs it after every mount whose source is a host path, so that a
+/// source below the host's `/dev/shm` (or a `$TMPDIR` there, which holds the
+/// private `/tmp`) is still the host's, and before the mounts below
+/// `/dev/shm` ([`is_below_dev_shm`]), which go into it.
+///
+/// `None` where one of the caller's mounts at `covering` covers `/dev/shm` (a
+/// mount at `/dev/shm`, `/dev` or `/`, which replaces it; `--bind /dev/shm`
+/// keeps the host's), or where the host has no `/dev/shm` to cover.
+pub(super) fn private_dev_shm<'a>(covering: impl Iterator<Item = &'a Path>) -> Option<Mount> {
+    let target = Path::new(GUEST_DEV_SHM);
+    is_uncovered_directory(target, covering, Path::is_dir).then(|| {
+        Mount::tmpfs(target)
+            .source("tmpfs")
+            .flags(MountFlags::MS_NOSUID | MountFlags::MS_NODEV | MountFlags::MS_STRICTATIME)
+    })
+}
+
+/// Whether the host has a directory at guest path `target` (by `is_dir`) for
+/// a mount of Hermit's own to cover, and none of the caller's mounts at
+/// `covering` covers it (a mount at `target` or at one of its ancestors,
+/// which replaces it).
+fn is_uncovered_directory<'a>(
+    target: &Path,
+    mut covering: impl Iterator<Item = &'a Path>,
+    is_dir: impl Fn(&Path) -> bool,
+) -> bool {
+    let resolved = canonical_mount_target(target);
+    is_dir(target) && !covering.any(|user| resolved.starts_with(canonical_mount_target(user)))
+}
+
+/// Where Linux distributions mount the mqueue filesystem, which lists the IPC
+/// namespace's POSIX message queues as files.
+pub(super) const GUEST_DEV_MQUEUE: &str = "/dev/mqueue";
+
+/// The guest's own `/dev/mqueue`, a fresh mount of the mqueue filesystem of
+/// its IPC namespace ([`GUEST_NAMESPACES`]) over the host's, which lists, and
+/// lets a guest create, open and unlink, the host's queues: Detcore refuses
+/// `mq_open`, but not an `open` of `/dev/mqueue/NAME` with `O_CREAT`, which
+/// creates a queue. It is mounted as systemd mounts it (`nosuid`, `nodev`,
+/// `noexec`), last in the plan: nothing is mounted into it and no mount's
+/// source is in it.
+///
+/// `None` where one of the caller's mounts at `user_targets` covers
+/// `/dev/mqueue` (a mount at `/dev/mqueue`, `/dev` or `/`; a bind of the
+/// host's `/dev/mqueue` keeps the host's queues there), or where the host has
+/// no `/dev/mqueue`. A caller's mount below `/dev/mqueue`, which the private
+/// mount would cover, is refused ([`refuse_mount_below_private_mqueue`]).
+pub(super) fn private_mqueue<'a>(
+    user_targets: impl Iterator<Item = &'a Path> + Clone,
+) -> Result<Option<Mount>, Error> {
+    let target = Path::new(GUEST_DEV_MQUEUE);
+    if !is_uncovered_directory(target, user_targets.clone(), Path::is_dir) {
+        return Ok(None);
+    }
+    refuse_mount_below_private_mqueue(user_targets, Path::is_dir)?;
+    Ok(Some(
+        Mount::new(target)
+            .source("mqueue")
+            .fstype("mqueue")
+            .flags(MountFlags::MS_NOSUID | MountFlags::MS_NODEV | MountFlags::MS_NOEXEC),
+    ))
+}
+
+/// Refuse a mount at one of the caller's targets `user_targets` that the
+/// guest's own `/dev/mqueue` ([`private_mqueue`]) would cover: one below
+/// `/dev/mqueue`, where the host has that directory (by `is_dir`) and no
+/// other of the caller's mounts covers it. `hermit run` checks this with the
+/// other `--mount` targets before setup, ahead of the check that a target
+/// exists on the host: a host's `/dev/mqueue` holds only the host's queues,
+/// so a target below it is usually missing there, and that would hide why
+/// the mount cannot be made.
+pub(super) fn refuse_mount_below_private_mqueue<'a>(
+    user_targets: impl Iterator<Item = &'a Path> + Clone,
+    is_dir: impl Fn(&Path) -> bool,
+) -> Result<(), Error> {
+    let target = Path::new(GUEST_DEV_MQUEUE);
+    if !is_uncovered_directory(target, user_targets.clone(), is_dir) {
+        return Ok(());
+    }
+    let resolved = canonical_mount_target(target);
+    if let Some(below) = user_targets
+        .into_iter()
+        .find(|user| canonical_mount_target(user).starts_with(&resolved))
+    {
+        anyhow::bail!(
+            "cannot mount at {}: the guest's /dev/mqueue is its own mqueue filesystem, which \
+             would cover it; mount at /dev/mqueue itself to replace it",
+            below.display()
+        );
+    }
+    Ok(())
+}
+
+/// Whether guest path `path` is `/dev/shm` itself.
+pub(super) fn is_dev_shm(path: &Path) -> bool {
+    canonical_mount_target(path) == canonical_mount_target(Path::new(GUEST_DEV_SHM))
+}
+
+/// Whether a mount at guest path `target` goes into the private `/dev/shm`:
+/// it is strictly below `/dev/shm`.
+pub(super) fn is_below_dev_shm(target: &Path) -> bool {
+    let dev_shm = canonical_mount_target(Path::new(GUEST_DEV_SHM));
+    let resolved = canonical_mount_target(target);
+    resolved.starts_with(&dev_shm) && resolved != dev_shm
+}
+
+/// Whether host path `path` is `/dev/shm` or below it.
+pub(super) fn is_in_dev_shm(path: &Path) -> bool {
+    canonical_mount_target(path).starts_with(canonical_mount_target(Path::new(GUEST_DEV_SHM)))
+}
+
+/// Refuse a bind into the private `/dev/shm` whose source is below host
+/// directory `covered`, which an earlier mount of the plan covers, so that
+/// the bind would find that mount's contents instead; `reason` says which.
+pub(super) fn refuse_covered_bind_source(
+    mount: &Mount,
+    covered: &Path,
+    reason: &str,
+) -> Result<(), Error> {
+    if let Some(source) = mount.get_source().filter(|_| is_bind_mount(mount))
+        && canonical_mount_target(source).starts_with(canonical_mount_target(covered))
+    {
+        anyhow::bail!(
+            "cannot bind {} from host {} to {} in the guest's private /dev/shm: {reason}",
+            source.display(),
+            covered.display(),
+            mount.get_target().display()
+        );
+    }
+    Ok(())
+}
+
+/// Refuse a bind into the private `/dev/shm` whose source is in the host's
+/// `/dev/shm`: the private one covers that source before the bind is made,
+/// so the bind would find the guest's own empty tmpfs instead.
+pub(super) fn refuse_bind_from_host_dev_shm(mount: &Mount) -> Result<(), Error> {
+    refuse_covered_bind_source(
+        mount,
+        Path::new(GUEST_DEV_SHM),
+        "the private /dev/shm covers the host's before the bind is made; pass --bind /dev/shm \
+         to keep the host's /dev/shm instead",
+    )
+}
+
+/// The superblock options `options` of a row a fresh (not bind) mount of the
+/// plan made, as the same mount by root shows them: without `uid=` or `gid=`.
+/// The container's user namespace maps one ID to its root, so a filesystem
+/// the plan mounts can be owned by no one else, and Linux prints a tmpfs's
+/// owner as the initial user namespace sees it, omitting root
+/// (`shmem_show_options`): a tmpfs the container's root mounts shows the host
+/// IDs of the user who ran Hermit (`uid=1000,gid=1000`) where the same mount
+/// by root shows none. The guest is root in its namespace and is told the
+/// host IDs nowhere else.
+fn superblock_options_as_root(options: &[u8]) -> Vec<u8> {
+    options
+        .split(|byte| *byte == b',')
+        .filter(|option| !option.starts_with(b"uid=") && !option.starts_with(b"gid="))
+        .collect::<Vec<_>>()
+        .join(&b',')
 }
 
 /// PROTOTYPE: a container whose root filesystem is a materialized OCI image
@@ -1247,18 +1729,27 @@ pub(super) fn container_proc_mount() -> Mount {
 /// automatically-created private `/tmp`; a user-supplied `--tmp` remains
 /// unclaimed.
 ///
-/// The CLI currently enables this only for the ptrace backend. Other backends
+/// The CLI enables this for the ptrace and KVM backends. Other backends
 /// have distinct launch/runtime-file requirements and must be qualified before
 /// they can safely share this filesystem setup.
+/// Backend/device and caller-bind choices for [`image_container`].
+pub(super) struct ImageContainerOpts<'a> {
+    pub bind_kvm: bool,
+    pub workdir_binds: &'a [(PathBuf, PathBuf)],
+}
+
 pub(super) fn image_container(
     rootfs: &Path,
     tmpfs: &Path,
     pin_threads: bool,
+    cpu_profile_source: Option<usize>,
     private_tmp: bool,
+    placeholder: bool,
+    opts: ImageContainerOpts<'_>,
 ) -> Result<(Container, IdentityGuard), Error> {
     let mut container = Container::new();
     container
-        .unshare(Namespace::PID)
+        .unshare(GUEST_NAMESPACES)
         .map_root()
         .hostname("hermetic-container.local")
         .domainname("local")
@@ -1279,12 +1770,34 @@ pub(super) fn image_container(
     // run failed at spawn under such a cache.
     container.mount(Mount::bind(rootfs, rootfs).readonly());
     container.mount(Mount::bind(tmpfs, rootfs.join("tmp")).rshared());
+    // Caller work directories (--bind HOST:GUEST with --image): bound after
+    // the read-only root so the guest can read/write its test workdir while
+    // the image itself stays immutable. Targets are guest-absolute paths.
+    for (source, target) in opts.workdir_binds {
+        let rel = target.strip_prefix("/").unwrap_or(target);
+        container.mount(Mount::bind(source, rootfs.join(rel)));
+    }
 
     // Mount the deterministic /proc into the target root. The materializer
     // guarantees <rootfs>/proc exists, so we do not need `touch_target()` (which
     // defers dir creation to the pre-exec child on a tiny clone stack).
     let proc_target = rootfs.join("proc");
     container.mount(Mount::proc().allow_readonly_fallback().target(&proc_target));
+    // No sysfs is mounted into the image root: a fresh sysfs would expose
+    // host kernel state (DMI, block, NIC, CPU topology) on every path
+    // Detcore does not render, and mounting one also fails without a new
+    // network namespace. The guest therefore sees the image's empty /sys
+    // until Detcore serves a rendered sysfs; that gap is deliberate.
+    // Detcore's placeholder directory, where the backend needs one
+    // (`placeholder`, `detcore::needs_directory_placeholder`), on the image's
+    // own procfs (`DIRECTORY_PLACEHOLDER`), which the image's table leaves
+    // out (`IdentityGuard::container_mount_table_of`).
+    if placeholder {
+        let path = Path::new(DIRECTORY_PLACEHOLDER);
+        container.mount(directory_placeholder_mount(
+            proc_target.join(path.strip_prefix("/proc").unwrap_or(path)),
+        ));
+    }
 
     // A minimal /dev. An OCI image layer ships no device nodes, so without this
     // the guest sees an empty /dev on a read-only root: `> /dev/null` fails with
@@ -1310,11 +1823,21 @@ pub(super) fn image_container(
     //   of environmental coupling is the point of image mode. Absent,
     //   `open("/dev/tty")` reports ENOENT instead of ENXIO; both mean "no
     //   controlling terminal".
-    // * `/dev/shm` -- a writable shared-memory area is cross-process shared state
-    //   and a determinism question in its own right, and nothing in the current
-    //   image workloads needs it.
+    // * `/dev/shm` -- a writable shared-memory area is cross-process shared state,
+    //   and nothing in the current image workloads needs it. A namespaced run
+    //   without an image gets a private one ([`private_dev_shm`]); an image run
+    //   could get the same tmpfs when a workload needs it.
+    // The KVM backend's VMM process opens /dev/kvm after chroot, so the host
+    // device must be bound inside the root for that backend only. Other
+    // backends keep the materializer's empty placeholder file.
+    if opts.bind_kvm {
+        container.mount(Mount::bind(
+            Path::new("/dev/kvm"),
+            rootfs.join("dev").join("kvm"),
+        ));
+    }
     let dev_root = rootfs.join("dev");
-    for node in crate::image::DEV_BIND_TARGETS {
+    for node in crate::app::image::DEV_BIND_TARGETS {
         container.mount(Mount::bind(
             Path::new("/dev").join(node),
             dev_root.join(node),
@@ -1338,12 +1861,14 @@ pub(super) fn image_container(
     // (mounts first, then chroot).
     container.chroot(rootfs);
 
-    apply_affinity(&mut container, pin_threads);
+    apply_affinity(&mut container, pin_threads, cpu_profile_source);
     let mut identity_sources = IdentityGuard::empty();
     if private_tmp {
         identity_sources.add_private_tmp(tmpfs)?;
     }
     identity_sources.set_image_root();
+    identity_sources
+        .set_directory_placeholder(placeholder.then(|| PathBuf::from(DIRECTORY_PLACEHOLDER)));
     Ok((container, identity_sources))
 }
 
@@ -3145,6 +3670,7 @@ pub(super) mod declared_inputs {
     mod tests {
         use super::super::super::native_exec_inputs::OpenedGuestRoot;
         use super::*;
+        use crate::app::container_clone::CheckedClone;
 
         fn requested_copy(path: &[u8], source: &File, executable: bool) -> RootCopy {
             let source_identity = checked_file_identity(source, executable, true).unwrap();
@@ -3210,6 +3736,9 @@ pub(super) mod declared_inputs {
 
         #[test]
         fn actual_readonly_root_backings_group_aliases_and_refuse_changed_owners() {
+            if crate::app::test_isolation::rerun_alone() {
+                return;
+            }
             let inputs = data_inputs();
             let source =
                 super::super::super::native_exec_inputs::seal_bytes(b"same bytes", InputRole::Data)
@@ -3256,7 +3785,7 @@ pub(super) mod declared_inputs {
             let mut container = super::super::default_container(false);
             plan.configure(&mut container).unwrap();
             let result: Result<(), String> = container
-                .run(|| {
+                .checked_run(|| {
                     let mut work = || -> Result<()> {
                         let prepared = unsafe { plan.materialize()? };
                         let a_path = GuestPath::new(b"/a".to_vec())?;
@@ -3616,6 +4145,9 @@ pub(super) mod declared_inputs {
             use std::os::unix::fs::FileTypeExt;
             use std::os::unix::net::UnixListener;
 
+            if crate::app::test_isolation::rerun_alone() {
+                return;
+            }
             use super::super::super::native_exec_run::NativeEndpoints;
 
             fn socket_view(path: &Path) -> (u64, u64, u32, libc::c_ulong) {
@@ -3706,7 +4238,7 @@ pub(super) mod declared_inputs {
             let mut container = super::super::default_container(false);
             plan.configure(&mut container).unwrap();
             container
-                .run(|| {
+                .checked_run(|| {
                     let namespace = std::fs::metadata("/proc/self/ns/mnt").unwrap();
                     assert_ne!((namespace.dev(), namespace.ino()), parent_namespace);
                     for (kind, source) in expected {
@@ -3741,7 +4273,9 @@ pub(super) mod declared_inputs {
             let _replacement = UnixListener::bind(&short_rpc).unwrap();
             let mut container = super::super::default_container(false);
             replaced.configure(&mut container).unwrap();
-            match container.run(|| -> () { panic!("replacement endpoint reached workload") }) {
+            match container
+                .checked_run(|| -> () { panic!("replacement endpoint reached workload") })
+            {
                 Err(reverie::process::RunError::Spawn(error)) => {
                     assert_eq!(error.context(), reverie::process::Context::Mount);
                     assert_eq!(
@@ -3756,6 +4290,9 @@ pub(super) mod declared_inputs {
 
         #[test]
         fn actual_common_container_materializes_readonly_data_and_same_task_proc() {
+            if crate::app::test_isolation::rerun_alone() {
+                return;
+            }
             // Filesystem component only: no Tool installation/native filter,
             // InstalledExecDomain or native exec success is represented here.
             // Init builds the graph; a real forked guest child binds its proc.
@@ -3764,7 +4301,7 @@ pub(super) mod declared_inputs {
             let mut container = super::super::default_container(false);
             plan.configure(&mut container).unwrap();
             let result: Result<(i32, i32, [u8; 8]), String> = container
-                .run(|| {
+                .checked_run(|| {
                     let mut work = || -> Result<_> {
                         let mut prepared = unsafe { plan.materialize()? };
                         assert_ne!(prepared.mount_id(), 0);
@@ -3970,7 +4507,7 @@ pub(super) mod declared_inputs {
 /// held until after `Container::run` returns.
 pub(super) fn deterministic_container() -> Result<(Container, IdentityGuard), Error> {
     let mut container = default_container(true);
-    let (mounts, identity_guard) = identity_hardening_mounts()?;
+    let (mounts, identity_guard) = identity_hardening_mounts(None)?;
     container.mounts(mounts);
     Ok((container, identity_guard))
 }
@@ -4216,7 +4753,9 @@ impl ContainerInitStopSignalBridge {
     /// Call this in the thread that clones the container init, immediately
     /// before the clone. The query and the install are not one atomic step, so
     /// this relies on the requirement Container already places on its caller:
-    /// no other thread is running.
+    /// no other thread is running, or only one that takes no lock, allocates
+    /// nothing and leaves signal dispositions alone, as the memory budget's
+    /// watchdog of analyze and bisect does (`analyze/memory.rs`).
     pub(super) fn install() -> Result<Self, Error> {
         let handler: extern "C" fn(libc::c_int) = bridge_container_init_stop_signal;
         let mut guard = Self {
@@ -4423,7 +4962,6 @@ static EXIT_AFTER_PUBLICATION: std::sync::atomic::AtomicBool =
 /// result is published instead of waiting for that thread, with the status
 /// the init returns anyway. Each init is its own process, so this never
 /// affects the caller.
-#[cfg(feature = "dbt")]
 pub(super) fn exit_init_after_publication() {
     EXIT_AFTER_PUBLICATION.store(true, Ordering::Release);
 }
@@ -4462,7 +5000,48 @@ pub(super) fn arm_container_init_guards() -> Result<(), SerializableError> {
     // above will never send it, so stop here instead.
     super::tracing::exit_if_log_cap_already_crossed();
     install_container_init_stop_handlers().map_err(SerializableError::from)?;
+    // Last, before anything can start a guest: a stop signal the parent took
+    // before it forked this init reached no init, so act on it here.
+    exit_if_stop_requested();
     Ok(())
+}
+
+/// The stop signal (SIGTERM, SIGINT or SIGHUP) that the `hermit` process has
+/// taken and acts on itself, or 0. `hermit analyze`'s handler sets it
+/// (`analyze::stop`) and passes the signal on to the container init of the
+/// run in progress, but a signal that arrives before that init is forked
+/// reaches no init. The init then copies this value at the fork and exits at
+/// [`exit_if_stop_requested`] instead of starting its guest. A signal that
+/// is pending when the fork starts is handled before the child is created
+/// (`copy_process`,
+/// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/fork.c?h=v6.9#n2201>),
+/// so the child copies it, and one that arrives during the fork is handled
+/// after it, when the child is there to be signalled.
+static STOP_REQUESTED: AtomicI32 = AtomicI32::new(0);
+
+/// Record `signal` in [`STOP_REQUESTED`] unless a signal is recorded
+/// already. Async-signal-safe.
+pub(super) fn request_stop(signal: libc::c_int) {
+    let _ = STOP_REQUESTED.compare_exchange(0, signal, Ordering::SeqCst, Ordering::SeqCst);
+}
+
+/// The first stop signal [`request_stop`] recorded in this process, or in the
+/// process that forked it before the fork.
+pub(super) fn stop_requested() -> Option<libc::c_int> {
+    match STOP_REQUESTED.load(Ordering::SeqCst) {
+        0 => None,
+        signal => Some(signal),
+    }
+}
+
+/// Exit 128 + signo, as the container init's own stop handler does
+/// ([`on_container_init_stop_signal`]), if a stop signal is recorded.
+/// Async-signal-safe.
+pub(super) fn exit_if_stop_requested() {
+    if let Some(signal) = stop_requested() {
+        // SAFETY: `_exit` has no preconditions and is async-signal-safe.
+        unsafe { libc::_exit(128 + signal) }
+    }
 }
 
 /// The `run --namespace-only` counterpart of [`arm_container_init_guards`], run
@@ -5073,6 +5652,53 @@ impl std::fmt::Display for LogCapExceeded {
 
 impl std::error::Error for LogCapExceeded {}
 
+/// The run ended with a scheduler terminal outcome
+/// ([`detcore::TerminalOutcome`]), reported across the container boundary:
+/// Detcore's scheduler found every remaining guest thread blocked with no
+/// wake it models (its "Deadlock detected" report), or the run's virtual clock
+/// passed `--virtual-timeout` (its "Virtual timeout" report), and ended the
+/// run. The child either finished the run and reported the outcome through
+/// its result channel, or exited the outcome's status.
+///
+/// ⚠️ NEITHER IS A GUEST RESULT, and neither is a [`ContainerChildExit`]. That
+/// type means "the child died with a status it did not pick"; this status was
+/// picked. A deadlock is a deadlock under Hermit's model: it says no wake
+/// Hermit models can reach a remaining thread, which is a native hang only when
+/// the model is complete for the program; past modeling gaps produced exactly
+/// this report (see [`detcore_model::HERMIT_GUEST_DEADLOCK_EXIT`]). A virtual
+/// timeout is a bound Hermit imposed for the caller, as `--timeout`'s is, in
+/// virtual time: the guest did not finish, so it has no result.
+///
+/// Carries only the outcome, as [`PolicyRefusal`] carries nothing: the report
+/// itself is already on stderr, written by the child before it ended.
+#[derive(Debug)]
+pub struct SchedulerOutcome(pub detcore::TerminalOutcome);
+
+impl std::fmt::Display for SchedulerOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            detcore::TerminalOutcome::GuestDeadlock => write!(
+                f,
+                "Deadlock under Hermit's model: no remaining thread can be woken by anything \
+                 Hermit models; the deadlock report is above. This is not a guest result. It is \
+                 a native hang only if Hermit models every wake the program relies on: if the \
+                 program does not hang natively, report it as a hermit bug."
+            ),
+            detcore::TerminalOutcome::VirtualTimeout { bound_ns } => write!(
+                f,
+                "The run's virtual clock passed --virtual-timeout={bound_ns} (virtual \
+                 nanoseconds since the run began), so hermit stopped the guest there, at the same \
+                 point of the same schedule on every host and in every run; the report above \
+                 names the turn. This is the bound working: not a guest result and not a hermit \
+                 failure. Raise --virtual-timeout to let the guest run longer, or use --timeout \
+                 to bound wall-clock time instead."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SchedulerOutcome {}
+
 /// Carries the signal, unlike [`PolicyRefusal`], because there is more than one
 /// and the number is the whole content of the report.
 #[derive(Debug)]
@@ -5119,6 +5745,31 @@ impl std::fmt::Display for ContainerChildPanic {
 
 impl std::error::Error for ContainerChildPanic {}
 
+/// What a container child that exited [`HERMIT_DEADLINE_EXIT`] stopped for,
+/// given the outcome its scheduler noted before exiting, if any: a virtual
+/// timeout with its note, otherwise `--timeout`'s deadline.
+fn deadline_exit(note: Option<detcore::TerminalOutcome>) -> Error {
+    match note {
+        Some(outcome @ detcore::TerminalOutcome::VirtualTimeout { .. }) => {
+            Error::new(SchedulerOutcome(outcome))
+        }
+        _ => Error::new(RunTimeoutMarker),
+    }
+}
+
+/// What a container child that exited `HERMIT_POLICY_REFUSAL_EXIT` refused,
+/// given the late precise timer events its scheduler noted before refusing a
+/// replay, if any: those events' skid-overshoot refusal, which a run that
+/// finishes after a late event reports too, otherwise the refusal it printed.
+fn policy_refusal_exit(late_events: Option<u64>) -> Error {
+    match late_events {
+        Some(late_events) => {
+            Error::new(PolicyRefusal).context(hermit::SkidOvershootError::new(late_events))
+        }
+        None => Error::new(PolicyRefusal),
+    }
+}
+
 /// Preserve the primary class from a settled container result. The owned CLI
 /// adapter also calls this for its strict error-only failed-child channel.
 pub fn classify_container_result<T>(
@@ -5161,6 +5812,11 @@ pub fn classify_container_result<T>(
                 // operator sees the bound; only the machine-readable class is
                 // reconstructed here.
                 FailureKind::RunTimeout => error.context(RunTimeoutMarker),
+                // The same terminal outcome (a deadlock under Hermit's model or
+                // a virtual timeout) as the status arms below, reported once the
+                // child had unwound the guest and finished the run; the report
+                // is above either way.
+                FailureKind::TerminalOutcome(outcome) => Error::new(SchedulerOutcome(outcome)),
                 // The marker goes UNDER the child's message, as it was in the
                 // child: the first `Error:` line keeps naming the failure.
                 FailureKind::BackendRunFailure => {
@@ -5175,10 +5831,18 @@ pub fn classify_container_result<T>(
         // are a container child that exited. Only the status distinguishes
         // them, and only because `unrecoverable_shutdown` chose one that says
         // so.
+        //
+        // ⚠️ A LATE TIMER EVENT IN A REPLAY EXITS THE SAME STATUS. The
+        // scheduler refuses a replayed schedule's callback checkpoint that a
+        // late precise timer event pushed the thread past, and exits the child
+        // 122 at once; its exit hook first leaves the late-event count in the
+        // note (`replay_refusal_note`) the child shares with this process. The
+        // note, not the status, makes it the late event's skid-overshoot
+        // refusal rather than a refusal of the schedule.
         Err(RunError::ExitStatus(status))
             if status.code() == Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT) =>
         {
-            Err(Error::new(PolicyRefusal))
+            Err(policy_refusal_exit(super::replay_refusal_note::take()))
         }
         // A DEADLINE HERMIT ITSELF ENFORCED, and it needs its own arm for exactly
         // the reason the refusal above does: the init chose this status on
@@ -5187,8 +5851,15 @@ pub fn classify_container_result<T>(
         // exit 125, `class=container-child-exit`, i.e. "hermit broke" for a
         // bound working as designed. Measured before this arm existed: the
         // `run --timeout` fallback exited the init 124 and the run reported 125.
+        //
+        // ⚠️ A VIRTUAL TIMEOUT EXITS THE SAME STATUS. A backend that cannot
+        // unwind the guest exits the child 124 from its scheduler when the run's
+        // virtual clock passes `--virtual-timeout`, and its exit hook leaves the
+        // bound in the note (`terminal_outcome_note`) the child shares with
+        // this process. The note, not the status, tells the two apart; without
+        // one the deadline is `--timeout`'s, as it always was.
         Err(RunError::ExitStatus(status)) if status.code() == Some(HERMIT_DEADLINE_EXIT) => {
-            Err(Error::new(RunTimeoutMarker))
+            Err(deadline_exit(super::terminal_outcome_note::take()))
         }
         // The --max-log-bytes cap, chosen by `CappedWriter` in the init. Same
         // reason as the deadline arm: without it a working bound reports 125.
@@ -5197,6 +5868,16 @@ pub fn classify_container_result<T>(
         Err(RunError::ExitStatus(status)) if status.code() == Some(HERMIT_LOG_CAP_EXIT) => {
             super::tracing::bound_log_cap_exit();
             Err(Error::new(LogCapExceeded))
+        }
+        // A deadlock under Hermit's model, reported before exiting. Without
+        // this arm it falls through to `ContainerChildExit` and reads as an
+        // unchosen child exit instead of the scheduler's named verdict.
+        Err(RunError::ExitStatus(status))
+            if status.code() == Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT) =>
+        {
+            Err(Error::new(SchedulerOutcome(
+                detcore::TerminalOutcome::GuestDeadlock,
+            )))
         }
         // A signal death, before the catch-all for the same reason the refusal arm
         // is: falling through would report a signal-terminated run as an
@@ -5229,6 +5910,18 @@ mod readonly_proc;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::container_clone::CheckedClone;
+
+    /// The `uid=` and `gid=` options go; every other option stays, in order.
+    #[test]
+    fn superblock_options_leave_out_the_owner() {
+        assert_eq!(
+            superblock_options_as_root(b"rw,uid=1000,gid=100,inode64,huge=within_size"),
+            b"rw,inode64,huge=within_size"
+        );
+        assert_eq!(superblock_options_as_root(b"rw,mode=700"), b"rw,mode=700");
+        assert_eq!(superblock_options_as_root(b"rw"), b"rw");
+    }
 
     /// A rewrite for a mount the snapshot lacks (a user bind's recursive copy
     /// whose host directory was removed, detaching it) is dropped; every
@@ -5315,7 +6008,7 @@ mod tests {
         T: serde::Serialize + serde::de::DeserializeOwned,
     {
         Container::new()
-            .run(body)
+            .checked_run(body)
             .expect("the isolated test process should run to completion")
             .unwrap_or_else(|error| panic!("{error}"))
     }
@@ -5440,6 +6133,9 @@ mod tests {
     /// init is still running when the budget expires.
     #[test]
     fn a_namespace_init_honours_stop_signals_sent_before_it_arms() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         for signal in CONTAINER_INIT_STOP_SIGNALS {
             let status = in_isolated_process(|| {
                 set_default_stop_dispositions()?;
@@ -5465,6 +6161,9 @@ mod tests {
     /// the wait status `SIG_DFL` would have given it.
     #[test]
     fn the_process_holding_the_bridge_still_dies_from_stop_signals() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         fn hold_the_bridge() -> bool {
             if set_default_stop_dispositions().is_err() {
                 return false;
@@ -5496,6 +6195,9 @@ mod tests {
     /// what was there before.
     #[test]
     fn the_bridge_leaves_ignored_and_handled_signals_alone_and_restores_the_default() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         extern "C" fn someone_elses_handler(_signal: libc::c_int) {}
         let dispositions = in_isolated_process(|| {
             let read = || -> Result<Vec<libc::sighandler_t>, String> {
@@ -5556,6 +6258,9 @@ mod tests {
     /// the way rather than guessing which of the two it is running in.
     #[test]
     fn the_bridge_is_not_installed_by_a_process_that_is_pid_1() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         fn install_as_pid_1() -> bool {
             // SAFETY: getpid(2) has no preconditions.
             if unsafe { libc::getpid() } != 1 || set_default_stop_dispositions().is_err() {
@@ -5579,6 +6284,184 @@ mod tests {
         });
     }
 
+    /// Detcore's placeholder directory is a fresh tmpfs, read-only, holding
+    /// nothing and unable to hold a set-user-ID, device or executable file,
+    /// installed at procfs's own empty mount point right after the
+    /// container's `/proc`, as plumbing the guest's mount table leaves out.
+    #[test]
+    fn the_placeholder_directory_is_a_hidden_empty_read_only_tmpfs() {
+        let mount = directory_placeholder_mount(DIRECTORY_PLACEHOLDER);
+        assert_eq!(
+            mount,
+            Mount::tmpfs("/proc/fs/nfsd")
+                .source("hermit")
+                .flags(
+                    MountFlags::MS_RDONLY
+                        | MountFlags::MS_NOSUID
+                        | MountFlags::MS_NODEV
+                        | MountFlags::MS_NOEXEC
+                )
+                .data("mode=0555,size=4k,nr_inodes=1")
+        );
+        let plan = [
+            PlannedMount::hermit(container_proc_mount()),
+            PlannedMount::placeholder(mount),
+        ];
+        let installations = installations_of(&plan);
+        assert_eq!(
+            installations[1].mountpoints,
+            vec![mountinfo_escape_path(Path::new("/proc/fs/nfsd"))]
+        );
+        assert!(installations[1].sources.is_empty(), "a fresh filesystem");
+        assert!(!installations[0].backend);
+        assert!(installations[1].backend, "left out of the guest's table");
+    }
+
+    /// A later mount whose target resolves, when the setup installs it, to
+    /// the placeholder directory's mountpoint or one above it covers the
+    /// placeholder, by any spelling: `/proc` and `/proc/fs/nfsd/../..` do; a
+    /// mount beside it, or on it from below, does not.
+    #[test]
+    fn a_later_mount_covers_the_placeholder_directory_by_any_spelling() {
+        let plan = |target: &str| {
+            vec![
+                PlannedMount::hermit(container_proc_mount()),
+                PlannedMount::placeholder(directory_placeholder_mount(DIRECTORY_PLACEHOLDER)),
+                PlannedMount::hermit(Mount::tmpfs(target)),
+            ]
+        };
+        for target in [
+            "/",
+            "/proc",
+            "/proc/fs",
+            "/proc/fs/nfsd",
+            "/proc/fs/nfsd/../..",
+            "/proc/./fs",
+        ] {
+            assert!(later_mount_covers(&plan(target), 1), "{target}");
+        }
+        for target in ["/tmp", "/proc/sys", "/procfs", "/proc/fs/nfsd/x"] {
+            assert!(!later_mount_covers(&plan(target), 1), "{target}");
+        }
+    }
+
+    /// Under an image root every row is the setup's and the table shows it,
+    /// except the placeholder directory's, which it leaves out as plumbing:
+    /// the guest's mount table is the image's own, and a descriptor on the
+    /// placeholder reports `/proc`'s mount. A tmpfs of the image's elsewhere
+    /// stays shown.
+    #[test]
+    fn an_image_roots_table_leaves_the_placeholder_directory_out() {
+        let rows = detcore_model::container_mounts::parse_container_mounts(
+            b"2201 1990 0:40 / / ro,noatime - btrfs /dev/md0 rw\n\
+              2202 2201 0:41 / /proc rw,relatime - proc none rw\n\
+              2203 2202 0:42 / /proc/fs/nfsd ro,nosuid,nodev,noexec,relatime - tmpfs hermit ro,size=4k\n\
+              2204 2201 0:43 / /run rw,nosuid,nodev,relatime - tmpfs tmpfs rw\n\
+              2205 2201 0:44 / /dev/pts rw,nosuid,noexec,relatime - devpts none rw\n",
+        )
+        .expect("the rows parse");
+        let mut guard = IdentityGuard::empty();
+        guard.set_image_root();
+        guard.set_directory_placeholder(Some(PathBuf::from(DIRECTORY_PLACEHOLDER)));
+        let table = guard
+            .container_mount_table_of(rows.clone())
+            .expect("an image root's table")
+            .expect("an image root records its table");
+        assert_eq!(
+            table.shown_mount_ids(),
+            std::collections::BTreeSet::from([2201, 2202, 2204, 2205])
+        );
+        assert_eq!(table.shown_mount_id(2203), 2202);
+        // Without a placeholder directory every row is shown.
+        guard.set_directory_placeholder(None);
+        let table = guard
+            .container_mount_table_of(rows)
+            .expect("an image root's table")
+            .expect("an image root records its table");
+        assert_eq!(
+            table.shown_mount_ids(),
+            std::collections::BTreeSet::from([2201, 2202, 2203, 2204, 2205])
+        );
+    }
+
+    /// What a process in a container with the placeholder directory finds
+    /// there: its filesystem type, whether it is read-only, how many entries
+    /// it holds, what a `mkdir` in it gets, and whether a procfs of its own
+    /// still mounts.
+    fn placeholder_directory_facts() -> Result<(i64, bool, usize, i32, i32), String> {
+        let mut statfs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: the path is NUL-terminated and `statfs` is writable.
+        if unsafe { libc::statfs(c"/proc/fs/nfsd".as_ptr(), statfs.as_mut_ptr()) } != 0 {
+            return Err(format!("statfs: {}", io::Error::last_os_error()));
+        }
+        // SAFETY: statfs returned 0, so it initialized `statfs`.
+        let statfs = unsafe { statfs.assume_init() };
+        let mut statvfs = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: the path is NUL-terminated and `statvfs` is writable.
+        if unsafe { libc::statvfs(c"/proc/fs/nfsd".as_ptr(), statvfs.as_mut_ptr()) } != 0 {
+            return Err(format!("statvfs: {}", io::Error::last_os_error()));
+        }
+        // SAFETY: statvfs returned 0, so it initialized `statvfs`.
+        let read_only = unsafe { statvfs.assume_init() }.f_flag & libc::ST_RDONLY != 0;
+        let entries = fs::read_dir("/proc/fs/nfsd")
+            .map_err(|error| error.to_string())?
+            .count();
+        // SAFETY: the path is NUL-terminated.
+        let mkdir = unsafe { libc::mkdir(c"/proc/fs/nfsd/x".as_ptr(), 0o755) };
+        let mkdir_errno = if mkdir == 0 {
+            0
+        } else {
+            io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        };
+        let scratch = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let target = std::ffi::CString::new(scratch.path().as_os_str().as_encoded_bytes())
+            .map_err(|error| error.to_string())?;
+        // SAFETY: every string is NUL-terminated; the data pointer may be null.
+        let mounted = unsafe {
+            libc::mount(
+                c"proc".as_ptr(),
+                target.as_ptr(),
+                c"proc".as_ptr(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        let mount_errno = if mounted == 0 {
+            // SAFETY: the path is NUL-terminated.
+            unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+            0
+        } else {
+            io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        };
+        Ok((statfs.f_type, read_only, entries, mkdir_errno, mount_errno))
+    }
+
+    /// The placeholder directory mounts in the container's user namespace,
+    /// on its own procfs, and leaves the guest free to mount a procfs of its
+    /// own, as procfs permits a submount on a permanently empty directory
+    /// (`mnt_already_visible`).
+    #[test]
+    fn the_placeholder_directory_mounts_and_leaves_procfs_mountable() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
+        let facts = Container::new()
+            .checked_run(|| {
+                let mut container = default_container(false);
+                container.mount(directory_placeholder_mount(DIRECTORY_PLACEHOLDER));
+                container
+                    .checked_run(placeholder_directory_facts)
+                    .map_err(|error| format!("{error:?}"))?
+            })
+            .unwrap()
+            .expect("the placeholder directory should mount over procfs's empty mount point");
+        assert_eq!(
+            facts,
+            (0x0102_1994, true, 0, libc::EROFS, 0),
+            "(f_type TMPFS_MAGIC, read-only, empty, mkdir EROFS, a procfs of its own mounts)"
+        );
+    }
+
     fn namespace_proc_contents() -> Result<(String, String), String> {
         Ok((
             fs::read_to_string("/proc/mounts").map_err(|error| error.to_string())?,
@@ -5588,12 +6471,15 @@ mod tests {
 
     #[test]
     fn default_container_uses_readonly_proc_fallback() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         // The outer child confines the irreversible seccomp filter to this test.
         let (mounts, status) = Container::new()
-            .run(|| {
+            .checked_run(|| {
                 readonly_proc::deny_writable_mounts().map_err(|error| error.to_string())?;
                 default_container(false)
-                    .run(namespace_proc_contents)
+                    .checked_run(namespace_proc_contents)
                     .map_err(|error| format!("{error:?}"))?
             })
             .unwrap()
@@ -5603,25 +6489,38 @@ mod tests {
 
     #[test]
     fn image_container_uses_readonly_proc_fallback() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         let rootfs = tempfile::tempdir().unwrap();
         let tmpfs = tempfile::tempdir().unwrap();
         for directory in ["proc", "tmp", "dev/pts"] {
             fs::create_dir_all(rootfs.path().join(directory)).unwrap();
         }
-        for node in crate::image::DEV_BIND_TARGETS {
+        for node in crate::app::image::DEV_BIND_TARGETS {
             File::create(rootfs.path().join("dev").join(node)).unwrap();
         }
 
         let (mounts, status) = Container::new()
-            .run(|| {
+            .checked_run(|| {
                 readonly_proc::deny_writable_mounts().map_err(|error| error.to_string())?;
-                let (mut container, _identity) =
-                    image_container(rootfs.path(), tmpfs.path(), false, true)
-                        .map_err(|error| error.to_string())?;
+                let (mut container, _identity) = image_container(
+                    rootfs.path(),
+                    tmpfs.path(),
+                    false,
+                    None,
+                    true,
+                    true,
+                    ImageContainerOpts {
+                        bind_kvm: false,
+                        workdir_binds: &[],
+                    },
+                )
+                .map_err(|error| error.to_string())?;
                 // This closure is already loaded, so the image needs no executable
                 // or libraries. It reads the proc mount after entering the chroot.
                 container
-                    .run(namespace_proc_contents)
+                    .checked_run(namespace_proc_contents)
                     .map_err(|error| format!("{error:?}"))?
             })
             .unwrap()
@@ -5640,6 +6539,9 @@ mod tests {
     /// with both locked flags still present.
     #[test]
     fn image_container_accepts_a_rootfs_on_a_nosuid_nodev_filesystem() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         fn root_mount_flags() -> Result<(bool, bool, bool), String> {
             let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
             // SAFETY: the path is a valid NUL-terminated string and `stat` is a
@@ -5662,20 +6564,31 @@ mod tests {
         let flags = Container::new()
             .map_root()
             .mount(Mount::tmpfs(&base_path).flags(MountFlags::MS_NOSUID | MountFlags::MS_NODEV))
-            .run(move || -> Result<(bool, bool, bool), String> {
+            .checked_run(move || -> Result<(bool, bool, bool), String> {
                 let rootfs = base_path.join("rootfs");
                 let tmpfs = base_path.join("scratch");
                 for directory in ["proc", "tmp", "dev/pts"] {
                     fs::create_dir_all(rootfs.join(directory)).map_err(|e| e.to_string())?;
                 }
-                for node in crate::image::DEV_BIND_TARGETS {
+                for node in crate::app::image::DEV_BIND_TARGETS {
                     File::create(rootfs.join("dev").join(node)).map_err(|e| e.to_string())?;
                 }
                 fs::create_dir(&tmpfs).map_err(|e| e.to_string())?;
-                let (mut container, _identity) = image_container(&rootfs, &tmpfs, false, true)
-                    .map_err(|error| error.to_string())?;
+                let (mut container, _identity) = image_container(
+                    &rootfs,
+                    &tmpfs,
+                    false,
+                    None,
+                    true,
+                    true,
+                    ImageContainerOpts {
+                        bind_kvm: false,
+                        workdir_binds: &[],
+                    },
+                )
+                .map_err(|error| error.to_string())?;
                 container
-                    .run(root_mount_flags)
+                    .checked_run(root_mount_flags)
                     .map_err(|error| format!("{error:?}"))?
             })
             .expect("run the outer namespace holding the nosuid,nodev filesystem")
@@ -5751,9 +6664,15 @@ mod tests {
         use detcore_model::schedule::boundary::Schedule;
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("terminal.json");
+        // Synthetic data stating the qualified test metric, which the run
+        // prepared below admits on a host whose profile qualifies.
         let recording = Recording::Boundaries(
             BoundaryRecording::new(
-                PreemptionRecord::default(),
+                PreemptionRecord::default().with_identity(Some(
+                    detcore::preemptions::HistoryIdentity::Known(
+                        reverie::pmu_config::RcbMetric::ConditionalBranchesRetiredUserV1,
+                    ),
+                )),
                 Schedule::new(vec![Record::Event(SchedEvent::branches(
                     DetTid::from_raw(1),
                     1,
@@ -5763,16 +6682,20 @@ mod tests {
             .unwrap(),
         );
         std::fs::write(&path, recording.encode().unwrap()).unwrap();
-        let error = detcore::GlobalState::init_for_external_scheduler(&detcore::Config {
-            sequentialize_threads: true,
-            strict_schedule_boundaries: true,
-            replay_schedule_from: Some(path),
-            record_preemptions: false,
-            ..detcore::Config::default()
-        })
-        .clean_up(false, &None)
-        .await
-        .unwrap_err();
+        let config = hermit::prepare_backend_config(
+            detcore::Config {
+                sequentialize_threads: true,
+                strict_schedule_boundaries: true,
+                replay_schedule_from: Some(path),
+                record_preemptions: false,
+                ..detcore::Config::default()
+            },
+            hermit::Backend::Ptrace,
+        );
+        let error = detcore::GlobalState::init_for_external_scheduler(&config)
+            .clean_up(false, &None)
+            .await
+            .unwrap_err();
         assert!(error.is::<detcore::TerminalReplayRefusal>());
         let serialized = SerializableError::from(Error::new(reverie::Error::Tool(error)));
         assert_eq!(serialized.kind(), FailureKind::PolicyRefusal);
@@ -5865,6 +6788,78 @@ mod tests {
         assert!(unchosen.downcast_ref::<SignalDeath>().is_none());
     }
 
+    /// The scheduler's deadlock status is its own outcome at the container
+    /// boundary, and the status of its other terminal verdicts (a
+    /// Hermit stall exits 1) is still an unchosen child exit. Delete the
+    /// guest-deadlock arm in `classify_container_result` and the first half
+    /// fails; widen it to the stall's status and the second does.
+    #[test]
+    fn a_container_child_exiting_guest_deadlock_is_a_guest_outcome() {
+        use reverie::process::ExitStatus;
+
+        let deadlock = classify_container_result::<()>(Err(RunError::ExitStatus(
+            ExitStatus::Exited(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+        )))
+        .expect_err("a deadlocked guest is not a success");
+        assert!(matches!(
+            deadlock.downcast_ref::<SchedulerOutcome>(),
+            Some(SchedulerOutcome(detcore::TerminalOutcome::GuestDeadlock))
+        ));
+        assert!(
+            deadlock.downcast_ref::<ContainerChildExit>().is_none(),
+            "a guest deadlock must not also read as an unaccounted container exit"
+        );
+        assert!(deadlock.downcast_ref::<PolicyRefusal>().is_none());
+
+        let stall =
+            classify_container_result::<()>(Err(RunError::ExitStatus(ExitStatus::Exited(1))))
+                .expect_err("a Hermit stall is not a success");
+        assert!(stall.downcast_ref::<ContainerChildExit>().is_some());
+        assert!(stall.downcast_ref::<SchedulerOutcome>().is_none());
+    }
+
+    /// A child that exited the refusal status is the late timer events' skid
+    /// overshoot when its scheduler noted them before refusing a replay, and
+    /// otherwise the plain refusal it printed. Drop the note from
+    /// `policy_refusal_exit` and the first half fails; type every 122 as a
+    /// skid overshoot and the second does.
+    #[test]
+    fn a_policy_refusal_exit_is_a_skid_overshoot_only_with_its_note() {
+        let noted = policy_refusal_exit(Some(3));
+        assert_eq!(
+            noted
+                .downcast_ref::<hermit::SkidOvershootError>()
+                .map(hermit::SkidOvershootError::count),
+            Some(3)
+        );
+        assert!(noted.downcast_ref::<PolicyRefusal>().is_some());
+        let plain = policy_refusal_exit(None);
+        assert!(plain.downcast_ref::<PolicyRefusal>().is_some());
+        assert!(plain.downcast_ref::<hermit::SkidOvershootError>().is_none());
+    }
+
+    /// A child that exited the deadline status is `--timeout`'s deadline
+    /// (`class=run-timeout`) unless its scheduler noted a virtual timeout
+    /// before exiting, which is then that terminal outcome with its bound; a
+    /// note of any other outcome does not turn the deadline into it. Drop
+    /// the note from `deadline_exit` and the first assertion fails; read the
+    /// status alone and the second does.
+    #[test]
+    fn a_deadline_exit_is_a_virtual_timeout_only_with_its_note() {
+        let outcome = detcore::TerminalOutcome::VirtualTimeout { bound_ns: 42 };
+        let noted = deadline_exit(Some(outcome));
+        assert!(matches!(
+            noted.downcast_ref::<SchedulerOutcome>(),
+            Some(SchedulerOutcome(o)) if *o == outcome
+        ));
+        assert!(noted.downcast_ref::<RunTimeoutMarker>().is_none());
+        for note in [None, Some(detcore::TerminalOutcome::GuestDeadlock)] {
+            let deadline = deadline_exit(note);
+            assert!(deadline.downcast_ref::<RunTimeoutMarker>().is_some());
+            assert!(deadline.downcast_ref::<SchedulerOutcome>().is_none());
+        }
+    }
+
     #[test]
     fn child_panic_becomes_an_error_naming_message_and_location() {
         let mut f = || -> Result<(), Error> { panic!("divergence detail that must survive") };
@@ -5916,8 +6911,8 @@ mod tests {
     // `run` mode regardless of whether the host `/etc/group` lists 65534.
     #[test]
     fn identity_hardening_freezes_group_with_overflow_entry() {
-        let (mounts, guard) =
-            identity_hardening_mounts().expect("identity hardening mounts should be constructible");
+        let (mounts, guard) = identity_hardening_mounts(None)
+            .expect("identity hardening mounts should be constructible");
         assert!(
             !mounts.is_empty(),
             "expected at least the frozen /etc/group mount"
@@ -5945,8 +6940,8 @@ mod tests {
     // a trailing separator, which mount refuses with ENOTDIR).
     #[test]
     fn identity_hardening_freezes_the_dynamic_linker_cache() {
-        let (mounts, guard) =
-            identity_hardening_mounts().expect("identity hardening mounts should be constructible");
+        let (mounts, guard) = identity_hardening_mounts(None)
+            .expect("identity hardening mounts should be constructible");
         let Ok(host) = fs::read(LD_SO_CACHE) else {
             assert!(guard._ld_so_cache.is_none());
             return;
@@ -5971,6 +6966,100 @@ mod tests {
         }));
     }
 
+    // Both runs of a verification take the guest's cache from the one
+    // snapshot their caller took, never from the host at each run's setup
+    // (https://github.com/rrnewton/hermit/issues/4693).
+    #[test]
+    fn identity_hardening_binds_the_given_dynamic_linker_cache_snapshot() {
+        let snapshot = LdSoCacheSnapshot::from_bytes(b"not the host's cache".to_vec());
+        let (mounts, guard) = identity_hardening_mounts(Some(&snapshot))
+            .expect("identity hardening mounts should be constructible");
+        let cache = guard
+            ._ld_so_cache
+            .as_ref()
+            .expect("a snapshot with bytes gets a frozen copy");
+        assert_eq!(fs::read(cache.path()).unwrap(), b"not the host's cache");
+        assert!(
+            guard.host_input_snapshots().is_empty(),
+            "unknown origin stays unknown"
+        );
+        assert_eq!(
+            mounts
+                .iter()
+                .filter(|mount| mount.get_target() == Path::new(LD_SO_CACHE))
+                .count(),
+            1,
+            "{mounts:?}"
+        );
+        let (mounts, guard) = identity_hardening_mounts(Some(&LdSoCacheSnapshot(None)))
+            .expect("identity hardening mounts should be constructible");
+        assert!(guard._ld_so_cache.is_none());
+        assert!(guard.host_input_snapshots().is_empty());
+        assert!(
+            mounts
+                .iter()
+                .all(|mount| mount.get_target() != Path::new(LD_SO_CACHE)),
+            "a snapshot of a host without a cache binds none: {mounts:?}"
+        );
+    }
+
+    #[test]
+    fn a_cache_snapshot_keeps_its_origin_across_copies_and_source_replacement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ld.so.cache");
+        fs::write(&path, b"captured cache").unwrap();
+        let source = File::open(&path).unwrap();
+        let origin = HostFileIdentity::from_stat(&nix::sys::stat::fstat(&source).unwrap());
+        let snapshot = LdSoCacheSnapshot::of_path(&path).unwrap();
+        let replacement = directory.path().join("new");
+        fs::write(&replacement, b"different host cache").unwrap();
+        fs::rename(replacement, &path).unwrap();
+        let (_, first) = identity_hardening_mounts(Some(&snapshot)).unwrap();
+        let (_, second) = identity_hardening_mounts(Some(&snapshot)).unwrap();
+        let first_identity = &first.host_input_snapshots()[0];
+        let second_identity = &second.host_input_snapshots()[0];
+        assert_ne!(first_identity.physical, second_identity.physical);
+        for (guard, identity) in [(&first, first_identity), (&second, second_identity)] {
+            assert_eq!(identity.origin, origin);
+            assert_ne!(identity.physical, origin);
+            assert_eq!(
+                identity.content,
+                detcore::Digest::new(b"captured cache").to_string()
+            );
+            assert_eq!(
+                fs::read(guard._ld_so_cache.as_ref().unwrap().path()).unwrap(),
+                b"captured cache"
+            );
+        }
+        assert_ne!(LdSoCacheSnapshot::of_path(&path).unwrap(), snapshot);
+        assert_eq!(
+            LdSoCacheSnapshot::of_path(&directory.path().join("absent")).unwrap(),
+            LdSoCacheSnapshot(None)
+        );
+    }
+
+    #[test]
+    fn a_cache_capture_refuses_an_in_place_change_during_its_read() {
+        let mut source = tempfile::NamedTempFile::new().unwrap();
+        source.write_all(b"original").unwrap();
+        let refused =
+            LdSoCacheSnapshot::capture(File::open(source.path()).unwrap(), |file, bytes| {
+                file.read_to_end(bytes)?;
+                // Keep both size and mtime: ctime must still expose this rewrite.
+                let mtime = source.as_file().metadata()?.modified()?;
+                fs::write(source.path(), b"modified")?;
+                source.as_file().set_modified(mtime)?;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("changed while it was captured"),
+            "{refused}"
+        );
+    }
+
     #[test]
     fn mountinfo_provenance_uses_object_identity_not_temp_name_or_target() {
         let actual = tempfile::NamedTempFile::new().expect("create actual temporary source");
@@ -5980,12 +7069,14 @@ mod tests {
         let guard = IdentityGuard {
             _group_file: Some(actual),
             _ld_so_cache: None,
+            ld_so_cache_origin: None,
             _nscd_dir: None,
             mountinfo_roots: vec![matching],
             user_mount_targets: Vec::new(),
             user_binds: Vec::new(),
             host_rows: Vec::new(),
             plan: MountPlan::Unrecorded,
+            directory_placeholder: None,
         };
 
         let rewrites = guard.mountinfo_root_rewrites().unwrap();
@@ -6015,12 +7106,34 @@ mod tests {
     fn image_container_registers_only_an_automatic_private_tmp() {
         let rootfs = tempfile::TempDir::new().expect("create image rootfs");
         let private_tmp = tempfile::TempDir::new().expect("create private tmp");
-        let (_, generated) = image_container(rootfs.path(), private_tmp.path(), false, true)
-            .expect("construct image container with generated tmp");
+        let (_, generated) = image_container(
+            rootfs.path(),
+            private_tmp.path(),
+            false,
+            None,
+            true,
+            true,
+            ImageContainerOpts {
+                bind_kvm: false,
+                workdir_binds: &[],
+            },
+        )
+        .expect("construct image container with generated tmp");
         assert_eq!(generated.mountinfo_roots.len(), 1);
 
-        let (_, supplied) = image_container(rootfs.path(), private_tmp.path(), false, false)
-            .expect("construct image container with user tmp");
+        let (_, supplied) = image_container(
+            rootfs.path(),
+            private_tmp.path(),
+            false,
+            None,
+            false,
+            true,
+            ImageContainerOpts {
+                bind_kvm: false,
+                workdir_binds: &[],
+            },
+        )
+        .expect("construct image container with user tmp");
         assert!(supplied.mountinfo_roots.is_empty());
     }
 
@@ -6055,12 +7168,14 @@ mod tests {
         let guard = IdentityGuard {
             _group_file: Some(actual),
             _ld_so_cache: None,
+            ld_so_cache_origin: None,
             _nscd_dir: None,
             mountinfo_roots: vec![same_target_wrong_source],
             user_mount_targets: Vec::new(),
             user_binds: Vec::new(),
             host_rows: Vec::new(),
             plan: MountPlan::Unrecorded,
+            directory_placeholder: None,
         };
 
         let error = guard.mountinfo_root_rewrites().unwrap_err().to_string();
@@ -6146,10 +7261,15 @@ mod tests {
         let allowed = cpu_ids(&affinity);
         assert_eq!(allowed, [7, 31, 211]);
         for _ in 0..128 {
-            let selected = choose_affinity_core(&allowed).expect("non-empty mask");
-            assert!(allowed.contains(&selected), "selected CPU {selected}");
+            // Without a /proc/stat reading, the draw is over every allowed CPU.
+            let (selected, basis) =
+                super::super::pinned_cpu::choose_with(&allowed, |_| None).expect("non-empty mask");
+            assert!(
+                allowed.contains(&selected),
+                "selected CPU {selected} ({basis})"
+            );
         }
-        assert_eq!(choose_affinity_core(&[]), None);
+        assert_eq!(super::super::pinned_cpu::choose_with(&[], |_| None), None);
     }
 
     /// How the candidate init in [`arm_after_the_parent_crossed`] ended: its
@@ -6171,9 +7291,9 @@ mod tests {
         use std::io::Read as _;
 
         in_isolated_process(move || {
-            let budget = crate::tracing::LogBudget::new(100).map_err(|e| e.to_string())?;
+            let budget = crate::app::tracing::LogBudget::new(100).map_err(|e| e.to_string())?;
             // Only in this isolated process; the harness registers nothing.
-            crate::tracing::register_invocation_log_budget(Some(budget.clone()));
+            crate::app::tracing::register_invocation_log_budget(Some(budget.clone()));
             // SAFETY: `prctl` touches no caller memory; this process is a fresh
             // fork, so the attribute reaches no other test.
             if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } == -1 {
@@ -6217,7 +7337,7 @@ mod tests {
                     }
                     libc::close(marker_fd);
                     let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
-                    let mut writer = crate::tracing::CappedWriter::file(
+                    let mut writer = crate::app::tracing::CappedWriter::file(
                         std::fs::File::from_raw_fd(null),
                         0,
                         Some(budget.clone()),
@@ -6282,6 +7402,9 @@ mod tests {
     /// death signal must not go on to start a guest.
     #[test]
     fn log_cap_crossed_before_the_container_init_arms_stops_the_init() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         let outcome = arm_after_the_parent_crossed(|| arm_container_init_guards().is_ok());
         assert_stopped_by_the_crossing("arm_container_init_guards", outcome);
     }
@@ -6290,6 +7413,9 @@ mod tests {
     /// arms in `pre_exec` and then execs the guest itself.
     #[test]
     fn log_cap_crossed_before_the_namespace_only_guest_arms_stops_the_exec() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         let outcome = arm_after_the_parent_crossed(|| arm_namespace_only_guest().is_ok());
         assert_stopped_by_the_crossing("arm_namespace_only_guest", outcome);
     }

@@ -21,14 +21,17 @@ use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Close;
 use reverie::syscalls::EpollPwait;
+#[cfg(target_arch = "x86_64")]
 use reverie::syscalls::EpollWait;
 use reverie::syscalls::MemoryAccess;
+#[cfg(target_arch = "x86_64")]
 use reverie::syscalls::Poll;
 use reverie::syscalls::PollFd;
 use reverie::syscalls::Ppoll;
 use reverie::syscalls::Pselect6;
 use reverie::syscalls::Recvfrom;
 use reverie::syscalls::Recvmsg;
+#[cfg(target_arch = "x86_64")]
 use reverie::syscalls::Select;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::Timespec;
@@ -37,6 +40,8 @@ use reverie::syscalls::family::SockOptFamily;
 use super::Recorder;
 use crate::event::AcceptEvent;
 use crate::event::EpollWaitEvent;
+#[cfg(target_arch = "x86_64")]
+use crate::event::InterruptedPoll;
 use crate::event::PollEvent;
 use crate::event::PpollEvent;
 use crate::event::RecvmsgEvent;
@@ -374,6 +379,7 @@ fn capture_pollfds<M: MemoryAccess>(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn capture_poll_event<M: MemoryAccess>(
     memory: &M,
     fds_address: Option<AddrMut<'_, PollFd>>,
@@ -518,6 +524,7 @@ fn capture_select_event<M: MemoryAccess>(
 }
 
 impl Recorder {
+    #[cfg(target_arch = "x86_64")]
     pub(super) async fn handle_epoll_wait<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -595,6 +602,7 @@ impl Recorder {
         result
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub(super) async fn handle_poll<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -607,7 +615,35 @@ impl Recorder {
             capture_poll_event(&guest.memory(), syscall.fds(), len, result).map(SyscallEvent::Poll);
 
         self.record_event(guest, event);
+        guest.thread_state_mut().interrupted_poll =
+            InterruptedPoll::after(syscall.fds(), syscall.nfds(), &result);
 
+        result
+    }
+
+    /// The kernel's restart of `poll`, which a signal ended in the kernel
+    /// (`InterruptedPoll`): `restart`, the guest's own `restart_syscall`, runs
+    /// in place, so Linux's `do_restart_poll` waits until the end time the
+    /// poll kept and writes the poll's `revents`, and no signal is taken off
+    /// the queue before it runs, as a poll injected in its stead would. Its
+    /// outputs are recorded as the poll's.
+    pub(super) async fn handle_restarted_poll<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        restart: Syscall,
+        poll: InterruptedPoll,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(restart).await;
+        let event = capture_poll_event(
+            &guest.memory(),
+            poll.fds_address(),
+            poll.nfds as usize,
+            result,
+        )
+        .map(SyscallEvent::Poll);
+        self.record_event(guest, event);
+        guest.thread_state_mut().interrupted_poll =
+            InterruptedPoll::after(poll.fds_address(), poll.nfds, &result);
         result
     }
 
@@ -645,6 +681,7 @@ impl Recorder {
         result
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub(super) async fn handle_select<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1118,9 +1155,17 @@ mod tests {
         assert_eq!(memory.slice(addrlen, 4), &PEER_LEN.to_ne_bytes());
     }
 
+    /// The host's page size: protections apply to whole pages, which are
+    /// 64 KiB on some aarch64 kernels.
+    fn host_page() -> usize {
+        // SAFETY: sysconf has no preconditions.
+        unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
+    }
+
     /// Maps `pages` private anonymous pages, each with its own protection.
     fn map_pages(protections: &[libc::c_int]) -> *mut u8 {
-        let len = protections.len() * USER_PAGE_SIZE;
+        let page = host_page();
+        let len = protections.len() * page;
         // SAFETY: a fresh anonymous mapping that nothing else refers to.
         let base = unsafe {
             libc::mmap(
@@ -1134,12 +1179,12 @@ mod tests {
         };
         assert_ne!(base, libc::MAP_FAILED);
         let base = base.cast::<u8>();
-        for (page, &protection) in protections.iter().enumerate() {
+        for (index, &protection) in protections.iter().enumerate() {
             // SAFETY: inside the mapping made above.
             unsafe {
-                let at = base.add(page * USER_PAGE_SIZE);
-                std::ptr::write_bytes(at, page as u8 + 1, USER_PAGE_SIZE);
-                assert_eq!(libc::mprotect(at.cast(), USER_PAGE_SIZE, protection), 0);
+                let at = base.add(index * page);
+                std::ptr::write_bytes(at, index as u8 + 1, page);
+                assert_eq!(libc::mprotect(at.cast(), page, protection), 0);
             }
         }
         base
@@ -1147,7 +1192,7 @@ mod tests {
 
     #[test]
     fn a_user_read_reaches_readable_and_write_only_pages_but_not_inaccessible_ones() {
-        let page = USER_PAGE_SIZE;
+        let page = host_page();
         let base = map_pages(&[libc::PROT_READ, libc::PROT_WRITE, libc::PROT_NONE]) as usize;
         let pid = Pid::this();
         let read = |address: usize| {
@@ -1266,6 +1311,8 @@ mod tests {
         assert_eq!((len, address), (2, family.to_vec()));
     }
 
+    // `poll` and its event exist only on x86_64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn capture_poll_keeps_outputs_on_efault() {
         let fds = [
@@ -1319,6 +1366,8 @@ mod tests {
         assert_eq!(event.timeout, Some(timeout));
     }
 
+    // `poll` and its event exist only on x86_64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn capture_poll_keeps_outputs_on_eintr() {
         let fds = [PollFd {
@@ -1338,6 +1387,8 @@ mod tests {
         assert_eq!(event.fds.as_deref(), Some(&fds[..]));
     }
 
+    // `poll` and its event exist only on x86_64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn early_einval_does_not_read_or_allocate_pollfds() {
         let event = capture_poll_event(
@@ -1434,6 +1485,8 @@ mod tests {
         );
     }
 
+    // `poll` and its event exist only on x86_64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn capture_poll_preserves_ready_fds() {
         let fds = [PollFd {
@@ -1455,6 +1508,8 @@ mod tests {
         assert_eq!(event.fds.unwrap()[0].revents, PollFlags::POLLIN);
     }
 
+    // `poll` and its event exist only on x86_64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn capture_poll_keeps_the_result_on_an_error_return() {
         // The defect this fixes: the old `result.and_then(..)` recorded NOTHING
@@ -1468,6 +1523,8 @@ mod tests {
         assert!(event.fds.is_none());
     }
 
+    // `poll` and its event exist only on x86_64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn capture_poll_early_error_does_not_read_or_allocate_pollfds() {
         // EINVAL must not trigger the best-effort read. An earlier attempt on

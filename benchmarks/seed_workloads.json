@@ -1,0 +1,159 @@
+{
+  "comment": "Seed suite: REPORT rows 1-16 and 20. Full, unshrunk cell programs from tests/e2e/manifests/*.yaml (program: / direct: fields). Timed by benchmarks/direct_run.py --workloads at K=1.",
+  "workloads": [
+    {
+      "name": "applications/kvm-python-examples",
+      "argv": [
+        "/bin/bash",
+        "tests/e2e/applications/kvm-python-examples.sh",
+        "--run"
+      ],
+      "prepare_script": true
+    },
+    {
+      "name": "data-handling/zstd-multithread",
+      "argv": [
+        "/bin/bash",
+        "tests/e2e/data-handling/zstd-multithread.sh",
+        "--run"
+      ],
+      "prepare_script": true
+    },
+    {
+      "name": "language-runtimes/example-python-random",
+      "argv": [
+        "/usr/bin/python3",
+        "examples/rand.py"
+      ]
+    },
+    {
+      "name": "applications/timed-progress-bar",
+      "argv": [
+        "/usr/bin/python3",
+        "examples/timed-progress-bar.py"
+      ]
+    },
+    {
+      "name": "language-runtimes/python-io-subprocess-time",
+      "argv": [
+        "/bin/bash",
+        "tests/e2e/language-runtimes/python-io-subprocess-time.sh",
+        "--run"
+      ],
+      "prepare_script": true
+    },
+    {
+      "name": "applications/c-toolchain-workflow",
+      "argv": [
+        "/bin/bash",
+        "tests/e2e/applications/c-toolchain-workflow.sh",
+        "--run"
+      ],
+      "prepare_script": true
+    },
+    {
+      "name": "applications/git-repository-workflow",
+      "argv": [
+        "/bin/bash",
+        "tests/e2e/applications/git-repository-workflow.sh",
+        "--run"
+      ],
+      "prepare_script": true
+    },
+    {
+      "name": "data-handling/archive-roundtrip",
+      "argv": [
+        "/bin/bash",
+        "tests/e2e/data-handling/archive-roundtrip.sh",
+        "--run"
+      ],
+      "prepare_script": true
+    },
+    {
+      "name": "data-handling/jq-json-transform",
+      "argv": [
+        "/bin/bash",
+        "tests/e2e/data-handling/jq-json-transform.sh",
+        "--run"
+      ],
+      "prepare_script": true
+    },
+    {
+      "name": "data-handling/shell-pipeline",
+      "argv": [
+        "/bin/bash",
+        "tests/e2e/data-handling/shell-pipeline.sh",
+        "--run"
+      ],
+      "prepare_script": true
+    },
+    {
+      "name": "data-handling/sqlite-query-determinism",
+      "argv": [
+        "/bin/bash",
+        "tests/e2e/data-handling/sqlite-query-determinism.sh",
+        "--run"
+      ],
+      "prepare_script": true
+    },
+    {
+      "name": "determinism-stress/process-chains",
+      "argv": [
+        "/bin/bash",
+        "tests/e2e/determinism-stress/process-chains.sh",
+        "--run"
+      ],
+      "prepare_script": true
+    },
+    {
+      "name": "determinism-stress/thread-contention",
+      "argv": [
+        "/bin/bash",
+        "tests/e2e/determinism-stress/thread-contention.sh",
+        "--run"
+      ],
+      "prepare_script": true
+    },
+    {
+      "name": "language-runtimes/node-v8-jit",
+      "argv": [
+        "/bin/bash",
+        "tests/e2e/language-runtimes/node-v8-jit.sh",
+        "--run"
+      ],
+      "prepare_script": true
+    },
+    {
+      "name": "language-runtimes/cpp-stl-determinism",
+      "argv": [
+        "/bin/bash",
+        "tests/e2e/language-runtimes/cpp-stl-determinism.sh",
+        "--run"
+      ],
+      "prepare_script": true
+    },
+    {
+      "name": "language-runtimes/perl-hash-order",
+      "argv": [
+        "/bin/bash",
+        "tests/e2e/language-runtimes/perl-hash-order.sh",
+        "--run"
+      ],
+      "prepare_script": true
+    },
+    {
+      "name": "determinism-stress/thread-interleaving",
+      "prepare_argv": [
+        "cc",
+        "-O2",
+        "-pthread",
+        "-o",
+        "{OUTPUT_DIR}/thread_interleaving",
+        "tests/chaos/thread_interleaving.c"
+      ],
+      "argv": [
+        "{OUTPUT_DIR}/thread_interleaving"
+      ]
+    }
+  ]
+}

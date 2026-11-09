@@ -172,10 +172,61 @@ static int check_semantic_advice(
   return 0;
 }
 
+/* Every backend answers a hint as Linux does (mm/madvise.c): success over a
+ * mapped range, ENOMEM over a range with an unmapped page, EINVAL for an
+ * unaligned start and success for a zero length, wherever it points.
+ * Recording is the exception: Hermit's record/replay mode answers every hint
+ * that passes the argument checks with success, without asking the kernel,
+ * so under --record the two ranges with an unmapped page succeed
+ * (https://github.com/rrnewton/hermit/issues/4686). */
+static int check_hint_answers(size_t page_size, bool record) {
+  unsigned char* pages = mmap(
+      NULL,
+      2 * page_size,
+      PROT_READ | PROT_WRITE,
+      MAP_PRIVATE | MAP_ANONYMOUS,
+      -1,
+      0);
+  if (pages == MAP_FAILED) {
+    return 1;
+  }
+  unsigned char* unmapped = pages + page_size;
+  if (munmap(unmapped, page_size) != 0) {
+    return 2;
+  }
+  pages[0] = 0x3c;
+  const int hints[] = {MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED};
+  for (size_t i = 0; i < sizeof(hints) / sizeof(hints[0]); i++) {
+    if (madvise(pages, page_size, hints[i]) != 0 ||
+        madvise(unmapped, 0, hints[i]) != 0) {
+      fprintf(stderr, "hint %d failed: errno %d\n", hints[i], errno);
+      return 3;
+    }
+    if (record) {
+      if (madvise(pages, 2 * page_size, hints[i]) != 0 ||
+          madvise(unmapped, page_size, hints[i]) != 0) {
+        fprintf(stderr, "recorded hint %d failed: errno %d\n", hints[i], errno);
+        return 4;
+      }
+    } else if (
+        expect_errno(pages, 2 * page_size, hints[i], ENOMEM) ||
+        expect_errno(unmapped, page_size, hints[i], ENOMEM)) {
+      return 4;
+    }
+    if (expect_errno(pages + 1, page_size, hints[i], EINVAL)) {
+      return 6;
+    }
+  }
+  if (pages[0] != 0x3c || munmap(pages, page_size) != 0) {
+    return 5;
+  }
+  return 0;
+}
+
 /* KVM implements MADV_DONTNEED for anonymous memory: private pages read back
  * as zeros and shared ones keep their contents. It refuses the advice with
  * ENOSYS, changing nothing, for a private file copy it cannot read again, and
- * still refuses the other guest-visible advice. */
+ * refuses the fork and core-dump advice it does not implement. */
 static int check_kvm_advice(
     const char* path,
     unsigned char* anonymous,
@@ -215,8 +266,17 @@ static int check_kvm_advice(
       file_mapping[1] != changed) {
     return 6;
   }
-  if (expect_errno(anonymous, page_size, MADV_DONTFORK, ENOSYS)) {
-    return 7;
+  const int refused[] = {
+      MADV_DONTFORK,
+      MADV_DOFORK,
+      MADV_DONTDUMP,
+      MADV_DODUMP,
+      MADV_WIPEONFORK,
+      MADV_KEEPONFORK};
+  for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); i++) {
+    if (expect_errno(anonymous, page_size, refused[i], ENOSYS)) {
+      return 7;
+    }
   }
   if (munmap(file_mapping, page_size) != 0 || munmap(shared, page_size) != 0 ||
       close(fd) != 0) {
@@ -227,6 +287,7 @@ static int check_kvm_advice(
 
 int main(int argc, char** argv) {
   const bool kvm = argc == 2 && strcmp(argv[1], "--kvm") == 0;
+  const bool record = argc == 2 && strcmp(argv[1], "--record") == 0;
   const long page_size_raw = sysconf(_SC_PAGESIZE);
   if (page_size_raw <= 0) {
     return 10;
@@ -253,6 +314,10 @@ int main(int argc, char** argv) {
       expect_errno(anonymous, page_size, INT_MAX, EINVAL) ||
       expect_errno(anonymous + 1, 0, MADV_FREE, EINVAL)) {
     return 13;
+  }
+
+  if (check_hint_answers(page_size, record)) {
+    return 16;
   }
 
   if (kvm) {

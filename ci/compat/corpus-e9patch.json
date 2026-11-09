@@ -186,6 +186,8 @@
   {
    "label": "python3",
    "argv": [
+    "env",
+    "PYTHONDONTWRITEBYTECODE=1",
     "/usr/bin/python3",
     "-c",
     "print(42)"
@@ -1062,7 +1064,8 @@
     "-d",
     "1",
     "2"
-   ]
+   ],
+   "proc": "standard"
   },
   {
    "label": "pidstat-disk",
@@ -1111,7 +1114,8 @@
     "--noheadings",
     "--output",
     "IRQ,TOTAL,NAME"
-   ]
+   ],
+   "proc": "standard"
   },
   {
    "label": "mpstat-softirqs",
@@ -1154,7 +1158,8 @@
    "argv": [
     "/usr/bin/vmstat",
     "-s"
-   ]
+   ],
+   "proc": "standard"
   },
   {
    "label": "top",

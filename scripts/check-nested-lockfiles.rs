@@ -895,6 +895,7 @@ esac
                     .iter()
                     .map(|workspace| format!("{workspace}/Cargo.toml")),
             )
+            .chain(std::iter::once("reverie/Cargo.toml".to_owned()))
             .chain(std::iter::once("agent-utils/rs/Cargo.toml".to_owned()))
             .collect::<BTreeSet<_>>();
         assert_eq!(
@@ -1084,11 +1085,12 @@ esac
             let rows = journal.lines().collect::<Vec<_>>();
             assert_eq!(
                 rows.len(),
-                7,
-                "all six Cargo operations plus offline: {journal}"
+                8,
+                "all seven Cargo operations plus offline: {journal}"
             );
-            for (row, prefix) in rows[..6].iter().zip([
+            for (row, prefix) in rows[..7].iter().zip([
                 "fetch:Cargo.toml:",
+                "fetch:reverie/Cargo.toml:",
                 "fetch:liteinst-runtime-build/Cargo.toml:",
                 "fetch:",
                 "metadata:",
@@ -1103,16 +1105,16 @@ esac
                 );
                 assert!(row.ends_with(&suffix), "{environment:?}: {journal}");
             }
-            assert!(rows[2].contains("/agent-utils/rs/Cargo.toml:"), "{journal}");
+            assert!(rows[3].contains("/agent-utils/rs/Cargo.toml:"), "{journal}");
             assert!(
-                rows[5].contains("/hermit-rust-script-packages."),
+                rows[6].contains("/hermit-rust-script-packages."),
                 "{journal}"
             );
             let original = environment
                 .iter()
                 .find(|(key, _)| *key == "CARGO_HTTP_PROXY");
             assert_eq!(
-                rows[6],
+                rows[7],
                 format!(
                     "offline:{}:{}",
                     if original.is_some() { "x" } else { "" },
@@ -1143,10 +1145,10 @@ esac
                     "{config:?} {configured_cwd}: {output:?}\n{journal}"
                 );
                 let rows = journal.lines().collect::<Vec<_>>();
-                assert_eq!(rows.len(), 7, "{journal}");
-                for (index, row) in rows[..6].iter().enumerate() {
+                assert_eq!(rows.len(), 8, "{journal}");
+                for (index, row) in rows[..7].iter().enumerate() {
                     let explicit_config =
-                        (index == 2) == (configured_cwd == "FIXTURE_NEUTRAL_CARGO_CONFIG");
+                        (index == 3) == (configured_cwd == "FIXTURE_NEUTRAL_CARGO_CONFIG");
                     let suffix = if explicit_config {
                         "::::"
                     } else {
@@ -1157,7 +1159,7 @@ esac
                         "{configured_cwd} row {index}: {journal}"
                     );
                 }
-                assert_eq!(rows[6], "offline::");
+                assert_eq!(rows[7], "offline::");
             }
         }
     }
@@ -1231,15 +1233,15 @@ esac
         let journal = fs::read_to_string(&proxy_journal).unwrap_or_default();
         assert!(output.status.success(), "{output:?}\n{journal}");
         let rows = journal.lines().collect::<Vec<_>>();
-        assert_eq!(rows.len(), 7, "{journal}");
-        for row in &rows[..6] {
+        assert_eq!(rows.len(), 8, "{journal}");
+        for row in &rows[..7] {
             assert!(
                 row.ends_with(":x:https://environment.invalid::"),
                 "{journal}"
             );
         }
-        assert!(rows[2].contains("/agent-utils/rs/Cargo.toml:"), "{journal}");
-        assert_eq!(rows[6], "offline::");
+        assert!(rows[3].contains("/agent-utils/rs/Cargo.toml:"), "{journal}");
+        assert_eq!(rows[7], "offline::");
     }
 
     fn install_rustup_fixture(fixture: &ProductionFixture, hardlink: bool) {
@@ -1321,7 +1323,7 @@ fi
                 assert!(output.status.success(), "{output:?}\n{journal}");
                 let proxy_journal = fs::read_to_string(&proxies).unwrap();
                 let rows = proxy_journal.lines().collect::<Vec<_>>();
-                assert_eq!(rows.len(), 7, "{proxy_journal}");
+                assert_eq!(rows.len(), 8, "{proxy_journal}");
                 if explicit_stable {
                     assert!(!journal.contains("nightly:"), "{journal}");
                     assert!(!journal.contains("-Zunstable-options"), "{journal}");
@@ -1329,7 +1331,7 @@ fi
                         String::from_utf8_lossy(&output.stderr)
                             .contains("applying no proxy default")
                     );
-                    for row in &rows[..6] {
+                    for row in &rows[..7] {
                         assert!(row.ends_with("::::"), "{proxy_journal}");
                     }
                 } else {
@@ -1357,9 +1359,9 @@ fi
                     } else {
                         "::::"
                     };
-                    assert!(rows[2].ends_with(expected), "{proxy_journal}");
+                    assert!(rows[3].ends_with(expected), "{proxy_journal}");
                 }
-                assert_eq!(rows[6], "offline::");
+                assert_eq!(rows[7], "offline::");
             }
         }
     }
@@ -1387,13 +1389,13 @@ fi
             );
             let journal = fs::read_to_string(&proxies).unwrap();
             let rows = journal.lines().collect::<Vec<_>>();
-            assert_eq!(rows.len(), 7, "{journal}");
+            assert_eq!(rows.len(), 8, "{journal}");
             let present = if explicit_proxy.is_some() { "x" } else { "" };
             let value = explicit_proxy.unwrap_or("");
-            for row in &rows[..6] {
+            for row in &rows[..7] {
                 assert!(row.ends_with(&format!(":{present}:{value}::")), "{journal}");
             }
-            assert_eq!(rows[6], format!("offline:{present}:{value}"));
+            assert_eq!(rows[7], format!("offline:{present}:{value}"));
         }
     }
 
@@ -1505,10 +1507,10 @@ fi
                 }
                 let proxy_journal = fs::read_to_string(&proxies).unwrap();
                 let rows = proxy_journal.lines().collect::<Vec<_>>();
-                assert_eq!(rows.len(), 7, "{proxy_journal}");
-                for (index, row) in rows[..6].iter().enumerate() {
+                assert_eq!(rows.len(), 8, "{proxy_journal}");
+                for (index, row) in rows[..7].iter().enumerate() {
                     let expected = explicit_proxy.or_else(|| {
-                        (index != 2 && config == "{}").then_some("https://environment.invalid")
+                        (index != 3 && config == "{}").then_some("https://environment.invalid")
                     });
                     let present = if expected.is_some() { "x" } else { "" };
                     assert!(
@@ -1521,7 +1523,7 @@ fi
                 }
                 let present = if explicit_proxy.is_some() { "x" } else { "" };
                 assert_eq!(
-                    rows[6],
+                    rows[7],
                     format!("offline:{present}:{}", explicit_proxy.unwrap_or(""))
                 );
                 let operations = fs::read_to_string(&fixture.journal).unwrap();

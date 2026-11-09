@@ -148,6 +148,20 @@ pub fn cpuid_faulting_absent(syscall: Result<(), i32>, advertised: Option<bool>)
     syscall == Err(libc::ENODEV) && advertised == Some(false)
 }
 
+/// Only x86 has a CPUID instruction for the kernel to fault, so CPUID faulting
+/// is absent everywhere else.
+#[cfg(not(target_arch = "x86_64"))]
+fn probe_cpuid_faulting() -> CapabilityVerdict {
+    CapabilityVerdict {
+        present: false,
+        evidence: format!(
+            "{} has no CPUID instruction to fault",
+            std::env::consts::ARCH
+        ),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 fn probe_cpuid_faulting() -> CapabilityVerdict {
     let syscall = arch_prctl_set_cpuid_off();
     let advertised = cpuinfo_advertises_cpuid_fault();
@@ -167,6 +181,7 @@ fn probe_cpuid_faulting() -> CapabilityVerdict {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn arch_prctl_set_cpuid_off() -> Result<(), i32> {
     const ARCH_SET_CPUID: libc::c_int = 0x1012;
     // SAFETY: the child performs one syscall and `_exit`s; it never returns into Rust.
@@ -196,6 +211,7 @@ fn arch_prctl_set_cpuid_off() -> Result<(), i32> {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn cpuinfo_advertises_cpuid_fault() -> Option<bool> {
     let text = std::fs::read_to_string("/proc/cpuinfo").ok()?;
     Some(text.split_whitespace().any(|word| word == "cpuid_fault"))

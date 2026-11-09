@@ -123,7 +123,7 @@ pub unsafe fn serialize_dirents64(dents: &[Dirent64], bytes: &mut [u8]) -> usize
                 // NOTE: name is null-terminated with the man page
                 // explicitly warning against other methods to read
                 // d_name besides strlen(): https://man7.org/linux/man-pages/man3/readdir.3.html
-                strlen(ent.name.as_ptr() as *const i8),
+                strlen(ent.name.as_ptr() as *const libc::c_char),
             );
             k += reclen as isize;
             i += 1;
@@ -188,7 +188,7 @@ pub unsafe fn serialize_dirents(dents: &[Dirent64], bytes: &mut [u8]) -> usize {
             ptr::copy_nonoverlapping(
                 ent.name.as_ptr(),
                 dirp.offset(j),
-                strlen(ent.name.as_ptr() as *const i8),
+                strlen(ent.name.as_ptr() as *const libc::c_char),
             );
             j = reclen as isize - 1;
             ptr::write(dirp.offset(j).cast::<u8>(), ent.ty);
@@ -207,6 +207,10 @@ pub(crate) enum DirentFormat {
     Dirent64,
     /// `struct linux_dirent`, returned by the legacy `getdents`: `d_type` is
     /// the last byte of the record.
+    #[cfg_attr(
+        not(target_arch = "x86_64"),
+        allow(dead_code, reason = "only x86_64 has the legacy getdents")
+    )]
     Legacy,
 }
 
@@ -377,6 +381,13 @@ fn compare_dir_entries(a: &DirEntry, b: &DirEntry) -> std::cmp::Ordering {
 pub(crate) enum DirectoryOrder {
     NameBytes,
     ProcfsIds,
+    /// A process's directory, or a thread's (`thread`), which Detcore lists
+    /// from its model in Linux's order (`procfs::levels::process_entry_rank`,
+    /// package K slice K10): `.` and `..` first, then by the table's order, a
+    /// name it does not have last, by its bytes.
+    ProcessEntries {
+        thread: bool,
+    },
 }
 
 impl DirectoryOrder {
@@ -403,6 +414,19 @@ impl DirectoryOrder {
                 }
                 key(&a.name).cmp(&key(&b.name))
             }
+            Self::ProcessEntries { thread } => {
+                let key = |name: &[u8]| -> (u8, usize, Vec<u8>) {
+                    match name {
+                        b"." => (0, 0, Vec::new()),
+                        b".." => (1, 0, Vec::new()),
+                        _ => match crate::procfs::levels::process_entry_rank(thread, name) {
+                            Some(rank) => (2, rank, Vec::new()),
+                            None => (3, 0, name.to_vec()),
+                        },
+                    }
+                };
+                key(&a.name).cmp(&key(&b.name))
+            }
         }
     }
 }
@@ -420,8 +444,16 @@ impl DirectoryOrder {
 /// Like the kernel's file position, the stream is shared by every descriptor
 /// that aliases the open file description through `dup` or `fork`.
 ///
-/// A descriptor Detcore does not track (one received through `SCM_RIGHTS`, for
-/// example) can alias the same open file and read it from the kernel position.
+/// A descriptor Detcore does not track (one received through `SCM_RIGHTS` and
+/// not recorded, `Detcore::record_received_descriptors`) can alias the same
+/// open file and read it from the kernel position. A received descriptor
+/// whose send Detcore queued joins the open file its sender's table modeled,
+/// and shares its stream (ptrace and KVM, `crate::syscalls::scm_rights`). Any
+/// other that Detcore records or discovers is a second model of the open
+/// file, with a stream and position of its own, even where the receiving
+/// process holds the original (one received through a socket whose peer
+/// Detcore does not know, and the in-guest backends,
+/// <https://github.com/rrnewton/hermit/issues/4670>).
 /// The stream keeps that position where such a reader gets every entry the
 /// stream has not returned (see [`DirectoryStream::kernel_target`]). Such a
 /// reader can also get entries the stream already returned, which Linux never
@@ -1332,6 +1364,42 @@ mod test {
         assert_eq!(
             names(&stream.next_batch(DirentFormat::Dirent64, 1024).unwrap()),
             ["2", "10", "0", "03", "15x", "2147483648"]
+        );
+    }
+
+    /// A process's or a thread's directory lists in Linux's table order, not
+    /// by bytes: the dots first, then `tgid_base_stuff` or `tid_base_stuff`,
+    /// and a name the table does not have last (package K slice K10).
+    #[test]
+    fn process_entries_keep_the_tables_order() {
+        let listed = |thread| {
+            let mut stream = DirectoryStream::default();
+            stream.install(
+                [
+                    "status", "zz", "fd", "..", "task", "children", "cwd", ".", "aa",
+                ]
+                .into_iter()
+                .map(entry)
+                .collect(),
+                DirectoryOrder::ProcessEntries { thread },
+            );
+            let batch = stream.next_batch(DirentFormat::Dirent64, 1024).unwrap();
+            names(&batch)
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            listed(false),
+            [
+                ".", "..", "task", "fd", "status", "cwd", "aa", "children", "zz"
+            ]
+        );
+        assert_eq!(
+            listed(true),
+            [
+                ".", "..", "fd", "status", "children", "cwd", "aa", "task", "zz"
+            ]
         );
     }
 

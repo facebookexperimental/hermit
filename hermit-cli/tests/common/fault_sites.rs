@@ -340,7 +340,7 @@ fn inspect(file_name: &str, text: &str) -> Result<Sites, String> {
             sites.declarations.insert(token_key(&function.sig.ident));
         }
     }
-    if file_name == "main.rs" {
+    if file_name == "mod.rs" {
         let declarations = file
             .items
             .iter()
@@ -372,7 +372,43 @@ fn inspect(file_name: &str, text: &str) -> Result<Sites, String> {
     Ok(sites)
 }
 
-/// A conservative source universe: every Rust file under the binary directory.
+/// Bind the library's one unconditional public app module to this inventory.
+/// This exact declaration does not grant any source-path exemption inside the
+/// app: inspect still refuses arbitrary #[path] and include! indirection.
+pub fn binds_shared_app(text: &str) -> bool {
+    let Ok(file) = syn::parse_file(text) else {
+        return false;
+    };
+    let declarations = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Mod(item) if ident_is(&item.ident, "app") => Some(item),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [module] = declarations.as_slice() else {
+        return false;
+    };
+    if module.content.is_some() || !matches!(module.vis, syn::Visibility::Public(_)) {
+        return false;
+    }
+    let [attribute] = module.attrs.as_slice() else {
+        return false;
+    };
+    let syn::Meta::NameValue(path) = &attribute.meta else {
+        return false;
+    };
+    let Expr::Lit(value) = &path.value else {
+        return false;
+    };
+    path_is(&path.path, "path")
+        && value.attrs.is_empty()
+        && matches!(&value.lit, syn::Lit::Str(value) if value.value() == "bin/hermit/mod.rs")
+}
+
+/// A conservative source universe: every Rust file under the app directory,
+/// including both the shared module root and the thin executable entrypoint.
 /// Fail on filesystem indirection/read errors. The AST pass rejects include!
 /// and #[path]; arbitrary macro expansion/synthesized identifiers are not proven.
 pub fn source_inventory(root: &Path) -> Result<BTreeMap<String, String>, String> {
@@ -427,8 +463,10 @@ pub fn source_inventory(root: &Path) -> Result<BTreeMap<String, String>, String>
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let mut files = BTreeMap::new();
     walk(&root, &root, &mut files)?;
-    if !files.contains_key("main.rs") {
-        return Err("source inventory lacks main.rs".into());
+    for required in ["main.rs", "mod.rs"] {
+        if !files.contains_key(required) {
+            return Err(format!("source inventory lacks {required}"));
+        }
     }
     Ok(files)
 }

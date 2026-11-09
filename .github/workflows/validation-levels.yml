@@ -109,9 +109,22 @@ jobs:
     env:
       DETCORE_TEST_RUST_LOG: "off"
     steps:
+      - name: Guard — refuse untrusted actor on self-hosted runner
+        env:
+          GUARD_ACTOR: ${{ github.actor }}
+        run: |
+          case "$GUARD_ACTOR" in
+            hermit-bot3|rrnewton) echo "runner-trust: actor $GUARD_ACTOR is allow-listed" ;;
+            *) echo "::error::runner-trust: actor '$GUARD_ACTOR' is not allow-listed for self-hosted runners (allowlist: hermit-bot3, rrnewton)"; exit 1 ;;
+          esac
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           submodules: recursive
+      - name: Guard — verify commit authors before running code
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+        run: bash scripts/check-runner-trust.sh
       - uses: actions/setup-go@v5
         with:
           go-version: stable
@@ -211,9 +224,22 @@ jobs:
     env:
       DETCORE_TEST_RUST_LOG: "off"
     steps:
+      - name: Guard — refuse untrusted actor on self-hosted runner
+        env:
+          GUARD_ACTOR: ${{ github.actor }}
+        run: |
+          case "$GUARD_ACTOR" in
+            hermit-bot3|rrnewton) echo "runner-trust: actor $GUARD_ACTOR is allow-listed" ;;
+            *) echo "::error::runner-trust: actor '$GUARD_ACTOR' is not allow-listed for self-hosted runners (allowlist: hermit-bot3, rrnewton)"; exit 1 ;;
+          esac
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           submodules: recursive
+      - name: Guard — verify commit authors before running code
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+        run: bash scripts/check-runner-trust.sh
       - name: Dependencies
         run: |
           if command -v dnf >/dev/null; then

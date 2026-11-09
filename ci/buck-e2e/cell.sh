@@ -16,6 +16,13 @@
 #        CELL_DEADLINE_S           optional cap on the harness wall time
 #                                  (default: Tpx timeout - 30 s; Tpx returns no
 #                                  artifacts at all from an RE action it kills)
+#        CELL_BUNDLE_MODE          pinned-root bundle preparation: "shared"
+#                                  (default) binds the staged bundle read-only
+#                                  into the container as an overlay lower, so
+#                                  per-cell writes copy up to a per-cell upper
+#                                  and never reach the shared bundle; "copy" is
+#                                  the previous per-cell reflink copy, kept so
+#                                  the two can be compared by CELL_BUNDLE_PREP_NS
 #        HERMIT_E2E_KVM_SLOTS      how many local KVM cells may run at once on this host
 #                                  (default 16; see acquire_kvm_slot)
 #        HERMIT_E2E_KVM_SLOT_DIR   where their slot files live
@@ -176,6 +183,13 @@ PY
     for fd in "${fds[@]}"; do exec {fd}>&-; done
 }
 
+bundle_mode=${CELL_BUNDLE_MODE:-shared}
+case $bundle_mode in
+copy | shared) ;;
+*) emit_fatal "CELL_BUNDLE_MODE must be copy or shared, not '$bundle_mode'" ;;
+esac
+bundle_prep_ns=0 bundle_prep_start_ns=0 bundle_prep_end_ns=0
+
 out=$W/out
 case $container in
 "")
@@ -203,7 +217,7 @@ case $container in
         HERMIT_BIN="$B/hermit/hermit" HERMIT_INSTALL_DIR="$B/hermit/install" "${bundle_env[@]}" \
         timeout --kill-after=10 "$deadline" \
         "$B/bin/test-harness" run --repo-root "$B/src" --source-sha "$SHA" \
-        --test "$TEST" --mode "$MODE" --backend "$BACKEND" --prebuilt --no-retry \
+        --test "$TEST" --mode "$MODE" --backend "$BACKEND" --prebuilt \
         --results "$out/results.jsonl" --junit "$out/junit.xml" --tpx-json "$out/tpx.jsonl" \
         "${extra[@]}" "$@" >"$W/harness.stdout" 2>"$W/harness.stderr" 9>&-
     harness_rc=$?
@@ -216,19 +230,80 @@ pinned-root)
         emit_fatal "HERMIT_E2E_CONTAINER=pinned-root needs a local route, not '${HERMIT_E2E_ROUTE:-}'"
     wrapper=$B/src/ci/hermetic/run-in-pinned-root.sh
     [[ -x $wrapper ]] || emit_fatal "the bundle source has no executable ci/hermetic/run-in-pinned-root.sh"
-    "$wrapper" --check-image >"$W/check-image.log" 2>&1 ||
-        emit_fatal "pinned-root image unavailable: $(tr '\n' ' ' <"$W/check-image.log")(build it with ci/hermetic/build-image.sh)"
+    probe_rc=0
+    "$wrapper" --check-image >"$W/check-image.log" 2>&1 || probe_rc=$?
+    if ((probe_rc != 0)); then
+        # The image probe is infrastructure, not the cell's test: synthesize
+        # harness-shaped outputs so the shared tail publishes an explicit
+        # ERROR row (plus result.json with a producer completion) for this
+        # cell, instead of the missing cell an early exit leaves behind —
+        # ingest counts a cell with no result.json as absent, not failed.
+        out=$W/out
+        mkdir -p "$out"
+        : >"$W/harness.stdout"
+        {
+            printf 'pinned-root image unavailable (infra probe rc=%s):\n' "$probe_rc"
+            cat "$W/check-image.log"
+        } >"$W/harness.stderr"
+        python3 - "$out" "$TEST" "$MODE" "$BACKEND" "$run_id" "$probe_rc" <<'PY'
+import json, sys
+out, test, mode, backend, run_id, rc = sys.argv[1:7]
+reason = (f"pinned-root image unavailable: the --check-image infra probe "
+          f"failed with rc={rc} before the harness ran (see harness.stderr)")
+with open(f"{out}/results.jsonl", "w") as f:
+    f.write(json.dumps({"test": test, "mode": mode, "backend": backend,
+                        "outcome": "ERROR", "attempt": 1, "run_id": run_id}) + "\n")
+with open(f"{out}/tpx.jsonl", "w") as f:
+    f.write(json.dumps({"op": "test_done", "test": f"{test}/{mode}@{backend}",
+                        "status": "failed",
+                        "details": json.dumps({"outcome": "ERROR", "reason": reason})}) + "\n")
+with open(f"{out}/junit.xml", "w") as f:
+    f.write("<testsuite/>\n")
+PY
+        harness_rc=$probe_rc
+    else
     # /src is mounted read-write, as in the cargo flow (--src-rw): hermit writes its
     # private verify and engagement summaries into its working directory, the bundle's
-    # src/, when no enclosing git checkout ignores `ignored/`. /src/bundle is therefore
-    # a private copy (a reflink on btrfs, about 1 s), never hard links, so nothing in
-    # buck-out is written. The mountpoints the wrapper adds under /src are created first.
+    # src/, when no enclosing git checkout ignores `ignored/`. Nothing in buck-out may
+    # be written. The mountpoints the wrapper adds under /src are created first.
+    #
+    # A host-side bind or overlay at $R/bundle is impossible in this cell's mount
+    # context: cell.sh runs unprivileged on the host (no CAP_SYS_ADMIN, and Buck/Tpx
+    # may sandbox it further), and the wrapper bind-mounts $R at /src with private
+    # propagation, so a mount cell.sh could create would not reliably appear in the
+    # container. The privileged container is the mount context that can hold an
+    # overlay, so in shared mode the wrapper binds the staged bundle read-only at
+    # /bundle-lower (--bundle-lower) and the container prologue below mounts a
+    # writable overlay over /src/bundle with that as its lower layer and its upper
+    # and work directories on the per-cell scratch under /src
+    # (.bundle-upper/.bundle-work, i.e. $R on the host). Every write then copies up
+    # into the upper and never reaches the shared bundle. If the overlay mount fails
+    # in the container, the prologue reflink-copies /bundle-lower into /src/bundle
+    # before the harness runs. In copy mode the host reflink copy (about 1 s on
+    # btrfs) is the bundle, exactly as before.
+    #
+    # The lower layer must not be a hard-linked copy of the bundle (cp -al, as it
+    # was from 3febe765 to 2026-11-02): overlayfs reports a lower file's own link
+    # count (fs/overlayfs/inode.c ovl_getattr), Detcore passes a regular file's link
+    # count through as the guest-visible fact it is, and every live cell's copy was
+    # one more link to the same inodes. A guest's stat of a bundle file then said
+    # nlink=164 in run 1 and nlink=167 in run 2 of one cell, as other cells started;
+    # that was the first divergence of 810 of the 813 non-passing Buck observations
+    # in the full validate of cd856249.
     R=$W/root
     mkdir -p "$R/target" "$R/agent-utils/rs/target" "$R/agent-utils/rs/.agent-utils-locks" \
         "$R/agent-utils/rs/.agent-utils-snapshots" "$W/results/buck-cell-out" "$W/pinned" ||
         emit_fatal "cannot create the pinned-root scratch tree"
-    cp -a --reflink=auto "$B" "$R/bundle" ||
-        emit_fatal "cannot place the bundle in the pinned-root scratch tree"
+    bundle_prep_start_ns=$(date +%s%N)
+    if [[ $bundle_mode == copy ]]; then
+        cp -a --reflink=auto "$B" "$R/bundle" ||
+            emit_fatal "cannot place the bundle in the pinned-root scratch tree"
+    else
+        mkdir -p "$R/bundle" "$R/.bundle-upper" "$R/.bundle-work" ||
+            emit_fatal "cannot create the pinned-root bundle overlay scratch"
+    fi
+    bundle_prep_end_ns=$(date +%s%N)
+    bundle_prep_ns=$((bundle_prep_end_ns - bundle_prep_start_ns))
     # DynamoRIO's private loader loads the DBT client's own libc, libm and libgcc_s. It
     # searches the client's RPATH and directory, LD_LIBRARY_PATH and /lib, /lib64,
     # /usr/lib64..., not the paths the image's nix loader knows, so in the container it
@@ -253,15 +328,49 @@ printf "%s\n" "$deps" | while read -r name arrow path rest; do
     esac
 done
 exec "$@"'
-    prologue=()
-    [[ $BACKEND != dbt ]] ||
+    # Shared-mode container prologue: mount the writable overlay, lower the read-only
+    # bundle bind, over the empty /src/bundle (upper/work are the per-cell scratch
+    # directories beside it under /src), then, for a DBT cell, the same library links
+    # link_dbt_runtime makes in the private copy, now in the overlay's upper. If the
+    # overlay mount fails (a container without overlay support), reflink-copy the
+    # lower into /src/bundle instead, so the cell still has a private writable bundle.
+    # Ends by exec'ing the rest of the command, like link_dbt_runtime.
+    bundle_setup='set -eu
+lower=${1%/} bundle=${2%/} backend=$3
+shift 3
+root=$(dirname "$bundle")
+upper=$root/.bundle-upper work=$root/.bundle-work
+mkdir -p "$bundle" "$upper" "$work"
+if ! mount -t overlay overlay -o "lowerdir=$lower,upperdir=$upper,workdir=$work" "$bundle" 2>/dev/null; then
+    cp -a --reflink=auto "$lower/." "$bundle/"
+fi
+if [ "$backend" = dbt ]; then
+    r=$bundle/hermit/install/rsrcs
+    link() { [ -e "$r/$2" ] || [ -L "$r/$2" ] || ln -s "$1" "$r/$2"; }
+    deps=$(ldd "$r/libreverie_dbt_client.so" "$r/libdetcore_dbt.so")
+    printf "%s\n" "$deps" | while read -r name arrow path rest; do
+        case "$arrow $path" in
+        "=> not"*) echo "cell.sh: the pinned-root image has no $name, which the DBT client needs" >&2; exit 125 ;;
+        "=> $r/"*) ;;
+        "=> /"*) link "$path" "${name##*/}" ;;
+        "("*) case $name in /*) link "$name" "${name##*/}" ;; esac ;;
+        esac
+    done
+fi
+exec "$@"'
+    prologue=() bundle_lower=()
+    if [[ $bundle_mode == shared ]]; then
+        bundle_lower=(--bundle-lower "$B")
+        prologue=(sh -c "$bundle_setup" bundle-setup /bundle-lower /src/bundle/ "$BACKEND")
+    elif [[ $BACKEND == dbt ]]; then
         prologue=(sh -c "$link_dbt_runtime" link-dbt-runtime /src/bundle/hermit/install/rsrcs)
+    fi
     # Outputs go through the wrapper's /results mount (E2E_RESULT_ROOT).
     out=$W/results/buck-cell-out
     o=/results/buck-cell-out
     # Tpx kills the cell at deadline + 30 s. The wrapper gets what is left of the deadline
-    # after the copy above, and the harness that less 15 s for starting and removing the
-    # container, so a hung container is stopped here, with its artifacts, before Tpx.
+    # after the bundle preparation above, and the harness that less 15 s for starting and
+    # removing the container, so a hung container is stopped here, with its artifacts, before Tpx.
     # A KVM cell's wait for a slot comes out of the same deadline.
     acquire_kvm_slot
     outer=$((deadline - ($(date +%s%N) - t0) / 1000000000))
@@ -276,7 +385,7 @@ exec "$@"'
         E2E_RESULT_ROOT="$W/results" E2E_RUN_ID="$run_id" \
         E2E_KEEP_VERIFY_LOGS=1 E2E_PARITY_POST_PASS=0 \
         timeout --kill-after=10 "$outer" \
-        "$wrapper" --src "$R" --out "$W/pinned" --src-rw \
+        "$wrapper" --src "$R" --out "$W/pinned" --src-rw "${bundle_lower[@]}" \
         --env HERMIT_E2E_EMPTY_WORKDIR --env VALIDATE_RUN_STATE --env E2E_RESULT_ROOT \
         --env E2E_RUN_ID --env E2E_KEEP_VERIFY_LOGS --env E2E_PARITY_POST_PASS \
         --env HERMIT_EPOCH -- \
@@ -284,14 +393,19 @@ exec "$@"'
         HERMIT_BIN=/src/bundle/hermit/hermit HERMIT_INSTALL_DIR=/src/bundle/hermit/install "${inner_bundle_env[@]}" \
         timeout --kill-after=10 "$deadline" \
         /src/bundle/bin/test-harness run --repo-root /src/bundle/src --source-sha "$SHA" \
-        --test "$TEST" --mode "$MODE" --backend "$BACKEND" --prebuilt --no-retry \
+        --test "$TEST" --mode "$MODE" --backend "$BACKEND" --prebuilt \
         --results "$o/results.jsonl" --junit "$o/junit.xml" --tpx-json "$o/tpx.jsonl" \
         "${extra[@]}" "$@" >"$W/harness.stdout" 2>"$W/harness.stderr" 9>&-
     harness_rc=$?
+    fi
     ;;
 *) emit_fatal "unknown HERMIT_E2E_CONTAINER '$container' (expected pinned-root or empty)" ;;
 esac
 t1=$(date +%s%N)
+if ((bundle_prep_ns > 0)); then
+    printf 'cell.sh: CELL_BUNDLE_MODE=%s CELL_BUNDLE_PREP_NS=%s bundle_prep_start_ns=%s bundle_prep_end_ns=%s\n' \
+        "$bundle_mode" "$bundle_prep_ns" "$bundle_prep_start_ns" "$bundle_prep_end_ns" >>"$W/harness.stderr"
+fi
 
 copy_errors=0
 put() { # put SRC NAME: logs over 256 KiB are zstd'd
@@ -306,7 +420,22 @@ for f in harness.stdout harness.stderr; do put "$W/$f" "$f"; done
 for f in results.jsonl junit.xml tpx.jsonl summary.json; do
     [[ -f $out/$f ]] && put "$out/$f" "$f"
 done
+# The harness owns retries, and each attempt gets its own artifact directory:
+# attempt 1 under the plain slug, a retry under "<slug>-attempt-N"
+# (runner.rs cell_artifact_path). Inside each directory the verify evidence is
+# numbered from 1 again (build_spec's attempt is "1" for a verify cell), so a
+# retried execution's evidence is its FINAL attempt's directory, judged exactly
+# as a one-attempt execution's. Copying only attempt 1's directory reads a
+# skid-overshoot-then-matched cell (attempt 1 kept no verdict, attempt 2 kept
+# only the golden log) as evidence-incomplete.
+final_attempt=$(python3 -c 'import json,os,sys
+p=sys.argv[1]
+rows=[json.loads(l) for l in open(p) if l.strip()] if os.path.exists(p) else []
+attempts=[r.get("attempt") for r in rows if isinstance(r.get("attempt"), int)]
+print(max(attempts) if attempts else 1)' "$out/results.jsonl" 2>/dev/null) || final_attempt=1
+[[ $final_attempt =~ ^[0-9]+$ ]] || final_attempt=1
 celldir="$W/results/runs/$run_id/$slug"
+((final_attempt > 1)) && celldir="$W/results/runs/$run_id/$slug-attempt-$final_attempt"
 if [[ -d $celldir ]]; then
     while IFS= read -r -d '' f; do
         rel=${f#"$celldir/"}
@@ -320,9 +449,17 @@ fi
 # run 2's), otherwise both.
 outcome=$(python3 -c 'import json,sys
 rows=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
-print(rows[-1]["outcome"] if rows else "")' "$out/results.jsonl" 2>/dev/null)
-n_run1=$(find "$A" -maxdepth 1 -name 'cell__verify-logs__*run1_log_*' | wc -l)
-n_run2=$(find "$A" -maxdepth 1 -name 'cell__verify-logs__*run2_log_*' | wc -l)
+outs=[r.get("outcome") for r in rows]
+print(next((o for o in ("PASS", "FAIL", "ERROR", "HOST-INAPPLICABLE") if o in outs), ""))' "$out/results.jsonl" 2>/dev/null)
+# The same rows as the verdict normalizer will judge them: how many, and the last one's outcome.
+rows_seen=$(python3 -c 'import json,os,sys
+p=sys.argv[1]
+rows=[json.loads(l) for l in open(p) if l.strip()] if os.path.exists(p) else []
+assert all(isinstance(r, dict) for r in rows)
+print(json.dumps({"count": len(rows), "outcome": next((o for o in ("PASS", "FAIL", "ERROR", "HOST-INAPPLICABLE") if o in [r.get("outcome") for r in rows]), None)}))' "$out/results.jsonl" 2>/dev/null) ||
+    rows_seen=unreadable
+n_run1=$(find "$A" -maxdepth 1 -name "cell__verify-logs__verify-1__run1_log_*" | wc -l)
+n_run2=$(find "$A" -maxdepth 1 -name "cell__verify-logs__verify-1__run2_log_*" | wc -l)
 n_detlogs=$((n_run1 + n_run2))
 verdict=$(python3 -c 'import json,sys
 print(json.load(open(sys.argv[1])).get("verdict") or "")' "$A/cell__verify-1.json" 2>/dev/null) || verdict=
@@ -350,6 +487,7 @@ json.dump({
     "container_reason": os.environ.get("HERMIT_E2E_CONTAINER_REASON", ""),
     "empty_workdir": "$workdir",
     "kvm_slot": "$kvm_slot", "kvm_slot_wait_ms": $kvm_slot_wait_ms,
+    "bundle_mode": "$bundle_mode", "bundle_prep_ns": $bundle_prep_ns,
     "harness_rc": $harness_rc, "outcome": "$outcome", "deadline_s": $deadline,
     "tpx_timeout_s": $tpx_timeout, "wall_ms": $(((t1 - t0) / 1000000)),
     "evidence_complete": "$evidence_complete" == "true", "missing": "${missing[*]}".split(),
@@ -367,47 +505,209 @@ for f in result.json tpx.jsonl summary.json results.jsonl harness.stderr; do
 done
 rm -rf "${W:?}"
 
-python3 - "$A/tpx.jsonl" "$CELL" "$evidence_complete" "$harness_rc" "${missing[*]}" "${HERMIT_E2E_ROUTE:-}" <<'PY'
+# Exactly one record, named for this cell, whatever the harness wrote, and the verdict on
+# the harness's output recorded for ingest.py as result.json's producer_completion. An
+# unreadable, malformed, contradictory or ambiguous payload is a failed cell and an
+# "invalid" completion: never a cell with no record (Tpx would count only the target's
+# passing "unmanaged" twin) and never a pass. The normalizer only prints: its record,
+# all_done and the completion it proposes. Only once it has exited 0 with exactly those
+# three lines does cell.sh publish the completion, by renaming a finished copy of
+# result.json over the original, so a normalizer or publication that fails at any point
+# leaves result.json without producer_completion, which ingest.py refuses.
+verdict_out=$(python3 - "$A/tpx.jsonl" "$CELL" "$evidence_complete" "$harness_rc" "${missing[*]}" "${HERMIT_E2E_ROUTE:-}" "$rows_seen" <<'PY'
 import json, os, re, sys
-path, cell, complete, rc, missing, route = sys.argv[1:7]
-records = [json.loads(l) for l in open(path) if l.strip()] if os.path.exists(path) else []
-done = [r for r in records if r.get("op") == "test_done"]
+path, cell, complete, rc, missing, route, rows_seen = sys.argv[1:8]
 
-def withheld_here(done):
-    """The cell's own record, as a skip, when the harness withheld this one cell as
-    HOST-INAPPLICABLE and failed the run only because it executed nothing; else None.
+class Invalid(Exception):
+    """The harness output breaks its contract with this cell; the reason says how."""
+
+def failed(reason):
+    details = {"outcome": "ERROR", "reason": reason}
+    return {"op": "test_done", "test": cell, "status": "failed", "details": json.dumps(details)}
+
+def details_of(record):
+    """The record's details as a dict, or None unless they are a JSON object in a string."""
+    raw = record.get("details")
+    if not isinstance(raw, str):
+        return None
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        return None
+    return value if isinstance(value, dict) else None
+
+def read_records():
+    """Every nonblank line of the payload, each a JSON object."""
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path) as f:
+            records = [json.loads(l) for l in f if l.strip()]
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        raise Invalid(f"unreadable tpx.jsonl: {error}")
+    if not all(isinstance(r, dict) for r in records):
+        raise Invalid("unreadable tpx.jsonl: a record is not a JSON object")
+    return records
+
+def read_rows():
+    """(how many rows the harness wrote, the last row's outcome or None)."""
+    try:
+        seen = json.loads(rows_seen)
+    except ValueError:
+        raise Invalid(f"harness rc={rc} wrote an unreadable results.jsonl")
+    # The harness owns retries: one execution writes one row per attempt.
+    return seen["count"], seen["outcome"]
+
+def withheld_pair(done, rows):
+    """The cell's own record when the harness withheld this one cell as HOST-INAPPLICABLE
+    and failed the run only because it executed nothing; else None. A withheld cell runs
+    nothing, so it writes no row. This is valid output on any route; withheld_here decides
+    what the route makes of it."""
+    if rows != 0 or len(done) != 2:
+        return None
+    own = [r for r in done if r.get("test") == cell]
+    run = [r for r in done if r.get("test") == "test-harness/run-verdict"]
+    if (len(own) != 1 or len(run) != 1 or own[0].get("status") != "skipped"
+            or run[0].get("status") != "failed"):
+        return None
+    details, run_details = details_of(own[0]), details_of(run[0])
+    if details is None or run_details is None:
+        return None
+    failures = run_details.get("run_failures")
+    vacuous = r"every one of the 1 selected cell\(s\) was host-inapplicable; .*"
+    if (details.get("outcome") != "HOST-INAPPLICABLE" or not isinstance(failures, list)
+            or len(failures) != 1 or not isinstance(failures[0], str)
+            or not re.fullmatch(vacuous, failures[0])):
+        return None
+    return own[0], details
+
+def withheld_here(pair):
+    """The withheld cell's record, as a skip, on a local route; else None.
 
     A local host that lacks a capability lacks it on a retry too, so the cell is
     reported skipped with the harness's reason, never as a pass. Only a local route
     qualifies: an RE worker that lacks the capability is retried on another worker."""
-    if route != "local" or len(done) != 2:
+    if route != "local" or pair is None:
+        return None
+    record, details = pair
+    reason = details.get("reason")
+    details["reason"] = "SKIP: " + (reason if isinstance(reason, str) and reason else "host-inapplicable")
+    return dict(record, details=json.dumps(details))
+
+def no_result_pair(done, rows):
+    """The cell's own record when the harness ran this one cell and got no result back:
+    it reports the cell failed with a null outcome and fails the run for exactly that
+    reason, with a nonzero exit and no row; else None."""
+    if rows != 0 or rc == "0" or len(done) != 2:
         return None
     own = [r for r in done if r.get("test") == cell]
     run = [r for r in done if r.get("test") == "test-harness/run-verdict"]
-    if len(own) != 1 or len(run) != 1 or own[0].get("status") != "skipped":
+    if (len(own) != 1 or len(run) != 1 or own[0].get("status") != "failed"
+            or run[0].get("status") != "failed"):
         return None
-    try:
-        details = json.loads(own[0]["details"])
-        failures = json.loads(run[0]["details"])["run_failures"]
-    except (KeyError, TypeError, ValueError):
+    details, run_details = details_of(own[0]), details_of(run[0])
+    if details is None or run_details is None or "outcome" not in details or details["outcome"] is not None:
         return None
-    vacuous = r"every one of the 1 selected cell\(s\) was host-inapplicable; .*"
-    if details.get("outcome") != "HOST-INAPPLICABLE" or len(failures) != 1 or not re.fullmatch(vacuous, failures[0]):
+    if run_details.get("run_failures") != ["only 0 of 1 selected cells returned a result"]:
         return None
-    details["reason"] = "SKIP: " + (details.get("reason") or "host-inapplicable")
-    return dict(own[0], details=json.dumps(details))
+    return own[0]
 
-skip = withheld_here(done)
-if skip:
-    done = [skip]
-elif len(done) != 1:
-    done = [{"op": "test_done", "test": cell, "status": "failed",
-             "details": json.dumps({"outcome": "ERROR", "reason": f"harness rc={rc} produced {len(done)} test_done records"})}]
-elif complete != "true" and done[0]["status"] == "passed":
-    details = json.loads(done[0]["details"])
-    details.update(outcome="ERROR", reason=f"evidence incomplete: {missing}")
-    done[0].update(status="failed", details=json.dumps(details))
-print(json.dumps(done[0]))
+def verdict():
+    """The one record for Tpx; raises Invalid when the harness output is invalid."""
+    rows, row_outcome = read_rows()
+    done = [r for r in read_records() if r.get("op") == "test_done"]
+    pair = withheld_pair(done, rows)
+    skip = withheld_here(pair)
+    if skip:
+        return skip
+    if pair:
+        # A withheld cell fails there; ci/buck-e2e/run reruns it locally (Tpx retries are off).
+        return failed(f"harness rc={rc} produced {len(done)} test_done records")
+    lost = no_result_pair(done, rows)
+    if lost:
+        # A failure like any other, which ingest.py keeps as the attempt it was, so a Tpx
+        # retry imports with that history.
+        return lost
+    if not done and rc != "0" and (rows == 0 or row_outcome not in ("PASS", None)):
+        # The harness died before its record (a deadline kill, a crash): a failure like any
+        # other, which ingest.py keeps as the attempt it was. Its exit status or a passing
+        # row would contradict that, so those stay invalid.
+        return failed(f"harness rc={rc} produced 0 test_done records")
+    if len(done) != 1:
+        raise Invalid(f"harness rc={rc} produced {len(done)} test_done records")
+    record = done[0]
+    if record.get("test") != cell:
+        raise Invalid(f"harness rc={rc} reported test {record.get('test')!r}, not {cell}")
+    status, details = record.get("status"), details_of(record)
+    if status not in ("passed", "failed", "skipped"):
+        raise Invalid(f"harness rc={rc} reported status {status!r}")
+    if details is None:
+        raise Invalid(f"harness rc={rc} reported {status} without JSON-object details")
+    outcome = details.get("outcome")
+    # The harness writes `passed` exactly for a PASS outcome; for one selected cell, a
+    # lone `skipped` only for a FAIL it excuses as a diagnostic (a withheld cell is the
+    # pair above); and `failed` otherwise. A null outcome comes only with the run
+    # failure no_result_pair recognizes, never alone. The row carries the record's outcome.
+    if status == "passed" and outcome != "PASS":
+        raise Invalid(f"harness rc={rc} reported a passing record with outcome {outcome!r}")
+    if status == "skipped" and outcome != "FAIL":
+        raise Invalid(f"harness rc={rc} reported a skipped record with outcome {outcome!r}")
+    if status == "failed" and not (isinstance(outcome, str) and outcome
+                                   and outcome not in ("PASS", "HOST-INAPPLICABLE")):
+        raise Invalid(f"harness rc={rc} reported a failed record with outcome {outcome!r}")
+    if outcome != (row_outcome if rows else None):
+        raise Invalid(f"harness rc={rc} reported outcome {outcome!r} but its rows say "
+                      f"{row_outcome if rows else 'nothing'!r}")
+    if status == "passed" and rc != "0":
+        raise Invalid(f"harness rc={rc} after a passing record")
+    if status == "passed" and complete != "true":
+        details.update(outcome="ERROR", reason=f"evidence incomplete: {missing}")
+        return dict(record, status="failed", details=json.dumps(details))
+    return record
+
+try:
+    record, problem = verdict(), None
+except Invalid as error:
+    record, problem = failed(str(error)), str(error)
+except Exception as error:  # a normalizer fault is the cell's failure, not a missing record
+    problem = f"harness rc={rc}: verdict normalizer error: {type(error).__name__}: {error}"
+    record = failed(problem)
+print(json.dumps(record))
 print(json.dumps({"op": "all_done"}))
+print(json.dumps({"version": 1, "status": "invalid" if problem else "valid", "reason": problem}))
 PY
+)
+normalizer_rc=$?
+mapfile -t verdict_lines <<<"$verdict_out"
+if [[ $normalizer_rc -ne 0 || ${#verdict_lines[@]} -ne 3 || ${verdict_lines[1]} != '{"op": "all_done"}' ]]; then
+    emit_fatal "verdict normalizer exited $normalizer_rc without exactly one record (harness rc=$harness_rc)"
+fi
+candidate=$(mktemp "$(dirname "$A")/hermit-cell-result.XXXXXX") ||
+    emit_fatal "cannot create a scratch result.json (harness rc=$harness_rc)"
+if ! python3 - "$A/result.json" "$candidate" "$CELL" "${verdict_lines[0]}" "${verdict_lines[2]}" <<'PY' ||
+import json, os, sys
+result_path, candidate, cell, record, completion = sys.argv[1:6]
+record, completion = json.loads(record), json.loads(completion)
+assert record["op"] == "test_done" and record["test"] == cell, record
+assert record["status"] in ("passed", "failed", "skipped"), record
+assert set(completion) == {"version", "status", "reason"} and type(completion["version"]) is int, completion
+assert completion["version"] == 1, completion
+assert ((completion["status"] == "valid" and completion["reason"] is None)
+        or (completion["status"] == "invalid" and isinstance(completion["reason"], str))), completion
+assert completion["status"] == "valid" or record["status"] == "failed", (record, completion)
+with open(result_path) as f:
+    result = json.load(f)
+assert "producer_completion" not in result, result_path
+result["producer_completion"] = completion
+with open(candidate, "w") as f:
+    json.dump(result, f, indent=1, sort_keys=True)
+    f.flush()
+    os.fsync(f.fileno())
+os.chmod(candidate, os.stat(result_path).st_mode & 0o777)
+PY
+    ! mv -f -- "$candidate" "$A/result.json"; then
+    rm -f -- "$candidate"
+    emit_fatal "cannot publish the producer completion in result.json (harness rc=$harness_rc)"
+fi
+printf '%s\n' "${verdict_lines[0]}" "${verdict_lines[1]}"
 exit 0

@@ -25,9 +25,11 @@ use hermit_manifest_plan::ci_selection::CiSelection;
 use hermit_manifest_plan::ci_selection::CiSelectionSpec;
 use hermit_manifest_plan::cli_help::is_help_flag;
 use hermit_manifest_plan::runner::ExpectedGuestExit;
+use hermit_manifest_plan::runner::ProgramResolution;
 #[cfg(test)]
 use hermit_manifest_plan::runner::REQUIRES_VOCABULARY;
 use hermit_manifest_plan::runner::requires_capability;
+use hermit_manifest_plan::runner::resolve_program;
 use hermit_manifest_plan::runner::validate_expected_guest_exit;
 use hermit_manifest_plan::runner::validate_mode_workdir;
 #[cfg(test)]
@@ -165,7 +167,9 @@ enum TestPopulation {
 
 fn parse_options(arguments: Vec<String>) -> Option<(Format, PathBuf, TestPopulation)> {
     let mut format = Format::Text;
-    let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    // Resolved after parsing so --help and explicit --root never touch
+    // the compiled-in default (absent under Buck; see compiled_manifest_dir!).
+    let mut root: Option<PathBuf> = None;
     let mut population = TestPopulation::Git;
     if matches!(arguments.as_slice(), [flag] if is_help_flag(flag)) {
         println!("{HELP}");
@@ -178,14 +182,14 @@ fn parse_options(arguments: Vec<String>) -> Option<(Format, PathBuf, TestPopulat
             if path.is_empty() {
                 die("--root requires a path");
             }
-            root = PathBuf::from(path);
+            root = Some(PathBuf::from(path));
             continue;
         }
         if let Some(path) = arg.strip_prefix("--root=") {
             if path.is_empty() {
                 die("--root requires a path");
             }
-            root = PathBuf::from(path);
+            root = Some(PathBuf::from(path));
             continue;
         }
         if arg == "--source-snapshot" {
@@ -209,6 +213,7 @@ fn parse_options(arguments: Vec<String>) -> Option<(Format, PathBuf, TestPopulat
             _ => die(format!("unknown format: {value}")),
         };
     }
+    let root = root.unwrap_or_else(|| hermit_manifest_plan::compiled_manifest_dir!().join("../.."));
     Some((format, root, population))
 }
 
@@ -311,7 +316,14 @@ fn main() {
         let location = path.file_name().unwrap().to_string_lossy().to_string();
         ensure_keys(
             &document,
-            &["schema", "bucket", "timeout_seconds", "slow_reason", "test"],
+            &[
+                "schema",
+                "bucket",
+                "timeout_seconds",
+                "slow_reason",
+                "image",
+                "test",
+            ],
             &location,
         );
 
@@ -822,13 +834,20 @@ fn validate_test_inventory(
         ));
     }
 
-    if &inventory_manifest_tests != manifest_programs {
-        let missing: Vec<_> = manifest_programs
+    // Vendored rr programs are owned by the submodule pin, not the tests/
+    // inventory; their existence is checked per manifest row instead.
+    let tests_manifest_programs: BTreeSet<_> = manifest_programs
+        .iter()
+        .filter(|program| program.starts_with("tests/"))
+        .cloned()
+        .collect();
+    if inventory_manifest_tests != tests_manifest_programs {
+        let missing: Vec<_> = tests_manifest_programs
             .difference(&inventory_manifest_tests)
             .cloned()
             .collect();
         let stale: Vec<_> = inventory_manifest_tests
-            .difference(manifest_programs)
+            .difference(&tests_manifest_programs)
             .cloned()
             .collect();
         die(format!(
@@ -1100,6 +1119,7 @@ fn cell_timeout_overrides(
     resolved
 }
 
+#[cfg(test)]
 fn is_file_or_symlink(path: &Path) -> bool {
     path.is_file()
         || std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
@@ -1186,13 +1206,19 @@ fn validate_and_expand(
             if !["sh", "c", "rs"].contains(&extension) {
                 die(format!("{id}: program `{program}` must end in .sh/.c/.rs"));
             }
-            if !program.starts_with("tests/") || program.split('/').any(|part| part == "..") {
+            // Vendored rr guests live in the pinned submodule, not tests/.
+            let below_tests =
+                program.starts_with("tests/") || program.starts_with("third-party/rr/src/test/");
+            if !below_tests || program.split('/').any(|part| part == "..") {
                 die(format!(
-                    "{id}: program must be a repo-relative path below tests/: {program}"
+                    "{id}: program must be a repo-relative path below tests/ or third-party/rr/src/test/: {program}"
                 ));
             }
             let path = repo_root.join(program);
-            if !is_file_or_symlink(&path) {
+            // Same resolver as manifest validation: a program inside a
+            // submodule this checkout leaves uninitialized is not
+            // available here, not a missing-program defect.
+            if resolve_program(repo_root, program) == ProgramResolution::Missing {
                 die(format!("{id}: program path does not exist: {program}"));
             }
             program_path = Some(path);
@@ -1215,8 +1241,13 @@ fn validate_and_expand(
     }
     if let Some(preprocessors) = test.get("preprocessors") {
         let preprocessors = string_array(Some(preprocessors), &format!("{id}.preprocessors"));
-        if preprocessors.iter().any(|value| value != "e9patch") {
-            die(format!("{id}: the only supported preprocessor is e9patch"));
+        if preprocessors
+            .iter()
+            .any(|value| !matches!(value.as_str(), "e9patch" | "rr-generated-headers"))
+        {
+            die(format!(
+                "{id}: supported preprocessors are e9patch and rr-generated-headers"
+            ));
         }
     }
     if let Some(level) = test.get("proc") {
@@ -2037,7 +2068,8 @@ mod tests {
         // NON-VACUITY. A bracket that passed against an empty corpus would prove
         // nothing, and this also pins the blast radius: if a future manifest edit
         // makes a second cell withholdable, a reviewer has to see it.
-        let manifests = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/e2e/manifests");
+        let manifests =
+            hermit_manifest_plan::compiled_manifest_dir!().join("../../tests/e2e/manifests");
         let mut documents = Vec::new();
         let mut paths: Vec<PathBuf> = std::fs::read_dir(&manifests)
             .expect("shipped manifests must be readable")
@@ -2202,7 +2234,7 @@ in-guest-trap = "unsupported"
     /// The first committed util-c test with `labels` added, through the
     /// front door's own test validation.
     fn expand_util_c_with(extra: &str) {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = hermit_manifest_plan::compiled_manifest_dir!().join("../..");
         let text = std::fs::read_to_string(root.join("tests/e2e/manifests/util-c.yaml")).unwrap();
         let (head, tail) = text.split_once("\n    lane: ").unwrap();
         let document: Value = format!("{head}\n    {extra}\n    lane: {tail}")
@@ -2225,6 +2257,17 @@ in-guest-trap = "unsupported"
     #[test]
     fn accepts_test_labels() {
         expand_util_c_with("labels: [strict-compat, full]");
+    }
+
+    #[test]
+    fn accepts_rr_generated_headers_preprocessor() {
+        expand_util_c_with("preprocessors: [rr-generated-headers]");
+    }
+
+    #[test]
+    #[should_panic(expected = "supported preprocessors are e9patch and rr-generated-headers")]
+    fn rejects_an_unknown_preprocessor() {
+        expand_util_c_with("preprocessors: [frobnicate]");
     }
 
     #[test]
@@ -3277,7 +3320,7 @@ mod runtime_root_tests {
         let (_, default, _) = parse_options(vec![]).unwrap();
         assert_eq!(
             default,
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+            hermit_manifest_plan::compiled_manifest_dir!().join("../..")
         );
         let missing = temporary.join("missing");
         assert!(

@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use detcore_model::pedigree::Pedigree;
 use detcore_model::summary::TimesliceStats;
+use detcore_model::syscall_histogram::SyscallHistogram;
 use nix::fcntl::OFlag;
 use nix::sys::stat;
 use nix::unistd::Pid;
@@ -51,6 +52,8 @@ use crate::record_or_replay::NoopTool;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::ChaosEpochTransition;
 use crate::resources::Device;
+use crate::resources::ExternalOpId;
+use crate::resources::InstructionOffset;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
@@ -87,12 +90,25 @@ pub struct FileMetadata {
     /// Socket-only sequence used for backend-independent socket cookies.
     #[serde(default)]
     next_socket_open_file_sequence: u64,
+    /// Random-device-only sequence that names each random-device open file's
+    /// stream (`crate::fd::RandomDeviceStream`).
+    #[serde(default)]
+    next_random_device_sequence: u64,
     /// A random-device or timerfd OFD from this table has been promoted.
     /// Retain this history after its final close so exec cannot reuse a
     /// canonical identity. (Serialized under its earlier name, which the
     /// field had while only random devices were promoted.)
     #[serde(default, rename = "has_promoted_random_files")]
     has_promoted_shared_files: bool,
+    /// A description from this table has kept its record's sequence in
+    /// Detcore's global state (`ProcfsFile::share_sequence`, at a fork or a
+    /// send), keyed by its identity: so an exec on a backend that rebuilds
+    /// the table carries this table's identity numbering, and no description
+    /// of the new image takes an identity whose sequence another process may
+    /// still hold (`ThreadState::procfs_records_for_exec`). Kept after the
+    /// description closes, and by `fork_for` and `for_exec`.
+    #[serde(default)]
+    has_shared_procfs_sequences: bool,
     /// Track what file handles actually point to (e.g. after dup2).
     /// This includes both the identifying resource (usually inode) and the deterministic file handle.
     /// Deserialization restores aliasing (`crate::fd::intern_open_files`).
@@ -121,11 +137,150 @@ pub struct FileMetadata {
     #[serde(default)]
     cpuinfo_placeholders: Option<bool>,
     /// Descriptors rediscovered before [`Self::cpuinfo_placeholders`] was
-    /// decided whose memfd is named as a `/proc/cpuinfo` placeholder: kept as
-    /// the ordinary descriptors they look like until the session's answer
-    /// says whether they are placeholders (`decide_cpuinfo_placeholders`).
+    /// decided whose memfd is named as a placeholder for a file rendered only
+    /// where `/proc/cpuinfo` is (the file itself, or a task's `arch_status`):
+    /// kept as the ordinary descriptors they look like until the session's
+    /// answer says whether they are placeholders
+    /// (`decide_cpuinfo_placeholders`).
     #[serde(default)]
     pending_cpuinfo_placeholders: Vec<RawFd>,
+    /// The run's `--proc` level, so that a memfd named as a placeholder for
+    /// a file the level omits stays the memfd it is when this table
+    /// discovers it (`discover_fd_from_current_process`): Detcore makes no
+    /// placeholder for such a file, whose open fails with ENOENT. Noted as
+    /// the table is made for a thread (`ThreadState::new`) and again at each
+    /// image's first guest callback (`decide_cpuinfo_placeholders`), kept by
+    /// `fork_for` and `for_exec`, and serialized with the table, so a table
+    /// carried across a fork or an `exec` knows it before it rediscovers a
+    /// descriptor. `None` until noted (a table no thread made) and when absent
+    /// from an older serialized table, where no name is refused for its
+    /// level.
+    #[serde(default)]
+    proc_level: Option<detcore_model::config::ProcLevel>,
+    /// Descriptors open in this table that Detcore keeps no description of,
+    /// with whether each is close-on-exec: a received anonymous inode, or a
+    /// received descriptor whose facts could not be taken
+    /// (`Detcore::record_received_descriptors`). Listed in the table's
+    /// descriptor directory (`syscalls::files::descriptor_directory`), so a
+    /// close-all loop reaches them; forgotten when the number is closed or
+    /// replaced.
+    #[serde(default)]
+    present_unmodelled: BTreeMap<RawFd, bool>,
+    /// Whether a receive may have installed descriptors in this table whose
+    /// numbers Detcore does not know (a receive whose layout could not be
+    /// trusted, one on the background path, or one without sequentialized
+    /// threads): then a listing of the table cannot come from Detcore's
+    /// model.
+    #[serde(default)]
+    unaccounted_receipts: bool,
+    /// The capacity Linux's descriptor table has (`max_fds`): 64
+    /// (`NR_OPEN_DEFAULT`) until a descriptor at or above it is installed,
+    /// then the next power of two above the highest one installed
+    /// (`expand_files`, `alloc_fdtable`); a fork's copy is sized from the
+    /// descriptors open at the fork (`dup_fd`, `sane_fdtable_size`); `exec`
+    /// keeps the table. The end of a descriptor directory's listing.
+    #[serde(default = "default_descriptor_capacity")]
+    descriptor_capacity: u64,
+    /// Whether the exec that made this table dropped a close-on-exec
+    /// description whose locks Detcore follows (`DetFd::is_lock_tracked`):
+    /// the post-exec handler then names the surviving ones to
+    /// `procfs::locks::LockLedger` even where none survived, so that the
+    /// ledger releases a placeholder `flock` the exec closed
+    /// (`LockLedger::exec_kept`).
+    #[serde(default)]
+    exec_dropped_lock_tracked: bool,
+    /// Descriptors queued over `SCM_RIGHTS` that Linux released in the
+    /// current call (the queue of a socket whose last reference this table
+    /// dropped, `FileMetadata::release_detfd`, or what a receive or a purge
+    /// handed over), until the call completes and releases what they held
+    /// (`Detcore::settle_released_rights`). Never serialized, and never
+    /// copied.
+    #[serde(skip)]
+    released_rights: ReleasedRights,
+    /// The processes whose threads hold this table, and how many threads of
+    /// each, counted by guest calls alone: its first holder; each thread or
+    /// process made with `CLONE_FILES`, counted as its creator's `clone`
+    /// makes it, before either runs on; and each holder's exit, a thread's
+    /// `exit` counting one out and an `exit_group` its whole process
+    /// ([`Self::leave`]). The count of thread states that share the table
+    /// cannot say which exit is its last: the backend drops an exited
+    /// thread's state at no particular point of the schedule. Empty for a
+    /// table whose holders are not known (one carried across a snapshot),
+    /// which no exit releases.
+    #[serde(default)]
+    holders: BTreeMap<DetPid, usize>,
+    /// The table the exec that made this one replaced, and the exec'ing
+    /// process (`Self::keep_replaced_table`): kept from the exec's entry
+    /// (`Detcore::handle_execveat`) until the new image's first callback,
+    /// where that process leaves the replaced table, and where it was the
+    /// table's last holder, the table's descriptors go, the close-on-exec ones
+    /// as Linux closes them at the exec
+    /// (`ThreadState::release_exec_dropped_descriptors`). A failed exec drops
+    /// this table, and the replaced one with it. Never serialized, and never
+    /// copied.
+    #[serde(skip)]
+    exec_replaced: ReplacedTable,
+    /// The open file descriptions a successful file-backed `mmap` through a
+    /// descriptor of this table mapped (`Detcore::note_flock_mapping`): a
+    /// mapping keeps its description, and so a `flock` lock it holds, after
+    /// its last descriptor goes (`vm_file`). Copied by a fork, whose child
+    /// inherits the mappings, and dropped by an exec, which replaces them.
+    /// Never cleared by `munmap`, so it names every description the process
+    /// may still map. Serialized under no older name.
+    #[serde(default)]
+    mapped_open_files: BTreeSet<OpenFileId>,
+}
+
+/// The table an exec replaced, and the exec'ing process
+/// ([`FileMetadata::exec_replaced`]). A copy of the table that holds it
+/// starts with none: the exec's own table leaves the replaced one, once.
+#[derive(Default)]
+struct ReplacedTable(Option<(Arc<Mutex<FileMetadata>>, DetPid)>);
+
+impl Clone for ReplacedTable {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl std::fmt::Debug for ReplacedTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ReplacedTable")
+            .field(&self.0.is_some())
+            .finish()
+    }
+}
+
+/// What the death of a process by a fatal signal did with one of the tables
+/// its threads held ([`FileMetadata::release_at_death`]).
+#[derive(Debug)]
+pub(crate) enum TableAtDeath {
+    /// No holder is left, and every descriptor went: what the queues of the
+    /// sockets whose last reference went held, for the death to release
+    /// (`Detcore::settle_released_rights`'s rule).
+    Released(Vec<SentDescriptor>),
+    /// Another process still holds the table, which keeps every descriptor.
+    Kept,
+    /// The table's holders are not known, or do not name the process, so
+    /// whether its death released the table cannot be decided.
+    Undecided,
+}
+
+/// The descriptors of messages queued to sockets a table released
+/// ([`FileMetadata::released_rights`]). A copy of the table, for a fork or an
+/// exec, starts with none: what one table released is released once.
+#[derive(Debug, Default)]
+struct ReleasedRights(Vec<SentDescriptor>);
+
+impl Clone for ReleasedRights {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+/// `NR_OPEN_DEFAULT` on 64-bit Linux.
+fn default_descriptor_capacity() -> u64 {
+    64
 }
 
 /// Deserializes a descriptor table with its aliases restored, so a table
@@ -165,23 +320,34 @@ pub(crate) struct CapturedDetFdInstallError {
 
 /// Cleanup required after the kernel created a descriptor but Detcore could not
 /// install its captured open-file-description identity in the current table.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct CapturedDetFdInstallCleanup {
     /// The exact kernel-returned descriptor that must be closed.
     pub(crate) close_fd: RawFd,
     /// A scheduler resource whose final modeled OFD reference was the capture.
     pub(crate) release_open_file: Option<OpenFileId>,
+    /// Where that capture was a receiving socket's last reference, the
+    /// messages queued to it, which go with it as at a close
+    /// ([`FileMetadata::release_detfd`]), for the call to release
+    /// (`ThreadState::defer_released_rights`).
+    pub(crate) released_rights: Vec<SentDescriptor>,
 }
 
 impl CapturedDetFdInstallError {
     /// Abandon the failed capture and preserve both cleanup obligations.
     pub(crate) fn into_cleanup(self) -> CapturedDetFdInstallCleanup {
-        let release_open_file = (self.captured.detfd.open_file_alias_count() == 1)
-            .then(|| self.captured.detfd.open_file_id());
+        let last = self.captured.detfd.is_last_reference();
+        let release_open_file = last.then(|| self.captured.detfd.open_file_id());
+        let released_rights = if last {
+            self.captured.detfd.take_all_queued_rights()
+        } else {
+            Vec::new()
+        };
         drop(self.captured);
         CapturedDetFdInstallCleanup {
             close_fd: self.returned_fd,
             release_open_file,
+            released_rights,
         }
     }
 }
@@ -235,6 +401,13 @@ pub struct ExecFdState {
     /// aliases and any cached bytes. Kernel EOF must not erase this authority.
     #[serde(default)]
     pub(crate) maps: Option<ExecMapsFiles>,
+    /// On a backend that rebuilds its descriptor table after exec: the
+    /// surviving descriptors of per-process files that follow their record's
+    /// sequence, with their open files' identities, models and sequences, and
+    /// the old table's identity numbering, where it has either
+    /// (`ThreadState::procfs_records_for_exec`).
+    #[serde(default)]
+    pub(crate) procfs_records: Option<ExecProcfsRecords>,
     /// Under `--pipe-wake-latency`, on a backend that rediscovers its
     /// descriptors after exec: the channel end each surviving descriptor is,
     /// reattached after rediscovery (`crate::pipe_wake`).
@@ -246,6 +419,12 @@ pub struct ExecFdState {
     /// channel elsewhere may still carry.
     #[serde(default)]
     pub(crate) open_file_namespace: Option<(DetTid, u64)>,
+    /// The old table's count of random-device opens. A backend that
+    /// rebuilds its descriptor table after exec starts the new one from it,
+    /// so no open after the exec reuses a stream's name
+    /// (`crate::fd::RandomDeviceStream`).
+    #[serde(default)]
+    pub(crate) random_device_sequence: u64,
     /// The image the exec runs, as Detcore resolved it from the exec's
     /// arguments before the exec ([`crate::exec_record`]), or for the
     /// registered root's first image the one its launch named
@@ -275,11 +454,17 @@ impl std::fmt::Debug for ExecFdState {
             // transport-only; they must not enter canonical guest logs.
             debug.field("maps_survivors", &maps.handles.len());
         }
+        if let Some(records) = &self.procfs_records {
+            debug.field("procfs_record_survivors", &records.handles.len());
+        }
         if !self.channels.is_empty() {
             debug.field("channels", &self.channels);
         }
         if let Some(namespace) = &self.open_file_namespace {
             debug.field("open_file_namespace", namespace);
+        }
+        if self.random_device_sequence != 0 {
+            debug.field("random_device_sequence", &self.random_device_sequence);
         }
         if let Some(exe) = &self.exe {
             debug.field("exe", &exe.exe);
@@ -309,6 +494,33 @@ struct ExecMapsFile {
     procfs: crate::procfs::ProcfsFile,
     flags: i32,
     path: Option<std::path::PathBuf>,
+}
+
+/// The descriptors of per-process files that follow their record's sequence
+/// (`ProcfsFile::follows_record_sequence`) surviving an exec on a backend
+/// that rebuilds its descriptor table after exec, and the old table's open
+/// file creator and next identity (`ThreadState::procfs_records_for_exec`).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ExecProcfsRecords {
+    creator: DetTid,
+    next_sequence: u64,
+    handles: BTreeMap<RawFd, ExecProcfsRecord>,
+}
+
+/// One surviving descriptor of [`ExecProcfsRecords`]: its open file's
+/// identity, authenticated against the descriptor after the exec, its model,
+/// its record's sequence whole (the model does not serialize where the
+/// sequence is, `ProcfsFile::read_pos`), its status flags and path, and
+/// whether that sequence is one Detcore cannot know
+/// (`DetFd::record_sequence_unknown`).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ExecProcfsRecord {
+    identity: ExecOpenFile,
+    procfs: crate::procfs::ProcfsFile,
+    sequence: crate::procfs::ProcfsSequence,
+    flags: i32,
+    path: Option<std::path::PathBuf>,
+    sequence_unknown: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -369,6 +581,7 @@ impl ExecFdState {
             .map(|files| files.creator)
             .or_else(|| self.open_file_namespace.map(|(creator, _)| creator))
             .or_else(|| self.maps.as_ref().map(|maps| maps.creator))
+            .or_else(|| self.procfs_records.as_ref().map(|records| records.creator))
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -378,8 +591,10 @@ impl ExecFdState {
             && self.initial_input.is_none()
             && self.open_files.is_none()
             && self.maps.is_none()
+            && self.procfs_records.is_none()
             && self.channels.is_empty()
             && self.open_file_namespace.is_none()
+            && self.random_device_sequence == 0
             && self.exe.is_none()
     }
 }
@@ -431,6 +646,11 @@ struct PosixTimer {
     /// for a timer created with no `sigevent` (`do_timer_create`).
     #[serde(default)]
     value: u64,
+    /// The CPU clock the timer was created on (`crate::cpu_clock`), if any.
+    /// Its armings count down on the virtual clock like any other timer's,
+    /// an absolute one made relative to the clock's reading.
+    #[serde(default)]
+    cpu_clock: Option<crate::cpu_clock::CpuTimerClock>,
 }
 
 /// The set of POSIX timers owned by a *process*.
@@ -453,12 +673,14 @@ impl PosixTimers {
     /// Allocate a new (disarmed) timer, returning its deterministic id.
     /// `thread` is the thread a `SIGEV_THREAD_ID` timer notifies, and
     /// `value` its `sigev_value`, or `None` for a timer created with no
-    /// `sigevent`, whose `si_value` is its id.
+    /// `sigevent`, whose `si_value` is its id. `cpu_clock` is the CPU clock
+    /// the timer was created on, if any.
     pub(crate) fn create(
         &mut self,
         signal: Option<i32>,
         thread: Option<DetTid>,
         value: Option<u64>,
+        cpu_clock: Option<crate::cpu_clock::CpuTimerClock>,
     ) -> i32 {
         let id = self.next_id;
         self.next_id += 1;
@@ -470,9 +692,15 @@ impl PosixTimers {
                 signal,
                 thread,
                 value: value.unwrap_or(id as u32 as u64),
+                cpu_clock,
             },
         );
         id
+    }
+
+    /// The CPU clock timer `id` was created on, if it exists and was.
+    pub(crate) fn cpu_clock(&self, id: i32) -> Option<crate::cpu_clock::CpuTimerClock> {
+        self.timers.get(&id).and_then(|timer| timer.cpu_clock)
     }
 
     /// The `si_value` of timer `id`'s signal.
@@ -677,7 +905,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         let call = translated
             .as_ref()
             .map_or(syscall, |translated| translated.call);
-        let result = if crate::record_or_replay::injects_only::<T>() {
+        crate::reserved_input::before_native_call(guest, call)?;
+        // A self-sentinel `pidfd_send_signal` the executing kernel spells
+        // differently from the guest: the model and the record or replay
+        // tool see the guest's call, and only its injection is respelled.
+        // Boxed, so the adapter's futures stay out of every other forwarded
+        // call's future.
+        let result = if let Some(respelling) = guest.thread_state().pidfd_respelling {
+            Box::pin(self.respelled_record_or_replay(guest, respelling, call)).await
+        } else if crate::record_or_replay::injects_only::<T>() {
             // What the tool's handler would have done (`NoopTool`), here:
             // the same single injection of the same call, awaited at the
             // same point, with its errno converted the same way.
@@ -691,6 +927,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             Box::pin(Self::finish_translated_call(guest, translated)).await;
         }
         result
+    }
+
+    /// What [`Self::translated_record_or_replay`] does with `call`, through
+    /// the respelling adapter, which lives in this future and so in its box.
+    async fn respelled_record_or_replay<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        respelling: crate::pidfd_self::PhysicalRespelling,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        let mut physical = crate::pidfd_self::PhysicalSpelling::new(guest, respelling);
+        if crate::record_or_replay::injects_only::<T>() {
+            physical.inject(call).await.map_err(Error::from)
+        } else {
+            self.record_or_replay
+                .handle_syscall_event(&mut physical.into_guest(), call)
+                .await
+        }
     }
 
     /// Helper function for delegating the injection of a syscall to the
@@ -802,22 +1056,121 @@ impl FileMetadata {
             files_id: FilesId::initial(owner),
             next_open_file_sequence: 0,
             next_socket_open_file_sequence: 0,
+            next_random_device_sequence: 0,
             has_promoted_shared_files: false,
+            has_shared_procfs_sequences: false,
             file_handles: HashMap::new(),
             accept_waits: Vec::new(),
             next_accept_wait: 0,
             cpuinfo_placeholders: None,
             pending_cpuinfo_placeholders: Vec::new(),
+            proc_level: None,
+            present_unmodelled: BTreeMap::new(),
+            unaccounted_receipts: false,
+            descriptor_capacity: default_descriptor_capacity(),
+            exec_dropped_lock_tracked: false,
+            released_rights: ReleasedRights::default(),
+            holders: BTreeMap::from([(owner, 1)]),
+            exec_replaced: ReplacedTable::default(),
+            mapped_open_files: BTreeSet::new(),
         }
+    }
+
+    /// Note that descriptor `fd` was installed in this table: it is no
+    /// longer an unmodelled one, and the table grows to hold it as Linux's
+    /// does ([`Self::descriptor_capacity`]).
+    fn note_installed(&mut self, fd: RawFd) {
+        self.present_unmodelled.remove(&fd);
+        self.grow_to_hold(fd);
+    }
+
+    /// Grow the table to hold descriptor `fd`, as Linux's `expand_files`
+    /// does ([`Self::descriptor_capacity`]): for an installed descriptor, and
+    /// for the target of a `dup2` or `dup3` that then fails because its old
+    /// descriptor is not open, which `ksys_dup3` expands the table for first
+    /// (<https://github.com/torvalds/linux/blob/v6.17/fs/file.c#L1408-L1415>).
+    fn grow_to_hold(&mut self, fd: RawFd) {
+        if let Ok(fd) = u64::try_from(fd)
+            && fd >= self.descriptor_capacity
+        {
+            self.descriptor_capacity = (fd + 1)
+                .checked_next_power_of_two()
+                .unwrap_or(u64::MAX / 2)
+                .max(default_descriptor_capacity());
+        }
+    }
+
+    /// Set the close-on-exec flag of descriptor `fd` if it is one this table
+    /// lists without modelling ([`Self::present_unmodelled`]); whether it is.
+    fn set_unmodelled_cloexec(&mut self, fd: RawFd, cloexec: bool) -> bool {
+        match self.present_unmodelled.get_mut(&fd) {
+            Some(flag) => {
+                *flag = cloexec;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The descriptors open in this table that it knows of, ascending:
+    /// those it models and those it does not ([`Self::present_unmodelled`]).
+    fn descriptor_numbers(&self) -> Vec<RawFd> {
+        let mut numbers: Vec<RawFd> = self
+            .file_handles
+            .keys()
+            .copied()
+            .chain(self.present_unmodelled.keys().copied())
+            .collect();
+        numbers.sort_unstable();
+        numbers.dedup();
+        numbers
+    }
+
+    /// The capacity a fork's copy of this table gets: `dup_fd` sizes it from
+    /// the highest descriptor open, rounded up to a multiple of
+    /// `BITS_PER_LONG` (`sane_fdtable_size`), and allocates a larger table
+    /// only past `NR_OPEN_DEFAULT`, to the next power of two
+    /// (`alloc_fdtable`).
+    fn forked_descriptor_capacity(&self) -> u64 {
+        let open = self
+            .descriptor_numbers()
+            .last()
+            .and_then(|fd| u64::try_from(*fd).ok())
+            .map_or(0, |fd| (fd + 1).next_multiple_of(64));
+        if open <= default_descriptor_capacity() {
+            default_descriptor_capacity()
+        } else {
+            open.checked_next_power_of_two().unwrap_or(u64::MAX / 2)
+        }
+    }
+
+    /// Note the run's `--proc` level ([`Self::proc_level`]).
+    pub(crate) fn note_proc_level(&mut self, level: detcore_model::config::ProcLevel) {
+        self.proc_level = Some(level);
+    }
+
+    /// The placeholder `found` names, unless it names a file outside the
+    /// run's `--proc` level ([`Self::proc_level`]), for which Detcore makes
+    /// no placeholder.
+    fn within_proc_level(
+        &self,
+        found: Option<(&'static std::path::Path, Vec<u8>)>,
+    ) -> Option<(&'static std::path::Path, Vec<u8>)> {
+        found.filter(|(path, _)| {
+            self.proc_level.is_none_or(|level| {
+                !crate::syscalls::rendered_procfs::named_file_outside_level(path, level)
+            })
+        })
     }
 
     /// Take the session's answer to whether it renders `/proc/cpuinfo`
     /// (`rendered`: `Detcore::rendered_files(guest).cpuinfo`), at the first
     /// guest callback of this image, before guest code runs. A descriptor
-    /// rediscovered before it whose memfd is named as a `/proc/cpuinfo`
-    /// placeholder becomes the placeholder it is where the session renders
-    /// the file, and stays an ordinary memfd where it does not. Later answers
-    /// of the same session are the same and change nothing.
+    /// rediscovered before it whose memfd is named as a placeholder for a
+    /// file rendered only where `/proc/cpuinfo` is (the file itself, or a
+    /// task's `arch_status`) becomes the placeholder it is where the session
+    /// renders the file, and stays an ordinary memfd where it does not. Later
+    /// answers of the same session are the same and change nothing.
     pub(crate) fn decide_cpuinfo_placeholders(&mut self, rendered: bool) -> Result<(), Errno> {
         if self.cpuinfo_placeholders.is_some() {
             return Ok(());
@@ -835,7 +1188,7 @@ impl FileMetadata {
                 stat::fstat(unsafe { BorrowedFd::borrow_raw(fd) }).map_err(|_| Errno::last())?;
             let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
             if let Some((path, snapshot)) =
-                placeholder_behind(fd, crate::procfs::RenderedFiles::ALL)
+                self.within_proc_level(placeholder_behind(fd, crate::procfs::RenderedFiles::ALL))
             {
                 self.adopt_placeholder(fd, &raw_stat, fd_flags, path, snapshot)?;
             }
@@ -958,6 +1311,19 @@ impl FileMetadata {
         }
     }
 
+    /// Another table takes a copy of this one (a fork, or a thread made
+    /// without `CLONE_FILES`): every description the lock ledger does not
+    /// follow yet (`DetFd::is_lock_tracked`) now has references it never saw
+    /// taken (`DetFd::mark_local_untracked_references_escaped`), without
+    /// contacting a promoted description's shared model, which the flock
+    /// model takes as escaped (`DetFd::is_shared`). The ledger copies the
+    /// references of the descriptions it follows (`LockLedger::fork`).
+    fn mark_untracked_references_escaped(&self) {
+        for detfd in self.file_handles.values() {
+            detfd.mark_local_untracked_references_escaped();
+        }
+    }
+
     // TODO-HUMAN-REVIEW(#2373)
     /// Fork the file table for `child`.
     ///
@@ -968,16 +1334,28 @@ impl FileMetadata {
     /// resets copied locks at its physical child boundary.
     pub(crate) fn fork_for(&self, child: DetTid) -> Self {
         self.forget_flock_modes();
+        self.mark_untracked_references_escaped();
         Self {
             files_id: FilesId::forked(child),
             next_open_file_sequence: self.next_open_file_sequence,
             next_socket_open_file_sequence: self.next_socket_open_file_sequence,
+            next_random_device_sequence: self.next_random_device_sequence,
             has_promoted_shared_files: self.has_promoted_shared_files,
+            has_shared_procfs_sequences: self.has_shared_procfs_sequences,
             file_handles: self.file_handles.clone(),
             accept_waits: Vec::new(),
             next_accept_wait: 0,
             cpuinfo_placeholders: self.cpuinfo_placeholders,
             pending_cpuinfo_placeholders: self.pending_cpuinfo_placeholders.clone(),
+            proc_level: self.proc_level,
+            present_unmodelled: self.present_unmodelled.clone(),
+            unaccounted_receipts: self.unaccounted_receipts,
+            descriptor_capacity: self.forked_descriptor_capacity(),
+            exec_dropped_lock_tracked: false,
+            released_rights: ReleasedRights::default(),
+            holders: BTreeMap::from([(child, 1)]),
+            exec_replaced: ReplacedTable::default(),
+            mapped_open_files: self.mapped_open_files.clone(),
         }
     }
 
@@ -986,7 +1364,9 @@ impl FileMetadata {
             files_id: self.files_id.for_exec(task),
             next_open_file_sequence: self.next_open_file_sequence,
             next_socket_open_file_sequence: self.next_socket_open_file_sequence,
+            next_random_device_sequence: self.next_random_device_sequence,
             has_promoted_shared_files: self.has_promoted_shared_files,
+            has_shared_procfs_sequences: self.has_shared_procfs_sequences,
             file_handles: self
                 .file_handles
                 .iter()
@@ -996,7 +1376,88 @@ impl FileMetadata {
             next_accept_wait: 0,
             cpuinfo_placeholders: self.cpuinfo_placeholders,
             pending_cpuinfo_placeholders: self.pending_cpuinfo_placeholders.clone(),
+            proc_level: self.proc_level,
+            present_unmodelled: self
+                .present_unmodelled
+                .iter()
+                .filter(|(_, cloexec)| !**cloexec)
+                .map(|(fd, cloexec)| (*fd, *cloexec))
+                .collect(),
+            unaccounted_receipts: self.unaccounted_receipts,
+            descriptor_capacity: self.descriptor_capacity,
+            exec_dropped_lock_tracked: self
+                .file_handles
+                .values()
+                .any(|detfd| detfd.is_cloexec() && detfd.is_lock_tracked()),
+            released_rights: ReleasedRights::default(),
+            holders: BTreeMap::from([(task, 1)]),
+            exec_replaced: ReplacedTable::default(),
+            mapped_open_files: BTreeSet::new(),
         }
+    }
+
+    /// A thread of `process` made with `CLONE_FILES` holds this table too
+    /// ([`Self::holders`]); a table whose holders are not known stays so.
+    pub(crate) fn join_holder(&mut self, process: DetPid) {
+        if !self.holders.is_empty() {
+            *self.holders.entry(process).or_insert(0) += 1;
+        }
+    }
+
+    /// One thread of `process` holds this table, and nothing else does
+    /// ([`Self::holders`]): a copy made for it, by a `clone` without
+    /// `CLONE_FILES` or by an `exec`.
+    pub(crate) fn hold_alone(&mut self, process: DetPid) {
+        self.holders = BTreeMap::from([(process, 1)]);
+    }
+
+    /// A thread of `process` that holds this table exits, with its whole
+    /// process where `whole_process` (an `exit_group`, which ends every
+    /// thread of it). Returns whether that left the table to no holder: then
+    /// it goes with this exit, as Linux releases a table with its last
+    /// holder's exit (`exit_files`). Never for a table whose holders are not
+    /// known, nor for a process that does not hold it.
+    pub(crate) fn leave(&mut self, process: DetPid, whole_process: bool) -> bool {
+        let Some(count) = self.holders.get_mut(&process) else {
+            return false;
+        };
+        if whole_process || *count <= 1 {
+            self.holders.remove(&process);
+        } else {
+            *count -= 1;
+        }
+        self.holders.is_empty()
+    }
+
+    /// `process` has ended, by the default action of a fatal signal, as the
+    /// terminal receipt of its death says (`GlobalState::release_tables_at_death`),
+    /// and this is one of the tables its threads held. Every thread of it
+    /// leaves the table at once ([`Self::leave`]); where that leaves the
+    /// table to no holder, every descriptor of it goes, in order, as Linux
+    /// releases a table with its last holder's exit (`exit_files`), and a
+    /// socket whose last reference goes takes its queue ([`Self::release_detfd`]).
+    /// Where another process still holds the table (`CLONE_FILES` without
+    /// `CLONE_THREAD`), it keeps every descriptor. Where its holders are not
+    /// known, or do not name `process`, nothing is decided.
+    pub(crate) fn release_at_death(&mut self, process: DetPid) -> TableAtDeath {
+        if !self.holders.contains_key(&process) {
+            return TableAtDeath::Undecided;
+        }
+        if !self.leave(process, true) {
+            return TableAtDeath::Kept;
+        }
+        self.release_every_descriptor();
+        TableAtDeath::Released(self.take_released_rights())
+    }
+
+    /// Keep `replaced`, the table an exec of `process` replaces with this
+    /// one, until the new image's first callback ([`Self::exec_replaced`]).
+    pub(crate) fn keep_replaced_table(
+        &mut self,
+        replaced: Arc<Mutex<FileMetadata>>,
+        process: DetPid,
+    ) {
+        self.exec_replaced = ReplacedTable(Some((replaced, process)));
     }
 
     /// Read the live table incarnation for an independently owned exec cut.
@@ -1254,6 +1715,33 @@ impl FileMetadata {
             }
             self.next_open_file_sequence = self.next_open_file_sequence.max(maps.next_sequence);
         }
+        if shared_guest_table && let Some(records) = &state.procfs_records {
+            // The same for the per-process files carried with their record's
+            // sequence, and their table's numbering, reserved before any
+            // rediscovery allocates an identity whose sequence another
+            // process may still hold.
+            for (&fd, survivor) in &records.handles {
+                if ExecOpenFile::capture(fd, survivor.identity.id)? != survivor.identity {
+                    return Err(Errno::EIO);
+                }
+            }
+            if state
+                .open_files
+                .as_ref()
+                .is_some_and(|files| files.creator != records.creator)
+                || state
+                    .open_file_namespace
+                    .is_some_and(|(creator, _)| creator != records.creator)
+                || state
+                    .maps
+                    .as_ref()
+                    .is_some_and(|maps| maps.creator != records.creator)
+            {
+                return Err(Errno::EIO);
+            }
+            self.next_open_file_sequence = self.next_open_file_sequence.max(records.next_sequence);
+            self.has_shared_procfs_sequences = true;
+        }
         // Legacy discovery also allocates IDs. Reserve the complete old
         // namespace before it can create any nonrandom descriptions, including
         // same-leader exec where the creator did not change.
@@ -1273,9 +1761,16 @@ impl FileMetadata {
             creator
         } else if shared_guest_table && let Some(maps) = &state.maps {
             maps.creator
+        } else if shared_guest_table && let Some(records) = &state.procfs_records {
+            records.creator
         } else {
             owner
         };
+        if shared_guest_table {
+            self.next_random_device_sequence = self
+                .next_random_device_sequence
+                .max(state.random_device_sequence);
+        }
         self.apply_exec_blocking_overrides(owner, state.blocking);
         if !shared_guest_table {
             return Ok(());
@@ -1348,6 +1843,62 @@ impl FileMetadata {
             crate::fd::intern_open_files(&mut handles);
             self.file_handles.extend(handles);
         }
+        if let Some(records) = state.procfs_records {
+            self.restore_procfs_records(records)?;
+        }
+        Ok(())
+    }
+
+    /// Restore the per-process files carried across exec with their open
+    /// files' identities and record sequences (`ExecProcfsRecords`), already
+    /// authenticated against the descriptors (`apply_exec_fd_state`): the
+    /// new image's table names the same open files as every other process
+    /// holding them, takes and stores a sequence a fork or a send moved to
+    /// Detcore's global state, and keeps one it alone held. A rendered file's
+    /// placeholder is registered again, under the open file it belongs to,
+    /// as its open registered it (`rendered_procfs::register_placeholder_open`).
+    fn restore_procfs_records(&mut self, records: ExecProcfsRecords) -> Result<(), Errno> {
+        let mut handles = HashMap::new();
+        let mut placeholders = Vec::new();
+        for (fd, survivor) in records.handles {
+            let raw_stat = stat::fstat(unsafe { BorrowedFd::borrow_raw(fd) })
+                .map_err(|error| Errno::new(error as i32))?;
+            let handle = DetFd::new(
+                fd,
+                OFlag::from_bits_truncate(survivor.flags),
+                FdType::Regular,
+                survivor.identity.id,
+            )
+            .with_stat(DetStat::from(raw_stat));
+            if let Some(path) = survivor.path {
+                handle.set_path(path);
+            }
+            let mut procfs = survivor.procfs;
+            procfs.adopt_sequence(survivor.sequence);
+            if let Some(rendered) = procfs.opened_path() {
+                placeholders.push((fd, (survivor.identity.dev, survivor.identity.ino), rendered));
+            }
+            handle.set_procfs(procfs);
+            handle.mark_flock_mode_unobserved();
+            if survivor.sequence_unknown {
+                handle.mark_record_sequence_unknown();
+            }
+            handles.insert(fd, handle);
+        }
+        crate::fd::intern_open_files(&mut handles);
+        self.file_handles.extend(handles);
+        for (fd, identity, rendered) in placeholders {
+            crate::syscalls::rendered_procfs::register_placeholder(
+                identity.0, identity.1, rendered,
+            );
+            let handle = &self.file_handles[&fd];
+            crate::syscalls::rendered_procfs::register_placeholder_open(
+                identity,
+                handle.open_file_handle(),
+                handle.open_file_id(),
+                Vec::new(),
+            );
+        }
         Ok(())
     }
 
@@ -1360,7 +1911,12 @@ impl FileMetadata {
         for detfd in self.file_handles.values() {
             let id = detfd.open_file_id();
             let total_aliases = detfd.open_file_alias_count();
-            let entry = open_files.entry(id).or_insert((0, total_aliases, true));
+            // A copy in flight keeps the description open, whatever holds the
+            // copy now (`DetFd::is_last_reference`).
+            let in_flight = detfd.copies_in_flight() > 0;
+            let entry = open_files
+                .entry(id)
+                .or_insert((0, total_aliases, !in_flight));
             debug_assert_eq!(entry.1, total_aliases);
             entry.0 += 1;
             entry.2 &= detfd.is_cloexec();
@@ -1377,7 +1933,12 @@ impl FileMetadata {
     }
 
     /// set default fds
-    fn setup_stdio(mut self, _pid: Pid, owner: DetTid) -> Self {
+    ///
+    /// `aliases`: for each of the three, the lowest of them that is one open
+    /// file description with it, where the launcher knows
+    /// (`Config::standard_stream_aliases`); only `procfs::locks::LockLedger`
+    /// reads the groups.
+    fn setup_stdio(mut self, _pid: Pid, owner: DetTid, aliases: Option<[u8; 3]>) -> Self {
         // guest stdio can be a pipe, which make things difficult
         // hence use a dummy stat here.
         // The raw syscall, not libc's interposable fstat: this runs inside the
@@ -1425,6 +1986,27 @@ impl FileMetadata {
         stdout.mark_flock_mode_unobserved();
         stderr.mark_flock_mode_unobserved();
 
+        // Which of the three are one open file description, as the launcher
+        // found with kcmp(KCMP_FILE) on the descriptors it handed the guest
+        // (`Config::standard_stream_aliases`): it may pass one description on
+        // several (`<>file >&0`, `>log 2>&1`), each of which Detcore models
+        // with an identity of its own, and the lock ledger then takes the
+        // group as the one description it is. Where the launcher does not
+        // know, each stream is a description of its own (a named residual).
+        if let Some(aliases) = aliases {
+            let streams = [&stdin, &stdout, &stderr];
+            for (later, earlier) in aliases.iter().enumerate() {
+                let earlier = usize::from(*earlier);
+                if earlier < later {
+                    let group = streams[earlier]
+                        .stdio_alias_group()
+                        .unwrap_or_else(|| streams[earlier].open_file_id());
+                    streams[earlier].set_stdio_alias_group(group);
+                    streams[later].set_stdio_alias_group(group);
+                }
+            }
+        }
+
         self.add_detfd(stdin);
         self.add_detfd(stdout);
         self.add_detfd(stderr);
@@ -1446,32 +2028,18 @@ impl FileMetadata {
         }
         let raw_stat =
             stat::fstat(unsafe { BorrowedFd::borrow_raw(fd) }).map_err(|_| Errno::last())?;
-        let file_type = stat::SFlag::from_bits_truncate(raw_stat.st_mode);
-        let ty = if file_type.contains(stat::SFlag::S_IFIFO) {
-            FdType::Pipe
-        } else if file_type.contains(stat::SFlag::S_IFSOCK) {
-            FdType::Socket
-        } else if status_flags & libc::O_PATH == 0
-            && crate::fd::is_random_device(raw_stat.st_mode, raw_stat.st_rdev)
-        {
-            // Linux's random devices by device number, as an open classifies
-            // them (`Detcore::handle_openat`).
-            FdType::Rng
-        } else {
-            FdType::Regular
-        };
-        let mut flags = OFlag::from_bits_truncate(status_flags);
-        let physically_nonblocking = flags.contains(OFlag::O_NONBLOCK);
-        // Discovered descriptors have unknown provenance, so an observed
-        // O_NONBLOCK bit must remain guest-visible. Detcore-created scheduler
-        // pipes are registered when created and do not reach this fallback.
-        if fd_flags & libc::FD_CLOEXEC != 0 {
-            flags.insert(OFlag::O_CLOEXEC);
-        }
-        self.add_fd(owner, fd, flags, ty, Some(raw_stat.into()))?;
-        // This newly discovered description predates our observation. Its
-        // kernel lock may be held, but no cached lock claim existed to go stale.
-        self.with_detfd(fd, |detfd| detfd.mark_flock_mode_unobserved())?;
+        // An anonymous inode has no file type; its link names what it is.
+        let link = (raw_stat.st_mode & libc::S_IFMT == 0)
+            .then(|| own_fd_link(fd))
+            .flatten();
+        self.add_discovered_fd(
+            owner,
+            fd,
+            fd_flags,
+            status_flags,
+            &raw_stat,
+            link.as_deref(),
+        )?;
         // A placeholder for a procfs file Detcore renders, which the backend
         // rediscovers after `exec`: the file again, at the position the old
         // image left and with the snapshot it took, as a backend that keeps
@@ -1484,21 +2052,33 @@ impl FileMetadata {
         // A `/proc/cpuinfo` placeholder only once the session's answer says
         // it renders the file (`decide_cpuinfo_placeholders`); before that
         // answer, one waits for it as the ordinary descriptor it looks like.
+        // So does a placeholder for a task's `arch_status`, which Detcore
+        // renders exactly where it renders `/proc/cpuinfo`.
         let decided = self.cpuinfo_placeholders;
         // A process's `mountinfo` or `mounts` has a placeholder only in a
         // session with a container mount table, the only one that renders it.
         let files = crate::procfs::RenderedFiles {
             cpuinfo: decided == Some(true),
             mounts: true,
+            // Rendered only where the tool runs outside the guest (KVM), which
+            // never rediscovers its descriptors.
+            locks: false,
+            address_space: false,
         };
-        let found = may_be_placeholder
-            .then(|| placeholder_behind(fd, files))
-            .flatten();
+        let found = self.within_proc_level(
+            may_be_placeholder
+                .then(|| placeholder_behind(fd, files))
+                .flatten(),
+        );
+        // Before the answer, `files` differs from every rendered file only in
+        // the files rendered where `/proc/cpuinfo` is: a placeholder it does
+        // not find but every rendered file does is one of those.
         if found.is_none()
             && decided.is_none()
             && may_be_placeholder
-            && placeholder_behind(fd, crate::procfs::RenderedFiles::ALL)
-                .is_some_and(|(path, _)| path == std::path::Path::new("/proc/cpuinfo"))
+            && self
+                .within_proc_level(placeholder_behind(fd, crate::procfs::RenderedFiles::ALL))
+                .is_some()
         {
             self.pending_cpuinfo_placeholders.push(fd);
         }
@@ -1533,8 +2113,89 @@ impl FileMetadata {
                 detfd.set_procfs_offset(offset);
             })?;
         }
+        // A per-process file that follows its record's sequence, which the
+        // kernel opened in another process and sent here over `SCM_RIGHTS`:
+        // where that sequence is and the record it buffered belong to the open
+        // file, which every holder shares and the sender's Detcore keeps,
+        // and which this one cannot know, so every read and seek through it
+        // is refused by name (`Detcore::refuse_unknown_record_sequence`; on
+        // DBT, through its runtime's exit path; on SaBRe, where a refusal that
+        // ended the run would strand it, with EOPNOTSUPP), so no read reaches
+        // the kernel's file. Before, it read the kernel's file, where the
+        // sender's captures had left it (end of file), unsanitized (Claude's
+        // narrow check of the kvm lane's slice N3, round 5; on SaBRe until its
+        // final check, which saw the host's own statm). One the exec that
+        // made this image kept is carried with its sequence instead
+        // (`ExecProcfsRecords`).
+        else if let Some(path) =
+            own_fd_link(fd).and_then(|link| kernel_record_file_link(&raw_stat, &link))
+        {
+            self.with_detfd(fd, |detfd| {
+                detfd.set_path(path.clone());
+                detfd.mark_record_sequence_unknown();
+            })?;
+        }
         if let Some(resource) = stdio_resource(fd) {
             self.with_detfd(fd, |detfd| detfd.set_resource(resource.clone()))?;
+        }
+        Ok(())
+    }
+
+    /// Record descriptor `fd`, whose creation Detcore did not see, from the
+    /// kernel's facts about it: its descriptor flags `fd_flags` (`F_GETFD`),
+    /// status flags `status_flags` (`F_GETFL`) and `raw_stat` (`fstat`). Its
+    /// type is the file's (pipe, socket, random device or regular), or, for
+    /// an anonymous inode whose descriptor link (`link`) names an inotify
+    /// instance, inotify; its
+    /// flags are the kernel's (an observed `O_NONBLOCK` stays guest-visible:
+    /// the provenance is unknown), and its lock state is unobserved. Shared by
+    /// the in-guest discovery ([`Self::discover_fd_from_current_process`])
+    /// and by the record of a descriptor received over `SCM_RIGHTS`
+    /// (`Detcore::record_received_descriptors`), so both make the same
+    /// description from the same facts.
+    fn add_discovered_fd(
+        &mut self,
+        owner: DetTid,
+        fd: RawFd,
+        fd_flags: libc::c_int,
+        status_flags: libc::c_int,
+        raw_stat: &libc::stat,
+        link: Option<&[u8]>,
+    ) -> Result<(), Errno> {
+        let file_type = stat::SFlag::from_bits_truncate(raw_stat.st_mode);
+        let ty = if raw_stat.st_mode & libc::S_IFMT == 0
+            && link == Some(crate::syscalls::inotify::INOTIFY_LINK)
+        {
+            // Its reads renumber rename cookies (`crate::syscalls::inotify`).
+            FdType::Inotify
+        } else if file_type.contains(stat::SFlag::S_IFIFO) {
+            FdType::Pipe
+        } else if file_type.contains(stat::SFlag::S_IFSOCK) {
+            FdType::Socket
+        } else if status_flags & libc::O_PATH == 0
+            && crate::fd::is_random_device(raw_stat.st_mode, raw_stat.st_rdev)
+        {
+            // Linux's random devices by device number, as an open classifies
+            // them (`Detcore::handle_openat`).
+            FdType::Rng
+        } else {
+            FdType::Regular
+        };
+        let mut flags = OFlag::from_bits_truncate(status_flags);
+        let physically_nonblocking = flags.contains(OFlag::O_NONBLOCK);
+        // Discovered descriptors have unknown provenance, so an observed
+        // O_NONBLOCK bit must remain guest-visible. Detcore-created scheduler
+        // pipes are registered when created and do not reach this fallback.
+        if fd_flags & libc::FD_CLOEXEC != 0 {
+            flags.insert(OFlag::O_CLOEXEC);
+        }
+        self.add_fd(owner, fd, flags, ty, Some((*raw_stat).into()))?;
+        // This newly discovered description predates our observation. Its
+        // kernel lock may be held, but no cached lock claim existed to go stale.
+        self.with_detfd(fd, |detfd| detfd.mark_flock_mode_unobserved())?;
+        if ty == FdType::Rng {
+            let stream = crate::fd::RandomDeviceStream::discovered(owner, fd);
+            self.with_detfd(fd, |detfd| detfd.set_random_device(stream))?;
         }
         if ty == FdType::Pipe && physically_nonblocking {
             self.with_detfd(fd, |detfd| detfd.set_physically_nonblocking())?;
@@ -1547,6 +2208,25 @@ impl FileMetadata {
     /// `fd_flags`) is, with the snapshot its name carries. Returns whether it
     /// joined another descriptor's open file (an alias), whose state it then
     /// shares.
+    ///
+    /// Otherwise the open file is rebuilt. A per-process file that follows
+    /// its record's sequence (`ProcfsFile::follows_record_sequence`) needs
+    /// more than its placeholder keeps: where its sequence is and the record
+    /// it buffered, which Linux keeps in the one open file every holder
+    /// shares. Where this process's registry names the open file the
+    /// placeholder belongs to (this process, or an ancestor before a fork,
+    /// opened it: `rendered_procfs::placeholder_open_id`), the descriptor
+    /// takes that open file's identity, and its sequence from Detcore's global
+    /// state, where every holder keeps it once the open file has left a
+    /// process (`ThreadState::share_procfs_sequences` at a fork,
+    /// `Detcore::share_sent_record_sequences` at a send). Otherwise (a
+    /// descriptor another process sent to one that never held the open file)
+    /// the sequence cannot be known, and every read and seek through it is
+    /// refused by name (`DetFd::mark_record_sequence_unknown`), on DBT through
+    /// its runtime's exit path, and on SaBRe, where a refusal that ended the
+    /// run would strand it, with EOPNOTSUPP. An open file
+    /// surviving `exec` is carried with its sequence instead
+    /// (`ExecProcfsRecords`), before this rediscovery could reach it.
     fn adopt_placeholder(
         &mut self,
         fd: RawFd,
@@ -1579,15 +2259,34 @@ impl FileMetadata {
         let procfs = crate::procfs::ProcfsFile::from_rendered_path(path)
             .expect("a rendered path is a procfs file")
             .into_rendered();
-        let procfs = if snapshot.is_empty() {
+        let mut procfs = if snapshot.is_empty() {
             procfs
         } else {
             procfs.with_rendered_snapshot(snapshot)
         };
+        let follows = procfs.follows_record_sequence();
+        let joined = follows
+            .then(|| {
+                crate::syscalls::rendered_procfs::placeholder_open_id((
+                    raw_stat.st_dev,
+                    raw_stat.st_ino,
+                ))
+            })
+            .flatten();
+        if joined.is_some() {
+            procfs.share_sequence();
+            self.has_shared_procfs_sequences = true;
+        }
         self.with_detfd(fd, |detfd| {
+            if let Some(id) = joined {
+                detfd.rebind_open_file_id(id);
+            }
             detfd.set_path(path);
             detfd.set_procfs(procfs.clone());
             detfd.set_procfs_offset(offset);
+            if follows && joined.is_none() {
+                detfd.mark_record_sequence_unknown();
+            }
         })?;
         Ok(false)
     }
@@ -1617,6 +2316,7 @@ impl FileMetadata {
     /// add a detfd
     fn add_detfd(&mut self, detfd: DetFd) {
         let fd = detfd.fd;
+        self.note_installed(fd);
         self.file_handles.insert(fd, detfd);
     }
 
@@ -1635,14 +2335,109 @@ impl FileMetadata {
         Ok(())
     }
 
+    /// Make `fd`, which `creator` just opened, a random device that reads a
+    /// stream named by the opener and the table's count of random-device
+    /// opens (`crate::fd::RandomDeviceStream`).
+    fn classify_random_device(&mut self, creator: DetTid, fd: RawFd) -> Result<(), Errno> {
+        let stream = crate::fd::RandomDeviceStream {
+            creator,
+            sequence: self.next_random_device_sequence,
+        };
+        self.with_detfd(fd, |detfd| detfd.set_random_device(stream))?;
+        self.next_random_device_sequence += 1;
+        Ok(())
+    }
+
+    /// The access trace's note of descriptor `fd` changing by `op`: the
+    /// open file it names now, and for an open, the path it was opened by.
+    fn slot_note(&self, fd: RawFd, op: FdNoteOp) -> crate::access_trace::FdNote {
+        use detcore_model::access_trace::FdOp;
+        let detfd = self.file_handles.get(&fd);
+        let op = match op {
+            FdNoteOp::Open => FdOp::Open {
+                path: detfd
+                    .and_then(DetFd::path)
+                    .map(|path| path.to_string_lossy().into_owned()),
+                kind: detfd
+                    .and_then(DetFd::stat)
+                    .and_then(|stat| detcore_model::access_trace::FileKind::of_mode(stat.mode)),
+            },
+            FdNoteOp::Dup(source) => FdOp::Dup { source },
+        };
+        crate::access_trace::FdNote {
+            slot: detcore_model::fd::FdSlot {
+                files: self.files_id,
+                fd,
+            },
+            open_file: detfd.map(DetFd::open_file_id),
+            op,
+            released: None,
+        }
+    }
+
+    /// The access trace's note that `fd` is about to be released, with what
+    /// it named; `None` when it names nothing Detcore models.
+    fn close_note(&self, fd: RawFd) -> Option<crate::access_trace::FdNote> {
+        let detfd = self.file_handles.get(&fd)?;
+        Some(crate::access_trace::FdNote {
+            slot: detcore_model::fd::FdSlot {
+                files: self.files_id,
+                fd,
+            },
+            open_file: Some(detfd.open_file_id()),
+            op: detcore_model::access_trace::FdOp::Close,
+            released: Some(crate::access_trace::FdInfo::of(detfd)),
+        })
+    }
+
     /// remove a rawfd
     fn remove_fd(&mut self, fd: RawFd) -> Option<OpenFileId> {
+        self.present_unmodelled.remove(&fd);
         let detfd = self.file_handles.remove(&fd)?;
-        (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())
+        self.release_detfd(detfd)
+    }
+
+    /// `detfd`, gone from this table: the description it names, if this was
+    /// its last reference ([`DetFd::is_last_reference`]: no other modeled
+    /// descriptor, no copy in flight), for the caller to release its port. A
+    /// socket's queued `SCM_RIGHTS` messages go with its last reference, as
+    /// Linux purges a released socket's receive queue (`unix_release_sock`),
+    /// and wait in [`Self::released_rights`] for the call to release what
+    /// they held (`Detcore::settle_released_rights`). A description with a
+    /// copy in flight stays, port and queue included, until a guest call
+    /// receives or releases the copy.
+    fn release_detfd(&mut self, detfd: DetFd) -> Option<OpenFileId> {
+        detfd.is_last_reference().then(|| {
+            self.released_rights
+                .0
+                .extend(detfd.take_all_queued_rights());
+            detfd.open_file_id()
+        })
+    }
+
+    /// Let go of every descriptor of this table, in order, as its last
+    /// holder's exit does (`ThreadState::release_table_at_exit`), or the
+    /// exec that replaced it (`ThreadState::release_exec_dropped_descriptors`):
+    /// a socket whose last reference goes takes its queue
+    /// ([`Self::release_detfd`]). No port is released here.
+    fn release_every_descriptor(&mut self) {
+        let mut fds: Vec<RawFd> = self.file_handles.keys().copied().collect();
+        fds.sort_unstable();
+        for fd in fds {
+            let _ = self.remove_fd(fd);
+        }
+    }
+
+    /// What closes in this table took from receiving sockets' queues
+    /// ([`Self::release_detfd`]).
+    fn take_released_rights(&mut self) -> Vec<SentDescriptor> {
+        std::mem::take(&mut self.released_rights.0)
     }
 
     /// Remove every modeled descriptor in an inclusive close_range interval.
     fn remove_fd_range(&mut self, first: u32, last: u32) -> Vec<OpenFileId> {
+        self.present_unmodelled
+            .retain(|fd, _| !(*fd >= 0 && first <= *fd as u32 && *fd as u32 <= last));
         let mut descriptors: Vec<_> = self
             .file_handles
             .keys()
@@ -1664,16 +2459,28 @@ impl FileMetadata {
         flags: OFlag,
     ) -> Result<Option<OpenFileId>, Errno> {
         if oldfd == newfd {
+            if self.present_unmodelled.contains_key(&oldfd) {
+                return Ok(None);
+            }
             self.with_detfd(oldfd, |_| ())?;
             return Ok(None);
+        }
+        // A copy of a descriptor Detcore keeps no description of is another
+        // such descriptor, which the kernel has installed.
+        if !self.file_handles.contains_key(&oldfd) && self.present_unmodelled.contains_key(&oldfd) {
+            self.note_installed(newfd);
+            self.present_unmodelled
+                .insert(newfd, flags.contains(OFlag::O_CLOEXEC));
+            let replaced = self.file_handles.remove(&newfd);
+            return Ok(replaced.and_then(|detfd| self.release_detfd(detfd)));
         }
 
         let detfd = self.with_detfd(oldfd, |old_detfd| {
             old_detfd.clone().with_fd(newfd).with_fd_flags(flags)
         })?;
+        self.note_installed(newfd);
         let replaced = self.file_handles.insert(newfd, detfd);
-        Ok(replaced
-            .and_then(|detfd| (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())))
+        Ok(replaced.and_then(|detfd| self.release_detfd(detfd)))
     }
 
     /// Capture the exact open-file description currently named by `fd`.
@@ -1706,19 +2513,23 @@ impl FileMetadata {
         }
 
         let detfd = captured.detfd.with_fd(newfd).with_fd_flags(flags);
+        self.note_installed(newfd);
         let replaced = self.file_handles.insert(newfd, detfd);
-        Ok(replaced
-            .and_then(|detfd| (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())))
+        Ok(replaced.and_then(|detfd| self.release_detfd(detfd)))
     }
 
     /// Drop a capture that was not installed and report whether it retained the
     /// final reference to the open-file description.
     fn abandon_captured_fd(&mut self, captured: CapturedDetFd) -> Option<OpenFileId> {
-        let release =
-            (captured.detfd.open_file_alias_count() == 1).then(|| captured.detfd.open_file_id());
-        drop(captured);
-        release
+        self.release_detfd(captured.detfd)
     }
+}
+
+/// How a descriptor slot changed, for [`FileMetadata::slot_note`].
+#[derive(Clone, Copy)]
+enum FdNoteOp {
+    Open,
+    Dup(RawFd),
 }
 
 fn stdio_resource(fd: RawFd) -> Option<ResourceID> {
@@ -1741,15 +2552,15 @@ mod posix_timers_tests {
     #[test]
     fn ids_are_deterministic_and_sequential() {
         let mut timers = PosixTimers::default();
-        assert_eq!(timers.create(None, None, None), 0);
-        assert_eq!(timers.create(Some(libc::SIGALRM), None, None), 1);
-        assert_eq!(timers.create(None, None, None), 2);
+        assert_eq!(timers.create(None, None, None, None), 0);
+        assert_eq!(timers.create(Some(libc::SIGALRM), None, None, None), 1);
+        assert_eq!(timers.create(None, None, None, None), 2);
     }
 
     #[test]
     fn settime_reports_previous_arming_and_remaining_uses_virtual_clock() {
         let mut timers = PosixTimers::default();
-        let id = timers.create(None, None, None);
+        let id = timers.create(None, None, None, None);
 
         // Arm a one-shot timer for 100ns at t=0. A freshly created timer was
         // disarmed, so the reported old value is zero.
@@ -1765,7 +2576,7 @@ mod posix_timers_tests {
     #[test]
     fn resetting_reports_old_remaining() {
         let mut timers = PosixTimers::default();
-        let id = timers.create(None, None, None);
+        let id = timers.create(None, None, None, None);
         timers.settime(id, 0, Some(t(100)), t(0));
         // Re-arm at t=30 (70ns remained) with a periodic 50ns timer.
         let old = timers
@@ -1780,7 +2591,7 @@ mod posix_timers_tests {
     #[test]
     fn periodic_remaining_advances_past_each_deadline() {
         let mut timers = PosixTimers::default();
-        let id = timers.create(Some(libc::SIGALRM), None, None);
+        let id = timers.create(Some(libc::SIGALRM), None, None, None);
         timers.settime(id, 50, Some(t(100)), t(0));
 
         assert_eq!(timers.gettime(id, t(100)), Some((50, 50)));
@@ -1792,7 +2603,7 @@ mod posix_timers_tests {
     #[test]
     fn disarm_and_unknown_ids() {
         let mut timers = PosixTimers::default();
-        let id = timers.create(None, None, None);
+        let id = timers.create(None, None, None, None);
         timers.settime(id, 0, Some(t(100)), t(0));
         // Disarm: value of 0 -> deadline None -> remaining 0.
         timers.settime(id, 0, None, t(10));
@@ -1807,7 +2618,7 @@ mod posix_timers_tests {
     #[test]
     fn delete_removes_timer() {
         let mut timers = PosixTimers::default();
-        let id = timers.create(None, None, None);
+        let id = timers.create(None, None, None, None);
         assert!(timers.contains(id));
         assert!(timers.remove(id));
         assert!(!timers.contains(id));
@@ -1882,6 +2693,32 @@ mod file_metadata_tests {
     use super::*;
     use crate::pipe_wake::ChannelEnd;
     use crate::pipe_wake::ChannelId;
+
+    /// Run the test named `case` in an isolated child process, returning
+    /// true when this invocation is the parent and the caller must return
+    /// at once. Tests here key model tables by this process's real
+    /// descriptor numbers; under plain `cargo test` a sibling thread can
+    /// be handed a number this test is using as a model-only alias, or
+    /// reuse a number this test just closed, so the model observes a
+    /// descriptor that is not its own. A child process has no sibling
+    /// threads allocating descriptors.
+    fn isolated_child(case: &str) -> bool {
+        const CHILD: &str = "HERMIT_FILE_METADATA_CHILD";
+        if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new(case)) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", case, "--nocapture", "--test-threads=1"])
+            .env(CHILD, case)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{output:?}"
+        );
+        true
+    }
 
     #[test]
     fn maps_exec_survivors_keep_opened_target_aliases_and_cursor() {
@@ -2089,11 +2926,13 @@ mod file_metadata_tests {
         parent
             .add_fd(fd, OFlag::O_RDONLY, FdType::Rng, None)
             .unwrap();
+        parent.classify_random_device(fd).unwrap();
         parent.dup_fd(fd, alias_fd, OFlag::empty()).unwrap();
         parent.dup_fd(fd, closed_fd, OFlag::O_CLOEXEC).unwrap();
         parent
             .add_fd(distinct_fd, OFlag::O_RDONLY, FdType::Rng, None)
             .unwrap();
+        parent.classify_random_device(distinct_fd).unwrap();
         parent
             .add_fd(socket_fd, OFlag::O_RDWR, FdType::Socket, None)
             .unwrap();
@@ -2171,6 +3010,7 @@ mod file_metadata_tests {
                 creator,
                 ExecFdState {
                     open_files: Some(transfer),
+                    random_device_sequence: parent.random_device_sequence_for_exec(),
                     ..ExecFdState::default()
                 },
                 true,
@@ -2210,6 +3050,7 @@ mod file_metadata_tests {
         successor
             .add_fd(fd, OFlag::O_RDONLY, FdType::Rng, None)
             .unwrap();
+        successor.classify_random_device(fd).unwrap();
         let reopened = successor.metadata().file_handles[&fd].open_file_id();
         assert_ne!(reopened, first_id);
         assert_ne!(reopened, high);
@@ -2217,6 +3058,13 @@ mod file_metadata_tests {
             reopened,
             OpenFileId::new(creator, successor.metadata().next_open_file_sequence - 1)
         );
+        // A survivor keeps its stream, and the exec exchange carries the count
+        // of random-device opens, so the new image's first open reads a new one.
+        let stream_of = |fd| successor.metadata().file_handles[&fd].random_device_stream();
+        let named = |sequence| crate::fd::RandomDeviceStream { creator, sequence };
+        assert_eq!(stream_of(alias_fd), named(0));
+        assert_eq!(stream_of(distinct_fd), named(1));
+        assert_eq!(stream_of(fd), named(2));
         assert_ne!(
             successor
                 .metadata()
@@ -2382,8 +3230,508 @@ mod file_metadata_tests {
     /// descriptor Detcore discovers afresh, as it does one it did not create
     /// (one received over `SCM_RIGHTS`), has none
     /// (<https://github.com/rrnewton/hermit/issues/4380>).
+    /// The capacity a descriptor directory's end follows is Linux's: it
+    /// grows to the next power of two above an installed descriptor, keeps
+    /// it when the descriptor closes, and a fork's copy is sized from what
+    /// is open (measured: `dup2(0, 100); close(100)` ends at 130, and a
+    /// fork's child after it at 66).
+    #[test]
+    fn the_descriptor_capacity_follows_linuxs_allocation() {
+        let owner = DetTid::from_raw(9031);
+        let mut table = FileMetadata::new(owner);
+        assert_eq!(table.descriptor_capacity, 64);
+        table
+            .add_fd(owner, 100, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        assert_eq!(table.descriptor_capacity, 128);
+        table.remove_fd(100);
+        assert_eq!(table.descriptor_capacity, 128);
+        assert_eq!(
+            table.fork_for(DetTid::from_raw(9032)).descriptor_capacity,
+            64
+        );
+        table
+            .add_fd(owner, 70, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        assert_eq!(
+            table.fork_for(DetTid::from_raw(9033)).descriptor_capacity,
+            128
+        );
+        assert_eq!(table.for_exec(owner).descriptor_capacity, 128);
+    }
+
+    /// A `dup2` or `dup3` to 100 whose old descriptor is not open grows the
+    /// table to 128 slots, as `ksys_dup3` expands it before it looks the old
+    /// descriptor up (measured: `dup2(-1, 100)` fails with EBADF and a
+    /// listing then ends at 130); a target below the capacity changes
+    /// nothing.
+    #[test]
+    fn a_failed_dup_grows_the_table_for_its_target() {
+        let owner = DetTid::from_raw(9041);
+        let mut table = FileMetadata::new(owner);
+        table.grow_to_hold(10);
+        assert_eq!(table.descriptor_capacity, 64);
+        table.grow_to_hold(100);
+        assert_eq!(table.descriptor_capacity, 128);
+        assert!(table.descriptor_numbers().is_empty());
+        table.grow_to_hold(-1);
+        assert_eq!(table.descriptor_capacity, 128);
+    }
+
+    /// A descriptor listed without modelling keeps the close-on-exec flag
+    /// `F_SETFD`, `FIOCLEX` and `FIONCLEX` give it, which decides whether it
+    /// survives `exec`; any other descriptor is not one.
+    #[test]
+    fn an_unmodelled_descriptor_keeps_its_close_on_exec_changes() {
+        let owner = DetTid::from_raw(9042);
+        let mut table = FileMetadata::new(owner);
+        table.present_unmodelled.insert(5, false);
+        table.present_unmodelled.insert(6, true);
+        assert!(table.set_unmodelled_cloexec(5, true));
+        assert!(table.set_unmodelled_cloexec(6, false));
+        assert!(!table.set_unmodelled_cloexec(7, true));
+        let after = table.for_exec(owner);
+        assert!(!after.present_unmodelled.contains_key(&5));
+        assert_eq!(after.present_unmodelled.get(&6), Some(&false));
+    }
+
+    /// A descriptor open in the table that Detcore does not model (a
+    /// received anonymous inode) is listed until it is closed or replaced,
+    /// survives `exec` unless it is close-on-exec, and a `dup` of it is
+    /// another such descriptor.
+    #[test]
+    fn an_unmodelled_descriptor_is_listed_until_it_goes() {
+        let owner = DetTid::from_raw(9034);
+        let mut table = FileMetadata::new(owner);
+        table
+            .add_fd(owner, 0, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        table.present_unmodelled.insert(5, false);
+        table.present_unmodelled.insert(6, true);
+        assert_eq!(table.descriptor_numbers(), vec![0, 5, 6]);
+        assert_eq!(table.for_exec(owner).descriptor_numbers(), vec![0, 5]);
+        assert_eq!(table.dup_fd(5, 9, OFlag::O_CLOEXEC).unwrap(), None);
+        assert_eq!(table.present_unmodelled.get(&9), Some(&true));
+        table.remove_fd(5);
+        table
+            .add_fd(owner, 6, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        assert_eq!(table.descriptor_numbers(), vec![0, 6, 9]);
+        assert!(!table.present_unmodelled.contains_key(&6));
+        table.remove_fd_range(0, 100);
+        assert!(table.descriptor_numbers().is_empty());
+    }
+
+    /// The close that drops a socket's last descriptor takes the messages
+    /// queued to it, for the call to release what they held
+    /// (`FileMetadata::release_detfd`), as Linux purges a released socket's
+    /// receive queue; one that leaves another descriptor of it takes
+    /// nothing, and a copy of the table has nothing to release.
+    #[test]
+    fn the_last_close_of_a_socket_takes_its_queue() {
+        let owner = DetTid::from_raw(9043);
+        let mut table = FileMetadata::new(owner);
+        for (fd, ty) in [
+            (3, FdType::Socket),
+            (4, FdType::Socket),
+            (5, FdType::Regular),
+        ] {
+            table.add_fd(owner, fd, OFlag::empty(), ty, None).unwrap();
+        }
+        let left = table.with_detfd(3, |detfd| detfd.clone()).unwrap();
+        let right = table.with_detfd(4, |detfd| detfd.clone()).unwrap();
+        left.pair_sockets(&right, false);
+        let carried = table
+            .with_detfd(5, |detfd| detfd.in_flight_open_file(true))
+            .unwrap();
+        assert!(matches!(
+            left.queue_rights_to_peer(
+                vec![SentDescriptor {
+                    file: (1, 5),
+                    open_file: Some(carried),
+                    lock_copy: None,
+                    suspect: false,
+                }],
+                1
+            ),
+            Ok(())
+        ));
+        drop((left, right));
+        table.dup_fd(4, 6, OFlag::empty()).unwrap();
+        assert_eq!(table.remove_fd(4), None, "another descriptor of it remains");
+        assert!(table.take_released_rights().is_empty());
+        let id = table.with_detfd(6, |detfd| detfd.open_file_id()).unwrap();
+        assert_eq!(table.remove_fd(6), Some(id), "its last descriptor");
+        let copy = table.clone();
+        assert_eq!(table.take_released_rights().len(), 1, "its queue, taken");
+        assert!(
+            copy.released_rights.0.is_empty(),
+            "a copy of the table releases nothing"
+        );
+    }
+
+    /// A table let go at its holder's exit takes the queue of each socket
+    /// whose last reference it held, so what those queues carried is
+    /// released by that exit (`ThreadState::release_table_at_exit`), whenever
+    /// the backend tears the exited thread's state down: here a socket the
+    /// parent sent and closed, queued to a socket only the child held, which
+    /// is then the last reference to it.
+    #[test]
+    fn a_table_let_go_at_exit_takes_its_last_sockets_queues() {
+        let parent_id = DetTid::from_raw(9044);
+        let mut parent = FileMetadata::new(parent_id);
+        for fd in [3, 4] {
+            parent
+                .add_fd(parent_id, fd, OFlag::empty(), FdType::Socket, None)
+                .unwrap();
+        }
+        let left = parent.with_detfd(3, |detfd| detfd.clone()).unwrap();
+        let right = parent.with_detfd(4, |detfd| detfd.clone()).unwrap();
+        left.pair_sockets(&right, false);
+        drop(right);
+        let mut child = parent.fork_for(DetTid::from_raw(9045));
+        assert_eq!(parent.remove_fd(4), None, "the child holds the receiver");
+        assert_eq!(child.remove_fd(3), None, "the parent holds the sender");
+        parent
+            .add_fd(parent_id, 5, OFlag::empty(), FdType::Socket, None)
+            .unwrap();
+        let carried = parent
+            .with_detfd(5, |detfd| detfd.in_flight_open_file(true))
+            .unwrap();
+        let sent_id = parent.with_detfd(5, |detfd| detfd.open_file_id()).unwrap();
+        assert!(matches!(
+            left.queue_rights_to_peer(
+                vec![SentDescriptor {
+                    file: (1, 5),
+                    open_file: Some(carried),
+                    lock_copy: None,
+                    suspect: false,
+                }],
+                1
+            ),
+            Ok(())
+        ));
+        assert_eq!(parent.remove_fd(5), None, "a copy is in flight");
+        child.release_every_descriptor();
+        assert!(child.file_handles.is_empty());
+        let released: Vec<_> = child
+            .take_released_rights()
+            .into_iter()
+            .filter_map(|sent| {
+                sent.open_file
+                    .and_then(crate::fd::InFlightOpenFile::release)
+            })
+            .map(|(id, ty, _)| (id, ty))
+            .collect();
+        assert_eq!(
+            released,
+            [(sent_id, FdType::Socket)],
+            "the exit released the queued socket, whose last reference it was"
+        );
+        drop(left);
+    }
+
+    /// The exit that leaves a table to no holder lets it go
+    /// (`FileMetadata::leave`), as guest calls alone count its holders: a
+    /// thread's `exit` counts one out and an `exit_group` its whole process;
+    /// a process made with `CLONE_FILES` holds the table too; a copy made for
+    /// a fork or an exec has one holder of its own. A table whose holders are
+    /// not known, or a process that does not hold it, never goes this way.
+    #[test]
+    fn a_table_goes_with_the_exit_that_leaves_it_no_holder() {
+        let process = DetTid::from_raw(9050);
+        let mut table = FileMetadata::new(process);
+        table.join_holder(process);
+        assert!(!table.leave(process, false), "one thread of two exits");
+        assert!(table.leave(process, false), "and then the other");
+
+        let mut table = FileMetadata::new(process);
+        table.join_holder(process);
+        table.join_holder(process);
+        assert!(table.leave(process, true), "an exit_group ends all three");
+
+        let sharer = DetTid::from_raw(9051);
+        let mut table = FileMetadata::new(process);
+        table.join_holder(sharer);
+        assert!(
+            !table.leave(process, true),
+            "a process made with CLONE_FILES"
+        );
+        assert!(
+            !table.leave(process, false),
+            "a process that left holds none"
+        );
+        assert!(table.leave(sharer, false));
+
+        let mut copy = FileMetadata::new(process).fork_for(sharer);
+        assert!(
+            copy.leave(sharer, false),
+            "a fork's copy, its child's alone"
+        );
+        let mut copy = FileMetadata::new(process).for_exec(sharer);
+        copy.hold_alone(process);
+        assert!(!copy.leave(sharer, false));
+        assert!(copy.leave(process, false), "an exec's copy, its process's");
+
+        let mut unknown = FileMetadata::new(process);
+        unknown.holders.clear();
+        unknown.join_holder(process);
+        assert!(!unknown.leave(process, true), "holders not known");
+    }
+
+    /// An exec leaves the table it replaces, all of the exec'ing process's
+    /// threads at once (`ThreadState::release_exec_dropped_descriptors`), and
+    /// drops that table's descriptors only where it was the last holder:
+    /// Linux copies a table another process still holds (`unshare_files`),
+    /// which keeps every descriptor, and that process's own exit then lets the
+    /// table go, which the exec'ing process no longer counts against. A table
+    /// whose holders are not known is left as it is (Codex's notes on K8-h
+    /// reb7: the exec'ing process stayed a holder of the shared table, so the
+    /// other process's exit never let it go).
+    #[test]
+    fn an_exec_leaves_a_table_another_process_still_holds() {
+        let process = DetTid::from_raw(9052);
+        let sharer = DetTid::from_raw(9053);
+        let exec_of = |table: FileMetadata| {
+            let replaced = Arc::new(Mutex::new(table));
+            let mut new = replaced.lock().unwrap().for_exec(process);
+            new.hold_alone(process);
+            new.keep_replaced_table(Arc::clone(&replaced), process);
+            let state = ThreadState::new(process, &Config::default(), ());
+            *state.file_metadata.lock().unwrap() = new;
+            let released = state.release_exec_dropped_descriptors();
+            (replaced, released)
+        };
+
+        let mut shared = FileMetadata::new(process);
+        shared.join_holder(process);
+        shared.join_holder(sharer);
+        shared
+            .add_fd(process, 3, OFlag::O_CLOEXEC, FdType::Regular, None)
+            .unwrap();
+        let (shared, released) = exec_of(shared);
+        assert!(!released, "a process made with CLONE_FILES still holds it");
+        let mut shared = shared.lock().unwrap();
+        assert_eq!(shared.file_handles.len(), 1, "it keeps every descriptor");
+        assert_eq!(shared.holders, BTreeMap::from([(sharer, 1)]));
+        assert!(shared.leave(sharer, true), "its exit lets the table go");
+
+        let mut unknown = FileMetadata::new(process);
+        unknown.holders.clear();
+        unknown
+            .add_fd(process, 3, OFlag::O_CLOEXEC, FdType::Regular, None)
+            .unwrap();
+        let (unknown, released) = exec_of(unknown);
+        assert!(!released);
+        assert_eq!(
+            unknown.lock().unwrap().file_handles.len(),
+            1,
+            "holders not known"
+        );
+    }
+
+    /// The exec of a process whose table only it holds lets go of that
+    /// table's descriptors at the new image's first callback
+    /// (`ThreadState::release_exec_dropped_descriptors`): here a receiving
+    /// socket whose last descriptor, in the child, is close-on-exec, queued a
+    /// description the parent sent and closed, so the exec releases the copy
+    /// in flight, as Linux releases it when the exec closes the socket
+    /// (Claude's narrow check of K8-h reb6, finding 1: before, the copy, and
+    /// with it the lock ledger's count of its locks, stayed for the rest of
+    /// the run). The replaced table names nothing afterwards, and a second
+    /// call releases nothing.
+    #[test]
+    fn an_exec_releases_what_its_close_on_exec_receiving_socket_held() {
+        let parent_id = DetTid::from_raw(9054);
+        let child_id = DetTid::from_raw(9055);
+        let mut parent = FileMetadata::new(parent_id);
+        parent
+            .add_fd(parent_id, 3, OFlag::empty(), FdType::Socket, None)
+            .unwrap();
+        parent
+            .add_fd(parent_id, 4, OFlag::O_CLOEXEC, FdType::Socket, None)
+            .unwrap();
+        let left = parent.with_detfd(3, |detfd| detfd.clone()).unwrap();
+        let right = parent.with_detfd(4, |detfd| detfd.clone()).unwrap();
+        left.pair_sockets(&right, false);
+        drop(right);
+        let mut child = parent.fork_for(child_id);
+        assert_eq!(parent.remove_fd(4), None, "the child holds the receiver");
+        assert_eq!(child.remove_fd(3), None, "the parent holds the sender");
+        parent
+            .add_fd(parent_id, 5, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        let carried = parent
+            .with_detfd(5, |detfd| detfd.in_flight_open_file(true))
+            .unwrap();
+        let sent_id = parent.with_detfd(5, |detfd| detfd.open_file_id()).unwrap();
+        assert!(matches!(
+            left.queue_rights_to_peer(
+                vec![SentDescriptor {
+                    file: (1, 5),
+                    open_file: Some(carried),
+                    lock_copy: Some(sent_id),
+                    suspect: false,
+                }],
+                1
+            ),
+            Ok(())
+        ));
+        assert_eq!(parent.remove_fd(5), None, "a copy is in flight");
+
+        child.join_holder(child_id);
+        let replaced = Arc::new(Mutex::new(child));
+        let mut new = replaced.lock().unwrap().for_exec(child_id);
+        new.hold_alone(child_id);
+        assert!(
+            new.file_handles.is_empty(),
+            "the receiver was close-on-exec"
+        );
+        new.keep_replaced_table(Arc::clone(&replaced), child_id);
+        let state = ThreadState::new(child_id, &Config::default(), ());
+        *state.file_metadata.lock().unwrap() = new;
+
+        assert!(state.release_exec_dropped_descriptors());
+        let released: Vec<_> = state
+            .take_released_rights()
+            .into_iter()
+            .map(|sent| {
+                (
+                    sent.lock_copy,
+                    sent.open_file
+                        .and_then(crate::fd::InFlightOpenFile::release)
+                        .map(|(id, ty, _)| (id, ty)),
+                )
+            })
+            .collect();
+        assert_eq!(
+            released,
+            [(Some(sent_id), Some((sent_id, FdType::Regular)))],
+            "the exec released the copy in flight, its description's last reference"
+        );
+        assert!(
+            replaced.lock().unwrap().file_handles.is_empty(),
+            "the replaced table names nothing"
+        );
+        assert!(!state.release_exec_dropped_descriptors(), "released once");
+        drop(left);
+    }
+
+    /// The death of a process by a fatal signal's default action, which its
+    /// terminal receipt reports (`GlobalState::release_tables_at_death`), lets
+    /// go of a table only that process held (`FileMetadata::release_at_death`):
+    /// here a receiving socket whose last descriptor the child holds queued
+    /// a description the parent sent and closed, so the death releases the
+    /// copy in flight, the description's last reference, as Linux's
+    /// `exit_files` releases it before the parent can wait (Codex's narrow
+    /// check of K8-h reb8: before, KVM listed its lock after the child died
+    /// by its own SIGTERM, abort() or SIGSEGV). Every thread of the process
+    /// leaves at once. A table another process still holds keeps every
+    /// descriptor, and a table whose holders are not known, or do not name
+    /// the process, is left undecided.
+    #[test]
+    fn a_fatal_signals_death_releases_a_table_only_its_process_held() {
+        let parent_id = DetTid::from_raw(9056);
+        let child_id = DetTid::from_raw(9057);
+        let sharer = DetTid::from_raw(9058);
+        let mut parent = FileMetadata::new(parent_id);
+        parent
+            .add_fd(parent_id, 3, OFlag::empty(), FdType::Socket, None)
+            .unwrap();
+        parent
+            .add_fd(parent_id, 4, OFlag::empty(), FdType::Socket, None)
+            .unwrap();
+        let left = parent.with_detfd(3, |detfd| detfd.clone()).unwrap();
+        let right = parent.with_detfd(4, |detfd| detfd.clone()).unwrap();
+        left.pair_sockets(&right, false);
+        drop(right);
+        let mut child = parent.fork_for(child_id);
+        child.hold_alone(child_id);
+        assert_eq!(parent.remove_fd(4), None, "the child holds the receiver");
+        assert_eq!(child.remove_fd(3), None, "the parent holds the sender");
+        parent
+            .add_fd(parent_id, 5, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        let carried = parent
+            .with_detfd(5, |detfd| detfd.in_flight_open_file(true))
+            .unwrap();
+        let sent_id = parent.with_detfd(5, |detfd| detfd.open_file_id()).unwrap();
+        assert!(matches!(
+            left.queue_rights_to_peer(
+                vec![SentDescriptor {
+                    file: (1, 5),
+                    open_file: Some(carried),
+                    lock_copy: Some(sent_id),
+                    suspect: false,
+                }],
+                1
+            ),
+            Ok(())
+        ));
+        assert_eq!(parent.remove_fd(5), None, "a copy is in flight");
+
+        // A second thread of the child holds the table too.
+        child.join_holder(child_id);
+        let TableAtDeath::Released(rights) = child.release_at_death(child_id) else {
+            panic!("the child alone held its table");
+        };
+        assert_eq!(
+            crate::syscalls::scm_rights::settle(rights),
+            crate::syscalls::scm_rights::Settled {
+                lock_copies: vec![sent_id],
+                unfollowable_copies: Vec::new(),
+                ports: Vec::new(),
+            },
+            "the death released the copy in flight, its description's last reference"
+        );
+        assert!(child.file_handles.is_empty(), "every descriptor went");
+        assert!(child.holders.is_empty(), "both threads left");
+        assert!(
+            matches!(child.release_at_death(child_id), TableAtDeath::Undecided),
+            "released once"
+        );
+
+        let mut shared = FileMetadata::new(child_id);
+        shared.join_holder(sharer);
+        shared
+            .add_fd(child_id, 3, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        assert!(matches!(
+            shared.release_at_death(child_id),
+            TableAtDeath::Kept
+        ));
+        assert_eq!(shared.file_handles.len(), 1, "it keeps every descriptor");
+        assert_eq!(shared.holders, BTreeMap::from([(sharer, 1)]));
+
+        let mut unknown = FileMetadata::new(child_id);
+        unknown.holders.clear();
+        unknown
+            .add_fd(child_id, 3, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        assert!(matches!(
+            unknown.release_at_death(child_id),
+            TableAtDeath::Undecided
+        ));
+        assert_eq!(unknown.file_handles.len(), 1, "holders not known");
+        let mut another = FileMetadata::new(sharer);
+        another
+            .add_fd(sharer, 3, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        assert!(matches!(
+            another.release_at_death(child_id),
+            TableAtDeath::Undecided
+        ));
+        assert_eq!(another.file_handles.len(), 1, "not the process's table");
+        drop(left);
+    }
+
     #[test]
     fn a_pipe_channel_follows_its_description_through_dup_and_fork() {
+        if isolated_child(
+            "tool_local::file_metadata_tests::a_pipe_channel_follows_its_description_through_dup_and_fork",
+        ) {
+            return;
+        }
         let owner = DetTid::from_raw(9018);
         let mut parent = FileMetadata::new(owner);
         let (reader, _writer) = nix::unistd::pipe2(OFlag::empty()).unwrap();
@@ -2422,6 +3770,90 @@ mod file_metadata_tests {
                 .unwrap(),
             None
         );
+    }
+
+    /// A descriptor received over `SCM_RIGHTS` on a backend whose tool does
+    /// not share the guest's table is recorded from injected facts
+    /// (`add_discovered_fd`); an in-guest backend discovers the same
+    /// descriptor in process. Both make the same description: type, status
+    /// flags, close-on-exec, physical nonblocking and an unobserved lock.
+    #[test]
+    fn a_received_descriptor_is_recorded_as_the_in_guest_discovery_records_it() {
+        let owner = DetTid::from_raw(9031);
+        let facts = |fd: RawFd| {
+            // SAFETY: fcntl and fstat only read this test's descriptor.
+            let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            let status = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
+            (fd_flags, status, stat)
+        };
+        let shape = |metadata: &FileMetadata, fd: RawFd| {
+            let detfd = &metadata.file_handles[&fd];
+            (
+                detfd.ty(),
+                detfd.status_flags(),
+                detfd.is_cloexec(),
+                detfd.physically_nonblocking(),
+                detfd.is_nonblocking(),
+                detfd.known_flock_mode(),
+                detfd.flock_may_have_been_granted(),
+                detfd.stat().map(|stat| stat.raw_inode()),
+            )
+        };
+        let (pipe_read, _pipe_write) =
+            nix::unistd::pipe2(OFlag::O_NONBLOCK | OFlag::O_CLOEXEC).unwrap();
+        let (socket, _peer) = nix::sys::socket::socketpair(
+            nix::sys::socket::AddressFamily::Unix,
+            nix::sys::socket::SockType::Stream,
+            None,
+            nix::sys::socket::SockFlag::empty(),
+        )
+        .unwrap();
+        let file = std::fs::File::open("/proc/self/exe").unwrap();
+        let random = std::fs::File::open("/dev/urandom").unwrap();
+        // SAFETY: inotify_init1 takes no pointer; the descriptor is owned here.
+        let inotify = unsafe {
+            <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(libc::inotify_init1(
+                libc::IN_NONBLOCK | libc::IN_CLOEXEC,
+            ))
+        };
+        let cases = [
+            (pipe_read.as_raw_fd(), FdType::Pipe),
+            (socket.as_raw_fd(), FdType::Socket),
+            (file.as_raw_fd(), FdType::Regular),
+            (random.as_raw_fd(), FdType::Rng),
+            (inotify.as_raw_fd(), FdType::Inotify),
+        ];
+        for (fd, ty) in cases {
+            let mut recorded = FileMetadata::new(owner);
+            let (fd_flags, status, stat) = facts(fd);
+            // As the receipt reads it: only an anonymous inode's link.
+            let link = (stat.st_mode & libc::S_IFMT == 0)
+                .then(|| super::own_fd_link(fd))
+                .flatten();
+            recorded
+                .add_discovered_fd(owner, fd, fd_flags, status, &stat, link.as_deref())
+                .unwrap();
+            let mut discovered = FileMetadata::new(owner);
+            discovered
+                .discover_fd_from_current_process(owner, fd)
+                .unwrap();
+            assert_eq!(shape(&recorded, fd), shape(&discovered, fd), "fd {fd}");
+            assert_eq!(recorded.file_handles[&fd].ty(), ty, "fd {fd}");
+            // Recorded unobserved: no lock claim, and one may be held.
+            assert_eq!(recorded.file_handles[&fd].known_flock_mode(), None);
+        }
+        let pipe = pipe_read.as_raw_fd();
+        let mut recorded = FileMetadata::new(owner);
+        let (fd_flags, status, stat) = facts(pipe);
+        recorded
+            .add_discovered_fd(owner, pipe, fd_flags, status, &stat, None)
+            .unwrap();
+        let detfd = &recorded.file_handles[&pipe];
+        // The kernel's flags are what the record knows: O_NONBLOCK stays
+        // visible and physical, and FD_CLOEXEC is the slot's.
+        assert!(detfd.is_cloexec() && detfd.is_nonblocking() && detfd.physically_nonblocking());
     }
 
     /// Under `--pipe-wake-latency` a rediscovering exec carries each surviving
@@ -2716,6 +4148,128 @@ mod file_metadata_tests {
         );
     }
 
+    /// A task's `arch_status` is rendered exactly where `/proc/cpuinfo` is,
+    /// so a memfd named and sealed as its placeholder, met before the
+    /// session's answer, waits for that answer as a `/proc/cpuinfo`
+    /// placeholder does, and becomes the placeholder it is once the session
+    /// renders the files (Claude review of the kvm lane's slice N3: it was
+    /// neither adopted nor queued, and stayed an ordinary memfd).
+    #[test]
+    fn an_arch_status_placeholder_waits_for_the_sessions_answer() {
+        let owner = DetTid::from_raw(9);
+        let stand_in = || {
+            // SAFETY: the name is NUL-terminated; the result is checked.
+            let raw = unsafe {
+                libc::memfd_create(
+                    c"hermit-procfs:/proc/3/arch_status#1@".as_ptr(),
+                    libc::MFD_ALLOW_SEALING,
+                )
+            };
+            assert!(
+                raw >= 0,
+                "memfd_create: {}",
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: `raw` is a descriptor this test just made and owns.
+            let fd = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) };
+            let seals = crate::syscalls::rendered_procfs::PLACEHOLDER_SEALS;
+            assert_eq!(unsafe { libc::fcntl(raw, libc::F_ADD_SEALS, seals) }, 0);
+            fd
+        };
+        // The session does not render the files: it stays an ordinary memfd.
+        let fd = stand_in();
+        let mut metadata = FileMetadata::new(owner);
+        metadata
+            .discover_fd_from_current_process(owner, fd.as_raw_fd())
+            .unwrap();
+        assert!(
+            metadata.file_handles[&fd.as_raw_fd()]
+                .procfs_rendered_path()
+                .is_none()
+        );
+        metadata.decide_cpuinfo_placeholders(false).unwrap();
+        assert!(
+            metadata.file_handles[&fd.as_raw_fd()]
+                .procfs_rendered_path()
+                .is_none()
+        );
+        // The session renders them: the waiting descriptor becomes the
+        // task's arch_status.
+        let mut metadata = FileMetadata::new(owner);
+        metadata
+            .discover_fd_from_current_process(owner, fd.as_raw_fd())
+            .unwrap();
+        assert!(
+            metadata.file_handles[&fd.as_raw_fd()]
+                .procfs_rendered_path()
+                .is_none()
+        );
+        metadata.decide_cpuinfo_placeholders(true).unwrap();
+        assert_eq!(
+            metadata.file_handles[&fd.as_raw_fd()].procfs_rendered_path(),
+            Some(std::path::Path::new("/proc/3/arch_status"))
+        );
+    }
+
+    /// A memfd named and sealed as the placeholder of a file the run's
+    /// `--proc` level omits stays the ordinary memfd it is when a table
+    /// discovers it: Detcore makes no placeholder for such a file, whose open
+    /// fails with ENOENT (Claude review of the kvm lane's slice N3, round 2).
+    /// At a level that has the file it is the placeholder, as before.
+    #[test]
+    fn a_memfd_with_a_stand_in_name_outside_the_proc_level_stays_a_memfd() {
+        use detcore_model::config::ProcLevel;
+        let owner = DetTid::from_raw(9);
+        // SAFETY: the name is NUL-terminated; the result is checked.
+        let raw = unsafe {
+            libc::memfd_create(
+                c"hermit-procfs:/proc/diskstats@".as_ptr(),
+                libc::MFD_ALLOW_SEALING,
+            )
+        };
+        assert!(
+            raw >= 0,
+            "memfd_create: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: `raw` is a descriptor this test just made and owns.
+        let fd = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) };
+        let seals = crate::syscalls::rendered_procfs::PLACEHOLDER_SEALS;
+        assert_eq!(unsafe { libc::fcntl(raw, libc::F_ADD_SEALS, seals) }, 0);
+        let diskstats = std::path::Path::new("/proc/diskstats");
+        assert!(crate::syscalls::rendered_procfs::named_file_outside_level(
+            diskstats,
+            ProcLevel::Minimal
+        ));
+        assert!(!crate::syscalls::rendered_procfs::named_file_outside_level(
+            diskstats,
+            ProcLevel::Standard
+        ));
+        let mut noted = FileMetadata::new(owner);
+        noted.note_proc_level(ProcLevel::Minimal);
+        // Carried through serialization, as a table is across a fork or an
+        // exec on an in-guest backend, before it rediscovers a descriptor.
+        let mut minimal: FileMetadata =
+            serde_json::from_slice(&serde_json::to_vec(&noted.for_exec(owner)).unwrap()).unwrap();
+        minimal
+            .discover_fd_from_current_process(owner, fd.as_raw_fd())
+            .unwrap();
+        assert!(
+            minimal.file_handles[&fd.as_raw_fd()]
+                .procfs_rendered_path()
+                .is_none()
+        );
+        let mut standard = FileMetadata::new(owner);
+        standard.note_proc_level(ProcLevel::Standard);
+        standard
+            .discover_fd_from_current_process(owner, fd.as_raw_fd())
+            .unwrap();
+        assert_eq!(
+            standard.file_handles[&fd.as_raw_fd()].procfs_rendered_path(),
+            Some(diskstats)
+        );
+    }
+
     #[test]
     fn inherited_terminal_aliases_survive_fork_serialization_and_exec_handoff() {
         use std::os::fd::FromRawFd;
@@ -2907,6 +4461,15 @@ mod file_metadata_tests {
                 .expect("live descriptor should be discovered");
             assert_eq!(metadata.file_handles[&fd].ty(), expected, "fd {fd}");
         }
+        // A discovered random device is named by its descriptor, apart from
+        // the count of opens, which discovery leaves alone.
+        for fd in [random.as_raw_fd(), urandom.as_raw_fd()] {
+            assert_eq!(
+                metadata.file_handles[&fd].random_device_stream(),
+                crate::fd::RandomDeviceStream::discovered(owner, fd)
+            );
+        }
+        assert_eq!(metadata.next_random_device_sequence, 0);
     }
 
     #[test]
@@ -3057,6 +4620,68 @@ mod file_metadata_tests {
         // Descriptor flags stay per descriptor.
         assert!(!three.is_cloexec());
         assert!(four.is_cloexec());
+    }
+
+    /// Each open of a random device reads a stream of its own, named by its
+    /// opener and the table's count of earlier random-device opens; a dup
+    /// alias shares it. Other opens leave the count alone. Fork and exec
+    /// carry it, and so does the exec exchange of a backend that rebuilds its
+    /// table, so no later open in the table or a copy of it reuses a name.
+    #[test]
+    fn each_random_device_open_reads_its_own_stream() {
+        use crate::fd::RandomDeviceStream;
+        let owner = DetTid::from_raw(9);
+        let thread = DetTid::from_raw(11);
+        let stream = |table: &mut FileMetadata, fd| {
+            table
+                .with_detfd(fd, |detfd| detfd.random_device_stream())
+                .expect("registered descriptor")
+        };
+        let open = |table: &mut FileMetadata, creator, fd| {
+            table
+                .add_fd(creator, fd, OFlag::empty(), FdType::Regular, None)
+                .expect("register the open");
+            table
+                .classify_random_device(creator, fd)
+                .expect("classify it");
+        };
+        let mut metadata = FileMetadata::new(owner);
+        open(&mut metadata, owner, 3);
+        metadata.dup_fd(3, 4, OFlag::empty()).expect("dup it");
+        metadata
+            .add_fd(owner, 5, OFlag::empty(), FdType::Regular, None)
+            .expect("open a regular file");
+        open(&mut metadata, thread, 6);
+        assert_eq!(
+            metadata.classify_random_device(thread, 7),
+            Err(Errno::EBADF)
+        );
+        let child = DetTid::from_raw(10);
+        let mut forked = metadata.fork_for(child);
+        open(&mut forked, child, 7);
+        let mut exec = metadata.for_exec(owner);
+        open(&mut exec, owner, 7);
+        let mut rebuilt = FileMetadata::new(owner);
+        rebuilt
+            .apply_exec_fd_state(
+                owner,
+                ExecFdState {
+                    random_device_sequence: 2,
+                    ..ExecFdState::default()
+                },
+                true,
+            )
+            .expect("apply the exec exchange");
+        open(&mut rebuilt, owner, 3);
+
+        let named = |creator, sequence| RandomDeviceStream { creator, sequence };
+        assert_eq!(stream(&mut metadata, 3), named(owner, 0));
+        assert_eq!(stream(&mut metadata, 4), named(owner, 0));
+        assert_eq!(stream(&mut metadata, 6), named(thread, 1));
+        assert_eq!(stream(&mut forked, 3), named(owner, 0));
+        assert_eq!(stream(&mut forked, 7), named(child, 2));
+        assert_eq!(stream(&mut exec, 7), named(owner, 2));
+        assert_eq!(stream(&mut rebuilt, 3), named(owner, 2));
     }
 
     #[test]
@@ -3526,6 +5151,276 @@ mod file_metadata_tests {
             "a non-CLOEXEC alias keeps the OFD live across exec"
         );
     }
+
+    /// A rendered per-process file `spelling` (`/proc/<pid>/<name>`) bound to
+    /// a task, as a rendered open makes one.
+    fn rendered_record_file(spelling: &str) -> crate::procfs::ProcfsFile {
+        let mut file = crate::procfs::ProcfsFile::from_path(Path::new(spelling)).unwrap();
+        file.bind_task(3, 5);
+        file.set_task_incarnation(crate::procfs::TaskIncarnation {
+            process: 1,
+            thread: None,
+        });
+        file.into_rendered()
+    }
+
+    /// A per-process file that follows its record's sequence survives an
+    /// exec on a backend that rebuilds its descriptor table with its open
+    /// file's identity, its model and its sequence (the cursor, where the
+    /// sequence is, the buffered record), aliases kept and a close-on-exec
+    /// copy dropped, and with the old table's numbering: so the new image
+    /// continues the record where every holder's sequence is (Claude's
+    /// narrow check of the kvm lane's slice N3, round 5: before, the new image
+    /// rebuilt it with no sequence) and allocates no identity a sequence in
+    /// Detcore's global state may still hold (Codex's, round 5: before, it
+    /// numbered from 0 again), also where the only such description closed
+    /// at the exec after a fork shared its sequence. A survivor whose sequence
+    /// Detcore cannot know stays so, and a slot reused since the preparation
+    /// is refused (EIO).
+    #[test]
+    fn record_sequence_exec_survivors_keep_identity_sequence_and_numbering() {
+        if isolated_child(
+            "tool_local::file_metadata_tests::record_sequence_exec_survivors_keep_identity_sequence_and_numbering",
+        ) {
+            return;
+        }
+        use crate::procfs::ProcfsFile;
+        use crate::procfs::ProcfsSnapshotContext;
+
+        let owner = DetTid::from_raw(9031);
+        let config = Config::default();
+        let mut parent = ThreadState::new(owner, &config, ());
+        let statm = std::fs::File::open("/proc/self/statm").unwrap();
+        let alias = statm.try_clone().unwrap();
+        let closed = statm.try_clone().unwrap();
+        let received = std::fs::File::open("/proc/self/statm").unwrap();
+        let (fd, alias_fd, closed_fd, received_fd) = (
+            statm.as_raw_fd(),
+            alias.as_raw_fd(),
+            closed.as_raw_fd(),
+            received.as_raw_fd(),
+        );
+        for number in [fd, received_fd] {
+            parent
+                .add_fd(number, OFlag::O_RDONLY, FdType::Regular, None)
+                .unwrap();
+            parent
+                .with_detfd(number, |handle| {
+                    handle.set_path("/proc/self/statm");
+                    handle
+                        .set_procfs(ProcfsFile::from_path(Path::new("/proc/self/statm")).unwrap());
+                })
+                .unwrap();
+        }
+        parent.dup_fd(fd, alias_fd, OFlag::empty()).unwrap();
+        parent.dup_fd(fd, closed_fd, OFlag::O_CLOEXEC).unwrap();
+        let record = b"1 2 3 4 5 6 7\n".to_vec();
+        parent
+            .with_detfd(fd, |handle| {
+                handle.initialize_procfs(record.clone(), ProcfsSnapshotContext::default());
+                handle.commit_procfs_read(0, 4);
+                handle.procfs_note_read_end(4);
+            })
+            .unwrap();
+        parent
+            .with_detfd(received_fd, |handle| handle.mark_record_sequence_unknown())
+            .unwrap();
+        // A fork marks the sequences shared.
+        parent.share_procfs_sequences();
+        let old_id = parent.with_detfd(fd, |h| h.open_file_id()).unwrap();
+        let sequence = parent
+            .with_detfd(fd, |h| h.procfs_sequence())
+            .unwrap()
+            .unwrap();
+        let records = parent.procfs_records_for_exec().unwrap().unwrap();
+        assert!(!records.handles.contains_key(&closed_fd));
+        assert_eq!(
+            records.handles[&fd].identity.id,
+            records.handles[&alias_fd].identity.id
+        );
+        assert!(records.handles[&received_fd].sequence_unknown);
+        let next_sequence = records.next_sequence;
+        let state = ExecFdState {
+            procfs_records: Some(records),
+            ..ExecFdState::default()
+        };
+        assert!(!state.is_empty());
+        assert_eq!(state.open_file_creator(), Some(owner));
+        // The serialized exec preparation and completion payload.
+        let state: ExecFdState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        let receiving = DetTid::from_raw(9032);
+        let mut successor_thread = ThreadState::new(receiving, &config, ());
+        // The creator choice the exec-completion handler makes.
+        successor_thread.set_open_file_creator(state.open_file_creator().unwrap());
+        let mut successor = successor_thread.metadata();
+        successor
+            .apply_exec_fd_state(receiving, state.clone(), true)
+            .unwrap();
+        assert!(!successor.file_handles.contains_key(&closed_fd));
+        for number in [fd, alias_fd] {
+            let handle = &successor.file_handles[&number];
+            assert_eq!(handle.open_file_id(), old_id);
+            assert_eq!(handle.procfs_shared_sequence(), Some(old_id));
+            assert_eq!(handle.procfs_sequence(), Some(sequence.clone()));
+            assert!(!handle.record_sequence_unknown());
+        }
+        assert!(successor.file_handles[&received_fd].record_sequence_unknown());
+        // One open file: a read through the alias moves the other's cursor.
+        successor.file_handles[&alias_fd].commit_procfs_read(4, 2);
+        assert_eq!(successor.file_handles[&fd].procfs_position().unwrap().0, 6);
+        assert!(successor.next_open_file_sequence >= next_sequence);
+        assert!(successor.has_shared_procfs_sequences);
+        drop(successor);
+        let next = tempfile::tempfile().unwrap();
+        successor_thread
+            .add_fd(next.as_raw_fd(), OFlag::O_RDWR, FdType::Regular, None)
+            .unwrap();
+        assert_eq!(
+            successor_thread
+                .with_detfd(next.as_raw_fd(), |h| h.open_file_id())
+                .unwrap(),
+            OpenFileId::new(owner, next_sequence),
+        );
+        // A table whose shared description closed at the exec still carries
+        // its numbering.
+        let lone = ThreadState::new(owner, &config, ());
+        let cloexec = std::fs::File::open("/proc/self/statm").unwrap();
+        lone.add_fd(cloexec.as_raw_fd(), OFlag::O_CLOEXEC, FdType::Regular, None)
+            .unwrap();
+        lone.with_detfd(cloexec.as_raw_fd(), |handle| {
+            handle.set_procfs(ProcfsFile::from_path(Path::new("/proc/self/statm")).unwrap());
+        })
+        .unwrap();
+        assert!(lone.procfs_records_for_exec().unwrap().is_none());
+        lone.share_procfs_sequences();
+        let numbering = lone.procfs_records_for_exec().unwrap().unwrap();
+        assert!(numbering.handles.is_empty());
+        assert_eq!(
+            numbering.next_sequence,
+            lone.metadata().next_open_file_sequence
+        );
+        assert!(numbering.next_sequence > 0);
+        // A reused numeric slot cannot take the old open file's identity.
+        let replacement = tempfile::tempfile().unwrap();
+        assert_eq!(
+            unsafe { libc::dup2(replacement.as_raw_fd(), alias_fd) },
+            alias_fd
+        );
+        assert_eq!(
+            FileMetadata::new(owner).apply_exec_fd_state(owner, state, true),
+            Err(Errno::EIO)
+        );
+    }
+
+    /// A descriptor's link names a per-process file that follows its record's
+    /// sequence as the kernel opens one only for an empty regular file with a
+    /// link (never a placeholder, which has none) whose link names a task's
+    /// `stat`, `statm`, `io`, `arch_status` or `cgroup`: not its `comm`, which
+    /// the kernel's own open file serves, nor any other file.
+    #[test]
+    fn a_kernel_record_file_link_names_only_a_sequence_file() {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        stat.st_mode = libc::S_IFREG | 0o444;
+        stat.st_nlink = 1;
+        for name in ["stat", "statm", "io", "arch_status", "cgroup"] {
+            let link = format!("/proc/12/{name}");
+            assert_eq!(
+                kernel_record_file_link(&stat, link.as_bytes()),
+                Some(std::path::PathBuf::from(&link)),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            kernel_record_file_link(&stat, b"/proc/12/task/13/statm"),
+            Some(std::path::PathBuf::from("/proc/12/task/13/statm"))
+        );
+        for link in [
+            "/proc/12/comm",
+            "/proc/12/status",
+            "/proc/12/maps",
+            "/proc/uptime",
+            "/tmp/statm",
+        ] {
+            assert_eq!(
+                kernel_record_file_link(&stat, link.as_bytes()),
+                None,
+                "{link}"
+            );
+        }
+        let mut placeholder = stat;
+        placeholder.st_nlink = 0;
+        assert_eq!(
+            kernel_record_file_link(&placeholder, b"/proc/12/statm"),
+            None
+        );
+        let mut sized = stat;
+        sized.st_size = 1;
+        assert_eq!(kernel_record_file_link(&sized, b"/proc/12/statm"), None);
+        let mut directory = stat;
+        directory.st_mode = libc::S_IFDIR | 0o555;
+        assert_eq!(kernel_record_file_link(&directory, b"/proc/12/statm"), None);
+    }
+
+    /// A rendered per-process file that follows its record's sequence keeps
+    /// that sequence in Detcore's global state once a send passes its
+    /// descriptor over `SCM_RIGHTS` (`ThreadState::share_sent_procfs_sequence`),
+    /// as a fork's copies do: marked, under its open file's identity, and
+    /// noted in the table's history. Not a file the kernel opened (a receiver
+    /// cannot name its open file), not one whose sequence Detcore cannot know
+    /// here, and not a file that follows no record's sequence.
+    #[test]
+    fn a_sent_rendered_record_file_shares_its_sequence() {
+        let owner = DetTid::from_raw(9033);
+        let config = Config::default();
+        let state = ThreadState::new(owner, &config, ());
+        state.metadata().file_handles.clear();
+        for (fd, spelling, rendered) in [
+            (40, "/proc/7/statm", true),
+            (41, "/proc/7/statm", false),
+            (42, "/proc/7/statm", true),
+            (43, "/proc/7/auxv", true),
+        ] {
+            state
+                .add_fd(fd, OFlag::O_RDONLY, FdType::Regular, None)
+                .unwrap();
+            let procfs = if rendered {
+                rendered_record_file(spelling)
+            } else {
+                crate::procfs::ProcfsFile::from_path(Path::new(spelling)).unwrap()
+            };
+            state
+                .with_detfd(fd, |handle| handle.set_procfs(procfs.clone()))
+                .unwrap();
+        }
+        state
+            .with_detfd(42, |handle| handle.mark_record_sequence_unknown())
+            .unwrap();
+        let id = state
+            .with_detfd(40, |handle| handle.open_file_id())
+            .unwrap();
+        assert!(!state.metadata().has_shared_procfs_sequences);
+        assert_eq!(state.share_sent_procfs_sequence(40), Some(id));
+        assert_eq!(
+            state
+                .with_detfd(40, |handle| handle.procfs_shared_sequence())
+                .unwrap(),
+            Some(id)
+        );
+        assert!(state.metadata().has_shared_procfs_sequences);
+        // Sent again: the same identity, the mark kept.
+        assert_eq!(state.share_sent_procfs_sequence(40), Some(id));
+        for fd in [41, 42, 43, 44] {
+            assert_eq!(state.share_sent_procfs_sequence(fd), None, "{fd}");
+        }
+        assert_eq!(
+            state
+                .with_detfd(41, |handle| handle.procfs_shared_sequence())
+                .unwrap(),
+            None
+        );
+        assert_eq!(state.rendered_descriptors(), vec![40, 42, 43]);
+    }
 }
 
 /// Various measurements of one guest thread's execution. This is useful for printing
@@ -3534,6 +5429,16 @@ mod file_metadata_tests {
 pub struct ThreadStats {
     /// A simple count of how many syscalls have been handled on this thread.
     pub syscall_count: u64,
+
+    /// This thread's syscall entries by number, with the outcome of each
+    /// completed one (`crate::syscall_histogram`). Its total is
+    /// `syscall_count`. Handed to the scheduler when the thread deregisters.
+    pub syscall_histogram: SyscallHistogram,
+
+    /// A Detcore refusal policy answered the current syscall
+    /// (`crate::syscall_histogram::mark_refused`). Cleared at each syscall
+    /// entry.
+    pub syscall_refused: bool,
 
     /// This thread's happens-before counting state: per (syscall, fd, futex
     /// operation) a syscall-occurrence anchor names, how many of this thread's
@@ -3593,11 +5498,12 @@ impl ThreadStats {
         Default::default()
     }
 
-    // TODO: this can evolve to keep a full histogram:
-    /// Increment the count of system calls
-    pub fn count_syscall(&mut self) {
+    /// Count one entry of `sysno`.
+    pub fn count_syscall(&mut self, sysno: Sysno) {
         self.syscall_count += 1;
         self.timeslice_syscall_count += 1;
+        self.syscall_histogram.enter(sysno);
+        self.syscall_refused = false;
     }
 
     /// Increment the count of signals.
@@ -3632,11 +5538,21 @@ impl ThreadStats {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingVfork {
     pub parent_dettid: DetTid,
+    /// The parent's `BlockingVfork` operation, which identifies this vfork's
+    /// scheduler barrier.
+    pub op: ExternalOpId,
     pub parent_detpid: DetPid,
     pub child_tid_addr: usize,
     pub flags: CloneFlags,
     pub exit_signal: libc::c_int,
     pub child_priority_entropy: Option<u64>,
+    /// With `CLONE_NEWUSER`: the creator's effective user ID may not have
+    /// been its real one, read before the clone
+    /// (`Detcore::user_namespace_owner_may_differ`). The child notes it for
+    /// the namespace the clone made when it registers itself, once the clone
+    /// has succeeded.
+    #[serde(default)]
+    pub user_namespace_owner_may_differ: bool,
 }
 
 // TODO-HUMAN-REVIEW(#797): Review process-wide logical CPU aggregation.
@@ -3721,6 +5637,13 @@ impl ChildCpuPublication {
 pub(crate) struct ProcessCpuTime {
     snapshot: ProcessCpuSnapshot,
     exited_children: BTreeMap<DetPid, ProcessCpuSnapshot>,
+    /// Each thread's own (user, system) time as of its last accounting, which
+    /// another thread's CPU clock of it reads (`crate::cpu_clock`). An entry
+    /// leaves once its thread has exited and left the scheduler, unless the
+    /// thread leads the process: a leader that exits before its threads stays
+    /// a zombie whose clock still reads its final time, as on Linux.
+    #[serde(default)]
+    threads: BTreeMap<DetTid, (LogicalTime, LogicalTime)>,
     // Runtime ownership, not record-format state. ThreadState clones retain the
     // same parent accounting Arc; notification tokens also retain their identity.
     #[serde(skip)]
@@ -3740,6 +5663,27 @@ impl ProcessCpuTime {
     fn add_thread_delta(&mut self, user: LogicalTime, system: LogicalTime) {
         self.snapshot.user = self.snapshot.user + user;
         self.snapshot.system = self.snapshot.system + system;
+    }
+
+    /// Record `thread`'s own (user, system) time, which its process total now
+    /// includes.
+    fn record_thread(&mut self, thread: DetTid, own: (LogicalTime, LogicalTime)) {
+        self.threads.insert(thread, own);
+    }
+
+    /// `thread`'s own (user, system) time as of its last accounting. A thread
+    /// that has not been accounted yet has not run, and has used none.
+    fn thread_time(&self, thread: DetTid) -> (LogicalTime, LogicalTime) {
+        self.threads
+            .get(&thread)
+            .copied()
+            .unwrap_or((LogicalTime::ZERO, LogicalTime::ZERO))
+    }
+
+    /// `thread` exited: its time stays in the process total, as an exited
+    /// thread's stays in Linux's (`thread_group_cputime`).
+    fn forget_thread(&mut self, thread: DetTid) {
+        self.threads.remove(&thread);
     }
 
     fn record_exited_child(&mut self, pid: DetPid, child: ProcessCpuSnapshot) {
@@ -3825,18 +5769,35 @@ pub(crate) struct RobustListOwner {
     pub(crate) head: usize,
 }
 
+/// The robust-list walk an exec still owes, where Detcore makes the walk
+/// itself (`OwnerDeathPath::Detcore`): set at the exec's entry
+/// (`Detcore::handle_execveat`) and taken where the exec can no longer fail
+/// (`Tool::handle_exec_commit`, `Detcore::commit_exec_robust_lists`).
+/// The exec's entry has already given the thread the new image's state by
+/// then, so this keeps what the walk needs from the old image: every
+/// registration to walk, the caller's included, and the shared-mapping model
+/// and address-space identity that name the futex keys of the walk's wakes.
+#[derive(Clone)]
+pub(crate) struct ExecRobustCommit {
+    pub(crate) owners: Vec<RobustListOwner>,
+    pub(crate) memory_metadata: Arc<Mutex<MemoryMetadata>>,
+    pub(crate) mm_id: MmId,
+}
+
 /// Robust-list registrations and staged wakes shared by one Linux thread
 /// group. A forked process starts with an empty instance; `CLONE_THREAD`
 /// members share it.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct RobustListProcessState {
     heads: BTreeMap<DetTid, usize>,
-    /// Threads whose own exit Detcore has already walked on DBT
-    /// ([`crate::syscalls::threads`]'s `OwnerDeathPath::Barrier`).
+    /// Threads whose own exit Detcore has already walked on DBT or KVM
+    /// ([`crate::syscalls::threads`]'s `OwnerDeathPath::Barrier` and
+    /// `OwnerDeathPath::Detcore`).
     #[serde(default)]
     tool_walked: BTreeSet<DetTid>,
-    /// An exit_group on DBT (`OwnerDeathPath::Barrier`) has been filed: an
-    /// exiting thread keeps its head here for that exit_group's walk
+    /// An exit_group on DBT or KVM (`OwnerDeathPath::Barrier`,
+    /// `OwnerDeathPath::Detcore`) has been filed: an exiting thread keeps its
+    /// head here for that exit_group's walk
     /// ([`ThreadState::drop_robust_list_head_at_exit`]).
     #[serde(default)]
     exit_group_filed: bool,
@@ -3924,6 +5885,387 @@ pub(crate) struct SignalAnnouncementState {
     pub(crate) turn: InboundTurn,
 }
 
+/// The guest tasks of a run that are live or not yet reaped, and the clones
+/// still making one: every task of every guest process, which the binder rule
+/// reads (`Detcore::binder_other_tasks`). A binder call runs off the guest's
+/// turn alone only while its caller is the run's one task.
+///
+/// One record is shared by every task of the run, as the guest clock is. A
+/// task joins it at the entry of the clone that makes it (or, where a backend
+/// runs the clone natively, at that backend's report of it,
+/// `Detcore::register_external_child`), and leaves it at the wait that reaps
+/// its process, or, for a thread that ends by its own `exit` without leading
+/// its process, at the commit of that exit's grant in its own turn, after
+/// which a sequentialized thread never runs again (on a backend that reports
+/// the exit complete afterwards). Every change is at a logical event in
+/// Hermit's turn order, never at a host-timed report, so a run and its verify
+/// pass find the same tasks; the report only delays an off-turn call until
+/// the kernel's last writes for the retired thread are done
+/// (`LiveTasks::unreported`). While a caller finds itself the only task, no
+/// other task exists to change the record, so the answer cannot change under
+/// it; while it finds others, each of them is live, unreaped or being made,
+/// so it can only be too many.
+#[derive(Debug, Default)]
+pub(crate) struct LiveTasks {
+    /// Each task, by thread ID, with its process, from the return of the
+    /// clone that made it, or the run's start for its first task, until the
+    /// wait that reaps its process; a thread that does not lead its process
+    /// and ends by its own `exit` leaves at the commit of that exit's grant
+    /// (`LiveTasks::commit_thread_exit`). A thread that an exec, an
+    /// `exit_group` or a signal ends, and a leader that exits while its
+    /// threads run on, a zombie, stay until the reap.
+    tasks: BTreeMap<DetTid, DetPid>,
+    /// How many clones each task has entered without returning: each may
+    /// have made a child that already runs, as a vfork's child does while its
+    /// parent waits, which `tasks` holds only once its clone returns. A clone
+    /// whose caller dies before it returns stays counted.
+    creating: BTreeMap<DetTid, usize>,
+    /// The tasks in `tasks` whose own `exit`, or their process's
+    /// `exit_group`, was granted: still counted, and named as exited in a
+    /// refusal. Only names; never shortens the count.
+    exited: BTreeSet<DetTid>,
+    /// The threads retired at the commit of their own `exit`
+    /// (`LiveTasks::commit_thread_exit`), each with its process, whose exit
+    /// the backend has not yet reported complete. Until it has, the kernel may
+    /// still mark the futex words of the thread's robust list and store 0 to
+    /// its `clear_child_tid` word (`mm_release`), anywhere in the memory it
+    /// shared. They no longer count, which was decided in turn order, but an
+    /// off-turn binder call is issued only once none is left
+    /// (`Detcore::run_binder_call_with`), so those writes are done before the call
+    /// can read or write a buffer. The report is Detcore's `on_exit_thread`,
+    /// which a backend whose kernel runs the exit
+    /// (`BackendCapabilities::runs_exit_robust_list`) calls only after the
+    /// thread's final exit status; a wait that reaps the thread's process
+    /// forgets its entry, since its exit is then complete whether or not a
+    /// report came.
+    unreported: BTreeMap<DetTid, DetPid>,
+    /// Set where this record was not carried here: a thread state read back
+    /// from its serialized form, which does not hold it. Then which tasks
+    /// are live is unknown, and no task is taken to be alone.
+    unknown: bool,
+    /// Set once a backend reported a task it cloned natively without first
+    /// announcing the clone (`LiveTasks::end_reported_clone`): the child may
+    /// have run unnamed, so from then on which tasks are live is unknown,
+    /// and no task is taken to be alone.
+    unannounced_clone: bool,
+}
+
+impl LiveTasks {
+    /// The record of a run whose first task, `tid`, leads process `pid`.
+    pub(crate) fn of_first_task(tid: DetTid, pid: DetPid) -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self {
+            tasks: BTreeMap::from([(tid, pid)]),
+            ..Self::default()
+        }))
+    }
+
+    /// A record that knows no task, for a thread state read back from its
+    /// serialized form (`LiveTasks::unknown`).
+    pub(crate) fn unknown() -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Self {
+            unknown: true,
+            ..Self::default()
+        }))
+    }
+
+    /// `creator` enters a clone, before the child can exist.
+    pub(crate) fn begin_clone(&mut self, creator: DetTid) {
+        *self.creating.entry(creator).or_default() += 1;
+    }
+
+    /// `creator`'s backend reported `child`, of process `pid`, a task it made
+    /// by running the clone natively (`Detcore::register_external_child`).
+    /// Where the backend counted that clone from its native entry
+    /// (`ThreadState::begin_native_clone`), this ends it and names the child.
+    /// Where it did not, the child may have run unnamed before this report,
+    /// so which tasks are live is unknown from here (`Self::unknown`) and no
+    /// task is taken to be alone again: an application backend that runs
+    /// native clones calls `begin_native_clone` before each one.
+    pub(crate) fn end_reported_clone(&mut self, creator: DetTid, child: DetTid, pid: DetPid) {
+        if !self.creating.contains_key(&creator) {
+            self.unannounced_clone = true;
+        }
+        self.end_clone(creator, Some((child, pid)));
+    }
+
+    /// `creator`'s clone returned, having made `child` (its thread ID and
+    /// process) or nothing.
+    pub(crate) fn end_clone(&mut self, creator: DetTid, child: Option<(DetTid, DetPid)>) {
+        if let std::collections::btree_map::Entry::Occupied(mut entry) =
+            self.creating.entry(creator)
+        {
+            *entry.get_mut() -= 1;
+            if *entry.get() == 0 {
+                entry.remove();
+            }
+        }
+        if let Some((tid, pid)) = child {
+            self.tasks.insert(tid, pid);
+        }
+    }
+
+    /// A wait reaped process `pid`: none of its tasks is left.
+    pub(crate) fn reaped(&mut self, pid: DetPid) {
+        let exited = &mut self.exited;
+        self.tasks.retain(|tid, process| {
+            let kept = *process != pid;
+            if !kept {
+                exited.remove(tid);
+            }
+            kept
+        });
+        // A reaped process's threads have all finished exiting, reported or
+        // not, so none of them can hold a binder call back any longer.
+        self.unreported.retain(|_, process| *process != pid);
+    }
+
+    /// Task `tid` had its own `exit`, or its process's `exit_group`, granted.
+    /// It still counts, named as exited, until the grant is committed
+    /// (`Self::commit_thread_exit`) or a wait reaps its process.
+    pub(crate) fn note_exit(&mut self, tid: DetTid) {
+        if self.tasks.contains_key(&tid) {
+            self.exited.insert(tid);
+        }
+    }
+
+    /// Task `tid`, of process `pid`, committed the grant of its own `exit`
+    /// in its turn, the last thing it does there: under sequentialized
+    /// threads it never runs again. A thread that does not lead its process
+    /// leaves the record here, its exit awaiting the backend's report
+    /// (`Self::unreported`). A leader stays, as the zombie it is, until a
+    /// wait reaps its process. Returns whether the thread left.
+    pub(crate) fn commit_thread_exit(&mut self, tid: DetTid, pid: DetPid) -> bool {
+        if tid.as_raw() == pid.as_raw() || !self.exited.remove(&tid) {
+            return false;
+        }
+        self.tasks.remove(&tid);
+        self.unreported.insert(tid, pid);
+        true
+    }
+
+    /// The backend reported task `tid`'s exit complete: the kernel has done
+    /// every write it makes for it (`Self::unreported`).
+    pub(crate) fn exit_reported(&mut self, tid: DetTid) {
+        self.unreported.remove(&tid);
+    }
+
+    /// Whether a thread retired at its exit's commit still awaits its
+    /// backend's report (`Self::unreported`).
+    #[cfg(test)]
+    pub(crate) fn exits_unreported(&self) -> bool {
+        !self.unreported.is_empty()
+    }
+
+    /// A thread retired at its exit's commit whose report is still awaited,
+    /// the lowest-numbered, to name in a refusal.
+    pub(crate) fn first_unreported(&self) -> Option<DetTid> {
+        self.unreported.keys().next().copied()
+    }
+
+    /// Process `pid`'s `exit_group` was granted, which ends each of its
+    /// tasks; they stay counted until a wait reaps it, as `note_exit`.
+    pub(crate) fn note_process_exit(&mut self, pid: DetPid) {
+        for (tid, process) in &self.tasks {
+            if *process == pid {
+                self.exited.insert(*tid);
+            }
+        }
+    }
+
+    /// The tasks besides `caller`, named for a refusal, or `None` where
+    /// `caller` is the run's only task.
+    pub(crate) fn others(&self, caller: DetTid) -> Option<String> {
+        if self.unknown {
+            return Some(
+                "which tasks are live is unknown (this thread's state was read back from its \
+                 serialized form)"
+                    .to_string(),
+            );
+        }
+        if self.unannounced_clone {
+            return Some(
+                "which tasks are live is unknown (a backend reported a task it cloned natively \
+                 without announcing the clone first)"
+                    .to_string(),
+            );
+        }
+        let mut named: Vec<String> = self
+            .tasks
+            .iter()
+            .filter(|(tid, _)| **tid != caller)
+            .map(|(tid, pid)| {
+                let task = if tid.as_raw() == pid.as_raw() {
+                    format!("task {tid}")
+                } else {
+                    format!("task {tid} of process {pid}")
+                };
+                if self.exited.contains(tid) {
+                    format!("{task}, which exited and is not reaped yet")
+                } else {
+                    task
+                }
+            })
+            .collect();
+        named.extend(self.creating.iter().map(|(creator, clones)| {
+            if *clones == 1 {
+                format!("a task being created by task {creator}")
+            } else {
+                format!("{clones} tasks being created by task {creator}")
+            }
+        }));
+        if named.is_empty() && self.tasks.contains_key(&caller) {
+            return None;
+        }
+        if named.is_empty() {
+            named.push("tasks whose number this record does not hold".to_string());
+        }
+        const SHOWN: usize = 4;
+        let more = named.len().saturating_sub(SHOWN);
+        named.truncate(SHOWN);
+        let mut list = named.join(", ");
+        if more > 0 {
+            list.push_str(&format!(" and {more} more"));
+        }
+        Some(list)
+    }
+}
+
+#[cfg(test)]
+mod live_tasks_tests {
+    use super::*;
+
+    /// A task counts among the run's tasks from the entry of the clone that
+    /// makes it, before it exists, until a wait reaps its process: an exited
+    /// task, and an exited thread of the caller's own process, stay counted
+    /// and are named as exited; a failed clone counts only while it runs. A
+    /// caller the record does not hold, or a record read back from its
+    /// serialized form, is never alone.
+    #[test]
+    fn a_task_counts_from_its_clone_s_entry_until_a_wait_reaps_its_process() {
+        let one = DetTid::from_raw(1);
+        let record = LiveTasks::of_first_task(one, one);
+        let mut tasks = record.lock().unwrap();
+        assert_eq!(tasks.others(one), None);
+        tasks.begin_clone(one);
+        assert_eq!(
+            tasks.others(one).as_deref(),
+            Some("a task being created by task 1")
+        );
+        tasks.end_clone(one, None);
+        assert_eq!(tasks.others(one), None);
+        tasks.begin_clone(one);
+        tasks.end_clone(one, Some((DetTid::from_raw(2), DetPid::from_raw(2))));
+        assert_eq!(tasks.others(one).as_deref(), Some("task 2"));
+        tasks.note_process_exit(DetPid::from_raw(2));
+        assert_eq!(
+            tasks.others(one).as_deref(),
+            Some("task 2, which exited and is not reaped yet")
+        );
+        tasks.reaped(DetPid::from_raw(2));
+        assert_eq!(tasks.others(one), None);
+        tasks.begin_clone(one);
+        tasks.end_clone(one, Some((DetTid::from_raw(3), one)));
+        tasks.note_exit(DetTid::from_raw(3));
+        assert_eq!(
+            tasks.others(one).as_deref(),
+            Some("task 3 of process 1, which exited and is not reaped yet")
+        );
+        assert!(tasks.others(DetTid::from_raw(9)).is_some());
+        drop(tasks);
+        assert!(LiveTasks::unknown().lock().unwrap().others(one).is_some());
+    }
+
+    /// A thread that does not lead its process and leaves by its own `exit`
+    /// counts while its exit is granted but not committed, and not once the
+    /// grant is committed, though its exit then awaits the backend's report
+    /// until it comes: a process that joined its helper is alone again. A
+    /// leader is never retired at its exit, and a process that exited counts
+    /// until a wait reaps it.
+    #[test]
+    fn a_thread_leaves_at_its_exit_s_commit_and_a_zombie_at_its_reap() {
+        let one = DetTid::from_raw(1);
+        let record = LiveTasks::of_first_task(one, one);
+        let mut tasks = record.lock().unwrap();
+        tasks.begin_clone(one);
+        tasks.end_clone(one, Some((DetTid::from_raw(2), one)));
+        // A commit with no grant retires nothing.
+        assert!(!tasks.commit_thread_exit(DetTid::from_raw(2), one));
+        tasks.note_exit(DetTid::from_raw(2));
+        assert_eq!(
+            tasks.others(one).as_deref(),
+            Some("task 2 of process 1, which exited and is not reaped yet")
+        );
+        assert!(tasks.commit_thread_exit(DetTid::from_raw(2), one));
+        assert_eq!(tasks.others(one), None);
+        assert!(tasks.exits_unreported());
+        tasks.exit_reported(DetTid::from_raw(2));
+        assert!(!tasks.exits_unreported());
+        // A leader whose threads run on stays a zombie until the reap.
+        tasks.note_exit(one);
+        assert!(!tasks.commit_thread_exit(one, one));
+        // A child process that exited counts until a wait reaps it.
+        tasks.begin_clone(one);
+        tasks.end_clone(one, Some((DetTid::from_raw(3), DetTid::from_raw(3))));
+        tasks.note_exit(DetTid::from_raw(3));
+        assert!(!tasks.commit_thread_exit(DetTid::from_raw(3), DetTid::from_raw(3)));
+        assert!(
+            tasks
+                .others(DetTid::from_raw(9))
+                .is_some_and(|others| others.contains("task 3, which exited"))
+        );
+        tasks.reaped(DetTid::from_raw(3));
+        assert!(
+            !tasks
+                .others(DetTid::from_raw(9))
+                .is_some_and(|others| others.contains("task 3"))
+        );
+    }
+
+    /// A wait that reaps a process forgets the unreported exits of its
+    /// threads retired at their exit's commit: they have all finished, so a
+    /// report that never arrives for them cannot hold back a later binder
+    /// call. Another process's unreported exit is kept.
+    #[test]
+    fn a_reaped_process_forgets_its_threads_unreported_exits() {
+        let one = DetTid::from_raw(1);
+        let record = LiveTasks::of_first_task(one, one);
+        let mut tasks = record.lock().unwrap();
+        // Process 3, and thread 5 of it; thread 2 of process 1.
+        tasks.begin_clone(one);
+        tasks.end_clone(one, Some((DetTid::from_raw(3), DetTid::from_raw(3))));
+        tasks.begin_clone(DetTid::from_raw(3));
+        tasks.end_clone(
+            DetTid::from_raw(3),
+            Some((DetTid::from_raw(5), DetTid::from_raw(3))),
+        );
+        tasks.begin_clone(one);
+        tasks.end_clone(one, Some((DetTid::from_raw(2), one)));
+        for (thread, process) in [(5, 3), (2, 1)] {
+            tasks.note_exit(DetTid::from_raw(thread));
+            assert!(tasks.commit_thread_exit(DetTid::from_raw(thread), DetTid::from_raw(process)));
+        }
+        assert_eq!(tasks.first_unreported(), Some(DetTid::from_raw(2)));
+        tasks.reaped(DetTid::from_raw(3));
+        assert_eq!(tasks.first_unreported(), Some(DetTid::from_raw(2)));
+        tasks.exit_reported(DetTid::from_raw(2));
+        assert!(!tasks.exits_unreported());
+        // Reaped first, then reported: the report finds nothing to clear.
+        tasks.begin_clone(one);
+        tasks.end_clone(one, Some((DetTid::from_raw(6), DetTid::from_raw(6))));
+        tasks.begin_clone(DetTid::from_raw(6));
+        tasks.end_clone(
+            DetTid::from_raw(6),
+            Some((DetTid::from_raw(7), DetTid::from_raw(6))),
+        );
+        tasks.note_exit(DetTid::from_raw(7));
+        assert!(tasks.commit_thread_exit(DetTid::from_raw(7), DetTid::from_raw(6)));
+        tasks.reaped(DetTid::from_raw(6));
+        assert!(!tasks.exits_unreported());
+        tasks.exit_reported(DetTid::from_raw(7));
+        assert!(!tasks.exits_unreported());
+    }
+}
+
 /// The Detcore per-thread state.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct ThreadState<T> {
@@ -3935,6 +6277,13 @@ pub struct ThreadState<T> {
     /// Whether the backend entered the thread-start callback. Construction
     /// alone does not imply that this thread was admitted to the scheduler.
     pub(crate) thread_start_entered: bool,
+
+    /// The parent's `BlockingVfork` operation, if a `CLONE_VFORK` call
+    /// created this thread. A vfork child that is torn down before its
+    /// scheduler registration completes reports it in its deregistration, so
+    /// the barrier of exactly that vfork ends
+    /// ([`crate::scheduler::Scheduler::record_unregistered_vfork_child_exit`]).
+    pub(crate) vfork_origin: Option<ExternalOpId>,
 
     /// Host thread ID supplied by a backend whose scheduler identity is
     /// virtual. `None` keeps the existing direct-ID behavior for other
@@ -3952,6 +6301,73 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub(crate) open_file_creator: Option<DetTid>,
 
+    /// The input geometry of the `recvmsg` or `recvmmsg` this thread is
+    /// running, while Detcore needs it to name the descriptors it receives:
+    /// `Some` from the handler's entry, re-read before each attempt of the
+    /// internal polling loop so that it is the geometry of the attempt that
+    /// succeeds (`retry_nonblocking_syscall_helper`), taken when the call
+    /// returns. Never carried across a fork or a migration.
+    #[serde(skip)]
+    pub(crate) receive_geometry: Option<Option<crate::syscalls::scm_rights::ReceiveGeometry>>,
+
+    /// The open file description a `flock` this thread is waiting in took at
+    /// its entry, as Linux's call holds the `struct file` its descriptor
+    /// named then (`fdget` in `sys_flock`): `Some` while the call waits in
+    /// Detcore's flock model, so that its grant is mirrored on that
+    /// description and noted in its cache even when a sibling closed or
+    /// replaced the descriptor meanwhile (`Detcore::flock_wait`). Never
+    /// carried across a fork or a migration.
+    #[serde(skip)]
+    pub(crate) flock_waiting_description: Option<crate::fd::DetFd>,
+
+    /// Retained metadata for the vectored call's observers. Original entry
+    /// regions preserve the existing outbound and exit-dependency overlays.
+    /// When buffer logging is observed, generic readv/recvmsg also retain a
+    /// separate complete-geometry result from the successful actual attempt;
+    /// their buffer observer hashes returned guest bytes without an overlay.
+    /// Set as internal polling ends and taken as the call returns. A failed
+    /// final capture cannot certify an earlier attempt's geometry.
+    #[serde(skip)]
+    pub(crate) entry_import: Option<Box<crate::syscalls::entry_import::EntryImport>>,
+
+    /// The `sendmsg` or `sendmmsg` this thread is running, while its
+    /// `SCM_RIGHTS` descriptors matter to the `/proc` directories Detcore
+    /// serves on placeholders: `Some` from the handler's inspection
+    /// (`Detcore::inspect_placeholder_send`), read before each attempt of the
+    /// internal polling loop, which refuses by name an attempt whose messages
+    /// pass other placeholders than were inspected
+    /// (`retry_nonblocking_syscall_helper`), taken when the call returns.
+    /// Never carried across a fork or a migration.
+    #[serde(skip)]
+    pub(crate) send_inspection: Option<crate::syscalls::SendInspection>,
+    /// The inotify read this thread is running, while the bytes queued on
+    /// its instance before the attempt that completes say what that attempt
+    /// took (`crate::syscalls::inotify::QueueCount`): `Some` from the read
+    /// handler's entry, measured again before each attempt of the internal
+    /// polling loop (`retry_nonblocking_syscall_helper`), so that it is the
+    /// count before the attempt that completed, and taken when the call
+    /// returns. Never carried across a fork or a migration.
+    #[serde(skip)]
+    pub(crate) inotify_queue: Option<crate::syscalls::inotify::QueueCount>,
+    /// The call this thread runs in parts (a readv reading on into a later
+    /// iovec, `Detcore::readv_inotify`), set around the whole call: whether
+    /// the part now running follows one that transferred bytes, and a signal
+    /// an earlier part completed with pending
+    /// (`crate::syscalls::helpers::CallParts`). Never carried across a fork
+    /// or a migration.
+    #[serde(skip)]
+    pub(crate) call_parts: Option<crate::syscalls::helpers::CallParts>,
+    /// The syscall in progress, while the run records an access trace: the
+    /// descriptors it named and the slot changes it made
+    /// (`crate::access_trace`). Never carried across a fork or a migration.
+    #[serde(skip)]
+    pub(crate) traced_call: crate::access_trace::TracedCall,
+
+    /// The thread's hardware watchpoints (`--watch`, `crate::watch`). Never
+    /// carried to another thread: debug registers are not inherited.
+    #[serde(skip)]
+    pub(crate) watch: crate::watch::WatchThread,
+
     /// Linux memory address space shared by tasks created with `CLONE_VM`.
     pub mm_id: MmId,
 
@@ -3959,6 +6375,18 @@ pub struct ThreadState<T> {
     /// result is published before ordinary RPC can transfer the turn.
     #[serde(skip)]
     pub(crate) published_runtime_private_memory: Option<(MmId, reverie::RuntimePrivateMemory)>,
+
+    /// The CPU accounting this thread last published to the global state
+    /// (`tool_global::GlobalRequest::WithCpuTime`), which its requests carry
+    /// again only once it has changed.
+    #[serde(skip)]
+    pub(crate) published_cpu: Option<crate::tool_global::CpuPublication>,
+
+    /// Whether this thread has made sure, at a clone, that the global state
+    /// knows its process's guest-visible parent
+    /// (`Detcore::record_external_parent_at_clone`).
+    #[serde(default)]
+    pub(crate) external_parent_checked: bool,
 
     /// Shared memory mappings used to resolve process-shared futex keys.
     pub(crate) memory_metadata: Arc<Mutex<MemoryMetadata>>,
@@ -3989,6 +6417,20 @@ pub struct ThreadState<T> {
     /// backend finishes the child. The child consumes this in
     /// `handle_thread_start`; the parent clears its copy when injection returns.
     pub pending_vfork: Option<PendingVfork>,
+
+    /// The ID this thread's restarted clone-family call took when Detcore
+    /// chooses the IDs (`GuestIds::Chosen`), and the call it is for: the call
+    /// comes back after the signal that interrupted it, and keeps its ID
+    /// (`Detcore::plan_clone_id`). Any other call retires it.
+    pub(crate) restarted_clone_id: Option<crate::syscalls::chosen_ids::RestartedCloneId>,
+
+    /// The open file description whose record sequence this thread took from
+    /// Detcore's global state for the read, positioned read or seek it is
+    /// handling, which stores it back when it ends
+    /// (`Detcore::take_procfs_sequence`); `None` outside one. The handler it
+    /// runs again sees it and takes nothing more.
+    #[serde(skip)]
+    pub(crate) procfs_sequence_taken: Option<OpenFileId>,
 
     /// Shared file metadata among all threads in the same process.
     /// Initialized for new threads (shared or fresh), and then overwritten again on `execve`.
@@ -4030,12 +6472,53 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub(crate) changed_root: Arc<std::sync::atomic::AtomicBool>,
 
+    /// This thread's working and root directories may not be its
+    /// thread-group leader's: it, or the thread it was created by, was
+    /// created as a thread without `CLONE_FS`, so it holds filesystem
+    /// information of its own. Its process's `/proc/<pid>/cwd` and
+    /// `/proc/<pid>/root` links, which Linux reads from the leader, are then
+    /// not the thread's own `getcwd` (`Detcore::readlink_own_task_link`). A
+    /// leader, a new process, and a thread after its exec (which makes it
+    /// the leader) hold their own.
+    #[serde(default)]
+    pub(crate) fs_apart_from_leader: bool,
+
     /// The image this thread's process executes ([`crate::exec_record`]),
-    /// which answers the process's `/proc/<pid>/exe` link; `None` leaves the
-    /// link to the kernel. A new task starts with its creator's, and a
+    /// which answers the process's `/proc/<pid>/exe` link on KVM while it
+    /// names the image exactly (`Detcore::readlink_own_task_link`), and in a
+    /// launched run (`Detcore::launched_exe`); `None` leaves the link to the
+    /// path it took before. A new task starts with its creator's, and a
     /// successful exec replaces it (`tool_global::mark_past_first_execve`).
     #[serde(default)]
     pub(crate) exe: Option<Arc<crate::exec_record::ExecRecord>>,
+
+    /// The effective user and group ids Linux gives Detcore's virtual root at
+    /// the exec this thread has in flight, as Detcore decided them from the
+    /// image's set-id bits before the exec (`Detcore::exec_effective_ids`);
+    /// anything but (0, 0) is an exec Linux runs in secure-execution mode.
+    /// Taken at the new image's first callback, which compares it with the
+    /// image's own `AT_SECURE` (`crate::secure_exec::outcome`) and applies
+    /// `commit_creds`'s rule (`crate::commit_creds`), and dropped when the
+    /// exec fails. `None` where nothing decided it.
+    #[serde(skip)]
+    pub(crate) exec_effective_ids: Option<(u32, u32)>,
+
+    /// This thread's permitted capability set when its exec in flight
+    /// started, read with an injected `capget` only where Detcore then held a
+    /// parent-death signal for it (`holds_parent_death_signal`), the one thing
+    /// `commit_creds`'s comparison at the new image's first callback can
+    /// clear. Dropped when the exec fails.
+    #[serde(skip)]
+    pub(crate) exec_permitted_before: Option<u64>,
+
+    /// Whether Detcore holds a nonzero parent-death signal for this thread,
+    /// as the scheduler last answered it (`tool_global::parent_death_signal`,
+    /// through which every change to it goes). Only the thread itself changes
+    /// its own value (Linux's `pdeath_signal` is per task: arming, a
+    /// credential change and an exec are all the task's own acts, and a new
+    /// task starts with none), so the answer stays current between calls.
+    #[serde(skip)]
+    pub(crate) holds_parent_death_signal: bool,
 
     /// The identity of the descriptor table this thread's process holds:
     /// the one its thread-group leader holds now, which procfs reads for
@@ -4065,19 +6548,74 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub(crate) guest_clock: Arc<Mutex<GuestClock>>,
 
+    /// The `AF_UNIX` connections waiting for an `accept`, shared by every
+    /// task in this process tree, as the guest clock is
+    /// (`crate::syscalls::scm_rights::UnixConnections`). It names
+    /// descriptions by handles that reach them only in the tool process that
+    /// serves every guest (ptrace, KVM), so it is never serialized.
+    #[serde(skip)]
+    pub(crate) unix_connections: Arc<Mutex<crate::syscalls::scm_rights::UnixConnections>>,
+
+    /// The run's live and unreaped tasks, shared by every task of the run, as
+    /// the guest clock is (`LiveTasks`). Never serialized: a thread state
+    /// read back from that form knows no task, and none is taken to be
+    /// alone.
+    #[serde(skip, default = "LiveTasks::unknown")]
+    pub(crate) live_tasks: Arc<Mutex<LiveTasks>>,
+
     /// Parent process accounting notified when this process leader exits.
     pub(crate) parent_process_cpu_time: Option<Arc<Mutex<ProcessCpuTime>>>,
+
+    /// The process accounting that holds each child process's birth-owned
+    /// final-CPU publication (`ProcessCpuTime::child_cpu_publications`),
+    /// shared by every task in this process tree, as the guest clock is. A
+    /// child's publication starts in its creator's accounting
+    /// (`prepare_child_cpu_publication`). When an exit re-parents the child
+    /// (`Scheduler::reparent_orphans`), the process whose wait the scheduler
+    /// selects it for takes the publication over
+    /// (`adopt_child_cpu_publication`), and the child's exit records into
+    /// whichever accounting holds it then
+    /// (`record_exited_child_process_cpu_time`). Only the backends whose
+    /// waits Detcore completes from these publications (`emulates_child_waits`)
+    /// register children here.
+    #[serde(skip)]
+    pub(crate) child_cpu_owners: Arc<Mutex<BTreeMap<DetPid, Arc<Mutex<ProcessCpuTime>>>>>,
 
     /// Actual sequential KVM child's birth-owned publication capability.
     #[serde(skip)]
     pub(crate) parent_cpu_publication: Option<Arc<ChildCpuPublication>>,
 
-    /// The deadline of a wait this thread's last syscall ended with
+    /// The record of a wait this thread's last syscall ended with
     /// `ERESTART_RESTARTBLOCK`, for the `restart_syscall` that resumes it
     /// (`syscalls::helpers::RestartBlock`). The next syscall takes it
     /// (`Detcore::handle_syscall_event`).
     #[serde(skip)]
     pub(crate) restart_block: Option<crate::syscalls::helpers::RestartBlock>,
+
+    /// What a signal that ended this thread's current syscall's wait through
+    /// `ERESTARTSYS`'s protocol left for the return to user mode
+    /// (`syscalls::helpers::WokenWait`): set where the wait ended, settled by
+    /// the syscall handler's last step
+    /// (`syscalls::helpers::settle_woken_wait_at_return`), and checked
+    /// against the deliveries at that return
+    /// (`syscalls::helpers::check_woken_wait_delivery`). Each syscall starts
+    /// with it clear (`Detcore::handle_syscall_event`).
+    #[serde(skip)]
+    pub(crate) woken_wait: crate::syscalls::helpers::WokenWait,
+
+    /// The calling thread's working directory in the guest's view, read for
+    /// the syscall it is running where the tool cannot read it from host
+    /// procfs (`procfs_inode::tool_can_read_guest_cwd`: KVM): its path where
+    /// an injected `getcwd` answered one, else, where `getcwd` rendered none
+    /// (a removed directory, or one whose path is longer than `PATH_MAX`),
+    /// the directories the syscall's spellings climb to out of it with `..`
+    /// (`syscalls::SyscallCwd`); `None` until it is read, at most
+    /// once per syscall (`Detcore::prepare_guest_cwd`). Each syscall starts
+    /// without it (`Detcore::handle_syscall_event`), so a later syscall never
+    /// decides by a directory read before it. Never carried across a fork or
+    /// a migration.
+    #[serde(skip)]
+    pub(crate) syscall_cwd: Option<crate::syscalls::SyscallCwd>,
 
     /// Whether this thread's process has a guest handler for SIGALRM, so that
     /// signal phase 1's table (`sigalrm_phase1`) gates its syscalls. Set by the
@@ -4107,6 +6645,24 @@ pub struct ThreadState<T> {
     /// takes the registers' own answer.
     #[serde(skip)]
     pub(crate) delivery_interruption: Option<reverie::Interruption>,
+
+    /// Under the in-guest delivery gate, what ended the current syscall's wait
+    /// for a signal (A5 step 3c.1c, design D40): set by the path that ends
+    /// the wait, and taken by the restart checkpoint straight after the
+    /// dispatch `match` (`Detcore::wait_end_checkpoint`), which turns the
+    /// wait's restart code into the guest's result. `None` on every other
+    /// call, and always with the gate off.
+    #[serde(skip)]
+    pub(crate) wait_signal_end: Option<crate::wait_signal_end::WaitSignalEnd>,
+
+    /// While this thread's `pidfd_send_signal` handler runs on a self
+    /// sentinel that the executing kernel spells differently from the guest:
+    /// the guest's call and its physical form, which
+    /// `translated_record_or_replay` injects in its place
+    /// (`pidfd_self::ArmedRespelling`). `None` on every other call, for every
+    /// new thread and after an exec.
+    #[serde(skip)]
+    pub(crate) pidfd_respelling: Option<crate::pidfd_self::PhysicalRespelling>,
 
     /// With `delivery_interruption` `AfterFrame`, the handler address the
     /// kernel's frame jumps to: a further delivery at the same exit, before
@@ -4219,6 +6775,30 @@ pub struct ThreadState<T> {
     /// post-hook.
     #[serde(default)]
     pub(crate) in_uncharged_bootstrap_syscall: bool,
+
+    /// Set when this thread may have passed descriptors over `SCM_RIGHTS` on
+    /// a socket that is not guest-held. Requests and the consuming exit
+    /// carry it to the scheduler. It stays set for this owner's lifetime:
+    /// cancellation can drop a request before its publication is received.
+    #[serde(default)]
+    pub(crate) passed_descriptors_out_unreported: bool,
+
+    /// Set once a resource request of this thread carried
+    /// `Resources::passes_descriptors_out`, after which the scheduler trusts
+    /// no guest-held mark for the rest of the run, so this thread need not
+    /// report a pass-out again (`Detcore::passes_descriptors_out_now`).
+    #[serde(default)]
+    pub(crate) passed_descriptors_out_reported: bool,
+
+    /// Set by the nonblocking retry loop when the call it completed returned
+    /// a result Detcore rewrote for the guest
+    /// (`NonblockableSyscall::normalize_nonblocking_result`): a retried
+    /// `connect` whose `EISCONN` reads as success. Such an attempt saw only
+    /// that the socket was connected, by an earlier attempt or by another
+    /// thread's connect of the same open file, not where to; `handle_connect`
+    /// clears it before the call and reads it after.
+    #[serde(default)]
+    pub(crate) nonblocking_result_normalized: bool,
 
     /// Set by the syscall handler when a `FUTEX_WAKE` woke a waiter and
     /// [`Config::yields_after_futex_wake`] holds, so that the
@@ -4337,6 +6917,23 @@ pub struct ThreadState<T> {
     /// its own awaits, so a grant among them ends the delivery window too.
     #[serde(default)]
     pub(crate) scheduler_grants: u64,
+    /// Whether this thread has recorded the determinism loss of a binder call
+    /// that ran an effect off the turn (`Detcore::admit_host_timed_binder_call`).
+    /// Kept per thread, so that each run that makes such a call records it:
+    /// a per-process latch would let a second run in the same Hermit process
+    /// go unmarked.
+    #[serde(default)]
+    pub(crate) host_timed_binder_loss_recorded: bool,
+    /// Whether this thread has recorded the determinism loss of a binder call
+    /// that ran off the turn while the run had another task
+    /// (`Detcore::admit_shared_binder_call`), per thread as above.
+    #[serde(default)]
+    pub(crate) shared_binder_loss_recorded: bool,
+    /// Whether this thread has recorded the determinism loss of descriptors a
+    /// binder read delivered off the turn that Detcore does not record
+    /// (`Detcore::take_binder_receipts`), per thread as above.
+    #[serde(default)]
+    pub(crate) unrecorded_binder_loss_recorded: bool,
 
     /// Thread state associated with record/replay.
     pub record_or_replay: T,
@@ -4357,6 +6954,13 @@ pub struct ThreadState<T> {
     /// `None` selects the legacy logical-time deadline path.
     #[serde(default)]
     pub replay_rcb_end: Option<u64>,
+
+    /// In a preemption replay, the logical time of the last priority change
+    /// point this thread filed (`ThreadState::file_replay_change_point`).
+    // Native-exec admission rejects live replay state; supported snapshots
+    // retain their existing positional layout.
+    #[serde(skip)]
+    pub last_replay_change_point: Option<LogicalTime>,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
@@ -4399,6 +7003,26 @@ pub struct ThreadState<T> {
     /// `end_of_timeslice` so syscall-heavy workloads can use a shorter, cheap target deadline.
     pub max_timeslice_end: Option<LogicalTime>,
 
+    /// The post-crash bound, once the run has switched to it
+    /// (`crate::post_crash`): this thread's slices are bounded by it from
+    /// its next slice on, instead of by `max_timeslice`. Learned from the
+    /// scheduler's answer to a post-crash step or from a reply that resumes
+    /// the thread from a grant.
+    #[serde(default)]
+    pub post_crash_bound: Option<std::num::NonZeroU64>,
+
+    /// The crash signal whose caught delivery armed the post-crash switch for
+    /// this thread, until a stop of the thread finds the handler returned
+    /// (`crate::post_crash::note_stop`).
+    #[serde(default)]
+    pub crash_armed: Option<i32>,
+    /// The slice length that replaces `--max-timeslice` while this thread
+    /// replays a record whose slices ran without that bound
+    /// (`Scheduler::uncapped_backstop`), as the replayer last said; `None` for
+    /// every other run and once the record has run out.
+    #[serde(default)]
+    pub uncapped_backstop: Option<LogicalTime>,
+
     /// The deadline hint carried by the last scheduler reply this thread
     /// received (`ThreadState::cap_timeslice_at_deadline`). Applied when the
     /// reply arrives, and again by the two paths that then install a fresh
@@ -4413,6 +7037,81 @@ pub struct ThreadState<T> {
     /// Whether `last_rcb_timer` represents the maximum deadline rather than a manual interrupt.
     #[serde(default)]
     pub last_rcb_timer_is_max: bool,
+
+    /// Whether the scheduler's last reply to this thread was a grant that
+    /// found it the only thread able to run before it next enters Detcore
+    /// (`GlobalResponse::WithLoneGrant`). Every reply without that mark
+    /// clears it.
+    #[serde(default)]
+    pub lone_grant: bool,
+
+    /// While the thread runs alone (`Config::replays_lone_preemptions`): the
+    /// branch count, in `committed_clock_value` units, at which its current
+    /// timeslice ends. No timer stops the guest there; the thread's next
+    /// entry into Detcore processes every such end at or before the count it
+    /// reached, in order (`Detcore::catch_up_lone_slice_ends`).
+    #[serde(default)]
+    pub lone_slice_end: Option<u64>,
+
+    /// While such an end is processed: its branch count, which the clock
+    /// update reads in place of the hardware counter.
+    #[serde(default)]
+    pub replaying_lone_slice_end: Option<u64>,
+
+    /// While such an end is processed: it is taken with the stop of the
+    /// check-in that follows it at its own branch count, because a replay
+    /// does not allow it without a stop
+    /// (`Detcore::catch_up_lone_slice_ends`). Its recorded event carries
+    /// that stop's RIP instead of a `stopless` mark, so a re-record below
+    /// `STOPLESS_SLICE_ENDS_FORMAT` keeps the end visible.
+    #[serde(default)]
+    pub lone_slice_end_at_check_in: bool,
+
+    /// Set when a grant while such an end was processed did not find the
+    /// thread alone, which the scheduler's predicate rules out; taken by
+    /// `Detcore::catch_up_lone_slice_ends`, which reports it.
+    #[serde(default)]
+    pub lone_replay_unsound: bool,
+
+    /// In a schedule replay: the branch count, in `committed_clock_value`
+    /// units, of the thread's next recorded timeslice end when the recording
+    /// took that end without a stop (`SchedEvent::stopless`), as the
+    /// replayer's latest reply to this thread names it (`ReplayedSliceEnd`;
+    /// every TraceSchedEvent reply sets it, `None` when it names no such
+    /// end). Only that end may be taken without a stop in the replay; at any
+    /// other the recording stopped, and its RIP is checked.
+    #[serde(default)]
+    pub replayed_stopless_end: Option<u64>,
+    /// Where `last_rcb_timer` was armed when it was armed past its branch
+    /// target (`--chaos-instruction-offset`): it may then retire up to that
+    /// many more conditional branches than `last_rcb_timer` says, one per
+    /// step.
+    #[serde(default)]
+    pub armed_instruction_offset: Option<InstructionOffset>,
+
+    /// The steps past its branch target this chaos timeslice's timer is armed
+    /// for (`--chaos-instruction-offset`), `0` for none.
+    #[serde(default)]
+    pub slice_instruction_offset: u64,
+
+    /// Where the recorded timeslice being replayed had its timer armed, if
+    /// `--chaos-instruction-offset` delivered it past its branch target.
+    #[serde(default)]
+    pub replay_instruction_offset: Option<InstructionOffset>,
+
+    /// How many instruction offsets this thread has drawn: the position of
+    /// its next draw in its own stream (`chaos_instruction_offset_draw`).
+    #[serde(default)]
+    pub chaos_instruction_offset_draws: u64,
+    /// Under a schedule replay, the slice end `next_timeslice` installed as
+    /// the backstop, `--max-timeslice` after the slice began; see
+    /// `restart_replay_backstop`. Installing a slice end the schedule decides
+    /// (`install_schedule_deadline`) clears it, even when that deadline falls
+    /// on the same nanosecond: a recorded slice end can coincide with the
+    /// backstop, and it is still the schedule's. It is also the backstop only
+    /// while it is still `end_of_timeslice`.
+    #[serde(default)]
+    pub replay_backstop: Option<LogicalTime>,
 
     /// Are we past the global moment when the guest's first execve of its root binary completes
     /// (with a successful exit code).
@@ -4434,12 +7133,27 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub(crate) robust_list_process: Arc<Mutex<RobustListProcessState>>,
 
+    /// The robust-list walk this thread's exec in flight still owes
+    /// ([`ExecRobustCommit`]), from the exec's entry to its point of no
+    /// return; `None` otherwise.
+    #[serde(skip)]
+    pub(crate) exec_robust_commit: Option<ExecRobustCommit>,
+
     /// Staged boundary protocol state. Runtime creation/exec does not enable
     /// it yet; legacy state keeps `None`. Native transfer cannot discard it.
     #[serde(default)]
     pub(crate) slice_boundary: Option<crate::slice_boundary::Observations>,
     #[serde(default)]
     pub(crate) callback_history: crate::preemptions::callback_history::State,
+
+    /// Under `--replay-schedule-from`, whether the replayed schedule is over
+    /// for this thread: it ran out, or the replay released it
+    /// (`Scheduler::schedule_replay_over`). The thread learns it from the
+    /// reply to its next traced event, and a new thread inherits it from the
+    /// thread that created it. From then on its slices end as in a run
+    /// without a schedule (`follows_replayed_schedule`).
+    #[serde(default)]
+    pub(crate) schedule_replay_over: bool,
 }
 
 /// We cannot assume that the record_or_replay "subtool" is Debug, so it is handy to be able to
@@ -4469,6 +7183,9 @@ impl<T> std::fmt::Debug for ThreadState<T> {
             .field("chaos_slowdown_factor", &self.chaos_slowdown_factor)
             .field("chaos_slowdown_active", &self.chaos_slowdown_active)
             .field("max_timeslice_end", &self.max_timeslice_end)
+            .field("post_crash_bound", &self.post_crash_bound)
+            .field("crash_armed", &self.crash_armed)
+            .field("uncapped_backstop", &self.uncapped_backstop)
             .field("last_rcb_timer", &self.last_rcb_timer)
             .field("last_rcb_timer_is_max", &self.last_rcb_timer_is_max)
             .finish()
@@ -4561,6 +7278,28 @@ pub(crate) fn chaos_per_thread_slowdown_factor(
     let u: f64 = prng.random::<f64>();
     let exponent = 2.0 * u - 1.0;
     RcbTimeMultiplier::from_f64(max_factor.powf(exponent))
+}
+
+/// The `draw`-th instruction offset of thread `dettid` under
+/// `--chaos-instruction-offset=max`: uniform in `0..=max`.
+///
+/// A pure function of `(sched_seed, dettid, draw)`, in a stream of its own,
+/// as `chaos_per_thread_slowdown_factor` is: drawing it takes nothing from the
+/// thread's `chaos_prng`, so every timeslice length and priority a seed draws
+/// is the same with the option on as with it off.
+pub(crate) fn chaos_instruction_offset_draw(
+    sched_seed: u64,
+    dettid: DetTid,
+    draw: u64,
+    max: u64,
+) -> u64 {
+    const OFFSET_SALT: u64 = 0x6f66_6673_6574_7321; // "offsets!"
+    const DRAW_GOLDEN: u64 = 0xbf58_476d_1ce4_e5b9;
+    let mixed = sched_seed
+        ^ OFFSET_SALT
+        ^ ((dettid.as_raw() as u32 as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+        ^ draw.wrapping_mul(DRAW_GOLDEN);
+    Pcg64Mcg::seed_from_u64(mixed).random_range(0..=max)
 }
 
 impl<T> ThreadState<T> {
@@ -4664,6 +7403,7 @@ impl<T> ThreadState<T> {
             || self.slice_boundary.is_some()
             || !self.interrupt_at.is_empty()
             || self.replay_rcb_end.is_some()
+            || self.last_replay_change_point.is_some()
             || self.last_rcb_timer.is_some()
             || self.last_rcb_timer_is_max
             || self.max_timeslice_end.is_some()
@@ -4798,12 +7538,65 @@ impl<T> ThreadState<T> {
         let system = self.thread_logical_time.system_cpu_time();
         let user_delta = user - self.last_accounted_user_time;
         let system_delta = system - self.last_accounted_system_time;
+        let own = self.thread_cpu_time();
+        let mut process = self
+            .process_cpu_time
+            .lock()
+            .expect("process CPU time mutex poisoned");
+        process.add_thread_delta(user_delta, system_delta);
+        process.record_thread(self.dettid, own);
+        drop(process);
+        self.last_accounted_user_time = user;
+        self.last_accounted_system_time = system;
+    }
+
+    /// At the exit of thread `exiting` of process `process`, once its final
+    /// time is accounted and it has left the scheduler: drop this thread's
+    /// entry from its process's per-thread table unless it leads the
+    /// process. A thread other than the leader is gone for good, and its id
+    /// names no thread's clock any more. A leader that exits before its
+    /// threads stays a zombie whose clock reads its final time
+    /// (`ProcessCpuTime::threads`).
+    pub(crate) fn release_thread_cpu_time_at_exit(&self, exiting: DetTid, process: DetPid) {
+        if exiting != process {
+            self.process_cpu_time
+                .lock()
+                .expect("process CPU time mutex poisoned")
+                .forget_thread(self.dettid);
+        }
+    }
+
+    /// Another thread of this process's own (user, system) time, as of that
+    /// thread's last accounting, which happens at each of its syscalls and
+    /// each RCB commit: with threads sequentialized, where it last stopped.
+    pub(crate) fn sibling_cpu_time(&self, thread: DetTid) -> (LogicalTime, LogicalTime) {
         self.process_cpu_time
             .lock()
             .expect("process CPU time mutex poisoned")
-            .add_thread_delta(user_delta, system_delta);
-        self.last_accounted_user_time = user;
-        self.last_accounted_system_time = system;
+            .thread_time(thread)
+    }
+
+    /// This thread's own (user, system) time and its process's accounting
+    /// as of this thread's last accounting, which happens at each of its
+    /// syscalls and each RCB commit; read without accounting anything now,
+    /// so the read changes no state (`tool_global::with_cpu_publication`).
+    pub(crate) fn accounted_cpu_times(&self) -> ((LogicalTime, LogicalTime), ProcessCpuSnapshot) {
+        let process = self
+            .process_cpu_time
+            .lock()
+            .expect("process CPU time mutex poisoned");
+        (process.thread_time(self.dettid), process.snapshot)
+    }
+
+    /// The own (user, system) time of `thread`, this thread or another of
+    /// its process: this thread's now ([`Self::thread_cpu_time`]), another's
+    /// as of its last accounting ([`Self::sibling_cpu_time`]).
+    pub(crate) fn task_cpu_time(&self, thread: DetTid) -> (LogicalTime, LogicalTime) {
+        if thread == self.dettid {
+            self.thread_cpu_time()
+        } else {
+            self.sibling_cpu_time(thread)
+        }
     }
 
     /// Decide whether the syscall this thread is making now charges its cost
@@ -4880,7 +7673,14 @@ impl<T> ThreadState<T> {
 
     pub(crate) fn record_exited_child_process_cpu_time(&mut self, pid: DetPid) -> bool {
         self.account_process_cpu_time();
-        let Some(parent) = &self.parent_process_cpu_time else {
+        // The accounting that holds this process's publication now: a
+        // re-parented process's new parent took it over
+        // (`adopt_child_cpu_publication`). The registry stays locked through
+        // the record, so a takeover cannot pass between the lookup and it.
+        let owners = Arc::clone(&self.child_cpu_owners);
+        let owners = owners.lock().expect("child CPU owners mutex poisoned");
+        let holder = owners.get(&pid).cloned();
+        let Some(parent) = holder.as_ref().or(self.parent_process_cpu_time.as_ref()) else {
             return true;
         };
         let child = self
@@ -4902,6 +7702,8 @@ impl<T> ThreadState<T> {
             }
             parent.record_exited_child(pid, child);
         }
+        // No waker runs under the registry's lock either.
+        drop(owners);
         if let Some(publication) = &self.parent_cpu_publication {
             publication.finish(true);
         }
@@ -4913,11 +7715,16 @@ impl<T> ThreadState<T> {
     pub(crate) fn prepare_child_cpu_publication(&self, pid: DetPid) -> Arc<ChildCpuPublication> {
         let publication = ChildCpuPublication::pending();
         let previous = {
+            let mut owners = self
+                .child_cpu_owners
+                .lock()
+                .expect("child CPU owners mutex poisoned");
             let mut parent = self
                 .process_cpu_time
                 .lock()
                 .expect("process CPU time mutex poisoned");
             parent.prepare_child(pid);
+            owners.insert(pid, Arc::clone(&self.process_cpu_time));
             parent
                 .child_cpu_publications
                 .insert(pid, Arc::clone(&publication))
@@ -4928,7 +7735,46 @@ impl<T> ThreadState<T> {
         publication
     }
 
+    /// Take over `pid`'s final-CPU publication, and the snapshot already
+    /// recorded for it, from the accounting that holds it
+    /// (`child_cpu_owners`), when this process does not hold it: an exit
+    /// re-parented `pid` to this process, and the scheduler selected it for
+    /// this process's wait. Linux adds a reaped child's times to its reaper's
+    /// (`wait_task_zombie`), whoever created it. The choice of parent is the
+    /// scheduler's; this only moves the record to the waiting process.
+    fn adopt_child_cpu_publication(&self, pid: DetPid) {
+        let mut owners = self
+            .child_cpu_owners
+            .lock()
+            .expect("child CPU owners mutex poisoned");
+        let Some(holder) = owners.get(&pid).cloned() else {
+            return;
+        };
+        if Arc::ptr_eq(&holder, &self.process_cpu_time) {
+            return;
+        }
+        let (publication, snapshot) = {
+            let mut holder = holder.lock().expect("process CPU time mutex poisoned");
+            let Some(publication) = holder.child_cpu_publications.remove(&pid) else {
+                return;
+            };
+            (publication, holder.exited_children.remove(&pid))
+        };
+        {
+            let mut own = self
+                .process_cpu_time
+                .lock()
+                .expect("process CPU time mutex poisoned");
+            own.child_cpu_publications.insert(pid, publication);
+            if let Some(snapshot) = snapshot {
+                own.exited_children.insert(pid, snapshot);
+            }
+        }
+        owners.insert(pid, Arc::clone(&self.process_cpu_time));
+    }
+
     pub(crate) async fn wait_for_child_cpu_publication(&self, pid: DetPid) -> bool {
+        self.adopt_child_cpu_publication(pid);
         let publication = {
             let parent = self
                 .process_cpu_time
@@ -4964,7 +7810,28 @@ impl<T> ThreadState<T> {
             .contains_key(&pid)
     }
 
+    /// A backend that runs a clone natively (an application backend, through
+    /// `hermit::app::backend_hook`) is about to: from here until its report
+    /// of the child (`Detcore::register_external_child`), the clone may have
+    /// made a task the run's record does not name, so it counts as one
+    /// (`LiveTasks::begin_clone`). Such a backend calls this before every
+    /// native clone; a report of a clone it did not announce leaves the
+    /// record unknown, and binder never alone (`LiveTasks::end_reported_clone`).
+    /// A native clone that fails, and so is never reported, stays counted.
+    pub fn begin_native_clone(&self) {
+        self.live_tasks
+            .lock()
+            .expect("live tasks mutex poisoned")
+            .begin_clone(self.dettid);
+    }
+
     pub(crate) fn reap_child_process_cpu_time(&mut self, pid: DetPid) {
+        // Every reap of a child's termination comes here, in the waiter's
+        // turn.
+        self.live_tasks
+            .lock()
+            .expect("live tasks mutex poisoned")
+            .reaped(pid);
         self.account_process_cpu_time();
         let publication = {
             let mut parent = self
@@ -4981,6 +7848,18 @@ impl<T> ThreadState<T> {
                 None
             }
         };
+        if publication.is_some() {
+            let mut owners = self
+                .child_cpu_owners
+                .lock()
+                .expect("child CPU owners mutex poisoned");
+            if owners
+                .get(&pid)
+                .is_some_and(|holder| Arc::ptr_eq(holder, &self.process_cpu_time))
+            {
+                owners.remove(&pid);
+            }
+        }
         if let Some(publication) = publication {
             publication.finish(false);
         }
@@ -5008,6 +7887,7 @@ impl<T> ThreadState<T> {
         let last_accounted_system_time = thread_logical_time.system_cpu_time();
         let file_metadata = if cfg.backend.tool_shares_guest_descriptor_table {
             let mut metadata = FileMetadata::new(pid);
+            metadata.note_proc_level(cfg.proc_level);
             for fd in 0..=2 {
                 match metadata.discover_fd_from_current_process(pid, fd) {
                     Ok(()) | Err(Errno::EBADF) => {}
@@ -5016,16 +7896,28 @@ impl<T> ThreadState<T> {
             }
             metadata
         } else {
-            FileMetadata::new(pid).setup_stdio(pid.into(), pid)
+            let mut metadata =
+                FileMetadata::new(pid).setup_stdio(pid.into(), pid, cfg.standard_stream_aliases);
+            metadata.note_proc_level(cfg.proc_level);
+            metadata
         };
         let process_files = Some(file_metadata.files_id);
         ThreadState {
             dettid: pid,
             detpid: None, // Initialized later.
             thread_start_entered: false,
+            vfork_origin: None, // The root thread.
             physical_tid: None,
             signal_task_identity: None,
             open_file_creator: None,
+            receive_geometry: None,
+            flock_waiting_description: None,
+            entry_import: None,
+            send_inspection: None,
+            inotify_queue: None,
+            call_parts: None,
+            traced_call: Default::default(),
+            watch: Default::default(),
             mm_id: MmId::initial(pid),
             memory_metadata: Arc::new(Mutex::new(MemoryMetadata::new())),
             pedigree: Pedigree::new(), // Root thread.
@@ -5036,19 +7928,30 @@ impl<T> ThreadState<T> {
             default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
             nested_pid_namespace: false,
             changed_root: Default::default(),
+            fs_apart_from_leader: false,
             exe: None,
+            exec_effective_ids: None,
+            exec_permitted_before: None,
+            holds_parent_death_signal: false,
             process_files,
             posix_timers: Arc::new(Mutex::new(PosixTimers::default())),
             resource_limits: Arc::new(Mutex::new(ResourceLimits::default())),
             process_cpu_time: Arc::new(Mutex::new(ProcessCpuTime::default())),
             guest_clock: Arc::new(Mutex::new(GuestClock::default())),
+            unix_connections: Default::default(),
+            live_tasks: LiveTasks::of_first_task(pid, pid),
             parent_process_cpu_time: None,
+            child_cpu_owners: Default::default(),
             parent_cpu_publication: None,
             restart_block: None,
+            woken_wait: Default::default(),
+            syscall_cwd: None,
             sigalrm_handled: false,
             signal_shadow: None,
             signal_shadow_lost: false,
             delivery_interruption: None,
+            wait_signal_end: None,
+            pidfd_respelling: None,
             delivery_frame_handler: 0,
             delivery_frame_signal: 0,
             delivery_frame_orig_ax: 0,
@@ -5064,6 +7967,8 @@ impl<T> ThreadState<T> {
             thread_cpu_start_system_time: last_accounted_system_time,
             clone_flags: None,
             pending_vfork: None,
+            restarted_clone_id: None,
+            procfs_sequence_taken: None,
             // For the root thread, we initialize from the seed in the config:
             prng: crate::random::root_prng(cfg.rng_seed()),
             initialized_random_auxv: None,
@@ -5072,6 +7977,9 @@ impl<T> ThreadState<T> {
             committed_clock_value: 0,
             uncharged_bootstrap_syscalls: 0,
             in_uncharged_bootstrap_syscall: false,
+            passed_descriptors_out_unreported: false,
+            passed_descriptors_out_reported: false,
+            nonblocking_result_normalized: false,
             yield_after_futex_wake: false,
             pipe_handoff_due: None,
             own_signal_turn_hold: None,
@@ -5081,8 +7989,12 @@ impl<T> ThreadState<T> {
             next_signal_announcement: 0,
             consecutive_continuations: 0,
             scheduler_grants: 0,
+            host_timed_binder_loss_recorded: false,
+            shared_binder_loss_recorded: false,
+            unrecorded_binder_loss_recorded: false,
             end_of_timeslice: None, // Temporary/bogus.
             replay_rcb_end: None,
+            last_replay_change_point: None,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-1151)
             chaos_epoch: chaos_epoch_sentinel(),
@@ -5093,18 +8005,36 @@ impl<T> ThreadState<T> {
             claimed_sigchld: false,
             pending_chaos_epochs: Vec::new(),
             max_timeslice_end: None,
+            post_crash_bound: None,
+            crash_armed: None,
+            uncapped_backstop: None,
             last_grant_deadline: None,
             published_runtime_private_memory: None,
+            published_cpu: None,
+            external_parent_checked: false,
             last_rcb_timer: None,
             last_rcb_timer_is_max: false,
+            lone_grant: false,
+            lone_slice_end: None,
+            replaying_lone_slice_end: None,
+            lone_slice_end_at_check_in: false,
+            lone_replay_unsound: false,
+            replayed_stopless_end: None,
+            armed_instruction_offset: None,
+            slice_instruction_offset: 0,
+            replay_instruction_offset: None,
+            chaos_instruction_offset_draws: 0,
+            replay_backstop: None,
             record_or_replay,
             preemption_points: None,
             past_global_first_execve: false,
             interrupt_at: cfg.interrupts_for_thread(pid),
             robust_list_head: None,
             robust_list_process: Arc::new(Mutex::new(RobustListProcessState::default())),
+            exec_robust_commit: None,
             slice_boundary: None,
             callback_history: Default::default(),
+            schedule_replay_over: false,
         }
     }
 
@@ -5192,8 +8122,20 @@ impl<T> ThreadState<T> {
             .insert(self.dettid);
     }
 
-    /// Note that an exit_group on DBT (`OwnerDeathPath::Barrier`) has been
-    /// filed. From now on a thread the exit_group's grant kills waits for its
+    /// The same for every owner a group death walked
+    /// (`OwnerDeathPath::Detcore`): each thread's death walks its list once,
+    /// however many paths of the one death reach a walk.
+    pub(crate) fn mark_robust_lists_walked_by_tool(&self, owners: &[RobustListOwner]) {
+        self.robust_list_process
+            .lock()
+            .expect("robust-list process state mutex poisoned")
+            .tool_walked
+            .extend(owners.iter().map(|owner| owner.dettid));
+    }
+
+    /// Note that an exit_group on DBT or KVM (`OwnerDeathPath::Barrier`,
+    /// `OwnerDeathPath::Detcore`; on KVM also a SIGKILL a thread sends its own
+    /// process) has been filed. From now on a thread the exit_group's grant kills waits for its
     /// walk before its native exit ([`Self::wait_for_exit_group_robust_walk`]),
     /// and a thread of the group that exits keeps its head registered for the
     /// walk, so the walk sees the registrations current at the grant even if
@@ -5203,10 +8145,12 @@ impl<T> ThreadState<T> {
     /// Nothing clears the filing: the thread group ends with the exit_group.
     /// The one exception is an exec granted first, which kills the filer.
     /// Where exec keeps this shared state for the new image, killed threads'
-    /// old heads would then stay listed for a later exit_group. Only DBT files,
-    /// and there the exec replaces the in-guest runtime's memory, this state
-    /// included; modeling exec on DBT
-    /// (<https://github.com/rrnewton/hermit/issues/4268>) must keep it so.
+    /// old heads would then stay listed for a later exit_group. DBT and KVM
+    /// file. On DBT the exec replaces the in-guest runtime's memory, this
+    /// state included; modeling exec on DBT
+    /// (<https://github.com/rrnewton/hermit/issues/4268>) must keep it so. On
+    /// KVM a successful exec gives the new image a state of its own
+    /// ([`Self::start_robust_list_process_for_exec`]).
     pub(crate) fn file_exit_group_for_robust_lists(&self) {
         let mut process = self
             .robust_list_process
@@ -5265,9 +8209,12 @@ impl<T> ThreadState<T> {
     /// host time, but nothing guest-visible depends on how long it takes: the
     /// thread is already logically dead. A walk that never comes, because an
     /// exec killed every filer first, is recognised when the last filing is
-    /// cancelled ([`Self::cancel_exit_group_filing`]). Only DBT files an
-    /// exit_group, and there each guest thread polls its own callbacks, so the
-    /// blocking wait holds up only this thread.
+    /// cancelled ([`Self::cancel_exit_group_filing`]). Only DBT and KVM file an
+    /// exit_group. On DBT each guest thread polls its own callbacks, and on KVM
+    /// each guest thread's callbacks run on a host worker of its own, so the
+    /// blocking wait holds up only this thread. On KVM no native exit marks a
+    /// word, so the wait is not needed there for the walk's reads, only
+    /// harmless: the walk's registrations are kept by the filing itself.
     pub(crate) fn wait_for_exit_group_robust_walk(&self, bound: std::time::Duration) -> bool {
         let started = std::time::Instant::now();
         loop {
@@ -5306,8 +8253,9 @@ impl<T> ThreadState<T> {
         }
     }
 
-    /// The registrations an exit_group walks on DBT
-    /// (`OwnerDeathPath::Barrier`), read at its grant: every registration current then, including
+    /// The registrations an exit_group walks on DBT or KVM
+    /// (`OwnerDeathPath::Barrier`, `OwnerDeathPath::Detcore`), read at its
+    /// grant: every registration current then, including
     /// those of threads the grant killed, less any thread whose own exit
     /// Detcore already replayed, so no list is walked twice.
     pub(crate) fn robust_list_owners_for_exit_group(&self) -> Vec<RobustListOwner> {
@@ -5428,9 +8376,12 @@ impl<T> ThreadState<T> {
     /// `exit_robust_list` before the old address space goes away. A caller that
     /// is not the group leader already holds the leader's TID by then
     /// (`exchange_tids` in `de_thread`), so its own list is walked with the
-    /// thread group ID. The lists can only be read before the exec, and a
-    /// failed exec never reaches that point, so the wakes wait here for
-    /// `take_robust_list_wakes_for_exec`.
+    /// thread group ID. The lists can only be read before the old address
+    /// space goes, so the wakes are staged here for
+    /// `take_robust_list_wakes_for_exec`: at the exec's entry where Linux's
+    /// exec walks the lists (ptrace), and at the exec's point of no return
+    /// where Detcore walks them itself (KVM,
+    /// `Detcore::commit_exec_robust_lists`). A failed exec delivers none.
     pub(crate) fn stage_robust_list_wakes_for_exec(
         &self,
         wakes: Vec<(DetTid, Vec<RobustListWake>)>,
@@ -5442,8 +8393,9 @@ impl<T> ThreadState<T> {
         process.exec_pending = flatten_exec_robust_list_wakes(wakes);
     }
 
-    /// Take the wakes staged at the exec's entry: to deliver them once it has
-    /// succeeded, or to drop them when it failed and left the old image running.
+    /// Take the wakes staged for an exec (`stage_robust_list_wakes_for_exec`):
+    /// to deliver them once it has succeeded, or to drop them when it failed
+    /// and left the old image running.
     pub(crate) fn take_robust_list_wakes_for_exec(&self) -> Vec<(DetTid, RobustListWake)> {
         std::mem::take(
             &mut self
@@ -5478,6 +8430,17 @@ impl<T> ThreadState<T> {
         self.record_robust_list_head(previous);
     }
 
+    /// Give the new image of a successful exec a robust-list state of its own
+    /// (`Detcore::exec_starts_a_new_robust_list_process`). The exec'ing thread
+    /// is its process's only thread now and has registered no list yet; the
+    /// threads the exec killed keep the old state for their exit hooks. Called
+    /// after the exec's staged wakes were taken
+    /// ([`Self::take_robust_list_wakes_for_exec`]).
+    pub(crate) fn start_robust_list_process_for_exec(&mut self) {
+        self.robust_list_head = None;
+        self.robust_list_process = Arc::new(Mutex::new(RobustListProcessState::default()));
+    }
+
     /// Resolve a futex key from its opcode mode and virtual address.
     pub(crate) fn futex_id(&self, address: usize, is_private: bool) -> FutexID {
         if is_private {
@@ -5488,6 +8451,59 @@ impl<T> ThreadState<T> {
                 .expect("memory metadata mutex poisoned")
                 .futex_id(self.mm_id, address)
         }
+    }
+
+    /// Record that the address space allocated or applied a protection key
+    /// (`MemoryMetadata::protection_keys`).
+    pub(crate) fn note_protection_keys(&self) {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .protection_keys = true;
+    }
+
+    /// Whether the address space has allocated or applied a protection key.
+    pub(crate) fn may_use_protection_keys(&self) -> bool {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .protection_keys
+    }
+
+    /// Record that a call that sets mapping flags the backend's memory map
+    /// does not list reached the backend for a mapping that map lists
+    /// (`MemoryMetadata::mapping_flags_changed`).
+    pub(crate) fn note_mapping_flags_changed(&self) {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .mapping_flags_changed = true;
+    }
+
+    /// Whether such a call reached the backend for the address space.
+    pub(crate) fn mapping_flags_may_have_changed(&self) -> bool {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .mapping_flags_changed
+    }
+
+    /// Record that a call that discards pages reached the backend for a
+    /// mapping the backend's memory map lists
+    /// (`MemoryMetadata::pages_discarded`).
+    pub(crate) fn note_pages_discarded(&self) {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .pages_discarded = true;
+    }
+
+    /// Whether such a call reached the backend for the address space.
+    pub(crate) fn pages_may_have_been_discarded(&self) -> bool {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .pages_discarded
     }
 
     /// Record an anonymous shared mapping.
@@ -5552,6 +8568,9 @@ impl<T> ThreadState<T> {
             reads_signalfd: false,
             read_fd: None,
             polls_guest_state_only: false,
+            polls_a_named_fifo: false,
+            relies_on_guest_held_marks: false,
+            passes_descriptors_out: false,
             waits_until_nothing_else_can_run: false,
             previous_attempt_made_progress: false,
             upgraded_from_attempt: 0,
@@ -5565,6 +8584,9 @@ impl<T> ThreadState<T> {
             slice_boundary: None,
             guest_signal_mask: None,
             callback_checkpoint: None,
+            priority_row: None,
+            slice_expired: false,
+            zero_length_sleep: false,
         }
     }
 
@@ -5578,6 +8600,62 @@ impl<T> ThreadState<T> {
     /// get file metadata
     fn metadata(&self) -> MutexGuard<'_, FileMetadata> {
         self.file_metadata.lock().unwrap()
+    }
+
+    /// The descriptors this thread's table holds, ascending, modelled or not
+    /// (`FileMetadata::descriptor_numbers`), its capacity
+    /// (`FileMetadata::descriptor_capacity`), and whether a receive may have
+    /// installed descriptors Detcore does not know
+    /// (`FileMetadata::unaccounted_receipts`).
+    pub(crate) fn descriptor_table(&self) -> (Vec<RawFd>, u64, bool) {
+        let metadata = self.metadata();
+        (
+            metadata.descriptor_numbers(),
+            metadata.descriptor_capacity,
+            metadata.unaccounted_receipts,
+        )
+    }
+
+    /// Record that descriptor `fd`, close-on-exec or not, is open in this
+    /// thread's table though Detcore keeps no description of it
+    /// (`FileMetadata::present_unmodelled`).
+    pub(crate) fn note_unmodelled_descriptor(&self, fd: RawFd, cloexec: bool) {
+        let mut metadata = self.metadata();
+        if !metadata.file_handles.contains_key(&fd) {
+            metadata.note_installed(fd);
+            metadata.present_unmodelled.insert(fd, cloexec);
+        }
+    }
+
+    /// Grow this thread's table to hold descriptor `fd`, as a `dup2` or
+    /// `dup3` to it of a descriptor that is not open does on Linux
+    /// (`FileMetadata::grow_to_hold`): `newfd` below `RLIMIT_NOFILE`, as
+    /// Detcore keeps it for the process.
+    pub(crate) fn note_failed_dup_target(&self, fd: RawFd) {
+        let limit = self
+            .resource_limits
+            .lock()
+            .unwrap()
+            .get(reverie::syscalls::linux_abi::RLIMIT_NOFILE)
+            .map_or(0, |limit| limit.current);
+        if u64::try_from(fd).is_ok_and(|fd| fd < limit) {
+            self.metadata().grow_to_hold(fd);
+        }
+    }
+
+    /// Set the close-on-exec flag of descriptor `fd` if Detcore lists it
+    /// without modelling it (`FileMetadata::present_unmodelled`), after the
+    /// kernel changed it (`F_SETFD`, `FIOCLEX`, `FIONCLEX`); whether it is
+    /// one.
+    pub(crate) fn set_unmodelled_cloexec(&self, fd: RawFd, cloexec: bool) -> bool {
+        self.metadata().set_unmodelled_cloexec(fd, cloexec)
+    }
+
+    /// Record that a receive may have installed descriptors in this thread's
+    /// table whose numbers Detcore does not know
+    /// (`FileMetadata::unaccounted_receipts`).
+    pub(crate) fn note_unaccounted_receipt(&self) {
+        self.metadata().unaccounted_receipts = true;
     }
 
     /// Identity of this thread's descriptor table.
@@ -5620,13 +8698,71 @@ impl<T> ThreadState<T> {
         ty: FdType,
         stat: Option<DetStat>,
     ) -> Result<(), Errno> {
-        self.metadata().add_fd(
+        let mut metadata = self.metadata();
+        metadata.add_fd(
             self.open_file_creator.unwrap_or(self.dettid),
             fd,
             flags,
             ty,
             stat,
-        )
+        )?;
+        if self.traced_call.is_active() {
+            self.traced_call
+                .note(metadata.slot_note(fd, FdNoteOp::Open));
+        }
+        Ok(())
+    }
+
+    /// Bring the open note [`Self::add_fd`] made for descriptor `fd` up to
+    /// date once the open's handler has set the descriptor's path, which it
+    /// does after the install: the note then names the file's path as well
+    /// as its kind.
+    pub(crate) fn note_opened_path(&self, fd: RawFd) {
+        if self.traced_call.is_active() {
+            let note = self.metadata().slot_note(fd, FdNoteOp::Open);
+            self.traced_call.replace_open_note(note);
+        }
+    }
+
+    /// Record descriptor `fd`, which Linux installed by a route Detcore did not
+    /// model as it ran (`SCM_RIGHTS`), from the kernel's facts about it, as an
+    /// in-guest backend records a descriptor it discovers
+    /// (`FileMetadata::add_discovered_fd`).
+    pub(crate) fn add_discovered_fd(
+        &self,
+        fd: RawFd,
+        fd_flags: libc::c_int,
+        status_flags: libc::c_int,
+        raw_stat: &libc::stat,
+        link: Option<&[u8]>,
+    ) -> Result<(), Errno> {
+        let mut metadata = self.metadata();
+        metadata.add_discovered_fd(
+            self.open_file_creator.unwrap_or(self.dettid),
+            fd,
+            fd_flags,
+            status_flags,
+            raw_stat,
+            link,
+        )?;
+        if self.traced_call.is_active() {
+            self.traced_call
+                .note(metadata.slot_note(fd, FdNoteOp::Open));
+        }
+        Ok(())
+    }
+
+    /// Make `fd`, which this thread just opened, a random device
+    /// (`FileMetadata::classify_random_device`).
+    pub(crate) fn classify_random_device(&self, fd: RawFd) -> Result<(), Errno> {
+        self.metadata()
+            .classify_random_device(self.open_file_creator.unwrap_or(self.dettid), fd)
+    }
+
+    /// This table's count of random-device opens, for the exec exchange
+    /// (`ExecFdState::random_device_sequence`).
+    pub(crate) fn random_device_sequence_for_exec(&self) -> u64 {
+        self.metadata().next_random_device_sequence
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -5703,11 +8839,14 @@ impl<T> ThreadState<T> {
     /// (their cursor) and timerfds (their virtual-time expirations,
     /// `crate::fd::VirtualTimerfd`) -- before a backend physically copies or
     /// replaces its in-process Tool. The shared model owns their full state;
-    /// this does not promote sockets or other OFDs. Call only while this task
+    /// this does not promote sockets or other OFDs. The record sequences of
+    /// per-process files move to Detcore's global state on their own
+    /// (`share_procfs_sequences`, first). Call only while this task
     /// owns its serial grant, before the native lifecycle operation can expose
     /// a child/new image. Ptrace's host-side Arc needs no promotion. See
     /// <https://github.com/rrnewton/hermit/issues/4381>.
     pub fn promote_shared_open_files(&self) -> Result<(), crate::fd::SharedOpenFileError> {
+        self.share_procfs_sequences();
         let mut metadata = self.metadata();
         let mut fds: Vec<_> = metadata.file_handles.keys().copied().collect();
         fds.sort_unstable();
@@ -5720,6 +8859,65 @@ impl<T> ThreadState<T> {
             }
         }
         Ok(())
+    }
+
+    /// Before a backend whose tool runs in each guest process physically
+    /// copies this process (a fork) or replaces its image: every description
+    /// of a per-process file that follows its record's sequence keeps that
+    /// sequence in Detcore's global state from then on, so the copies a fork
+    /// makes share it as Linux's processes share the one `struct file` and
+    /// `seq_file` (`ProcfsFile::share_sequence`, `Detcore::take_procfs_sequence`).
+    /// Local and RPC-free: the first operation after the fork, in either
+    /// process, finds no sequence there yet and keeps its copy, which is the
+    /// one the fork made. Runs in the caller's turn, before the copy exists
+    /// (`promote_shared_open_files`, and `Detcore::handle_clone_family` for
+    /// SaBRe, whose runtime promotes nothing).
+    pub fn share_procfs_sequences(&self) {
+        let mut metadata = self.metadata();
+        let mut shared = false;
+        for handle in metadata.file_handles.values() {
+            shared |= handle.share_procfs_sequence();
+        }
+        metadata.has_shared_procfs_sequences |= shared;
+    }
+
+    /// Before a send passes descriptor `fd` over `SCM_RIGHTS`, where the tool
+    /// runs in each guest process: a rendered per-process file that follows
+    /// its record's sequence keeps that sequence in Detcore's global state
+    /// from then on, as a fork's copies do (`share_procfs_sequences`). The
+    /// identity it is kept under, which the caller then takes and stores
+    /// (`Detcore::share_sent_record_sequences`). `None` for any other
+    /// descriptor, and for one whose sequence Detcore cannot know here
+    /// (`DetFd::record_sequence_unknown`). Local and RPC-free.
+    pub(crate) fn share_sent_procfs_sequence(&self, fd: RawFd) -> Option<OpenFileId> {
+        let mut metadata = self.metadata();
+        let handle = metadata.file_handles.get(&fd)?;
+        if handle.is_shared()
+            || handle.record_sequence_unknown()
+            || handle.procfs_rendered_path().is_none()
+            || !handle.share_procfs_sequence()
+        {
+            return None;
+        }
+        let id = handle.procfs_shared_sequence();
+        metadata.has_shared_procfs_sequences |= id.is_some();
+        id
+    }
+
+    /// The descriptors of this thread's table open on a rendered procfs file
+    /// (`DetFd::procfs_rendered_path`), lowest first. A shared model (a
+    /// random device, a timerfd) is never one, and is passed over without a
+    /// lease.
+    pub(crate) fn rendered_descriptors(&self) -> Vec<RawFd> {
+        let metadata = self.metadata();
+        let mut fds: Vec<RawFd> = metadata
+            .file_handles
+            .iter()
+            .filter(|(_, detfd)| !detfd.is_shared() && detfd.procfs_rendered_path().is_some())
+            .map(|(&fd, _)| fd)
+            .collect();
+        fds.sort_unstable();
+        fds
     }
 
     /// Rebuild only process-local locks after a physical process copy. This
@@ -5775,6 +8973,55 @@ impl<T> ThreadState<T> {
             creator: self.open_file_creator.unwrap_or(self.dettid),
             next_sequence: metadata.next_open_file_sequence,
             next_socket_sequence: metadata.next_socket_open_file_sequence,
+            handles,
+        }))
+    }
+
+    /// Before an exec on a backend that rebuilds its descriptor table after
+    /// exec: each surviving descriptor of a per-process file that follows its
+    /// record's sequence, with its open file's identity, model and sequence
+    /// (`DetFd::procfs_record_for_exec`), so the new image's table names the
+    /// same open file as every other process holding it, and a read there
+    /// continues where the open file's sequence is (before, the new image
+    /// rebuilt it from its placeholder with no sequence: an exec'd child's
+    /// read moved the shared position while the other holder kept its own
+    /// sequence, and on DBT and SaBRe that holder's next read ran show where
+    /// Linux continues the record, Claude's narrow check of the kvm lane's
+    /// slice N3, round 5); and this table's open file creator and next
+    /// identity, so no description of the new image takes an identity whose
+    /// sequence another process may still hold in Detcore's global state
+    /// (before, the new image numbered its descriptions from 0 again, Codex's
+    /// narrow check, round 5). `None` where the table has no such descriptor
+    /// and never shared a sequence (`FileMetadata::has_shared_procfs_sequences`).
+    pub(crate) fn procfs_records_for_exec(&self) -> Result<Option<ExecProcfsRecords>, Errno> {
+        let metadata = self.metadata();
+        let mut handles = BTreeMap::new();
+        for (&fd, handle) in &metadata.file_handles {
+            if handle.is_cloexec() || handle.is_shared() {
+                continue;
+            }
+            let Some(procfs) = handle.procfs_record_for_exec() else {
+                continue;
+            };
+            let sequence = procfs.sequence();
+            handles.insert(
+                fd,
+                ExecProcfsRecord {
+                    identity: ExecOpenFile::capture(fd, handle.open_file_id())?,
+                    procfs,
+                    sequence,
+                    flags: handle.status_flags(),
+                    path: handle.path(),
+                    sequence_unknown: handle.record_sequence_unknown(),
+                },
+            );
+        }
+        if handles.is_empty() && !metadata.has_shared_procfs_sequences {
+            return Ok(None);
+        }
+        Ok(Some(ExecProcfsRecords {
+            creator: self.open_file_creator.unwrap_or(self.dettid),
+            next_sequence: metadata.next_open_file_sequence,
             handles,
         }))
     }
@@ -5847,6 +9094,21 @@ impl<T> ThreadState<T> {
         fds
     }
 
+    /// Whether a descriptor of this table other than `fd` names, through a
+    /// guest-held description (`DetFd::is_guest_held`), the object at host
+    /// device `dev` and inode `inode`: the same socket end, or either end of
+    /// the same pipe. Only descriptions whose host `fstat` Detcore keeps can
+    /// match.
+    pub(crate) fn names_guest_held_object(&self, fd: RawFd, dev: u64, inode: u64) -> bool {
+        self.metadata().file_handles.iter().any(|(&other, detfd)| {
+            other != fd
+                && detfd.is_guest_held()
+                && detfd
+                    .stat()
+                    .is_some_and(|stat| stat.dev == dev && stat.inode == inode)
+        })
+    }
+
     /// Mark every listener in this table eligible for accept in turn as passed
     /// over `SCM_RIGHTS` (`DetFd::set_exported`), for a message whose
     /// descriptors Detcore could not read.
@@ -5856,6 +9118,15 @@ impl<T> ThreadState<T> {
             if detfd.is_accept_in_turn_eligible() {
                 detfd.set_exported();
             }
+        }
+    }
+
+    /// Every socket of this table may have been passed to a table that holds
+    /// it as an open file of its own: no pair's queues hold every message
+    /// any more (`DetFd::give_up_pair_completeness`).
+    pub(crate) fn give_up_every_pair_completeness(&self) {
+        for detfd in self.metadata().file_handles.values() {
+            detfd.give_up_pair_completeness();
         }
     }
 
@@ -5904,14 +9175,164 @@ impl<T> ThreadState<T> {
         self.metadata().forget_flock_modes();
     }
 
+    /// After a successful clone that gave another table a copy of this one:
+    /// the descriptions the lock ledger does not follow have references it
+    /// never saw taken, in this process's view too where the copy is a
+    /// separate tool state (`FileMetadata::mark_untracked_references_escaped`).
+    pub fn mark_untracked_references_escaped(&self) {
+        self.metadata().mark_untracked_references_escaped();
+    }
+
+    /// A successful file-backed `mmap` through a descriptor of this table
+    /// mapped `open_file` (`FileMetadata::mapped_open_files`).
+    pub(crate) fn note_mapped_open_file(&self, open_file: OpenFileId) {
+        self.metadata().mapped_open_files.insert(open_file);
+    }
+
+    /// Whether this process may map `open_file`
+    /// (`FileMetadata::mapped_open_files`).
+    pub(crate) fn maps_open_file(&self, open_file: OpenFileId) -> bool {
+        self.metadata().mapped_open_files.contains(&open_file)
+    }
+
     /// remove a rawfd
     pub fn remove_fd(&self, fd: RawFd) -> Option<OpenFileId> {
-        self.metadata().remove_fd(fd)
+        let mut metadata = self.metadata();
+        if self.traced_call.is_active()
+            && let Some(note) = metadata.close_note(fd)
+        {
+            self.traced_call.note(note);
+        }
+        metadata.remove_fd(fd)
+    }
+
+    /// This thread is exiting, with its whole process where `whole_process`
+    /// (an `exit_group`), and the scheduler has granted the exit: it no longer
+    /// holds its descriptor table (`FileMetadata::leave`). Where no thread
+    /// holds the table any more, as guest calls alone count its holders
+    /// (`FileMetadata::holders`), the table goes with this exit, as Linux
+    /// releases it with its last holder's exit (`exit_files`): every
+    /// descriptor of it is let go now, in this thread's turn, before the
+    /// native call that ends it (`Detcore::release_table_at_exit`), so that
+    /// whether another table's later close is a
+    /// description's last reference depends on this call and not on when the
+    /// backend tears thread states down. A socket whose last reference goes
+    /// takes its queue, for the exit to release
+    /// ([`Self::take_released_rights`]), as Linux purges a released socket's
+    /// receive queue. The descriptions themselves keep their ports, as an
+    /// exiting process's sockets always have. Returns whether the table was
+    /// let go; a table that another thread still holds is kept.
+    pub(crate) fn release_table_at_exit(&self, whole_process: bool) -> bool {
+        let Some(process) = self.detpid else {
+            return false;
+        };
+        let mut metadata = self.metadata();
+        if !metadata.leave(process, whole_process) {
+            return false;
+        }
+        metadata.release_every_descriptor();
+        true
+    }
+
+    /// The new image's first callback, after an exec that replaced a table
+    /// (`FileMetadata::keep_replaced_table`): the exec'ing process leaves it,
+    /// all its threads at once (`FileMetadata::leave`), as Linux's exec kills
+    /// the process's other threads (`de_thread`) and gives the process a table
+    /// of its own where another process still holds the old one
+    /// (`unshare_files`). Where that leaves the table to no holder, every
+    /// descriptor of it goes now, in order. The close-on-exec ones go as Linux
+    /// closes them at the exec (`do_close_on_exec`); the others, which this
+    /// thread's new table holds too, release nothing by going. So the replaced
+    /// table names no description any more, however long the backend keeps
+    /// it, and whether a later close is a description's last reference
+    /// depends on the exec, not on when the backend drops that table. Where
+    /// another process still holds it (`CLONE_FILES` without `CLONE_THREAD`),
+    /// that process keeps every descriptor, and the table goes with that
+    /// process's own exit or exec, which the exec'ing process no longer
+    /// counts against. A socket whose last reference goes takes its queue,
+    /// for the exec to release ([`Self::take_released_rights`]), as Linux
+    /// purges a released socket's receive queue (`unix_release_sock`). No
+    /// port is released here: `Detcore::handle_execveat` releases those of the
+    /// descriptions the exec closes before the exec runs, as before. Returns
+    /// whether that left anything to release.
+    pub(crate) fn release_exec_dropped_descriptors(&self) -> bool {
+        let Some((replaced, process)) = self.metadata().exec_replaced.0.take() else {
+            return false;
+        };
+        let released = {
+            let mut replaced = replaced.lock().expect("file metadata mutex poisoned");
+            if !replaced.leave(process, true) {
+                return false;
+            }
+            replaced.release_every_descriptor();
+            replaced.take_released_rights()
+        };
+        if released.is_empty() {
+            return false;
+        }
+        self.defer_released_rights(released);
+        true
+    }
+
+    /// What the current call made Linux release from receiving sockets'
+    /// queues, for the call to release when it completes
+    /// (`Detcore::settle_released_rights`): what closes in this thread's
+    /// table took (`FileMetadata::release_detfd`), and what receives and
+    /// purges handed over ([`Self::defer_released_rights`]).
+    pub(crate) fn take_released_rights(&self) -> Vec<SentDescriptor> {
+        self.metadata().take_released_rights()
+    }
+
+    /// Whether the current call holds descriptors to release
+    /// ([`Self::take_released_rights`]).
+    pub(crate) fn holds_released_rights(&self) -> bool {
+        !self.metadata().released_rights.0.is_empty()
+    }
+
+    /// Hold `released`, descriptors queued to a socket that Linux has just
+    /// released with their message, for the current call to release when it
+    /// completes ([`Self::take_released_rights`]).
+    pub(crate) fn defer_released_rights(&self, released: impl IntoIterator<Item = SentDescriptor>) {
+        self.metadata().released_rights.0.extend(released);
     }
 
     /// Remove every modeled descriptor in an inclusive close_range interval.
     pub(crate) fn remove_fd_range(&self, first: u32, last: u32) -> Vec<OpenFileId> {
-        self.metadata().remove_fd_range(first, last)
+        let mut metadata = self.metadata();
+        if self.traced_call.is_active() {
+            let mut released: Vec<RawFd> = metadata
+                .file_handles
+                .keys()
+                .copied()
+                .filter(|fd| *fd >= 0 && first <= *fd as u32 && *fd as u32 <= last)
+                .collect();
+            released.sort_unstable();
+            for note in released
+                .into_iter()
+                .filter_map(|fd| metadata.close_note(fd))
+            {
+                self.traced_call.note(note);
+            }
+        }
+        metadata.remove_fd_range(first, last)
+    }
+
+    /// A descriptor of this thread's table that names the open file
+    /// description `open_file`: `preferred` where it does, else the lowest
+    /// that does (`Detcore::flock_wait`).
+    pub(crate) fn slot_naming(&self, open_file: OpenFileId, preferred: RawFd) -> Option<RawFd> {
+        let handles = &self.metadata().file_handles;
+        if handles
+            .get(&preferred)
+            .is_some_and(|detfd| detfd.open_file_id() == open_file)
+        {
+            return Some(preferred);
+        }
+        handles
+            .iter()
+            .filter(|(_, detfd)| detfd.open_file_id() == open_file)
+            .map(|(fd, _)| *fd)
+            .min()
     }
 
     /// How many slots of this thread's table name the open file description
@@ -5924,6 +9345,32 @@ impl<T> ThreadState<T> {
             .filter(|detfd| detfd.open_file_id() == open_file)
             .count();
         u32::try_from(count).unwrap_or(u32::MAX)
+    }
+
+    /// Whether the exec that made this thread's table dropped a close-on-exec
+    /// description whose locks Detcore follows (`FileMetadata::exec_dropped_lock_tracked`).
+    pub(crate) fn exec_dropped_lock_tracked(&self) -> bool {
+        self.metadata().exec_dropped_lock_tracked
+    }
+
+    /// Whether this thread's table holds a descriptor Detcore serves as a
+    /// `/proc` directory on a placeholder (`DetFd::placeholder`).
+    pub(crate) fn holds_placeholder(&self) -> bool {
+        self.metadata()
+            .file_handles
+            .values()
+            .any(|detfd| detfd.placeholder().is_some())
+    }
+
+    /// The lowest numbered descriptor of this thread's table that names the
+    /// open file description `open_file`, if any.
+    pub(crate) fn lowest_slot_naming(&self, open_file: OpenFileId) -> Option<RawFd> {
+        self.metadata()
+            .file_handles
+            .iter()
+            .filter(|(_, detfd)| detfd.open_file_id() == open_file)
+            .map(|(&fd, _)| fd)
+            .min()
     }
 
     /// The descriptions in this thread's table whose locks
@@ -5960,7 +9407,18 @@ impl<T> ThreadState<T> {
                 oldfd,
             )?;
         }
-        metadata.dup_fd(oldfd, newfd, flags)
+        let replaced = (self.traced_call.is_active() && oldfd != newfd)
+            .then(|| metadata.close_note(newfd))
+            .flatten();
+        let released = metadata.dup_fd(oldfd, newfd, flags)?;
+        if self.traced_call.is_active() && oldfd != newfd {
+            if let Some(note) = replaced {
+                self.traced_call.note(note);
+            }
+            self.traced_call
+                .note(metadata.slot_note(newfd, FdNoteOp::Dup(oldfd)));
+        }
+        Ok(released)
     }
 
     /// Atomically validate a pidfd target and capture its source descriptor.
@@ -6008,16 +9466,53 @@ impl<T> ThreadState<T> {
         newfd: RawFd,
         flags: OFlag,
     ) -> Result<Option<OpenFileId>, CapturedDetFdInstallError> {
-        self.metadata().install_captured_fd(captured, newfd, flags)
+        let mut metadata = self.metadata();
+        let replaced = self
+            .traced_call
+            .is_active()
+            .then(|| metadata.close_note(newfd))
+            .flatten();
+        let released = metadata.install_captured_fd(captured, newfd, flags)?;
+        if self.traced_call.is_active() {
+            if let Some(note) = replaced {
+                self.traced_call.note(note);
+            }
+            self.traced_call
+                .note(metadata.slot_note(newfd, FdNoteOp::Open));
+        }
+        Ok(released)
     }
 
     /// Install `detfd`, which refers to an open file description Detcore
-    /// models, as descriptor `detfd.fd` of this table: a descriptor that
-    /// reached the description by a route Detcore does not model
-    /// (`SCM_RIGHTS`), adopted when the guest first names it
-    /// (`Detcore::adopt_received_placeholders`).
+    /// models, as descriptor `detfd.fd` of this table: a rendered procfs
+    /// descriptor that reached the description over `SCM_RIGHTS`, adopted
+    /// when it is received (`Detcore::record_received_descriptors`) or when
+    /// the guest first names it (`Detcore::adopt_received_placeholders`).
     pub(crate) fn install_alias(&self, detfd: DetFd) {
-        self.metadata().add_detfd(detfd);
+        let fd = detfd.fd;
+        let mut metadata = self.metadata();
+        metadata.add_detfd(detfd);
+        if self.traced_call.is_active() {
+            self.traced_call
+                .note(metadata.slot_note(fd, FdNoteOp::Open));
+        }
+    }
+
+    /// The descriptors among `fds` this thread's table names, as the access
+    /// trace needs them (`crate::access_trace::FdInfo`).
+    pub(crate) fn access_trace_fds(
+        &self,
+        fds: &[RawFd],
+    ) -> BTreeMap<RawFd, crate::access_trace::FdInfo> {
+        let metadata = self.metadata();
+        fds.iter()
+            .filter_map(|fd| {
+                metadata
+                    .file_handles
+                    .get(fd)
+                    .map(|detfd| (*fd, crate::access_trace::FdInfo::of(detfd)))
+            })
+            .collect()
     }
 
     /// Abandon an uninstalled capture and identify a deferred final-OFD release.
@@ -6029,6 +9524,17 @@ impl<T> ThreadState<T> {
     /// for crypto.
     pub fn thread_prng(&mut self) -> &mut Pcg64Mcg {
         &mut self.prng
+    }
+
+    /// Whether this thread's slices still follow a replayed schedule
+    /// (`--replay-schedule-from`): they end where the schedule says, and no
+    /// pending deadline or PMU maximum ends them. False without a schedule,
+    /// and once the schedule is over for this thread
+    /// (`schedule_replay_over`): its slices then end as in a run without a
+    /// schedule, which `hermit analyze` assumes of a replayed prefix's
+    /// continuation.
+    pub(crate) fn follows_replayed_schedule(&self, cfg: &Config) -> bool {
+        cfg.replay_schedule_from.is_some() && !self.schedule_replay_over
     }
 
     /// Whether a trapped instruction (`rdtsc`, `cpuid`) should end the current
@@ -6046,8 +9552,9 @@ impl<T> ThreadState<T> {
     /// With no PMU maximum it is the only way out of a busy-wait on the TSC,
     /// and it still ends the expired target. Replay of recorded preemptions or
     /// schedules keeps its recorded boundaries.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn instruction_trap_ends_timeslice(&self, cfg: &Config) -> bool {
-        let replaying = self.preemption_points.is_some() || cfg.replay_schedule_from.is_some();
+        let replaying = self.preemption_points.is_some() || self.follows_replayed_schedule(cfg);
         match self.max_timeslice_end {
             Some(max_end) if cfg.target_timeslice_syscalls_only && !replaying => {
                 self.thread_logical_time.as_nanos() >= max_end
@@ -6112,6 +9619,101 @@ impl<T> ThreadState<T> {
         }
     }
 
+    /// The recorded priority-history row whose end the current slice waits
+    /// for, under `--replay-preemptions-from`; `None` without a history.
+    /// Derived from the history's own cursor: rows are installed as slice
+    /// ends in order, and the final slice follows the last.
+    pub(crate) fn active_priority_row(
+        &self,
+    ) -> Option<crate::preemptions::callback_history::ActiveRow> {
+        use crate::preemptions::callback_history::ActiveRow;
+        let history = self.preemption_points.as_ref()?;
+        Some(if self.stats.last_recorded_slice.is_some() {
+            ActiveRow::Exhausted
+        } else {
+            match history.installed_rows() {
+                0 => ActiveRow::BeforeFirst,
+                installed => ActiveRow::Row(installed - 1),
+            }
+        })
+    }
+
+    /// The active row's callback checkpoint, when the row has one and it has
+    /// not been consumed (`Config::annotated_priority_replay`).
+    pub(crate) fn pending_checkpoint(
+        &self,
+    ) -> Option<&crate::preemptions::callback_history::Checkpoint> {
+        use crate::preemptions::callback_history::ActiveRow;
+        let ActiveRow::Row(row) = self.active_priority_row()? else {
+            return None;
+        };
+        if !self.callback_history.annotates(row) {
+            return None;
+        }
+        self.callback_history.remaining().next()
+    }
+
+    /// The post-hook's margin of one retired conditional branch, in logical
+    /// time at this thread's current clock and chaos slowdown: a PMU
+    /// deadline closer than this ends the slice at once.
+    pub(crate) fn pmu_epsilon(&self, cfg: &Config) -> Duration {
+        Duration::from_nanos((NANOS_PER_RCB * self.clock_multiplier(cfg)).ceil() as u64)
+    }
+
+    /// Logical nanoseconds per nanosecond of retired-branch time for this
+    /// thread now: the configured clock multiplier times its chaos slowdown.
+    pub(crate) fn clock_multiplier(&self, cfg: &Config) -> f64 {
+        cfg.clock_multiplier.unwrap_or(1.0) * self.rcb_time_multiplier().as_f64()
+    }
+
+    /// Files a priority change point at `time` in a preemption replay, or
+    /// returns the thread's last one when `time` is not after it.
+    ///
+    /// A replay that reproduces its record files each thread's change points
+    /// at the record's times, which are strictly increasing (the loaded
+    /// record is validated), so it never gets the error. A change point at or
+    /// before the last one is a thread that left the record: a slice closed
+    /// with no time in it, as when the slice before ran onto the next
+    /// recorded end's branch count while that end's time was still ahead and
+    /// the thread's time did not move (the adjacent zero-RCB slices of
+    /// `end_timeslice_with_checkpoint`). Filed, such a change point was never
+    /// granted, and the replay stalled until `--timeout`. Outside a
+    /// preemption replay nothing is checked or kept, and nor is it for an
+    /// edited record (`--replay-edited-preemptions`), which keeps a slice
+    /// whose RCB target is the thread's count and ends it at once
+    /// (`next_edited_slice`): its change points need not advance.
+    pub(crate) fn file_replay_change_point(
+        &mut self,
+        cfg: &Config,
+        time: LogicalTime,
+    ) -> Result<(), LogicalTime> {
+        if cfg.replay_preemptions_from.is_none() || cfg.replay_edited_preemptions {
+            return Ok(());
+        }
+        if let Some(last) = self.last_replay_change_point.filter(|last| time <= *last) {
+            return Err(last);
+        }
+        self.last_replay_change_point = Some(time);
+        Ok(())
+    }
+
+    /// Runs the rest of a preemption replay's thread as its final slice: no
+    /// recorded end governs it any more, and only the run's own PMU maximum
+    /// (if any) bounds its slices, as when the record runs out. For a thread
+    /// that left its record ([`Self::file_replay_change_point`]), whose
+    /// remaining recorded ends no longer describe it.
+    pub(crate) fn abandon_replayed_slices(&mut self, cfg: &Config) {
+        self.stats.last_recorded_slice = Some(self.stats.timeslice_count);
+        self.end_of_timeslice = Some(LogicalTime::MAX);
+        self.replay_rcb_end = None;
+        let now = self.thread_logical_time.as_nanos();
+        self.max_timeslice_end = cfg
+            .max_timeslice
+            .map(|max_timeslice| now + Duration::from_nanos(u64::from(max_timeslice)));
+        self.last_rcb_timer = None;
+        self.last_rcb_timer_is_max = false;
+    }
+
     /// Whether this thread has consumed its current logical timeslice.
     pub(crate) fn timeslice_expired(&self) -> bool {
         if let Some(replay_rcb_end) = self.replay_rcb_end {
@@ -6120,6 +9722,19 @@ impl<T> ThreadState<T> {
         let current_time = self.thread_logical_time.as_nanos();
         self.end_of_timeslice
             .is_some_and(|end_of_timeslice| current_time >= end_of_timeslice)
+    }
+
+    /// Take the instruction offset the ending slice's timer was armed with
+    /// (`--chaos-instruction-offset`), for the change point that records it:
+    /// only if the thread reached the branch target, so that the timer, or a
+    /// check-in among its steps, ended the slice. A slice that ended at a
+    /// check-in before the target records no offset; its replay ends it at
+    /// that check-in, as any such slice.
+    pub(crate) fn take_ended_slice_offset(&mut self) -> Option<InstructionOffset> {
+        let committed = self.committed_clock_value;
+        self.armed_instruction_offset
+            .take()
+            .filter(|offset| committed >= offset.rcb_target)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -6157,7 +9772,77 @@ impl<T> ThreadState<T> {
         );
     }
 
+    /// Refresh the slowdown at a consumed slice boundary without choosing a
+    /// deadline, drawing a priority or resetting slice statistics. A precise
+    /// priority-history replay uses its previous recorded endpoint, even when
+    /// the PMU checked in one RCB early. A schedule callback supplies its actual
+    /// boundary instead of a future deadline already installed by its cursor.
+    /// Ambient slowdown always follows the current elapsed logical time.
+    pub(crate) fn refresh_chaos_epoch(&mut self, cfg: &Config, recorded_boundary: LogicalTime) {
+        let current_ns = self.thread_logical_time.as_nanos();
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-1151)
+        // Redraw only at scheduler commit boundaries, keyed to elapsed
+        // deterministic logical time. Replay artifacts take precedence and
+        // restore the exact recorded Q32 factor even without ambient flags.
+        let replay_has_epochs = self
+            .preemption_points
+            .as_ref()
+            .is_some_and(ThreadHistoryIterator::has_chaos_epochs);
+        if replay_has_epochs {
+            // Precise PMU replay deliberately checks in up to one RCB
+            // before the recorded logical boundary. The new slice still
+            // begins at that recorded boundary, so install its factor
+            // against the prior slice's exact target rather than the
+            // slightly-early observed clock. Otherwise a short epoch can
+            // be skipped and the following RCBs receive the wrong weight.
+            let transition = self
+                .preemption_points
+                .as_mut()
+                .and_then(|history| history.advance_chaos_epoch(recorded_boundary));
+            if let Some(transition) = transition {
+                self.install_chaos_epoch(transition, false);
+            }
+        } else if cfg.chaos && cfg.chaos_per_thread_slowdown {
+            let elapsed_ns = self.thread_logical_time.without_starting().as_nanos();
+            let epoch = elapsed_ns
+                .checked_div(cfg.chaos_epoch_length_ns)
+                .unwrap_or(0);
+            let factor = chaos_per_thread_slowdown_factor(
+                cfg.sched_seed(),
+                self.dettid,
+                epoch,
+                cfg.chaos_slowdown_max_factor,
+            );
+            if epoch != self.chaos_epoch {
+                self.install_chaos_epoch(
+                    ChaosEpochTransition {
+                        logical_time: current_ns,
+                        epoch,
+                        factor,
+                    },
+                    true,
+                );
+            } else {
+                self.chaos_slowdown_factor = factor;
+                self.chaos_slowdown_active = true;
+            }
+        } else {
+            self.chaos_slowdown_factor = RcbTimeMultiplier::ONE;
+            self.chaos_slowdown_active = false;
+            self.pending_chaos_epochs.clear();
+        }
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
+    /// `bound`, a configured slice bound, raised to the post-crash bound once
+    /// the run has switched to it (`crate::post_crash`). A bound already
+    /// above it is kept.
+    pub(crate) fn after_post_crash(&self, bound: std::num::NonZeroU64) -> std::num::NonZeroU64 {
+        self.post_crash_bound
+            .map_or(bound, |post_crash| post_crash.max(bound))
+    }
+
     /// Choose the logical target and PMU maximum deadlines for the next timeslice.
     ///
     /// Effects:
@@ -6167,74 +9852,61 @@ impl<T> ThreadState<T> {
     ///
     /// Returns: an optional new priority.
     pub fn next_timeslice(&mut self, cfg: &Config) -> Option<Priority> {
-        let logical_timeslice = cfg.target_timeslice.or(cfg.max_timeslice);
+        self.replay_backstop = None;
+        let logical_timeslice = cfg
+            .target_timeslice
+            .or(cfg.max_timeslice)
+            .map(|bound| self.after_post_crash(bound));
         if let Some(timeout_ns) = logical_timeslice {
             let current_ns = self.thread_logical_time.as_nanos();
 
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-1151)
-            // Redraw only at scheduler commit boundaries, keyed to elapsed
-            // deterministic logical time. Replay artifacts take precedence and
-            // restore the exact recorded Q32 factor even without ambient flags.
-            let replay_has_epochs = self
-                .preemption_points
-                .as_ref()
-                .is_some_and(ThreadHistoryIterator::has_chaos_epochs);
-            if replay_has_epochs {
-                // Precise PMU replay deliberately checks in up to one RCB
-                // before the recorded logical boundary. The new slice still
-                // begins at that recorded boundary, so install its factor
-                // against the prior slice's exact target rather than the
-                // slightly-early observed clock. Otherwise a short epoch can
-                // be skipped and the following RCBs receive the wrong weight.
-                let transition_time = self.end_of_timeslice.unwrap_or(current_ns);
-                let transition = self
-                    .preemption_points
-                    .as_mut()
-                    .and_then(|history| history.advance_chaos_epoch(transition_time));
-                if let Some(transition) = transition {
-                    self.install_chaos_epoch(transition, false);
-                }
-            } else if cfg.chaos && cfg.chaos_per_thread_slowdown {
-                let elapsed_ns = self.thread_logical_time.without_starting().as_nanos();
-                let epoch = elapsed_ns
-                    .checked_div(cfg.chaos_epoch_length_ns)
-                    .unwrap_or(0);
-                let factor = chaos_per_thread_slowdown_factor(
-                    cfg.sched_seed(),
-                    self.dettid,
-                    epoch,
-                    cfg.chaos_slowdown_max_factor,
-                );
-                if epoch != self.chaos_epoch {
-                    self.install_chaos_epoch(
-                        ChaosEpochTransition {
-                            logical_time: current_ns,
-                            epoch,
-                            factor,
-                        },
-                        true,
-                    );
-                } else {
-                    self.chaos_slowdown_factor = factor;
-                    self.chaos_slowdown_active = true;
-                }
-            } else {
-                self.chaos_slowdown_factor = RcbTimeMultiplier::ONE;
-                self.chaos_slowdown_active = false;
-                self.pending_chaos_epochs.clear();
-            }
+            let recorded_boundary = self.end_of_timeslice.unwrap_or(current_ns);
+            self.refresh_chaos_epoch(cfg, recorded_boundary);
 
             let mut result = None;
             self.replay_rcb_end = None;
+            self.slice_instruction_offset = 0;
+            self.replay_instruction_offset = None;
             let replay_controls_deadline =
-                self.preemption_points.is_some() || cfg.replay_schedule_from.is_some();
+                self.preemption_points.is_some() || self.follows_replayed_schedule(cfg);
 
+            // How far ahead an edited record's slice without an RCB target
+            // must end to be replayed (`next_edited_slice`): the post-hook's
+            // one-RCB margin at this slice's clock, which ends a closer slice
+            // at once. Without a PMU maximum there is no such margin, so a
+            // slice is kept whenever it ends ahead, as in a faithful replay.
+            let margin = if cfg.max_timeslice.is_some() {
+                self.pmu_epsilon(cfg)
+            } else {
+                Duration::from_nanos(1)
+            };
             // Preemption-point replay from recorded --chaos configuration.
             if let Some(thi) = &mut self.preemption_points {
                 if self.stats.last_recorded_slice.is_none() {
                     // We have not tapped out the recording yet.
-                    if let Some((end_time, prio, replay_rcb_end)) = thi.next_with_rcbs() {
+                    let current_rcbs = self.committed_clock_value;
+                    // For an edited record, skip the recorded slices that
+                    // already ended (`next_edited_slice`). The chaos epoch
+                    // advanced only to the previous slice's end (above), so
+                    // a slice after skipped ones keeps that epoch's
+                    // slowdown: deterministic, if stale. At a thread's start
+                    // the scheduler has already applied the record's first
+                    // priority, which then holds until the kept slice ends
+                    // (the startup reset files no scheduler request).
+                    let next = if cfg.replay_edited_preemptions {
+                        let (next, skipped) =
+                            next_edited_slice(thi, current_ns, current_rcbs, margin);
+                        if skipped > 0 {
+                            debug!(
+                                "[dtid {}] edited record: skipped {} recorded slices that ended before {} (RCB {})",
+                                self.dettid, skipped, current_ns, current_rcbs
+                            );
+                        }
+                        next
+                    } else {
+                        thi.next_with_offset()
+                    };
+                    if let Some((end_time, prio, replay_rcb_end, offset)) = next {
                         debug!(
                             "[dtid {}] next timeslice (T{}), set by recording to {:?} (current {}), priority {}",
                             self.dettid,
@@ -6243,18 +9915,23 @@ impl<T> ThreadState<T> {
                             current_ns,
                             prio
                         );
-                        let current_rcbs = self.committed_clock_value;
                         if let Some(target_rcbs) = replay_rcb_end
                             && target_rcbs < current_rcbs
                         {
                             panic!(
-                                "Cannot set RCB end of timeslice to {} for thread {}, when current RCB count is already {}.",
+                                "Cannot set RCB end of timeslice to {} for thread {}, when current RCB count is already {}. \
+                                 An edited record, not the recording of this run's schedule, needs \
+                                 --replay-edited-preemptions.",
                                 target_rcbs, self.dettid, current_rcbs
                             )
                         }
                         let exact_deadline_is_now =
                             replay_rcb_end.is_some_and(|target| target == current_rcbs);
-                        if end_time <= current_ns && !exact_deadline_is_now {
+                        // An edited record keeps a slice whose end has passed
+                        // while its RCB target is ahead: the target governs.
+                        let rcb_target_governs =
+                            cfg.replay_edited_preemptions && replay_rcb_end.is_some();
+                        if end_time <= current_ns && !exact_deadline_is_now && !rcb_target_governs {
                             // Records that store their epoch are reconciled with
                             // this run's epoch before any guest starts (see
                             // `adopt_replayed_schedule_epoch` in hermit-cli), so
@@ -6265,12 +9942,17 @@ impl<T> ThreadState<T> {
                                 "Cannot set end of timeslice to {} for thread {}, when current thread logical time is already {}. \
                                  The replayed preemption record's timeslice ends are absolute virtual times; if it was \
                                  recorded under a different virtual-time epoch, replay it with that --epoch \
-                                 (https://github.com/rrnewton/hermit/issues/3413).",
+                                 (https://github.com/rrnewton/hermit/issues/3413). An edited record, not the \
+                                 recording of this run's schedule, needs --replay-edited-preemptions.",
                                 end_time, self.dettid, current_ns
                             )
                         }
                         self.end_of_timeslice = Some(end_time);
                         self.replay_rcb_end = replay_rcb_end;
+                        // An offset is only meaningful against the exact RCB
+                        // end it was recorded with.
+                        self.replay_instruction_offset =
+                            offset.filter(|_| replay_rcb_end.is_some());
                         result = Some(prio);
                     } else {
                         let max = LogicalTime::MAX;
@@ -6294,16 +9976,17 @@ impl<T> ThreadState<T> {
                     self.end_of_timeslice = Some(LogicalTime::MAX);
                     result = Some(thi.final_priority())
                 }
-            } else if !cfg.chaos {
-                if cfg.replay_schedule_from.is_some() {
-                    if cfg.no_rcb_time {
-                        let max_timeslice = cfg
-                            .max_timeslice
+            } else if !cfg.chaos_draws_schedule() {
+                if self.follows_replayed_schedule(cfg) {
+                    if cfg.no_rcb_time && cfg.max_timeslice.is_some() {
+                        let length = self
+                            .max_slice_length(cfg)
                             .expect("schedule replay with PMU requires a maximum");
-                        self.end_of_timeslice =
-                            Some(current_ns + Duration::from_nanos(u64::from(max_timeslice)));
+                        self.end_of_timeslice = Some(current_ns + Duration::from_nanos(length));
                     } else {
-                        // Branch-event replay will overwrite this deadline when needed.
+                        // The schedule's events and callback checkpoints decide
+                        // the slice end. A cooperative target without a PMU
+                        // maximum does not manufacture a replay backstop.
                         debug!(
                             "[dtid {}] next timeslice (T{}), in replay mode setting timeslice to max (current time {})",
                             self.dettid,
@@ -6344,12 +10027,48 @@ impl<T> ThreadState<T> {
                     );
                 }
                 let next_rcbs: u64 = if cfg.chaos {
+                    // `--chaos-timeslice-range`: this slice's mean is drawn
+                    // log-uniformly from the range, from the same seeded chaos
+                    // stream, so slices of every scale in it mix in one run. A
+                    // schedule replay draws none: its slices end where the
+                    // record says, and the drawn ends would only add PMU
+                    // check-ins. A per-run timeslice (`--chaos-timeslice-draw=run`,
+                    // or one a replayed record states) replaces the draw too,
+                    // and so does the post-crash switch: a switched process's
+                    // slices are drawn around its post-crash bound
+                    // (`after_post_crash`), the coarse scale the switch is for,
+                    // never from the range again.
+                    let target_timeout_rcbs = match cfg.chaos_timeslice_range {
+                        Some(range)
+                            if !replay_controls_deadline
+                                && cfg.chaos_timeslice.is_none()
+                                && self.post_crash_bound.is_none() =>
+                        {
+                            range.log_uniform(self.chaos_prng.random::<f64>()) / nanos_per_rcb
+                        }
+                        _ => target_timeout_rcbs,
+                    };
                     // Average frequency of preemptions per nanosecond:
                     let lambda = 1.0 / target_timeout_rcbs;
                     let exp = Exp::new(lambda).unwrap();
                     // Add one to prevent generating a zero time slice:
                     let rcbs = 1 + exp.sample(&mut self.chaos_prng) as u64;
                     detlog!("[dtid {}] CHAOSRAND => next_rcbs = {}", self.dettid, rcbs);
+                    if cfg.chaos_instruction_offset > 0 {
+                        let offset = chaos_instruction_offset_draw(
+                            cfg.sched_seed(),
+                            self.dettid,
+                            self.chaos_instruction_offset_draws,
+                            cfg.chaos_instruction_offset,
+                        );
+                        self.chaos_instruction_offset_draws += 1;
+                        self.slice_instruction_offset = offset;
+                        detlog!(
+                            "[dtid {}] CHAOSRAND => instruction_offset = {}",
+                            self.dettid,
+                            offset
+                        );
+                    }
                     rcbs
                 } else {
                     target_timeout_rcbs as u64
@@ -6370,9 +10089,24 @@ impl<T> ThreadState<T> {
                 );
             }
 
-            let configured_max_end = cfg
-                .max_timeslice
-                .map(|max_timeslice| current_ns + Duration::from_nanos(u64::from(max_timeslice)));
+            // Past an edited record's last recorded slice, a restored chaos
+            // slowdown can make one RCB longer than the configured maximum
+            // (the configuration checks that maximum at the ambient
+            // slowdown): keep at least the post-hook's one-RCB margin, or it
+            // would end this slice at once and find itself past its maximum
+            // again.
+            let past_an_edited_record = cfg.replay_edited_preemptions
+                && self.preemption_points.is_some()
+                && self.end_of_timeslice == Some(LogicalTime::MAX);
+            let configured_max_end = self.max_slice_length(cfg).map(|length| {
+                let length = Duration::from_nanos(length);
+                current_ns
+                    + if past_an_edited_record {
+                        length.max(margin)
+                    } else {
+                        length
+                    }
+            });
             self.max_timeslice_end = if replay_controls_deadline {
                 if cfg.max_timeslice.is_some() {
                     // A replay history uses `LogicalTime::MAX` after its last
@@ -6402,9 +10136,13 @@ impl<T> ThreadState<T> {
             {
                 self.end_of_timeslice = Some(max_end);
             }
+            if cfg.replay_schedule_from.is_some() && self.preemption_points.is_none() {
+                self.replay_backstop = self.end_of_timeslice;
+            }
 
             self.last_rcb_timer = None;
             self.last_rcb_timer_is_max = false;
+            self.armed_instruction_offset = None;
             self.reset_timeslice_stats(current_ns);
             result
         } else {
@@ -6413,8 +10151,143 @@ impl<T> ThreadState<T> {
             self.max_timeslice_end = None;
             self.last_rcb_timer = None;
             self.last_rcb_timer_is_max = false;
+            self.armed_instruction_offset = None;
+            self.slice_instruction_offset = 0;
+            self.replay_instruction_offset = None;
             None
         }
+    }
+
+    /// Take what the reply to a traced event says about the replayed
+    /// schedule (`Scheduler::trace_replay_reply`): whether it is over
+    /// (`schedule_replay_over`), and the replay backstop
+    /// (`learn_uncapped_backstop`), in that order, so a backstop never
+    /// outlives the schedule it came with.
+    pub(crate) fn hear_schedule_replay_reply(
+        &mut self,
+        schedule_over: bool,
+        backstop: Option<LogicalTime>,
+        bound: Option<std::num::NonZeroU64>,
+        schedule_replay: bool,
+    ) {
+        if schedule_over {
+            self.schedule_replay_over = true;
+        }
+        self.learn_uncapped_backstop(backstop, bound, schedule_replay);
+    }
+
+    /// Take the replay backstop the replayer sent with a traced event
+    /// (`Scheduler::uncapped_backstop`). Only a thread that still follows the
+    /// schedule keeps one (`follows_replayed_schedule`): once the schedule is
+    /// over the thread's slices end as in a run without a schedule, whatever
+    /// a reply carried. A thread's first slice begins before it traces
+    /// anything, so it began under the plain bound; when the backstop first
+    /// arrives, a slice end that came from that bound moves out to the
+    /// backstop, counted from the slice's start, as if the slice had begun
+    /// with it.
+    pub(crate) fn learn_uncapped_backstop(
+        &mut self,
+        backstop: Option<LogicalTime>,
+        bound: Option<std::num::NonZeroU64>,
+        schedule_replay: bool,
+    ) {
+        let following = schedule_replay && !self.schedule_replay_over;
+        let backstop = backstop.filter(|_| following);
+        let first = self.uncapped_backstop.is_none() && backstop.is_some();
+        self.uncapped_backstop = backstop;
+        if !first {
+            return;
+        }
+        if let (Some(start), Some(end), Some(max_end), Some(length)) = (
+            self.stats.timeslice_start_ns,
+            self.end_of_timeslice,
+            self.max_timeslice_end,
+            self.slice_length_within(bound, following),
+        ) && end == max_end
+        {
+            let backstop_end = start + Duration::from_nanos(length);
+            if backstop_end > end {
+                self.end_of_timeslice = Some(backstop_end);
+                self.max_timeslice_end = Some(backstop_end);
+                self.last_rcb_timer = None;
+                self.last_rcb_timer_is_max = false;
+            }
+        }
+    }
+
+    /// The longest a slice runs before the `--max-timeslice` bound ends it, in
+    /// nanoseconds of the thread's logical time: the bound itself, except
+    /// while the thread follows the replayed schedule of a record whose
+    /// slices ran without it (`uncapped_backstop`,
+    /// `follows_replayed_schedule`), where only the record ends a slice. A
+    /// recorded slice can be far longer than the bound there (one that
+    /// replayed a preemption record ends its slices where that record says),
+    /// and ending it at the bound would leave the record. Once the schedule is
+    /// over the bound holds again, as in a run without a schedule.
+    pub(crate) fn max_slice_length(&self, cfg: &Config) -> Option<u64> {
+        // The post-crash bound (main's `after_post_crash`) and the uncapped
+        // backstop each replace the configured bound with the larger of the
+        // two, so the effective maximum is the largest of the three.
+        self.slice_length_within(
+            cfg.max_timeslice.map(|bound| self.after_post_crash(bound)),
+            self.follows_replayed_schedule(cfg),
+        )
+    }
+
+    fn slice_length_within(
+        &self,
+        bound: Option<std::num::NonZeroU64>,
+        following: bool,
+    ) -> Option<u64> {
+        let bound = bound?.get();
+        Some(
+            self.uncapped_backstop
+                .filter(|_| following)
+                .map_or(bound, |backstop| backstop.as_nanos().max(bound)),
+        )
+    }
+
+    /// Restart a schedule replay's backstop deadline from now, at a recorded
+    /// slice end that a callback checkpoint replays without closing the slice
+    /// (an administrative turn).
+    ///
+    /// A schedule replay ends a slice where its record does. Beyond that it
+    /// keeps the slice end `next_timeslice` installs, `--max-timeslice` after
+    /// the slice began, as the recorded run did (`replay_backstop`). The
+    /// recorded run began a new slice at this checkpoint, so its next slice
+    /// end comes at most `--max-timeslice` after it. A backstop counted from
+    /// the slice the administrative turn kept would end the replayed slice
+    /// early, at a point the record does not have, and the extra scheduler
+    /// turn would move the virtual clock the guest reads. Any other slice end,
+    /// a deadline the replayed schedule set above all, stays.
+    pub(crate) fn restart_replay_backstop(&mut self, cfg: &Config) {
+        let Some(max_timeslice) = cfg.max_timeslice else {
+            return;
+        };
+        if self.end_of_timeslice.is_none() || self.end_of_timeslice != self.replay_backstop {
+            return;
+        }
+        let end = self.thread_logical_time.as_nanos()
+            + Duration::from_nanos(u64::from(self.after_post_crash(max_timeslice)));
+        self.end_of_timeslice = Some(end);
+        self.max_timeslice_end = Some(end);
+        self.replay_backstop = Some(end);
+        self.last_rcb_timer = None;
+        self.last_rcb_timer_is_max = false;
+    }
+
+    /// Install a slice end the replayed schedule decides: the replayer's
+    /// deadline for this thread's next recorded event (`trace_schedevent`), the
+    /// deadline an exec's continuation resumes, or the no-RCB-time fallback
+    /// past a replayed maximum. It bounds the PMU maximum too when one is
+    /// configured, and it is no backstop, whatever its value
+    /// (`replay_backstop`).
+    pub(crate) fn install_schedule_deadline(&mut self, deadline: LogicalTime, max_timeslice: bool) {
+        self.end_of_timeslice = Some(deadline);
+        if max_timeslice {
+            self.max_timeslice_end = Some(deadline);
+        }
+        self.replay_backstop = None;
     }
 
     /// Close the current logical-timeslice statistics without selecting a new
@@ -6444,6 +10317,111 @@ impl<T> ThreadState<T> {
     /// guarantee determinism!
     pub fn guest_past_first_execve(&self) -> bool {
         self.past_global_first_execve
+    }
+}
+
+/// A recorded slice as `ThreadHistoryIterator::next_with_offset` yields it: its end, priority, RCB
+/// target and where its timer was armed past that target.
+type RecordedSlice = (
+    LogicalTime,
+    Priority,
+    Option<u64>,
+    Option<InstructionOffset>,
+);
+
+/// The first recorded slice of an edited record (`--replay-edited-preemptions`)
+/// still ahead of a thread at logical time `now` and committed PMU count
+/// `rcbs`, and how many recorded slices before it were skipped.
+///
+/// An edited record (`hermit analyze` knocks preemptions out of a recording)
+/// changes when threads run, so a thread can reach recorded slices that have
+/// already ended. Those no longer apply. A slice is ahead when its RCB target
+/// is, since that target governs where there is one (its end may have
+/// passed), and otherwise when it ends at least `margin` ahead
+/// ([`ThreadState::next_timeslice`] passes the post-hook's one-RCB margin), so
+/// a recorded one-RCB slice that starts where the previous one ended is kept.
+/// Only the baseline search's knock-outs keep RCB targets; minimization's
+/// records skip by time alone. The returned target is the kept slice's own,
+/// or none when its end governs.
+fn next_edited_slice(
+    history: &mut ThreadHistoryIterator,
+    now: LogicalTime,
+    rcbs: u64,
+    margin: Duration,
+) -> (Option<RecordedSlice>, usize) {
+    let mut skipped = 0;
+    loop {
+        match history.next_with_offset() {
+            None => return (None, skipped),
+            Some((end, prio, Some(target), offset)) if target >= rcbs => {
+                return (Some((end, prio, Some(target), offset)), skipped);
+            }
+            Some((end, prio, _, offset)) if end >= now + margin => {
+                return (Some((end, prio, None, offset)), skipped);
+            }
+            Some(_) => skipped += 1,
+        }
+    }
+}
+
+#[cfg(test)]
+mod traced_call_tests {
+    use detcore_model::access_trace::FdOp;
+
+    use super::*;
+
+    /// While a traced call is in progress, the descriptor table notes each
+    /// slot it opens, dups onto and closes, in order: a dup2 onto an open
+    /// number closes it first, and a close_range lists every slot it
+    /// releases with the open file it held. Without a traced call nothing is
+    /// noted.
+    #[test]
+    fn a_traced_call_notes_the_slots_it_changes() {
+        let mut state = ThreadState::<()>::new(DetTid::from_raw(3), &Config::default(), ());
+        for fd in [10, 11] {
+            state.add_fd(fd, OFlag::O_RDWR, FdType::Pipe, None).unwrap();
+        }
+        let id = |state: &ThreadState<()>, fd| state.with_detfd(fd, |d| d.open_file_id()).unwrap();
+        let (ten, eleven) = (id(&state, 10), id(&state, 11));
+        state.remove_fd(12);
+        assert!(
+            state.traced_call.take().is_none(),
+            "no traced call, no notes"
+        );
+
+        state.traced_call.begin(BTreeMap::new());
+        state.dup_fd(10, 11, OFlag::empty()).unwrap();
+        state.remove_fd_range(10, u32::MAX);
+        let notes = state.traced_call.take().expect("a traced call").notes;
+        let slot = |fd| detcore_model::fd::FdSlot {
+            files: state.files_id(),
+            fd,
+        };
+        let summary: Vec<_> = notes
+            .iter()
+            .map(|note| {
+                (
+                    note.slot,
+                    note.open_file,
+                    note.op.clone(),
+                    note.released.as_ref().map(|r| (r.open_file, r.ty)),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    slot(11),
+                    Some(eleven),
+                    FdOp::Close,
+                    Some((eleven, FdType::Pipe))
+                ),
+                (slot(11), Some(ten), FdOp::Dup { source: 10 }, None),
+                (slot(10), Some(ten), FdOp::Close, Some((ten, FdType::Pipe))),
+                (slot(11), Some(ten), FdOp::Close, Some((ten, FdType::Pipe))),
+            ]
+        );
     }
 }
 
@@ -7160,6 +11138,67 @@ mod timeslice_tests {
         assert!(!parent.has_exited_child_process_cpu_time(child));
     }
 
+    /// An exit re-parents a child whose final-CPU publication its creator
+    /// holds; the reaper whose wait the scheduler selects it for takes the
+    /// publication over, with the snapshot an exited child already recorded,
+    /// and reaps the child's times into its own, as Linux's
+    /// `wait_task_zombie` adds them to the reaper's. A child that exits after
+    /// the takeover records into the reaper too.
+    #[tokio::test]
+    async fn a_reparented_childs_cpu_publication_moves_to_the_reaper_that_waits() {
+        use std::future::Future;
+        use std::task::Context;
+
+        let cfg = Config::default();
+        for exits_first in [true, false] {
+            let child = DetPid::from_raw(7);
+            let creator = ThreadState::new(DetPid::from_raw(5), &cfg, ());
+            let mut reaper = ThreadState::new(DetPid::from_raw(3), &cfg, ());
+            reaper.child_cpu_owners = Arc::clone(&creator.child_cpu_owners);
+            let token = creator.prepare_child_cpu_publication(child);
+            let mut orphan = ThreadState::new(child, &cfg, ());
+            orphan.child_cpu_owners = Arc::clone(&creator.child_cpu_owners);
+            orphan.parent_process_cpu_time = Some(Arc::clone(&creator.process_cpu_time));
+            orphan.parent_cpu_publication = Some(Arc::clone(&token));
+            orphan.process_cpu_time.lock().unwrap().snapshot = cpu_snapshot(10, 20, 3, 4);
+            if exits_first {
+                assert!(orphan.record_exited_child_process_cpu_time(child));
+                assert!(reaper.wait_for_child_cpu_publication(child).await);
+            } else {
+                let mut wait = Box::pin(reaper.wait_for_child_cpu_publication(child));
+                let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+                assert!(wait.as_mut().poll(&mut cx).is_pending());
+                assert!(orphan.record_exited_child_process_cpu_time(child));
+                assert!(wait.await);
+            }
+            assert!(
+                reaper.has_exited_child_process_cpu_time(child),
+                "{exits_first}"
+            );
+            {
+                let creator = creator.process_cpu_time.lock().unwrap();
+                assert!(!creator.child_cpu_publications.contains_key(&child));
+                assert!(!creator.exited_children.contains_key(&child));
+            }
+            let recorded = reaper.process_cpu_time.lock().unwrap().exited_children[&child];
+            assert!(recorded.user >= LogicalTime::from_nanos(10));
+            reaper.reap_child_process_cpu_time(child);
+            let after = reaper.process_cpu_time.lock().unwrap().snapshot;
+            assert_eq!(after.children_user, recorded.user + recorded.children_user);
+            assert_eq!(
+                after.children_system,
+                recorded.system + recorded.children_system
+            );
+            assert!(
+                !creator
+                    .child_cpu_owners
+                    .lock()
+                    .unwrap()
+                    .contains_key(&child)
+            );
+        }
+    }
+
     fn nz(value: u64) -> Option<NonZeroU64> {
         NonZeroU64::new(value)
     }
@@ -7203,6 +11242,106 @@ mod timeslice_tests {
         state.cap_timeslice_at_deadline(Duration::ZERO, 1.0, Duration::ZERO, false);
         assert_eq!(state.end_of_timeslice, Some(now + Duration::from_nanos(11)));
         assert_eq!(state.max_timeslice_end, Some(end));
+    }
+
+    /// A schedule replay of a record whose slices ran without the bound
+    /// ends a slice at the replay backstop instead of `--max-timeslice` while
+    /// the replayer sends one. A thread's first slice, begun under the plain
+    /// bound before its first traced event, moves out to the backstop when it
+    /// first arrives; a later one moves nothing, and once the record runs out
+    /// (no backstop) the next slice is bounded as before. Outside a schedule
+    /// replay the backstop is ignored.
+    #[test]
+    fn an_uncapped_replay_ends_slices_at_its_backstop_while_the_record_lasts() {
+        let bound = std::num::NonZeroU64::new(100_000);
+        let config = Config {
+            max_timeslice: bound,
+            replay_schedule_from: Some(std::path::PathBuf::from("record.json")),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+        state.next_timeslice(&config);
+        let start = state.thread_logical_time.as_nanos();
+        assert_eq!(
+            state.max_timeslice_end,
+            Some(start + Duration::from_nanos(100_000))
+        );
+        let backstop = LogicalTime::from_nanos(3_000_000);
+        state.learn_uncapped_backstop(Some(backstop), bound, true);
+        let moved = start + Duration::from_nanos(3_000_000);
+        assert_eq!(state.end_of_timeslice, Some(moved));
+        assert_eq!(state.max_timeslice_end, Some(moved));
+        assert_eq!(state.max_slice_length(&config), Some(3_000_000));
+        // A backstop that arrives again moves nothing.
+        state.end_of_timeslice = Some(start + Duration::from_nanos(7));
+        state.learn_uncapped_backstop(Some(backstop), bound, true);
+        assert_eq!(
+            state.end_of_timeslice,
+            Some(start + Duration::from_nanos(7))
+        );
+        // A backstop shorter than the bound never shortens a slice.
+        state.learn_uncapped_backstop(Some(LogicalTime::from_nanos(10)), bound, true);
+        assert_eq!(state.max_slice_length(&config), Some(100_000));
+        // The record ran out.
+        state.learn_uncapped_backstop(None, bound, true);
+        assert_eq!(state.uncapped_backstop, None);
+        state.next_timeslice(&config);
+        let now = state.thread_logical_time.as_nanos();
+        assert_eq!(
+            state.max_timeslice_end,
+            Some(now + Duration::from_nanos(100_000))
+        );
+        // Not a schedule replay.
+        let plain = Config {
+            max_timeslice: bound,
+            ..Default::default()
+        };
+        state.uncapped_backstop = Some(backstop);
+        assert_eq!(state.max_slice_length(&plain), Some(100_000));
+    }
+
+    /// A replay backstop never outlives the replayed schedule. A reply that
+    /// says the schedule is over leaves the thread no backstop, even one that
+    /// carries a backstop, as a reply built from state read before another
+    /// thread ended the schedule did; and a thread whose schedule is over ends
+    /// its slices at the bound even while it holds one. The next ordinary
+    /// slice after the schedule is bounded, and a backstop that first arrives
+    /// with the end moves no slice end.
+    #[test]
+    fn a_backstop_never_outlives_the_replayed_schedule() {
+        let bound = std::num::NonZeroU64::new(100_000);
+        let config = Config {
+            max_timeslice: bound,
+            replay_schedule_from: Some(std::path::PathBuf::from("record.json")),
+            ..Default::default()
+        };
+        let backstop = LogicalTime::from_nanos(3_000_000);
+        let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+        state.next_timeslice(&config);
+        state.hear_schedule_replay_reply(false, Some(backstop), bound, true);
+        assert_eq!(state.max_slice_length(&config), Some(3_000_000));
+        // The reply that ends the schedule, carrying a stale backstop.
+        state.hear_schedule_replay_reply(true, Some(backstop), bound, true);
+        assert!(state.schedule_replay_over);
+        assert_eq!(state.uncapped_backstop, None);
+        state.next_timeslice(&config);
+        let now = state.thread_logical_time.as_nanos();
+        assert_eq!(
+            state.max_timeslice_end,
+            Some(now + Duration::from_nanos(100_000))
+        );
+        state.uncapped_backstop = Some(backstop);
+        assert_eq!(state.max_slice_length(&config), Some(100_000));
+        // A thread whose first backstop comes with the end of the schedule.
+        let mut late = ThreadState::new(DetPid::from_raw(4), &config, ());
+        late.next_timeslice(&config);
+        let (end, max_end) = (late.end_of_timeslice, late.max_timeslice_end);
+        late.hear_schedule_replay_reply(true, Some(backstop), bound, true);
+        assert_eq!(late.uncapped_backstop, None);
+        assert_eq!(
+            (late.end_of_timeslice, late.max_timeslice_end),
+            (end, max_end)
+        );
     }
 
     /// The cap never ends a slice sooner than one scheduler turn charge
@@ -7397,6 +11536,605 @@ mod timeslice_tests {
         );
     }
 
+    /// A thread at 500 ns of logical time (50 RCBs at multiplier 1) and PMU
+    /// count 10, replaying `history` from its start with `config`: returns
+    /// the thread, the priority its next slice gets, and the time it chose
+    /// that slice at.
+    fn replay_from_500ns(
+        config: &Config,
+        history: ThreadHistory,
+    ) -> (ThreadState<()>, Option<Priority>, LogicalTime) {
+        let mut state = ThreadState::new(DetPid::from_raw(5), config, ());
+        state.preemption_points = Some(history.into_iter());
+        state
+            .thread_logical_time
+            .add_rcbs_with_multiplier(50, RcbTimeMultiplier::ONE);
+        state.committed_clock_value = 10;
+        let now = state.thread_logical_time.as_nanos();
+        let prio = state.next_timeslice(config);
+        (state, prio, now)
+    }
+
+    fn edited_replay_config() -> Config {
+        Config {
+            target_timeslice: nz(10_000),
+            max_timeslice: nz(100_000),
+            replay_edited_preemptions: true,
+            ..Default::default()
+        }
+    }
+
+    /// With --replay-edited-preemptions, recorded slices that ended before
+    /// the thread got to them are skipped: the first slice still ahead
+    /// applies, with its own end, priority and RCB target, and the slice
+    /// after it follows as recorded. Slices whose RCB target has passed, or
+    /// that end within the post-hook's one-RCB margin, count as ended.
+    #[test]
+    fn an_edited_record_skips_the_slices_that_already_ended() {
+        let config = edited_replay_config();
+        let start = ThreadState::new(DetPid::from_raw(5), &config, ())
+            .thread_logical_time
+            .as_nanos();
+        let at = |ns: u64| start + Duration::from_nanos(ns);
+        let history = ThreadHistory::new()
+            .with_prio_changes(vec![
+                (at(100), DEFAULT_PRIORITY + 1),
+                // RCB target behind, end within one RCB (10 ns) of 500 ns.
+                (at(505), DEFAULT_PRIORITY + 2),
+                (at(900), DEFAULT_PRIORITY + 3),
+                (at(1300), DEFAULT_PRIORITY + 4),
+            ])
+            .with_preemption_rcbs(vec![4, 9, 90, 130]);
+        let (mut state, prio, _) = replay_from_500ns(&config, history);
+        assert_eq!(prio, Some(DEFAULT_PRIORITY + 3));
+        assert_eq!(state.end_of_timeslice, Some(at(900)));
+        assert_eq!(state.replay_rcb_end, Some(90));
+
+        state
+            .thread_logical_time
+            .add_rcbs_with_multiplier(40, RcbTimeMultiplier::ONE);
+        state.committed_clock_value = 90;
+        assert!(state.timeslice_expired());
+        assert_eq!(state.next_timeslice(&config), Some(DEFAULT_PRIORITY + 4));
+        assert_eq!(state.end_of_timeslice, Some(at(1300)));
+        assert_eq!(state.replay_rcb_end, Some(130));
+    }
+
+    /// Only one clock may have passed: an RCB target still ahead governs a
+    /// slice whose end has passed, and an end still ahead (with no RCB
+    /// target, or a passed one) governs on its own.
+    #[test]
+    fn an_edited_record_keeps_a_slice_one_of_whose_deadlines_is_ahead() {
+        let config = edited_replay_config();
+        let start = ThreadState::new(DetPid::from_raw(5), &config, ())
+            .thread_logical_time
+            .as_nanos();
+        let at = |ns: u64| start + Duration::from_nanos(ns);
+        let one_slice = |end: u64, rcbs: Option<u64>| {
+            let history = ThreadHistory::new().with_prio_changes(vec![
+                (at(end), DEFAULT_PRIORITY + 7),
+                (at(5000), DEFAULT_PRIORITY),
+            ]);
+            match rcbs {
+                Some(rcbs) => history.with_preemption_rcbs(vec![rcbs, 500]),
+                None => history,
+            }
+        };
+        // End passed, RCB target ahead: the target governs.
+        let (state, prio, _) = replay_from_500ns(&config, one_slice(100, Some(20)));
+        assert_eq!(prio, Some(DEFAULT_PRIORITY + 7));
+        assert_eq!(state.replay_rcb_end, Some(20));
+        assert!(!state.timeslice_expired());
+        // RCB target passed, end ahead: the end governs, without the target.
+        let (state, prio, _) = replay_from_500ns(&config, one_slice(800, Some(4)));
+        assert_eq!(prio, Some(DEFAULT_PRIORITY + 7));
+        assert_eq!(
+            (state.end_of_timeslice, state.replay_rcb_end),
+            (Some(at(800)), None)
+        );
+        // An RCB target exactly at the current count ends the slice at once,
+        // as in any replay.
+        let (state, prio, _) = replay_from_500ns(&config, one_slice(100, Some(10)));
+        assert_eq!(prio, Some(DEFAULT_PRIORITY + 7));
+        assert_eq!(state.replay_rcb_end, Some(10));
+        assert!(state.timeslice_expired());
+    }
+
+    /// When every recorded slice has ended, the thread goes on at the
+    /// record's final priority, as after the last recorded slice.
+    #[test]
+    fn an_edited_record_whose_slices_all_ended_goes_on_at_its_final_priority() {
+        let config = edited_replay_config();
+        let start = ThreadState::new(DetPid::from_raw(5), &config, ())
+            .thread_logical_time
+            .as_nanos();
+        let history = ThreadHistory::new().with_prio_changes(vec![
+            (start + Duration::from_nanos(100), DEFAULT_PRIORITY + 1),
+            (start + Duration::from_nanos(200), DEFAULT_PRIORITY + 2),
+        ]);
+        let final_priority = history.clone().into_iter().final_priority();
+        let (state, prio, now) = replay_from_500ns(&config, history);
+        assert_eq!(prio, Some(final_priority));
+        // As after the last recorded slice of any replay: no recorded end,
+        // so the configured maximum timeslice bounds it.
+        assert_eq!(
+            state.end_of_timeslice,
+            Some(now + Duration::from_nanos(100_000))
+        );
+        assert!(state.stats.last_recorded_slice.is_some());
+    }
+
+    /// The one-RCB margin follows the clock multiplier and the thread's chaos
+    /// slowdown: at multiplier 0.3 one RCB is 3 ns, so an end 2 ns ahead is
+    /// within it (the post-hook would end that slice at once) and one 3 ns
+    /// ahead is not. Without a PMU maximum there is no margin.
+    #[test]
+    fn the_skipping_margin_is_one_rcb_at_the_thread_clock() {
+        let config = Config {
+            clock_multiplier: Some(0.3),
+            ..edited_replay_config()
+        };
+        let state = ThreadState::new(DetPid::from_raw(5), &config, ());
+        assert_eq!(state.pmu_epsilon(&config), Duration::from_nanos(3));
+        let mut slowed = ThreadState::new(DetPid::from_raw(5), &config, ());
+        slowed.chaos_slowdown_factor = RcbTimeMultiplier::from_f64(2.0);
+        slowed.chaos_slowdown_active = true;
+        assert_eq!(slowed.pmu_epsilon(&config), Duration::from_nanos(6));
+
+        let start = state.thread_logical_time.as_nanos();
+        for (ahead, skipped) in [(2, true), (3, false)] {
+            // 50 RCBs at multiplier 1 are 500 ns; at 0.3 the thread's time
+            // advances by 150 ns.
+            let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+            state
+                .thread_logical_time
+                .add_rcbs_with_multiplier(50, RcbTimeMultiplier::ONE);
+            let now = state.thread_logical_time.as_nanos();
+            state.preemption_points = Some(
+                ThreadHistory::new()
+                    .with_prio_changes(vec![
+                        (now + Duration::from_nanos(ahead), DEFAULT_PRIORITY + 1),
+                        (start + Duration::from_nanos(9000), DEFAULT_PRIORITY + 2),
+                    ])
+                    .into_iter(),
+            );
+            let prio = state.next_timeslice(&config);
+            let expected = if skipped {
+                DEFAULT_PRIORITY + 2
+            } else {
+                DEFAULT_PRIORITY + 1
+            };
+            assert_eq!(prio, Some(expected), "{ahead} ns ahead");
+        }
+
+        // At a 2 times slowdown (a recorded epoch) one RCB is 6 ns: an end
+        // 5 ns ahead is within it, one 6 ns ahead is not.
+        for (ahead, skipped) in [(5, true), (6, false)] {
+            let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+            let begin = state.thread_logical_time.as_nanos();
+            state.preemption_points = Some(
+                ThreadHistory::new()
+                    .with_prio_changes(vec![
+                        (begin + Duration::from_nanos(ahead), DEFAULT_PRIORITY + 1),
+                        (begin + Duration::from_nanos(9000), DEFAULT_PRIORITY + 2),
+                    ])
+                    .with_chaos_epochs(vec![ChaosEpochTransition {
+                        logical_time: begin,
+                        epoch: 0,
+                        factor: RcbTimeMultiplier::from_f64(2.0),
+                    }])
+                    .into_iter(),
+            );
+            let prio = state.next_timeslice(&config);
+            assert_eq!(state.pmu_epsilon(&config), Duration::from_nanos(6));
+            let expected = if skipped {
+                DEFAULT_PRIORITY + 2
+            } else {
+                DEFAULT_PRIORITY + 1
+            };
+            assert_eq!(prio, Some(expected), "{ahead} ns ahead at 2 times");
+        }
+
+        // Without a PMU maximum the post-hook has no margin: a slice is kept
+        // whenever it ends ahead, as in a faithful replay.
+        let unbounded = Config {
+            max_timeslice: None,
+            ..edited_replay_config()
+        };
+        for (end, expected) in [(501, DEFAULT_PRIORITY + 1), (500, DEFAULT_PRIORITY + 2)] {
+            let history = ThreadHistory::new().with_prio_changes(vec![
+                (start + Duration::from_nanos(end), DEFAULT_PRIORITY + 1),
+                (start + Duration::from_nanos(9000), DEFAULT_PRIORITY + 2),
+            ]);
+            let (_, prio, _) = replay_from_500ns(&unbounded, history);
+            assert_eq!(
+                prio,
+                Some(expected),
+                "an end at {end} ns, without a maximum"
+            );
+        }
+    }
+
+    /// A recorded one-RCB slice that starts exactly where the previous one
+    /// ended is one the post-hook runs, not one that ended: on a record
+    /// without RCB targets (as minimization writes), an edited replay keeps
+    /// every such slice, with the same ends and priorities as a faithful one.
+    #[test]
+    fn an_edited_replay_keeps_one_rcb_slices_as_a_faithful_one_does() {
+        let edited = edited_replay_config();
+        let faithful = Config {
+            replay_edited_preemptions: false,
+            ..edited_replay_config()
+        };
+        let start = ThreadState::new(DetPid::from_raw(5), &edited, ())
+            .thread_logical_time
+            .as_nanos();
+        let at = |ns: u64| start + Duration::from_nanos(ns);
+        // At 500 ns, one RCB (10 ns) per slice, then a longer one.
+        let history = ThreadHistory::new().with_prio_changes(vec![
+            (at(510), DEFAULT_PRIORITY + 1),
+            (at(520), DEFAULT_PRIORITY + 2),
+            (at(530), DEFAULT_PRIORITY + 3),
+            (at(900), DEFAULT_PRIORITY + 4),
+        ]);
+        let slices = |config: &Config| {
+            let (mut state, prio, _) = replay_from_500ns(config, history.clone());
+            let mut slices = vec![(prio, state.end_of_timeslice)];
+            for _ in 0..3 {
+                state.thread_logical_time.add_rcbs(1);
+                let prio = state.next_timeslice(config);
+                slices.push((prio, state.end_of_timeslice));
+            }
+            slices
+        };
+        assert_eq!(slices(&edited), slices(&faithful));
+        assert_eq!(
+            slices(&edited)[..3],
+            [
+                (Some(DEFAULT_PRIORITY + 1), Some(at(510))),
+                (Some(DEFAULT_PRIORITY + 2), Some(at(520))),
+                (Some(DEFAULT_PRIORITY + 3), Some(at(530))),
+            ]
+        );
+    }
+
+    /// Past an edited record's last recorded slice, a restored chaos slowdown
+    /// can make one RCB longer than the configured maximum timeslice: the
+    /// slice's PMU maximum is kept at least one RCB ahead, so the post-hook
+    /// neither ends it at once nor finds itself past it again. A faithful
+    /// replay keeps the configured maximum.
+    #[test]
+    fn past_an_edited_record_the_maximum_keeps_one_rcb_at_a_restored_slowdown() {
+        let config = |edited: bool| Config {
+            target_timeslice: None,
+            max_timeslice: nz(10),
+            replay_edited_preemptions: edited,
+            ..Default::default()
+        };
+        for (edited, expected) in [(true, 20), (false, 10)] {
+            let config = config(edited);
+            let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+            let now = state.thread_logical_time.as_nanos();
+            let doubled = ChaosEpochTransition {
+                logical_time: now,
+                epoch: 1,
+                factor: RcbTimeMultiplier::from_f64(2.0),
+            };
+            state.preemption_points = Some(
+                ThreadHistory::new()
+                    .with_chaos_epochs(vec![doubled])
+                    .into_iter(),
+            );
+            state.next_timeslice(&config);
+            assert_eq!(state.chaos_slowdown_factor, doubled.factor);
+            assert_eq!(state.pmu_epsilon(&config), Duration::from_nanos(20));
+            assert!(state.stats.last_recorded_slice.is_some());
+            assert_eq!(
+                state.max_timeslice_end,
+                Some(now + Duration::from_nanos(expected)),
+                "edited: {edited}"
+            );
+        }
+    }
+
+    /// Without --replay-edited-preemptions, a replay that reaches a recorded
+    /// slice end already passed stops: a faithful replay never does, so the
+    /// replay diverged.
+    #[test]
+    #[should_panic(expected = "needs --replay-edited-preemptions")]
+    fn a_faithful_replay_past_a_recorded_end_stops() {
+        let config = Config {
+            replay_edited_preemptions: false,
+            ..edited_replay_config()
+        };
+        let start = ThreadState::new(DetPid::from_raw(5), &config, ())
+            .thread_logical_time
+            .as_nanos();
+        let history = ThreadHistory::new().with_prio_changes(vec![
+            (start + Duration::from_nanos(100), DEFAULT_PRIORITY + 1),
+            (start + Duration::from_nanos(900), DEFAULT_PRIORITY),
+        ]);
+        replay_from_500ns(&config, history);
+    }
+
+    /// The same for a recorded RCB deadline the PMU count has passed.
+    #[test]
+    #[should_panic(expected = "count is already 10. An edited record")]
+    fn a_faithful_replay_past_a_recorded_rcb_end_stops() {
+        let config = Config {
+            replay_edited_preemptions: false,
+            ..edited_replay_config()
+        };
+        let start = ThreadState::new(DetPid::from_raw(5), &config, ())
+            .thread_logical_time
+            .as_nanos();
+        let history = ThreadHistory::new()
+            .with_prio_changes(vec![
+                (start + Duration::from_nanos(100), DEFAULT_PRIORITY + 1),
+                (start + Duration::from_nanos(900), DEFAULT_PRIORITY),
+            ])
+            .with_preemption_rcbs(vec![4, 90]);
+        replay_from_500ns(&config, history);
+    }
+
+    // Exercise the same production selector with larger counts and both
+    // settings of the optional skid diagnostic. A faithful replay must stop
+    // at its first already-passed RCB end, even when later ends remain ahead.
+    fn assert_faithful_rcb_ends_stop(panic_on_rcb_overshoot: bool) {
+        for counts in [
+            vec![40, 80],
+            vec![40, 45, 80],
+            vec![40, 51, 80],
+            vec![40, 45],
+        ] {
+            let config = Config {
+                target_timeslice: nz(10_000),
+                max_timeslice: nz(100_000),
+                panic_on_rcb_overshoot,
+                ..Default::default()
+            };
+            let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+            let now = state.thread_logical_time.as_nanos();
+            let history = ThreadHistory::new()
+                .with_prio_changes(
+                    (0..counts.len())
+                        .map(|i| {
+                            (
+                                now + Duration::from_nanos(100 * (i as u64 + 1)),
+                                DEFAULT_PRIORITY,
+                            )
+                        })
+                        .collect(),
+                )
+                .with_preemption_rcbs(counts.clone());
+            state.preemption_points = Some(history.into_iter());
+            state.committed_clock_value = 51;
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                state.next_timeslice(&config)
+            }))
+            .expect_err("faithful replay must not pass a recorded RCB end");
+            let message = panic.downcast_ref::<String>().unwrap();
+            assert!(
+                message.contains("Cannot set RCB end of timeslice to 40"),
+                "{counts:?}: {message}"
+            );
+            assert!(
+                message.contains("count is already 51. An edited record"),
+                "{counts:?}: {message}"
+            );
+            assert!(
+                message.contains("needs --replay-edited-preemptions"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_faithful_replay_past_larger_rcb_ends_stops_by_default() {
+        assert_faithful_rcb_ends_stop(false);
+    }
+
+    #[test]
+    fn a_faithful_replay_past_larger_rcb_ends_stops_with_skid_panic_enabled() {
+        assert_faithful_rcb_ends_stop(true);
+    }
+
+    /// Edited histories retain the semantics of
+    /// https://github.com/rrnewton/hermit/pull/4672: an equal-count slice
+    /// ends at once, a future time-only slice is kept, and filed change
+    /// points need not advance. The optional diagnostic must not panic.
+    #[test]
+    fn an_edited_record_reports_no_departure() {
+        let config = Config {
+            panic_on_rcb_overshoot: true,
+            replay_preemptions_from: Some(std::path::PathBuf::from("history.json")),
+            ..edited_replay_config()
+        };
+        let start = ThreadState::new(DetPid::from_raw(5), &config, ())
+            .thread_logical_time
+            .as_nanos();
+        let at = |ns: u64| start + Duration::from_nanos(ns);
+        let history = |end: u64, rcbs: u64| {
+            ThreadHistory::new()
+                .with_prio_changes(vec![
+                    (at(end), DEFAULT_PRIORITY + 7),
+                    (at(5000), DEFAULT_PRIORITY),
+                ])
+                .with_preemption_rcbs(vec![rcbs, 500])
+        };
+        let (mut state, prio, now) = replay_from_500ns(&config, history(100, 10));
+        assert_eq!(prio, Some(DEFAULT_PRIORITY + 7));
+        assert_eq!(
+            (state.end_of_timeslice, state.replay_rcb_end),
+            (Some(at(100)), Some(10))
+        );
+        assert!(state.timeslice_expired());
+        assert_eq!(state.file_replay_change_point(&config, now), Ok(()));
+        assert_eq!(state.file_replay_change_point(&config, now), Ok(()));
+        assert_eq!(state.file_replay_change_point(&config, at(100)), Ok(()));
+        let (state, prio, _) = replay_from_500ns(&config, history(800, 4));
+        assert_eq!(prio, Some(DEFAULT_PRIORITY + 7));
+        assert_eq!(
+            (state.end_of_timeslice, state.replay_rcb_end),
+            (Some(at(800)), None)
+        );
+        // Main also keeps this equal-count slice in faithful mode. Unlike
+        // edited exploration, filing the same change point twice is refused.
+        let faithful = Config {
+            replay_edited_preemptions: false,
+            ..config
+        };
+        let (mut state, _, now) = replay_from_500ns(&faithful, history(100, 10));
+        assert_eq!(state.replay_rcb_end, Some(10));
+        assert_eq!(state.file_replay_change_point(&faithful, now), Ok(()));
+        assert_eq!(state.file_replay_change_point(&faithful, now), Err(now));
+    }
+
+    /// Main admits an equal-RCB end even when its timestamp is behind.
+    /// Preserve that instant slice in this Android-shaped history, but refuse
+    /// filing it twice at the preceding slice's unchanged logical instant.
+    #[test]
+    fn a_replay_keeps_an_equal_rcb_end_and_refuses_repeated_filing() {
+        let config = Config {
+            target_timeslice: nz(10_000),
+            max_timeslice: nz(100_000),
+            replay_preemptions_from: Some("history.json".into()),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(31754), &config, ());
+        state.thread_logical_time.add_rcbs(863_958);
+        state.committed_clock_value = 863_958;
+        let now = state.thread_logical_time.as_nanos();
+        let history = ThreadHistory::new()
+            .with_prio_changes(vec![
+                (
+                    LogicalTime::from_nanos(now.as_nanos() - 1_802_680),
+                    DEFAULT_PRIORITY + 1,
+                ),
+                (
+                    LogicalTime::from_nanos(now.as_nanos() - 1_802_670),
+                    DEFAULT_PRIORITY + 2,
+                ),
+                (now + Duration::from_nanos(10_780), DEFAULT_PRIORITY + 3),
+            ])
+            .with_preemption_rcbs(vec![863_958, 863_959, 864_037]);
+        state.preemption_points = Some(history.into_iter());
+
+        assert_eq!(state.file_replay_change_point(&config, now), Ok(()));
+        let prio = state.next_timeslice(&config);
+        assert_eq!(prio, Some(DEFAULT_PRIORITY + 1));
+        assert_eq!(state.replay_rcb_end, Some(863_958));
+        assert_eq!(
+            state.end_of_timeslice,
+            Some(LogicalTime::from_nanos(now.as_nanos() - 1_802_680))
+        );
+        assert!(state.timeslice_expired());
+        assert_eq!(state.file_replay_change_point(&config, now), Err(now));
+        state.abandon_replayed_slices(&config);
+        assert!(!state.timeslice_expired());
+        assert_eq!(state.end_of_timeslice, Some(LogicalTime::MAX));
+    }
+
+    /// An end exactly at the thread's count whose time is not behind it is
+    /// the slice's end, now, as before (the record's adjacent zero-RCB
+    /// slices, `replay_preserves_adjacent_zero_rcb_slices`).
+    #[test]
+    fn a_replay_follows_an_end_at_its_count_whose_time_is_ahead() {
+        let config = Config {
+            target_timeslice: nz(10_000),
+            max_timeslice: nz(100_000),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+        let now = state.thread_logical_time.as_nanos();
+        let history = ThreadHistory::new()
+            .with_prio_changes(vec![(
+                now + Duration::from_nanos(25_000),
+                DEFAULT_PRIORITY + 1,
+            )])
+            .with_preemption_rcbs(vec![0]);
+        state.preemption_points = Some(history.into_iter());
+
+        assert_eq!(state.next_timeslice(&config), Some(DEFAULT_PRIORITY + 1));
+        assert_eq!(state.replay_rcb_end, Some(0));
+        assert_eq!(
+            state.end_of_timeslice,
+            Some(now + Duration::from_nanos(25_000))
+        );
+
+        // At the thread's time exactly, too.
+        let mut state = ThreadState::new(DetPid::from_raw(6), &config, ());
+        let now = state.thread_logical_time.as_nanos();
+        let history = ThreadHistory::new()
+            .with_prio_changes(vec![(now, DEFAULT_PRIORITY + 1)])
+            .with_preemption_rcbs(vec![0]);
+        state.preemption_points = Some(history.into_iter());
+        assert_eq!(state.next_timeslice(&config), Some(DEFAULT_PRIORITY + 1));
+        assert_eq!(state.replay_rcb_end, Some(0));
+        assert_eq!(state.end_of_timeslice, Some(now));
+    }
+
+    /// The shape of a stalled Android emulator replay (`--chaos
+    /// --preemption-timeout=1000`): a slice ended at the branch count of the
+    /// next recorded end, whose time was still ahead, so that end was
+    /// followed and its slice was over at once (adjacent zero-RCB slices);
+    /// but the thread's time had not moved, so the second change point would
+    /// have been filed at the instant of the first. It is caught before it
+    /// is filed, and the thread runs on as its final slice, not already over.
+    #[test]
+    fn a_replay_change_point_at_the_last_ones_instant_is_caught_before_filing() {
+        let config = Config {
+            target_timeslice: nz(10_000),
+            max_timeslice: nz(100_000),
+            replay_preemptions_from: Some(std::path::PathBuf::from("history.json")),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(31744), &config, ());
+        let start = state.thread_logical_time.as_nanos();
+        let history = ThreadHistory::new()
+            .with_prio_changes(vec![
+                (start + Duration::from_nanos(70), DEFAULT_PRIORITY + 1),
+                (start + Duration::from_nanos(80), DEFAULT_PRIORITY + 2),
+                (start + Duration::from_nanos(500), DEFAULT_PRIORITY + 3),
+            ])
+            .with_preemption_rcbs(vec![4, 4, 40]);
+        state.preemption_points = Some(history.into_iter());
+
+        state.next_timeslice(&config);
+        state.thread_logical_time.add_rcbs(4);
+        state.committed_clock_value = 4;
+        assert!(state.timeslice_expired());
+        let now = state.thread_logical_time.as_nanos();
+        assert_eq!(state.file_replay_change_point(&config, now), Ok(()));
+
+        // The end at the same count, 10 ns later, is followed (its time is
+        // ahead), and its slice is over at once; the thread's time is still
+        // `now`.
+        state.next_timeslice(&config);
+        assert_eq!(state.replay_rcb_end, Some(4));
+        assert!(state.timeslice_expired());
+        assert_eq!(state.file_replay_change_point(&config, now), Err(now));
+
+        state.abandon_replayed_slices(&config);
+        assert!(!state.timeslice_expired());
+        assert_eq!(state.replay_rcb_end, None);
+        assert_eq!(state.end_of_timeslice, Some(LogicalTime::MAX));
+        assert_eq!(
+            state.max_timeslice_end,
+            Some(now + Duration::from_nanos(100_000))
+        );
+
+        // A later change point files as usual; outside a preemption replay
+        // nothing is checked.
+        let later = now + Duration::from_nanos(1);
+        assert_eq!(state.file_replay_change_point(&config, later), Ok(()));
+        let recording = Config {
+            replay_preemptions_from: None,
+            ..config
+        };
+        assert_eq!(state.file_replay_change_point(&recording, later), Ok(()));
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
     #[test]
@@ -7424,6 +12162,139 @@ mod timeslice_tests {
         state.next_timeslice(&config);
         assert_eq!(state.replay_rcb_end, Some(4));
         assert!(state.timeslice_expired());
+    }
+
+    /// `--chaos-instruction-offset=N` draws each timeslice's offset uniformly
+    /// from `0..=N`, as a pure function of the seed, the thread and the draw.
+    #[test]
+    fn an_instruction_offset_draw_is_seeded_bounded_and_per_thread() {
+        let (three, four) = (DetTid::from_raw(3), DetTid::from_raw(4));
+        let mut seen = [false; 9];
+        for draw in 0..200 {
+            let k = chaos_instruction_offset_draw(7, three, draw, 8);
+            assert_eq!(k, chaos_instruction_offset_draw(7, three, draw, 8));
+            seen[usize::try_from(k).unwrap()] = true;
+            assert!(chaos_instruction_offset_draw(7, three, draw, 1) <= 1);
+            assert!(chaos_instruction_offset_draw(7, three, draw, 65_536) <= 65_536);
+        }
+        assert!(
+            seen.iter().all(|seen| *seen),
+            "0..=8 not all drawn: {seen:?}"
+        );
+        let stream = |seed, tid| -> Vec<u64> {
+            (0..32)
+                .map(|draw| chaos_instruction_offset_draw(seed, tid, draw, 1_000))
+                .collect()
+        };
+        assert_ne!(stream(7, three), stream(7, four));
+        assert_ne!(stream(7, three), stream(8, three));
+    }
+
+    /// The offsets come from a stream of their own: a seed draws the same
+    /// timeslice ends with the option as without it, and without it draws no
+    /// offset at all.
+    #[test]
+    fn an_instruction_offset_leaves_the_chaos_draws_alone() {
+        let off = Config {
+            chaos: true,
+            max_timeslice: nz(100_000),
+            ..Default::default()
+        };
+        let on = Config {
+            chaos_instruction_offset: 8,
+            ..off.clone()
+        };
+        let tid = DetTid::from_raw(3);
+        let mut without = ThreadState::new(tid, &off, ());
+        let mut with = ThreadState::new(tid, &on, ());
+        let mut offsets = Vec::new();
+        for _ in 0..20 {
+            without.next_timeslice(&off);
+            with.next_timeslice(&on);
+            assert_eq!(with.end_of_timeslice, without.end_of_timeslice);
+            assert_eq!(with.max_timeslice_end, without.max_timeslice_end);
+            assert_eq!(without.slice_instruction_offset, 0);
+            assert!(with.slice_instruction_offset <= 8);
+            offsets.push(with.slice_instruction_offset);
+        }
+        assert_eq!(without.chaos_instruction_offset_draws, 0);
+        assert_eq!(with.chaos_instruction_offset_draws, 20);
+        let expected: Vec<u64> = (0..20)
+            .map(|draw| chaos_instruction_offset_draw(off.sched_seed(), tid, draw, 8))
+            .collect();
+        assert_eq!(offsets, expected);
+    }
+
+    /// A new timeslice drops the offset the old timer was armed with (the
+    /// hooks hand it to the change point that ends the slice), and a replayed
+    /// timeslice takes the offset its row recorded, only together with that
+    /// row's exact RCB end.
+    #[test]
+    fn a_timeslice_offset_reaches_its_record_and_its_replay() {
+        let chaos = Config {
+            chaos: true,
+            chaos_instruction_offset: 8,
+            max_timeslice: nz(100_000),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(5), &chaos, ());
+        state.next_timeslice(&chaos);
+        let armed = InstructionOffset {
+            rcb_target: 40,
+            instructions: 3,
+        };
+        state.armed_instruction_offset = Some(armed);
+        // A reset that ends no timeslice of its own drops the offset with
+        // the timer, so no later change point can file it.
+        state.next_timeslice(&chaos);
+        assert_eq!(state.armed_instruction_offset, None);
+        // The end of a slice takes the offset only once its branch target
+        // is reached.
+        state.armed_instruction_offset = Some(armed);
+        state.committed_clock_value = 39;
+        assert_eq!(state.take_ended_slice_offset(), None);
+        assert_eq!(state.armed_instruction_offset, None);
+        state.armed_instruction_offset = Some(armed);
+        state.committed_clock_value = 40;
+        assert_eq!(state.take_ended_slice_offset(), Some(armed));
+
+        let replay = Config {
+            target_timeslice: nz(10_000),
+            max_timeslice: nz(100_000),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(5), &replay, ());
+        let now = state.thread_logical_time.as_nanos();
+        let history = ThreadHistory::new()
+            .with_prio_changes(vec![
+                (now + Duration::from_nanos(70), DEFAULT_PRIORITY),
+                (now + Duration::from_nanos(800), DEFAULT_PRIORITY),
+            ])
+            .with_preemption_rcbs(vec![42, 80])
+            .with_preemption_instruction_offsets(vec![Some(armed), None]);
+        state.preemption_points = Some(history.into_iter());
+        state.next_timeslice(&replay);
+        assert_eq!(state.replay_rcb_end, Some(42));
+        assert_eq!(state.replay_instruction_offset, Some(armed));
+        state.thread_logical_time.add_rcbs(42);
+        state.committed_clock_value = 42;
+        assert!(state.timeslice_expired());
+        state.next_timeslice(&replay);
+        assert_eq!(state.replay_rcb_end, Some(80));
+        assert_eq!(state.replay_instruction_offset, None);
+
+        // A row without an exact RCB end is replayed by logical time, which
+        // an offset cannot refine.
+        let mut state = ThreadState::new(DetPid::from_raw(5), &replay, ());
+        state.preemption_points = Some(
+            ThreadHistory::new()
+                .with_prio_changes(vec![(now + Duration::from_nanos(70), DEFAULT_PRIORITY)])
+                .with_preemption_instruction_offsets(vec![Some(armed)])
+                .into_iter(),
+        );
+        state.next_timeslice(&replay);
+        assert_eq!(state.replay_rcb_end, None);
+        assert_eq!(state.replay_instruction_offset, None);
     }
 
     #[test]
@@ -7503,6 +12374,240 @@ mod timeslice_tests {
         assert_eq!(state.max_timeslice_end, state.end_of_timeslice);
         assert!(state.max_timeslice_end.unwrap() <= configured_max);
         assert!(state.max_timeslice_end.unwrap() >= minimum_progress);
+    }
+
+    /// Under `--chaos-timeslice-range` every slice ends within one RCB and
+    /// MAX of its start, and the slices span the range's scales.
+    #[test]
+    fn a_chaos_timeslice_range_draws_slices_of_every_scale_up_to_its_max() {
+        let config = Config {
+            chaos: true,
+            max_timeslice: nz(100_000_000),
+            chaos_timeslice_range: Some("1000..100000000".parse().unwrap()),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let now = state.thread_logical_time.as_nanos();
+        let lengths: Vec<u64> = (0..3000)
+            .map(|_| {
+                state.next_timeslice(&config);
+                let end = state.end_of_timeslice.unwrap();
+                assert_eq!(state.max_timeslice_end, Some(end));
+                (end - now).as_nanos()
+            })
+            .collect();
+        assert!(
+            lengths
+                .iter()
+                .all(|length| (10..=100_000_000).contains(length)),
+            "{:?}",
+            lengths.iter().max()
+        );
+        assert!(lengths.iter().filter(|length| **length < 10_000).count() > 100);
+        assert!(
+            lengths
+                .iter()
+                .filter(|length| **length > 10_000_000)
+                .count()
+                > 100
+        );
+    }
+
+    /// A schedule replay draws no slice mean from the range: its deadlines
+    /// and generator state are those of the same replay without one.
+    #[test]
+    fn a_schedule_replay_draws_nothing_from_the_chaos_timeslice_range() {
+        let plain = Config {
+            chaos: true,
+            max_timeslice: nz(100_000),
+            replay_schedule_from: Some(std::path::PathBuf::from("schedule.json")),
+            ..Default::default()
+        };
+        let ranged = Config {
+            chaos_timeslice_range: Some("1000..100000".parse().unwrap()),
+            ..plain.clone()
+        };
+        let mut without = ThreadState::new(DetPid::from_raw(1), &plain, ());
+        let mut with = ThreadState::new(DetPid::from_raw(1), &ranged, ());
+        for _ in 0..16 {
+            without.next_timeslice(&plain);
+            with.next_timeslice(&ranged);
+            assert_eq!(with.end_of_timeslice, without.end_of_timeslice);
+            assert_eq!(with.max_timeslice_end, without.max_timeslice_end);
+        }
+        assert!(with.chaos_prng == without.chaos_prng);
+    }
+
+    /// Once its process has switched to the post-crash bound, a thread draws
+    /// no slice mean from `--chaos-timeslice-range`: its deadlines and
+    /// generator state are those of the same switched thread without a range,
+    /// drawn around the post-crash bound, where before the range replaced
+    /// that mean with a fresh fine-grained draw at every slice. Before the
+    /// switch the range draws as usual. A schedule replay of such a run
+    /// draws nothing either way (`replay_controls_deadline`).
+    #[test]
+    fn a_switched_thread_draws_no_slice_mean_from_the_chaos_timeslice_range() {
+        let plain = Config {
+            chaos: true,
+            max_timeslice: nz(2_000),
+            post_crash_timeslice: nz(200_000_000),
+            ..Default::default()
+        };
+        let ranged = Config {
+            chaos_timeslice_range: Some("1000..2000".parse().unwrap()),
+            ..plain.clone()
+        };
+        let mut without = ThreadState::new(DetPid::from_raw(1), &plain, ());
+        let mut with = ThreadState::new(DetPid::from_raw(1), &ranged, ());
+        without.next_timeslice(&plain);
+        with.next_timeslice(&ranged);
+        assert!(
+            with.chaos_prng != without.chaos_prng,
+            "before the switch the range draws"
+        );
+        let mut without = ThreadState::new(DetPid::from_raw(1), &plain, ());
+        let mut with = ThreadState::new(DetPid::from_raw(1), &ranged, ());
+        let bound = std::num::NonZeroU64::new(200_000_000);
+        without.post_crash_bound = bound;
+        with.post_crash_bound = bound;
+        let now = with.thread_logical_time.as_nanos();
+        let mut longest = 0;
+        for _ in 0..16 {
+            without.next_timeslice(&plain);
+            with.next_timeslice(&ranged);
+            assert_eq!(with.end_of_timeslice, without.end_of_timeslice);
+            assert_eq!(with.max_timeslice_end, without.max_timeslice_end);
+            longest = longest.max((with.end_of_timeslice.unwrap() - now).as_nanos());
+        }
+        assert!(with.chaos_prng == without.chaos_prng);
+        assert!(
+            longest > 2_000,
+            "slices are drawn around the post-crash bound"
+        );
+    }
+
+    /// A schedule replay under `--chaos` draws no slice end: the slice runs to
+    /// the backstop, `--max-timeslice` from now, unless the replayed schedule
+    /// ends it first, exactly as without `--chaos`, and the thread's chaos
+    /// generator is left as it was.
+    #[test]
+    fn chaos_schedule_replay_draws_no_slice_end() {
+        let replay = |chaos| Config {
+            chaos,
+            max_timeslice: nz(100_000),
+            replay_schedule_from: Some(std::path::PathBuf::from("schedule.json")),
+            ..Default::default()
+        };
+        let mut plain = ThreadState::new(DetPid::from_raw(1), &replay(false), ());
+        let mut chaos = ThreadState::new(DetPid::from_raw(1), &replay(true), ());
+        let generator = chaos.chaos_prng.clone();
+
+        assert_eq!(plain.next_timeslice(&replay(false)), None);
+        assert_eq!(chaos.next_timeslice(&replay(true)), None);
+
+        let backstop = chaos.thread_logical_time.as_nanos() + Duration::from_nanos(100_000);
+        assert_eq!(chaos.end_of_timeslice, Some(backstop));
+        assert_eq!(chaos.end_of_timeslice, plain.end_of_timeslice);
+        assert_eq!(chaos.max_timeslice_end, plain.max_timeslice_end);
+        assert_eq!(chaos.chaos_prng, generator);
+    }
+
+    /// Disabling the PMU maximum does not disable the cooperative target or
+    /// forbid its schedule replay. Replayed checkpoints own its slice ends;
+    /// after EOF the same configured target owns ordinary slices again.
+    #[test]
+    fn target_only_chaos_schedule_replay_keeps_recorded_boundaries_without_a_pmu_maximum() {
+        for (replay, no_rcb_time) in [(false, true), (true, false), (true, true)] {
+            let mut config = Config {
+                chaos: true,
+                no_rcb_time,
+                max_timeslice: None,
+                target_timeslice: nz(100_000),
+                replay_schedule_from: replay.then(|| "schedule.json".into()),
+                ..Default::default()
+            };
+            config.validate();
+            assert_eq!(config.max_timeslice, None);
+            assert_eq!(config.target_timeslice, nz(100_000));
+            let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+            let generator = state.chaos_prng.clone();
+            assert_eq!(state.next_timeslice(&config), None);
+            assert_eq!(state.max_timeslice_end, None);
+            if replay {
+                assert_eq!(state.end_of_timeslice, Some(LogicalTime::MAX));
+                assert_eq!(state.chaos_prng, generator);
+                state.schedule_replay_over = true;
+                state.next_timeslice(&config);
+                assert_eq!(
+                    state.end_of_timeslice,
+                    Some(state.thread_logical_time.as_nanos() + Duration::from_nanos(100_000))
+                );
+                assert_eq!(state.max_timeslice_end, None);
+                assert_eq!(state.chaos_prng, generator);
+            } else {
+                assert!(state.end_of_timeslice > Some(state.thread_logical_time.as_nanos()));
+            }
+        }
+    }
+
+    /// At a checkpoint turn that keeps the slice, a schedule replay counts its
+    /// backstop from now, as the recorded run's new slice did, unless another
+    /// slice end, such as the replayed schedule's deadline, replaced it.
+    #[test]
+    fn a_kept_replay_slice_restarts_only_the_backstop() {
+        let config = Config {
+            max_timeslice: nz(100_000),
+            replay_schedule_from: Some(std::path::PathBuf::from("schedule.json")),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        state.next_timeslice(&config);
+        state.thread_logical_time.add_rcbs(1000);
+        let now = state.thread_logical_time.as_nanos();
+        assert!(state.end_of_timeslice < Some(now + Duration::from_nanos(100_000)));
+
+        state.restart_replay_backstop(&config);
+        let backstop = Some(now + Duration::from_nanos(100_000));
+        assert_eq!(state.end_of_timeslice, backstop);
+        assert_eq!(state.max_timeslice_end, backstop);
+
+        let scheduled = now + Duration::from_nanos(10);
+        state.install_schedule_deadline(scheduled, true);
+        state.restart_replay_backstop(&config);
+        assert_eq!(state.end_of_timeslice, Some(scheduled));
+        assert_eq!(state.max_timeslice_end, Some(scheduled));
+
+        state.next_timeslice(&config);
+        state.thread_logical_time.add_rcbs(1000);
+        state.restart_replay_backstop(&config);
+        assert_eq!(
+            state.end_of_timeslice,
+            Some(state.thread_logical_time.as_nanos() + Duration::from_nanos(100_000))
+        );
+    }
+
+    /// A slice end the replayed schedule installs stays one even on the
+    /// backstop's nanosecond. A recorded slice end can fall there by chance
+    /// (a chaos draw of 9 branches that ended 90 ns after a checkpoint, where
+    /// the kept slice's backstop also ran out); restarting the backstop there
+    /// moved the schedule's slice end 1000 ns later.
+    #[test]
+    fn a_schedule_deadline_on_the_backstop_keeps_its_place() {
+        let config = Config {
+            max_timeslice: nz(1_000),
+            replay_schedule_from: Some(std::path::PathBuf::from("schedule.json")),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        state.next_timeslice(&config);
+        let backstop = state.replay_backstop.expect("a schedule replay's backstop");
+        state.thread_logical_time.add_rcbs(91);
+        state.install_schedule_deadline(backstop, true);
+
+        state.restart_replay_backstop(&config);
+        assert_eq!(state.end_of_timeslice, Some(backstop));
+        assert_eq!(state.max_timeslice_end, Some(backstop));
+        assert_eq!(state.replay_backstop, None);
     }
 
     #[test]
@@ -7591,6 +12696,8 @@ mod timeslice_tests {
         assert!(state.timeslice_expired());
     }
 
+    // x86_64 only: instruction traps (CPUID, RDTSC) exist only there.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn instruction_trap_ends_an_expired_target_only_at_the_pmu_maximum() {
         let config = Config {
@@ -7612,6 +12719,8 @@ mod timeslice_tests {
         assert!(state.instruction_trap_ends_timeslice(&config));
     }
 
+    // x86_64 only: instruction traps (CPUID, RDTSC) exist only there.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn instruction_trap_ends_an_expired_target_by_default() {
         let config = Config {
@@ -7628,6 +12737,8 @@ mod timeslice_tests {
         assert!(state.instruction_trap_ends_timeslice(&config));
     }
 
+    // x86_64 only: instruction traps (CPUID, RDTSC) exist only there.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn instruction_trap_ends_an_expired_target_without_a_pmu_maximum() {
         // With PMU preemption disabled nothing else can break a busy-wait on
@@ -7649,6 +12760,8 @@ mod timeslice_tests {
         assert!(state.instruction_trap_ends_timeslice(&config));
     }
 
+    // x86_64 only: instruction traps (CPUID, RDTSC) exist only there.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn instruction_trap_keeps_replayed_and_untargeted_boundaries() {
         // Without a target the slice end is the PMU maximum itself, and a
@@ -7983,8 +13096,15 @@ mod native_exec_cut_tests {
                     thread.restart_block = Some(crate::syscalls::helpers::RestartBlock {
                         rip: 0x1234,
                         deadline: None,
+                        // Any call with a restart block will do; aarch64 has
+                        // no poll.
+                        #[cfg(target_arch = "x86_64")]
                         call: crate::syscalls::helpers::RestartCall::Poll(
                             reverie::syscalls::Poll::new(),
+                        ),
+                        #[cfg(not(target_arch = "x86_64"))]
+                        call: crate::syscalls::helpers::RestartCall::Futex(
+                            reverie::syscalls::Futex::new(),
                         ),
                     })
                 }
@@ -7993,11 +13113,13 @@ mod native_exec_cut_tests {
                 5 => {
                     thread.pending_vfork = Some(PendingVfork {
                         parent_dettid: binding.dettid,
+                        op: ExternalOpId::new(binding.dettid, 0),
                         parent_detpid: binding.detpid,
                         child_tid_addr: 0,
                         flags: CloneFlags::CLONE_VFORK,
                         exit_signal: libc::SIGCHLD,
                         child_priority_entropy: None,
+                        user_namespace_owner_may_differ: false,
                     })
                 }
                 6 => thread.own_signal_turn_hold = Some(libc::SIGALRM),
@@ -8217,9 +13339,9 @@ fn thread_rng_from_parent_entropy_labeled(
 /// <https://github.com/rrnewton/hermit/issues/4263>). Read with raw
 /// system calls (under in-guest backends the tool shares the guest's C
 /// library).
-/// The fixed procfs file the kernel opened at `fd`, if its descriptor link
-/// names one (`ProcfsFile::snapshot_is_fixed`).
-fn fixed_procfs_behind(fd: RawFd) -> Option<crate::procfs::ProcfsFile> {
+/// What this thread's descriptor `fd` links to (`/proc/thread-self/fd/<fd>`),
+/// read with a raw `readlinkat` as the in-guest runtime must.
+fn own_fd_link(fd: RawFd) -> Option<Vec<u8>> {
     // The calling thread's own table: `/proc/self/fd` is the leader's.
     let link = std::ffi::CString::new(format!("/proc/thread-self/fd/{fd}")).ok()?;
     let mut target = [0_u8; 256];
@@ -8240,8 +13362,41 @@ fn fixed_procfs_behind(fd: RawFd) -> Option<crate::procfs::ProcfsFile> {
     let length = usize::try_from(length)
         .ok()
         .filter(|length| *length < target.len())?;
+    Some(target[..length].to_vec())
+}
+
+/// The path a descriptor's link `link` names where it is a per-process file
+/// that follows its record's sequence as the kernel opens one, and the
+/// descriptor's file (`raw_stat`) is an empty regular file with a link, as
+/// every procfs file is (a placeholder has none): a task's `stat`, `statm`,
+/// `io`, `arch_status` or `cgroup` (`ProcfsFile::follows_record_sequence`),
+/// not its `comm`, which Detcore leaves to the kernel's own file whoever
+/// opened it, so the kernel's one open file serves every holder. ASSUMED,
+/// as for `fixed_procfs_behind`: a link under `/proc` naming such a file is
+/// the procfs file, not an ordinary file a changed root put at that path.
+pub(crate) fn kernel_record_file_link(
+    raw_stat: &libc::stat,
+    link: &[u8],
+) -> Option<std::path::PathBuf> {
+    if raw_stat.st_mode & libc::S_IFMT != libc::S_IFREG
+        || raw_stat.st_size != 0
+        || raw_stat.st_nlink == 0
+    {
+        return None;
+    }
+    let path =
+        std::path::Path::new(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(link));
+    crate::procfs::ProcfsFile::from_path(path)
+        .filter(|file| file.follows_record_sequence() && !file.is_task_comm())
+        .map(|_| path.to_path_buf())
+}
+
+/// The fixed procfs file the kernel opened at `fd`, if its descriptor link
+/// names one (`ProcfsFile::snapshot_is_fixed`).
+fn fixed_procfs_behind(fd: RawFd) -> Option<crate::procfs::ProcfsFile> {
+    let target = own_fd_link(fd)?;
     let path = std::path::Path::new(
-        <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&target[..length]),
+        <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&target),
     );
     crate::procfs::ProcfsFile::from_path(path).filter(crate::procfs::ProcfsFile::snapshot_is_fixed)
 }
@@ -8537,4 +13692,38 @@ mod native_main_state_tests {
             .unwrap();
         assert_eq!(again.shared_open_files_for_exec().unwrap(), Some(empty));
     }
+}
+/// The hint every report of a preemption replay that left its record ends
+/// with: a faithful replay never leaves it, but a record edited after it was
+/// recorded (preemptions knocked out, as `hermit analyze` does) does by
+/// design, and is replayed with `--replay-edited-preemptions`, which skips the
+/// slices that already ended instead (`next_edited_slice`) and reports none
+/// of these.
+pub(crate) const EDITED_RECORD_HINT: &str = "An edited record, not the recording of this run's \
+     schedule, needs --replay-edited-preemptions.";
+
+/// Reports a preemption replay's thread about to file a change point at
+/// `time`, not after its last one at `last`
+/// ([`ThreadState::file_replay_change_point`]). This is not evidence of PMU
+/// skid. The caller publishes it to the coordinator before abandonment, unless
+/// `--panic-on-rcb-overshoot` preserves its synchronous stop here.
+#[cold]
+pub(crate) fn report_stale_replay_filing(
+    panic_on_rcb_overshoot: bool,
+    dettid: DetTid,
+    slice: u64,
+    time: LogicalTime,
+    last: LogicalTime,
+) {
+    let message = format!(
+        "{} preemption replay: thread {} would end slice T{} with a change point at {}, not \
+         after its last change point at {}: the slice closed with no time in it, which the \
+         replayed record never does. The thread files no change point here and runs on as \
+         its final slice; the rest of this run does not replay the record exactly. {}",
+        "HERMIT_REPLAY_DEPARTURE:", dettid, slice, time, last, EDITED_RECORD_HINT,
+    );
+    if panic_on_rcb_overshoot {
+        panic!("{message}");
+    }
+    tracing::error!("{message}");
 }

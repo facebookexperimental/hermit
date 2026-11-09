@@ -41,7 +41,7 @@
  * - across exec, a descriptor opened before it reads the old image's vector,
  *   and the new image reads its own, another.
  *
- * usage: rendered_process_auxv [--hermit]
+ * usage: rendered_process_auxv [--hermit] [--no-sharing-clones]
  *        rendered_process_auxv --kernel-file
  *        rendered_process_auxv --after-exec <fd> <hex> <padding> [--hermit]
  *   --hermit: under Hermit, which renders the file: its identity is
@@ -49,6 +49,9 @@
  *   it prints what it checked, which must be the same on every backend.
  *   Without it (natively) the same relations are checked against the
  *   kernel's file, and nothing is printed.
+ *   --no-sharing-clones: do not attempt clone(CLONE_NEWUSER) or a CLONE_VM
+ *   process, for a backend that refuses them by name, which ends a strict
+ *   run; print that they were not attempted instead.
  *   --kernel-file: under a backend that reports no initial stack pointer,
  *   where Detcore renders no auxv: check that /proc/self/auxv is the
  *   kernel's procfs file (not a rendered one, whose inode has its top bit
@@ -86,6 +89,7 @@ extern char** environ;
 
 static int failures;
 static int hermit;
+static int no_sharing_clones;
 static const char* program;
 
 #define CHECK(condition, ...)                              \
@@ -827,6 +831,11 @@ static int vm_child(void* argument) {
  *   CAP_SYS_ADMIN or CAP_PERFMON opens it: not asserted there). A backend
  *   that refuses the clone (KVM: EOPNOTSUPP) says so. */
 static void check_namespaces_and_shared_maps(void) {
+  if (no_sharing_clones) {
+    say("userns: not attempted: the backend refuses clone(CLONE_NEWUSER) by name");
+    say("clone_vm: not attempted: the backend refuses a CLONE_VM process by name");
+    return;
+  }
   pid_t creator = getpid();
   struct channel channel;
   open_channel(&channel);
@@ -940,8 +949,10 @@ int main(int argc, char** argv) {
   for (int arg = 1; arg < argc; arg++) {
     if (strcmp(argv[arg], "--hermit") == 0) {
       hermit = 1;
+    } else if (strcmp(argv[arg], "--no-sharing-clones") == 0) {
+      no_sharing_clones = 1;
     } else {
-      fprintf(stderr, "usage: %s [--hermit]\n", argv[0]);
+      fprintf(stderr, "usage: %s [--hermit] [--no-sharing-clones]\n", argv[0]);
       return 2;
     }
   }

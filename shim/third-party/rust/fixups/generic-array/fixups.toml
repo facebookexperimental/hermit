@@ -7,3 +7,13 @@
 # above-listed licenses.
 
 buildscript.run = false
+
+# generic-array's build script emits exactly one cfg,
+# `cargo:rustc-cfg=relaxed_coherence`, whenever rustc is at least 1.41.0
+# (vendor/generic-array-0.14.7/build.rs). The pinned toolchain is far
+# newer, so Cargo always sets it. Without it, `From<GenericArray> for
+# [T; n]` is not implemented (only `Into` is) and detcore's
+# `<[u8; 32]>::from(Sha256::digest(..))` fails under Buck with E0277
+# while Cargo compiles it. The build script stays off; this replicates
+# its sole output, as the blake3 and indexmap fixups do for theirs.
+cfgs = ["relaxed_coherence"]

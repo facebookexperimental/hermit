@@ -25,7 +25,19 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends,kvm-native-test-support",
+            "liteinst,kvm-native-test-support",
+            "--lib",
+            "--bins",
+        ]),
+        // The hermit_unit selection plus native-exec, prepared in its own
+        // cohort (nextest_binaries::NATIVE_EXEC_COHORT) so the feature never
+        // enters the default workspace union or the production binary. The
+        // node's filters own exactly the cases this feature adds.
+        "test.hermit_native_exec" => Some(&[
+            "-p",
+            "hermit-run",
+            "--features",
+            "liteinst,kvm-native-test-support,native-exec",
             "--lib",
             "--bins",
         ]),
@@ -34,7 +46,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "inherited_terminal_read",
         ]),
@@ -61,7 +73,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "aio_nr_determinism",
             "--test",
@@ -109,8 +121,6 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "cpuidle_determinism",
             "--test",
-            "dbt_copied_tty",
-            "--test",
             "deadline_slice_cap",
             "--test",
             "dentry_state_determinism",
@@ -146,6 +156,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "host_kernel_probes",
             "--test",
             "host_security_identity",
+            "--test",
+            "image_archive",
             "--test",
             "inode_nr_determinism",
             "--test",
@@ -329,7 +341,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "arbitrary_binaries",
         ]),
@@ -337,7 +349,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "liteinst_allocator",
         ]),
@@ -345,7 +357,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "liteinst_stacks",
         ]),
@@ -353,6 +365,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         | "test.isolated_dbt_workdir"
         | "test.cli_on_host"
         | "privileged-test.pmu_cli_cases"
+        | "privileged-test.binder_cli_cases"
         | "privileged-cpuid.cpu_profile_v3"
         | "super.dbt_pipe_backpressure_diagnostic"
         | "super.dbt_failed_exec_recovery_diagnostic"
@@ -362,7 +375,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "cli",
         ]),
@@ -372,16 +385,26 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends,kvm-execution-tests",
+            "liteinst,kvm-execution-tests",
             "--lib",
             "--test",
             "cli",
         ]),
-        "test.sabre_examples" => Some(&[
+        // The deadline_slice_cap suite under the KVM node's features, the
+        // same feature set as the KVM CLI node above.
+        "privileged-test.deadline_slice_cap_kvm" => Some(&[
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst,kvm-execution-tests",
+            "--test",
+            "deadline_slice_cap",
+        ]),
+        "test.sabre_examples" | "sabrecompat.sabre_examples" => Some(&[
+            "-p",
+            "hermit-run",
+            "--features",
+            "liteinst",
             "--test",
             "sabre_examples",
         ]),
@@ -396,7 +419,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "hermit_modes",
         ]),
@@ -404,7 +427,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "app_strict_verify",
         ]),
@@ -412,7 +435,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "command_strict_verify",
         ]),
@@ -420,7 +443,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "epoll_determinism",
             "--test",
@@ -430,7 +453,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "rr_suite",
         ]),
@@ -439,7 +462,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "relaxed_flag_matrix",
         ]),
@@ -447,7 +470,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "pselect6_simulation",
         ]),
@@ -455,7 +478,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "record_replay",
         ]),
@@ -463,7 +486,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "ipc_determinism",
         ]),
@@ -471,7 +494,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "random_determinism",
         ]),
@@ -479,7 +502,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "integration_matrix",
         ]),
@@ -488,7 +511,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
                 "-p",
                 "hermit-run",
                 "--features",
-                "third-party-backends",
+                "liteinst",
                 "--test",
                 "stress_suite",
             ])
@@ -497,7 +520,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "analyze",
         ]),
@@ -505,7 +528,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "leveldb",
         ]),
@@ -513,13 +536,17 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "-p",
             "hermit-run",
             "--features",
-            "third-party-backends",
+            "liteinst",
             "--test",
             "sqlite_veryquick",
         ]),
         _ => None,
     }
 }
+
+/// The KVM gap-ledger runner, which lists and runs a suite through the prepared
+/// Nextest executables with the Cargo selection after its `--`.
+const KVM_GAP_LEDGER_RUN: &str = "kvm-gap-ledger.rs run";
 
 /// Recover the exact authored payload from the one supported execution wrapper.
 /// Both the generator and its preparation audit inspect the same command bytes
@@ -599,11 +626,25 @@ pub(super) fn assert_command_selection(step: &dagrun::model::Step) -> Result<(),
             "{tag} does not require prepared Nextest executables"
         ));
     }
-    for marker in ["run-nextest-counted.sh", "nextest-binaries.rs list"] {
+    for marker in [
+        "run-nextest-counted.sh",
+        "nextest-binaries.rs list",
+        KVM_GAP_LEDGER_RUN,
+    ] {
         if !command.contains(marker) {
             continue;
         }
         let mut arguments = command_arguments(&command, marker)?;
+        if marker == KVM_GAP_LEDGER_RUN {
+            // `run -- NEXTEST_ARGS`: the runner hands NEXTEST_ARGS to both its
+            // Nextest list and its counted run, and reads its ledger from
+            // crate::known_gaps::LEDGER_ENV.
+            let separator = arguments
+                .iter()
+                .position(|argument| argument == "--")
+                .ok_or_else(|| format!("{tag} gives {KVM_GAP_LEDGER_RUN} no `--`"))?;
+            arguments.drain(..=separator);
+        }
         if marker == "run-nextest-counted.sh" {
             match arguments.first().map(String::as_str) {
                 Some("--calibration-host") => {
@@ -662,8 +703,15 @@ pub(super) fn assert_command_selection(step: &dagrun::model::Step) -> Result<(),
 }
 
 // `prepare` is one fixed command; only its fixed, profile-matched packaging
-// finalizer may follow it. Never truncate an arbitrary shell command at `&&`.
-fn preparation_profile<'a>(tag: &str, command: &'a str) -> Result<Option<&'a str>, String> {
+// finalizer may follow it, plus, for the pinned workspace prepare node
+// alone, its fixed early-artifact gate after that finalizer. A non-default
+// cohort's prepare is the one other fixed form (`cohort_prepare_command`):
+// prepare under the run's build mode, then assert, with no finalizer.
+// Never truncate an arbitrary shell command at `&&`.
+fn preparation_profile<'a>(
+    tag: &str,
+    command: &'a str,
+) -> Result<Option<(&'a str, crate::nextest_binaries::PreparedCohort)>, String> {
     let marker = "./ci/nextest-binaries.rs prepare ";
     let Some((_, rest)) = command.split_once(marker) else {
         return Ok(None);
@@ -672,15 +720,48 @@ fn preparation_profile<'a>(tag: &str, command: &'a str) -> Result<Option<&'a str
         return Err(format!("{tag} has duplicate prepared commands"));
     }
     let profile = rest.split_whitespace().next().unwrap_or("");
-    let finalized = crate::nextest_binaries::cargo_profile_for(profile).map(|directory| {
-        format!("{profile} && target/{directory}/stage-detcore-liteinst --git target")
-    });
-    if profile.is_empty() || (rest != profile && finalized.as_deref() != Some(rest)) {
+    for cohort in [crate::nextest_binaries::NATIVE_EXEC_COHORT] {
+        if let Ok(expected) = crate::nextest_binaries::cohort_prepare_command(profile, cohort) {
+            if expected.strip_prefix(marker) == Some(rest) {
+                return Ok(Some((profile, cohort)));
+            }
+        }
+    }
+    // The full producer appends `--build-mode "${HERMIT_VALIDATE_BUILD_MODE:-cargo}"`
+    // before its finalizer; the bare and mode-less finalized forms stay exact.
+    let tails: Vec<String> = crate::nextest_binaries::cargo_profile_for(profile)
+        .map(|directory| {
+            vec![
+                format!(
+                    "{profile} --build-mode \"${{HERMIT_VALIDATE_BUILD_MODE:-cargo}}\" && target/{directory}/stage-detcore-liteinst --git target"
+                ),
+                format!("{profile} && target/{directory}/stage-detcore-liteinst --git target"),
+            ]
+        })
+        .unwrap_or_default();
+    let gated = if tag == crate::validation_dag::PINNED_WORKSPACE_PREPARE_TAG {
+        tails
+            .iter()
+            .map(|tail| {
+                format!(
+                    "{tail}{}",
+                    crate::validation_dag::EARLY_ARTIFACT_GATE_SUFFIX
+                )
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if profile.is_empty()
+        || (rest != profile
+            && !tails.iter().any(|tail| tail == rest)
+            && !gated.iter().any(|tail| tail == rest))
+    {
         return Err(format!(
             "{tag} has an ambiguous prepared profile or finalizer"
         ));
     }
-    Ok(Some(profile))
+    Ok(Some((profile, crate::nextest_binaries::DEFAULT_COHORT)))
 }
 
 /// A producer of a unifying profile (`nextest_binaries::unifies`) must end
@@ -701,9 +782,23 @@ pub(super) fn assert_producers_build_the_unified_selection(
         } else {
             execution_command(step)?
         };
-        let Some(profile) = preparation_profile(&step.tag(), &command)? else {
+        let Some((profile, cohort)) = preparation_profile(&step.tag(), &command)? else {
             continue;
         };
+        if !cohort.is_default() {
+            // A cohort producer builds nothing in its prepare node: its
+            // compile node built the executables, and widening this payload
+            // to the workspace union is exactly what the cohort exists to
+            // prevent. Its one fixed form is `cohort_prepare_command`.
+            let expected = crate::nextest_binaries::cohort_prepare_command(profile, cohort)?;
+            if !command.ends_with(&expected) || command.contains("--workspace") {
+                return Err(format!(
+                    "{} must end with its cohort prepare `{expected}` and build no workspace selection",
+                    step.tag()
+                ));
+            }
+            continue;
+        }
         if !crate::nextest_binaries::unifies(profile) {
             continue;
         }
@@ -717,9 +812,9 @@ pub(super) fn assert_producers_build_the_unified_selection(
                 step.tag()
             ));
         }
-        if !expected.contains("hermit-run/third-party-backends") {
+        if !expected.contains("hermit-run/liteinst") {
             return Err(format!(
-                "{} links the E2E Hermit without hermit-run/third-party-backends: `{expected}`",
+                "{} links the E2E Hermit without hermit-run/liteinst: `{expected}`",
                 step.tag()
             ));
         }
@@ -733,8 +828,10 @@ pub(super) fn assert_preparation_dependencies(
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
 
+    use crate::nextest_binaries::COHORT_ENV;
+    use crate::nextest_binaries::PreparedCohort;
     use crate::nextest_binaries::SELECTION_ENV;
-    use crate::nextest_binaries::config_selections;
+    use crate::nextest_binaries::config_selections_in_cohort;
     use crate::nextest_binaries::selection_key;
     let by_tag = cfg
         .steps
@@ -744,12 +841,13 @@ pub(super) fn assert_preparation_dependencies(
     let mut producers = BTreeMap::new();
     for step in &cfg.steps {
         let command = execution_command(step)?;
-        if let Some(profile) = preparation_profile(&step.tag(), &command)? {
+        if let Some((profile, cohort)) = preparation_profile(&step.tag(), &command)? {
             producers.insert(
                 step.tag(),
                 (
                     step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh "),
-                    config_selections(cfg, profile)?,
+                    cohort,
+                    config_selections_in_cohort(cfg, profile, cohort)?,
                 ),
             );
         }
@@ -758,6 +856,9 @@ pub(super) fn assert_preparation_dependencies(
         let Some(raw) = step.env.get(SELECTION_ENV) else {
             continue;
         };
+        let consumer_cohort =
+            PreparedCohort::from_slug(step.env.get(COHORT_ENV).map(String::as_str))
+                .map_err(|e| format!("{}: {e}", step.tag()))?;
         let args: Vec<String> = serde_json::from_str(raw).map_err(|e| e.to_string())?;
         let key = selection_key(&args);
         let mut ancestors = BTreeSet::new();
@@ -771,14 +872,18 @@ pub(super) fn assert_preparation_dependencies(
             }
         }
         if !ancestors.iter().any(|tag| {
-            producers.get(tag).is_some_and(|(pinned, selections)| {
-                *pinned == step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ")
-                    && selections.get(&key) == Some(&args)
-            })
+            producers
+                .get(tag)
+                .is_some_and(|(pinned, cohort, selections)| {
+                    *pinned == step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ")
+                        && *cohort == consumer_cohort
+                        && selections.get(&key) == Some(&args)
+                })
         }) {
             return Err(format!(
-                "{} can run before any producer in the same filesystem root of its exact Cargo selection {args:?}",
-                step.tag()
+                "{} can run before any producer in the same filesystem root and cohort {} of its exact Cargo selection {args:?}",
+                step.tag(),
+                consumer_cohort.name()
             ));
         }
     }
@@ -876,18 +981,14 @@ mod tests {
             // its completeness test, and its 57 fixtures with a Rust guest.
             // Plus signal_determinism's DBT thread-directed SIGKILL refusal test.
             // The local node runs in shards, which together execute the same.
-            let executed = |tag: &str| -> u64 {
-                let step = graph.steps.iter().find(|step| step.tag() == tag).unwrap();
-                step.env["NEXTEST_EXPECTED_EXECUTED"].parse().unwrap()
-            };
-            let population: u64 = if tag == crate::validation_dag::HERMIT_INTEGRATION_TAG {
-                crate::validation_dag::hermit_integration_shard_tags()
-                    .iter()
-                    .map(|shard| executed(shard))
-                    .sum()
-            } else {
-                executed(tag)
-            };
+            // The listed population is guarded at run time by the census
+            // (listed IDs vs the last landed population), not by a total
+            // asserted here; this test keeps the selection/binary identity
+            // assertions below.
+            assert!(
+                !step.env.contains_key("NEXTEST_EXPECTED_EXECUTED"),
+                "{tag} declares a retired Nextest count pin"
+            );
             // The ten DBT SIGKILL scenarios replace one aggregate test (+9),
             // and container_init_deadline gains the parent-died-before-arming
             // test (+1). And procfs_determinism's directory-alias
@@ -939,7 +1040,40 @@ mod tests {
             // test moves there from frontier_app_benchmarks, plus
             // a_declared_redis_pair_is_used_only_when_declared and
             // a_bad_redis_declaration_is_refused_rather_than_replaced (+2): 691.
-            assert_eq!(population, 691);
+            // Separately name the optional e9patch source-inspection leg (+1): 692.
+            // And the two-run syscall-histogram test in dispatch_stats (+1): 693.
+            // random_determinism's
+            // a_schedule_replay_hands_the_guest_the_recorded_random_values (+1):
+            // 694.
+            // fatal_core_capture's
+            // a_fault_ends_the_run_while_the_leader_waits_on_a_condition_variable
+            // (+1): 695.
+            // And robust_futex_owner_death's native and ptrace SIGKILL
+            // owner-death tests: the population measures 698 at this
+            // integration head (the PR's +2 on its stale base of 694,
+            // re-measured here rather than carried over).
+            // Recount at 3bdd41fda38: the selection lists 700
+            // (`cargo nextest list --profile ci` on the on-host
+            // selection), matching the full validate at that tip, whose
+            // third shard executed 349 (347 + 2), all passed: 700.
+            // Recount at 360e99b2e24: shard 2 grew to 292 (61 + 292 +
+            // 349), so the on-host population is 702.
+            // The integrated chain grows shard 3 to 361 (61 + 292 + 361),
+            // so the on-host population is 714.
+            // Shard 2 then grows to 293 (61 + 293 + 361): 715.
+            // The DBT robust-futex #[ignore] (issue 5023) drops shard 3
+            // to 360 (61 + 293 + 360): 714.
+            // The runtime_private maps/smaps #[ignore]s (same issue) drop
+            // shard 3 to 358 (61 + 293 + 358): 712.
+            // Shard 2 recounts to 294 in run1470 (61 + 294 + 358): 713.
+            // The split retains seven package-identity cases in
+            // version_provenance and transfers the copied-child TTY case to
+            // its DynamoRIO owner: 713 + 7 - 1 = 719.
+            // PR 4630's three fatal-core cases grow shard 2: 719 + 3 = 722,
+            // measured by the batch3 donor validate at f7ec284e.
+            // image_archive's eleven local-image tests join the second
+            // shard: 722 + 11 = 733, listed.
+            // (Population total intentionally unasserted: census-guarded.)
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
@@ -1025,7 +1159,7 @@ mod tests {
             for command in [&bare, &finalized] {
                 assert_eq!(
                     preparation_profile("producer", command).unwrap(),
-                    Some(profile)
+                    Some((profile, crate::nextest_binaries::DEFAULT_COHORT))
                 );
             }
             for refused in [
@@ -1042,11 +1176,53 @@ mod tests {
                 );
             }
         }
+        // The pinned workspace prepare node alone may append its fixed
+        // early-artifact gate after the finalizer; no other producer may.
+        let gated = format!(
+            "prefix && ./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target{}",
+            crate::validation_dag::EARLY_ARTIFACT_GATE_SUFFIX
+        );
+        assert_eq!(
+            preparation_profile(crate::validation_dag::PINNED_WORKSPACE_PREPARE_TAG, &gated)
+                .unwrap(),
+            Some(("full", crate::nextest_binaries::DEFAULT_COHORT))
+        );
+        assert!(preparation_profile("producer", &gated).is_err());
+        // A non-default cohort's prepare is the one other exact form:
+        // prepare under the run's build mode, then assert, no finalizer.
+        let cohort_command = format!(
+            "prefix && {}",
+            crate::nextest_binaries::cohort_prepare_command(
+                "full",
+                crate::nextest_binaries::NATIVE_EXEC_COHORT
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            preparation_profile("producer", &cohort_command).unwrap(),
+            Some(("full", crate::nextest_binaries::NATIVE_EXEC_COHORT))
+        );
+        for refused in [
+            // Without its assert half.
+            "prefix && ./ci/nextest-binaries.rs prepare full --build-mode \"${HERMIT_VALIDATE_BUILD_MODE:-cargo}\" --cohort native-exec"
+                .to_string(),
+            // With the default cohort's finalizer appended.
+            format!("{cohort_command} && target/validate/stage-detcore-liteinst --git target"),
+            // An unregistered slug.
+            cohort_command.replace("native-exec", "bogus"),
+            // A non-unifying profile has no cohort prepare form.
+            cohort_command.replace("prepare full", "prepare quick"),
+        ] {
+            assert!(
+                preparation_profile("producer", &refused).is_err(),
+                "{refused}"
+            );
+        }
         for profile in ["quick", "super"] {
             let bare = format!("./ci/nextest-binaries.rs prepare {profile}");
             assert_eq!(
                 preparation_profile("producer", &bare).unwrap(),
-                Some(profile)
+                Some((profile, crate::nextest_binaries::DEFAULT_COHORT))
             );
             for directory in ["debug", "validate"] {
                 let refused =
@@ -1117,8 +1293,15 @@ mod tests {
             narrowed.contains("must end with its unified workspace build"),
             "{narrowed}"
         );
+        // The core producer must keep the CLI's LiteInst opt-in from the
+        // declared selection union, even if all other features remain.
+        let core_installer = mutated(&|cmd| cmd.replace(",hermit-run/liteinst", ""));
+        assert!(
+            core_installer.contains("must end with its unified workspace build"),
+            "{core_installer}"
+        );
 
-        // A union that no longer carries the third-party backends: every
+        // A union that no longer carries the core LiteInst backend: every
         // selection drops the feature, and the producer follows the union, so
         // only the backend requirement refuses it.
         let mut stripped = graph.clone();
@@ -1130,7 +1313,7 @@ mod tests {
             if let Some(index) = args.iter().position(|arg| arg == "--features") {
                 let kept = args[index + 1]
                     .split(',')
-                    .filter(|feature| *feature != "third-party-backends")
+                    .filter(|feature| *feature != "liteinst")
                     .collect::<Vec<_>>()
                     .join(",");
                 if kept.is_empty() {
@@ -1147,7 +1330,6 @@ mod tests {
                 crate::nextest_binaries::unified_prebuild_command(&graph, profile).unwrap();
             let after =
                 crate::nextest_binaries::unified_prebuild_command(&stripped, profile).unwrap();
-            assert!(!after.contains("third-party-backends"), "{after}");
             // The pinned compile half carries only the Cargo build, the text
             // of the union before its `prepare` tail, so it follows that part.
             let cargo_half = |union: &str| {
@@ -1158,6 +1340,12 @@ mod tests {
                     .to_owned()
             };
             let (before_cargo, after_cargo) = (cargo_half(&before), cargo_half(&after));
+            assert!(!after_cargo.contains("liteinst"), "{after_cargo}");
+            // Removing the Cargo opt-in must retain exact preparation and staging.
+            assert_eq!(
+                before.strip_prefix(before_cargo.as_str()).unwrap(),
+                after.strip_prefix(after_cargo.as_str()).unwrap(),
+            );
             for step in &mut stripped.steps {
                 step.cmd = if step.cmd.contains(&before) {
                     step.cmd.replace(&before, &after)
@@ -1167,10 +1355,7 @@ mod tests {
             }
         }
         let error = assert_producers_build_the_unified_selection(&stripped).unwrap_err();
-        assert!(
-            error.contains("without hermit-run/third-party-backends"),
-            "{error}"
-        );
+        assert!(error.contains("without hermit-run/liteinst"), "{error}");
     }
 
     #[test]
@@ -1211,7 +1396,12 @@ mod tests {
             (
                 "test.regular_crates_on_host",
                 hosted.tag(),
-                image.cmd.clone(),
+                // The pinned prepare payload's early-artifact gate is
+                // admitted only on that node's own tag; strip it so the
+                // transplanted command stays a well-formed preparation.
+                image
+                    .cmd
+                    .replace(crate::validation_dag::EARLY_ARTIFACT_GATE_SUFFIX, ""),
             ),
         ] {
             let mut wrong_root = graph.clone();
@@ -1271,7 +1461,7 @@ mod tests {
                 "-p",
                 "hermit-run",
                 "--features",
-                "third-party-backends",
+                "liteinst",
                 "--test",
                 "inherited_terminal_read",
             ]
@@ -1280,14 +1470,45 @@ mod tests {
         assert_ne!(terminal_key, hardware_key);
         assert_eq!(full.get(&terminal_key), Some(&terminal_selection));
         assert!(!portable.contains_key(&terminal_key));
-        assert_eq!(full.len(), portable.len() + 2);
+        // The KVM gap-ledger node lists and runs its suite through the prepared
+        // executables of the selection after its runner's `--`.
+        let ledger = graph
+            .steps
+            .iter()
+            .find(|step| step.tag() == "privileged-test.deadline_slice_cap_kvm")
+            .unwrap();
+        assert_command_selection(ledger).unwrap();
+        assert_eq!(
+            ledger.env[crate::known_gaps::LEDGER_ENV],
+            "hermit-cli/tests/deadline_slice_cap.kvm-gaps.tsv"
+        );
+        let ledger_selection: Vec<String> =
+            serde_json::from_str(&ledger.env[SELECTION_ENV]).unwrap();
+        let ledger_key = crate::nextest_binaries::selection_key(&ledger_selection);
+        assert_eq!(full.get(&ledger_key), Some(&ledger_selection));
+        assert!(!portable.contains_key(&ledger_key));
+        let mut narrowed = ledger.clone();
+        narrowed.cmd = narrowed
+            .cmd
+            .replace("--test deadline_slice_cap;", "--test cli;");
+        let error = assert_command_selection(&narrowed).unwrap_err();
+        assert!(error.contains("command has Cargo selection"), "{error}");
+        let mut separatorless = ledger.clone();
+        separatorless.cmd = separatorless
+            .cmd
+            .replace("kvm-gap-ledger.rs run -- ", "kvm-gap-ledger.rs run ");
+        let error = assert_command_selection(&separatorless).unwrap_err();
+        assert!(error.contains("no `--`"), "{error}");
+        // The hardware CLI selection, the inherited-terminal selection and the
+        // KVM gap-ledger selection are full-only.
+        assert_eq!(full.len(), portable.len() + 3);
         for (key, selection) in &portable {
             assert_eq!(full.get(key), Some(selection));
         }
         for tag in ["test.hermit_unit", "test.hermit_unit_on_host"] {
             let step = graph.steps.iter().find(|step| step.tag() == tag).unwrap();
             let selection: Vec<String> = serde_json::from_str(&step.env[SELECTION_ENV]).unwrap();
-            assert!(selection.contains(&"third-party-backends,kvm-native-test-support".into()));
+            assert!(selection.contains(&"liteinst,kvm-native-test-support".into()));
             assert!(
                 !selection
                     .iter()
@@ -1333,12 +1554,16 @@ mod tests {
             .find(|step| step.tag() == "build.workspace_in_pinned_root")
             .unwrap();
         assert!(
-            execution_command(producer)
-                .unwrap()
-                .ends_with("./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target")
+            execution_command(producer).unwrap().ends_with(&format!(
+                "./ci/nextest-binaries.rs prepare full --build-mode \"${{HERMIT_VALIDATE_BUILD_MODE:-cargo}}\" && target/validate/stage-detcore-liteinst --git target{}",
+                crate::validation_dag::EARLY_ARTIFACT_GATE_SUFFIX
+            ))
         );
         producer.cmd = producer.cmd.replace(
-            "./ci/nextest-binaries.rs prepare full && target/validate/stage-detcore-liteinst --git target",
+            &format!(
+                "./ci/nextest-binaries.rs prepare full --build-mode \"${{HERMIT_VALIDATE_BUILD_MODE:-cargo}}\" && target/validate/stage-detcore-liteinst --git target{}",
+                crate::validation_dag::EARLY_ARTIFACT_GATE_SUFFIX
+            ),
             "./ci/nextest-binaries.rs prepare portable",
         );
         missing_hardware

@@ -70,6 +70,7 @@ fn no_result_prints_the_typed_cause() {
     )
     .unwrap();
     let output = run(&["matched", report.path().to_str().unwrap()]);
+    // EXIT-CLASS: hermit (the inspection refusal's own exit status)
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -124,6 +125,7 @@ fn duplicate_report_fields_are_a_refusal_with_no_inspection_output() {
     let raw = serde_json::to_string(&report).unwrap();
     std::fs::write(file.path(), &raw).unwrap();
     let output = run(&["--json", "matched", file.path().to_str().unwrap()]);
+    // EXIT-CLASS: hermit (the inspection refusal's own exit status)
     assert_eq!(output.status.code(), Some(1));
     assert!(!output.stdout.is_empty());
     for (needle, replacement) in [

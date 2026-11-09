@@ -14,6 +14,8 @@ use hermit_manifest_plan::ledger::CellResult as LedgerCellResult;
 use hermit_manifest_plan::ledger::CellResultsArtifact;
 use hermit_manifest_plan::ledger::CellResultsEvidence;
 use hermit_manifest_plan::ledger::CellVerdict;
+use hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL;
+use hermit_manifest_plan::runner::history_past_generic_bound_is_skid_qualified;
 use hermit_manifest_plan::runner::outcome_after_retries;
 use serde_json::Value;
 use sha2::Digest;
@@ -214,9 +216,15 @@ fn collect_snapshot_paths(
             collect_snapshot_paths(&entry.path(), files, custody)?;
         } else if kind.is_file() && entry.file_name() == "results.jsonl" {
             files.push(entry.path());
-        } else if kind.is_symlink() && custody.is_ok() {
-            // The legacy reader ignores links. That behavior remains ordinary
-            // evidence, but cannot attest complete rooted input membership.
+        } else if kind.is_symlink() && entry.file_name() == "results.jsonl" && custody.is_ok() {
+            // The legacy reader opens collected files by name, so a link at
+            // a collected name would be followed and cannot attest complete
+            // rooted input membership. Links at any other name are never
+            // followed by this walk and cannot add or remove a collected
+            // input; retained per-cell evidence legitimately contains them
+            // (a retained recording's dev/fd -> /proc/self/fd). A swap that
+            // changes the collected set is caught by the census membership
+            // fence, which re-walks and compares the exact file set.
             *custody = Err(format!(
                 "raw result authority encountered a link: {}",
                 entry.path().display()
@@ -437,6 +445,36 @@ fn require_current_timeout_policy(row: &Value) -> Result<(), String> {
 
 fn cell_verdict(row: &Value) -> Result<CellVerdict, String> {
     hermit_manifest_plan::ledger::cell_verdict_from_source(row)
+}
+
+/// Refuse a retained history past the generic attempt bound unless every
+/// attempt before the final one re-decides as skid-only from its full
+/// retained row (`history_past_generic_bound_is_skid_qualified`). The
+/// outcome-string selector cannot make that distinction, so both retain
+/// paths apply this before selecting.
+fn require_skid_qualified_history(rows: &[(u64, &Value)]) -> Result<(), String> {
+    if rows.iter().map(|(attempt, _)| *attempt).max().unwrap_or(0) <= MAX_ATTEMPTS_PER_CELL {
+        return Ok(());
+    }
+    let full_rows = rows
+        .iter()
+        .map(|(_, row)| {
+            serde_json::from_value::<hermit_manifest_plan::runner::CellResult>((*row).clone())
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            format!(
+                "cell result history past the generic bound is not skid-qualified: row does not decode as a cell result: {error}"
+            )
+        })?;
+    if history_past_generic_bound_is_skid_qualified(&full_rows) {
+        Ok(())
+    } else {
+        Err(format!(
+            "cell result history of {} attempt(s) exceeds the generic maximum of {MAX_ATTEMPTS_PER_CELL} without skid-only evidence for every attempt before the final one",
+            rows.len()
+        ))
+    }
 }
 
 fn sort_key(value: &Value) -> Result<CellIdentity, String> {
@@ -811,6 +849,9 @@ pub fn retain_snapshot(
         .into_iter()
         .map(|(identity, mut rows)| {
             rows.sort_by_key(|(attempt, _)| *attempt);
+            require_skid_qualified_history(
+                &rows.iter().map(|(a, r)| (*a, r)).collect::<Vec<_>>(),
+            )?;
             let outcome = outcome_after_retries(rows.iter().map(|(attempt, row)| {
                 Ok((*attempt, string(row, "outcome")?))
             }).collect::<Result<Vec<_>, String>>()?)?;
@@ -1161,6 +1202,9 @@ fn retain_v10_with_contract(
         }) {
             return Err("selected cell emitted the retired ptrace reference comparison".into());
         }
+        require_skid_qualified_history(
+            &rows.iter().map(|(a, r)| (*a, r)).collect::<Vec<_>>(),
+        )?;
         let outcome = outcome_after_retries(
             rows.iter()
                 .map(|(attempt, row)| Ok((*attempt, string(row, "outcome")?)))
@@ -2741,6 +2785,46 @@ mod tests {
                     &"a".repeat(40),
                     &[PathBuf::from("results.jsonl")].into_iter().collect()
                 )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn raw_snapshot_census_tolerates_retained_recording_links() {
+        // A retained recording keeps its staging links (dev/fd ->
+        // /proc/self/fd) under the result root. Those links are never
+        // followed by the result walk, so the census must still attest;
+        // a link at a collected name still refuses.
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("raw");
+        let recording = root.join("runs/run/cell/verify-runs/1/run1/recording/.tmpX/dev");
+        fs::create_dir_all(&recording).unwrap();
+        fs::create_dir_all(root.join("bucket")).unwrap();
+        let commit = "abababababababababababababababababababab";
+        let mut row = result_row("captured-run", commit);
+        row["attempt"] = 1.into();
+        let bytes = format!("{row}\n").into_bytes();
+        fs::write(root.join("bucket/results.jsonl"), &bytes).unwrap();
+        std::os::unix::fs::symlink("/proc/self/fd", recording.join("fd")).unwrap();
+        let members = [PathBuf::from("bucket/results.jsonl")]
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let snapshot = CapturedResults::capture(&root);
+        let census = snapshot.census("captured-run", commit, &members).unwrap();
+        assert_eq!(census.files.len(), 1);
+
+        let alias_root = parent.path().join("alias-raw");
+        fs::create_dir_all(alias_root.join("bucket")).unwrap();
+        fs::write(alias_root.join("bucket/real.jsonl"), &bytes).unwrap();
+        std::os::unix::fs::symlink(
+            alias_root.join("bucket/real.jsonl"),
+            alias_root.join("bucket/results.jsonl"),
+        )
+        .unwrap();
+        let aliased = CapturedResults::capture(&alias_root);
+        assert!(
+            aliased
+                .census("captured-run", commit, &BTreeSet::new())
                 .is_err()
         );
     }

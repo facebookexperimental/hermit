@@ -13,10 +13,10 @@ use hermit::Error;
 use reverie::process::ExitStatus;
 
 use super::global_opts::GlobalOpts;
-use crate::clean::CleanOpts;
-use crate::list::ListOpts;
-use crate::record_start::StartOpts;
-use crate::remove::RemoveOpts;
+use crate::app::clean::CleanOpts;
+use crate::app::list::ListOpts;
+use crate::app::record_start::StartOpts;
+use crate::app::remove::RemoveOpts;
 
 /// Command-line options for the "record" subcommand.
 #[derive(Debug, Parser)]
@@ -68,13 +68,17 @@ impl RecordOpts {
         }
     }
 
-    pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+    pub fn main_with_backend<A: super::backend_hook::BackendAdapter>(
+        &self,
+        global: &GlobalOpts,
+        adapter: &A,
+    ) -> Result<ExitStatus, Error> {
         match &self.record_command {
             Some(RecordCommand::List(x)) => x.main(global),
             Some(RecordCommand::Remove(x)) => x.main(global),
             Some(RecordCommand::Clean(x)) => x.main(global),
-            Some(RecordCommand::Start(x)) => x.main(global),
-            None => self.start.main(global),
+            Some(RecordCommand::Start(x)) => x.main_with_backend(global, adapter),
+            None => self.start.main_with_backend(global, adapter),
         }
     }
 }

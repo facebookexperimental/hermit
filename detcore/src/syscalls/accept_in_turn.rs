@@ -464,7 +464,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 },
                 None => None,
             };
-            if fault == Some(BracketFault::KillAfterSet) {
+            if fault == Some(BracketFault::KillAfterSet)
+                && !crate::syscalls::host_signal_send_refused(
+                    "the accept-in-turn kill-after-set fault hook",
+                    guest.pid().as_raw(),
+                    guest.tid().as_raw(),
+                    libc::SIGKILL,
+                )
+            {
                 // Neither phase runs the attempt: the task is gone, and replay
                 // must not consume an event that record never wrote. The
                 // bracket's drop restores the flags.

@@ -62,7 +62,9 @@ runs through `sudo` and is printed before it runs. In order, the script:
 3. Reads `MSR_PLATFORM_INFO` (0xce) and `MSR_MISC_FEATURES_ENABLES` (0x140)
    through `/dev/cpu/*/msr` on every online CPU. It refuses unless every CPU
    has bit 31 set and 0x140 equal to 0.
-4. Installs `kernel-devel-$(uname -r)` with dnf if the build tree is missing.
+4. Installs `kernel-devel-$(uname -r)` with dnf if the build tree is missing,
+   and `dwarves` (for `pahole`) if the kernel generates BTF for modules
+   (`CONFIG_DEBUG_INFO_BTF_MODULES=y`), whose module builds stop without it.
    The on-demand VMs' kernels are built by clang with ThinLTO, and gcc rejects
    their flags (`-fsplit-lto-unit`). For such a kernel, the script installs the
    `clang`, `lld` and `llvm` packages whose version matches

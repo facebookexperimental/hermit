@@ -21,6 +21,18 @@ from pathlib import Path
 
 WRAPPER = Path(__file__).with_name("run-in-pinned-root.sh")
 
+# Wall bound for one run-in-pinned-root.sh invocation. Measured 2026-11-03
+# on a quiet host at hermit 2baafbdf: the heaviest single test in this file
+# (InheritedGitLocation.test_scratch_repository_tests_ignore_inherited_git_
+# location_variables) used 27.15 CPU-s (9.58 user + 17.57 sys) in 7.77
+# wall-s, and the full 30-test file used 41.65 CPU-s in 23.33 wall-s.
+# Owner labelling: CPU cap about 1.5x the observed CPU (40 CPU-s, at most
+# 60 CPU-s); wall cap 8x the CPU cap (320 s, at most 600 s). The old flat
+# 10 s expired on every wrapper call in the 2026-11-03 buck-hybrid red run
+# at 31.4x CPU/wall. Git fixture calls below keep their 10 s: they are
+# local operations that did not expire in that run.
+WRAPPER_TIMEOUT_S = 320
+
 # Git exports these to hooks and to every `git rebase --exec` step, and they
 # take precedence over `git -C`. Every command below names its repository
 # explicitly, so it runs without them; otherwise a scratch `git init` rewrites
@@ -88,6 +100,7 @@ class CargoCacheMounts(unittest.TestCase):
             "    image = next(i for i, arg in enumerate(sys.argv) if arg.startswith('fixture@sha256:'))\n"
             "    os.execv(sys.argv[image + 1], sys.argv[image + 1:])\n"
             "if sys.argv[1:3] == ['image', 'inspect']: print('c' * 64); sys.exit(0)\n"
+            "if sys.argv[1:3] == ['image', 'exists'] and os.environ.get('PINNED_ROOT_IMAGE_EXISTS_RC'): sys.exit(int(os.environ['PINNED_ROOT_IMAGE_EXISTS_RC']))\n"
             "sys.exit(0 if sys.argv[1:3] == ['image', 'exists'] or sys.argv[1] == 'run' else 90)\n"
         )
         fake.chmod(0o755)
@@ -103,6 +116,10 @@ class CargoCacheMounts(unittest.TestCase):
         git_location=None,
         command=None,
         caller_affinity=None,
+        project=None,
+        bundle_lower=None,
+        extra_env=None,
+        extra_forwarded=None,
     ):
         # The wrapper gets this process's environment, as it does in
         # production, so an inherited Git location variable reaches it.
@@ -114,12 +131,21 @@ class CargoCacheMounts(unittest.TestCase):
         env["PATH"] = str(self.root / "tools") + os.pathsep + env["PATH"]
         env["PINNED_ROOT_CAPTURE"] = str(self.capture)
         forwarded = ["--nextest-calibration"] if calibration else []
+        if project is not None:
+            forwarded += project
+
         if proc_locks_runtime is not None:
             env["XDG_RUNTIME_DIR"] = str(proc_locks_runtime)
             forwarded.append("--proc-locks-runtime")
         if run_state is not None:
             env["VALIDATE_RUN_STATE"] = str(run_state)
             forwarded += ["--env", "VALIDATE_RUN_STATE"]
+        if bundle_lower is not None:
+            forwarded += ["--bundle-lower", str(bundle_lower)]
+        if extra_env:
+            env.update(extra_env)
+        if extra_forwarded:
+            forwarded += extra_forwarded
         result = subprocess.run(
             [
                 "bash",
@@ -140,15 +166,115 @@ class CargoCacheMounts(unittest.TestCase):
             env=env,
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=WRAPPER_TIMEOUT_S,
             preexec_fn=(
                 None
                 if caller_affinity is None
                 else lambda: os.sched_setaffinity(0, caller_affinity)
             ),
         )
-        calls = [json.loads(line) for line in self.capture.read_text().splitlines()]
+        calls = [json.loads(line) for line in self.capture.read_text().splitlines()] if self.capture.exists() else []
         return result, calls
+
+    def check_image(self, exists_rc):
+        env = repository_neutral_env()
+        env["PATH"] = str(self.root / "tools") + os.pathsep + env["PATH"]
+        env["PINNED_ROOT_CAPTURE"] = str(self.capture)
+        env["PINNED_ROOT_IMAGE_EXISTS_RC"] = str(exists_rc)
+        result = subprocess.run(
+            [
+                "bash",
+                str(WRAPPER),
+                "--check-image",
+                "--digest",
+                "fixture@sha256:" + "0" * 64,
+            ],
+            cwd=self.root,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=WRAPPER_TIMEOUT_S,
+        )
+        calls = [json.loads(line) for line in self.capture.read_text().splitlines()]
+        return result, [c for c in calls if c[:2] == ["image", "exists"]]
+
+    def test_check_image_timeout_gets_one_logged_retry_and_still_refuses(self):
+        # The probe's WALL bound is generous (120 s) and a timeout status is
+        # retried once, logged; admission still refuses afterwards. The fake
+        # podman answers 124 at once, so no real 120 s elapses.
+        result, exists = self.check_image(124)
+        self.assertEqual(result.returncode, 124)
+        self.assertEqual(len(exists), 2)
+        self.assertIn("retrying once", result.stderr)
+        self.assertIn("120s query bound", result.stderr)
+
+    def test_check_image_missing_image_is_not_retried(self):
+        result, exists = self.check_image(1)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(len(exists), 1)
+        self.assertIn("is not present locally", result.stderr)
+    def test_paired_project_keeps_original_core_paths_and_relocates_real_git_metadata(self):
+        env=repository_neutral_env()
+        env.update(GIT_CONFIG_GLOBAL=os.devnull,GIT_CONFIG_NOSYSTEM='1',GIT_OPTIONAL_LOCKS='0')
+        def git(root,*args):
+            result=subprocess.run(['git','-c','user.name=fixture','-c','user.email=fixture@example.invalid','-C',str(root),*args],env=env,capture_output=True,text=True,timeout=10)
+            self.assertEqual(result.returncode,0,result.stderr)
+            return result.stdout.strip()
+        core=self.root/'source';git(core,'init','-q');(core/'file').write_text('core');git(core,'add','file');git(core,'commit','-qm','core')
+        seed=self.root/'project-seed';seed.mkdir();git(seed,'init','-q');(seed/'file').write_text('project');git(seed,'add','file');git(seed,'commit','-qm','project')
+        project=self.root/'project';git(seed,'worktree','add','--detach',str(project))
+        descriptor=project/'ci/project.json';descriptor.parent.mkdir();graph=project/'ci/graph.json';graph.write_text('{"steps":[]}\n'+' '*65536)
+        descriptor.write_text(json.dumps({'schema':1,'repository':'/project','tools_root':'/src','graph':'/project/ci/graph.json','shared_package':'hermit-run'}))
+        git(project,'add','ci');git(project,'commit','-qm','project inputs')
+        original_head=git(project,'rev-parse','HEAD');original_index=git(project,'ls-files','--stage')
+        result,calls=self.invoke(project=['--project-src',str(project),'--project-out',str(self.root/'project-output'),'--project-descriptor',str(descriptor)])
+        self.assertEqual(result.returncode,0,result.stderr);argv=calls[-1]
+        mounts=[argv[i+1] for i,arg in enumerate(argv) if arg=='--mount']
+        self.assertIn(f'type=bind,source={core},destination=/src,ro=true',mounts)
+        self.assertIn(f'type=bind,source={self.root}/output/target,destination=/src/target',mounts)
+        self.assertIn(f'type=bind,source={project},destination=/project,ro=true',mounts)
+        self.assertIn(f'type=bind,source={self.root}/project-output/target,destination=/project/target',mounts)
+        self.assertIn('CARGO_TARGET_DIR=/project/target',argv);self.assertEqual(argv[argv.index('-w')+1],'/project')
+        overlays=[dict(p.split('=',1) for p in m.split(',')) for m in mounts if 'git-root-configs.' in m]
+        # A linked worktree without extensions.worktreeConfig finds its root
+        # through its .git file, so its shared metadata is mounted where it is
+        # and no private config is bound over it (issue 3920).
+        common=git(project,'rev-parse','--path-format=absolute','--git-common-dir')
+        private=git(project,'rev-parse','--path-format=absolute','--git-dir')
+        self.assertIn(f'type=bind,source={common},destination={common},ro=true',mounts)
+        self.assertIn(f'type=bind,source={private},destination={private},ro=true',mounts)
+        self.assertEqual(overlays,[])
+        proof=json.loads(next((self.root/'project-output').glob('source-binding.*.json')).read_text())
+        self.assertEqual(proof['sources'][1]['head'],original_head);self.assertEqual(proof['sources'][0]['guest'],'/src')
+        self.assertEqual(git(project,'rev-parse','HEAD'),original_head);self.assertEqual(git(project,'ls-files','--stage'),original_index)
+        # A tracked graph link does not give its untracked target source custody.
+        graph.unlink();(graph.parent/'untracked.json').write_text('{"steps":[]}')
+        graph.symlink_to('untracked.json');git(project,'add','ci/graph.json');git(project,'commit','-qm','tracked graph symlink')
+        self.capture.unlink(missing_ok=True)
+        result,calls=self.invoke(project=['--project-src',str(project),'--project-out',str(self.root/'project-output'),'--project-descriptor',str(descriptor)])
+        self.assertEqual(result.returncode,2);self.assertIn('graph has a symlink component',result.stderr)
+        self.assertFalse(any(call and call[0]=='run' for call in calls))
+
+    def test_paired_project_refuses_partial_or_aliasing_inputs_before_any_payload(self):
+        descriptor=self.root/'descriptor.json';descriptor.write_text('{}')
+        for arguments in (['--project-src',str(self.root/'source')],['--project-out',str(self.root/'output')],['--project-src-rw'],['--project-src',str(self.root/'source'),'--project-out',str(self.root/'different-output'),'--project-descriptor',str(descriptor)]):
+            with self.subTest(arguments=arguments):
+                self.capture.unlink(missing_ok=True)
+                result,calls=self.invoke(project=arguments)
+                self.assertNotEqual(result.returncode,0)
+                self.assertFalse(any(call and call[0]=='run' for call in calls))
+                self.assertIn('distinct and non-overlapping' if len(arguments)>2 else 'required together',result.stderr)
+
+        # Cross-owner ancestors are as unsafe as descendants. Same-owner
+        # source/output layouts keep the original admission rules.
+        nested=self.root/'output/project';nested.mkdir(parents=True)
+        separate=self.root/'other-project';separate.mkdir()
+        for source,project_source,output,project_output in [(self.root/'source',nested,self.root/'output',self.root/'other-output'),(self.root/'source',separate,self.root/'core-output',self.root)]:
+            with self.subTest(project_source=project_source,project_output=project_output):
+                self.capture.unlink(missing_ok=True)
+                result,calls=self.invoke(source=str(source),output=str(output),project=['--project-src',str(project_source),'--project-out',str(project_output),'--project-descriptor',str(descriptor)])
+                self.assertEqual(result.returncode,2);self.assertIn('distinct and non-overlapping',result.stderr)
+                self.assertFalse(any(call and call[0]=='run' for call in calls))
 
     def prepare_capture_fixture(self, probe_status=0, resolve_status=0):
         source = self.root / "source"
@@ -594,6 +720,73 @@ class CargoCacheMounts(unittest.TestCase):
         self.assertIn("VALIDATE_RUN_STATE=/validate-run-state", argv)
         self.assertEqual((run_state / "fixture").read_bytes(), b"existing fixture")
         self.assertEqual(argv[-2:], ["/not-executed/command", "literal argument"])
+
+    def test_census_base_dir_is_mounted_and_rewritten_for_the_guest(self):
+        # The queue supplies the stamped census base as host paths outside
+        # the source mount; the guest must see the directory and the files
+        # inside it at rewritten guest paths, or counted nodes refuse.
+        census = self.root / "census base"
+        census.mkdir()
+        (census / "cli.listed-ids").write_text("pkg::bin$one\n")
+        (census / "dropped.txt").write_text("")
+        result, calls = self.invoke(
+            extra_env={
+                "HERMIT_CENSUS_BASE_COMMIT": "a" * 40,
+                "HERMIT_CENSUS_BASE_DIR": str(census),
+                "HERMIT_CENSUS_BASE_LISTED_IDS": str(census / "cli.listed-ids"),
+                "HERMIT_CENSUS_DROPPED_FILE": str(census / "dropped.txt"),
+            },
+            extra_forwarded=[
+                "--env", "HERMIT_CENSUS_BASE_COMMIT",
+                "--env", "HERMIT_CENSUS_BASE_DIR",
+                "--env", "HERMIT_CENSUS_BASE_LISTED_IDS",
+                "--env", "HERMIT_CENSUS_DROPPED_FILE",
+            ],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = calls[-1]
+        self.assertIn(
+            f"type=bind,source={census},destination=/census-base,ro=true", argv)
+        self.assertIn("HERMIT_CENSUS_BASE_DIR=/census-base", argv)
+        self.assertIn(
+            "HERMIT_CENSUS_BASE_LISTED_IDS=/census-base/cli.listed-ids", argv)
+        self.assertIn("HERMIT_CENSUS_DROPPED_FILE=/census-base/dropped.txt", argv)
+
+    def test_bundle_lower_is_a_read_only_bind_that_adds_no_link(self):
+        # ci/buck-e2e/cell.sh shares one staged bundle across concurrent cells as
+        # an overlay lower. A bind leaves its files' link counts alone; a guest
+        # stat reports them, so a hard-linked copy per cell diverged run 1 from
+        # run 2.
+        bundle = self.root / "staged bundle"
+        (bundle / "src").mkdir(parents=True)
+        (bundle / "src/test.sh").write_text("#!/bin/sh\n")
+        result, calls = self.invoke(bundle_lower=bundle)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = calls[-1]
+        self.assertEqual(argv[0], "run")
+        self.assertIn(
+            f"type=bind,source={bundle},destination=/bundle-lower,ro=true", argv
+        )
+        self.assertEqual((bundle / "src/test.sh").stat().st_nlink, 1)
+
+    def test_no_bundle_lower_mounts_nothing_there(self):
+        result, calls = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any("/bundle-lower" in arg for arg in calls[-1]))
+
+    def test_unusable_bundle_lower_refuses_before_container_launch(self):
+        comma = self.root / "a,b"
+        comma.mkdir()
+        for lower, message in (
+            (self.root / "missing", "is not a directory"),
+            (comma, "cannot contain a comma"),
+        ):
+            with self.subTest(lower=lower):
+                self.capture.write_text("")
+                result, calls = self.invoke(bundle_lower=lower)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(message, result.stderr)
+                self.assertFalse(any(call[0] == "run" for call in calls), calls)
 
     def test_relative_run_state_refuses_before_container_launch(self):
         result, calls = self.invoke(run_state="relative-state")
@@ -1744,7 +1937,16 @@ class PinnedGuestPathContract(unittest.TestCase):
         self.assertEqual(len(paths), len(set(paths)), "duplicate guest paths")
         self.assertTrue(paths)
         for path in paths:
-            self.assertRegex(path, r"^/usr/bin/[A-Za-z0-9_-]+$")
+            # The manifest is the exact allowlist (see
+            # assert-build-dependencies.sh): literal paths are admitted as
+            # listed, including /usr/bin/[ and /usr/sbin/*; only canonical
+            # absolute shape is required here.
+            self.assertTrue(path.startswith("/usr/"), path)
+            self.assertNotRegex(path, r"\s")
+            self.assertNotIn("//", path)
+            self.assertNotIn("/./", path)
+            self.assertNotIn("/../", path)
+            self.assertFalse(path.endswith("/.") or path.endswith("/.."), path)
         # The in-guest LiteInst program tests, run by test.cli in the pinned
         # root (formerly hermit-cli/tests/liteinst_advanced.rs).
         source = (

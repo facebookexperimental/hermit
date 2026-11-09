@@ -53,6 +53,14 @@ jobs:
       contents: read
       pull-requests: read
     steps:
+      - name: Guard — refuse untrusted actor on self-hosted runner
+        env:
+          GUARD_ACTOR: ${{ github.actor }}
+        run: |
+          case "$GUARD_ACTOR" in
+            hermit-bot3|rrnewton) echo "runner-trust: actor $GUARD_ACTOR is allow-listed" ;;
+            *) echo "::error::runner-trust: actor '$GUARD_ACTOR' is not allow-listed for self-hosted runners (allowlist: hermit-bot3, rrnewton)"; exit 1 ;;
+          esac
       - name: Re-dispatch the gate for completed portable, privileged, or demo runs
         env:
           GH_TOKEN: ${{ github.token }}
@@ -99,6 +107,14 @@ jobs:
       issues: write
       pull-requests: write
     steps:
+      - name: Guard — refuse untrusted actor on self-hosted runner
+        env:
+          GUARD_ACTOR: ${{ github.actor }}
+        run: |
+          case "$GUARD_ACTOR" in
+            hermit-bot3|rrnewton) echo "runner-trust: actor $GUARD_ACTOR is allow-listed" ;;
+            *) echo "::error::runner-trust: actor '$GUARD_ACTOR' is not allow-listed for self-hosted runners (allowlist: hermit-bot3, rrnewton)"; exit 1 ;;
+          esac
       - name: Check out the trusted label-strip evidence helper
         uses: actions/checkout@v4
         with:
@@ -167,6 +183,14 @@ jobs:
       issues: write
       pull-requests: read
     steps:
+      - name: Guard — refuse untrusted actor on self-hosted runner
+        env:
+          GUARD_ACTOR: ${{ github.actor }}
+        run: |
+          case "$GUARD_ACTOR" in
+            hermit-bot3|rrnewton) echo "runner-trust: actor $GUARD_ACTOR is allow-listed" ;;
+            *) echo "::error::runner-trust: actor '$GUARD_ACTOR' is not allow-listed for self-hosted runners (allowlist: hermit-bot3, rrnewton)"; exit 1 ;;
+          esac
       - name: Fetch the trusted receipt verifier
         # Fetch the verifier and both registries from one immutable parent
         # revision.  Advance both refs and all three digests together, and
@@ -312,6 +336,14 @@ jobs:
       issues: read
       pull-requests: read
     steps:
+      - name: Guard — refuse untrusted actor on self-hosted runner
+        env:
+          GUARD_ACTOR: ${{ github.actor }}
+        run: |
+          case "$GUARD_ACTOR" in
+            hermit-bot3|rrnewton) echo "runner-trust: actor $GUARD_ACTOR is allow-listed" ;;
+            *) echo "::error::runner-trust: actor '$GUARD_ACTOR' is not allow-listed for self-hosted runners (allowlist: hermit-bot3, rrnewton)"; exit 1 ;;
+          esac
       - name: Check out the review-protocol linter
         uses: actions/checkout@v4
         with:
@@ -469,6 +501,14 @@ jobs:
       contents: read
       pull-requests: read
     steps:
+      - name: Guard — refuse untrusted actor on self-hosted runner
+        env:
+          GUARD_ACTOR: ${{ github.actor }}
+        run: |
+          case "$GUARD_ACTOR" in
+            hermit-bot3|rrnewton) echo "runner-trust: actor $GUARD_ACTOR is allow-listed" ;;
+            *) echo "::error::runner-trust: actor '$GUARD_ACTOR' is not allow-listed for self-hosted runners (allowlist: hermit-bot3, rrnewton)"; exit 1 ;;
+          esac
       - name: Check out the trusted pin checker
         uses: actions/checkout@v4
         with:
@@ -581,6 +621,14 @@ jobs:
       issues: read
       pull-requests: read
     steps:
+      - name: Guard — refuse untrusted actor on self-hosted runner
+        env:
+          GUARD_ACTOR: ${{ github.actor }}
+        run: |
+          case "$GUARD_ACTOR" in
+            hermit-bot3|rrnewton) echo "runner-trust: actor $GUARD_ACTOR is allow-listed" ;;
+            *) echo "::error::runner-trust: actor '$GUARD_ACTOR' is not allow-listed for self-hosted runners (allowlist: hermit-bot3, rrnewton)"; exit 1 ;;
+          esac
       - name: Require the registered v4 gate definition
         env:
           EXPECTED_GATE_BLOB: ${{ vars.MERGE_GATE_V4_BLOB }}
@@ -1050,6 +1098,14 @@ jobs:
     runs-on: [self-hosted, gate]
     timeout-minutes: 5
     steps:
+      - name: Guard — refuse untrusted actor on self-hosted runner
+        env:
+          GUARD_ACTOR: ${{ github.actor }}
+        run: |
+          case "$GUARD_ACTOR" in
+            hermit-bot3|rrnewton) echo "runner-trust: actor $GUARD_ACTOR is allow-listed" ;;
+            *) echo "::error::runner-trust: actor '$GUARD_ACTOR' is not allow-listed for self-hosted runners (allowlist: hermit-bot3, rrnewton)"; exit 1 ;;
+          esac
       - name: Mirror the registered v4 result during migration
         env:
           V4_RESULT: ${{ needs.merge-gate.result }}

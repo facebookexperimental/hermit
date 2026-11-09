@@ -1,0 +1,99 @@
+{
+  "schema": 2,
+  "regenerate": "cargo run -p hermit-manifest-plan --bin generate-parity-cells -- --write",
+  "reference": {
+    "backend": "ptrace",
+    "mode": "verify"
+  },
+  "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
+  "counts": {
+    "all": {
+      "cells": 30,
+      "applicable": 13,
+      "selectable": 12,
+      "population": 30,
+      "population_candidate_selected": 12,
+      "population_candidate_not_selected": 1,
+      "population_candidate_disabled": 17
+    },
+    "by_backend": {
+      "dbt": {
+        "cells": 6,
+        "applicable": 6,
+        "selectable": 6,
+        "population": 6,
+        "population_candidate_selected": 6,
+        "population_candidate_not_selected": 0,
+        "population_candidate_disabled": 0
+      },
+      "in-guest-trap": {
+        "cells": 6,
+        "applicable": 0,
+        "selectable": 0,
+        "population": 6,
+        "population_candidate_selected": 0,
+        "population_candidate_not_selected": 0,
+        "population_candidate_disabled": 6
+      },
+      "kvm": {
+        "cells": 6,
+        "applicable": 6,
+        "selectable": 6,
+        "population": 6,
+        "population_candidate_selected": 6,
+        "population_candidate_not_selected": 0,
+        "population_candidate_disabled": 0
+      },
+      "liteinst": {
+        "cells": 6,
+        "applicable": 0,
+        "selectable": 0,
+        "population": 6,
+        "population_candidate_selected": 0,
+        "population_candidate_not_selected": 0,
+        "population_candidate_disabled": 6
+      },
+      "sabre": {
+        "cells": 6,
+        "applicable": 1,
+        "selectable": 0,
+        "population": 6,
+        "population_candidate_selected": 0,
+        "population_candidate_not_selected": 1,
+        "population_candidate_disabled": 5
+      }
+    }
+  },
+  "cells": [
+    {"test_id":"determinism-stress/example-race","backend":"dbt","category":"determinism-stress","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"determinism-stress/example-race","backend":"in-guest-trap","category":"determinism-stress","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
+    {"test_id":"determinism-stress/example-race","backend":"kvm","category":"determinism-stress","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"determinism-stress/example-race","backend":"liteinst","category":"determinism-stress","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: The preload runtime cannot survive the shell script's post-start exec"},
+    {"test_id":"determinism-stress/example-race","backend":"sabre","category":"determinism-stress","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites"},
+    {"test_id":"determinism-stress/order-violation","backend":"dbt","category":"determinism-stress","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"determinism-stress/order-violation","backend":"in-guest-trap","category":"determinism-stress","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: The in-guest runtime runs one thread of the guest and refuses thread creation (reverie 2d68a3bd, hermit d9d98c01); this guest creates threads with pthread_create, so its clone3 is refused and the run ends: in-guest-trap reports the refusal as missing LiteInst statistics, and liteinst as process 3 exiting without deregistering, because the fail-closed exit runs inside the guest process (hermit b3362616 validate, 2026-10-16)"},
+    {"test_id":"determinism-stress/order-violation","backend":"kvm","category":"determinism-stress","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"determinism-stress/order-violation","backend":"liteinst","category":"determinism-stress","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: The in-guest runtime runs one thread of the guest and refuses thread creation (reverie 2d68a3bd, hermit d9d98c01); this guest creates threads with pthread_create, so its clone3 is refused and the run ends: in-guest-trap reports the refusal as missing LiteInst statistics, and liteinst as process 3 exiting without deregistering, because the fail-closed exit runs inside the guest process (hermit b3362616 validate, 2026-10-16)"},
+    {"test_id":"determinism-stress/order-violation","backend":"sabre","category":"determinism-stress","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: SaBRe requires its external runtime"},
+    {"test_id":"determinism-stress/process-chains","backend":"dbt","category":"determinism-stress","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"determinism-stress/process-chains","backend":"in-guest-trap","category":"determinism-stress","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
+    {"test_id":"determinism-stress/process-chains","backend":"kvm","category":"determinism-stress","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"determinism-stress/process-chains","backend":"liteinst","category":"determinism-stress","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: LiteInst coverage is owned by its backend compatibility partition"},
+    {"test_id":"determinism-stress/process-chains","backend":"sabre","category":"determinism-stress","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: SaBRe requires its external runtime"},
+    {"test_id":"determinism-stress/thread-contention","backend":"dbt","category":"determinism-stress","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"determinism-stress/thread-contention","backend":"in-guest-trap","category":"determinism-stress","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
+    {"test_id":"determinism-stress/thread-contention","backend":"kvm","category":"determinism-stress","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"determinism-stress/thread-contention","backend":"liteinst","category":"determinism-stress","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: LiteInst coverage is owned by its backend compatibility partition"},
+    {"test_id":"determinism-stress/thread-contention","backend":"sabre","category":"determinism-stress","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: SaBRe requires its external runtime"},
+    {"test_id":"determinism-stress/thread-interleaving","backend":"dbt","category":"determinism-stress","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"determinism-stress/thread-interleaving","backend":"in-guest-trap","category":"determinism-stress","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
+    {"test_id":"determinism-stress/thread-interleaving","backend":"kvm","category":"determinism-stress","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"determinism-stress/thread-interleaving","backend":"liteinst","category":"determinism-stress","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: LiteInst coverage is owned by its backend compatibility partition"},
+    {"test_id":"determinism-stress/thread-interleaving","backend":"sabre","category":"determinism-stress","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: SaBRe requires its external runtime"},
+    {"test_id":"determinism-stress/thread-output","backend":"dbt","category":"determinism-stress","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"determinism-stress/thread-output","backend":"in-guest-trap","category":"determinism-stress","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
+    {"test_id":"determinism-stress/thread-output","backend":"kvm","category":"determinism-stress","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"determinism-stress/thread-output","backend":"liteinst","category":"determinism-stress","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: LiteInst coverage is owned by its backend compatibility partition"},
+    {"test_id":"determinism-stress/thread-output","backend":"sabre","category":"determinism-stress","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: SaBRe requires its external runtime"}
+  ]
+}

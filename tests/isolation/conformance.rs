@@ -381,6 +381,18 @@ fn read_ledger(path: &Path) -> Result<Vec<Expected>, String> {
 struct LedgerFailure {
     id: String,
     message: String,
+    /// An infrastructure refusal, not a change verdict: the run's input
+    /// inventory changed (or could not be measured) during collection
+    /// (dh-j8eb7). When every failure is infra, the checker exits 75 so
+    /// the node is COULD_NOT_RUN, never a red cell.
+    infra: bool,
+}
+
+fn is_infra_failure(name: &str, verdict: driver::conformance::Verdict, detail: &str) -> bool {
+    name == "receipt.input_stability"
+        && verdict == driver::conformance::Verdict::NoResult
+        && (detail.starts_with("input inventory changed during collection")
+            || detail.starts_with("input inventory could not be measured"))
 }
 
 /// The structured result row of one collected cell.
@@ -424,6 +436,7 @@ fn check_ledger(
             (false, None) => {
                 failures.push(LedgerFailure {
                     id: cell_row_id(cell),
+                    infra: false,
                     message: format!(
                         "UNEXPECTED: {} collected no guest observations ({}), and no ledger row expects that",
                         cell.name(),
@@ -434,6 +447,7 @@ fn check_ledger(
             }
             (true, Some(row)) => failures.push(LedgerFailure {
                 id: cell_row_id(cell),
+                infra: false,
                 message: format!(
                     "STALE: ledger line {} ({}) expects {} to collect nothing, but it now does; delete or narrow the row",
                     row.line,
@@ -460,6 +474,7 @@ fn check_ledger(
                 }
                 None => failures.push(LedgerFailure {
                     id: cell_row_id(cell),
+                    infra: is_infra_failure(&assertion.name, assertion.verdict, &assertion.detail),
                     message: format!(
                         "UNEXPECTED: {} {} is {verdict} ({}), and no ledger row expects that",
                         cell.name(),
@@ -479,6 +494,7 @@ fn check_ledger(
             if complete.contains(backend) && !used.contains(&(row.line, backend.clone())) {
                 failures.push(LedgerFailure {
                     id: ledger_row_id(row.line, backend),
+                    infra: false,
                     message: format!(
                         "STALE: ledger line {} ({}) names {backend}, but nothing on {backend} needs it any more; delete {backend} from the row",
                         row.line, row.issue
@@ -690,7 +706,11 @@ fn write_results(
         .map(|result| cell_row_id(&result.cell))
         .chain(ledger_rows.iter().cloned());
     for id in ids {
-        let result = if failing.contains(&id) { "fail" } else { "pass" };
+        let result = if failing.contains(&id) {
+            "fail"
+        } else {
+            "pass"
+        };
         writeln!(rows, "{id}\t{result}").expect("String writes succeed");
     }
     fs::write(artifacts.join("results.tsv"), rows)
@@ -700,6 +720,7 @@ fn write_results(
 fn run() -> Result<bool, String> {
     let mut repository = std::env::current_dir().map_err(|error| format!("repository: {error}"))?;
     let mut hermit = None;
+    let mut command_bindings = None;
     let mut safehermit = None;
     let mut artifacts = None;
     let mut installation = None;
@@ -722,7 +743,7 @@ fn run() -> Result<bool, String> {
             println!("Usage: conformance.rs --hermit PATH --artifacts DIR [OPTIONS]");
             println!("Defaults to every required backend, root, path, and namespace policy.");
             println!(
-                "Options: --repository DIR --safehermit PATH --installation DIR --backends LIST --roots LIST --paths LIST --policies LIST --descriptor-obligations FILE --descriptor-obligations-sha256 HEX --assert-scope full|launch-migration --executor safehermit|local --jobs N --expected LEDGER --list"
+                "Options: --repository DIR --safehermit PATH --command-bindings FILE --installation DIR --backends LIST --roots LIST --paths LIST --policies LIST --descriptor-obligations FILE --descriptor-obligations-sha256 HEX --assert-scope full|launch-migration --executor safehermit|local --jobs N --expected LEDGER --list"
             );
             println!(
                 "--executor local runs each command as this process's own bounded child, for a runner such as the validation DAG that bounds the whole run itself."
@@ -761,6 +782,11 @@ fn run() -> Result<bool, String> {
         match name {
             "--repository" => repository = PathBuf::from(value),
             "--hermit" => hermit = Some(PathBuf::from(value)),
+            "--command-bindings" => {
+                if command_bindings.replace(PathBuf::from(value)).is_some() {
+                    return Err("--command-bindings is repeated".to_owned());
+                }
+            }
             "--safehermit" => safehermit = Some(PathBuf::from(value)),
             "--artifacts" => artifacts = Some(PathBuf::from(value)),
             "--installation" => installation = Some(PathBuf::from(value)),
@@ -879,6 +905,11 @@ fn run() -> Result<bool, String> {
         return Ok(true);
     }
     let hermit = hermit.ok_or("--hermit is required")?;
+    let command_bindings = command_bindings
+        .or_else(|| std::env::var_os("HERMIT_E2E_COMMAND_BINDINGS").map(PathBuf::from));
+    // Authenticate every requested physical command before fixture compilation
+    // or any guest. No missing owner can become an empty/available result.
+    let commands = driver::CommandBindings::open(command_bindings.as_deref(), &hermit, &cells)?;
     let artifacts = artifacts
         .ok_or("--artifacts is required and must name a fresh ignored/ or target/ directory")?;
     close_inherited_descriptors()?;
@@ -903,6 +934,7 @@ fn run() -> Result<bool, String> {
             descriptor_registry,
         )?
     };
+    let prepared = prepared.with_command_bindings(commands)?;
     let mut matches = true;
     // A backend whose every required cell runs here: only for it can a
     // ledger row be found to describe nothing any more.
@@ -1029,6 +1061,17 @@ fn run() -> Result<bool, String> {
             failures.len(),
         );
         matches = failures.is_empty();
+        if !failures.is_empty() && failures.iter().all(|failure| failure.infra) {
+            // Every disagreement is the input inventory changing (or
+            // being unmeasurable) during collection: an infrastructure
+            // refusal, not a verdict on the change (dh-j8eb7). The
+            // structured results are not written, so the node is
+            // COULD_NOT_RUN instead of red; the cells never pass either.
+            return Err(format!(
+                "INFRA: all {} disagreement(s) are input-inventory instability during collection (dh-j8eb7)",
+                failures.len()
+            ));
+        }
     }
     write_results(&prepared.artifacts, &collected, &ledger_rows, &failing)?;
     write_summary(&prepared, &required, &collected, &scope).map_err(|error| {
@@ -1051,7 +1094,8 @@ fn main() {
         Ok(false) => std::process::exit(1),
         Err(error) => {
             eprintln!("isolation conformance: {error}");
-            std::process::exit(2);
+            // INFRA: is the checker's could-not-run class (dh-j8eb7).
+            std::process::exit(if error.starts_with("INFRA:") { 75 } else { 2 });
         }
     }
 }

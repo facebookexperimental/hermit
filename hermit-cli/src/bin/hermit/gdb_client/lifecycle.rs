@@ -12,11 +12,11 @@ use std::time::Instant;
 
 use super::GdbClientWatch;
 use super::helper;
-use crate::cli_owned_lifecycle::pidfd;
-use crate::cli_owned_lifecycle::ready;
-use crate::cli_owned_lifecycle::receive_fd;
-use crate::cli_owned_lifecycle::transfer_fd;
-use crate::cli_owned_lifecycle::wait;
+use crate::app::cli_owned_lifecycle::pidfd;
+use crate::app::cli_owned_lifecycle::ready;
+use crate::app::cli_owned_lifecycle::receive_fd;
+use crate::app::cli_owned_lifecycle::transfer_fd;
+use crate::app::cli_owned_lifecycle::wait;
 
 struct Rescue(Vec<OwnedFd>);
 impl Drop for Rescue {

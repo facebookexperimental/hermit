@@ -49,6 +49,7 @@ pub type SpawnTracer = Pin<Box<dyn Future<Output = Result<Tracer, reverie::Error
 /// compiled in this crate, and `hermit` only calls it through the vtable.
 pub fn spawn_tracer(command: Command, config: detcore::Config) -> SpawnTracer {
     Box::pin(async move {
+        detcore::admit_chosen_input_stream(&config, reverie::ToolStreamRole::BinaryRecord);
         reverie_ptrace::TracerBuilder::<detcore::Detcore<Recorder>>::new(command)
             .config(config)
             .spawn()

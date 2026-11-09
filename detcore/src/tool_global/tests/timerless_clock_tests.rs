@@ -16,6 +16,7 @@ use std::sync::Mutex;
 use clap::Parser;
 use detcore_model::schedule::Op;
 use detcore_model::schedule::SchedEvent;
+use detcore_model::schedule::SyscallPhase;
 use reverie::Errno;
 use reverie::GlobalRPC;
 use reverie::GlobalTool;
@@ -56,6 +57,7 @@ impl GlobalRPC<GlobalState> for ClockGuest {
         request: <GlobalState as GlobalTool>::Request,
     ) -> <GlobalState as GlobalTool>::Response {
         let (time, mm, request) = request;
+        let request = crate::tool_global::without_cpu_publication(request);
         assert_eq!(mm, self.thread.mm_id);
         // DetTime's PartialEq compares only nanoseconds: compare all fields.
         assert_eq!(
@@ -63,7 +65,7 @@ impl GlobalRPC<GlobalState> for ClockGuest {
             serde_json::to_value(&self.thread.thread_logical_time).unwrap(),
         );
         match request {
-            GlobalRequest::TraceSchedEvent(event, pid, bootstrap) => {
+            GlobalRequest::TraceSchedEvent(event, pid, bootstrap, access, watch) => {
                 assert_eq!(pid, TID);
                 self.records.lock().unwrap().push(event.clone());
                 if let Some(state) = &self.rpc_state {
@@ -73,7 +75,9 @@ impl GlobalRPC<GlobalState> for ClockGuest {
                             (
                                 time,
                                 mm,
-                                GlobalRequest::TraceSchedEvent(event, pid, bootstrap),
+                                GlobalRequest::TraceSchedEvent(
+                                    event, pid, bootstrap, access, watch,
+                                ),
                             ),
                         )
                         .await;
@@ -83,6 +87,10 @@ impl GlobalRPC<GlobalState> for ClockGuest {
                     GlobalResponse::TraceSchedEvent(TraceSchedEventResponse {
                         print_stack_strace: None,
                         timeslice: None,
+                        schedule_released: false,
+                        schedule_over: false,
+                        watch: None,
+                        backstop: None,
                     }),
                 )
             }
@@ -121,7 +129,7 @@ impl Guest<Detcore> for ClockGuest {
     async fn regs(&mut self) -> libc::user_regs_struct {
         // SAFETY: user_regs_struct contains only integer register fields.
         let mut registers: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-        registers.rip = RIP;
+        crate::arch::set_instruction_pointer(&mut registers, RIP);
         registers
     }
     async fn stack(&mut self) -> Self::Stack {
@@ -260,6 +268,12 @@ fn rcb_accounting_progresses_without_an_implicit_preemption_timer() {
                 );
                 let mut expected_cpu = initial_cpu.clone();
                 expected_cpu["snapshot"]["user"] = serde_json::to_value(nanos).unwrap();
+                if observes {
+                    // The accounting also records the thread's own time, for
+                    // another thread's CPU clock of it.
+                    expected_cpu["threads"][TID.as_raw().to_string()] =
+                        serde_json::to_value((nanos, LogicalTime::ZERO)).unwrap();
+                }
                 assert_eq!(
                     serde_json::to_value(&*cpu_owner.lock().unwrap()).unwrap(),
                     expected_cpu,
@@ -283,6 +297,8 @@ fn rcb_accounting_progresses_without_an_implicit_preemption_timer() {
                             start_rip: None,
                             end_rip: None,
                             end_time: Some(nanos),
+                            stopless: false,
+                            instruction_offset: None,
                         });
                     }
                     // Imprecise cuts record OtherInstructions even when the
@@ -294,6 +310,8 @@ fn rcb_accounting_progresses_without_an_implicit_preemption_timer() {
                         start_rip: None,
                         end_rip: std::num::NonZeroUsize::new(RIP as usize),
                         end_time: Some(nanos),
+                        stopless: false,
+                        instruction_offset: None,
                     });
                 }
                 assert_eq!(
@@ -387,6 +405,8 @@ fn interleaved_clock_observations_preserve_deadlines_and_timer_capability() {
                 assert!(Arc::ptr_eq(&floor_owner, &guest.thread.guest_clock));
                 let mut expected_cpu = initial_cpu.clone();
                 expected_cpu["snapshot"]["user"] = serde_json::to_value(nanos).unwrap();
+                expected_cpu["threads"][TID.as_raw().to_string()] =
+                    serde_json::to_value((nanos, LogicalTime::ZERO)).unwrap();
                 assert_eq!(
                     serde_json::to_value(&*cpu_owner.lock().unwrap()).unwrap(),
                     expected_cpu
@@ -404,6 +424,8 @@ fn interleaved_clock_observations_preserve_deadlines_and_timer_capability() {
                             start_rip: None,
                             end_rip: None,
                             end_time: Some(nanos),
+                            stopless: false,
+                            instruction_offset: None,
                         });
                     }
                     expected_records.push(SchedEvent {
@@ -413,6 +435,8 @@ fn interleaved_clock_observations_preserve_deadlines_and_timer_capability() {
                         start_rip: None,
                         end_rip: std::num::NonZeroUsize::new(RIP as usize),
                         end_time: Some(nanos),
+                        stopless: false,
+                        instruction_offset: None,
                     });
                 }
                 assert_eq!(*guest.records.lock().unwrap(), expected_records);
@@ -491,10 +515,14 @@ fn interleaved_clock_observations_preserve_deadlines_and_timer_capability() {
                     Some(initial + LogicalTime::from_nanos(20_000)),
                 );
                 assert_eq!(boundary.timeslice_expired(), target_expired);
+                // x86_64 only: instruction traps (CPUID, RDTSC) exist only there.
+                #[cfg(target_arch = "x86_64")]
                 assert_eq!(
                     boundary.instruction_trap_ends_timeslice(&boundary_config),
                     trap_ends,
                 );
+                #[cfg(not(target_arch = "x86_64"))]
+                let _ = trap_ends;
                 assert_eq!(boundary.last_rcb_timer, None);
                 assert!(!boundary.last_rcb_timer_is_max);
             }
@@ -573,6 +601,8 @@ async fn replay_continue_installs_a_logical_deadline_without_requiring_a_timer()
             start_rip: None,
             end_rip: std::num::NonZeroUsize::new(RIP as usize),
             end_time: Some(sample_time),
+            stopless: false,
+            instruction_offset: None,
         };
         let branch = SchedEvent {
             op: Op::Branch,
@@ -584,28 +614,31 @@ async fn replay_continue_installs_a_logical_deadline_without_requiring_a_timer()
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
             file.path(),
-            crate::preemptions::PreemptionRecord::from_sched_events(vec![
-                event.clone(),
-                branch.clone(),
-                SchedEvent {
-                    end_time: branch.end_time,
-                    ..event.clone()
-                },
-                SchedEvent {
-                    count: 1,
-                    end_time: Some(sample_time + LogicalTime::from_nanos(1_240)),
-                    ..branch.clone()
-                },
-            ])
+            // A timer preemption the thread runs on from, as recordings write
+            // it: branches, with no OtherInstructions after them, then more.
+            crate::preemptions::PreemptionRecord::from_sched_events_with_identity(
+                vec![
+                    event.clone(),
+                    branch.clone(),
+                    SchedEvent {
+                        count: 1,
+                        end_time: Some(sample_time + LogicalTime::from_nanos(1_240)),
+                        ..branch.clone()
+                    },
+                ],
+                Some(crate::clock_identity::test_sources::known()),
+            )
             .to_string(),
         )
         .unwrap();
-        let config = Config {
-            sequentialize_threads: true,
-            replay_schedule_from: Some(file.path().to_path_buf()),
-            ..Config::default()
-        }
-        .with_backend(|backend| backend.delivers_preemption_timer_events = delivers_timer);
+        let config = crate::clock_identity::test_sources::qualified(
+            Config {
+                sequentialize_threads: true,
+                replay_schedule_from: Some(file.path().to_path_buf()),
+                ..Config::default()
+            }
+            .with_backend(|backend| backend.delivers_preemption_timer_events = delivers_timer),
+        );
         let state = GlobalState::initialize(&config, false);
         state
             .past_first_execve
@@ -666,6 +699,145 @@ async fn replay_continue_installs_a_logical_deadline_without_requiring_a_timer()
     }
 }
 
+/// A schedule replay that switches threads at a syscall prehook, to a thread
+/// whose next recorded slice ends at a timer preemption (a nonempty recorded
+/// duration), hands that duration to the switching thread as its new slice
+/// end (and maximum), measured from its clock at the prehook, and stages it
+/// for the destination (`Scheduler::timeslices`); the rest of the switching
+/// thread's state, its clock included, is unchanged. The prehook is traced
+/// through the actual `trace_schedevent`, `receive_rpc` and replayer path,
+/// and the reply is applied by the same code a guest thread runs; the
+/// switching thread runs on into its call, so no grant is waited for, and
+/// nothing desynchronizes.
+///
+/// The switching thread's earlier slice end is not kept: in the recording its
+/// yield ended that slice, and keeping it ended slices the recording did not
+/// have, which moved the clock of a static guest's yielding thread
+/// (`a_schedule_replay_keeps_the_clock_of_a_thread_that_yields_beside_a_computing_one`
+/// in hermit-cli's tests).
+#[tokio::test]
+async fn a_prehook_switch_hands_the_switching_thread_the_recorded_slice() {
+    const NEXT: DetTid = DetTid::from_raw(18);
+    let sample_time =
+        crate::types::DetTime::new(&Config::default()).as_nanos() + LogicalTime::from_nanos(70);
+    let prehook = SchedEvent {
+        dettid: TID,
+        op: Op::Syscall(reverie::syscalls::Sysno::sched_yield, SyscallPhase::Prehook),
+        count: 1,
+        start_rip: None,
+        end_rip: std::num::NonZeroUsize::new(RIP as usize),
+        end_time: Some(sample_time),
+        stopless: false,
+        instruction_offset: None,
+    };
+    // The next thread's slice, ended by a timer preemption as recordings
+    // write it: branches with no OtherInstructions after them, then another
+    // thread's event.
+    let branches = SchedEvent {
+        dettid: NEXT,
+        op: Op::Branch,
+        count: 123,
+        start_rip: None,
+        end_rip: None,
+        end_time: Some(sample_time + LogicalTime::from_rcbs(123)),
+        stopless: false,
+        instruction_offset: None,
+    };
+    let after = SchedEvent {
+        dettid: DetTid::from_raw(19),
+        op: Op::Syscall(reverie::syscalls::Sysno::getpid, SyscallPhase::Prehook),
+        count: 1,
+        start_rip: None,
+        end_rip: std::num::NonZeroUsize::new(RIP as usize),
+        end_time: Some(sample_time + LogicalTime::from_rcbs(123)),
+        stopless: false,
+        instruction_offset: None,
+    };
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        file.path(),
+        crate::preemptions::PreemptionRecord::from_sched_events_with_identity(
+            vec![prehook.clone(), branches, after],
+            Some(crate::clock_identity::test_sources::known()),
+        )
+        .to_string(),
+    )
+    .unwrap();
+    let config = crate::clock_identity::test_sources::qualified(Config {
+        sequentialize_threads: true,
+        replay_schedule_from: Some(file.path().to_path_buf()),
+        ..Config::default()
+    });
+    let state = GlobalState::initialize(&config, false);
+    state
+        .past_first_execve
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    state
+        .sched
+        .lock()
+        .unwrap()
+        .thread_tree
+        .add_child(TID, TID, true);
+    super::install_test_registration(&state, TID, crate::ivar::Ivar::new());
+    let tool: Detcore = Detcore::new(Tid::from_raw(TID.as_raw()), &config);
+    let mut thread = tool.init_thread_state(Tid::from_raw(TID.as_raw()), None);
+    thread.detpid = Some(TID);
+    thread.past_global_first_execve = true;
+    thread.thread_logical_time.add_rcbs(7);
+    thread.committed_clock_value = 7;
+    thread.account_process_cpu_time();
+    assert_eq!(thread.thread_logical_time.as_nanos(), sample_time);
+    // The switching thread's slice end from before its yield.
+    let earlier_end = sample_time + LogicalTime::from_rcbs(4_000);
+    thread.end_of_timeslice = Some(earlier_end);
+    thread.max_timeslice_end = Some(earlier_end);
+    let handed_end = sample_time + LogicalTime::from_rcbs(123);
+    let expected = {
+        let mut expected = thread.clone();
+        expected.end_of_timeslice = Some(handed_end);
+        if config.max_timeslice.is_some() {
+            expected.max_timeslice_end = Some(handed_end);
+        }
+        bincode::serde::encode_to_vec(&expected, bincode::config::legacy()).unwrap()
+    };
+    let mut guest = ClockGuest {
+        config,
+        thread,
+        raw: 7,
+        reads: 0,
+        records: Mutex::new(Vec::new()),
+        precise_timers: Vec::new(),
+        imprecise_timers: Vec::new(),
+        rpc_state: Some(state),
+    };
+    super::super::trace_schedevent(&mut guest, prehook.clone(), false).await;
+    assert_eq!(*guest.records.lock().unwrap(), vec![prehook]);
+    assert_eq!(guest.thread.end_of_timeslice, Some(handed_end));
+    assert_eq!(
+        bincode::serde::encode_to_vec(&guest.thread, bincode::config::legacy()).unwrap(),
+        expected,
+        "only the switching thread's slice end changes"
+    );
+    let sched = guest.rpc_state.as_ref().unwrap().sched.lock().unwrap();
+    assert_eq!(
+        sched.timeslices.get(&NEXT),
+        Some(&Some(LogicalTime::from_rcbs(123))),
+        "the recorded duration is staged for the next thread"
+    );
+    let replayer = sched.replayer.as_ref().unwrap();
+    assert_eq!(replayer.traced_event_count, 1);
+    assert_eq!(replayer.events_popped, 1);
+    assert!(
+        replayer
+            .desync_counts
+            .values()
+            .all(|counts| counts.soft == 0 && counts.hard == 0),
+        "{:?}",
+        replayer.desync_counts
+    );
+    assert_eq!(replayer.cursor.peek().map(|event| event.dettid), Some(NEXT));
+}
+
 /// Actual shared pre/post hooks and the CPUID Tool callback, with typed
 /// observations installed by the fixture. The RPC stub still refuses any
 /// added scheduling request. This is callback plumbing, not backend replay.
@@ -678,6 +850,9 @@ fn boundary_callback_tokens_preserve_actual_accounting_and_nested_entries() {
                 sequentialize_threads: true,
                 record_preemptions: true,
                 strict_schedule_boundaries: true,
+                // No image is launched, so nothing resolves auto: name the
+                // profile whose CPUID table the tool builds.
+                cpu_profile: detcore_model::cpu_profile::CpuProfile::X86_64V2,
                 ..Config::default()
             }
             .with_backend(|backend| backend.delivers_preemption_timer_events = false);
@@ -730,7 +905,10 @@ fn boundary_callback_tokens_preserve_actual_accounting_and_nested_entries() {
                 assert_eq!(observation["current"][2], 2);
             }
             // Use the real Tool implementation, not only the token helper.
+            // x86_64 only: CPUID traps exist only there.
+            #[cfg(target_arch = "x86_64")]
             tool.handle_cpuid_event(&mut guest, 0, 0).await.unwrap();
+            #[cfg(target_arch = "x86_64")]
             if observed {
                 let observation =
                     serde_json::to_value(guest.thread.slice_boundary.as_ref().unwrap()).unwrap();

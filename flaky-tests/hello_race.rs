@@ -9,9 +9,10 @@
 /*! One of the simplest possible race conditions.
     Exits with a nonzero code under one order, and not the other.
 
-    However, we complicate things a bit by having an rdtsc and a branch right before
-    the critical event, to make it easier to recognize in the raw schedule recordings,
-    as when manually checking the results of this test.
+    However, we complicate things a bit by having an intercepted clock read (rdtsc on
+    x86_64) and a branch right before the critical event, to make it easier to
+    recognize in the raw schedule recordings, as when manually checking the results
+    of this test.
 
 ```cargo
  [dependencies]
@@ -19,14 +20,27 @@
 ```
  */
 
-use core::arch::x86_64::_rdtsc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering::SeqCst;
 
+/// A clock read that Hermit intercepts.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn rdtsc() -> u64 {
-    unsafe { _rdtsc() }
+    unsafe { core::arch::x86_64::_rdtsc() }
+}
+
+/// A clock read that Hermit intercepts. aarch64 has no trapping counter
+/// instruction (`cntvct_el0` reads run unobserved), so this calls
+/// `clock_gettime`, whose vDSO entry Reverie replaces with the syscall.
+#[cfg(not(target_arch = "x86_64"))]
+#[inline(always)]
+fn rdtsc() -> u64 {
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    since_epoch.as_nanos() as u64
 }
 
 const WORK_AMT: usize = 100;

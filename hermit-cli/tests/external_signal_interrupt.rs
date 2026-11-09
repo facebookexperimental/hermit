@@ -112,6 +112,9 @@
 #[path = "common/hermit_binary.rs"]
 mod hermit_binary;
 
+#[path = "common/process_tree.rs"]
+mod process_tree;
+
 use std::cell::Cell;
 use std::fs;
 use std::io::BufRead;
@@ -128,25 +131,45 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
-/// Wall-clock bound on one whole cell, from starting Hermit to its exit.
-const WATCHDOG_BACKSTOP: Duration = Duration::from_secs(90);
-/// Wall-clock bound from starting Hermit to the guest's `READY` line: 20 s, the
-/// same margin as `RESULT_BOUND`. Every cell measured on 2026-10-05, startup,
-/// both strict-verification runs and exit included, took under 3 s; the slowest
-/// test, of eight cells, took 8.1 s.
-const STARTUP_BOUND: Duration = Duration::from_secs(20);
+/// Limits are CPU-primary (owner rule, 2026-11-01): wall bounds below are
+/// hang backstops only, at 8x the former wall-primary bounds (watchdog
+/// capped at 600 s). Donor job eb64ff5f (2026-11-05, load ~980) failed a
+/// cell whose Hermit startup passed the old 52 s test wall budget while
+/// descheduled. CPU basis, measured 2026-11-05 locally: the failing
+/// eight-cell test takes 10.2 s CPU in total (~1.3 s per cell, guest compile
+/// 0.44 s included in the first cell's process), and every cell measured on
+/// 2026-10-05, startup, both strict-verification runs and exit included,
+/// took under 3 s wall on an unloaded host.
+/// Wall backstop on one whole cell, from starting Hermit to its exit.
+const WATCHDOG_BACKSTOP: Duration = Duration::from_secs(600);
+/// CPU bound on one whole cell (Hermit's whole process group).
+const CELL_CPU_BOUND: Duration = Duration::from_secs(10);
+/// CPU bound from starting Hermit to the guest's `READY` line.
+const STARTUP_CPU_BOUND: Duration = Duration::from_secs(4);
+/// CPU bound from the guest's `READY` line to its `RESULT` line.
+const RESULT_CPU_BOUND: Duration = Duration::from_secs(4);
+/// One test's total CPU budget across all of its cells (children's CPU).
+/// At the owner rule's 60 s cap, because one budget serves every test in
+/// this file and the largest cell matrices run far more cells than the
+/// eight-cell test measured above.
+const TEST_CPU_BUDGET: Duration = Duration::from_secs(60);
+/// CPU budget for compiling the guest (measured 0.44 s, above).
+const GUEST_COMPILE_CPU: Duration = Duration::from_secs(2);
+/// Wall backstop from starting Hermit to the guest's `READY` line: 8x the
+/// former 20 s wall-primary bound.
+const STARTUP_BOUND: Duration = Duration::from_secs(160);
 /// The per-test wall kill in `.config/nextest.toml` (57 s), before the runner
 /// scales it by `HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER`.
 const NEXTEST_WALL_KILL: Duration = Duration::from_secs(57);
 /// Wall time kept free below that kill for this harness to stop Hermit, reap
 /// it, and report which cell and phase ran out of time.
 const REPORT_MARGIN: Duration = Duration::from_secs(5);
-/// Wall-clock bound from the guest's `READY` line to its `RESULT` line: 20 s,
-/// unchanged since this file was added. It catches a lost interruption, which
-/// hangs; it is not a timing assertion, which the `ELAPSED` windows below make
-/// on Hermit's virtual clock. Every passing run measured on 2026-09-28 finished
-/// in under 3 s; the rest of the bound is margin for a loaded host.
-const RESULT_BOUND: Duration = Duration::from_secs(20);
+/// Wall backstop from the guest's `READY` line to its `RESULT` line: 8x the
+/// former 20 s wall-primary bound. The CPU bound above is primary; it
+/// catches a lost interruption, which hangs or spins; neither is a timing
+/// assertion, which the `ELAPSED` windows below make on Hermit's virtual
+/// clock. Every passing run measured on 2026-09-28 finished in under 3 s.
+const RESULT_BOUND: Duration = Duration::from_secs(160);
 /// Wall-clock delay between `READY` and the external signal, so the guest has
 /// entered the blocking call. An early signal cannot make a broken Hermit pass:
 /// the handler would run first and the wait would then block with no waker.
@@ -314,14 +337,14 @@ fn build_root() -> PathBuf {
         .join(format!("external-signal-interrupt-{}", std::process::id()))
 }
 
-/// The guest binary, compiled on first use within the test's wall budget, which
-/// starts here if no cell has started it (`test_wall_deadline`): a stalled
+/// The guest binary, compiled on first use within the test's budgets, which
+/// start here if no cell has started them (`test_wall_deadline`): a stalled
 /// compiler fails with this harness's report instead of reaching the runner's
-/// kill. Moving the clock alone cannot bound blocking compilation, so the
-/// compiler is a supervised child that is killed and reaped when the budget runs
-/// out. Under Cargo's harness, where tests share the process, a test that finds
+/// kill. The compiler is a supervised child that is killed and reaped when
+/// its CPU budget (primary) or the test's wall backstop runs out. Under
+/// Cargo's harness, where tests share the process, a test that finds
 /// another test compiling waits for that compilation, which its own test's
-/// budget bounds.
+/// budgets bound.
 fn guest() -> &'static Path {
     let deadline = test_wall_deadline();
     GUEST.get_or_init(|| {
@@ -359,22 +382,29 @@ fn guest() -> &'static Path {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(diagnostics))
+            .process_group(0)
             .spawn()
             .unwrap_or_else(|error| panic!("failed to start the guest's compiler: {error}"));
+        let compiler_pgid = compiler.id();
         let status = loop {
             match compiler.try_wait() {
                 Ok(Some(status)) => break status,
-                Ok(None) if Instant::now() < deadline => {
+                Ok(None)
+                    if Instant::now() < deadline && pgid_cpu(compiler_pgid) < GUEST_COMPILE_CPU =>
+                {
                     std::thread::sleep(Duration::from_millis(10))
                 }
                 Ok(None) => {
+                    let cpu = pgid_cpu(compiler_pgid);
                     let _ = compiler.kill();
                     let reaped = compiler.wait();
                     panic!(
-                        "compiling {} did not finish within the test's {:.1}s wall budget; \
+                        "compiling {} did not finish within its {:.1}s CPU budget \
+                         ({:.2}s CPU used) or the test's wall backstop; \
                          the compiler was killed and reaped ({reaped:?})",
                         source.display(),
-                        test_wall_budget().as_secs_f64(),
+                        GUEST_COMPILE_CPU.as_secs_f64(),
+                        cpu.as_secs_f64(),
                     );
                 }
                 Err(error) => panic!("failed to wait for the guest's compiler: {error}"),
@@ -451,50 +481,124 @@ fn wall_timeout_multiplier() -> f64 {
     }
 }
 
-/// One test's wall budget for all of its cells: the runner's scaled per-test
-/// wall kill, less `REPORT_MARGIN`. A test that runs out of it fails with this
-/// harness's own report instead of being killed by the runner without one.
+/// One test's former wall budget for all of its cells: the runner's scaled
+/// per-test wall kill, less `REPORT_MARGIN`. It now only sizes the wall
+/// backstop (8x it); `TEST_CPU_BUDGET` is the primary test limit.
 fn test_wall_budget() -> Duration {
     NEXTEST_WALL_KILL
         .mul_f64(wall_timeout_multiplier())
         .saturating_sub(REPORT_MARGIN)
 }
 
-thread_local! {
-    /// When this test began (`test_wall_deadline`), and how many cells it has
-    /// started.
-    /// Every test runs its cells on its own thread, under Cargo's harness and
-    /// under nextest alike.
-    static TEST_CELLS: Cell<Option<(Instant, usize)>> = const { Cell::new(None) };
+/// CPU time of this process's waited-for children (Hermit cells and the
+/// guest compiler are reaped before this is read at a cell boundary).
+fn children_cpu() -> Duration {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, &mut usage) };
+    assert_eq!(rc, 0, "getrusage(RUSAGE_CHILDREN) failed");
+    let tv = |tv: libc::timeval| Duration::new(tv.tv_sec as u64, (tv.tv_usec as u32) * 1_000);
+    tv(usage.ru_utime) + tv(usage.ru_stime)
 }
 
-/// The running test's wall deadline: `test_wall_budget` after the test began,
-/// which is its first guest setup or its first cell, whichever came first.
+/// CPU time summed over the process tree rooted at `root` (each cell's
+/// Hermit starts its own process group, or its own session as leader, so
+/// the tree is the cell). Walking `children` files costs O(tree); a full
+/// `/proc` scan every 50 ms measured more CPU than the cell itself.
+fn pgid_cpu(root: u32) -> Duration {
+    let clk_tck = {
+        let tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if tck > 0 { tck as u64 } else { 100 }
+    };
+    let mut ticks: u64 = 0;
+    let mut stack = vec![root];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) || seen.len() > 4096 {
+            continue;
+        }
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        let Some(close) = stat.rfind(')') else {
+            continue;
+        };
+        let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+        if fields.len() < 15 {
+            continue;
+        }
+        let parse = |i: usize| fields.get(i).and_then(|f| f.parse::<u64>().ok());
+        for i in [11, 12, 13, 14] {
+            ticks = ticks.saturating_add(parse(i).unwrap_or(0));
+        }
+        if let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) {
+            for task in tasks.flatten() {
+                if let Ok(children) = fs::read_to_string(task.path().join("children")) {
+                    stack.extend(
+                        children
+                            .split_whitespace()
+                            .filter_map(|text| text.parse::<u32>().ok()),
+                    );
+                }
+            }
+        }
+    }
+    Duration::from_secs_f64(ticks as f64 / clk_tck as f64)
+}
+
+thread_local! {
+    /// When this test began, the children-CPU reading then, and how many
+    /// cells it has started.
+    /// Every test runs its cells on its own thread, under Cargo's harness and
+    /// under nextest alike.
+    static TEST_CELLS: Cell<Option<(Instant, Duration, usize)>> = const { Cell::new(None) };
+}
+
+fn test_started() -> (Instant, Duration) {
+    TEST_CELLS.with(|cells| {
+        let (started, cpu_baseline, count) =
+            cells.get().unwrap_or((Instant::now(), children_cpu(), 0));
+        cells.set(Some((started, cpu_baseline, count)));
+        (started, cpu_baseline)
+    })
+}
+
+/// The running test's wall backstop deadline: 8x its former wall budget
+/// after the test began (its first guest setup or first cell). The CPU
+/// budget is primary; this only catches a no-progress hang with this
+/// harness's own report.
 fn test_wall_deadline() -> Instant {
-    let started = TEST_CELLS.with(|cells| {
-        let (started, count) = cells.get().unwrap_or((Instant::now(), 0));
-        cells.set(Some((started, count)));
-        started
-    });
-    started + test_wall_budget()
+    let (started, _) = test_started();
+    started + test_wall_budget() * 8
+}
+
+/// CPU this test's completed cells and setup have burned so far.
+fn test_cpu_used() -> Duration {
+    let (_, baseline) = test_started();
+    children_cpu().saturating_sub(baseline)
 }
 
 /// Count a new cell of the running test and print a progress line for it, so
 /// that a test the runner stops still names the cell it was in. Returns the
-/// cell's 1-based number and the test's wall deadline.
-fn begin_cell(describe: &str) -> (usize, Instant) {
-    let budget = test_wall_budget();
-    let (started, index) = TEST_CELLS.with(|cells| {
-        let (started, count) = cells.get().unwrap_or((Instant::now(), 0));
-        cells.set(Some((started, count + 1)));
-        (started, count + 1)
+/// cell's 1-based number, the test's wall backstop deadline, and the test
+/// CPU already used before this cell.
+fn begin_cell(describe: &str) -> (usize, Instant, Duration) {
+    let (started, _) = test_started();
+    let index = TEST_CELLS.with(|cells| {
+        let (started, cpu_baseline, count) = cells
+            .get()
+            .expect("test_started initialized the cell state");
+        cells.set(Some((started, cpu_baseline, count + 1)));
+        count + 1
     });
+    let used = test_cpu_used();
     eprintln!(
-        "[esi] cell {index}: {describe}; {:.1}s of the test's {:.1}s wall budget used",
+        "[esi] cell {index}: {describe}; {:.1}s CPU of the test's {:.1}s CPU budget used \
+         ({:.1}s wall)",
+        used.as_secs_f64(),
+        TEST_CPU_BUDGET.as_secs_f64(),
         started.elapsed().as_secs_f64(),
-        budget.as_secs_f64(),
     );
-    (index, started + budget)
+    (index, started + test_wall_budget() * 8, used)
 }
 
 /// The deadline of one phase of a cell that began at `start`: `bound` later,
@@ -508,13 +612,14 @@ fn phase_deadline(
     if own <= test_deadline {
         (own, "its phase bound")
     } else {
-        (test_deadline, "the test's wall budget")
+        (test_deadline, "the test's wall backstop")
     }
 }
 
-/// Each phase of a cell ends by the test's wall deadline, startup included, and
-/// that deadline comes before the runner's scaled per-test wall kill, so a hung
-/// cell fails with this harness's report rather than the runner's kill.
+/// Each phase of a cell ends by the test's wall backstop deadline, startup
+/// included, so a hung cell fails with this harness's report; the CPU
+/// bounds are the primary limits and must nest inside the cell and test
+/// CPU budgets.
 #[test]
 fn every_cell_phase_ends_by_the_tests_wall_deadline() {
     let start = Instant::now();
@@ -522,7 +627,7 @@ fn every_cell_phase_ends_by_the_tests_wall_deadline() {
     for bound in [STARTUP_BOUND, RESULT_BOUND, WATCHDOG_BACKSTOP] {
         assert_eq!(
             phase_deadline(start, bound, soon),
-            (soon, "the test's wall budget"),
+            (soon, "the test's wall backstop"),
             "a {bound:?} phase must end at a test deadline 5 s away"
         );
         let late = start + bound + Duration::from_secs(1);
@@ -532,12 +637,9 @@ fn every_cell_phase_ends_by_the_tests_wall_deadline() {
             "a {bound:?} phase must keep its own bound when the test has time left"
         );
     }
-    let budget = test_wall_budget();
-    assert!(budget < NEXTEST_WALL_KILL.mul_f64(wall_timeout_multiplier()));
     assert!(
-        STARTUP_BOUND < budget && RESULT_BOUND < budget,
-        "startup ({STARTUP_BOUND:?}) and the READY-to-RESULT phase ({RESULT_BOUND:?}) must \
-         each fit in one test's {budget:?} wall budget"
+        STARTUP_CPU_BOUND + RESULT_CPU_BOUND <= CELL_CPU_BOUND && CELL_CPU_BOUND <= TEST_CPU_BUDGET,
+        "phase CPU bounds must nest in the cell and test CPU budgets"
     );
 }
 
@@ -733,7 +835,7 @@ fn run_cell_attempt(
         .stdout(Stdio::from(stdout_writer))
         .stderr(Stdio::piped());
 
-    let (cell, test_deadline) = begin_cell(&format!(
+    let (cell, test_deadline, test_cpu_before) = begin_cell(&format!(
         "{backend} {mode:?} {args:?} external_signals={external_signals:?} observe={observe:?}"
     ));
     let mut child = command
@@ -766,6 +868,11 @@ fn run_cell_attempt(
     let mut stderr_eof = false;
     let mut status = None;
     let mut ready_at = None;
+    let mut ready_cpu = None;
+    let mut cell_cpu = Duration::ZERO;
+    let mut last_cpu_sample = Instant::now()
+        .checked_sub(Duration::from_millis(100))
+        .unwrap_or_else(Instant::now);
     let mut signalled = !external;
     let mut failure = None;
 
@@ -773,16 +880,28 @@ fn run_cell_attempt(
         if status.is_none() {
             status = child.try_wait().expect("failed to poll hermit");
         }
+        if status.is_none() && last_cpu_sample.elapsed() >= Duration::from_millis(50) {
+            last_cpu_sample = Instant::now();
+            cell_cpu = pgid_cpu(child.id());
+        }
         let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
         if ready_at.is_none() && stdout.lines().any(|line| line == "READY") {
             ready_at = Some(Instant::now());
+            ready_cpu = Some(cell_cpu);
         }
         let has_result = stdout.lines().any(|line| line.starts_with("RESULT "));
         let now = Instant::now();
-        if failure.is_none() && ready_at.is_none() && status.is_none() && now >= startup_deadline {
+        if failure.is_none()
+            && ready_at.is_none()
+            && status.is_none()
+            && (cell_cpu >= STARTUP_CPU_BOUND || now >= startup_deadline)
+        {
             failure = Some(format!(
-                "cell {cell}: no READY line {:.1}s after starting Hermit, at {startup_limit}",
-                (now - started).as_secs_f64()
+                "cell {cell}: no READY line {:.1}s after starting Hermit \
+                 ({:.2}s CPU of {:.1}s startup CPU bound), at {startup_limit}",
+                (now - started).as_secs_f64(),
+                cell_cpu.as_secs_f64(),
+                STARTUP_CPU_BOUND.as_secs_f64(),
             ));
         }
         if let Some(ready) = ready_at {
@@ -809,19 +928,35 @@ fn run_cell_attempt(
             }
             let (result_deadline, result_limit) =
                 phase_deadline(ready, RESULT_BOUND, test_deadline);
-            if failure.is_none() && !has_result && now >= result_deadline {
+            let result_cpu = cell_cpu.saturating_sub(ready_cpu.unwrap_or(Duration::ZERO));
+            if failure.is_none()
+                && !has_result
+                && (result_cpu >= RESULT_CPU_BOUND || now >= result_deadline)
+            {
                 failure = Some(format!(
-                    "cell {cell}: no RESULT line {:.1}s after READY, at {result_limit} \
+                    "cell {cell}: no RESULT line {:.1}s after READY \
+                     ({:.2}s CPU of {:.1}s result CPU bound), at {result_limit} \
                      (external={external}): the blocked call was not interrupted",
-                    (now - ready).as_secs_f64()
+                    (now - ready).as_secs_f64(),
+                    result_cpu.as_secs_f64(),
+                    RESULT_CPU_BOUND.as_secs_f64(),
                 ));
             }
         }
-        if failure.is_none() && now >= cell_deadline {
+        if failure.is_none()
+            && (cell_cpu >= CELL_CPU_BOUND
+                || test_cpu_before + cell_cpu >= TEST_CPU_BUDGET
+                || now >= cell_deadline)
+        {
             failure = Some(format!(
                 "cell {cell}: watchdog deadline {:.1}s after starting Hermit, at {cell_limit}; \
+                 cell CPU {:.2}s of {:.1}s, test CPU {:.2}s of {:.1}s; \
                  process_exited={}, ready={}",
                 (now - started).as_secs_f64(),
+                cell_cpu.as_secs_f64(),
+                CELL_CPU_BOUND.as_secs_f64(),
+                (test_cpu_before + cell_cpu).as_secs_f64(),
+                TEST_CPU_BUDGET.as_secs_f64(),
                 status.is_some(),
                 ready_at.is_some(),
             ));
@@ -3274,7 +3409,7 @@ fn run_inherited_terminal_cell_attempt(
         });
     }
 
-    let (cell, test_deadline) = begin_cell(&describe);
+    let (cell, test_deadline, test_cpu_before) = begin_cell(&describe);
     let mut leader = command
         .spawn()
         .unwrap_or_else(|error| panic!("failed to spawn the session leader: {error}"));
@@ -3304,6 +3439,11 @@ fn run_inherited_terminal_cell_attempt(
     let (cell_deadline, cell_limit) = phase_deadline(started, WATCHDOG_BACKSTOP, test_deadline);
     let mut status: Option<ExitStatus> = None;
     let mut ready_at: Option<Instant> = None;
+    let mut ready_cpu = None;
+    let mut cell_cpu = Duration::ZERO;
+    let mut last_cpu_sample = Instant::now()
+        .checked_sub(Duration::from_millis(100))
+        .unwrap_or_else(Instant::now);
     let mut result_at: Option<Instant> = None;
     let mut signalled = false;
     let mut lines = Vec::new();
@@ -3317,18 +3457,30 @@ fn run_inherited_terminal_cell_attempt(
                 .try_wait()
                 .expect("failed to poll the session leader");
         }
+        if status.is_none() && last_cpu_sample.elapsed() >= Duration::from_millis(50) {
+            last_cpu_sample = Instant::now();
+            cell_cpu = pgid_cpu(leader_pid as u32);
+        }
         let stdout = fs::read_to_string(&stdout_path).unwrap_or_default();
         let now = Instant::now();
         if ready_at.is_none() && stdout.lines().any(|line| line == "READY") {
             ready_at = Some(now);
+            ready_cpu = Some(cell_cpu);
         }
         if result_at.is_none() && stdout.lines().any(|line| line.starts_with("RESULT ")) {
             result_at = Some(now);
         }
-        if failure.is_none() && ready_at.is_none() && status.is_none() && now >= startup_deadline {
+        if failure.is_none()
+            && ready_at.is_none()
+            && status.is_none()
+            && (cell_cpu >= STARTUP_CPU_BOUND || now >= startup_deadline)
+        {
             failure = Some(format!(
-                "cell {cell}: no READY line {:.1}s after starting Hermit, at {startup_limit}",
-                (now - started).as_secs_f64()
+                "cell {cell}: no READY line {:.1}s after starting Hermit \
+                 ({:.2}s CPU of {:.1}s startup CPU bound), at {startup_limit}",
+                (now - started).as_secs_f64(),
+                cell_cpu.as_secs_f64(),
+                STARTUP_CPU_BOUND.as_secs_f64(),
             ));
         }
         if let Some(ready) = ready_at {
@@ -3349,18 +3501,34 @@ fn run_inherited_terminal_cell_attempt(
             }
             let (result_deadline, result_limit) =
                 phase_deadline(ready, RESULT_BOUND, test_deadline);
-            if failure.is_none() && result_at.is_none() && now >= result_deadline {
+            let result_cpu = cell_cpu.saturating_sub(ready_cpu.unwrap_or(Duration::ZERO));
+            if failure.is_none()
+                && result_at.is_none()
+                && (result_cpu >= RESULT_CPU_BOUND || now >= result_deadline)
+            {
                 failure = Some(format!(
-                    "cell {cell}: no RESULT line {:.1}s after READY, at {result_limit}",
-                    (now - ready).as_secs_f64()
+                    "cell {cell}: no RESULT line {:.1}s after READY \
+                     ({:.2}s CPU of {:.1}s result CPU bound), at {result_limit}",
+                    (now - ready).as_secs_f64(),
+                    result_cpu.as_secs_f64(),
+                    RESULT_CPU_BOUND.as_secs_f64(),
                 ));
             }
         }
-        if failure.is_none() && now >= cell_deadline {
+        if failure.is_none()
+            && (cell_cpu >= CELL_CPU_BOUND
+                || test_cpu_before + cell_cpu >= TEST_CPU_BUDGET
+                || now >= cell_deadline)
+        {
             failure = Some(format!(
                 "cell {cell}: watchdog deadline {:.1}s after starting Hermit, at {cell_limit}; \
+                 cell CPU {:.2}s of {:.1}s, test CPU {:.2}s of {:.1}s; \
                  status={status:?}, ready={}",
                 (now - started).as_secs_f64(),
+                cell_cpu.as_secs_f64(),
+                CELL_CPU_BOUND.as_secs_f64(),
+                (test_cpu_before + cell_cpu).as_secs_f64(),
+                TEST_CPU_BUDGET.as_secs_f64(),
                 ready_at.is_some(),
             ));
         }
@@ -3384,6 +3552,13 @@ fn run_inherited_terminal_cell_attempt(
         }
     }
 
+    // Where a failed cell's processes were waiting, recorded before the kill
+    // (https://github.com/rrnewton/hermit/issues/4820). A leader that had
+    // already exited took its process tree with it.
+    let snapshot = failure.is_some().then(|| match status {
+        Some(status) => format!("(the session leader had already exited: {status})\n"),
+        None => process_tree::process_tree_snapshot(leader_pid as u32),
+    });
     if failure.is_some() {
         // The leader's process group holds Hermit and every guest process.
         // SAFETY: plain kill(2).
@@ -3409,7 +3584,11 @@ fn run_inherited_terminal_cell_attempt(
         ));
     }
     if let Some(reason) = failure {
-        panic!("{describe}: {reason}\nguest stdout:\n{stdout}\nhermit stderr:\n{stderr}");
+        panic!(
+            "{describe}: {reason}\nguest stdout:\n{stdout}\nhermit stderr:\n{stderr}\n\
+             process tree before the kill:\n{}",
+            snapshot.unwrap_or_default()
+        );
     }
     let ready_to_result = ready_at
         .zip(result_at)

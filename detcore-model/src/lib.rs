@@ -59,6 +59,188 @@ const _: () = assert!(
     "a refusal exiting 0 would report success"
 );
 
+/// Attempts a test harness gives a Hermit run refused only for a typed PMU
+/// skid overshoot (exit [`HERMIT_POLICY_REFUSAL_EXIT`],
+/// `cause=skid-overshoot`): one initial attempt plus four skid retries.
+/// In the manifest runner the attempts past the generic retry bound are
+/// additionally wall-bounded to that bound's lifecycle, so this count
+/// never widens an enclosing node timeout.
+///
+/// A skid refusal measures the host's PMU interrupt latency under load,
+/// not the guest (<https://github.com/rrnewton/hermit/issues/1845>), so its
+/// budget is separate from every generic retry budget (nextest's own
+/// retries, the manifest runner's per-cell retry). Every harness that
+/// retries such a refusal spells the bound from this one constant — the
+/// integration-test helper, the manifest runner's skid budget and the
+/// nextest CPU wrapper's retry credits (bound − 1) — instead of keeping a
+/// copy each. Exhausting it is a distinct infrastructure verdict
+/// (`SKID-INFRA`), never a test failure.
+///
+/// It lives here for the reason [`HERMIT_POLICY_REFUSAL_EXIT`] does: the
+/// integration tests, `hermit-verify` and the manifest-plan runner all
+/// depend on `detcore-model`, and on no common test crate.
+pub const SKID_RETRY_MAX_ATTEMPTS: u32 = 5;
+
+/// The distinct verdict a harness selects when the skid budget
+/// ([`SKID_RETRY_MAX_ATTEMPTS`]) is exhausted by typed skid-overshoot
+/// refusals and nothing else: the host refused every measurement, so
+/// there is no product result and no test failure. Spelled identically
+/// in the manifest runner, the nextest counted output and the
+/// validate-run verdict built on them.
+pub const SKID_INFRA_VERDICT: &str = "SKID-INFRA";
+
+const _: () = assert!(
+    SKID_RETRY_MAX_ATTEMPTS == 5,
+    "the skid budget is five attempts everywhere; a copy drifting from it is the defect this removes"
+);
+
+/// Exit status for a run that DEADLOCKED UNDER HERMIT'S MODEL: Detcore's
+/// scheduler found every remaining guest thread blocked on something no later
+/// turn can supply (its "Deadlock detected" report) and ended the run.
+///
+/// ⚠️ A VERDICT OF HERMIT'S MODEL, NOT THE GUEST'S RESULT. "No possible wake"
+/// means no wake that Detcore models: under Hermit's sequentialized virtual
+/// time "no thread can be woken now" is also "no thread can ever be woken" BY
+/// ANYTHING HERMIT MODELS. When the model is complete for the program, Linux
+/// would leave it hung forever and the hang is reported instead of reproduced.
+/// When it is not, the deadlock is Hermit's bug: the tests record robust-futex
+/// owner death, dash's sigsuspend, raw exit, KVM's kill and happens-before
+/// re-admission each once reported this way. So the status is neither a guest
+/// status nor `HERMIT_INTERNAL_FAILURE_EXIT` (125), and `--verify`, chaos-stress
+/// and `analyze` do not take it as a guest result by default. A caller that
+/// needs to know which it was compares a native run (`docs/ERROR_CATALOG.md`).
+/// Before this, the scheduler exited the container child 1 and the parent's
+/// classifier turned the deadlock into `class=container-child-exit` and 125.
+///
+/// ⚠️ ONLY A GUEST DEADLOCK EXITS THIS. The scheduler's `HERMIT_DEADLOCK:`
+/// verdicts (an invariant of Hermit's own bookkeeping broke, or a backend never
+/// reported a death the kernel owed) still exit 1 and stay internal failures,
+/// and a happens-before refusal still exits [`HERMIT_POLICY_REFUSAL_EXIT`].
+///
+/// ⚠️ WHY 121. It extends the reserved band downwards by one (121 guest
+/// deadlock, 122 refusal, 123 log cap, 124 deadline, 125 hermit broke, 126/127
+/// exec-level), so the reserved codes stay contiguous and the guest range loses
+/// only its top value. It is not a signal status (`signal_from_exit_status` is
+/// `None`), so the classifier arms cannot both match. As with every other code,
+/// a guest may still exit 121 of its own accord: the stderr line
+/// [`HERMIT_MODEL_DEADLOCK_LINE`] is the discriminator, present only when the
+/// scheduler declared the deadlock. See the allocation table above the
+/// constants in `hermit-cli/src/lib.rs`.
+///
+/// It lives here for the reason [`HERMIT_POLICY_REFUSAL_EXIT`] does: `detcore`
+/// emits it and `hermit-cli` recognises it.
+pub const HERMIT_GUEST_DEADLOCK_EXIT: i32 = 121;
+
+/// The stderr class line Hermit prints, last, for a run that ended with
+/// [`HERMIT_GUEST_DEADLOCK_EXIT`]: a deadlock under Hermit's model. Named for
+/// the model, not the guest, because the verdict is only as complete as the
+/// model (see [`HERMIT_GUEST_DEADLOCK_EXIT`]).
+pub const HERMIT_MODEL_DEADLOCK_LINE: &str =
+    "HERMIT_MODEL_DEADLOCK class=deadlock-under-hermit-model";
+
+const _: () = assert!(
+    HERMIT_GUEST_DEADLOCK_EXIT == 121,
+    "121 extends the reserved band 122..=127 downwards and keeps it contiguous"
+);
+const _: () = assert!(
+    HERMIT_GUEST_DEADLOCK_EXIT != 0
+        && HERMIT_GUEST_DEADLOCK_EXIT != 1
+        && HERMIT_GUEST_DEADLOCK_EXIT != HERMIT_POLICY_REFUSAL_EXIT,
+    "a deadlock must not read as success, as the scheduler's old exit 1, or as a refusal"
+);
+
+/// Exit status for a run whose virtual clock passed `--virtual-timeout`: 124,
+/// the status every deadline in Hermit already uses (`hermit::HERMIT_DEADLINE_EXIT`,
+/// which pins itself to this value). The stderr class line, not the status,
+/// tells it from `--timeout`'s.
+const VIRTUAL_TIMEOUT_EXIT: i32 = 124;
+
+/// How Detcore's scheduler ended a run itself, with a status and a stderr class
+/// line of its own: NEITHER KIND IS A GUEST RESULT. A deadlock is a verdict of
+/// Hermit's model (see [`HERMIT_GUEST_DEADLOCK_EXIT`]) and a virtual timeout is
+/// a bound Hermit imposed, so `--verify` (under the default
+/// `--verify-allow=success`), chaos-stress and `analyze` do not take either as
+/// the guest's outcome. Neither is a Hermit failure (125) either.
+///
+/// The scheduler hands it to the run's owner when the backend can unwind the
+/// parked guest (ptrace), and otherwise exits the process with
+/// [`TerminalOutcome::exit_status`]. Both kinds stop a run at a committed
+/// scheduler turn, so both stop it at the same point of the same schedule in
+/// every run.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    PartialEq,
+    serde::Serialize,
+    serde::Deserialize
+)]
+pub enum TerminalOutcome {
+    /// Every remaining guest thread is blocked with no wake Hermit models: a
+    /// deadlock under Hermit's model, not a guest result
+    /// ([`HERMIT_GUEST_DEADLOCK_EXIT`], [`HERMIT_MODEL_DEADLOCK_LINE`]).
+    GuestDeadlock,
+    /// The run's virtual clock passed `--virtual-timeout`: at a committed
+    /// scheduler turn, Detcore's global virtual time was more than `bound_ns`
+    /// virtual nanoseconds past the run's start (the time a run summary
+    /// reports as `virttime_elapsed`). Exits 124, as a deadline does. A bound
+    /// Hermit imposed, not a guest result.
+    VirtualTimeout {
+        /// The configured bound, in virtual nanoseconds.
+        bound_ns: u64,
+    },
+}
+
+impl TerminalOutcome {
+    /// The status a run with this outcome ends with.
+    pub const fn exit_status(self) -> i32 {
+        match self {
+            Self::GuestDeadlock => HERMIT_GUEST_DEADLOCK_EXIT,
+            Self::VirtualTimeout { .. } => VIRTUAL_TIMEOUT_EXIT,
+        }
+    }
+
+    /// The machine-readable stderr line Hermit ends such a run with, which
+    /// tells it from a guest that exited the same status of its own accord
+    /// and, for a virtual timeout, from `--timeout`'s `class=run-timeout`.
+    pub fn class_line(self) -> String {
+        match self {
+            Self::GuestDeadlock => HERMIT_MODEL_DEADLOCK_LINE.to_owned(),
+            Self::VirtualTimeout { bound_ns } => {
+                format!("HERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns={bound_ns}")
+            }
+        }
+    }
+
+    /// The `(guest_deadlock, virtual_timeout_ns)` pair a run summary and a
+    /// verification record store an outcome as: a deadlock keeps the
+    /// `guest_deadlock` flag it has always been stored as.
+    pub fn to_fields(outcome: Option<Self>) -> (bool, Option<u64>) {
+        match outcome {
+            None => (false, None),
+            Some(Self::GuestDeadlock) => (true, None),
+            Some(Self::VirtualTimeout { bound_ns }) => (false, Some(bound_ns)),
+        }
+    }
+
+    /// The outcome [`TerminalOutcome::to_fields`] stored.
+    pub fn from_fields(guest_deadlock: bool, virtual_timeout_ns: Option<u64>) -> Option<Self> {
+        match (guest_deadlock, virtual_timeout_ns) {
+            (true, _) => Some(Self::GuestDeadlock),
+            (false, Some(bound_ns)) => Some(Self::VirtualTimeout { bound_ns }),
+            (false, None) => None,
+        }
+    }
+}
+
+const _: () = assert!(
+    signal_from_exit_status(VIRTUAL_TIMEOUT_EXIT).is_none()
+        && VIRTUAL_TIMEOUT_EXIT != HERMIT_GUEST_DEADLOCK_EXIT
+        && VIRTUAL_TIMEOUT_EXIT != HERMIT_POLICY_REFUSAL_EXIT,
+    "a virtual timeout must not read as a signal death, a deadlock or a refusal"
+);
+
 /// The shell's base for "killed by signal N": a process killed by signal `N` is
 /// conventionally reported as `128 + N`.
 pub const SIGNAL_EXIT_BASE: i32 = 128;
@@ -149,6 +331,10 @@ const _: () = assert!(
     signal_from_exit_status(HERMIT_POLICY_REFUSAL_EXIT).is_none(),
     "a policy refusal must not also parse as a signal death"
 );
+const _: () = assert!(
+    signal_from_exit_status(HERMIT_GUEST_DEADLOCK_EXIT).is_none(),
+    "a deadlock under Hermit's model must not also parse as a signal death"
+);
 
 // ⚠️ PINNED AGAINST BOTH FAILURE DIRECTIONS. The first pin catches the band
 // moving; the second catches the far worse edit, because the whole point of the
@@ -163,6 +349,7 @@ const _: () = assert!(
     "a signal death and a policy refusal must not share a code -- that collision is the defect"
 );
 
+pub mod access_trace;
 pub mod collections;
 pub mod config;
 pub mod container_mounts;
@@ -183,12 +370,62 @@ pub mod network_trace;
 pub mod pedigree;
 pub mod pid;
 pub mod procfs;
+pub mod replay_departure;
 pub mod schedule;
+
+/// Source text of `schedule.rs`, for Detcore's global-RPC revision digest test.
+///
+/// The test in detcore hashes the wire definitions in this file's text;
+/// exposing the text from this crate keeps that check working in build
+/// systems that cannot read a sibling crate's source file by relative path.
+#[doc(hidden)]
+pub const SCHEDULE_RS_SOURCE: &str = include_str!("schedule.rs");
+
 pub mod summary;
+pub mod syscall_histogram;
 pub mod time;
+pub mod virtual_timeout;
+pub mod watch;
 
 /// Exact native runtime/dispatch-sequence envelope, separate from admission.
 pub mod liteinst_native_exec_runtime;
 
 #[cfg(feature = "native-exec")]
 pub mod liteinst_native_exec_sources;
+
+#[cfg(test)]
+mod terminal_outcome_tests {
+    use super::*;
+
+    /// Each terminal outcome has its own status and class line. A guest
+    /// deadlock keeps exactly the ones it had (121, [`HERMIT_MODEL_DEADLOCK_LINE`]); a
+    /// virtual timeout exits 124 like every deadline but names its own class
+    /// and bound, so `--timeout`'s `class=run-timeout` is never confused with
+    /// it. Both survive the summary and record fields they are stored as.
+    #[test]
+    fn terminal_outcomes_carry_their_status_and_class_line() {
+        let deadlock = TerminalOutcome::GuestDeadlock;
+        assert_eq!(deadlock.exit_status(), 121);
+        assert_eq!(
+            deadlock.class_line(),
+            "HERMIT_MODEL_DEADLOCK class=deadlock-under-hermit-model"
+        );
+        let timeout = TerminalOutcome::VirtualTimeout {
+            bound_ns: 3_500_000_000,
+        };
+        assert_eq!(timeout.exit_status(), 124);
+        assert_eq!(
+            timeout.class_line(),
+            "HERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns=3500000000"
+        );
+        assert_ne!(timeout.class_line(), "HERMIT_RUN_TIMEOUT class=run-timeout");
+        for outcome in [None, Some(deadlock), Some(timeout)] {
+            let (guest_deadlock, virtual_timeout_ns) = TerminalOutcome::to_fields(outcome);
+            assert_eq!(
+                TerminalOutcome::from_fields(guest_deadlock, virtual_timeout_ns),
+                outcome
+            );
+        }
+        assert_eq!(TerminalOutcome::to_fields(Some(deadlock)), (true, None));
+    }
+}

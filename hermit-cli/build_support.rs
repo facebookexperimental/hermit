@@ -178,23 +178,19 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
 
 include!("reverie_pin.rs");
 
-/// Whether a Cargo manifest declares a `dbt` feature. Main's hermit-cli does;
-/// the crates.io projection of `hermit-run` does not, and build.rs turns that
-/// absence into `cfg(hermit_registry_build)`.
-pub fn declares_dbt_feature(manifest: &str) -> bool {
-    let mut in_features = false;
-    for line in manifest.lines().map(str::trim) {
-        if line.starts_with('[') {
-            in_features = line == "[features]";
-        } else if in_features
-            && line
-                .split_once('=')
-                .is_some_and(|(key, _)| key.trim() == "dbt")
-        {
-            return true;
-        }
+/// Package identity is independent of which backend features are declared or
+/// enabled. The source manifest and its autocargo producer say `source`; the
+/// registry projection must explicitly change this metadata to `registry`.
+/// Missing, malformed or unknown identities refuse the build rather than
+/// silently select the wrong diagnostic.
+pub fn registry_build(identity: Option<&str>) -> Result<bool, String> {
+    match identity {
+        Some("source") => Ok(false),
+        Some("registry") => Ok(true),
+        other => Err(format!(
+            "package.metadata.hermit.build-identity must be \"source\" or \"registry\"; got {other:?}"
+        )),
     }
-    false
 }
 
 /// The Reverie revision this tree pins, read from the canonical manifest.

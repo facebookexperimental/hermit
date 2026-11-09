@@ -20,13 +20,14 @@ derive_more
 kvm-bindings
 kvm-ioctls
 linked-hash-map
-liteinst2
+linux-raw-sys
 memmap2
 never-say-never
 num-traits
 parking_lot
 paste
 perf-event-open-sys
+quickcheck
 thiserror
 tokio-stream
 typed-arena

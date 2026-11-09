@@ -1,0 +1,28 @@
+# @lint-ignore-every AUTODEPS2
+# This freestanding C fixture is not part of the fbsource Buck graph.
+
+load("@fbcode_macros//build_defs:export_files.bzl", "export_file")
+
+oncall("hermit")
+
+# Named by label from tests/BUCK; a package may not list another package's
+# files as sources.
+export_file(
+    name = "hello_nostdlib.c",
+    src = "hello_nostdlib.c",
+)
+
+export_file(
+    name = "racewrite_nostdlib.c",
+    src = "racewrite_nostdlib.c",
+)
+
+export_file(
+    name = "nanosleep-threads-simple.c",
+    src = "nanosleep-threads-simple.c",
+)
+
+export_file(
+    name = "nanosleep-threads-nocrash.c",
+    src = "nanosleep-threads-nocrash.c",
+)

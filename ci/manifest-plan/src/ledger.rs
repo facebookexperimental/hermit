@@ -30,6 +30,9 @@ pub use disjoint_main::*;
 mod framework_retries;
 pub use framework_retries::*;
 
+mod retry_rollup;
+pub use retry_rollup::*;
+
 /// The stable fields emitted by `validate/aggregate.py --json` and JSONL stores.
 /// Optional fields reflect honest reconstructed rows where a measurement was not
 /// available; unrecognized fields are retained for forward compatibility.
@@ -1142,7 +1145,7 @@ pub enum CellResultsValue {
     /// JSON text instead of a `Value` tree. A `Value` costs about 7 bytes of
     /// heap per byte of JSON: on the 2026-10-10 ledger the 616 rows with cell
     /// results held 728 MB of JSON as 4.9 GB of `Value`
-    /// (<https://github.com/rrnewton/dev-hermit/issues/552>). It reads,
+    /// (validate-status holds every ledger row this way). It reads,
     /// compares and serializes exactly as `Other` holding the same value.
     Retained(RetainedJson),
     /// Decode-only duplicate identity state. Historical serialization and typed
@@ -1551,6 +1554,10 @@ pub enum TestResultVerdict {
     /// `failed_tests`: `TestResultTotals::diagnostic_failed_tests` counts it.
     #[serde(rename = "diagnostic_fail")]
     DiagnosticFail,
+    /// A test that started and reported it could not run (dagrun
+    /// structured-result schema 5). It is not a pass or a failure:
+    /// `TestResultTotals::skipped_tests` counts it.
+    Skip,
 }
 
 /// One producer-owned terminal test row in the retained JSONL artifact.
@@ -1681,6 +1688,11 @@ pub struct TestResultTotals {
     /// without one keeps its existing bytes.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub diagnostic_failed_tests: u64,
+    /// Executed tests that reported at runtime they could not run (schema-5
+    /// `skip` rows); not in `passed_tests` or `failed_tests`. Omitted when
+    /// zero, so every artifact without one keeps its existing bytes.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub skipped_tests: u64,
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -1764,6 +1776,7 @@ struct RecomputedTestResultCounts {
     passed_tests: u64,
     failed_tests: u64,
     diagnostic_failed_tests: u64,
+    skipped_tests: u64,
 }
 
 impl RecomputedTestResultCounts {
@@ -1776,6 +1789,7 @@ impl RecomputedTestResultCounts {
             TestResultVerdict::Pass => &mut self.passed_tests,
             TestResultVerdict::Fail => &mut self.failed_tests,
             TestResultVerdict::DiagnosticFail => &mut self.diagnostic_failed_tests,
+            TestResultVerdict::Skip => &mut self.skipped_tests,
         };
         *count = count
             .checked_add(1)
@@ -1805,6 +1819,7 @@ fn checked_summary(summary: &TestResultTotals, row_count: u64) -> Result<(), Str
         .passed_tests
         .checked_add(summary.failed_tests)
         .and_then(|total| total.checked_add(summary.diagnostic_failed_tests))
+        .and_then(|total| total.checked_add(summary.skipped_tests))
         .ok_or_else(|| "test-results pass/fail total overflowed u64".to_string())?
         != summary.executed_tests
     {
@@ -1885,6 +1900,7 @@ impl TestResultsEvidenceV9 {
             failed_tests: 0,
             filtered_tests: 0,
             diagnostic_failed_tests: 0,
+            skipped_tests: 0,
         };
         let mut recorded_count = 0u64;
         let mut add = |summary: &TestResultTotals, row_count: u64| -> Result<(), String> {
@@ -1909,6 +1925,10 @@ impl TestResultsEvidenceV9 {
                 .diagnostic_failed_tests
                 .checked_add(summary.diagnostic_failed_tests)
                 .ok_or("schema 9 diagnostic_failed_tests overflowed u64")?;
+            totals.skipped_tests = totals
+                .skipped_tests
+                .checked_add(summary.skipped_tests)
+                .ok_or("schema 9 skipped_tests overflowed u64")?;
             recorded_count = recorded_count
                 .checked_add(row_count)
                 .ok_or("schema 9 recorded_count overflowed u64")?;
@@ -2123,6 +2143,7 @@ impl TestResultsEvidenceV9 {
             failed_tests: 0,
             filtered_tests: 0,
             diagnostic_failed_tests: 0,
+            skipped_tests: 0,
         };
         let mut add_verified = |counts: RecomputedTestResultCounts,
                                 filtered_tests: u64|
@@ -2133,6 +2154,7 @@ impl TestResultsEvidenceV9 {
                 failed_tests: counts.failed_tests,
                 filtered_tests,
                 diagnostic_failed_tests: counts.diagnostic_failed_tests,
+                skipped_tests: counts.skipped_tests,
             };
             verified_totals.executed_tests = verified_totals
                 .executed_tests
@@ -2154,22 +2176,46 @@ impl TestResultsEvidenceV9 {
                 .diagnostic_failed_tests
                 .checked_add(totals.diagnostic_failed_tests)
                 .ok_or("schema 9 verified diagnostic_failed_tests overflowed u64")?;
+            verified_totals.skipped_tests = verified_totals
+                .skipped_tests
+                .checked_add(totals.skipped_tests)
+                .ok_or("schema 9 verified skipped_tests overflowed u64")?;
             Ok(totals)
         };
 
         for summary in &self.nodes {
             let producer = TestResultProducerIdentity::Node(summary.node.clone());
-            let recomputed = counts.remove(&producer).ok_or_else(|| {
-                format!(
-                    "schema 9 test-results artifact omits selected producer {}",
-                    summary.node
-                )
-            })?;
+            // A selected producer with no rows at all is present only as
+            // its zero totals: an empty bucket (e2e.manifest_gvisor runs
+            // with --allow-empty and can legitimately produce zero test
+            // rows) writes no artifact rows, so there is no counts entry
+            // to remove. Absence with any nonzero summary total is still
+            // the omission this check exists to refuse.
+            let recomputed = match counts.remove(&producer) {
+                Some(counts) => counts,
+                None if summary.row_count == 0
+                    && summary.totals.executed_tests == 0
+                    && summary.totals.passed_tests == 0
+                    && summary.totals.failed_tests == 0
+                    && summary.totals.filtered_tests == 0
+                    && summary.totals.diagnostic_failed_tests == 0
+                    && summary.totals.skipped_tests == 0 =>
+                {
+                    RecomputedTestResultCounts::default()
+                }
+                None => {
+                    return Err(format!(
+                        "schema 9 test-results artifact omits selected producer {}",
+                        summary.node
+                    ));
+                }
+            };
             if recomputed.executed_tests != summary.row_count
                 || recomputed.executed_tests != summary.totals.executed_tests
                 || recomputed.passed_tests != summary.totals.passed_tests
                 || recomputed.failed_tests != summary.totals.failed_tests
                 || recomputed.diagnostic_failed_tests != summary.totals.diagnostic_failed_tests
+                || recomputed.skipped_tests != summary.totals.skipped_tests
             {
                 return Err(format!(
                     "schema 9 test-results artifact totals differ for producer {}",
@@ -2198,6 +2244,7 @@ impl TestResultsEvidenceV9 {
                     || recomputed.passed_tests != summary.totals.passed_tests
                     || recomputed.failed_tests != summary.totals.failed_tests
                     || recomputed.diagnostic_failed_tests != summary.totals.diagnostic_failed_tests
+                    || recomputed.skipped_tests != summary.totals.skipped_tests
                 {
                     return Err(
                         "schema 9 test-results artifact totals differ for compatibility producer"
@@ -2587,8 +2634,7 @@ mod tests {
     }
 
     /// An untyped shape is kept as compact text, and every reader sees exactly
-    /// what it saw when the shape was a `Value`
-    /// (<https://github.com/rrnewton/dev-hermit/issues/552>).
+    /// what it saw when the shape was a `Value`, at a fraction of the memory.
     #[test]
     fn untyped_cell_results_are_retained_as_text_and_read_exactly_as_a_value() {
         let json = serde_json::json!({
@@ -3463,6 +3509,42 @@ mod tests {
             &bytes,
             "omits selected producer",
         );
+
+        // The empty-bucket case (e2e.manifest_gvisor, --allow-empty):
+        // the producer's summary is zero in every total including
+        // filtered, and the artifact simply has no rows for it. That
+        // verifies; the omitted case above, whose summary still claims
+        // filtered rows, still refuses.
+        let zero_rows = schema9_artifact_rows()
+            .into_iter()
+            .filter(|row| {
+                !matches!(
+                    &row.producer,
+                    TestResultProducer::Node { node, .. } if node == "test.beta"
+                )
+            })
+            .collect::<Vec<_>>();
+        let zero_bytes = schema9_artifact_bytes(&zero_rows);
+        let mut zero = schema9_row();
+        zero["test_results"]["nodes"][1]["totals"] = serde_json::json!({
+            "executed_tests": 0,
+            "passed_tests": 0,
+            "failed_tests": 0,
+            "filtered_tests": 0
+        });
+        zero["test_results"]["nodes"][1]["row_count"] = serde_json::json!(0);
+        zero["test_results"]["totals"]["executed_tests"] = serde_json::json!(3);
+        zero["test_results"]["totals"]["passed_tests"] = serde_json::json!(2);
+        zero["test_results"]["totals"]["filtered_tests"] = serde_json::json!(3);
+        zero["test_results"]["recorded_count"] = serde_json::json!(3);
+        zero["executed_tests"] = serde_json::json!(3);
+        zero["passed_tests"] = serde_json::json!(2);
+        zero["filtered_tests"] = serde_json::json!(3);
+        bind_schema9_artifact(&mut zero, &zero_bytes, 3);
+        let zero_row: HistoryRow = serde_json::from_value(zero).unwrap();
+        zero_row
+            .verify_test_results_artifact_bytes(&constructed_plan_steps, true, &zero_bytes)
+            .expect("an all-zero selected producer must verify without rows");
 
         let mut compatibility_omitted_rows = schema9_artifact_rows();
         compatibility_omitted_rows.pop();

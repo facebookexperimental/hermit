@@ -201,25 +201,8 @@ fn qualify_cpu_profile(profile: CpuProfile) -> Result<ExitStatus, Error> {
         Ok((report, _host)) => {
             writeln!(
                 stdout,
-                "{profile}: QUALIFIED — XINUSE probe on CPU {}: XCR0 {:#x}, {} cases, {} cells, \
-                 {} certified pairs at {} repetitions; forced exit {}; interrupt counter: {}; \
-                 retried {} reference, {} reload and {} exit trials; reopened the counter {} times",
-                report.cpu,
-                report.xcr0,
-                report.cases,
-                report.cells,
-                report.certified_pairs,
-                report.repetitions,
-                if report.forced_exit {
-                    "on"
-                } else {
-                    "off (no hypervisor)"
-                },
-                report.calibration,
-                report.retried_references,
-                report.retried_reloads,
-                report.retried_exits,
-                report.counter_reopens,
+                "{profile}: QUALIFIED — {}",
+                v3_qualification(&report)
             )?;
             writeln!(stdout, "{}", detcore_model::cpu_profile::V3_RESIDUAL)?;
             Ok(ExitStatus::Exited(0))
@@ -231,6 +214,40 @@ fn qualify_cpu_profile(profile: CpuProfile) -> Result<ExitStatus, Error> {
             ))
         }
     }
+}
+
+/// The x86-64-v3 qualification's probe report, as `host-capabilities` prints
+/// it after `QUALIFIED — `.
+#[cfg(target_arch = "x86_64")]
+fn v3_qualification(report: &hermit::xstate_probe::ProbeReport) -> String {
+    format!(
+        "XINUSE probe on CPU {}: XCR0 {:#x}, {} cases, {} cells, \
+         {} certified pairs at {} repetitions; forced exit {}; interrupt counter: {}; \
+         retried {} reference, {} reload and {} exit trials; reopened the counter {} times",
+        report.cpu,
+        report.xcr0,
+        report.cases,
+        report.cells,
+        report.certified_pairs,
+        report.repetitions,
+        if report.forced_exit {
+            "on"
+        } else {
+            "off (no hypervisor)"
+        },
+        report.calibration,
+        report.retried_references,
+        report.retried_reloads,
+        report.retried_exits,
+        report.counter_reopens,
+    )
+}
+
+/// No x86-64-v3 qualification succeeds off x86
+/// (`cpu_profile_admission::Qualification`).
+#[cfg(not(target_arch = "x86_64"))]
+fn v3_qualification(report: &std::convert::Infallible) -> String {
+    match *report {}
 }
 
 #[cfg(test)]

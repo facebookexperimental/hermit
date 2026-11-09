@@ -136,6 +136,39 @@ fn sha256_hex(bytes: &[u8]) -> impl std::fmt::LowerHex {
     Hex(sha2::Sha256::digest(bytes).into())
 }
 
+/// A `--verify-run` under a holder that sealed the host's /etc/ld.so.cache
+/// binds that copy (https://github.com/rrnewton/hermit/issues/4693): the run
+/// succeeds, its guest reads the sealed bytes, and a run that did not adopt
+/// the role would refuse to set up its container.
+#[test]
+fn a_verify_run_binds_the_ld_so_cache_its_holder_sealed() {
+    let Ok(host) = fs::read("/etc/ld.so.cache") else {
+        return;
+    };
+    let _guard = hermit_run_guard();
+    let dir = tempfile::tempdir().unwrap();
+    let run = dir.path().join("run");
+    let guest = ["/usr/bin/wc", "-c", "/etc/ld.so.cache"];
+    let script = format!("set -e\n{} </dev/null\n", run_words(&run, &guest));
+    let output = super::hermit_test::hermit_output_with("hermit verify-inputs", || {
+        let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+            .args(["verify-inputs", "--manifest-fd", MANIFEST_FD])
+            .args(["--input", "ld-so-cache:/etc/ld.so.cache"])
+            .args(["bash", "-c", &script])
+            .env("HERMIT_EPOCH", EPOCH)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("failed to run hermit verify-inputs");
+        (output, ())
+    })
+    .0;
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        fs::read_to_string(run.join("stdout")).unwrap(),
+        format!("{} /etc/ld.so.cache\n", host.len())
+    );
+}
+
 #[test]
 fn a_run_refuses_lost_substituted_or_unsealed_shared_inputs() {
     let _guard = hermit_run_guard();

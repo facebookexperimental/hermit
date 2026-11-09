@@ -40,6 +40,8 @@ pub(crate) use hermit::canonical_verdict::NoResultReason;
 use hermit::canonical_verdict::RecordEnvelopeReport;
 use hermit::canonical_verdict::RunFailure;
 use hermit::canonical_verdict::RuntimeStats;
+use hermit::canonical_verdict::StoreExclusiveRetries;
+use hermit::canonical_verdict::StoreExclusiveRunCounts;
 pub(crate) use hermit::canonical_verdict::Verdict;
 pub(crate) use hermit::canonical_verdict::VerificationReport;
 pub(crate) use hermit::canonical_verdict::VerificationRun;
@@ -56,6 +58,178 @@ use super::container::LogCapExceeded;
 use super::global_opts::GlobalOpts;
 use super::record_envelope::RecordEnvelope;
 use super::record_envelope::RecordEnvelopePolicy;
+
+/// The exact native dimensions used by both live adapters and retained-run
+/// comparison. The full validated snapshot stays with the physical adapter.
+pub(super) trait NativeStatistics: std::fmt::Debug {
+    fn intercepted_syscalls(&self) -> u64;
+    fn rewritten_syscalls(&self) -> u64;
+    fn stdin_reads(&self) -> u64;
+    fn memory_hash_fold(&self) -> u64;
+}
+
+pub(super) fn same_native_observable_behavior(
+    first: &impl NativeStatistics,
+    second: &impl NativeStatistics,
+) -> bool {
+    // The counted-branch clock is a separate exact dimension, not an exemption.
+    first.intercepted_syscalls() == second.intercepted_syscalls()
+        && first.rewritten_syscalls() == second.rewritten_syscalls()
+        && first.stdin_reads() == second.stdin_reads()
+        && first.memory_hash_fold() == second.memory_hash_fold()
+}
+
+pub(super) fn native_branch_clock_mismatch(label: &str, first: u64, second: u64) -> Option<String> {
+    (first != second).then(|| {
+        format!(
+            "{label} verification failed: counted-branch clocks differed between runs ({first} != {second}); \
+             the clock is a deterministic function of the executed instruction stream"
+        )
+    })
+}
+
+pub(super) fn native_initialization_record_mismatch(
+    label: &str,
+    first: usize,
+    second: usize,
+) -> Option<String> {
+    (first != second).then(|| {
+        format!(
+            "{label} verification failed: authenticated process-image initialization counts differed between runs ({first} != {second})"
+        )
+    })
+}
+
+#[derive(Debug)]
+pub(super) struct NativeSummaryComparison {
+    failure: Option<String>,
+}
+
+impl NativeSummaryComparison {
+    #[cfg(test)]
+    pub(super) fn compare(
+        first_stats: &impl NativeStatistics,
+        second_stats: &impl NativeStatistics,
+        first_initialization_records: usize,
+        second_initialization_records: usize,
+    ) -> Self {
+        Self::compare_named(
+            "DBT",
+            first_stats,
+            second_stats,
+            first_initialization_records,
+            second_initialization_records,
+        )
+    }
+
+    fn compare_named(
+        label: &str,
+        first_stats: &impl NativeStatistics,
+        second_stats: &impl NativeStatistics,
+        first_initialization_records: usize,
+        second_initialization_records: usize,
+    ) -> Self {
+        let mut failures = Vec::new();
+        if !same_native_observable_behavior(first_stats, second_stats) {
+            failures.push(format!(
+                "{label} verification failed: typed native Detcore statistics differed \
+                 ({first_stats:?} != {second_stats:?})"
+            ));
+        }
+        if let Some(failure) = native_initialization_record_mismatch(
+            label,
+            first_initialization_records,
+            second_initialization_records,
+        ) {
+            failures.push(failure);
+        }
+        Self {
+            failure: (!failures.is_empty()).then(|| failures.join("; ")),
+        }
+    }
+
+    pub(super) fn requires_log_retention(&self) -> bool {
+        self.failure.is_some()
+    }
+
+    pub(super) fn apply(self, outcome: &mut VerificationOutcome) -> Option<String> {
+        if self.failure.is_some() {
+            outcome.verdict = Verdict::Diverged;
+            outcome.no_result_reason = None;
+        }
+        self.failure
+    }
+}
+
+pub(super) fn record_native_branch_clock_comparison(
+    label: &str,
+    outcome: &mut VerificationOutcome,
+    comparison: DbtCountedBranchComparison,
+) -> Option<String> {
+    match native_branch_clock_mismatch(label, comparison.left, comparison.right) {
+        Some(message) => {
+            outcome.dbt_counted_branches = Some(comparison);
+            outcome.verdict = Verdict::Diverged;
+            outcome.no_result_reason = None;
+            Some(message)
+        }
+        None if outcome.verdict == Verdict::NoResult => {
+            // Equal clocks never promote a refused common comparison.
+            outcome.dbt_counted_branches = None;
+            None
+        }
+        None => {
+            outcome.dbt_counted_branches = Some(comparison);
+            None
+        }
+    }
+}
+
+/// Core-owned exact evidence policy, applied around the sole common comparator.
+pub(super) struct NativeEvidenceComparison {
+    label: String,
+    branches: DbtCountedBranchComparison,
+    summary: NativeSummaryComparison,
+}
+
+impl NativeEvidenceComparison {
+    pub(super) fn new(
+        backend: &str,
+        first: &super::backend_hook::NativeFacts,
+        second: &super::backend_hook::NativeFacts,
+    ) -> Self {
+        // Preserve the existing DBT diagnostics and wire field exactly. A new
+        // executable uses its own validated identity, never a fabricated enum.
+        let label = if backend == "dbt" { "DBT" } else { backend }.to_owned();
+        Self {
+            branches: DbtCountedBranchComparison {
+                left: first.counted_branches,
+                right: second.counted_branches,
+            },
+            summary: NativeSummaryComparison::compare_named(
+                &label,
+                first,
+                second,
+                first.initialization_records,
+                second.initialization_records,
+            ),
+            label,
+        }
+    }
+
+    pub(super) fn configure(&self, options: &mut ComparisonOptions) {
+        options.strictness = LogCompareStrictness::Canonical;
+        let mismatch = !self.branches.matched() || self.summary.requires_log_retention();
+        options.keep_logs |= mismatch;
+        options.match_overridden |= mismatch;
+    }
+
+    pub(super) fn apply(self, outcome: &mut VerificationOutcome) -> Vec<String> {
+        let summary = self.summary.apply(outcome);
+        let branches = record_native_branch_clock_comparison(&self.label, outcome, self.branches);
+        branches.into_iter().chain(summary).collect()
+    }
+}
 
 const FAILED_VERIFY_LOG_DIR_PREFIX: &str = "comparison-";
 const FAILED_VERIFY_LOG_PENDING_PREFIX: &str = ".pending-comparison-";
@@ -505,6 +679,10 @@ fn runtime_stats(summary: &RunSummary) -> RuntimeStats {
         virtual_nanoseconds: summary.virttime_elapsed,
         syscalls: summary.syscalls,
         dispatch: summary.dispatch_stats.clone(),
+        syscall_histogram: summary
+            .syscall_histogram
+            .as_ref()
+            .map(|histogram| histogram.compact()),
     }
 }
 
@@ -516,6 +694,135 @@ pub(crate) fn verification_runtime_from_summaries(
         run1: run1.map(runtime_stats),
         run2: run2.map(runtime_stats),
     })
+}
+
+/// aarch64: the store-exclusive failures that name a possible cause of a
+/// divergence, from the two runs' summaries. A store-exclusive fails when an
+/// exception clears the exclusive monitor between its load and its store,
+/// which a host interrupt can do at any point; the loop then runs again (or a
+/// weak compare-and-swap takes its failure path) and retires more branches,
+/// which moves the thread's virtual time and can move everything after it.
+/// The counts are not tied to the first divergence, so this is a candidate
+/// cause, not a proof. `Some` only for a [`Verdict::Diverged`] comparison in
+/// which either run counted a failure: the counters are speculative events
+/// whose counts are indicative rather than exact, so a run that counted none
+/// may still have retried, and is not named. It changes no verdict. `rewrite_exclusives` is whether the runs had
+/// `--rewrite-exclusives`, when known.
+pub(crate) fn store_exclusive_retries(
+    verdict: Verdict,
+    run1: Option<&RunSummary>,
+    run2: Option<&RunSummary>,
+    rewrite_exclusives: Option<bool>,
+) -> Option<StoreExclusiveRetries> {
+    if verdict != Verdict::Diverged {
+        return None;
+    }
+    let counts = |run: Option<&RunSummary>| {
+        run.and_then(|summary| summary.store_exclusives)
+            .map(|counts| StoreExclusiveRunCounts {
+                failed: counts.failed,
+                executed: counts.executed,
+                fully_counted: counts.fully_counted,
+                counted_per_mille: counts.counted_per_mille,
+            })
+    };
+    let (counts1, counts2) = (counts(run1), counts(run2));
+    if [counts1, counts2]
+        .iter()
+        .all(|counts| counts.is_none_or(|counts| counts.failed == 0))
+    {
+        return None;
+    }
+    let mut loops_left = std::collections::BTreeMap::new();
+    for summary in [run1, run2].into_iter().flatten() {
+        for (path, left) in summary.exclusive_pairs_left() {
+            let most = loops_left.entry(path).or_insert(0);
+            *most = left.max(*most);
+        }
+    }
+    Some(StoreExclusiveRetries {
+        run1: counts1,
+        run2: counts2,
+        loops_left,
+        rewrite_exclusives,
+    })
+}
+
+/// The line that names [`store_exclusive_retries`] on the console, after
+/// `HERMIT_STORE_EXCLUSIVE_RETRIES`.
+pub(crate) fn store_exclusive_retries_line(retries: &StoreExclusiveRetries) -> String {
+    fn plural(count: u64, noun: &str) -> String {
+        if count == 1 {
+            format!("1 {noun}")
+        } else {
+            format!("{count} {noun}s")
+        }
+    }
+    let run = |label: &str, counts: Option<StoreExclusiveRunCounts>| match counts {
+        None => format!("{label} did not count them"),
+        Some(counts) => {
+            let failed = match counts.executed {
+                Some(executed) => format!(
+                    "{label} failed {} of {}",
+                    counts.failed,
+                    plural(executed, "store-exclusive")
+                ),
+                None => format!(
+                    "{label} failed {}",
+                    plural(counts.failed, "store-exclusive")
+                ),
+            };
+            match (counts.fully_counted, counts.counted_per_mille) {
+                (true, _) => failed,
+                (false, Some(per_mille)) => format!(
+                    "{failed} (counted for {} of the run)",
+                    detcore_model::summary::counted_share(per_mille)
+                ),
+                (false, None) => format!("{failed} (counted for part of the run)"),
+            }
+        }
+    };
+    let loops = if retries.loops_left.is_empty() {
+        // Only a mapping whose scan succeeded is in the summaries: one that
+        // could not be read, or was unlinked, can hold the failing loop.
+        "No scanned executable file mapping has a known load/store-exclusive loop left; the \
+         failures may be in an unscanned mapping or in other code"
+            .to_owned()
+    } else {
+        let paths: Vec<String> = retries
+            .loops_left
+            .iter()
+            .map(|(path, loops)| format!("{path} ({loops})"))
+            .collect();
+        format!(
+            "Load/store-exclusive loops either run could retry: {}",
+            paths.join(", ")
+        )
+    };
+    // What removes the loops, said only where some are left in executable
+    // file mappings: the rewrite reaches nothing else.
+    let setting = match (retries.loops_left.is_empty(), retries.rewrite_exclusives) {
+        (true, _) => "",
+        (false, Some(false)) => {
+            "; suggested setting: --rewrite-exclusives, which rewrites the loops it \
+             recognizes to single LSE atomics"
+        }
+        (false, Some(true)) => {
+            "; --rewrite-exclusives left these: its report names why it refused each, and a \
+             loop it cannot rewrite needs a new idiom or a build with LSE atomics \
+             (-march=armv8.1-a or later)"
+        }
+        (false, None) => {
+            "; --rewrite-exclusives rewrites the loops it recognizes to single LSE atomics"
+        }
+    };
+    format!(
+        "possible cause: {}, {}. A failed store-exclusive runs its loop again, or sends a \
+         weak compare-and-swap down its failure path, and either retires more branches, which \
+         moves virtual time. {loops}{setting}",
+        run("run 1", retries.run1),
+        run("run 2", retries.run2),
+    )
 }
 
 /// The full outcome of comparing two runs: the verification [`Verdict`] plus the
@@ -552,6 +859,9 @@ pub struct VerificationOutcome {
     pub dbt_counted_branches: Option<DbtCountedBranchComparison>,
     /// Runtime totals for the two compared executions when their summaries were readable.
     pub runtime: Option<VerificationRuntime>,
+    /// aarch64: the store-exclusive failures that name a cause of a
+    /// divergence ([`store_exclusive_retries`]); `None` elsewhere.
+    pub store_exclusive_retries: Option<StoreExclusiveRetries>,
     /// Scheduler turn at the first log divergence, when a preceding COMMIT
     /// identified the turn.
     pub first_divergent_scheduler_turn: Option<u64>,
@@ -720,6 +1030,11 @@ pub(crate) fn verification_report(outcome: &VerificationOutcome) -> Verification
         first_divergent_left_message: outcome.first_divergent_left_message.clone(),
         first_divergent_right_message: outcome.first_divergent_right_message.clone(),
         exact_branch_counter: None,
+        // Only a divergence names a cause (`store_exclusive_retries`).
+        store_exclusive_retries: outcome
+            .store_exclusive_retries
+            .clone()
+            .filter(|_| outcome.verdict == Verdict::Diverged),
     }
 }
 
@@ -809,6 +1124,8 @@ pub fn write_skid_overshoot_verification_json(
     report.no_result_reason = None;
     report.infrastructure_error = Some(InfrastructureError::SkidOvershoot { count });
     report.dbt_counted_branches = None;
+    // The verdict is no longer a divergence, so no cause of one is named.
+    report.store_exclusive_retries = None;
     write_report_json(path, &report)
 }
 
@@ -838,6 +1155,8 @@ pub fn write_host_input_change_verification_json(
     report.no_result_reason = None;
     report.infrastructure_error = Some(change);
     report.dbt_counted_branches = None;
+    // The verdict is no longer a divergence, so no cause of one is named.
+    report.store_exclusive_retries = None;
     write_report_json(path, &report)
 }
 
@@ -973,7 +1292,9 @@ pub(crate) fn container_failed_report(
 /// error. Neither is an untyped error (a bad flag, an unreadable path), which
 /// leaves the pending stamp.
 pub(crate) fn run_failure_of(error: &Error) -> Option<RunFailure> {
-    if error.downcast_ref::<hermit::SkidOvershootError>().is_some() {
+    if detcore::ReplayDepartureError::in_error(error).is_some() {
+        Some(RunFailure::PolicyRefusal)
+    } else if error.downcast_ref::<hermit::SkidOvershootError>().is_some() {
         None
     } else if error
         .downcast_ref::<super::run::DeterminismLossRecorded>()
@@ -987,6 +1308,16 @@ pub(crate) fn run_failure_of(error: &Error) -> Option<RunFailure> {
         .is_some()
     {
         Some(RunFailure::PolicyRefusal)
+    } else if matches!(
+        error.downcast_ref::<super::container::SchedulerOutcome>(),
+        Some(super::container::SchedulerOutcome(
+            detcore::TerminalOutcome::GuestDeadlock
+        ))
+    ) {
+        // Not a virtual timeout: `--verify` with the bound is refused on
+        // every backend that cannot unwind the guest, and on ptrace a stopped
+        // run completes and is compared.
+        Some(RunFailure::Deadlock)
     } else {
         None
     }
@@ -1044,17 +1375,14 @@ pub(crate) fn run_failed_report(
 /// backend whose scheduler runs in this process (DBT) installs it; a backend
 /// whose scheduler runs in a container child reports the same exit as a
 /// container failure.
-#[cfg(feature = "dbt")]
 pub(crate) struct TerminalDeadlockRecording;
 
-#[cfg(feature = "dbt")]
 impl Drop for TerminalDeadlockRecording {
     fn drop(&mut self) {
         detcore::set_terminal_deadlock_hook(None);
     }
 }
 
-#[cfg(feature = "dbt")]
 pub(crate) fn record_terminal_deadlock(
     path: Option<&Path>,
     run: VerificationRun,
@@ -2120,6 +2448,7 @@ fn compare_two_runs_with_unsupported_scan(
             compared_outputs,
             dbt_counted_branches: None,
             runtime: None,
+            store_exclusive_retries: None,
             first_divergent_scheduler_turn,
             first_divergent_record_positions,
             first_divergent_virtual_nanoseconds,
@@ -2139,6 +2468,7 @@ fn compare_two_runs_with_unsupported_scan(
             compared_outputs,
             dbt_counted_branches: None,
             runtime: None,
+            store_exclusive_retries: None,
             first_divergent_scheduler_turn,
             first_divergent_record_positions,
             first_divergent_virtual_nanoseconds,
@@ -2406,9 +2736,165 @@ fn display_diff(left: &str, right: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
 
     use super::*;
+    use crate::app::container_clone::CheckedClone;
+
+    #[test]
+    fn native_facts_preserve_canonical_comparison_and_force_mismatch_retention() {
+        use super::super::backend_hook::NativeFacts;
+        use super::native_branch_policy_tests::typed_outcome;
+
+        let first = NativeFacts {
+            counted_branches: 100,
+            intercepted_syscalls: 7,
+            rewritten_syscalls: 7,
+            stdin_reads: 0,
+            memory_hash_fold: 42,
+            initialization_records: 2,
+            statistics_diagnostic: "native comparison control".to_owned(),
+        };
+        for (branches, images, mismatch, caller_owns_logs, initial_override) in [
+            (100, 2, false, false, false),
+            (101, 2, true, false, false),
+            (100, 3, true, false, false),
+            (100, 2, false, true, false),
+            (101, 2, true, true, false),
+            (100, 3, true, true, false),
+            (100, 2, false, false, true),
+            (101, 2, true, false, true),
+            (100, 3, true, false, true),
+            (100, 2, false, true, true),
+            (101, 2, true, true, true),
+            (100, 3, true, true, true),
+        ] {
+            let second = NativeFacts {
+                counted_branches: branches,
+                initialization_records: images,
+                ..first.clone()
+            };
+            let comparison = NativeEvidenceComparison::new("native-control", &first, &second);
+            let mut options = ComparisonOptions {
+                verbose: false,
+                strictness: LogCompareStrictness::Stripped,
+                compare_logs: true,
+                diagnostic_full_trace: false,
+                compare_io_buffers: true,
+                keep_logs: false,
+                match_overridden: initial_override,
+                failed_log_retention: None,
+                record_envelope: RecordEnvelope::all_records_v1(),
+                virtualize_time: true,
+                caller_owns_logs,
+            };
+            comparison.configure(&mut options);
+            assert_eq!(options.caller_owns_logs, caller_owns_logs);
+            assert_eq!(options.strictness, LogCompareStrictness::Canonical);
+            assert!(options.compare_logs && options.compare_io_buffers && options.virtualize_time);
+            assert_eq!(options.keep_logs, mismatch);
+            assert_eq!(options.match_overridden, initial_override || mismatch);
+            let mut outcome = typed_outcome(Verdict::Matched, 23);
+            let failures = comparison.apply(&mut outcome);
+            assert_eq!(!failures.is_empty(), mismatch);
+            assert_eq!(outcome.verified(), !mismatch);
+            assert_eq!(outcome.guest_status, ExitStatus::Exited(23));
+        }
+    }
+    #[test]
+    fn missing_native_completion_failure_keeps_saved_and_live_run_attribution() {
+        for (run, expected) in [
+            (VerificationRun::Run1, "run1"),
+            (VerificationRun::Run2, "run2"),
+        ] {
+            // The extension's real missing sink/finish control establishes
+            // this exact typed marker and cause through its maintained decoder.
+            // This half exercises the fixed common classifier and publisher;
+            // it does not substitute a synthetic decoder or physical provider.
+            let error = Error::new(hermit::BackendRunFailure)
+                .context("typed whole-process statistics were missing");
+            assert!(error.downcast_ref::<hermit::BackendRunFailure>().is_some());
+            let saved =
+                serde_json::to_value(super::super::run::verify_run_outcome_of(&error)).unwrap();
+            assert_eq!(saved["kind"], "run_failed");
+            assert_eq!(saved["failure"], "backend_failure");
+            assert!(
+                saved["detail"]
+                    .as_str()
+                    .unwrap()
+                    .contains("typed whole-process statistics were missing")
+            );
+            let report = tempfile::NamedTempFile::new().unwrap();
+            let error = super::super::verify::publish_run_failure(Some(report.path()), run, error);
+            assert!(format!("{error:#}").contains("typed whole-process statistics were missing"));
+            let report: serde_json::Value =
+                serde_json::from_slice(&fs::read(report.path()).unwrap()).unwrap();
+            assert_eq!(report["verdict"], "no_result");
+            assert_eq!(report["no_result_reason"]["kind"], "run_failed");
+            assert_eq!(report["no_result_reason"]["run"], expected);
+            assert_eq!(report["no_result_reason"]["failure"], "backend_failure");
+        }
+    }
+    #[test]
+    fn native_summary_compares_every_non_branch_observation() {
+        use super::super::backend_hook::NativeFacts;
+
+        let native_stats = |counted_branches,
+                            intercepted_syscalls,
+                            rewritten_syscalls,
+                            stdin_reads,
+                            memory_hash_fold| NativeFacts {
+            counted_branches,
+            intercepted_syscalls,
+            rewritten_syscalls,
+            stdin_reads,
+            memory_hash_fold,
+            initialization_records: 0,
+            statistics_diagnostic: "synthetic common comparison observations".to_owned(),
+        };
+        let expected = native_stats(100, 169, 168, 0, 0x4b5e0e70f3050157);
+
+        assert!(!same_native_observable_behavior(
+            &expected,
+            &native_stats(100, 170, 168, 0, 0x4b5e0e70f3050157)
+        ));
+        assert!(!same_native_observable_behavior(
+            &expected,
+            &native_stats(100, 169, 167, 0, 0x4b5e0e70f3050157)
+        ));
+        assert!(!same_native_observable_behavior(
+            &expected,
+            &native_stats(100, 169, 168, 1, 0x4b5e0e70f3050157)
+        ));
+        assert!(!same_native_observable_behavior(
+            &expected,
+            &native_stats(100, 169, 168, 0, 0)
+        ));
+
+        let different_branch_clock = native_stats(101, 169, 168, 0, 0x4b5e0e70f3050157);
+        assert!(
+            same_native_observable_behavior(&expected, &different_branch_clock),
+            "the counted-branch clock has its own typed comparison and must not be folded into \
+             the opaque summary mismatch"
+        );
+        assert!(
+            native_branch_clock_mismatch(
+                "common-control",
+                expected.counted_branches,
+                different_branch_clock.counted_branches,
+            )
+            .is_some()
+        );
+        assert!(
+            native_branch_clock_mismatch(
+                "common-control",
+                expected.counted_branches,
+                expected.counted_branches,
+            )
+            .is_none()
+        );
+    }
 
     /// A report larger than a page reaches a one-page pipe that has room for
     /// its first lines. Written as one write it put nothing there: 3600 bytes
@@ -2621,7 +3107,7 @@ mod tests {
         // These controls do not need the CLI's child panic-hook installation.
         super::super::container::classify_container_result(
             reverie::process::Container::new()
-                .run(|| child().map_err(hermit::SerializableError::from)),
+                .checked_run(|| child().map_err(hermit::SerializableError::from)),
         )
     }
 
@@ -2694,22 +3180,32 @@ mod tests {
 
     #[test]
     fn real_container_failure_replaces_run1_stamp() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         check_real_container_failure(VerificationRun::Run1);
     }
 
     #[test]
     fn real_container_failure_replaces_run2_stamp_without_claiming_run1_status() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         check_real_container_failure(VerificationRun::Run2);
     }
 
     #[test]
     fn real_container_zero_exit_and_deliberate_stops_remain_distinct() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("verify.json");
         for code in [
             0,
             101,
             detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+            detcore_model::HERMIT_GUEST_DEADLOCK_EXIT,
             hermit::HERMIT_DEADLINE_EXIT,
             hermit::HERMIT_LOG_CAP_EXIT,
             detcore_model::signal_exit_status(libc::SIGTERM),
@@ -2741,6 +3237,16 @@ mod tests {
                             .is_some()
                     );
                     assert_eq!(report, VerificationReport::no_result());
+                }
+                121 => {
+                    assert!(matches!(
+                        error.downcast_ref::<super::super::container::SchedulerOutcome>(),
+                        Some(super::super::container::SchedulerOutcome(
+                            detcore::TerminalOutcome::GuestDeadlock
+                        ))
+                    ));
+                    assert_eq!(report, VerificationReport::no_result());
+                    assert_eq!(super::super::failure_exit_code(&error), 121);
                 }
                 124 => {
                     assert!(
@@ -2796,6 +3302,18 @@ mod tests {
                     .context(super::super::container::PolicyRefusal),
                 Some(RunFailure::PolicyRefusal),
             ),
+            (
+                Error::new(super::super::container::SchedulerOutcome(
+                    detcore::TerminalOutcome::GuestDeadlock,
+                )),
+                Some(RunFailure::Deadlock),
+            ),
+            (
+                Error::new(super::super::container::SchedulerOutcome(
+                    detcore::TerminalOutcome::VirtualTimeout { bound_ns: 1 },
+                )),
+                None,
+            ),
             // Already published as its infrastructure error.
             (
                 Error::new(hermit::SkidOvershootError::new(2))
@@ -2842,6 +3360,9 @@ mod tests {
 
     #[test]
     fn returned_guest_signal_and_unknown_error_do_not_become_container_failure() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("verify.json");
         write_pending_verification_json(&path).unwrap();
@@ -2880,6 +3401,9 @@ mod tests {
 
     #[test]
     fn container_failure_keeps_primary_type_and_secondary_errors() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let error = real_container_exit(
             &dir.path().join("absent/verify.json"),
@@ -3176,7 +3700,7 @@ mod tests {
         drop(reader);
         assert_eq!(
             retention_report_in_child(
-                "verify::tests::log_cap_retention_report_survives_a_stderr_without_a_reader",
+                "app::verify::tests::log_cap_retention_report_survives_a_stderr_without_a_reader",
                 "log cap",
                 &writer,
                 dir.path()
@@ -3213,7 +3737,7 @@ mod tests {
         }
         assert_eq!(
             retention_report_in_child(
-                "verify::tests::log_cap_retention_report_does_not_wait_on_a_full_stderr_pipe",
+                "app::verify::tests::log_cap_retention_report_does_not_wait_on_a_full_stderr_pipe",
                 "log cap",
                 &writer,
                 dir.path()
@@ -3236,7 +3760,7 @@ mod tests {
             let (reader, writer) = retention_stderr_pipe();
             assert_eq!(
                 retention_report_in_child(
-                    "verify::tests::retention_report_reads_as_before_when_stderr_has_room",
+                    "app::verify::tests::retention_report_reads_as_before_when_stderr_has_room",
                     class,
                     &writer,
                     dir.path()
@@ -3367,6 +3891,10 @@ mod tests {
             max_log_bytes: None,
             log_budget: None,
             log_file_handle: None,
+            log_file_limit: None,
+            log_ring: None,
+            log_ring_file: None,
+            log_ring_handle: None,
             unsafe_ignore_host_seccomp: false,
             backend: None,
         }
@@ -3689,9 +4217,18 @@ mod tests {
 
     #[test]
     fn production_comparison_callers_bind_truthful_side_labels() {
+        // Production code is what precedes a file's top-level `mod tests`.
+        // The last `#[cfg(test)]` is not that boundary: verify.rs keeps
+        // further test modules after `mod tests`, and the needles below are
+        // spelled out inside this test, which a later boundary would count.
+        let production_of = |source: &'static str| -> &'static str {
+            source
+                .split_once("\n#[cfg(test)]\nmod tests {")
+                .expect("production/test boundary")
+                .0
+        };
         for (name, source, left, right) in [
             ("generic run", include_str!("run.rs"), "run 1", "run 2"),
-            ("DBT run", include_str!("backends.rs"), "run 1", "run 2"),
             (
                 "record/replay",
                 include_str!("record_start.rs"),
@@ -3699,10 +4236,7 @@ mod tests {
                 "the replay",
             ),
         ] {
-            let production = source
-                .rsplit_once("#[cfg(test)]")
-                .expect("production/test boundary")
-                .0;
+            let production = production_of(source);
             for label in [left, right] {
                 let binding = format!("label: \"{label}\"");
                 assert_eq!(
@@ -3713,10 +4247,7 @@ mod tests {
             }
         }
 
-        let production = include_str!("verify.rs")
-            .rsplit_once("#[cfg(test)]")
-            .expect("production/test boundary")
-            .0;
+        let production = production_of(include_str!("verify.rs"));
         assert!(production.contains("side_labels: compared_labels.clone()"));
         assert_eq!(
             production
@@ -4900,6 +5431,10 @@ mod tests {
     /// Runs from a temporary working directory so the target really is a bare
     /// relative name. Under the old code this failed on any host where the
     /// working directory and `TMPDIR` are on different filesystems.
+    #[cfg_attr(
+        fbcode_build,
+        ignore = "fbsource-disabled: compile-time CARGO_MANIFEST_DIR is not present at test runtime"
+    )]
     #[test]
     fn a_bare_filename_target_is_overwritten_not_left_stale() {
         // `set_current_dir` is process-global; serialize against any other test
@@ -4907,18 +5442,18 @@ mod tests {
         static CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = CWD.lock().unwrap_or_else(|e| e.into_inner());
 
-        // Root the working directory in the SOURCE TREE, not in TMPDIR. A
-        // plain `tempdir()` lands beside the staged file and the cross-
-        // filesystem rename never happens, so the test would pass against the
-        // defect -- measured: it did. On this host the checkout and /tmp are
-        // distinct btrfs subvolumes (st_dev 46 vs 47), and cross-subvolume
-        // rename(2) is EXDEV, which is what makes this end-to-end rather than
-        // decorative.
+        // Root the working directory where the process already runs, not in
+        // TMPDIR. A plain `tempdir()` lands beside the staged file and the
+        // cross-filesystem rename never happens, so the test would pass
+        // against the defect -- measured: it did. Where the run directory and
+        // /tmp are distinct filesystems, as a checkout beside a tmpfs /tmp
+        // ordinarily is, cross-filesystem rename(2) is EXDEV, which is what
+        // makes this end-to-end rather than decorative.
+        let previous = std::env::current_dir().unwrap();
         let dir = tempfile::Builder::new()
             .prefix("verify-json-bare-")
-            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .tempdir_in(&previous)
             .unwrap();
-        let previous = std::env::current_dir().unwrap();
         std::env::set_current_dir(dir.path()).unwrap();
 
         let outcome = (|| {
@@ -5386,6 +5921,7 @@ mod tests {
             },
             dbt_counted_branches: None,
             runtime: None,
+            store_exclusive_retries: None,
             first_divergent_scheduler_turn: None,
             first_divergent_record_positions: None,
             first_divergent_virtual_nanoseconds: None,
@@ -5395,6 +5931,256 @@ mod tests {
             first_divergent_right_message: None,
         };
         assert!(!verification_report(&diverged).bitwise_parity);
+
+        // A named store-exclusive cause travels with the report and changes
+        // neither the verdict nor parity.
+        let retries = StoreExclusiveRetries {
+            run1: Some(StoreExclusiveRunCounts {
+                failed: 1,
+                executed: Some(9),
+                fully_counted: true,
+                counted_per_mille: None,
+            }),
+            run2: None,
+            loops_left: BTreeMap::from([("/bin/guest".to_owned(), 1)]),
+            rewrite_exclusives: Some(false),
+        };
+        let named = VerificationOutcome {
+            store_exclusive_retries: Some(retries.clone()),
+            ..diverged
+        };
+        let report = verification_report(&named);
+        assert_eq!(report.verdict, Verdict::Diverged);
+        assert!(!report.bitwise_parity);
+        assert_eq!(report.store_exclusive_retries, Some(retries.clone()));
+        // An outcome that is not a divergence publishes no cause, and the
+        // writers that turn a divergence into another verdict drop it.
+        let not_diverged = VerificationOutcome {
+            verdict: Verdict::NoResult,
+            ..named.clone()
+        };
+        assert_eq!(
+            verification_report(&not_diverged).store_exclusive_retries,
+            None
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let skid = directory.path().join("skid.json");
+        write_skid_overshoot_verification_json(&skid, &named, 1).unwrap();
+        let skid = VerificationReport::from_json_slice(&fs::read(&skid).unwrap()).unwrap();
+        assert_eq!(skid.verdict, Verdict::InfrastructureError);
+        assert_eq!(skid.store_exclusive_retries, None);
+    }
+
+    fn store_exclusive_summary(
+        failed: u64,
+        executed: Option<u64>,
+        pairs: &[(&str, u64)],
+    ) -> RunSummary {
+        RunSummary {
+            store_exclusives: Some(detcore_model::summary::StoreExclusiveCounts {
+                failed,
+                executed,
+                fully_counted: true,
+                counted_per_mille: Some(1000),
+            }),
+            exclusive_pairs: pairs
+                .iter()
+                .map(|(path, pairs)| ((*path).to_owned(), *pairs))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_divergence_with_failed_store_exclusives_names_them_and_the_loops_left() {
+        let first = store_exclusive_summary(2, Some(16_641), &[("/bin/guest", 4)]);
+        let second = store_exclusive_summary(
+            0,
+            Some(16_645),
+            &[("/bin/guest", 4), ("/lib/libc.so.6", 19)],
+        );
+        let retries =
+            store_exclusive_retries(Verdict::Diverged, Some(&first), Some(&second), Some(false))
+                .expect("a failure in either run names the cause");
+        assert_eq!(
+            retries,
+            StoreExclusiveRetries {
+                run1: Some(StoreExclusiveRunCounts {
+                    failed: 2,
+                    executed: Some(16_641),
+                    fully_counted: true,
+                    counted_per_mille: Some(1000),
+                }),
+                run2: Some(StoreExclusiveRunCounts {
+                    failed: 0,
+                    executed: Some(16_645),
+                    fully_counted: true,
+                    counted_per_mille: Some(1000),
+                }),
+                loops_left: BTreeMap::from([
+                    ("/bin/guest".to_owned(), 4),
+                    ("/lib/libc.so.6".to_owned(), 19),
+                ]),
+                rewrite_exclusives: Some(false),
+            }
+        );
+        assert_eq!(
+            store_exclusive_retries_line(&retries),
+            "possible cause: run 1 failed 2 of 16641 store-exclusives, run 2 failed 0 of 16645 \
+             store-exclusives. A failed store-exclusive runs its loop again, or sends a weak \
+             compare-and-swap down its failure path, and either retires more branches, which \
+             moves virtual time. Load/store-exclusive loops either run could retry: /bin/guest \
+             (4), /lib/libc.so.6 (19); suggested setting: --rewrite-exclusives, which rewrites \
+             the loops it recognizes to single LSE atomics"
+        );
+    }
+
+    #[test]
+    fn the_store_exclusive_line_says_what_a_rewrite_left_and_where_none_was_left() {
+        let left = StoreExclusiveRetries {
+            run1: Some(StoreExclusiveRunCounts {
+                failed: 1,
+                executed: None,
+                fully_counted: false,
+                counted_per_mille: None,
+            }),
+            run2: None,
+            loops_left: BTreeMap::from([("/bin/guest".to_owned(), 1)]),
+            rewrite_exclusives: Some(true),
+        };
+        let line = store_exclusive_retries_line(&left);
+        assert!(
+            line.starts_with(
+                "possible cause: run 1 failed 1 store-exclusive (counted for part of the run), \
+                 run 2 did not count them."
+            ),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(
+                "/bin/guest (1); --rewrite-exclusives left these: its report names why it \
+                 refused each, and a loop it cannot rewrite needs a new idiom or a build with \
+                 LSE atomics (-march=armv8.1-a or later)"
+            ),
+            "{line}"
+        );
+        // A run whose counters covered a known share says it.
+        let share = StoreExclusiveRetries {
+            run1: Some(StoreExclusiveRunCounts {
+                failed: 1,
+                executed: Some(80_002),
+                fully_counted: false,
+                counted_per_mille: Some(632),
+            }),
+            ..left.clone()
+        };
+        assert!(
+            store_exclusive_retries_line(&share).starts_with(
+                "possible cause: run 1 failed 1 of 80002 store-exclusives (counted for 63.2% of \
+                 the run), run 2 did not count them."
+            ),
+            "{}",
+            store_exclusive_retries_line(&share)
+        );
+        let elsewhere = StoreExclusiveRetries {
+            loops_left: BTreeMap::new(),
+            rewrite_exclusives: None,
+            ..left
+        };
+        let line = store_exclusive_retries_line(&elsewhere);
+        // With no loop left in a scanned executable file mapping, no setting
+        // is suggested, and no cause is ruled out.
+        assert!(
+            line.ends_with(
+                "No scanned executable file mapping has a known load/store-exclusive loop \
+                 left; the failures may be in an unscanned mapping or in other code"
+            ),
+            "{line}"
+        );
+        let none_left_without_rewrite = StoreExclusiveRetries {
+            rewrite_exclusives: Some(false),
+            ..elsewhere.clone()
+        };
+        assert!(
+            !store_exclusive_retries_line(&none_left_without_rewrite).contains("setting"),
+            "{line}"
+        );
+    }
+
+    /// A divergence with counted failures where neither run's summary
+    /// names a loop, scanned or rewritten: a mapping enters them only after
+    /// a successful scan, so an unreadable or unlinked library can hold the
+    /// failing loop. The line names no file and rules nothing out.
+    #[test]
+    fn failures_with_no_scanned_loop_left_do_not_rule_out_an_unscanned_mapping() {
+        let failed = store_exclusive_summary(3, Some(100), &[]);
+        assert!(failed.exclusive_rewrites.is_empty());
+        let retries =
+            store_exclusive_retries(Verdict::Diverged, Some(&failed), Some(&failed), Some(false))
+                .expect("a divergence with counted failures names them");
+        assert!(retries.loops_left.is_empty(), "{retries:?}");
+        let line = store_exclusive_retries_line(&retries);
+        assert!(
+            line.starts_with(
+                "possible cause: run 1 failed 3 of 100 store-exclusives, run 2 failed 3 of 100 \
+                 store-exclusives."
+            ),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(
+                "No scanned executable file mapping has a known load/store-exclusive loop \
+                 left; the failures may be in an unscanned mapping or in other code"
+            ),
+            "{line}"
+        );
+        assert!(!line.contains("were in other code"), "{line}");
+        assert!(!line.contains("setting"), "{line}");
+    }
+
+    #[test]
+    fn no_store_exclusive_cause_is_named_without_a_divergence_and_a_failure() {
+        let failed = store_exclusive_summary(3, Some(100), &[("/bin/guest", 2)]);
+        let clean = store_exclusive_summary(0, Some(100), &[("/bin/guest", 2)]);
+        let uncounted = RunSummary {
+            exclusive_pairs: BTreeMap::from([("/bin/guest".to_owned(), 2)]),
+            ..Default::default()
+        };
+        // A match names nothing, even with failures counted.
+        for verdict in [
+            Verdict::Matched,
+            Verdict::NoResult,
+            Verdict::InfrastructureError,
+        ] {
+            assert_eq!(
+                store_exclusive_retries(verdict, Some(&failed), Some(&failed), Some(false)),
+                None
+            );
+        }
+        // A divergence names nothing when neither run counted a failure, or
+        // neither counted at all.
+        assert_eq!(
+            store_exclusive_retries(Verdict::Diverged, Some(&clean), Some(&clean), Some(false)),
+            None
+        );
+        assert_eq!(
+            store_exclusive_retries(
+                Verdict::Diverged,
+                Some(&uncounted),
+                Some(&uncounted),
+                Some(false)
+            ),
+            None
+        );
+        assert_eq!(
+            store_exclusive_retries(Verdict::Diverged, None, None, None),
+            None
+        );
+        // One run's failure is enough.
+        assert!(
+            store_exclusive_retries(Verdict::Diverged, Some(&uncounted), Some(&failed), None)
+                .is_some()
+        );
     }
 
     #[test]
@@ -5558,5 +6344,301 @@ mod tests {
         assert!(default.ignore_lines.is_empty());
         assert!(!default.skip_commit);
         assert!(!default.skip_detlog);
+    }
+}
+
+// Generic typed branch-clock verdict policy remains owned by the common verifier.
+#[cfg(test)]
+pub(super) mod native_branch_policy_tests {
+    use super::*;
+
+    fn record_branch_clock_comparison(
+        outcome: &mut VerificationOutcome,
+        comparison: DbtCountedBranchComparison,
+    ) -> Option<String> {
+        super::record_native_branch_clock_comparison("DBT", outcome, comparison)
+    }
+
+    pub(crate) fn typed_outcome(verdict: Verdict, guest_exit: i32) -> VerificationOutcome {
+        use super::ComparedLogCounts;
+        use super::ComparisonSpec;
+
+        VerificationOutcome {
+            verdict,
+            no_result_reason: (verdict == Verdict::NoResult).then(|| {
+                super::NoResultReason::ComparisonRefused {
+                    detail: "fixture comparator refusal".into(),
+                }
+            }),
+            refused_log_comparison: (verdict == Verdict::NoResult)
+                .then(|| "fixture comparator refusal".into()),
+            guest_status: ExitStatus::Exited(guest_exit),
+            comparison: ComparisonSpec::new(
+                LogCompareStrictness::Canonical,
+                true,
+                false,
+                true,
+                RecordEnvelope::all_records_v1().policy(),
+                true,
+            ),
+            compared_log_messages: Some(ComparedLogCounts { left: 4, right: 4 }),
+            compared_outputs: {
+                let output = hermit::canonical_verdict::ComparedOutput {
+                    exit_code: Some(guest_exit),
+                    signal: None,
+                    stdout_sha256: "a".repeat(64),
+                    stdout_bytes: 0,
+                    stderr_sha256: "b".repeat(64),
+                    stderr_bytes: 0,
+                };
+                hermit::canonical_verdict::ComparedOutputs {
+                    left: output.clone(),
+                    right: output,
+                }
+            },
+            dbt_counted_branches: None,
+            store_exclusive_retries: None,
+            runtime: None,
+            first_divergent_scheduler_turn: None,
+            first_divergent_record_positions: None,
+            first_divergent_virtual_nanoseconds: None,
+            first_divergent_record: None,
+            first_divergent_syscall: None,
+            first_divergent_left_message: None,
+            first_divergent_right_message: None,
+        }
+    }
+
+    #[test]
+    fn equal_branch_clocks_do_not_authorize_a_no_result() {
+        let outcome = typed_outcome(Verdict::NoResult, 23);
+        let comparison = DbtCountedBranchComparison {
+            left: 563_145,
+            right: 563_145,
+        };
+        let verdict_file = tempfile::NamedTempFile::new().unwrap();
+
+        let mut outcome = outcome;
+        let failure = record_branch_clock_comparison(&mut outcome, comparison);
+        write_verification_json(verdict_file.path(), &outcome).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_slice(&fs::read(verdict_file.path()).unwrap()).unwrap();
+
+        assert!(failure.is_none());
+        assert_eq!(outcome.verdict, Verdict::NoResult);
+        assert!(outcome.dbt_counted_branches.is_none());
+        assert_eq!(json["verdict"], "no_result");
+        assert_eq!(json["verified"], false);
+        assert!(json.get("dbt_counted_branches").is_none());
+        let error = outcome.into_exit_status().unwrap_err().to_string();
+        assert!(error.contains("did not reach a verdict"), "{error}");
+    }
+
+    #[test]
+    fn branch_clock_divergence_is_retained_in_the_serialized_typed_verdict() {
+        use super::ComparedLogCounts;
+
+        for initial_verdict in [Verdict::Matched, Verdict::NoResult] {
+            let outcome = typed_outcome(initial_verdict, 0);
+            let comparison = DbtCountedBranchComparison {
+                left: 563_145,
+                right: 563_103,
+            };
+            let verdict_file = tempfile::NamedTempFile::new().unwrap();
+            let mut outcome = outcome;
+            let message = record_branch_clock_comparison(&mut outcome, comparison);
+            write_verification_json(verdict_file.path(), &outcome).unwrap();
+            let message = message.unwrap();
+            let json: serde_json::Value =
+                serde_json::from_slice(&fs::read(verdict_file.path()).unwrap()).unwrap();
+
+            assert!(message.contains("563145 != 563103"), "{message}");
+            assert_eq!(outcome.verdict, Verdict::Diverged);
+            assert_eq!(outcome.dbt_counted_branches, Some(comparison));
+            assert_eq!(json["verdict"], "diverged");
+            assert_eq!(json["verified"], false);
+            assert_eq!(json["bitwise_parity"], false);
+            assert_eq!(json["dbt_counted_branches"]["left"], 563_145);
+            assert_eq!(json["dbt_counted_branches"]["right"], 563_103);
+            assert_eq!(
+                outcome.compared_log_messages,
+                Some(ComparedLogCounts { left: 4, right: 4 })
+            );
+            assert_eq!(
+                outcome.into_exit_status().unwrap(),
+                ExitStatus::Exited(hermit::HERMIT_VERIFICATION_DIVERGENCE_EXIT)
+            );
+        }
+    }
+
+    #[test]
+    fn equal_branch_clocks_preserve_match_and_nonzero_guest_status() {
+        let outcome = typed_outcome(Verdict::Matched, 23);
+        let comparison = DbtCountedBranchComparison {
+            left: 563_145,
+            right: 563_145,
+        };
+
+        let mut outcome = outcome;
+        let failure = record_branch_clock_comparison(&mut outcome, comparison);
+        assert!(failure.is_none());
+        let report = super::verification_report(&outcome);
+
+        assert_eq!(outcome.verdict, Verdict::Matched);
+        assert_eq!(report.dbt_counted_branches, Some(comparison));
+        assert!(report.verified);
+        assert!(report.bitwise_parity);
+        assert_eq!(outcome.into_exit_status().unwrap(), ExitStatus::Exited(23));
+    }
+}
+
+#[cfg(test)]
+mod native_initialization_policy_tests {
+    use std::io::Write as _;
+
+    use super::native_branch_policy_tests::typed_outcome;
+    use super::*;
+    const DBT_INITIALIZATION_RECORD: &[u8] =
+        b"1970-01-01T00:00:00.000000Z INFO reverie_dbt::evidence: protected evidence initialized\n";
+    #[test]
+    fn native_initialization_record_counts_control_the_terminal_outcome() {
+        use super::super::record_envelope::RecordEnvelopePolicy;
+        use super::super::verify::ComparedLogCounts;
+        use super::super::verify::verification_report;
+
+        fn native_verdict(
+            directory: &Path,
+            left: &[&[u8]],
+            right: &[&[u8]],
+        ) -> VerificationOutcome {
+            let output = reverie::process::Output {
+                status: ExitStatus::Exited(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            };
+            let log = |records: &[&[u8]]| {
+                let (mut file, path) = tempfile::NamedTempFile::new_in(directory)
+                    .unwrap()
+                    .into_parts();
+                for record in records {
+                    file.write_all(record).unwrap();
+                }
+                file.flush().unwrap();
+                path
+            };
+            compare_two_runs(
+                ComparedRun {
+                    output: &output,
+                    log: log(left),
+                    label: "run 1",
+                },
+                ComparedRun {
+                    output: &output,
+                    log: log(right),
+                    label: "run 2",
+                },
+                ComparisonOptions {
+                    verbose: false,
+                    strictness: LogCompareStrictness::Canonical,
+                    compare_logs: true,
+                    diagnostic_full_trace: false,
+                    compare_io_buffers: true,
+                    keep_logs: false,
+                    match_overridden: false,
+                    failed_log_retention: None,
+                    record_envelope: RecordEnvelope::all_records_v1(),
+                    virtualize_time: true,
+                    caller_owns_logs: false,
+                },
+            )
+            .unwrap()
+        }
+
+        let stats = super::super::backend_hook::NativeFacts {
+            counted_branches: 10,
+            intercepted_syscalls: 20,
+            rewritten_syscalls: 5,
+            stdin_reads: 2,
+            memory_hash_fold: 99,
+            initialization_records: 2,
+            statistics_diagnostic: "native initialization policy control".to_owned(),
+        };
+        let equal = NativeSummaryComparison::compare(&stats, &stats, 2, 2);
+        assert!(!equal.requires_log_retention());
+        let mut matched = typed_outcome(Verdict::Matched, 0);
+        assert!(equal.apply(&mut matched).is_none());
+        assert_eq!(matched.verdict, Verdict::Matched);
+
+        let unequal = NativeSummaryComparison::compare(&stats, &stats, 2, 3);
+        assert!(
+            unequal.requires_log_retention(),
+            "an initialization mismatch must retain both evidence logs"
+        );
+        let mut outcome = typed_outcome(Verdict::Matched, 0);
+        let failure = unequal.apply(&mut outcome).unwrap();
+        assert_eq!(outcome.verdict, Verdict::Diverged);
+        assert!(!outcome.verified());
+        assert!(
+            !outcome
+                .into_exit_status()
+                .expect("divergence has a terminal status")
+                .success()
+        );
+        assert!(
+            failure.contains("initialization counts differed"),
+            "{failure}"
+        );
+        assert!(failure.contains("2 != 3"), "{failure}");
+
+        // The extension owns real decode/materialization; this core half keeps
+        // the same exact five materialized bytes and real verdict options. The
+        // comparison counts five INFO records per side, where `records()` alone
+        // holds three, and the report names `all_records_v1`. Moving the child's
+        // initialization record away from the position the collector gives it,
+        // immediately before the child's first record, diverges the verdict
+        // although the guest records and the initialization counts are
+        // unchanged.
+        let parent_first: &[u8] = b"1970-01-01T00:00:00.000000Z INFO detcore: parent record 1\n";
+        let parent_second: &[u8] = b"1970-01-01T00:00:00.000000Z INFO detcore: parent record 2\n";
+        let child: &[u8] = b"1970-01-01T00:00:00.000000Z INFO detcore: child record 1\n";
+        let canonical = [
+            DBT_INITIALIZATION_RECORD,
+            parent_first,
+            parent_second,
+            DBT_INITIALIZATION_RECORD,
+            child,
+        ];
+        let moved = [
+            DBT_INITIALIZATION_RECORD,
+            parent_first,
+            DBT_INITIALIZATION_RECORD,
+            parent_second,
+            child,
+        ];
+        // A diverged comparison keeps its logs, so they must live in a
+        // directory this test removes.
+        let directory = tempfile::tempdir().unwrap();
+
+        let matched = native_verdict(directory.path(), &canonical, &canonical);
+        assert_eq!(matched.verdict, Verdict::Matched);
+        assert_eq!(
+            matched.compared_log_messages,
+            Some(ComparedLogCounts { left: 5, right: 5 }),
+            "the initialization records must be compared with the guest records"
+        );
+        assert_eq!(
+            matched.comparison.record_envelope,
+            RecordEnvelopePolicy::AllRecordsV1
+        );
+        let report = serde_json::to_value(verification_report(&matched)).unwrap();
+        assert_eq!(report["comparison"]["record_envelope"], "all_records_v1");
+        assert_eq!(report["bitwise_parity"], true);
+
+        let diverged = native_verdict(directory.path(), &canonical, &moved);
+        assert_eq!(diverged.verdict, Verdict::Diverged);
+        assert_eq!(
+            diverged.compared_log_messages,
+            Some(ComparedLogCounts { left: 5, right: 5 })
+        );
     }
 }

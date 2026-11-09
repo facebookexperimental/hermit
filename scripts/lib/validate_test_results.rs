@@ -87,7 +87,9 @@ pub fn terminal_results(
     filtered: u64,
     rows: Vec<dagrun::TestResult>,
 ) -> Result<dagrun::TestResults, String> {
-    if rows.iter().any(|row| row.diagnostic.is_some()) {
+    if rows.iter().any(|row| row.is_skipped()) {
+        dagrun::TestResults::skipped(executed, filtered, rows)
+    } else if rows.iter().any(|row| row.diagnostic.is_some()) {
         dagrun::TestResults::diagnostic(executed, filtered, rows)
     } else if rows.iter().any(|row| row.attempt_results.is_some()) {
         dagrun::TestResults::classified(executed, filtered, rows)
@@ -127,9 +129,13 @@ fn checked_results(
             .count(),
     )
     .map_err(|_| "structured diagnostic-failure count does not fit u64".to_string())?;
+    let skipped_tests =
+        u64::try_from(sorted.iter().filter(|result| result.is_skipped()).count())
+            .map_err(|_| "structured skipped-test count does not fit u64")?;
     let failed_tests = row_count
         .checked_sub(passed_tests)
         .and_then(|rest| rest.checked_sub(diagnostic_failed_tests))
+        .and_then(|rest| rest.checked_sub(skipped_tests))
         .ok_or("structured failed-test count underflowed")?;
     let totals = TestResultTotals {
         executed_tests: results.executed_tests,
@@ -137,12 +143,15 @@ fn checked_results(
         failed_tests,
         filtered_tests: results.filtered_tests,
         diagnostic_failed_tests,
+        skipped_tests,
     };
     let rows = sorted
         .into_iter()
         .map(|result| {
             let verdict = if result.passed {
                 TestResultVerdict::Pass
+            } else if result.is_skipped() {
+                TestResultVerdict::Skip
             } else if result.is_diagnostic_failure() {
                 TestResultVerdict::DiagnosticFail
             } else {
@@ -183,6 +192,10 @@ fn add_totals(total: &mut TestResultTotals, add: TestResultTotals) -> Result<(),
         .diagnostic_failed_tests
         .checked_add(add.diagnostic_failed_tests)
         .ok_or("retained diagnostic_failed_tests overflowed u64")?;
+    total.skipped_tests = total
+        .skipped_tests
+        .checked_add(add.skipped_tests)
+        .ok_or("retained skipped_tests overflowed u64")?;
     Ok(())
 }
 
@@ -268,6 +281,7 @@ pub fn verify_artifact(
         failed_tests: 0,
         filtered_tests: 0,
         diagnostic_failed_tests: 0,
+        skipped_tests: 0,
     };
     let mut verify_group = |producer: TestResultProducer,
                             totals: TestResultTotals,
@@ -277,6 +291,7 @@ pub fn verify_artifact(
             .passed_tests
             .checked_add(totals.failed_tests)
             .and_then(|total| total.checked_add(totals.diagnostic_failed_tests))
+            .and_then(|total| total.checked_add(totals.skipped_tests))
             != Some(totals.executed_tests)
             || expected_rows != totals.executed_tests
         {
@@ -304,6 +319,7 @@ pub fn verify_artifact(
         if count(TestResultVerdict::Pass)? != totals.passed_tests
             || count(TestResultVerdict::Fail)? != totals.failed_tests
             || count(TestResultVerdict::DiagnosticFail)? != totals.diagnostic_failed_tests
+            || count(TestResultVerdict::Skip)? != totals.skipped_tests
         {
             return Err("retained test-results artifact verdict totals mismatch".into());
         }
@@ -381,6 +397,7 @@ pub fn retain(
         failed_tests: 0,
         filtered_tests: 0,
         diagnostic_failed_tests: 0,
+        skipped_tests: 0,
     };
     for node in nodes {
         if node.outer_attempt == 0 {
@@ -430,7 +447,8 @@ pub fn retain(
         None
     };
     // The run totals count passes and executions only; every executed test
-    // that did not pass is either a blocking or a diagnostic failure.
+    // that did not pass is a blocking failure, a diagnostic failure, or a
+    // runtime skip.
     let expected_totals = TestResultTotals {
         executed_tests: expected.executed_tests,
         passed_tests: expected.passed_tests,
@@ -438,9 +456,11 @@ pub fn retain(
             .executed_tests
             .checked_sub(expected.passed_tests)
             .and_then(|rest| rest.checked_sub(totals.diagnostic_failed_tests))
+            .and_then(|rest| rest.checked_sub(totals.skipped_tests))
             .ok_or("expected passed_tests exceeds executed_tests")?,
         filtered_tests: expected.filtered_tests,
         diagnostic_failed_tests: totals.diagnostic_failed_tests,
+        skipped_tests: totals.skipped_tests,
     };
     if totals != expected_totals {
         return Err(format!(
@@ -731,6 +751,49 @@ mod tests {
     }
 
     #[test]
+    fn an_all_zero_producer_is_retained_and_verifies() {
+        // dh-h3z82: the transitional retention refusal is gone. The
+        // canonical writer carries the all-zero producer tolerance
+        // since the dev-hermit hermit pin advanced past PR 5237
+        // (dev-hermit 30aead8d), so an all-zero selected producer now
+        // retains schema-9 evidence that verifies, instead of leaving
+        // the run PASSED but receipt-less.
+        let root = tempfile::tempdir().unwrap();
+        let selected = fixture_selected_producers(&["test.alpha", "test.beta"], false).unwrap();
+        let nodes = vec![
+            NodeTestResultsInput {
+                node: "test.alpha".into(),
+                outer_attempt: 1,
+                test_results: terminal_results(1, 0, vec![result("a", true)]).unwrap(),
+            },
+            NodeTestResultsInput {
+                node: "test.beta".into(),
+                outer_attempt: 1,
+                test_results: terminal_results(0, 0, vec![]).unwrap(),
+            },
+        ];
+        let retained = retain(
+            root.path(),
+            ValidatePath::Full,
+            "fixture-run",
+            "0123456789abcdef0123456789abcdef01234567",
+            false,
+            &selected,
+            nodes,
+            None,
+            ExactTestTotals {
+                executed_tests: 1,
+                passed_tests: 1,
+                filtered_tests: 0,
+            },
+        )
+        .expect("an all-zero producer must retain now that the writer tolerates it");
+        let bytes = fs::read(root.path().join(&retained.evidence.artifact.path)).unwrap();
+        let rows = verify_artifact(&retained.evidence, &bytes).unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[test]
     fn diagnostic_failures_are_retained_and_counted_apart_from_failures() {
         let root = tempfile::tempdir().unwrap();
         let selected = fixture_selected_producers(&["e2e.bucket"], false).unwrap();
@@ -822,6 +885,7 @@ mod tests {
             failed_tests: 0,
             filtered_tests: 0,
             diagnostic_failed_tests: 0,
+            skipped_tests: 0,
         })
         .unwrap();
         assert!(
@@ -832,6 +896,91 @@ mod tests {
             serde_json::to_value(totals).unwrap()["diagnostic_failed_tests"],
             1
         );
+    }
+
+    #[test]
+    fn runtime_skips_are_retained_and_counted_apart_from_passes_and_failures() {
+        let root = tempfile::tempdir().unwrap();
+        let selected = fixture_selected_producers(&["test.kvm_node"], false).unwrap();
+        let skipped = dagrun::TestResult::skipped(
+            "no-kvm".into(),
+            vec![
+                dagrun::TestAttemptResult::new(
+                    1,
+                    dagrun::TestAttemptOutcome::Skipped,
+                    Some("no /dev/kvm".into()),
+                )
+                .unwrap(),
+            ],
+            "no /dev/kvm".into(),
+        )
+        .unwrap();
+        let nodes = vec![NodeTestResultsInput {
+            node: "test.kvm_node".into(),
+            outer_attempt: 1,
+            test_results: terminal_results(
+                3,
+                0,
+                vec![result("ok", true), result("red", false), skipped],
+            )
+            .unwrap(),
+        }];
+        let retained = retain(
+            root.path(),
+            ValidatePath::Full,
+            "fixture-run",
+            "0123456789abcdef0123456789abcdef01234567",
+            false,
+            &selected,
+            nodes,
+            None,
+            ExactTestTotals {
+                executed_tests: 3,
+                passed_tests: 1,
+                filtered_tests: 0,
+            },
+        )
+        .unwrap();
+        let totals = retained.evidence.totals;
+        assert_eq!(
+            (
+                totals.executed_tests,
+                totals.passed_tests,
+                totals.failed_tests,
+                totals.diagnostic_failed_tests,
+                totals.skipped_tests
+            ),
+            (3, 1, 1, 0, 1),
+            "a runtime skip is neither a pass nor a failure"
+        );
+        let bytes = fs::read(root.path().join(&retained.evidence.artifact.path)).unwrap();
+        let rows = verify_artifact(&retained.evidence, &bytes).unwrap();
+        let verdicts: Vec<_> = rows
+            .iter()
+            .map(|row| (row.id.as_str(), row.result))
+            .collect();
+        assert_eq!(
+            verdicts,
+            [
+                ("no-kvm", TestResultVerdict::Skip),
+                ("ok", TestResultVerdict::Pass),
+                ("red", TestResultVerdict::Fail),
+            ]
+        );
+        // Relabelling the skip row as a pass or a plain failure is refused.
+        for relabel in [TestResultVerdict::Pass, TestResultVerdict::Fail] {
+            let mut mutated = rows.clone();
+            mutated[0].result = relabel;
+            let mutated_bytes = canonical_jsonl(&mutated).unwrap();
+            let mut spoofed = retained.evidence.clone();
+            spoofed.artifact.sha256 = hex_digest(&mutated_bytes);
+            assert!(
+                verify_artifact(&spoofed, &mutated_bytes)
+                    .unwrap_err()
+                    .contains("verdict totals"),
+                "{relabel:?}"
+            );
+        }
     }
 
     #[test]

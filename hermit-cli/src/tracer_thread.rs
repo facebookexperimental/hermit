@@ -63,8 +63,11 @@ pub fn launch_on_calling_thread() {
 /// In the last case (`/proc` hidden or not mounted) a process cannot tell its
 /// tracer handle from one a forked child inherited, so it keeps no handle,
 /// and the launch refuses on the calling thread (`Identity`), as it did before
-/// the tracer thread. One read per call, so that `/proc` vanishing between
-/// two reads cannot make a call both keep and discard its handle.
+/// the tracer thread. A kernel without PID namespaces is not that case: its
+/// one namespace is read as such (`PidNamespace::Only`), and the PID alone
+/// tells a forked child from its parent. One read per call, so that `/proc`
+/// vanishing between two reads cannot make a call both keep and discard its
+/// handle.
 fn tracer_identity() -> Option<ProcessIdentity> {
     if ON_TRACER.get() || ON_CALLER.load(Ordering::Relaxed) {
         return None;
@@ -88,17 +91,17 @@ struct TracerThread {
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct ProcessIdentity {
     pid: u32,
-    namespace: Option<(u64, u64)>,
+    /// `None` when `/proc` cannot say.
+    namespace: Option<crate::ptrace_completion::PidNamespace>,
 }
 
 impl ProcessIdentity {
     fn current() -> Self {
-        use std::os::unix::fs::MetadataExt;
         Self {
             pid: std::process::id(),
-            namespace: std::fs::metadata("/proc/self/ns/pid")
+            namespace: crate::ptrace_completion::open_pid_namespace()
                 .ok()
-                .map(|meta| (meta.dev(), meta.ino())),
+                .map(|(namespace, _file)| namespace),
         }
     }
 }

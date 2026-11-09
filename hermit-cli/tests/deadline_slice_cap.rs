@@ -19,11 +19,22 @@
 //! The cap ends a slice at the thread's next check-in (a syscall, signal or
 //! timer event). It does not lower the PMU maximum: a thread that makes no
 //! syscalls still runs to it, as before. The last test pins that scope.
+//!
+//! The suite runs on ptrace unless the harness names a backend in
+//! `HERMIT_TEST_BACKEND` (see [`backend_option`]). The validation node
+//! privileged-test.deadline_slice_cap_kvm runs it on KVM, where every test must
+//! pass except those in `deadline_slice_cap.kvm-gaps.tsv`, the KVM gap ledger
+//! beside this file: each row names a known KVM gap and the issue tracking it.
+//! The node runs a row's test, which must still fail on KVM the way the row
+//! says and never counts as a pass, or, when the row says skipped, leaves it
+//! out of the KVM run. [`capped_schedules_verify_bitwise`] also proves to that
+//! node that its runs were on KVM ([`BACKEND_PROOF_ENV`]).
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
 
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -47,6 +58,45 @@ const UNCAPPED_WAIT_US: i64 = 150_000;
 /// (https://github.com/rrnewton/hermit/issues/4139).
 const MIN_STORM_WORK_US: i64 = 50_000;
 
+/// The `--backend` option every Hermit run of the suite gets, from the
+/// harness's `HERMIT_TEST_BACKEND` (`ptrace` or `kvm`). Unset, there is none:
+/// the runs use Hermit's default backend, ptrace, exactly as before this
+/// switch, and the verification runs keep the `--backend=ptrace` they have
+/// always named ([`verification_backend_option`]). With `kvm`, every run names
+/// KVM, the verification runs included, so no test can pass on KVM's behalf by
+/// running on ptrace. Any other value, an empty one included, refuses: a
+/// misspelled backend must not fall back to ptrace and report a KVM pass.
+fn backend_option() -> Option<&'static str> {
+    static OPTION: OnceLock<Option<&'static str>> = OnceLock::new();
+    *OPTION.get_or_init(|| {
+        let value = std::env::var_os("HERMIT_TEST_BACKEND")?;
+        match value.to_str() {
+            Some("ptrace") => Some("--backend=ptrace"),
+            Some("kvm") => Some("--backend=kvm"),
+            _ => panic!("HERMIT_TEST_BACKEND must be ptrace or kvm, got {value:?}"),
+        }
+    })
+}
+
+/// The `--backend` option of a `--verify` run: the harness's backend
+/// ([`backend_option`]), or ptrace, which these runs have always named.
+fn verification_backend_option() -> &'static str {
+    backend_option().unwrap_or("--backend=ptrace")
+}
+
+/// What a verified `--backend=kvm` run prints after its comparison, and no
+/// other backend prints (hermit-cli/src/bin/hermit/run.rs and verify_run.rs).
+const KVM_VERIFY_BANNER: &str = ":: Backend: KVM (reverie-kvm KvmGuest<Detcore>)";
+
+/// The file a node's runner names for the backend proof
+/// (`known_gaps::BACKEND_PROOF_ENV` in ci/manifest-plan): when it is set,
+/// [`capped_schedules_verify_bitwise`] appends the backend each verified run
+/// showed, one line per run. ci/kvm-gap-ledger.rs requires every line to name
+/// the node's backend, so a runner that stopped passing `HERMIT_TEST_BACKEND`,
+/// or a suite that stopped honouring it, fails the node instead of running the
+/// suite on ptrace.
+const BACKEND_PROOF_ENV: &str = "HERMIT_TEST_BACKEND_PROOF";
+
 static SPIN_WAIT: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_RESUME: OnceLock<PathBuf> = OnceLock::new();
 static SELF_ALARM: OnceLock<PathBuf> = OnceLock::new();
@@ -55,6 +105,7 @@ static PARENT_CONTINUE: OnceLock<PathBuf> = OnceLock::new();
 static SLEEPY_SIBLING: OnceLock<PathBuf> = OnceLock::new();
 static ITIMER_LOOP: OnceLock<PathBuf> = OnceLock::new();
 static ITIMER_STORM: OnceLock<PathBuf> = OnceLock::new();
+static LONE_SPIN: OnceLock<PathBuf> = OnceLock::new();
 
 /// Compile `hermit-cli/tests/fixtures/<name>.c` once.
 fn fixture(cell: &'static OnceLock<PathBuf>, name: &str) -> &'static Path {
@@ -125,11 +176,24 @@ fn strict_output(
     hermit_args: &[&str],
     run_args: &[&str],
 ) -> (Output, String) {
+    strict_output_env(guest, guest_args, hermit_args, run_args, &[])
+}
+
+/// [`strict_output`] with `env` set for Hermit.
+fn strict_output_env(
+    guest: &Path,
+    guest_args: &[&str],
+    hermit_args: &[&str],
+    run_args: &[&str],
+    env: &[(&str, &str)],
+) -> (Output, String) {
     let mut command = Command::new("timeout");
     command
+        .envs(env.iter().copied())
         .arg("--kill-after=2s")
         .arg(format!("{TIMEOUT_SECONDS}s"))
         .arg(hermit_test::hermit_binary())
+        .args(backend_option())
         .args(hermit_args)
         .args([
             "run",
@@ -369,7 +433,7 @@ fn capped_schedules_verify_bitwise() {
             .arg(hermit_test::hermit_binary())
             .args([
                 "--log=info",
-                "--backend=ptrace",
+                verification_backend_option(),
                 "run",
                 "--base-env=minimal",
                 "--strict",
@@ -394,6 +458,27 @@ fn capped_schedules_verify_bitwise() {
             stderr.contains("comparison=BitwiseInfoV1 relaxations=none"),
             "verify did not use the canonical comparator: {rendered}\nstderr:\n{stderr}"
         );
+        // The positive control of the backend switch: the verified run ran on
+        // the backend it was asked for, which only KVM's banner shows.
+        let on_kvm = stderr.contains(KVM_VERIFY_BANNER);
+        assert_eq!(
+            on_kvm,
+            verification_backend_option() == "--backend=kvm",
+            "the verified run did not show the requested {}: {rendered}\nstderr:\n{stderr}",
+            verification_backend_option()
+        );
+        if let Some(path) = std::env::var_os(BACKEND_PROOF_ENV) {
+            let mut proof = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap_or_else(|error| {
+                    panic!("cannot open {BACKEND_PROOF_ENV}={path:?}: {error}")
+                });
+            writeln!(proof, "{}", if on_kvm { "kvm" } else { "ptrace" }).unwrap_or_else(|error| {
+                panic!("cannot write {BACKEND_PROOF_ENV}={path:?}: {error}")
+            });
+        }
     }
 }
 
@@ -796,6 +881,23 @@ fn itimer_mixed_masks_keep_the_timer_running() {
     assert!(field(&native, "positive") >= 1, "native: {native}");
 }
 
+/// The thread Linux's `complete_signal` gives an expiry: it tries the
+/// leader, which `it_real_fn` names, first, and a computing leader that
+/// leaves SIGALRM unblocked wants it, so the handler runs on the leader and a
+/// sibling waiting in `pause` with SIGALRM unblocked is not woken
+/// (https://github.com/rrnewton/hermit/issues/4929).
+#[test]
+fn itimer_the_leader_takes_the_expiry_before_a_paused_sibling() {
+    let guest = fixture(&ITIMER_COALESCE, "itimer_coalesce");
+    for stdout in [
+        run_strict(guest, &["receiver", "5000"], &[]).0,
+        run_native(&["receiver", "50000"]),
+    ] {
+        assert_eq!(field(&stdout, "on_leader"), 1, "{stdout}");
+        assert_eq!(field(&stdout, "sibling_woken"), 0, "{stdout}");
+    }
+}
+
 /// SIG_IGN set while SIGALRM is blocked: the expiry queues, and unblocking
 /// dequeues and discards the ignored copy, which restarts the timer.
 #[test]
@@ -907,6 +1009,11 @@ fn itimer_generation_discard_follows_the_wait_mask() {
 /// thread blocks SIGALRM and arms a 10 ms timer. Linux queues that expiry
 /// (blocked means not ignored), so a copy is pending 45 ms later. A mask
 /// left published from the wait (SIGALRM unblocked) would discard it.
+///
+/// `ppoll_mask` runs last: on KVM it was a known gap (F' of
+/// https://github.com/rrnewton/hermit/issues/4929: a masked ppoll that would
+/// wait was refused by name) until SIGSHARE S2b let it wait there, and KVM
+/// now requires it.
 #[test]
 fn itimer_a_wait_mask_is_withdrawn_when_the_wait_returns() {
     let guest = fixture(&ITIMER_COALESCE, "itimer_coalesce");
@@ -915,9 +1022,9 @@ fn itimer_a_wait_mask_is_withdrawn_when_the_wait_returns() {
         "select",
         "pselect6_null",
         "pselect6_mask",
-        "ppoll_mask",
         "epoll_pwait",
         "sigtimedwait",
+        "ppoll_mask",
     ] {
         let (stdout, _) = run_strict(guest, &["stale", kind], &[]);
         let native = run_native(&["stale", kind]);
@@ -939,7 +1046,7 @@ fn verify_bitwise(args: &[&str], run_args: &[&str]) {
         .arg(hermit_test::hermit_binary())
         .args([
             "--log=info",
-            "--backend=ptrace",
+            verification_backend_option(),
             "run",
             "--base-env=minimal",
             "--strict",
@@ -1061,4 +1168,403 @@ fn itimer_a_recorded_schedule_replays() {
         results[0], results[1],
         "the replay did not reproduce the record"
     );
+}
+
+/// The INFO log lines in `stderr`, without their wall-clock prefixes.
+fn info_lines(stderr: &str) -> Vec<&str> {
+    stderr
+        .lines()
+        .filter(|line| line.contains(" INFO "))
+        .map(|line| line.split_once(' ').map_or(line, |(_, rest)| rest))
+        .collect()
+}
+
+/// `lines` with each host address (`<hostaddr 0x...>`, which address-space
+/// randomization moves from run to run) replaced by its ordinal of first
+/// appearance, as `--verify-strict` compares them.
+fn canonical_host_addresses(lines: Vec<&str>) -> Vec<String> {
+    let mut ordinals: Vec<String> = Vec::new();
+    lines
+        .into_iter()
+        .map(|line| {
+            let mut out = String::new();
+            let mut rest = line;
+            while let Some(start) = rest.find("<hostaddr 0x") {
+                let Some(len) = rest[start..].find('>') else {
+                    break;
+                };
+                let address = &rest[start..=start + len];
+                let ordinal = ordinals
+                    .iter()
+                    .position(|seen| seen == address)
+                    .unwrap_or_else(|| {
+                        ordinals.push(address.to_owned());
+                        ordinals.len() - 1
+                    });
+                out.push_str(&rest[..start]);
+                out.push_str(&format!("<hostaddr #{ordinal}>"));
+                rest = &rest[start + len + 1..];
+            }
+            out.push_str(rest);
+            out
+        })
+        .collect()
+}
+
+/// What a run of the `lone_spin_then_race` fixture printed and logged.
+struct LoneRun {
+    stdout: String,
+    info: Vec<String>,
+    /// `PreemptionSummary::stopless_slice_ends` from `--summary-json`.
+    stopless: Option<u64>,
+    /// `schedevent_desynced` from `--summary-json`.
+    desynced: u64,
+}
+
+/// The directory the lone-slice-end tests write summaries and records to.
+fn lone_dir() -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("lone-slice-ends-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("failed to create the summary directory");
+    dir
+}
+
+/// Run the fixture in `mode` under `--strict --chaos --seed=3` at
+/// `max_timeslice`, skipping a lone thread's slice-end stops (the default)
+/// or taking them (`eager`).
+fn lone_run(mode: &str, max_timeslice: &str, eager: bool) -> LoneRun {
+    lone_run_with(mode, max_timeslice, eager, "run", &[])
+}
+
+/// [`lone_run`] with more `hermit run` arguments, for a run named `tag`.
+fn lone_run_with(
+    mode: &str,
+    max_timeslice: &str,
+    eager: bool,
+    tag: &str,
+    extra: &[String],
+) -> LoneRun {
+    let guest = fixture(&LONE_SPIN, "lone_spin_then_race");
+    let summary = lone_dir().join(format!("{mode}-{max_timeslice}-{eager}-{tag}.json"));
+    let mut run_args = vec![
+        "--chaos".to_owned(),
+        "--seed=3".to_owned(),
+        format!("--max-timeslice={max_timeslice}"),
+        format!("--summary-json={}", summary.display()),
+    ];
+    if eager {
+        run_args.push("--eager-lone-preemptions".to_owned());
+    }
+    run_args.extend_from_slice(extra);
+    let run_args: Vec<&str> = run_args.iter().map(String::as_str).collect();
+    let (stdout, stderr) = run_strict_with(guest, &[mode], &["--log=info"], &run_args);
+    let text = fs::read_to_string(&summary)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", summary.display()));
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("{} is not JSON: {error}", summary.display()));
+    LoneRun {
+        stdout,
+        info: canonical_host_addresses(info_lines(&stderr)),
+        stopless: json["preemption"]["stopless_slice_ends"].as_u64(),
+        desynced: json["schedevent_desynced"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("{tag}: no schedevent_desynced in {text}")),
+    }
+}
+
+/// Run `mode` both ways and require the same output and the same INFO log,
+/// line for line; return how many ends the skipping run took without a stop.
+/// `--eager-lone-preemptions` takes every stop and reports no count.
+fn lone_and_eager_agree(mode: &str, max_timeslice: &str) -> u64 {
+    let lazy = lone_run(mode, max_timeslice, false);
+    let eager = lone_run(mode, max_timeslice, true);
+    assert!(lazy.stdout.contains("sum="), "{mode}: {}", lazy.stdout);
+    assert_eq!(lazy.stdout, eager.stdout, "{mode}: outputs differ");
+    assert!(!lazy.info.is_empty(), "{mode}: no INFO lines");
+    if let Some((index, (lazy, eager))) = lazy
+        .info
+        .iter()
+        .zip(&eager.info)
+        .enumerate()
+        .find(|(_, (lazy, eager))| lazy != eager)
+    {
+        panic!("{mode}: INFO line {index} differs:\n  skipping: {lazy}\n  eager:    {eager}");
+    }
+    assert_eq!(
+        lazy.info.len(),
+        eager.info.len(),
+        "{mode}: INFO line counts"
+    );
+    assert_eq!(
+        eager.stopless, None,
+        "{mode}: --eager-lone-preemptions skips no stop"
+    );
+    lazy.stopless
+        .unwrap_or_else(|| panic!("{mode}: the skipping run reports no count"))
+}
+
+/// A slice end where no other thread could run is taken without a stop and
+/// processed when the thread next enters Detcore. Under chaos at 1000 ns, a
+/// main thread computing 25000 iterations alone while its worker waits on a
+/// condition variable, then racing it on a counter, prints the same output
+/// and the same INFO log as with a stop at every slice end, and takes some
+/// ends without a stop.
+#[test]
+fn slice_ends_taken_without_a_stop_leave_the_run_unchanged() {
+    let skipped = lone_and_eager_agree("wait", "1000");
+    assert!(skipped > 0, "no slice end was taken without a stop");
+}
+
+/// A worker in a timed wait could run at any slice end, so main's loop keeps
+/// its stops; with the worker in an untimed wait it skips them. At 1000 ns
+/// the 25000-iteration loop alone is about 500 slice ends.
+#[test]
+fn a_timed_waiter_keeps_the_stops_an_untimed_waiter_does_not() {
+    let napping = lone_and_eager_agree("sleep", "1000");
+    let waiting = lone_run("wait", "1000", false)
+        .stopless
+        .expect("the skipping run reports a count");
+    assert!(
+        napping + 300 < waiting,
+        "ends taken without a stop: {napping} beside a napping worker, {waiting} beside a waiting one"
+    );
+}
+
+/// Ends skipped before a trapped instruction (rdtsc) are processed before
+/// Detcore handles the instruction.
+#[test]
+fn skipped_slice_ends_come_before_a_trapped_instruction() {
+    let skipped = lone_and_eager_agree("rdtsc", "1000");
+    assert!(skipped > 0, "no slice end was taken without a stop");
+}
+
+/// Ends skipped before a trapped cpuid are processed before Detcore handles
+/// the instruction (`handle_cpuid_event`, a path apart from rdtsc's).
+#[test]
+fn skipped_slice_ends_come_before_a_cpuid() {
+    let skipped = lone_and_eager_agree("cpuid", "1000");
+    assert!(skipped > 0, "no slice end was taken without a stop");
+}
+
+/// Ends skipped before a signal (a SIGSEGV the guest handles) are processed
+/// before Detcore handles the signal.
+#[test]
+fn skipped_slice_ends_come_before_a_signal() {
+    let skipped = lone_and_eager_agree("segv", "1000");
+    assert!(skipped > 0, "no slice end was taken without a stop");
+}
+
+/// A lone stretch longer than the backstop timer of a thread running alone
+/// (2M branches; at 1000000 ns the stretch is about 40 slice ends, 37 of them
+/// taken without a stop, and the backstop fires once) leaves the run
+/// unchanged. Its eager run costs about 3.4 us per branch (8 CPU seconds,
+/// measured 2026-10-27 on an AMD EPYC host) and can take a skid-overshoot
+/// retry (https://github.com/rrnewton/hermit/issues/1845), so the stretch is
+/// kept short, and apart from the exec case, for one retry to fit the
+/// per-test budgets.
+#[test]
+fn skipped_slice_ends_survive_the_backstop() {
+    let skipped = lone_and_eager_agree("long", "1000000");
+    assert!(skipped > 20, "long: {skipped} ends taken without a stop");
+    // The stretch must cross the backstop, or the case tests nothing: a
+    // compiler that hoisted the loop's trap check would halve its branches
+    // (measured: 19136 to 2519268 with GCC -O2, the backstop at 2019216).
+    // Detcore's own debug line for a backstop timer event counts them on any
+    // backend that delivers timer events, where a backend's log line would
+    // count them on that backend only.
+    let guest = fixture(&LONE_SPIN, "lone_spin_then_race");
+    let (output, rendered) = strict_output_env(
+        guest,
+        &["long"],
+        &["--log=info"],
+        &["--chaos", "--seed=3", "--max-timeslice=1000000"],
+        &[("RUST_LOG", "detcore::lone_backstop=debug")],
+    );
+    let (_, stderr) = checked(output, &rendered);
+    let backstops = stderr
+        .lines()
+        .filter(|line| line.contains("lone backstop timer event"))
+        .count();
+    assert_eq!(backstops, 1, "long: backstop events");
+}
+
+/// An exec right after a lone stretch leaves the run unchanged.
+#[test]
+fn skipped_slice_ends_survive_exec() {
+    let skipped = lone_and_eager_agree("exec", "1000");
+    assert!(skipped > 0, "exec: no slice end was taken without a stop");
+}
+
+/// Record `mode` with `--record-preemptions-to`, skipping lone slice-end
+/// stops or not (`eager`); return the run and the parsed record.
+fn lone_record(mode: &str, eager: bool) -> (LoneRun, PathBuf, serde_json::Value) {
+    let record = lone_dir().join(format!("{mode}-{eager}.preemptions.json"));
+    let _ = fs::remove_file(&record);
+    let run = lone_run_with(
+        mode,
+        "1000",
+        eager,
+        "record",
+        &[format!("--record-preemptions-to={}", record.display())],
+    );
+    let json = hermit_test::recorded_preemption_json(&record);
+    (run, record, json)
+}
+
+/// The global events of a parsed record.
+fn global_events(record: &serde_json::Value) -> Vec<detcore_model::schedule::SchedEvent> {
+    serde_json::from_value(record["global"].clone()).expect("the record's global events parse")
+}
+
+/// A recording keeps a lone thread's slice ends without a stop. Each such end
+/// is the same event a stop records, with no RIP and marked `stopless`; the
+/// per-thread preemption rows and callback checkpoints are identical; and
+/// the run prints and logs what a recording with a stop at every end does.
+#[test]
+fn a_recording_keeps_lone_slice_ends_and_marks_them() {
+    let (lazy, _, lazy_record) = lone_record("wait", false);
+    let (eager, _, eager_record) = lone_record("wait", true);
+    assert_eq!(lazy.stdout, eager.stdout, "outputs differ");
+    assert_eq!(lazy.info, eager.info, "INFO logs differ");
+    let skipped = lazy
+        .stopless
+        .expect("the skipping recording reports a count");
+    assert!(skipped > 300, "{skipped} ends taken without a stop");
+    for field in ["per_thread", "callback_checkpoints"] {
+        assert_eq!(lazy_record[field], eager_record[field], "{field} differs");
+    }
+    let lazy_events = global_events(&lazy_record);
+    let eager_events = global_events(&eager_record);
+    assert_eq!(lazy_events.len(), eager_events.len(), "event counts differ");
+    let marked: Vec<_> = lazy_events.iter().filter(|event| event.stopless).collect();
+    assert_eq!(
+        marked.len() as u64,
+        skipped,
+        "one marked event per end taken without a stop"
+    );
+    assert!(marked.iter().all(|event| event.end_rip.is_none()));
+    assert!(!eager_events.iter().any(|event| event.stopless));
+    for (index, (lazy, eager)) in lazy_events.iter().zip(&eager_events).enumerate() {
+        assert!(
+            lazy.same_operations(eager),
+            "event {index} differs: {lazy} against {eager}"
+        );
+        if lazy.stopless {
+            assert!(
+                eager.end_rip.is_some(),
+                "event {index}: the stop read no RIP"
+            );
+        } else {
+            assert_eq!(lazy, eager, "event {index}");
+        }
+    }
+}
+
+/// Both replays of a recording that kept lone slice ends take those ends
+/// without a stop where the thread runs alone again, and leave the replayed
+/// run as a stop at every end does: the same output, with its virtual
+/// CLOCK_MONOTONIC reading, the same INFO log and the same desynchronized
+/// events, so a schedule replay accepts a stop at an end its recording took
+/// without one.
+///
+/// The preemption replay also reproduces the recording itself: the
+/// recording's output, with its virtual clock reading, no desynchronized
+/// event, and its own record of the run is the recording's events, event
+/// for event (the same operations, however each run took a slice end). A
+/// schedule replay of this `--chaos` recording at a 1000 ns maximum slice
+/// does not reproduce it on main either, with a stop at every end: it
+/// desyncs 32 events and reads CLOCK_MONOTONIC 11.5 ms late, a baseline
+/// defect of schedule replay (<https://github.com/rrnewton/hermit/issues/5104>)
+/// that no slice length with lone ends to take escapes for this fixture. So
+/// the schedule replay of the marked recording is required to be exactly the
+/// schedule replay of the recording that stopped at every end: the same
+/// output, the same INFO log and the same desynchronized events. A schedule
+/// replay of a recording that stopped at every end takes none without a
+/// stop, since it checks every RIP that recording read; a preemption replay
+/// of it takes them, since it checks none.
+#[test]
+fn replays_take_recorded_lone_slice_ends_the_same_way() {
+    let (recorded, marked, marked_record) = lone_record("wait-short", false);
+    let recorded_events = global_events(&marked_record);
+    let (_, unmarked, _) = lone_record("wait-short", true);
+    let marked_ends = global_events(&marked_record)
+        .iter()
+        .filter(|event| event.stopless)
+        .count();
+    assert!(marked_ends > 300, "{marked_ends} marked ends");
+    for option in ["--replay-schedule-from", "--replay-preemptions-from"] {
+        let replay = |record: &Path, eager: bool, tag: &str| {
+            let tag = format!("{}-{tag}", option.trim_start_matches("--"));
+            lone_run_with(
+                "wait-short",
+                "1000",
+                eager,
+                &tag,
+                &[format!("{option}={}", record.display())],
+            )
+        };
+        let rerecorded = lone_dir().join(format!(
+            "{}-rerecorded.preemptions.json",
+            option.trim_start_matches("--")
+        ));
+        let _ = fs::remove_file(&rerecorded);
+        let lazy = lone_run_with(
+            "wait-short",
+            "1000",
+            false,
+            &format!("{}-marked", option.trim_start_matches("--")),
+            &[
+                format!("{option}={}", marked.display()),
+                format!("--record-preemptions-to={}", rerecorded.display()),
+            ],
+        );
+        let eager = replay(marked.as_path(), true, "marked-eager");
+        assert_eq!(lazy.stdout, eager.stdout, "{option}: outputs differ");
+        assert_eq!(lazy.info, eager.info, "{option}: INFO logs differ");
+        assert_eq!(lazy.desynced, eager.desynced, "{option}: desyncs differ");
+        if option == "--replay-preemptions-from" {
+            // Fidelity to the recording, not only between the two replays.
+            assert_eq!(
+                lazy.stdout, recorded.stdout,
+                "{option}: the replay's output, with its virtual clock reading, is not the \
+                 recording's"
+            );
+            assert_eq!(lazy.desynced, 0, "{option}: desynchronized events");
+            let replayed = hermit_test::recorded_preemption_json(&rerecorded);
+            let replayed_events = global_events(&replayed);
+            assert_eq!(
+                replayed_events.len(),
+                recorded_events.len(),
+                "{option}: event counts differ"
+            );
+            for (index, (replayed, recorded)) in
+                replayed_events.iter().zip(&recorded_events).enumerate()
+            {
+                assert!(
+                    replayed.same_operations(recorded),
+                    "{option}: event {index} differs: {replayed} against {recorded}"
+                );
+            }
+        }
+        // How many depends on how much of the recording the replay follows,
+        // which the replay fixes outside this change decide.
+        let skipped = lazy.stopless.expect("the replay reports a count");
+        assert!(skipped > 0, "{option}: no marked end taken without a stop");
+        assert_eq!(eager.stopless, None, "{option}");
+        let all_stops = replay(unmarked.as_path(), false, "unmarked");
+        let skipped = all_stops.stopless.expect("the replay reports a count");
+        if option == "--replay-schedule-from" {
+            assert_eq!(skipped, 0, "{option}: a recorded stop was skipped");
+            // The marked recording replays exactly as the recording that
+            // stopped at every end does.
+            assert_eq!(lazy.stdout, all_stops.stdout, "{option}: outputs differ");
+            assert_eq!(lazy.info, all_stops.info, "{option}: INFO logs differ");
+            assert_eq!(
+                lazy.desynced, all_stops.desynced,
+                "{option}: desyncs differ"
+            );
+        } else {
+            assert!(skipped > 0, "{option}: no end taken without a stop");
+        }
+    }
 }

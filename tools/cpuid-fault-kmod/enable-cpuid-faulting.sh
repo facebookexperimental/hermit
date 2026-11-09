@@ -276,6 +276,15 @@ prepare_toolchain() {
     fi
     say "kernel build tree: $KDIR"
     command -v make >/dev/null 2>&1 || dnf_install make
+    # A kernel with BTF for modules runs pahole on every module it builds, and
+    # the build stops without it.
+    if grep -qs '^CONFIG_DEBUG_INFO_BTF_MODULES=y' "$KDIR/.config" &&
+        ! command -v pahole >/dev/null 2>&1; then
+        say "the kernel generates BTF for modules, which needs pahole; installing dwarves"
+        dnf_install dwarves
+        command -v pahole >/dev/null 2>&1 ||
+            refuse "dwarves was installed but pahole is still not on PATH; install pahole by hand and rerun"
+    fi
     if ! grep -qs '^CONFIG_CC_IS_CLANG=y' "$KDIR/.config"; then
         say "the kernel was built by gcc; building the module with gcc"
         return

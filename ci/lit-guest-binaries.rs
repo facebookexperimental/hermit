@@ -3,7 +3,8 @@
 // shared by the producer (ci/manifest-plan/src/nextest_binaries.rs) and the
 // consumer.
 pub const LIT_GUEST_PACKAGE: &str = "hermit-lit-guests";
-pub const LIT_GUEST_BINARIES: [&str; 20] = [
+pub const LIT_GUEST_BINARIES: [&str; 21] = [
+    "lit_chaos_schedule_replay",
     "lit_child_should_inherit_fds",
     "lit_close_on_exec",
     "lit_dup2_existing_fd",

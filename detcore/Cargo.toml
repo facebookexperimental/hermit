@@ -26,7 +26,7 @@
 [package]
 name = "hermit-detcore"
 description = "Detcore: the deterministic scheduler and syscall determinization core of the Hermit execution engine."
-version = "0.5.3"
+version = "0.5.5"
 edition = "2024"
 readme = "README.md"
 homepage = "https://hermetic-infra.org"
@@ -61,8 +61,9 @@ bincode = { version = "2", features = ["serde"] }
 bitflags = { version = "2.13.1", features = ["serde"], default-features = false }
 chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-features = false }
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
-detcore-model = { version = "0.5.3", path = "../detcore-model" }
+detcore-model = { version = "0.5.5", path = "../detcore-model" }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
+goblin = { version = "0.10.7", features = ["elf32", "elf64", "endian_fd"] }
 hex = { version = "0.4.3", features = ["alloc"] }
 libc = "0.2.186"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
@@ -76,13 +77,13 @@ raw-cpuid = "10.7.0"
 regex = "1.13.1"
 # Abstract Reverie interface ONLY. Never add a concrete backend here (see the
 # BACKEND-ABSTRACTION COMMANDMENT at the top of this file).
-reverie = { package = "reverie-core", version = "0.5.3", git = "https://github.com/rrnewton/reverie.git", rev = "befaebe7482ef3fa8becb242bd020ec882963205" }
+reverie = { package = "reverie-core", version = "0.5.5", git = "https://github.com/rrnewton/reverie.git", rev = "e39f78dd604e4761b5eeea024001b9c1e26af901" }
 ruzstd = "0.9.0"
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 sha2 = "0.10.6"
 tempfile = "3.27.0"
-tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
 
 [dev-dependencies]

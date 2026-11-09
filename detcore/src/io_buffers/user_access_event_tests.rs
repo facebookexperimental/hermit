@@ -71,7 +71,6 @@ mod user_access_event_tests {
         config.detlog_heap = true;
         config.detlog_stack = true;
         config.detlog_io_buffers = true;
-        config.backend.virtualizes_syscall_clobbers = false;
         // This fixture audits the timer setters implemented by EventGuest.
         config.backend.delivers_preemption_timer_events = true;
         config.max_timeslice = std::num::NonZeroU64::new(1_000_000_000);
@@ -138,10 +137,11 @@ mod user_access_event_tests {
             generator.fill(&mut bytes);
         } else if matches!(call, Call::Preadv | Call::Preadv2) {
             // Explicit offset19 is distinct from the shared cursor7.
-            bytes = [148, 221, 38, 111, 184, 1, 74, 147];
+            bytes = [54, 74, 0, 152, 31, 135, 94, 224];
         } else {
-            // Literal seed0 stream offsets7..15, not production byte helpers.
-            bytes = [40, 113, 186, 3, 76, 149, 222, 39];
+            // Literal offsets7..15 of the fixture's stream (the default stream
+            // at run seed 0), not production byte helpers.
+            bytes = [143, 247, 174, 112, 238, 2, 248, 208];
         }
         (bytes, generator)
     }
@@ -299,17 +299,13 @@ mod user_access_event_tests {
                     assert!(audit.import_failed);
                     assert!(audit.copy_lengths.is_empty());
                     assert_eq!(audit.observer_reads, [(FIRST_DEST, 8), (RETRY_DEST, 8)]);
-                    for operation in [
-                        "release",
-                        "regs",
-                        "memory-regions",
-                        "memory-read",
-                        "timer",
-                        "set-regs",
-                    ] {
+                    for operation in ["release", "regs", "memory-regions", "memory-read", "timer"] {
                         assert!(audit.after_import_error.contains(&operation));
                     }
                     assert!(!audit.after_import_error.contains(&"user-read"));
+                    // The backend leaves the syscall-clobbered registers as a
+                    // native return would; Detcore writes no registers back.
+                    assert!(!audit.after_import_error.contains(&"set-regs"));
                     assert_eq!(*guest.releases.lock().unwrap(), 1);
                     assert!(guest.injected_iovecs.is_empty());
                     assert_eq!(guest.injected_zero_reads, 0);
@@ -377,7 +373,9 @@ mod user_access_event_tests {
                     assert!(audit.after_copy.contains(&"memory-regions"));
                     assert!(audit.after_copy.contains(&"memory-read"));
                     assert!(audit.after_copy.contains(&"timer"));
-                    assert!(audit.after_copy.contains(&"set-regs"));
+                    // The backend leaves the syscall-clobbered registers as a
+                    // native return would; Detcore writes no registers back.
+                    assert!(!audit.after_copy.contains(&"set-regs"));
                     assert_eq!(guest.thread.stats.regs_sample_index, 1);
                     assert!(guest.thread.last_rcb_timer.is_some());
                     let messages = logs.0.lock().unwrap();

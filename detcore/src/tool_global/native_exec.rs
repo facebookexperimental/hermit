@@ -958,12 +958,7 @@ impl super::GlobalState {
         {
             return Err(ExecControlError::Identity);
         }
-        let live_group: Vec<_> = sched
-            .thread_tree
-            .my_thread_group(&owner)
-            .into_iter()
-            .filter(|tid| sched.thread_is_live(*tid))
-            .collect();
+        let live_group: Vec<_> = sched.live_process_threads(owner).collect();
         if live_group != [owner]
             || !sched.thread_tree.unreaped_children_of(owner).is_empty()
             || !sched.holds_serial_grant(owner)
@@ -1463,6 +1458,98 @@ mod control_tests {
                                 .fd_blocking
                                 .robust_wakes,
                             vec![(owner, crate::types::FutexID::private(old_mm, 0x456000))]
+                        );
+                    });
+            },
+        );
+    }
+
+    /// A native exec is prepared only while its owner is its process's only
+    /// live thread. A live thread of another process whose ID the thread
+    /// tree still lists under the owner (the owner's former thread 43, now
+    /// process 44's) is not the owner's, so preparation qualifies. A live
+    /// thread of the owner's process that the tree's walk misses (46, whose
+    /// creating thread's ID 45 now leads another process) is, so preparation
+    /// is refused.
+    #[test]
+    fn native_exec_preparation_counts_only_the_owners_own_live_threads() {
+        isolated(
+            "native_exec_preparation_counts_only_the_owners_own_live_threads",
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        let _source = Source::new();
+                        let physical = i32::try_from(std::process::id()).unwrap();
+                        let (state, owner, _, mm) = fixture(true, Some((physical, physical)));
+                        let register = |thread: DetTid| {
+                            let mut sched = state.sched.lock().unwrap();
+                            sched.next_turns.insert(
+                                thread,
+                                ThreadNextTurn {
+                                    dettid: thread,
+                                    child_tid_addr: 0,
+                                    req: Ivar::new(),
+                                    resp: Ivar::new(),
+                                    protocol: Default::default(),
+                                },
+                            );
+                            sched.priorities.insert(thread, DEFAULT_PRIORITY);
+                        };
+                        let tid = DetTid::from_raw;
+                        // Processes 44 and 45 are CLONE_PARENT siblings of the
+                        // root owner, so neither is a child it must reap first.
+                        {
+                            let mut sched = state.sched.lock().unwrap();
+                            let tree = &mut sched.thread_tree;
+                            tree.add_child(owner, tid(43), false);
+                            tree.add_child_with_wait_metadata(
+                                owner,
+                                tid(44),
+                                true,
+                                true,
+                                libc::SIGCHLD,
+                            );
+                            tree.add_child(tid(44), tid(43), false);
+                        }
+                        register(tid(43));
+                        let ticket =
+                            match neutral(&state, owner, mm, counted(0, prepare(&state, mm))).await
+                            {
+                                R::PrepareNativeExec(Ok(ticket)) => ticket,
+                                response => panic!(
+                                    "another process's reused thread must not refuse: {response:?}"
+                                ),
+                            };
+                        assert_eq!(
+                            neutral(
+                                &state,
+                                owner,
+                                mm,
+                                counted(0, Q::CancelNativeExec { ticket }),
+                            )
+                            .await,
+                            R::CancelNativeExec(Ok(()))
+                        );
+                        {
+                            let mut sched = state.sched.lock().unwrap();
+                            let tree = &mut sched.thread_tree;
+                            tree.add_child(owner, tid(45), false);
+                            tree.add_child(tid(45), tid(46), false);
+                            tree.add_child_with_wait_metadata(
+                                owner,
+                                tid(45),
+                                true,
+                                true,
+                                libc::SIGCHLD,
+                            );
+                        }
+                        register(tid(46));
+                        assert_eq!(
+                            neutral(&state, owner, mm, counted(0, prepare(&state, mm))).await,
+                            R::PrepareNativeExec(Err(ExecControlError::Preparation))
                         );
                     });
             },

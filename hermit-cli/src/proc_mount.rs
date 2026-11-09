@@ -140,6 +140,11 @@ mod tests {
 
     #[test]
     fn readonly_proc_warning_survives_closed_stderr() {
+        if crate::run_in_fresh_process(
+            "proc_mount::tests::readonly_proc_warning_survives_closed_stderr",
+        ) {
+            return;
+        }
         let mut descriptors = [-1; 2];
         // SAFETY: pipe2 initializes two distinct owned descriptors on success.
         assert_eq!(

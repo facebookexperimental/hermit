@@ -13,13 +13,18 @@ dependency.
 Compatibility is substantial but incomplete, especially for less common Linux
 system calls.
 
+Chosen IDs for `--no-namespace` have a reserved-input admission contract,
+including named refusals for legacy Chosen schedule JSON and raw Chosen binary
+record/replay. See [Chosen process IDs](CHOSEN_IDS.md) for the supported scope,
+native-rseq incompatibility, observable mapping and remaining boundaries.
+
 ## Supported Environment
 
 Hermit supports x86_64 Linux. It requires:
 
 - A Rust nightly toolchain. The repository's `rust-toolchain.toml` selects it
   automatically when Rust is managed by `rustup`.
-- Linux user, PID, and mount namespaces.
+- Linux user, PID, IPC, and mount namespaces.
 - Parent-child `ptrace` and seccomp filter support.
 - `libunwind` and LZMA development libraries.
 - User-space performance counters for precise thread preemption. Hermit can
@@ -166,6 +171,20 @@ run without `--epoch` (or `HERMIT_EPOCH`, or a replayed recording that supplies
 the epoch), or with `--seed-from=SystemRandom`, is refused before the guest
 starts instead of drawing that input from the host.
 
+A run on a backend with precise timer events (ptrace, e9patch preprocessing on
+it, or KVM) whose precise timers preempted a thread late (a skid overshoot: the
+counter's interrupt arrived past its target) is refused at the end with exit
+status 122, since the moved preemption point is not deterministic evidence.
+`--summary` and `--summary-json` record the number of skid-overshoot events
+(`skid_overshoots`, with `seed_reproducible: false`). Reverie and Detcore can
+each report one overshoot, so an event is one thread's late timer and its
+target, however many reports name it; the JSON also records the reports
+(`skid_overshoot_reports`), which the refusal counts. Both describe that
+execution, not its seed: the same seed can run clean once and overshoot the
+next time, so a seed is never classified. An absent `seed_reproducible` with
+`skid_overshoots: 0` means that no overshoot was observed in that run, not that
+the seed reproduces it.
+
 ## Choosing A Mode
 
 | Goal | Command |
@@ -185,7 +204,8 @@ starts instead of drawing that input from the host.
 - makes I/O completion behavior deterministic;
 - virtualizes time, random inputs, CPUID, and selected file metadata;
 - rejects syscalls classified Unsupported instead of forwarding them silently;
-- gives the guest an isolated PID namespace and `/tmp`;
+- gives the guest isolated PID and IPC namespaces, `/tmp`, `/dev/shm` and
+  `/dev/mqueue`;
 - uses an isolated local network namespace;
 - exposes most of the host file system read/write.
 
@@ -198,14 +218,12 @@ hermit run --base-env=minimal -e LANG=C --workdir=/tmp -- /bin/pwd
 
 #### Backend Selection
 
-Use `--backend=ptrace|dbt|liteinst|sabre|kvm|e9patch` to select the process
-instrumentation backend.
-It is a global option and belongs before the subcommand, but backend scope is
-command-specific. Every backend supports `run`; KVM also supports `analyze` and
-`bisect`, which launch `run` trials (`hermit --backend=kvm analyze ...`);
-e9patch also supports `record`, and SaBRe also supports `strace`; unsupported
-combinations fail closed. The default is
-`ptrace`, so existing commands are unchanged:
+Use `--backend=ptrace|liteinst|in-guest-trap|kvm` to select the core process
+instrumentation backend. It is a global option and belongs before the
+subcommand, but backend scope is command-specific. KVM also supports `analyze`
+and `bisect`, which launch `run` trials (`hermit --backend=kvm analyze ...`);
+unsupported combinations fail closed. The default is `ptrace`, so existing
+commands are unchanged:
 
 ```bash
 hermit --backend=ptrace run -- /bin/echo hello
@@ -220,9 +238,8 @@ stages), else the one built beside the Hermit executable. Its constructor instal
 the guest process before the program's `main`, and Detcore's global state stays
 in Hermit, reached over a socket. No ptrace tracer sits on the system-call path.
 
-Build the runtime beside a Hermit built with the optional `liteinst` feature,
-which `third-party-backends` includes; a build without it refuses
-`--backend=liteinst`:
+Build the runtime beside a Hermit built with the optional `liteinst` feature;
+a build without it refuses `--backend=liteinst`:
 
 ```bash
 cargo build --locked -p hermit-run --features liteinst --bin hermit
@@ -323,24 +340,36 @@ backends; `--no-namespace` remains available for trusted guests. The in-guest
 runtime reserves `SIGSYS` for itself. This experimental path is not a security
 boundary for intentionally hostile code.
 
-The `dbt`, `sabre`, and `e9patch` selections require optional CLI features as
-well as their runtime resources. Build and stage both with:
+DynamoRIO's static frontend and runtime resources are built and staged by
+[hermit-dynamorio](https://github.com/rrnewton/hermit-dynamorio). SaBRe and
+e9patch are built and staged by
+[hermit-3rdparty-patching](https://github.com/rrnewton/hermit-3rdparty-patching).
+Follow those repositories' maintained frontend, artifact, and validation
+instructions. Their backend selections are unavailable in the core executable;
+a core build never substitutes ptrace for an explicit unavailable selection.
 
-```bash
-cargo build --release --workspace --features hermit-run/third-party-backends
-./target/install_pkg/hermit --backend=dbt run -- /bin/echo hello
-```
-
-For DBT, the default `--network=local` gives each physical execution a fresh
-network namespace with active loopback, including both executions of
+For the external DynamoRIO frontend, the default `--network=local` gives each
+physical execution a fresh network namespace with active loopback, including both executions of
 `--verify`. Each guest and its verification channel share that namespace.
 Newly created guest sockets are isolated from unrelated outer listeners; a
 namespace setup failure stops before the guest runs. Explicit `--network=host`
 shares the caller's network and remains incompatible with `--strict`.
 
-The same executable accepts `--backend=sabre` and `--backend=e9patch`.
-A default `cargo install` does not enable these selections. KVM requires
-read-write `/dev/kvm` access plus a guest-kernel ABI.
+SaBRe and e9patch use their patching repository's static frontends. Core KVM
+requires read-write `/dev/kvm` access plus a guest-kernel ABI, and an unlimited
+address-space limit: it reserves 3 GiB of host address space for every guest
+process, plus 3 GiB for each exec in flight, so Hermit refuses to start it under a finite
+`RLIMIT_AS` (`kvm_address_space_limit`, exit 122; see
+[ERROR_CATALOG.md](ERROR_CATALOG.md)). Bound its memory with a cgroup instead.
+
+On KVM, Detcore decides a guest's `flock(2)` locks inside the run and does not
+place them on the host: a guest's lock does not exclude a process outside the
+run, such as a writer on the host or another Hermit run, and theirs do not
+exclude the guest. Files that only the run uses are not affected. Run a guest
+that shares flock-protected files with processes outside the run, such as a
+`cargo` home or a `~/.rustup` that a host process also uses, on the ptrace
+backend, which places each of the run's locks on the host
+(https://github.com/rrnewton/hermit/issues/5043).
 
 See [SaBRe backend compatibility](SABRE_COMPATIBILITY.md) for the measured
 `Stripped` allowlist, build commands, and known gaps. An enabled probe is
@@ -391,6 +420,17 @@ for seed in 1 2 3 4 5; do
 done
 ```
 
+On a host whose retired-branch counter fails Reverie's performance-counter
+validation (`hermit host-capabilities` reports `exact-branch-counter: ABSENT`),
+the same seed is not guaranteed to reproduce a schedule when the run has a
+timeslice, because preemptions are timed with that counter. On the ptrace and
+e9patch backends `--strict` refuses such a run; without it, `hermit run`,
+`hermit analyze`, `hermit bisect` and `hermit record start` go on but first
+print one line that starts `WARNING: this host's retired-branch counter failed`.
+Rerun a finding from such a host on one where `hermit host-capabilities`
+reports `exact-branch-counter: PRESENT` with the validation passed before
+treating it as reproducible.
+
 The seed options have distinct roles:
 
 - `--sched-seed=N` controls scheduler randomness.
@@ -405,6 +445,16 @@ available. `--max-timeslice=N` controls the longest uninterrupted virtual
 time slice. Smaller values create more scheduling opportunities at additional
 runtime cost; positive values must be at least one RCB, which is 10 virtual
 nanoseconds at the default clock multiplier and scales with that multiplier.
+The cost grows steeply: each slice of a thread that computes without a syscall
+ends with a timer event, which the ptrace and KVM backends place by stepping
+the guest through up to the processor's skid margin (100 to 10000 RCBs, or
+`--skid-margin`), so a CPU-bound guest can run thousands of times slower at
+`--max-timeslice=1000` than at the default. When a slice is at most ten skid
+margins long (on a processor with a 10000-RCB margin, `--max-timeslice` of
+1000000 or less at the default clock multiplier), `hermit run`, `hermit
+analyze` and `hermit bisect` print a `NOTICE:` line saying so; there, a run that
+`--timeout` cuts off may be slow rather than hung, and `--summary` reports how
+many timeslices it had.
 `--target-timeslice=N` adds a cheaper logical deadline checked at syscall
 boundaries; it is useful for workloads that enter the kernel frequently.
 `--max-timeslice=disabled` avoids PMU use but can miss bugs in
@@ -412,9 +462,323 @@ CPU-bound code that rarely makes system calls. The old
 `--preemption-timeout` spelling is a deprecated alias for
 `--max-timeslice`.
 
+The value that finds a race depends on the race. Chaos ends each timeslice after
+a random number of retired conditional branches, drawn from an exponential
+distribution whose mean parameter is the maximum timeslice and capped at the
+maximum, so slices average about 0.63 of it before rounding to whole branches. A
+race whose window spans a few branches needs a maximum of about a hundred
+branches (`--max-timeslice=1000`); a race whose other thread must first run far
+into its own work needs slices long enough to get there, and short slices miss
+it. No single value finds both. Rather than guessing, let each seed draw its own
+value:
+
+```bash
+for seed in $(seq 0 63); do
+  hermit run --chaos --chaos-seeded-timeslice --sched-seed="$seed" -- ./target/debug/hello_race
+done
+```
+
+Two in five seeds draw their maximum from 1000 to 2000 virtual nanoseconds (100
+to 200 branches, for windows of a few dozen branches), two in five from 1000000
+to 200000000 (for races whose other thread must first run far), and one in five
+from the decades between, each log-uniformly within its range. Where
+`--clock-multiplier` makes one RCB longer than the value drawn, the maximum is
+one RCB, and a replay of the run under the same clock multiplier and slowdown
+settings keeps it. The races measured so far needed one end or the other: a
+46-branch window in a multithreaded C++ test binary failed in 9 of 32 seeds at
+1000 and in none of 32 at 1e4, 1e5, 1e6 or the default. Hermit prints the value:
+`[hermit] --chaos-seeded-timeslice: scheduler seed 7 drew --max-timeslice=...`.
+Rerunning the seed reproduces the run, and so does passing the printed value as
+`--max-timeslice` instead of the flag. The draw is part of what a seed selects,
+so a Hermit release that changed it would change every seed's schedule; the
+printed value pins it. Seeds that draw small values run much slower: every
+timeslice ends with a timer event, and the ptrace backend steps the guest
+through the last skid margin (100 to 10000 branches, depending on the processor)
+of every slice. The option needs the PMU timer of the ptrace backend; on other
+backends, set chaos's cooperative deadline with `--target-timeslice`.
+
+Every scheduler turn adds a fixed charge to the guest-visible clock
+(`--scheduler-turn-cost`, 500000 virtual nanoseconds by default), including
+the turn that ends a timeslice. With slices far shorter than the charge,
+CPU-bound work therefore appears about `1 + charge / slice` times slower to
+the guest: 501 times at `--max-timeslice=1000`, so a test's own timeouts can
+expire before the code under test runs. `--cap-preemption-charge` charges a
+turn that ends an expired slice at most the virtual time its thread ran since
+its previous turn, which bounds that factor at 2. A thread's previous turn can
+be a syscall inside the same slice: a preemption whose thread ran at least one
+charge since its previous turn is charged as before, and one that follows a
+syscall by less is charged only the time since that syscall, however long the
+slice was. A capped turn whose full charge is nonzero still adds at least
+one virtual nanosecond; a full charge that `--clock-multiplier` makes zero
+stays zero. A recorded schedule stores the setting, and a replay under the
+other is refused.
+
+The option changes what the guest observes. After a capped preemption,
+`clock_gettime(CLOCK_MONOTONIC)`, and every other clock Hermit derives from
+the same virtual time, has advanced less than it would without the option. A
+timer or timeout measured on those clocks (a sleep, a futex, `poll` or
+`epoll_wait` timeout, a POSIX timer or `timerfd`) therefore expires after more
+guest work, and a program that times its own work sees shorter intervals.
+Linux defines no cost for a context switch that Hermit could copy. What it
+does define for `CLOCK_MONOTONIC` still holds. `clock_gettime` calls the
+clock's `clock_get_timespec`
+([kernel/time/posix-timers.c:1132-1148 at v6.9](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/time/posix-timers.c?h=v6.9#n1132)),
+which for `CLOCK_MONOTONIC` is `posix_get_monotonic_timespec`, a read of
+`ktime_get_ts64`
+([:154-159](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/time/posix-timers.c?h=v6.9#n154),
+[:1448-1451](https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/time/posix-timers.c?h=v6.9#n1448)),
+a clock that never goes back. Under the option Hermit's virtual time still
+never goes back either: a thread's own work only adds to it, and a capped
+scheduler charge only shrinks what a turn adds, never below zero. The
+one-nanosecond floor further keeps a capped turn whose full charge is nonzero
+from adding nothing.
+
+Most of that cost comes from stopping the guest at the end of every slice,
+and much of it is saved where no other thread could run. When every other
+thread waits on a futex without a timeout, on a child or in `rt_sigsuspend`,
+and no timer, sleeper, poll deadline or host call is pending, a slice end
+cannot hand the turn to anyone, so Hermit lets the thread run on and processes
+each end it skipped when the thread next enters Hermit (a system call, a
+signal, a trapped instruction), at the same retired-branch count and in the
+same order. The schedule, the virtual clock and the chaos draws are what a stop
+at every end gives; `--eager-lone-preemptions` restores those stops, for
+comparison, and `--summary` reports how many ends were taken without a stop.
+Inputs from the host are the exception, as they are timed by the host either
+way: a signal sent from outside (which can also wake a thread asleep in
+`rt_sigsuspend`, a call that waits in the kernel) is seen at the next scheduler
+turn, which may come later than a stop would have; and a thread killed from
+outside with `SIGKILL` never has its skipped ends processed.
+Slice ends while two threads can run still stop the guest. This applies to the
+ptrace backend's precise timer, and not where the run uses `--target-timeslice`,
+`--chaos-per-thread-slowdown`, `--imprecise-timers`, strict schedule boundaries,
+turn-numbered triggers (`--stop-after-turn`, `--stop-after-iter`,
+`--signal-at`), stack traces at preemptions or events, manual interrupt points,
+a happens-before program, `--chaos-instruction-offset` (each offset is stepped
+from a stop at its branch target) or `--gdbserver` (a debugger stopping the
+thread between skipped ends would see Hermit's slice bookkeeping behind its
+program counter).
+
+Recording and replaying keep these savings. A recorded schedule
+(`--record-preemptions-to`) holds each slice end taken without a stop as the
+branches up to it, as for any slice end, but with no instruction pointer (the
+guest was not stopped there) and marked `"stopless": true`. A schedule replay
+(`--replay-schedule-from`) takes such an end without a stop too when the thread
+again runs alone, and stops at every other end, where it checks the instruction
+pointer the recording read. A thread that the replay switches to takes its
+first end with a stop. A preemption replay (`--replay-preemptions-from`) takes
+any recorded end at a retired-branch count without a stop when the thread runs
+alone, except in a record with per-thread chaos rates, and except for a thread
+whose recorded ends hold instruction offsets, which are stepped from a stop. A
+record made before this mark existed replays as before. A record that holds the
+mark is preemption record format 5, which an older Hermit, reading formats 1 to
+4, refuses as a format it does not know before the guest starts. A record that
+keeps no background starts, and so states format 3 (a schedule replay's
+re-record, a prefix or edit of a schedule, an analyze or bisect trial), keeps
+no marks either: its replay stops at those ends, which replays the run as
+faithfully.
+
+Which slice length exposes a race depends on the race: some need a preemption
+in a short window (fine slices), others a long uninterrupted run of one thread
+(coarse slices), and a seed sweep under one `--max-timeslice` explores mostly
+one scale. `--chaos-timeslice-range=MIN..MAX` draws each slice's mean
+log-uniformly from MIN..MAX virtual nanoseconds, so every run mixes all the
+scales in the range, and caps every slice at MAX. Slices are still random
+around the drawn mean, so some fall below MIN:
+
+```bash
+for seed in $(seq 1 32); do
+  hermit run --chaos --sched-seed="$seed" --chaos-timeslice-range=1000..200000000 \
+    -- ./target/debug/hello_race
+done
+```
+
+The draws come from the scheduler seed, so a seed reproduces its run. The
+range sets the run's `--max-timeslice` to MAX; give one or the other, and do
+not combine it with `--target-timeslice`. It needs PMU-backed preemption. A
+small MIN makes runs slower, because fine slices mean many preemptions.
+
 Advanced investigations can save preemption decisions with
 `--record-preemptions-to=FILE` and replay them with
-`--replay-preemptions-from=FILE`.
+`--replay-preemptions-from=FILE`. A record edited after it was recorded (for
+example, with preemptions removed, as `hermit analyze --minimize` does) can
+bring a thread to recorded slices that have already ended. A faithful replay
+never does, so Hermit stops it there; add `--replay-edited-preemptions` to skip
+those slices and go on with the first recorded slice still ahead, at its
+priority (at a thread's start, the record's first priority holds until that
+slice ends). `hermit analyze` adds it to the records it edits.
+A record pins every slice end, so a run under `--chaos-timeslice-range`
+replays from it exactly; give the replay the same range, or
+`--max-timeslice=MAX`, so slices past the end of the record are capped as in
+the recording.
+
+Explicit `--replay-edited-preemptions` is exploration-only. It cannot be
+combined with `--verify`, `--verify-strict`, or `--verify-run`, even when the
+input record has no departure marker: an edited replay can omit a change point
+while running, so matching output alone cannot certify faithful replay. Ordinary
+unmarked faithful replay and verification remain supported. Analyze's separate
+selfcheck requires both its input and recorded result to have no known omission.
+
+A record with `replay_departed_at` is known to omit a replay change point.
+Faithful history replay, global-schedule replay, boundary replay, and analysis
+refuse it with `HERMIT_INCOMPLETE_REPLAY_RECORD` before using it as execution
+evidence. Explicit edited history exploration may read it, with a warning, and
+any new recording retains the omission fact. Copying, stripping timestamps,
+normalizing, or interpolating a record cannot remove that fact. A retained count
+refers to a source observation; it need not index a transformed output.
+
+Newly written marked JSON uses the mandatory
+`incomplete_preemption_record` version-1 envelope, which old readers reject.
+The new reader also recognizes historical flat marked JSON and refuses its
+faithful use, but cannot protect those already-written flat files from old
+binaries. Unmarked legacy bytes and their admission policy remain unchanged;
+a missing marker does not prove historical completeness. Marked records cannot
+be serialized through an unversioned non-human format. No appended-data
+detection or generic legacy binary roundtrip guarantee is implied.
+A schedule replay (`--replay-schedule-from`) whose next recorded event goes
+unmatched for a thousand observed events in a row releases the rest of the
+schedule and runs on unguided. Unmatched polling retries neither count toward
+that run nor break it. The replay's warning and the run summary's
+`RELEASED replayed schedule at event #N` line number events without polling
+retries, whose count can depend on host timing. A `--stacktrace-event` index,
+like the desync and `Missed stack trace` lines, counts every traced event,
+polling retries included, so a release's number is not a `--stacktrace-event`
+index. A requested index the run never reaches is reported, not dropped. The
+report comes in the run summary of a run that records or replays a schedule,
+or before a replay stops the run under `--replay-exhausted-panic` or a
+strict replay stop (strict is the default; `--die-on-desync` is retired). A run that ends without a summary, such as a non-ptrace
+backend's `--timeout`, does not report.
+
+Under `--strict-schedule-boundaries` a `--stacktrace-event` index is a
+position in the complete boundary stream instead, `TimesliceEnd` records
+included. A replay refuses an index outside its stored stream when the run
+starts, and the reports above do not apply to it. A recording counts the
+stream as it writes it and, like any recording, reports an unreached index
+in its run summary.
+
+A replay reproduces the recording only if the guest reads the same host
+files. The recorded schedule therefore keeps the set of host files the run
+read (`host_inputs`: each path with its host identity and, for a regular file
+of at most 32 MiB, the SHA-256 of its bytes, or for a directory, of the names
+in it), and a replay (with
+`--replay-preemptions-from` or `--replay-schedule-from`) prints one line for
+each such file that changed since:
+
+```text
+HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING host input /etc/ld.so.cache changed since the recording (...); the run may diverge where the guest reads it
+```
+
+The comparison counts the files the guest opens and those the kernel opens
+for its execs: each program image and its ELF interpreter (for a `#!`
+script, the interpreter the kernel ran, not the script), each with the
+identity it had when the guest opened it or the kernel ran it, so a file
+replaced later in the run is reported against the one the guest used. An
+interpreter Hermit cannot identify as the file the kernel mapped (on an
+overlayfs root, for example) is left out, and a comparison then has no
+evidence about it. Where Hermit may not follow `/proc/<pid>/map_files` (it
+needs CAP_CHECKPOINT_RESTORE or CAP_SYS_ADMIN in the initial user
+namespace), it identifies the interpreter by its inode number alone, so a
+file of the same inode number that another filesystem or btrfs subvolume
+exposes at the interpreter's name cannot be told apart. A file whose bytes
+were hashed in both runs counts as changed only if its bytes differ, so a
+file rewritten unchanged, as `ldconfig` rewrites `/etc/ld.so.cache`, is not
+reported; a directory counts as changed only if the names in it differ,
+leaving out the names the guest made or removed itself, so the `/tmp` Hermit
+makes afresh for each run is not reported. A file that was not hashed (larger
+than 32 MiB, changed again before the run ended, or on a backend whose tool
+cannot name the guest's descriptors) counts as changed when its host inode,
+size or modification time differs. Hermit reads the bytes and names only
+after every guest process has exited, never while the guest runs: Linux
+raises an inotify event for every open and read of a file, and a guest
+watching the file's directory would see those reads. So a regular file whose
+size changed is reported at the guest's first open of it, and any other
+change when the run ends. Kernel objects (paths under
+`/proc`, `/sys` and `/dev`, names that lead there, such as `/etc/mtab`, and
+FIFOs, sockets and devices wherever they are, which hold no bytes to compare)
+are left out, and so are paths the guest itself renamed, linked or unlinked,
+or opened with `O_CREAT`. Under `--backend=dbt` nothing is recorded. The
+line is information, not a refusal: Hermit does not make a changing
+filesystem deterministic.
+
+#### Discovery mode
+
+For race discovery, sweep seeds with `--chaos-timeslice-draw=run`. Each run
+draws its `--max-timeslice` once, log-uniformly from the recommended range
+1000..200000000 virtual nanoseconds (1 us to 200 ms), as a pure function of the
+scheduler seed, and is then an ordinary chaos run under it, so the seeds of a
+sweep spread over the scales of the range, each seed at one scale:
+
+```bash
+for seed in $(seq 1 64); do
+  timeout 600 hermit run --chaos --chaos-timeslice-draw=run --sched-seed="$seed" \
+    --summary-json="$PWD/run-$seed.json" -- ./target/debug/hello_race
+done
+```
+
+The recommended range is `RECOMMENDED_CHAOS_TIMESLICE_RANGE` in
+`detcore-model/src/config.rs`, and `hermit run --help` states it; give
+`--chaos-timeslice-range=MIN..MAX` to draw from another range. It spans the
+fine timeslices at which races that the fixed default never reaches were found
+(1 us to 5 ms) and the default itself (200 ms). The default is unchanged: plain
+`--chaos` keeps the fixed 200 ms, and `--chaos-timeslice-draw=slice` (the
+default draw) draws each slice's mean from `--chaos-timeslice-range`, which it
+requires when given explicitly. The per-run draw is not the default because it
+costs time and trades races:
+
+- Fine draws mean many preemptions. On the repository's racy guests the p90
+  run took up to about 120 times as long as at the fixed default; in a study of
+  115 cases the draw took 4.4 times the run time in all, and 78 of its runs hit
+  their time cap against 9. Size time limits for the fine end.
+- Draws below about 3 us dilate guest-visible time by two to three orders of
+  magnitude. At draws near 1 us the fixed charge for each committed scheduler
+  turn (0.5 ms) makes up about 99% of guest-visible time
+  ([#4813](https://github.com/rrnewton/hermit/issues/4813)), so a guest's own
+  watchdogs can fire on threads that are making progress. Pass
+  `--cap-preemption-charge` beside fine draws: it caps that charge (in that
+  study it cut a control's watchdog aborts at a 1038 ns draw from 5 of 5 seeds
+  to 1 of 5). It is refused where no timeslice ends by expiry
+  (`--max-timeslice=disabled` without `--target-timeslice`), where no Detcore
+  scheduler orders the threads (`--namespace-only`, `--strace-only`,
+  `--no-sequentialize-threads`) and with the DBT backend, and it is never
+  applied in record mode.
+- A race that needs coarse slices is reached by fewer seeds than at the fixed
+  default.
+- It is meant for seed sweeps: without a seed every run is seed 0 and draws the
+  same value.
+
+`--summary-json` reports the drawn value (`preemption.max_timeslice_ns`), and a
+`--record-preemptions-to` record stores it (`chaos_timeslice`). On a replay:
+
+- A record that states a drawn value replays under it with no timeslice
+  option, drawing nothing. It takes precedence over a range or
+  `--chaos-timeslice-draw` the replay gives. `--max-timeslice=N` is accepted
+  for the recorded N only when the replay passes no range or per-run draw;
+  beside either, an explicit `--max-timeslice` is refused, whatever the
+  record states. `--chaos-seeded-timeslice` is refused.
+- A record that states none (one recorded at a fixed timeslice, or before
+  records stated the draw) leaves the replay's own timeslice options in force.
+  With `--chaos-timeslice-draw=run` the replay draws its maximum from its own
+  scheduler seed, as a run without a record does; to replay such a record as it
+  was recorded, give the `--max-timeslice` it was recorded with, or no
+  timeslice option for the default 200000000.
+- A range without the per-run draw beside such a record replays its slice
+  ends under the range's MAX, as for any per-slice record.
+
+`hermit analyze` runs all its trials under the drawn value its recordings
+state (`--run1-preemptions`, `--run2-preemptions`), and `hermit bisect` all its
+replays under the one its `--good` and `--bad` schedules state, passed as
+`--max-timeslice=N`. Both refuse `--chaos-timeslice-draw=run` in their run
+arguments (each trial would draw its own value), recordings that state
+different values, a `--chaos-timeslice-range` in the run arguments beside a
+recording that states one, and a `--max-timeslice` that differs from it. The
+schedules analyze writes do not state the value: give a later `hermit bisect`
+of them the same `--max-timeslice=N`.
+
+The draw and the range need `--chaos` and PMU-backed preemption (the ptrace
+backend; the others refuse them), and conflict with an explicit
+`--max-timeslice`, with `--chaos-seeded-timeslice` and with
+`--target-timeslice`. Each bound of a range must be at least 10 virtual
+nanoseconds (one RCB at the default clock multiplier), and MIN no larger than
+MAX.
 
 ### Verify Mode
 
@@ -618,6 +982,22 @@ hermit log-diff --verify-json report.json rec rep
 `rec/recording` holds the recording. Give both commands the same options; the
 comparison writes the report `record start --verify --verify-json` writes.
 
+To record a racy failure, record under chaos scheduling and try seeds until one
+fails, then replay that recording under GDB:
+
+```bash
+for seed in $(seq 1 64); do
+  hermit record start --chaos --seed="$seed" -- PROGRAM || break
+done
+hermit replay
+```
+
+The recording stores its schedule, and replay follows it. `--seed` (also
+spelled `--sched-seed`, as for `hermit run`) seeds only the scheduler; the
+guest's random numbers are recorded. Recording runs under a different
+configuration from `hermit run`, so a seed that fails under
+`hermit run --chaos` does not necessarily fail under `hermit record`.
+
 Replay depends on the captured data and compatible Hermit behavior. Keep the
 recording directory intact and prefer the same Hermit revision for recording
 and replay.
@@ -637,6 +1017,312 @@ Run `hermit analyze --help` before using this workflow. Search, minimization,
 and schedule replay can perform many guest executions and require a reliably
 reproducible target condition.
 
+Analyze keeps every run's schedules, logs, output and reproducer command in a
+workspace, a `hermit_analyze*` directory it creates in `--tmp-dir`, or else in
+`$TMPDIR` (`/tmp` when TMPDIR is unset); the paths it prints name that
+directory. Analyze removes the workspace when it exits after its report, and
+when SIGTERM, SIGINT or SIGHUP stops it; after an error it keeps it, since the
+error can name trial files in it (a trial that did not finish, say), and a
+budget's partial report keeps it too (see below). A stop
+signal ends the run in progress and starts no other; analyze then removes the
+workspace and that run's own temporary directories, and dies of the signal, so
+a shell reports 128 plus its number (143 for SIGTERM). Pass `--keep-tmp` to
+keep the workspace, for example to rerun a reproducer; `--verbose` keeps it
+too, since the reproducers it prints name its files, and so does
+`--trial-log` above `warn`. The report file (`--report-file`) and the
+`--tmp-dir` directory itself are never removed.
+
+Every run analyze starts logs at the `warn` level to analyze's stderr, as
+`hermit run` does. `--trial-log=info` or `--trial-log=debug` writes each run's
+log at that level into a file of its own in the workspace (`<run>.log`), and
+`--trial-log=off` drops the runs' warnings but keeps their errors, among them
+the reason Hermit gives when it refuses a trial; `--verbose` prints analyze's
+own detail and leaves the runs' level alone. Without `--trial-log`,
+`--guest-log` (or HERMIT_LOG) gives the level. A debug log can grow to
+gigabytes per run and make the run several times slower, so a trial that a
+bound stops gets through less of the program. `--selfcheck` compares the
+target run's log with its replay's, so the runs whose logs it may compare (the
+target run, the `--search` run that becomes it, the `--minimize` runs and the
+replay) log at `debug` or above into their files, whatever `--trial-log` says.
+
+While analyze runs, a bisection trial's schedules, as large as the endpoints'
+(hundreds of MB for a few million events), are removed as soon as the trial's
+outcome is read, and every run's recording with event times once analyze has
+written it without them. `--keep-tmp` keeps them as well; `--verbose` does
+not, so the reproducer it prints for each trial needs `--keep-tmp` to run
+afterwards. `hermit bisect` keeps them.
+
+Analyze cannot clean up after SIGKILL, nor after a stop signal it does not
+handle: a signal it inherits as ignored stays ignored (SIGINT in a shell's
+background job, SIGHUP under `nohup`), and an analyze that is PID 1 of its PID
+namespace, as in `docker run IMAGE hermit analyze ...` without `--init`, keeps
+the default actions, which Linux discards for a namespace's init. Analyze also
+leaves the stop signals to kill it at once, as before, when `/proc` is not its
+own PID namespace's (analyze started by another process inside `unshare -pf`
+without `--mount-proc`) or when it inherited more than 64 children, since it
+could not then find the run to stop, and where it cannot open a pidfd, send
+a signal through one or wait on one (Linux before 5.4, or a seccomp filter
+that refuses `pidfd_open`, `pidfd_send_signal` or `waitid`), since it signals
+the run only through a pidfd: a process ID it found can be reaped and given to
+another process before the signal goes out. A stop it cannot pass on to the
+run (no file descriptor left to read `/proc`, or a pidfd call that fails) is
+not lost either: analyze says which call failed and dies of the signal as it
+would without its handler, the run dies with it, and the workspace and the
+running trial's private temporary directory stay, since such a death unwinds
+nothing.
+`hermit bisect` keeps its workspace and names it when it exits.
+
+A replayed or spliced schedule can leave the guest spinning or waiting indefinitely.
+`--trial-timeout=SECONDS|auto|off` bounds runs after the initial target attempt.
+The default `auto` uses the initial completed run and completed target/baseline
+endpoints: max(60 seconds, 10 times the slowest measured run), rounded up to
+whole seconds. Analyze prints the bound when it changes. A shorter `--timeout`
+in the run arguments still wins and also bounds the initial run. With
+`--run1-preemptions` the initial run is a replay of the record, measured like
+a seed's, which an explicit `--trial-timeout=SECONDS` bounds too. On a
+backend that does not enforce `--timeout`, `auto` gives no bound and an explicit
+number is refused; bound the whole analysis from outside there.
+
+A timed-out trial cannot certify a causal report: it establishes neither the
+target nor the baseline outcome, even if it captured stacks. Analysis returns
+exit 124 without saving a successful report; diagnostics from previously
+completed runs may already have been printed. This also applies when the
+default non-chaos baseline times out; analyze
+does not replace it with a prefix search. Retry with a larger trial bound if the
+guest can finish. `--trial-timeout=off` removes analyze's time and log bounds,
+while leaving a user-supplied `--timeout` in force. The log files bounded
+trials write under `--trial-log` above warn or `--selfcheck` are capped at
+max(64 MiB, 10 times the largest measured endpoint log), within
+`HERMIT_LOG_MAX_BYTES`; setting that variable to `0`
+lifts both file caps. These host resource limits may stop a trial on a slow
+machine; they never change a stopped trial into a completed outcome.
+
+A trial refused by Hermit (`HERMIT_POLICY_REFUSAL`, exit 122) stops the search
+without establishing a program outcome for that trial. It cannot replace a
+completed baseline or certify a causal report. The error names the trial and
+its log file, or stderr when no file was requested. Inspect the named refusal
+and use a supported operation or configuration before retrying. An ordinary
+guest exit 122 remains a completed guest outcome, classified by the target
+criteria; its numeric status alone is not a refusal.
+
+By default analyze bisects between the failing schedule and a passing one from
+another run. When the two runs differ in events only one of them executed (for
+example timeslices that end at other points, or extra iterations of a polling
+loop), no single swap may separate the outcomes. `--prefix-search` searches
+within the failing schedule instead: each trial replays its first K events and
+then schedules without chaos, and a binary search finds the event at which the
+outcome flips. The continuation runs at the run's own `--max-timeslice`; a race
+found only at a short timeslice often shows without chaos at that timeslice
+too, and then the search continues at 200 ms instead
+(`--continuation-timeslice`). The report shows the stack of the thread the
+failing schedule runs at that event and of the thread that runs there
+otherwise. When both continuations run the same thread there, the decision is
+how long that thread runs: the report then shows its stack, and the stacks of
+the threads that run after it with and without the event:
+
+```bash
+hermit analyze --prefix-search --run1-seed=1 --target-stdout='FAILED' \
+  --target-exit-code=any --report-file=analysis.json -- --chaos -- PROGRAM
+```
+
+Analyze runs every trial under the `--expired-wait-charge` rule of the
+recording it starts from, or `each` for a chaos target it records itself. A
+baseline schedule recorded by a plain `hermit run --record-preemptions-to=...`
+stores `once`, so analyze refuses it beside a chaos target. Re-record it with
+`--expired-wait-charge=each`, or, if it is the target, pass
+`--expired-wait-charge=once` in the run arguments.
+
+Analyze's exit status says what it concluded. A conclusion is never reported
+as a failure of Hermit; only a failure to conclude exits 125, under a class
+line that says which. The class line is the first line on stderr:
+
+| Exit | Line on stderr | Meaning |
+| --- | --- | --- |
+| 0 (or `--success-exit-code`) | none | The report names the critical events (`"verdict": "critical_events"`). |
+| 0 (or `--success-exit-code`) | `HERMIT_ANALYZE_VERDICT class=reproduced-without-schedule` | The target is reproduced without the target schedule: without chaos the scheduler alone meets the target, so the prefix search localizes no event (which does not show that no event decides the outcome); debug that run directly. The report says why (`"verdict": "reproduced_without_schedule"`) and names no event. |
+| 2 | `HERMIT_ANALYZE_PRECONDITION class=target-not-reproduced` | The target run, the failing endpoint of a bisection, or `--minimize`'s last record does not meet the target criteria. |
+| 2 | `HERMIT_ANALYZE_PRECONDITION class=baseline-not-reproduced` | The baseline meets the target too, or the baseline the user chose does not finish. |
+| 2 | `HERMIT_ANALYZE_PRECONDITION class=no-prefix-continuation` | No continuation timeslice allows a prefix search. |
+| 2 | `HERMIT_ANALYZE_PRECONDITION class=endpoints-not-separable` | `hermit bisect` only: its search established no exact one-swap pair of schedules with opposite outcomes between `--good` and `--bad`. Analyze attempts a prefix search within the target schedule instead. |
+| 2 | `HERMIT_ANALYZE_PRECONDITION class=endpoints-identical` | `hermit bisect` only: `--good` and `--bad` contain identical event traces. |
+| 2 | none | clap's usage error: the command line did not parse. |
+| 120 | `HERMIT_ANALYZE_PARTIAL class=time-budget` or `class=trial-budget` | A budget (`--time-budget`, `--trial-budget`) ended the analysis, which reports its best answer so far (see below). |
+| 122 | `HERMIT_POLICY_REFUSAL class=policy-refusal` | Hermit refused the target run, or analyze or bisect refused its options or schedules. |
+| 123 | `HERMIT_LOG_CAP class=log-cap` | `--max-log-bytes` ended the analysis. |
+| 125 | `HERMIT_INTERNAL_FAILURE class=replay-not-reproducible` | `--selfcheck` found a difference, or a jittered schedule never replayed the same way twice: replay, Hermit's or this host's (`hermit host-capabilities` says whether its branch counter is exact), did not reproduce a run. |
+| 125 | `HERMIT_INTERNAL_FAILURE class=search-did-not-converge` | The event-level search did not converge within its passes. |
+| 125 | another `HERMIT_INTERNAL_FAILURE class=...` | Hermit failed. |
+| 128 + N | none | Signal N (SIGTERM, SIGINT or SIGHUP) stopped the analysis. |
+
+Exit 2 means that the inputs do not give analyze what it needs, as `diff` and
+`grep` exit 2 when they cannot do what was asked; the message says what to
+change. `--success-exit-code` refuses 2 and 120 to 127 for that reason. `hermit
+bisect` checks that its `--good` schedule misses the target and its `--bad`
+schedule meets it, and exits 2 with the same lines when one does not.
+
+A report file (`--report-file`) has one schema for every verdict: read its
+`verdict` first. `critical_events` fills `critical_event1` and
+`critical_event2` (and `deciding_event` for a timing decision);
+`reproduced_without_schedule` leaves them out, and the racing accesses
+(`racing_accesses`) too, and `header` says why. Its
+`verdict_reason` says what the scheduler alone shows. When the trials keep
+timing settings from the run arguments (`--pipe-wake-latency`,
+`--scheduler-turn-cost` other than the default charge), analyze runs one more
+trial, the empty prefix without them at the first continuation it tried: if it
+misses the target, the
+reason is `{"cause": "timing_semantics", "options": [...], "alternatives":
+[...], "trial": "..."}`, the settings cause the outcome, a two-seed search
+can end the same way, and a new failing run under the alternatives may have
+an event that decides it. Otherwise (it meets the target too, or it is not
+run because a `--run1-preemptions` recording fixes the settings) the reason
+is `{"cause": "scheduler_alone", "timing_in_force": [...]}`, and without
+such settings `{"cause": "scheduler_alone"}`. A cause a later build adds
+reads as `unknown`. A report from before the field names the critical
+events.
+
+A long analysis can be bounded, and it then reports its best answer so far
+instead of nothing. `--time-budget=DURATION` (`1800`, `30m`, `2h`) bounds the
+invocation's wall-clock time, and `--trial-budget=N` the number of runs it
+starts. The budget is checked before every run, and each run's `--timeout` is
+shortened to the time left; a run the budget cuts short is thrown away rather
+than counted as not meeting the target, so the budget decides only when
+analyze stops, never what it finds. When it runs out, analyze exits **120**
+after the stderr line `HERMIT_ANALYZE_PARTIAL class=time-budget` (or
+`class=trial-budget`) and a report that says it is partial, why, and which
+phase was running:
+
+- The default search reports the closest pair of schedules it found, a
+  schedule whose replay misses the target and one whose replay meets it
+  (`interval_passing.events` and `interval_failing.events` in the workspace),
+  their edit and swap distances, and the first event at which they differ: the
+  deciding event is that one or a later one. It takes the two schedules'
+  stacks there when two replays as slow as the slowest endpoint run fit
+  min(120 s, 5% of `--time-budget`) after the budget ran out, and says so when
+  they do not.
+- `--prefix-search` reports its bracket. Short prefixes miss the target and
+  long ones meet it, so the report names the longest prefix whose replay
+  finished and missed, the shortest whose replay met it, and the range of
+  events between them that holds the deciding event.
+- A budget that runs out after the search finished, during its final
+  replays, reports no decision: analyze names one only once those replays
+  repeat the search's outcomes, so the report's event fields are absent and
+  `partial.stacks` says why; `--resume` runs them. A partial report never
+  names a decision, so a script reads `partial` first.
+
+In a report file such a report's `verdict` is `partial`, and `partial` holds
+what it found. While the default search runs, `critical_event1` and
+`critical_event2` name where its closest pair first differs, which is the
+deciding event or one before it; otherwise the event fields are absent.
+
+Analyze stops itself only between runs, and the default search's computation
+between runs and the stack replays after the budget can take a little longer,
+so give a harness's own kill bound (a test timeout, `timeout(1)`) room above
+`--time-budget` plus min(120 s, 5% of it), for example a few minutes more.
+Analyze then stops itself first and writes its partial report and resume
+command, which an outer kill would lose.
+
+Analyze writes its progress into the workspace as it goes: every finished
+run's outcome (`analyze-journal.jsonl`), what the analysis is of
+(`analyze-checkpoint.json`) and the search's interval or bracket
+(`analyze-progress.json`). When a budget ends it, the workspace is kept even
+without `--keep-tmp`, and the report gives the command that continues it: the
+same arguments plus `--resume=WORKSPACE`. A resumed analysis runs again from
+its start, and every run in the journal takes its recorded outcome instead of
+running. A run its own bound stopped, or Hermit refused, is journaled too, and
+resumes as the same error, which ends the analysis there again: such a run has
+no outcome. The default search restarts at the pass whose interval the
+progress names, from that interval's two schedules in the workspace, rather
+than replaying its earlier passes, which would need every trial's schedules.
+So the resumed analysis makes the same decisions and reports what an
+uninterrupted analysis would. It refuses (exit 122), naming each difference,
+when the hermit binary, the guest program, the run arguments, the target
+criteria, the search options and `--max-log-bytes`, the record or schedule
+files given as runs, or `--analyze-seed` differ from the recorded ones; to
+start over anyway, run the command without `--resume`. With `--image` in the
+run arguments, `--resume`, `--time-budget` and `--trial-budget` are refused
+(exit 122): the image reference can name another image by the next invocation,
+and the program runs from the image's root, so analyze cannot show that a
+resumed analysis has the same guest. A workspace that `--keep-tmp` kept, or
+that a SIGKILL left, can be resumed the same way. A resumed analysis that
+errors or is stopped keeps the workspace, whatever its retention, so that it
+can be resumed again.
+
+```bash
+hermit analyze --prefix-search --time-budget=30m --run1-seed=1 \
+  --target-stdout='FAILED' -- --chaos -- PROGRAM          # exits 120 if the budget runs out
+hermit analyze --prefix-search --time-budget=30m --run1-seed=1 \
+  --target-stdout='FAILED' --resume=/tmp/hermit_analyzeXXXX -- --chaos -- PROGRAM
+```
+
+#### Racing accesses
+
+The report ends with a "Racing accesses" section (`racing_accesses` in a
+`--report-file`; `--no-racing-accesses` leaves it out). The final replays on
+each side of the deciding event record an access trace, and analyze compares
+the two from that event on. Its `status` says how far the evidence goes:
+
+| Status | Meaning |
+| --- | --- |
+| `found` | The evidence singles out one pair of conflicting syscalls on two threads whose order flips between the runs. |
+| `timing` | No conflicting pair; two timed calls whose return order flips. |
+| `candidates` | Up to three ranked candidates, none singled out; each says what differs between the runs. |
+| `found_by_intervention` | Exactly one candidate whose reversal changes the outcome while an unedited control does not. |
+| `none_found`, `unavailable` | Neither, with the reason. |
+
+A rank is not a verdict. Candidates are listed by kind of evidence: a thread's
+change of course that fed the outcome's input first, then waits in flight
+across the deciding event, then order flips the evidence supports, then the
+rest. Analyze checks each candidate by replaying one run with the candidate's
+turn order reversed, beside a control replay without the reversal, and the
+candidate's `Check:` line (`check` in the report file) says what that showed:
+`decides` (the reversal changed whether the run meets the target, and the
+control did not), `does not decide`, `not realized` (the replay could not
+follow the edited schedule; a timed sleep, for example, cannot return before
+its deadline) or `not checked`, with how many events the edit moved and which
+threads' events they crossed. A candidate whose check does not decide ends
+"not shown to decide", whatever its rank. Only `found_by_intervention` says an
+order decides the outcome. In a report file that sentence is not part of a
+candidate's `evidence`: read its `check.verdict`, which is `decides` only for
+a candidate shown to decide.
+
+When the checks ran and none decides, the report says so after the
+candidates, and keeps the cases apart. A reversal that ran as edited and left
+the outcome as it was clears its candidate, but only as far as one turn
+reversal in one run goes: when all of them did, the outcome probably does not
+turn on any one of these candidates' orders alone, and may turn on an order not
+ranked here, an order in memory that syscalls do not show, one outside the
+trace, or several together. A reversal that could not be replayed as edited
+(`not realized`), one never tried because its control did not reproduce the
+run, and a candidate not checked leave it untested, not cleared. Either way,
+nothing says the right pair is among the candidates. The report then lists what to try next: `--minimize`, so fewer
+chaos interventions surround the deciding event; a wider `--race-window` when a
+trace was cut short; and the unrealized checks' replays
+(`racing_candidate_N.repro`), which show where each left its edit. A report
+file carries the same information in the candidates' `check.verdict` values.
+
+For example, an RPC server's shutdown removes a client in memory just before
+the server's default handler looks the client up. No syscall shows that order,
+so the first candidate is the handler thread's change of course against the
+call the deciding event runs. The two run in the same order in both runs (in
+the baseline the order is measured at the handler's call of the same number,
+which there takes another course), and an edge Hermit observes orders them, so
+the candidate is listed for the change rather than for an order flip, and its
+check could not replay the reversal (stacks and part of the Check line left
+out):
+
+```text
+Racing accesses: thread 3's read(5, 0x7fffffffec48, 4) returns 4 in both runs but reaches different data; it takes its data from a thread whose calls change course after the deciding event, and no access Hermit sees changes order around that change.
+Candidates, ranked (each says what differs between the runs; a rank is not a verdict, and a candidate decides only where its check says so):
+  1. thread 3's read(5, 0x7fffffffec48, 4) returns 4 in both runs but reaches different data; it takes its data from thread 9's write (#716), and thread 9's calls change course at its call 5 (#704); the deciding event 668 runs thread 7's read; the two run in the same order in both runs (the changed call's counterpart enters at #703 in the baseline); ordered in the target by futex wake thread 7 #684 -> thread 9 #701; it is listed for that change, ahead of order flips, and no access Hermit sees changes order around it, so what decides may be an order in memory that syscalls do not show; thread 3's read is 24 events before the outcome and reaches it through program order; not shown to decide.
+     thread 7  #668  read(7, 0x7ffff73fde47, 1) = 1 (its return)
+     thread 9  #704  write(2, "server: client 3 not found, no handler", 39) = 39
+   Check: not realized: reversing this turn order (moving 8 events of thread 9 before thread 7's turn at #668, crossing thread 3 (1 event), thread 5 (3 events)) in the target run cannot be replayed as edited: the replay ran (...) at event #659, where the schedule has (...) (racing_candidate_1.repro).
+```
+
+Here thread 7 is the shutdown, thread 9 the default handler and thread 3 the
+client. The candidate names the right roles, but nothing in the two runs shows
+that their order decides the failure.
+
 ## Common Run Options
 
 ### Scheduling And Determinism
@@ -646,14 +1332,41 @@ reproducible target condition.
 | `--strict` | Uses the current deterministic defaults and refuses a run that would draw an input from the host: pass `--epoch` (or set `HERMIT_EPOCH`), and do not use `--seed-from=SystemRandom`. |
 | `--allow-unsupported-syscalls` | Run-only compatibility escape hatch that permits Unsupported syscalls to reach Linux and prints a warning. A successful exit does not establish complete deterministic execution. |
 | `--passthru-opt` | Use the reduced syscall subscription set for performance. Requires `--allow-unsupported-syscalls`; unlisted PassThrough syscalls bypass Detcore, weakening deterministic accounting. Unsupported syscalls remain subscribed so the explicit policy is observable. |
+| `--untrap-passthrough-syscalls` | Off by default. Lets `getppid`, `umask`, `getgroups`, `capget`, `sched_get_priority_max`, `sched_get_priority_min` and `get_robust_list`, which Detcore always passes through unchanged and which never wait, run without a tracer stop. They then charge no virtual time, log no DETLOG line, are not counted in the run summary (its syscall histogram says so) and end no timeslice, so the clock, schedule, turn numbers and log differ from a run without the flag, the same way in every run with it. Ptrace backend only; refused with `--strict`, `--namespace-only`, without RCB time (`--max-timeslice=disabled`, `--no-rcb-time`, or a host without usable performance counters), with a preemption record to write or replay (`--record-preemptions`, `--record-preemptions-to`, `--replay-preemptions-from`, `--replay-schedule-from`, whether given on the command line, in a `--config` file or by a `--from` manifest), `--happens-before`, `--verify-run` and in `hermit analyze`. |
 | `--no-sequentialize-threads` | Lets Linux schedule guest threads concurrently. This weakens schedule reproducibility. |
 | `--no-deterministic-io` | Disables Hermit's deterministic short-I/O completion behavior. |
 | `--chaos` | Uses seeded randomized deterministic scheduling. |
 | `--sched-seed=N` | Selects a reproducible chaos schedule. |
+| `--chaos-seeded-timeslice` | With `--chaos`, draws `--max-timeslice` from the scheduler seed (two in five seeds 1000 to 2000 virtual nanoseconds, two in five 1000000 to 200000000, one in five between) and prints the value. |
 | `--target-timeslice=N` | Ends a logical turn at the first syscall boundary after N virtual nanoseconds. |
 | `--max-timeslice=N` | Sets the maximum virtual time slice (minimum one scaled RCB) and requires PMU support. |
 | `--max-timeslice=disabled` | Disables PMU timer preemption. |
 | `--preemption-timeout=N` | Deprecated alias for `--max-timeslice=N`. |
+| `--expired-wait-charge=each\|once` | How a run of consecutive turns that each end an expired timed wait is charged while another thread is queued: `once`, one scheduler turn for the run (the default outside race search), or `each`, a turn per wait (the default under `--chaos` or a heuristic that does not select by priority). |
+| `--cap-preemption-charge` | Charges a turn that ends an expired timeslice at most the time its thread ran since its previous turn. |
+| `--chaos-timeslice-range=MIN..MAX` | With `--chaos`, draws each slice's mean log-uniformly from MIN..MAX virtual nanoseconds and caps slices at MAX (the run's `--max-timeslice`). Not with `--chaos-seeded-timeslice`, which draws the maximum instead. |
+| `--chaos-timeslice-draw=run` | Discovery mode: draws the run's `--max-timeslice` once from the range (without one, the recommended 1000..200000000), from the scheduler seed. Fine draws make runs much slower. |
+| `--chaos-timeslice-draw=slice` | The default draw: each slice's mean from `--chaos-timeslice-range`, which it needs; what a range alone does. |
+
+A thread that polls with timed waits shorter than a scheduler turn's charge
+(`--scheduler-turn-cost`) would otherwise burn a full charge of virtual time
+per poll while other threads wait. Under `--expired-wait-charge=once` a run of
+turns that each end an expired wait, by one thread or several, is charged
+once, so time moves as it would while those threads slept. Only a futex wait
+answered `ETIMEDOUT` and a sleep already due count as expired waits; a
+`ppoll`, `epoll_pwait2` or `pselect6` timeout is still charged each time. The
+rule changes the guest-visible clock of such runs, so a recorded schedule
+stores it, a replay that leaves the option out takes the record's, and a
+replay under the other rule is refused. A record that stores no rule replays
+under `each`; that includes schedules written by Hermit builds from the
+middle of the rule's landing (commits `027e47703` to `90bccf201`), which
+charged runs once without storing it. Two changes that came with the rule
+apply to every `--replay-schedule-from` replay, whatever rule it uses: a
+switch the schedule makes to a thread whose timed wait has already passed
+wakes that thread for the switch, and a replay's own switch turns no longer
+count as the previous turn when Hermit decides whether a signal to the
+running thread costs a turn. Both bring a replay closer to its recording, but
+a replay of an older schedule can differ from what an earlier Hermit did.
 
 `--no-sequentialize-threads` is useful for compatibility experiments and
 workloads such as virtual machines that need real host parallelism. It removes
@@ -679,21 +1392,112 @@ time slice; with `--max-timeslice=disabled`, a thread that never reaches an
 intercepted event can starve its peers. No separate fairness flag is needed for
 the default equal-priority policy.
 
+### Exclusive-Loop Rewrite (aarch64)
+
+On aarch64, a load/store-exclusive retry loop (`LDXR`, then `STXR`, then a
+branch back on failure) retries whenever an exception clears the exclusive
+monitor between the two, so the same work can retire a different number of
+branches. `--rewrite-exclusives` rewrites canonical loops in the guest
+executable into single LSE atomic instructions before the run, which cannot
+retry. It is preprocessing for the ptrace backend, not a backend.
+
+| Option | Effect |
+| --- | --- |
+| `--rewrite-exclusives` | Rewrites the loops it can show are code. |
+| `--rewrite-exclusives-also=FILE` | Also rewrites FILE, a shared library the guest loads. Repeatable. |
+
+Only mapping symbols prove where code is: the AArch64 ELF ABI has the
+assembler mark every switch between code (`$x`) and data (`$d`), so the
+rewrite takes only what they mark as code. A file, or an executable section,
+with no mapping symbols, such as every stripped file, is left unchanged and
+named: the run's diagnostics and its summary (`exclusive_rewrite_unmarked`)
+list it, and `hermit rewrite-exclusives --list-refusals FILE` lists each of
+its loops as `no-mapping-symbols`. A section that holds a mapping symbol of
+another kind (AArch32's `$a` or `$t`, or a `$` name Hermit does not know) is
+not proved by them and is left unchanged, its loops listed as
+`unsupported-mapping-symbol` with the symbol's name.
+
+An unwind table (`.eh_frame`) does not prove code either: it covers whole
+functions, including any table a function branches over or keeps after a call
+that does not return, so a stripped file is left unchanged whatever its unwind
+table covers.
+
+A loop the file's code may read as data is left unchanged as well, listed as
+`literal-inside-the-sequence`. Hermit follows every PC-relative address the
+code forms (`LDR` literal, `ADR` and `ADRP`, through the `ADD`s and loads that
+complete it) to each use of it. An access whose address and width the
+instruction gives protects those bytes; any other use, such as an index
+register, an SVE access, the address copied, stored or passed to a call, or
+still held where the code branches, may read any executable byte, so every
+loop in the file is left alone. That holds for a function pointer as well: a
+pointer passed on or kept can be read as well as called. Only forming an
+address that names a function's start (an unwind table entry), with nothing
+read through it, leaves the instruction there unprotected.
+
+`--rewrite-exclusives-mode` chooses where the rewrite applies. `overlay`
+rewrites copies of the guest executable and the `--rewrite-exclusives-also`
+files and bind-mounts them over the originals, which needs a mount namespace.
+`memory` rewrites the loops of every executable file the guest maps, in the
+guest's own pages, before any of their instructions run, and leaves the files
+untouched. `auto`, the default, is `memory` under `--no-namespace` and
+`overlay` otherwise. Both apply the same proof of code.
+
+The in-memory rewrite writes into a mapping only when it can prove that the
+mapped object is the file it planned from: through `/proc/<pid>/map_files`,
+which needs `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN`, or by the file's
+inode and device where those identify it. On btrfs or overlayfs, whose inode
+numbers are not identities across subvolumes or layers, an unprivileged run
+therefore writes nothing. The run summary's `exclusive_rewrites` reports each
+such file as not written, with the reason, and the guest runs its original
+loops. Run from a filesystem whose inode numbers identify files (ext4, xfs or
+tmpfs), with the capability, or with the overlay.
+
 ### Virtual Inputs
 
 | Option | Effect |
 | --- | --- |
 | `--seed=N` | Sets the fallback random seed. |
 | `--rng-seed=N` | Sets only guest random-data generation. |
-| `--epoch=TIMESTAMP` | Sets the virtual clock's RFC 3339 starting time. When omitted, `hermit run` and `hermit oci run` capture the host wall clock once at invocation start, print the resolved value, and use it as an immutable input for the whole run (including both `--verify` executions). Bypass modes such as `--namespace-only` and `--strace-only` neither capture nor report a virtual epoch. Pass a printed value explicitly to reproduce the same virtual-time trajectory. |
+| `--epoch=TIMESTAMP` | Sets the virtual clock's RFC 3339 starting time. When omitted, `hermit run` and `hermit oci run` capture the host wall clock once at invocation start, print the resolved value, and use it as an immutable input for the whole run (including both `--verify` executions). Bypass modes such as `--namespace-only` and `--strace-only` neither capture nor report a virtual epoch. Pass a printed value explicitly to reproduce the same virtual-time trajectory. A guest that checks TLS certificates over the host network (`--network=host` or `--record-networking`) checks them against this clock, so an epoch outside a server certificate's validity fails the HTTPS connections to that server (curl exits 60 with "SSL certificate problem: certificate is not yet valid" or "certificate has expired"; a libcurl caller sees "SSL peer certificate or SSH remote key was not OK"). For those runs omit `--epoch`: the run then starts the clock at the current time and saves it in its manifest, and `hermit run --from last-run` repeats it with that epoch. |
 | `--clock-multiplier=F` | Changes the rate of virtual time. |
 | `--no-virtualize-time` | Uses host time; also requires `--no-virtualize-metadata`. |
 | `--no-virtualize-cpuid` | Exposes host CPUID behavior. |
 | `--cpu-profile x86-64-v3` | Gives the guest an x86-64-v3 CPU instead of the default x86-64-v2; see below. |
 | `--cpu-profile host-no-rdrand` | Intercepts CPUID and returns host features with hardware randomness and unvirtualized timing features hidden; ptrace only, with CPUID faulting required. |
+| `--virtual-cpus=N` | Tells the guest it has N CPUs (1 to 128) instead of one, so thread pools start N workers; see below. |
 
 Disabling a virtualization feature introduces a host-dependent input. Do it to
 diagnose compatibility problems, not when asserting full reproducibility.
+
+#### Virtual CPUs
+
+Without `--virtual-cpus`, a guest sees one CPU. A program that sizes a thread
+pool from the CPU count (TBB, folly, `std::thread::hardware_concurrency`,
+`sysconf(_SC_NPROCESSORS_ONLN)`) then starts one worker, and races between
+workers cannot happen under any schedule. `--virtual-cpus=4` presents four
+CPUs everywhere a program can count them: `sched_getaffinity`, `sysconf`,
+`/sys/devices/system/cpu`, `/proc/cpuinfo`, `/proc/stat`, `Cpus_allowed` in
+`/proc/<pid>/status`, CPUID's APIC IDs and `getcpu`. They form four
+single-core sockets on one NUMA node. Hermit still runs one thread at a time,
+so `--chaos` explores the pool's interleavings deterministically:
+
+```
+hermit run --chaos --sched-seed=7 --virtual-cpus=4 -- ./pool_program
+```
+
+`sched_setaffinity` then behaves as on a four-CPU Linux machine: the mask
+reads back, and a mask naming none of the four CPUs is refused with `EINVAL`.
+A thread's `getcpu` is a CPU of its mask chosen by the order threads were
+created, and changes only when the mask leaves that CPU out. The host must
+have at least N online CPUs, because the guest sees the host's `cpuN`
+directories, rendered for the virtual CPUs. Only the ptrace backend (and
+e9patch preprocessing on it) takes the option: other backends, `--lite` and
+`hermit record` refuse it.
+
+More CPUs can change more than the pool size. Some runtimes spin-wait
+instead of sleeping when they see more than one CPU: OpenMP's spin count, Go's
+scheduler, adaptive mutexes. Under serialized threads such a spin ends only at
+a preemption, so a run can be slower than with one CPU.
 
 #### The x86-64-v3 CPU profile
 
@@ -796,13 +1600,50 @@ hermit run --bind=/host/path:/guest-name -- /tmp/guest-name
 ```
 
 `--bind=SOURCE` exposes a host path under guest `/tmp` with its name preserved;
-`--bind=SOURCE:TARGET` selects the target under guest `/tmp`. For general mount
-targets, use Docker-style `--mount` syntax. Mount sources must exist before
-Hermit starts.
+`--bind=SOURCE:TARGET` selects the target under guest `/tmp` or the guest's
+private `/dev/shm` (below). For general mount targets, use Docker-style
+`--mount` syntax. Mount sources must exist before Hermit starts.
 
 `--tmp=DIR` uses a chosen host directory as guest `/tmp`. `--tmp=/tmp` exposes
 the real host `/tmp`, which is convenient for diagnosis but weakens isolation
 and reproducibility.
+
+Every run and recording also gets a private, empty `/dev/shm`: a fresh tmpfs,
+mounted as Linux distributions mount it (mode 1777, `nosuid`, `nodev`, and
+tmpfs's default size, half the host's RAM). POSIX shared memory objects and
+named semaphores (`shm_open`, `sem_open`) therefore do not pass between the
+guest and the host or another run. That matters because every run of a
+program gets the same PIDs and random bytes: a program that names such objects
+after them chooses the same names in every run, and concurrent runs sharing
+the host's `/dev/shm` would open, truncate and remove each other's.
+
+Hermit installs it after every mount whose source is a host path, so a
+`--bind /dev/shm/x:/tmp/x` or a `TMPDIR` below `/dev/shm` still names the
+host's, and before the binds and mounts below `/dev/shm`, which go into it. A
+bind from the host's `/dev/shm` into the private one is refused, and so is
+one from host `/tmp` when `TMPDIR` or `--tmp` keeps the private `/tmp` in the
+host's `/dev/shm` (it is then bound first). `--bind
+/dev/shm` keeps the host's `/dev/shm` for a guest that talks to host processes
+through it, `--bind DIR:/dev/shm` uses host directory `DIR` instead, and a
+`--mount` at `/dev/shm` (or at `/dev`) replaces it. A `--no-namespace` run uses
+the host's `/dev/shm`, an `--image` run has none, and `hermit replay` does not
+make one, as it answers the guest's calls from the recording.
+
+Every run and recording also gets its own IPC namespace, empty, and a fresh
+mqueue filesystem of it at `/dev/mqueue`, mounted as systemd mounts it
+(`nosuid`, `nodev`, `noexec`). Detcore refuses System V IPC and the `mq_*`
+calls with `ENOSYS`, as a kernel built without them would, but a guest can
+still list, create, open and remove POSIX message queues as files in
+`/dev/mqueue`: those are now its own, not the host's or another run's. A
+`--namespace-only` guest, whose System V and `mq_*` calls reach the kernel,
+likewise gets keys and names that no other run or host process holds; it no
+longer reaches the host's System V objects or message queues, which only a
+`--no-namespace` run, sharing the host's IPC namespace, still does. A
+`--mount` at `/dev/mqueue`, `/dev` or `/` replaces the private mqueue mount,
+and `--mount type=bind,source=/dev/mqueue,target=/dev/mqueue` shows the
+host's queues there; a mount below `/dev/mqueue` is refused. `hermit replay`
+gets the IPC namespace but no private `/dev/mqueue`, and an `--image` run's
+minimal `/dev` has none.
 
 DBT reserves `/tmp/.hermit-dbt-stats-N` for its current run's statistics, choosing
 the lowest number that does not overlap a declared bind target. The backing
@@ -816,10 +1657,15 @@ The guest's mount table (`/proc/<pid>/mountinfo`, `/proc/<pid>/mounts` and
 host's live table. It is the same on every backend, and in every run as long as
 the mounts it lists (and, under `--no-namespace`, the mounts holding the working
 directory and `/tmp`) do not change on the host between runs. In Hermit's
-container it lists the mounts Hermit installed (its `/proc`, `/tmp`, identity
-files and your `--mount` and `--bind` targets), the ancestors of those mounts,
-and the base mountpoints `/`, `/proc`, `/dev`, `/dev/pts`, `/dev/shm`,
-`/dev/mqueue`, `/sys`, `/sys/fs/cgroup` and `/run` where they are mounted. With
+container it lists the mounts Hermit installed (its `/proc`, `/tmp`,
+`/dev/shm`, `/dev/mqueue`, identity files and your `--mount` and `--bind`
+targets), the ancestors of those mounts, and the base mountpoints `/`, `/proc`,
+`/dev`, `/dev/pts`, `/dev/shm`, `/dev/mqueue`, `/sys`, `/sys/fs/cgroup` and
+`/run` where
+they are mounted. A filesystem Hermit or a `--mount` mounts afresh in the
+container (not a bind) shows no `uid=` or `gid=` option for the host user who
+ran Hermit, as the same mount made by root shows none; a `--namespace-only`
+guest, which reads the kernel's table, still sees them. With
 `--no-namespace`, where Hermit installs no mount, it lists the mounts holding
 the guest's working directory and the host `/tmp`, their ancestors, and those
 base mountpoints. Every other host mount is hidden, although its files stay
@@ -846,20 +1692,84 @@ runtime mappings absent from the supplied ownership facts.
 
 Network modes are:
 
-- `--network=local` (default): isolated loopback networking.
+- `--network=local` (default): isolated loopback networking. Each run has its
+  own network namespace, so its ports and abstract unix socket names are its
+  own.
 - `--network=host`: host networking. External responses and port state become
-  nondeterministic inputs.
+  nondeterministic inputs, and the guest shares the host's ports and abstract
+  unix socket names with every other program, other Hermit runs included.
 
-`hermit run --gdbserver` needs a host gdb client to reach the gdbserver port.
-Because `--network=local` binds that port inside the guest's isolated network
-namespace, run mode forces host networking (printing a warning) whenever
-`--gdbserver` is set so the debugger can attach. Attach from another terminal
-with `gdb -ex 'target remote :PORT'` (default port 1234, override with
-`--gdbserver-port=PORT`). `--gdbserver` cannot be combined with
-`--analyze-networking`, which requires the isolated namespace.
+Prefer `--network=local` unless the guest must reach the host's network. An
+abstract unix socket name (`@name`, a `sun_path` that starts with a NUL byte)
+belongs to the network namespace, not the file system. Every Hermit guest's
+first process is pid 3, and Hermit picks autobind names (`@` and five hex
+digits) the same way in every run. So two concurrent `--network=host` runs
+whose guests bind the same abstract name, for instance one built from the pid,
+collide: the second bind fails with `EADDRINUSE`, although natively each
+process would have used its own name. On the ptrace backend, when a
+`--network=host` guest binds an abstract name, or fails to with `EADDRINUSE`,
+Hermit prints one notice per run on stderr:
+
+```text
+hermit: NOTICE: the guest bound the abstract unix socket "@myapp:3" under --network=host. Abstract names belong to the network namespace, ...
+```
+
+The bind itself is unchanged. Run such guests with `--network=local`, or one at
+a time when they need the host's network. `--strace-only` includes
+`--network=host`; to give such a run its own names, spell out its expansion
+with `--network=local` instead.
+
+`hermit run --gdbserver` serves the guest to one gdb client and waits for it
+before the guest runs; only the ptrace backend (the default) serves gdb, and
+the other backends refuse the flag. Attach from another terminal with
+`gdb -ex 'target remote 127.0.0.1:PORT' PROGRAM` (default port 1234; override
+it with `--gdbserver-port=PORT`, or pass `0` for any free port, which the run
+prints). Hermit binds that port in the host's network namespace before it
+makes the guest's, so the guest keeps the network `--network` gives it,
+`--analyze-networking` included. A `--strict` run can be debugged with every
+strict refusal in force:
+
+```bash
+hermit run --strict --epoch=2026-01-01T00:00:00Z --gdbserver -- PROGRAM
+```
+
+The debugger is an input of the run that `--strict` cannot control.
+Breakpoints write `int3` into the guest's code, and writes to its memory or
+registers, the signals gdb sends and the moment it interrupts the guest all
+change the run; another session repeats the run only if it does the same.
+With a gdbserver, Detcore also takes no reports of the guest's signal-handler
+returns (docs/SIGNAL_STATE_CHECK.md), as in a recording and its replays: after
+a handler that took a scheduler turn, another thread can run before the next
+signal is delivered, so a multithreaded guest can be scheduled differently
+than without a debugger. A replay served to gdb (`hermit replay`,
+`--serve-only`, `hermit record start --verify-with-gdbex`) binds its port the
+same way and keeps the network the recording used.
 
 Environment controls include `--base-env=empty`, `--base-env=minimal`,
 `--base-env=host`, `-e NAME[=VALUE]`, and `--workdir=PATH`.
+
+`--base-env=minimal` gives the guest exactly these variables, with the same
+values on every host, plus the `ASAN_OPTIONS` and `LSAN_OPTIONS` leak-check
+overrides every instrumented guest gets:
+
+| Variable | Value |
+| --- | --- |
+| `HOSTNAME` | `hermetic-container.local` |
+| `PATH` | `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` |
+| `HOME` | `/root` |
+| `USER` | `root` |
+| `LOGNAME` | `root` |
+
+`HOME`, `USER` and `LOGNAME` name the guest's own identity, as login sets them
+for a user: Hermit presents every guest user ID 0 (`getuid()` returns 0), and
+the guest's user database (`getpwuid(0)`) names that user `root` with home
+directory `/root`. A program that reads `USER` sees the same user as one that
+asks the user database. `/root` is usually the host's root home directory, which
+the guest can find but usually cannot list or write. Give a program that writes
+under its home directory a writable one, for example `-e HOME=/tmp`.
+`-e NAME=VALUE` replaces any of these values, and `--base-env=empty` sets none
+of them. `LANG`, `TERM`, `TZ` and `SHELL` are not set; pass them with `-e` when
+a program needs them.
 
 ## Logs And Run Summaries
 
@@ -873,6 +1783,15 @@ hermit --log=info --log-file=hermit.log run --summary \
 The equivalent environment variables are `HERMIT_LOG` and
 `HERMIT_LOG_FILE`. Use `debug` or `trace` only for focused diagnosis; output can
 be large.
+
+The JSON summary also holds `host_inputs`, the host files the guest read
+(see the replay paragraph under "Chaos Mode"), with a `digest` of the set,
+and on a schedule replay `host_inputs_changed`, the files that changed since
+the recording. Two separate runs of the same command whose digests differ
+read different host files (or, for a file that was not hashed, the same path
+at another inode, size or time), so a difference in their results may come
+from those files rather than from Hermit: compare the `files` to find which,
+and rerun with them pinned before calling it a Hermit divergence.
 
 For a minimally invasive interception trace:
 
@@ -1118,12 +2037,12 @@ it into guest `/tmp`. Hermit's startup error names this case explicitly.
 
 ### Namespace Setup Fails With EPERM
 
-Hermit needs unprivileged user, PID, and mount namespace support. Container
+Hermit needs unprivileged user, PID, IPC, and mount namespace support. Container
 runtimes and hardened hosts may disable these facilities. A useful host probe
 is:
 
 ```bash
-unshare --user --map-root-user --pid --mount --fork true
+unshare --user --map-root-user --pid --ipc --mount --fork true
 ```
 
 If that fails, adjust the host or container policy. Running Hermit as root is
@@ -1180,6 +2099,75 @@ Compare with `--strace-only` to determine whether interception or Hermit's
 deterministic model causes the failure. Reduce the command to a small reproducer
 before reporting an issue.
 
+### Android Binder
+
+A binder call that waits for another process (a blocking
+`ioctl(BINDER_WRITE_READ)` read) cannot hold the guest's
+turn, so Hermit runs it off the turn, and the call then finishes when the host's
+kernel delivers its work. A waiting `BINDER_FREEZE` is host-timed, so it is
+refused by name instead (the same refusal returns `EOPNOTSUPP` under
+`--allow-unsupported-syscalls`); it never runs off the turn. Hermit does that only while the calling task is the
+run's one task: no other thread or process of the guest is live, exited but not
+yet reaped, or being created, and no debugger is attached (`--gdbserver`,
+`--dap-listen`). Then no other task can change what the call reads and writes,
+use a descriptor it delivers before Hermit records it, or take the work it waits
+for. A single-threaded binder client or service, whose peer runs outside Hermit,
+works this way. A thread that ends by its own `exit` without leading its
+process stops counting when Hermit commits that exit in the thread's turn, after
+which it never runs again, so a program that joined its helper threads and runs
+on alone is alone again (on the ptrace backend; elsewhere, or with
+`--no-sequentialize-threads`, it counts until its process is reaped). Every
+other ended task counts until a wait reaps its process: a process that exited, a
+thread-group leader that exited while its threads ran on, and a thread that an
+exec, an `exit_group` or a signal ended. A child reaped without a wait (its
+parent ignores `SIGCHLD` or set `SA_NOCLDWAIT`), and an orphan reaped by a
+process outside the guest, are never removed. Once such a task exists, the run
+is never alone again, so a fail-closed run refuses its waiting binder calls.
+
+Beside any other task, such a call is refused by name, naming the other tasks,
+and the run ends with the policy-refusal status (122). With
+`--allow-unsupported-syscalls` the same named refusal returns `EOPNOTSUPP` to
+the guest instead of ending the run (`HERMIT_SHARED_BINDER_CALL`); the call is
+not issued either way: a libbinder thread pool, or a client and service that
+both run under Hermit and wait for each other, cannot be served this way. A
+call that sends and waits in one `BINDER_WRITE_READ` (as libbinder's
+`talkWithDriver` does) is refused the same way, recorded as
+`HERMIT_HOST_TIMED_BINDER`. Calls that do not wait, such as every read on a
+descriptor opened `O_NONBLOCK`, run in the caller's turn as usual.
+
+A `--strict` run never holds a binder descriptor, in a fresh run and in a
+replay alike: binder reply payloads are not recorded, so no run can repeat
+what a binder call returns (https://github.com/rrnewton/hermit/issues/5124).
+The run ends by name, with the policy-refusal status (122), where a binder
+descriptor would reach the guest: an open of a binder device, a descriptor
+received through `SCM_RIGHTS` or `pidfd_getfd`, or one the run starts with,
+such as a binder device passed as standard input. Hermit tells a binder
+device by the open file (a character device on binderfs, or the misc device
+binder registers without binderfs), never by its path, and through the
+calling thread's own descriptor table. A descriptor whose identity Hermit
+cannot read is refused the same way. That includes a misc device with a
+dynamically assigned minor on a kernel where no binder driver's `devices`
+parameter can be read (`binder` or `binder_linux`), such as
+`/dev/userfaultfd` on a kernel without binder. Other character devices, such
+as `/dev/null`, `/dev/urandom`, terminals, `/dev/fuse` or `/dev/net/tun`, are
+not binder devices. As a backstop, a binder `ioctl` request on a descriptor
+Hermit cannot tell is not a binder device is refused too, before Hermit waits
+for anything or reads the call's argument. Under the KVM backend, guest
+descriptors are not host descriptors Hermit can inspect
+(https://github.com/rrnewton/hermit/issues/5129). So, as a temporary
+conservative policy, a `--strict` run is refused before it starts on a host
+that offers binder in any form, whether or not the guest would use it. That
+means binderfs listed in `/proc/filesystems`, a misc device in `/proc/misc`
+whose name contains "binder" or that the binder driver's `devices` parameter
+names, or a binder descriptor among those Hermit's guest inherits. It is
+refused, too, when any of that, or that parameter, cannot be read, when
+`/sys/module` is not visible as sysfs, where a missing parameter would not
+show that there is no binder driver, or when `/sys/module` lists the binder
+module without its `devices` parameter. The check trusts these host files as
+the kernel presents them; a host that deliberately mounts a substitute over
+them is outside `--strict`'s threat model. Run a guest that uses binder
+without `--strict`.
+
 ### The Guest Hangs
 
 1. Run the command normally to confirm the program itself terminates.
@@ -1217,6 +2205,15 @@ fresh work directory. Save logs from both runs when narrowing the difference.
 - Keep the captured directory unchanged and use a compatible Hermit revision.
 - Record/replay support is experimental; some system calls and ancillary file
   descriptor behavior remain incomplete.
+- Replay maps recorded copies of file contents. Every `MAP_SHARED` mapping of
+  one file, in any process and PID namespace, maps one replay copy of that file
+  at its offset, opened with the access mode of the descriptor it was mapped
+  through, so a store through one is read through the others, as under Linux,
+  and a mapping of a descriptor opened read-only cannot be made writable. A
+  write through a descriptor reaches the mappings already made only when
+  replay holds the file itself (a file the recording created, or a memfd);
+  otherwise it reaches only mappings made after it, whose recorded contents
+  include it.
 
 ### CPUID Or Hardware Warnings
 
@@ -1268,7 +2265,10 @@ Before treating a result as reproducible:
 - Use the same Hermit revision, executable, arguments, and configuration.
 - Save the run's options with `--save-config` and rerun with `--config`; the
   file records the epoch and any seed Hermit chose.
-- Keep file contents and mount layout fixed.
+- Keep file contents and mount layout fixed. On a host whose packages
+  change, that includes system files such as `/etc/ld.so.cache`; compare the
+  runs' `--summary-json` `host_inputs` digests, or pin a file with
+  `--mount type=bind,source=COPY,target=/etc/ld.so.cache,readonly`.
 - Prefer `--base-env=minimal` and explicit `-e` variables.
 - Keep networking isolated; do not depend on external services.
 - Keep strict thread serialization and deterministic I/O enabled.

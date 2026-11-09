@@ -64,6 +64,11 @@ int strlength(const char* str) {
   return i - str;
 }
 
+// The message each process chose: both processes write it, at the same
+// address in their own copies, so `hermit run --watch` on it sees both
+// writers.
+const char* volatile chosen;
+
 int main(void) {
   char* msg;
   if (fork()) {
@@ -71,6 +76,7 @@ int main(void) {
   } else {
     msg = "bar";
   }
+  chosen = msg;
   write(STDOUT, msg, strlength(msg));
 
   return 0;

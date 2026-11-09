@@ -91,16 +91,30 @@ pub(crate) enum AlarmPhase {
     Inactive { copy: bool },
 }
 
-/// The first point after `t` on the grid `last + k * interval` (k >= 1).
+/// The first point after `t` on the grid `last + k * interval`, for the least
+/// `k >= 1` that passes `t` (`k = 1` when `t` is before `last`), or `None`
+/// when that point does not fit in 64 bits. Linux's `hrtimer_forward` puts a
+/// restarted periodic timer at that point of its grid, dropping the missed
+/// periods. Both models of a periodic `ITIMER_REAL` restart there: the traced
+/// one (`grid_after`) and the controlled one (`real_timer.rs`).
+pub(crate) fn checked_grid_after(
+    last: LogicalTime,
+    interval: std::num::NonZeroU64,
+    t: LogicalTime,
+) -> Option<LogicalTime> {
+    let k = (t.as_nanos().saturating_sub(last.as_nanos()) / interval).checked_add(1)?;
+    k.checked_mul(interval.get())
+        .and_then(|step| last.as_nanos().checked_add(step))
+        .map(LogicalTime::from_nanos)
+}
+
+/// The first point after `t` on the grid `last + k * interval` (k >= 1), as
+/// `checked_grid_after` computes it, saturating at the end of time. An
+/// interval of zero counts as one nanosecond.
 pub(crate) fn grid_after(last: LogicalTime, interval: LogicalTime, t: LogicalTime) -> LogicalTime {
-    let interval_ns = interval.as_nanos().max(1);
-    let last_ns = last.as_nanos();
-    let k = if t.as_nanos() >= last_ns {
-        (t.as_nanos() - last_ns) / interval_ns + 1
-    } else {
-        1
-    };
-    LogicalTime::from_nanos(last_ns.saturating_add(k.saturating_mul(interval_ns)))
+    let interval =
+        std::num::NonZeroU64::new(interval.as_nanos()).unwrap_or(std::num::NonZeroU64::MIN);
+    checked_grid_after(last, interval, t).unwrap_or(LogicalTime::from_nanos(u64::MAX))
 }
 
 /// What a signal timer does when it expires.
@@ -648,6 +662,15 @@ impl TimedEvents {
         self.map.is_empty()
     }
 
+    /// No deadline of any kind, and no alarm, interval or POSIX timer in any
+    /// phase (an inactive alarm is reconciled at every quiesced boundary):
+    /// nothing here can act at a scheduler pass.
+    pub fn holds_nothing(&self) -> bool {
+        self.map.is_empty()
+            && self.signal_timers.is_empty()
+            && self.controlled_real_timer_deadlines.is_empty()
+    }
+
     /// Remove a specific thread from the set of those waiting on time to elapse.
     pub fn remove(&mut self, dettid: DetTid) {
         let mut to_remove: Option<LogicalTime> = None;
@@ -1152,6 +1175,24 @@ mod test {
             "missed periods are dropped"
         );
         assert_eq!(ev.iter().count(), 1);
+    }
+
+    /// An `Inactive` periodic timer queues no deadline (`is_empty`) yet a
+    /// quiesced boundary still reconciles it: `holds_nothing` counts it.
+    #[test]
+    fn an_inactive_alarm_is_not_nothing() {
+        let p = pid(100);
+        let mut ev = TimedEvents::default();
+        assert!(ev.holds_nothing());
+        ev.insert_alarm(at(1_000), p, tid(100), Signal::SIGALRM, at(1_000));
+        assert!(!ev.holds_nothing());
+        ev.pop_if_before(at(5_500));
+        ev.alarm_after_fire(p, at(1_000), Some(true), at(5_500));
+        assert!(ev.is_empty());
+        assert!(!ev.holds_nothing());
+        let mut ev = TimedEvents::default();
+        ev.insert(at(1_000), tid(101));
+        assert!(!ev.holds_nothing());
     }
 
     /// Replacing or cancelling an `Inactive` alarm, which has no queued

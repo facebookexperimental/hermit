@@ -1721,6 +1721,7 @@ fn rewrite_manifest_pins(scan: &PinScan, main: &str) -> Result<(usize, usize), S
 const BUDGET_CALIBRATION_SITE: &str = "ci/run-with-reverie-dbt-budget.sh";
 
 /// The revision the DBT build budget is currently calibrated for.
+#[cfg(test)]
 fn calibrated_pin(root: &Path) -> Result<Option<String>, String> {
     let path = root.join(BUDGET_CALIBRATION_SITE);
     if !path.is_file() {
@@ -1812,6 +1813,7 @@ fn carry_derived_pin_sites(
 /// Deliberately NOT a value this tool guesses. A bump that silently rewrote the
 /// wrapper would assert a measured budget still applies, report success, and
 /// look exactly like a fix -- which is worse than the hand-carry it replaced.
+#[cfg(test)]
 fn calibration_decision_required(old: &str, main: &str) -> String {
     format!(
         "\n\
@@ -1854,9 +1856,9 @@ fn update_to_latest(
     main: &str,
     verify_build: bool,
 ) -> Result<(), String> {
-    // Read the calibration BEFORE any rewrite: once the derived sites move, the
-    // wrapper is the only remaining record of the revision we are carrying from.
-    let calibrated = calibrated_pin(root)?;
+    // The core carry begins at the actual uniform Cargo pin. SDK recipe
+    // calibration belongs to the extension producer, not to this pin's ancestry.
+    let recorded = unique_pin(scan)?.to_owned();
 
     if scan
         .occurrences
@@ -1866,7 +1868,7 @@ fn update_to_latest(
         // Cargo metadata is current, but the CI sites are a separate scope and
         // may still be mid-carry -- finish them rather than reporting success
         // over a narrower scope than the caller means by "the pin".
-        return finish_and_verify_pin_update(root, calibrated.as_deref(), main, true, verify_build);
+        return finish_core_pin_update(root, &recorded, main, true, verify_build);
     }
 
     let (changed_files, changed_entries) = rewrite_manifest_pins(scan, main)?;
@@ -1903,7 +1905,43 @@ fn update_to_latest(
         "Reverie pin advanced to main tip {main} across {} derived Cargo revision entries.",
         updated.occurrences.len()
     );
-    finish_and_verify_pin_update(root, calibrated.as_deref(), main, false, verify_build)
+    finish_core_pin_update(root, &recorded, main, false, verify_build)
+}
+
+/// Carry the core's derived source references, then run the same mandatory
+/// locked whole-workspace viability check. No SDK timing judgement is made.
+fn finish_core_pin_update(
+    root: &Path,
+    recorded: &str,
+    main: &str,
+    cargo_already_current: bool,
+    verify_build: bool,
+) -> Result<(), String> {
+    if recorded != main {
+        let (touched, rewritten) = carry_derived_pin_sites(root, recorded, main)?;
+        println!(
+            "Carried {rewritten} derived core pin occurrence(s) in {} file(s).",
+            touched.len()
+        );
+    } else if cargo_already_current {
+        println!("Reverie pin already equals the main tip: {main}");
+    }
+    // Cargo may already have been updated by an interrupted invocation. Always
+    // inspect the actual selected core bindings before reporting success or
+    // running Cargo; the retired SDK calibration is not authority for these.
+    let caches = check_liteinst_cache_keys(root, main)?;
+    let buck = check_buck_build_pin_binding(root, main)?;
+    if caches != 0 || buck != 0 {
+        return Err("derived core pin bindings are stale or ambiguous; repair the reported cache/Buck sites before pin viability can be checked".into());
+    }
+    if verify_build {
+        verify_bumped_tree_builds(root, Path::new("cargo"), &[])
+    } else {
+        eprintln!(
+            "WARNING: --no-verify-build was passed: pin consistency was checked, but pin viability was not. The bumped tree may not compile."
+        );
+        Ok(())
+    }
 }
 
 /// Finish every non-build carry before judging whether the bumped tree builds.
@@ -1911,24 +1949,7 @@ fn update_to_latest(
 /// `finish_ci_pin_sites` can still refuse an unsettled DBT calibration. Running
 /// it first preserves that decision boundary and ensures the compile result is
 /// about the complete candidate tree, not a half-carried pin.
-fn finish_and_verify_pin_update(
-    root: &Path,
-    calibrated: Option<&str>,
-    main: &str,
-    cargo_already_current: bool,
-    verify_build: bool,
-) -> Result<(), String> {
-    finish_and_verify_pin_update_with(
-        root,
-        calibrated,
-        main,
-        cargo_already_current,
-        verify_build,
-        Path::new("cargo"),
-        &[],
-    )
-}
-
+#[cfg(test)]
 fn finish_and_verify_pin_update_with(
     root: &Path,
     calibrated: Option<&str>,
@@ -1982,6 +2003,7 @@ fn verify_bumped_tree_builds(
 /// current" is a narrower fact than "the pin is carried", and reporting the
 /// former as the latter is what let 16 CI sites go stale behind a success
 /// message three times in one day.
+#[cfg(test)]
 fn finish_ci_pin_sites(
     root: &Path,
     calibrated: Option<&str>,
@@ -2149,16 +2171,13 @@ fn check_liteinst_cache_keys(root: &Path, pin: &str) -> Result<i32, String> {
     Ok(0)
 }
 
-/// Every 40-hex revision that appears as CODE (not prose) in one of these
-/// files is a DBT budget calibration binding and must equal the canonical pin.
-const DBT_BUDGET_BINDING_FILES: [&str; 2] = [BUDGET_CALIBRATION_SITE, "ci/configure-build-jobs.sh"];
-
 /// Exactly-40-hex tokens on a line, ignoring longer hex runs.
 ///
 /// The length bound is load-bearing in BOTH directions. A bare `[0-9a-f]{40}`
 /// also matches the first 40 characters of the 64-hex DynamoRIO recipe key that
 /// lives in the same file, which would report a permanent false violation; and
 /// accepting shorter tokens would match ordinary hex in a message.
+#[cfg(test)]
 fn exact_40_hex_tokens(line: &str) -> Vec<String> {
     line.split(|c: char| !c.is_ascii_hexdigit())
         .filter(|t| {
@@ -2168,133 +2187,6 @@ fn exact_40_hex_tokens(line: &str) -> Vec<String> {
         })
         .map(str::to_string)
         .collect()
-}
-
-/// Bind the DBT budget calibration to the canonical Reverie pin.
-///
-/// ⚠️ THIS COUPLING IS INVISIBLE FROM THE BUMP SIDE, WHICH IS THE WHOLE REASON
-/// THE CHECK EXISTS. `ci/run-with-reverie-dbt-budget.sh` hard-codes the one
-/// Reverie revision its effective-job-seconds budget was measured against, and
-/// `ci/configure-build-jobs.sh` hard-codes the same revision a second time.
-/// Both DECLINE with exit 75 on any mismatch, in either direction. Nothing in
-/// the bump path mentions either file, so moving the pin disables every node
-/// behind that wrapper and the only way to find out is to suspect it.
-///
-/// MEASURED, 2026-08-26: the pin moved ad598995 -> 926d931a at 21:22 and the
-/// DBT/SaBRe build node declined from then until it was recalibrated, unnoticed
-/// for over an hour. The decline was NOT silent -- exit 75 is `no_result` and
-/// `scripts/validate.rs` reports `FINAL_VALIDATE_STATUS: COULD_NOT_RUN`, so no
-/// run claimed PASSED while those nodes had no verdict -- but the coverage was
-/// really gone and no one was told at the moment it went.
-///
-/// RELATIONSHIP TO [`calibrated_pin`], WHICH ALREADY READS ONE OF THESE FILES.
-/// That reader serves the pin-UPDATE path, which refuses to rewrite
-/// [`BUDGET_CALIBRATION_SITE`] because rewriting it would assert that a
-/// measurement still applies -- something this tool cannot establish. That
-/// reasoning is unchanged and this check does not rewrite anything either. What
-/// it adds is coverage on the ORDINARY path, which the pre-commit hook and
-/// `scripts/validate.rs` both run, and coverage of
-/// `ci/configure-build-jobs.sh`, which holds the same revision a second time
-/// and which nothing checked at all.
-///
-/// SCOPE IS DELIBERATELY NARROW. Only NON-COMMENT lines in the two files above
-/// are read. Those files carry a long carry-history in comments naming every
-/// previous calibration revision. That history is not a binding and may not
-/// block a bump.
-fn check_dbt_budget_bindings(root: &Path, pin: &str) -> Result<i32, String> {
-    let mut violations: Vec<(String, String)> = Vec::new();
-    let mut absent: Vec<&str> = Vec::new();
-    let mut bindingless: Vec<&str> = Vec::new();
-    let mut checked = 0usize;
-    for rel in DBT_BUDGET_BINDING_FILES {
-        let path = root.join(rel);
-        let contents = match fs::read_to_string(&path) {
-            Ok(c) => c,
-            // ⚠️ ABSENT IS SKIPPED, AND THE SKIP IS REPORTED RATHER THAN SILENT.
-            // An earlier version made this a hard error, reasoning that a check
-            // which skips its own subject is worthless. That broke six existing
-            // tests, which build synthetic repositories holding only Cargo
-            // metadata -- measured 45 passed/0 failed before, 42/6 after. The
-            // reasoning was right and the remedy was wrong: those repositories
-            // genuinely have no binding to check, and erroring turned "nothing
-            // to judge" into "the tree is broken". The count below is what keeps
-            // it honest -- a real Hermit checkout reports 3 bindings, so a 0
-            // is visible to anyone reading the line.
-            Err(_) => {
-                absent.push(rel);
-                continue;
-            }
-        };
-        let mut in_this_file = 0usize;
-        for (idx, line) in contents.lines().enumerate() {
-            if line.trim_start().starts_with('#') {
-                continue;
-            }
-            for sha in exact_40_hex_tokens(line) {
-                checked += 1;
-                in_this_file += 1;
-                if sha != pin {
-                    violations.push((format!("{rel}:{}", idx + 1), sha));
-                }
-            }
-        }
-        if in_this_file == 0 {
-            bindingless.push(rel);
-        }
-    }
-    // ⚠️ A PRESENT BINDING FILE THAT CONTAINS NO BINDING IS A REFUSAL, NOT A PASS.
-    // Found by a broken probe of this very check: a test that truncated the file
-    // instead of editing it left the gate reporting success over an EMPTY file,
-    // because "no bindings" and "no violations" are the same thing to the loop
-    // above. That is the shape this repository keeps paying for -- a check whose
-    // subject disappeared still reports green.
-    // ⚠️ PER FILE, NOT IN AGGREGATE. An earlier version asked whether ANY binding
-    // was found anywhere, which let one file lose its binding entirely while the
-    // other still had one -- measured: deleting the configure-build-jobs.sh
-    // binding returned rc=0 and the gate said nothing. Each present file must
-    // carry at least one.
-    if !bindingless.is_empty() {
-        loud_header("DBT BUDGET BINDINGS MISSING - BLOCKED");
-        eprintln!("Canonical Reverie pin: {pin}");
-        eprintln!("These files are present but contain NO 40-hex calibration binding:");
-        for rel in &bindingless {
-            eprintln!("  {rel}");
-        }
-        eprintln!("The binding this gate exists to check is gone, so the gate can no longer");
-        eprintln!("see a stale calibration. Restore it, or remove this check deliberately.");
-        return Ok(1);
-    }
-    if !violations.is_empty() {
-        loud_header("DBT BUDGET CALIBRATION DRIFT - BLOCKED");
-        eprintln!("Canonical Reverie pin: {pin}");
-        eprintln!("These DBT budget bindings do NOT equal the pin, so every node behind");
-        eprintln!("ci/run-with-reverie-dbt-budget.sh will DECLINE with exit 75 (no_result):");
-        for (location, sha) in &violations {
-            eprintln!("  {location}: {sha}");
-        }
-        eprintln!();
-        eprintln!("BOTH FILES MUST MOVE TOGETHER. Updating only the wrapper leaves");
-        eprintln!("configure-build-jobs.sh declining with a message naming the same condition.");
-        eprintln!("Before recalibrating, confirm the budget still applies at the new pin:");
-        eprintln!("  reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs and third-party/ must be");
-        eprintln!("  byte-identical by git object id between the pins, and a cold rebuild must");
-        eprintln!("  land the same DynamoRIO install key. Record that carry in the wrapper's");
-        eprintln!("  comment: the gate says the coupling broke, the comment says why it exists.");
-        return Ok(1);
-    }
-    if absent.is_empty() {
-        eprintln!(
-            "DBT budget bindings: {checked} binding(s) all equal the pin ({}).",
-            &pin[..7.min(pin.len())]
-        );
-    } else {
-        eprintln!(
-            "DBT budget bindings: {checked} binding(s) all equal the pin ({}); NOT PRESENT in this tree: {}.",
-            &pin[..7.min(pin.len())],
-            absent.join(", ")
-        );
-    }
-    Ok(0)
 }
 
 /// The Buck build bypasses `hermit-cli/build.rs`, so it must restate the
@@ -2562,10 +2454,6 @@ fn run_with_config(config: Config) -> Result<i32, String> {
         if cache_code != 0 {
             return Ok(cache_code);
         }
-        let budget_code = check_dbt_budget_bindings(&root, updated_pin)?;
-        if budget_code != 0 {
-            return Ok(budget_code);
-        }
         let buck_code = check_buck_build_pin_binding(&root, updated_pin)?;
         if buck_code != 0 {
             return Ok(buck_code);
@@ -2578,10 +2466,6 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     if cache_code != 0 {
         return Ok(cache_code);
     }
-    let budget_code = check_dbt_budget_bindings(&root, pin)?;
-    if budget_code != 0 {
-        return Ok(budget_code);
-    }
     let buck_code = check_buck_build_pin_binding(&root, pin)?;
     if buck_code != 0 {
         return Ok(buck_code);
@@ -2592,7 +2476,7 @@ fn run_with_config(config: Config) -> Result<i32, String> {
 
     // OFFLINE STOPS HERE, having decided everything that does not need the
     // network: manifests agree with each other, LiteInst cache keys track the
-    // pin, DBT budget bindings equal it, and Buck-built Hermit's compile-time
+    // pin, and Buck-built Hermit's compile-time
     // provenance does too. Those are real, offline-decidable defects that no
     // amount of waiting fixes, so they stay BLOCKING for every caller. What
     // offline deliberately does NOT judge is remote-policy compliance -- see
@@ -3164,6 +3048,77 @@ mod tests {
         git_in(&root, &["add", "-A"]).expect("stage fixture");
         git_in(&root, &["commit", "-q", "-m", "fixture"]).expect("commit fixture");
         root
+    }
+
+    #[test]
+    fn core_finish_refuses_interrupted_buck_and_cache_carries_without_calibration_authority() {
+        let old = "1".repeat(40);
+        let main = "2".repeat(40);
+        let root = calibration_fixture("core-interrupted-carry", &old);
+        fs::create_dir_all(root.join("hermit-cli")).unwrap();
+        let buck = |pin: &str| {
+            format!(
+                "hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\nrust_library(\n    env = hermit_build_env,\n)\nrust_binary(\n    env = hermit_build_env,\n)\n"
+            )
+        };
+        fs::write(root.join(BUCK_BUILD_PIN_SITE), buck(&old)).unwrap();
+        fs::write(
+            root.join("ci/cache.yml"),
+            format!("key: liteinst-runtime-{}\n", &main[..7]),
+        )
+        .unwrap();
+        assert!(git_in(&root, &["add", "-A"]).unwrap().status.success());
+        assert!(finish_core_pin_update(&root, &main, &main, true, false).is_err());
+        assert_eq!(
+            fs::read_to_string(root.join(BUCK_BUILD_PIN_SITE)).unwrap(),
+            buck(&old)
+        );
+        fs::write(root.join(BUCK_BUILD_PIN_SITE), buck(&main)).unwrap();
+        fs::write(
+            root.join("ci/cache.yml"),
+            format!("key: liteinst-runtime-{}\n", &old[..7]),
+        )
+        .unwrap();
+        assert!(finish_core_pin_update(&root, &main, &main, true, false).is_err());
+        fs::write(
+            root.join("ci/cache.yml"),
+            format!("key: liteinst-runtime-{}\n", &main[..7]),
+        )
+        .unwrap();
+        assert!(finish_core_pin_update(&root, &main, &main, true, false).is_ok());
+        assert!(
+            fs::read_to_string(root.join(BUDGET_CALIBRATION_SITE))
+                .unwrap()
+                .contains(&old)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn core_finish_carries_known_old_full_bindings_then_rechecks_the_real_core_sites() {
+        let old = "1".repeat(40);
+        let main = "2".repeat(40);
+        let root = calibration_fixture("core-complete-carry", &old);
+        fs::create_dir_all(root.join("hermit-cli")).unwrap();
+        fs::write(root.join(BUCK_BUILD_PIN_SITE), format!("hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{old}\",\n}}\nrust_library(\n    env = hermit_build_env,\n)\nrust_binary(\n    env = hermit_build_env,\n)\n")).unwrap();
+        assert!(git_in(&root, &["add", "-A"]).unwrap().status.success());
+        finish_core_pin_update(&root, &old, &main, false, false).unwrap();
+        assert!(
+            fs::read_to_string(root.join(BUCK_BUILD_PIN_SITE))
+                .unwrap()
+                .contains(&main)
+        );
+        assert!(
+            fs::read_to_string(root.join("ci/configure-build-jobs.sh"))
+                .unwrap()
+                .contains(&main)
+        );
+        assert!(
+            fs::read_to_string(root.join(BUDGET_CALIBRATION_SITE))
+                .unwrap()
+                .contains(&old)
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// NEGATIVE. The one judgement must never be defaulted.

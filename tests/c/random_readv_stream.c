@@ -17,12 +17,16 @@
 #include <unistd.h>
 
 /*
- * Default mode checks Hermit's canonical stream through independent opens.
+ * Default mode checks Hermit's canonical stream: byte i of a stream seeded s is
+ * (i * 73 + 41) mod 256 XOR byte (i mod 8) of s. Each open file description
+ * reads a stream of its own, so the oracle learns a description's seed from
+ * the first eight bytes it reads at offset zero, which leave its cursor in
+ * place, and then predicts every other byte without Hermit's read paths; a new
+ * open must not repeat an earlier open's seed, as Linux's opens never repeat.
  * --native checks only Linux counts, errno, and untouched memory. Native random
  * bytes are deliberately never compared, including between independent opens.
  */
 static int native;
-static int expected_seed;
 
 #define CHECK(condition)            \
   do {                              \
@@ -65,19 +69,36 @@ static void dump(const char* name, const uint8_t* bytes, size_t length) {
   putchar('\n');
 }
 
-static void control(const char* path, uint8_t* bytes, size_t length) {
+static uint8_t canonical_byte(uint64_t seed, uint64_t index) {
+  return (uint8_t)((uint8_t)index * 73 + 41) ^
+      (uint8_t)(seed >> (8 * (index % 8)));
+}
+
+/* The seed of the stream `fd`'s open file description reads. */
+static uint64_t stream_seed(int fd) {
+  uint8_t head[8];
+  CHECK(pread(fd, head, sizeof(head), 0) == (ssize_t)sizeof(head));
+  uint64_t seed = 0;
+  for (size_t i = 0; i < sizeof(head); ++i) {
+    seed |= (uint64_t)(head[i] ^ canonical_byte(0, i)) << (8 * i);
+  }
+  return seed;
+}
+
+/* Fill `bytes` with the start of the stream that `fd`, a new open, reads. */
+static void control(int fd, uint8_t* bytes, size_t length) {
+  static uint64_t seeds[64];
+  static size_t opens;
   if (!native) {
-    int fd = open(path, O_RDONLY);
-    CHECK(fd >= 0);
-    CHECK(read(fd, bytes, length) == (ssize_t)length);
-    /* A literal oracle independent of either Hermit read implementation. */
-    const uint8_t seed0[] = {
-        41, 114, 187, 4, 77, 150, 223, 40, 113, 186, 3, 76, 149, 222, 39, 112};
-    const uint8_t seed17[] = {
-        56, 114, 187, 4, 77, 150, 223, 40, 96, 186, 3, 76, 149, 222, 39, 112};
-    size_t checked = length < sizeof(seed0) ? length : sizeof(seed0);
-    CHECK(memcmp(bytes, expected_seed == 17 ? seed17 : seed0, checked) == 0);
-    CHECK(close(fd) == 0);
+    uint64_t seed = stream_seed(fd);
+    for (size_t i = 0; i < opens; ++i) {
+      CHECK(seeds[i] != seed);
+    }
+    CHECK(opens < sizeof(seeds) / sizeof(seeds[0]));
+    seeds[opens++] = seed;
+    for (size_t i = 0; i < length; ++i) {
+      bytes[i] = canonical_byte(seed, i);
+    }
   }
 }
 
@@ -91,9 +112,9 @@ equal(const uint8_t* actual, const uint8_t* expected, size_t length) {
 static void mixed_stream(const char* path) {
   uint8_t expected[15] = {0};
   uint8_t actual[15] = {0};
-  control(path, expected, sizeof(expected));
   int fd = open(path, O_RDONLY);
   CHECK(fd >= 0);
+  control(fd, expected, sizeof(expected));
   CHECK(read(fd, actual, 7) == 7);
   int alias = dup(fd);
   CHECK(alias >= 0);
@@ -116,9 +137,9 @@ static void long_stream(const char* path) {
   uint8_t* expected = calloc(TOTAL, 1);
   uint8_t* actual = calloc(TOTAL, 1);
   CHECK(expected != NULL && actual != NULL);
-  control(path, expected, TOTAL);
   int fd = open(path, O_RDONLY);
   CHECK(fd >= 0);
+  control(fd, expected, TOTAL);
   CHECK(read(fd, actual, PREFIX) == PREFIX);
   struct iovec iov[] = {
       {actual + PREFIX, 65529}, {actual + PREFIX + 65529, VECTOR - 65529}};
@@ -145,9 +166,9 @@ static void
 inherited_stream(const char* path, const char* executable, int with_exec) {
   uint8_t expected[15] = {0};
   uint8_t actual[15] = {0};
-  control(path, expected, sizeof(expected));
   int fd = open(path, O_RDONLY);
   CHECK(fd >= 0);
+  control(fd, expected, sizeof(expected));
   CHECK(read(fd, actual, 7) == 7);
   int alias = dup(fd);
   CHECK(alias >= 0);
@@ -226,11 +247,13 @@ static void access_modes(const char* path) {
     int alias = dup(fd);
     CHECK(alias >= 0);
     struct stream stream = {.fd = fd};
-    control(path, stream.expected, sizeof(stream.expected));
+    int readable = status_modes[i] == O_RDONLY || status_modes[i] == O_RDWR;
+    if (readable) {
+      control(fd, stream.expected, sizeof(stream.expected));
+    }
     for (size_t j = 0; j < sizeof(updates) / sizeof(updates[0]); ++j) {
       CHECK(fcntl(alias, F_SETFL, updates[j]) == 0);
       CHECK((fcntl(fd, F_GETFL) & O_ACCMODE) == status_modes[i]);
-      int readable = status_modes[i] == O_RDONLY || status_modes[i] == O_RDWR;
       result(fd, NULL, 0, readable ? 0 : -1, readable ? 0 : EBADF);
       errno = 0;
       CHECK(read(fd, NULL, 0) == (readable ? 0 : -1));
@@ -261,7 +284,7 @@ static void access_modes(const char* path) {
 static void import_and_faults(const char* path) {
   struct stream stream = {.fd = open(path, O_RDONLY)};
   CHECK(stream.fd >= 0);
-  control(path, stream.expected, sizeof(stream.expected));
+  control(stream.fd, stream.expected, sizeof(stream.expected));
   const void* invalid = (const void*)UINTPTR_MAX;
 
   result(stream.fd, invalid, 0, 0, 0);
@@ -469,9 +492,9 @@ static void positioned_result(
 static void positioned_stream(const char* path) {
   uint8_t expected[16] = {0};
   uint8_t actual[16] = {0};
-  control(path, expected, sizeof(expected));
   int fd = open(path, O_RDONLY);
   CHECK(fd >= 0);
+  control(fd, expected, sizeof(expected));
   int alias = dup(fd);
   CHECK(alias >= 0);
   CHECK(read(fd, actual, 3) == 3);
@@ -482,8 +505,14 @@ static void positioned_stream(const char* path) {
   dump("positioned-mixed", actual, 7);
 
   const int64_t offsets[] = {5, 65536, 0x100000005LL, INT64_MAX - 1};
-  /* Independent literal seed0/17 values, including the former carrier EOF. */
-  const uint8_t values[] = {150, expected_seed == 17 ? 56 : 41, 150, 151};
+  /* Predicted bytes at each offset, including the former carrier EOF. */
+  uint8_t values[sizeof(offsets) / sizeof(offsets[0])] = {0};
+  if (!native) {
+    uint64_t seed = stream_seed(alias);
+    for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); ++i) {
+      values[i] = canonical_byte(seed, (uint64_t)offsets[i]);
+    }
+  }
   for (int version2 = 0; version2 <= 1; ++version2) {
     for (size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); ++i) {
       uint8_t guarded[] = {0xa5, 0xa5, 0xa5};
@@ -504,7 +533,7 @@ static void positioned_stream(const char* path) {
 static void positioned_errors(const char* path) {
   struct stream stream = {.fd = open(path, O_RDONLY)};
   CHECK(stream.fd >= 0);
-  control(path, stream.expected, sizeof(stream.expected));
+  control(stream.fd, stream.expected, sizeof(stream.expected));
   const void* invalid = (const void*)UINTPTR_MAX;
   uint8_t guarded[3] = {0xa5, 0xa5, 0xa5};
   struct iovec one = {guarded + 1, 1};
@@ -589,7 +618,7 @@ static void positioned_errors(const char* path) {
 static void positioned_faults(const char* path) {
   struct stream stream = {.fd = open(path, O_RDONLY)};
   CHECK(stream.fd >= 0);
-  control(path, stream.expected, sizeof(stream.expected));
+  control(stream.fd, stream.expected, sizeof(stream.expected));
   size_t page = (size_t)sysconf(_SC_PAGESIZE);
   CHECK(page >= 4096);
   uint8_t* mapping = mmap(
@@ -662,10 +691,6 @@ int main(int argc, char** argv) {
       selected = argv[++i];
     } else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
       device = argv[++i];
-    } else if (strcmp(argv[i], "--expect-seed") == 0 && i + 1 < argc) {
-      ++i;
-      CHECK(strcmp(argv[i], "0") == 0 || strcmp(argv[i], "17") == 0);
-      expected_seed = atoi(argv[i]);
     } else {
       CHECK(0);
     }

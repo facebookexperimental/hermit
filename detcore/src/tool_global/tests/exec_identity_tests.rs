@@ -68,7 +68,12 @@ impl GlobalRPC<GlobalState> for ExecRpc<'_> {
         request: <GlobalState as GlobalTool>::Request,
     ) -> <GlobalState as GlobalTool>::Response {
         let reconnect = matches!(&request.2, GlobalRequest::ReconnectExec { .. });
-        self.requests.lock().unwrap().push(request.2.clone());
+        self.requests
+            .lock()
+            .unwrap()
+            .push(crate::tool_global::without_cpu_publication(
+                request.2.clone(),
+            ));
         if reconnect && self.gate == Gate::BeforeCommit {
             self.suspend().await;
         }
@@ -411,6 +416,7 @@ impl Fixture {
         duplicate.dettid = LEADER;
         duplicate.syscall_count = 999;
         duplicate.timeslice_stats.record(999);
+        duplicate.passed_descriptors_out = true;
         let response = self
             .state
             .receive_rpc(
@@ -425,6 +431,14 @@ impl Fixture {
         assert_eq!(response, (None, GlobalResponse::DeregisterThread(())));
         self.assert_final_stats(true);
         self.assert_final_clock(LEADER);
+        assert!(
+            !self
+                .state
+                .sched
+                .lock()
+                .unwrap()
+                .guest_held_marks_revoked_for_test()
+        );
     }
 }
 
@@ -434,9 +448,14 @@ fn deregistration(thread: &ThreadState<()>) -> ThreadDeregistration {
         detpid: thread.detpid.unwrap(),
         mm: thread.mm_id,
         thread_start_entered: thread.thread_start_entered,
+        vfork_origin: None,
         timeslice_stats: thread.stats.timeslice_stats,
         syscall_count: thread.stats.syscall_count,
+        syscall_histogram: Default::default(),
         chaos_epochs: Vec::new(),
+        killed_by_group_signal: false,
+        passed_descriptors_out: thread.passed_descriptors_out_unreported,
+        wait_status: 0,
     }
 }
 
@@ -798,6 +817,51 @@ async fn unbound_exec_normal_exit_cannot_consume_pending_or_completed_transfer()
             fixture.assert_running();
         }
     }
+}
+
+/// An exec continuation whose grant carries the replayed schedule's slice
+/// length (`Scheduler::timeslices`, which a schedule replay fills for the new
+/// leader) installs that slice end as the schedule's, through
+/// `ThreadState::install_schedule_deadline`: it bounds the PMU maximum and
+/// clears the `--max-timeslice` backstop the slice kept, so a later callback
+/// checkpoint's restart (`restart_replay_backstop`) cannot move it, even where
+/// the two fall on the same nanosecond.
+#[tokio::test]
+async fn an_exec_continuation_resumes_the_schedules_slice_end_not_a_backstop() {
+    let fixture = Fixture::prepared().await;
+    let mut guest = fixture.guest(Gate::None);
+    let now = guest.thread.thread_logical_time.as_nanos();
+    let backstop = now + LogicalTime::from_nanos(200_000_000);
+    guest.thread.end_of_timeslice = Some(backstop);
+    guest.thread.max_timeslice_end = Some(backstop);
+    guest.thread.replay_backstop = Some(backstop);
+    let length = LogicalTime::from_nanos(777);
+    {
+        let mut reconnect = Box::pin(super::super::reconnect_exec(&mut guest));
+        assert!(futures::poll!(&mut reconnect).is_pending());
+        assert!(futures::poll!(&mut reconnect).is_pending());
+        fixture
+            .state
+            .sched
+            .lock()
+            .unwrap()
+            .timeslices
+            .insert(LEADER, Some(length));
+        let turn = crate::scheduler::do_a_turn_blocking(
+            fixture.state.sched.clone(),
+            fixture.state.global_time.clone(),
+            &Err(crate::scheduler::SkipTurn),
+        )
+        .await
+        .expect("replacement must receive its continuation grant");
+        assert_eq!(turn.tid, LEADER);
+        assert_eq!(reconnect.await, Ok(()));
+    }
+    let expected = now + length;
+    assert_eq!(guest.thread.end_of_timeslice, Some(expected));
+    assert_eq!(guest.thread.max_timeslice_end, Some(expected));
+    assert_eq!(guest.thread.replay_backstop, None);
+    consume(&fixture.state, &fixture.tool, LEADER, guest.thread).await;
 }
 
 #[tokio::test]
@@ -1234,9 +1298,20 @@ async fn retired_exec_former_rpc_cannot_recreate_clock_or_account_twice() {
         let mut payload = deregistration(&fixture.worker);
         payload.mm = mm;
         payload.syscall_count = 999;
+        payload.passed_descriptors_out = true;
+        let mut resource_export = Resources::new(WORKER);
+        resource_export.passes_descriptors_out = true;
         for request in [
             GlobalRequest::GlobalTimeLowerBound,
-            GlobalRequest::RequestResources(Resources::new(WORKER), LEADER),
+            GlobalRequest::RequestResources(resource_export, LEADER),
+            GlobalRequest::FutexAction(
+                WORKER,
+                FutexAction::WaitRequest(None, None),
+                FutexID::private(mm, 0x1000),
+                0,
+                u32::MAX,
+                true,
+            ),
             GlobalRequest::DeregisterThread(payload),
         ] {
             let expected = if matches!(&request, GlobalRequest::DeregisterThread(_)) {
@@ -1274,6 +1349,7 @@ async fn retired_exec_former_rpc_cannot_recreate_clock_or_account_twice() {
                 assert!(!sched.per_thread_syscalls.contains_key(&WORKER));
                 assert!(!sched.per_thread_timeslice.contains_key(&WORKER));
                 assert!(sched.next_turns[&LEADER].req.try_read().is_none());
+                assert!(!sched.guest_held_marks_revoked_for_test());
             }
             assert!(
                 fixture
@@ -1568,7 +1644,7 @@ async fn reused_exec_worker_start_waits_for_parent_registration_before_clock_or_
         startup.await,
         (
             None,
-            GlobalResponse::Granted(Box::new(GlobalResponse::StartNewThread(None)))
+            GlobalResponse::Granted(Box::new(GlobalResponse::StartNewThread(None, None)))
         )
     );
     assert_eq!(fixture.state.sched.lock().unwrap().turn, 2);
@@ -1846,7 +1922,7 @@ async fn reused_exec_worker_vfork_registration_requires_creation_mode(
         startup.await,
         (
             None,
-            GlobalResponse::Granted(Box::new(GlobalResponse::StartNewThread(None)))
+            GlobalResponse::Granted(Box::new(GlobalResponse::StartNewThread(None, None)))
         )
     );
     assert_eq!(fixture.state.sched.lock().unwrap().turn, 3);

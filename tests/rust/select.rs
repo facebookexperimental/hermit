@@ -17,15 +17,20 @@
 //! `pselect6` syscall, so this guest issues the raw `select` syscall directly to
 //! actually cover Detcore's `handle_select` path rather than `handle_pselect6`.
 
+#[cfg(target_arch = "x86_64")]
 use std::os::fd::AsRawFd;
+#[cfg(target_arch = "x86_64")]
 use std::os::fd::OwnedFd;
 
+#[cfg(target_arch = "x86_64")]
 use nix::unistd::pipe;
+#[cfg(target_arch = "x86_64")]
 use nix::unistd::write;
 
 /// Invoke the raw `select(2)` syscall (bypassing glibc's pselect6-based wrapper)
 /// and return its raw result plus the (possibly updated) timeout that Linux
 /// writes back with the time not slept.
+#[cfg(target_arch = "x86_64")]
 fn raw_select(read_fd: i32, timeout: &mut libc::timeval) -> i64 {
     // SAFETY: fd_set is a plain bitmap; we zero it and set a single valid fd.
     let mut readfds: libc::fd_set = unsafe { std::mem::zeroed() };
@@ -52,6 +57,15 @@ fn raw_select(read_fd: i32, timeout: &mut libc::timeval) -> i64 {
     ret
 }
 
+/// Only x86_64 has the `select` syscall (newer architectures have only
+/// `pselect6`); elsewhere this guest only says so, and fails.
+#[cfg(not(target_arch = "x86_64"))]
+fn main() {
+    eprintln!("the raw select syscall exists only on x86_64");
+    std::process::exit(1);
+}
+
+#[cfg(target_arch = "x86_64")]
 fn main() {
     // Ready path: data queued in the pipe makes the read end selectable.
     let (ready_r, ready_w): (OwnedFd, OwnedFd) = pipe().unwrap();

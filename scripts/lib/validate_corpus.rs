@@ -43,6 +43,10 @@ use std::path::Path;
 pub struct CorpusRow {
     pub label: String,
     pub argv: Vec<String>,
+    /// The `/proc` level the row runs at (`--proc`), when the program reads
+    /// a name Hermit's default level, minimal, omits. Mirrors the `proc`
+    /// field of tests/e2e/manifests/compat.yaml rows.
+    pub proc: Option<String>,
 }
 
 /// Runtime values substituted into the `{{PLACEHOLDER}}` tokens the extractor left
@@ -102,13 +106,39 @@ pub fn load(root: &Path, mode: &str, paths: &CorpusPaths) -> Result<Vec<CorpusRo
             })?;
             argv.push(paths.expand(s));
         }
-        if argv.is_empty() {
-            return Err(format!("{} row {i} ({label}): empty argv", file.display()));
-        }
-        out.push(CorpusRow {
+        let mut parsed = CorpusRow {
             label: label.to_string(),
             argv,
-        });
+            proc: None,
+        };
+        if parsed.argv.is_empty() {
+            return Err(format!(
+                "{} row {i} ({}): empty argv",
+                file.display(),
+                parsed.label
+            ));
+        }
+        parsed.proc = match row.get("proc") {
+            None => None,
+            Some(value) => {
+                let level = value.as_str().ok_or_else(|| {
+                    format!("{} row {i} ({label}): non-string `proc`", file.display())
+                })?;
+                Some(level.to_string())
+            }
+        };
+        if let Some(level) = parsed
+            .proc
+            .as_deref()
+            .filter(|level| !matches!(*level, "minimal" | "standard"))
+        {
+            return Err(format!(
+                "{} row {i} ({}): proc {level:?} is not one of minimal|standard",
+                file.display(),
+                parsed.label
+            ));
+        }
+        out.push(parsed);
     }
     if out.is_empty() {
         return Err(format!("{} contained zero rows", file.display()));

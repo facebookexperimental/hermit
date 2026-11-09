@@ -195,7 +195,7 @@ impl Scheduler {
         } else {
             None
         };
-        self.release_replay_priorities_if_exhausted();
+        self.release_replay_priorities_if_exhausted(true);
         let keep_running = match action {
             ReplayAction::Continue(None) => true,
             ReplayAction::ContextSwitch(now, next, None) => {
@@ -209,9 +209,17 @@ impl Scheduler {
                 );
                 self.requeue_with_new_priority(current, REPLAY_DEFERRED_PRIORITY);
                 self.requeue_with_new_priority(next, REPLAY_FOREGROUND_PRIORITY);
+                // A timeslice-end marker also switches before its request, but
+                // that request resumes guest code: only a syscall prehook hands
+                // its call a turn (`replay_prehook_handoff`).
+                let at_syscall_prehook = matches!(
+                    observed,
+                    Record::Event(event) if super::observed_is_syscall_prehook(event)
+                );
+                self.note_replay_switch(current, next, at_syscall_prehook);
                 // The expectation rides the existing grant. No old leader's
                 // legacy duration may leak into this new-format continuation.
-                self.timeslices.remove(&next);
+                self.forget_replay_timeslice(&next);
                 !now
             }
             _ => unreachable!("the boundary cursor cannot resync or infer a logical duration"),
@@ -221,6 +229,7 @@ impl Scheduler {
             print_stack,
             event_ix: index as u64,
             timeslice_remaining: None,
+            instruction_offset: None,
         })
     }
 }
@@ -239,9 +248,15 @@ mod tests {
 
     use super::*;
     use crate::config::Config;
+    use crate::ivar::Ivar;
     use crate::preemptions::PreemptionWriter;
+    use crate::resources::Permission;
+    use crate::resources::ResourceID;
+    use crate::resources::Resources;
+    use crate::scheduler::ThreadNextTurn;
     use crate::scheduler::boundary_replayer::BoundaryReplayer;
     use crate::scheduler::runqueue::DEFAULT_PRIORITY;
+    use crate::types::SyscallPhase;
 
     fn marker(tid: i32, slice: u64) -> Record {
         Record::TimesliceEnd(Boundary {
@@ -276,6 +291,55 @@ mod tests {
         scheduler
     }
 
+    /// A finished run's summary refuses a replay that did not reach its
+    /// schedule's end, and names unconsumed callback checkpoints. The summary
+    /// of a run `--timeout` stopped does neither: a stopped replay is
+    /// unfinished by definition.
+    #[test]
+    fn only_a_finished_runs_summary_requires_its_replay_to_have_ended() {
+        use crate::preemptions::callback_history::Checkpoint;
+        use crate::preemptions::callback_history::Origin;
+        use crate::preemptions::callback_history::Site;
+        use crate::slice_boundary::callbacks::Callback;
+
+        let mut finished = scheduler(vec![marker(3, 1)]);
+        let refusal = finished
+            .generate_partial_run_summary_for_log(None)
+            .unwrap_err();
+        assert!(
+            refusal
+                .downcast_ref::<crate::TerminalReplayRefusal>()
+                .is_some(),
+            "{refusal:#}"
+        );
+
+        let mut stopped = scheduler(vec![marker(3, 1)]);
+        stopped.callback_checkpoints.insert(
+            DetTid::from_raw(3),
+            [Checkpoint {
+                history_index: 0,
+                origin: Origin {
+                    callback: Callback::Syscall(Sysno::close),
+                    site: Site::Posthook,
+                    progress: 10,
+                    last_op: None,
+                    time: LogicalTime::from_nanos(100),
+                    rcbs: 10,
+                },
+            }]
+            .into(),
+        );
+        let (summary, _) = stopped.generate_stopped_run_summary_for_log(None).unwrap();
+        assert_eq!(summary.desync_descrip, None);
+        stopped.boundary_replayer = None;
+        let (summary, _) = stopped.generate_partial_run_summary_for_log(None).unwrap();
+        assert!(
+            summary
+                .desync_descrip
+                .is_some_and(|text| text.contains("incomplete callback history")),
+        );
+    }
+
     #[test]
     fn boundary_constructor_preserves_formats_and_authenticates_lookahead() {
         use crate::preemptions::PreemptionRecord;
@@ -287,18 +351,25 @@ mod tests {
         let schedule = Schedule::new(vec![marker(3, 1)]).unwrap();
         let path = directory.path().join("recording.json");
         Recording::Boundaries(
-            BoundaryRecording::new(PreemptionRecord::from_sched_events(vec![]), schedule).unwrap(),
+            BoundaryRecording::new(
+                PreemptionRecord::from_sched_events_with_identity(
+                    vec![],
+                    Some(crate::clock_identity::test_sources::known()),
+                ),
+                schedule,
+            )
+            .unwrap(),
         )
         .write(&path)
         .unwrap();
-        let config = Config {
+        let config = crate::clock_identity::test_sources::qualified(Config {
             sequentialize_threads: true,
             replay_schedule_from: Some(path.clone()),
             record_preemptions: true,
             strict_schedule_boundaries: true,
             stacktrace_event: vec![(0, Some("marker.stack".into()))],
             ..Config::default()
-        };
+        });
         let mut scheduler = Scheduler::new(&config);
         assert!(scheduler.replayer.is_none());
         assert!(
@@ -342,9 +413,10 @@ mod tests {
         assert_eq!(scheduler.boundary_budget_for_live_owner(tid).unwrap(), None);
         // Old format retains its exact old replayer and producer rather than
         // trying to synthesize absent callback identities.
-        Recording::Legacy(PreemptionRecord::from_sched_events(vec![
-            SchedEvent::branches(tid, 1),
-        ]))
+        Recording::Legacy(PreemptionRecord::from_sched_events_with_identity(
+            vec![SchedEvent::branches(tid, 1)],
+            Some(crate::clock_identity::test_sources::known()),
+        ))
         .write(&path)
         .unwrap();
         let legacy = Scheduler::new(&Config {
@@ -523,6 +595,78 @@ mod tests {
         assert!(!scheduler.replay_priorities_released);
     }
 
+    /// The replayed-SIGCHLD rule reads the boundary cursor too: a parked or
+    /// arriving delivery is not held behind a replay-held polling retry when
+    /// the next stored record, here a timeslice-end marker, is the signaled
+    /// thread's, and it still is when the next record is the poller's
+    /// (`Scheduler::sigchld_waits_behind_work`).
+    #[test]
+    fn a_replayed_sigchld_reads_the_boundary_cursor() {
+        let (poller, signaled) = (DetTid::from_raw(3), DetTid::from_raw(7));
+        for (next_owner, waits) in [(7, false), (3, true)] {
+            let mut scheduler = scheduler(vec![marker(next_owner, 1)]);
+            let mut polling = Resources::new(poller);
+            polling.insert(ResourceID::InternalIOPolling, Permission::W);
+            scheduler.next_turns.insert(
+                poller,
+                ThreadNextTurn {
+                    dettid: poller,
+                    child_tid_addr: 0,
+                    req: Ivar::full(Ok(polling)),
+                    resp: Ivar::new(),
+                    protocol: Default::default(),
+                },
+            );
+            scheduler
+                .priorities
+                .insert(poller, REPLAY_DEFERRED_PRIORITY);
+            scheduler.runqueue_push_back(poller);
+            assert!(scheduler.run_queue.has_runnable_besides(signaled));
+            assert_eq!(
+                scheduler.sigchld_waits_behind_work(signaled),
+                waits,
+                "next record owned by {next_owner}"
+            );
+            scheduler.blocked.sigchld_deferred.insert(signaled);
+            assert_eq!(
+                scheduler.replay_readmits_parked_sigchld(),
+                (!waits).then_some(signaled),
+                "next record owned by {next_owner}"
+            );
+        }
+    }
+
+    /// The boundary replayer switches away before the next thread's record at
+    /// a syscall prehook and at a timeslice-end marker alike. Only the prehook
+    /// leaves the thread a call to carry out (`replay_prehook_handoff`): the
+    /// request after a marker resumes guest code, which records events, so it
+    /// is not handed a turn ahead of the other deferred threads.
+    #[test]
+    fn only_a_prehook_switch_leaves_its_thread_a_call_to_carry_out() {
+        let (current, next) = (DetTid::from_raw(3), DetTid::from_raw(4));
+        let prehook = Record::Event(
+            SchedEvent::syscall(current, Sysno::clone3, SyscallPhase::Prehook)
+                .with_time(LogicalTime::from_nanos(10_000)),
+        );
+        let following = Record::Event(SchedEvent::branches(next, 10));
+        for (observed, hands_over) in [(prehook, true), (marker(3, 1), false)] {
+            let mut scheduler = scheduler(vec![observed.clone(), following.clone()]);
+            for tid in [current, next] {
+                scheduler.priorities.insert(tid, DEFAULT_PRIORITY);
+                scheduler.runqueue_push_back(tid);
+            }
+            let result = scheduler.consume_boundary_record(&observed).unwrap();
+            assert!(result.keep_running, "{observed:?}");
+            assert_eq!(scheduler.priorities[&current], REPLAY_DEFERRED_PRIORITY);
+            assert_eq!(scheduler.priorities[&next], REPLAY_FOREGROUND_PRIORITY);
+            assert_eq!(
+                scheduler.replay_prehook_callers.contains(&current),
+                hands_over,
+                "{observed:?}"
+            );
+        }
+    }
+
     #[test]
     fn pending_marker_and_refused_branch_fragment_keep_readmission_deferred_until_exact_eof() {
         let branch = SchedEvent::branches(DetTid::from_raw(3), 10);
@@ -547,7 +691,7 @@ mod tests {
             scheduler.boundary_replayer.as_ref().unwrap().stored_index(),
             0
         );
-        scheduler.release_replay_priorities_if_exhausted();
+        scheduler.release_replay_priorities_if_exhausted(true);
         scheduler.readmit_ready_thread(peer);
         assert_eq!(
             scheduler.run_queue.queued_priority(peer),
@@ -565,7 +709,7 @@ mod tests {
         assert!(scheduler.replay_priorities_released);
         assert_eq!(scheduler.priorities[&peer], DEFAULT_PRIORITY);
         let queue = scheduler.run_queue.tids().copied().collect::<Vec<_>>();
-        scheduler.release_replay_priorities_if_exhausted();
+        scheduler.release_replay_priorities_if_exhausted(true);
         assert_eq!(
             scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
             queue
@@ -583,6 +727,82 @@ mod tests {
                 .schedevent_replayed,
             2
         );
+    }
+
+    #[test]
+    fn boundary_eof_changes_only_dispatch_not_logical_priority() {
+        for exhaust in [false, true] {
+            let tid = DetTid::from_raw(3);
+            let peer = DetTid::from_raw(4);
+            let branch = SchedEvent::branches(tid, 10);
+            let last = marker(3, 1);
+            let mut scheduler = scheduler(vec![Record::Event(branch.clone()), last.clone()]);
+            scheduler.record_logical_replay_priorities = true;
+            scheduler.preemption_writer =
+                Some(PreemptionWriter::new(None).with_slice_boundaries().unwrap());
+            for (thread, priority, vfork) in [
+                (tid, REPLAY_FOREGROUND_PRIORITY, false),
+                (peer, REPLAY_DEFERRED_PRIORITY, true),
+            ] {
+                scheduler.register_thread_for_test(thread);
+                scheduler.priorities.insert(thread, priority);
+                scheduler.register_preemption_thread(thread, priority, vfork);
+            }
+            scheduler.readmit_ready_thread(peer);
+            let before = (scheduler.turn, scheduler.committed_time);
+            scheduler.consume_schedevent(&branch);
+            assert_eq!(
+                scheduler.boundary_replayer.as_ref().unwrap().stored_index(),
+                1
+            );
+            assert!(!scheduler.replay_priorities_released);
+            assert_eq!(scheduler.priorities[&tid], REPLAY_FOREGROUND_PRIORITY);
+            assert_eq!(scheduler.priorities[&peer], REPLAY_DEFERRED_PRIORITY);
+            if exhaust {
+                scheduler.consume_boundary_record(&last).unwrap();
+                let late_vfork = DetTid::from_raw(7);
+                scheduler.register_thread_for_test(late_vfork);
+                assert!(
+                    !scheduler.replay_registration_priority(late_vfork, REPLAY_DEFERRED_PRIORITY)
+                );
+                scheduler.register_preemption_thread(late_vfork, REPLAY_DEFERRED_PRIORITY, true);
+                assert_eq!(scheduler.priorities[&late_vfork], DEFAULT_PRIORITY);
+                assert_eq!(
+                    scheduler
+                        .preemption_writer
+                        .as_ref()
+                        .unwrap()
+                        .current_priority(late_vfork),
+                    DEFAULT_PRIORITY - 1
+                );
+            }
+            assert_eq!(
+                scheduler.boundary_replayer.as_ref().unwrap().stored_index(),
+                if exhaust { 2 } else { 1 }
+            );
+            assert_eq!(scheduler.replay_has_records_left(), !exhaust);
+            assert_eq!(scheduler.replay_priorities_released, exhaust);
+            let controls = if exhaust {
+                [DEFAULT_PRIORITY, DEFAULT_PRIORITY]
+            } else {
+                [REPLAY_FOREGROUND_PRIORITY, REPLAY_DEFERRED_PRIORITY]
+            };
+            assert_eq!(scheduler.priorities[&tid], controls[0]);
+            assert_eq!(scheduler.run_queue.queued_priority(peer), Some(controls[1]));
+            assert_eq!((scheduler.turn, scheduler.committed_time), before);
+            let exported: serde_json::Value =
+                serde_json::from_str(&scheduler.preemption_writer.take().unwrap().into_string())
+                    .unwrap();
+            let rows = &exported["slice_boundary_recording"]["preemptions"]["per_thread"];
+            assert_eq!(rows["3"]["final_prio"], DEFAULT_PRIORITY);
+            assert_eq!(rows["4"]["final_prio"], DEFAULT_PRIORITY - 1);
+            if exhaust {
+                assert_eq!(rows["7"]["final_prio"], DEFAULT_PRIORITY - 1);
+            }
+            for thread in ["3", "4"] {
+                assert_eq!(rows[thread]["prio_changes"], serde_json::json!([]));
+            }
+        }
     }
 
     #[test]

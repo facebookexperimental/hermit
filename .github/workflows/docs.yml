@@ -76,14 +76,22 @@ jobs:
     # starting on a runner too small for it. "Keep a self-hosted run off the
     # host's shared state" and the runner.environment conditions below keep the
     # job from changing that host. Return the rebuild to ubuntu-latest once the
-    # builder streams the ledger instead of holding it
-    # (https://github.com/rrnewton/dev-hermit/issues/515).
+    # builder streams the ledger instead of holding it whole in memory.
     runs-on: ${{ (github.event_name == 'schedule' || inputs.rebuild_compatibility) && fromJSON('["self-hosted", "gate", "docs-rebuild"]') || 'ubuntu-latest' }}
-    # Room for the 180-minute rebuild step below plus the steps around it
+    # Room for the 420-minute rebuild step below plus the steps around it
     # (about 10 minutes on 2026-09-27, with an 11-minute public-byte check cap).
-    timeout-minutes: 240
+    timeout-minutes: 480
 
     steps:
+    - name: Guard — refuse untrusted actor on self-hosted runner
+      if: ${{ github.event_name == 'schedule' || inputs.rebuild_compatibility }}
+      env:
+        GUARD_ACTOR: ${{ github.actor }}
+      run: |
+        case "$GUARD_ACTOR" in
+          hermit-bot3|rrnewton) echo "runner-trust: actor $GUARD_ACTOR is allow-listed" ;;
+          *) echo "::error::runner-trust: actor '$GUARD_ACTOR' is not allow-listed for self-hosted runners (allowlist: hermit-bot3, rrnewton)"; exit 1 ;;
+        esac
     # Before any git command: the runner's user has git URL rewrites in its
     # global configuration that serve some GitHub URLs from stale local mirrors,
     # so git reads an empty global configuration file instead (not /dev/null,
@@ -123,6 +131,50 @@ jobs:
         # The publication gate compares the registry with every earlier version
         # so an already-public content-addressed path cannot disappear or change.
         fetch-depth: 0
+    - name: Guard — verify commit authors before running code
+      if: ${{ github.event_name == 'schedule' || inputs.rebuild_compatibility }}
+      env:
+        GITHUB_ACTOR: ${{ github.actor }}
+      run: bash scripts/check-runner-trust.sh
+    - name: Save the dispatched builder pin
+      # The workspace stays at the DISPATCHED commit for the whole job;
+      # only the builder source moves, into its own checkout.  So the
+      # pin file is saved (not the adapter tree) before anything reads
+      # it: source-config and rebuild are told this exact pin, never the
+      # older one recorded at hermit_commit inside the pin checkout
+      # (which lagged one generation and refused runs 41537071693 and
+      # 41666103898).  Running the workspace adapter also keeps the
+      # publisher's append-only history gate inside this full-history
+      # repository; running it from a snapshot outside the repository
+      # refused there, or silently compared against 0 historical
+      # versions inside an enclosing checkout.
+      if: github.event_name == 'schedule' || inputs.rebuild_compatibility
+      run: |
+        set -euo pipefail
+        cp .github/compatibility-site-builder.json \
+          "$RUNNER_TEMP/website-builder-pin.json"
+    - name: Check out the reviewed Hermit source pin
+      # A dispatch on main must not race main moving past the reviewed
+      # pin.  The reviewed Hermit sources (the metadata checkout the
+      # rebuild verifies, and the tree cargo doc builds) live in their
+      # own worktree at _pin_source; the workspace itself stays at the
+      # dispatched commit, so the adapter, publisher, registry and full
+      # history in force are the dispatched commit's.  The pin must
+      # exist in this full-history checkout, or the rebuild refuses here
+      # instead of comparing a moved checkout to the pin.
+      if: github.event_name == 'schedule' || inputs.rebuild_compatibility
+      run: |
+        set -euo pipefail
+        pin=$(jq -er '.hermit_commit | select(type == "string" and test("^[0-9a-f]{40}$"))' \
+          "$RUNNER_TEMP/website-builder-pin.json")
+        git cat-file -e "$pin^{commit}"
+        # A leftover worktree at the same path (a failed earlier run on
+        # a persistent self-hosted workspace) must not change which
+        # commit is checked out; prune registrations first.
+        rm -rf _pin_source
+        git worktree prune
+        git worktree add --detach _pin_source "$pin"
+        [[ $(git -C _pin_source rev-parse 'HEAD^{commit}') == "$pin" ]]
     - name: Initialize dagrun submodule
       run: git submodule update --init --depth 1 -- agent-utils
     - name: Check nightly source access and pins
@@ -142,7 +194,8 @@ jobs:
           echo "::error::Nightly rebuild needs COMPATIBILITY_SOURCE_DEPLOY_KEY: a read-only deploy key for rrnewton/dev-hermit. No old archive was rebuilt."
           exit 1
         fi
-        python3 .github/scripts/rebuild-compatibility-site.py source-config > "$RUNNER_TEMP/website-source.json"
+        python3 .github/scripts/rebuild-compatibility-site.py source-config \
+          --builder-config "$RUNNER_TEMP/website-builder-pin.json" > "$RUNNER_TEMP/website-source.json"
         jq -r '"parent_commit=" + .parent_commit, "hermit_commit=" + .hermit_commit' \
           "$RUNNER_TEMP/website-source.json" >> "$GITHUB_OUTPUT"
         # Capture public data before the authenticated full-history P fetch.
@@ -172,8 +225,12 @@ jobs:
         printf '%s\n' "$history" > "$RUNNER_TEMP/website-validation-history.txt"
     - name: Dependencies
       # A self-hosted runner's host already builds Hermit and is not Debian.
+      # Refresh the index first: the runner image's index can name package
+      # versions the mirror no longer serves, and install then fails with 404.
       if: runner.environment == 'github-hosted'
-      run: sudo apt-get install -y libunwind-dev liblzma-dev
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libunwind-dev liblzma-dev
     # The published ledger as an earlier run left it, so this run's fetch of the
     # published commit (fetch_ledger) downloads only what changed since then:
     # the restored repository holds the commit an earlier run built from
@@ -299,7 +356,7 @@ jobs:
       # The rebuild's projection child peaked at 13.85 GB on 2026-10-03 (9.77 GB
       # on 2026-10-01), and the step's cgroup reached ~16.2 GB of the runner's
       # 16.77 GB. The next two runs ran out of memory in stage1.projection
-      # (https://github.com/rrnewton/dev-hermit/issues/515). This swap is the
+      # because the projection holds its whole input in memory. This swap is the
       # stopgap until the projection streams its input; remove it then.
       run: |
         set -euo pipefail
@@ -343,8 +400,12 @@ jobs:
       # release upload, which each attempt bounds by the archive's size
       # (rebuild-compatibility-site.py, upload_timeout): about 44 minutes for
       # a 471 MB archive. 101 minutes would not hold a slow fetch, the build
-      # and one slow upload.
-      timeout-minutes: 180
+      # and one slow upload. The 10,500 s inner cap below was the proven
+      # killer of run 40974370554 (exit 137 after exactly 10,530 s: the cap
+      # plus its 30 s kill grace, not OOM — the gate runner has no memory
+      # cap), so the inner cap is 21,600 s and this step and job budget
+      # cover it with headroom while the export's peak and wall are cut.
+      timeout-minutes: 420
       env:
         GH_TOKEN: ${{ github.token }}
         CARGO_TARGET_DIR: ${{ runner.temp }}/compatibility-target
@@ -359,20 +420,30 @@ jobs:
         RUSTUP_AUTO_INSTALL: "0"
         PYTHONDONTWRITEBYTECODE: "1"
         # Print one wall/CPU line per build phase to this step's log, so the
-        # step's duration can be split by phase from the log alone
-        # (https://github.com/rrnewton/dev-hermit/issues/391).
+        # step's duration can be split by phase from the log alone. Before
+        # this, the hosted rebuild step took 3700 s, 3001 s and 2586 s on three
+        # Docs runs (36461693420, 36470493141, 36491135006; recorded in
+        # d3a0a4ae3d16) and its slow phase was not visible.
         COMPATIBILITY_WEBSITE_PHASE_TIMING: "1"
+        # The export's evidence verdict cache must live outside the builder
+        # checkout: build_and_serve otherwise creates it under the state
+        # root (the checkout itself), and the build's later clean-checkout
+        # verification refuses its own cache (run 41547597829). The scratch
+        # parent is job-owned and removed after the run, like the build's
+        # other scratch state.
+        LEDGER_EVIDENCE_VERIFY_CACHE_DIR: ${{ runner.temp }}/evidence-verify-cache
         LEDGER_COMMIT: ${{ steps.website-source.outputs.ledger_commit }}
         VALIDATION_HISTORY_COMMIT: ${{ steps.website-history.outputs.validation_history_commit }}
       run: |
         set -euo pipefail
-        timeout --signal=TERM --kill-after=30s 10500s \
+        timeout --signal=TERM --kill-after=30s 21600s \
           python3 -B .github/scripts/rebuild-compatibility-site.py rebuild \
           --builder-parent "$GITHUB_WORKSPACE/_website_source" \
           --scratch "${COMPATIBILITY_SCRATCH_PARENT:-$RUNNER_TEMP}/compatibility-nightly-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
           --receipt "$RUNNER_TEMP/compatibility-rebuild.json" \
           --ledger-commit "$LEDGER_COMMIT" \
-          --validation-history-commit "$VALIDATION_HISTORY_COMMIT"
+          --validation-history-commit "$VALIDATION_HISTORY_COMMIT" \
+          --builder-config "$RUNNER_TEMP/website-builder-pin.json"
         jq -r '"registry_asset=" + (.registry_asset | tostring), "registry_sha256=" + .registry_sha256' \
           "$RUNNER_TEMP/compatibility-rebuild.json" >> "$GITHUB_OUTPUT"
         {
@@ -424,7 +495,7 @@ jobs:
       if: always() && (github.event_name == 'schedule' || inputs.rebuild_compatibility)
       # The rebuild's resource receipt does not count swapped-out pages, so its
       # memory peaks stop near physical RAM once swap is on. Log the swap the
-      # rebuild actually used (https://github.com/rrnewton/dev-hermit/issues/515).
+      # rebuild actually used.
       run: |
         set -uo pipefail
         swapon --show --bytes || true
@@ -444,9 +515,19 @@ jobs:
       # site is deployed (see the last step). The validation DAG's
       # Documentation node remains the gate for documentation lints.
       continue-on-error: true
-      run: cargo doc --workspace --no-deps
+      working-directory: ${{ (github.event_name == 'schedule' || inputs.rebuild_compatibility) && '_pin_source' || '.' }}
+      run: |
+        cargo doc --workspace --no-deps
+        # Deploy reads ./target/doc from the workspace; on rebuild runs
+        # the docs were built in the pin worktree, so copy them over.
+        if [[ "$PWD" == *_pin_source ]]; then
+          rm -rf "$GITHUB_WORKSPACE/target/doc"
+          mkdir -p "$GITHUB_WORKSPACE/target"
+          cp -R target/doc "$GITHUB_WORKSPACE/target/doc"
+        fi
     - name: Build documentation without the lint gate
       if: steps.rustdoc.outcome == 'failure'
+      working-directory: ${{ (github.event_name == 'schedule' || inputs.rebuild_compatibility) && '_pin_source' || '.' }}
       env:
         RUSTFLAGS: -C link-arg=-llzma
         RUSTDOCFLAGS: ""
@@ -454,6 +535,11 @@ jobs:
         set -euo pipefail
         echo '::warning::cargo doc failed under -D warnings. Rebuilding the documentation without -D warnings so the website still deploys; the job fails after deployment.'
         cargo doc --workspace --no-deps
+        if [[ "$PWD" == *_pin_source ]]; then
+          rm -rf "$GITHUB_WORKSPACE/target/doc"
+          mkdir -p "$GITHUB_WORKSPACE/target"
+          cp -R target/doc "$GITHUB_WORKSPACE/target/doc"
+        fi
     - name: Add Hermetic Infra landing page
       run: |
         install -m 0644 docs/site/index.html target/doc/index.html

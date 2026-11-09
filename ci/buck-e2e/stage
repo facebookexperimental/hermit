@@ -3,13 +3,14 @@
 #
 #   bin/        test-harness + hermit-manifest-plan (release: the debug front door costs
 #               ~0.65 CPU-s per cell, which Buck pays once per cell)
-#   install/    the backend resource bundle (hermit-install: DynamoRIO, SaBRe, e9patch,
-#               liteinst runtime) plus the libunwind runtime closure, published with
+#   install/    the first-party resource bundle (hermit-install and LiteInst runtime)
+#               plus the libunwind runtime closure, published with
 #               ci/publish-hermit-e2e-artifact.sh
 #   hermit      the cargo validate-profile hermit, for -c hermit_e2e.hermit=staged
 #   src/        `git archive HEAD`: the source snapshot cells read (no .git, no submodules)
 #   build/      `test-harness build` fixtures for every CI-selected cell, built from src/
-#   run-state/  the compat fixtures (tests/compat/prepare_real_compat_fixtures.sh)
+#   run-state/  the compat fixtures (tests/compat/prepare_real_compat_fixtures.sh,
+#               prepared inside the pinned root, as the cargo flow prepares them)
 #   SOURCE_SHA  HEAD
 #
 # usage: ci/buck-e2e/stage --from-cargo [--target-dir DIR]   build them here with cargo
@@ -71,7 +72,7 @@ fi
 #     so checkout, target and fixture paths are constant;
 #   - CARGO_HOME, which stays where it is, is reached through a symlink at
 #     $HERMIT_BUCK_STAGE_DIR/cargo, so every crate and vendored C source path
-#     (SaBRe's build ignores CFLAGS) is constant too. Remapping it with
+#     is constant too. Remapping it with
 #     RUSTFLAGS instead would not work: Cargo hashes RUSTFLAGS into each
 #     crate's metadata, so a per-run path there changes every symbol hash;
 #   - SOURCE_DATE_EPOCH is HEAD's commit time, which fixes __DATE__/__TIME__;
@@ -79,8 +80,47 @@ fi
 #     checkout through HERMIT_BUCK_STAGE_GIT_ROOT, not to the copy: a submodule
 #     whose .git file names its gitdir by a relative path (agent-utils) does not
 #     resolve from the copy, and `git status` there fails;
-#   - the build is still cold every run: the fixed directory is wiped before and
-#     removed after, and only staged/ is copied back into this checkout.
+#   - the build is warm (2026-10-26): the fixed directory, its target with it, is
+#     kept between stages, so a stage rebuilds only what changed since the last
+#     one (wiped and built cold every run, the stage compiled 862 crates, 1.17
+#     CPU-h of each validate of ccbec065). The copy is the files Git tracks
+#     (submodules included, with their .git links), refreshed by content with
+#     rsync --checksum --files-from, never preserving times: a file whose bytes
+#     are unchanged keeps the time of the stage that copied it, older than every
+#     build since, and a changed or new file is written now, newer than every
+#     build, so Cargo's mtime freshness rebuilds exactly the crates and build
+#     scripts whose inputs changed. ci/buck-e2e/refresh_copy.py does the
+#     refresh: it removes a path an earlier stage copied that Git no longer
+#     tracks (each completed refresh records what it copied in
+#     $HERMIT_BUCK_STAGE_DIR/src.copied) and anything standing where a tracked
+#     path now goes (a file that became a directory or the reverse, a .git
+#     directory that became a .git link) before it copies; what the stage's own
+#     builds write into the copy otherwise stays. It journals the refresh
+#     ($HERMIT_BUCK_STAGE_DIR/src.refreshing, written before the copy is
+#     touched and removed once the record is replaced), so a refresh that did
+#     not finish wipes the copy at the next stage instead of leaving a path it
+#     copied unrecorded. Only tracked files are read: the validation's other nodes
+#     build into the checkout while this stage runs (build.rust_scripts writes
+#     agent-utils/rs/target), and copying that tree, as the first version of
+#     this did with rsync --delete over everything but target/ and ignored/,
+#     failed the validate of 3b0374ae with rsync code 24 when a compiler
+#     temporary vanished mid-copy. Copying this checkout's own times (cp -a) would not be safe
+#     once the target is kept: a checkout made before another validate's stage
+#     carries times older than that stage's build, and Cargo would keep stale
+#     objects. Measured on two consecutive main commits (ebf077bc, 44981290c):
+#     cold 263-280 s and 3,157-3,384 CPU-s, 863 crates; warm after a Detcore
+#     change 157 s and 1,273 CPU-s, 17 crates; warm with nothing changed 17 s;
+#     and every staged file of the warm stage byte-identical to the cold stage's
+#     except libdetcore_liteinst.package.json, whose receipt names its run's own
+#     log directory and timings in any stage. The directory is wiped, and that
+#     stage is cold, once it is older than HERMIT_BUCK_STAGE_MAX_AGE_SECONDS
+#     (default a day), which bounds how long an input some build script reads
+#     without declaring it could leave an output stale, or larger than
+#     HERMIT_BUCK_STAGE_MAX_BYTES (default 64 GiB; about 5.5 GiB after one
+#     stage), when it has no record of what an earlier stage copied (a
+#     directory the first version of this left, holding copies of other nodes'
+#     build output), or when an earlier refresh did not finish. Only staged/ is
+#     copied back into this checkout.
 # One stage at a time holds the fixed directory: concurrent validations on a host
 # wait for the lock (about three minutes, one stage's length), up to
 # HERMIT_BUCK_STAGE_LOCK_TIMEOUT seconds (default 1200). flock releases the lock
@@ -104,16 +144,33 @@ if [[ $mode == cargo && -z ${HERMIT_BUCK_STAGE_INNER:-} && ${HERMIT_BUCK_STAGE_R
         exit 1
     fi
     echo "pid $$ since $(date -u +%FT%TZ) for $root" >"$fixed.holder"
-    cleanup_fixed() { rm -rf "${fixed_src:?}" "${fixed:?}/cargo" "${fixed:?}.holder"; }
+    cleanup_fixed() { rm -rf "${fixed:?}/cargo" "${fixed:?}.holder"; }
     trap cleanup_fixed EXIT
-    rm -rf "${fixed_src:?}"
+    max_bytes=${HERMIT_BUCK_STAGE_MAX_BYTES:-$((64 * 1024 * 1024 * 1024))}
+    max_age=${HERMIT_BUCK_STAGE_MAX_AGE_SECONDS:-86400}
+    born=$fixed_src/.stage-born
+    copied=$fixed/src.copied
+    journal=$fixed/src.refreshing
+    if [[ -d $fixed_src ]]; then
+        held=$(du -sb "$fixed_src" 2>/dev/null | cut -f1) || held=0
+        age=$(($(date +%s) - $(stat -c %Y "$born" 2>/dev/null || echo 0)))
+        cold=
+        [[ ${held:-0} -gt $max_bytes ]] && cold="it holds ${held:-0} bytes, over $max_bytes"
+        [[ $age -gt $max_age ]] && cold="it is ${age} s old, over $max_age"
+        [[ -f $copied ]] || cold="it has no record of what was copied"
+        [[ -e $journal ]] && cold="an earlier refresh of it did not finish"
+        if [[ -n $cold ]]; then
+            echo "ci/buck-e2e/stage: $fixed_src is wiped because $cold; this stage is cold" >&2
+            rm -rf "${fixed_src:?}" "${copied:?}" "${journal:?}"
+        fi
+    fi
     mkdir -p "$fixed_src"
-    # Everything but build outputs and local state. The copy keeps .git, so the
-    # inner stage reads this checkout's commit and status.
-    for entry in "$root"/* "$root"/.[!.]*; do
-        case ${entry##*/} in target | ignored) continue ;; esac
-        cp -a --reflink=auto "$entry" "$fixed_src/"
-    done
+    [[ -e $born ]] || : >"$born"
+    # The files Git tracks, refreshed by content (above), journaled, with
+    # obsolete paths and file/directory changes reconciled before the copy:
+    # ci/buck-e2e/refresh_copy.py. Nothing untracked is read, so no other node's
+    # build output can vanish under the copy.
+    python3 "$root/ci/buck-e2e/refresh_copy.py" "$root" "$fixed_src" "$copied" "$journal"
     ln -sfn "$(realpath -m "${CARGO_HOME:-$HOME/.cargo}")" "$fixed/cargo"
     status=0
     HERMIT_BUCK_STAGE_INNER=1 HERMIT_BUCK_STAGE_GIT_ROOT=$root CARGO_HOME=$fixed/cargo \
@@ -167,16 +224,11 @@ stop_background_builds() {
 }
 trap 'stop_background_builds; rm -rf "${tmp:?}"' EXIT
 
-# 1. Binaries: the release harness, the validate-profile hermit and its install bundle.
-# Cargo locks each profile directory (target/release, target/validate), so builds that
-# share one run one at a time. Three run at once instead: the release harness in
-# target/release; the validate-profile hermit, the longest build, in a target directory
-# of its own (its dependencies are built a second time there); and detcore-dbt then the
-# install bundle in target/validate, as before. The two background builds' output is
-# shown once each finishes, so the logs do not interleave. Each command is main's
-# except for the hermit build's --target-dir, so no feature set changes; the hermit
-# binary differs from a target/validate build only in the build-time DynamoRIO paths
-# reverie-dbt bakes in as a fallback (hermit finds its runtime through install_pkg).
+# 1. Binaries: the release harness, the first-party validate-profile hermit
+# and its core install bundle. The release harness, hermit and ordinary LiteInst
+# runtime build in separate profile/target directories while the foreground
+# first-party install build runs. External SDKs/loaders/preprocessors belong to
+# the separately measured extension producers, never this core stage.
 hermit_target_dir=$target_dir/stage-hermit
 # Both target directories exist before any build starts. Cargo creates a missing target
 # directory by renaming a temporary directory onto it, and rename() replaces an empty
@@ -191,7 +243,7 @@ setsid -w "$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --rel
     --target-dir "$target_dir" >"$tmp/release-build.log" 2>&1 &
 release_build=$!
 setsid -w "$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit-run --bin hermit \
-    --features hermit-run/third-party-backends --target-dir "$hermit_target_dir" >"$tmp/hermit-build.log" 2>&1 &
+    --features hermit-run/liteinst --target-dir "$hermit_target_dir" >"$tmp/hermit-build.log" 2>&1 &
 hermit_build=$!
 # The ordinary in-guest Detcore runtime in the liteinst-runtime profile: the Cargo
 # command the packaging finalizer below runs, started here so it compiles beside the
@@ -202,16 +254,13 @@ hermit_build=$!
 # stage's other builds are still fetching the git dependencies when it starts, and
 # Cargo's fingerprints do not include --offline. A cold build of it took 97-100 s of
 # the finalizer's 107-110 s at eight jobs (main 359ab376).
-setsid -w "$retry" cargo build --manifest-path "$root/Cargo.toml" --locked -p detcore-liteinst --lib --profile liteinst-runtime \
+setsid -w "$retry" cargo build --manifest-path "$root/Cargo.toml" --locked -p detcore-liteinst --lib --no-default-features --profile liteinst-runtime \
     --target-dir "$target_dir" >"$tmp/liteinst-runtime-build.log" 2>&1 &
 liteinst_build=$!
-"$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p detcore-dbt -p detcore-dbt-cdylib --target-dir "$target_dir"
-# hermit-install's build script stages install_pkg/ next to the profile directories and
-# links libdetcore_sabre.so into it. The ordinary LiteInst resource is finalized
-# below, after the last Cargo invocation; publish-hermit-e2e-artifact.sh requires
-# every one of them. Its hermit link, to ../validate/hermit, resolves once the hermit
-# build is copied there below.
-"$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit-install -p detcore-sabre \
+# hermit-install stages only the core resources. The ordinary LiteInst resource
+# is finalized below after every Cargo invocation, and the strict core publisher
+# still requires its complete current receipt and resource inventory.
+"$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit-install \
     -p detcore-liteinst --target-dir "$target_dir"
 finish_build() { # finish_build WHAT PID-VARIABLE LOG
     local status=0
@@ -254,6 +303,18 @@ for lane in portable privileged; do
     VALIDATE_RUN_STATE="$staged/run-state" E2E_RESULT_ROOT="$tmp/results" E2E_BUILD_ROOT="$staged/build" E2E_RUN_ID=buck-e2e-stage \
         "$staged/bin/test-harness" build --repo-root "$staged/src" --source-sha "$sha" --ci-only --lane "$lane" --jobs "$fixture_jobs" >/dev/null
 done
-env -C "$staged/src" ./tests/compat/prepare_real_compat_fixtures.sh "$staged/run-state/strict-compat/real-compat-fixtures" >/dev/null
+# The compat fixtures are prepared inside the pinned root, never on this host:
+# the corpus runs in the pinned root (cell.sh's pinned-root cells, like the
+# cargo flow's compatprep.fixtures_in_pinned_root), so a host preparation leaks
+# host paths into it -- with rustup on the staging host, toolchain/cargo links
+# to ~/.rustup/toolchains/.../bin/cargo, which does not exist in the image, and
+# compat/cargo's guest dies at its `test -x` (hermit --verify exit 125). The
+# staged snapshot's own wrapper pins the image by digest; its --check-image
+# names the remedy when the image is absent.
+"$staged/src/ci/hermetic/run-in-pinned-root.sh" --check-image ||
+    { echo "ci/buck-e2e/stage: the pinned-root image is required to prepare the compat fixtures (see above)" >&2; exit 1; }
+mkdir -p "$tmp/fixture-out"
+"$staged/src/ci/hermetic/run-in-pinned-root.sh" --src "$staged" --out "$tmp/fixture-out" --src-rw -- \
+    bash -c 'cd /src/src && ./tests/compat/prepare_real_compat_fixtures.sh /src/run-state/strict-compat/real-compat-fixtures' >/dev/null
 echo "$sha" >"$staged/SOURCE_SHA"
 echo "staged $(du -sh "$staged" | cut -f1) for $sha"

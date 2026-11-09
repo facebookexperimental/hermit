@@ -39,6 +39,12 @@
 //!
 //! Record and replay keep the legacy recurrence and return values
 //! (`recordreplay_modes`), so recordings keep their event stream.
+//!
+//! A run with an installed process signal control keeps its `ITIMER_REAL` in
+//! `real_timer.rs` instead: the backend publishes the copy and acknowledges
+//! each real dequeue. Its timer restarts at these same reconcile points (O1,
+//! O2, O3) from the acknowledged dequeue rather than from a read of the
+//! shared queue (<https://github.com/rrnewton/hermit/issues/4929>).
 
 use nix::sys::signal::Signal;
 use serde::Deserialize;
@@ -88,7 +94,8 @@ impl Scheduler {
     /// Whether this scheduler coalesces periodic `ITIMER_REAL` expiries at all:
     /// only on the traced path, which models signal targets, outside record and
     /// replay, and not where a backend owns process signal control (that one
-    /// has its own dequeue-time re-arm, `real_timer.rs`).
+    /// keeps its own timer, `real_timer.rs`, which restarts at the same
+    /// reconcile points: `reconcile_alarm`, `reconcile_inactive_alarms`).
     pub(super) fn coalesces_alarms(&self) -> bool {
         self.models_signal_targets && !self.recordreplay_modes && !self.signal_control_installed()
     }
@@ -143,20 +150,29 @@ impl Scheduler {
     /// when the process is a guest namespace init (`sig_task_ignored` discards
     /// that for a `SIGNAL_UNKILLABLE` task), and the leader's committed mask
     /// does not block it. `None` when the leader's state cannot be read.
+    ///
+    /// The rule is the one every discard at generation is decided by
+    /// (`discarded_at_send::discards_at_generation`,
+    /// <https://github.com/rrnewton/hermit/issues/4929>); the inputs are the
+    /// ones this traced model has always read: the leader's state through
+    /// `read_sleeper_signal_state`, and its mask as Detcore saved it while a
+    /// private mask is installed.
     fn leader_ignores_sigalrm(&self, process: DetPid) -> Option<bool> {
         let leader = DetTid::from_raw(process.as_raw());
         let state = self.read_sleeper_signal_state(leader).ok()?;
-        let bit = sigalrm_bit();
         let mask = self
             .saved_guest_sigmasks
             .get(&leader)
             .copied()
             .unwrap_or(state.blocked);
-        let sig_ign = state.ignored & bit != 0;
-        let sig_dfl_init = self.thread_tree.is_pid_namespace_init(process)
-            && state.ignored & bit == 0
-            && state.caught & bit == 0;
-        Some((sig_ign || sig_dfl_init) && mask & bit == 0)
+        Some(super::discarded_at_send::discards_at_generation(
+            libc::SIGALRM,
+            mask,
+            state.ignored,
+            state.caught,
+            self.thread_tree.is_pid_namespace_init(process),
+            false,
+        ))
     }
 
     /// Fire the expiry at `deadline` of `process`'s `ITIMER_REAL`, which
@@ -261,8 +277,17 @@ impl Scheduler {
     }
 
     /// `process`'s shared pending set, read through the thread group
-    /// (`/proc/<tgid>/status`, valid while any thread lives).
-    fn read_process_shared_pending(&self, process: DetPid) -> Option<u64> {
+    /// (`/proc/<tgid>/status`, valid while any thread lives). Where Detcore
+    /// reads signal state from the backend, any live thread of the process
+    /// reports the process's shared queue (`Scheduler::backend_signal_state`).
+    pub(super) fn read_process_shared_pending(&self, process: DetPid) -> Option<u64> {
+        if crate::syscalls::reads_signal_state_from_backend(&self.backend) {
+            return self
+                .process_signal_targets(process)
+                .into_iter()
+                .find_map(|thread| self.backend_signal_state(thread)?.ok())
+                .map(|state| state.shared_pending);
+        }
         #[cfg(test)]
         {
             let leader = DetTid::from_raw(process.as_raw());
@@ -280,11 +305,18 @@ impl Scheduler {
     /// `t`: re-arm it when its copy has left the shared queue, or when the
     /// process stopped being observable (rule 6). Returns the new deadline if
     /// it re-armed.
+    ///
+    /// With an installed signal control the process's timer is the
+    /// controlled one, which restarts here when its backend has acknowledged
+    /// the copy's dequeue (`reconcile_controlled_real_timer`).
     pub(crate) fn reconcile_alarm(
         &mut self,
         process: DetPid,
         t: LogicalTime,
     ) -> Option<LogicalTime> {
+        if self.signal_control_installed() {
+            return self.reconcile_controlled_real_timer(process, t);
+        }
         let AlarmPhase::Inactive { copy } = self.blocked.timed_waiters.alarm_phase(process)? else {
             return None;
         };
@@ -416,8 +448,14 @@ impl Scheduler {
         }
     }
 
-    /// O3: at a quiesced boundary, reconcile every `Inactive` `ITIMER_REAL`.
+    /// O3: at a quiesced boundary, reconcile every `Inactive` `ITIMER_REAL`,
+    /// or, with an installed signal control, restart every controlled one
+    /// whose copy was dequeued (`reconcile_dequeued_real_timers`).
     pub(super) fn reconcile_inactive_alarms(&mut self, t: LogicalTime) {
+        if self.signal_control_installed() {
+            self.reconcile_dequeued_real_timers(t);
+            return;
+        }
         if !self.coalesces_alarms() {
             return;
         }

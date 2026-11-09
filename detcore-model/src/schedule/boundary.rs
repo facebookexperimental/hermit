@@ -184,8 +184,8 @@ impl Record {
 /// A separate envelope prevents an old `PreemptionRecord` reader from silently
 /// ignoring a new metadata field, including for a recording with zero markers.
 /// No implicit conversion to a vector of legacy events is provided.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(try_from = "Wire", into = "Wire")]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(try_from = "Wire")]
 pub struct Schedule {
     records: Vec<Record>,
 }
@@ -198,6 +198,17 @@ struct Wire {
     record_count: usize,
     boundary_count: usize,
     records: Vec<Record>,
+}
+
+/// A validated borrowed wire view; serialization never copies the record tape.
+#[derive(Serialize)]
+#[serde(rename = "Wire")]
+pub struct BorrowedSchedule<'a> {
+    protocol: &'static str,
+    version: u32,
+    record_count: usize,
+    boundary_count: usize,
+    records: &'a [Record],
 }
 
 const PROTOCOL: &str = "hermit-slice-boundaries";
@@ -280,15 +291,9 @@ impl TryFrom<Wire> for Schedule {
     }
 }
 
-impl From<Schedule> for Wire {
-    fn from(schedule: Schedule) -> Self {
-        Self {
-            protocol: PROTOCOL.into(),
-            version: VERSION,
-            record_count: schedule.records.len(),
-            boundary_count: boundary_count(&schedule.records),
-            records: schedule.records,
-        }
+impl Serialize for Schedule {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.borrowed().serialize(serializer)
     }
 }
 
@@ -362,6 +367,21 @@ impl Boundary {
 
 impl Schedule {
     pub fn new(records: Vec<Record>) -> Result<Self, Error> {
+        Self::validate_records(&records)?;
+        Ok(Self { records })
+    }
+
+    /// Validate the same tape without cloning it for a recording writer.
+    pub fn borrow_records(records: &[Record]) -> Result<BorrowedSchedule<'_>, Error> {
+        Self::validate_records(records)?;
+        Ok(BorrowedSchedule::new(records))
+    }
+
+    fn borrowed(&self) -> BorrowedSchedule<'_> {
+        BorrowedSchedule::new(&self.records)
+    }
+
+    fn validate_records(records: &[Record]) -> Result<(), Error> {
         let mut previous: BTreeMap<Owner, Identity> = BTreeMap::new();
         let mut latest_owner: BTreeMap<DetTid, Owner> = BTreeMap::new();
         let mut latest_birth: BTreeMap<(DetTid, u64), Owner> = BTreeMap::new();
@@ -371,6 +391,15 @@ impl Schedule {
                     return Err(Error::InvalidEvent {
                         index,
                         reason: "event owner and count must be positive",
+                    });
+                }
+                // A slice-boundary recording stops at every timeslice end: its
+                // writer notes no background starts, so it states a format
+                // below the one that may mark an end taken without a stop.
+                if event.stopless {
+                    return Err(Error::InvalidEvent {
+                        index,
+                        reason: "a slice-boundary recording marks no event `stopless`",
                     });
                 }
                 continue;
@@ -424,7 +453,7 @@ impl Schedule {
             latest_owner.insert(id.owner.tid, id.owner);
             latest_birth.insert(birth, id.owner);
         }
-        Ok(Self { records })
+        Ok(())
     }
 
     pub fn records(&self) -> &[Record] {
@@ -461,6 +490,18 @@ impl Schedule {
         Cursor {
             schedule: self,
             next: 0,
+        }
+    }
+}
+
+impl<'a> BorrowedSchedule<'a> {
+    fn new(records: &'a [Record]) -> Self {
+        Self {
+            protocol: PROTOCOL,
+            version: VERSION,
+            record_count: records.len(),
+            boundary_count: boundary_count(records),
+            records,
         }
     }
 }
@@ -601,6 +642,29 @@ mod tests {
 
     fn one() -> Schedule {
         Schedule::new(vec![Record::TimesliceEnd(boundary())]).unwrap()
+    }
+
+    #[test]
+    fn borrowed_wire_preserves_owned_bytes_and_the_complete_validator() {
+        for schedule in [Schedule::new(vec![]).unwrap(), one()] {
+            let wire = Wire {
+                protocol: PROTOCOL.into(),
+                version: VERSION,
+                record_count: schedule.records.len(),
+                boundary_count: boundary_count(&schedule.records),
+                records: schedule.records.clone(),
+            };
+            let expected = serde_json::to_vec(&wire).unwrap();
+            assert_eq!(serde_json::to_vec(&schedule).unwrap(), expected);
+            assert_eq!(
+                serde_json::to_vec(&Schedule::borrow_records(schedule.records()).unwrap()).unwrap(),
+                expected
+            );
+        }
+        let mut invalid = one().records;
+        invalid.extend(invalid.clone());
+        assert!(Schedule::new(invalid.clone()).is_err());
+        assert!(Schedule::borrow_records(&invalid).is_err());
     }
 
     #[test]

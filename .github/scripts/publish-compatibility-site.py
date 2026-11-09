@@ -271,6 +271,37 @@ def load_historical_registries(path: Path, repository_root: Path) -> list[dict]:
     except (OSError, ValueError) as error:
         refuse(f"release-pin registry is outside the repository: {error}")
 
+    # The root must BE this repository, and the registry must be a
+    # tracked path in it: git run in an untracked directory inside an
+    # enclosing checkout otherwise finds that repository, lists no
+    # history for the untracked path, and the gate below silently
+    # verifies against 0 historical versions.
+    toplevel = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=root,
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if toplevel.returncode != 0:
+        refuse("full git history is required to preserve published release pins")
+    if Path(toplevel.stdout.decode().strip()).resolve() != root:
+        refuse(
+            "release-pin registry repository root is not the repository "
+            f"top level: {toplevel.stdout.decode(errors='replace').strip()}"
+        )
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", "--", relative],
+        cwd=root,
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    if tracked.returncode != 0:
+        refuse(
+            f"release-pin registry is not tracked in the repository: {relative}"
+        )
+
     shallow = subprocess.run(
         ["git", "rev-parse", "--is-shallow-repository"],
         cwd=root,

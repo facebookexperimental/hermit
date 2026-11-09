@@ -72,11 +72,10 @@ use super::kernel_signal_bit;
 use crate::resources::NANOSLEEP_FYI;
 use crate::resources::PAUSE_FYI;
 use crate::resources::Permission;
+use crate::resources::RT_SIGSUSPEND_FYI;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::syscalls::KernelSignalState;
-use crate::syscalls::read_thread_signal_state;
-use crate::syscalls::thread_is_gone;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
 use crate::types::SigWrapper;
@@ -100,10 +99,68 @@ pub(super) enum SleeperStateUnreadable {
 }
 
 impl Scheduler {
+    /// The deadline of the `nanosleep` `dettid`'s filed request is, on any
+    /// backend: unlike `signal_sleep`, it needs none of the guest's signal
+    /// state, only the request.
+    pub(super) fn filed_nanosleep_deadline(&self, dettid: DetTid) -> Option<LogicalTime> {
+        let resources = self.next_turns.get(&dettid)?.req.try_read()?.ok()?;
+        match resources.resources.iter().next() {
+            Some((ResourceID::SleepUntil(deadline), _))
+                if resources.resources.len() == 1 && resources.fyi.as_str() == NANOSLEEP_FYI =>
+            {
+                Some(*deadline)
+            }
+            _ => None,
+        }
+    }
+
+    /// When the signal being sent now was sent: a timed signal's own due time
+    /// while it is dispatched (`dispatch_timed_signal`), else the commit
+    /// point's `committed_time`.
+    pub(super) fn signal_sent_at(&self) -> LogicalTime {
+        self.signal_sent_at.unwrap_or(self.committed_time)
+    }
+
+    /// When the timed signal being sent was due, if `dettid`'s filed request
+    /// is a `nanosleep` it is about to wake: the instant the sleep is
+    /// interrupted. Read before the wake replaces the request. A send at a
+    /// commit point gives `None`, which leaves the remaining time to the
+    /// sleep's own reading.
+    pub(super) fn timed_sleep_interruption(&self, dettid: DetTid) -> Option<LogicalTime> {
+        self.signal_sent_at
+            .filter(|_| self.filed_nanosleep_deadline(dettid).is_some())
+    }
+
+    /// Note, once `dettid`'s sleep is woken, when it was interrupted
+    /// (`timed_sleep_interruption`, `BlockedPool::sleep_interruptions`). The
+    /// wake has already cleared any earlier note (`remove_blocking_entries`).
+    pub(super) fn note_sleep_interruption(&mut self, dettid: DetTid, due: Option<LogicalTime>) {
+        if let Some(due) = due {
+            self.blocked.sleep_interruptions.insert(dettid, due);
+        }
+    }
+
+    /// When the timed signal that last woke `dettid`'s `nanosleep` was due, if
+    /// one did, taken so a later sleep cannot read it.
+    pub(crate) fn take_sleep_interruption(&mut self, dettid: DetTid) -> Option<LogicalTime> {
+        self.blocked.sleep_interruptions.remove(&dettid)
+    }
+
     /// The sleep `dettid`'s filed request is, if it is one a cross-task signal
     /// can end on this backend.
     pub(super) fn signal_sleep(&self, dettid: DetTid) -> Option<SignalSleep> {
-        if !self.models_signal_targets {
+        // D50 reader 8 under the in-guest delivery gate (A5 step 3c.1c).
+        if !self.models_signal_targets && !self.in_guest_signal_delivery {
+            return None;
+        }
+        // Where the backend owns signal delivery (KVM), a parked sleep is
+        // ended by the backend's own observation of the parked call
+        // (`select_parked_alarm`, `observe_parked_thread_woken_by_its_own_signal`),
+        // which takes the signal in the same pass. A drain wake here as well
+        // would take the thread out of the park first, so that observation
+        // never saw it, and a process signal published in the same pass
+        // would then be chosen for another thread.
+        if self.signal_control_installed() {
             return None;
         }
         let resources = self.next_turns.get(&dettid)?.req.try_read()?.ok()?;
@@ -115,6 +172,11 @@ impl Scheduler {
         };
         match resources.fyi.as_str() {
             PAUSE_FYI if deadline.is_indefinite() => Some(SignalSleep::Pause),
+            // The gate's parked `rt_sigsuspend` (A5 step 3c.1d) ends as a
+            // `pause` does, under the temporary mask it published.
+            RT_SIGSUSPEND_FYI if deadline.is_indefinite() && self.in_guest_signal_delivery => {
+                Some(SignalSleep::Pause)
+            }
             NANOSLEEP_FYI => Some(SignalSleep::Nanosleep {
                 deadline: *deadline,
             }),
@@ -148,10 +210,16 @@ impl Scheduler {
     /// is. A state that cannot be read here is recorded, and the drain decides.
     pub(super) fn admits_sleep_signal(&self, dettid: DetTid, signal: SigWrapper) -> bool {
         let bit = kernel_signal_bit(signal.raw());
-        if signal.raw() == libc::SIGKILL
-            || self.signal_sleep(dettid).is_none()
-            || self.futex_wait_held_signals(dettid) & !self.private_sigchld(dettid) & bit != 0
-        {
+        if signal.raw() == libc::SIGKILL || self.signal_sleep(dettid).is_none() {
+            return false;
+        }
+        // Under the in-guest delivery gate every other signal is recorded,
+        // and the drain decides by the design's deliverable set
+        // (`sleep_interrupting_signals`), which needs it still pending.
+        if self.in_guest_signal_delivery {
+            return true;
+        }
+        if self.futex_wait_held_signals(dettid) & !self.private_sigchld(dettid) & bit != 0 {
             return false;
         }
         match self.read_sleeper_signal_state(dettid) {
@@ -174,6 +242,12 @@ impl Scheduler {
         dettid: DetTid,
         sleep: SignalSleep,
     ) -> Result<u64, SleeperStateUnreadable> {
+        // Under the in-guest delivery gate (A5 step 3c.1c): the design's
+        // deliverable set under the sleep's published mask, for `pause` and
+        // `nanosleep` alike, since a default stop is never deliverable there.
+        if self.in_guest_signal_delivery {
+            return self.gated_deliverable(dettid);
+        }
         let state = self.read_sleeper_signal_state(dettid)?;
         let interrupting = (state.pending & !self.futex_wait_held_signals(dettid)
             | self.private_sigchld(dettid))
@@ -199,15 +273,16 @@ impl Scheduler {
         if let Some(failure) = self.test_sleeper_read_failures.get(&dettid) {
             return Err(*failure);
         }
-        let process = reverie::Pid::from_raw(self.sigchld_process(dettid).as_raw());
-        let thread = reverie::Pid::from_raw(dettid.as_raw());
-        read_thread_signal_state(process, thread).map_err(|errno| {
-            if thread_is_gone(process, thread) {
-                SleeperStateUnreadable::Gone
-            } else {
-                SleeperStateUnreadable::Unreadable(errno)
-            }
-        })
+        let process = self.sigchld_process(dettid).as_raw();
+        let thread = dettid.as_raw();
+        self.guest_thread_signal_state(dettid, process, thread)
+            .map_err(|errno| {
+                if self.guest_thread_is_gone(dettid, process, thread) {
+                    SleeperStateUnreadable::Gone
+                } else {
+                    SleeperStateUnreadable::Unreadable(errno)
+                }
+            })
     }
 
     /// Applies cross-task `signals` drained for `dettid`, whose request is

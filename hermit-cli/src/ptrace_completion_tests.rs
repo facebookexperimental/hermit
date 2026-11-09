@@ -395,6 +395,78 @@ fn a_child_with_its_parents_pid_in_a_new_pid_namespace_has_its_own_tracer() {
     );
 }
 
+/// This host's kernel has PID namespaces: the `pid` entry is read and held.
+#[test]
+fn the_pid_namespace_is_read_from_its_entry() {
+    let (namespace, file) = open_pid_namespace().unwrap();
+    let file = file.expect("the namespace file is held");
+    let meta = file.metadata().unwrap();
+    assert_eq!(namespace, PidNamespace::Inode(meta.dev(), meta.ino()));
+}
+
+/// On a kernel with PID namespaces, a `pid` entry hidden from the caller's
+/// `ns` directory is never read as a kernel without them: not under a tmpfs
+/// mounted over that directory (not procfs), nor under another procfs
+/// directory mounted there (which has no `mnt` entry either) (Codex review).
+#[test]
+fn a_masked_ns_directory_is_not_read_as_a_kernel_without_pid_namespaces() {
+    isolated_with_child_setup(
+        "a_masked_ns_directory_is_not_read_as_a_kernel_without_pid_namespaces",
+        &[],
+        enter_user_and_mount_namespaces,
+        || {
+            let pid = std::process::id();
+            let ns = std::ffi::CString::new(format!("/proc/{pid}/ns")).unwrap();
+            let fdinfo = std::ffi::CString::new(format!("/proc/{pid}/fdinfo")).unwrap();
+            let mount = |source: &std::ffi::CStr, kind: Option<&std::ffi::CStr>, flags| {
+                let result = unsafe {
+                    libc::mount(
+                        source.as_ptr(),
+                        ns.as_ptr(),
+                        kind.map_or(std::ptr::null(), |kind| kind.as_ptr()),
+                        flags,
+                        std::ptr::null(),
+                    )
+                };
+                if result == 0 {
+                    return true;
+                }
+                let error = std::io::Error::last_os_error();
+                // A host whose user namespaces may not mount over procfs
+                // cannot mask the entry this way either.
+                assert_eq!(
+                    error.raw_os_error(),
+                    Some(libc::EPERM),
+                    "mount over {ns:?}: {error}"
+                );
+                false
+            };
+            let unmount = || {
+                assert_eq!(unsafe { libc::umount2(ns.as_ptr(), libc::MNT_DETACH) }, 0);
+            };
+            if !mount(c"tmpfs", Some(c"tmpfs"), 0) {
+                eprintln!("SKIPPED: this host refuses mounts over procfs in a user namespace");
+                return;
+            }
+            assert!(
+                open_pid_namespace().is_err(),
+                "a tmpfs over the ns directory"
+            );
+            unmount();
+            assert!(mount(&fdinfo, None, libc::MS_BIND));
+            assert!(
+                open_pid_namespace().is_err(),
+                "a procfs directory with no mnt entry over the ns directory"
+            );
+            unmount();
+            assert!(matches!(
+                open_pid_namespace(),
+                Ok((PidNamespace::Inode(..), Some(_)))
+            ));
+        },
+    );
+}
+
 /// Without a readable PID namespace (here a tmpfs over `/proc`), a process
 /// cannot tell its own tracer handle from an inherited one, so launches run on
 /// the calling thread, as before the tracer thread, and refuse there
@@ -644,6 +716,7 @@ fn origin_pidfd_and_primary_serialization_refuse_false_proofs() {
             let serialized = crate::SerializableError::from(
                 Error::new(diagnostic.clone()).context(GuestTimedOut {
                     limit: Duration::from_secs(1),
+                    survivors: None,
                 }),
             );
             assert_eq!(serialized.kind(), FailureKind::Error);
@@ -716,6 +789,74 @@ fn mid_startup_timeout_retains_original_waiter_and_resources() {
 }
 
 include!("ptrace_random_failure_tests.rs");
+
+/// The output-capturing API must identify a child adopted by its tracer as
+/// orphaned, just as the ordinary CLI timeout does. The isolated process acts
+/// as a subreaper, giving adoption the same parent identity as namespace init.
+#[test]
+fn captured_output_timeout_names_the_orphan_after_its_root_exits() {
+    isolated(
+        "captured_output_timeout_names_the_orphan_after_its_root_exits",
+        || {
+            use std::os::unix::ffi::OsStrExt;
+
+            assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+            let directory = tempfile::tempdir().unwrap();
+            let fifo = directory.path().join("never-written");
+            let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+            let mut command = reverie::process::Command::new("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    "printf 'before-orphan\\n'; exec /bin/cat \"$1\" & exit 0",
+                    "orphan-capture",
+                ])
+                .arg(&fifo);
+            let mut config = detcore::Config {
+                sequentialize_threads: true,
+                deterministic_io: true,
+                has_uts_namespace: false,
+                notice_host_network_abstract_binds: false,
+                max_timeslice: None,
+                ..Default::default()
+            };
+            config.validate();
+            let error = crate::run_with_output_backend_timeout(
+                command,
+                config,
+                false,
+                &None,
+                crate::Backend::Ptrace,
+                Some(Duration::from_secs(1)),
+            )
+            .unwrap_err();
+            let failure = error
+                .downcast_ref::<HermitPtraceFailure>()
+                .unwrap_or_else(|| panic!("expected completed timeout cleanup: {error:#}"));
+            assert_eq!(failure.kind(), FailureKind::RunTimeout);
+            let captured = failure.failure().captured_prefix().unwrap();
+            assert_eq!(captured.stdout(), b"before-orphan\n");
+            let primary = failure.failure().primary();
+            let reverie::Error::Tool(primary) = primary else {
+                panic!("expected timeout tool failure: {primary:?}");
+            };
+            let timeout = primary.downcast_ref::<GuestTimedOut>().unwrap();
+            assert_eq!(timeout.limit, Duration::from_secs(1));
+            let survivors = timeout.survivors.as_deref().unwrap();
+            assert!(
+                survivors.contains("1 guest process was still running: pid ")
+                    && survivors.contains("\"cat\"")
+                    && survivors.contains(&format!(
+                        "parent {}, orphaned: its parent exited",
+                        std::process::id()
+                    ))
+                    && survivors.contains(" in openat"),
+                "captured-output timeout lost the adopted child's identity: {survivors}"
+            );
+        },
+    );
+}
 
 #[test]
 fn terminal_result_releases_owned_future_and_keeps_concurrent_caller_alive() {
@@ -795,4 +936,103 @@ async fn finalization_secondary_preserves_nested_cleanup_kind_and_stage() {
     let diagnostic = format!("{serialized:?}");
     assert!(diagnostic.contains("Incomplete"));
     assert!(diagnostic.contains("another output failure"));
+}
+
+/// A run torn down for a terminal outcome (a guest deadlock, a virtual
+/// timeout) completes with the outcome's status in place of a guest status it
+/// never had, keeping the output the guest wrote. It does only when the
+/// outcome is the run's primary cause and the teardown recorded no failure of
+/// its own; an output run with no captured bytes has nothing honest to report
+/// and stays a failure too.
+#[test]
+fn a_terminal_outcome_completes_with_its_status_and_the_captured_output() {
+    use detcore::TerminalOutcome;
+    for (outcome, status) in [
+        (
+            TerminalOutcome::GuestDeadlock,
+            detcore_model::HERMIT_GUEST_DEADLOCK_EXIT,
+        ),
+        (
+            TerminalOutcome::VirtualTimeout { bound_ns: 7 },
+            crate::HERMIT_DEADLINE_EXIT,
+        ),
+    ] {
+        let ended = || reverie::Error::Tool(Error::new(SchedulerEndedRun::new(outcome, None)));
+        assert_eq!(clean_terminal_outcome(&ended(), 0), Some(outcome));
+        assert_eq!(
+            clean_terminal_outcome(&ended(), 1),
+            None,
+            "a teardown failure"
+        );
+
+        let status = reverie::ExitStatus::Exited(status);
+        assert_eq!(
+            <reverie::ExitStatus as TerminalOutcomeResult>::terminal_outcome(outcome, None),
+            Some(status)
+        );
+        let output = <reverie::process::Output as TerminalOutcomeResult>::terminal_outcome(
+            outcome,
+            Some(&CapturedPrefix::default()),
+        )
+        .expect("captured bytes make an output");
+        assert_eq!(output.status, status);
+        assert!(output.stdout.is_empty() && output.stderr.is_empty());
+        assert!(
+            <reverie::process::Output as TerminalOutcomeResult>::terminal_outcome(outcome, None)
+                .is_none()
+        );
+    }
+    assert_eq!(
+        clean_terminal_outcome(&reverie::Error::Tool(Error::msg("an earlier failure")), 0),
+        None
+    );
+}
+
+/// A terminal outcome whose teardown recorded a failure of its own (a
+/// secondary: a capture drain or cleanup error) does not complete with the
+/// outcome's status, with or without captured output: the run stays a failed
+/// ptrace run, and its primary classifies as Hermit's failure
+/// (`FailureKind::Error`, reported as `HERMIT_INTERNAL_FAILURE` and 125), not
+/// as the deadlock or the virtual timeout. Only a clean teardown completes with
+/// the outcome's status (121, 124).
+#[test]
+fn a_deadlock_whose_teardown_failed_stays_hermits_failure() {
+    use detcore::TerminalOutcome;
+    let captured = CapturedPrefix::default();
+    for outcome in [
+        TerminalOutcome::GuestDeadlock,
+        TerminalOutcome::VirtualTimeout { bound_ns: 7 },
+    ] {
+        let primary = reverie::Error::Tool(Error::new(SchedulerEndedRun::new(outcome, None)));
+        for secondaries in [1, 2] {
+            assert!(
+                completed_terminal_outcome::<reverie::ExitStatus>(&primary, secondaries, None)
+                    .is_none(),
+                "{outcome:?}: {secondaries} teardown failure(s)"
+            );
+            assert!(
+                completed_terminal_outcome::<reverie::process::Output>(
+                    &primary,
+                    secondaries,
+                    Some(&captured)
+                )
+                .is_none(),
+                "{outcome:?}: {secondaries} teardown failure(s), with output"
+            );
+        }
+        assert_eq!(
+            crate::error::classify_ptrace_primary(&primary),
+            FailureKind::Error
+        );
+        let status = reverie::ExitStatus::Exited(outcome.exit_status());
+        assert_eq!(
+            completed_terminal_outcome::<reverie::ExitStatus>(&primary, 0, None),
+            Some(status)
+        );
+        assert_eq!(
+            completed_terminal_outcome::<reverie::process::Output>(&primary, 0, Some(&captured))
+                .map(|output| output.status),
+            Some(status)
+        );
+    }
 }

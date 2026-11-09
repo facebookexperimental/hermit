@@ -43,22 +43,47 @@ use nextest_cpu::ResolvedBudget;
 use nextest_cpu::ResolvedBudgets;
 
 const CPU_WRAPPER_BIN_ENV: &str = "HERMIT_NEXTEST_CPU_WRAPPER_BIN";
+/// Executor early-exit selector: unset or `1` stops the nextest batch at
+/// the first failing test (the default); `0` is the run-everything opt-in
+/// validate records on every step of a keep-going run.
+const FAIL_FAST_ENV: &str = "HERMIT_NEXTEST_FAIL_FAST";
 const CPU_WRAPPER_NAME: &str = "hermit-per-test-cpu";
+const PMU_INTEGRATION_BUDGET_ENV: &str = "HERMIT_NEXTEST_BUDGET_SCOPE";
+const PMU_INTEGRATION_BUDGET_SCOPE: &str = "pmu-integration";
+const PMU_CLI_BUDGET_SCOPE: &str = "pmu-cli-cases";
 const DETCORE_ALLOCATOR_WRAPPER_NAME: &str = "hermit-detcore-allocator-cpu";
 const DETCORE_CONSTRUCTOR_WRAPPER_NAME: &str = "hermit-detcore-constructor-cpu";
 const STANDALONE_ALLOCATOR_WRAPPER_NAME: &str = "hermit-standalone-allocator-cpu";
 const DETCORE_STACK_WRAPPER_NAME: &str = "hermit-detcore-stack-cpu";
 // Whole-attempt observations and all 24 fixture decisions are retained in
 // ci/liteinst-fixture-cpu-budgets.md. Every prepared stacks test has a separate
-// 3x-CPU wall backstop; allocator and unrelated wall policies stay unchanged.
+// 8x-CPU wall backstop (owner policy 2026-11-01: wall = 8x the CPU cap, capped at 600s; CPU caps stay <= 60s so 8x never reaches the cap); unrelated wall policies stay unchanged.
 // prior CPU timeouts remain censored, not successful old-cap completion samples.
 // Detcore allocator completed maximum 20.754169s: ceil(1.5 * max) = 32.
-const DETCORE_ALLOCATOR_CPU_SECONDS: u64 = 32;
+// That quiet-host calibration no longer covers full validates: the leaf
+// passes alone but inside full validates it repeatedly died on the 32s CPU
+// cap (exit 124 at 43.578s wall on b8a477b3 and 59.570s on d5c04a82, while
+// the same test completed at 55.194s wall in another full validate), so its
+// completion cost under that load is censored at 32. Following the
+// standalone conservative precedent below, the cap is ceil(1.5 * 32) = 48:
+// not a claim of 50% headroom over an observed completion under that load.
+// Uncensored diagnostics at b8a477b3 (validate profile, wrapper cgroup CPU)
+// complete at 8.43s quiet and 8.76-9.16s under pinned 8-core contention;
+// see ci/liteinst-fixture-cpu-budgets.md.
+const DETCORE_ALLOCATOR_CPU_SECONDS: u64 = 48;
+// The detcore allocator leaf gets the same 8x-CPU wall backstop as the
+// constructor and stacks identities: at 694f5df2 it passes alone (wall
+// 21.545s and 37.366s in admitted tight loops, CPU within the old 32s cap)
+// but inside full validates the unchanged wall backstop killed it at
+// 43.990s (exit 124) while -j16 neighbours competed; the wall has since
+// been 8x the CPU cap, so a runaway still dies on CPU and the wall stays a
+// backstop derived from the CPU budget, not a raised wall guess.
+const DETCORE_ALLOCATOR_WALL_SECONDS: u64 = 8 * DETCORE_ALLOCATOR_CPU_SECONDS;
 // Detcore constructor completed maximum 36.113714s: ceil(1.5 * max) = 55.
 const DETCORE_CONSTRUCTOR_CPU_SECONDS: u64 = 55;
 // Separately approved host-load backstop, not measured wall headroom.
 // The earlier f141 wall timeout remains a failed run.
-const DETCORE_CONSTRUCTOR_WALL_SECONDS: u64 = 3 * DETCORE_CONSTRUCTOR_CPU_SECONDS;
+const DETCORE_CONSTRUCTOR_WALL_SECONDS: u64 = 8 * DETCORE_CONSTRUCTOR_CPU_SECONDS;
 // Retained d7efd4cb/da86dfbe standalone diagnostic N=3 at CPU44/wall57:
 // 17.718674, 17.632669, 17.573148s. The completed-sample formula would give 27.
 // Use 33 conservatively after the concurrent CPU22 timeout at 22.799306s;
@@ -70,11 +95,21 @@ const STANDALONE_ALLOCATOR_CPU_SECONDS: u64 = 33;
 // Earlier CPU22 timeouts stay censored, not successful completion samples.
 const DETCORE_STACK_CPU_SECONDS: u64 = 51;
 const RENDERED_PROCFS_WRAPPER_NAME: &str = "hermit-rendered-procfs-cpu";
-// hermit-run::cli detcore_renders_its_procfs_files_on_every_backend runs a
-// --verify of one guest on every backend this build has, DBT's among them, plus
-// a DBT chroot run. Completed cgroup CPU seconds in the 13 full validations of
-// 2026-10-15/16 that ran it: 4.5 to 14.9 (12.8, 12.9 and 14.6 at 2f640c23,
-// 90dec733 and d7efd4cb), at 18-24 s wall. dbbbdc86's was stopped by the
+// hermit-run::cli detcore_renders_its_procfs_files_on_dbt_as_on_ptrace runs
+// DBT's --verify of one guest and ptrace's, to compare them. Until 2026-10-26
+// both ran in detcore_renders_its_procfs_files_on_every_backend, which also
+// verified the guest on KVM and e9patch and ran a DBT chroot run and a forged
+// placeholder run on each backend; that test now leaves DBT's verified run to
+// this one and DBT's other two runs to a third
+// (https://github.com/rrnewton/hermit/issues/4783). This test does a part of
+// the whole test's work, so the whole test's measurements below bound it.
+// Measured 2026-10-26, one test at a time: quiet, the whole test took 18.1 s
+// and 5.9 CPU seconds, this part 14.9 s and 3.9; pinned to 2 CPUs shared with
+// 16 CPU-bound spinners, the whole test took 54.9 to 58.1 s (three of five
+// runs past 57 s, the one under nextest stopped there), this part 35.4 to
+// 36.8 s. The whole test's completed cgroup CPU seconds in the 13 full
+// validations of 2026-10-15/16 that ran it: 4.5 to 14.9 (12.8, 12.9 and 14.6
+// at 2f640c23, 90dec733 and d7efd4cb), at 18-24 s wall. dbbbdc86's was stopped by the
 // 22-second cap at 23.6 (32.9 s wall), in a run where every DBT test cost more
 // (detcore_fixes_the_virtual_kernel_files_on_dbt 17.6 against 14.0-15.6).
 // ceil(1.5 * 23.6) = 36 covers that censored run with half again; the
@@ -92,7 +127,7 @@ const CPU_PROFILE_V3_LOADER_WRAPPER_NAME: &str = "hermit-cpu-profile-v3-loader-c
 // 23.995 (35.5 s wall); c59f758a's then completed it at 4.86, and six
 // --only runs of the node at 9eb80258 at loads of 260 to 300 at 3.11 to 6.07.
 // ceil(1.5 * 23.995) = 36 covers that censored run with half again; the
-// completed-sample formula would give 26. Its wall backstop is three times
+// completed-sample formula would give 26. Its wall backstop is eight times
 // the cap, as for the liteinst_stacks identities: a host-load policy.
 const CPU_PROFILE_V3_LOADER_CPU_SECONDS: u64 = 36;
 const RR_THREAD_STRESS_WRAPPER_NAME: &str = "hermit-rr-thread-stress-cpu";
@@ -126,7 +161,19 @@ const RR_THREAD_STRESS_CPU_SECONDS: u64 = 34;
 // coordinator validations, at most 28.3 s wall); the 13 others were stopped
 // by the 22-second cap at 22.00 to 22.02 (22.1 to 29.6 s wall).
 // ceil(1.5 * 22.02) = 34.
-const ESI_POLL_DEADLINE_CPU_SECONDS: u64 = 34;
+// Recalibrated 2026-10-31: under full-validation load the two
+// without-namespace tests now cost more than that sample. The full
+// validations at fd59b85c73 and 4892f76e6a each stopped both of them at the
+// 34-second cap (34.08 to 34.14 s wall) in their third cell, the first two
+// cells completing with their correct RESULT lines at 10.8 to 11.7 s of
+// host wall per 10-second deadline poll; the same tests completed at
+// 17.6 s wall in e7c3643d52's full validation and at 20.4 s in
+// 185c2c1d3c's focused node, so the assertions are unchanged and only the
+// bound moved. A cap stop counts as an observation of at least the cap:
+// ceil(1.5 * 34) = 51. The per-cell cost under full load is about twice
+// the calibration sample's per-cell share; that rise is the poll owners'
+// to explain, and this cap remains a hang guard, not a measurement of it.
+const ESI_POLL_DEADLINE_CPU_SECONDS: u64 = 51;
 const ESI_POLL_DEADLINE_TESTS: [(&str, &str); 4] = [
     (
         "hermit-esi-poll-deadline-resize-namespace-cpu",
@@ -164,13 +211,11 @@ const CPU_PROFILE_V3_GUEST_WRAPPER_NAME: &str = "hermit-cpu-profile-v3-guest-cpu
 // maximum, beside cpu_profile_v3_cpuinfo_matches_cpuid at 23.2 s wall in the
 // same node. ceil(1.5 * 23.99) = 36.
 const CPU_PROFILE_V3_GUEST_CPU_SECONDS: u64 = 36;
-const SIGNAL_DISCARD_WRAPPER_NAME: &str = "hermit-signal-discard-no-take-cpu";
-// hermit-run::cli a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take:
-// 121 of 122 completed at 6.47 to 21.81 CPU seconds, 99% of the 22-second cap
-// (at most 45.4 s wall). ceil(1.5 * 21.81) = 33. The other, d1f777df's, was
-// stopped by the 57-second wall at 10.22 CPU seconds, which this cap does not
-// change.
-const SIGNAL_DISCARD_CPU_SECONDS: u64 = 33;
+// hermit-run::cli a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take
+// had a 33-second allowance here: as one test of 45 Hermit verify rows, 121 of
+// 122 runs completed at 6.47 to 21.81 CPU seconds (at most 45.4 s wall). Its
+// rows are now split across three tests of 15, each about a third of that
+// cost, so all three keep the ordinary 22-second cap.
 const PARITY_POST_PASS_NO_GUEST_WRAPPER_NAME: &str = "hermit-parity-post-pass-no-guest-cpu";
 // hermit-manifest-plan's test-harness
 // tests::the_parity_post_pass_changes_no_determinism_output_and_runs_no_guest
@@ -197,16 +242,115 @@ const EPOLL_PWAIT2_STRICT_WRAPPER_NAME: &str = "hermit-epoll-pwait2-strict-cpu";
 const EPOLL_PWAIT2_STRICT_CPU_SECONDS: u64 = 35;
 const EPOLL_PWAIT_MASK_WRAPPER_NAME: &str = "hermit-epoll-pwait-mask-cpu";
 const EPOLL_PWAIT_MASK_CPU_SECONDS: u64 = 34;
-// hermit-run::cli a_cross_process_sigkill_notification_verifies_at_bitwise_parity:
-// 155 of 158 completed at 6.76 to 21.77 CPU seconds (7.1 to 9.6 in ops-tick
-// validations, 10.5 to 21.77 in coordinator validations, at most 53.5 s wall);
-// 2 were stopped by the cap at 22.07 and 22.21 (30.5 and 33.5 s wall) and 1 by
-// the wall at 9.92. ceil(1.5 * 22.21) = 34.
-const CROSS_PROCESS_SIGKILL_WRAPPER_NAME: &str = "hermit-cross-process-sigkill-cpu";
-const CROSS_PROCESS_SIGKILL_CPU_SECONDS: u64 = 34;
+// hermit-run::cli a_cross_process_sigkill_notification_verifies_at_bitwise_parity
+// had a 34-second allowance here: as one test of 15 modes (45 verified runs),
+// 155 of 158 runs completed at 6.76 to 21.77 CPU seconds (at most 53.5 s
+// wall). Its modes are now split across three tests of 5, each about a third
+// of that cost, so all three keep the ordinary 22-second cap
+// (https://github.com/rrnewton/hermit/issues/4783).
+// hermit-run::deadline_slice_cap skipped_slice_ends_survive_the_backstop
+// (node test.pmu_integration_cases) runs the lone_spin_then_race fixture's
+// "long" mode skipping lone slice-end stops, again with a stop at every end
+// (--eager-lone-preemptions, about 3.4 microseconds of ptrace work per
+// retired branch), and once more to count backstop events. Its eager run can
+// end in the typed skid-overshoot refusal that the test retries
+// (https://github.com/rrnewton/hermit/issues/1845), and each retry repeats
+// that whole run. Measured 2026-10-27, one test at a time on a 316-CPU AMD
+// EPYC development host (name withheld): before the counting run, 12 runs, 9
+// without a retry at 8.4 to 9.3 CPU seconds and 3 with one retry at 16.9 to
+// 17.1; with it, 6 runs without a retry at 8.8 to 9.2. Two retries, about a
+// 6% chance per execution at that rate, would take about 26 and pass the
+// 22-second cap. ceil(1.5 * 17.1) = 26 would leave two retries no
+// room for host contention, which costs this host's ptrace tests two to four
+// times their quiet CPU (above), so this takes the 34 seconds most
+// contended-host allowances here carry.
+const LONE_BACKSTOP_WRAPPER_NAME: &str = "hermit-lone-backstop-cpu";
+const LONE_BACKSTOP_CPU_SECONDS: u64 = 34;
+// hermit-run::cli run_ptrace_signal_permits_are_per_thread runs fifteen
+// modes of the signal-permits-per-thread guest, each as a
+// `run --strict --verify --verify-strict` pair (thirty Hermit executions)
+// in one test. Measured 2026-10-31 at Hermit 4304385b11 on the
+// measurement host named in docs/TESTING_ENVIRONMENTS.md, with the
+// validate-profile binaries the counted node runs: three solo attempts
+// completed at 10.3 to 11.5 CPU seconds (11.2 to 12.7 s wall). The full
+// validations of 6d34a412 and 5d111b3e stopped it at the ordinary
+// 22-second cap (24.955 s wall at 5d111b3e), the same censored-stop shape
+// as the poll-deadline allowances above: ceil(1.5 * 22.05) = 34. Wall
+// stays the profile's 57 seconds.
+const SIGNAL_PERMITS_WRAPPER_NAME: &str = "hermit-signal-permits-cpu";
+const SIGNAL_PERMITS_CPU_SECONDS: u64 = 34;
+// hermit-run::cli another_processs_io_reads_with_a_full_descriptor_table_on_every_backend
+// runs five `run --strict --verify --verify-strict` legs (ptrace, sabre,
+// liteinst, in-guest-trap, e9patch), each running the guest twice. CALIBRATION
+// 2026-11-01 (coordinator-approved stopgap, not a root-cause fix): measured
+// alone in the pinned root at Hermit 8a9d035ec7 it completes at 11.20 s wall
+// and 11.19 CPU s (4.39 user, 6.80 sys), and every leg passes alone at
+// bitwise parity. In four consecutive full validates (three at 8a9d035ec7,
+// one at d192e5d72) it was stopped by the ordinary 22-second cap at 23.2,
+// 23.6, 23.6 and 24.1 s wall, at host loads from 21 to 123, serial group or
+// not: about 3x its solo cost, spent inside its own Hermit legs. The cause
+// is not yet known (tracked in the Hermit issue filed with this change).
+// ceil(1.5 * 24.1) = 36. Wall stays the profile's 57 seconds.
+const FULL_TABLE_IO_WRAPPER_NAME: &str = "hermit-full-table-io-cpu";
+const FULL_TABLE_IO_CPU_SECONDS: u64 = 36;
+// Measured 2026-11-07 from the per-test CPU files of that day's queue
+// validations (338 .cpu.json files under ignored/validate on the
+// measurement host named in docs/TESTING_ENVIRONMENTS.md, "Named
+// measurement hosts"), ordinary tests only: every test whose p90 CPU
+// exceeded the 22-second base cap divided by 1.5 and which had no
+// allowance yet (dh-5p14j). Each cap is ceil(1.5 * the largest
+// completed observation that day); wall is eight times the cap, as
+// for the other measured allowances. Attempts that day:
+// hermit-run::cli a_schedule_replay_keeps_the_clock_of_a_thread_that_
+// yields_beside_a_computing_one (n=12, max 33.7) -> 51;
+// chaos_instruction_offset_splits_a_branch_free_window (n=12, max
+// 29.4) -> 45; a_chaos_instruction_offset_run_verifies_and_replays_
+// at_its_offsets (n=12, max 21.0) -> 32;
+// a_schedule_replay_keeps_the_long_slices_of_a_preemption_replay
+// (n=10, max 19.7) -> 30;
+// chaos_change_points_come_within_a_timeslice_of_turn_charges (n=13,
+// max 19.4) -> 30;
+// posix_timer_signal_rows_are_delivered_as_on_linux_at_bitwise_parity
+// (n=13, max 17.3) -> 26; hermit-verify::replay_modes
+// trace_replay_split_just_spin (n=13, max 18.4) -> 28 and
+// chaos_replay_shell_par_work (n=13, max 15.7) -> 24;
+// hermit-run::rr_suite rr_vdso_time_stack (n=14, max 15.8) -> 24,
+// rr_vdso_gettimeofday_stack (n=14, max 15.9) -> 24 and
+// rr_vdso_clock_gettime_stack (n=14, max 15.4) -> 24;
+// hermit-manifest-plan shipped_export_is_deterministic_and_matches_
+// the_comparable_projection (n=13, max 17.3) -> 26.
+const SCHEDULE_REPLAY_CLOCK_WRAPPER_NAME: &str = "hermit-schedule-replay-clock-cpu";
+const SCHEDULE_REPLAY_CLOCK_CPU_SECONDS: u64 = 51;
+const CHAOS_OFFSET_SPLIT_WRAPPER_NAME: &str = "hermit-chaos-offset-split-cpu";
+const CHAOS_OFFSET_SPLIT_CPU_SECONDS: u64 = 45;
+const CHAOS_OFFSET_VERIFY_WRAPPER_NAME: &str = "hermit-chaos-offset-verify-cpu";
+const CHAOS_OFFSET_VERIFY_CPU_SECONDS: u64 = 32;
+const SCHEDULE_REPLAY_LONG_SLICES_WRAPPER_NAME: &str = "hermit-schedule-replay-long-slices-cpu";
+const SCHEDULE_REPLAY_LONG_SLICES_CPU_SECONDS: u64 = 30;
+const CHAOS_CHANGE_POINTS_WRAPPER_NAME: &str = "hermit-chaos-change-points-cpu";
+// Re-measured 2026-11-08 from the queue's retained per-test CPU rows
+// (last 14 merge-queue runs): chaos_change_points largest completed
+// 24.7 CPU-s (n=10, one attempt capped at the old 30) -> ceil(1.5*24.7) = 38;
+// shipped_export largest completed 22.8 CPU-s (n=11, two attempts capped
+// at the old 26) -> ceil(1.5*22.8) = 35. Walls stay 8x the cap.
+const CHAOS_CHANGE_POINTS_CPU_SECONDS: u64 = 38;
+const POSIX_TIMER_SIGNAL_ROWS_WRAPPER_NAME: &str = "hermit-posix-timer-signal-rows-cpu";
+const POSIX_TIMER_SIGNAL_ROWS_CPU_SECONDS: u64 = 26;
+const TRACE_REPLAY_SPLIT_WRAPPER_NAME: &str = "hermit-trace-replay-split-cpu";
+const TRACE_REPLAY_SPLIT_CPU_SECONDS: u64 = 28;
+const CHAOS_REPLAY_SHELL_WRAPPER_NAME: &str = "hermit-chaos-replay-shell-cpu";
+const CHAOS_REPLAY_SHELL_CPU_SECONDS: u64 = 24;
+const RR_VDSO_TIME_WRAPPER_NAME: &str = "hermit-rr-vdso-time-cpu";
+const RR_VDSO_TIME_CPU_SECONDS: u64 = 24;
+const RR_VDSO_GETTIMEOFDAY_WRAPPER_NAME: &str = "hermit-rr-vdso-gettimeofday-cpu";
+const RR_VDSO_GETTIMEOFDAY_CPU_SECONDS: u64 = 24;
+const RR_VDSO_CLOCK_GETTIME_WRAPPER_NAME: &str = "hermit-rr-vdso-clock-gettime-cpu";
+const RR_VDSO_CLOCK_GETTIME_CPU_SECONDS: u64 = 24;
+const SHIPPED_EXPORT_WRAPPER_NAME: &str = "hermit-shipped-export-cpu";
+const SHIPPED_EXPORT_CPU_SECONDS: u64 = 35;
 const CPU_TERMINATION_GRACE_SECONDS: u64 = 2;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MeasuredCpuAllowance {
     wrapper_name: &'static str,
     package: &'static str,
@@ -224,7 +368,7 @@ impl MeasuredCpuAllowance {
             binary: "hermit-run::liteinst_stacks",
             test,
             cpu_seconds,
-            wall_seconds: Some(3 * cpu_seconds),
+            wall_seconds: Some(8 * cpu_seconds),
         }
     }
 
@@ -238,14 +382,48 @@ impl MeasuredCpuAllowance {
     }
 }
 
-const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 32] = [
+// Lead decision, 2026-11-04: widen only this PMU-node case to 40 CPU / 320 wall
+// seconds. Four diagnostics at a 60-second CPU cap completed in 22.56–26.05 CPU
+// seconds; the twelve earlier 22-second CPU timeouts remain censored failures.
+// This fixed allowance is a new resource policy, not the old measured-max formula.
+// KVM and other invocations of the same test keep their existing bounds.
+const PMU_LONE_REPLAY_ALLOWANCE: MeasuredCpuAllowance = MeasuredCpuAllowance {
+    wrapper_name: "hermit-pmu-lone-slice-replay-cpu",
+    package: "hermit-run",
+    binary: "hermit-run::deadline_slice_cap",
+    test: "replays_take_recorded_lone_slice_ends_the_same_way",
+    cpu_seconds: 40,
+    wall_seconds: Some(320),
+};
+
+// hermit-run::cli
+// an_instruction_offset_record_replays_from_its_schedule_and_analyze_verifies_its_endpoints
+// with fixed seed 4 at 30,000 iterations used 33.03, 28.06 and 28.39 CPU
+// seconds in its cgroup in the validation profile at this head (the
+// d005dfbdc512 sample of 36.780064 CPU seconds was the earlier seeds 1-8
+// search variant, which did more work). Its PMU CLI node applies a CPU
+// multiplier of 4, so a base allowance of 13 seconds yields an actual
+// 52-second cap: above ceil(1.5 * 33.03) = 50, below the owner's
+// 60-second maximum and below the node's ordinary scaled 88-second cap.
+const PMU_SCHEDULE_OFFSET_WRAPPER_NAME: &str = "hermit-pmu-schedule-offset-cpu";
+const PMU_SCHEDULE_OFFSET_CPU_SECONDS: u64 = 13;
+const PMU_SCHEDULE_OFFSET_ALLOWANCE: MeasuredCpuAllowance = MeasuredCpuAllowance {
+    wrapper_name: PMU_SCHEDULE_OFFSET_WRAPPER_NAME,
+    package: "hermit-run",
+    binary: "hermit-run::cli",
+    test: "an_instruction_offset_record_replays_from_its_schedule_and_analyze_verifies_its_endpoints",
+    cpu_seconds: PMU_SCHEDULE_OFFSET_CPU_SECONDS,
+    wall_seconds: None,
+};
+
+const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 45] = [
     MeasuredCpuAllowance {
         wrapper_name: DETCORE_ALLOCATOR_WRAPPER_NAME,
         package: "hermit-run",
         binary: "hermit-run::liteinst_allocator",
         test: "genuine_detcore_leaf_keeps_scope_free_work_private",
         cpu_seconds: DETCORE_ALLOCATOR_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(DETCORE_ALLOCATOR_WALL_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: DETCORE_CONSTRUCTOR_WRAPPER_NAME,
@@ -261,15 +439,15 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 32] = [
         binary: "hermit-run::liteinst_allocator",
         test: "genuine_standalone_leaf_keeps_scope_free_work_private",
         cpu_seconds: STANDALONE_ALLOCATOR_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * STANDALONE_ALLOCATOR_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: RENDERED_PROCFS_WRAPPER_NAME,
         package: "hermit-run",
         binary: "hermit-run::cli",
-        test: "detcore_renders_its_procfs_files_on_every_backend",
+        test: "detcore_renders_its_procfs_files_on_dbt_as_on_ptrace",
         cpu_seconds: RENDERED_PROCFS_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * RENDERED_PROCFS_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: DETCORE_STACK_WRAPPER_NAME,
@@ -277,7 +455,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 32] = [
         binary: "hermit-run::liteinst_stacks",
         test: "genuine_detcore_reaches_fixed_guarded_callback_and_altstack",
         cpu_seconds: DETCORE_STACK_CPU_SECONDS,
-        wall_seconds: Some(3 * DETCORE_STACK_CPU_SECONDS),
+        wall_seconds: Some(8 * DETCORE_STACK_CPU_SECONDS),
     },
     MeasuredCpuAllowance::stack(
         "hermit-stack-exact-got-cpu",
@@ -350,7 +528,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 32] = [
         binary: "hermit-run::cli",
         test: "cpu_profile_v3_host_loader_sees_exactly_x86_64_v3",
         cpu_seconds: CPU_PROFILE_V3_LOADER_CPU_SECONDS,
-        wall_seconds: Some(3 * CPU_PROFILE_V3_LOADER_CPU_SECONDS),
+        wall_seconds: Some(8 * CPU_PROFILE_V3_LOADER_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: RR_THREAD_STRESS_WRAPPER_NAME,
@@ -358,7 +536,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 32] = [
         binary: "hermit-run::rr_suite",
         test: "rr_thread_stress",
         cpu_seconds: RR_THREAD_STRESS_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * RR_THREAD_STRESS_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: ESI_POLL_DEADLINE_TESTS[0].0,
@@ -366,7 +544,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 32] = [
         binary: "hermit-run::external_signal_interrupt",
         test: ESI_POLL_DEADLINE_TESTS[0].1,
         cpu_seconds: ESI_POLL_DEADLINE_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * ESI_POLL_DEADLINE_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: ESI_POLL_DEADLINE_TESTS[1].0,
@@ -374,7 +552,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 32] = [
         binary: "hermit-run::external_signal_interrupt",
         test: ESI_POLL_DEADLINE_TESTS[1].1,
         cpu_seconds: ESI_POLL_DEADLINE_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * ESI_POLL_DEADLINE_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: ESI_POLL_DEADLINE_TESTS[2].0,
@@ -382,7 +560,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 32] = [
         binary: "hermit-run::external_signal_interrupt",
         test: ESI_POLL_DEADLINE_TESTS[2].1,
         cpu_seconds: ESI_POLL_DEADLINE_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * ESI_POLL_DEADLINE_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: ESI_POLL_DEADLINE_TESTS[3].0,
@@ -390,7 +568,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 32] = [
         binary: "hermit-run::external_signal_interrupt",
         test: ESI_POLL_DEADLINE_TESTS[3].1,
         cpu_seconds: ESI_POLL_DEADLINE_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * ESI_POLL_DEADLINE_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: LIT_CHAOS_VERIFY_WRAPPER_NAME,
@@ -398,7 +576,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 32] = [
         binary: "hermit-run::lit",
         test: "lit_scheduler_strategies_chaos_verify",
         cpu_seconds: LIT_CHAOS_VERIFY_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * LIT_CHAOS_VERIFY_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: DBT_VIRTUAL_KERNEL_FILES_WRAPPER_NAME,
@@ -406,7 +584,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 32] = [
         binary: "hermit-run::cli",
         test: "detcore_fixes_the_virtual_kernel_files_on_dbt",
         cpu_seconds: DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: CPU_PROFILE_V3_GUEST_WRAPPER_NAME,
@@ -414,15 +592,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 32] = [
         binary: "hermit-run::cli",
         test: "cpu_profile_v3_guest_sees_the_v3_cpu_at_bitwise_parity",
         cpu_seconds: CPU_PROFILE_V3_GUEST_CPU_SECONDS,
-        wall_seconds: None,
-    },
-    MeasuredCpuAllowance {
-        wrapper_name: SIGNAL_DISCARD_WRAPPER_NAME,
-        package: "hermit-run",
-        binary: "hermit-run::cli",
-        test: "a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take",
-        cpu_seconds: SIGNAL_DISCARD_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * CPU_PROFILE_V3_GUEST_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: PARITY_POST_PASS_NO_GUEST_WRAPPER_NAME,
@@ -430,7 +600,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 32] = [
         binary: "hermit-manifest-plan::bin/test-harness",
         test: "tests::the_parity_post_pass_changes_no_determinism_output_and_runs_no_guest",
         cpu_seconds: PARITY_POST_PASS_NO_GUEST_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * PARITY_POST_PASS_NO_GUEST_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: EPOLL_PWAIT2_STRICT_WRAPPER_NAME,
@@ -438,7 +608,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 32] = [
         binary: "hermit-run::epoll_determinism",
         test: "epoll_pwait2_polls_under_run_strict",
         cpu_seconds: EPOLL_PWAIT2_STRICT_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * EPOLL_PWAIT2_STRICT_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
         wrapper_name: EPOLL_PWAIT_MASK_WRAPPER_NAME,
@@ -446,15 +616,127 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 32] = [
         binary: "hermit-run::epoll_determinism",
         test: "epoll_pwait_sleeps_under_its_temporary_mask",
         cpu_seconds: EPOLL_PWAIT_MASK_CPU_SECONDS,
-        wall_seconds: None,
+        wall_seconds: Some(8 * EPOLL_PWAIT_MASK_CPU_SECONDS),
     },
     MeasuredCpuAllowance {
-        wrapper_name: CROSS_PROCESS_SIGKILL_WRAPPER_NAME,
+        wrapper_name: LONE_BACKSTOP_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::deadline_slice_cap",
+        test: "skipped_slice_ends_survive_the_backstop",
+        cpu_seconds: LONE_BACKSTOP_CPU_SECONDS,
+        wall_seconds: Some(8 * LONE_BACKSTOP_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: SIGNAL_PERMITS_WRAPPER_NAME,
         package: "hermit-run",
         binary: "hermit-run::cli",
-        test: "a_cross_process_sigkill_notification_verifies_at_bitwise_parity",
-        cpu_seconds: CROSS_PROCESS_SIGKILL_CPU_SECONDS,
-        wall_seconds: None,
+        test: "run_ptrace_signal_permits_are_per_thread",
+        cpu_seconds: SIGNAL_PERMITS_CPU_SECONDS,
+        wall_seconds: Some(8 * SIGNAL_PERMITS_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: FULL_TABLE_IO_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::cli",
+        test: "another_processs_io_reads_with_a_full_descriptor_table_on_every_backend",
+        cpu_seconds: FULL_TABLE_IO_CPU_SECONDS,
+        wall_seconds: Some(8 * FULL_TABLE_IO_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: SCHEDULE_REPLAY_CLOCK_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::cli",
+        test: "a_schedule_replay_keeps_the_clock_of_a_thread_that_yields_beside_a_computing_one",
+        cpu_seconds: SCHEDULE_REPLAY_CLOCK_CPU_SECONDS,
+        wall_seconds: Some(8 * SCHEDULE_REPLAY_CLOCK_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: CHAOS_OFFSET_SPLIT_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::cli",
+        test: "chaos_instruction_offset_splits_a_branch_free_window",
+        cpu_seconds: CHAOS_OFFSET_SPLIT_CPU_SECONDS,
+        wall_seconds: Some(8 * CHAOS_OFFSET_SPLIT_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: CHAOS_OFFSET_VERIFY_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::cli",
+        test: "a_chaos_instruction_offset_run_verifies_and_replays_at_its_offsets",
+        cpu_seconds: CHAOS_OFFSET_VERIFY_CPU_SECONDS,
+        wall_seconds: Some(8 * CHAOS_OFFSET_VERIFY_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: SCHEDULE_REPLAY_LONG_SLICES_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::cli",
+        test: "a_schedule_replay_keeps_the_long_slices_of_a_preemption_replay",
+        cpu_seconds: SCHEDULE_REPLAY_LONG_SLICES_CPU_SECONDS,
+        wall_seconds: Some(8 * SCHEDULE_REPLAY_LONG_SLICES_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: CHAOS_CHANGE_POINTS_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::cli",
+        test: "chaos_change_points_come_within_a_timeslice_of_turn_charges",
+        cpu_seconds: CHAOS_CHANGE_POINTS_CPU_SECONDS,
+        wall_seconds: Some(8 * CHAOS_CHANGE_POINTS_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: POSIX_TIMER_SIGNAL_ROWS_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::cli",
+        test: "posix_timer_signal_rows_are_delivered_as_on_linux_at_bitwise_parity",
+        cpu_seconds: POSIX_TIMER_SIGNAL_ROWS_CPU_SECONDS,
+        wall_seconds: Some(8 * POSIX_TIMER_SIGNAL_ROWS_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: TRACE_REPLAY_SPLIT_WRAPPER_NAME,
+        package: "hermit-verify",
+        binary: "hermit-verify::replay_modes",
+        test: "trace_replay_split_just_spin",
+        cpu_seconds: TRACE_REPLAY_SPLIT_CPU_SECONDS,
+        wall_seconds: Some(8 * TRACE_REPLAY_SPLIT_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: CHAOS_REPLAY_SHELL_WRAPPER_NAME,
+        package: "hermit-verify",
+        binary: "hermit-verify::replay_modes",
+        test: "chaos_replay_shell_par_work",
+        cpu_seconds: CHAOS_REPLAY_SHELL_CPU_SECONDS,
+        wall_seconds: Some(8 * CHAOS_REPLAY_SHELL_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: RR_VDSO_TIME_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::rr_suite",
+        test: "rr_vdso_time_stack",
+        cpu_seconds: RR_VDSO_TIME_CPU_SECONDS,
+        wall_seconds: Some(8 * RR_VDSO_TIME_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: RR_VDSO_GETTIMEOFDAY_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::rr_suite",
+        test: "rr_vdso_gettimeofday_stack",
+        cpu_seconds: RR_VDSO_GETTIMEOFDAY_CPU_SECONDS,
+        wall_seconds: Some(8 * RR_VDSO_GETTIMEOFDAY_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: RR_VDSO_CLOCK_GETTIME_WRAPPER_NAME,
+        package: "hermit-run",
+        binary: "hermit-run::rr_suite",
+        test: "rr_vdso_clock_gettime_stack",
+        cpu_seconds: RR_VDSO_CLOCK_GETTIME_CPU_SECONDS,
+        wall_seconds: Some(8 * RR_VDSO_CLOCK_GETTIME_CPU_SECONDS),
+    },
+    MeasuredCpuAllowance {
+        wrapper_name: SHIPPED_EXPORT_WRAPPER_NAME,
+        package: "hermit-manifest-plan",
+        binary: "hermit-manifest-plan",
+        test: "manifest_metadata::tests::shipped_export_is_deterministic_and_matches_the_comparable_projection",
+        cpu_seconds: SHIPPED_EXPORT_CPU_SECONDS,
+        wall_seconds: Some(8 * SHIPPED_EXPORT_CPU_SECONDS),
     },
 ];
 
@@ -630,11 +912,18 @@ fn add_cpu_wrapper(
         experimental.push("wrapper-scripts");
     }
 
-    for name in std::iter::once(CPU_WRAPPER_NAME).chain(
-        MEASURED_CPU_ALLOWANCES
-            .iter()
-            .map(|allowance| allowance.wrapper_name),
-    ) {
+    for name in std::iter::once(CPU_WRAPPER_NAME)
+        .chain(
+            MEASURED_CPU_ALLOWANCES
+                .iter()
+                .map(|allowance| allowance.wrapper_name),
+        )
+        .chain(
+            measured_budgets
+                .iter()
+                .map(|(allowance, _)| allowance.wrapper_name),
+        )
+    {
         if document
             .get("scripts")
             .and_then(Item::as_table)
@@ -789,6 +1078,7 @@ fn add_wall_allowances(
     Ok(())
 }
 
+#[cfg(test)]
 fn scaled_config(
     source: &str,
     multiplier: f64,
@@ -797,16 +1087,37 @@ fn scaled_config(
     scaled_config_with_allowances(source, multiplier, cpu_wrapper, &[])
 }
 
+#[cfg(test)]
 fn scaled_config_with_allowances(
     source: &str,
     multiplier: f64,
     cpu_wrapper: Option<(&Path, f64)>,
     selected_allowances: &[MeasuredCpuAllowance],
 ) -> Result<String, String> {
+    scaled_config_with_allowances_and_fail_fast(
+        source,
+        multiplier,
+        cpu_wrapper,
+        selected_allowances,
+        true,
+    )
+}
+
+fn scaled_config_with_allowances_and_fail_fast(
+    source: &str,
+    multiplier: f64,
+    cpu_wrapper: Option<(&Path, f64)>,
+    selected_allowances: &[MeasuredCpuAllowance],
+    fail_fast: bool,
+) -> Result<String, String> {
     timeouts::validate_timeout_multiplier(multiplier, "wall multiplier")?;
     let mut document = source
         .parse::<DocumentMut>()
         .map_err(|error| format!("cannot parse nextest TOML: {error}"))?;
+    // The rendered config, not the checked-in source, decides the batch
+    // shape: early exit unless this invocation opted in to running
+    // everything. Custom profiles inherit `default`, so one key suffices.
+    document["profile"]["default"]["fail-fast"] = value(fail_fast);
     let mut wall_deadlines = Vec::new();
     visit_table(document.as_table_mut(), multiplier, &mut wall_deadlines)?;
     if wall_deadlines.is_empty() {
@@ -899,6 +1210,16 @@ fn cpu_wrapper_from_env() -> Option<std::path::PathBuf> {
     env::var_os(CPU_WRAPPER_BIN_ENV).map(Into::into)
 }
 
+fn fail_fast_from_env() -> Result<bool, String> {
+    match env::var(FAIL_FAST_ENV) {
+        Err(env::VarError::NotPresent) => Ok(true),
+        Ok(value) if value == "1" => Ok(true),
+        Ok(value) if value == "0" => Ok(false),
+        Ok(value) => Err(format!("{FAIL_FAST_ENV} must be 0 or 1, got {value:?}")),
+        Err(error) => Err(format!("{FAIL_FAST_ENV} must be UTF-8: {error}")),
+    }
+}
+
 fn exact_filter(identity: &nextest_cpu::AttemptIdentity) -> String {
     // Nextest 0.9.100 equality matcher syntax, not a regex or substring match.
     // Unicode escapes also preserve leading/trailing whitespace and delimiters.
@@ -922,8 +1243,26 @@ fn exact_filter(identity: &nextest_cpu::AttemptIdentity) -> String {
     )
 }
 
+fn pmu_integration_budget_scope(
+    scope: Option<&std::ffi::OsStr>,
+    backend: Option<&std::ffi::OsStr>,
+) -> bool {
+    scope == Some(std::ffi::OsStr::new(PMU_INTEGRATION_BUDGET_SCOPE))
+        && backend.is_none_or(|value| value == "ptrace")
+}
+
+fn pmu_cli_budget_scope(
+    scope: Option<&std::ffi::OsStr>,
+    backend: Option<&std::ffi::OsStr>,
+) -> bool {
+    scope == Some(std::ffi::OsStr::new(PMU_CLI_BUDGET_SCOPE))
+        && backend.is_none_or(|value| value == "ptrace")
+}
+
 fn prepared_selected_cpu_allowances(
     prepared: bool,
+    pmu_integration: bool,
+    pmu_cli_cases: bool,
     inventory: impl FnOnce() -> Result<Vec<u8>, String>,
 ) -> Result<Vec<MeasuredCpuAllowance>, String> {
     if !prepared {
@@ -933,19 +1272,38 @@ fn prepared_selected_cpu_allowances(
     }
     // selected_inventory also performs the existing binary-map validation.
     let selected = nextest_cpu::selected_inventory(&inventory()?)?;
-    Ok(MEASURED_CPU_ALLOWANCES
+    let mut allowances = MEASURED_CPU_ALLOWANCES
         .iter()
         .copied()
         .filter(|allowance| selected.contains(&allowance.identity()))
-        .collect())
+        .collect::<Vec<_>>();
+    if pmu_integration && selected.contains(&PMU_LONE_REPLAY_ALLOWANCE.identity()) {
+        allowances.push(PMU_LONE_REPLAY_ALLOWANCE);
+    }
+    if pmu_cli_cases && selected.contains(&PMU_SCHEDULE_OFFSET_ALLOWANCE.identity()) {
+        allowances.push(PMU_SCHEDULE_OFFSET_ALLOWANCE);
+    }
+    Ok(allowances)
 }
+
+/// The one retry count a regular validate configuration may carry. It must
+/// match `.config/nextest.toml` exactly: any other value (including none)
+/// leaves budget resolution uncertified rather than budgeting for attempts
+/// the runner will not make, or the reverse.
+const REGULAR_NEXTEST_RETRIES: i64 = 2;
 
 /// The only overrides a regular configuration may carry, as (filter,
 /// test-group) pairs. Each group only lowers how many of its tests run at once.
-const REGULAR_GROUP_OVERRIDES: [(&str, &str); 1] = [(
-    "package(=hermit-run) & binary(=cli) & (test(=record_classifies_a_gdbserver_replay_stage_container_child_failure) | test(=every_record_container_site_classifies_a_child_fault_by_name))",
-    "cli-gdbserver-port",
-)];
+const REGULAR_GROUP_OVERRIDES: [(&str, &str); 2] = [
+    (
+        "package(=hermit-run) & binary(=cli) & (test(=record_classifies_a_gdbserver_replay_stage_container_child_failure) | test(=every_record_container_site_classifies_a_child_fault_by_name))",
+        "cli-gdbserver-port",
+    ),
+    (
+        "package(=hermit-run) & binary(=cli) & test(=another_processs_io_reads_with_a_full_descriptor_table_on_every_backend)",
+        "cli-full-table-io",
+    ),
+];
 
 fn regular_config_compatible(document: &DocumentMut) -> bool {
     let Some(default_timeout) = document
@@ -958,7 +1316,7 @@ fn regular_config_compatible(document: &DocumentMut) -> bool {
     else {
         return false;
     };
-    if default_timeout.get("period").and_then(Value::as_str) != Some("57s")
+    if default_timeout.get("period").and_then(Value::as_str) != Some("180s")
         || default_timeout
             .get("terminate-after")
             .and_then(Value::as_integer)
@@ -976,7 +1334,11 @@ fn regular_config_compatible(document: &DocumentMut) -> bool {
         else {
             continue;
         };
-        if table.contains_key("retries")
+        if table
+            .get("retries")
+            .and_then(Item::as_value)
+            .and_then(Value::as_integer)
+            != Some(REGULAR_NEXTEST_RETRIES)
             || table.contains_key("threads-required")
             || profile == "ci" && table.contains_key("slow-timeout")
         {
@@ -1005,18 +1367,51 @@ fn regular_config_compatible(document: &DocumentMut) -> bool {
     true
 }
 
+/// The retry count the canonical configuration gives the selected profile,
+/// for budget resolution when the invocation does not state one itself.
+/// `ci` inherits `default` in nextest, as here. None when either table or
+/// the key is absent or not an integer.
+fn configured_retries(document: &DocumentMut, args: &[String]) -> Option<u64> {
+    let mut selected = env::var("NEXTEST_PROFILE").unwrap_or_else(|_| "default".into());
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "--profile" {
+            selected = args.get(index + 1)?.clone();
+            index += 2;
+            continue;
+        }
+        if let Some(value) = args[index].strip_prefix("--profile=") {
+            selected = value.into();
+        }
+        index += 1;
+    }
+    let retries_of = |name: &str| {
+        document
+            .get("profile")
+            .and_then(Item::as_table)
+            .and_then(|profiles| profiles.get(name))
+            .and_then(Item::as_table)
+            .and_then(|profile| profile.get("retries"))
+            .and_then(Item::as_value)
+            .and_then(Value::as_integer)
+    };
+    let value = retries_of(&selected).or_else(|| retries_of("default"))?;
+    u64::try_from(value).ok()
+}
+
 /// Only certify an emitted finite width and the supported regular profiles.
 /// Unknown invocation semantics retain the original configuration unchanged.
-fn runtime_settings(args: &[String]) -> Option<(u64, u64)> {
+/// The retry count is explicit-only here (flag or environment); a caller
+/// budgeting a counted run falls back to `configured_retries`, because the
+/// counted runner states no `--retries` of its own.
+fn runtime_settings(args: &[String]) -> Option<(u64, Option<u64>)> {
     if env::var("NEXTEST_PROFILE")
         .is_ok_and(|profile| !matches!(profile.as_str(), "default" | "ci"))
     {
         return None;
     }
     let mut threads = env::var("NEXTEST_TEST_THREADS").ok();
-    let mut retries = env::var("NEXTEST_RETRIES")
-        .ok()
-        .unwrap_or_else(|| "0".into());
+    let mut retries: Option<String> = env::var("NEXTEST_RETRIES").ok();
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -1027,7 +1422,7 @@ fn runtime_settings(args: &[String]) -> Option<(u64, u64)> {
             }
             "--retries" => {
                 index += 1;
-                retries = args.get(index)?.clone();
+                retries = Some(args.get(index)?.clone());
             }
             "--profile" => {
                 index += 1;
@@ -1048,7 +1443,7 @@ fn runtime_settings(args: &[String]) -> Option<(u64, u64)> {
                 {
                     threads = Some(value.into());
                 } else if let Some(value) = arg.strip_prefix("--retries=") {
-                    retries = value.into();
+                    retries = Some(value.into());
                 } else if !matches!(arg.as_str(), "--profile=default" | "--profile=ci") {
                     return None;
                 }
@@ -1057,7 +1452,17 @@ fn runtime_settings(args: &[String]) -> Option<(u64, u64)> {
         index += 1;
     }
     let threads = threads?.parse::<u64>().ok().filter(|value| *value > 0)?;
-    Some((threads, retries.parse().ok()?))
+    let retries = match retries {
+        Some(value) => Some(value.parse::<u64>().ok()?),
+        None => None,
+    };
+    Some((threads, retries))
+}
+
+#[derive(Clone, Copy)]
+struct BudgetMultipliers {
+    cpu: f64,
+    wall: f64,
 }
 
 fn resolve_budgets(
@@ -1066,8 +1471,8 @@ fn resolve_budgets(
     calibration: Option<&[u8]>,
     threads: u64,
     retries: u64,
-    cpu_multiplier: f64,
-    wall_multiplier: f64,
+    multipliers: BudgetMultipliers,
+    selected_allowances: &[MeasuredCpuAllowance],
 ) -> Result<ResolvedBudgets, String> {
     let identities = nextest_cpu::selected_inventory(inventory)?;
     context.validate_execution_cohort()?;
@@ -1084,7 +1489,12 @@ fn resolve_budgets(
         .transpose()
         .map_err(|error| format!("invalid regular calibration: {error}"))?;
     let mut rows = std::collections::BTreeMap::new();
-    let mut applicability = "absent: unchanged defaults".to_string();
+    let mut applicability = if selected_allowances.is_empty() {
+        "absent: unchanged defaults"
+    } else {
+        "absent: defaults with selected measured floors"
+    }
+    .to_string();
     if let Some(table) = &calibration {
         table.context.validate_execution_cohort()?;
         if table.schema != nextest_cpu::BUDGET_SCHEMA
@@ -1114,18 +1524,35 @@ fn resolve_budgets(
                 "applicable".into()
             } else {
                 rows.clear();
-                "stale source/build/resource cohort: unchanged defaults".into()
+                if selected_allowances.is_empty() {
+                    "stale source/build/resource cohort: unchanged defaults"
+                } else {
+                    "stale source/build/resource cohort: defaults with selected measured floors"
+                }
+                .into()
             };
     }
     let mut entries = Vec::with_capacity(identities.len());
     for identity in identities {
-        let mut cpu = timeouts::DEFAULT_TEST_CPU_TIMEOUT_SECONDS;
-        let mut wall = timeouts::DEFAULT_TEST_WALL_TIMEOUT_SECONDS;
-        let mut reason = "unresolved: unchanged defaults";
+        let allowance = selected_allowances
+            .iter()
+            .find(|allowance| allowance.identity() == identity);
+        let cpu_floor = allowance.map_or(0, |allowance| allowance.cpu_seconds);
+        let wall_floor = allowance
+            .and_then(|allowance| allowance.wall_seconds)
+            .unwrap_or(0);
+        let mut cpu = timeouts::DEFAULT_TEST_CPU_TIMEOUT_SECONDS.max(cpu_floor);
+        let mut wall = timeouts::DEFAULT_TEST_WALL_TIMEOUT_SECONDS.max(wall_floor);
+        let mut reason = if allowance.is_some() {
+            "unresolved: defaults with selected measured floors"
+        } else {
+            "unresolved: unchanged defaults"
+        };
         if let Some(row) = rows.get(&identity) {
             let candidate_cpu =
                 timeouts::cpu_bound_from_p90_usec(row.p90_cpu_usec.max(row.historical_cpu_usec))
-                    .max(1);
+                    .max(1)
+                    .max(cpu_floor);
             let candidate_wall = timeouts::wall_bound_from_p90_millis(
                 row.p90_wall_millis.max(row.historical_wall_millis),
             )
@@ -1133,21 +1560,26 @@ fn resolve_budgets(
                 candidate_cpu
                     .checked_add(3)
                     .ok_or("calibrated CPU bound overflows")?,
-            );
+            )
+            .max(wall_floor);
             if candidate_cpu <= cpu && candidate_wall <= wall {
                 cpu = candidate_cpu;
                 wall = candidate_wall;
                 reason = "calibrated: owner formula with historical floor";
             } else {
-                reason = "unresolved: owner formula exceeds unchanged defaults";
+                reason = if allowance.is_some() {
+                    "unresolved: owner formula exceeds defaults with measured floors"
+                } else {
+                    "unresolved: owner formula exceeds unchanged defaults"
+                };
             }
         }
         entries.push(ResolvedBudget {
             identity,
-            cpu_seconds: timeouts::scale_timeout_seconds(cpu, cpu_multiplier, "CPU multiplier")?,
+            cpu_seconds: timeouts::scale_timeout_seconds(cpu, multipliers.cpu, "CPU multiplier")?,
             wall_seconds: timeouts::scale_timeout_seconds(
                 wall,
-                wall_multiplier,
+                multipliers.wall,
                 "wall multiplier",
             )?,
             reason: reason.into(),
@@ -1170,7 +1602,7 @@ fn resolve_budgets(
 fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
     if args == [std::ffi::OsString::from("--help")] || args == [std::ffi::OsString::from("-h")] {
         println!(
-            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains the regular default bounds. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), CPU-profile v3 host loader ({CPU_PROFILE_V3_LOADER_CPU_SECONDS}s), rr thread stress ({RR_THREAD_STRESS_CPU_SECONDS}s), the four external-signal poll-deadline tests ({ESI_POLL_DEADLINE_CPU_SECONDS}s), lit chaos verify ({LIT_CHAOS_VERIFY_CPU_SECONDS}s), DBT virtual kernel files ({DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS}s), CPU-profile v3 guest ({CPU_PROFILE_V3_GUEST_CPU_SECONDS}s), signal discard ({SIGNAL_DISCARD_CPU_SECONDS}s), parity post-pass ({PARITY_POST_PASS_NO_GUEST_CPU_SECONDS}s), epoll_pwait2 strict ({EPOLL_PWAIT2_STRICT_CPU_SECONDS}s), epoll_pwait temporary mask ({EPOLL_PWAIT_MASK_CPU_SECONDS}s), cross-process SIGKILL ({CROSS_PROCESS_SIGKILL_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. Every exact prepared selected liteinst_stacks identity, and the CPU-profile v3 host loader, gets a separate base wall backstop of three times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
+            "usage: nextest-timeout-config.rs --resolve SOURCE MULTIPLIER OUTPUT INVENTORY CONTEXT MAP CALIBRATION -- NEXTEST_ARGS...\n\nGenerate Nextest config OUTPUT from canonical TOML SOURCE and the wall MULTIPLIER. INVENTORY is typed Nextest list JSON; CONTEXT is verified budget-context JSON (or null); MAP is a new absolute output path; CALIBRATION is the optional reviewed JSON table. NEXTEST_ARGS are the actual counted-run arguments, including concurrency and retries. HERMIT_NEXTEST_CPU_WRAPPER_BIN must name the prepared wrapper; HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER defaults to 1.\n\nAbsent/stale regular calibration retains defaults with prepared selected measured floors. Prepared post-inventory selection admits only the exact Detcore allocator ({DETCORE_ALLOCATOR_CPU_SECONDS}s), Detcore constructor ({DETCORE_CONSTRUCTOR_CPU_SECONDS}s), standalone allocator ({STANDALONE_ALLOCATOR_CPU_SECONDS}s), Detcore stack callback ({DETCORE_STACK_CPU_SECONDS}s), rendered-procfs ({RENDERED_PROCFS_CPU_SECONDS}s), CPU-profile v3 host loader ({CPU_PROFILE_V3_LOADER_CPU_SECONDS}s), rr thread stress ({RR_THREAD_STRESS_CPU_SECONDS}s), the four external-signal poll-deadline tests ({ESI_POLL_DEADLINE_CPU_SECONDS}s), lit chaos verify ({LIT_CHAOS_VERIFY_CPU_SECONDS}s), DBT virtual kernel files ({DBT_VIRTUAL_KERNEL_FILES_CPU_SECONDS}s), CPU-profile v3 guest ({CPU_PROFILE_V3_GUEST_CPU_SECONDS}s), parity post-pass ({PARITY_POST_PASS_NO_GUEST_CPU_SECONDS}s), epoll_pwait2 strict ({EPOLL_PWAIT2_STRICT_CPU_SECONDS}s), epoll_pwait temporary mask ({EPOLL_PWAIT_MASK_CPU_SECONDS}s), lone-slice-end backstop ({LONE_BACKSTOP_CPU_SECONDS}s), ptrace signal permits ({SIGNAL_PERMITS_CPU_SECONDS}s), schedule-replay clock ({SCHEDULE_REPLAY_CLOCK_CPU_SECONDS}s), chaos offset split ({CHAOS_OFFSET_SPLIT_CPU_SECONDS}s), chaos offset verify ({CHAOS_OFFSET_VERIFY_CPU_SECONDS}s), schedule-replay long slices ({SCHEDULE_REPLAY_LONG_SLICES_CPU_SECONDS}s), chaos change points ({CHAOS_CHANGE_POINTS_CPU_SECONDS}s), posix timer signal rows ({POSIX_TIMER_SIGNAL_ROWS_CPU_SECONDS}s), trace replay split ({TRACE_REPLAY_SPLIT_CPU_SECONDS}s), chaos replay shell ({CHAOS_REPLAY_SHELL_CPU_SECONDS}s), rr vdso time ({RR_VDSO_TIME_CPU_SECONDS}s), rr vdso gettimeofday ({RR_VDSO_GETTIMEOFDAY_CPU_SECONDS}s), rr vdso clock_gettime ({RR_VDSO_CLOCK_GETTIME_CPU_SECONDS}s), shipped export ({SHIPPED_EXPORT_CPU_SECONDS}s), and all 15 measured stacks identities (22 to 55 seconds) base CPU allowances, each scaled once; tests outside those exact identities keep the 22-second base. The PMU integration node alone gives replays_take_recorded_lone_slice_ends_the_same_way 40 CPU seconds and 320 wall seconds; The PMU CLI node (scope pmu-cli-cases) gives the schedule-offset case a 13-second base allowance, which that node's CPU multiplier of 4 scales to an actual 52 CPU seconds; other unscoped invocations keep their prior bounds. Every exact prepared selected liteinst_stacks identity, the Detcore allocator leaf, and the CPU-profile v3 host loader, gets a separate base wall backstop of eight times its base CPU cap, scaled once by the wall multiplier. This is a host-load policy, not measured wall headroom; other wall bounds and cleanup2 are unchanged. See ci/liteinst-fixture-cpu-budgets.md for the complete fixture decisions and censored-observation limits. Unknown context/profile/concurrency produces no regular map or aggregate certification. Malformed input refuses. No test or preparation command is run."
         );
         return Ok(());
     }
@@ -1188,15 +1620,16 @@ fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
     let wrapper = cpu_wrapper_from_env().ok_or("budget resolution requires the CPU wrapper")?;
     let selected_allowances = prepared_selected_cpu_allowances(
         env::var("HERMIT_PREPARED_NEXTEST_REQUIRED").as_deref() == Ok("1"),
+        pmu_integration_budget_scope(
+            env::var_os(PMU_INTEGRATION_BUDGET_ENV).as_deref(),
+            env::var_os("HERMIT_TEST_BACKEND").as_deref(),
+        ),
+        pmu_cli_budget_scope(
+            env::var_os(PMU_INTEGRATION_BUDGET_ENV).as_deref(),
+            env::var_os("HERMIT_TEST_BACKEND").as_deref(),
+        ),
         || fs::read(&args[3]).map_err(|error| error.to_string()),
     )?;
-    let rendered = scaled_config_with_allowances(
-        &source,
-        wall_multiplier,
-        Some((&wrapper, cpu_multiplier)),
-        &selected_allowances,
-    )?;
-    let mut document = rendered.parse::<DocumentMut>().map_err(|e| e.to_string())?;
     let context: Option<BudgetContext> =
         serde_json::from_slice(&fs::read(&args[4]).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
@@ -1209,10 +1642,20 @@ fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
         })
         .collect::<Result<Vec<_>, _>>()?;
     let settings = runtime_settings(&runtime);
-    if context.is_none()
-        || settings.is_none()
-        || !regular_config_compatible(&source.parse::<DocumentMut>().map_err(|e| e.to_string())?)
-    {
+    let regular = context.is_some()
+        && settings.is_some()
+        && regular_config_compatible(&source.parse::<DocumentMut>().map_err(|e| e.to_string())?);
+    // The regular map owns every wrapper and wall limit: earlier exact rules
+    // must not bypass or shadow it. Legacy callers retain their reviewed rendering.
+    let rendered = scaled_config_with_allowances_and_fail_fast(
+        &source,
+        wall_multiplier,
+        Some((&wrapper, cpu_multiplier)),
+        if regular { &[] } else { &selected_allowances },
+        fail_fast_from_env()?,
+    )?;
+    let mut document = rendered.parse::<DocumentMut>().map_err(|e| e.to_string())?;
+    if !regular {
         if !selected_allowances.is_empty() {
             for allowance in &selected_allowances {
                 let wall = match allowance.wall_seconds {
@@ -1241,7 +1684,19 @@ fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
         }
         return fs::write(&args[2], rendered).map_err(|e| e.to_string());
     }
-    let (threads, retries) = settings.unwrap();
+    let (threads, explicit_retries) = settings.unwrap();
+    // The counted runner states no `--retries` of its own: the attempts it
+    // will make come from the canonical configuration, and the population
+    // budget must count them. An explicit invocation value (the fixture's
+    // `--retries 0` included) always wins.
+    let retries = match explicit_retries {
+        Some(retries) => retries,
+        None => configured_retries(
+            &source.parse::<DocumentMut>().map_err(|e| e.to_string())?,
+            &runtime,
+        )
+        .ok_or("configured nextest retries are missing or invalid")?,
+    };
     let calibration = match fs::read(&args[6]) {
         Ok(bytes) => Some(bytes),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -1253,8 +1708,11 @@ fn resolve_config(args: Vec<std::ffi::OsString>) -> Result<(), String> {
         calibration.as_deref(),
         threads,
         retries,
-        cpu_multiplier,
-        wall_multiplier,
+        BudgetMultipliers {
+            cpu: cpu_multiplier,
+            wall: wall_multiplier,
+        },
+        &selected_allowances,
     )?;
     resolved.calibration_sha256 = calibration
         .as_ref()
@@ -1351,10 +1809,12 @@ fn run() -> Result<(), String> {
     } else {
         1.0
     };
-    let rendered = scaled_config(
+    let rendered = scaled_config_with_allowances_and_fail_fast(
         &source_text,
         multiplier,
         cpu_wrapper.as_deref().map(|path| (path, cpu_multiplier)),
+        &[],
+        fail_fast_from_env()?,
     )?;
     fs::write(Path::new(&output), rendered)
         .map_err(|error| format!("cannot write {}: {error}", Path::new(&output).display()))
@@ -1407,8 +1867,11 @@ mod tests {
                 Some(&serde_json::to_vec(table).unwrap()),
                 8,
                 0,
-                1.0,
-                1.0,
+                BudgetMultipliers {
+                    cpu: 1.0,
+                    wall: 1.0,
+                },
+                &[],
             )
             .unwrap()
         };
@@ -1483,7 +1946,7 @@ mod tests {
                 result
                     .entries
                     .iter()
-                    .all(|row| row.cpu_seconds == 22 && row.wall_seconds == 57)
+                    .all(|row| row.cpu_seconds == 22 && row.wall_seconds == 180)
             );
         }
         let mut legacy = context.clone();
@@ -1501,8 +1964,11 @@ mod tests {
                 Some(&serde_json::to_vec(&table).unwrap()),
                 8,
                 0,
-                1.0,
-                1.0
+                BudgetMultipliers {
+                    cpu: 1.0,
+                    wall: 1.0
+                },
+                &[],
             )
             .is_err()
         );
@@ -1572,6 +2038,273 @@ mod tests {
         )
     }
 
+    fn trace_split_allowance() -> MeasuredCpuAllowance {
+        *MEASURED_CPU_ALLOWANCES
+            .iter()
+            .find(|allowance| allowance.test == "trace_replay_split_just_spin")
+            .expect("the reviewed trace-replay allowance")
+    }
+
+    /// Exercise the real resolver without changing this test process's environment.
+    /// The exact-test child receives all inputs through a private fixture directory.
+    fn regular_resolution_fixture(
+        test_name: &str,
+        calibration_mode: &str,
+    ) -> (ResolvedBudgets, DocumentMut) {
+        const FIXTURE_ENV: &str = "HERMIT_TEST_REGULAR_BUDGET_FIXTURE";
+        let read_outputs = |root: &Path| {
+            let map = fs::read(root.join("map.json")).unwrap();
+            let digest = format!("{:x}", Sha256::digest(&map));
+            (
+                ResolvedBudgets::read_bound(&root.join("map.json"), &digest).unwrap(),
+                fs::read_to_string(root.join("output.toml"))
+                    .unwrap()
+                    .parse::<DocumentMut>()
+                    .unwrap(),
+            )
+        };
+        if let Some(root) = env::var_os(FIXTURE_ENV) {
+            let root = std::path::PathBuf::from(root);
+            resolve_config(vec![
+                root.join("source.toml").into_os_string(),
+                "1".into(),
+                root.join("output.toml").into_os_string(),
+                root.join("inventory.json").into_os_string(),
+                root.join("context.json").into_os_string(),
+                root.join("map.json").into_os_string(),
+                root.join("calibration.json").into_os_string(),
+                "--".into(),
+                "-j8".into(),
+                "--retries=0".into(),
+            ])
+            .unwrap();
+            return read_outputs(&root);
+        }
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let root = Fixture(env::temp_dir().join(format!(
+            "hermit-regular-budgets-{}-{test_name}",
+            std::process::id()
+        )));
+        fs::create_dir(&root.0).unwrap();
+        let measured = trace_split_allowance().identity();
+        let mut ordinary = measured.clone();
+        ordinary.test = "ordinary_unmeasured_test".into();
+        let mut other_binary = measured.clone();
+        other_binary.binary = "hermit-verify::other_binary".into();
+        let inventory = measured_inventory(&[measured.clone(), ordinary, other_binary]);
+        let (_, context, mut calibration) = budget_fixture();
+        calibration.rows[0].identity = measured;
+        match calibration_mode {
+            "absent" => {}
+            "stale" => {
+                calibration.context.source_sha256 = "f".repeat(64);
+                fs::write(
+                    root.0.join("calibration.json"),
+                    serde_json::to_vec(&calibration).unwrap(),
+                )
+                .unwrap();
+            }
+            "low" => fs::write(
+                root.0.join("calibration.json"),
+                serde_json::to_vec(&calibration).unwrap(),
+            )
+            .unwrap(),
+            _ => panic!("unknown calibration fixture {calibration_mode}"),
+        }
+        fs::write(
+            root.0.join("source.toml"),
+            include_str!("../.config/nextest.toml"),
+        )
+        .unwrap();
+        fs::write(
+            root.0.join("inventory.json"),
+            serde_json::to_vec(&inventory).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            root.0.join("context.json"),
+            serde_json::to_vec(&context).unwrap(),
+        )
+        .unwrap();
+        let output = std::process::Command::new(env::current_exe().unwrap())
+            .args(["--exact", &format!("tests::{test_name}"), "--nocapture"])
+            .env(FIXTURE_ENV, &root.0)
+            .env(CPU_WRAPPER_BIN_ENV, "/fixture/cpu-wrapper")
+            .env("HERMIT_PREPARED_NEXTEST_REQUIRED", "1")
+            .env(timeouts::TEST_CPU_TIMEOUT_MULTIPLIER_ENV, "1")
+            .env(FAIL_FAST_ENV, "1")
+            .env_remove("NEXTEST_PROFILE")
+            .env_remove("NEXTEST_TEST_THREADS")
+            .env_remove("NEXTEST_RETRIES")
+            .env_remove(PMU_INTEGRATION_BUDGET_ENV)
+            .env_remove("HERMIT_TEST_BACKEND")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "resolver child failed: {}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        read_outputs(&root.0)
+    }
+
+    fn assert_regular_measured_budget(map: &ResolvedBudgets, document: &DocumentMut) {
+        let allowance = trace_split_allowance();
+        assert_eq!(
+            (allowance.cpu_seconds, allowance.wall_seconds),
+            (28, Some(224))
+        );
+        let identity = allowance.identity();
+        let entry = map
+            .entries
+            .iter()
+            .find(|row| row.identity == identity)
+            .unwrap();
+        assert_eq!((entry.cpu_seconds, entry.wall_seconds), (28, 224));
+        assert_eq!(map.cpu_budget_usec(&identity).unwrap(), 28_000_000);
+        // Every regular attempt must use the authenticated map, not an earlier
+        // exact wrapper which bypasses it or a later duplicate wall override.
+        let scripts = document["profile"]["default"]["scripts"]
+            .as_array_of_tables()
+            .unwrap();
+        assert_eq!(scripts.len(), 1);
+        assert_eq!(scripts.get(0).unwrap()["filter"].as_str(), Some("all()"));
+        assert_eq!(
+            scripts.get(0).unwrap()["run-wrapper"].as_str(),
+            Some(CPU_WRAPPER_NAME)
+        );
+        let argv = wrapper_argv(document, CPU_WRAPPER_NAME);
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair[0] == "--budget-map" && pair[1].ends_with("/map.json"))
+        );
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec_pretty(map).unwrap())
+        );
+        assert!(
+            argv.windows(2)
+                .any(|pair| pair[0] == "--budget-sha256" && pair[1] == digest)
+        );
+        let filter = exact_filter(&identity);
+        let walls = document["profile"]["default"]["overrides"]
+            .as_array_of_tables()
+            .unwrap()
+            .iter()
+            .filter(|row| {
+                row.contains_key("slow-timeout") && row["filter"].as_str() == Some(&filter)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            walls.len(),
+            1,
+            "Nextest must not choose an earlier competing wall bound"
+        );
+        assert_eq!(walls[0]["slow-timeout"]["period"].as_str(), Some("224s"));
+    }
+
+    #[test]
+    fn regular_map_preserves_selected_measured_budgets() {
+        let (map, document) =
+            regular_resolution_fixture("regular_map_preserves_selected_measured_budgets", "absent");
+        assert_regular_measured_budget(&map, &document);
+    }
+
+    #[test]
+    fn stale_regular_calibration_preserves_selected_measured_budgets() {
+        let (map, document) = regular_resolution_fixture(
+            "stale_regular_calibration_preserves_selected_measured_budgets",
+            "stale",
+        );
+        assert!(map.applicability.starts_with("stale"));
+        assert_regular_measured_budget(&map, &document);
+    }
+
+    #[test]
+    fn regular_calibration_cannot_lower_measured_budgets() {
+        let (map, document) =
+            regular_resolution_fixture("regular_calibration_cannot_lower_measured_budgets", "low");
+        assert_eq!(map.applicability, "applicable");
+        assert_regular_measured_budget(&map, &document);
+    }
+
+    #[test]
+    fn regular_map_keeps_unmeasured_defaults() {
+        let (map, _) =
+            regular_resolution_fixture("regular_map_keeps_unmeasured_defaults", "absent");
+        let measured = trace_split_allowance().identity();
+        let ordinary = map
+            .entries
+            .iter()
+            .filter(|row| row.identity != measured)
+            .collect::<Vec<_>>();
+        assert_eq!(ordinary.len(), 2);
+        assert!(
+            ordinary
+                .iter()
+                .all(|row| (row.cpu_seconds, row.wall_seconds) == (22, 180))
+        );
+    }
+
+    #[test]
+    fn regular_calibration_respects_a_measured_wall_below_the_default() {
+        let (inventory, context, calibration) = budget_fixture();
+        let allowance = MeasuredCpuAllowance {
+            wrapper_name: "fixture-measured",
+            package: "fixture",
+            binary: "fixture",
+            test: "same name,(special)",
+            cpu_seconds: 22,
+            wall_seconds: Some(176),
+        };
+        assert_eq!(allowance.identity(), calibration.rows[0].identity);
+        let initial = resolve_budgets(
+            &inventory,
+            context.clone(),
+            None,
+            8,
+            0,
+            BudgetMultipliers {
+                cpu: 1.0,
+                wall: 1.0,
+            },
+            &[allowance],
+        )
+        .unwrap();
+        let entry = initial
+            .entries
+            .iter()
+            .find(|row| row.identity == allowance.identity())
+            .unwrap();
+        assert_eq!((entry.cpu_seconds, entry.wall_seconds), (22, 180));
+        let calibrated = resolve_budgets(
+            &inventory,
+            context,
+            Some(&serde_json::to_vec(&calibration).unwrap()),
+            8,
+            0,
+            BudgetMultipliers {
+                cpu: 1.0,
+                wall: 1.0,
+            },
+            &[allowance],
+        )
+        .unwrap();
+        let entry = calibrated
+            .entries
+            .iter()
+            .find(|row| row.identity == allowance.identity())
+            .unwrap();
+        assert_eq!((entry.cpu_seconds, entry.wall_seconds), (22, 176));
+    }
+
     #[test]
     fn exact_identity_calibration_retains_unknowns_and_historical_floor() {
         let (inventory, context, mut calibration) = budget_fixture();
@@ -1581,8 +2314,11 @@ mod tests {
             Some(&serde_json::to_vec(&calibration).unwrap()),
             8,
             0,
-            1.0,
-            1.0,
+            BudgetMultipliers {
+                cpu: 1.0,
+                wall: 1.0,
+            },
+            &[],
         )
         .unwrap();
         assert_eq!(resolved.entries.len(), 3);
@@ -1596,26 +2332,31 @@ mod tests {
             resolved
                 .entries
                 .iter()
-                .filter(|row| row.cpu_seconds == 22 && row.wall_seconds == 57)
+                .filter(|row| row.cpu_seconds == 22 && row.wall_seconds == 180)
                 .count(),
             2
         );
-        calibration.rows[0].historical_wall_millis = 19_084;
+        // 69.084 s historical wall: the formula's 3x branch gives 208 s,
+        // above the 180 s default, so it stays unresolved (formula exceeds).
+        calibration.rows[0].historical_wall_millis = 69_084;
         let unresolved = resolve_budgets(
             &inventory,
             context,
             Some(&serde_json::to_vec(&calibration).unwrap()),
             8,
             0,
-            1.0,
-            1.0,
+            BudgetMultipliers {
+                cpu: 1.0,
+                wall: 1.0,
+            },
+            &[],
         )
         .unwrap();
         assert!(
             unresolved
                 .entries
                 .iter()
-                .all(|row| row.cpu_seconds == 22 && row.wall_seconds == 57)
+                .all(|row| row.cpu_seconds == 22 && row.wall_seconds == 180)
         );
         assert!(
             unresolved
@@ -1638,18 +2379,41 @@ mod tests {
         let mut other_cpu = context.clone();
         other_cpu.available_cpus = 2;
         for changed in [stale, dirty, other_build, other_cpu] {
-            let result =
-                resolve_budgets(&inventory, changed, Some(&bytes), 8, 0, 1.0, 1.0).unwrap();
+            let result = resolve_budgets(
+                &inventory,
+                changed,
+                Some(&bytes),
+                8,
+                0,
+                BudgetMultipliers {
+                    cpu: 1.0,
+                    wall: 1.0,
+                },
+                &[],
+            )
+            .unwrap();
             assert_eq!(result.entries.len(), 3);
             assert!(
                 result
                     .entries
                     .iter()
-                    .all(|row| row.cpu_seconds == 22 && row.wall_seconds == 57)
+                    .all(|row| row.cpu_seconds == 22 && row.wall_seconds == 180)
             );
             assert!(result.applicability.starts_with("stale"));
         }
-        let absent = resolve_budgets(&inventory, context, None, 8, 0, 1.0, 1.0).unwrap();
+        let absent = resolve_budgets(
+            &inventory,
+            context,
+            None,
+            8,
+            0,
+            BudgetMultipliers {
+                cpu: 1.0,
+                wall: 1.0,
+            },
+            &[],
+        )
+        .unwrap();
         assert_eq!(absent.entries.len(), 3);
         assert!(absent.applicability.starts_with("absent"));
     }
@@ -1659,12 +2423,34 @@ mod tests {
         let (inventory, context, mut calibration) = budget_fixture();
         let bytes = serde_json::to_vec(&calibration).unwrap();
         assert!(
-            resolve_budgets(&inventory, context.clone(), Some(&bytes), 8, 0, 2.0, 1.0)
-                .unwrap_err()
-                .contains("cleanup")
+            resolve_budgets(
+                &inventory,
+                context.clone(),
+                Some(&bytes),
+                8,
+                0,
+                BudgetMultipliers {
+                    cpu: 2.0,
+                    wall: 1.0
+                },
+                &[],
+            )
+            .unwrap_err()
+            .contains("cleanup")
         );
-        let scaled =
-            resolve_budgets(&inventory, context.clone(), Some(&bytes), 8, 0, 2.0, 2.0).unwrap();
+        let scaled = resolve_budgets(
+            &inventory,
+            context.clone(),
+            Some(&bytes),
+            8,
+            0,
+            BudgetMultipliers {
+                cpu: 2.0,
+                wall: 2.0,
+            },
+            &[],
+        )
+        .unwrap();
         assert!(
             scaled
                 .entries
@@ -1679,8 +2465,11 @@ mod tests {
                 Some(&serde_json::to_vec(&calibration).unwrap()),
                 8,
                 0,
-                1.0,
-                1.0
+                BudgetMultipliers {
+                    cpu: 1.0,
+                    wall: 1.0
+                },
+                &[],
             )
             .is_err()
         );
@@ -1693,18 +2482,47 @@ mod tests {
                 Some(&serde_json::to_vec(&calibration).unwrap()),
                 8,
                 0,
-                1.0,
-                1.0
+                BudgetMultipliers {
+                    cpu: 1.0,
+                    wall: 1.0
+                },
+                &[],
             )
             .is_err()
         );
-        assert!(resolve_budgets(&inventory, context, Some(b"{}"), 8, 0, 1.0, 1.0).is_err());
+        assert!(
+            resolve_budgets(
+                &inventory,
+                context,
+                Some(b"{}"),
+                8,
+                0,
+                BudgetMultipliers {
+                    cpu: 1.0,
+                    wall: 1.0
+                },
+                &[],
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn population_accounts_for_all_cases_width_retries_and_overflow() {
         let (inventory, context, _) = budget_fixture();
-        let result = resolve_budgets(&inventory, context, None, 8, 0, 1.0, 1.0).unwrap();
+        let result = resolve_budgets(
+            &inventory,
+            context,
+            None,
+            8,
+            0,
+            BudgetMultipliers {
+                cpu: 1.0,
+                wall: 1.0,
+            },
+            &[],
+        )
+        .unwrap();
         let eight = nextest_cpu::population_budget(&result.entries, 8, 0).unwrap();
         let one = nextest_cpu::population_budget(&result.entries, 1, 0).unwrap();
         assert_eq!(
@@ -1714,7 +2532,7 @@ mod tests {
                 one.cpu_seconds,
                 one.nominal_wall_seconds
             ),
-            (3, 3, 66, 177)
+            (3, 3, 66, 546)
         );
         assert!(eight.nominal_wall_seconds < one.nominal_wall_seconds);
         let retried = nextest_cpu::population_budget(&result.entries[..1], 8, 1).unwrap();
@@ -1724,7 +2542,7 @@ mod tests {
                 retried.cpu_seconds,
                 retried.nominal_wall_seconds
             ),
-            (2, 44, 118)
+            (2, 44, 364)
         );
         assert!(nextest_cpu::population_budget(&result.entries, 0, 0).is_err());
         assert!(nextest_cpu::population_budget(&result.entries, 8, u64::MAX).is_err());
@@ -1754,8 +2572,8 @@ mod tests {
             .unwrap()
             .push(rule);
         assert!(!regular_config_compatible(&changed));
-        let changed_default =
-            include_str!("../.config/nextest.toml").replace("period = \"57s\"", "period = \"58s\"");
+        let changed_default = include_str!("../.config/nextest.toml")
+            .replace("period = \"180s\"", "period = \"181s\"");
         assert!(!regular_config_compatible(
             &changed_default.parse::<DocumentMut>().unwrap()
         ));
@@ -1777,10 +2595,30 @@ mod tests {
         ));
         assert_eq!(
             runtime_settings(&["-j8".into(), "--retries=2".into()]),
-            Some((8, 2))
+            Some((8, Some(2)))
         );
+        assert_eq!(runtime_settings(&["-j8".into()]), Some((8, None)));
         assert!(runtime_settings(&["-j0".into()]).is_none());
         assert!(runtime_settings(&["-j8".into(), "--profile=other".into()]).is_none());
+        // The canonical configuration carries exactly the certified retry
+        // count for both validate profiles; any other value (or none) is
+        // not certified, and budget resolution reads the configured count.
+        assert_eq!(configured_retries(&canonical, &["-j8".into()]), Some(2));
+        assert_eq!(
+            configured_retries(&canonical, &["--profile=ci".into(), "-j8".into()]),
+            Some(2)
+        );
+        let wrong_retries =
+            include_str!("../.config/nextest.toml").replace("retries = 2", "retries = 1");
+        assert_ne!(wrong_retries, include_str!("../.config/nextest.toml"));
+        assert!(!regular_config_compatible(
+            &wrong_retries.parse::<DocumentMut>().unwrap()
+        ));
+        let no_retries = include_str!("../.config/nextest.toml").replace("retries = 2\n", "");
+        assert_ne!(no_retries, include_str!("../.config/nextest.toml"));
+        assert!(!regular_config_compatible(
+            &no_retries.parse::<DocumentMut>().unwrap()
+        ));
     }
 
     #[test]
@@ -1830,6 +2668,36 @@ mod tests {
             scaled_config("[profile.default]\nfail-fast = false\n", 1.0, None)
                 .unwrap_err()
                 .contains("no slow-timeout.period")
+        );
+    }
+
+    /// Early exit is the executor default (owner directive 2026-11-04):
+    /// the rendered config stops the batch at the first failing test
+    /// unless the run opted in to running everything.
+    #[test]
+    fn rendered_fail_fast_follows_the_requested_mode() {
+        let source = concat!(
+            "[profile.default]\n",
+            "fail-fast = false\n",
+            "slow-timeout = { period = \"57s\", terminate-after = 1 }\n",
+        );
+        for (fail_fast, expected) in [(true, true), (false, false)] {
+            let rendered =
+                scaled_config_with_allowances_and_fail_fast(source, 1.0, None, &[], fail_fast)
+                    .unwrap();
+            let document = rendered.parse::<DocumentMut>().unwrap();
+            assert_eq!(
+                document["profile"]["default"]["fail-fast"].as_bool(),
+                Some(expected),
+                "fail_fast={fail_fast} must render fail-fast = {expected}"
+            );
+        }
+        // The plain entry point defaults to early exit.
+        let rendered = scaled_config(source, 1.0, None).unwrap();
+        let document = rendered.parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            document["profile"]["default"]["fail-fast"].as_bool(),
+            Some(true)
         );
     }
 
@@ -2007,8 +2875,199 @@ mod tests {
         inventory
     }
 
+    fn assert_pmu_lone_replay_scope() {
+        let target = PMU_LONE_REPLAY_ALLOWANCE.identity();
+        let mut identities = MEASURED_CPU_ALLOWANCES
+            .iter()
+            .map(|allowance| allowance.identity())
+            .collect::<Vec<_>>();
+        identities.push(target.clone());
+        let bytes = serde_json::to_vec(&measured_inventory(&identities)).unwrap();
+        let ordinary =
+            prepared_selected_cpu_allowances(true, false, false, || Ok(bytes.clone())).unwrap();
+        assert_eq!(ordinary, MEASURED_CPU_ALLOWANCES);
+        let source = include_str!("../.config/nextest.toml");
+        let render = |selected: &[MeasuredCpuAllowance]| {
+            scaled_config_with_allowances(
+                source,
+                1.0,
+                Some((Path::new("/fixture/wrapper"), 1.0)),
+                selected,
+            )
+            .unwrap()
+        };
+        for (scope, backend, enabled) in [
+            (None, None, false),
+            (None, Some("ptrace"), false),
+            (None, Some("kvm"), false),
+            (Some(""), None, false),
+            (Some("other-node"), None, false),
+            (Some("pmu-integration-extra"), None, false),
+            (Some("pmu-integration"), None, true),
+            (Some("pmu-integration"), Some("ptrace"), true),
+            (Some("pmu-integration"), Some("kvm"), false),
+            (Some("pmu-integration"), Some(""), false),
+            (Some("pmu-integration"), Some("other"), false),
+        ] {
+            let admitted = pmu_integration_budget_scope(
+                scope.map(std::ffi::OsStr::new),
+                backend.map(std::ffi::OsStr::new),
+            );
+            assert_eq!(admitted, enabled, "scope={scope:?} backend={backend:?}");
+            let selected =
+                prepared_selected_cpu_allowances(true, admitted, false, || Ok(bytes.clone()))
+                    .unwrap();
+            assert_eq!(&selected[..ordinary.len()], ordinary.as_slice());
+            assert_eq!(selected.len(), ordinary.len() + usize::from(enabled));
+            if enabled {
+                assert_eq!(selected.last(), Some(&PMU_LONE_REPLAY_ALLOWANCE));
+            } else {
+                assert_eq!(render(&selected), render(&ordinary));
+            }
+        }
+
+        let inventory = measured_inventory(std::slice::from_ref(&target));
+        for defect in 0..6 {
+            let mut changed = inventory.clone();
+            let suite = &mut changed["rust-suites"][&target.binary];
+            match defect {
+                0 => suite["package-name"] = "other".into(),
+                1 => {
+                    let mut other = suite.clone();
+                    other["binary-id"] = "hermit-run::deadline_slice_cap_extra".into();
+                    changed["rust-suites"] = serde_json::json!({
+                        "hermit-run::deadline_slice_cap_extra": other
+                    });
+                }
+                2 => {
+                    let case = suite["testcases"][&target.test].clone();
+                    suite["testcases"] = serde_json::json!({
+                        (format!("{}_extra", target.test)): case
+                    });
+                }
+                3 => suite["testcases"][&target.test]["ignored"] = true.into(),
+                4 => {
+                    suite["testcases"][&target.test]["filter-match"]["status"] = "mismatch".into();
+                }
+                _ => suite["testcases"] = serde_json::json!({}),
+            }
+            assert!(
+                prepared_selected_cpu_allowances(true, true, false, || {
+                    Ok(serde_json::to_vec(&changed).unwrap())
+                })
+                .unwrap()
+                .is_empty(),
+                "nonselected identity defect {defect}"
+            );
+        }
+        assert!(
+            prepared_selected_cpu_allowances(false, true, false, || panic!(
+                "legacy inventory read"
+            ))
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            prepared_selected_cpu_allowances(true, true, false, || Ok(b"malformed".to_vec()))
+                .is_err()
+        );
+
+        let selected = prepared_selected_cpu_allowances(true, true, false, || {
+            Ok(serde_json::to_vec(&inventory).unwrap())
+        })
+        .unwrap();
+        assert_eq!(selected, [PMU_LONE_REPLAY_ALLOWANCE]);
+        for (cpu_multiplier, wall_multiplier, cpu, wall) in [
+            (1.0, 1.0, "40000000", "320s"),
+            (1.25, 1.5, "50000000", "480s"),
+        ] {
+            let rendered = scaled_config_with_allowances(
+                source,
+                wall_multiplier,
+                Some((Path::new("/fixture/wrapper"), cpu_multiplier)),
+                &selected,
+            )
+            .unwrap();
+            let document = rendered.parse::<DocumentMut>().unwrap();
+            let filter = exact_filter(&target);
+            let rules = document["profile"]["default"]["scripts"]
+                .as_array_of_tables()
+                .unwrap();
+            assert_eq!(rules.len(), 2);
+            assert_eq!(
+                rules.get(0).unwrap()["filter"].as_str(),
+                Some(format!("!({filter})").as_str())
+            );
+            assert_eq!(
+                rules.get(1).unwrap()["filter"].as_str(),
+                Some(filter.as_str())
+            );
+            assert_eq!(
+                wrapper_argv(&document, PMU_LONE_REPLAY_ALLOWANCE.wrapper_name)[2],
+                cpu
+            );
+            assert_eq!(run_wrapper_count(&document, "ci").unwrap(), 0);
+            let walls = document["profile"]["default"]["overrides"]
+                .as_array_of_tables()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.contains_key("slow-timeout"))
+                .collect::<Vec<_>>();
+            assert_eq!(walls.len(), 1);
+            assert_eq!(walls[0]["filter"].as_str(), Some(filter.as_str()));
+            assert_eq!(walls[0]["slow-timeout"]["period"].as_str(), Some(wall));
+        }
+        let collision = format!(
+            "{source}\n[scripts.wrapper.{}]\ncommand = 'existing'\n",
+            PMU_LONE_REPLAY_ALLOWANCE.wrapper_name
+        );
+        assert!(
+            scaled_config_with_allowances(
+                &collision,
+                1.0,
+                Some((Path::new("/fixture/wrapper"), 1.0)),
+                &selected
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn pmu_schedule_offset_scope_is_exact_and_scoped() {
+        let target = PMU_SCHEDULE_OFFSET_ALLOWANCE.identity();
+        let inventory = measured_inventory(std::slice::from_ref(&target));
+        let bytes = serde_json::to_vec(&inventory).unwrap();
+        assert!(
+            prepared_selected_cpu_allowances(true, false, false, || Ok(bytes.clone()))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            prepared_selected_cpu_allowances(true, true, false, || Ok(bytes.clone()))
+                .unwrap()
+                .is_empty()
+        );
+        let selected = prepared_selected_cpu_allowances(true, false, true, || Ok(bytes)).unwrap();
+        assert_eq!(selected, [PMU_SCHEDULE_OFFSET_ALLOWANCE]);
+
+        let source = include_str!("../.config/nextest.toml");
+        let rendered = scaled_config_with_allowances(
+            source,
+            3.0,
+            Some((Path::new("/fixture/wrapper"), 4.0)),
+            &selected,
+        )
+        .unwrap();
+        let document = rendered.parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            wrapper_argv(&document, PMU_SCHEDULE_OFFSET_WRAPPER_NAME)[2],
+            "52000000"
+        );
+    }
+
     #[test]
     fn new_measured_cells_require_exact_prepared_selected_identities() {
+        assert_pmu_lone_replay_scope();
         for (binary, test, name, budget) in [
             (
                 "hermit-run::liteinst_stacks",
@@ -2082,11 +3141,12 @@ mod tests {
                 let bytes =
                     serde_json::to_vec(&measured_inventory(std::slice::from_ref(&identity)))
                         .unwrap();
-                let selected = prepared_selected_cpu_allowances(true, || Ok(bytes)).unwrap();
+                let selected =
+                    prepared_selected_cpu_allowances(true, false, false, || Ok(bytes)).unwrap();
                 let expected = if identity == target {
                     Some((name, budget))
                 } else if identity == detcore_allocator_identity() {
-                    Some((DETCORE_ALLOCATOR_WRAPPER_NAME, "32000000"))
+                    Some((DETCORE_ALLOCATOR_WRAPPER_NAME, "48000000"))
                 } else if identity.package == "hermit-run"
                     && identity.binary == "hermit-run::liteinst_stacks"
                 {
@@ -2132,7 +3192,7 @@ mod tests {
                 assert_eq!(run_wrapper_count(&document, "ci").unwrap(), 0);
                 assert_eq!(
                     document["profile"]["default"]["slow-timeout"]["period"].as_str(),
-                    Some("57s")
+                    Some("180s")
                 );
                 let wall_overrides = document["profile"]["default"]["overrides"]
                     .as_array_of_tables()
@@ -2140,9 +3200,10 @@ mod tests {
                     .iter()
                     .filter(|entry| entry.contains_key("slow-timeout"))
                     .collect::<Vec<_>>();
+                // Every measured allowance now carries an 8x wall (owner
+                // policy 2026-11-01), so every selected identity renders one.
                 let expected_wall = expected
-                    .filter(|_| identity.binary == "hermit-run::liteinst_stacks")
-                    .map(|(_, cpu)| format!("{}s", cpu.parse::<u64>().unwrap() / 1_000_000 * 3));
+                    .map(|(_, cpu)| format!("{}s", cpu.parse::<u64>().unwrap() / 1_000_000 * 8));
                 assert_eq!(wall_overrides.len(), usize::from(expected_wall.is_some()));
                 if let Some(entry) = wall_overrides.first() {
                     assert_eq!(
@@ -2184,14 +3245,14 @@ mod tests {
                 }
                 let bytes = serde_json::to_vec(&inventory).unwrap();
                 assert!(
-                    prepared_selected_cpu_allowances(true, || Ok(bytes))
+                    prepared_selected_cpu_allowances(true, false, false, || Ok(bytes))
                         .unwrap()
                         .is_empty()
                 );
             }
             let bytes = serde_json::to_vec(&measured_inventory(&[target])).unwrap();
             assert!(
-                prepared_selected_cpu_allowances(false, || Ok(bytes))
+                prepared_selected_cpu_allowances(false, false, false, || Ok(bytes))
                     .unwrap()
                     .is_empty()
             );
@@ -2207,13 +3268,14 @@ mod tests {
             attempt: 1,
         };
         let inventory = measured_inventory(std::slice::from_ref(&identity));
-        let selected =
-            prepared_selected_cpu_allowances(true, || Ok(serde_json::to_vec(&inventory).unwrap()))
-                .unwrap();
+        let selected = prepared_selected_cpu_allowances(true, false, false, || {
+            Ok(serde_json::to_vec(&inventory).unwrap())
+        })
+        .unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(
             (selected[0].cpu_seconds, selected[0].wall_seconds),
-            (36, Some(108))
+            (36, Some(288))
         );
         for (cpu_multiplier, wall_multiplier) in [(1.0, 1.0), (1.25, 1.5)] {
             let rendered = scaled_config_with_allowances(
@@ -2239,7 +3301,7 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(walls.len(), 1);
             let wall_seconds =
-                timeouts::scale_timeout_seconds(108, wall_multiplier, "wall multiplier").unwrap();
+                timeouts::scale_timeout_seconds(288, wall_multiplier, "wall multiplier").unwrap();
             assert_eq!(
                 walls[0]["slow-timeout"]["period"].as_str(),
                 Some(format!("{wall_seconds}s").as_str())
@@ -2248,9 +3310,12 @@ mod tests {
         }
         // Without prepared admission the test keeps the ordinary 22-second cap.
         assert!(
-            prepared_selected_cpu_allowances(false, || Ok(serde_json::to_vec(&inventory).unwrap()))
-                .unwrap()
-                .is_empty()
+            prepared_selected_cpu_allowances(false, false, false, || Ok(serde_json::to_vec(
+                &inventory
+            )
+            .unwrap()))
+            .unwrap()
+            .is_empty()
         );
     }
 
@@ -2259,7 +3324,7 @@ mod tests {
     /// wrapper and budget, keeps the profile's wall, and nothing without
     /// prepared admission.
     #[test]
-    fn contended_host_allowances_have_their_measured_caps_and_keep_their_walls() {
+    fn contended_host_allowances_have_their_measured_caps_and_wall_backstops() {
         let mut expected = ESI_POLL_DEADLINE_TESTS
             .iter()
             .map(|(name, test)| {
@@ -2268,7 +3333,7 @@ mod tests {
                     "hermit-run::external_signal_interrupt",
                     *test,
                     *name,
-                    34,
+                    51,
                 )
             })
             .collect::<Vec<_>>();
@@ -2295,13 +3360,6 @@ mod tests {
                 36,
             ),
             (
-                "hermit-run",
-                "hermit-run::cli",
-                "a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take",
-                SIGNAL_DISCARD_WRAPPER_NAME,
-                33,
-            ),
-            (
                 "hermit-manifest-plan",
                 "hermit-manifest-plan::bin/test-harness",
                 "tests::the_parity_post_pass_changes_no_determinism_output_and_runs_no_guest",
@@ -2324,9 +3382,9 @@ mod tests {
             ),
             (
                 "hermit-run",
-                "hermit-run::cli",
-                "a_cross_process_sigkill_notification_verifies_at_bitwise_parity",
-                CROSS_PROCESS_SIGKILL_WRAPPER_NAME,
+                "hermit-run::deadline_slice_cap",
+                "skipped_slice_ends_survive_the_backstop",
+                LONE_BACKSTOP_WRAPPER_NAME,
                 34,
             ),
         ]);
@@ -2342,9 +3400,10 @@ mod tests {
             )
             .collect::<Vec<_>>();
         let inventory = measured_inventory(&identities);
-        let selected =
-            prepared_selected_cpu_allowances(true, || Ok(serde_json::to_vec(&inventory).unwrap()))
-                .unwrap();
+        let selected = prepared_selected_cpu_allowances(true, false, false, || {
+            Ok(serde_json::to_vec(&inventory).unwrap())
+        })
+        .unwrap();
         assert_eq!(selected.len(), expected.len());
         let names = MEASURED_CPU_ALLOWANCES
             .iter()
@@ -2377,24 +3436,36 @@ mod tests {
                 let overrides = doc["profile"]["default"]["overrides"]
                     .as_array_of_tables()
                     .unwrap();
-                assert!(
-                    !overrides
-                        .iter()
-                        .any(|r| r.contains_key("slow-timeout")
-                            && r["filter"].as_str() == Some(&filter)),
-                    "{filter} keeps the profile's wall"
+                // 8x policy: each contended allowance now carries its own
+                // wall backstop instead of keeping the profile wall.
+                let matching = overrides
+                    .iter()
+                    .filter(|r| {
+                        r.contains_key("slow-timeout") && r["filter"].as_str() == Some(&filter)
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(matching.len(), 1, "{filter}");
+                let wall_seconds =
+                    timeouts::scale_timeout_seconds(8 * *base, wall_multiplier, "wall multiplier")
+                        .unwrap();
+                assert_eq!(
+                    matching[0]["slow-timeout"]["period"].as_str(),
+                    Some(format!("{wall_seconds}s").as_str())
                 );
             }
         }
         assert!(
-            prepared_selected_cpu_allowances(false, || Ok(serde_json::to_vec(&inventory).unwrap()))
-                .unwrap()
-                .is_empty()
+            prepared_selected_cpu_allowances(false, false, false, || Ok(serde_json::to_vec(
+                &inventory
+            )
+            .unwrap()))
+            .unwrap()
+            .is_empty()
         );
     }
 
     #[test]
-    fn rr_thread_stress_has_its_measured_cap_and_keeps_its_wall() {
+    fn rr_thread_stress_has_its_measured_cap_and_wall_backstop() {
         let identity = nextest_cpu::AttemptIdentity {
             package: "hermit-run".into(),
             binary: "hermit-run::rr_suite".into(),
@@ -2402,13 +3473,14 @@ mod tests {
             attempt: 1,
         };
         let inventory = measured_inventory(std::slice::from_ref(&identity));
-        let selected =
-            prepared_selected_cpu_allowances(true, || Ok(serde_json::to_vec(&inventory).unwrap()))
-                .unwrap();
+        let selected = prepared_selected_cpu_allowances(true, false, false, || {
+            Ok(serde_json::to_vec(&inventory).unwrap())
+        })
+        .unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(
             (selected[0].cpu_seconds, selected[0].wall_seconds),
-            (34, None)
+            (34, Some(272))
         );
         for (cpu_multiplier, wall_multiplier) in [(1.0, 1.0), (1.25, 1.5)] {
             let rendered = scaled_config_with_allowances(
@@ -2425,23 +3497,30 @@ mod tests {
                 wrapper_argv(&doc, RR_THREAD_STRESS_WRAPPER_NAME)[2],
                 (cpu_seconds * 1_000_000).to_string()
             );
-            // No wall override: the test keeps the profile's wall bound.
+            // 8x policy: the test carries its own wall backstop.
             let filter = exact_filter(&identity);
-            assert!(
-                !doc["profile"]["default"]["overrides"]
-                    .as_array_of_tables()
-                    .unwrap()
-                    .iter()
-                    .any(
-                        |r| r.contains_key("slow-timeout") && r["filter"].as_str() == Some(&filter)
-                    )
+            let matching = doc["profile"]["default"]["overrides"]
+                .as_array_of_tables()
+                .unwrap()
+                .iter()
+                .filter(|r| r.contains_key("slow-timeout") && r["filter"].as_str() == Some(&filter))
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), 1);
+            let wall_seconds =
+                timeouts::scale_timeout_seconds(272, wall_multiplier, "wall multiplier").unwrap();
+            assert_eq!(
+                matching[0]["slow-timeout"]["period"].as_str(),
+                Some(format!("{wall_seconds}s").as_str())
             );
         }
         // Without prepared admission the test keeps the ordinary 22-second cap.
         assert!(
-            prepared_selected_cpu_allowances(false, || Ok(serde_json::to_vec(&inventory).unwrap()))
-                .unwrap()
-                .is_empty()
+            prepared_selected_cpu_allowances(false, false, false, || Ok(serde_json::to_vec(
+                &inventory
+            )
+            .unwrap()))
+            .unwrap()
+            .is_empty()
         );
     }
 
@@ -2458,56 +3537,80 @@ mod tests {
             "package(=hermit-run) & binary_id(=hermit-run::liteinst_allocator) & test(=genuine_detcore_leaf_keeps_scope_free_work_private)",
             "package(=hermit-run) & binary_id(=hermit-run::liteinst_stacks) & test(=cold_constructor::genuine_detcore_constructor_uses_retained_disjoint_bootstrap_stack)",
             "package(=hermit-run) & binary_id(=hermit-run::liteinst_allocator) & test(=genuine_standalone_leaf_keeps_scope_free_work_private)",
-            "package(=hermit-run) & binary_id(=hermit-run::cli) & test(=detcore_renders_its_procfs_files_on_every_backend)",
+            "package(=hermit-run) & binary_id(=hermit-run::cli) & test(=detcore_renders_its_procfs_files_on_dbt_as_on_ptrace)",
             "package(=hermit-run) & binary_id(=hermit-run::liteinst_stacks) & test(=genuine_detcore_reaches_fixed_guarded_callback_and_altstack)",
         ];
-        for mask in 0..(1 << names.len()) {
+        for mask in 0..(1u64 << names.len()) {
             let identities = MEASURED_CPU_ALLOWANCES
                 .iter()
                 .enumerate()
                 .rev()
-                .filter(|(index, _)| mask & (1 << index) != 0)
+                .filter(|(index, _)| mask & (1u64 << index) != 0)
                 .map(|(_, allowance)| allowance.identity())
                 .collect::<Vec<_>>();
             let bytes = serde_json::to_vec(&measured_inventory(&identities)).unwrap();
-            let selected = prepared_selected_cpu_allowances(true, || Ok(bytes)).unwrap();
+            let selected =
+                prepared_selected_cpu_allowances(true, false, false, || Ok(bytes)).unwrap();
             assert_eq!(selected.len(), identities.len());
-            for (cpu, wall, ordinary, measured, period, constructor_period, callback_period) in [
+            for (
+                cpu,
+                wall,
+                ordinary,
+                measured,
+                period,
+                constructor_period,
+                callback_period,
+                allocator_period,
+                standalone_period,
+                procfs_period,
+            ) in [
                 (
                     1.0,
                     1.0,
                     "22000000",
-                    ["32000000", "55000000", "33000000", "36000000", "51000000"],
-                    "57s",
-                    "165s",
-                    "153s",
+                    ["48000000", "55000000", "33000000", "36000000", "51000000"],
+                    "180s",
+                    "440s",
+                    "408s",
+                    "384s",
+                    "264s",
+                    "288s",
                 ),
                 (
                     1.25,
                     1.5,
                     "28000000",
-                    ["40000000", "69000000", "42000000", "45000000", "64000000"],
-                    "86s",
-                    "248s",
-                    "230s",
+                    ["60000000", "69000000", "42000000", "45000000", "64000000"],
+                    "270s",
+                    "660s",
+                    "612s",
+                    "576s",
+                    "396s",
+                    "432s",
                 ),
                 (
                     0.01,
                     0.1,
                     "1000000",
                     ["1000000", "1000000", "1000000", "1000000", "1000000"],
-                    "6s",
-                    "17s",
-                    "16s",
+                    "18s",
+                    "44s",
+                    "41s",
+                    "39s",
+                    "27s",
+                    "29s",
                 ),
                 (
                     1.0,
                     1.01,
                     "22000000",
-                    ["32000000", "55000000", "33000000", "36000000", "51000000"],
-                    "58s",
-                    "167s",
-                    "155s",
+                    ["48000000", "55000000", "33000000", "36000000", "51000000"],
+                    "182s",
+                    "445s",
+                    "413s",
+                    "388s",
+                    "267s",
+                    "291s",
                 ),
             ] {
                 let rendered = scaled_config_with_allowances(
@@ -2529,11 +3632,16 @@ mod tests {
                     .iter()
                     .filter(|entry| entry.contains_key("slow-timeout"))
                     .collect::<Vec<_>>();
-                assert_eq!(
-                    wall_overrides.len(),
-                    usize::from(mask & 2 != 0) + usize::from(mask & 16 != 0)
-                );
-                for (index, expected_period) in [(1, constructor_period), (4, callback_period)] {
+                // Every measured allowance carries a wall now (8x policy),
+                // so every selected identity renders an override.
+                assert_eq!(wall_overrides.len(), (mask & 31).count_ones() as usize);
+                for (index, expected_period) in [
+                    (0, allocator_period),
+                    (1, constructor_period),
+                    (2, standalone_period),
+                    (3, procfs_period),
+                    (4, callback_period),
+                ] {
                     let matches = wall_overrides
                         .iter()
                         .filter(|row| row["filter"].as_str() == Some(filters[index]))
@@ -2605,77 +3713,77 @@ mod tests {
             (
                 "artifact::tests::credits_exact_local_relative_got_route_and_direct_tailcall",
                 22,
-                66,
+                176,
             ),
             (
                 "artifact::tests::inline_endpoints_require_owned_allocator_allocation_methods",
                 22,
-                66,
+                176,
             ),
             (
                 "artifact::tests::missing_build_finished_is_a_failed_current_artifact_selection",
                 22,
-                66,
+                176,
             ),
             (
                 "artifact::tests::observed_integrated_detcore_e8_tls_whole_recipes",
                 22,
-                66,
+                176,
             ),
             (
                 "artifact::tests::refuses_new_or_unrecognized_guest_symbol_versions",
                 22,
-                66,
+                176,
             ),
             (
                 "artifact::tests::unresolved_or_preemptible_indirect_calls_do_not_earn_a_path",
                 22,
-                66,
+                176,
             ),
             (
                 "cold_constructor::caller_stack_samples_never_receive_constructor_placement_credit",
                 22,
-                66,
+                176,
             ),
             (
                 "cold_constructor::genuine_detcore_constructor_uses_retained_disjoint_bootstrap_stack",
                 55,
-                165,
+                440,
             ),
             (
                 "cold_constructor::later_guard_cannot_alias_the_retained_bootstrap_extent",
                 22,
-                66,
+                176,
             ),
             (
                 "genuine_detcore_reaches_fixed_guarded_callback_and_altstack",
                 51,
-                153,
+                408,
             ),
             (
                 "genuine_standalone_registers_fixed_guarded_altstack_without_continuation",
                 47,
-                141,
+                376,
             ),
             (
                 "inert_preload_does_not_reserve_or_register_runtime_stacks",
                 49,
-                147,
+                392,
             ),
             (
                 "stack_observation::tests::rejects_foreign_and_unreached_callback_records",
                 22,
-                66,
+                176,
             ),
             (
                 "stack_observation::tests::rejects_unprobed_and_readable_guards",
                 22,
-                66,
+                176,
             ),
             (
                 "standalone_altstack_disabled_receives_no_owned_stack_credit",
                 46,
-                138,
+                368,
             ),
         ];
         let identities = expected
@@ -2688,11 +3796,12 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let inventory = measured_inventory(&identities);
-        let selected =
-            prepared_selected_cpu_allowances(true, || Ok(serde_json::to_vec(&inventory).unwrap()))
-                .unwrap();
+        let selected = prepared_selected_cpu_allowances(true, false, false, || {
+            Ok(serde_json::to_vec(&inventory).unwrap())
+        })
+        .unwrap();
         assert_eq!(selected.len(), 15);
-        assert_eq!(MEASURED_CPU_ALLOWANCES.len(), 32);
+        assert_eq!(MEASURED_CPU_ALLOWANCES.len(), 45);
         for (cpu_multiplier, wall_multiplier) in [(1.0, 1.0), (1.25, 1.5), (0.01, 0.1)] {
             let rendered = scaled_config_with_allowances(
                 include_str!("../.config/nextest.toml"),
@@ -2766,10 +3875,9 @@ mod tests {
                         format!("{target}_extra")
                     };
                     assert!(
-                        prepared_selected_cpu_allowances(true, || Ok(serde_json::to_vec(
-                            &measured_inventory(&[neighbor])
-                        )
-                        .unwrap()))
+                        prepared_selected_cpu_allowances(true, false, false, || Ok(
+                            serde_json::to_vec(&measured_inventory(&[neighbor])).unwrap()
+                        ))
                         .unwrap()
                         .is_empty()
                     );
@@ -2785,10 +3893,9 @@ mod tests {
                     _ => {}
                 }
                 assert!(
-                    prepared_selected_cpu_allowances(state != 2, || Ok(serde_json::to_vec(
-                        &inventory
-                    )
-                    .unwrap()))
+                    prepared_selected_cpu_allowances(state != 2, false, false, || Ok(
+                        serde_json::to_vec(&inventory).unwrap()
+                    ))
                     .unwrap()
                     .is_empty()
                 );
@@ -2816,7 +3923,7 @@ mod tests {
         )
         .unwrap();
         let document = rendered.parse::<DocumentMut>().unwrap();
-        for (profile, old_period, old_index) in [("default", "75s", 2), ("ci", "113s", 1)] {
+        for (profile, old_period, old_index) in [("default", "75s", 3), ("ci", "113s", 1)] {
             let entries = document["profile"][profile]["overrides"]
                 .as_array_of_tables()
                 .unwrap();
@@ -2829,7 +3936,7 @@ mod tests {
             );
             assert_eq!(
                 entries.get(0).unwrap()["slow-timeout"]["period"].as_str(),
-                Some("207s")
+                Some("550s")
             );
             let previous = entries.get(old_index).unwrap();
             assert_eq!(previous["filter"].as_str(), Some("all()"));
@@ -2864,14 +3971,14 @@ mod tests {
         }
         let source =
             "[profile.default]\nslow-timeout = { period = \"200s\", terminate-after = 1 }\n";
-        // The actual constructor wall is 165*.34 -> 57, exactly CPU55+2:
-        // equality refuses, even though the original default200*.34 is ample.
+        // The actual constructor wall is 440*.12 -> 53, below CPU55+2:
+        // it refuses, even though the original default200*.12 is ample.
         assert!(
-            scaled_config_with_allowances(source, 0.34, wrapper, &selected)
+            scaled_config_with_allowances(source, 0.12, wrapper, &selected)
                 .unwrap_err()
                 .contains("(55s)")
         );
-        let rendered = scaled_config_with_allowances(source, 0.35, wrapper, &selected).unwrap();
+        let rendered = scaled_config_with_allowances(source, 0.13, wrapper, &selected).unwrap();
         let document = rendered.parse::<DocumentMut>().unwrap();
         assert_eq!(
             document["profile"]["default"]["overrides"]
@@ -2892,7 +3999,7 @@ mod tests {
                 .is_ok()
         );
         // Two owned tests do not inherit each other's CPU maxima: a 66s
-        // ordinary stack backstop may coexist with constructor CPU55/wall165.
+        // ordinary stack backstop may coexist with constructor CPU55/wall440.
         assert!(
             scaled_config_with_allowances(
                 source,
@@ -2907,7 +4014,7 @@ mod tests {
                 DETCORE_CONSTRUCTOR_CPU_SECONDS,
                 DETCORE_CONSTRUCTOR_WALL_SECONDS
             ),
-            (55, 165)
+            (55, 440)
         );
     }
 
@@ -2915,12 +4022,15 @@ mod tests {
     fn unoverridden_allowances_keep_strict_cpu_cleanup_separation_from_every_finite_wall() {
         let source =
             "[profile.default]\nslow-timeout = { period = \"57s\", terminate-after = 1 }\n";
-        // These allocator/procfs assertions and boundaries are unchanged.
+        // No shipped allowance is wall-less any more (8x policy), so the
+        // wall-less separation rule is exercised on synthetic copies of the
+        // standalone-allocator/procfs allowances with the wall removed.
         for (allowance, seconds, cutoff, first_pass, collision, separated, period) in [
-            (MEASURED_CPU_ALLOWANCES[0], 32, 34, 35, 0.7, 0.8, "46s"),
             (MEASURED_CPU_ALLOWANCES[2], 33, 35, 36, 0.75, 0.8, "46s"),
             (MEASURED_CPU_ALLOWANCES[3], 36, 38, 39, 0.8, 0.85, "49s"),
         ] {
+            let mut allowance = allowance;
+            allowance.wall_seconds = None;
             assert_eq!(allowance.cpu_seconds, seconds);
             assert!(allowance.wall_seconds.is_none());
             for source in [
@@ -2980,23 +4090,29 @@ mod tests {
                 );
             }
         }
-        // The largest non-owned cap remains36 regardless of the stack rows.
-        let mut reversed = MEASURED_CPU_ALLOWANCES.to_vec();
-        reversed.reverse();
-        for selected in [MEASURED_CPU_ALLOWANCES.as_slice(), reversed.as_slice()] {
+        // The largest cap remains 51 regardless of the stack rows (the
+        // recalibrated poll-deadline cap; see ESI_POLL_DEADLINE_CPU_SECONDS).
+        // All shipped allowances are owned now, so exercise the wall-less
+        // separation on a synthetic copy of the 51 s poll-deadline allowance.
+        let mut poll_deadline = *MEASURED_CPU_ALLOWANCES
+            .iter()
+            .find(|a| a.cpu_seconds == ESI_POLL_DEADLINE_CPU_SECONDS)
+            .unwrap();
+        poll_deadline.wall_seconds = None;
+        for selected in [&[poll_deadline][..]] {
             assert!(
                 scaled_config_with_allowances(
-                    &source.replace("57s", "38s"),
+                    &source.replace("57s", "53s"),
                     1.0,
                     Some((Path::new("/fixture/wrapper"), 1.0)),
                     selected
                 )
                 .unwrap_err()
-                .contains("(36s)")
+                .contains("(51s)")
             );
             assert!(
                 scaled_config_with_allowances(
-                    &source.replace("57s", "39s"),
+                    &source.replace("57s", "54s"),
                     1.0,
                     Some((Path::new("/fixture/wrapper"), 1.0)),
                     selected
@@ -3043,7 +4159,8 @@ mod tests {
         }
         for identity in identities {
             let bytes = serde_json::to_vec(&allocator_inventory(&identity)).unwrap();
-            let selected = prepared_selected_cpu_allowances(true, || Ok(bytes)).unwrap();
+            let selected =
+                prepared_selected_cpu_allowances(true, false, false, || Ok(bytes)).unwrap();
             assert_eq!(
                 selected
                     .iter()
@@ -3116,30 +4233,36 @@ mod tests {
             }
             let bytes = serde_json::to_vec(&inventory).unwrap();
             assert!(
-                prepared_selected_cpu_allowances(true, || Ok(bytes))
+                prepared_selected_cpu_allowances(true, false, false, || Ok(bytes))
                     .unwrap()
                     .is_empty()
             );
         }
         assert!(
-            prepared_selected_cpu_allowances(true, || Ok(br#"{"rust-suites":{}}"#.to_vec()))
-                .unwrap()
-                .is_empty()
+            prepared_selected_cpu_allowances(true, false, false, || Ok(
+                br#"{"rust-suites":{}}"#.to_vec()
+            ))
+            .unwrap()
+            .is_empty()
         );
         // The old null-context caller never consumed its unused inventory. Its
         // malformed or missing input must stay unused when not prepared.
         assert!(
-            prepared_selected_cpu_allowances(false, || panic!("legacy inventory read"))
-                .unwrap()
-                .is_empty()
+            prepared_selected_cpu_allowances(false, false, false, || panic!(
+                "legacy inventory read"
+            ))
+            .unwrap()
+            .is_empty()
         );
         assert!(
-            prepared_selected_cpu_allowances(false, || Err("missing inventory".into()))
-                .unwrap()
-                .is_empty()
+            prepared_selected_cpu_allowances(false, false, false, || Err(
+                "missing inventory".into()
+            ))
+            .unwrap()
+            .is_empty()
         );
         assert!(
-            prepared_selected_cpu_allowances(false, || Ok(b"malformed".to_vec()))
+            prepared_selected_cpu_allowances(false, false, false, || Ok(b"malformed".to_vec()))
                 .unwrap()
                 .is_empty()
         );
@@ -3156,10 +4279,19 @@ mod tests {
     #[test]
     fn prepared_inventory_refuses_missing_malformed_and_ambiguous_binary_evidence() {
         assert!(
-            prepared_selected_cpu_allowances(true, || Err("missing inventory".into())).is_err()
+            prepared_selected_cpu_allowances(
+                true,
+                false,
+                false,
+                || Err("missing inventory".into())
+            )
+            .is_err()
         );
         for bytes in [b"malformed".as_slice(), b"{}".as_slice()] {
-            assert!(prepared_selected_cpu_allowances(true, || Ok(bytes.to_vec())).is_err());
+            assert!(
+                prepared_selected_cpu_allowances(true, false, false, || Ok(bytes.to_vec()))
+                    .is_err()
+            );
         }
         let target = detcore_allocator_identity();
         let original = allocator_inventory(&target);
@@ -3183,7 +4315,7 @@ mod tests {
             }
             let bytes = serde_json::to_vec(&inventory).unwrap();
             assert!(
-                prepared_selected_cpu_allowances(true, || Ok(bytes)).is_err(),
+                prepared_selected_cpu_allowances(true, false, false, || Ok(bytes)).is_err(),
                 "defect {defect}"
             );
         }
@@ -3195,8 +4327,8 @@ mod tests {
         let exact = "package(=hermit-run) & binary_id(=hermit-run::liteinst_allocator) & test(=genuine_detcore_leaf_keeps_scope_free_work_private)";
         let path = "/tmp/a path/it's-$(literal)-wrapper";
         for (multiplier, ordinary, detcore) in [
-            (1.0, "22000000", "32000000"),
-            (1.25, "28000000", "40000000"),
+            (1.0, "22000000", "48000000"),
+            (1.25, "28000000", "60000000"),
             (0.01, "1000000", "1000000"),
         ] {
             let rendered = scaled_config_with_allocator(
@@ -3263,7 +4395,7 @@ mod tests {
                     .count(),
                 1
             );
-            assert!(rendered.contains("period = \"57s\""));
+            assert!(rendered.contains("period = \"180s\""));
         }
     }
 
@@ -3271,7 +4403,9 @@ mod tests {
     fn larger_allocator_cpu_and_grace_must_fit_every_scaled_finite_wall_bound() {
         let source =
             "[profile.default]\nslow-timeout = { period = \"57s\", terminate-after = 1 }\n";
-        // The ordinary 22+2 fits 34, but admitted 32+2 must be strictly below it.
+        // The ordinary 22+2 fits 34. The admitted allocator carries its own
+        // 384s wall backstop (8x its 48s CPU cap), checked against its own CPU
+        // plus grace, so a short default wall no longer refuses it.
         let short = source.replace("57s", "34s");
         assert!(scaled_config(&short, 1.0, Some((Path::new("/fixture/wrapper"), 1.0))).is_ok());
         assert!(
@@ -3281,12 +4415,13 @@ mod tests {
                 Some((Path::new("/fixture/wrapper"), 1.0)),
                 true
             )
-            .unwrap_err()
-            .contains("32s")
+            .is_ok()
         );
         let shorter_override = format!(
             "{source}[[profile.ci.overrides]]\nfilter = \"test(short)\"\nslow-timeout = {{ period = \"34s\", terminate-after = 1 }}\n"
         );
+        // The allocator's owned wall rides in the ci overrides too, so the
+        // short foreign override no longer bounds it.
         assert!(
             scaled_config_with_allocator(
                 &shorter_override,
@@ -3294,9 +4429,9 @@ mod tests {
                 Some((Path::new("/fixture/wrapper"), 1.0)),
                 true
             )
-            .is_err()
+            .is_ok()
         );
-        for multiplier in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::MAX, 1e12, 2.0] {
+        for multiplier in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::MAX, 1e12] {
             assert!(
                 scaled_config_with_allocator(
                     source,
@@ -3307,7 +4442,19 @@ mod tests {
                 .is_err()
             );
         }
-        // CPU scaling: 32*1.25 -> 40; wall rounds 57*.7 -> 40, below 40+2.
+        // At CPU multiplier 2.0 the scaled CPU is 64s; the owned 96s wall
+        // still exceeds it plus grace, so the config is admitted.
+        assert!(
+            scaled_config_with_allocator(
+                source,
+                1.0,
+                Some((Path::new("/fixture/wrapper"), 2.0)),
+                true
+            )
+            .is_ok()
+        );
+        // CPU scaling: 32*1.25 -> 40; the owned wall scales 96*.7 -> 68,
+        // above 40+2, so the scaled config is admitted.
         assert!(
             scaled_config_with_allocator(
                 source,
@@ -3315,7 +4462,7 @@ mod tests {
                 Some((Path::new("/fixture/wrapper"), 1.25)),
                 true
             )
-            .is_err()
+            .is_ok()
         );
         assert!(
             scaled_config_with_allocator(
@@ -3327,6 +4474,9 @@ mod tests {
             .unwrap()
             .contains("period = \"72s\"")
         );
+        // A warning-only default (no terminate-after) is not a finite wall
+        // bound; with an owned wall selected it now refuses instead of
+        // silently dropping the backstop.
         let warning = "[profile.default]\nslow-timeout = { period = \"1s\" }\n";
         assert!(
             scaled_config_with_allocator(
@@ -3335,7 +4485,8 @@ mod tests {
                 Some((Path::new("/fixture/wrapper"), 1.0)),
                 true
             )
-            .is_ok()
+            .unwrap_err()
+            .contains("finite default timeout")
         );
     }
 
@@ -3344,7 +4495,7 @@ mod tests {
         for admitted in [false, true] {
             for profile in ["default", "ci"] {
                 let source = format!(
-                    "[profile.default]\nslow-timeout = {{ period = \"57s\" }}\n[[profile.{profile}.scripts]]\nfilter = \"all()\"\nrun-wrapper = \"other\"\n"
+                    "[profile.default]\nslow-timeout = {{ period = \"57s\", terminate-after = 1 }}\n[[profile.{profile}.scripts]]\nfilter = \"all()\"\nrun-wrapper = \"other\"\n"
                 );
                 assert!(
                     scaled_config_with_allocator(
@@ -3366,7 +4517,7 @@ mod tests {
                 DETCORE_STACK_WRAPPER_NAME,
             ] {
                 let source = format!(
-                    "[profile.default]\nslow-timeout = {{ period = \"57s\" }}\n[scripts.wrapper.{name}]\ntarget-runner = \"within-wrapper\"\ncommand = {{ command-line = [\"/other\"], relative-to = \"none\" }}\n"
+                    "[profile.default]\nslow-timeout = {{ period = \"57s\", terminate-after = 1 }}\n[scripts.wrapper.{name}]\ntarget-runner = \"within-wrapper\"\ncommand = {{ command-line = [\"/other\"], relative-to = \"none\" }}\n"
                 );
                 assert!(
                     scaled_config_with_allocator(
@@ -3397,20 +4548,36 @@ mod tests {
         let inventory =
             serde_json::to_vec(&allocator_inventory(&detcore_allocator_identity())).unwrap();
         assert_eq!(
-            prepared_selected_cpu_allowances(true, || Ok(inventory.clone()))
+            prepared_selected_cpu_allowances(true, false, false, || Ok(inventory.clone()))
                 .unwrap()
                 .len(),
             1
         );
         let (_, context, _) = budget_fixture();
         assert!(
-            resolve_budgets(&inventory, context, None, 1, 0, 1.0, 1.0)
-                .unwrap_err()
-                .contains("regular calibration cannot cover the hermit package")
+            resolve_budgets(
+                &inventory,
+                context,
+                None,
+                1,
+                0,
+                BudgetMultipliers {
+                    cpu: 1.0,
+                    wall: 1.0
+                },
+                &[],
+            )
+            .unwrap_err()
+            .contains("regular calibration cannot cover the hermit package")
         );
+        // The 32s formula bound over the quiet-host maximum (20_754_169us)
+        // was censored repeatedly inside full validates, so the cap is the
+        // conservative ceil(1.5 * 32) over that censored observation, not
+        // a formula bound over a completed maximum.
+        assert_eq!(DETCORE_ALLOCATOR_CPU_SECONDS, 48);
         assert_eq!(
-            DETCORE_ALLOCATOR_CPU_SECONDS,
-            timeouts::cpu_bound_from_p90_usec(20_754_169)
+            DETCORE_ALLOCATOR_WALL_SECONDS,
+            8 * DETCORE_ALLOCATOR_CPU_SECONDS
         );
     }
 }

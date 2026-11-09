@@ -51,9 +51,11 @@ static int check_environment(void) {
       "HOME",
       "HOSTNAME",
       "LC_ALL",
+      "LOGNAME",
       "LSAN_OPTIONS",
       "PATH",
       "TZ",
+      "USER",
       "XDG_CONFIG_HOME",
   };
   int seen[sizeof(expected) / sizeof(expected[0])] = {0};
@@ -99,8 +101,10 @@ static int check_environment(void) {
           0 ||
       strcmp(environment_value("ASAN_OPTIONS"), "detect_leaks=0") != 0 ||
       strcmp(environment_value("LC_ALL"), "C") != 0 ||
+      strcmp(environment_value("LOGNAME"), "root") != 0 ||
       strcmp(environment_value("LSAN_OPTIONS"), "detect_leaks=0") != 0 ||
       strcmp(environment_value("TZ"), "UTC") != 0 ||
+      strcmp(environment_value("USER"), "root") != 0 ||
       strcmp(environment_value("E2E_TMPDIR"), "/test") != 0) {
     return fail("environment contains an unexpected fixed value");
   }

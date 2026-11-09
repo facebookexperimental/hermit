@@ -1,0 +1,184 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under both the MIT license found in the
+# LICENSE-MIT file in the root directory of this source tree and the Apache
+# License, Version 2.0 found in the LICENSE-APACHE file in the root directory
+# of this source tree.
+
+load("@prelude//tests:test_toolchain.bzl", "noop_test_toolchain")
+load("@prelude//toolchains:cxx.bzl", "system_cxx_toolchain")
+load("@prelude//toolchains:genrule.bzl", "system_genrule_toolchain")
+load("@prelude//toolchains:go.bzl", "system_go_bootstrap_toolchain", "system_go_toolchain")
+load("@prelude//toolchains:haskell.bzl", "system_haskell_toolchain")
+load("@prelude//toolchains:ocaml.bzl", "system_ocaml_toolchain")
+load("@prelude//toolchains:python.bzl", "system_python_bootstrap_toolchain", "system_python_toolchain")
+load("@prelude//toolchains:remote_test_execution.bzl", "remote_test_execution_toolchain")
+load("@prelude//toolchains:rust.bzl", "system_rust_toolchain")
+load("//platforms:defs.bzl", "hermit_input_rust_toolchain", "remote_linking_cxx_toolchain")
+
+oncall("open_source")
+
+# hermit.rust_sysroot names a directory under shim/ holding hermit's pinned rust
+# toolchain (staged by shim/modes/stage-rust-sysroot). When set (the RE modes,
+# shim/modes/hybrid and remote), rustc travels with every action as an input, which
+# Remote Execution needs; otherwise the system (rustup) rustc on PATH is used, as before.
+_RUST_SYSROOT = read_config("hermit", "rust_sysroot", "")
+
+# These flags reproduce Cargo's default release profile (the workspace
+# declares no [profile.release]) for the target dependency closure, while host
+# build scripts/proc macros keep their execution configuration. Measured with this
+# toolchain, Cargo's release rustc line carries -Copt-level=3,
+# -Cembed-bitcode=no and, on the final binary, -Cstrip=debuginfo; the other
+# values below are rustc's implicit defaults at opt-level 3. Cargo's default
+# `lto = false` passes no -Clto flag, leaving rustc's thin local LTO in
+# effect, so none appears here: -Clto=off would be `lto = "off"`, different
+# code generation. The one difference is -Cstrip=none, which keeps the
+# precompiled std debuginfo at link time and does not change generated code.
+# The dedicated configured platform below gives Buck the same split without
+# changing the default Hermit target or its dependency graph.
+HERMIT_RELEASE_RUSTC_FLAGS = [
+    "-Ccodegen-units=16",
+    "-Cdebuginfo=0",
+    "-Cdebug-assertions=no",
+    "-Cembed-bitcode=no",
+    "-Copt-level=3",
+    "-Coverflow-checks=no",
+    "-Cpanic=unwind",
+    "-Cstrip=none",
+]
+
+constraint_setting(
+    name = "hermit_rust_profile",
+    visibility = ["PUBLIC"],
+)
+
+constraint_value(
+    name = "hermit_rust_release",
+    constraint_setting = ":hermit_rust_profile",
+    visibility = ["PUBLIC"],
+)
+
+config_setting(
+    name = "hermit_rust_release_enabled",
+    constraint_values = [":hermit_rust_release"],
+)
+
+platform(
+    name = "hermit_rust_release_platform",
+    constraint_values = [":hermit_rust_release"],
+    deps = ["prelude//platforms:default"],
+    visibility = ["PUBLIC"],
+)
+
+# Under the RE modes (hermit.rust_sysroot set) links and archives may run remotely too;
+# see remote_linking_cxx_toolchain.
+[
+    remote_linking_cxx_toolchain(
+        name = "cxx",
+        base = ":cxx-system",
+        visibility = ["PUBLIC"],
+    )
+    for _ in ([None] if _RUST_SYSROOT else [])
+]
+
+system_cxx_toolchain(
+    name = "cxx-system" if _RUST_SYSROOT else "cxx",
+    compiler = "gcc",
+    # `compiler_type = "gcc"` is required in addition to the compiler
+    # binary names. The prelude gates many flags on `compiler_type`
+    # rather than the binary name (e.g. `prelude/cxx/compiler.bzl` adds
+    # `-Xclang -fdebug-compilation-dir ... -fcolor-diagnostics` only when
+    # `compiler_type in ["clang", ...]`). Without this, gcc is invoked
+    # with clang-only flags and rejects them.
+    compiler_type = "gcc",
+    cxx_compiler = "g++",
+    cxx_flags = ["-std=c++20"],
+    # The sandcastle OSS-bootstrap environment has `gcc`/`g++` on PATH but
+    # not `clang`/`clang++` or `lld`, which are the defaults pulled in by
+    # `prelude//toolchains/cxx/clang:path_clang_tools`. Using `g++` as the
+    # linker also causes `prelude/toolchains/cxx.bzl` to drop its
+    # automatic `-fuse-ld=lld` link flag (see the g++-gated branch there),
+    # so we don't need lld either.
+    linker = "g++",
+    visibility = ["PUBLIC"],
+)
+
+system_genrule_toolchain(
+    name = "genrule",
+    visibility = ["PUBLIC"],
+)
+
+system_go_toolchain(
+    name = "go",
+    visibility = ["PUBLIC"],
+)
+
+system_go_bootstrap_toolchain(
+    name = "go_bootstrap",
+    visibility = ["PUBLIC"],
+)
+
+system_haskell_toolchain(
+    name = "haskell",
+    visibility = ["PUBLIC"],
+)
+
+system_ocaml_toolchain(
+    name = "ocaml",
+    visibility = ["PUBLIC"],
+)
+
+system_python_toolchain(
+    name = "python",
+    visibility = ["PUBLIC"],
+)
+
+system_python_bootstrap_toolchain(
+    name = "python_bootstrap",
+    visibility = ["PUBLIC"],
+)
+
+_RUST_RELEASE_FLAGS = select({
+    ":hermit_rust_release_enabled": HERMIT_RELEASE_RUSTC_FLAGS,
+    "DEFAULT": [],
+})
+
+
+[
+    export_file(
+        name = "rust-sysroot",
+        src = _RUST_SYSROOT,
+    )
+    for _ in ([None] if _RUST_SYSROOT else [])
+]
+
+[
+    hermit_input_rust_toolchain(
+        name = "rust",
+        default_edition = "2024",
+        rustc_flags = _RUST_RELEASE_FLAGS,
+        sysroot = ":rust-sysroot",
+        visibility = ["PUBLIC"],
+    )
+    for _ in ([None] if _RUST_SYSROOT else [])
+]
+
+[
+    system_rust_toolchain(
+        name = "rust",
+        default_edition = "2024",
+        rustc_flags = _RUST_RELEASE_FLAGS,
+        visibility = ["PUBLIC"],
+    )
+    for _ in ([] if _RUST_SYSROOT else [None])
+]
+
+remote_test_execution_toolchain(
+    name = "remote_test_execution",
+    visibility = ["PUBLIC"],
+)
+
+noop_test_toolchain(
+    name = "test",
+    visibility = ["PUBLIC"],
+)

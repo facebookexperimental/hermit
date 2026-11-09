@@ -139,12 +139,37 @@ fn find_sortable_range(perm: &[usize], max_index: usize) -> Range<usize> {
     }
 }
 
+/// The states a bubble sort of a permutation passes through, one adjacent swap
+/// at a time: cursor 0 is the permutation itself and cursor
+/// [`Self::swap_distance`] is sorted order.
+///
+/// No swap is recorded. A state is rebuilt from the permutation's inversion
+/// table, which counts the larger values before each value. A bubble sort pass
+/// moves every value that has a larger one before it one place left, past
+/// exactly one larger value, so it lowers each nonzero entry of the table by
+/// one (Knuth, The Art of Computer Programming, Vol. 3, section 5.2.2). The
+/// state after `k` swaps is therefore the permutation whose table is the
+/// original one less the passes those swaps complete, followed by the first
+/// swaps of the next pass. That keeps memory linear in the permutation and
+/// costs `O(n log n)` per move, where a record of every swap grows with the
+/// square of its length: two schedules of a few million events can be
+/// trillions of swaps apart.
 pub struct BubbleSortIter<'a, T> {
     perm: Vec<usize>,
     source: &'a [T],
-    swap_history: Vec<(usize, usize)>,
-    history_size: usize,
-    history_cursor: usize,
+    /// The part of `perm` the sort reorders; the rest is already in place.
+    sortable: Range<usize>,
+    /// The values of `perm[sortable]` in ascending order: a value's rank is
+    /// its index here.
+    ranked: Vec<usize>,
+    /// For each rank, how many larger values precede it in the unsorted
+    /// permutation.
+    larger_before: Vec<usize>,
+    /// `at_least[p]`: how many values have at least `p` larger values before
+    /// them, so pass `p` of the sort makes `at_least[p]` swaps.
+    at_least: Vec<usize>,
+    swap_count: usize,
+    cursor: usize,
     unused_value_count: usize,
 }
 
@@ -152,18 +177,40 @@ impl<'a, T> BubbleSortIter<'a, T>
 where
     T: Hash + Eq,
 {
-    fn new(
-        perm: Vec<usize>,
-        source: &'a [T],
-        swap_history: Vec<(usize, usize)>,
-        unused_value_count: usize,
-    ) -> Self {
+    /// The sort of `perm`, positioned at its end (sorted order).
+    fn new(mut perm: Vec<usize>, source: &'a [T], unused_value_count: usize) -> Self {
+        let sortable = find_sortable_range(&perm, source.len().saturating_sub(1));
+        let unsorted = &mut perm[sortable.clone()];
+        let mut ranked = unsorted.to_vec();
+        ranked.sort_unstable();
+        let mut larger_before = vec![0; unsorted.len()];
+        let mut seen = Fenwick::zeros(unsorted.len());
+        for (preceding, value) in unsorted.iter().enumerate() {
+            let rank = ranked
+                .binary_search(value)
+                .expect("every value of the permutation is ranked");
+            larger_before[rank] = preceding - seen.count_before(rank);
+            seen.add(rank);
+        }
+        let deepest = larger_before.iter().copied().max().unwrap_or(0);
+        let mut at_least = vec![0; deepest + 2];
+        for &larger in &larger_before {
+            at_least[larger] += 1;
+        }
+        for p in (0..=deepest).rev() {
+            at_least[p] += at_least[p + 1];
+        }
+        let swap_count = larger_before.iter().sum();
+        unsorted.copy_from_slice(&ranked);
         BubbleSortIter {
             perm,
             source,
-            history_size: swap_history.len(),
-            history_cursor: swap_history.len(),
-            swap_history,
+            sortable,
+            ranked,
+            larger_before,
+            at_least,
+            swap_count,
+            cursor: swap_count,
             unused_value_count,
         }
     }
@@ -172,45 +219,38 @@ where
     /// swap distance because any elements that appear in one slice, but not the other will
     /// not contribute to the swap distance
     pub fn edit_distance(&self) -> usize {
-        self.history_size + self.unused_value_count
+        self.swap_count + self.unused_value_count
     }
 
     /// Number of swaps take to permute the source slice into the target slice when values
     /// not accounting for items that appear in one slice, but not the other
     pub fn swap_distance(&self) -> usize {
-        self.history_size
+        self.swap_count
     }
 
+    /// The state one swap further toward sorted order. Each step rebuilds
+    /// the state, in `O(n log n)`, as every move does.
     pub fn next<'b>(&'b mut self) -> Option<Perm<'a, 'b, T>> {
-        (self.history_cursor < self.history_size).then(|| {
-            let swap = self.swap_history[self.history_cursor];
-            self.perm.swap(swap.0, swap.1);
-            self.history_cursor += 1;
-
+        (self.cursor < self.swap_count).then(|| {
+            self.seek(self.cursor + 1);
             self.current()
         })
     }
 
     pub fn skip(&mut self, distance: usize) {
-        for _ in 0..distance {
-            let _ = self.next();
-        }
+        self.seek(self.cursor.saturating_add(distance));
     }
 
+    /// The state one swap back toward the permutation, in `O(n log n)`.
     pub fn next_back<'b>(&'b mut self) -> Option<Perm<'a, 'b, T>> {
-        (self.history_cursor > 0).then(|| {
-            self.history_cursor -= 1;
-            let swap = self.swap_history[self.history_cursor];
-            self.perm.swap(swap.0, swap.1);
-
+        (self.cursor > 0).then(|| {
+            self.seek(self.cursor - 1);
             self.current()
         })
     }
 
     pub fn skip_back(&mut self, distance: usize) {
-        for _ in 0..distance {
-            let _ = self.next_back();
-        }
+        self.seek(self.cursor.saturating_sub(distance));
     }
 
     pub fn current<'b>(&'b self) -> Perm<'a, 'b, T> {
@@ -218,27 +258,61 @@ where
     }
 
     pub fn midpoint<'b>(&'b mut self) -> Perm<'a, 'b, T> {
-        let m = self.history_size / 2;
-        if m > self.history_cursor {
-            self.skip(m - self.history_cursor);
-        } else {
-            self.skip_back(self.history_cursor - m);
-        }
+        self.seek(self.swap_count / 2);
         self.current()
     }
 
     pub fn interpolate<'b>(&'b mut self, interpolate_percentage: u8) -> Perm<'a, 'b, T> {
-        let m = (self.history_size * (interpolate_percentage as usize)) / 100;
-        if m > self.history_cursor {
-            self.skip(m - self.history_cursor);
-        } else {
-            self.skip_back(self.history_cursor - m);
-        }
+        self.seek((self.swap_count * (interpolate_percentage as usize)) / 100);
         self.current()
     }
 
     pub fn history_size(&self) -> usize {
-        self.history_size
+        self.swap_count
+    }
+
+    /// Move to the state after the sort's first `swaps` swaps, or to its end
+    /// if it makes fewer.
+    fn seek(&mut self, swaps: usize) {
+        let swaps = swaps.min(self.swap_count);
+        if swaps == self.cursor {
+            return;
+        }
+        let (passes, partial) = self.passes_within(swaps);
+        let state = &mut self.perm[self.sortable.clone()];
+        // Values are placed in ascending order. After `passes` passes, each
+        // still has `larger` larger values before it, and those are exactly
+        // the free slots before its own, as every smaller value is placed.
+        let mut free = Fenwick::ones(state.len());
+        for (rank, &value) in self.ranked.iter().enumerate() {
+            let larger = self.larger_before[rank].saturating_sub(passes);
+            let slot = free.nth(larger);
+            free.remove(slot);
+            state[slot] = value;
+        }
+        let mut left = partial;
+        let mut j = 0;
+        while left > 0 {
+            if state[j] > state[j + 1] {
+                state.swap(j, j + 1);
+                left -= 1;
+            }
+            j += 1;
+        }
+        self.cursor = swaps;
+    }
+
+    /// How many passes the sort's first `swaps` swaps complete, and how many
+    /// swaps of the next pass they include. Pass `p + 1` makes one swap for
+    /// each value with more than `p` larger values before it.
+    fn passes_within(&self, swaps: usize) -> (usize, usize) {
+        let deepest = self.at_least.len() - 2;
+        let (mut passes, mut done) = (0, 0);
+        while passes < deepest && done + self.at_least[passes + 1] <= swaps {
+            done += self.at_least[passes + 1];
+            passes += 1;
+        }
+        (passes, swaps - done)
     }
 }
 
@@ -273,48 +347,84 @@ where
     }
 }
 
-/// Perform the bubble sort algorithm and return the record of each pairwise swap to perform
-/// the sort
-fn bubble_sort_history<T>(perm: &mut [usize], source: &[T]) -> Vec<(usize, usize)> {
-    let mut history = vec![];
-    let sortable_range = find_sortable_range(perm, source.len() - 1);
-    let index_offset = sortable_range.start;
-    let sortable_slice = &mut perm[sortable_range];
-    let size = sortable_slice.len();
+/// A binary indexed (Fenwick) tree of counts over the slots `0..len`: it
+/// counts the marked slots before a slot, and finds the slot of the `n`th
+/// marked one, each in `O(log len)`.
+struct Fenwick(Vec<usize>);
 
-    if size == 0 {
-        return history;
+/// The lowest set bit of a tree node's index, nonzero: the size of the range
+/// the node sums.
+fn lowest_bit(node: usize) -> usize {
+    1 << node.trailing_zeros()
+}
+
+impl Fenwick {
+    /// No slot marked.
+    fn zeros(len: usize) -> Self {
+        Fenwick(vec![0; len + 1])
     }
 
-    for i in 0..(size - 1) {
-        let mut swapped = false;
-        for j in 0..(size - i - 1) {
-            if sortable_slice[j] > sortable_slice[j + 1] {
-                // swapping occurs if elements
-                // are not in the intended order
-                // this is save because both the
-                sortable_slice.swap(j, j + 1);
-
-                history.push((index_offset + j, index_offset + j + 1));
-                swapped = true;
+    /// Every slot marked.
+    fn ones(len: usize) -> Self {
+        let mut tree = vec![1; len + 1];
+        tree[0] = 0;
+        for node in 1..=len {
+            let parent = node + lowest_bit(node);
+            if parent <= len {
+                tree[parent] += tree[node];
             }
         }
+        Fenwick(tree)
+    }
 
-        // no swapping means the array is already sorted
-        // so no need for further comparison
-        if !swapped {
-            break;
+    fn add(&mut self, slot: usize) {
+        let mut node = slot + 1;
+        while node < self.0.len() {
+            self.0[node] += 1;
+            node += lowest_bit(node);
         }
     }
 
-    history
+    fn remove(&mut self, slot: usize) {
+        let mut node = slot + 1;
+        while node < self.0.len() {
+            self.0[node] -= 1;
+            node += lowest_bit(node);
+        }
+    }
+
+    /// How many marked slots precede `slot`.
+    fn count_before(&self, slot: usize) -> usize {
+        let mut node = slot;
+        let mut count = 0;
+        while node > 0 {
+            count += self.0[node];
+            node -= lowest_bit(node);
+        }
+        count
+    }
+
+    /// The marked slot with exactly `n` marked slots before it.
+    fn nth(&self, n: usize) -> usize {
+        let mut slot = 0;
+        let mut rest = n;
+        let mut step = (self.0.len() - 1).checked_ilog2().map_or(0, |log| 1 << log);
+        while step > 0 {
+            if slot + step < self.0.len() && self.0[slot + step] <= rest {
+                slot += step;
+                rest -= self.0[slot];
+            }
+            step >>= 1;
+        }
+        slot
+    }
 }
 
 pub fn bubble_sort_distance<T>(source: &[T], target: &[T]) -> usize
 where
     T: PartialEq + Hash + Eq + Debug + Clone + Copy + 'static,
 {
-    iterable_bubble_sort(source, target).history_size
+    iterable_bubble_sort(source, target).swap_count
 }
 
 pub fn iterable_bubble_sort_from_perm<T>(
@@ -325,16 +435,14 @@ where
     T: Hash + Eq,
 {
     let PermutationResult {
-        mut perm,
+        perm,
         unmatched_source_indices,
         unmatched_target_indices,
     } = permutation_result;
 
-    let history = bubble_sort_history(&mut perm, source);
-
     let unused_values = unmatched_source_indices.len() + unmatched_target_indices.len();
 
-    BubbleSortIter::new(perm, source, history, unused_values)
+    BubbleSortIter::new(perm, source, unused_values)
 }
 
 pub fn iterable_bubble_sort<'a, T>(source: &'a [T], target: &'a [T]) -> BubbleSortIter<'a, T>
@@ -483,6 +591,208 @@ mod tests {
         let mut it = iterable_bubble_sort(b"baaaa", b"aaaab");
 
         assert_perm_eq!("aabaa", it.midpoint());
+    }
+
+    /// Every state of the bubble sort of `perm`, from `perm` itself to sorted
+    /// order, as the sort was first written: swap by swap, keeping each one.
+    fn recorded_states(perm: &[usize]) -> Vec<Vec<usize>> {
+        let mut perm = perm.to_vec();
+        let mut states = vec![perm.clone()];
+        for pass in 0..perm.len().saturating_sub(1) {
+            let mut swapped = false;
+            for j in 0..perm.len() - pass - 1 {
+                if perm[j] > perm[j + 1] {
+                    perm.swap(j, j + 1);
+                    states.push(perm.clone());
+                    swapped = true;
+                }
+            }
+            if !swapped {
+                break;
+            }
+        }
+        states
+    }
+
+    /// Every order of `values`.
+    fn orders(values: &[usize]) -> Vec<Vec<usize>> {
+        if values.is_empty() {
+            return vec![vec![]];
+        }
+        (0..values.len())
+            .flat_map(|first| {
+                let mut rest = values.to_vec();
+                let head = rest.remove(first);
+                orders(&rest).into_iter().map(move |mut order| {
+                    order.insert(0, head);
+                    order
+                })
+            })
+            .collect()
+    }
+
+    /// The sort of `perm` (over `source`) is at the recorded sort's state
+    /// after as many swaps at every cursor: walking back from sorted order,
+    /// forward again, and seeking each percentage and the midpoint.
+    fn assert_states_are_the_recorded_sorts(source: &[()], perm: Vec<usize>) {
+        let states = recorded_states(&perm);
+        let swaps = states.len() - 1;
+        let mut sort = iterable_bubble_sort_from_perm(
+            source,
+            PermutationResult {
+                perm: perm.clone(),
+                unmatched_source_indices: vec![],
+                unmatched_target_indices: vec![],
+            },
+        );
+        assert_eq!(sort.swap_distance(), swaps, "{perm:?}");
+        assert_eq!(sort.perm, states[swaps], "{perm:?}");
+        for state in states.iter().rev().skip(1) {
+            sort.next_back().expect("a swap is left to undo");
+            assert_eq!(&sort.perm, state, "{perm:?}");
+        }
+        assert!(sort.next_back().is_none(), "{perm:?}");
+        for state in &states[1..] {
+            sort.next().expect("a swap is left");
+            assert_eq!(&sort.perm, state, "{perm:?}");
+        }
+        assert!(sort.next().is_none(), "{perm:?}");
+        for percentage in 0..=100 {
+            sort.interpolate(percentage);
+            let expected = &states[swaps * usize::from(percentage) / 100];
+            assert_eq!(&sort.perm, expected, "{perm:?} at {percentage}%");
+        }
+        sort.midpoint();
+        assert_eq!(sort.perm, states[swaps / 2], "{perm:?}");
+    }
+
+    /// The sort rebuilds each state from the permutation's inversion table
+    /// instead of replaying recorded swaps, and every state is the one the
+    /// recorded sort reaches: for every order of up to seven values, and for
+    /// longer shuffles that take many passes. The values are dense, as when
+    /// every event is matched, so that a prefix and suffix already in place
+    /// are left out of the sort; and sparse, as the matched source indices
+    /// are when some events are unmatched.
+    #[test]
+    fn every_state_is_the_recorded_sorts() {
+        for len in 0..=7 {
+            let dense: Vec<usize> = (0..len).collect();
+            let sparse: Vec<usize> = (0..len).map(|value| 2 * value + 1).collect();
+            for (values, source_len) in [(dense, len), (sparse, 2 * len + 2)] {
+                let source = vec![(); source_len];
+                for order in orders(&values) {
+                    assert_states_are_the_recorded_sorts(&source, order);
+                }
+            }
+        }
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut random = move |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as usize % bound
+        };
+        for len in [20, 41, 64] {
+            for _ in 0..10 {
+                let mut order: Vec<usize> = (0..len).collect();
+                for last in (1..len).rev() {
+                    order.swap(last, random(last + 1));
+                }
+                assert_states_are_the_recorded_sorts(&vec![(); len], order);
+            }
+        }
+    }
+
+    /// The marker under which [`a_long_reversal_sorts_in_bounded_memory`]
+    /// starts this test binary again to run its body alone.
+    const BOUNDED_MEMORY_CHILD_ENV: &str = "HERMIT_BUBBLE_SORT_BOUNDED_MEMORY_CHILD";
+
+    /// Reversing 200,000 events takes 19,999,900,000 adjacent swaps, which a
+    /// record of every swap held in 320 GB. The sort runs alone in a process
+    /// of its own, which caps its data at 1 GiB so that a regression fails
+    /// here instead of exhausting the host, and must peak below 256 MiB
+    /// resident.
+    #[test]
+    fn a_long_reversal_sorts_in_bounded_memory() {
+        // The harness names a test by its path below the crate.
+        let (_, module) = module_path!().split_once("::").unwrap();
+        let name = format!("{module}::a_long_reversal_sorts_in_bounded_memory");
+        if std::env::var(BOUNDED_MEMORY_CHILD_ENV).as_deref() == Ok(name.as_str()) {
+            sort_a_long_reversal_under_a_data_cap();
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([name.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+            .env(BOUNDED_MEMORY_CHILD_ENV, &name)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let rendered = format!(
+            "status {}\nstdout:\n{stdout}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.status.success(), "{rendered}");
+        // The harness prints the test's name and its output on one line.
+        let peak_kib: u64 = stdout
+            .split("peak resident KiB: ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .unwrap_or_else(|| panic!("the sort did not run:\n{rendered}"))
+            .parse()
+            .unwrap();
+        assert!(
+            peak_kib < 256 << 10,
+            "peaked at {peak_kib} KiB:\n{rendered}"
+        );
+    }
+
+    /// The body of [`a_long_reversal_sorts_in_bounded_memory`]'s own process.
+    fn sort_a_long_reversal_under_a_data_cap() {
+        use nix::sys::resource::Resource;
+        use nix::sys::resource::getrlimit;
+        use nix::sys::resource::setrlimit;
+        // A regression ends in a failed allocation and an abort: dump no
+        // core. A core limit of 1, not 0, also stops a dump to a core_pattern
+        // pipe, which ignores the limit otherwise (fs/coredump.c); a hard
+        // limit already at 0 cannot be raised to it.
+        let (_, core_hard) = getrlimit(Resource::RLIMIT_CORE).unwrap();
+        setrlimit(Resource::RLIMIT_CORE, core_hard.min(1), core_hard.min(1)).unwrap();
+        let (_, data_hard) = getrlimit(Resource::RLIMIT_DATA).unwrap();
+        let data_cap = data_hard.min(1 << 30);
+        setrlimit(Resource::RLIMIT_DATA, data_cap, data_cap).unwrap();
+        let len = 200_000;
+        let source: Vec<usize> = (0..len).collect();
+        let target: Vec<usize> = source.iter().rev().copied().collect();
+        let mut sort = iterable_bubble_sort(&source, &target);
+        let swaps = len * (len - 1) / 2;
+        assert_eq!(sort.swap_distance(), swaps);
+        // Each swap removes one inversion, so the midpoint, half the swaps
+        // from the reversal, has the other half left to sort.
+        let midpoint: Vec<usize> = sort.midpoint().copied().collect();
+        assert_eq!(inversions(&midpoint), swaps - swaps / 2);
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let peak = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmHWM:"))
+            .and_then(|kib| kib.trim().strip_suffix("kB"))
+            .expect("/proc/self/status reports VmHWM");
+        println!("peak resident KiB: {}", peak.trim());
+    }
+
+    /// How many pairs of `values`, distinct and each below `values.len()`,
+    /// are out of order.
+    fn inversions(values: &[usize]) -> usize {
+        let mut seen = Fenwick::zeros(values.len());
+        values
+            .iter()
+            .enumerate()
+            .map(|(preceding, &value)| {
+                let larger = preceding - seen.count_before(value);
+                seen.add(value);
+                larger
+            })
+            .sum()
     }
 
     /// This macro implifies checking for the correctness of the `expanded_perm`

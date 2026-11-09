@@ -17,15 +17,15 @@ use crate::types::FutexID;
 use crate::types::MmId;
 use crate::types::SharedMemoryObjectId;
 
-const PAGE_SIZE: usize = 4096;
-
+/// A mapping's length as the kernel records it: rounded up to the host's page.
 fn page_aligned_len(len: usize) -> usize {
     if len == 0 {
         return 0;
     }
-    len.checked_add(PAGE_SIZE - 1)
+    let page = usize::try_from(crate::page::page_size()).expect("the page size fits in usize");
+    len.checked_add(page - 1)
         .expect("a successful memory range must fit in the address space")
-        & !(PAGE_SIZE - 1)
+        & !(page - 1)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -70,6 +70,46 @@ pub(crate) struct MemoryMetadata {
     /// (`Detcore::handle_brk` refuses a brk by this name).
     #[serde(default)]
     pub(crate) brk_unmodeled: Option<String>,
+    /// Whether the address space has allocated or applied a protection key
+    /// (`pkey_alloc`, `pkey_mprotect`). Hermit's copies of guest memory do
+    /// not check protection keys, so where one may be in force they cannot
+    /// tell which pages the guest can write (`crate::syscalls::inotify`).
+    /// A fork copies the address space, keys included; an exec replaces it.
+    #[serde(default)]
+    pub(crate) protection_keys: bool,
+    /// Whether a call that sets flags on a mapping that the backend's memory
+    /// map (`reverie::MemoryMap`) does not list reached the backend for a
+    /// range overlapping a mapping that map lists, in a session that renders
+    /// a process's `smaps` from it (`procfs::RenderedFiles::address_space`):
+    /// `madvise(2)` access-pattern, fork and dump advice (VM_SEQ_READ,
+    /// VM_RAND_READ, VM_DONTCOPY, VM_DONTDUMP, VM_WIPEONFORK), and `mlock(2)`
+    /// or `mlock2(2)` (VM_LOCKED, VM_LOCKONFAULT), or any `mlockall(2)`. A
+    /// rendered `smaps` cannot then derive a listed mapping's `VmFlags`, and
+    /// is refused (`procfs::memory_map::smaps`); a call on a mapping the map
+    /// does not list changes nothing such a file shows. A fork copies the
+    /// address space, flags included; an exec replaces it. Never cleared
+    /// otherwise: advice that clears a flag (`MADV_NORMAL`, `MADV_DOFORK`)
+    /// changes flags too.
+    #[serde(default)]
+    pub(crate) mapping_flags_changed: bool,
+    /// Whether a call that discards a mapping's pages reached the backend for
+    /// a range overlapping a mapping the backend's memory map lists, in a
+    /// session that renders a process's `numa_maps` from it: `madvise(2)`
+    /// with `MADV_DONTNEED`, `MADV_DONTNEED_LOCKED` or `MADV_GUARD_INSTALL`,
+    /// and `MADV_WIPEONFORK`, which leaves the copy a later fork makes with
+    /// none. Whether that mapping still holds a resident page is then not a
+    /// fact, and Linux's `numa_maps` prints `kernelpagesize_kB` only for a
+    /// mapping that holds one (`show_numa_map`), so a rendered `numa_maps` is
+    /// refused (`procfs::memory_map::smaps`). A fork copies it; an exec
+    /// replaces the address space.
+    #[serde(default)]
+    pub(crate) pages_discarded: bool,
+    /// aarch64: the file-backed ranges `crate::store_exclusive` has seen in
+    /// this address space, and whether each was scanned for exclusive pairs.
+    /// Not part of the serialized model.
+    #[cfg(target_arch = "aarch64")]
+    #[serde(skip)]
+    pub(crate) exclusive_scan: crate::store_exclusive::ScannedRanges,
 }
 
 /// Detcore's model of a process's program break: where Linux starts it for
@@ -106,6 +146,9 @@ impl MemoryMetadata {
             && self.brk_current.is_none()
             && self.brk_model.is_none()
             && self.brk_unmodeled.is_none()
+            && !self.protection_keys
+            && !self.mapping_flags_changed
+            && !self.pages_discarded
     }
 
     /// Record a program break reported by a `brk(2)` return.

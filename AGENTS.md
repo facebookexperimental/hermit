@@ -36,9 +36,10 @@ external network dependencies.
 ## Supported Environment
 
 - Use x86_64 Linux. AArch64 support is incomplete, and macOS is not supported.
-- The repository's `rust-toolchain.toml` selects Rust nightly. Let `rustup` and
-  Cargo honor that file; do not substitute stable Rust without a task that is
-  specifically about stable support.
+- The repository's `rust-toolchain.toml` selects the Rust toolchain. Let
+  `rustup` and Cargo honor that file. The workspace also builds on stable
+  Rust 1.97.1; the pinned default switches to it in a separate change so
+  validation moves in one step.
 - Install libunwind development headers before building. On Debian/Ubuntu use
   `sudo apt-get install -y libunwind-dev`; on Fedora/CentOS use
   `sudo dnf install -y libunwind-devel`.
@@ -101,7 +102,7 @@ hardware-sensitive test merely to make a local VM green.
 
 ## Lint And Format
 
-The checked-in rustfmt configuration requires the selected nightly toolchain.
+The checked-in rustfmt configuration requires the selected toolchain.
 Before finishing a Rust change, run:
 
 ```bash
@@ -573,13 +574,35 @@ unset `PR_LABELS` or `PR_BODY` exits 2. For a labeled pull request, a missing
 used above because a complete comment history can exceed the per-environment-
 variable size limit.
 
-⚠️ **DO NOT "FIX" THIS BY ARMING THE GATE.** Adding a `pull_request` trigger
-contradicts the standing directive that Actions never run automatically for
-pull requests or `main`. The portable workflow's automatic integration-branch
-run is supplemental evidence only. A trigger without a `required_status_checks`
-rule — or a rule without a trigger — yields either a check that gates nothing or
-a requirement nothing can satisfy. Both layers or neither, and that pairing is
-an owner decision.
+⚠️ **DO NOT "FIX" THIS BY ARMING THE GATE.** This lint and the merge gate stay
+hand-run: no `pull_request` trigger on `merge-gate.yml` and no
+`required_status_checks` rule. A trigger without a rule, or a rule without a
+trigger, yields either a check that gates nothing or a requirement nothing can
+satisfy. Both layers or neither, and that pairing is an owner decision.
+
+The portable workflow is the one exception, by owner decision on 2026-10-27:
+"invoke CI automatically only for external PRs not by our hermit-bot account".
+`ci-portable.yml` runs on `pull_request` (opened, synchronize, reopened,
+ready_for_review) unless the author is `hermit-bot3` or the pull request is a
+draft, as well as after a push to `integration` and on manual dispatch. It
+uses no secrets and a `contents: read` token (its `cleanup` job alone asks for
+`actions: write` to delete the run's own artifacts, and skips fork pull
+requests, whose token cannot have it), so it behaves the same for a branch of
+this repository and for a fork. Its result is supplemental evidence and gates
+nothing: it is not a required status check. The privileged (self-hosted, PMU)
+workflows remain dispatch-only. `scripts/check-github-actions-triggers.rs`
+enforces this shape: the bot/draft gate on every job that can start on its
+own, and GitHub-hosted runners only for every `ci-portable.yml` job.
+
+⚠️ **THE CHECKED-IN TRIGGERS DO NOT PROTECT THE SELF-HOSTED HOSTS.** For a
+`pull_request` event GitHub runs the workflow files from the pull request
+itself, so a fork can add a workflow, or edit this one, that targets the
+self-hosted labels. What keeps an outside contributor's code off those hosts is
+repository configuration: Settings, Actions, "Fork pull request workflows from
+outside collaborators" set to require approval for all outside collaborators
+(not only first-time ones), and runner access that does not admit pull
+requests from forks. A maintainer approving a fork run must first read the
+pull request's `.github/` changes.
 
 **What actually holds this line today is agents choosing to hold it.**
 

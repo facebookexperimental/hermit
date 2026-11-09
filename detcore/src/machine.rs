@@ -12,12 +12,14 @@
 //! (<https://github.com/rrnewton/hermit/issues/4266>).
 //!
 //! Today `uname`, `sysinfo` and the fixed procfs files (`procfs::fixed`)
-//! read it. The virtual CPU (CPUID, `/proc/cpuinfo`, the CPU files under
-//! `/sys`, `sched_getaffinity`) still has its own sources, which this
+//! read it, and the CPU count: `/proc/stat`, `/proc/cpuinfo`, the CPU files
+//! under `/sys` and the per-CPU tables. The rest of the virtual CPU (CPUID's
+//! table, `sched_getaffinity`) still has its own sources, which this
 //! description is to absorb; the design lists every source that must agree.
 //!
 //! The values are fixed. They may come only from Hermit's configuration
-//! (today: the epoch and the memory size), never from the host.
+//! (today: the epoch, the memory size and the CPU count), never from the
+//! host.
 
 use chrono::DateTime;
 use chrono::Utc;
@@ -29,11 +31,12 @@ pub struct MachineDescription {
     pub kernel: Kernel,
     /// The kernel's fixed limits and settings.
     pub limits: KernelLimits,
-    /// The number of CPUs: 1. Detcore runs a guest's threads one at a time,
-    /// as on one CPU, and `/proc/stat`, the CPU files under `/sys` and
-    /// `sched_getaffinity` already report one; the tables that have a column
-    /// or block per CPU (`/proc/interrupts`, `/proc/softirqs`,
-    /// `/proc/schedstat`, `/proc/zoneinfo`) render this many.
+    /// The number of CPUs: `--virtual-cpus`, or 1 without it. Detcore runs a
+    /// guest's threads one at a time whatever the count; it is what the
+    /// guest is told. `/proc/stat`, `/proc/cpuinfo`, the CPU files under
+    /// `/sys` and the tables that have a column or block per CPU
+    /// (`/proc/interrupts`, `/proc/softirqs`, `/proc/schedstat`,
+    /// `/proc/zoneinfo`) render this many.
     pub cpus: u32,
     /// The memory size in bytes, which `/proc/meminfo` (in kB, rounded
     /// down) and `sysinfo` report: the configured `--memory` (1 GB by
@@ -79,6 +82,7 @@ impl MachineDescription {
     pub fn of(config: &crate::config::Config) -> Self {
         Self {
             memory: config.memory,
+            cpus: config.virtual_cpu_count(),
             ..Self::new(config.epoch)
         }
     }
@@ -172,7 +176,7 @@ pub struct KernelLimits {
     /// which says that no asynchronous I/O context can be set up.)
     pub aio_max_nr: u64,
     /// `fs/pipe-max-size`: the capacity Detcore pins every pipe at
-    /// (`DETERMINISTIC_PIPE_CAPACITY_BYTES`), which is also the most that
+    /// (`deterministic_pipe_capacity_bytes`, two pages), which is also the most that
     /// `F_SETPIPE_SZ` allows.
     pub pipe_max_size: u32,
 }
@@ -190,7 +194,7 @@ impl Default for KernelLimits {
             mmap_min_addr: 65536,
             file_max: i64::MAX as u64,
             aio_max_nr: 65536,
-            pipe_max_size: crate::syscalls::DETERMINISTIC_PIPE_CAPACITY_BYTES as u32,
+            pipe_max_size: crate::syscalls::deterministic_pipe_capacity_bytes() as u32,
         }
     }
 }

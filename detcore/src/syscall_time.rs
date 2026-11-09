@@ -27,53 +27,57 @@ pub(crate) fn cost_ns(sysno: Sysno) -> u64 {
     match sysno {
         Sysno::gettimeofday => GETTIMEOFDAY_NS,
 
-        Sysno::time
-        | Sysno::clock_gettime
+        Sysno::clock_gettime
         | Sysno::clock_getres
         | Sysno::timerfd_gettime
         | Sysno::timer_gettime
         | Sysno::timer_getoverrun => CLOCK_NS,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::time => CLOCK_NS,
 
         Sysno::getpid
         | Sysno::gettid
         | Sysno::getcpu
-        | Sysno::arch_prctl
         | Sysno::set_tid_address
         | Sysno::set_robust_list
         | Sysno::rt_sigprocmask
         | Sysno::rt_sigaction
         | Sysno::sigaltstack => FAST_NS,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::arch_prctl => FAST_NS,
 
-        Sysno::stat
-        | Sysno::lstat
-        | Sysno::fstat
-        | Sysno::newfstatat
+        Sysno::fstat
         | Sysno::statx
         | Sysno::uname
         | Sysno::getrusage
         | Sysno::sysinfo
-        | Sysno::access
-        | Sysno::readlink
         | Sysno::readlinkat
-        | Sysno::utime
-        | Sysno::utimes
         | Sysno::utimensat
-        | Sysno::futimesat
         | Sysno::prlimit64
         | Sysno::prctl => METADATA_NS,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::stat
+        | Sysno::lstat
+        | Sysno::newfstatat
+        | Sysno::access
+        | Sysno::readlink
+        | Sysno::utime
+        | Sysno::utimes
+        | Sysno::futimesat => METADATA_NS,
+        #[cfg(target_arch = "aarch64")]
+        Sysno::fstatat => METADATA_NS,
 
         Sysno::futex
         | Sysno::rseq
         | Sysno::sched_yield
         | Sysno::nanosleep
         | Sysno::clock_nanosleep
-        | Sysno::alarm
-        | Sysno::pause
-        | Sysno::poll
         | Sysno::epoll_pwait
-        | Sysno::epoll_wait
-        | Sysno::epoll_wait_old
         | Sysno::rt_sigtimedwait => SYNC_NS,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::alarm | Sysno::pause | Sysno::poll | Sysno::epoll_wait | Sysno::epoll_wait_old => {
+            SYNC_NS
+        }
 
         Sysno::read
         | Sysno::pread64
@@ -83,8 +87,9 @@ pub(crate) fn cost_ns(sysno: Sysno) -> u64 {
         | Sysno::fcntl
         | Sysno::ioctl
         | Sysno::getrandom
-        | Sysno::getdents
         | Sysno::getdents64 => IO_NS,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::getdents => IO_NS,
 
         Sysno::mmap
         | Sysno::munmap
@@ -94,25 +99,18 @@ pub(crate) fn cost_ns(sysno: Sysno) -> u64 {
         | Sysno::madvise
         | Sysno::userfaultfd => MEMORY_NS,
 
-        Sysno::open
-        | Sysno::openat
-        | Sysno::creat
+        Sysno::openat
         | Sysno::close
         | Sysno::dup
-        | Sysno::dup2
         | Sysno::dup3
-        | Sysno::pipe
         | Sysno::pipe2
-        | Sysno::eventfd
         | Sysno::eventfd2
-        | Sysno::signalfd
         | Sysno::signalfd4
         | Sysno::timerfd_create
         | Sysno::timerfd_settime
         | Sysno::timer_create
         | Sysno::timer_settime
         | Sysno::timer_delete
-        | Sysno::inotify_init
         | Sysno::inotify_init1
         | Sysno::inotify_add_watch
         | Sysno::inotify_rm_watch
@@ -120,13 +118,21 @@ pub(crate) fn cost_ns(sysno: Sysno) -> u64 {
         | Sysno::io_uring_setup
         | Sysno::io_uring_enter
         | Sysno::io_uring_register
-        | Sysno::epoll_create
         | Sysno::epoll_create1
         | Sysno::epoll_ctl
-        | Sysno::epoll_ctl_old
         | Sysno::add_key
         | Sysno::request_key
         | Sysno::keyctl => OPEN_CLOSE_NS,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::open
+        | Sysno::creat
+        | Sysno::dup2
+        | Sysno::pipe
+        | Sysno::eventfd
+        | Sysno::signalfd
+        | Sysno::inotify_init
+        | Sysno::epoll_create
+        | Sysno::epoll_ctl_old => OPEN_CLOSE_NS,
 
         Sysno::socket
         | Sysno::socketpair
@@ -142,8 +148,6 @@ pub(crate) fn cost_ns(sysno: Sysno) -> u64 {
 
         Sysno::clone
         | Sysno::clone3
-        | Sysno::fork
-        | Sysno::vfork
         | Sysno::wait4
         | Sysno::setsid
         | Sysno::execve
@@ -152,6 +156,8 @@ pub(crate) fn cost_ns(sysno: Sysno) -> u64 {
         | Sysno::exit_group
         | Sysno::sched_getaffinity
         | Sysno::sched_setaffinity => PROCESS_NS,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::fork | Sysno::vfork => PROCESS_NS,
 
         _ => FAST_NS,
     }
@@ -186,10 +192,8 @@ pub(crate) const MAX_UNCHARGED_BOOTSTRAP_SYSCALLS: u32 = 32768;
 /// wall-clock and monotonic clocks, the CPU-time clocks and counters, uptime,
 /// the time left on a timer, and the `time` field an `adjtimex` or
 /// `clock_adjtime` query returns (glibc's `ntp_gettime` reads the clock that
-/// way). Timerfd calls currently pass through to a host timer
-/// (https://github.com/rrnewton/hermit/issues/1923), so `timerfd_gettime`
-/// reports host time left, not virtual time; it is listed because its result
-/// is a timer value.
+/// way). For timerfds on Detcore's virtual clock, `timerfd_gettime` reports
+/// virtual time remaining (see [`crate::syscalls::timerfd`]).
 ///
 /// Inside a backend-runtime bootstrap window these syscalls are always charged,
 /// so two such reads on the bootstrapping thread differ by at least one syscall
@@ -210,20 +214,21 @@ pub(crate) const MAX_UNCHARGED_BOOTSTRAP_SYSCALLS: u32 = 32768;
 /// - socket receive timestamps, which Detcore sets to the virtual time of the
 ///   receive.
 pub(crate) fn observes_virtual_time(sysno: Sysno) -> bool {
-    matches!(
-        sysno,
+    match sysno {
         Sysno::gettimeofday
-            | Sysno::time
-            | Sysno::clock_gettime
-            | Sysno::sysinfo
-            | Sysno::times
-            | Sysno::getrusage
-            | Sysno::timerfd_gettime
-            | Sysno::timer_gettime
-            | Sysno::getitimer
-            | Sysno::adjtimex
-            | Sysno::clock_adjtime
-    )
+        | Sysno::clock_gettime
+        | Sysno::sysinfo
+        | Sysno::times
+        | Sysno::getrusage
+        | Sysno::timerfd_gettime
+        | Sysno::timer_gettime
+        | Sysno::getitimer
+        | Sysno::adjtimex
+        | Sysno::clock_adjtime => true,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::time => true,
+        _ => false,
+    }
 }
 
 #[cfg(test)]

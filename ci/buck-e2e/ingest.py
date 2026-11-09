@@ -25,10 +25,16 @@ execution is its last one that did not withhold the cell on an RE worker (below)
 has one: such an execution is not an attempt, so its claim is not the cell's outcome.
 summary.json's evidence_complete_executions lists each execution whose result.json
 (written by cell.sh) records complete evidence, by its run id; import mode refuses a
-PASS whose own execution is not listed. An execution's rows, result.json and run_id.
+PASS whose own execution is not listed. Every execution that left a row, a summary.json
+or a result.json must also have result.json's producer_completion: cell.sh adds it only
+after it has judged the harness's Tpx payload and exit status, so its absence (a cell.sh
+that died first, or one older than the field), a malformed one, or one that records the
+payload as invalid refuses the whole ingest before anything is written to IMPORT_DIR.
+An execution's rows, result.json and run_id.
 marker (see --local-artifacts) must name one run id, and no two executions may share one.
-Tpx owns retries (cells run the harness with --no-retry). A cell's Nth execution in Tpx
-order is attempt N, and its row (at most one, for its own cell) carries that number. An
+The Hermit test-harness owns retries in both modes (owner policy, 2026-10-30; Tpx retries
+are off). A cell's Nth harness attempt in execution order is attempt N, and its row carries
+that number; one execution may write several rows, one per attempt. An
 execution that wrote no row still takes its number, so the next row shows the gap and
 import mode refuses the history. "Passed only on rerun" therefore stays visible, as
 attempt 1 failing before attempt 2 passes, even when attempt 1 died before writing a row.
@@ -242,6 +248,31 @@ def no_row_cause(slug, end, events):
                      for r in tpx) or "no Tpx result for it"
     return (f"{said}; the command's status {command['command_status']}, exit code {command['exit_code']}, "
             f"after {seconds(command['wall_s'])} of wall time")
+
+PRODUCER_COMPLETION_VERSION = 1  # cell.sh: result.json's producer_completion
+
+def producer_completion_problem(result):
+    """Why cell.sh did not finish judging this execution's harness output, or None.
+
+    cell.sh writes result.json before it reads the harness's Tpx payload and publishes
+    producer_completion only after its normalizer has judged the payload and exited
+    cleanly: "valid", or "invalid" with the reason it rejected the payload. So a missing completion is a cell.sh that died there, or one older than the
+    field, and neither is evidence; evidence_complete says nothing about the payload."""
+    if not isinstance(result, dict):
+        return "has no result.json"
+    completion = result.get("producer_completion")
+    if completion is None:
+        return "has a result.json without producer_completion (an unfinished or unsupported cell.sh)"
+    if not isinstance(completion, dict) or set(completion) != {"version", "status", "reason"}:
+        return f"has a malformed producer_completion {completion!r}"
+    # The exact integer: True and 1.0 compare equal to 1 but are not what cell.sh writes.
+    if type(completion["version"]) is not int or completion["version"] != PRODUCER_COMPLETION_VERSION:
+        return f"has producer_completion version {completion['version']!r}, not {PRODUCER_COMPLETION_VERSION}"
+    if completion["status"] == "valid" and completion["reason"] is None:
+        return None
+    if completion["status"] == "invalid" and isinstance(completion["reason"], str) and completion["reason"]:
+        return f"has harness output cell.sh rejected: {completion['reason']}"
+    return f"has a malformed producer_completion {completion!r}"
 
 def claims_host_inapplicable(cell, summary):
     return any(cell_of(h) == cell for h in (summary or {}).get("host_inapplicable_cells", []))
@@ -589,9 +620,12 @@ def main():
         # fetch them never fails the ingest.
         logs, log_dir, fetch_error = verify_logs(rows, names), d, None
         log_names = sorted({n for found in logs.values() if not isinstance(found, str) for n in found[2]})
-        # As cell.sh reports it to Tpx: a PASS row whose evidence is incomplete is an ERROR.
+        # As cell.sh reports it to Tpx: a PASS row whose evidence is incomplete is an ERROR,
+        # and one whose harness output cell.sh did not accept is a failure, whose logs are
+        # kept as evidence before the refusal below.
         passed = (bool(rows) and all(row.get("outcome") == "PASS" for row in rows)
-                  and isinstance(result, dict) and result.get("evidence_complete") is True)
+                  and isinstance(result, dict) and result.get("evidence_complete") is True
+                  and producer_completion_problem(result) is None)
         failed = run_logs(names) if failed_root is not None and not passed else None
         def get(directory, wanted):
             if all(os.path.exists(os.path.join(directory, n)) for n in wanted):
@@ -620,13 +654,14 @@ def main():
     run_cells = {}
     log_sources = []  # (run id, result, (logs, log_dir, fetch_error)) of each execution
     failed_sources = []  # (cell, run id, rows, result, failed logs, log_dir, fetch_error) of each that did not pass
+    unfinished = []  # each execution whose harness output cell.sh did not accept, and why
     for cell, end, marker, source, rows, summary, result, logs, failed in sorted(fetched, key=lambda x: (x[0], x[1])):
         where = f"the execution of {cell} that ended at {end}"
         if result is not None and result.get("cell") != cell:
             sys.exit(f"ingest: {where} has a result.json for {result.get('cell')}")
-        if len(rows) > 1 or any(cell_of(row) != cell for row in rows):
+        if any(cell_of(row) != cell for row in rows):
             sys.exit(f"ingest: {where} has {len(rows)} rows, for cells {sorted({cell_of(row) for row in rows})}; "
-                     f"a cell runs the harness once (--no-retry), which writes one row, for that cell")
+                     f"a cell runs the harness, which writes one row per attempt, for that cell")
         ids = [row.get("run_id") for row in rows] + ([result.get("run_id")] if result is not None else [])
         ids += [marker] if marker is not None else []
         if len(set(ids)) > 1 or None in ids:
@@ -637,7 +672,10 @@ def main():
             if run_id in run_cells:
                 sys.exit(f"ingest: run {run_id} names two executions: {run_cells[run_id]} and {where}")
             run_cells[run_id] = where
-        if result is not None and result.get("evidence_complete") is True:
+        problem = producer_completion_problem(result) if rows or summary is not None or result is not None else None
+        if problem is not None:
+            unfinished.append(f"{where} (run {run_id}) {problem}")
+        elif result is not None and result.get("evidence_complete") is True:
             complete_runs[cell].append(run_id)
         per_cell[cell].append((rows, summary, result.get("route") if result is not None else None))
         per_cell_ends[cell].append(end)
@@ -669,6 +707,9 @@ def main():
         if failed_logs_error is not None:
             print(f"ingest: the failed cells' verify logs were not kept: {failed_logs_error}", file=sys.stderr)
     failed_logs = [one for entry in failed_entries for one in entry["logs"]]
+    if unfinished:
+        sys.exit(f"ingest: {len(unfinished)} execution(s) without a valid producer completion: "
+                 + "; ".join(unfinished[:20]))
 
     def covered(cell):
         runs = per_cell.get(cell, [])
@@ -709,11 +750,14 @@ def main():
             evidence_complete[(lane, category)].append(
                 {"test": c["test"], "mode": c["mode"], "backend": None if c["backend"] == "native" else c["backend"],
                  "run_id": run_id})
+        attempts_already = sum(len(rows) for rows, _, _ in ran)
         if not ran:
             rerun_locally.append(cell_slug(want[cell]))
-        elif withheld_on_re(cell, *runs[-1]):
+        elif withheld_on_re(cell, *runs[-1]) and attempts_already < 2:
+            # A withheld rerun is only for an attempt the cell has not had;
+            # a cell that already consumed both harness attempts is final.
             retry_locally.append(cell_slug(want[cell]))
-        elif len(ran) == 1 and len(runs) > 1 and ran[0][2] == "re" and failed_attempt(cell, *ran[0]):
+        elif attempts_already < 2 and len(ran) == 1 and len(runs) > 1 and ran[0][2] == "re" and failed_attempt(cell, *ran[0]):
             # Tpx's one retry went to an execution withheld on RE before the
             # cell's only attempt, which failed on RE: that attempt never got
             # the retry an executed run gives it. (A local rerun's attempt has
@@ -727,8 +771,17 @@ def main():
             if withheld_on_re(cell, rows, summary, route):
                 withheld += 1
                 continue
-            attempt += 1
+            if not rows:
+                attempt += 1
+            # The harness owns retries (owner policy, 2026-10-30): one
+            # execution may write several rows, one per innermost attempt.
+            # The producer's own attempt numbers must already be 1..N in
+            # order; renumbering must never launder a disordered file.
+            if [row.get("attempt") for row in rows] != list(range(1, len(rows) + 1)):
+                sys.exit(f"ingest: the execution of {cell} that ended at {end} has producer attempts "
+                         f"{[row.get('attempt') for row in rows]}; expected 1..{len(rows)} in order")
             for row in rows:
+                attempt += 1
                 buckets[(lane, category)].append(dict(row, attempt=attempt))
                 attempts[attempt] += 1
             if not rows and not claims_host_inapplicable(cell, summary):

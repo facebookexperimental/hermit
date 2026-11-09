@@ -245,7 +245,9 @@ impl MappedFirstAdmission {
                 ));
             }
             let issues = server.retain_connection_issues();
-            server.set_connection_admission(self.clone());
+            server
+                .set_connection_admission(self.clone())
+                .map_err(error)?;
             server
                 .set_initial_image_admission(self.clone())
                 .map_err(error)?;
@@ -500,6 +502,9 @@ mod packet_lease;
 mod mapped_run;
 mod runtime_binding;
 mod runtime_support;
+pub(crate) use mapped_run::CapturePolicy;
+pub(crate) use mapped_run::VerificationCapture;
+pub(crate) use mapped_run::capture_verification as capture_verification_in_container;
 pub(crate) use mapped_run::run as run_mapped;
 pub(crate) use runtime_binding::RetainedImage;
 pub(crate) use runtime_binding::declared as packaged_image_declared;

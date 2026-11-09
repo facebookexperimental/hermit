@@ -7,18 +7,10 @@
  */
 
 /*
- * A recvmsg whose buffers the `hermit run --verify` buffer digest can or
- * cannot observe after the call.
- *
- * With "plain", iov[0] is {buffer, 16}: the digest hashes buffer+16.
- * With "overwritten", the iovec array is its own receive buffer: iov[0] is
- * {&iov, 16}, and the 16-byte datagram encodes {unmapped page, 1}. Linux
- * imports {&iov, 16} at entry and then writes the payload over it, so after
- * the call the header walk finds an iovec that covers 1 byte of the 16
- * returned, at an unmapped address. The digest records an explicit
- * "unobserved" entry and the guest still receives the kernel's result.
- * Before that entry, the failed read became the guest's recvmsg error
- * (EFAULT) under --verify only.
+ * A receive whose output overwrites its own iovec. Linux imports the original
+ * geometry before copying the datagram. A certified observer must hash the
+ * received payload, not temporarily reinstated metadata. The independently
+ * sent bytes are printed so the test can calculate the exact expected hash.
  */
 
 #define _GNU_SOURCE
@@ -60,10 +52,20 @@ int main(int argc, char** argv) {
     perror("recvmsg");
     return 2;
   }
+  void* destination = overwritten ? (void*)iov : (void*)buffer;
+  if (memcmp(destination, &payload, sizeof(payload)) != 0) {
+    fputs("received payload differs from the sent bytes\n", stderr);
+    return 3;
+  }
   printf(
       "buffer=%p received=%zd overwritten=%d\n",
       (void*)buffer,
       received,
       iov[0].iov_base == unmapped);
+  printf("destination=%p sent=", destination);
+  for (size_t i = 0; i < sizeof(payload); ++i) {
+    printf("%02x", ((const unsigned char*)&payload)[i]);
+  }
+  putchar('\n');
   return 0;
 }

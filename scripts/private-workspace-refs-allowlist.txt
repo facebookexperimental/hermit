@@ -1,0 +1,13 @@
+# Lines that scripts/check-private-workspace-refs.sh must not refuse.
+#
+# Format: PATH | SUBSTRING | REASON
+# A hit is allowed when its file is PATH (or lies under PATH, when PATH ends in
+# "/") and its line contains SUBSTRING. Every entry needs a reason, and an entry
+# that matches no hit fails the check. Keep this list short: the usual fix is to
+# rewrite the line, not to list it here.
+
+.claude/skills/repo-cleanliness/SKILL.md | ~/work/dev-hermit/ | Agent instructions saying where experiments and notes go in the maintainers' parent workspace. Skill files change only on the owner's direct request, so the owner decides how to reword them.
+AGENTS.md | ~/work/dev-hermit/experiments/ | The same agent protocol rule as the repo-cleanliness skill (experiments live in the parent workspace); a protocol change is the owner's decision.
+scripts/validate.rs | const FROZEN_RUN_WITHHELD_ISSUE: &str = "https://github.com/rrnewton/dev-hermit/issues/549"; | Functional: validate writes this URL into the evidence of every frozen-run skip record in the ledger, and the private parent's ci-hub tests compare that evidence string exactly. Changing it changes recorded output.
+scripts/validate.rs | parent.join("worktrees/slots/validate-fresh-lookalike") | Functional: a self-test fixture for validate's checkout admission, which must tell a disposable validation checkout from a path in the parent workspace's slot layout that only looks like one.
+ci/compat-envelope/testdata/parity-ledger/provenance.json | $HOME/work/dev-hermit/bin/safehermit | Byte-authenticated evidence: the wrapper text sits beside its recorded size and sha256 (d6e90b66...), which every row's hermit_bin_sha256 repeats; editing the text breaks that check.

@@ -261,17 +261,22 @@ on_exit() { # keep the invocations' records, then stop the buck2 daemon; the nod
     fi
     "$buck2" kill >/dev/null 2>&1
 }
-on_signal() { # $1: the signal. Record it, keep what records fit in 2 seconds (none if the exit
-    # had begun keeping them), stop the buck2 daemon, then die of $1 as if it were not caught.
+on_signal() { # $1: the signal. Record it, stop the buck2 daemon, keep what records fit in
+    # 2 seconds (none if the exit had begun keeping them), then die of $1 as if it were not
+    # caught. The daemon stops FIRST: the DAG reaps the group 5 s after its SIGTERM, and the
+    # record keeping below may spend that whole window under load, which once left the daemon
+    # running and its stop unrecorded (dh-6aaks).
     # Bash runs this once the foreground command returns; on an uncaught signal its EXIT trap
     # would see that command's status and record a signal as an ordinary exit.
     trap - EXIT
     set +e
     if [[ -n $kept ]]; then
         printf '%s\tsignal %s\n' "$(date -u +%s.%N)" "$1" >>"$kept/phases.tsv"
-        [[ -n $exiting ]] || keep_invocations $((${EPOCHREALTIME/[^0-9]/} + 2000000)) "the 2 s a signalled node keeps for the Buck invocation records"
     fi
     timeout --foreground -k 0.5 1 "$buck2" kill >/dev/null 2>&1
+    if [[ -n $kept && -z $exiting ]]; then
+        keep_invocations $((${EPOCHREALTIME/[^0-9]/} + 2000000)) "the 2 s a signalled node keeps for the Buck invocation records"
+    fi
     trap - "$1"
     kill -s "$1" "$$"
 }

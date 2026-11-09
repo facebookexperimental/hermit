@@ -26,8 +26,9 @@
  *
  * With the argument "scm-rights", the main thread first passes the listener
  * to itself over an AF_UNIX socketpair and accepts through the descriptor it
- * received. Detcore does not track a received descriptor, so replay must
- * recognise the accept by the call alone.
+ * received. Detcore registers the received descriptor as an alias of the
+ * listener, which the send marked as exported, so the accept still runs
+ * outside the turn and replay must recognise it by the call.
  */
 
 #ifndef _GNU_SOURCE

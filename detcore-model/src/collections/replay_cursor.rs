@@ -44,8 +44,21 @@ impl<T: Eq + fmt::Display> ReplayCursor<T> {
         None
     }
 
+    /// Discard the next `count` elements (all of them if fewer remain), so the
+    /// element after them becomes the head.
     pub fn drop(&mut self, count: usize) {
-        let _ = self.inner_data.split_off(count);
+        let count = count.min(self.inner_data.len());
+        self.inner_data.drain(..count);
+    }
+
+    /// How many elements remain to be replayed.
+    pub fn len(&self) -> usize {
+        self.inner_data.len()
+    }
+
+    /// Whether nothing remains to be replayed.
+    pub fn is_empty(&self) -> bool {
+        self.inner_data.is_empty()
     }
 
     // print a window of up to N events
@@ -95,6 +108,19 @@ mod tests {
         T: std::cmp::Eq + Display,
     {
         (cursor.peek_nth(0), cursor.peek_nth(1))
+    }
+
+    /// A fast-forward drops the stale head of the schedule and keeps the rest.
+    #[test]
+    fn drop_discards_the_head_and_keeps_the_rest() {
+        let mut cursor: ReplayCursor<usize> = vec![1, 2, 3, 4, 5].into_iter().collect();
+        cursor.drop(2);
+        assert_eq!(cursor.len(), 3);
+        assert_eq!(cursor.collect::<Vec<_>>(), vec![3, 4, 5]);
+
+        let mut short: ReplayCursor<usize> = vec![1, 2].into_iter().collect();
+        short.drop(5);
+        assert!(short.is_empty());
     }
 
     #[test]

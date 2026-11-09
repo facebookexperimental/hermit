@@ -20,6 +20,7 @@ use std::pin::Pin;
 
 use reverie::BackendStatsRequest;
 use reverie::process::Command;
+use reverie_ptrace::GdbConnection;
 
 /// The plain ptrace tracer: `detcore::Detcore` under `reverie_ptrace`.
 pub type Tracer = reverie_ptrace::Tracer<detcore::GlobalState>;
@@ -28,8 +29,8 @@ pub type Tracer = reverie_ptrace::Tracer<detcore::GlobalState>;
 pub type SpawnTracer = Pin<Box<dyn Future<Output = Result<Tracer, reverie::Error>>>>;
 
 /// Spawns COMMAND under Detcore with CONFIG on the ptrace backend, collecting
-/// backend statistics as STATS requests. When GDBSERVER names a port, a gdb
-/// remote is served there; SEQUENTIALIZED_GUEST then tells gdbserver that
+/// backend statistics as STATS requests. When GDBSERVER names a connection, a
+/// gdb remote is served on it; SEQUENTIALIZED_GUEST then tells gdbserver that
 /// Detcore already sequentializes the guest's threads.
 ///
 /// Without that, gdbserver freezes the other threads around a breakpoint stop
@@ -43,15 +44,15 @@ pub type SpawnTracer = Pin<Box<dyn Future<Output = Result<Tracer, reverie::Error
 pub fn spawn_tracer(
     command: Command,
     config: detcore::Config,
-    gdbserver: Option<u16>,
+    gdbserver: Option<GdbConnection>,
     sequentialized_guest: bool,
     stats: BackendStatsRequest,
 ) -> SpawnTracer {
     Box::pin(async move {
         let mut builder =
             reverie_ptrace::TracerBuilder::<detcore::Detcore>::new(command).config(config);
-        if let Some(port) = gdbserver {
-            builder = builder.gdbserver(port);
+        if let Some(connection) = gdbserver {
+            builder = builder.gdbserver(connection);
             if sequentialized_guest {
                 builder = builder.sequentialized_guest();
             }

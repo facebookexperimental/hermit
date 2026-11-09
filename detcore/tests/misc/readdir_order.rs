@@ -24,6 +24,7 @@ use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::Arc;
 
 use detcore::Config;
 use detcore::Detcore;
@@ -40,14 +41,14 @@ fn run_five_times(guest: fn()) {
 }
 
 fn run_five_times_with(guest: fn(), sequentialize_threads: bool) {
-    run_five_times_on(|| (), |()| guest(), sequentialize_threads)
+    run_five_times_on(|| (), move |()| guest(), sequentialize_threads)
 }
 
 /// Runs `guest` five times, each on a new value from `setup`. The value is made
 /// outside the guest and dropped after its run.
-fn run_five_times_on<S: Sync>(
+fn run_five_times_on<S: Send + Sync + 'static>(
     setup: impl Fn() -> S,
-    guest: impl Fn(&S) + Sync,
+    guest: impl Fn(&S) + Send + Sync + 'static,
     sequentialize_threads: bool,
 ) {
     let config = Config {
@@ -79,7 +80,7 @@ fn run_five_times_hashing_buffers(guest: fn()) {
         detlog_io_buffers: true,
         ..Default::default()
     };
-    run_five_times_under(|| (), |()| guest(), config)
+    run_five_times_under(|| (), move |()| guest(), config)
 }
 
 /// Like [`run_five_times`], without hashing the bytes each syscall returns
@@ -92,16 +93,50 @@ fn run_five_times_without_hashing_buffers(guest: fn()) {
         detlog_io_buffers: false,
         ..Default::default()
     };
-    run_five_times_under(|| (), |()| guest(), config)
+    run_five_times_under(|| (), move |()| guest(), config)
 }
 
-fn run_five_times_under<S: Sync>(setup: impl Fn() -> S, guest: impl Fn(&S) + Sync, config: Config) {
+fn run_five_times_under<S: Send + Sync + 'static>(
+    setup: impl Fn() -> S,
+    guest: impl Fn(&S) + Send + Sync + 'static,
+    config: Config,
+) {
+    // Every run below drives Detcore in this process, whose directory-stream
+    // state, detlog forwarder, and soft RLIMIT_NOFILE are process-global: a
+    // sibling test's stream state can leave this test's listing empty, its
+    // forwarder changes what this test hashes, and the full-table test's
+    // lowered descriptor limit makes this test's setup fail with EMFILE.
+    // Each test therefore runs in a child process of its own, as nextest
+    // already runs it.
+    const CHILD: &str = "HERMIT_READDIR_ORDER_CHILD";
+    let case = std::thread::current()
+        .name()
+        .unwrap_or_default()
+        .to_string();
+    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(&case)) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &case, "--nocapture", "--test-threads=1"])
+            .env(CHILD, &case)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{output:?}"
+        );
+        return;
+    }
     let mut expected = None;
+    // The guest closure owns what it uses (detcore-testutils'
+    // `test_fn_with_logs`): the value stays this thread's to drop after the
+    // run.
+    let guest = Arc::new(guest);
 
     for run in 1..=RUNS {
-        let value = setup();
+        let value = Arc::new(setup());
+        let (guest_fn, guest_value) = (Arc::clone(&guest), Arc::clone(&value));
         let (output, _state) = detcore_testutils::test_fn_with_config::<Detcore, _>(
-            || guest(&value),
+            move || guest_fn(&guest_value),
             detcore_testutils::prepare_ptrace_timer_config(config.clone()),
             true,
         )
@@ -447,7 +482,12 @@ fn drain_names(fd: i32) -> Vec<String> {
 }
 
 /// Send `fd` to this process over a Unix socket and return the descriptor
-/// that arrives. Detcore does not track descriptors received this way.
+/// that arrives. With sequentialized threads Detcore records it as an alias
+/// of `fd`'s open file while `fd` is open, sharing its sorted stream and
+/// position as Linux shares the kernel position
+/// (`Detcore::record_received_descriptors`); without, it keeps no record of
+/// it, and `getdents` through it reads the kernel's buffers from the
+/// position it shares with `fd`. The tests that use it run both ways.
 fn receive_descriptor(fd: i32) -> i32 {
     /// Room for one `SCM_RIGHTS` message, aligned as a `cmsghdr` must be.
     #[repr(C, align(8))]
@@ -506,7 +546,7 @@ fn received_descriptor_guest(root: &tempfile::TempDir) {
     // Without a stream, each kernel buffer is sorted on its own, as on main,
     // so only the set of names is fixed. The length check above together with
     // set equality still rules out any repeated entry. The per-buffer order
-    // is an older deviation of untracked descriptors, which an identity for
+    // is an older deviation of received descriptors, which an identity for
     // received descriptors removes
     // (https://github.com/rrnewton/hermit/issues/3387). No stream is shared
     // here, because `dir` is closed before any read, so the repeats of
@@ -518,12 +558,19 @@ fn received_descriptor_guest(root: &tempfile::TempDir) {
     println!("received descriptor ok");
 }
 
-/// Compares only the set of names, because an untracked descriptor still sorts
+/// Compares only the set of names, because a received descriptor still sorts
 /// each buffer on its own (https://github.com/rrnewton/hermit/issues/3387);
 /// see the guest.
 #[test]
 fn received_descriptor_lists_whole_directory() {
     run_five_times_on(scrambled_directory, received_descriptor_guest, true);
+}
+
+/// The same with unsequentialized threads, where Detcore keeps no record of
+/// the received descriptor.
+#[test]
+fn unrecorded_received_descriptor_lists_whole_directory() {
+    run_five_times_on(scrambled_directory, received_descriptor_guest, false);
 }
 
 fn unsequentialized_threads_guest(root: &tempfile::TempDir) {
@@ -640,29 +687,38 @@ fn small_buffer_returns_entries_that_fit() {
     run_five_times(small_buffer_guest);
 }
 
-fn seek_before_first_read_guest() {
-    let root = tempfile::tempdir().unwrap();
-    for index in 0..5 {
-        File::create(root.path().join(name(index))).unwrap();
-    }
-
-    // Learn a real host position: a received descriptor has no stream, so
-    // its records carry the kernel's own `d_off` cookies. `.` comes first on
-    // Linux filesystems, and its cookie is the position after it.
-    let probe = File::open(root.path()).unwrap();
-    let received = receive_descriptor(probe.as_raw_fd());
-    drop(probe);
+/// The kernel's own `d_off` cookie of the `.` entry of `directory`, read
+/// natively before a guest runs: the position after `.` (`.` comes first on
+/// Linux filesystems). (These tests used to learn it inside the guest through
+/// a received descriptor, which then had no stream; a recorded one has a
+/// sorted stream with ordinal `d_off` values.)
+fn host_dot_cookie(directory: &std::path::Path) -> i64 {
+    let probe = File::open(directory).unwrap();
     let mut buf = [0u8; 4096];
-    let n = getdents64(received, &mut buf).unwrap();
-    unsafe { libc::close(received) };
+    let n = getdents64(probe.as_raw_fd(), &mut buf).unwrap();
     let cookie = records(&buf[..n])
         .into_iter()
         .find_map(|(name, off)| (name == ".").then_some(off))
         .expect("no `.` entry");
     assert_ne!(cookie, 0);
+    cookie
+}
 
-    // Seeking a fresh descriptor there before its first read resumes after
-    // `.`, as on Linux, rather than restarting the directory.
+/// A directory of five entries and its host `.` cookie.
+fn seek_before_first_read_setup() -> (tempfile::TempDir, i64) {
+    let root = tempfile::tempdir().unwrap();
+    for index in 0..5 {
+        File::create(root.path().join(name(index))).unwrap();
+    }
+    let cookie = host_dot_cookie(root.path());
+    (root, cookie)
+}
+
+fn seek_before_first_read_guest((root, cookie): &(tempfile::TempDir, i64)) {
+    let cookie = *cookie;
+    // Seeking a fresh descriptor to a real host position before its first
+    // read resumes after `.`, as on Linux, rather than restarting the
+    // directory.
     let dir = File::open(root.path()).unwrap();
     let fd = dir.as_raw_fd();
     assert_eq!(unsafe { libc::lseek(fd, cookie, libc::SEEK_SET) }, cookie);
@@ -677,26 +733,22 @@ fn seek_before_first_read_guest() {
 
 #[test]
 fn seek_before_first_read_is_kept() {
-    run_five_times(seek_before_first_read_guest);
+    run_five_times_on(
+        seek_before_first_read_setup,
+        seek_before_first_read_guest,
+        true,
+    );
 }
 
-fn rewind_after_host_order_guest(root: &tempfile::TempDir) {
+fn rewind_after_host_order_guest((root, cookie): &(tempfile::TempDir, i64)) {
+    let cookie = *cookie;
     let mut expected = vec![".".to_owned(), "..".to_owned()];
     expected.extend(sorted_names());
 
     // A descriptor seeked before its first read is read in host order (see
     // `seek_before_first_read_is_kept`). Seeking it back to 0 starts the
     // directory over, and the sorted stream with it.
-    let probe = File::open(root.path()).unwrap();
-    let received = receive_descriptor(probe.as_raw_fd());
-    drop(probe);
     let mut buf = [0u8; 4096];
-    let n = getdents64(received, &mut buf).unwrap();
-    unsafe { libc::close(received) };
-    let cookie = records(&buf[..n])
-        .into_iter()
-        .find_map(|(name, off)| (name == ".").then_some(off))
-        .expect("no `.` entry");
     let dir = File::open(root.path()).unwrap();
     let fd = dir.as_raw_fd();
     assert_eq!(unsafe { libc::lseek(fd, cookie, libc::SEEK_SET) }, cookie);
@@ -719,15 +771,28 @@ fn rewind_after_host_order_guest(root: &tempfile::TempDir) {
 
 #[test]
 fn rewind_after_host_order_sorts_again() {
-    run_five_times_on(scrambled_directory, rewind_after_host_order_guest, true);
+    run_five_times_on(
+        || {
+            let root = scrambled_directory();
+            let cookie = host_dot_cookie(root.path());
+            (root, cookie)
+        },
+        rewind_after_host_order_guest,
+        true,
+    );
 }
 
-fn passed_on_descriptor_guest(root: &tempfile::TempDir) {
+/// `recorded`: whether Detcore records the received descriptor (with
+/// sequentialized threads), as an alias that shares the stream, or keeps no
+/// record of it (without), so that it reads the kernel's position.
+fn passed_on_descriptor_guest(root: &tempfile::TempDir, recorded: bool) {
     let mut expected = vec![".".to_owned(), "..".to_owned()];
     expected.extend(sorted_names());
 
-    // Read part of the directory, then hand the open file to a descriptor
-    // Detcore does not track. On Linux it reads the entries not yet returned;
+    // Read part of the directory, then hand the open file to a received
+    // descriptor, which Detcore records as an alias of the open file or does
+    // not track (see `receive_descriptor`). On Linux it reads the entries not yet
+    // returned;
     // it may also repeat some here, because the host order differs, but it
     // must not miss any. The repeats are a known regression, not the spec:
     // https://github.com/rrnewton/hermit/issues/3722.
@@ -753,15 +818,21 @@ fn passed_on_descriptor_guest(root: &tempfile::TempDir) {
         missing.first()
     );
 
-    // The stream itself continues where it stopped. This is NOT Linux
-    // behaviour: the two descriptors share one position, so after the
-    // passed-on descriptor read to the end, Linux returns nothing here. The
-    // stream does not see the alias's reads and returns those entries again,
-    // the second mechanism of https://github.com/rrnewton/hermit/issues/3722.
-    // Flip this assertion when that issue is fixed.
-    let mut names = first;
-    names.extend(drain_names(fd));
-    assert_eq!(names, expected);
+    // The two descriptors share one position, so after the passed-on
+    // descriptor read to the end, Linux returns nothing here. A recorded
+    // received descriptor shares the stream, so the same holds. An unrecorded
+    // one reads the kernel's position, which the stream does not see: the
+    // stream continues where it stopped and returns those entries again. That
+    // is NOT Linux behaviour, the second mechanism of
+    // https://github.com/rrnewton/hermit/issues/3722; flip that branch when
+    // the issue is fixed.
+    if recorded {
+        assert_eq!(drain_names(fd), Vec::<String>::new());
+    } else {
+        let mut names = first;
+        names.extend(drain_names(fd));
+        assert_eq!(names, expected);
+    }
 
     // At the end of the stream, the passed-on descriptor is at the end too.
     let mut buf = [0u8; 4096];
@@ -775,11 +846,26 @@ fn passed_on_descriptor_guest(root: &tempfile::TempDir) {
     println!("passed-on descriptor ok");
 }
 
-/// Tolerates repeated entries on an untracked descriptor, a known regression
+/// Tolerates repeated entries on a received descriptor, a known regression
 /// tracked in https://github.com/rrnewton/hermit/issues/3722; see the guest.
 #[test]
 fn passed_on_descriptor_misses_no_entry() {
-    run_five_times_on(scrambled_directory, passed_on_descriptor_guest, true);
+    run_five_times_on(
+        scrambled_directory,
+        |root| passed_on_descriptor_guest(root, true),
+        true,
+    );
+}
+
+/// The same with unsequentialized threads, where Detcore keeps no record of
+/// the passed-on descriptor.
+#[test]
+fn unrecorded_passed_on_descriptor_misses_no_entry() {
+    run_five_times_on(
+        scrambled_directory,
+        |root| passed_on_descriptor_guest(root, false),
+        false,
+    );
 }
 
 fn partly_mapped_buffer_guest(root: &tempfile::TempDir) {
@@ -1003,6 +1089,10 @@ fn sorted(mut names: Vec<String>) -> Vec<String> {
     names
 }
 
+/// Detcore records the received descriptor (with sequentialized threads) as
+/// an alias of the open file, sharing its stream and position, or keeps no
+/// record of it (without), so that it reads from the kernel's position,
+/// which it shares. Either way it follows the rewinds as on Linux.
 fn alias_after_rewinds_guest() {
     let root = both_orders(300);
     let expected = listing_of(300);
@@ -1027,6 +1117,10 @@ fn alias_after_rewinds_guest() {
         );
         assert_eq!(unsafe { libc::lseek(fd, 0, libc::SEEK_SET) }, 0);
         drop(dir);
+        // Linux shares one position: after the stream is rewound, the
+        // passed-on descriptor reads every entry again, though the
+        // descriptor it was sent from is closed. A recorded received
+        // descriptor is an alias of that open file and shares its stream.
         assert_eq!(
             sorted(drain_names(received)),
             sorted(expected.clone()),
@@ -1067,12 +1161,19 @@ fn alias_after_rewinds_guest() {
     println!("alias after rewinds ok");
 }
 
-/// Tolerates repeated entries on an untracked descriptor, a known regression
+/// Tolerates repeated entries on a received descriptor, a known regression
 /// tracked in https://github.com/rrnewton/hermit/issues/3722; see
 /// `assert_contains_rest`.
 #[test]
 fn passed_on_descriptor_follows_repeated_seeks() {
-    run_five_times(alias_after_rewinds_guest);
+    run_five_times_on(|| (), |()| alias_after_rewinds_guest(), true);
+}
+
+/// The same with unsequentialized threads, where Detcore keeps no record of
+/// the passed-on descriptor, which then shares the kernel's position.
+#[test]
+fn unrecorded_passed_on_descriptor_follows_repeated_seeks() {
+    run_five_times_on(|| (), |()| alias_after_rewinds_guest(), false);
 }
 
 /// A mapping of `pages` pages filled with 0xaa, of which the first `writable`
@@ -2290,8 +2391,10 @@ fn negative_count_untracked_guest() {
         File::create(root.path().join(name(index))).unwrap();
     }
 
-    // A descriptor Detcore does not track, and one it reads in host order
-    // because it was seeked to a host position before its first read: a
+    // A received descriptor (recorded as an alias of an open file, or
+    // untracked), and one it
+    // reads in host order because it was seeked to a host position before
+    // its first read: a
     // count that is negative as an `int` fails with EINVAL while entries
     // remain and returns 0 at the end, writing nothing and moving nothing.
     let mut buf = vec![0xaa_u8; 4096];
@@ -2348,10 +2451,9 @@ fn negative_count_untracked_guest() {
                 );
                 assert!(buf.iter().all(|&byte| byte == 0xaa), "{context}");
                 // Every entry still follows, so the position is still 0.
-                // (Asked with `lseek`, Hermit answers EBADF on the ptrace,
-                // KVM and LiteInst backends, as for every call on a
-                // descriptor received through `SCM_RIGHTS`: Detcore does not
-                // track it.)
+                // (Not asked with `lseek`, which a backend that keeps no
+                // record of a descriptor received through `SCM_RIGHTS`
+                // answers with EBADF.)
                 let name_offset = if call == libc::SYS_getdents64 { 19 } else { 18 };
                 let mut names = Vec::new();
                 loop {
@@ -2377,7 +2479,9 @@ fn negative_count_untracked_guest() {
     }
 
     // A descriptor Detcore tracks, rewound to 0 after it was read to the
-    // end, while a descriptor it does not track, for the same open file,
+    // end, while a received descriptor (recorded as an alias, or
+    // untracked),
+    // for the same open file,
     // leaves the kernel's position at the end. Linux keeps one position for
     // both, so there nothing follows and a negative count returns 0.
     // Detcore keeps the tracked stream's own position, from which every
@@ -2425,6 +2529,13 @@ fn negative_count_untracked_guest() {
 #[test]
 fn negative_count_on_untracked_and_host_order_descriptors() {
     run_five_times(negative_count_untracked_guest);
+}
+
+/// The same with unsequentialized threads, where Detcore keeps no record of
+/// the received descriptors.
+#[test]
+fn negative_count_on_unrecorded_received_descriptors() {
+    run_five_times_with(negative_count_untracked_guest, false);
 }
 
 /// Whether a host inode is new to Detcore depends on host state the guest does
@@ -3214,7 +3325,12 @@ fn an_inherited_fdinfo_table_names_the_parents_entries() {
 }
 
 /// With `/proc/self/fd` as the working directory, a stat of `"40"` relative
-/// to it gives the entry a listing gives (P2-2).
+/// to it (the kernel's entry, numbered by Detcore) gives the entry Detcore's
+/// served listing of the directory gives (P2-2). `fchdir` to the directory's
+/// descriptor enters it, as on Linux, and the working directory is then the
+/// directory's own path: Detcore serves the directory on a descriptor on
+/// procfs's root (ptrace) and enters the directory itself, by its path
+/// within procfs from that descriptor (package K slices F1 and P1).
 fn cwd_table_guest() {
     open_slot_40();
     let dir = unsafe {
@@ -3225,6 +3341,10 @@ fn cwd_table_guest() {
     };
     assert!(dir >= 0);
     assert_eq!(unsafe { libc::fchdir(dir) }, 0);
+    assert_eq!(
+        std::env::current_dir().unwrap(),
+        std::path::PathBuf::from(format!("/proc/{}/fd", std::process::id()))
+    );
     let listed = listed_in(dir, "40");
     let relative = at_identity(libc::AT_FDCWD, c"40", libc::AT_SYMLINK_NOFOLLOW).1;
     assert_eq!(relative, listed, "cwd-relative stat and listing");

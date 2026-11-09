@@ -43,11 +43,12 @@ else
     echo "Environment under --base=env=empty looks ok."
 fi
 
-# Minimal env contains at least HOME, PATH, HOSTNAME currently:
+# Minimal env contains HOSTNAME, PATH, HOME, USER and LOGNAME, plus the
+# ASAN_OPTIONS and LSAN_OPTIONS every instrumented guest gets:
 "$hermit" run --base-env=minimal /bin/env > "$tmpdir/minimal_env"
 minimal_size=$(wc -l < "$tmpdir/minimal_env")
-if [ "$minimal_size" -gt 5 ] || [ "$minimal_size" -lt 3 ]; then
-    echo "Expected --base-env=minimal environment to contain 2 or fewer variables, got $minimal_size"
+if [ "$minimal_size" -gt 7 ] || [ "$minimal_size" -lt 5 ]; then
+    echo "Expected --base-env=minimal environment to contain 5 to 7 variables, got $minimal_size"
     echo "Environment was: "
     cat "$tmpdir/minimal_env"
     exit 1

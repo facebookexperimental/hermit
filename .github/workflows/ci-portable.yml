@@ -1,9 +1,23 @@
 name: CI (GitHub-managed portable)
 
 # Diagnostic fan-out of the constructed portable plan. It runs automatically
-# only after a commit reaches the integration branch, and may also be dispatched
-# manually. Follow AGENTS.md for landing: local or GitHub evidence is acceptable,
-# and reported failures require investigation.
+# after a commit reaches the integration branch and for pull requests opened by
+# anyone other than the project bot (owner decision, 2026-10-27: "invoke CI
+# automatically only for external PRs not by our hermit-bot account"), and may
+# also be dispatched manually. Follow AGENTS.md for landing: local or GitHub
+# evidence is acceptable, and reported failures require investigation.
+#
+# EXTERNAL PULL REQUESTS. A pull_request run whose author is hermit-bot3, or
+# whose pull request is a draft, skips every job: the gate sits on the jobs
+# that can start without a predecessor (select, plan) and on the two that run
+# under always() (regular, cleanup); every other job needs select and is skipped
+# with it. The workflow uses no secrets and a contents: read token, so it runs
+# the same for a branch of this repository and for a fork. For a fork, GitHub
+# also withholds write scopes, so cleanup (which deletes this run's short-lived
+# artifacts and needs actions: write) is skipped there; those artifacts expire
+# on their own after one day. First-time fork contributors still need a
+# maintainer to approve the run in the Actions tab (repository setting).
+# This is diagnostic signal only: no status check is required for landing.
 #
 # WHY: the former serial `regular` job ran the entire 46-node
 # portable DAG on ONE ubuntu-latest runner with outer concurrency 1 (serial
@@ -59,6 +73,8 @@ on:
   workflow_dispatch:
   push:
     branches: [integration]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
 
 concurrency:
   # Runs for one ref share a group. cancel-in-progress:false lets the running
@@ -109,9 +125,9 @@ env:
 jobs:
   # -------------------------------------------------- affected-test selection
   # Consume ci/select-tests.rs (#1500) to shrink the matrix for a limited-
-  # footprint pull request. That selection path is dormant under the current
-  # trigger policy: the integration push and workflow_dispatch events always
-  # select the full suite. A disabled kill-switch, an
+  # footprint pull request. That selection path runs for pull_request events
+  # (non-bot, non-draft pull requests, since 2026-10-27); the integration push
+  # and workflow_dispatch events always select the full suite. A disabled kill-switch, an
   # unresolvable base, ANY tool error, or an unrecognized decision all fall
   # through to the full matrix — the exact behavior before this job existed. The
   # `skip`/`selective` decisions themselves are the tool's audited, proof-of-inert
@@ -119,6 +135,7 @@ jobs:
   # subset); this job only translates them into matrices, never widens `skip`.
   select:
     name: Select affected tests
+    if: github.event_name != 'pull_request' || (github.event.pull_request.user.login != 'hermit-bot3' && !github.event.pull_request.draft)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -126,12 +143,10 @@ jobs:
       build_debug: ${{ steps.sel.outputs.build_debug }}
       build_release: ${{ steps.sel.outputs.build_release }}
       run_debug_shards: ${{ steps.sel.outputs.run_debug_shards }}
-      run_release_shards: ${{ steps.sel.outputs.run_release_shards }}
       run_strict_compat: ${{ steps.sel.outputs.run_strict_compat }}
       run_e2e: ${{ steps.sel.outputs.run_e2e }}
       cell_backends: ${{ steps.sel.outputs.cell_backends }}
       debug_matrix: ${{ steps.sel.outputs.debug_matrix }}
-      release_matrix: ${{ steps.sel.outputs.release_matrix }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -149,20 +164,17 @@ jobs:
           # Emit the FULL matrix straight from the audited shard map — the safe
           # default used for every non-selective path.
           emit_full() {
-            local dbg rel
+            local dbg
             dbg=$(jq -c '{include: [ .debug_shards[]   | {slug, nodes: (.nodes|join(","))} ]}' ci/portable-shards.json)
-            rel=$(jq -c '{include: [ .release_shards[] | {slug, needs, nodes: (.nodes|join(","))} ]}' ci/portable-shards.json)
             {
               echo "decision=full"
               echo "build_debug=true"
               echo "build_release=true"
               echo "run_debug_shards=true"
-              echo "run_release_shards=true"
               echo "run_strict_compat=true"
               echo "run_e2e=true"
               echo "cell_backends=ALL"
               echo "debug_matrix=$dbg"
-              echo "release_matrix=$rel"
             } >> "$GITHUB_OUTPUT"
             echo "selection: FULL matrix (reason: $1)" >&2
           }
@@ -192,11 +204,7 @@ jobs:
           dbg=$(jq -c --argjson sel "$sel_shards" \
             '{include: [ .debug_shards[]   | select(.slug as $s | $sel | index($s)) | {slug, nodes: (.nodes|join(","))} ]}' \
             ci/portable-shards.json)
-          rel=$(jq -c --argjson sel "$sel_shards" \
-            '{include: [ .release_shards[] | select(.slug as $s | $sel | index($s)) | {slug, needs, nodes: (.nodes|join(","))} ]}' \
-            ci/portable-shards.json)
           run_dbg=$(jq -e '.include|length>0' <<<"$dbg" >/dev/null 2>&1 && echo true || echo false)
-          run_rel=$(jq -e '.include|length>0' <<<"$rel" >/dev/null 2>&1 && echo true || echo false)
           run_strict=$(jq -r \
             'if any(.nodes[]; . == "e2e.manifest_compat_on_host") then "true" else "false" end' \
             <<<"$sel_json")
@@ -219,7 +227,7 @@ jobs:
           # (gated by build_release) produces from the build-debug tree. Keep
           # both jobs together for any test fan-out instead of letting
           # selection cut the build edge.
-          if [[ "$run_dbg" == "true" || "$run_rel" == "true" || "$run_strict" == "true" || "$run_e2e" == "true" || "$build_release" == "true" ]]; then
+          if [[ "$run_dbg" == "true" || "$run_strict" == "true" || "$run_e2e" == "true" || "$build_release" == "true" ]]; then
             build_debug=true
             build_release=true
           fi
@@ -228,24 +236,25 @@ jobs:
             echo "build_debug=$build_debug"
             echo "build_release=$build_release"
             echo "run_debug_shards=$run_dbg"
-            echo "run_release_shards=$run_rel"
             echo "run_strict_compat=$run_strict"
             echo "run_e2e=$run_e2e"
             echo "cell_backends=$backends"
             echo "debug_matrix=$dbg"
-            echo "release_matrix=$rel"
           } >> "$GITHUB_OUTPUT"
-          echo "selection: decision=$decision debug_shards=$run_dbg release_shards=$run_rel strict_compat=$run_strict e2e=$run_e2e backends=[$backends] build_debug=$build_debug build_release=$build_release" >&2
+          echo "selection: decision=$decision debug_shards=$run_dbg strict_compat=$run_strict e2e=$run_e2e backends=[$backends] build_debug=$build_debug build_release=$build_release" >&2
 
   # ---------------------------------------------------------------- plan (cheap)
-  # Fail-closed integrity guard over the shard map itself. Runs UNCONDITIONALLY
-  # (it has no `needs: select`) so a corrupt ci/portable-shards.json reds the
+  # Fail-closed integrity guard over the shard map itself. Runs on every
+  # admitted event (it has no `needs: select`; like select it carries the
+  # pull-request gate, so a bot or draft pull request skips it) so a corrupt
+  # ci/portable-shards.json reds the
   # `regular` diagnostic even on a skip/selective run. The shard MATRICES are
   # now derived by the `select` job (full or affected-test-filtered); this job no
   # longer emits them, it only verifies the map every downstream matrix is cut
   # from is internally consistent and covers the DAG.
   plan:
     name: Verify shard/DAG coverage
+    if: github.event_name != 'pull_request' || (github.event.pull_request.user.login != 'hermit-bot3' && !github.event.pull_request.draft)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -268,7 +277,6 @@ jobs:
         run: |
           set -euo pipefail
           echo "debug shards:";   jq -r '.debug_shards[]   | "  - \(.slug): \(.nodes|join(", "))"' ci/portable-shards.json
-          echo "release shards:"; jq -r '.release_shards[] | "  - \(.slug) (needs \(.needs)): \(.nodes|join(", "))"' ci/portable-shards.json
 
   # --------------------------------------------------- constructed preflight
   preflight:
@@ -529,6 +537,19 @@ jobs:
           packages: bc binutils bsdextrautils bzip2 clang cmake cpio curl dc file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
       - name: Rust components
         run: rustup component add clippy rustfmt
+      # setup.nextest probes `cargo nextest show-config version` and only then
+      # falls back to compiling cargo-nextest from source, inside that node's
+      # 80 CPU-second budget. A cold source build cannot meet it: run
+      # 42565076328 was killed at 80.5s CPU after 29s wall, still mid
+      # dependency tree, on a runner whose rust-cache held no nextest binary.
+      # Provision the prebuilt binary the same way the checks and
+      # unit-parallel jobs already do (same action pin, same
+      # NEXTEST_VERSION the node's fallback names), so the probe passes
+      # and the Stage cargo-nextest step below stages this exact binary.
+      - name: Install cargo-nextest (build-debug)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
       # gate.manifest runs `test-harness validate`, which shells out to
       # tests/manifest-cli.rs -- one of the tracked entrypoints carrying
       # `#!/usr/bin/env -S rust-script --force`. Without the interpreter that
@@ -550,6 +571,17 @@ jobs:
             exit 1
           fi
           echo "rust-script resolved: $(command -v rust-script) $(rust-script --version)"
+      # build.workspace_on_host reaches hermit-install, whose nested LiteInst
+      # build first resolves its declared sources with
+      # `cargo metadata --locked --offline`. That standalone workspace is not
+      # in the root build's initial download graph, so on a fresh runner its
+      # locked git/registry sources may still be absent when the offline call
+      # runs; run 42595572926 failed there with exit 101 before any test ran.
+      # Fetch both locked workspaces now, while this job is still online.
+      - name: Fetch locked workspace dependencies
+        run: |
+          cargo fetch --locked
+          cargo fetch --locked --manifest-path liteinst-runtime-build/Cargo.toml
       - name: Download manifest plan tools and rust-script binaries
         uses: actions/download-artifact@v4
         with:
@@ -611,20 +643,12 @@ jobs:
           echo "archive_count=$archive_count" >> "$GITHUB_OUTPUT"
           echo "Fanning out $count constructed portable E2E steps:" >&2
           jq -r '.include[] | "  - \(.node)"' <<<"$matrix" >&2
-      # build.workspace_on_host already builds detcore-dbt (in its
-      # feature-unified workspace build, in the validate profile since the
-      # one-build change d44bbbb79ac; until 2026-10-18 a separate first command
-      # also built `-p detcore-dbt`, which the workspace build then recompiled)
-      # and then hashes
-      # target/validate/deps/libdetcore_dbt.{so,rlib} into the prepared-Nextest
-      # record as runtime files of every -p hermit-run and --workspace selection.
-      # A step here used to re-run
-      # `cargo build -p detcore-dbt` to "stage" the DBT runtime. That build
-      # resolves different dependency features from the workspace build (for
-      # example parking_lot, bytes, syn and tracing-core), so Cargo recompiled
-      # reverie-dbt and detcore-dbt and overwrote both unhashed cdylib/rlib
-      # files after they were recorded. Every consumer then refused its inventory:
-      # run 36485831200 lost 12 nodes in 7 test-debug jobs to "prepared
+      # build.workspace_on_host builds the workspace once (validate profile
+      # since the one-build change d44bbbb79ac) and hashes its executables and
+      # runtime files into the prepared-Nextest record. Anything that rebuilds
+      # afterward can rewrite a recorded file under a different feature
+      # resolution, and every consumer then refuses its inventory: run
+      # 36485831200 lost 12 nodes in 7 test-debug jobs to "prepared
       # executable, package identity, or runtime file changed", about 5 s after
       # start and before any test ran. The pack step below ships the recorded
       # runtime unchanged. Re-verify the whole prepared record here, after the
@@ -648,8 +672,8 @@ jobs:
           # simply find no prebuilt fixtures, exactly as an unstaged tree intends.
           mkdir -p ignored/e2e/build
           # build.workspace_on_host compiles Hermit once, in the validate
-          # profile (d44bbbb79ac), so hermit, verification-report and the DBT
-          # runtime are under target/validate. test-harness,
+          # profile (d44bbbb79ac), so hermit and verification-report are
+          # under target/validate. test-harness,
           # hermit-manifest-plan and the Nextest CPU wrapper are dev-profile
           # tools and stay under target/debug. Report every absent input before
           # failing: a bare `test` under `set -e` exits 1 without a word, which
@@ -667,7 +691,6 @@ jobs:
           require -x target/debug/hermit-manifest-plan
           require -x target/validate/verification-report
           require -x target/debug/nextest-cpu-wrapper
-          require -f target/validate/deps/libdetcore_dbt.so
           require -x target/ci/bin/cargo-nextest
           require -f target/ci/nextest-binaries/current.json
           # No release-profile producer exists since d44bbbb79ac
@@ -679,13 +702,11 @@ jobs:
           # ci/publish-hermit-e2e-artifact.sh requires, and test.liteinst_strict
           # reads the profile-staged LiteInst runtime under target/validate.
           # `test` follows symlinks, so a dangling resource link fails here.
-          require -x target/install_pkg/rsrcs/dynamorio/bin64/drrun
-          require -x target/install_pkg/rsrcs/sabre
-          require -s target/install_pkg/rsrcs/sabre.revision
-          require -x target/install_pkg/rsrcs/e9patch
-          require -x target/install_pkg/rsrcs/e9tool
-          require -s target/install_pkg/rsrcs/libdetcore_sabre.so
-          require -s target/install_pkg/rsrcs/libreverie_dbt_client.so
+          # The first-party core split
+          # (ee51613d1cd2dd1a6f26b053636614fd4a35a5ae) removed DynamoRIO, SaBRe
+          # and e9patch staging from hermit-install; the core installer now
+          # stages only the LiteInst resources required below, matching
+          # require_core_resources in ci/verify-hermit-e2e-artifact.sh.
           require -s target/install_pkg/rsrcs/libreverie_liteinst.so
           require -s target/validate/libreverie_liteinst.so
           require -s target/validate/libreverie_liteinst.so.revision
@@ -699,19 +720,11 @@ jobs:
             echo "Pack debug prebuilt tree: $missing required input(s) missing; nothing was packed" >&2
             exit 1
           fi
-          # Cargo test shards may rewrite target/validate/deps, and hermit-install
-          # stages this resource as a symlink to ../../validate/libdetcore_dbt.so,
-          # which this tarball does not carry. Replace the symlink with a regular
-          # copy in Hermit's install-resource location so later CLI nodes depend
-          # on neither.
-          rm -f target/install_pkg/rsrcs/libdetcore_dbt.so
-          install -Dm755 target/validate/deps/libdetcore_dbt.so \
-            target/install_pkg/rsrcs/libdetcore_dbt.so
-          # hermit-install also links rsrcs/libdetcore_sabre.so and
-          # install_pkg/hermit into target/validate, which this tarball does
-          # not carry in full. Replace every remaining link with a regular copy
-          # of its resolved target, refusing a dangling or non-file link, so the
-          # packed target/install_pkg is self-contained in every consumer.
+          # hermit-install links install_pkg/hermit into target/validate,
+          # which this tarball does not carry in full. Replace every link with
+          # a regular copy of its resolved target, refusing a dangling or
+          # non-file link, so the packed target/install_pkg is self-contained
+          # in every consumer.
           while IFS= read -r -d '' link; do
             if ! resolved=$(readlink -e -- "$link") || ! test -f "$resolved"; then
               echo "::error::Pack debug prebuilt tree: dangling or non-file symlink: $link" >&2
@@ -728,7 +741,6 @@ jobs:
             target/debug/hermit-manifest-plan \
             target/validate/verification-report \
             target/debug/nextest-cpu-wrapper \
-            target/validate/deps/libdetcore_dbt.so \
             target/validate/libreverie_liteinst.so \
             target/validate/libreverie_liteinst.so.revision \
             target/validate/libdetcore_liteinst.so \
@@ -860,10 +872,6 @@ jobs:
           require -x target/validate/hermit
           require -x target/debug/nextest-cpu-wrapper
           require -f target/ci/nextest-binaries/current.json
-          require -x target/install_pkg/rsrcs/dynamorio/bin64/drrun
-          require -x target/install_pkg/rsrcs/sabre
-          require -s target/install_pkg/rsrcs/sabre.revision
-          require -s target/install_pkg/rsrcs/libdetcore_sabre.so
           require -s target/validate/libreverie_liteinst.so
           require -s target/validate/libreverie_liteinst.so.revision
           if ((missing > 0)); then
@@ -898,10 +906,7 @@ jobs:
             fi
           }
           require -x target/ci/hermit
-          require -s target/ci/libdetcore_sabre.so
           require -s target/ci/hermit-e2e-artifact.path
-          require -s target/install_pkg/rsrcs/libdetcore_dbt.so
-          require -s target/install_pkg/rsrcs/libreverie_dbt_client.so
           require -s target/validate/libreverie_liteinst.so
           require -s target/validate/libreverie_liteinst.so.revision
           if ((missing > 0)); then
@@ -1022,7 +1027,7 @@ jobs:
         with:
           name: ${{ env.NEXTEST_ARTIFACT }}
           path: .
-      # The completed release tree carries the DBT and LiteInst runtimes plus
+      # The completed release tree carries the LiteInst runtime plus
       # the constructed E2E artifact. A selective run may skip it only when the
       # selector proved the chosen debug shard needs none of those outputs.
       - name: Download completed release tree
@@ -1041,9 +1046,7 @@ jobs:
           test -x target/validate/hermit
           test -x target/validate/verification-report
           test -x target/debug/nextest-cpu-wrapper
-          test -f target/validate/deps/libdetcore_dbt.so
           test -f target/validate/libdetcore_liteinst.so
-          test -f target/install_pkg/rsrcs/libdetcore_dbt.so
           test -x target/ci/bin/cargo-nextest
           test -f target/ci/nextest-binaries/current.json
       # Install into CARGO_HOME/bin rather than adding target/ci/bin to PATH:
@@ -1083,8 +1086,6 @@ jobs:
             echo "Unpack completed release tree: $missing required input(s) missing" >&2
             exit 1
           fi
-          test -x target/install_pkg/rsrcs/dynamorio/bin64/drrun
-          test -f target/install_pkg/rsrcs/libreverie_dbt_client.so
           ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null
       - name: Run shard nodes (${{ matrix.slug }})
         env:
@@ -1240,130 +1241,6 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-  # ----------------------------------------------- test shards (release-backed)
-  test-release:
-    name: "test: ${{ matrix.slug }}"
-    needs: [select, build-complete]
-    if: needs.select.outputs.run_release_shards != 'false'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.select.outputs.release_matrix) }}
-    steps:
-      - uses: actions/checkout@v4
-      # hermit-cli/tests/liteinst_allocator.rs compiles reverie/scripts/m1_artifact.rs
-      # from the pinned reverie submodule, so every job that builds workspace tests
-      # needs it checked out (run 38106386550 failed at build.workspace_on_host).
-      - name: Initialize dagrun and reverie submodules
-        run: git submodule update --init agent-utils reverie
-      # build-debug saves the only workspace cache; the release-profile cache
-      # lost its producer with build-release
-      # (https://github.com/rrnewton/hermit/issues/3458).
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: portable-parallel-debug
-          save-if: false
-      - name: Dependencies
-        uses: ./.github/actions/apt-install
-        with:
-          packages: bc binutils bzip2 clang cmake file g++ gcc git iproute2 jq libc6-dbg libelf-dev libunwind-dev liblzma-dev make pkg-config procps python3-full time zlib1g-dev zstd
-      # Release shards now execute individual tests through the same pinned
-      # nextest timeout policy as debug shards. The release artifact contains
-      # product binaries, not Cargo subcommand tooling, so provision it here.
-      - name: Install cargo-nextest (release shards)
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
-      # run-node.sh enters every release shard through scripts/validate.rs, and
-      # check.dbt_runtime_abi also uses rust-script directly.
-      - name: Install rust-script
-        # RUSTFLAGS is cleared for the same reason as the preflight and
-        # build-debug installs (d9aa6066): the workflow-level
-        # `-C link-arg=-llzma` describes Hermit's own build and breaks a tool
-        # build that does not link lzma. This job's `Dependencies` step does
-        # install liblzma-dev, so the flag would happen to survive here -- but
-        # depending on a neighbouring apt list is precisely how the preflight
-        # copy of this line failed, so the step is made correct on its own.
-        env:
-          RUSTFLAGS: ""
-        run: cargo install rust-script --version "${RUST_SCRIPT_VERSION}" --locked
-      - name: Verify rust-script resolves
-        run: |
-          if ! command -v rust-script >/dev/null; then
-            echo "::error::rust-script is not on PATH; check.dbt_runtime_abi would die at exec with status 127."
-            exit 1
-          fi
-          echo "rust-script resolved: $(command -v rust-script) $(rust-script --version)"
-      # test.sabre_examples_on_host verifies the prepared-Nextest record inside
-      # ci/run-hosted-node.sh's network namespace, which re-hashes each git
-      # dependency's Cargo checkout; see test-debug's fetch step for the
-      # rust-cache key miss that left those checkouts absent in run
-      # 37469056816.
-      - name: Fetch locked workspace dependencies
-        run: cargo fetch --locked
-      - name: Enable unprivileged user and mount namespaces
-        run: |
-          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          fi
-          sudo install -d -o "$(id -u)" -g "$(id -g)" /test
-          unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
-      - name: Download full release prebuilt tree
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.RELEASE_ARTIFACT }}
-          path: .
-      - name: Download prepared Nextest inputs
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.NEXTEST_ARTIFACT }}
-          path: .
-      - name: Unpack full release prebuilt tree
-        run: |
-          set -euo pipefail
-          tar --zstd -xf "$RELEASE_TARBALL"
-          rm -f "$RELEASE_TARBALL"
-          tar --zstd -xf "$NEXTEST_TARBALL"
-          rm -f "$NEXTEST_TARBALL"
-          # No target/release tree exists since d44bbbb79ac
-          # (https://github.com/rrnewton/hermit/issues/3458). The release shards
-          # run target/ci/hermit, read DBT and SaBRe resources from
-          # target/install_pkg, and test.liteinst_strict stages the LiteInst
-          # runtime from target/validate.
-          missing=0
-          require() {
-            if ! test "$1" "$2"; then
-              echo "::error::Unpack full release prebuilt tree: missing: $2 (test $1 failed)" >&2
-              missing=$((missing + 1))
-            fi
-          }
-          require -x target/ci/hermit
-          require -x target/install_pkg/rsrcs/sabre
-          require -f target/install_pkg/rsrcs/libreverie_dbt_client.so
-          require -f target/install_pkg/rsrcs/libdetcore_dbt.so
-          require -s target/validate/libreverie_liteinst.so
-          require -s target/validate/libreverie_liteinst.so.revision
-          if ((missing > 0)); then
-            echo "Unpack full release prebuilt tree: $missing required input(s) missing" >&2
-            exit 1
-          fi
-          test -x target/debug/nextest-cpu-wrapper
-          test -f target/ci/nextest-binaries/current.json
-          ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null
-      - name: Run shard nodes (${{ matrix.slug }})
-        env:
-          RUN_NODE_PERF_DIR: ${{ runner.temp }}/run-node-perf
-        run: ./ci/run-hosted-node.sh portable "${{ matrix.nodes }}"
-      - name: Upload release shard node performance report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: run-node-perf-test-release-${{ matrix.slug }}
-          path: ${{ runner.temp }}/run-node-perf
-          if-no-files-found: warn
-          retention-days: 14
-
   # ------------------------------------------------------------- e2e steps
   # Every selected E2E product verdict remains part of this workflow's result.
   # Failure does not prevent the retained evidence from reaching the reducer.
@@ -1474,103 +1351,6 @@ jobs:
           retention-days: 1
           compression-level: 0
 
-  # These known-red exec probes stay visible and publish structured evidence,
-  # but do not taint the portable diagnostic result while SaBRe's private
-  # coordinator socket cannot survive guest exec.
-  sabre_non_gated_parity:
-    name: SaBRe non-gating exec diagnostics
-    needs: [select, build-debug, build-complete]
-    if: needs.select.outputs.build_release != 'false'
-    continue-on-error: true
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    env:
-      HERMIT_BIN: ${{ github.workspace }}/target/ci/hermit
-    steps:
-      - uses: actions/checkout@v4
-      - name: Dependencies
-        uses: ./.github/actions/apt-install
-        with:
-          packages: bsdextrautils jq libunwind-dev liblzma-dev zstd
-      - name: Enable unprivileged user and mount namespaces
-        run: |
-          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          fi
-          sudo install -d -o "$(id -u)" -g "$(id -g)" /test
-          unshare --user --map-root-user --pid --fork --uts --net --mount sh -c 'mount -t proc proc /proc && mount -t sysfs sysfs /sys && test -r /proc/self/status && test -r /sys/devices/system/cpu/online'
-      - name: Download full release prebuilt tree
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.RELEASE_ARTIFACT }}
-          path: .
-      - name: Download Rust E2E runner
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.DEBUG_ARTIFACT }}
-          path: .
-      - name: Unpack product and runner trees
-        run: |
-          set -euo pipefail
-          tar --zstd -xf "$RELEASE_TARBALL"
-          rm -f "$RELEASE_TARBALL"
-          tar --zstd -xf "$DEBUG_TARBALL"
-          rm -f "$DEBUG_TARBALL"
-          # HERMIT_BIN names target/ci/hermit, which build.e2e_artifact
-          # installs; nothing builds target/release since d44bbbb79ac
-          # (https://github.com/rrnewton/hermit/issues/3458).
-          missing=0
-          require() {
-            if ! test "$1" "$2"; then
-              echo "::error::Unpack product and runner trees: missing: $2 (test $1 failed)" >&2
-              missing=$((missing + 1))
-            fi
-          }
-          require -x target/ci/hermit
-          if ((missing > 0)); then
-            echo "Unpack product and runner trees: $missing required input(s) missing" >&2
-            exit 1
-          fi
-          test -x target/debug/test-harness
-          test -x target/install_pkg/rsrcs/sabre
-          ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null
-      - name: Run known-red SaBRe exec probes
-        run: |
-          set -euo pipefail
-          # Each budgeted E2E invocation measures its CPU in a cgroup the
-          # runner creates below its own, which the root-owned hosted job
-          # cgroup refuses. Move this shell into a runner-owned child first, as
-          # the preflight step does for nextest-cpu-wrapper; without it every
-          # probe would stop on unmeasurable CPU instead of reaching SaBRe.
-          ./ci/delegate-hosted-cgroup.sh "$$"
-          failures=0
-          probe() {
-            test_id=$1
-            slug=${test_id//\//-}
-            out="ignored/e2e/sabre-non-gating/$slug"
-            if timeout --foreground --kill-after=5s 75s \
-              target/debug/test-harness run --lane portable --test "$test_id" \
-                --mode verify --backend sabre --probe-disabled \
-                --results "$out/results.jsonl" --junit "$out/junit.xml"; then
-              echo "::notice::SaBRe diagnostic unexpectedly passed: $test_id"
-            else
-              failures=$((failures + 1))
-              echo "::warning::Known SaBRe exec gap remains: $test_id"
-            fi
-          }
-          probe data-handling/archive-roundtrip
-          probe system-utils/date-nanoseconds
-          probe system-utils/random-device
-          echo "SaBRe non-gating diagnostics: $failures known-red probe(s)."
-      - name: Upload SaBRe diagnostic evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: sabre-non-gating-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ignored/e2e/sabre-non-gating
-          if-no-files-found: warn
-          retention-days: 14
-
   # ------------------------------------- gate + reduce per-cell transport evidence
   # Stable diagnostic name. This job fails closed over the complete parallel
   # graph so a green summary cannot hide a missing selected shard. No branch
@@ -1589,9 +1369,8 @@ jobs:
       - build-complete
       - test-debug
       - strict-compat
-      - test-release
       - e2e
-    if: always()
+    if: always() && (github.event_name != 'pull_request' || (github.event.pull_request.user.login != 'hermit-bot3' && !github.event.pull_request.draft))
     runs-on: ubuntu-latest
     # 10m absorbs the folded-in e2e parity reduction (former reduce-e2e job,
     # itself 5m-capped) plus the gate jq.
@@ -1776,9 +1555,9 @@ jobs:
   cleanup:
     name: Delete prebuilt build artifacts
     # Name every artifact consumer directly. In particular, test-debug is a
-    # matrix job whose integration shard owns test.cli and the run_dbt_* tests.
-    needs: [test-debug, test-release, e2e, sabre_non_gated_parity, regular]
-    if: always()
+    # matrix job whose integration shard owns test.cli.
+    needs: [test-debug, e2e, regular]
+    if: always() && (github.event_name != 'pull_request' || (github.event.pull_request.user.login != 'hermit-bot3' && !github.event.pull_request.draft)) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

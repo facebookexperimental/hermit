@@ -1,5 +1,13 @@
 # e9patch Compatibility
 
+> **Archived (nightly only) since 2026-10-25.** The owner archived e9patch
+> preprocessing together with the SaBRe backend: it gets no feature work. It has
+> no manifest cells; per commit, its feature build, the corpus driver contract
+> (`check.e9patch_corpus`) and the e9patch legs of the CLI tests keep it from
+> rotting, and the corpus below runs nightly in the pressure sweep's
+> `e9patch-corpus` part
+> (`ci/manifest-plan/src/archived.rs`).
+
 [e9patch](https://github.com/GJDuck/e9patch) is a static binary rewriter that
 inserts trampolines into an x86-64 executable ahead of time, without recompiling
 it. Hermit uses it as a preprocessing step: it rewrites the main ELF, then runs

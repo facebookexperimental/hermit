@@ -14,3 +14,4 @@ pub const LOG_EXT: &str = "log";
 pub const PREEMPTS_EXT: &str = "preempts";
 pub const PREEMPTS_EXT_PRESTRIPPED: &str = "preempts_with_times";
 pub const SCHED_EXT: &str = "events";
+pub const ACCESS_TRACE_EXT: &str = "access";

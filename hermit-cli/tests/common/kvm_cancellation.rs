@@ -190,7 +190,85 @@ pub(super) fn bounded_command_with_timeout(
     directory: &Path,
     wall_limit: Duration,
 ) -> ExitStatus {
-    bounded_command_polling(command, directory, wall_limit, || {})
+    bounded_command_polling(command, directory, None, wall_limit, "CPU limit", || {})
+}
+
+/// `bounded_command_with_timeout` with a CPU-time primary limit: the command
+/// (its whole process group) may burn at most `cpu_limit` of CPU, and
+/// `wall_backstop` only catches a hang that makes no CPU progress. Under host
+/// load a descheduled command passes wall bounds while doing little work, so
+/// wall must not be the primary limit (owner rule, 2026-11-01; donor job
+/// eb64ff5f, 2026-11-05: a 0.2 s-CPU fixture compile exceeded a 20 s wall
+/// limit at load ~980). A fixture-compile `cpu_limit` is an anti-runaway
+/// guard, not a 1.5x measurement allowance: compile CPU inflates under host
+/// contention, so callers size it well above loaded observations.
+/// `limit_name` names the guard in the failure message.
+pub(super) fn bounded_command_with_budgets(
+    command: &mut Command,
+    directory: &Path,
+    cpu_limit: Duration,
+    wall_backstop: Duration,
+    limit_name: &str,
+) -> ExitStatus {
+    bounded_command_polling(
+        command,
+        directory,
+        Some(cpu_limit),
+        wall_backstop,
+        limit_name,
+        || {},
+    )
+}
+
+/// CPU time (user + system, including waited-for children) summed over the
+/// process tree rooted at `root`, from `/proc/<pid>/stat`. Walking the tree
+/// via each thread's `children` file costs O(tree), unlike a full `/proc`
+/// scan, which on a busy host costs more CPU than the command being
+/// measured. Reaped descendants are already in an ancestor's cutime/cstime,
+/// so summing all four fields over live nodes counts each exited
+/// descendant exactly once.
+fn process_group_cpu(root: u32, clk_tck: u64) -> Duration {
+    let mut ticks: u64 = 0;
+    let mut stack = vec![root];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) || seen.len() > 4096 {
+            continue;
+        }
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        // Field 2 (comm) is parenthesized and may contain spaces or parens;
+        // fields after the last ')' start at field 3 (state).
+        let Some(close) = stat.rfind(')') else {
+            continue;
+        };
+        let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+        if fields.len() < 15 {
+            continue;
+        }
+        let parse = |i: usize| fields.get(i).and_then(|f| f.parse::<u64>().ok());
+        for i in [11, 12, 13, 14] {
+            ticks = ticks.saturating_add(parse(i).unwrap_or(0));
+        }
+        if let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) {
+            for task in tasks.flatten() {
+                if let Ok(children) = fs::read_to_string(task.path().join("children")) {
+                    stack.extend(
+                        children
+                            .split_whitespace()
+                            .filter_map(|text| text.parse::<u32>().ok()),
+                    );
+                }
+            }
+        }
+    }
+    Duration::from_secs_f64(ticks as f64 / clk_tck as f64)
+}
+
+fn clk_tck() -> u64 {
+    let tck = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if tck > 0 { tck as u64 } else { 100 }
 }
 
 /// [`bounded_command_with_timeout`] for a `hermit run --verify --keep-logs`
@@ -209,7 +287,7 @@ pub(super) fn bounded_verify_command(
     let logs = directory.join("verify-logs");
     let capture = directory.join("captured-run2.log");
     let mut captured = false;
-    let status = bounded_command_polling(command, directory, wall_limit, || {
+    let status = bounded_command_polling(command, directory, None, wall_limit, "CPU limit", || {
         if !captured {
             captured = super::run2_log::link_run2_log(&logs, &capture);
         }
@@ -217,10 +295,12 @@ pub(super) fn bounded_verify_command(
     (status, captured.then_some(capture))
 }
 
-fn bounded_command_polling(
+pub(super) fn bounded_command_polling(
     command: &mut Command,
     directory: &Path,
+    cpu_limit: Option<Duration>,
     wall_limit: Duration,
+    limit_name: &str,
     mut poll: impl FnMut(),
 ) -> ExitStatus {
     fs::create_dir_all(directory).expect("create retained command directory");
@@ -251,11 +331,30 @@ fn bounded_command_polling(
         "stderr",
         16 * MIB,
     );
+    let clk_tck = clk_tck();
+    let mut last_cpu_sample = Instant::now()
+        .checked_sub(Duration::from_millis(100))
+        .unwrap_or_else(Instant::now);
     let status = loop {
         stdout.drain();
         stderr.drain();
         check_outputs(directory);
         poll();
+        if let Some(cpu_limit) = cpu_limit
+            && last_cpu_sample.elapsed() >= Duration::from_millis(50)
+        {
+            last_cpu_sample = Instant::now();
+            let cpu = process_group_cpu(child.child.id(), clk_tck);
+            assert!(
+                cpu < cpu_limit,
+                "{limit_name} exceeded: {:.1}-second CPU limit exceeded \
+                 ({:.2}s CPU over {:.1}s wall); evidence at {}",
+                cpu_limit.as_secs_f64(),
+                cpu.as_secs_f64(),
+                start.elapsed().as_secs_f64(),
+                directory.display()
+            );
+        }
         // Do not reap the direct child until both pipes reach EOF. If a
         // descendant retains a write end after the child exits, the unchanged
         // deadline fails while we still own the unreaped process-group ID.
@@ -716,4 +815,44 @@ pub(super) fn run(loops: usize, expected: i32) {
         assert_mechanism(&log, loops, timestamp);
     }
     fs::remove_file(&run2_log).expect("remove run 2's checked log");
+}
+
+#[cfg(test)]
+mod cpu_budget_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("bounded-cpu-budget-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// The CPU limit is primary: a busy loop is stopped for burning CPU long
+    /// before the generous wall backstop could fire.
+    #[test]
+    #[should_panic(expected = "test CPU budget guard exceeded: 0.2-second CPU limit exceeded")]
+    fn cpu_budget_stops_a_busy_loop_before_the_wall_backstop() {
+        bounded_command_with_budgets(
+            Command::new("sh").args(["-c", "while :; do :; done"]),
+            &scratch("busy"),
+            Duration::from_millis(200),
+            Duration::from_secs(600),
+            "test CPU budget guard",
+        );
+    }
+
+    /// A command that sleeps (descheduled, as under host load) burns almost
+    /// no CPU and must not be failed by the CPU limit.
+    #[test]
+    fn cpu_budget_lets_a_sleeping_command_finish() {
+        let status = bounded_command_with_budgets(
+            Command::new("sh").args(["-c", "sleep 2"]),
+            &scratch("sleep"),
+            Duration::from_millis(200),
+            Duration::from_secs(600),
+            "test CPU budget guard",
+        );
+        assert!(status.success(), "{status}");
+    }
 }

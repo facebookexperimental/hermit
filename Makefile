@@ -33,7 +33,7 @@ endif
 # immediately saturating every hardware thread. Override on smaller shared hosts.
 THIRD_PARTY_BUILD_JOBS ?= 64
 
-# Hermit binary that validate-kvm and validate-dbt below hand to test-harness as
+# Hermit binary that validate-kvm below hands to test-harness as
 # HERMIT_BIN. Override to run those cells against a prebuilt binary, e.g.
 #   make validate-kvm HERMIT_DEBUG_BIN=/path/to/hermit
 HERMIT_DEBUG_BIN ?= target/debug/hermit
@@ -45,14 +45,14 @@ HERMIT_DEBUG_BIN ?= target/debug/hermit
 	validate-self-test validate-timeout-layers-test lint lint-parent-checks lint-script-tests \
 	validate-kvm validate-dbt validate-sabre validate-e9patch
 
-build: prune-stale-release install-deps ## Build the development Hermit binary with every backend
-	@echo 'make: building the hermit binary (dev profile, third-party-backends) -- expect ~45s warm, longer cold'
+build: prune-stale-release install-deps ## Build the development Hermit binary with first-party backends
+	@echo 'make: building the hermit binary (dev profile, ptrace/kvm/liteinst)'
 	@echo "make: cargo jobs=$(THIRD_PARTY_BUILD_JOBS) (host has $$(nproc) logical cores)"
 	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --locked \
-		-p hermit-run --features third-party-backends
+		-p hermit-run --features liteinst
 	@bin=target/debug/hermit; \
 		if [ -x "$$bin" ]; then \
-			echo "make: BUILD OK -- $$bin (dev profile, third-party-backends)"; \
+			echo "make: BUILD OK -- $$bin (dev profile, ptrace/kvm/liteinst)"; \
 		else \
 			echo "make: BUILD INCOMPLETE -- cargo reported success but $$bin is absent" >&2; \
 			exit 1; \
@@ -64,13 +64,13 @@ build: prune-stale-release install-deps ## Build the development Hermit binary w
 # the transitive `check-build-tools` prereq sees this and installs before it
 # asserts. `validate`/`release-core` do NOT set it and therefore only assert.
 install-deps: INSTALL_BUILD_TOOLS := 1
-install-deps: install-hooks check-submodules ## Build and stage all third-party backend runtimes and plugins
-	@echo 'make: building the third-party backend runtimes (release profile) -- expect ~60s cold'
+install-deps: install-hooks check-submodules ## Build and stage the first-party LiteInst runtimes
+	@echo 'make: building the first-party LiteInst runtimes (release profile)'
 	@echo "make: cargo jobs=$(THIRD_PARTY_BUILD_JOBS) (host has $$(nproc) logical cores)"
 	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --release --locked \
-		-p detcore-dbt -p detcore-dbt-cdylib -p detcore-sabre -p detcore-liteinst -p hermit-install
+		-p detcore-liteinst -p hermit-install
 	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO_PROXY) target/release/stage-detcore-liteinst --git target
-	@echo 'make: backend runtimes OK (release profile: detcore-dbt, detcore-dbt-cdylib, detcore-sabre, detcore-liteinst, hermit-install)'
+	@echo 'make: first-party runtimes OK (release profile: detcore-liteinst, hermit-install)'
 
 # Install this clone's git pre-commit hooks (core.hooksPath -> .githooks) so a
 # fresh clone/worktree gets the BLOCKING local pin-consistency check plus the
@@ -123,7 +123,7 @@ prune-stale-release: ## Remove target/release/hermit if stale (not built from cu
 # Keep `validate` as an explicit .PHONY convenience target for the sole Rust
 # validation entrypoint.
 validate: verify-submodules ## Run the full validation suite (Rust driver; pass flags via ARGS)
-	./scripts/validate.rs $(ARGS)
+	./scripts/validate.rs --all $(ARGS)
 
 validate-plan: ## Print the boxed DAG plan (nodes, wall/CPU/memory caps, deps) without running it
 	./scripts/validate.rs --show-plan $(ARGS)
@@ -200,9 +200,11 @@ lint-parent-checks: ## The lint checker that needs the dev-hermit parent (CI nod
 LINT_CHECK_TARGETS := \
     lint-check-skill-discovery \
     lint-check-github-actions-triggers \
+    lint-check-runner-trust \
     lint-check-docs-pages-contract \
     lint-check-pre-push-submodule-diagnosis \
     lint-check-doc-bare-urls \
+    lint-check-private-workspace-refs \
     lint-check-pre-push-doc-bare-urls \
     lint-check-required-check-outcomes \
     lint-check-check-status-outcome \
@@ -226,16 +228,19 @@ LINT_CHECK_TARGETS := \
     lint-check-apt-install-cached \
     lint-check-pinned-root-cache \
     lint-check-checker-scheduling \
+    lint-check-early-artifact-gate \
     lint-check-validate-refusal-predicate \
     lint-check-audit-test-binary-registration \
     lint-check-shellcheck \
     lint-check-whitespace \
     lint-check-verify-submodules \
     lint-check-reverie-pin \
+    lint-check-musl-detcore \
     lint-check-nested-lockfiles \
     lint-check-record-version-floor \
+    lint-check-known-gap-ledgers \
     lint-check-buck-reindeer-features \
-    lint-check-reverie-dbt-buck-inventory \
+    lint-check-buck-graph-drift \
     lint-check-core-review-protocol \
     lint-check-audit-test-binary-registration-test \
     lint-check-buck-e2e-ingest \
@@ -244,8 +249,12 @@ LINT_CHECK_TARGETS := \
     lint-check-buck-e2e-stage \
     lint-check-buck-e2e-stages \
     lint-check-guest-preload-gate \
-    lint-check-reverie-dbt-budget \
-    lint-check-conformance-test-counts
+    lint-check-core-build \
+    lint-check-conformance-test-counts \
+    lint-check-recount-pins \
+    lint-check-census-diff \
+    lint-check-runner-guard \
+    lint-check-no-sve
 .PHONY: lint-checks $(LINT_CHECK_TARGETS)
 lint-checks: $(LINT_CHECK_TARGETS) ## The lint checkers CI schedules as one node (everything in `lint` except the two cargo passes)
 
@@ -255,6 +264,9 @@ lint-check-skill-discovery:
 lint-check-github-actions-triggers:
 	./scripts/check-github-actions-triggers.rs
 
+lint-check-runner-trust:
+	./scripts/check-runner-trust.sh --self-test
+
 lint-check-docs-pages-contract:
 	./scripts/docs-pages-contract.rs
 
@@ -263,6 +275,9 @@ lint-check-pre-push-submodule-diagnosis:
 
 lint-check-doc-bare-urls:
 	./scripts/check-doc-bare-urls.rs
+
+lint-check-private-workspace-refs:
+	./scripts/check-private-workspace-refs.sh
 
 lint-check-pre-push-doc-bare-urls:
 	./scripts/test-pre-push-doc-bare-urls.sh
@@ -334,6 +349,9 @@ lint-check-checker-scheduling:
 	./scripts/check-checker-scheduling.rs --self-test
 	./scripts/check-checker-scheduling.rs
 
+lint-check-early-artifact-gate:
+	./ci/verify-early-hermit-e2e-artifact.sh --self-test
+
 lint-check-validate-refusal-predicate:
 	python3 ./scripts/check-validate-refusal-predicate.py --self-test
 	python3 ./scripts/check-validate-refusal-predicate.py
@@ -362,17 +380,25 @@ lint-check-verify-submodules:
 lint-check-reverie-pin:
 	$(SUBMODULE_PROXY) ./ci/run-reverie-pin-check.sh $(_VALIDATE_PIN_ARG)
 
+lint-check-musl-detcore:
+	./ci/check-musl-detcore.sh
+
 lint-check-nested-lockfiles:
 	$(SUBMODULE_PROXY) ./scripts/check-nested-lockfiles.rs
 
 lint-check-record-version-floor:
 	./scripts/check-record-version-floor.rs $(_VALIDATE_PIN_ARG)
 
+# Every known-gap ledger (ci/manifest-plan/src/known_gaps.rs) against its suite and its own
+# history: the ledger can only shrink, and a row added later carries a bound approval.
+lint-check-known-gap-ledgers:
+	./ci/kvm-gap-ledger.rs history
+
 lint-check-buck-reindeer-features:
 	./scripts/check-buck-reindeer-features.rs
 
-lint-check-reverie-dbt-buck-inventory:
-	./scripts/patch-reverie-dbt-buck.rs --check-inventory
+lint-check-buck-graph-drift:
+	./scripts/check-buck-graph-drift.rs
 
 lint-check-core-review-protocol:
 	./scripts/core-review-protocol-lint-test.sh
@@ -399,13 +425,25 @@ lint-check-guest-preload-gate:
 	python3 ./ci/test_guest_preload_gate.py
 	python3 ./ci/test_packaged_detcore.py
 
-lint-check-reverie-dbt-budget:
-	./ci/run-with-reverie-dbt-budget-test.sh
+lint-check-core-build:
+	./ci/run-with-core-build-test.sh
 	./ci/retry-on-compiler-crash.sh --self-test
-	./ci/clean-stale-reverie-dbt.sh --self-test
 
 lint-check-conformance-test-counts:
 	./ci/conformance-test-counts.sh --self-test
+
+lint-check-recount-pins:
+	python3 ./ci/test_recount_pins.py
+
+lint-check-census-diff:
+	python3 ./ci/test_census_diff.py
+
+lint-check-runner-guard:
+	python3 ./ci/test_runner_guard.py
+
+lint-check-no-sve:
+	rust-script --test ./scripts/check-no-sve.rs
+	./scripts/check-no-sve.rs /bin/true
 
 # The unit tests carried by rust-script entrypoints are their own CI node,
 # check.script_unit_tests, so they run beside lint-checks instead of inside its
@@ -424,10 +462,10 @@ help: ## Show this help (the list of make targets)
 	@printf '\nPer-backend validate targets run ONLY one backend'"'"'s compatibility\n'
 	@printf 'corpus, for a tight per-backend iteration loop. Runtimes are approximate:\n'
 	@printf '  validate-kvm       KVM manifest cells    (needs /dev/kvm)            not yet timed\n'
-	@printf '  validate-dbt       DBT manifest cells    (third-party-backends)      not yet timed\n'
-	@printf '  validate-sabre     SaBRe corpus          (needs HERMIT_SABRE_BINARY) ~10-20 min\n'
-	@printf '  validate-e9patch   e9patch corpus        (needs HERMIT_E9PATCH_BACKEND) ~5-20 min\n'
-	@printf '\nThe full multi-backend suite is ./scripts/validate.rs (see ./scripts/validate.rs --help).\n'
+	@printf '  validate-dbt       external DynamoRIO owner (unavailable in core)\n'
+	@printf '  validate-sabre     external patching owner (unavailable in core)\n'
+	@printf '  validate-e9patch   external patching owner (unavailable in core)\n'
+	@printf '\nThe full first-party suite is ./scripts/validate.rs --all (see ./scripts/validate.rs --help).\n'
 
 # Detect the native build toolchain (cmake + a C and C++ compiler) that the
 # third-party backends need. reverie-dbt's build.rs CMake-configures DynamoRIO
@@ -518,17 +556,9 @@ check-submodules: checkout-all ## Initialize if needed, then verify (build path)
 # ---------------------------------------------------------------------------
 # Per-backend validation targets.
 #
-# Each target runs ONLY its backend's compatibility corpus so a backend lane
-# agent can iterate tightly without paying for the full cross-backend suite.
-# They wrap the pre-existing mechanisms rather than adding new ones:
-#   * KVM and DBT (real Detcore backends) -> the E2E manifest runner,
-#     `test-harness run --backend <backend>`, which runs that backend's
-#     required cells in every manifest. It runs no ptrace cell, so its parity
-#     post-pass has no reference to compare against; `test-harness parity
-#     compare` measures parity from a run that retained both sides' logs.
-#   * SaBRe / LiteInst / e9patch          -> the Rust driver's focused
-#     `--<backend>-compat-only` profiles, which self-build the release binary
-#     and any backend artifacts.
+# KVM uses the existing E2E manifest runner and its required cells. A KVM-only
+# run has no ptrace reference for parity; compare retained logs from both sides.
+# Retired third-party targets refuse here and name their maintained owners.
 # ---------------------------------------------------------------------------
 
 validate-kvm: check-submodules ## Run ONLY the KVM cells of the E2E manifests (needs /dev/kvm)
@@ -537,13 +567,14 @@ validate-kvm: check-submodules ## Run ONLY the KVM cells of the E2E manifests (n
 	cargo build -p hermit-manifest-plan --bin test-harness
 	HERMIT_BIN=$(abspath $(HERMIT_DEBUG_BIN)) target/debug/test-harness run --backend kvm
 
-validate-dbt: check-submodules ## Run ONLY the DBT cells of the E2E manifests (third-party-backends feature)
-	cargo build -p hermit-run --features third-party-backends
-	cargo build -p hermit-manifest-plan --bin test-harness
-	HERMIT_BIN=$(abspath $(HERMIT_DEBUG_BIN)) target/debug/test-harness run --backend dbt
+validate-dbt: ## Refuse the retired core DBT route and name its maintained owner
+	@echo 'validate-dbt: DynamoRIO validation is owned by https://github.com/rrnewton/hermit-dynamorio; invoke its maintained static frontend and CI catalog' >&2
+	@exit 2
 
-validate-sabre: check-submodules ## Run ONLY the SaBRe compatibility corpus (needs HERMIT_SABRE_BINARY)
-	./scripts/validate.rs --sabre-compat-only
+validate-sabre: ## Refuse the retired core SaBRe route and name its maintained owner
+	@echo 'validate-sabre: SaBRe validation is owned by https://github.com/rrnewton/hermit-3rdparty-patching; invoke its maintained static frontend and CI catalog' >&2
+	@exit 2
 
-validate-e9patch: check-submodules ## Run ONLY the e9patch (ptrace-preprocessing) compat corpus (needs HERMIT_E9PATCH_BACKEND)
-	./scripts/validate.rs --e9patch-compat-only
+validate-e9patch: ## Refuse the retired core e9patch route and name its maintained owner
+	@echo 'validate-e9patch: e9patch validation is owned by https://github.com/rrnewton/hermit-3rdparty-patching; invoke its maintained preprocess-to-ptrace frontend and CI catalog' >&2
+	@exit 2

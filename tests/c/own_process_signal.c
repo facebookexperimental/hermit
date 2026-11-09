@@ -55,8 +55,11 @@
  *   sigwaited: as merged without the child, but sigtimedwait takes the
  *             timer's SIGHUP, so it never reaches a delivery stop.
  *
- * Refused modes send once and print `<mode> rc=<r> <errno>`; under
- * --allow-unsupported-syscalls a refused send returns -1 ENOSYS.
+ * Modes the schedule does not fix send once and print `<mode> rc=<r> <errno>`,
+ * or the admitted line where they report one. Hermit sends each to the thread
+ * Linux's complete_signal gives it, and must print what Linux prints; a few it
+ * refuses by name (SIGTRAP and SIGSTKFLT handlers, a siginfo_t Hermit cannot
+ * read), and under --allow-unsupported-syscalls such a send returns -1 ENOSYS.
  *   sender_is_not_sole: a worker sends kill(getpid(), SIGUSR1) while the main
  *             thread waits with SIGUSR1 unblocked.
  *   sender_blocks: the main thread blocks SIGUSR1 and sends it.

@@ -4,7 +4,8 @@ bucket: compat
 # validation host, each run under Hermit's verify. The verify cells of the rows
 # labelled sabre-compat-only, and every row's SaBRe cell (`focused`), belong to
 # the SaBRe run type alone; the full validation runs the ptrace verify cells of
-# the other rows (since 2026-10-13 only rustc, javac, java, node and timeout
+# the other rows (since 2026-10-13 only rustc, javac, java, node and timeout;
+# javac and java split into compile/run rows on 2026-11-05
 # carry that label: https://github.com/rrnewton/hermit/issues/4269 moved 25
 # rows into the full run, so that parity compares them), and the liteinst and in-guest-trap verify cells of the rows
 # each `additional` entry names. The rr lane's rows also have a replay cell
@@ -16,8 +17,9 @@ bucket: compat
 # 2026-10-13 the `variants` entry repeated every row as a second test,
 # compat/strict-<row>, for a strict run type, while this cell always ran
 # relaxed (https://github.com/rrnewton/hermit/issues/4276).
-# The scheduled super suite runs the four heavy rows' ptrace cells (rustc,
-# javac, java, node: the `heavy` section's `labels`) through
+# The scheduled super suite runs the heavy rows' ptrace cells (rustc,
+# javac-compile, javac-run, java-compile, java-run, node: the `heavy`
+# section's `labels`) through
 # supercompat.manifest_compat, against the super run type's release Hermit. Lane settings are stated once below and every
 # row is expanded into an ordinary test recipe
 # (ci/manifest-plan/src/manifest_corpus.rs). The rows were moved verbatim from
@@ -66,8 +68,10 @@ corpus:
     labels: [super]
     rows:
       rustc: compiles and runs a Rust program
-      javac: compiles a Java program
-      java: compiles and runs a Java program
+      javac-compile: compiles a Java program
+      javac-run: runs the fixture-prepared Java program
+      java-compile: compiles a Java program
+      java-run: runs the fixture-prepared Java program
       node: starts the Node.js runtime
   # The SaBRe run type (scripts/validate.rs --sabre-compat-only): every row
   # also runs on SaBRe, except the four the SaBRe corpus never had. Until
@@ -1474,6 +1478,45 @@ corpus:
     # cells run): 10 of 10 with four runs at once. mountpoint joined once
     # Detcore rendered /proc/<pid>/mountinfo from the container mount table
     # (K3a of https://github.com/rrnewton/hermit/issues/4213): 10 of 10.
+    # kill, lsirq, lsmod and sysctl-random-uuid joined after running clean,
+    # 3 of 3, on each of the five nightly pressure sweeps from 2026-10-21 to
+    # 2026-10-25 (Hermit 9b30cb9a to 7903351d). xargs joined on 2026-10-29
+    # after 21 of 21 canonical strict verify pairs at Hermit a69361ae, the
+    # tree that enabled it, using at most 0.52 of the default 22 CPU seconds
+    # (the 2026-10-13 runs had exceeded them). Its stdout and every syscall
+    # return value are identical to ptrace's. 3 of its 130 syscall output
+    # buffers differ, each a valid Linux answer that depends on timing: the
+    # revents of xargs's startup poll of 4 descriptors, and two pipe mtimes
+    # (xargs's fstat of fd 0, expr's of fd 1) that KVM gives exactly 500
+    # microseconds later than ptrace. vmstat-disk joined on 2026-10-29 once
+    # Detcore rendered /proc/diskstats from the host's block devices on every
+    # backend (slice N3 of the kvm lane's verify-100 plan; before, KVM's open
+    # of it was EACCES): 21 of 21 canonical strict verify pairs on the tree
+    # that enabled it (bitwise parity, 2025 INFO records each side), its
+    # stdout byte-identical to ptrace's. rustc joined on 2026-11-01 (the KVM
+    # qualification sweep at Hermit 26eb116d): 21 of 21 canonical strict
+    # verify runs (bitwise parity, 65233 INFO records each side), its stdout
+    # byte-identical to ptrace's, at 5.6 CPU seconds median and 6.4 at most
+    # against the default 22-second budget that stopped it in 10 of 10 runs
+    # on 2026-10-13. flock joined with Detcore's flock model (the kvm lane's
+    # slice SP2; before it, KVM refused every flock,
+    # https://github.com/rrnewton/reverie/issues/1069): 21 of 21 canonical
+    # strict verify pairs on the tree that enabled it. flock(1) takes its lock
+    # before it forks the command, as rustup does.
+    # ps joined on 2026-11-01 once Detcore served the caller's own /proc
+    # directories on KVM (package K slice K10 of
+    # https://github.com/rrnewton/hermit/issues/5039; before, its open of
+    # /proc/self was EACCES): 21 of 21 canonical strict verify pairs in the
+    # pinned root on the tree that enabled it (bitwise parity, 502 INFO records
+    # each side). Its table lists ps alone: KVM's own /proc refuses /proc/1,
+    # Hermit's init, another process's directory, with EACCES
+    # (https://github.com/rrnewton/hermit/issues/4564), where ptrace also
+    # lists pid 1 with Hermit's own command line.
+    # pgrep and pkill joined on 2026-11-08 once Detcore served another guest
+    # process's /proc/<pid> stat, status and cmdline on KVM (package K item 2b,
+    # slices 2b-1 to 2b-3): 3 of 3 strict verify runs each in the pinned root
+    # at Hermit 61eac51c (bitwise parity; 1133 INFO records each side for
+    # pgrep, 825 for pkill), stdout identical to ptrace's.
     - backend: kvm
       rows:
         [
@@ -1483,45 +1526,258 @@ corpus:
           column, comm, cp, cpio-roundtrip, cpp, crc32, cscope, csplit, curl,
           curl-localhost, cut, date, dc, dd, df, df-direct, diff, diff3,
           dirname, dos2unix, du, echo, egrep, elfedit, env, envsubst, expand,
-          expr, factor, fallocate, fgrep, file, find, findmnt, flex,
+          expr, factor, fallocate, fgrep, file, find, findmnt, flex, flock,
           fmt, fold, free, "g++", gcc, gcov, getconf, getopt, git, gprof, grep,
           groups, gzip, gzip-roundtrip, head, hexdump, hostname, iconv, id,
-          install, ionice, iostat, ip, join, jq, ld, ln, logger, logname, ls,
-          lscpu, lua, lua-direct, m4, make, md5sum, mkdir, mkfifo, mktemp,
+          install, ionice, iostat, ip, join, jq, kill, ld, ln, logger, logname, ls,
+          lscpu, lsirq, lsmod, lua, lua-direct, m4, make, md5sum, mkdir, mkfifo, mktemp,
           mountpoint, mpstat-softirqs, msgfmt, msgunfmt, mv, namei, netlink-route,
           netlink-sock-diag, nice, nl, nm, node, nohup, nproc, numactl-hardware,
           numastat, numfmt, objcopy, objdump, od, openssl, paste, patch,
-          pathchk, perl, perl-direct, pidstat-disk, pinky, pkg-config, pr,
-          printenv, printf, ptx, pwd, python3, ranlib, readelf, readlink,
-          realpath, rev, rm, rmdir, ruby, sar-resource-tables, sed, seq,
+          pathchk, perl, perl-direct, pgrep, pidstat-disk, pinky, pkg-config,
+          pkill, pr, printenv, printf, ps, ptx, pwd, python3, ranlib, readelf, readlink,
+          realpath, rev, rm, rmdir, ruby, rustc, sar-resource-tables, sed, seq,
           setfacl, setfattr, sha1sum, sha224sum, sha256sum, sha384sum,
           sha512sum, shell-build, shred, shuf, size, sleep, sort, split,
-          sqlite3, ss, stat, stdbuf, strings, strip, sum, sync, tac, tar,
+          sqlite3, ss, stat, stdbuf, strings, strip, sum, sync, sysctl-random-uuid, tac, tar,
           tar-roundtrip, taskset, tcl, tee, test, time, timeout, top, touch, tr,
           "true", truncate, tsort, tty, uname, unexpand, uniq, uptime, users,
-          uuidgen, vmstat, wc, wc-lines, wget-localhost, whoami, xmllint, xxd,
-          xz, xz-roundtrip, "yes", zip-unzip, zstd, zstd-roundtrip
+          uuidgen, vmstat, vmstat-disk, wc, wc-lines, wget-localhost, whoami,
+          xargs, xmllint, xxd, xz, xz-roundtrip, "yes", zip-unzip, zstd,
+          zstd-roundtrip
         ]
       disabled_reason: >-
         Not in the 2026-10-13 KVM survey: its KVM verify cell was not green
         on the compatibility ledger
       disabled:
-        rustc: >-
-          Exceeded the default 22-second CPU budget in 10 of 10 KVM verify
-          runs on 2026-10-13; the lane's own cell gives this heavy row 599
-        xargs: >-
-          Exceeded the default 22-second CPU budget in 10 of 10 KVM verify
-          runs on 2026-10-13
-        flock: >-
-          KVM refuses every flock lock operation by name (ENOSYS with the
-          typed refusal UnsupportedOperation::Flock): it cannot keep a host
-          lock's lifetime equal to the guest description's. This cell passed
-          only because KVM flock used to be a silent no-op
-          (https://github.com/rrnewton/reverie/issues/1069)
+        java-compile: >-
+          The JVM's shared file mappings beside its other threads now go ahead
+          on KVM (https://github.com/rrnewton/reverie/issues/1108). At Hermit
+          534dd831, before Detcore's flock model was in this base, the run
+          then stopped at flock: the pinned root's OpenJDK
+          (openjdk-headless-21.0.12+8) creates its perf-data file
+          /tmp/hsperfdata_root/<pid> and calls flock(LOCK_EX|LOCK_NB) on it,
+          which KVM refused by name (`KVM flock is unsupported`,
+          HERMIT_POLICY_REFUSAL, exit 122) in 10 of 10 KVM verify runs. What
+          stops it on this tree, which has the flock model, is unmeasured; it
+          stays off KVM until it is measured. The workload now also runs
+          its JVMs with -XX:-UsePerfData (dh-gg5uv), so no perf-data file
+          is created or flocked at all; what stops it on KVM must be
+          remeasured either way. Measured then on the combined
+          java row; both split halves start a JVM, so both inherit this.
+        java-run: >-
+          The JVM's shared file mappings beside its other threads now go ahead
+          on KVM (https://github.com/rrnewton/reverie/issues/1108). At Hermit
+          534dd831, before Detcore's flock model was in this base, the run
+          then stopped at flock: the pinned root's OpenJDK
+          (openjdk-headless-21.0.12+8) creates its perf-data file
+          /tmp/hsperfdata_root/<pid> and calls flock(LOCK_EX|LOCK_NB) on it,
+          which KVM refused by name (`KVM flock is unsupported`,
+          HERMIT_POLICY_REFUSAL, exit 122) in 10 of 10 KVM verify runs. What
+          stops it on this tree, which has the flock model, is unmeasured; it
+          stays off KVM until it is measured. The workload now also runs
+          its JVMs with -XX:-UsePerfData (dh-gg5uv), so no perf-data file
+          is created or flocked at all; what stops it on KVM must be
+          remeasured either way. Measured then on the combined
+          java row; both split halves start a JVM, so both inherit this.
+        javac-compile: >-
+          javac's JVM gets past its shared file mappings beside its threads on
+          KVM too (https://github.com/rrnewton/reverie/issues/1108). At Hermit
+          534dd831, before Detcore's flock model was in this base, it stopped
+          at the same flock of its perf-data file /tmp/hsperfdata_root/<pid>,
+          which KVM refused by name (`KVM flock is unsupported`,
+          HERMIT_POLICY_REFUSAL, exit 122) in 10 of 10 KVM verify runs. What
+          stops it on this tree, which has the flock model, is unmeasured; it
+          stays off KVM until it is measured. The workload now also runs
+          its JVMs with -XX:-UsePerfData (dh-gg5uv), so no perf-data file
+          is created or flocked at all; what stops it on KVM must be
+          remeasured either way. Measured then on the combined
+          javac row; both split halves start a JVM, so both inherit this.
+        javac-run: >-
+          javac's JVM gets past its shared file mappings beside its threads on
+          KVM too (https://github.com/rrnewton/reverie/issues/1108). At Hermit
+          534dd831, before Detcore's flock model was in this base, it stopped
+          at the same flock of its perf-data file /tmp/hsperfdata_root/<pid>,
+          which KVM refused by name (`KVM flock is unsupported`,
+          HERMIT_POLICY_REFUSAL, exit 122) in 10 of 10 KVM verify runs. What
+          stops it on this tree, which has the flock model, is unmeasured; it
+          stays off KVM until it is measured. The workload now also runs
+          its JVMs with -XX:-UsePerfData (dh-gg5uv), so no perf-data file
+          is created or flocked at all; what stops it on KVM must be
+          remeasured either way. Measured then on the combined
+          javac row; both split halves start a JVM, so both inherit this.
+        lsof: >-
+          lsof stats every process's /proc/<pid> directory, which KVM's /proc
+          does not serve (another process's:
+          https://github.com/rrnewton/hermit/issues/4564; its own:
+          https://github.com/rrnewton/hermit/issues/5039): each answers EACCES, so lsof
+          exits 1 without output in 3 of 3 KVM verify runs at Hermit 26eb116d
+    # DBT (batch-2 flip, sweep 2026-10-27 at Hermit 0948c8eb): rows CLEAN on
+    # DBT in both the 2026-10-26 and 2026-10-27 nightly sweeps get a required
+    # DBT verify cell; the other rows keep no DBT cell under the reason below.
+    - backend: dbt
+      slow:
+        - timeout_seconds: 57
+          cpu_timeout_seconds: 33
+          slow_reason: >-
+            The full validation of 77635530182d stopped git, ld and
+            pkg-config at the default 22 CPU s, and the landed flip's
+            validation of 330a8b849db3 stopped node the same way on its
+            local Buck route. Local single samples on the host named in
+            docs/TESTING_ENVIRONMENTS.md under "Named measurement hosts",
+            at the flip head (2026-10-27), measured git 12.465, ld 14.868 and
+            pkg-config 13.172 CPU s; five Buck-cell runs of node at
+            25d8071f6aa measured 13.487-14.242 CPU s (max wall 24.838 s).
+            The configured bound is ceil(1.5 x 22.0) = 33, the rule of
+            DBT_2026_10_25_TIMEOUT_CALIBRATIONS, because the
+            validate-context measurement is the 22.0 stop itself. Wall
+            stays at the 57 s default (measured walls at most 24.9 s).
+          rows: [git, ld, node, pkg-config]
+      rows:
+        [
+          addr2line, ar, arch, as, awk, b2sum, base32, base64, basename, basenc,
+          bash, bc, bracket, bzip2, bzip2-roundtrip, "c++filt", cal, cargo, cat,
+          chmod, chown, chrt, cksum, cmake, cmp, col, colrm, column, comm, cp,
+          cpio-roundtrip, crc32, cscope, csplit, curl, curl-localhost, cut, date,
+          dc, dd, df, df-direct, diff, diff3, dirname, dos2unix, du, echo, egrep,
+          elfedit, env, envsubst, expand, expr, factor, fallocate, fgrep, file,
+          find, findmnt, flock, fmt, fold, free, gcov, getconf, getopt, git,
+          gprof, grep, groups, gzip, gzip-roundtrip, head, hexdump, hostname,
+          iconv, id, install, ionice, iostat, ip, join, jq, ld, ln, logger,
+          logname, ls, lscpu, lsirq, lsmod, lua, lua-direct, m4, md5sum, mkdir,
+          mkfifo, mktemp, mountpoint, mpstat-softirqs, msgfmt, msgunfmt, mv,
+          namei, netlink-route, nice, nl, nm, node, nohup, nproc,
+          numactl-hardware, numastat, numfmt, objcopy, objdump, od, openssl,
+          paste, patch, pathchk, perl, perl-direct, pgrep, pidstat-disk, pinky,
+          pkg-config, pkill, pr, printenv, printf, ps, ptx, pwd, python3, ranlib,
+          readelf, readlink, realpath, rev, rm, rmdir, ruby, sar-resource-tables,
+          sed, seq, setfacl, setfattr, sha1sum, sha224sum, sha256sum, sha384sum,
+          sha512sum, shred, shuf, size, sleep, sort, split, sqlite3, ss, stat,
+          stdbuf, strings, strip, sum, sync, sysctl-random-uuid, tac, tar,
+          tar-roundtrip, taskset, tcl, tee, test, time, top, touch, tr, "true",
+          truncate, tsort, tty, uname, unexpand, uniq, uptime, users, uuidgen,
+          vmstat, vmstat-disk, wc, wc-lines, wget-localhost, whoami, xargs,
+          xmllint, xxd, xz, xz-roundtrip, "yes", zip-unzip, zstd, zstd-roundtrip
+        ]
+      disabled_reason: >-
+        Not CLEAN on DBT in both the 2026-10-26 and 2026-10-27 nightly
+        sweeps (Hermit 0948c8eb), so this row has no DBT verify cell yet
   # Cells measured red on 2026-10-01 (release Hermit at 03bbb8358, through
   # this bucket): each stays enabled with ci: false and its failure class's
   # issue, so the SaBRe run type does not require it.
   unselected:
+    # Re-measured red on 2026-11-06 in the merge-queue pinned root
+    # (validate-merge-queue-d864ef93d9a6, both attempts): the pinned root
+    # lacks a journal socket at /dev/log under ptrace, so logger (nix
+    # util-linux) exits 1 on connect even with --stderr --no-act, while the
+    # same cell passes under KVM, whose guest provides the socket. The
+    # 2026-11-05 sweep CLEAN evidence for this cell was host-contaminated:
+    # the sweep host had a /dev/log socket that the pinned root does not.
+    # The /dev/log stub or new argv rework stays tracked in the evidence
+    # bead; pkg-config, flipped with logger, is not implicated by that run.
+    - backend: ptrace
+      result: crash-error
+      evidence: https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md
+      reason: >-
+        In the pinned root, logger (nix util-linux) opens /dev/log even
+        with --stderr --no-act and exits 1 with no journal socket present;
+        the sweep CLEAN evidence was host-contaminated (sweep host had
+        /dev/log, pinned root does not)
+      rows:
+        [
+          logger
+        ]
+    # Dropped 2026-11-06 under dh-jn0hh part 2 (coordinator ruling): in
+    # the pinned root, pkg-config 0.29.2 emits -D before -I where the
+    # workload asserts freedesktop pkg-config's file-order output, so the
+    # 2026-11-05 sweep flip's pkg-config cells have no passing run in the
+    # pinned root to require. The flag-order rework stays tracked in the
+    # evidence bead.
+    - backend: ptrace
+      result: crash-error
+      evidence: https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md
+      reason: >-
+        Dropped under dh-jn0hh part 2: in the pinned root, pkg-config
+        0.29.2 emits -D before -I where the workload asserts freedesktop
+        pkg-config's file-order output
+      rows:
+        [
+          pkg-config
+        ]
+    - backend: kvm
+      result: crash-error
+      evidence: https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md
+      reason: >-
+        Dropped under dh-jn0hh part 2: measured crash-error under KVM in
+        the pinned root, where pkg-config 0.29.2 emits -D before -I where
+        the workload asserts freedesktop pkg-config's file-order output
+      rows:
+        [
+          pkg-config
+        ]
+    # Dropped 2026-11-06 under DROP-6 (coordinator ruling): compat/shred
+    # verify/kvm, promoted by the 2026-11-05 sweep flip (1258b8ad), fails
+    # locally 6/6 with the KVM zero-count-read refusal below, so it
+    # returns to unselected with that reason. Main never selected this
+    # cell: at the flip base it sat in the pre-flip KVM crash-error
+    # block (pkg-config, shred, sysctl-random-uuid, top) and in
+    # ci/optional-e2e-cells.txt.
+    - backend: kvm
+      result: crash-error
+      evidence: https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md
+      reason: >-
+        Dropped under DROP-6: measured crash-error under KVM locally
+        6/6: unsupported KVM zero-count read on guest fd 3: the endpoint
+        may wait in the host
+      rows:
+        [
+          shred
+        ]
+    # Dropped 2026-11-06 under DROP-7 (coordinator ruling A): compat/
+    # sysctl-random-uuid verify/kvm, promoted by the 2026-11-05 sweep
+    # flip (1258b8ad), is the sole failure at 930ece78 (635/636 passed,
+    # both attempts, crash-error: verify exited with status 125 before
+    # producing a terminal comparison), so it returns to unselected.
+    # Main never selected it: same pre-flip KVM crash-error block and
+    # ci/optional-e2e-cells.txt line as shred above.
+    - backend: kvm
+      result: crash-error
+      evidence: https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md
+      reason: >-
+        Dropped under DROP-7: measured crash-error under KVM at
+        930ece78, sole failure 635/636 (both attempts): verify exited
+        with status 125 before producing a terminal comparison
+      rows:
+        [
+          sysctl-random-uuid
+        ]
+    # Measured red on 2026-10-30 in the pinned hermetic image (full validate
+    # validate-museland-9ab8418de603, 7 cells): the same image difference on
+    # the remaining backends, plus gcov's DBT determinism failure.
+    - backend: dbt
+      result: crash-error
+      evidence: https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md
+      reason: >-
+        In the pinned image, logger (nix util-linux) opens /dev/log even
+        with --stderr --no-act and exits 1 with no journal socket present,
+        and pkg-config is pkgconf, which emits -D before -I where the
+        workload asserts freedesktop pkg-config's file-order output
+      rows:
+        [
+          logger, pkg-config
+        ]
+    - backend: dbt
+      result: determinism-failure
+      evidence: https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md
+      reason: >-
+        Measured diverged under DBT in the pinned image (full validate
+        validate-museland-9ab8418de603); gcov in the image is GCC 14's,
+        whose coverage output ordering differs under DBT
+      rows: [gcov]
+    # The cargo/gcov verify cells deselected here on 2026-10-31 under
+    # issue 4997 were re-enabled the same day once the fixture race was
+    # fixed (271ec81bd4): one writer for the shared fixtures, published
+    # atomically, so cells no longer see inputs swapped mid-run.
     - backend: sabre
       result: crash-error
       evidence: https://github.com/rrnewton/hermit/issues/3486
@@ -1538,7 +1794,7 @@ corpus:
           dd, df, diff, diff3, dos2unix, egrep, elfedit, env, envsubst, expand,
           factor, fallocate, fgrep, file, find, flex, flock, fmt, fold, "g++",
           gcc, gcov, getconf, git, gprof, grep, gzip, gzip-roundtrip, hexdump,
-          iconv, install, ionice, ip, javac, join, jq, ld, ln, logname, lscpu,
+          iconv, install, ionice, ip, javac-compile, javac-run, join, jq, ld, ln, logname, lscpu,
           lua, m4, mkdir, mkfifo, mktemp, mountpoint, msgfmt, msgunfmt, mv,
           namei, nice, nl, nm, nohup, objcopy, objdump, od, paste, patch,
           pathchk, perl, pgrep, pkg-config, pkill, printenv, ptx, ranlib,
@@ -1584,10 +1840,13 @@ corpus:
       evidence: https://github.com/rrnewton/hermit/issues/3492
       reason: >-
         The java row's javac step aborts on the in-guest Detcore invariant
-        "end_of_timeslice is None during update_logical_time_rcbs"
+        "end_of_timeslice is None during update_logical_time_rcbs". Since
+        the 2026-11-05 split that step is the java-compile row; java-run
+        is grouped here unmeasured until its SaBRe cell is measured, as
+        the combined row never got past the compile step on SaBRe
       rows:
         [
-          java
+          java-compile, java-run
         ]
     - backend: sabre
       result: determinism-failure
@@ -1597,19 +1856,7 @@ corpus:
         4 runs; ptrace passes 3 of 3
       rows:
         [
-          iostat, mpstat-softirqs
-        ]
-    - backend: ptrace
-      result: crash-error
-      evidence: https://github.com/rrnewton/hermit/issues/3789
-      reason: >-
-        Detcore panics with "signal_guest: thread should be parked in the
-        scheduler" while timeout waits in rt_sigsuspend for its child (1 of
-        1 in the validation of 57883eff8); locally 1 of 40 runs diverged at
-        the same rt_sigsuspend
-      rows:
-        [
-          timeout
+          iostat
         ]
   # The rr run type (scripts/validate.rs --rr-compat-only): every program
   # the rr lane listed as passing record/replay (its 139
@@ -1645,10 +1892,6 @@ corpus:
       wall seconds together through the retired command
     except:
       - reason: >-
-          The rr corpus ran these programs with the argv of the -direct
-          row of the same name, which this run type runs instead
-        rows: [lua, perl, df]
-      - reason: >-
           Its own check fails when a receive path delivers NETLINK_SOCK_DIAG
           socket inodes unzeroed, which is Detcore's run-mode metadata
           sanitizer. Record and replay disable metadata virtualization by
@@ -1664,12 +1907,39 @@ corpus:
     # sixth, joined once https://github.com/rrnewton/hermit/issues/3964 and
     # https://github.com/rrnewton/hermit/issues/3963 were fixed.)
     unselected:
+      # Same pinned-root /dev/log absence as the verify cell above,
+      # re-measured 2026-11-06 (validate-merge-queue-d864ef93d9a6): the
+      # recorded guest exits 1 on connect to /dev/log, so replay has no
+      # passing recording to require. The sweep CLEAN evidence was
+      # host-contaminated (sweep host had /dev/log, pinned root does not).
+      - result: replay-failure
+        evidence: https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md
+        reason: >-
+          In the pinned root, logger (nix util-linux) opens /dev/log even
+          with --stderr --no-act and exits 1 with no journal socket present;
+          the sweep CLEAN evidence was host-contaminated (sweep host had
+          /dev/log, pinned root does not)
+        rows: [logger]
+      # Dropped 2026-11-06 under dh-jn0hh part 2 (coordinator ruling):
+      # same pinned-root pkg-config 0.29.2 -D-before-I behavior as the
+      # verify cells above, so replay has no passing recording to require.
+      - result: replay-failure
+        evidence: https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md
+        reason: >-
+          Dropped under dh-jn0hh part 2: in the pinned root, pkg-config
+          0.29.2 emits -D before -I where the workload asserts freedesktop
+          pkg-config's file-order output, so replay has no passing
+          recording to require
+        rows: [pkg-config]
       - result: replay-failure
         evidence: https://github.com/rrnewton/hermit/issues/3966
         reason: >-
           Replay reads a different 11-byte readlink target than the recording
           at scheduler turn 112, in 3 of 3 runs
         rows: [lsof]
+      # The cargo/gcov/rustc replay cells deselected here on 2026-10-31
+      # under issue 4997 were re-enabled the same day once the fixture
+      # race was fixed (271ec81bd4).
       - result: replay-failure
         evidence: https://github.com/rrnewton/hermit/issues/4536
         reason: >-
@@ -1679,9 +1949,10 @@ corpus:
           to create /tmp/cscope.9 (the guest's deterministic pid) and zip-unzip
           finding /tmp/hermit-compat-zip removed under it
         rows: [cscope, zip-unzip]
-    # The three heavy compile and JVM rows replay at 20 to 31 CPU seconds,
+    # The heavy compile and JVM rows replay at 20 to 31 CPU seconds,
     # about half the section's 59, and their wall needs more than double that
-    # on a loaded host.
+    # on a loaded host. The java/javac rows split into compile and run cells
+    # on 2026-11-05; each half keeps this backstop.
     slow:
       - timeout_seconds: 177
         cpu_timeout_seconds: 59
@@ -1697,7 +1968,7 @@ corpus:
           about twice the largest measured use; the wall bound is three times
           it, the host-load backstop ci/nextest-timeout-config.rs gives the
           liteinst_stacks tests
-        rows: [java, javac, rustc]
+        rows: [java-compile, java-run, javac-compile, javac-run, rustc]
   rows:
     - {label: "echo", argv: ["/bin/echo", "hermit-compat"]}
     - {label: "true", argv: ["/usr/bin/true"]}
@@ -1901,8 +2172,28 @@ corpus:
     # corpus's programs this corpus lacks, and the four heavy rows, whose
     # ptrace cells the super run type runs too (the `heavy` section's labels).
     - {label: "rustc", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "rustc"], labels: [sabre-compat-only]}
-    - {label: "javac", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "javac"], labels: [sabre-compat-only]}
-    - {label: "java", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "java"], labels: [sabre-compat-only]}
+    # Power/weight 2026-11-05 @ Hermit 1db0a95883, ptrace, 316-core host:
+    # java/javac split javac and application execution into parallel cells.
+    # Each run cell first makes a discarded `java -version` JVM start so the
+    # observed JVM remains the second JVM over initialized perf-data state,
+    # as in the combined rows. Production replay-cell CPU medians (n=55 to
+    # 2026-11-05): java 77.1 s, javac 76.7 s combined. Local strict-run
+    # walls (medians of 3): java 8.1 s -> compile 6.0 s + run 3.3 s; javac
+    # 5.9 s -> compile 5.7 s + run 2.8 s. An interleaved five-repetition A/B
+    # against the single-start run cells measured the discarded JVM start
+    # at +0.74 s (java-run) and +0.84 s (javac-run) local wall. Hermit
+    # coverage (hermit-code-coverage collect for each compile+run pair):
+    # java baseline 30151 lines/41841 regions -> pair 30243 / 41952, and
+    # javac baseline 30017 / 41636 -> pair 30118 / 41766; the official
+    # `diff --fail-on-loss` preserves every normalized baseline line and
+    # region for both pairs (lost 0/0). Guest stdout and milestones (JVM
+    # startup, compile, file I/O, SHA-256, worker thread; fibonacci
+    # assertion) preserved; run cells print the fixture class digest the
+    # compile cells produce.
+    - {label: "javac-compile", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "javac-compile"], labels: [sabre-compat-only]}
+    - {label: "javac-run", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "javac-run"], labels: [sabre-compat-only]}
+    - {label: "java-compile", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "java-compile"], labels: [sabre-compat-only]}
+    - {label: "java-run", argv: ["env", "REAL_COMPAT_FIXTURES={{VALIDATE_RUN_STATE}}/strict-compat/real-compat-fixtures", "bash", "{{ROOT_DIR}}/tests/compat/real_compat_workload.sh", "java-run"], labels: [sabre-compat-only]}
     - {label: "node", argv: ["/bin/node", "-e", "console.log(42)"], labels: [sabre-compat-only]}
     - {label: "timeout", argv: ["/usr/bin/timeout", "1", "/usr/bin/true"], labels: [sabre-compat-only]}
     - {label: "truncate", argv: ["bash", "-c", "set -euo pipefail; f=$(mktemp); printf \"Hermit\\n\" >\"$f\"; /usr/bin/truncate -s 4096 \"$f\"; test \"$(stat -c %s \"$f\")\" = 4096; /usr/bin/truncate -s 7 \"$f\"; test \"$(stat -c %s \"$f\")\" = 7; test \"$(cat \"$f\")\" = Hermit; rm -f \"$f\"; printf \"truncate:4096-to-7-ok\\n\""]}

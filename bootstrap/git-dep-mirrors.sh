@@ -4,8 +4,8 @@
 # allowing crates.io (a Meta devserver agent, for one).
 #
 # HERMIT_GIT_DEP_MIRRORS=DIR names a directory holding a bare mirror per git source,
-# named after the URL's last component: https://github.com/rrnewton/liteinst2 is
-# served from DIR/liteinst2.git, https://github.com/rrnewton/reverie.git from
+# named after the URL's last component: https://github.com/rrnewton/agent-utils.git
+# is served from DIR/agent-utils.git, https://github.com/rrnewton/reverie.git from
 # DIR/reverie.git. Two sources with the same last component would share a mirror, and
 # are refused. Once it is set, every git source must come from there: a
 # missing mirror, or one without a commit Cargo.lock pins, is refused before

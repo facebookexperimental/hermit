@@ -204,6 +204,93 @@ class NightlyRegistryTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(b"removed published identity", result.stderr)
 
+    def test_history_gate_refuses_untracked_registry_in_enclosing_repo(self):
+        # B2: the append-only gate must refuse a registry that is not a
+        # tracked path in the repository it is given.  Before the
+        # hardening, git run in an untracked directory inside an
+        # enclosing repository found that repository, listed no history,
+        # and the gate verified against 0 historical versions.
+        baseline = json.loads(PINS.read_bytes())
+        with tempfile.TemporaryDirectory() as directory:
+            outer = Path(directory) / "outer"
+            (outer / ".github").mkdir(parents=True)
+            tracked = outer / ".github/compatibility-site-releases.json"
+            tracked.write_text(json.dumps(baseline))
+
+            def git(*args, cwd):
+                subprocess.run(
+                    ["git", *args], cwd=cwd, check=True, capture_output=True
+                )
+
+            git("init", "-q", cwd=outer)
+            git("add", str(tracked.relative_to(outer)), cwd=outer)
+            git(
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "Outer registry",
+                cwd=outer,
+            )
+            git(
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "Later outer revision",
+                cwd=outer,
+            )
+
+            # Control: the tracked registry validates (its history exists).
+            control = subprocess.run(
+                [sys.executable, str(HELPER), "validate", str(tracked), str(outer)],
+                capture_output=True,
+            )
+            self.assertEqual(control.returncode, 0, control.stderr.decode())
+            self.assertIn(b"historical versions", control.stdout)
+
+            inner = outer / "untracked"
+            (inner / ".github").mkdir(parents=True)
+            untracked = inner / ".github/compatibility-site-releases.json"
+            untracked.write_text(json.dumps(baseline))
+
+            # validate against the untracked inner root: old behavior
+            # verified against 0 historical versions inside the enclosing
+            # repository; the gate must refuse instead.
+            result = subprocess.run(
+                [sys.executable, str(HELPER), "validate", str(untracked), str(inner)],
+                capture_output=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(b"refused", result.stderr)
+
+            # select-registry and validate-update against the same inner
+            # root must refuse the same way, in the layout the rebuild
+            # adapter uses.
+            previous = inner / "served.json"
+            previous.write_text(json.dumps(baseline))
+            for argv in (
+                [str(HELPER), "select-registry", str(untracked), str(inner), str(previous)],
+                [
+                    str(HELPER),
+                    "validate-update",
+                    str(untracked),
+                    str(untracked),
+                    str(inner),
+                    str(previous),
+                ],
+            ):
+                outcome = subprocess.run(
+                    [sys.executable, *argv], capture_output=True
+                )
+                self.assertNotEqual(outcome.returncode, 0, argv)
+                self.assertIn(b"refused", outcome.stderr)
+
     def test_describe_reports_actual_tree_and_manifest_directories(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

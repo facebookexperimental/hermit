@@ -77,32 +77,48 @@ pub fn open_process_cwd(pid: Pid) -> io::Result<OwnedFd> {
     open_proc_directory(&format!("/proc/{}/cwd", pid.as_raw()))
 }
 
+/// Names a pinned tracee directory as the thread itself would see it: its
+/// procfs link with the thread's root prefix removed.
+fn process_directory_path(tid: Pid, directory: &OwnedFd, link: PathBuf) -> io::Result<PathBuf> {
+    // procfs appends " (deleted)" to a removed directory's name. That string is
+    // not a path, and replay cannot reproduce a deleted directory.
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(directory.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { stat.assume_init() }.st_nlink == 0 {
+        return Err(io::Error::other(format!(
+            "directory of thread {tid} has been removed"
+        )));
+    }
+    let root = std::fs::read_link(format!("/proc/{}/root", tid.as_raw()))?;
+    let relative = link.strip_prefix(&root).map_err(|_| {
+        io::Error::other(format!(
+            "tracee directory {link:?} is not beneath its root {root:?}"
+        ))
+    })?;
+    Ok(Path::new("/").join(relative))
+}
+
 /// Names the tracee thread's current working directory as the thread itself
 /// would see it: the procfs cwd link with the thread's root prefix removed.
 /// Recording keeps this resolved name for a successful `chdir`, so replay can
 /// enter the same directory even when the spelled path went through a host
 /// symlink that the replay root does not contain.
 pub fn process_cwd_path(tid: Pid) -> io::Result<PathBuf> {
-    // procfs appends " (deleted)" to a removed directory's name. That string is
-    // not a path, and replay cannot reproduce a deleted working directory.
-    let cwd_fd = open_process_cwd(tid)?;
-    let mut stat = MaybeUninit::<libc::stat>::uninit();
-    if unsafe { libc::fstat(cwd_fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if unsafe { stat.assume_init() }.st_nlink == 0 {
-        return Err(io::Error::other(format!(
-            "working directory of thread {tid} has been removed"
-        )));
-    }
-    let root = std::fs::read_link(format!("/proc/{}/root", tid.as_raw()))?;
-    let cwd = std::fs::read_link(format!("/proc/{}/cwd", tid.as_raw()))?;
-    let relative = cwd.strip_prefix(&root).map_err(|_| {
-        io::Error::other(format!(
-            "tracee cwd {cwd:?} is not beneath its root {root:?}"
-        ))
-    })?;
-    Ok(Path::new("/").join(relative))
+    let cwd = open_process_cwd(tid)?;
+    let link = std::fs::read_link(format!("/proc/{}/cwd", tid.as_raw()))?;
+    process_directory_path(tid, &cwd, link)
+}
+
+/// Names the directory behind one tracee descriptor as the thread itself
+/// would see it: the procfs descriptor link with the thread's root prefix
+/// removed. This lets replay remember where a relative recorded open was
+/// based even after the guest closes that descriptor or changes cwd.
+pub fn process_directory_fd_path(tid: Pid, fd: RawFd) -> io::Result<PathBuf> {
+    let directory = open_process_directory_fd(tid, fd)?;
+    let link = std::fs::read_link(format!("/proc/{}/fd/{fd}", tid.as_raw()))?;
+    process_directory_path(tid, &directory, link)
 }
 
 /// Pins one tracee descriptor when it currently names a directory.

@@ -18,6 +18,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use detcore_model::summary::RunSummary;
+use detcore_model::syscall_histogram::SyscallHistogramSummary;
+use detcore_model::syscall_histogram::SyscallObservationGap;
+use detcore_model::syscall_histogram::SyscallObservationScope;
 use reverie::DispatchStats;
 
 /// Raw syscalls the guest makes; every backend must dispatch at least these.
@@ -41,7 +44,9 @@ int main(void) {
 
 /// A directory under `CARGO_TARGET_TMPDIR` owned by this test process. Nextest
 /// runs every test in its own process, so with a shared path two tests running
-/// at once would write, or run, the same file.
+/// at once would write, or run, the same file. Under plain `cargo test` the
+/// tests of one binary share a process, so everything below this root that a
+/// test removes or rewrites must also be unique per test or per call.
 fn process_build_root() -> PathBuf {
     Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("dispatch-stats")
@@ -129,16 +134,99 @@ pub(super) fn run_guest(
     stderr
 }
 
-/// Run `guest` under `backend` with a summary JSON and return the record.
+/// Syscalls whose calls may end without returning to Detcore's handler: the
+/// thread or image is gone, or the kernel resumes elsewhere.
+const UNRETURNING_SYSCALLS: [&str; 5] =
+    ["exit", "exit_group", "execve", "execveat", "rt_sigreturn"];
+
+/// The observation scope a `backend` run's histogram must declare: an
+/// in-process runtime starts after the guest's dynamic loader and misses its
+/// syscalls.
+pub(super) fn expected_observation_scope(backend: &str) -> SyscallObservationScope {
+    match backend {
+        "liteinst" | "in-guest-trap" | "sabre" => {
+            SyscallObservationScope::from_gaps([SyscallObservationGap::InProcessRuntimeStart])
+        }
+        _ => SyscallObservationScope::Complete,
+    }
+}
+
+/// Check the properties every backend's syscall histogram must have and return
+/// it: it is in ascending syscall-number order, its calls sum to the summary's
+/// `syscalls`, every call that returns has exactly one outcome, its scope is
+/// the backend's, and the guest's own syscalls appear by name. `expected`
+/// names syscalls the guest makes at least the given number of times.
+pub(super) fn checked_syscall_histogram<'a>(
+    backend: &str,
+    summary: &'a RunSummary,
+    expected: &[(&str, u64)],
+) -> &'a SyscallHistogramSummary {
+    let histogram = summary
+        .syscall_histogram
+        .as_ref()
+        .unwrap_or_else(|| panic!("{backend}: the summary JSON carries no syscall histogram"));
+    assert_eq!(histogram.architecture, "x86_64");
+    assert_eq!(
+        histogram.observation_scope,
+        expected_observation_scope(backend),
+        "{backend}: wrong observation scope"
+    );
+    assert!(
+        histogram
+            .syscalls
+            .windows(2)
+            .all(|pair| pair[0].nr < pair[1].nr),
+        "{backend}: entries are not in ascending syscall-number order: {histogram:?}"
+    );
+    assert_eq!(
+        summary.syscall_histogram_is_consistent(),
+        Some(true),
+        "{backend}: the histogram's calls are not the summary's syscalls ({:?}): {histogram:?}",
+        summary.syscalls
+    );
+    for entry in &histogram.syscalls {
+        if !UNRETURNING_SYSCALLS.contains(&entry.name.as_str()) {
+            assert_eq!(
+                entry.counts.unfinished(),
+                0,
+                "{backend}: {} has calls without an outcome: {:?}",
+                entry.name,
+                entry.counts
+            );
+        }
+    }
+    for (name, at_least) in expected {
+        let entry = histogram
+            .get(name)
+            .unwrap_or_else(|| panic!("{backend}: no {name} in {histogram:?}"));
+        assert!(
+            entry.counts.calls >= *at_least,
+            "{backend}: {name} counted {:?}, expected at least {at_least} calls",
+            entry.counts
+        );
+    }
+    histogram
+}
+
+/// Run `guest` under `backend` with a summary JSON and return the summary.
 /// `run_args` are extra `run` options, as for [`run_guest`].
-pub(super) fn dispatch_record(
+pub(super) fn guest_summary(
     backend: &str,
     hermit: &Path,
     run_args: &[&str],
     env: &[(&str, &Path)],
     guest: &Path,
-) -> DispatchStats {
-    let summary_dir = process_build_root().join(format!("{backend}-summary"));
+) -> RunSummary {
+    // One summary directory per call: two tests of one binary share this
+    // process under `cargo test`, and a shared `summary.json` lets one test
+    // remove or replace another's summary between its run and its read.
+    static SUMMARY_CALL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let call = SUMMARY_CALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let guest_name = guest
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "guest".to_owned());
+    let summary_dir = process_build_root().join(format!("{backend}-summary-{guest_name}-{call}"));
     fs::create_dir_all(&summary_dir).expect("failed to create summary directory");
     let summary = summary_dir.join("summary.json");
     let _ = fs::remove_file(&summary);
@@ -155,6 +243,25 @@ pub(super) fn dispatch_record(
         &fs::read(&summary).unwrap_or_else(|error| panic!("{backend}: no summary JSON: {error}")),
     )
     .expect("the summary JSON parses");
+    let histogram = checked_syscall_histogram(backend, &summary, &[("getppid", GUEST_SYSCALLS)]);
+    assert_eq!(
+        histogram.get("getppid").expect("checked").counts.calls,
+        GUEST_SYSCALLS,
+        "{backend}: the guest makes exactly {GUEST_SYSCALLS} getppid calls"
+    );
+    summary
+}
+
+/// Run `guest` under `backend` with a summary JSON and return the record.
+/// `run_args` are extra `run` options, as for [`run_guest`].
+pub(super) fn dispatch_record(
+    backend: &str,
+    hermit: &Path,
+    run_args: &[&str],
+    env: &[(&str, &Path)],
+    guest: &Path,
+) -> DispatchStats {
+    let summary = guest_summary(backend, hermit, run_args, env, guest);
     let record = summary
         .dispatch_stats
         .unwrap_or_else(|| panic!("{backend}: the summary JSON carries no dispatch record"));

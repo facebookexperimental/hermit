@@ -3,6 +3,10 @@
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
+use std::os::fd::AsFd;
+use std::os::fd::AsRawFd;
+use std::os::fd::BorrowedFd;
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::FileExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
@@ -15,6 +19,8 @@ use serde::Deserialize;
 use sha2::Digest;
 use sha2::Sha256;
 
+use super::super::verify_inputs::MappedPackageMeta;
+use super::super::verify_inputs::RetainedPackageFileMeta;
 use super::runtime_support::ObservedImage;
 use super::runtime_support::PAGE;
 use super::runtime_support::ProposedPlacement;
@@ -176,6 +182,55 @@ impl RetainedFile {
             state: before,
         })
     }
+    fn pair_meta(&self) -> RetainedPackageFileMeta {
+        RetainedPackageFileMeta {
+            state: self.state,
+            sha256: format!("{:x}", Sha256::digest(&self.bytes)),
+        }
+    }
+    fn adopt_pair(file: File, expected: RetainedPackageFileMeta, limit: u64) -> io::Result<Self> {
+        // The exporter duplicates the original read-only OFD. Never reopen a
+        // source path or substitute a sealed copy for that physical identity.
+        // SAFETY: F_GETFL only queries an owned, live descriptor.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if flags & libc::O_ACCMODE != libc::O_RDONLY {
+            return Err(rpc("retained mapped package descriptor is not read-only"));
+        }
+        // Keep the owner safe even if a direct caller did not set CLOEXEC.
+        // SAFETY: descriptor-only flag operations on the owned file.
+        let descriptor_flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+        if descriptor_flags < 0
+            || unsafe {
+                libc::fcntl(
+                    file.as_raw_fd(),
+                    libc::F_SETFD,
+                    descriptor_flags | libc::FD_CLOEXEC,
+                )
+            } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let expected_digest = digest(&expected.sha256)?;
+        let before = state(&file)?;
+        if before != expected.state || before[2] == 0 || before[2] > limit {
+            return Err(rpc(
+                "retained mapped package identity/bound differs from holder",
+            ));
+        }
+        let mut bytes = vec![0; usize::try_from(before[2]).map_err(rpc)?];
+        file.read_exact_at(&mut bytes, 0)?;
+        if state(&file)? != before || <[u8; 32]>::from(Sha256::digest(&bytes)) != expected_digest {
+            return Err(rpc("retained mapped package bytes differ from holder"));
+        }
+        Ok(Self {
+            file,
+            bytes,
+            state: before,
+        })
+    }
     fn verify(&self) -> io::Result<()> {
         let actual = state(&self.file)?;
         if actual != self.state {
@@ -200,15 +255,69 @@ pub(crate) struct RetainedImage {
     #[cfg(feature = "loader-rcb-observation")]
     completion_syscall: u64,
 }
+impl std::fmt::Debug for RetainedImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RetainedImage(<retained package DATA>)")
+    }
+}
 impl RetainedImage {
     pub(crate) fn open() -> io::Result<Self> {
         let (image, descriptor) = package_paths()?;
         Self::open_paths(&image, &descriptor)
     }
+    /// Required, test-scoped paired resource input. This reuses the actual
+    /// retained package parser and OFDs without changing process-wide discovery.
+    /// The caller's package gate owns source/entry binding; these remain DATA.
+    #[cfg(test)]
+    pub(crate) fn open_test_install(install: &Path) -> io::Result<Self> {
+        let resources = install.join("rsrcs");
+        Self::open_paths(
+            &resources.join(ELF_RESOURCE),
+            &resources.join(DATA_RESOURCE),
+        )
+    }
     fn open_paths(image_path: &Path, descriptor_path: &Path) -> io::Result<Self> {
         let descriptor = RetainedFile::open(descriptor_path, MAX_DATA)?;
         let data = parse_data(&descriptor.bytes)?;
         let image = RetainedFile::open(image_path, MAX_IMAGE)?;
+        Self::from_retained(image, descriptor, data)
+    }
+    /// Export the SAME original regular files for the existing pair holder.
+    /// Metadata and bytes remain DATA; this does not qualify entry or source.
+    pub(crate) fn export_pair_inputs(&self) -> io::Result<(MappedPackageMeta, [OwnedFd; 2])> {
+        self.verify()?;
+        let meta = MappedPackageMeta {
+            image: self.image.pair_meta(),
+            descriptor: self.descriptor.pair_meta(),
+        };
+        let files = [
+            self.image.file.try_clone()?.into(),
+            self.descriptor.file.try_clone()?.into(),
+        ];
+        self.verify()?;
+        Ok((meta, files))
+    }
+    /// Adopt original inherited OFDs, checked against the sealed holder record.
+    /// All package parsing/ELF/layout checks are the same as ordinary opening.
+    pub(crate) fn adopt_pair_inputs(
+        meta: MappedPackageMeta,
+        files: [OwnedFd; 2],
+    ) -> io::Result<Self> {
+        let [image, descriptor] = files;
+        let descriptor = RetainedFile::adopt_pair(descriptor.into(), meta.descriptor, MAX_DATA)?;
+        let data = parse_data(&descriptor.bytes)?;
+        let image = RetainedFile::adopt_pair(image.into(), meta.image, MAX_IMAGE)?;
+        Self::from_retained(image, descriptor, data)
+    }
+    /// Only descriptor-retirement custody, not a second image owner.
+    pub(crate) fn pair_fds(&self) -> [BorrowedFd<'_>; 2] {
+        [self.image.file.as_fd(), self.descriptor.file.as_fd()]
+    }
+    fn from_retained(
+        image: RetainedFile,
+        descriptor: RetainedFile,
+        data: PackageData,
+    ) -> io::Result<Self> {
         let image_sha256 = digest(&data.image.sha256)?;
         if image.state[2] != data.image.bytes
             || <[u8; 32]>::from(Sha256::digest(&image.bytes)) != image_sha256
@@ -394,6 +503,180 @@ mod tests {
         bad["observed"]["ordinary_post_ips"] = json!([]);
         assert!(parse(&bad).is_err());
         assert!(parse_data(&vec![b' '; MAX_DATA as usize + 1]).is_err());
+    }
+    #[test]
+    fn pair_file_adoption_keeps_original_identity_offset_and_both_consumers() {
+        use std::io::Seek;
+        use std::io::SeekFrom;
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let path = source.join("image");
+        std::fs::write(&path, b"original file DATA").unwrap();
+        let retained = RetainedFile::open(&path, MAX_IMAGE).unwrap();
+        let meta = retained.pair_meta();
+        let mut offset = retained.file.try_clone().unwrap();
+        offset.seek(SeekFrom::Start(3)).unwrap();
+        // Moving the parent directory leaves the held file unchanged. Both
+        // consumers must work while the old path is absent, and after a
+        // different inode appears there; neither case permits reopening it.
+        std::fs::rename(&source, directory.path().join("held-directory")).unwrap();
+        for replacement in [false, true] {
+            if replacement {
+                std::fs::create_dir(&source).unwrap();
+                std::fs::write(&path, b"replacement bytes").unwrap();
+            } else {
+                assert!(!path.exists());
+            }
+            retained.verify().unwrap();
+            for _ in 0..2 {
+                let adopted = RetainedFile::adopt_pair(
+                    retained.file.try_clone().unwrap(),
+                    meta.clone(),
+                    MAX_IMAGE,
+                )
+                .unwrap();
+                assert_eq!(adopted.state, retained.state);
+                assert_eq!(adopted.bytes, b"original file DATA");
+                assert_eq!(offset.stream_position().unwrap(), 3);
+                adopted.verify().unwrap();
+                assert_ne!(
+                    unsafe { libc::fcntl(adopted.file.as_raw_fd(), libc::F_GETFD) }
+                        & libc::FD_CLOEXEC,
+                    0
+                );
+            }
+        }
+        assert!(RetainedFile::adopt_pair(File::open(&path).unwrap(), meta, MAX_IMAGE).is_err());
+    }
+    #[test]
+    fn pair_file_moved_parent_does_not_hide_original_inode_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let path = source.join("image");
+        std::fs::write(&path, b"original file DATA").unwrap();
+        let writer = OpenOptions::new().write(true).open(&path).unwrap();
+        let retained = RetainedFile::open(&path, MAX_IMAGE).unwrap();
+        let meta = retained.pair_meta();
+        let adopted =
+            RetainedFile::adopt_pair(retained.file.try_clone().unwrap(), meta.clone(), MAX_IMAGE)
+                .unwrap();
+        std::fs::rename(&source, directory.path().join("held-directory")).unwrap();
+        assert!(!path.exists());
+        retained.verify().unwrap();
+        adopted.verify().unwrap();
+        // Modify the original inode through its still-open writer, not a
+        // replacement path. A retained owner is never a mutation exemption.
+        writer.write_all_at(b"modified", 0).unwrap();
+        assert!(retained.verify().is_err());
+        assert!(adopted.verify().is_err());
+        assert!(
+            RetainedFile::adopt_pair(retained.file.try_clone().unwrap(), meta, MAX_IMAGE).is_err()
+        );
+    }
+    #[test]
+    fn pair_file_adoption_refuses_equal_bytes_on_another_inode_or_writable_fd() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original");
+        let substitute = directory.path().join("substitute");
+        std::fs::write(&original, b"same bytes").unwrap();
+        std::fs::write(&substitute, b"same bytes").unwrap();
+        let retained = RetainedFile::open(&original, MAX_DATA).unwrap();
+        assert!(
+            RetainedFile::adopt_pair(
+                File::open(&substitute).unwrap(),
+                retained.pair_meta(),
+                MAX_DATA
+            )
+            .is_err()
+        );
+        let writable = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&original)
+            .unwrap();
+        assert!(RetainedFile::adopt_pair(writable, retained.pair_meta(), MAX_DATA).is_err());
+    }
+    #[test]
+    fn pair_file_checks_holder_digest_bounds_metadata_and_late_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("original");
+        std::fs::write(&path, b"original DATA").unwrap();
+        let retained = RetainedFile::open(&path, MAX_DATA).unwrap();
+        let mut wrong_digest = retained.pair_meta();
+        wrong_digest.sha256 = "00".repeat(32);
+        assert!(
+            RetainedFile::adopt_pair(retained.file.try_clone().unwrap(), wrong_digest, MAX_DATA)
+                .is_err()
+        );
+        let mut wrong_identity = retained.pair_meta();
+        wrong_identity.state[1] ^= 1;
+        assert!(
+            RetainedFile::adopt_pair(retained.file.try_clone().unwrap(), wrong_identity, MAX_DATA)
+                .is_err()
+        );
+        let mut malformed = retained.pair_meta();
+        malformed.sha256 = "AA".repeat(32);
+        assert!(
+            RetainedFile::adopt_pair(retained.file.try_clone().unwrap(), malformed, MAX_DATA)
+                .is_err()
+        );
+        assert!(
+            RetainedFile::adopt_pair(retained.file.try_clone().unwrap(), retained.pair_meta(), 1)
+                .is_err()
+        );
+        let adopted = RetainedFile::adopt_pair(
+            retained.file.try_clone().unwrap(),
+            retained.pair_meta(),
+            MAX_DATA,
+        )
+        .unwrap();
+        // Same original inode, changed metadata: neither old nor adopted owner accepts it.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(retained.verify().is_err());
+        assert!(adopted.verify().is_err());
+    }
+    #[test]
+    fn pair_file_bytes_changed_before_and_after_adoption_refuse() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("original");
+        std::fs::write(&path, b"original DATA").unwrap();
+        let writer = OpenOptions::new().write(true).open(&path).unwrap();
+        let retained = RetainedFile::open(&path, MAX_DATA).unwrap();
+        let meta = retained.pair_meta();
+        let adopted =
+            RetainedFile::adopt_pair(retained.file.try_clone().unwrap(), meta.clone(), MAX_DATA)
+                .unwrap();
+        writer.write_all_at(b"modified DATA", 0).unwrap();
+        assert!(
+            RetainedFile::adopt_pair(retained.file.try_clone().unwrap(), meta, MAX_DATA).is_err()
+        );
+        assert!(retained.verify().is_err());
+        assert!(adopted.verify().is_err());
+    }
+    #[test]
+    fn pair_image_adoption_still_requires_original_package_and_elf_validation() {
+        let directory = tempfile::tempdir().unwrap();
+        let image_path = directory.path().join("image");
+        let descriptor_path = directory.path().join("descriptor");
+        let bytes = [0; 4096];
+        let mut descriptor = data();
+        descriptor["image"]["sha256"] = json!(format!("{:x}", Sha256::digest(bytes)));
+        std::fs::write(&image_path, bytes).unwrap();
+        std::fs::write(&descriptor_path, serde_json::to_vec(&descriptor).unwrap()).unwrap();
+        let image = RetainedFile::open(&image_path, MAX_IMAGE).unwrap();
+        let descriptor = RetainedFile::open(&descriptor_path, MAX_DATA).unwrap();
+        let meta = MappedPackageMeta {
+            image: image.pair_meta(),
+            descriptor: descriptor.pair_meta(),
+        };
+        // Matching original-file identities and hashes do NOT make a valid ELF.
+        assert!(
+            RetainedImage::adopt_pair_inputs(meta, [image.file.into(), descriptor.file.into()])
+                .is_err()
+        );
     }
     #[test]
     fn retained_descriptor_changes_are_not_reparsed_or_accepted() {

@@ -92,7 +92,6 @@ use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::ioctl::Request;
-use reverie::syscalls::linux_abi::Cmsghdr;
 use reverie::syscalls::linux_abi::Mmsghdr;
 use reverie::syscalls::linux_abi::Msghdr;
 
@@ -101,6 +100,7 @@ use super::io::Pselect6SigmaskArg;
 use super::io::ppoll_timeout_duration;
 use super::io::pselect6_fd_set_len;
 use super::io::read_pselect6_fd_set;
+#[cfg(target_arch = "x86_64")]
 use super::io::select_timeout_duration;
 use super::io::write_pselect6_fd_set;
 use crate::fd::FdType;
@@ -110,10 +110,15 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::syscalls::helpers::NonblockableSyscall;
+use crate::syscalls::helpers::PollProbe;
+use crate::syscalls::helpers::RestartBlock;
 use crate::syscalls::helpers::get_fd;
+#[cfg(target_arch = "x86_64")]
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
 use crate::syscalls::helpers::poll_nfds;
 use crate::syscalls::helpers::record_retry_event;
+use crate::syscalls::helpers::woken_poll_errno;
+use crate::syscalls::scm_rights::received_descriptors;
 use crate::tool_global::GlobalRequest;
 use crate::tool_global::GlobalResponse;
 use crate::tool_global::ResumeStatus;
@@ -303,28 +308,30 @@ fn is_configuration_option(level: i32, name: i32) -> bool {
 /// ignores. Everything else on a channel is answered by the engine or
 /// refused.
 fn channel_call_takes_ordinary_path(call: &Syscall) -> bool {
-    matches!(
-        call,
+    match call {
         Syscall::Close(_)
-            | Syscall::Fcntl(_)
-            | Syscall::Fstat(_)
-            | Syscall::Fstatfs(_)
-            | Syscall::Openat(_)
-            | Syscall::Mkdirat(_)
-            | Syscall::Mknodat(_)
-            | Syscall::Fchownat(_)
-            | Syscall::Futimesat(_)
-            | Syscall::Newfstatat(_)
-            | Syscall::Unlinkat(_)
-            | Syscall::Readlinkat(_)
-            | Syscall::Fchmodat(_)
-            | Syscall::Faccessat(_)
-            | Syscall::NameToHandleAt(_)
-            | Syscall::Execveat(_)
-            | Syscall::Statx(_)
-            | Syscall::Symlinkat(_)
-            | Syscall::Utimensat(_)
-    )
+        | Syscall::Fcntl(_)
+        | Syscall::Fstat(_)
+        | Syscall::Fstatfs(_)
+        | Syscall::Openat(_)
+        | Syscall::Mkdirat(_)
+        | Syscall::Mknodat(_)
+        | Syscall::Fchownat(_)
+        | Syscall::Unlinkat(_)
+        | Syscall::Readlinkat(_)
+        | Syscall::Fchmodat(_)
+        | Syscall::Faccessat(_)
+        | Syscall::NameToHandleAt(_)
+        | Syscall::Execveat(_)
+        | Syscall::Statx(_)
+        | Syscall::Symlinkat(_)
+        | Syscall::Utimensat(_) => true,
+        #[cfg(target_arch = "x86_64")]
+        Syscall::Futimesat(_) | Syscall::Newfstatat(_) => true,
+        #[cfg(target_arch = "aarch64")]
+        Syscall::Fstatat(_) => true,
+        _ => false,
+    }
 }
 
 /// Whether `call`, naming an IPv4 or IPv6 socket of `kind` that is not a
@@ -480,6 +487,22 @@ fn read_sockaddr<M: MemoryAccess>(
     Ok(bytes)
 }
 
+/// Why a blocking send on a recorded socket that a signal interrupted is
+/// refused (`Detcore::network_send_wait`).
+const SEND_INTERRUPTION: &str =
+    "network record does not model a signal interrupting a send that waits for buffer space";
+
+/// The refusal of a blocking send on a recorded socket that a signal
+/// interrupts in a way the network record does not model, as
+/// `Detcore::network_refuse` prints it: from the send's wait
+/// (`Detcore::network_send_wait`), and at the send's return, where its
+/// `ERESTARTSYS` is admitted again and each delivery checked
+/// (`syscalls::helpers::settle_woken_wait_at_return`,
+/// `syscalls::helpers::check_woken_wait_delivery`).
+pub(crate) fn send_interruption_refusal() -> String {
+    format!("hermit: {SEND_INTERRUPTION}. {UNSUPPORTED_REMEDY}")
+}
+
 /// Whether a `setsockopt` timeout value sets a timeout. Zero clears it and a
 /// microsecond count out of range fails with `EDOM`, both without reaching
 /// the network. A negative second count sets an immediate timeout, so a
@@ -503,36 +526,6 @@ fn names_abstract_unix_address(bytes: &[u8], addrlen: usize, binding: bool) -> b
         2 => binding,
         _ => bytes.get(2) == Some(&0),
     }
-}
-
-/// The descriptors carried by the `SCM_RIGHTS` messages in a sent or
-/// received control buffer.
-pub(crate) fn received_descriptors(control: &[u8]) -> Vec<RawFd> {
-    const HEADER: usize = size_of::<Cmsghdr>();
-    let align = |length: usize| length.next_multiple_of(size_of::<usize>());
-    let mut descriptors = Vec::new();
-    let mut offset = 0;
-    while let Some(header) = control.get(offset..offset + HEADER) {
-        let length = usize::from_ne_bytes(header[..8].try_into().unwrap());
-        let level = i32::from_ne_bytes(header[8..12].try_into().unwrap());
-        let kind = i32::from_ne_bytes(header[12..16].try_into().unwrap());
-        let Some(data) = control.get(offset + HEADER..offset.saturating_add(length)) else {
-            break;
-        };
-        if level == libc::SOL_SOCKET && kind == libc::SCM_RIGHTS {
-            descriptors.extend(
-                data.as_chunks::<{ size_of::<RawFd>() }>()
-                    .0
-                    .iter()
-                    .map(|fd| RawFd::from_ne_bytes(*fd)),
-            );
-        }
-        if length < HEADER {
-            break;
-        }
-        offset += align(length);
-    }
-    descriptors
 }
 
 /// The `sockaddr` bytes Linux reports for `address`.
@@ -637,11 +630,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         match call {
             // A connect may create a channel and a poll may name one; each
             // falls back to its ordinary handler otherwise.
-            Syscall::Connect(_) | Syscall::Poll(_) | Syscall::Ppoll(_) => true,
+            Syscall::Connect(_) | Syscall::Ppoll(_) => true,
+            #[cfg(target_arch = "x86_64")]
+            Syscall::Poll(_) => true,
             // A received descriptor may be a socket this module never saw.
             Syscall::Recvmsg(_) | Syscall::Recvmmsg(_) => true,
             // Only AF_UNIX sockets stay out of the host's network namespace.
             Syscall::Socket(c) => c.family() != libc::AF_UNIX,
+            #[cfg(target_arch = "x86_64")]
             Syscall::Select(c) => Self::select_names_channel(
                 guest,
                 c.nfds(),
@@ -779,15 +775,26 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Handle a call that [`Self::network_trace_owns`] accepted.
+    ///
+    /// `restart` is the record the thread's previous syscall kept for its
+    /// restart, if any, which the dispatcher took (`handle_syscall_event`): a
+    /// woken `poll` that runs again after `ERESTARTSYS` keeps its deadline
+    /// there, whether it named a recorded socket or not
+    /// (<https://github.com/rrnewton/hermit/issues/4929>, the Codex review of
+    /// slice 2, round 3, finding 2).
     pub(crate) async fn handle_network_trace_syscall<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: Syscall,
+        restart: Option<RestartBlock>,
     ) -> Result<i64, Error> {
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = restart;
         match call {
             Syscall::Socket(c) => return self.network_socket(guest, c).await,
             Syscall::Connect(c) => return self.network_connect(guest, c).await,
-            Syscall::Poll(c) => return self.network_poll(guest, c).await,
+            #[cfg(target_arch = "x86_64")]
+            Syscall::Poll(c) => return self.network_poll(guest, c, restart).await,
             Syscall::Ppoll(c) => return self.network_ppoll(guest, c).await,
             Syscall::Setsockopt(c) => return self.network_setsockopt(guest, c).await,
             Syscall::Recvmsg(c) if !Self::is_network_channel(guest, c.sockfd()) => {
@@ -827,6 +834,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )
                 .await
             }
+            #[cfg(target_arch = "x86_64")]
             Syscall::Select(c) => return self.network_select(guest, c).await,
             Syscall::Pselect6(c) => return self.network_pselect6(guest, c).await,
             Syscall::Sendfile(_)
@@ -1196,6 +1204,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<Option<i16>, Error> {
         let mut stack = guest.stack().await;
         let pollfd: AddrMut<libc::pollfd> = stack.reserve();
+        let probe = PollProbe::reserve(&mut stack);
         let _guard = stack.commit()?;
         guest.memory().write_value(
             pollfd,
@@ -1206,10 +1215,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             },
         )?;
         loop {
-            let call = syscalls::Poll::new()
-                .with_fds(Some(pollfd.cast()))
-                .with_nfds(1)
-                .with_timeout(timeout_millis);
+            let call = probe.call(guest.memory(), pollfd, 1, timeout_millis)?;
             match guest.inject(call).await {
                 Ok(0) => return Ok(None),
                 Ok(_) => {
@@ -1728,7 +1734,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         }
                         waits += 1;
                         waited = true;
-                        self.network_send_wait(guest, fd, &mut rsrc).await;
+                        self.network_send_wait(guest, fd, &mut rsrc, sent).await?;
                     }
                     Err(errno) => {
                         self.network_refuse(
@@ -1761,7 +1767,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     NetworkReply::NotYet => {
                         waits += 1;
                         waited = true;
-                        self.network_send_wait(guest, fd, &mut rsrc).await;
+                        self.network_send_wait(guest, fd, &mut rsrc, sent).await?;
                     }
                     _ => unreachable!(),
                 }
@@ -1772,26 +1778,68 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Wait once for a blocking send: publish a retry event and yield one
     /// polling turn to the scheduler. Record and replay wait identically.
+    /// `sent` is how many of the call's bytes were sent before this wait.
+    ///
+    /// A signal can end the wait: on KVM, the scheduler wakes the thread
+    /// Linux's `complete_signal` chooses for a SIGALRM
+    /// (`wake_polling_alarm_receiver`). Linux's send then stops waiting for
+    /// room (`sk_stream_wait_memory` sees `signal_pending`,
+    /// net/core/stream.c:137-138 and 180-181 at v6.12, and returns
+    /// `sock_intr_errno`, `-ERESTARTSYS` for a send with no `SO_SNDTIMEO`,
+    /// which the network record refuses anyway), and returns the bytes it sent
+    /// so far, if any (`tcp_sendmsg_locked`, net/ipv4/tcp.c:1315-1317 and
+    /// 1333-1337), or that `-ERESTARTSYS`, which the return to user
+    /// mode settles: a handler runs and the call fails with `EINTR`, or is made
+    /// again under `SA_RESTART`; a signal at a default action that ends the
+    /// process ends it; and an ignored copy, or none left (another thread took
+    /// it first), restarts the call unseen (arch/x86/kernel/signal.c:266-270
+    /// and 344-357). The network record models only that restart. So on a
+    /// backend that restarts a call through `ERESTARTSYS` (KVM), a wake with
+    /// nothing sent yet whose return would deliver nothing but ignored copies
+    /// ends the call with `ERESTARTSYS`: the backend drops those copies at the
+    /// return and makes the call again, as Linux's restart does, and record and
+    /// replay restart it at the same point. That admission is made again at
+    /// the return, after the syscall handler's last scheduling point, by the
+    /// same rule, which refuses the run there if a signal with an effect came
+    /// during the handler's later awaits, whatever it would do to the send
+    /// (`settle_woken_wait_at_return`); and each delivery there is checked: a
+    /// handler without `SA_RESTART`, which a sibling may have installed during
+    /// a delivery's turn, would fail the send with `EINTR`, which the network
+    /// record does not model, and is refused there
+    /// (`check_woken_wait_delivery`; the Codex review of round 5). Anything
+    /// else is refused by name here, fail closed: a signal the return would
+    /// deliver to a handler or to a default action that is not ignoring it, a
+    /// wake after part of the buffer was sent, and, on every other backend,
+    /// any wake (<https://github.com/rrnewton/hermit/issues/4929>, the Claude
+    /// review of slice 2, round 4, finding 2).
     async fn network_send_wait<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fd: RawFd,
         rsrc: &mut Resources,
-    ) {
+        sent: usize,
+    ) -> Result<(), Error> {
         rsrc.poll_attempt += 1;
         record_retry_event(guest, syscalls::Sendto::new().with_fd(fd)).await;
-        if matches!(
+        if !matches!(
             resource_request(guest, rsrc.clone()).await,
             ResumeStatus::Signaled(_)
         ) {
-            self.network_refuse(
-                guest,
-                "network record does not model a signal interrupting a send that waits for \
-                 buffer space",
-                UNSUPPORTED_REMEDY,
-            )
-            .await
+            return Ok(());
         }
+        if crate::syscalls::restarts_woken_calls_only_through_erestartsys(&guest.config().backend)
+            && sent == 0
+            && let Ok(sets) = guest.signal_sets(guest.tid())
+            && !crate::syscalls::helpers::delivers_a_signal_with_an_effect(sets)
+        {
+            // Admitted again at the return, after the last scheduling point,
+            // and checked at each delivery there
+            // (`settle_woken_wait_at_return`, `check_woken_wait_delivery`).
+            guest.thread_state_mut().woken_wait = crate::syscalls::helpers::WokenWait::Send;
+            return Err(Errno::ERESTARTSYS.into());
+        }
+        self.network_refuse(guest, SEND_INTERRUPTION, UNSUPPORTED_REMEDY)
+            .await
     }
 
     /// Prepare a blocking send to go on after it waited, while other guest
@@ -1910,21 +1958,38 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(pollfds.iter().filter(|pollfd| pollfd.revents != 0).count() as i64)
     }
 
-    /// `poll` naming at least one channel.
+    /// `poll` naming at least one channel. A `poll` naming none is an
+    /// ordinary one (`handle_poll`), given the restart record too: a woken
+    /// poll that runs again after `ERESTARTSYS` keeps its deadline either way.
+    #[cfg(target_arch = "x86_64")]
     async fn network_poll<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Poll,
+        restart: Option<RestartBlock>,
     ) -> Result<i64, Error> {
         let address = call.fds().map(|fds| fds.cast::<libc::pollfd>());
         let Some((pollfds, channels)) =
             Self::network_pollfds(guest, address, poll_nfds(call.nfds()))
         else {
-            return self.handle_poll(guest, call).await;
+            return self.handle_poll(guest, call, restart).await;
         };
         let address = address.expect("a pollfd array naming a channel");
-        let deadline = millis_duration_to_absolute_timeout(guest, call.timeout()).await;
-        let pollfds = self
+        // The same call at the same address, run again after ERESTARTSYS,
+        // ends when the first would have (`keep_deadline_for_rerun`); no other
+        // record is taken (`RestartBlock::rerun_deadline`).
+        let kept = match restart {
+            Some(block) => {
+                let rip = crate::arch::instruction_pointer(&guest.regs().await);
+                block.rerun_deadline(rip, call)
+            }
+            None => None,
+        };
+        let deadline = match kept {
+            Some(deadline) => deadline,
+            None => millis_duration_to_absolute_timeout(guest, call.timeout()).await,
+        };
+        let result = self
             .network_wait(
                 guest,
                 Some(address),
@@ -1936,8 +2001,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Syscall::Poll(call),
                 poll_ready,
             )
-            .await?;
-        Self::network_poll_result(guest, address, &pollfds)
+            .await
+            .and_then(|pollfds| Self::network_poll_result(guest, address, &pollfds));
+        Self::keep_deadline_for_rerun(guest, &result, call, deadline).await;
+        result
     }
 
     /// `ppoll` naming at least one channel.
@@ -1993,6 +2060,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#3804): Review select on a recorded socket.
     // https://github.com/rrnewton/hermit/issues/3804
+    #[cfg(target_arch = "x86_64")]
     async fn network_select<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2175,7 +2243,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let probe_host = probe.iter().any(|pollfd| pollfd.fd >= 0);
         let mut stack = guest.stack().await;
         let scratch: AddrMut<[u8; POLL_PULL_BYTES]> = stack.reserve();
-        let _guard = stack.commit()?;
+        let poll_probe = PollProbe::reserve(&mut stack);
+        let guard = stack.commit()?;
         let probe_address = match address {
             Some(address) => address,
             None => {
@@ -2187,10 +2256,30 @@ impl<T: RecordOrReplay> Detcore<T> {
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("network poll");
         loop {
-            if matches!(
-                resource_request(guest, rsrc.clone()).await,
-                ResumeStatus::Signaled(_)
-            ) {
+            let resumed = resource_request(guest, rsrc.clone()).await;
+            if matches!(resumed, ResumeStatus::Signaled(_)) {
+                // Linux ends each of these calls (`poll`, `ppoll`, `select`,
+                // `pselect6`) with `ERESTARTNOHAND`, or `poll` with
+                // `ERESTART_RESTARTBLOCK`: `EINTR` once a handler runs, a
+                // restart with the time left when none does. On a backend
+                // that restarts a call only through `ERESTARTSYS`
+                // (`restarts_woken_calls_only_through_erestartsys`, KVM), a
+                // signal that wakes this wait is settled as one that wakes an
+                // ordinary `poll` (`woken_poll_errno`, and again at the
+                // return, `settle_woken_wait_at_return`): an ignored copy,
+                // which the scheduler's SIGALRM receiver may wake it for,
+                // restarts the call rather than failing it with `EINTR`
+                // (<https://github.com/rrnewton/hermit/issues/4929>). A
+                // `poll` keeps its deadline for that restart
+                // (`network_poll`); the others write the time left back to
+                // the guest's timeout, which the restart reads.
+                if crate::syscalls::restarts_woken_calls_only_through_erestartsys(
+                    &guest.config().backend,
+                ) && interrupted == Errno::EINTR
+                {
+                    drop(guard);
+                    return Err(woken_poll_errno(guest, resumed).await?.into());
+                }
                 return Err(interrupted.into());
             }
             let mut request = Vec::new();
@@ -2219,10 +2308,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .memory()
                     .write_values(probe_address, &probe)
                     .map_err(|_| Errno::EFAULT)?;
-                let call = syscalls::Poll::new()
-                    .with_fds(Some(probe_address.cast()))
-                    .with_nfds(probe.len() as libc::nfds_t)
-                    .with_timeout(0);
+                let call = poll_probe.call(
+                    guest.memory(),
+                    probe_address.cast(),
+                    probe.len() as libc::nfds_t,
+                    0,
+                )?;
                 let probed = guest.inject(call).await;
                 let mut after = probe.clone();
                 let read = guest.memory().read_values(probe_address.into(), &mut after);
@@ -2367,6 +2458,44 @@ impl<T: RecordOrReplay> Detcore<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// <https://github.com/rrnewton/hermit/issues/4929> (the Claude review of
+    /// slice 2, round 4, finding 2): a signal that woke a blocking send's wait
+    /// has an effect at the return only when its mask leaves it unblocked and
+    /// it is caught, or at a default action that is not to ignore it; an
+    /// ignored copy, one ignored by default, a blocked one, or none (another
+    /// thread took it), has none, and the send is made again.
+    #[test]
+    fn only_a_signal_with_an_effect_ends_a_send_wait() {
+        let bit = |signal: i32| 1u64 << (signal - 1);
+        let alrm = bit(libc::SIGALRM);
+        let chld = bit(libc::SIGCHLD);
+        let sets_of = reverie::SignalSets::new;
+        for (label, sets, effect) in [
+            ("caught", sets_of(0, alrm, 0, 0, alrm), true),
+            ("caught, own queue", sets_of(alrm, 0, 0, 0, alrm), true),
+            (
+                "default action ends the process",
+                sets_of(0, alrm, 0, 0, 0),
+                true,
+            ),
+            ("ignored", sets_of(0, alrm, 0, alrm, 0), false),
+            ("ignored by default", sets_of(chld, 0, 0, 0, 0), false),
+            ("caught but blocked", sets_of(0, alrm, alrm, 0, alrm), false),
+            ("taken", sets_of(0, 0, 0, 0, alrm), false),
+            (
+                "ignored with a caught one",
+                sets_of(0, alrm | chld, 0, alrm, chld),
+                true,
+            ),
+        ] {
+            assert_eq!(
+                crate::syscalls::helpers::delivers_a_signal_with_an_effect(sets),
+                effect,
+                "{label}"
+            );
+        }
+    }
 
     #[test]
     fn sockaddr_round_trips_both_families() {
@@ -2617,46 +2746,6 @@ mod tests {
             false
         ));
         assert!(!names_abstract_unix_address(&[], 0, true));
-    }
-
-    #[test]
-    fn rights_are_found_in_every_control_message() {
-        fn message(level: i32, kind: i32, fds: &[RawFd]) -> Vec<u8> {
-            let length = size_of::<Cmsghdr>() + size_of_val(fds);
-            let mut bytes = Vec::new();
-            bytes.extend_from_slice(&length.to_ne_bytes());
-            bytes.extend_from_slice(&level.to_ne_bytes());
-            bytes.extend_from_slice(&kind.to_ne_bytes());
-            fds.iter()
-                .for_each(|fd| bytes.extend_from_slice(&fd.to_ne_bytes()));
-            bytes.resize(length.next_multiple_of(size_of::<usize>()), 0);
-            bytes
-        }
-        let mut control = message(libc::SOL_SOCKET, libc::SCM_CREDENTIALS, &[1, 2, 3]);
-        control.extend(message(libc::SOL_SOCKET, libc::SCM_RIGHTS, &[5]));
-        control.extend(message(libc::SOL_SOCKET, libc::SCM_RIGHTS, &[6, 7]));
-        assert_eq!(received_descriptors(&control), vec![5, 6, 7]);
-        // A truncated message carries nothing.
-        assert_eq!(received_descriptors(&control[..control.len() - 8]), vec![5]);
-        let mut zero_length = control.clone();
-        zero_length[..8].copy_from_slice(&0usize.to_ne_bytes());
-        assert_eq!(received_descriptors(&zero_length), Vec::<RawFd>::new());
-        assert_eq!(received_descriptors(&[]), Vec::<RawFd>::new());
-    }
-
-    #[test]
-    fn rights_control_length_is_not_truncated_to_wrapper_width() {
-        let mut control = [0u8; 24];
-        control[..8].copy_from_slice(&((1usize << 32) + 20).to_ne_bytes());
-        control[8..12].copy_from_slice(&libc::SOL_SOCKET.to_ne_bytes());
-        control[12..16].copy_from_slice(&libc::SCM_RIGHTS.to_ne_bytes());
-        control[16..20].copy_from_slice(&42i32.to_ne_bytes());
-        assert!(received_descriptors(&control).is_empty());
-        // The identical low-width valid message must still yield its FD.
-        control[..8].copy_from_slice(&20usize.to_ne_bytes());
-        assert_eq!(received_descriptors(&control), vec![42]);
-        control[..8].copy_from_slice(&usize::MAX.to_ne_bytes());
-        assert!(received_descriptors(&control).is_empty());
     }
 
     #[test]

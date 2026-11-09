@@ -42,34 +42,82 @@ run_strict() {
 }
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-# The checkout may be git-backed (CI) or a Sapling/Eden checkout (local
-# fbsource). Try git first so git checkouts behave exactly as before.
-if ! repo_root=$(git -C "$script_dir" rev-parse --show-toplevel 2>/dev/null); then
-  if ! repo_root=$(sl --cwd "$script_dir" root 2>/dev/null); then
-    fail "could not determine repository root from $script_dir (not a git or Sapling checkout)"
-  fi
-fi
-hermit_bin=${HERMIT_BIN:-$repo_root/target/release/hermit}
+# Staged sources need not include Git metadata or a Cargo toolchain.
+# Set COMPRESSION_SOURCE_IDENTITY=content with an explicit HERMIT_BIN to identify
+# staged runner/tool bytes without claiming a repository revision. The default
+# revision mode uses COMPRESSION_SOURCE_REVISION when set, otherwise Git.
+repo_root=${COMPRESSION_REPO_ROOT:-$script_dir/../../../..}
+repo_root=$(cd "$repo_root" && pwd) || fail "invalid compression repository root"
+[[ $repo_root/hermit-cli/tests/fixtures/compression/run.sh -ef ${BASH_SOURCE[0]} ]] ||
+  fail "COMPRESSION_REPO_ROOT does not contain this compression runner: $repo_root"
+hermit_bin=${HERMIT_BIN-$repo_root/target/release/hermit}
 artifact_root=${COMPRESSION_ARTIFACT_ROOT:-$repo_root/target/compression}
 runs=${COMPRESSION_RUNS:-3}
 input_lines=${COMPRESSION_INPUT_LINES:-24000}
+source_identity=${COMPRESSION_SOURCE_IDENTITY-revision}
+
+case "$source_identity" in
+  revision | content) ;;
+  *) fail "COMPRESSION_SOURCE_IDENTITY must be revision or content: $source_identity" ;;
+esac
 
 require_positive_integer COMPRESSION_RUNS "$runs"
 require_positive_integer COMPRESSION_INPUT_LINES "$input_lines"
 ((runs == 3)) || fail "COMPRESSION_RUNS must be 3 for the determinism check"
 
-for tool in awk basename bzip2 bzip2recover cargo cat cmp cp date git gzip mkdir seq sha256sum uname wc; do
+for tool in awk basename bzip2 bzip2recover cat cmp cp date gzip mkdir seq sha256sum uname wc; do
   command -v "$tool" >/dev/null || fail "required command not found: $tool"
 done
+
+if [[ $source_identity == content ]]; then
+  [[ ! ${COMPRESSION_SOURCE_REVISION+x} ]] ||
+    fail "unset COMPRESSION_SOURCE_REVISION when COMPRESSION_SOURCE_IDENTITY=content"
+  [[ -n ${HERMIT_BIN-} && -f $hermit_bin && -x $hermit_bin ]] ||
+    fail "COMPRESSION_SOURCE_IDENTITY=content requires HERMIT_BIN to name an executable file"
+  repository_commit_source=unavailable-staged
+elif [[ ${COMPRESSION_SOURCE_REVISION+x} ]]; then
+  [[ -n $COMPRESSION_SOURCE_REVISION ]] || fail "COMPRESSION_SOURCE_REVISION must not be empty"
+  repository_commit=$COMPRESSION_SOURCE_REVISION
+  repository_commit_source=explicit
+else
+  # Try git first so git checkouts behave exactly as before; fall back to
+  # Sapling so the fixture also runs in a Sapling/Eden checkout (fbsource).
+  if command -v git >/dev/null &&
+    git_root=$(git -C "$repo_root" rev-parse --show-toplevel 2>/dev/null) &&
+    [[ $git_root -ef $repo_root ]]; then
+    repository_commit=$(git -C "$repo_root" rev-parse HEAD) ||
+      fail "cannot determine source revision; set COMPRESSION_SOURCE_REVISION for staged sources"
+    repository_commit_source=git
+  elif command -v sl >/dev/null &&
+    repository_commit=$(sl --cwd "$repo_root" log -r . -T '{node}' 2>/dev/null) &&
+    [[ -n $repository_commit ]]; then
+    repository_commit_source=sapling
+  else
+    fail "cannot determine source revision; set COMPRESSION_SOURCE_REVISION for staged sources"
+  fi
+fi
 
 bzip2_bin=$(command -v bzip2)
 bzip2recover_bin=$(command -v bzip2recover)
 gzip_bin=$(command -v gzip)
 
 if [[ ! -x $hermit_bin ]]; then
+  [[ ! ${HERMIT_BIN+x} ]] || fail "Hermit binary is not executable: $hermit_bin"
+  command -v cargo >/dev/null || fail "required command not found: cargo"
   cargo build --manifest-path "$repo_root/Cargo.toml" --release -p hermit-run --bin hermit
 fi
 [[ -x $hermit_bin ]] || fail "Hermit binary is not executable: $hermit_bin"
+
+# Assign before printing metadata so a failed hash cannot be hidden by printf.
+hermit_sha256=$(sha256_file "$hermit_bin")
+if [[ $source_identity == content ]]; then
+  # The input generator is inline below; this is the only source file read.
+  # These hashes identify observed files, not an archived runtime environment.
+  runner_sha256=$(sha256_file "${BASH_SOURCE[0]}")
+  bzip2_sha256=$(sha256_file "$bzip2_bin")
+  bzip2recover_sha256=$(sha256_file "$bzip2recover_bin")
+  gzip_sha256=$(sha256_file "$gzip_bin")
+fi
 
 export LC_ALL=C
 timestamp=$(date -u +%Y%m%dT%H%M%SZ)
@@ -92,14 +140,24 @@ metadata=$evidence_dir/metadata.txt
 {
   printf 'schema_version=1\n'
   printf 'started_at_utc=%s\n' "$timestamp"
-  printf 'repository_commit=%s\n' "$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || sl --cwd "$repo_root" log -r . -T '{node}' 2>/dev/null || printf 'unknown')"
+  if [[ $source_identity == content ]]; then
+    printf 'source_identity=content-sha256\n'
+    printf 'runner_sha256=%s\n' "$runner_sha256"
+    printf 'bzip2_sha256=%s\n' "$bzip2_sha256"
+    printf 'bzip2recover=%s\n' "$bzip2recover_bin"
+    printf 'bzip2recover_sha256=%s\n' "$bzip2recover_sha256"
+    printf 'gzip_sha256=%s\n' "$gzip_sha256"
+  else
+    printf 'repository_commit=%s\n' "$repository_commit"
+  fi
+  printf 'repository_commit_source=%s\n' "$repository_commit_source"
   printf 'host_kernel=%s\n' "$(uname -srmo)"
   printf 'runs=%s\n' "$runs"
   printf 'input_lines=%s\n' "$input_lines"
   printf 'input_bytes=%s\n' "$input_bytes"
   printf 'input_sha256=%s\n' "$input_sha256"
   printf 'hermit=%s\n' "$hermit_bin"
-  printf 'hermit_sha256=%s\n' "$(sha256_file "$hermit_bin")"
+  printf 'hermit_sha256=%s\n' "$hermit_sha256"
   printf 'bzip2=%s\n' "$bzip2_bin"
   printf 'gzip=%s\n' "$gzip_bin"
   printf 'gzip_flags=-n -9 -c\n'

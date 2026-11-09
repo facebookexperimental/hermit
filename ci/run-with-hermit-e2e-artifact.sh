@@ -20,7 +20,7 @@ bundle=$("$ROOT_DIR/ci/verify-hermit-e2e-artifact.sh" "$pointer")
 export HERMIT_BIN="$bundle/hermit"
 # A runtime-only bundle also has install/, holding just the unwind closure, so
 # the verified kind (bound into the identity) decides, not the directory.
-if ((require_install)) && [[ $(<"$bundle/kind") != complete ]]; then
+if ((require_install)) && [[ $(<"$bundle/kind") != complete && $(<"$bundle/kind") != core-complete ]]; then
     echo "run-with-hermit-e2e-artifact.sh: consumer requires a complete resource bundle: $bundle" >&2
     exit 2
 fi

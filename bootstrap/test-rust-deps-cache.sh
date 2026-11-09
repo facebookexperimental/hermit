@@ -232,10 +232,6 @@ case $5 in
 esac
 EOF
 printf '#!/usr/bin/env bash\n' >"$repo/scripts/check-buck-reindeer-features.rs"
-cat >"$repo/scripts/patch-reverie-dbt-buck.rs" <<'EOF'
-#!/usr/bin/env bash
-echo "# patched" >>"$1"
-EOF
 chmod +x "$tmp/bin/cargo" "$tmp/bin/rustc" "$tmp/rustc-wrapper" "$tmp/rmbin/rm" "$tmp/flockbin/flock" \
   "$repo/bootstrap/reindeer" "$repo/bootstrap/rust-deps-cache-key.rs" "$repo/scripts/"*.rs
 echo '# none' >"$repo/shim/third-party/rust/shared-cell-aliases.txt"
@@ -336,7 +332,10 @@ regen first
 expect_vendored first
 [[ $(entries) == 1 ]] || fail "first: expected 1 cache entry, found $(entries)"
 [[ ! -e $repo/shim/third-party/rust/.cargo/registry ]] || fail "first: Cargo's download cache was kept"
-[[ $(grep -c '^# patched$' "$buck") == 1 ]] || fail "first: postprocessing ran $(grep -c '^# patched$' "$buck") times"
+# The shared-cell alias postprocessing reads the reverie submodule, so it is
+# not cached: it runs once on a generated or a restored BUCK.
+postprocessed='^# Appended by bootstrap/regenerate-rust-deps from shared-cell-aliases[.]txt[.]$'
+[[ $(grep -c "$postprocessed" "$buck") == 1 ]] || fail "first: postprocessing ran $(grep -c "$postprocessed" "$buck") times"
 
 # Same inputs: no Reindeer call, the same tree, postprocessing applied once.
 regen second

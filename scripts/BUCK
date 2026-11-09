@@ -1,0 +1,27 @@
+load("@fbcode_macros//build_defs:export_files.bzl", "export_file")
+
+oncall("hermit")
+
+# Shared verbatim with ci/manifest-plan, which includes these files via
+# #[path] modules (ci/manifest-plan/src/lib.rs) exactly as
+# scripts/validate.rs includes them. Exported so the manifest-plan Buck
+# library can name them in mapped_srcs.
+export_file(
+    name = "validate_corpus.rs",
+    src = "lib/validate_corpus.rs",
+)
+
+export_file(
+    name = "validate_generator.rs",
+    src = "lib/validate_generator.rs",
+)
+
+export_file(
+    name = "validate_plan.rs",
+    src = "lib/validate_plan.rs",
+)
+
+export_file(
+    name = "validate_super.rs",
+    src = "lib/validate_super.rs",
+)

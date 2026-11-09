@@ -12,6 +12,7 @@ use reverie::syscalls::ClockGetres;
 use reverie::syscalls::ClockGettime;
 use reverie::syscalls::Gettimeofday;
 use reverie::syscalls::MemoryAccess;
+#[cfg(target_arch = "x86_64")]
 use reverie::syscalls::Time;
 
 use super::Replayer;
@@ -47,6 +48,7 @@ impl Replayer {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub(super) async fn handle_time<G: Guest<Self>>(
         &self,
         guest: &mut G,

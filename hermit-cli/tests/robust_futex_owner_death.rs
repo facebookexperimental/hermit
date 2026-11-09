@@ -129,15 +129,6 @@ fn assert_nonempty_canonical_l2(report_path: &Path, stdout: &str, stderr: &str) 
     );
 }
 
-/// Every line of a Hermit log that records a robust-list owner-death store or
-/// wake, in order.
-#[cfg(feature = "dbt")]
-fn owner_death_records(log: &str) -> Vec<&str> {
-    log.lines()
-        .filter(|line| line.contains("robust-list owner death"))
-        .collect()
-}
-
 fn build_guest(build_root: &Path) -> PathBuf {
     fs::create_dir_all(build_root).expect("failed to create guest build directory");
     let guest = build_root.join("robust_futex_test");
@@ -152,26 +143,6 @@ fn build_guest(build_root: &Path) -> PathBuf {
         "robust-futex guest compilation",
         &build_root.join("compile.out"),
         &build_root.join("compile.err"),
-        true,
-    );
-    guest
-}
-
-#[cfg(feature = "dbt")]
-fn build_fatal_signal_guest(build_root: &Path) -> PathBuf {
-    fs::create_dir_all(build_root).expect("failed to create fatal-signal guest build directory");
-    let guest = build_root.join("fatal_signal_threads");
-    let mut compile = Command::new("cc");
-    compile
-        .args(["-O2", "-Wall", "-Wextra", "-Werror"])
-        .arg(repository().join("tests/c/fatal_signal_threads.c"))
-        .args(["-pthread", "-o"])
-        .arg(&guest);
-    run_captured(
-        compile,
-        "fatal-signal guest compilation",
-        &build_root.join("compile-fatal-signal.out"),
-        &build_root.join("compile-fatal-signal.err"),
         true,
     );
     guest
@@ -456,6 +427,115 @@ fn ptrace_wakes_after_guest_observed_fatal_signal_and_exit_group_cleanup() {
     }
 }
 
+/// The lifecycle guest's SIGKILL modes, each with the number of robust
+/// mutexes whose owner it kills. Another process kills the owner's process
+/// while a waiter waits: with `kill` (`sigkill`), with a `tgkill` naming a
+/// thread that is not the owner (`sigkill-thread`), with `pidfd_send_signal`
+/// (`sigkill-pidfd`), with `kill(-pgid)` (`sigkill-group`), while the owner
+/// holds the mutex only through its pending slot (`sigkill-pending`), while
+/// the waiter is a thread of the killing process (`sigkill-killer-waits`), or
+/// while two of the process's threads each own a mutex with a waiter
+/// (`sigkill-two-owners`). Or the owner's process kills itself, from a thread
+/// that is not the owner (`sigkill-self`), from the owner
+/// (`sigkill-self-owner`), or from a thread that owns one mutex while a
+/// sibling owns the other (`sigkill-self-both`).
+const SIGKILL_MODES: [(&str, usize); 10] = [
+    ("sigkill", 1),
+    ("sigkill-thread", 1),
+    ("sigkill-pidfd", 1),
+    ("sigkill-group", 1),
+    ("sigkill-pending", 1),
+    ("sigkill-killer-waits", 1),
+    ("sigkill-two-owners", 2),
+    ("sigkill-self", 1),
+    ("sigkill-self-owner", 1),
+    ("sigkill-self-both", 2),
+];
+
+/// Linux walks a robust-mutex owner's list however the owner dies, a SIGKILL
+/// included: the waiter's lock returns `EOWNERDEAD` in every SIGKILL mode.
+#[test]
+fn linux_wakes_the_waiter_when_a_sigkill_ends_the_owner() {
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "robust-futex-sigkill-native-{}",
+        std::process::id()
+    ));
+    let guest = build_lifecycle_guest(&build_root);
+    for (mode, owners) in SIGKILL_MODES {
+        let mut native = Command::new("timeout");
+        native
+            .args(["--kill-after", "5s", "30s"])
+            .arg(&guest)
+            .arg(mode);
+        let captured = run_captured(
+            native,
+            &format!("native robust-futex {mode} control"),
+            &build_root.join(format!("native-{mode}.out")),
+            &build_root.join(format!("native-{mode}.err")),
+            true,
+        );
+        assert!(
+            captured.stdout.contains("PASS: waiter received EOWNERDEAD")
+                && (owners == 1
+                    || captured
+                        .stdout
+                        .contains("PASS: second waiter received EOWNERDEAD")),
+            "native {mode} control did not wake its waiters\nstdout:\n{}\nstderr:\n{}",
+            captured.stdout,
+            captured.stderr,
+        );
+    }
+}
+
+/// A SIGKILL ends its victims without a stop at which Detcore could read their
+/// robust lists, so the sender records them before the send and each victim's
+/// exit callback replays Linux's walk over its record. Each SIGKILL mode
+/// passes at L2 on ptrace, and a strict run records one modeled wake of one
+/// waiter per killed owner after its physical exit; L2 pins their order.
+/// Before that, the waiters stayed parked in the precise futex model and the
+/// run ended in a deadlock report.
+#[test]
+fn ptrace_wakes_the_waiter_when_a_sigkill_ends_the_owner() {
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "robust-futex-sigkill-ptrace-{}",
+        std::process::id()
+    ));
+    let guest = build_lifecycle_guest(&build_root);
+    for (mode, owners) in SIGKILL_MODES {
+        let run = run_lifecycle_mode("ptrace", &build_root, &guest, mode, false);
+        assert!(
+            run.stdout.contains("PASS: waiter received EOWNERDEAD")
+                && (owners == 1
+                    || run
+                        .stdout
+                        .contains("PASS: second waiter received EOWNERDEAD")),
+            "ptrace {mode}: the waiter did not get EOWNERDEAD\nstdout:\n{}\nstderr:\n{}",
+            run.stdout,
+            run.stderr,
+        );
+        let wakes: Vec<&str> = run
+            .stderr
+            .lines()
+            .filter(|line| line.contains("robust-list owner death woke"))
+            .collect();
+        assert!(
+            wakes.len() == owners
+                && wakes.iter().all(|wake| {
+                    wake.contains("woke 1 waiter(s)") && wake.contains("after physical exit")
+                }),
+            "ptrace {mode}: expected {owners} modeled wake(s) of one waiter each after the owners' exits, got {wakes:#?}\nstderr:\n{}",
+            run.stderr,
+        );
+        let verified = run_lifecycle_mode("ptrace", &build_root, &guest, mode, true);
+        assert!(
+            verified.stdout.contains("PASS: waiter received EOWNERDEAD"),
+            "ptrace {mode} verification did not make progress after owner death\nstdout:\n{}\nstderr:\n{}",
+            verified.stdout,
+            verified.stderr,
+        );
+    }
+}
+
 /// A successful execve ends robust-mutex owners too. Past exec's point of no
 /// return, `de_thread` kills every other thread, whose exits run
 /// `futex_exit_release`, and `exec_mm_release` runs `futex_exec_release` for
@@ -680,38 +760,6 @@ fn ptrace_wakes_nobody_when_an_exec_leaves_the_owner_word_alone() {
     }
 }
 
-/// The DBT leg of `ptrace_wakes_the_waiter_when_an_exec_ends_the_owner`. DBT
-/// runs the native execve outside Detcore's handler, and the new image starts a
-/// fresh runtime, so Detcore reads the group's lists before the exec and hands
-/// the wakes to the coordinator, which delivers them when the new image
-/// reconnects (https://github.com/rrnewton/hermit/issues/4268). Before, each of
-/// these modes left the waiter parked until the run timed out.
-/// `thread-tgid-exec` needs DBT's client to rewrite a non-leader caller's word
-/// naming the virtual thread group ID to the host one before the native exec,
-/// so that Linux's walk under that ID marks it
-/// (https://github.com/rrnewton/reverie/issues/1052, fixed by
-/// https://github.com/rrnewton/reverie/pull/1053).
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_wakes_the_waiter_when_an_exec_ends_the_owner() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "robust-futex-lifecycle-dbt-exec-{}",
-        std::process::id()
-    ));
-    let guest = build_lifecycle_guest(&build_root);
-    for mode in ["de-thread", "owner-exec", "leader-exec", "thread-tgid-exec"] {
-        for verify in [true, false] {
-            let run = run_dbt_lifecycle_mode(&build_root, &guest, mode, verify);
-            assert!(
-                run.stdout.contains("PASS: waiter received EOWNERDEAD"),
-                "DBT {mode} (verify {verify}) did not wake the waiter\nstdout:\n{}\nstderr:\n{}",
-                run.stdout,
-                run.stderr,
-            );
-        }
-    }
-}
-
 /// Linux's exec walk marks each owned word once and wakes one waiter on it;
 /// the second waiter on the word times out. With two raw waiters on one word,
 /// a second modeled wake would wake both (Claude review of
@@ -722,18 +770,41 @@ fn assert_an_exec_wakes_one_waiter_per_word(backend: &str) {
         .join(format!("robust-futex-exec-two-waiters-{backend}"));
     let guest = build_lifecycle_guest(&build_root);
     let expected = "EXEC-TWO-WAITERS: woken=1 timed_out=1 word=0xc0000000";
-    let mut native = Command::new(&guest);
-    native.arg("exec-two-waiters");
-    let native = run_captured(
-        native,
-        "native robust-futex exec-two-waiters",
-        &build_root.join("native.out"),
-        &build_root.join("native.err"),
-        true,
-    );
+    // The native run is the oracle for the Hermit runs below, and the
+    // oracle itself races under load: a waiter that had announced
+    // itself parked but not yet queued in its FUTEX_WAIT when the
+    // exec marked the word got EAGAIN and printed "woken=1
+    // timed_out=0", falsely failing an unrelated queue PR (dh-wmzqx).
+    // The guest now proves both waiters are blocked (see
+    // wait_until_two_waiters_blocked in the lifecycle guest); as a
+    // backstop the ORACLE run alone may retry, bounded and counted
+    // here. The expected string never changes, and the Hermit runs
+    // below are never retried.
+    let mut native = None;
+    for attempt in 1..=2 {
+        let mut command = Command::new(&guest);
+        command.arg("exec-two-waiters");
+        let run = run_captured(
+            command,
+            "native robust-futex exec-two-waiters",
+            &build_root.join(format!("native-{attempt}.out")),
+            &build_root.join(format!("native-{attempt}.err")),
+            true,
+        );
+        eprintln!(
+            "native oracle exec-two-waiters attempt {attempt}/2: {}",
+            run.stdout.trim()
+        );
+        let matched = run.stdout.contains(expected);
+        native = Some(run);
+        if matched {
+            break;
+        }
+    }
+    let native = native.expect("native oracle ran at least once");
     assert!(
         native.stdout.contains(expected),
-        "native: {}",
+        "native oracle (after bounded attempts): {}",
         native.stdout
     );
     for verify in [true, false] {
@@ -747,418 +818,9 @@ fn assert_an_exec_wakes_one_waiter_per_word(backend: &str) {
     }
 }
 
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_an_exec_wakes_one_waiter_per_word_it_marks() {
-    assert_an_exec_wakes_one_waiter_per_word("dbt");
-}
-
 #[test]
 fn ptrace_an_exec_wakes_one_waiter_per_word_it_marks() {
     assert_an_exec_wakes_one_waiter_per_word("ptrace");
-}
-
-/// The DBT leg of `ptrace_wakes_nobody_when_an_exec_leaves_the_owner_word_alone`:
-/// an exec whose walk marks nothing (`thread-owner-exec`) and an exec that
-/// fails (`failed-exec`) wake nobody, as on Linux, at L2.
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_wakes_nobody_when_an_exec_leaves_the_owner_word_alone() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "robust-futex-lifecycle-dbt-exec-nowake-{}",
-        std::process::id()
-    ));
-    let guest = build_lifecycle_guest(&build_root);
-    for (mode, required) in [
-        (
-            "thread-owner-exec",
-            "RAW: wait ETIMEDOUT, owner unlocked 0, OWNER_DIED 0",
-        ),
-        (
-            "failed-exec",
-            "RAW: wait woken, owner unlocked 1, OWNER_DIED 0",
-        ),
-    ] {
-        let run = run_dbt_lifecycle_mode(&build_root, &guest, mode, true);
-        assert!(
-            run.stdout.contains(required),
-            "DBT {mode} did not match Linux\nstdout:\n{}\nstderr:\n{}",
-            run.stdout,
-            run.stderr,
-        );
-    }
-}
-
-/// DBT reports a thread's exit to Detcore before the native exit runs. Detcore
-/// walks the list, leaves each owner word to Linux and wakes the modeled
-/// waiter, and the scheduler commits no turn until the kernel has ended the
-/// thread, so the waiter runs only after Linux has marked the word
-/// (https://github.com/rrnewton/hermit/issues/4238). Before that, DBT did not
-/// model owner death at all, and this guest ended in Detcore's "Deadlock
-/// detected" report with the waiter parked.
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_robust_futex_owner_death_wakes_the_waiter_at_l2() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "robust-futex-owner-death-dbt-{}",
-        std::process::id()
-    ));
-    let guest = build_guest(&build_root);
-    let verify_json = build_root.join("dbt.verify.json");
-    let _ = fs::remove_file(&verify_json);
-
-    let mut verify = Command::new("timeout");
-    verify
-        .args(["--kill-after", "5s", "120s"])
-        .arg(hermit_test::hermit_binary())
-        .args([
-            "--log=info",
-            "--backend=dbt",
-            "run",
-            "--strict",
-            "--tmp=/tmp",
-            "--verify",
-            "--verify-strict",
-            "--verify-json",
-        ])
-        .arg(&verify_json)
-        .args(["--base-env=minimal", "--"])
-        .arg(&guest);
-    let captured = run_captured(
-        verify,
-        "DBT robust-futex owner-death strict verification",
-        &build_root.join("verify.out"),
-        &build_root.join("verify.err"),
-        true,
-    );
-    assert!(
-        captured
-            .stdout
-            .contains("PASS: robust mutex waiter received EOWNERDEAD"),
-        "the waiter did not observe EOWNERDEAD under Hermit DBT\nstdout:\n{}\nstderr:\n{}",
-        captured.stdout,
-        captured.stderr,
-    );
-    assert_nonempty_canonical_l2(&verify_json, &captured.stdout, &captured.stderr);
-}
-
-/// The DBT leg of `detcore_wakes_the_modeled_waiter_before_linux_finishes_exit`:
-/// as on ptrace, Detcore leaves the owner word to Linux's own exit and wakes
-/// exactly one modeled waiter; it makes no store itself. The record of the
-/// word is at DEBUG because it carries a raw guest address.
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_detcore_leaves_the_owner_word_to_linux_and_wakes_the_waiter() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("robust-futex-dbt-evidence-{}", std::process::id()));
-    let guest = build_guest(&build_root);
-
-    let mut run = Command::new("timeout");
-    run.args(["--kill-after", "5s", "120s"])
-        .arg(hermit_test::hermit_binary())
-        .args([
-            "--log=debug",
-            "--backend=dbt",
-            "run",
-            "--strict",
-            "--tmp=/tmp",
-            "--base-env=minimal",
-            "--",
-        ])
-        .arg(&guest);
-    let captured = run_captured(
-        run,
-        "DBT robust-futex owner-death instrumented run",
-        &build_root.join("run.out"),
-        &build_root.join("run.err"),
-        true,
-    );
-    let stdout = captured.stdout;
-    let stderr = captured.stderr;
-    assert!(
-        stdout.contains("PASS: robust mutex waiter received EOWNERDEAD"),
-        "the waiter did not observe EOWNERDEAD under Hermit DBT\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    // Every owner-death record, in order: the word left to Linux, then one
-    // wake that reached exactly one modeled waiter.
-    let records = owner_death_records(&stderr);
-    assert_eq!(
-        records.len(),
-        2,
-        "owner-death records: {records:#?}\nstderr:\n{stderr}"
-    );
-    assert!(
-        records[0].contains("leaving futex word")
-            && records[0].contains("for backend exit cleanup"),
-        "Detcore did not leave the owner word to Linux: {records:#?}"
-    );
-    assert!(
-        records[1].contains("robust-list owner death woke 1 waiter(s)"),
-        "Detcore's owner-death wake did not reach exactly one modeled waiter: {records:#?}"
-    );
-    assert!(
-        !stderr.contains("robust-list owner death: stored futex word"),
-        "Detcore stored the owner word itself\nstderr:\n{stderr}"
-    );
-}
-
-/// An exit_group by a thread that does not own the robust mutex ends the
-/// owning sibling too, and Linux walks that sibling's list as it dies. On DBT,
-/// Detcore walks the group's lists and wakes the waiter in the exit_group's
-/// own handler, after its grant has logically killed the group, and no turn
-/// runs until the kernel has ended every thread of the group
-/// (https://github.com/rrnewton/hermit/issues/4238). The killed sibling holds
-/// its native exit until that walk is done: otherwise Linux marks the word
-/// (clearing the owner's TID) before Detcore reads it, and in about a third
-/// of runs the waiter stayed parked.
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_wakes_the_waiter_when_an_exit_group_ends_the_owner() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("robust-futex-lifecycle-dbt-{}", std::process::id()));
-    let guest = build_lifecycle_guest(&build_root);
-    let verify_json = build_root.join("dbt-exit-group.verify.json");
-    let _ = fs::remove_file(&verify_json);
-
-    let mut verify = Command::new("timeout");
-    verify
-        .args(["--kill-after", "5s", "120s"])
-        .arg(hermit_test::hermit_binary())
-        .args([
-            "--log=info",
-            "--backend=dbt",
-            "run",
-            "--strict",
-            "--tmp=/tmp",
-            "--verify",
-            "--verify-strict",
-            "--verify-json",
-        ])
-        .arg(&verify_json)
-        .args(["--base-env=minimal", "--"])
-        .arg(&guest)
-        .arg("exit-group");
-    let captured = run_captured(
-        verify,
-        "DBT robust-futex exit-group strict verification",
-        &build_root.join("dbt-exit-group-verify.out"),
-        &build_root.join("dbt-exit-group-verify.err"),
-        true,
-    );
-    assert!(
-        captured.stdout.contains("PASS: waiter received EOWNERDEAD"),
-        "the waiter did not observe EOWNERDEAD after exit_group under Hermit DBT\nstdout:\n{}\nstderr:\n{}",
-        captured.stdout,
-        captured.stderr,
-    );
-    assert_nonempty_canonical_l2(&verify_json, &captured.stdout, &captured.stderr);
-
-    let mut run = Command::new("timeout");
-    run.args(["--kill-after", "5s", "120s"])
-        .arg(hermit_test::hermit_binary())
-        .args([
-            "--log=info",
-            "--backend=dbt",
-            "run",
-            "--strict",
-            "--tmp=/tmp",
-            "--base-env=minimal",
-            "--",
-        ])
-        .arg(&guest)
-        .arg("exit-group");
-    let captured = run_captured(
-        run,
-        "DBT robust-futex exit-group run",
-        &build_root.join("dbt-exit-group.out"),
-        &build_root.join("dbt-exit-group.err"),
-        true,
-    );
-    assert!(
-        captured.stdout.contains("PASS: waiter received EOWNERDEAD"),
-        "the waiter did not observe EOWNERDEAD after exit_group under Hermit DBT\nstdout:\n{}\nstderr:\n{}",
-        captured.stdout,
-        captured.stderr,
-    );
-    // Exactly one owner-death wake record, reaching one modeled waiter. The
-    // store record is DEBUG, and absent when Linux marked the word first.
-    let wakes: Vec<&str> = owner_death_records(&captured.stderr)
-        .into_iter()
-        .filter(|record| record.contains("robust-list owner death woke"))
-        .collect();
-    assert_eq!(
-        wakes.len(),
-        1,
-        "Detcore must issue exactly one owner-death wake: {wakes:#?}\nstderr:\n{}",
-        captured.stderr,
-    );
-    assert!(
-        wakes[0].contains("woke 1 waiter(s)"),
-        "the owner-death wake did not reach exactly one modeled waiter: {wakes:#?}"
-    );
-    assert!(
-        !captured.stderr.contains("after physical exit"),
-        "DBT took the staged path that waits for exit callbacks\nstderr:\n{}",
-        captured.stderr,
-    );
-}
-
-/// The DBT leg of the `signal` mode of
-/// `ptrace_wakes_after_guest_observed_fatal_signal_and_exit_group_cleanup`: a
-/// thread of the owner's process raises SIGTERM, whose default action ends the
-/// process, and the waiter is woken with EOWNERDEAD, at L2 and in a plain run.
-/// Before, DynamoRIO's process exit waited forever to synchronize with the
-/// owner thread, which was blocked waiting for its turn, and the run was
-/// killed at its deadline (https://github.com/rrnewton/hermit/issues/4278).
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_wakes_the_waiter_when_a_fatal_signal_ends_the_owner() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "robust-futex-lifecycle-dbt-signal-{}",
-        std::process::id()
-    ));
-    let guest = build_lifecycle_guest(&build_root);
-    for verify in [true, false] {
-        let run = run_dbt_lifecycle_mode(&build_root, &guest, "signal", verify);
-        assert!(
-            run.stdout.contains("PASS: waiter received EOWNERDEAD"),
-            "DBT signal (verify {verify}) did not wake the waiter\nstdout:\n{}\nstderr:\n{}",
-            run.stdout,
-            run.stderr,
-        );
-        if !verify {
-            // Exactly one owner-death wake, reaching one modeled waiter, as
-            // for an exit_group (Claude review of
-            // https://github.com/rrnewton/hermit/pull/4387, finding 3).
-            let wakes = owner_death_wakes(&run.stderr);
-            assert_eq!(
-                wakes.len(),
-                1,
-                "Detcore must issue exactly one owner-death wake: {wakes:#?}\nstderr:\n{}",
-                run.stderr,
-            );
-            assert!(
-                wakes[0].contains("woke 1 waiter(s)"),
-                "the owner-death wake did not reach exactly one modeled waiter: {wakes:#?}"
-            );
-        }
-    }
-}
-
-/// The same fatal SIGTERM with no robust mutex at all: a forked child with a
-/// second thread blocked in pause() is ended by the signal's default action,
-/// and its parent sees it killed by SIGTERM, at L2 and in a plain run. The
-/// child with one thread, and a child with a SIGTERM handler, whose handler
-/// must still run, are the controls. Each output must match the native run
-/// (https://github.com/rrnewton/hermit/issues/4278).
-///
-/// In `threaded-race` the sibling's next turn falls right after the
-/// delivery's decision. It would install a SIGTERM handler and then store to
-/// a page the parent prints. Linux kills every other thread when it commits
-/// the default action, so "signaled sig=15 shm=1" never happens there. Hermit
-/// grants the group exit before any other thread's turn, so the sibling never
-/// runs after the decision: "shm=0", and the action never needs restoring
-/// (Codex review and Claude re-check of
-/// https://github.com/rrnewton/hermit/pull/4387).
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_a_default_fatal_signal_ends_a_threaded_process_and_a_handler_still_runs() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("fatal-signal-threads-dbt-{}", std::process::id()));
-    let guest = build_fatal_signal_guest(&build_root);
-    for (mode, expected) in [
-        (
-            "single-default",
-            "FATAL-SIGNAL single-default: signaled sig=15\n",
-        ),
-        (
-            "threaded-default",
-            "FATAL-SIGNAL threaded-default: signaled sig=15\n",
-        ),
-        (
-            "threaded-caught",
-            "FATAL-SIGNAL threaded-caught: exited code=0\n",
-        ),
-    ] {
-        let mut native = Command::new("timeout");
-        native
-            .args(["--kill-after", "5s", "30s"])
-            .arg(&guest)
-            .arg(mode);
-        let control = run_captured(
-            native,
-            &format!("native fatal-signal {mode} control"),
-            &build_root.join(format!("native-{mode}.out")),
-            &build_root.join(format!("native-{mode}.err")),
-            true,
-        );
-        assert_eq!(control.stdout, expected, "native {mode} control");
-        for verify in [true, false] {
-            let run = run_dbt_lifecycle_mode(&build_root, &guest, mode, verify);
-            assert_eq!(
-                run.stdout, expected,
-                "DBT {mode} (verify {verify})\nstderr:\n{}",
-                run.stderr
-            );
-        }
-    }
-
-    let mut native = Command::new("timeout");
-    native
-        .args(["--kill-after", "5s", "30s"])
-        .arg(&guest)
-        .arg("threaded-race");
-    let control = run_captured(
-        native,
-        "native fatal-signal threaded-race control",
-        &build_root.join("native-threaded-race.out"),
-        &build_root.join("native-threaded-race.err"),
-        true,
-    );
-    assert!(
-        [
-            "FATAL-SIGNAL threaded-race: signaled sig=15 shm=0\n",
-            "FATAL-SIGNAL threaded-race: exited code=0 shm=1\n",
-            "FATAL-SIGNAL threaded-race: exited code=0 shm=0\n",
-        ]
-        .contains(&control.stdout.as_str()),
-        "native threaded-race control: {}",
-        control.stdout
-    );
-    for verify in [true, false] {
-        let run = run_dbt_lifecycle_mode(&build_root, &guest, "threaded-race", verify);
-        assert_eq!(
-            run.stdout, "FATAL-SIGNAL threaded-race: signaled sig=15 shm=0\n",
-            "DBT threaded-race (verify {verify})\nstderr:\n{}",
-            run.stderr
-        );
-        if !verify {
-            assert_eq!(
-                run.stderr
-                    .matches("ends its thread group by default")
-                    .count(),
-                1,
-                "the delivery did not decide the default action\nstderr:\n{}",
-                run.stderr
-            );
-            assert_eq!(
-                run.stderr
-                    .matches("changed after the delivery decision")
-                    .count(),
-                0,
-                "a sibling ran between the decision and the group exit\nstderr:\n{}",
-                run.stderr
-            );
-        }
-    }
-}
-
-/// Runs the lifecycle guest's `mode` under Hermit DBT with `--strict` and
-/// returns the capture: with `--verify --verify-strict` (and the report's L2
-/// checked) when `verify`, else at `--log=info`.
-#[cfg(feature = "dbt")]
-fn run_dbt_lifecycle_mode(build_root: &Path, guest: &Path, mode: &str, verify: bool) -> Captured {
-    run_lifecycle_mode("dbt", build_root, guest, mode, verify)
 }
 
 /// Runs the lifecycle guest in `mode` under `backend` with `--strict`, at L2
@@ -1208,146 +870,6 @@ fn run_lifecycle_mode(
         captured.stderr,
     );
     captured
-}
-
-/// The owner-death wake records of a `--log=info` run.
-#[cfg(feature = "dbt")]
-fn owner_death_wakes(stderr: &str) -> Vec<&str> {
-    owner_death_records(stderr)
-        .into_iter()
-        .filter(|record| record.contains("robust-list owner death woke"))
-        .collect()
-}
-
-/// A sibling blocked in pthread_mutex_lock on the owner's mutex keeps that
-/// mutex in its pending slot. Created first, it is walked first. The caller
-/// holds 1,500 robust mutexes, whose walk gave the owner's native exit time to
-/// mark the word first (Claude re-check of
-/// https://github.com/rrnewton/hermit/pull/4277: the wake was then recorded
-/// under the sibling in 20 of 20 runs). The killed threads now hold their
-/// native exits until the walk is done, so the one wake is recorded under the
-/// owner in every run, and the strict comparison of two runs' INFO records
-/// matches.
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_wakes_a_blocked_siblings_mutex_once_under_its_owner() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "robust-futex-blocked-sibling-dbt-{}",
-        std::process::id()
-    ));
-    let guest = build_lifecycle_guest(&build_root);
-    let verified = run_dbt_lifecycle_mode(&build_root, &guest, "blocked-sibling", true);
-    assert!(
-        verified.stdout.contains("PASS: waiter received EOWNERDEAD"),
-        "stdout:\n{}\nstderr:\n{}",
-        verified.stdout,
-        verified.stderr,
-    );
-    let run = run_dbt_lifecycle_mode(&build_root, &guest, "blocked-sibling", false);
-    let owner = run
-        .stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("OWNER: tid "))
-        .unwrap_or_else(|| panic!("the guest did not report its owner\n{}", run.stdout));
-    let wakes = owner_death_wakes(&run.stderr);
-    assert_eq!(
-        wakes.len(),
-        1,
-        "owner-death wakes: {wakes:#?}\nstderr:\n{}",
-        run.stderr
-    );
-    let recorded = format!("[detcore, dtid {owner}] robust-list owner death woke 1 waiter(s)");
-    assert!(
-        wakes[0].contains(&recorded),
-        "the wake must be recorded under the owner, dtid {owner}: {wakes:#?}"
-    );
-}
-
-/// A thread that registers its robust list only after another thread has
-/// filed its exit_group, before the grant: Linux walks the registration
-/// current when the thread dies, so the waiter is woken and the word marked.
-/// Under Hermit the registration lands in that window, so an exit_group walk
-/// that read the registrations when it was filed would miss it (measured: the
-/// waiter timed out with the word registered, 3 of 3 runs).
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_walks_a_registration_made_after_the_exit_group_is_filed() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "robust-futex-late-registration-dbt-{}",
-        std::process::id()
-    ));
-    let guest = build_lifecycle_guest(&build_root);
-    let run = run_dbt_lifecycle_mode(&build_root, &guest, "late-registration", false);
-    assert!(
-        run.stdout
-            .contains("RAW: wait woken, owner unlocked 0, OWNER_DIED 1, registered 1"),
-        "stdout:\n{}\nstderr:\n{}",
-        run.stdout,
-        run.stderr,
-    );
-    let wakes = owner_death_wakes(&run.stderr);
-    assert_eq!(
-        wakes.len(),
-        1,
-        "owner-death wakes: {wakes:#?}\nstderr:\n{}",
-        run.stderr
-    );
-    assert!(wakes[0].contains("woke 1 waiter(s)"), "{wakes:#?}");
-}
-
-/// Cases from the Codex and Claude re-checks of
-/// https://github.com/rrnewton/hermit/pull/4277, natively and under Hermit
-/// DBT, which must agree: one word reached through two mappings of a shared
-/// page is woken once (one of two waiters times out); and two threads pending
-/// on one ownerless word each wake once, whether the word is free or already
-/// marked by an earlier owner's death, with or without waiters (both waiters
-/// are woken, the word is unchanged).
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_wakes_a_shared_alias_once_and_each_pending_slot_once_as_linux_does() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("robust-futex-boundary-dbt-{}", std::process::id()));
-    let guest = build_lifecycle_guest(&build_root);
-    for (mode, expected) in [
-        (
-            "shared-alias",
-            "BOUNDARY: mode=shared-alias woken=1 timed_out=1 word=0xc0000000",
-        ),
-        (
-            "two-pending",
-            "BOUNDARY: mode=two-pending woken=2 timed_out=0 word=0",
-        ),
-        (
-            "pending-marked",
-            "BOUNDARY: mode=pending-marked woken=2 timed_out=0 word=0xc0000000",
-        ),
-        (
-            "pending-marked-quiet",
-            "BOUNDARY: mode=pending-marked-quiet woken=2 timed_out=0 word=0x40000000",
-        ),
-    ] {
-        let mut native = Command::new(&guest);
-        native.arg(mode);
-        let native = run_captured(
-            native,
-            &format!("native robust-futex {mode}"),
-            &build_root.join(format!("native-{mode}.out")),
-            &build_root.join(format!("native-{mode}.err")),
-            true,
-        );
-        assert!(
-            native.stdout.contains(expected),
-            "native {mode}: {}",
-            native.stdout
-        );
-        let run = run_dbt_lifecycle_mode(&build_root, &guest, mode, false);
-        assert!(
-            run.stdout.contains(expected),
-            "DBT {mode} differs from Linux\nstdout:\n{}\nstderr:\n{}",
-            run.stdout,
-            run.stderr,
-        );
-    }
 }
 
 /// The ptrace leg of `dbt_wakes_a_shared_alias_once_and_each_pending_slot_once_as_linux_does`.
@@ -1593,11 +1115,24 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
     // 0x183 authenticates bootstrap LOAD ownership in the guest maps view,
     // 0x184 projects those private intervals from complete Smaps sections,
     // 0x185 random devices are classified by device number,
-    // and 0x186 projects coherent NUMA rows with authenticated private ownership),
+    // 0x186 projects coherent NUMA rows with authenticated private ownership,
+    // 0x187 a recording stores the schedule it ran under,
+    // 0x188 runs a MSG_DONTWAIT call on a socketpair end once,
+    // 0x189 replays a recorded poll's ERESTARTSYS as ERESTARTNOHAND,
+    // 0x18a gives each open of a random device a stream of its own,
+    // 0x18b keeps ignored signals from ending kernel-run epoll waits,
+    // 0x18c and kernel-run poll and select waits that name no mask,
+    // 0x18f a descriptor received over SCM_RIGHTS joins the open file its
+    // send modelled,
+    // 0x190 a fatal signal retires the process's other threads in its turn,
+    // 0x193 every /proc status file shows TracerPid 0,
+    // 0x195 runs a kernel-run poll's restart as the guest's own
+    // restart_syscall,
+    // and 0x19e counts every conditional branch on seven Intel models),
     // and a recording from before the change, 0x14f, is still refused by
     // the exact-match gate.
     assert_eq!(
-        metadata["version"], 0x186,
+        metadata["version"], 0x19e,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x14f);
@@ -1621,160 +1156,5 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
         !refused.stdout.contains("BOUNDARY:"),
         "the 0x14f recording's guest ran before the refusal\nstdout:\n{}",
         refused.stdout,
-    );
-}
-
-/// The owned word sits only in its owner's pending slot (glibc's state inside
-/// pthread_mutex_unlock), and a sibling walked first waits on it with it in
-/// its own pending slot (Claude re-check of c65d9202, NF2). The threads the
-/// exit_group kills hold their native exits until its walk is done, so the
-/// owner's native exit cannot mark the word before the sibling's slot is read:
-/// the one wake is recorded under the owner in every run, and two runs' INFO
-/// records match.
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_wakes_an_owners_pending_word_under_its_owner() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "robust-futex-pending-owner-dbt-{}",
-        std::process::id()
-    ));
-    let guest = build_lifecycle_guest(&build_root);
-    let verified = run_dbt_lifecycle_mode(&build_root, &guest, "pending-owner", true);
-    assert!(
-        verified
-            .stdout
-            .contains("PENDING-OWNER: waiter woken word=0xc0000000"),
-        "stdout:\n{}\nstderr:\n{}",
-        verified.stdout,
-        verified.stderr,
-    );
-    let run = run_dbt_lifecycle_mode(&build_root, &guest, "pending-owner", false);
-    let owner = run
-        .stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("OWNER: tid "))
-        .unwrap_or_else(|| panic!("the guest did not report its owner\n{}", run.stdout));
-    let wakes = owner_death_wakes(&run.stderr);
-    assert_eq!(
-        wakes.len(),
-        1,
-        "owner-death wakes: {wakes:#?}\nstderr:\n{}",
-        run.stderr
-    );
-    let recorded = format!("[detcore, dtid {owner}] robust-list owner death woke 1 waiter(s)");
-    assert!(
-        wakes[0].contains(&recorded),
-        "the wake must be recorded under the owner, dtid {owner}: {wakes:#?}"
-    );
-}
-
-/// Two threads of one process call exit_group at once, as two threads calling
-/// exit() do; each owns a process-shared robust mutex with a waiter in
-/// another process (Claude re-check of 3719cd4e, F1). Whichever exit_group is
-/// granted, the other filer is killed by it and must hold its native exit until
-/// the winner's walk is done: both waiters get EOWNERDEAD, as on Linux, the
-/// two wakes are recorded under A and then B, and two runs match. A thread
-/// created first holds 2,000 robust mutexes, so the walk reaches the killed
-/// filer's list late (Claude review of 65138a17, N1): with a killed filer
-/// exempt from the wait, a waiter timed out in 5 of 5 runs.
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_wakes_both_owners_waiters_when_two_threads_call_exit_group() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "robust-futex-concurrent-exit-group-dbt-{}",
-        std::process::id()
-    ));
-    let guest = build_lifecycle_guest(&build_root);
-    let verified = run_dbt_lifecycle_mode(&build_root, &guest, "concurrent-exit-group", true);
-    assert!(
-        verified
-            .stdout
-            .contains("CONCURRENT-EXIT-GROUP: A=EOWNERDEAD B=EOWNERDEAD"),
-        "stdout:\n{}\nstderr:\n{}",
-        verified.stdout,
-        verified.stderr,
-    );
-    let run = run_dbt_lifecycle_mode(&build_root, &guest, "concurrent-exit-group", false);
-    assert!(
-        run.stdout
-            .contains("CONCURRENT-EXIT-GROUP: A=EOWNERDEAD B=EOWNERDEAD"),
-        "stdout:\n{}\nstderr:\n{}",
-        run.stdout,
-        run.stderr,
-    );
-    let tid = |name: &str| {
-        run.stdout
-            .lines()
-            .find_map(|line| line.strip_prefix(name))
-            .unwrap_or_else(|| panic!("the guest did not report {name}\n{}", run.stdout))
-            .to_owned()
-    };
-    let (a, b) = (tid("A: tid "), tid("B: tid "));
-    let wakes = owner_death_wakes(&run.stderr)
-        .into_iter()
-        .filter(|wake| !wake.contains("woke 0 waiter(s)"))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        wakes.len(),
-        2,
-        "owner-death wakes: {wakes:#?}\nstderr:\n{}",
-        run.stderr
-    );
-    assert!(
-        wakes[0].contains(&format!(
-            "[detcore, dtid {a}] robust-list owner death woke 1 waiter(s)"
-        )) && wakes[1].contains(&format!(
-            "[detcore, dtid {b}] robust-list owner death woke 1 waiter(s)"
-        )),
-        "the wakes must come from A's walk, then B's (A={a}, B={b}): {wakes:#?}"
-    );
-}
-
-/// A lock owned by thread B linked into thread A's list, with B pending on it
-/// (Codex re-check of 5899d5c8, P2-3,
-/// https://github.com/rrnewton/hermit/issues/4302). A's walk, first in owner
-/// order, skips that word and wakes A's own; B's walk then wakes the word from
-/// its pending slot. With the killed threads holding their native exits, the
-/// two wakes are recorded under A and then B in every run.
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_wakes_a_reversed_owner_registration_as_linux_does() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
-        "robust-futex-reversed-owner-dbt-{}",
-        std::process::id()
-    ));
-    let guest = build_lifecycle_guest(&build_root);
-    let verified = run_dbt_lifecycle_mode(&build_root, &guest, "reversed-owner", true);
-    assert!(
-        verified
-            .stdout
-            .contains("REVERSED-OWNER: W=woken U=woken words=0xc0000000,0xc0000000"),
-        "stdout:\n{}\nstderr:\n{}",
-        verified.stdout,
-        verified.stderr,
-    );
-    let run = run_dbt_lifecycle_mode(&build_root, &guest, "reversed-owner", false);
-    let tid = |name: &str| {
-        run.stdout
-            .lines()
-            .find_map(|line| line.strip_prefix(name))
-            .unwrap_or_else(|| panic!("the guest did not report {name}\n{}", run.stdout))
-            .to_owned()
-    };
-    let (a, b) = (tid("A: tid "), tid("B: tid "));
-    let wakes = owner_death_wakes(&run.stderr);
-    assert_eq!(
-        wakes.len(),
-        2,
-        "owner-death wakes: {wakes:#?}\nstderr:\n{}",
-        run.stderr
-    );
-    assert!(
-        wakes[0].contains(&format!(
-            "[detcore, dtid {a}] robust-list owner death woke 1 waiter(s)"
-        )) && wakes[1].contains(&format!(
-            "[detcore, dtid {b}] robust-list owner death woke 1 waiter(s)"
-        )),
-        "the wakes must come from A's walk, then B's (A={a}, B={b}): {wakes:#?}"
     );
 }

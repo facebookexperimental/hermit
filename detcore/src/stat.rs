@@ -131,9 +131,10 @@ impl From<&libc::stat> for DetStat {
             dev: st.st_dev,
             rdev: st.st_rdev,
             inode: st.st_ino,
-            nlink: st.st_nlink,
+            // `st_nlink` and `st_blksize` are 32 bits wide on aarch64.
+            nlink: st.st_nlink as _,
             size: st.st_size,
-            blksize: st.st_blksize,
+            blksize: st.st_blksize as _,
             blocks: st.st_blocks,
             atime: Timespec {
                 tv_sec: st.st_atime as _,
@@ -166,13 +167,15 @@ impl From<&DetStat> for libc::stat {
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         stat.st_dev = st.dev;
         stat.st_ino = st.inode;
-        stat.st_nlink = st.nlink;
+        // Narrower on aarch64, where every source of these two fields (`stat`
+        // and `statx`) is 32 bits wide.
+        stat.st_nlink = st.nlink as _;
         stat.st_mode = st.mode;
         stat.st_uid = st.uid;
         stat.st_gid = st.gid;
         stat.st_rdev = st.rdev;
         stat.st_size = st.size;
-        stat.st_blksize = st.blksize;
+        stat.st_blksize = st.blksize as _;
         stat.st_blocks = st.blocks;
         stat.st_atime = st.atime.tv_sec;
         stat.st_atime_nsec = st.atime.tv_nsec;

@@ -29,6 +29,10 @@ use tracing::trace;
 
 use super::signal::SleepCheck;
 use super::signal::SleepSignal;
+use crate::cpu_clock;
+use crate::cpu_clock::ClockIdClass;
+use crate::cpu_clock::ClockLookup;
+use crate::cpu_clock::ClockTask;
 use crate::detlog;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
@@ -55,11 +59,16 @@ use crate::types::SigWrapper;
 /// clock, or a clock descriptor; whether it is valid depends on the process
 /// or descriptor it names, so it is accepted here as before.
 fn clock_id_is_known(clockid: ClockId) -> bool {
-    use reverie::syscalls::FromToRaw;
-    match clockid.into_raw() as i32 {
+    match raw_clock_id(clockid) {
         0..=9 | 11 => true,
         id => id < 0,
     }
+}
+
+/// `clockid` as the kernel's `clockid_t`.
+fn raw_clock_id(clockid: ClockId) -> i32 {
+    use reverie::syscalls::FromToRaw;
+    clockid.into_raw() as i32
 }
 
 /// Linux's answer to `timer_create` for `clockid` alone, which it gives
@@ -127,6 +136,21 @@ fn timespec_to_ns(ts: libc::timespec) -> u64 {
     secs.saturating_mul(1_000_000_000).saturating_add(nsec)
 }
 
+/// The CPU time an absolute CPU-clock sleep to `deadline` still has to wait
+/// for when the clock reads `now`: none once the deadline has passed, where
+/// Linux returns at once (`posix_cpu_timer_set` fires an expired timer,
+/// kernel/time/posix-cpu-timers.c:729-735 at v6.16). The caller checked the
+/// request's fields; the deadline saturates.
+fn cpu_sleep_remaining(deadline: &Timespec, now: LogicalTime) -> Duration {
+    let deadline =
+        LogicalTime::ZERO + Duration::new(deadline.tv_sec as u64, deadline.tv_nsec as u32);
+    if deadline > now {
+        deadline.duration_since(now)
+    } else {
+        Duration::ZERO
+    }
+}
+
 /// Inverse of [`timespec_to_ns`].
 fn ns_to_timespec(ns: u64) -> libc::timespec {
     libc::timespec {
@@ -178,6 +202,13 @@ struct TvRepairFailure {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_arch = "x86_64"),
+    allow(
+        dead_code,
+        reason = "the repair's time(2) probes, which build most of these, are x86_64-only"
+    )
+)]
 enum TvRepairFailureKind {
     /// The backend could not execute the `time(2)` probe. EFAULT is not a
     /// failure: it means Linux stopped before storing this word.
@@ -208,6 +239,9 @@ enum TvRepairFailureKind {
     /// A recorded EFAULT does not prove that this replay execution performed
     /// the original stores, so live probing would mix replayed and host state.
     ReplayMode,
+    /// This architecture has no `time(2)` to probe each word with.
+    #[cfg(not(target_arch = "x86_64"))]
+    NoStoreProbe,
 }
 
 impl std::fmt::Display for TvRepairFailure {
@@ -245,6 +279,10 @@ impl std::fmt::Display for TvRepairFailure {
             TvRepairFailureKind::ReplayMode => {
                 f.write_str("cannot probe a recorded or replayed EFAULT")
             }
+            #[cfg(not(target_arch = "x86_64"))]
+            TvRepairFailureKind::NoStoreProbe => f.write_str(
+                "this architecture has no time(2) to probe which words Linux stored",
+            ),
         }
     }
 }
@@ -255,12 +293,14 @@ fn tv_repair_error(field: &'static str, kind: TvRepairFailureKind) -> Error {
     Error::Tool(anyhow::Error::new(TvRepairFailure { field, kind }))
 }
 
+#[cfg(target_arch = "x86_64")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimeStoreProbe {
     Stored,
     Stopped,
 }
 
+#[cfg(target_arch = "x86_64")]
 fn classify_time_store_probe(
     field: &'static str,
     result: Result<i64, Errno>,
@@ -277,6 +317,7 @@ fn classify_time_store_probe(
 
 /// `time(NULL)` stores nothing and cannot fail on Linux, so any error means
 /// the injected `time(2)` never reached the native call.
+#[cfg(target_arch = "x86_64")]
 fn require_native_time_control_probe(
     field: &'static str,
     result: Result<i64, Errno>,
@@ -291,6 +332,7 @@ fn require_native_time_control_probe(
 }
 
 /// How a word that Linux did not store reads after the call.
+#[cfg(target_arch = "x86_64")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoppedWord {
     /// Readable, with the value it held before the call.
@@ -301,6 +343,7 @@ enum StoppedWord {
 }
 
 /// A word Linux did not store keeps both its contents and its readability.
+#[cfg(target_arch = "x86_64")]
 fn require_unchanged_stopped_word(
     field: &'static str,
     before: Result<libc::time_t, Errno>,
@@ -318,6 +361,7 @@ fn require_unchanged_stopped_word(
 
 /// Whether every byte of the `time_t` at `word` lies in one of `ranges`, the
 /// half-open address ranges of the guest's mappings.
+#[cfg(target_arch = "x86_64")]
 fn time_word_is_fully_mapped(mut ranges: Vec<(u64, u64)>, word: u64) -> bool {
     let Some(end) = word.checked_add(std::mem::size_of::<libc::time_t>() as u64) else {
         return false;
@@ -348,6 +392,7 @@ fn time_word_is_fully_mapped(mut ranges: Vec<(u64, u64)>, word: u64) -> bool {
 /// `gettimeofday` whose store faults on any of these ends the run rather than
 /// returning EFAULT. An empty map is refused because a filter that fakes a
 /// successful zero-byte read would otherwise make every word look unmapped.
+#[cfg(target_arch = "x86_64")]
 fn require_unmapped_unreadable_word(
     field: &'static str,
     maps: Result<Vec<(u64, u64)>, Error>,
@@ -415,6 +460,7 @@ fn timeval_word_addr<'a>(
 /// `gettimeofday` left it alone, or `None` when the address is past the end of
 /// the address space. No store can reach such a word, so it needs no check.
 /// (A probe needs a real address, so `timeval_word_addr` fails closed instead.)
+#[cfg(target_arch = "x86_64")]
 fn stopped_timeval_word_addr<'a>(
     tv_addr: AddrMut<'a, Timeval>,
     offset: usize,
@@ -425,6 +471,7 @@ fn stopped_timeval_word_addr<'a>(
         .and_then(AddrMut::<libc::time_t>::from_raw)
 }
 
+#[cfg(target_arch = "x86_64")]
 fn require_complete_time_word_overwrite(
     field: &'static str,
     expected: usize,
@@ -507,6 +554,7 @@ fn require_live_time_store_probe(replay_data_is_some: bool) -> Result<(), Error>
 /// `pid()` is not the guest (KVM). A backend that executes `gettimeofday` and
 /// `time(2)` itself, as KVM does, stores them as Linux does: each word with an
 /// all-or-nothing store to a writable page, in kernel order.
+#[cfg(target_arch = "x86_64")]
 async fn overwrite_failed_gettimeofday_tv<'a, G, T>(
     guest: &mut G,
     tv_addr: AddrMut<'a, Timeval>,
@@ -553,6 +601,22 @@ where
     Ok(())
 }
 
+/// The repair above probes each `tv` word with `time(2)`, which aarch64 does
+/// not have, so there it cannot tell which words Linux stored and refuses.
+#[cfg(not(target_arch = "x86_64"))]
+async fn overwrite_failed_gettimeofday_tv<'a, G, T>(
+    _guest: &mut G,
+    _tv_addr: AddrMut<'a, Timeval>,
+    _tv: &Timeval,
+    _before: &TimevalWordSnapshot,
+) -> Result<(), Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    Err(tv_repair_error("tv", TvRepairFailureKind::NoStoreProbe))
+}
+
 fn remaining_sleep_duration(target: LogicalTime, now: LogicalTime) -> Duration {
     if target > now {
         target.duration_since(now)
@@ -563,11 +627,14 @@ fn remaining_sleep_duration(target: LogicalTime, now: LogicalTime) -> Duration {
 
 impl<T: RecordOrReplay> Detcore<T> {
     /// Convenience function for constructing a sleep request with a nanosecond offset from "now".
+    /// A zero offset marks the request a zero-length sleep (`Resources::zero_length_sleep`).
     pub async fn sleep_request<G: Guest<Self>>(guest: &mut G, ns_delta: Duration) -> Resources {
         let base_time = thread_observe_time(guest).await;
         let target_time = base_time + ns_delta;
         let resource = ResourceID::SleepUntil(target_time);
-        guest.thread_state().mk_request(resource, Permission::W)
+        let mut request = guest.thread_state().mk_request(resource, Permission::W);
+        request.zero_length_sleep = ns_delta.is_zero();
+        request
     }
 
     /// Convenience function for constructing a sleep request with a absolute nanosecond value from the realtime clock.
@@ -655,6 +722,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// time
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_time<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -671,7 +739,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(secs)
     }
 
-    /// clock_gettime
+    /// clock_gettime. A CPU clock reads Detcore's logical CPU accounting
+    /// (`crate::cpu_clock`); every other clock reads the guest clock. Every
+    /// accepted id first makes the guest-clock observation, a global request,
+    /// as every clock read always has, so a CPU-clock read keeps its place in
+    /// the schedule and only the value it returns is the CPU clock's.
     pub async fn handle_clock_gettime<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -680,7 +752,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !clock_id_is_known(call.clockid()) {
             return Err(Errno::EINVAL.into());
         }
-        let time_ns = guest_clock_time(guest).await;
+        let guest_time = guest_clock_time(guest).await;
+        let time_ns = match cpu_clock::classify(raw_clock_id(call.clockid())) {
+            ClockIdClass::Other => guest_time,
+            ClockIdClass::NoCpuClock => return Err(Errno::EINVAL.into()),
+            ClockIdClass::Cpu(clock) => {
+                self.read_cpu_clock(guest, Sysno::clock_gettime, clock)
+                    .await?
+            }
+        };
         trace!("Converting nanoseconds into clock_gettime: {}", time_ns);
 
         let tp = call.tp().ok_or(Errno::EFAULT)?;
@@ -701,6 +781,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !clock_id_is_known(call.clockid()) {
             return Err(Errno::EINVAL.into());
         }
+        // A CPU clock is valid while the thread or process it names lives
+        // (`posix_cpu_clock_getres`, kernel/time/posix-cpu-timers.c:160-176 at
+        // v6.16), which is how glibc's `clock_getcpuclockid` checks a pid, and
+        // has its kind's resolution.
+        let cpu_resolution = match cpu_clock::classify(raw_clock_id(call.clockid())) {
+            ClockIdClass::Other => None,
+            ClockIdClass::NoCpuClock => return Err(Errno::EINVAL.into()),
+            ClockIdClass::Cpu(clock) => {
+                self.cpu_clock_task(guest, Sysno::clock_getres, clock.owner, ClockLookup::Other)
+                    .await?;
+                Some(clock.kind.resolution())
+            }
+        };
         // A NULL `res` pointer is valid for clock_getres: the kernel validates
         // the clockid and returns 0 without storing the resolution. GHC's RTS
         // probes the per-thread CPU clock exactly this way
@@ -708,12 +801,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         // returning EFAULT here spuriously aborts the guest. Only write the
         // resolution when the caller supplied a destination.
         if let Some(res) = call.res() {
-            // For now we report a constant clock res of 10ms:
-            let clock_res = 10;
-
+            // Every other clock reports a constant resolution of 10 us.
+            let resolution = cpu_resolution.unwrap_or(Duration::from_micros(10));
             let t = Timespec {
                 tv_sec: 0,
-                tv_nsec: 1000 * clock_res as i64,
+                tv_nsec: resolution.as_nanos() as i64,
             };
 
             guest.memory().write_value(res, &t)?;
@@ -778,6 +870,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         // interrupts it (`scheduler::sleep_signal`).
         request.fyi(crate::resources::NANOSLEEP_FYI);
         let mut claimed = false;
+        // When the timed signal that ended the sleep was due, if one did
+        // (`Scheduler::take_sleep_interruption`): Linux interrupts the sleep
+        // then, and reports the time left from there, even when Detcore's
+        // pass pops the timer later (https://github.com/rrnewton/hermit/issues/4931).
+        let mut interrupted_at = None;
         loop {
             // A signal already pending ends the sleep before it parks, and one
             // still pending after a wake ends it; a wake whose signal was taken
@@ -807,6 +904,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // A sleep never asks for `NothingElseCanRun`.
                 ResumeStatus::Normal | ResumeStatus::NothingElseCanRun => return Ok(0),
                 ResumeStatus::Signaled(signals) => {
+                    // Taken at every wake, so a wake that does not end the
+                    // sleep leaves nothing for a later one.
+                    interrupted_at = crate::tool_global::take_sleep_interruption(guest).await;
                     match super::signal::sleep_signal(guest, SleepCheck::AfterWake(signals), false)
                         .await?
                     {
@@ -824,7 +924,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         }
         let now = thread_observe_time(guest).await;
-        let delta = remaining_sleep_duration(target_time, now);
+        let interrupted = interrupted_at.map_or(now, |due| due.min(now));
+        let delta = remaining_sleep_duration(target_time, interrupted);
         // Linux never touches remain for TIMER_ABSTIME, even when
         // a caught signal interrupts the absolute sleep.
         let addr2 = if call.flags() & libc::TIMER_ABSTIME == 0 {
@@ -892,8 +993,29 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         if call.flags() > libc::TIMER_ABSTIME {
             trace!("Unhandled clock_nanosleep flags, letting syscall through...");
-            return Ok(guest.inject(Syscall::from(call)).await?);
+            // Linux reads only TIMER_ABSTIME from the flags, so the kernel runs
+            // this as a relative or absolute sleep and may leave a restart block.
+            return crate::syscalls::helpers::inject_keeping_kernel_restart(
+                guest,
+                Syscall::from(call),
+            )
+            .await;
         }
+
+        // The CPU clocks are Detcore's own only where it virtualizes time;
+        // otherwise the host's clocks are read and slept on.
+        let clock_class = if self.cfg.virtualize_time {
+            // `clock_thread` has no `nsleep` (kernel/time/posix-cpu-timers.c:1666-1670
+            // at v6.16), so Linux answers EOPNOTSUPP before it reads the
+            // request (`clock_nanosleep`, kernel/time/posix-timers.c:1385-1386).
+            // glibc answers EINVAL itself, without the syscall.
+            if raw_clock_id(call.clockid()) == libc::CLOCK_THREAD_CPUTIME_ID {
+                return Err(Errno::EOPNOTSUPP.into());
+            }
+            cpu_clock::classify(raw_clock_id(call.clockid()))
+        } else {
+            ClockIdClass::Other
+        };
 
         let addr = call.req().ok_or(Errno::EFAULT)?;
         let t: Timespec = guest.memory().read_value(addr)?;
@@ -917,21 +1039,20 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::EINVAL.into());
         }
 
+        match clock_class {
+            ClockIdClass::Other => {}
+            ClockIdClass::NoCpuClock => return Err(Errno::EINVAL.into()),
+            ClockIdClass::Cpu(clock) => return self.cpu_clock_sleep(guest, call, clock, &t).await,
+        }
+
         match call.flags() {
             0 => {
-                if self.cfg.sequentialize_threads {
-                    let time = Duration::from_secs(t.tv_sec as u64)
-                        + Duration::from_nanos(t.tv_nsec as u64);
-                    let request = Self::sleep_request(guest, time).await;
-                    trace!(
-                        "nanosleep adding delta {:?} to yield request {:?}",
-                        time, &request
-                    );
-                    self.wait_and_return(guest, request, call).await
-                } else {
-                    trace!("Not sequentializing threads, letting nanosleep through...");
-                    Ok(guest.inject(Syscall::from(call)).await?)
-                }
+                // Main's `sleep_for` is this arm's sequentialized path plus
+                // the kernel run; `sleep_for` keeps the kernel restart
+                // below, which is this change's non-sequentialized arm.
+                let time =
+                    Duration::from_secs(t.tv_sec as u64) + Duration::from_nanos(t.tv_nsec as u64);
+                self.sleep_for(guest, call, time).await
             }
             libc::TIMER_ABSTIME => {
                 let target_time = LogicalTime::from_secs(t.tv_sec as u64)
@@ -961,7 +1082,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let req = stack.push(relative_ts);
                     stack.commit()?;
                     let modified_call = syscalls::Nanosleep::new().with_req(Some(req));
-                    Ok(guest.inject(modified_call).await?)
+                    // Linux restarts an absolute sleep by running it again, but
+                    // this relative one keeps the host end the kernel computed,
+                    // so it restarts from the kernel's restart block. Running
+                    // the absolute call again would wait the whole interval
+                    // again: logical time stands still while the thread sleeps
+                    // in the kernel. The block holds no pointer to the request
+                    // on the stack, and no `rem`.
+                    crate::syscalls::helpers::inject_keeping_kernel_restart(guest, modified_call)
+                        .await
                 } else {
                     trace!(
                         "Not sequentializing threads not virtualizing, letting nanosleep through..."
@@ -971,6 +1100,95 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             _ => unreachable!("Unexpected, unhandled flag value"),
         }
+    }
+
+    /// Sleep for `time`: on the virtual clock where threads are
+    /// sequentialized, otherwise in the kernel as the call is.
+    async fn sleep_for<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: NanosleepFamily,
+        time: Duration,
+    ) -> Result<i64, Error> {
+        if self.cfg.sequentialize_threads {
+            let request = Self::sleep_request(guest, time).await;
+            trace!(
+                "nanosleep adding delta {:?} to yield request {:?}",
+                time, &request
+            );
+            return self.wait_and_return(guest, request, call).await;
+        }
+        trace!("Not sequentializing threads, letting nanosleep through...");
+        // A kernel-run relative sleep keeps the kernel's restart
+        // block, as in the handlers this change converted.
+        crate::syscalls::helpers::inject_keeping_kernel_restart(guest, Syscall::from(call)).await
+    }
+
+    /// Linux's CPU-clock sleep (`posix_cpu_nsleep`,
+    /// kernel/time/posix-cpu-timers.c:1570-1595 at v6.16) for a `clock`
+    /// Detcore reads: EINVAL for the caller's own thread's clock (:1579-1582)
+    /// and for a clock of no live task, as `posix_cpu_timer_create` answers
+    /// (:386-397). Linux arms a CPU timer on the clock's task and sleeps until
+    /// that task has used the CPU time (`posix_cpu_timer_set`, :622-739):
+    /// only the task's own threads can end the sleep, never another process,
+    /// and a single-threaded process sleeping on its own clock sleeps until a
+    /// signal. Detcore has no wait keyed to a task's CPU time: its sleeps
+    /// count down on the virtual clock, which every process advances. So a
+    /// sleep whose deadline the clock has already reached returns at once, as
+    /// on Linux (an expired timer fires at once, :729-735), and one that would
+    /// have to wait is refused by the unsupported-operation policy rather than
+    /// ended by another process's work. That refusal is a known limitation,
+    /// tracked as a follow-up
+    /// (<https://github.com/rrnewton/hermit/issues/5102>): a wait keyed to a
+    /// task's CPU time, which relative CPU timers need too, would let such a
+    /// sleep wait as on Linux. A relative sleep waits for the CPU time it
+    /// requests, so only a zero request returns at once. An absolute
+    /// one waits for its deadline less the clock's current reading
+    /// ([`cpu_sleep_remaining`]), which needs the reading, so an absolute
+    /// sleep on another process's clock is refused too (`cpu_clock_reading`).
+    async fn cpu_clock_sleep<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: NanosleepFamily,
+        clock: cpu_clock::CpuClock,
+        request: &Timespec,
+    ) -> Result<i64, Error> {
+        let task = self
+            .cpu_clock_task(
+                guest,
+                Sysno::clock_nanosleep,
+                clock.owner,
+                ClockLookup::Other,
+            )
+            .await?;
+        if task == ClockTask::OwnThread {
+            return Err(Errno::EINVAL.into());
+        }
+        // A zero request, relative or absolute, arms nothing and returns at
+        // once, whatever the clock reads (`posix_cpu_timer_set` arms only a
+        // nonzero expiration, :704-722, and `do_cpu_nanosleep` then finds it
+        // unarmed, :1511-1518).
+        if request.tv_sec == 0 && request.tv_nsec == 0 {
+            return Ok(0);
+        }
+        let remaining = if call.flags() & libc::TIMER_ABSTIME != 0 {
+            let now = self
+                .cpu_clock_reading(guest, Sysno::clock_nanosleep, task, clock.kind)
+                .await?;
+            cpu_sleep_remaining(request, now)
+        } else {
+            Duration::new(request.tv_sec as u64, request.tv_nsec as u32)
+        };
+        if remaining.is_zero() {
+            return Ok(0);
+        }
+        Err(self
+            .refuse_cpu_clock(
+                guest,
+                Sysno::clock_nanosleep,
+                "a CPU-clock sleep that would have to wait: Detcore has no wait that only the clock's task's CPU time can end (its sleeps count down on the virtual clock, which every process advances)",
+            )
+            .await)
     }
 
     async fn relative_time_from_abs_target<G: Guest<Self>>(
@@ -1091,6 +1309,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             (Some(libc::SIGALRM), None, None)
         };
+        // A CPU clock names a task, which must be live
+        // (`posix_cpu_timer_create`, kernel/time/posix-cpu-timers.c:386-397 at
+        // v6.16): Linux checks it after the notification, before it arms
+        // anything. Where Detcore does not virtualize time the host's clocks
+        // serve the timer, as before.
+        let cpu_timer_clock = match (
+            self.cfg.virtualize_time,
+            cpu_clock::classify(raw_clock_id(clockid)),
+        ) {
+            (true, ClockIdClass::Cpu(clock)) => Some(self.cpu_timer_clock(guest, clock).await?),
+            _ => None,
+        };
         // A reserved in-guest signal as the timer's notification signal, for
         // each notification that delivers one (`SIGEV_SIGNAL`, `SIGEV_THREAD`,
         // `SIGEV_THREAD_ID`), after Linux's answers for the clock and the
@@ -1110,9 +1340,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         if signal == Some(Signal::SIGALRM) {
             refuse_sigalrm(guest, SigalrmControl::ArmProducer).await?;
         }
+        if signo == Some(libc::SIGKILL) {
+            crate::reserved_input::expose_global(guest, "posix-timer-sigkill")?;
+        }
         let id = {
             let mut timers = guest.thread_state().posix_timers.lock().unwrap();
-            timers.create(signo, thread, value)
+            timers.create(signo, thread, value, cpu_timer_clock)
         };
         guest
             .memory()
@@ -1158,9 +1391,55 @@ impl<T: RecordOrReplay> Detcore<T> {
         let interval_ns = timespec_to_ns(new.it_interval);
         let value_ns = timespec_to_ns(new.it_value);
 
+        // A CPU clock's absolute expiration is a CPU time of the task the
+        // timer was created for (`posix_cpu_timer_set`,
+        // kernel/time/posix-cpu-timers.c:622-739 at v6.16, samples the clock
+        // and arms against the sample). Linux first finds that task, and
+        // answers ESRCH, arming or disarming nothing, once it is gone
+        // (:634-643). An expiration the clock has already passed fires at once
+        // (:729-735), and so does it here. Detcore's timers count down on the
+        // virtual clock, which every process advances, so one that would wait
+        // for CPU time still to come, or reload for more, is refused by the
+        // unsupported-operation policy rather than ended by another process's
+        // work, as a CPU-clock sleep is (`cpu_clock_sleep`; the same known
+        // limitation and follow-up,
+        // https://github.com/rrnewton/hermit/issues/5102). A relative
+        // expiration counts down on the virtual clock as before, which that
+        // follow-up would also correct.
+        let cpu_timer_clock = guest
+            .thread_state()
+            .posix_timers
+            .lock()
+            .unwrap()
+            .cpu_clock(id);
+        let cpu_timer_task = match cpu_timer_clock {
+            Some(clock) => Some((self.cpu_timer_task(guest, clock).await?, clock.kind)),
+            None => None,
+        };
+        let cpu_remaining = match cpu_timer_task {
+            Some((task, kind)) if value_ns != 0 && call.flags() & libc::TIMER_ABSTIME != 0 => {
+                let reading = self
+                    .cpu_clock_reading(guest, Sysno::timer_settime, task, kind)
+                    .await?;
+                if LogicalTime::from_nanos(value_ns) > reading || interval_ns != 0 {
+                    return Err(self
+                        .refuse_cpu_clock(
+                            guest,
+                            Sysno::timer_settime,
+                            "an absolute expiration on a CPU-clock timer that would wait for CPU time still to come, or reload for more: Detcore's timers count down on the virtual clock, which every process advances",
+                        )
+                        .await);
+                }
+                Some(Duration::ZERO)
+            }
+            _ => None,
+        };
+
         let now = thread_observe_time(guest).await;
         let deadline = if value_ns == 0 {
             None
+        } else if let Some(remaining) = cpu_remaining {
+            Some(now + remaining)
         } else if call.flags() & libc::TIMER_ABSTIME != 0 {
             // Absolute expiration is interpreted against the same virtual clock.
             Some(LogicalTime::from_nanos(value_ns))
@@ -1410,6 +1689,37 @@ mod tests {
         }
     }
 
+    /// An absolute CPU-clock deadline waits for the CPU time still to come,
+    /// and none once the clock has passed it.
+    #[test]
+    fn an_absolute_cpu_deadline_waits_for_the_rest() {
+        let deadline = Timespec {
+            tv_sec: 2,
+            tv_nsec: 500,
+        };
+        let at = LogicalTime::from_nanos;
+        assert_eq!(
+            cpu_sleep_remaining(&deadline, at(1_999_999_000)),
+            Duration::from_nanos(1_500)
+        );
+        assert_eq!(
+            cpu_sleep_remaining(&deadline, at(2_000_000_500)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            cpu_sleep_remaining(&deadline, at(9_000_000_000)),
+            Duration::ZERO
+        );
+        let far = Timespec {
+            tv_sec: i64::MAX,
+            tv_nsec: 999_999_999,
+        };
+        assert_eq!(
+            cpu_sleep_remaining(&far, LogicalTime::ZERO),
+            Duration::from_nanos(u64::MAX)
+        );
+    }
+
     #[test]
     fn timex_policy_distinguishes_queries_from_mutations() {
         assert!(timex_mode_is_query(0));
@@ -1457,6 +1767,47 @@ mod tests {
             }
         }
 
+        /// The aarch64 side of the repair: with no time(2) to probe each word
+        /// with, the repair of a `gettimeofday` that failed with EFAULT
+        /// refuses with the typed `NoStoreProbe` failure, injects nothing and
+        /// leaves `tv` as the call left it.
+        #[cfg(target_arch = "aarch64")]
+        #[test]
+        fn without_a_store_probe_the_repair_refuses() {
+            use crate::record_or_replay::NoopTool;
+            use crate::syscall_hot_path_tests::InjectGuest;
+            let tv: &'static mut Timeval = Box::leak(Box::new(Timeval {
+                tv_sec: 7,
+                tv_usec: 8,
+            }));
+            let tv_addr = tv as *mut Timeval as usize;
+            let mut guest = InjectGuest::<NoopTool>::new(Ok(0));
+            let virtual_tv = Timeval {
+                tv_sec: 1,
+                tv_usec: 2,
+            };
+            let result = futures::executor::block_on(overwrite_failed_gettimeofday_tv(
+                &mut guest,
+                AddrMut::from_raw(tv_addr).unwrap(),
+                &virtual_tv,
+                &[Ok(7), Ok(8)],
+            ));
+            assert_eq!(
+                failure(result.expect_err("the repair refuses")),
+                TvRepairFailure {
+                    field: "tv",
+                    kind: TvRepairFailureKind::NoStoreProbe,
+                }
+            );
+            assert!(guest.injected().is_empty(), "no probe is injected");
+            // SAFETY: the leaked timeval this test owns.
+            let tv = unsafe { *(tv_addr as *const Timeval) };
+            assert_eq!((tv.tv_sec, tv.tv_usec), (7, 8), "tv is left alone");
+        }
+
+        // x86_64 only: the repair's time(2) store probe, which aarch64 does not
+        // have.
+        #[cfg(target_arch = "x86_64")]
         #[test]
         fn successful_time_store_probe_requires_an_overwrite() {
             assert_eq!(
@@ -1465,6 +1816,9 @@ mod tests {
             );
         }
 
+        // x86_64 only: the repair's time(2) store probe, which aarch64 does not
+        // have.
+        #[cfg(target_arch = "x86_64")]
         #[test]
         fn efault_time_store_probe_stops_without_an_overwrite() {
             assert_eq!(
@@ -1473,6 +1827,9 @@ mod tests {
             );
         }
 
+        // x86_64 only: the repair's time(2) store probe, which aarch64 does not
+        // have.
+        #[cfg(target_arch = "x86_64")]
         #[test]
         fn any_control_probe_error_means_the_efault_was_not_a_store_fault() {
             require_native_time_control_probe("tv_sec", Ok(1_767_225_600)).unwrap();
@@ -1489,6 +1846,9 @@ mod tests {
             }
         }
 
+        // x86_64 only: the repair's time(2) store probe, which aarch64 does not
+        // have.
+        #[cfg(target_arch = "x86_64")]
         #[test]
         fn a_stopped_word_must_keep_its_contents_and_readability() {
             assert_eq!(
@@ -1518,6 +1878,9 @@ mod tests {
             }
         }
 
+        // x86_64 only: the repair's time(2) store probe, which aarch64 does not
+        // have.
+        #[cfg(target_arch = "x86_64")]
         #[test]
         fn an_unreadable_word_is_unstored_only_if_part_of_it_is_unmapped() {
             const PAGE: u64 = 0x1000;
@@ -1540,6 +1903,9 @@ mod tests {
             }
         }
 
+        // x86_64 only: the repair's time(2) store probe, which aarch64 does not
+        // have.
+        #[cfg(target_arch = "x86_64")]
         #[test]
         fn an_unreadable_word_needs_a_readable_nonempty_map() {
             let unreadable = Err(Error::Errno(Errno::EPERM));
@@ -1556,6 +1922,9 @@ mod tests {
             }
         }
 
+        // x86_64 only: the repair's time(2) store probe, which aarch64 does not
+        // have.
+        #[cfg(target_arch = "x86_64")]
         #[test]
         fn other_time_store_probe_errors_fail_closed() {
             for errno in [Errno::ENOSYS, Errno::EPERM, Errno::EIO] {
@@ -1571,6 +1940,9 @@ mod tests {
             }
         }
 
+        // x86_64 only: the repair's time(2) store probe, which aarch64 does not
+        // have.
+        #[cfg(target_arch = "x86_64")]
         #[test]
         fn overwrite_errors_and_nonexact_counts_fail_closed() {
             assert_eq!(
@@ -1638,23 +2010,203 @@ mod tests {
                 }
             );
 
-            // Checking a stopped word needs no probe, so a word past the end of
-            // the address space is simply one no store reached.
-            for (_, offset) in TIMEVAL_WORDS {
+            // x86_64 only: stopped words are checked only by the time(2) store
+            // probe, which aarch64 does not have.
+            #[cfg(target_arch = "x86_64")]
+            {
+                // Checking a stopped word needs no probe, so a word past the end of
+                // the address space is simply one no store reached.
+                for (_, offset) in TIMEVAL_WORDS {
+                    assert_eq!(
+                        stopped_timeval_word_addr(tv_addr, offset).map(|addr| addr.as_raw()),
+                        Some(tv_addr.as_raw() + offset)
+                    );
+                }
+                // `gettimeofday((void *)-1, NULL)`: `tv_sec` is the last byte of
+                // the address space and `tv_usec` has no address at all.
+                let last = AddrMut::<Timeval>::from_raw(usize::MAX).unwrap();
                 assert_eq!(
-                    stopped_timeval_word_addr(tv_addr, offset).map(|addr| addr.as_raw()),
-                    Some(tv_addr.as_raw() + offset)
+                    stopped_timeval_word_addr(last, 0).map(|addr| addr.as_raw()),
+                    Some(usize::MAX)
                 );
+                assert!(stopped_timeval_word_addr(last, 8).is_none());
+                assert!(stopped_timeval_word_addr(overflowing, 8).is_none());
             }
-            // `gettimeofday((void *)-1, NULL)`: `tv_sec` is the last byte of
-            // the address space and `tv_usec` has no address at all.
-            let last = AddrMut::<Timeval>::from_raw(usize::MAX).unwrap();
-            assert_eq!(
-                stopped_timeval_word_addr(last, 0).map(|addr| addr.as_raw()),
-                Some(usize::MAX)
-            );
-            assert!(stopped_timeval_word_addr(last, 8).is_none());
-            assert!(stopped_timeval_word_addr(overflowing, 8).is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod sleep_request_tests {
+    use reverie::GlobalRPC;
+    use reverie::GlobalTool;
+    use reverie::Tid;
+    use reverie::syscalls::Addr;
+    use reverie::syscalls::LocalMemory;
+    use reverie::syscalls::SyscallInfo;
+
+    use super::*;
+    use crate::Config;
+    use crate::GlobalState;
+    use crate::ThreadState;
+    use crate::scheduler::ends_a_due_sleep;
+    use crate::tool_global::GlobalRequest;
+    use crate::tool_global::GlobalResponse;
+    use crate::types::DetPid;
+
+    /// The clock reading the coordinator answers.
+    fn now() -> LogicalTime {
+        LogicalTime::from_nanos(5_000_000)
+    }
+    const THREAD: DetPid = DetPid::from_raw(7);
+
+    /// A thread whose one RPC is the clock reading a relative sleep starts
+    /// from (`thread_observe_time`), answered with `now()`.
+    struct ClockReader {
+        config: Config,
+        thread: ThreadState<()>,
+    }
+
+    impl ClockReader {
+        fn new() -> Self {
+            let config = Config::default();
+            let mut thread = ThreadState::new(THREAD, &config, ());
+            thread.detpid = Some(THREAD);
+            Self { config, thread }
+        }
+    }
+
+    /// Building a sleep request takes no stack.
+    struct NoStack;
+    struct NoStackGuard;
+    impl Drop for NoStackGuard {
+        fn drop(&mut self) {}
+    }
+    impl Stack for NoStack {
+        type StackGuard = NoStackGuard;
+        fn size(&self) -> usize {
+            panic!("building a sleep request must not use the guest stack")
+        }
+        fn capacity(&self) -> usize {
+            panic!("building a sleep request must not use the guest stack")
+        }
+        fn push<'stack, T>(&mut self, _: T) -> Addr<'stack, T> {
+            panic!("building a sleep request must not use the guest stack")
+        }
+        fn reserve<'stack, T>(&mut self) -> AddrMut<'stack, T> {
+            panic!("building a sleep request must not use the guest stack")
+        }
+        fn commit(self) -> Result<Self::StackGuard, Errno> {
+            panic!("building a sleep request must not use the guest stack")
+        }
+    }
+
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for ClockReader {
+        async fn send_rpc(
+            &self,
+            message: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            match message.2 {
+                GlobalRequest::GlobalTimeLowerBound => {
+                    (None, GlobalResponse::GlobalTimeLowerBound(now()))
+                }
+                other => panic!("building a sleep request sent {other:?}"),
+            }
+        }
+        fn config(&self) -> &Config {
+            &self.config
+        }
+    }
+
+    #[reverie::tool]
+    impl Guest<Detcore> for ClockReader {
+        type Memory = LocalMemory;
+        type Stack = NoStack;
+
+        fn tid(&self) -> Tid {
+            Tid::from_raw(THREAD.as_raw())
+        }
+        fn pid(&self) -> Tid {
+            self.tid()
+        }
+        fn ppid(&self) -> Option<Tid> {
+            None
+        }
+        fn memory(&self) -> Self::Memory {
+            panic!("building a sleep request must not read guest memory")
+        }
+        fn thread_state(&self) -> &ThreadState<()> {
+            &self.thread
+        }
+        fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
+            &mut self.thread
+        }
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            panic!("building a sleep request must not read registers")
+        }
+        async fn stack(&mut self) -> Self::Stack {
+            panic!("building a sleep request must not use the guest stack")
+        }
+        async fn daemonize(&mut self) {
+            panic!("building a sleep request must not daemonize")
+        }
+        async fn inject<S: SyscallInfo>(&mut self, call: S) -> Result<i64, Errno> {
+            panic!(
+                "building a sleep request must not inject {:?}",
+                call.number()
+            )
+        }
+        async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> reverie::Never {
+            panic!("building a sleep request must not retire the guest")
+        }
+        fn set_timer(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("building a sleep request must not set a timer")
+        }
+        fn set_timer_precise(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("building a sleep request must not set a timer")
+        }
+        fn read_clock(&mut self) -> Result<u64, Error> {
+            panic!("building a sleep request must not read the clock")
+        }
+    }
+
+    /// `sleep_request`, which `nanosleep` and `clock_nanosleep` without
+    /// `TIMER_ABSTIME` build their request with, marks a sleep of zero length
+    /// (`usleep(0)` is `nanosleep` of zero) and no other: a yield idiom the
+    /// scheduler must not take for a due sleep at its deadline
+    /// (`ends_a_due_sleep`), so its turn counts toward a chaos slice. A sleep
+    /// of 1 ns or 100 us is not marked and is a due sleep once its deadline has
+    /// come, and so is an absolute sleep whose deadline is already now
+    /// (`sleep_request_abs`).
+    #[tokio::test]
+    async fn only_a_relative_sleep_of_zero_is_a_zero_length_sleep() {
+        for (length, zero_length) in [
+            (Duration::ZERO, true),
+            (Duration::from_nanos(1), false),
+            (Duration::from_micros(100), false),
+        ] {
+            let mut guest = ClockReader::new();
+            let request = <Detcore>::sleep_request(&mut guest, length).await;
+            let deadline = now() + length;
+            assert_eq!(request.zero_length_sleep, zero_length, "{length:?}");
+            assert_eq!(
+                request.resources.keys().collect::<Vec<_>>(),
+                [&ResourceID::SleepUntil(deadline)],
+                "{length:?}"
+            );
+            assert_eq!(
+                ends_a_due_sleep(&request, deadline),
+                !zero_length,
+                "{length:?}: a due sleep at its deadline"
+            );
+        }
+        let mut guest = ClockReader::new();
+        let request = <Detcore>::sleep_request_abs(&mut guest, now()).await;
+        assert!(!request.zero_length_sleep, "an absolute sleep");
+        assert!(
+            ends_a_due_sleep(&request, now()),
+            "an absolute sleep at its deadline"
+        );
     }
 }

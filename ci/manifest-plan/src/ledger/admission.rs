@@ -206,7 +206,7 @@ struct CapturedValue {
 
 /// Extensions large enough to keep as compact text when decoded from history.
 /// On the 2026-10-10 ledger `raw_result_input_census_v1` held 134 MB of JSON as
-/// 1.58 GB of `Value` (<https://github.com/rrnewton/dev-hermit/issues/552>).
+/// 1.58 GB of `Value`, held for every row validate-status reads.
 const RETAINED_EXTENSIONS: &[&str] = &["raw_result_input_census_v1"];
 
 /// The historical extension map plus private original-input metadata. The
@@ -760,7 +760,7 @@ struct AdmissionIdentity<'a> {
     run_id: &'a str,
     started_at: &'a str,
     log_valid: bool,
-    /// Only the V2 contract carries a `disjoint-main` floor.
+    /// Only the V2 contract carries a `disjoint-main` or `queue-base` floor.
     v2_contract: bool,
     authority: &'a AdmissionAuthorityV1,
     floor: &'a AdmissionFloorV1,
@@ -817,6 +817,9 @@ impl AdmissionIdentity<'_> {
         if f.kind == "disjoint-main" && !self.v2_contract {
             return Err("a disjoint-main floor requires the v2 admission context contract".into());
         }
+        if f.kind == "queue-base" && !self.v2_contract {
+            return Err("a queue-base floor requires the v2 admission context contract".into());
+        }
         if (f.kind == "disjoint-main") != f.main_delta_commits.is_some() {
             return Err(
                 "admission floor carries main_delta_commits if and only if it is disjoint-main"
@@ -839,6 +842,18 @@ impl AdmissionIdentity<'_> {
                     && f.sha != self.target_sha
                     && f.main_delta_commits
                         .is_some_and(|n| (1..=DISJOINT_MAIN_MAX_DELTA_COMMITS).contains(&n)) => {}
+            // A merge-queue run admitted against B, the base the queue
+            // built the target on, after main moved to M. The queue owns
+            // freshness, so no delta bound or disjointness is claimed:
+            // the identities decidable here are the same shape as
+            // disjoint-main without the count (B and M differ, the target
+            // is neither M nor B itself). That B is merge-base(target, M)
+            // needs Git, so the driver and the parent's admission prove
+            // it; this reader only keeps the shape honest.
+            ("validate", "queue-base")
+                if f.sha != f.observed_main_sha
+                    && f.observed_main_sha != self.target_sha
+                    && f.sha != self.target_sha => {}
             // A post-landing run of a commit that a later observed main
             // contains: the floor is the target itself, the same floor a
             // current-main run of that commit had while it was the tip.
@@ -1106,6 +1121,10 @@ impl AdmissionEvidence {
     /// and the target, with the floor-sensitive list read from the target's
     /// tree. This reader has no Git, so it cannot run that proof, and a shape
     /// check is not the proof. A caller that has Git runs the proof itself.
+    ///
+    /// A `queue-base` floor is NOT canonical here for the same reason: its
+    /// claim is that the floor is merge-base(target, M), a Git fact. A
+    /// caller that has Git recomputes that merge base itself.
     pub fn is_canonical(&self) -> bool {
         self.validate().is_ok()
             && matches!(self.floor().kind.as_str(), "current-main" | "main-ancestor")
@@ -1739,6 +1758,63 @@ mod tests {
         assert!(AdmissionEvidence::V2(evidence_v2(current)).is_canonical());
     }
 
+    /// A queue-base context: the target contains the base B the merge
+    /// queue built it on (the floor and every pin base), and admission
+    /// observed a later main M. No delta count: the queue owns
+    /// freshness, so neither a bound nor disjointness is claimed.
+    fn queue_base_context() -> AdmissionContextV2 {
+        let mut c = context_v2();
+        c.floor.kind = "queue-base".into();
+        c.floor.observed_main_sha = "a".repeat(40);
+        c
+    }
+
+    /// A queue-base floor is well formed as B against a later main the
+    /// target does not equal, with every pin binding on B and no delta
+    /// count. It is never canonical from the record alone: that B is
+    /// merge-base(target, M) is a Git fact this reader cannot check.
+    #[test]
+    fn queue_base_floor_is_well_formed_and_never_canonical_from_the_record() {
+        let queue = queue_base_context();
+        queue.validate().unwrap();
+        let evidence = AdmissionEvidence::V2(evidence_v2(queue.clone()));
+        assert_eq!(evidence.floor().kind, "queue-base");
+        assert!(!evidence.is_canonical());
+
+        let refused = |c: AdmissionContextV2| c.validate().unwrap_err();
+        // B == M is a current-main run.
+        let mut same = queue.clone();
+        same.floor.observed_main_sha = same.floor.sha.clone();
+        assert!(refused(same).contains("floor disagrees"));
+        // The target is never M: M is not contained in the target.
+        let mut tip = queue.clone();
+        tip.floor.observed_main_sha = tip.target_sha.clone();
+        assert!(refused(tip).contains("floor disagrees"));
+        // A target that is B itself is a main-ancestor run.
+        let mut own = queue.clone();
+        own.floor.sha = own.target_sha.clone();
+        own.floor.tree = own.target_tree.clone();
+        own.pin_bindings[0].base_sha = own.target_sha.clone();
+        assert!(refused(own).contains("floor disagrees"));
+        // No delta count: that field is disjoint-main's alone.
+        let mut counted = queue.clone();
+        counted.floor.main_delta_commits = Some(1);
+        assert!(refused(counted).contains("if and only if"));
+        // Only ordinary validation authority selects it.
+        let mut frozen = queue.clone();
+        frozen.authority.kind = "frozen-validate".into();
+        assert!(refused(frozen).contains("floor disagrees"));
+        // Pin bindings stay on B, never on the observed main.
+        let mut pin = queue.clone();
+        pin.pin_bindings[0].base_sha = pin.floor.observed_main_sha.clone();
+        assert!(refused(pin).contains("pin binding"));
+        // The same record re-labelled current-main is canonical, so the
+        // non-canonical verdict above is the kind's, not the record's.
+        let current = context_v2();
+        current.validate().unwrap();
+        assert!(AdmissionEvidence::V2(evidence_v2(current)).is_canonical());
+    }
+
     #[test]
     fn disjoint_main_delta_field_is_strict_on_the_wire() {
         let current = admission_context_v2_bytes(&context_v2()).unwrap();
@@ -1788,6 +1864,27 @@ mod tests {
     #[test]
     fn disjoint_main_floor_is_refused_under_the_v1_contract() {
         let v2 = disjoint_main_context();
+        v2.validate().unwrap();
+        let mut v1 = context();
+        v1.floor = v2.floor.clone();
+        let e = v1.validate().unwrap_err();
+        assert!(
+            e.contains("requires the v2 admission context contract"),
+            "{e}"
+        );
+        assert!(admission_context_bytes(&v1).is_err());
+        // The other kinds are unchanged under v1.
+        context().validate().unwrap();
+    }
+
+    /// The v1 contract predates this kind too: its contexts may not
+    /// carry it. Without this gate a v1 context carrying a queue-base
+    /// floor would pass `AdmissionIdentity::validate` (the shape arm
+    /// makes no contract distinction) and surface through the legacy
+    /// v1 reader, so the kind string in the gate is load-bearing.
+    #[test]
+    fn queue_base_floor_is_refused_under_the_v1_contract() {
+        let v2 = queue_base_context();
         v2.validate().unwrap();
         let mut v1 = context();
         v1.floor = v2.floor.clone();
