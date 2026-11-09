@@ -528,8 +528,8 @@ CARGO_HTTP_PROXY=http://fwdproxy:8080 \
 ```
 
 **A proxy that refuses `github.com` to the build needs local git mirrors.**
-`Cargo.lock` locks some crates to git commits (`rust-shed`, `liteinst2` and
-`reverie` today), and Reindeer's Cargo fetches them from GitHub even when the
+`Cargo.lock` locks some crates to git commits (`rust-shed`, `reverie` and
+`agent-utils` today), and Reindeer's Cargo fetches them from GitHub even when the
 host's `~/.cargo/git` already holds them. If the proxy refuses that fetch
 (`CONNECT tunnel failed, response 403`), mirror each source with whatever
 route does reach GitHub, then point `HERMIT_GIT_DEP_MIRRORS` at the directory:
@@ -554,6 +554,28 @@ Each mirror is named after its URL's last component without `.git`, plus
 fetch` that fixes it. Because each source is pinned to a commit, a mirror
 changes only where the objects come from, never what is built. After a
 `Cargo.lock` change, `git -C <mirror> fetch` brings a mirror up to date.
+
+The recursive submodule fetch has the same problem one level down, and
+`HERMIT_GIT_DEP_MIRRORS` does not cover it: `git clone --recursive` (or
+`git submodule update --init --recursive`) also fetches the `agent-utils`
+submodule's nested submodules — `ext/minibeads`
+(`https://github.com/rrnewton/minibeads`) and, inside it, `beads` and
+`.claude_template` (relative `../beads` and `../claude_template`,
+resolving to `https://github.com/rrnewton/beads` and
+`https://github.com/rrnewton/claude_template`). Where `github.com` is
+refused, mirror those three into the same directory and rewrite their
+URLs *before* the recursive fetch:
+
+```sh
+for name in minibeads beads claude_template; do
+  with-proxy git clone --mirror "https://github.com/rrnewton/$name" "$mirrors/$name.git"
+  git config --global "url.$mirrors/$name.git.insteadOf" "https://github.com/rrnewton/$name"
+done
+git -c protocol.file.allow=always submodule update --init --recursive
+```
+
+Without the rewrites the recursive fetch fails on the nested submodules
+even when every Cargo git dependency is mirrored.
 
 ## Pinned versions
 
@@ -716,8 +738,13 @@ How it fits together:
   output paths embedded in commands and defeats reuse), the same pinned
   Buck2 binary (`bootstrap/buck2`), project config, and toolchain.
 - The OSS release-provenance path is unaffected: it passes
-  `--no-remote-cache` and refuses remote results, and its binary is
-  byte-identical with and without the cache platform (measured below).
+  `--no-remote-cache` and refuses remote results, and the binary is
+  byte-identical in linked and truly unlinked checkouts (measured
+  below). Linked and unlinked checkouts select different execution
+  platforms, so exec-platform actions (proc macros, build scripts)
+  get different action keys and `.rmeta` bytes: the two modes do not
+  share cache entries for those actions, even though the final
+  binary matches.
   Public CI installs no such file and builds exactly as before. The
   internal Buck2's Meta RE routing is also unaffected: measured with the
   link present, an `@shim/modes/hybrid` build still executes on Meta RE
@@ -735,7 +762,17 @@ commit building `//hermit-cli:hermit //:hermit-inguest-engine`:
 
 The `hermit` binaries from A (locally executed), B (cache hits), and an
 independent `--no-remote-cache` build are byte-identical (SHA-256
-`9bdce2a49c1f…`). The 2 non-cached actions are
+`9bdce2a49c1f…`). A later check at `fabd9416` compared the case the
+table does not cover — clean `--no-remote-cache` builds of
+`//hermit-cli:hermit` in linked and truly unlinked checkouts:
+byte-identical again (`cmp` clean, SHA-256
+`9bdce2a49c1f5bed2309abfa643f60314ca41a9f9cf1d193b31a658d4cdb80a4`;
+118 s unlinked, 113 s linked). Intermediate exec-platform outputs do
+differ between the modes (leaf `//detcore-model` `.rmeta` SHA-256:
+`b846034a…` unlinked, `469c4317…` linked, even with
+`--no-remote-cache` on both), which is why the modes do not share
+cache entries above; the linked binary's bytes do not depend on the
+choice. The 2 non-cached actions are
 `reverie//:reverie-linuxemu-terminal-read` (compile + archive): their
 command environment embeds the checkout's absolute path, so their digests
 differ per checkout — a hermeticity fix in Reverie, tracked as a
