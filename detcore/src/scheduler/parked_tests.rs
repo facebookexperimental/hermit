@@ -7010,6 +7010,225 @@ fn a_due_sigalrm_with_a_filed_request_that_has_not_blocked_is_no_loss() {
     assert!(!woken_by_sigalrm(&s, tid));
 }
 
+/// Files a pipe read with an `InternalIOPolling` resource plus
+/// a `read_fd`, as detcore's read handling files its retries.
+fn file_pipe_read_attempt(s: &mut Scheduler, tid: DetTid, attempt: u32) {
+    let mut r = Resources::new(tid);
+    r.insert(ResourceID::InternalIOPolling, Permission::W);
+    r.insert(ResourceID::SleepUntil(at(0)), Permission::W);
+    r.poll_attempt = attempt;
+    r.read_fd = Some((detcore_model::fd::FilesId::initial(tid), 4));
+    file_request(s, r, false);
+}
+
+/// Files the successor request the probe's syscall pass produced: the
+/// next retry of the same logical read, at the attempt lineage the
+/// probe advanced, with the probe's progress bit.
+fn file_probe_successor(s: &mut Scheduler, tid: DetTid, attempt: u32, progress: bool) {
+    let mut r = Resources::new(tid);
+    r.insert(ResourceID::InternalIOPolling, Permission::W);
+    r.poll_attempt = attempt;
+    r.previous_attempt_made_progress = progress;
+    r.read_fd = Some((detcore_model::fd::FilesId::initial(tid), 4));
+    file_request(s, r, false);
+}
+
+/// Files a follow-up syscall request of the original shape after a probe
+/// completed: its presence is the R1 post-result state.
+fn file_post_result(s: &mut Scheduler, tid: DetTid) {
+    file(s, tid, ResourceID::SleepUntil(at(0)), false);
+}
+
+/// Whether `tid` still has a due SIGALRM reserved for its reserved probe.
+fn sigalrm_reserved_for(s: &Scheduler, tid: DetTid) -> bool {
+    s.sigalrm_reserved_poll_target() == Some(tid)
+}
+
+/// The stored request's (poll_attempt, upgraded_from_attempt) pair:
+/// the upgrade resets the former to 0 and keeps the lineage in the
+/// latter.
+fn stored_attempts(s: &Scheduler, tid: DetTid) -> (u32, u32) {
+    let stored = s.next_turns[&tid].req.try_read().unwrap().unwrap();
+    (stored.poll_attempt, stored.upgraded_from_attempt)
+}
+
+/// dh-ru056 slice 1 (rev.2 section 5.1): a due SIGALRM in an
+/// `InternalIOPolling` pipe-read wait is no longer a loss. The entry is
+/// reserved to the owner, its request is normalized by the same
+/// upgrade step 4 applies, and nothing is substituted until the written
+/// probe proves no progress; then the `InboundSignal` wake replaces the
+/// successor retry. This is the filed-but-ungranted substate.
+#[test]
+fn a_due_sigalrm_reserves_a_filed_pipe_read_and_wakes_after_a_no_progress_probe() {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    s.set_sigalrm_handled(pid, true);
+    file_pipe_read_attempt(&mut s, tid, 1);
+    s.runqueue_push_back(tid);
+
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    s.step2_sigalrm_ledger();
+
+    assert!(sigalrm_reserved_for(&s, tid), "reserved, not lost");
+    assert!(!s.sigalrm_loss_recorded(pid));
+    assert!(s.sigalrm_pending(pid), "still pending until taken");
+    assert!(
+        !woken_by_sigalrm(&s, tid),
+        "no substitution before the probe"
+    );
+    assert_eq!(
+        stored_attempts(&s, tid),
+        (0, 1),
+        "normalized by the upgrade"
+    );
+    // Runnable on the public queue read surfaces the same
+    // non-polling way `upgrade_polled_to_runnable`'s upgraded
+    // retries do (a plain contains_tid cannot tell a poller from
+    // ordinary work).
+    assert!(
+        s.run_queue.contains_non_polling_tid(tid) || !s.run_queue.only_pollers(),
+        "the probe is runnable as ordinary work"
+    );
+
+    // The probe is selected (popped), grants, and files the next
+    // retry: no bytes moved.
+    assert_eq!(s.run_queue.tentative_pop_tid(tid), Some(tid));
+    assert_eq!(s.run_queue.commit_tentative_pop(), tid);
+    s.clear_nextturn(tid).unwrap();
+    file_probe_successor(&mut s, tid, 1, false);
+    s.step2_sigalrm_ledger();
+
+    assert!(woken_by_sigalrm(&s, tid), "wake substitutes the successor");
+    assert!(s.sigalrm_pending(pid));
+    assert!(!sigalrm_reserved_for(&s, tid));
+}
+
+/// Same transition from the deferred-poller substate: step 4 already
+/// deferred the retry and reset its count; reservation restores the
+/// probe without rewriting the stored request.
+#[test]
+fn a_due_sigalrm_reserves_a_deferred_pipe_poller_and_wakes_after_a_no_progress_probe() {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    s.set_sigalrm_handled(pid, true);
+    file_pipe_read_attempt(&mut s, tid, 1);
+    s.runqueue_push_back(tid);
+    assert_eq!(s.run_queue.tentative_pop_tid(tid), Some(tid));
+    let stored = s.next_turns[&tid].req.try_read().unwrap().unwrap();
+    assert!(s.step4_resource_block(tid, &stored, &Ivar::new()).is_err());
+    let stored = s.next_turns[&tid].req.try_read().unwrap().unwrap();
+    assert_eq!(stored.poll_attempt, 0, "deferral reset the count");
+
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    s.step2_sigalrm_ledger();
+
+    assert!(sigalrm_reserved_for(&s, tid));
+    assert!(!s.sigalrm_loss_recorded(pid));
+    assert!(
+        s.run_queue.contains_non_polling_tid(tid) || !s.run_queue.only_pollers(),
+        "poller restored for its probe"
+    );
+
+    assert_eq!(s.run_queue.tentative_pop_tid(tid), Some(tid));
+    assert_eq!(s.run_queue.commit_tentative_pop(), tid);
+    s.clear_nextturn(tid).unwrap();
+    file_probe_successor(&mut s, tid, 1, false);
+    s.step2_sigalrm_ledger();
+    assert!(woken_by_sigalrm(&s, tid));
+    assert!(!sigalrm_reserved_for(&s, tid));
+}
+
+/// R1: a writer whose commit precedes the expiry has its data in the
+/// pipe when the reserved probe runs: the probe completes, its result
+/// stands untouched, and the entry stays pending for the ordinary
+/// post-result completion delivery — never an EINTR substitution.
+#[test]
+fn a_reserved_pipe_probe_that_completes_keeps_its_result_and_stays_pending() {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    s.set_sigalrm_handled(pid, true);
+    file_pipe_read_attempt(&mut s, tid, 1);
+    s.runqueue_push_back(tid);
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    s.step2_sigalrm_ledger();
+    assert!(sigalrm_reserved_for(&s, tid));
+
+    // The probe is selected (popped) and completes the read (data
+    // already there); the thread's next request is an unrelated
+    // follow-up syscall.
+    assert_eq!(s.run_queue.tentative_pop_tid(tid), Some(tid));
+    assert_eq!(s.run_queue.commit_tentative_pop(), tid);
+    s.clear_nextturn(tid).unwrap();
+    file_post_result(&mut s, tid);
+    s.runqueue_push_back(tid);
+    s.step2_sigalrm_ledger();
+
+    assert!(!woken_by_sigalrm(&s, tid), "no wake substituted a result");
+    assert!(s.sigalrm_pending(pid), "delivery remains post-result");
+    assert!(!sigalrm_reserved_for(&s, tid), "reservation consumed");
+}
+
+/// G1: a single blocking pipe read that moved bytes returns; it
+/// cannot still be polling the same read. A progressed-but-repolls
+/// successor therefore means a second attached probe ran between
+/// reservation and classification — a protocol violation slice 1
+/// keeps unrepresentable. The reservation is consumed into the
+/// ordinary due-entry loss, never carried across retries.
+#[test]
+fn a_reserved_probe_that_progressed_but_repolls_is_a_g1_loss() {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    s.set_sigalrm_handled(pid, true);
+    file_pipe_read_attempt(&mut s, tid, 1);
+    s.runqueue_push_back(tid);
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    s.step2_sigalrm_ledger();
+    assert!(sigalrm_reserved_for(&s, tid));
+
+    assert_eq!(s.run_queue.tentative_pop_tid(tid), Some(tid));
+    assert_eq!(s.run_queue.commit_tentative_pop(), tid);
+    s.clear_nextturn(tid).unwrap();
+    file_probe_successor(&mut s, tid, 1, true);
+    s.runqueue_push_back(tid);
+    s.step2_sigalrm_ledger();
+
+    assert!(
+        !sigalrm_reserved_for(&s, tid),
+        "violation consumes the reservation"
+    );
+    assert!(!woken_by_sigalrm(&s, tid));
+    assert!(s.sigalrm_loss_recorded(pid));
+}
+
+/// A timed-out/deadline read (`signal_interrupt_errno` set at filing):
+/// the alarm must take it post-result, never substitute EINTR for its
+/// own ETIMEDOUT. Reservation refuses it; the due-entry loss is
+/// preserved exactly as before this machinery.
+#[test]
+fn a_reserved_probe_refuses_a_timed_read_with_an_interrupt_errno() {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    s.set_sigalrm_handled(pid, true);
+    let mut r = Resources::new(tid);
+    r.insert(ResourceID::InternalIOPolling, Permission::W);
+    r.poll_attempt = 1;
+    r.read_fd = Some((detcore_model::fd::FilesId::initial(tid), 4));
+    r.signal_interrupt_errno = Some(libc::ETIMEDOUT);
+    file_request(&mut s, r, false);
+    s.runqueue_push_back(tid);
+
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    s.step2_sigalrm_ledger();
+
+    assert!(!sigalrm_reserved_for(&s, tid));
+    assert!(s.sigalrm_loss_recorded(pid), "timed read is out of scope");
+}
+
 /// A due SIGALRM finds its thread in a polling wait, an `InternalIOPolling`
 /// operation retried after EAGAIN, which stays on the run queue between
 /// retries: a loss, whether step 4 has yet to see the filed retry or has

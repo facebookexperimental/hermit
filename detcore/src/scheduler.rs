@@ -19261,6 +19261,10 @@ impl Scheduler {
         rs: &Resources,
         resp: &Ivar<SchedResponse>,
     ) -> Result<(), SkipTurn> {
+        // The reserved probe's NoProgress settle fires at its
+        // CheckTurn, before this retry can be deferred (G2); an
+        // unexpected ProgressRetry is triaged to loss there first.
+        self.act_on_sigalrm_reserved_head(dettid);
         if rs.priority_row.is_some() {
             assert!(
                 rs.resources.len() == 1
