@@ -626,6 +626,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 internal_fd && get_fd(wrapped).is_some_and(|fd| is_named_fifo(guest, fd));
             // A pipe read: a recorded private `SIGCHLD` ends it as on Linux.
             rsrc.private_sigchld_decides = reads_a_pipe(guest, wrapped);
+            // ... and names the read it polls for, which binds a SIGALRM
+            // reserved for one of its probes (`Scheduler::reserve_sigalrm_poll`).
+            if rsrc.private_sigchld_decides {
+                rsrc.read_fd =
+                    read_family_fd(wrapped).map(|fd| (guest.thread_state().files_id(), fd));
+            }
             // A read waits for data, a write for room (`--pipe-wake-latency`).
             rsrc.polls_channel = crate::pipe_wake::poll_of(&wrapped).and_then(|(fd, wants)| {
                 self.pipe_channel_end(guest, fd)

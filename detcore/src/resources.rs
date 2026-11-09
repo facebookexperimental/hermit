@@ -608,8 +608,11 @@ pub struct Resources {
     #[serde(default)]
     pub(crate) reads_signalfd: bool,
     /// The descriptor a `BlockingExternalIO` request's `read`, `readv` or
-    /// `preadv2` reads, whatever it is, with the identity of the descriptor
-    /// table it is in; `None` for every other request. Under
+    /// `preadv2` reads, whatever it is, or an `InternalIOPolling` pipe read's
+    /// (`read`, `readv`), with the identity of the descriptor table it is in;
+    /// `None` for every other request. A polled pipe read's names the read a
+    /// reserved SIGALRM probe is bound to (`Scheduler::reserve_sigalrm_poll`,
+    /// dh-ru056 slice 1); nothing else reads it on such a request. Under
     /// record and replay the scheduler asks the kernel, as it grants the
     /// request, whether that descriptor is a signalfd and which signals it
     /// reads, so that a signalfd Detcore's table does not record as one (one

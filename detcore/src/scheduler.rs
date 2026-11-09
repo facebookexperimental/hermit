@@ -19261,10 +19261,17 @@ impl Scheduler {
         rs: &Resources,
         resp: &Ivar<SchedResponse>,
     ) -> Result<(), SkipTurn> {
-        // The reserved probe's NoProgress settle fires at its
-        // CheckTurn, before this retry can be deferred (G2); an
-        // unexpected ProgressRetry is triaged to loss there first.
-        self.act_on_sigalrm_reserved_head(dettid);
+        // The reserved probe's settle fires at its CheckTurn, before
+        // this retry can be deferred (G2); an unexpected ProgressRetry
+        // is triaged to loss there first. A substituted wake replaced
+        // `rs`, which this turn must no longer act on.
+        if self.act_on_sigalrm_reserved_head(dettid) {
+            info!(
+                "[scheduler] >>>>>>>\n\n NONCOMMIT turn {}, SKIP dettid {}: its reserved pipe-read probe moved nothing; SIGALRM wake substituted",
+                self.turn, dettid
+            );
+            return self.skip_turn();
+        }
         if rs.priority_row.is_some() {
             assert!(
                 rs.resources.len() == 1
