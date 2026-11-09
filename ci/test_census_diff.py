@@ -50,6 +50,22 @@ def test_new_test_appears_and_passes(tmp_path):
     assert r.returncode == 0 and "+brand_new" in r.stdout and "added=1" in r.stdout
 
 
+def test_added_unknown_outcome_fails(tmp_path):
+    r = _run(tmp_path, {"s": []}, {"s": [_row("x", "bogus")]})
+    _assert_named_failure(r, "unknown outcome", "x")
+
+
+def test_added_skipped_without_reason_fails(tmp_path):
+    r = _run(tmp_path, {"s": []}, {"s": [_row("x", "skipped")]})
+    _assert_named_failure(r, "without a reason", "x")
+
+
+def test_candidate_only_suite_unknown_outcome_fails(tmp_path):
+    r = _run(tmp_path, {"s": ["a"]},
+             {"s": [_row("a")], "new": [_row("x", "bogus")]})
+    _assert_named_failure(r, "unknown outcome", "x")
+
+
 def _run_raw(tmp_path, base, cand_raw, report_only=False):
     import uuid
     root = tmp_path / uuid.uuid4().hex

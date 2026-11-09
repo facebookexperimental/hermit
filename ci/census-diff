@@ -4,8 +4,10 @@
 Every base ID must have a recorded outcome in the candidate
 (passed|failed|skipped(reason)|omitted(reason)) or an explicit drop
 record (Test-Dropped: <id> -- <reason>). A disappearance with no record
-fails naming the missing IDs. Additions are reported and pass. Totals
-are reported, never asserted.
+fails naming the missing IDs. Additions are reported and pass, but
+every candidate outcome is validated whether or not its ID was in the
+base: an unknown outcome value, or a skipped/omitted outcome without
+a reason, fails naming the ID. Totals are reported, never asserted.
 
 Usage:
   ci/census-diff --base DIR --candidate DIR [--dropped FILE] [--report-only]
@@ -170,6 +172,12 @@ def main(argv: list[str]) -> int:
             else:
                 failures.append(f"{suite}: {ident}: MISSING (no outcome, no drop record)")
         added = [i for i in c if i not in b_set]
+        for ident in added:
+            outcome, reason = c[ident]
+            if outcome not in OUTCOMES:
+                failures.append(f"{suite}: {ident}: unknown outcome {outcome!r}")
+            elif outcome in ("skipped", "omitted") and not reason.strip():
+                failures.append(f"{suite}: {ident}: {outcome} without a reason")
         totals["added"] += len(added)
         parts = [f"{k}={v}" for k, v in
                  (("passed", sum(1 for i in b_ids if c.get(i, ("",))[0] == "passed")),
