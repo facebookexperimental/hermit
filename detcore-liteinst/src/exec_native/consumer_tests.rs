@@ -53,6 +53,7 @@ fn emit_record() {
 // Global forwarding state/OnceLock cannot be reset to manufacture a fresh cut.
 // Each case runs in a fresh copy of the maintained CLI test executable.
 const ISOLATED_CASE_ENV: &str = "HERMIT_NATIVE_CONSUMER_COMPLETE_TEST";
+const ISOLATED_PARENT_ENV: &str = "HERMIT_NATIVE_CONSUMER_COMPLETE_PARENT_PID";
 const CASE_COMPLETED: &str = "NATIVE_CONSUMER_CASE_COMPLETED";
 
 fn dispatch_isolated_case(name: &str, cases: &[&str], body: impl FnOnce(&str)) -> bool {
@@ -70,32 +71,45 @@ fn dispatch_isolated_case(name: &str, cases: &[&str], body: impl FnOnce(&str)) -
                     "invalid native consumer isolation marker: {active:?} for {name}; expected {cases:?}"
                 )
             });
+        let parent = unsafe { libc::getppid() };
+        let binding = std::env::var_os(ISOLATED_PARENT_ENV);
+        assert!(
+            parent > 0 && binding.as_deref() == Some(std::ffi::OsStr::new(&parent.to_string())),
+            "invalid native consumer isolation parent binding: {binding:?} for {name}; expected spawning parent {parent}"
+        );
         body(case);
         return true;
     }
     false
 }
 
+fn isolated_test_name(module: &str, name: &str) -> String {
+    let (_, module) = module
+        .split_once("::")
+        .expect("isolated tests are declared inside a module");
+    format!("{module}::{name}")
+}
+
 fn isolated_command(name: &str, case: &str) -> std::process::Command {
-    let full_name = format!("app::native_exec_consumer::tests::{name}");
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
-        .args(["--exact", &full_name, "--nocapture", "--test-threads=1"])
-        .env(ISOLATED_CASE_ENV, format!("{name}:{case}"));
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(ISOLATED_CASE_ENV, format!("{name}:{case}"))
+        .env(ISOLATED_PARENT_ENV, std::process::id().to_string());
     command
 }
 
-fn isolated_cases(name: &str, cases: &[&str], body: impl FnOnce(&str)) {
-    if dispatch_isolated_case(name, cases, |case| {
+fn isolated_cases(module: &str, name: &str, cases: &[&str], body: impl FnOnce(&str)) {
+    let full_name = isolated_test_name(module, name);
+    if dispatch_isolated_case(&full_name, cases, |case| {
         body(case);
-        eprintln!("{CASE_COMPLETED} {name}:{case}");
+        eprintln!("{CASE_COMPLETED} {full_name}:{case}");
     }) {
         return;
     }
-    let full_name = format!("app::native_exec_consumer::tests::{name}");
     for case in cases {
-        let key = format!("{name}:{case}");
-        let output = isolated_command(name, case).output().unwrap();
+        let key = format!("{full_name}:{case}");
+        let output = isolated_command(&full_name, case).output().unwrap();
         assert!(
             output.status.success(),
             "{full_name} ({case}): {:?}\n{}\n{}",
@@ -122,8 +136,8 @@ fn isolated_cases(name: &str, cases: &[&str], body: impl FnOnce(&str)) {
     }
 }
 
-fn isolated(name: &str, case: &str, body: impl FnOnce()) {
-    isolated_cases(name, &[case], |_| body());
+fn isolated(module: &str, name: &str, case: &str, body: impl FnOnce()) {
+    isolated_cases(module, name, &[case], |_| body());
 }
 
 #[test]
@@ -136,20 +150,27 @@ fn isolated_case_dispatch_requires_a_known_marker_and_completed_body() {
     const BODY: &str = "NATIVE_CONSUMER_ISOLATION_GUARD_BODY";
     const CASES: &[&str] = &["wrong", "negative"];
     if std::env::var_os(ISOLATED_CASE_ENV).is_some() {
-        isolated_cases(NAME, CASES, |case| eprintln!("{BODY} {case}"));
+        isolated_cases(module_path!(), NAME, CASES, |case| {
+            eprintln!("{BODY} {case}")
+        });
         return;
     }
-    let full_name = format!("app::native_exec_consumer::tests::{NAME}");
-    let run = |marker: &OsStr| {
-        std::process::Command::new(std::env::current_exe().unwrap())
+    let full_name = isolated_test_name(module_path!(), NAME);
+    let parent = OsString::from(std::process::id().to_string());
+    let run = |marker: &OsStr, binding: Option<&OsStr>| {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
             .args(["--exact", &full_name, "--nocapture", "--test-threads=1"])
             .env(ISOLATED_CASE_ENV, marker)
-            .output()
-            .unwrap()
+            .env_remove(ISOLATED_PARENT_ENV);
+        if let Some(binding) = binding {
+            command.env(ISOLATED_PARENT_ENV, binding);
+        }
+        command.output().unwrap()
     };
     for case in CASES {
-        let marker = OsString::from(format!("{NAME}:{case}"));
-        let output = run(&marker);
+        let marker = OsString::from(format!("{full_name}:{case}"));
+        let output = run(&marker, Some(&parent));
         assert!(output.status.success(), "{case}: {output:?}");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
@@ -159,7 +180,10 @@ fn isolated_case_dispatch_requires_a_known_marker_and_completed_body() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         for (prefix, expected) in [
             (BODY, format!("{BODY} {case}")),
-            (CASE_COMPLETED, format!("{CASE_COMPLETED} {NAME}:{case}")),
+            (
+                CASE_COMPLETED,
+                format!("{CASE_COMPLETED} {full_name}:{case}"),
+            ),
         ] {
             assert_eq!(
                 stderr
@@ -184,12 +208,30 @@ fn isolated_case_dispatch_requires_a_known_marker_and_completed_body() {
         ("malformed", OsString::from("wrong")),
         (
             "foreign",
-            OsString::from("model_consumer_complete_zero_interval_and_second_attempt:zero"),
+            OsString::from(format!(
+                "{}:zero",
+                isolated_test_name(
+                    module_path!(),
+                    "model_consumer_complete_zero_interval_and_second_attempt"
+                )
+            )),
         ),
-        ("unknown case", OsString::from(format!("{NAME}:unknown"))),
+        (
+            "unknown case",
+            OsString::from(format!("{full_name}:unknown")),
+        ),
+        (
+            "trailing bytes",
+            OsString::from(format!("{full_name}:wrong:extra")),
+        ),
+        (
+            "crate-qualified",
+            OsString::from(format!("{}::{NAME}:wrong", module_path!())),
+        ),
+        ("leaf-only", OsString::from(format!("{NAME}:wrong"))),
         ("non-UTF8", OsString::from_vec(vec![0xff])),
     ] {
-        let output = run(&marker);
+        let output = run(&marker, Some(&parent));
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             !output.status.success(),
@@ -198,6 +240,31 @@ fn isolated_case_dispatch_requires_a_known_marker_and_completed_body() {
         assert!(
             stderr.contains("invalid native consumer isolation marker:"),
             "{label} marker failed for a different reason: {stderr}"
+        );
+        assert!(!stderr.contains(BODY), "{label} reached the body: {stderr}");
+        assert!(
+            !stderr.contains(CASE_COMPLETED),
+            "{label} reached completion: {stderr}"
+        );
+    }
+    let marker = OsString::from(format!("{full_name}:wrong"));
+    let wrong_parent = if std::process::id() == 1 { 2 } else { 1 };
+    for (label, binding) in [
+        ("missing", None),
+        ("wrong", Some(OsString::from(wrong_parent.to_string()))),
+        ("zero", Some(OsString::from("0"))),
+        ("empty", Some(OsString::new())),
+        ("non-UTF8", Some(OsString::from_vec(vec![0xff]))),
+    ] {
+        let output = run(&marker, binding.as_deref());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "{label} parent binding passed: {output:?}"
+        );
+        assert!(
+            stderr.contains("invalid native consumer isolation parent binding:"),
+            "{label} parent binding failed for a different reason: {stderr}"
         );
         assert!(!stderr.contains(BODY), "{label} reached the body: {stderr}");
         assert!(
@@ -401,6 +468,7 @@ fn exchange_case(
 #[test]
 fn model_consumer_complete_accounts_real_post_exec_record() {
     isolated(
+        module_path!(),
         "model_consumer_complete_accounts_real_post_exec_record",
         "one",
         || {
@@ -421,6 +489,7 @@ fn model_consumer_complete_accounts_real_post_exec_record() {
 #[test]
 fn model_consumer_complete_zero_interval_and_second_attempt() {
     isolated(
+        module_path!(),
         "model_consumer_complete_zero_interval_and_second_attempt",
         "zero",
         || {
@@ -441,6 +510,7 @@ fn model_consumer_complete_zero_interval_and_second_attempt() {
 #[test]
 fn model_consumer_complete_wrong_binding_preserves_the_attempt() {
     isolated(
+        module_path!(),
         "model_consumer_complete_wrong_binding_preserves_the_attempt",
         "binding",
         || {
@@ -461,6 +531,7 @@ fn model_consumer_complete_wrong_binding_preserves_the_attempt() {
 #[test]
 fn model_consumer_complete_refuses_bad_and_negative_ack() {
     isolated_cases(
+        module_path!(),
         "model_consumer_complete_refuses_bad_and_negative_ack",
         &["wrong", "negative"],
         |case| {
@@ -488,6 +559,7 @@ fn model_consumer_complete_refuses_bad_and_negative_ack() {
 #[test]
 fn model_consumer_complete_refuses_other_slot_record_at_ack() {
     isolated(
+        module_path!(),
         "model_consumer_complete_refuses_other_slot_record_at_ack",
         "late",
         || {
@@ -532,6 +604,7 @@ fn configured_rpc(tid: i32) -> (CoordinatorRpc<detcore::GlobalState>, UnixStream
 #[test]
 fn model_consumer_complete_refuses_actual_in_flight_request() {
     isolated(
+        module_path!(),
         "model_consumer_complete_refuses_actual_in_flight_request",
         "busy",
         || {
@@ -608,7 +681,8 @@ fn model_consumer_complete_refuses_actual_in_flight_request() {
 fn model_consumer_complete_disconnected_peer_is_terminal() {
     const KEY: &str = "HERMIT_NATIVE_CONSUMER_CLOSED_SOCKET";
     const NAME: &str = "model_consumer_complete_disconnected_peer_is_terminal";
-    if dispatch_isolated_case(NAME, &["closed"], |_| {
+    let full_name = isolated_test_name(module_path!(), NAME);
+    if dispatch_isolated_case(&full_name, &["closed"], |_| {
         let path = std::env::var_os(KEY).expect("disconnected child socket path is absent");
         let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
         let mut consumer = modeled_consumer(tid);
@@ -638,7 +712,7 @@ fn model_consumer_complete_disconnected_peer_is_terminal() {
     let path = directory.path().join("complete.sock");
     let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
     listener.set_nonblocking(true).unwrap();
-    let mut child = isolated_command(NAME, "closed")
+    let mut child = isolated_command(&full_name, "closed")
         .env(KEY, &path)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -696,4 +770,16 @@ fn model_consumer_complete_disconnected_peer_is_terminal() {
     );
     // Terminal state cannot be read from the dead child. The busy case proves
     // actual attempt consumption; this peer proves request/no-ACK/no-retry.
+}
+
+mod nested_isolation_controls {
+    #[test]
+    fn child_selector_uses_registered_module() {
+        super::isolated(
+            module_path!(),
+            "child_selector_uses_registered_module",
+            "nested",
+            || {},
+        );
+    }
 }
