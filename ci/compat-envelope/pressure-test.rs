@@ -16851,9 +16851,14 @@ fn compat_fixture_step_refusal_self_test(root: &Path) -> Result<(), String> {
     }
 }
 
-/// The recurring scheduler's whole-run bound, at which some red cells'
-/// declared paths cannot fit.
-const UNSAMPLEABLE_FIXTURE_RUN_TIMEOUT_SECONDS: i64 = 2700;
+/// Whole-run bound for the unsampleable-sample fixture: one second above
+/// the 3300s wall the pressure graph clones from build.workspace_on_host
+/// (the timeout ladder requires every step wall to sit strictly below the
+/// run bound), and below the longest declared post-build chain (3522s when
+/// set), so the real cells carrying that chain stay genuinely
+/// unsampleable. This is a fixture bound, not a production budget: the
+/// recurring scheduler runs far above it.
+const UNSAMPLEABLE_FIXTURE_RUN_TIMEOUT_SECONDS: i64 = 3301;
 
 /// A seeded sample draws only from cells whose own declared path fits the
 /// run's limit, so a draw can never produce a plan the limit must refuse.
