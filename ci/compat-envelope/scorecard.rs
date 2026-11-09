@@ -4904,12 +4904,15 @@ fn known_gap_nodes(root: &Path) -> Result<Vec<KnownGapNode>, String> {
                 .map_err(|e| format!("cannot read known-gap ledger {}: {e}", declaration.ledger))?;
             let rows = known_gaps::parse(&text)
                 .map_err(|e| format!("known-gap ledger {}: {e}", declaration.ledger))?;
-            let required_tests = known_gaps::required_tests(declaration).ok_or_else(|| {
-                format!(
-                    "{} has no pinned number of required tests",
-                    declaration.node
-                )
+            // Required tests are derived, never pinned: the suite's listed
+            // population (from its source) less its ledger rows, exactly as
+            // known_gaps::required defines it.
+            let source = fs::read_to_string(root.join(declaration.suite_source)).map_err(|e| {
+                format!("cannot read suite source {}: {e}", declaration.suite_source)
             })?;
+            let tests = known_gaps::suite_tests(&source)
+                .map_err(|e| format!("suite source {}: {e}", declaration.suite_source))?;
+            let required_tests = known_gaps::required(declaration, &rows, &tests).len() as u64;
             Ok(KnownGapNode {
                 node: declaration.node.to_string(),
                 backend: declaration.backend.to_string(),
@@ -4919,6 +4922,38 @@ fn known_gap_nodes(root: &Path) -> Result<Vec<KnownGapNode>, String> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod known_gap_nodes_tests {
+    use super::*;
+
+    #[test]
+    fn required_tests_are_derived_from_suite_less_ledger_rows() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        let tests_dir = root.join("hermit-cli/tests");
+        fs::create_dir_all(&tests_dir).unwrap();
+        fs::write(
+            tests_dir.join("deadline_slice_cap.kvm-gaps.tsv"),
+            "id\tgap\tissue\toutcome\tsignature\tapproval\n\
+             hermit-run::deadline_slice_cap$gap_one\tC\thttps://github.com/rrnewton/hermit/issues/4929\tfailed\tboom\tbaseline\n",
+        )
+        .unwrap();
+        fs::write(
+            tests_dir.join("deadline_slice_cap.rs"),
+            "#[test]\nfn required_one() {}\n\
+             #[test]\nfn gap_one() {}\n\
+             #[test]\n#[ignore]\nfn ignored_one() {}\n",
+        )
+        .unwrap();
+        let nodes = known_gap_nodes(root).unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].rows.len(), 1);
+        // Non-ignored suite tests {required_one, gap_one} less the ledger
+        // row {gap_one}: one required test, derived with no pinned count.
+        assert_eq!(nodes[0].required_tests, 1);
+    }
 }
 
 /// The scorecard's section for the known gaps: every row of every declared ledger, outside every

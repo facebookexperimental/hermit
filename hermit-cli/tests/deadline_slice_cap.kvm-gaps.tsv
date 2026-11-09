@@ -11,8 +11,8 @@
 #   passes, or fails some other way, fails the node.
 # - skipped: the node does not run it. It prints KVM-GAP-SKIPPED for the row and leaves the test
 #   out of its run by name, so nothing shows whether the gap is still there.
-# When a gap is fixed, delete its row (the node then runs the test as a required one), raise the
-# node's pinned count (privileged-test.deadline_slice_cap_kvm in NEXTEST_EXPECTED_COUNTS), and run
+# When a gap is fixed, delete its row (the node then runs the test as a required one; required
+# counts are derived from the suite less its rows, and the population is census-guarded), and run
 # ./ci/sync-cell-config.sh to refresh the scorecard.
 #
 # A signature is text the failure's output must show; in it \n is a newline, \\ a backslash and
