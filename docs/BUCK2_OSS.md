@@ -662,6 +662,83 @@ Reverie's BUCK files resolve their third-party crates through the same generated
 targets as Hermit. `shared-cell-aliases.txt` provides the unversioned names used
 by Reverie's hand-written BUCK targets.
 
-No shared action-cache performance measurement has yet been made. A local
-successful build proves target compatibility only, not the vision's claimed
-cross-worktree benefit.
+## Shared action cache on team hosts
+
+By default each checkout keeps its own `buck-out/` and daemon, so N
+checkouts of the same commit re-execute the same actions N times (the table
+under "Public nightly evidence" above: a fresh second checkout re-executes
+all ~2,220). On team hosts, one shared REAPI ActionCache/CAS per host
+removes that duplication. This is a host property, not a project default:
+nothing changes for a checkout whose host has not installed the file below,
+and `buck-out/` itself is never shared between checkouts.
+
+The host installs one config file (path and endpoint are host values; the
+cache byte cap lives in the service, not here):
+
+```ini
+# ~/.config/hermit/buckconfig.local  (team hosts; ports are host-chosen)
+[build]
+execution_platforms = gh_facebook_buck2_shims_meta//platforms:local-cache
+[buck2_re_client]
+address = 127.0.0.1:39291
+tls = false
+capabilities = true
+[buck2]
+default_allow_cache_upload = true
+```
+
+and each checkout links it as `.buckconfig.local` (gitignored):
+
+```sh
+ln -s ~/.config/hermit/buckconfig.local /path/to/hermit/.buckconfig.local
+```
+
+How it fits together:
+
+- `shim//platforms:local-cache` executes locally only, with
+  `remote_cache_enabled` and `allow_cache_uploads`: check the shared cache
+  first, run locally on a miss, upload the result. The plain local executor
+  never consults the cache (measured: 0 B uploaded with only
+  `[buck2_re_client]` set), and `hybrid`/`remote` would attempt remote
+  *execution*, which a cache-only service cannot serve. A user-level
+  `~/.buckconfig.d/` file cannot select the platform (the project's
+  `[build] execution_platforms` wins over the user layer; measured with
+  `buck2 audit config`), which is why the per-checkout link exists.
+- The service is any REAPI ActionCache+CAS on localhost. Team hosts run
+  `bazel-remote` (single static binary, built-in LRU with a hard GiB cap)
+  as a user systemd unit with its own CPU/memory bounds; the cap (20 GiB on
+  current hosts) and data directory are host config values.
+- Checkouts that share a cache must agree on the action-digest inputs:
+  the same isolation-dir name (the default `v2` — a custom name changes
+  output paths embedded in commands and defeats reuse), the same pinned
+  Buck2 binary (`bootstrap/buck2`), project config, and toolchain.
+- The OSS release-provenance path is unaffected: it passes
+  `--no-remote-cache` and refuses remote results, and its binary is
+  byte-identical with and without the cache platform (measured below).
+  Public CI installs no such file and builds exactly as before. The
+  internal Buck2's Meta RE routing is also unaffected: measured with the
+  link present, an `@shim/modes/hybrid` build still executes on Meta RE
+  (its thrift RE client ignores the gRPC `address`) and the localhost
+  cache sees no traffic.
+
+Measured 2026-11-08 on one team host at `f08e4082d`, pinned public Buck2,
+empty 20 GiB-capped localhost cache, two clean worktrees at the same
+commit building `//hermit-cli:hermit //:hermit-inguest-engine`:
+
+| Build | Actions | Wall | `buck-out` |
+| --- | --- | --- | --- |
+| Worktree A (populate) | 1,204 local, 0 cached | 2 m 13 s | 4.8 GiB |
+| Worktree B (fresh) | 2 local, 1,202 cached | 2.6 s | 294 MiB |
+
+The `hermit` binaries from A (locally executed), B (cache hits), and an
+independent `--no-remote-cache` build are byte-identical (SHA-256
+`9bdce2a49c1f…`). The 2 non-cached actions are
+`reverie//:reverie-linuxemu-terminal-read` (compile + archive): their
+command environment embeds the checkout's absolute path, so their digests
+differ per checkout — a hermeticity fix in Reverie, tracked as a
+follow-up. The full binary's cache footprint is 650 MiB compressed
+(2.7 GiB uncompressed). Two simultaneous builds of an uncached target
+family (`//ci/manifest-plan/...`) both succeed with byte-identical
+outputs; racing uploads of one digest are idempotent. So the marginal
+cost of another slot at the same commit is its sources plus ~0.3 GiB of
+materialized outputs, behind one capped cache — not another `target/`.
