@@ -1287,6 +1287,14 @@ mod tests {
     /// The `run` rows of the sample table; see [`GLOBAL_SAMPLES`].
     const RUN_SAMPLES: &[(&str, &[&str])] = &[
         ("in-guest-exec-stop", &["--in-guest-exec-stop"]),
+        #[cfg(any(feature = "native-exec", feature = "native-exec-input-admission"))]
+        (
+            "native-exec-inputs",
+            &[
+                "--verify",
+                "--native-exec-inputs=/fixtures/native-exec-inputs.json",
+            ],
+        ),
         ("happens-before", &["--happens-before=/tmp/hb.json"]),
         (
             "hb-list-events",
