@@ -631,20 +631,12 @@ jobs:
           echo "archive_count=$archive_count" >> "$GITHUB_OUTPUT"
           echo "Fanning out $count constructed portable E2E steps:" >&2
           jq -r '.include[] | "  - \(.node)"' <<<"$matrix" >&2
-      # build.workspace_on_host already builds detcore-dbt (in its
-      # feature-unified workspace build, in the validate profile since the
-      # one-build change d44bbbb79ac; until 2026-10-18 a separate first command
-      # also built `-p detcore-dbt`, which the workspace build then recompiled)
-      # and then hashes
-      # target/validate/deps/libdetcore_dbt.{so,rlib} into the prepared-Nextest
-      # record as runtime files of every -p hermit-run and --workspace selection.
-      # A step here used to re-run
-      # `cargo build -p detcore-dbt` to "stage" the DBT runtime. That build
-      # resolves different dependency features from the workspace build (for
-      # example parking_lot, bytes, syn and tracing-core), so Cargo recompiled
-      # reverie-dbt and detcore-dbt and overwrote both unhashed cdylib/rlib
-      # files after they were recorded. Every consumer then refused its inventory:
-      # run 36485831200 lost 12 nodes in 7 test-debug jobs to "prepared
+      # build.workspace_on_host builds the workspace once (validate profile
+      # since the one-build change d44bbbb79ac) and hashes its executables and
+      # runtime files into the prepared-Nextest record. Anything that rebuilds
+      # afterward can rewrite a recorded file under a different feature
+      # resolution, and every consumer then refuses its inventory: run
+      # 36485831200 lost 12 nodes in 7 test-debug jobs to "prepared
       # executable, package identity, or runtime file changed", about 5 s after
       # start and before any test ran. The pack step below ships the recorded
       # runtime unchanged. Re-verify the whole prepared record here, after the
@@ -668,8 +660,8 @@ jobs:
           # simply find no prebuilt fixtures, exactly as an unstaged tree intends.
           mkdir -p ignored/e2e/build
           # build.workspace_on_host compiles Hermit once, in the validate
-          # profile (d44bbbb79ac), so hermit, verification-report and the DBT
-          # runtime are under target/validate. test-harness,
+          # profile (d44bbbb79ac), so hermit and verification-report are
+          # under target/validate. test-harness,
           # hermit-manifest-plan and the Nextest CPU wrapper are dev-profile
           # tools and stay under target/debug. Report every absent input before
           # failing: a bare `test` under `set -e` exits 1 without a word, which
@@ -687,7 +679,6 @@ jobs:
           require -x target/debug/hermit-manifest-plan
           require -x target/validate/verification-report
           require -x target/debug/nextest-cpu-wrapper
-          require -f target/validate/deps/libdetcore_dbt.so
           require -x target/ci/bin/cargo-nextest
           require -f target/ci/nextest-binaries/current.json
           # No release-profile producer exists since d44bbbb79ac
@@ -699,13 +690,11 @@ jobs:
           # ci/publish-hermit-e2e-artifact.sh requires, and test.liteinst_strict
           # reads the profile-staged LiteInst runtime under target/validate.
           # `test` follows symlinks, so a dangling resource link fails here.
-          require -x target/install_pkg/rsrcs/dynamorio/bin64/drrun
-          require -x target/install_pkg/rsrcs/sabre
-          require -s target/install_pkg/rsrcs/sabre.revision
-          require -x target/install_pkg/rsrcs/e9patch
-          require -x target/install_pkg/rsrcs/e9tool
-          require -s target/install_pkg/rsrcs/libdetcore_sabre.so
-          require -s target/install_pkg/rsrcs/libreverie_dbt_client.so
+          # The first-party core split
+          # (ee51613d1cd2dd1a6f26b053636614fd4a35a5ae) removed DynamoRIO, SaBRe
+          # and e9patch staging from hermit-install; the core installer now
+          # stages only the LiteInst resources required below, matching
+          # require_core_resources in ci/verify-hermit-e2e-artifact.sh.
           require -s target/install_pkg/rsrcs/libreverie_liteinst.so
           require -s target/validate/libreverie_liteinst.so
           require -s target/validate/libreverie_liteinst.so.revision
@@ -719,19 +708,11 @@ jobs:
             echo "Pack debug prebuilt tree: $missing required input(s) missing; nothing was packed" >&2
             exit 1
           fi
-          # Cargo test shards may rewrite target/validate/deps, and hermit-install
-          # stages this resource as a symlink to ../../validate/libdetcore_dbt.so,
-          # which this tarball does not carry. Replace the symlink with a regular
-          # copy in Hermit's install-resource location so later CLI nodes depend
-          # on neither.
-          rm -f target/install_pkg/rsrcs/libdetcore_dbt.so
-          install -Dm755 target/validate/deps/libdetcore_dbt.so \
-            target/install_pkg/rsrcs/libdetcore_dbt.so
-          # hermit-install also links rsrcs/libdetcore_sabre.so and
-          # install_pkg/hermit into target/validate, which this tarball does
-          # not carry in full. Replace every remaining link with a regular copy
-          # of its resolved target, refusing a dangling or non-file link, so the
-          # packed target/install_pkg is self-contained in every consumer.
+          # hermit-install links install_pkg/hermit into target/validate,
+          # which this tarball does not carry in full. Replace every link with
+          # a regular copy of its resolved target, refusing a dangling or
+          # non-file link, so the packed target/install_pkg is self-contained
+          # in every consumer.
           while IFS= read -r -d '' link; do
             if ! resolved=$(readlink -e -- "$link") || ! test -f "$resolved"; then
               echo "::error::Pack debug prebuilt tree: dangling or non-file symlink: $link" >&2
@@ -748,7 +729,6 @@ jobs:
             target/debug/hermit-manifest-plan \
             target/validate/verification-report \
             target/debug/nextest-cpu-wrapper \
-            target/validate/deps/libdetcore_dbt.so \
             target/validate/libreverie_liteinst.so \
             target/validate/libreverie_liteinst.so.revision \
             target/validate/libdetcore_liteinst.so \
@@ -880,10 +860,6 @@ jobs:
           require -x target/validate/hermit
           require -x target/debug/nextest-cpu-wrapper
           require -f target/ci/nextest-binaries/current.json
-          require -x target/install_pkg/rsrcs/dynamorio/bin64/drrun
-          require -x target/install_pkg/rsrcs/sabre
-          require -s target/install_pkg/rsrcs/sabre.revision
-          require -s target/install_pkg/rsrcs/libdetcore_sabre.so
           require -s target/validate/libreverie_liteinst.so
           require -s target/validate/libreverie_liteinst.so.revision
           if ((missing > 0)); then
@@ -918,10 +894,7 @@ jobs:
             fi
           }
           require -x target/ci/hermit
-          require -s target/ci/libdetcore_sabre.so
           require -s target/ci/hermit-e2e-artifact.path
-          require -s target/install_pkg/rsrcs/libdetcore_dbt.so
-          require -s target/install_pkg/rsrcs/libreverie_dbt_client.so
           require -s target/validate/libreverie_liteinst.so
           require -s target/validate/libreverie_liteinst.so.revision
           if ((missing > 0)); then
@@ -1042,7 +1015,7 @@ jobs:
         with:
           name: ${{ env.NEXTEST_ARTIFACT }}
           path: .
-      # The completed release tree carries the DBT and LiteInst runtimes plus
+      # The completed release tree carries the LiteInst runtime plus
       # the constructed E2E artifact. A selective run may skip it only when the
       # selector proved the chosen debug shard needs none of those outputs.
       - name: Download completed release tree
@@ -1061,9 +1034,7 @@ jobs:
           test -x target/validate/hermit
           test -x target/validate/verification-report
           test -x target/debug/nextest-cpu-wrapper
-          test -f target/validate/deps/libdetcore_dbt.so
           test -f target/validate/libdetcore_liteinst.so
-          test -f target/install_pkg/rsrcs/libdetcore_dbt.so
           test -x target/ci/bin/cargo-nextest
           test -f target/ci/nextest-binaries/current.json
       # Install into CARGO_HOME/bin rather than adding target/ci/bin to PATH:
@@ -1103,8 +1074,6 @@ jobs:
             echo "Unpack completed release tree: $missing required input(s) missing" >&2
             exit 1
           fi
-          test -x target/install_pkg/rsrcs/dynamorio/bin64/drrun
-          test -f target/install_pkg/rsrcs/libreverie_dbt_client.so
           ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null
       - name: Run shard nodes (${{ matrix.slug }})
         env:
@@ -1348,7 +1317,7 @@ jobs:
           rm -f "$NEXTEST_TARBALL"
           # No target/release tree exists since d44bbbb79ac
           # (https://github.com/rrnewton/hermit/issues/3458). The release shards
-          # run target/ci/hermit, read DBT and SaBRe resources from
+          # run target/ci/hermit, read install resources from
           # target/install_pkg, and test.liteinst_strict stages the LiteInst
           # runtime from target/validate.
           missing=0
@@ -1359,9 +1328,6 @@ jobs:
             fi
           }
           require -x target/ci/hermit
-          require -x target/install_pkg/rsrcs/sabre
-          require -f target/install_pkg/rsrcs/libreverie_dbt_client.so
-          require -f target/install_pkg/rsrcs/libdetcore_dbt.so
           require -s target/validate/libreverie_liteinst.so
           require -s target/validate/libreverie_liteinst.so.revision
           if ((missing > 0)); then

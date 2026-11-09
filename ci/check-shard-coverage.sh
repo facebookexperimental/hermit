@@ -311,7 +311,7 @@ require_gate_contract() {
 }
 
 # build.workspace_on_host builds Hermit in the validate profile (d44bbbb79ac),
-# so hermit, verification-report and the DBT runtime must be packed from
+# so hermit and verification-report must be packed from
 # target/validate. Run 36836745615 failed when this step still named the
 # target/debug copies, while this contract, which pinned the same stale path,
 # stayed green. The pack step checks each input with `require`, which names a
@@ -338,9 +338,9 @@ debug_artifact_contract() {
         grep -Fqx '          require -x target/validate/hermit' <<<"$pack_step" &&
         grep -Fqx '            target/validate/hermit \' <<<"$pack_step" &&
         grep -Fqx '          test -x target/validate/hermit' <<<"$unpack_step" &&
-        grep -Fqx '          require -f target/validate/deps/libdetcore_dbt.so' <<<"$pack_step" &&
-        grep -Fqx '            target/validate/deps/libdetcore_dbt.so \' <<<"$pack_step" &&
-        grep -Fqx '          test -f target/validate/deps/libdetcore_dbt.so' <<<"$unpack_step" &&
+        grep -Fqx '          require -s target/validate/libdetcore_liteinst.so' <<<"$pack_step" &&
+        grep -Fqx '            target/validate/libdetcore_liteinst.so \' <<<"$pack_step" &&
+        grep -Fqx '          test -f target/validate/libdetcore_liteinst.so' <<<"$unpack_step" &&
         grep -Fqx '            if ! test "$1" "$2"; then' <<<"$pack_step" &&
         grep -Fqx '              missing=$((missing + 1))' <<<"$pack_step" &&
         grep -Fqx '          if ((missing > 0)); then' <<<"$pack_step" &&
@@ -354,7 +354,7 @@ debug_artifact_contract() {
 # only carrier of the install resources that build.e2e_artifact publishes and
 # the release shards read, and of the profile-staged Reverie LiteInst runtime
 # that hermit-install writes beside the validate-profile Hermit. hermit-install
-# links three of those resources
+# links install_pkg/hermit
 # into target/validate, which the tree does not carry whole, so the pack step
 # must replace every link with a regular copy and refuse a leftover one. The
 # replacement loop is pinned whole and must precede the tar: its dangling-link
@@ -379,13 +379,6 @@ EOF
     before_tar=${pack_step%%'          tar --zstd -cf "$DEBUG_TARBALL" \'*}
     [[ $before_tar != "$pack_step" && $before_tar == *"$symlink_block"* ]] || return 1
     for required in \
-        '          require -x target/install_pkg/rsrcs/dynamorio/bin64/drrun' \
-        '          require -x target/install_pkg/rsrcs/sabre' \
-        '          require -s target/install_pkg/rsrcs/sabre.revision' \
-        '          require -x target/install_pkg/rsrcs/e9patch' \
-        '          require -x target/install_pkg/rsrcs/e9tool' \
-        '          require -s target/install_pkg/rsrcs/libdetcore_sabre.so' \
-        '          require -s target/install_pkg/rsrcs/libreverie_dbt_client.so' \
         '          require -s target/install_pkg/rsrcs/libreverie_liteinst.so' \
         '          require -s target/validate/libreverie_liteinst.so' \
         '          require -s target/validate/libreverie_liteinst.so.revision' \
@@ -480,10 +473,6 @@ completed_build_contract() {
     for required in \
         '          tar --zstd -xf "$DEBUG_TARBALL"' \
         '          require -x target/validate/hermit' \
-        '          require -x target/install_pkg/rsrcs/dynamorio/bin64/drrun' \
-        '          require -x target/install_pkg/rsrcs/sabre' \
-        '          require -s target/install_pkg/rsrcs/sabre.revision' \
-        '          require -s target/install_pkg/rsrcs/libdetcore_sabre.so' \
         '          require -s target/validate/libreverie_liteinst.so' \
         '          require -s target/validate/libreverie_liteinst.so.revision' \
         '              missing=$((missing + 1))' \
@@ -494,10 +483,7 @@ completed_build_contract() {
     done
     for required in \
         '          require -x target/ci/hermit' \
-        '          require -s target/ci/libdetcore_sabre.so' \
         '          require -s target/ci/hermit-e2e-artifact.path' \
-        '          require -s target/install_pkg/rsrcs/libdetcore_dbt.so' \
-        '          require -s target/install_pkg/rsrcs/libreverie_dbt_client.so' \
         '          require -s target/validate/libreverie_liteinst.so' \
         '          require -s target/validate/libreverie_liteinst.so.revision' \
         '              missing=$((missing + 1))' \
@@ -538,9 +524,6 @@ release_tree_consumer_contract() {
     done
     step=$(workflow_job_step_body test-release 'Unpack full release prebuilt tree' "$workflow_text") || return 1
     for required in \
-        '          require -x target/install_pkg/rsrcs/sabre' \
-        '          require -f target/install_pkg/rsrcs/libreverie_dbt_client.so' \
-        '          require -f target/install_pkg/rsrcs/libdetcore_dbt.so' \
         '          require -s target/validate/libreverie_liteinst.so' \
         '          require -s target/validate/libreverie_liteinst.so.revision'
     do
@@ -856,7 +839,7 @@ workflow_wiring_contract() {
 # of passing merely because the binary is mentioned somewhere in the workflow.
 workflow_text=$(<"$workflow")
 if ! debug_artifact_contract "$workflow_text"; then
-    echo "check-shard-coverage.sh: FAIL — debug artifact must transport target/validate/{hermit,verification-report,deps/libdetcore_dbt.so}, the symlink-free target/install_pkg resources and the target/validate LiteInst runtime, and fail closed on a missing input" >&2
+    echo "check-shard-coverage.sh: FAIL — debug artifact must transport target/validate/{hermit,verification-report,libdetcore_liteinst.so}, the symlink-free target/install_pkg resources and the target/validate LiteInst runtime, and fail closed on a missing input" >&2
     status=1
 fi
 if ! prepared_nextest_artifact_contract "$workflow_text"; then
