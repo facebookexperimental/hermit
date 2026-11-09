@@ -26,5 +26,19 @@ if ! rustup target list --installed | grep -qx "$target"; then
     exit 75
 fi
 
-cargo check -p hermit-detcore --target "$target"
+# This guard judges musl PORTABILITY (type errors), not deprecation hygiene.
+# libc deprecates its `time_t`/`suseconds_t` aliases on musl targets only, in
+# advance of following musl 1.2's 64-bit change; Detcore names those aliases
+# deliberately for the x86_64 guest ABI word (`size_of::<libc::time_t>()`
+# guest-layout reads and `timeval` field casts), where both are already
+# 64-bit on glibc and musl alike. The GitHub portable workflow exports
+# `-D warnings` to every cargo invocation, which promoted that musl-only
+# deprecation to 31 compile errors in this checker alone while the local
+# lane, which sets no such flags, stayed green. Downgrade only the
+# `deprecated` lint for this one check so its verdict means the same thing in
+# both lanes; every other warning stays at the ambient level, and deprecation
+# hygiene on the host target remains denied by the workspace build and
+# clippy. With no ambient RUSTFLAGS this changes nothing locally.
+RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-A deprecated" \
+    cargo check -p hermit-detcore --target "$target"
 echo "check-musl-detcore: OK -- hermit-detcore compiles for $target"
