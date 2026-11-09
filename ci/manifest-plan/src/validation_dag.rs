@@ -4697,8 +4697,7 @@ fn assert_m1_allocator_gate(cfg: &DagConfig) -> Result<(), String> {
     if consumer.env.contains_key("NEXTEST_EXPECTED_EXECUTED") {
         return Err("M1 consumer declares a retired Nextest count pin".into());
     }
-    if consumer.integration_test_binaries.as_deref()
-        != Some(&["liteinst_allocator".to_owned()][..])
+    if consumer.integration_test_binaries.as_deref() != Some(&["liteinst_allocator".to_owned()][..])
     {
         return Err("M1 consumer lost its allocator target population".into());
     }
@@ -4757,9 +4756,7 @@ fn assert_m2_stack_gate(cfg: &DagConfig) -> Result<(), String> {
     if consumer.env.contains_key("NEXTEST_EXPECTED_EXECUTED") {
         return Err("stack consumer declares a retired Nextest count pin".into());
     }
-    if consumer.integration_test_binaries.as_deref()
-        != Some(&["liteinst_stacks".to_owned()][..])
-    {
+    if consumer.integration_test_binaries.as_deref() != Some(&["liteinst_stacks".to_owned()][..]) {
         return Err("stack consumer lost its stacks target population".into());
     }
     crate::nextest_build_selections::assert_command_selection(consumer)?;
@@ -8922,10 +8919,7 @@ sys.exit(37)
                 .env
                 .insert("NEXTEST_EXPECTED_EXECUTED".into(), value.into());
             let error = assert_structured_result_producers(&changed).unwrap_err();
-            assert!(
-                error.contains(tag) && error.contains("retired"),
-                "{error}"
-            );
+            assert!(error.contains(tag) && error.contains("retired"), "{error}");
         }
 
         let mut inline_count = committed.clone();

@@ -332,17 +332,25 @@ function run_nextest {
         # against the base (last landed main) population the queue adapter
         # cached. HERMIT_CENSUS_BASE_LISTED_IDS names that base .listed-ids
         # file; HERMIT_CENSUS_DROPPED_FILE names Test-Dropped records dumped
-        # from `git log base..head`. Enforcement is the default whenever a
-        # base is supplied: an unrecorded disappearance fails this node
-        # naming the IDs. HERMIT_CENSUS_REPORT_ONLY=1 is the explicit
-        # downgrade to a report. With no base supplied (the adapter has not
-        # cached one for this node yet) the check reports that and passes:
-        # the adapter integration point is exactly these variables, and no
-        # count pin is consulted either way.
-        local -a census_args=(--candidate-listed "${DAGRUN_TEST_COUNTS_PATH}.listed-ids")
+        # from `git log base..head`. Base contract (adapter-owned): cached
+        # from a full counted run at the last landed main commit, keyed by
+        # that commit, never mutated in place; a stale/short base is an
+        # adapter bug this gate cannot detect. Since the count pins were
+        # deleted the census is the only disappearance guard, so a counted
+        # node REQUIRES its base: with none supplied this node fails,
+        # unless HERMIT_CENSUS_ALLOW_NO_BASE=1 marks an explicit local/
+        # standalone run with no adapter. HERMIT_CENSUS_REPORT_ONLY is
+        # retired in counted nodes (phase-2 rollout lever): it is ignored
+        # here so a stale adapter setting cannot silently downgrade
+        # enforcement; --report-only remains a manual ci/census-check.sh
+        # debugging aid only.
+        local -a census_args=(--candidate-listed "${DAGRUN_TEST_COUNTS_PATH}.listed-ids" --require-base)
         [[ -n ${HERMIT_CENSUS_BASE_LISTED_IDS:-} ]] && census_args+=(--base-listed "$HERMIT_CENSUS_BASE_LISTED_IDS")
         [[ -n ${HERMIT_CENSUS_DROPPED_FILE:-} ]] && census_args+=(--dropped "$HERMIT_CENSUS_DROPPED_FILE")
-        [[ ${HERMIT_CENSUS_REPORT_ONLY:-} == 1 ]] && census_args+=(--report-only)
+        [[ ${HERMIT_CENSUS_ALLOW_NO_BASE:-} == 1 ]] && census_args+=(--allow-no-base)
+        if [[ ${HERMIT_CENSUS_REPORT_ONLY:-} == 1 ]]; then
+            printf 'run-nextest-counted: HERMIT_CENSUS_REPORT_ONLY=1 is ignored in counted nodes since the count pins were deleted (census stays enforced)\n' >&2
+        fi
         if ! "$SCRIPT_DIR/census-check.sh" "${census_args[@]}"; then
             printf 'run-nextest-counted: census gate refused this listed population (see census FAIL lines above)\n' >&2
             cleanup_nextest_config
@@ -742,7 +750,7 @@ PYEOF
     set +e
     inventory="$scratch/wrapper-inventory.json"
     binary_map="$scratch/wrapper-binary-map.json"
-    got=$(TMPDIR="$scratch" DAGRUN_TEST_COUNTS_PATH="$scratch/wrapper-counts.json" \
+    got=$(TMPDIR="$scratch" HERMIT_CENSUS_ALLOW_NO_BASE=1 DAGRUN_TEST_COUNTS_PATH="$scratch/wrapper-counts.json" \
         run_nextest "$scratch/wrapper-events" "$wall_multiplier" "$cpu_wrapper" \
         "$attempts" "$binary_map" "$inventory" "$scratch/wrapper-cpu.json" \
         --profile ci -p suite -j 1 --retries 2 -- --skip skipme)
@@ -818,7 +826,7 @@ PYEOF
     attempts="$scratch/reresolve-attempts"
     mkdir "$attempts"
     status=0
-    got=$(TMPDIR="$scratch" DAGRUN_TEST_COUNTS_PATH="$scratch/reresolve-counts.json" \
+    got=$(TMPDIR="$scratch" HERMIT_CENSUS_ALLOW_NO_BASE=1 DAGRUN_TEST_COUNTS_PATH="$scratch/reresolve-counts.json" \
         HERMIT_PREPARED_NEXTEST_REQUIRED=1 \
         run_nextest "$scratch/reresolve-events" "$wall_multiplier" "$cpu_wrapper" \
         "$attempts" "$binary_map" "$inventory" "$scratch/reresolve-cpu.json" \
@@ -863,7 +871,7 @@ PYEOF
     inventory_wrong_name=1
     mkdir "$scratch/attribution-attempts"
     status=0
-    TMPDIR="$scratch" DAGRUN_TEST_COUNTS_PATH="$scratch/attribution-counts.json" \
+    TMPDIR="$scratch" HERMIT_CENSUS_ALLOW_NO_BASE=1 DAGRUN_TEST_COUNTS_PATH="$scratch/attribution-counts.json" \
         run_nextest "$scratch/attribution-events" "$wall_multiplier" "$cpu_wrapper" \
         "$scratch/attribution-attempts" "$binary_map" "$inventory" "$scratch/attribution-cpu.json" \
         --profile ci -p suite -j 1 --retries 2 -- --skip skipme \
@@ -880,7 +888,7 @@ PYEOF
     attempts="$scratch/launch-attempts"
     mkdir "$attempts"
     status=0
-    got=$(TMPDIR="$scratch" DAGRUN_TEST_COUNTS_PATH="$scratch/launch-counts.json" \
+    got=$(TMPDIR="$scratch" HERMIT_CENSUS_ALLOW_NO_BASE=1 DAGRUN_TEST_COUNTS_PATH="$scratch/launch-counts.json" \
         run_nextest "$scratch/launch-events" "$wall_multiplier" "$cpu_wrapper" \
         "$attempts" "$binary_map" "$inventory" "$scratch/launch-cpu.json" \
         --profile ci -p suite -j 1 --retries 2 -- --skip skipme) || status=$?

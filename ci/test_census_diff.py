@@ -202,6 +202,18 @@ def test_wired_missing_base_file_fails_closed(tmp_path):
     assert r.returncode == 2 and "absent.listed-ids" in r.stderr and "refusing" in r.stderr
 
 
+def test_wired_require_base_without_base_fails(tmp_path):
+    # Counted nodes require their base since the pins were deleted; only an
+    # explicit local opt-out may run baseless.
+    r = subprocess.run(["bash", str(CHECK), "--candidate-listed", "/dev/null",
+                        "--require-base"], capture_output=True, text=True)
+    assert r.returncode == 2 and "require-base" in r.stderr
+    r2 = subprocess.run(["bash", str(CHECK), "--candidate-listed", "/dev/null",
+                         "--require-base", "--allow-no-base"],
+                        capture_output=True, text=True)
+    assert r2.returncode == 0 and "report-only" in r2.stderr
+
+
 def test_wired_no_base_is_report_only_and_passes(tmp_path):
     r = subprocess.run(["bash", str(CHECK), "--candidate-listed", "/dev/null"],
                        capture_output=True, text=True)

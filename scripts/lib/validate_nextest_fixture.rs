@@ -706,7 +706,7 @@ fn actual_nextest_results_and_publication_failures() {
              export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=1; \
              export CARGO_TARGET_DIR={} TMPDIR={}; unset HERMIT_PREPARED_NEXTEST_REQUIRED; \
              printf '%s\\n' \"$DAGRUN_TEST_COUNTS_PATH\" > {}; {lock}{fault}set +e; \
-             {override_env}HERMIT_NEXTEST_FAIL_FAST=0 NEXTEST_EXPECTED_EXECUTED={expected} HERMIT_NEXTEST_CPU_REPORT_PATH={} \
+             {override_env}HERMIT_CENSUS_ALLOW_NO_BASE=1 HERMIT_NEXTEST_FAIL_FAST=0 NEXTEST_EXPECTED_EXECUTED={expected} HERMIT_NEXTEST_CPU_REPORT_PATH={} \
              {} --manifest-path {} --locked --offline \
              --profile ci --lib -j 1 --retries 0 --no-tests fail -E {} >{} 2>{}; \
              fixture_status=$?; cat {}; cat {} >&2; exit \"$fixture_status\"",

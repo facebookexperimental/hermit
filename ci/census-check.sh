@@ -4,7 +4,15 @@
 #
 # Usage: ci/census-check.sh --candidate-listed FILE [--base-listed FILE]
 #          [--candidate-outcomes FILE] [--dropped FILE] [--report-only]
-#          [--suite NAME]
+#          [--require-base] [--allow-no-base] [--suite NAME]
+#
+# Base contract (queue-adapter-owned, recorded here as the review point):
+# the base is the .listed-ids of a full counted run at the last landed
+# main commit, cached under that commit and never mutated in place. A
+# base cast from an older or partial run is stale: this gate cannot tell
+# a short base from a complete one, so freshness is the adapter's duty
+# and a stale base is an adapter bug, not a pass. --report-only is a
+# manual/local debugging aid only; the counted wrapper never passes it.
 #
 # With no --base-listed there is no base population in-node (the queue
 # adapter owns the cached base; see HERMIT_CENSUS_BASE_LISTED_IDS in
@@ -20,7 +28,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 
 base_listed= candidate_listed= candidate_outcomes= dropped= suite=nextest
-report_only=0
+report_only=0 require_base=0 allow_no_base=0
 while (($#)); do
     case $1 in
         --base-listed) base_listed=$2; shift 2 ;;
@@ -29,6 +37,8 @@ while (($#)); do
         --dropped) dropped=$2; shift 2 ;;
         --suite) suite=$2; shift 2 ;;
         --report-only) report_only=1; shift ;;
+        --require-base) require_base=1; shift ;;
+        --allow-no-base) allow_no_base=1; shift ;;
         *) printf 'census-check: unknown argument %s\n' "$1" >&2; exit 2 ;;
     esac
 done
@@ -37,6 +47,10 @@ if [[ -z $candidate_listed && -z $candidate_outcomes ]]; then
     exit 2
 fi
 if [[ -z $base_listed ]]; then
+    if ((require_base && ! allow_no_base)); then
+        printf 'census-check: no base population supplied and --require-base is in force; the queue adapter must provide HERMIT_CENSUS_BASE_LISTED_IDS (local runs opt out explicitly with HERMIT_CENSUS_ALLOW_NO_BASE=1)\n' >&2
+        exit 2
+    fi
     printf 'census %s: report-only (no base population supplied; queue adapter has not provided HERMIT_CENSUS_BASE_LISTED_IDS)\n' "$suite" >&2
     exit 0
 fi
