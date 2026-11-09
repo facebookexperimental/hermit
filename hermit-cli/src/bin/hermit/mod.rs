@@ -188,6 +188,28 @@ fn startup_stdin() -> io::Result<Option<File>> {
     }
 }
 
+/// One invocation's authority to transfer an owned stdin source. Keep the
+/// source lazy so static refusals never consume the executable's reservation.
+struct OwnedStdin<F> {
+    source: Option<F>,
+}
+
+impl<F: FnOnce() -> io::Result<Option<File>>> OwnedStdin<F> {
+    fn new(source: F) -> Self {
+        Self {
+            source: Some(source),
+        }
+    }
+
+    fn take(&mut self) -> io::Result<Option<File>> {
+        let source = self
+            .source
+            .take()
+            .ok_or_else(|| io::Error::other("owned-stdin-provider-already-consumed"))?;
+        source()
+    }
+}
+
 /// Retire unsolicited caller descriptors before this exec image starts workers
 /// or creates its own resources. Private exec roles supply only borrowed handles
 /// from their already adopted owners; ordinary CLI entry supplies none.
@@ -718,12 +740,17 @@ impl Subcommand {
         global: &GlobalOpts,
         admit_host: impl FnOnce(bool) -> Result<(), Error>,
     ) -> Result<ExitStatus, Error> {
-        self.main_with_backend_and_host_admission(
+        // Libtest has no executable preinit reservation. Create its owned
+        // empty input only at the normal consumption boundary, after the same
+        // admission and option refusals, without touching the startup atomic.
+        let mut stdin = OwnedStdin::new(|| tempfile::tempfile().map(Some));
+        self.main_with_backend_and_host_admission_and_stdin(
             global,
             &core_adapter::CoreApplicationAdapter,
             (),
             false,
             admit_host,
+            &mut stdin,
         )
     }
 
@@ -734,6 +761,25 @@ impl Subcommand {
         adapter_options: A::Options,
         selected_by_executable: bool,
         admit_host: impl FnOnce(bool) -> Result<(), Error>,
+    ) -> Result<ExitStatus, Error> {
+        self.main_with_backend_and_host_admission_and_stdin(
+            global,
+            adapter,
+            adapter_options,
+            selected_by_executable,
+            admit_host,
+            &mut OwnedStdin::new(startup_stdin),
+        )
+    }
+
+    fn main_with_backend_and_host_admission_and_stdin<A: backend_hook::BackendAdapter>(
+        &mut self,
+        global: &GlobalOpts,
+        adapter: &A,
+        adapter_options: A::Options,
+        selected_by_executable: bool,
+        admit_host: impl FnOnce(bool) -> Result<(), Error>,
+        stdin: &mut OwnedStdin<impl FnOnce() -> io::Result<Option<File>>>,
     ) -> Result<ExitStatus, Error> {
         // Stamp the invocation-bound NO-RESULT record BEFORE the first fallible
         // statement of the whole program. This is the outermost point at which
@@ -789,7 +835,9 @@ impl Subcommand {
         match self {
             Subcommand::HostCapabilities(x) => x.main(),
             Subcommand::Version(x) => x.main(),
-            Subcommand::Run(x) => x.main_with_backend(global, adapter, adapter_options),
+            Subcommand::Run(x) => {
+                x.main_with_backend_and_stdin(global, adapter, adapter_options, stdin)
+            }
             Subcommand::Strace(x) => x.main_with_backend(global, adapter),
             Subcommand::Record(x) => x.main_with_backend(global, adapter),
             Subcommand::Replay(x) => x.main(global),
@@ -1506,7 +1554,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(host_calls.get(), 1);
         // This real policy check follows the stdin snapshot, but precedes any
-        // VM, host-availability probe or guest launch. Before the owned-input
+        // VM creation, backend-availability check or guest launch. Before the owned-input
         // seam, libtest instead fails at the absent executable reservation.
         assert_kvm_timeout_refusal(&error);
         let (reserved, input) = crate::output_backend_stdin_reservation().unwrap();

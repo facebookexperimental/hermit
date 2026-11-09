@@ -12764,6 +12764,21 @@ impl RunOpts {
         adapter: &A,
         adapter_options: A::Options,
     ) -> Result<ExitStatus, Error> {
+        self.main_with_backend_and_stdin(
+            global,
+            adapter,
+            adapter_options,
+            &mut super::OwnedStdin::new(super::startup_stdin),
+        )
+    }
+
+    pub(super) fn main_with_backend_and_stdin<A: super::backend_hook::BackendAdapter>(
+        &mut self,
+        global: &GlobalOpts,
+        adapter: &A,
+        adapter_options: A::Options,
+        stdin: &mut super::OwnedStdin<impl FnOnce() -> std::io::Result<Option<File>>>,
+    ) -> Result<ExitStatus, Error> {
         if self.application_backend.is_some() {
             self.adapter_capabilities = Some(A::CAPABILITIES);
             adapter.validate_mode(if self.verify_run.is_some() {
@@ -12797,7 +12812,7 @@ impl RunOpts {
         // times out unwinds past this frame, so the property snapshot is
         // removed by this guard, whatever the result.
         let _remove_property_snapshot = super::property_snapshot::RemoveOnExit;
-        let result = self.main_without_core_cleanup(global, adapter, adapter_options);
+        let result = self.main_without_core_cleanup(global, adapter, adapter_options, stdin);
         drop(self.property_snapshot.take());
         if let Ok(status) = &result {
             self.finish_manifest(*status);
@@ -12932,6 +12947,7 @@ impl RunOpts {
         global: &GlobalOpts,
         adapter: &A,
         adapter_options: A::Options,
+        stdin: &mut super::OwnedStdin<impl FnOnce() -> std::io::Result<Option<File>>>,
     ) -> Result<ExitStatus, Error> {
         // Set up an early tracing option before we're ready to set the global default:
 
@@ -13060,17 +13076,17 @@ impl RunOpts {
             // DBT streams this reservation during live or saved-run execution.
             // The common live owner replays it without pre-draining stdin;
             // library output-capturing backends reserve their input below.
-            super::startup_stdin()?
+            stdin.take()?
         } else if verification {
             // `--verify` runs the guest twice through the output-capturing
             // backend, which otherwise feeds the guest an empty stdin. Snapshot
             // the real stdin now so both runs replay identical input; without
             // this, piped input (e.g. `echo prog | hermit run --verify -- gcc
             // -x c -`) is dropped and hermit reports a false deterministic pass.
-            hermit::reserve_output_stdin_snapshot(super::startup_stdin()?)?;
+            hermit::reserve_output_stdin_snapshot(stdin.take()?)?;
             None
         } else if self.selected_backend() == Backend::Kvm {
-            hermit::reserve_kvm_stdin(super::startup_stdin()?)?;
+            hermit::reserve_kvm_stdin(stdin.take()?)?;
             None
         } else {
             None
