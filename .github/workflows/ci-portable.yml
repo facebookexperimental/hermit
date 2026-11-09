@@ -549,6 +549,19 @@ jobs:
           packages: bc binutils bsdextrautils bzip2 clang cmake cpio curl dc file g++ gcc gawk git gzip iproute2 jq kmod less libc6-dbg libelf-dev libunwind-dev liblzma-dev libxml2-utils lm-sensors lsof lua5.4 m4 make ncal ncat netcat-openbsd nginx nodejs numactl openssl patch perl php-cli pkg-config procps psmisc python3-full redis-server redis-tools ruby socat sqlite3 sysstat tcl time unzip util-linux util-linux-extra vim-common wget xz-utils zip zlib1g-dev zstd
       - name: Rust components
         run: rustup component add clippy rustfmt
+      # setup.nextest probes `cargo nextest show-config version` and only then
+      # falls back to compiling cargo-nextest from source, inside that node's
+      # 80 CPU-second budget. A cold source build cannot meet it: run
+      # 42565076328 was killed at 80.5s CPU after 29s wall, still mid
+      # dependency tree, on a runner whose rust-cache held no nextest binary.
+      # Provision the prebuilt binary the same way the checks and
+      # unit-parallel jobs already do (same action pin, same
+      # NEXTEST_VERSION the node's fallback names), so the probe passes
+      # and the Stage cargo-nextest step below stages this exact binary.
+      - name: Install cargo-nextest (build-debug)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
       # gate.manifest runs `test-harness validate`, which shells out to
       # tests/manifest-cli.rs -- one of the tracked entrypoints carrying
       # `#!/usr/bin/env -S rust-script --force`. Without the interpreter that
