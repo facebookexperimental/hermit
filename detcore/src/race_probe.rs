@@ -298,6 +298,7 @@ pub(crate) async fn delay(point: &str) {
 /// blocks the calling thread where none runs (KVM drives each guest
 /// process's and thread's tool on a thread of its own), which then serves
 /// that task alone.
+#[cfg(debug_assertions)]
 pub(crate) async fn delay_on_any_backend(point: &str, in_guest: bool) {
     let Some(perturbation) = choose(point) else {
         return;
@@ -327,6 +328,7 @@ async fn hold(point: &str, release: &Path) {
 }
 
 /// [`hold`], blocking the calling thread.
+#[cfg(debug_assertions)]
 fn hold_blocking(point: &str, release: &Path) {
     if release.exists() {
         return;
