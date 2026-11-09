@@ -529,6 +529,7 @@ mod tests {
             false,
             prepared.plan.path.as_str(),
             super::super::validate_receipt::RELEASE_BUILDER_CARGO,
+            super::super::validate_receipt::BUILD_MODE_CARGO,
         )
         .unwrap_err();
         assert_eq!(
