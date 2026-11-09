@@ -872,11 +872,13 @@ pub(super) fn assert_preparation_dependencies(
             }
         }
         if !ancestors.iter().any(|tag| {
-            producers.get(tag).is_some_and(|(pinned, cohort, selections)| {
-                *pinned == step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ")
-                    && *cohort == consumer_cohort
-                    && selections.get(&key) == Some(&args)
-            })
+            producers
+                .get(tag)
+                .is_some_and(|(pinned, cohort, selections)| {
+                    *pinned == step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ")
+                        && *cohort == consumer_cohort
+                        && selections.get(&key) == Some(&args)
+                })
         }) {
             return Err(format!(
                 "{} can run before any producer in the same filesystem root and cohort {} of its exact Cargo selection {args:?}",

@@ -1541,12 +1541,8 @@ impl LockedArtifacts {
     }
 
     fn record_from(&self, value: Value) -> Result<PreparedRecord, String> {
-        serde_json::from_value(value).map_err(|e| {
-            format!(
-                "invalid prepared record {}: {e}",
-                self.record.display()
-            )
-        })
+        serde_json::from_value(value)
+            .map_err(|e| format!("invalid prepared record {}: {e}", self.record.display()))
     }
 
     fn current_value(&self) -> Result<Value, String> {
@@ -2385,9 +2381,7 @@ fn qualified_features(
 /// The canonical `feature_set` a record prepared from `selections` names:
 /// [`qualified_features`] sorted and comma-joined, empty when no selection
 /// names features.
-pub fn prepared_feature_set(
-    selections: &BTreeMap<String, Vec<String>>,
-) -> Result<String, String> {
+pub fn prepared_feature_set(selections: &BTreeMap<String, Vec<String>>) -> Result<String, String> {
     Ok(qualified_features(selections)?
         .into_iter()
         .collect::<Vec<_>>()
@@ -4642,9 +4636,7 @@ mod tests {
             .insert(PROJECT_ENV.into(), owner.to_str().unwrap().into());
         graph.steps = vec![step];
         assert!(config_selections(&graph, "full").is_err());
-        assert!(
-            config_selections_for_project(&graph, "full", Some(owner), DEFAULT_COHORT).is_ok()
-        );
+        assert!(config_selections_for_project(&graph, "full", Some(owner), DEFAULT_COHORT).is_ok());
         assert!(
             config_selections_for_project(
                 &graph,
@@ -5434,10 +5426,7 @@ mod tests {
             NATIVE_EXEC_COHORT.target_dir(),
             Some("target/cohort-native-exec")
         );
-        assert_eq!(
-            PreparedCohort::from_slug(None).unwrap(),
-            DEFAULT_COHORT
-        );
+        assert_eq!(PreparedCohort::from_slug(None).unwrap(), DEFAULT_COHORT);
         assert_eq!(
             PreparedCohort::from_slug(Some("native-exec")).unwrap(),
             NATIVE_EXEC_COHORT
@@ -5600,19 +5589,12 @@ mod tests {
         // The default cohort declares no target and keeps any target
         // Cargo reports, as before cohorts existed.
         check_cohort_target(root, DEFAULT_COHORT, Path::new("/fixture/target"), "run").unwrap();
-        check_cohort_target(
-            root,
-            DEFAULT_COHORT,
-            Path::new("/elsewhere/target"),
-            "run",
-        )
-        .unwrap();
+        check_cohort_target(root, DEFAULT_COHORT, Path::new("/elsewhere/target"), "run").unwrap();
     }
 
     #[test]
     fn config_selections_partition_by_cohort() {
-        let mut graph =
-            dagrun::io::dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let mut graph = dagrun::io::dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let template = graph
             .steps
             .iter()
@@ -5653,9 +5635,7 @@ mod tests {
                 "-p hermit-run --features liteinst,kvm-native-test-support,native-exec --lib --bins"
             )]
         );
-        graph.steps[1]
-            .env
-            .insert(COHORT_ENV.into(), "bogus".into());
+        graph.steps[1].env.insert(COHORT_ENV.into(), "bogus".into());
         assert!(config_selections(&graph, "full").is_err());
         assert!(config_selections_in_cohort(&graph, "full", NATIVE_EXEC_COHORT).is_err());
     }

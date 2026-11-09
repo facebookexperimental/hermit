@@ -521,7 +521,10 @@ impl StaticStepSpec {
         if !cohort.is_default() {
             env.insert(
                 crate::nextest_binaries::COHORT_ENV.into(),
-                cohort.env_value().expect("non-default cohort has a slug").into(),
+                cohort
+                    .env_value()
+                    .expect("non-default cohort has a slug")
+                    .into(),
             );
             env.insert(
                 "CARGO_TARGET_DIR".into(),
