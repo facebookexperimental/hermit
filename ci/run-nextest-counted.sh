@@ -331,7 +331,11 @@ function run_nextest {
         # Census gate (phase 3, enforced): diff this run's listed population
         # against the base (last landed main) population the queue adapter
         # cached. HERMIT_CENSUS_BASE_LISTED_IDS names that base .listed-ids
-        # file; HERMIT_CENSUS_DROPPED_FILE names Test-Dropped records dumped
+        # file (single-suite selections); HERMIT_CENSUS_BASE_DIR names the
+        # adapter's per-suite supply directory (one stamped
+        # <suite>.listed-ids per suite) for multi-suite/full-profile nodes,
+        # resolved per node below; HERMIT_CENSUS_DROPPED_FILE names
+        # Test-Dropped records dumped
         # from `git log base..head`. Base contract (adapter-owned): cached
         # from a full counted run at the last landed main commit, keyed by
         # that commit, never mutated in place, and stamped by its producer
@@ -349,8 +353,21 @@ function run_nextest {
         # rollout lever): it is ignored here so a stale adapter setting
         # cannot silently downgrade enforcement; --report-only remains a
         # manual ci/census-check.sh debugging aid only.
-        local -a census_args=(--candidate-listed "${DAGRUN_TEST_COUNTS_PATH}.listed-ids" --require-base)
+        # This node's suite is the one its counts report is named for
+        # (test.<suite>.json, the census cache's suite key); the per-suite
+        # base file carries the same name under HERMIT_CENSUS_BASE_DIR.
+        local census_suite counts_name=${DAGRUN_TEST_COUNTS_PATH##*/}
+        counts_name=${counts_name##*:}
+        counts_name=${counts_name%.json}
+        census_suite=${counts_name#test.}
+        [[ -n $census_suite && $census_suite != "$counts_name" ]] || census_suite=${counts_name:-nextest}
+        local -a census_args=(--candidate-listed "${DAGRUN_TEST_COUNTS_PATH}.listed-ids" --require-base --suite "$census_suite")
         [[ -n ${HERMIT_CENSUS_BASE_LISTED_IDS:-} ]] && census_args+=(--base-listed "$HERMIT_CENSUS_BASE_LISTED_IDS")
+        [[ -n ${HERMIT_CENSUS_BASE_DIR:-} ]] && census_args+=(--base-dir "$HERMIT_CENSUS_BASE_DIR")
+        # Case-selected runs list a subset, never the suite population:
+        # census-check names that treatment instead of comparing the
+        # full base (or refusing for want of one).
+        [[ -n ${HERMIT_NEXTEST_FILTER_EXPR:-} ]] && census_args+=(--case-selected)
         [[ -n ${HERMIT_CENSUS_DROPPED_FILE:-} ]] && census_args+=(--dropped "$HERMIT_CENSUS_DROPPED_FILE")
         [[ ${HERMIT_CENSUS_ALLOW_NO_BASE:-} == 1 ]] && census_args+=(--allow-no-base)
         local expected_base_commit=${HERMIT_CENSUS_EXPECTED_BASE_COMMIT:-${HERMIT_CENSUS_BASE_COMMIT:-}}

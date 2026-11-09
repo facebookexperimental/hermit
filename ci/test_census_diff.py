@@ -275,6 +275,81 @@ def test_wired_require_base_without_provenance_refused(tmp_path):
     assert r2.returncode == 2 and "census-base-provenance" in r2.stderr
 
 
+def _check_base_dir(tmp_path, suite, base_ids, cand_ids, commit=SHA_A,
+                    declared=None, expected=SHA_A):
+    import uuid
+    root = tmp_path / uuid.uuid4().hex
+    (root / "base-dir").mkdir(parents=True)
+    n = len(base_ids) if declared is None else declared
+    (root / "base-dir" / f"{suite}.listed-ids").write_text(
+        f"# census-base: commit={commit} count={n}\n"
+        + "".join(f"{i}\n" for i in base_ids))
+    (root / "cand.listed-ids").write_text("".join(f"{i}\n" for i in cand_ids))
+    args = ["bash", str(CHECK), "--base-dir", str(root / "base-dir"),
+            "--suite", suite, "--candidate-listed", str(root / "cand.listed-ids"),
+            "--require-base"]
+    if expected is not None:
+        args += ["--expected-base-commit", expected]
+    return subprocess.run(args, capture_output=True, text=True)
+
+
+def test_wired_base_dir_fresh_base_passes(tmp_path):
+    # Full-profile supply: no single file, the node's suite resolves
+    # its stamped base from HERMIT_CENSUS_BASE_DIR.
+    r = _check_base_dir(tmp_path, "mysuite", ["pkg/bin/a", "pkg/bin/b"],
+                        ["pkg/bin/a", "pkg/bin/b"])
+    assert r.returncode == 0, (r.returncode, r.stdout, r.stderr)
+
+
+def test_wired_base_dir_vanished_id_fails_naming_it(tmp_path):
+    r = _check_base_dir(tmp_path, "mysuite",
+                        ["pkg/bin/kept", "pkg/bin/gone_test"],
+                        ["pkg/bin/kept"])
+    assert r.returncode == 1 and "gone_test" in r.stderr and "MISSING" in r.stderr
+
+
+def test_wired_base_dir_stale_commit_refused_by_name(tmp_path):
+    r = _check_base_dir(tmp_path, "mysuite", ["pkg/bin/a"], ["pkg/bin/a"],
+                        commit=SHA_B)
+    assert r.returncode == 2 and "census-base-stale" in r.stderr
+
+
+def test_wired_base_dir_truncated_refused_by_name(tmp_path):
+    r = _check_base_dir(tmp_path, "mysuite", ["pkg/bin/a", "pkg/bin/b"],
+                        ["pkg/bin/a", "pkg/bin/b"], declared=3)
+    assert r.returncode == 2 and "census-base-truncated" in r.stderr
+
+
+def test_wired_base_dir_missing_suite_refused_by_name(tmp_path):
+    import uuid
+    root = tmp_path / uuid.uuid4().hex
+    (root / "base-dir").mkdir(parents=True)
+    (root / "cand.listed-ids").write_text("pkg/bin/a\n")
+    r = subprocess.run(
+        ["bash", str(CHECK), "--base-dir", str(root / "base-dir"),
+         "--suite", "nosuchsuite",
+         "--candidate-listed", str(root / "cand.listed-ids"), "--require-base"],
+        capture_output=True, text=True)
+    assert r.returncode == 2 and "census-base-suite-missing" in r.stderr
+    assert "nosuchsuite" in r.stderr
+
+
+def test_wired_case_selected_is_named_not_refused(tmp_path):
+    # A case-selected candidate is a subset, not the population: the
+    # check names the treatment and passes even under --require-base
+    # with no base supplied.
+    import uuid
+    root = tmp_path / uuid.uuid4().hex
+    root.mkdir(parents=True)
+    (root / "cand.listed-ids").write_text("pkg/bin/a\n")
+    r = subprocess.run(
+        ["bash", str(CHECK), "--candidate-listed", str(root / "cand.listed-ids"),
+         "--require-base", "--case-selected", "--suite", "mysuite"],
+        capture_output=True, text=True)
+    assert r.returncode == 0 and "case-selected" in r.stderr
+    assert "mysuite" in r.stderr
+
+
 def test_provenance_header_is_not_a_base_id(tmp_path):
     # census-diff fed a stamped base directly must not diff the header.
     r = _check_stamped(tmp_path, ["a"], ["a"], require=False, expected=None)

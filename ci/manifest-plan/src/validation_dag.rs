@@ -673,6 +673,18 @@ const PINNED_ROOT_FORWARDED_ENV: &[&str] = &[
     crate::timeouts::TEST_CPU_TIMEOUT_MULTIPLIER_ENV,
     crate::timeouts::TEST_WALL_TIMEOUT_MULTIPLIER_ENV,
     "HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT",
+    // The queue adapter supplies the stamped census base under these names
+    // (HERMIT_CENSUS_BASE_LISTED_IDS for a single-suite node,
+    // HERMIT_CENSUS_BASE_DIR with one stamped <suite>.listed-ids per suite
+    // plus HERMIT_CENSUS_BASE_COMMIT and HERMIT_CENSUS_DROPPED_FILE);
+    // forwarded only when set, they carry that supply into the pinned
+    // root, where counted nodes require their base and refuse by name
+    // without it. Without forwarding, hermetic counted nodes never see
+    // the base and fail closed.
+    "HERMIT_CENSUS_BASE_COMMIT",
+    "HERMIT_CENSUS_BASE_DIR",
+    "HERMIT_CENSUS_BASE_LISTED_IDS",
+    "HERMIT_CENSUS_DROPPED_FILE",
     // validate --keep-going sets these to 0 on every step; forwarded only
     // when set, they carry the run-past-the-first-failure opt-in into the
     // pinned root, where the counted nextest wrapper and the e2e harness
@@ -6407,6 +6419,42 @@ sys.exit(37)
         assert_eq!(pinned.len(), 87, "pinned-root step count changed");
         for step in pinned {
             for name in ["HERMIT_NEXTEST_FAIL_FAST", "HERMIT_E2E_FAIL_FAST"] {
+                assert!(
+                    step.cmd.contains(&format!(" --env {name} ")),
+                    "{} does not forward {name}",
+                    step.tag()
+                );
+                assert!(
+                    pinned_root_command(step).contains(&format!(" --env {name} ")),
+                    "{} loses {name} when its command is rebuilt",
+                    step.tag()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_committed_pinned_root_node_forwards_the_census_base_supply() {
+        // The queue adapter supplies the stamped census base as
+        // HERMIT_CENSUS_BASE_LISTED_IDS / HERMIT_CENSUS_BASE_DIR /
+        // HERMIT_CENSUS_BASE_COMMIT / HERMIT_CENSUS_DROPPED_FILE; a
+        // pinned-root counted node sees them only if its wrapper command
+        // forwards their names, and counted nodes refuse by name without
+        // a base since the count pins were deleted.
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let pinned: Vec<_> = committed
+            .steps
+            .iter()
+            .filter(|step| step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh "))
+            .collect();
+        assert_eq!(pinned.len(), 87, "pinned-root step count changed");
+        for step in pinned {
+            for name in [
+                "HERMIT_CENSUS_BASE_COMMIT",
+                "HERMIT_CENSUS_BASE_DIR",
+                "HERMIT_CENSUS_BASE_LISTED_IDS",
+                "HERMIT_CENSUS_DROPPED_FILE",
+            ] {
                 assert!(
                     step.cmd.contains(&format!(" --env {name} ")),
                     "{} does not forward {name}",

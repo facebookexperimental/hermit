@@ -3,9 +3,23 @@
 # population against a base (last landed main) population with ci/census-diff.
 #
 # Usage: ci/census-check.sh --candidate-listed FILE [--base-listed FILE]
-#          [--candidate-outcomes FILE] [--dropped FILE] [--report-only]
-#          [--require-base] [--allow-no-base]
-#          [--expected-base-commit SHA] [--suite NAME]
+#          [--base-dir DIR] [--candidate-outcomes FILE] [--dropped FILE]
+#          [--report-only] [--require-base] [--allow-no-base]
+#          [--case-selected] [--expected-base-commit SHA] [--suite NAME]
+#
+# --base-dir names the adapter's per-suite supply directory
+# (HERMIT_CENSUS_BASE_DIR): one stamped <suite>.listed-ids per suite.
+# When no single-file --base-listed is given, the base resolves to
+# <dir>/<suite>.listed-ids and faces exactly the same freshness checks;
+# a directory holding no file for this suite is refused by name
+# (census-base-suite-missing). A single-file base wins when both are
+# given (the adapter supplies it only for single-suite selections).
+#
+# --case-selected names the case-selected treatment: HERMIT_NEXTEST_FILTER_EXPR
+# selects individual cases, so the candidate listing is a subset, never
+# the suite population; the full-population comparison does not apply
+# and the check reports that by name instead of refusing for want of a
+# base. The disappearance guard binds full-suite counted nodes.
 #
 # Base contract (queue-adapter-owned, recorded here as the review point):
 # the base is the .listed-ids of a full counted run at the last landed
@@ -38,12 +52,13 @@ set -uo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 readonly SCRIPT_DIR
 
-base_listed= candidate_listed= candidate_outcomes= dropped= suite=nextest
-report_only=0 require_base=0 allow_no_base=0
+base_listed= base_dir= candidate_listed= candidate_outcomes= dropped= suite=nextest
+report_only=0 require_base=0 allow_no_base=0 case_selected=0
 expected_base_commit=${HERMIT_CENSUS_EXPECTED_BASE_COMMIT:-${HERMIT_CENSUS_BASE_COMMIT:-}}
 while (($#)); do
     case $1 in
         --base-listed) base_listed=$2; shift 2 ;;
+        --base-dir) base_dir=$2; shift 2 ;;
         --candidate-listed) candidate_listed=$2; shift 2 ;;
         --candidate-outcomes) candidate_outcomes=$2; shift 2 ;;
         --dropped) dropped=$2; shift 2 ;;
@@ -51,6 +66,7 @@ while (($#)); do
         --report-only) report_only=1; shift ;;
         --require-base) require_base=1; shift ;;
         --allow-no-base) allow_no_base=1; shift ;;
+        --case-selected) case_selected=1; shift ;;
         --expected-base-commit) expected_base_commit=$2; shift 2 ;;
         *) printf 'census-check: unknown argument %s\n' "$1" >&2; exit 2 ;;
     esac
@@ -59,12 +75,27 @@ if [[ -z $candidate_listed && -z $candidate_outcomes ]]; then
     printf 'census-check: --candidate-listed or --candidate-outcomes is required\n' >&2
     exit 2
 fi
-if [[ -z $base_listed ]]; then
-    if ((require_base && ! allow_no_base)); then
-        printf 'census-check: no base population supplied and --require-base is in force; the queue adapter must provide HERMIT_CENSUS_BASE_LISTED_IDS (local runs opt out explicitly with HERMIT_CENSUS_ALLOW_NO_BASE=1)\n' >&2
+if ((case_selected)); then
+    printf 'census %s: case-selected counted run (HERMIT_NEXTEST_FILTER_EXPR selects cases, not the suite population); full-population base comparison not applicable; the disappearance guard binds full-suite counted nodes\n' "$suite" >&2
+    exit 0
+fi
+# Per-suite resolution: with no single-file base, the adapter's supply
+# directory holds this suite's stamped base as <suite>.listed-ids. A
+# supplied directory with no file for this suite is a broken supply,
+# refused by name like a supplied-but-missing single file.
+if [[ -z $base_listed && -n $base_dir ]]; then
+    if [[ ! -f $base_dir/$suite.listed-ids ]]; then
+        printf 'census-check: census-base-suite-missing: no per-suite base %s for suite %s in HERMIT_CENSUS_BASE_DIR %s; refusing (a supplied base directory must hold every suite it arms)\n' "$base_dir/$suite.listed-ids" "$suite" "$base_dir" >&2
         exit 2
     fi
-    printf 'census %s: report-only (no base population supplied; queue adapter has not provided HERMIT_CENSUS_BASE_LISTED_IDS)\n' "$suite" >&2
+    base_listed=$base_dir/$suite.listed-ids
+fi
+if [[ -z $base_listed ]]; then
+    if ((require_base && ! allow_no_base)); then
+        printf 'census-check: no base population supplied and --require-base is in force; the queue adapter must provide HERMIT_CENSUS_BASE_LISTED_IDS or HERMIT_CENSUS_BASE_DIR (local runs opt out explicitly with HERMIT_CENSUS_ALLOW_NO_BASE=1)\n' >&2
+        exit 2
+    fi
+    printf 'census %s: report-only (no base population supplied; queue adapter has not provided HERMIT_CENSUS_BASE_LISTED_IDS or HERMIT_CENSUS_BASE_DIR)\n' "$suite" >&2
     exit 0
 fi
 # A supplied base must be real: an unreadable or empty base would make every
