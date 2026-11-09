@@ -488,7 +488,7 @@ dependencies = [
  "chrono",
  "clap",
  "libc",
- "nix",
+ "nix 0.30.1",
  "pretty_assertions",
  "reverie-core",
  "reverie-syscalls",
@@ -859,7 +859,7 @@ dependencies = [
  "close-err",
  "hermit-detcore",
  "libc",
- "nix",
+ "nix 0.30.1",
  "regex",
  "tempfile",
 ]
@@ -886,7 +886,7 @@ dependencies = [
  "goblin",
  "hex",
  "libc",
- "nix",
+ "nix 0.30.1",
  "pretty",
  "pretty_assertions",
  "procfs",
@@ -916,7 +916,7 @@ dependencies = [
  "detcore-testutils",
  "hermit-detcore",
  "libc",
- "nix",
+ "nix 0.30.1",
  "pretty_assertions",
  "raw-cpuid",
  "reverie-core",
@@ -957,7 +957,7 @@ version = "0.5.4"
 dependencies = [
  "close-err",
  "libc",
- "nix",
+ "nix 0.30.1",
  "syscalls",
  "tempfile",
 ]
@@ -1016,7 +1016,7 @@ dependencies = [
  "hermit-detcore",
  "hermit-record-format",
  "libc",
- "nix",
+ "nix 0.30.1",
  "reverie-core",
  "reverie-ptrace",
  "serde",
@@ -1053,7 +1053,7 @@ dependencies = [
  "hermit-run-ptrace",
  "iced-x86",
  "libc",
- "nix",
+ "nix 0.30.1",
  "object 0.40.0",
  "pretty_assertions",
  "proc-macro2",
@@ -1277,6 +1277,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
+name = "liteinst"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38e2e683117ef65c460ef78aa3d4e80a8ba5f8c81890bed76c799cc7a0b7d828"
+dependencies = [
+ "iced-x86",
+ "libc",
+ "liteinst-x86",
+ "memmap2",
+ "nix 0.31.3",
+]
+
+[[package]]
+name = "liteinst-x86"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c663b904c7a56bd98d1acc594d0b26d4eee1c96a6c50eb4a982505f0ced3bad3"
+dependencies = [
+ "iced-x86",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1362,6 +1384,18 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "memoffset",
+]
+
+[[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags 2.13.1",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
 ]
 
 [[package]]
@@ -1699,7 +1733,7 @@ dependencies = [
  "linked-hash-map",
  "memmap2",
  "never-say-never",
- "nix",
+ "nix 0.30.1",
  "object 0.40.0",
  "perf-event-open-sys",
  "procfs",
@@ -1720,7 +1754,7 @@ source = "git+https://github.com/rrnewton/reverie.git?rev=78d41ebd4befc6ba364ca6
 dependencies = [
  "bincode",
  "libc",
- "nix",
+ "nix 0.30.1",
  "reverie-core",
  "reverie-loader",
  "reverie-memory",
@@ -1789,7 +1823,9 @@ version = "0.5.4"
 source = "git+https://github.com/rrnewton/reverie.git?rev=78d41ebd4befc6ba364ca695e168cb8656223545#78d41ebd4befc6ba364ca695e168cb8656223545"
 dependencies = [
  "bincode",
+ "iced-x86",
  "libc",
+ "liteinst",
  "reverie-core",
  "reverie-inguest",
  "reverie-rpc-transport",
@@ -1834,7 +1870,7 @@ dependencies = [
  "colored",
  "futures 0.3.33",
  "libc",
- "nix",
+ "nix 0.30.1",
  "serde",
  "syscalls",
  "thiserror",
@@ -1855,7 +1891,7 @@ dependencies = [
  "goblin",
  "iced-x86",
  "libc",
- "nix",
+ "nix 0.30.1",
  "num-traits",
  "paste",
  "perf-event-open-sys",
@@ -1897,7 +1933,7 @@ dependencies = [
  "derive_more",
  "libc",
  "linux-raw-sys",
- "nix",
+ "nix 0.30.1",
  "paste",
  "reverie-memory",
  "serde",
@@ -1961,7 +1997,7 @@ dependencies = [
  "bitflags 2.13.1",
  "futures 0.3.33",
  "libc",
- "nix",
+ "nix 0.30.1",
  "parking_lot",
  "reverie-memory",
  "reverie-process",

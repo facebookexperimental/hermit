@@ -35,7 +35,7 @@ detcore = { package = "hermit-detcore", version = "0.5.4", path = "../detcore" }
 libc = "0.2.186"
 reverie = { package = "reverie-core", version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "78d41ebd4befc6ba364ca695e168cb8656223545" }
 reverie-inguest = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "78d41ebd4befc6ba364ca695e168cb8656223545", default-features = false }
-reverie-liteinst = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "78d41ebd4befc6ba364ca695e168cb8656223545", default-features = false }
+reverie-liteinst = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "78d41ebd4befc6ba364ca695e168cb8656223545", default-features = false, features = ["liteinst"] }
 
 detcore-model = { version = "0.5.4", path = "../detcore-model", optional = true }
 reverie-rpc-transport = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "78d41ebd4befc6ba364ca695e168cb8656223545", optional = true }
