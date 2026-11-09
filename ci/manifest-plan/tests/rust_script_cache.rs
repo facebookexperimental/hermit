@@ -233,7 +233,7 @@ fn a_violating_build_is_found_beside_a_newer_clean_build() {
             d = deps.display()
         )
     };
-    let path_read = "# env-dep:CARGO_MANIFEST_DIR=/home/someone/hermit/ci/manifest-plan\n";
+    let path_read = "# env-dep:CARGO_MANIFEST_DIR=/src/hermit/ci/manifest-plan\n";
     write(&dir.join("src/lib.rs"), "", 100);
     // Built from the sources as they are now: the linked default build, which
     // reads the path, and the newer clean alternate.
@@ -299,12 +299,12 @@ fn a_path_read_in_a_library_build_is_found() {
                    src/lib.rs:\n\
                    \n\
                    # env-dep:CARGO_PKG_VERSION=0.5.4\n\
-                   # env-dep:CARGO_MANIFEST_DIR=/home/someone/hermit/ci/manifest-plan\n";
+                   # env-dep:CARGO_MANIFEST_DIR=/src/hermit/ci/manifest-plan\n";
     assert!(is_library_build(library));
     assert_eq!(first_rule_sources(library), ["src/lib.rs", "src/a b.rs"]);
     assert_eq!(
         path_capable_environment(library),
-        ["CARGO_MANIFEST_DIR=/home/someone/hermit/ci/manifest-plan"]
+        ["CARGO_MANIFEST_DIR=/src/hermit/ci/manifest-plan"]
     );
     // A value-less record (a variable unset at compile time) still counts.
     assert_eq!(
@@ -315,13 +315,13 @@ fn a_path_read_in_a_library_build_is_found() {
     let binary = "/t/deps/hermit_manifest_plan-0b.d: src/main.rs\n\
                   /t/deps/hermit_manifest_plan-0b: src/main.rs\n\
                   \n\
-                  # env-dep:CARGO_MANIFEST_DIR=/home/someone/hermit/ci/manifest-plan\n";
+                  # env-dep:CARGO_MANIFEST_DIR=/src/hermit/ci/manifest-plan\n";
     assert!(!is_library_build(binary));
     // `cargo clippy --tests` checks the unit-test harness: metadata only.
     let checked = "/t/deps/hermit_manifest_plan-0c.d: src/lib.rs\n\
                    /t/deps/libhermit_manifest_plan-0c.rmeta: src/lib.rs\n\
                    \n\
-                   # env-dep:CARGO_MANIFEST_DIR=/home/someone/hermit/ci/manifest-plan\n\
+                   # env-dep:CARGO_MANIFEST_DIR=/src/hermit/ci/manifest-plan\n\
                    # env-dep:CLIPPY_CONF_DIR\n";
     assert!(!is_library_build(checked));
 }
