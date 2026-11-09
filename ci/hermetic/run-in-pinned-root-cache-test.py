@@ -118,6 +118,8 @@ class CargoCacheMounts(unittest.TestCase):
         caller_affinity=None,
         project=None,
         bundle_lower=None,
+        extra_env=None,
+        extra_forwarded=None,
     ):
         # The wrapper gets this process's environment, as it does in
         # production, so an inherited Git location variable reaches it.
@@ -140,6 +142,10 @@ class CargoCacheMounts(unittest.TestCase):
             forwarded += ["--env", "VALIDATE_RUN_STATE"]
         if bundle_lower is not None:
             forwarded += ["--bundle-lower", str(bundle_lower)]
+        if extra_env:
+            env.update(extra_env)
+        if extra_forwarded:
+            forwarded += extra_forwarded
         result = subprocess.run(
             [
                 "bash",
@@ -714,6 +720,37 @@ class CargoCacheMounts(unittest.TestCase):
         self.assertIn("VALIDATE_RUN_STATE=/validate-run-state", argv)
         self.assertEqual((run_state / "fixture").read_bytes(), b"existing fixture")
         self.assertEqual(argv[-2:], ["/not-executed/command", "literal argument"])
+
+    def test_census_base_dir_is_mounted_and_rewritten_for_the_guest(self):
+        # The queue supplies the stamped census base as host paths outside
+        # the source mount; the guest must see the directory and the files
+        # inside it at rewritten guest paths, or counted nodes refuse.
+        census = self.root / "census base"
+        census.mkdir()
+        (census / "cli.listed-ids").write_text("pkg::bin$one\n")
+        (census / "dropped.txt").write_text("")
+        result, calls = self.invoke(
+            extra_env={
+                "HERMIT_CENSUS_BASE_COMMIT": "a" * 40,
+                "HERMIT_CENSUS_BASE_DIR": str(census),
+                "HERMIT_CENSUS_BASE_LISTED_IDS": str(census / "cli.listed-ids"),
+                "HERMIT_CENSUS_DROPPED_FILE": str(census / "dropped.txt"),
+            },
+            extra_forwarded=[
+                "--env", "HERMIT_CENSUS_BASE_COMMIT",
+                "--env", "HERMIT_CENSUS_BASE_DIR",
+                "--env", "HERMIT_CENSUS_BASE_LISTED_IDS",
+                "--env", "HERMIT_CENSUS_DROPPED_FILE",
+            ],
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = calls[-1]
+        self.assertIn(
+            f"type=bind,source={census},destination=/census-base,ro=true", argv)
+        self.assertIn("HERMIT_CENSUS_BASE_DIR=/census-base", argv)
+        self.assertIn(
+            "HERMIT_CENSUS_BASE_LISTED_IDS=/census-base/cli.listed-ids", argv)
+        self.assertIn("HERMIT_CENSUS_DROPPED_FILE=/census-base/dropped.txt", argv)
 
     def test_bundle_lower_is_a_read_only_bind_that_adds_no_link(self):
         # ci/buck-e2e/cell.sh shares one staged bundle across concurrent cells as

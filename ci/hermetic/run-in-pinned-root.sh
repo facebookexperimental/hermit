@@ -528,6 +528,36 @@ for name in "${pass_env[@]}"; do
             extra_mounts+=(--mount "type=bind,source=$counts_dir,destination=/dagrun-test-counts")
             env_args+=(-e "DAGRUN_TEST_COUNTS_PATH=/dagrun-test-counts/$counts_file")
             ;;
+        HERMIT_CENSUS_BASE_DIR)
+            # The stamped census base lives outside the source mount (the
+            # queue adapter materializes it under the state root), so the
+            # host path alone would name nothing inside the container.
+            # Mount it read-only at a fixed guest path and rewrite the
+            # variable; the file variables below rewrite against it.
+            [[ ${!name} == /* ]] || {
+                echo "run-in-pinned-root: HERMIT_CENSUS_BASE_DIR must be absolute" >&2
+                exit 2
+            }
+            extra_mounts+=(--mount "type=bind,source=${!name},destination=/census-base,ro=true")
+            env_args+=(-e HERMIT_CENSUS_BASE_DIR=/census-base)
+            ;;
+        HERMIT_CENSUS_BASE_LISTED_IDS|HERMIT_CENSUS_DROPPED_FILE)
+            # Files inside the census base dir ride its /census-base
+            # mount; a file elsewhere gets its own read-only mount.
+            [[ ${!name} == /* ]] || {
+                echo "run-in-pinned-root: $name must be absolute" >&2
+                exit 2
+            }
+            if [[ -v HERMIT_CENSUS_BASE_DIR && ${!name} == "${HERMIT_CENSUS_BASE_DIR}/"* ]]; then
+                env_args+=(-e "$name=/census-base/${!name#"${HERMIT_CENSUS_BASE_DIR}/"}")
+            elif [[ $name == HERMIT_CENSUS_BASE_LISTED_IDS ]]; then
+                extra_mounts+=(--mount "type=bind,source=$(dirname -- "${!name}"),destination=/census-listed,ro=true")
+                env_args+=(-e "$name=/census-listed/$(basename -- "${!name}")")
+            else
+                extra_mounts+=(--mount "type=bind,source=$(dirname -- "${!name}"),destination=/census-dropped,ro=true")
+                env_args+=(-e "$name=/census-dropped/$(basename -- "${!name}")")
+            fi
+            ;;
         DAGRUN_ARTIFACT_READY_DIR)
             [[ ${!name} == /* ]] || {
                 echo "run-in-pinned-root: DAGRUN_ARTIFACT_READY_DIR must be absolute" >&2
