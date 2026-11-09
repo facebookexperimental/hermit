@@ -5842,18 +5842,23 @@ mod tests {
             "cargo_profile": "validate", "build_mode": "buck",
             "feature_set": native_features,
         });
-        assert!(check_prepared_cohort(
-            &buck_record,
-            "prepared Nextest run",
-            NATIVE_EXEC_COHORT,
-            NATIVE_EXEC_COHORT.resolve_build_mode("buck"),
-            Some(native_features),
-        )
-        .is_err());
+        assert!(
+            check_prepared_cohort(
+                &buck_record,
+                "prepared Nextest run",
+                NATIVE_EXEC_COHORT,
+                NATIVE_EXEC_COHORT.resolve_build_mode("buck"),
+                Some(native_features),
+            )
+            .is_err()
+        );
         // The pinned producer command carries the literal mode, never the
         // run-mode forwarding that prepare would refuse under buck.
         let command = cohort_prepare_command("full", NATIVE_EXEC_COHORT).unwrap();
-        assert!(command.contains("--build-mode cargo --cohort native-exec"), "{command}");
+        assert!(
+            command.contains("--build-mode cargo --cohort native-exec"),
+            "{command}"
+        );
         assert!(!command.contains("HERMIT_VALIDATE_BUILD_MODE"), "{command}");
     }
 

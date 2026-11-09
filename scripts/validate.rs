@@ -1490,21 +1490,35 @@ fn establish_build_mode_environment(
     Ok(build_mode)
 }
 
-/// Refuse buck build mode outside the full level, by name and before any
-/// node runs. Only the full producer carries the build-mode segment into
-/// prepare (`prepare full --build-mode`); the quick, super,
-/// portable-only, privileged and hosted-portable prepares stamp cargo
-/// records, which a buck run's consumers would then refuse late and
-/// obscurely. Buck at those levels earns admission by threading the mode
-/// through their producers, not by falling through to cargo here.
-fn check_build_mode_level(build_mode: &str, level: Level) -> Result<(), String> {
-    if build_mode == BUILD_MODE_BUCK && level != Level::Full {
-        return Err(format!(
+/// Refuse buck build mode outside an unfocused full run, by name and
+/// before any node runs. Only the full producer carries the build-mode
+/// segment into prepare (`prepare full --build-mode`); the quick, super
+/// and portable-only levels and every focused profile (privileged-only,
+/// hosted-portable-only, and the rest — all of which parse with the
+/// default full level) select prepares that stamp cargo records, which a
+/// buck run's consumers would then refuse late and obscurely. Buck in
+/// those selections earns admission by threading the mode through their
+/// producers, not by falling through to cargo here.
+fn check_build_mode_selection(
+    build_mode: &str,
+    level: Level,
+    focused: Option<&Focused>,
+) -> Result<(), String> {
+    if build_mode != BUILD_MODE_BUCK {
+        return Ok(());
+    }
+    match (level, focused) {
+        (Level::Full, None) => Ok(()),
+        (_, Some(focused)) => Err(format!(
+            "--build-mode buck is supported only by an unfocused full run; focused mode --{} (profile {}) prepares its Nextest selections with cargo and has no buck harvest. Rerun unfocused at the full level, or drop --build-mode buck.",
+            focused.cli_name(),
+            focused.profile()
+        )),
+        (level, None) => Err(format!(
             "--build-mode buck is supported only at the full level; level {} prepares its Nextest selections with cargo and has no buck harvest. Rerun at the full level, or drop --build-mode buck.",
             level.name()
-        ));
+        )),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1549,16 +1563,52 @@ mod build_mode_environment_tests {
         // buck mode into unrelated fixture prepares.
         establish_build_mode_environment(None, None).unwrap();
         assert_eq!(std::env::var(BUILD_MODE_ENV).unwrap(), BUILD_MODE_CARGO);
-        // Buck is a full-level mode: every other level refuses by name,
-        // and cargo is admitted at every level.
+        // Buck is an unfocused-full mode: every other level and every
+        // focused profile refuses by name, and cargo is admitted in
+        // every selection.
         for level in [Level::Quick, Level::PortableOnly, Level::Super] {
-            let error = check_build_mode_level(BUILD_MODE_BUCK, level).unwrap_err();
+            let error = check_build_mode_selection(BUILD_MODE_BUCK, level, None).unwrap_err();
             assert!(error.contains(level.name()), "{error}");
             assert!(error.contains("only at the full level"), "{error}");
-            check_build_mode_level(BUILD_MODE_CARGO, level).unwrap();
+            check_build_mode_selection(BUILD_MODE_CARGO, level, None).unwrap();
         }
-        check_build_mode_level(BUILD_MODE_BUCK, Level::Full).unwrap();
-        check_build_mode_level(BUILD_MODE_CARGO, Level::Full).unwrap();
+        check_build_mode_selection(BUILD_MODE_BUCK, Level::Full, None).unwrap();
+        check_build_mode_selection(BUILD_MODE_CARGO, Level::Full, None).unwrap();
+        for focused in [Focused::PrivilegedOnly, Focused::HostedPortable] {
+            let error =
+                check_build_mode_selection(BUILD_MODE_BUCK, Level::Full, Some(&focused))
+                    .unwrap_err();
+            assert!(error.contains(focused.cli_name()), "{error}");
+            assert!(error.contains("unfocused full"), "{error}");
+            check_build_mode_selection(BUILD_MODE_CARGO, Level::Full, Some(&focused)).unwrap();
+        }
+        // Parser to policy: the focused flags parse with the default full
+        // level, so the refusal must come from the focused selection, not
+        // the level.
+        for argv in [
+            vec!["--privileged-only", "--build-mode", "buck"],
+            // Hosted selections are off-record shard modes; the parser
+            // requires the explicit off-record opt-in beside them.
+            vec![
+                "--hosted-portable-only",
+                "--allow-local-off-the-record-run",
+                "--build-mode",
+                "buck",
+            ],
+        ] {
+            let parsed =
+                parse_argv(&argv.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+                    .expect("focused buck argv parses; policy refuses it");
+            assert_eq!(parsed.level, Level::Full);
+            assert_eq!(parsed.build_mode.as_deref(), Some(BUILD_MODE_BUCK));
+            let error = check_build_mode_selection(
+                BUILD_MODE_BUCK,
+                parsed.level,
+                parsed.focused.as_ref(),
+            )
+            .unwrap_err();
+            assert!(error.contains("unfocused full"), "{error}");
+        }
         // A non-UTF-8 ambient value refuses by variable name for both
         // variables, instead of collapsing to unset.
         #[cfg(unix)]
@@ -30195,7 +30245,9 @@ fn run(
             return RunSummary::refused(2, args.level.name(), "build mode", vec![error]);
         }
     };
-    if let Err(error) = check_build_mode_level(&build_mode, args.level) {
+    if let Err(error) =
+        check_build_mode_selection(&build_mode, args.level, args.focused.as_ref())
+    {
         return RunSummary::refused(2, args.level.name(), "build mode", vec![error]);
     }
 
