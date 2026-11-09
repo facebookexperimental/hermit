@@ -14,4 +14,5 @@ tpx_labels = struct(
     disabled = "",
     run_as_bundle = "",
     test_is_invisible_to_testpilot = "",
+    enable_artifact_reporting = "",
 )

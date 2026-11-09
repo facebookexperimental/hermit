@@ -194,9 +194,10 @@ def cpp_unittest(
     resources = {},
     test_main = None,
     versions = None,
+    network_access = None,
     **kwargs,
 ):
-    _unused = (supports_static_listing, allocator, owner, labels, emails, extract_helper_lib, compiler_specific_flags, default_strip_mode, versions)  # @unused
+    _unused = (supports_static_listing, allocator, owner, labels, emails, extract_helper_lib, compiler_specific_flags, default_strip_mode, versions, network_access)  # @unused
     if test_main != None:
         deps = deps + [test_main]
     elif read_bool("oss", "folly_cxx_tests", True):

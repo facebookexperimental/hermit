@@ -168,7 +168,7 @@ buck_sh_test(
         env = {
             "HERMIT_BIN": "$(location //hermetic_infra/hermit/hermit-cli:hermit)",
         },
-        test = "./util/hermit_verify_trace_replay.sh",
+        test = "//hermetic_infra/hermit/tests/util:hermit_verify_trace_replay.sh",
     )
     for test_target in [
         # TODO: Fixme, currently broken:
@@ -189,7 +189,7 @@ buck_sh_test(
             "ANALYZE_OPTS": analyze_opts,
             "EXPECTED_OUTPUT": expected_output,
         },
-        test = "./util/hermit_analyze_test.sh",
+        test = "//hermetic_infra/hermit/tests/util:hermit_analyze_test.sh",
     )
     for (name, target, analyze_opts, expected_output) in [
         # ("hello_race_mini", "$(location //hermetic_infra/hermit/flaky-tests:hello_race_mini)", "", ""),
@@ -297,7 +297,7 @@ buck_sh_test(
         path = path,
     )
     for path, hermit_args in {
-        "c/just_spin.c": [
+        "//hermetic_infra/hermit/tests/c:just_spin.c": [
             "--preemption-timeout=10000000",
         ],
     }.items()
@@ -305,9 +305,9 @@ buck_sh_test(
 
 buck_genrule(
     name = "minimal_hello",
-    srcs = ["c/simple/hello_nostdlib.c"],
+    srcs = ["//hermetic_infra/hermit/tests/c/simple:hello_nostdlib.c"],
     out = "minimal_hello.bin",
-    cmd = "clang.par -g -nostdlib c/simple/hello_nostdlib.c -o $OUT",
+    cmd = "clang.par -g -nostdlib $(location //hermetic_infra/hermit/tests/c/simple:hello_nostdlib.c) -o $OUT",
     # Is there an efficient/correct way to depend on clang as a buck target?
     # cmd = "$(location fbsource//third-party/llvm-project/12.0.0-fbcode:bin/clang-12) -nostdlib c/simple/hello_nostdlib.c -o $OUT",
     executable = True,
@@ -315,9 +315,9 @@ buck_genrule(
 
 buck_genrule(
     name = "racewrite_nostdlib",
-    srcs = ["c/simple/racewrite_nostdlib.c"],
+    srcs = ["//hermetic_infra/hermit/tests/c/simple:racewrite_nostdlib.c"],
     out = "racewrite_nostdlib.bin",
-    cmd = "clang.par -g -nostdlib c/simple/racewrite_nostdlib.c -o $OUT",
+    cmd = "clang.par -g -nostdlib $(location //hermetic_infra/hermit/tests/c/simple:racewrite_nostdlib.c) -o $OUT",
     # Is there an efficient/correct way to depend on clang as a buck target?
     # cmd = "$(location fbsource//third-party/llvm-project/12.0.0-fbcode:bin/clang-12) -nostdlib c/simple/hello_nostdlib.c -o $OUT",
     executable = True,
@@ -327,7 +327,7 @@ buck_genrule(
 cpp_binary(
     name = "nanosleep-threads-simple",
     srcs = [
-        "c/simple/nanosleep-threads-simple.c",
+        "//hermetic_infra/hermit/tests/c/simple:nanosleep-threads-simple.c",
     ],
     allocator = "malloc",
     external_deps = [
@@ -338,7 +338,7 @@ cpp_binary(
 cpp_binary(
     name = "nanosleep-threads-nocrash",
     srcs = [
-        "c/simple/nanosleep-threads-nocrash.c",
+        "//hermetic_infra/hermit/tests/c/simple:nanosleep-threads-nocrash.c",
     ],
     allocator = "malloc",
     external_deps = [
@@ -491,18 +491,18 @@ hermit_chaos_stress_test(
 # For reuse as a dependency in other tests:
 export_file(
     name = "simplest_server_py",
-    src = "util/simplest_server.py",
+    src = "//hermetic_infra/hermit/tests/util:simplest_server.py",
     visibility = ["//hermetic_infra/hermit/tests/..."],
 )
 
 cpp_binary(
     name = "memoryPress",
-    srcs = ["c/memoryPress.c"],
+    srcs = ["//hermetic_infra/hermit/tests/c:memoryPress.c"],
 )
 
 buck_sh_binary(
     name = "chaos_stress_wrapper",
-    main = "util/chaos_stress_wrapper.sh",
+    main = "//hermetic_infra/hermit/tests/util:chaos_stress_wrapper.sh",
 )
 # TODO: In the future add Java tests, go tests, etc.
 

@@ -140,7 +140,10 @@ def build_test(
         )
 
 def resolve_target_name(path, kind):
-    basename = paths.replace_extension(paths.basename(path), "")
+    # Accept a plain path or a label (//...:file.c); the target name comes
+    # from the file name either way.
+    file_name = path.split(":")[-1]
+    basename = paths.replace_extension(paths.basename(file_name), "")
     return "{}bin_{}".format(kind, basename)
 
 def hermit_verify_c_bin(path, name_suffix, guest_args = [], args = [], hermit_args = [], env = {}):
@@ -151,7 +154,7 @@ def hermit_verify_c_bin(path, name_suffix, guest_args = [], args = [], hermit_ar
             target_compatible_with = ["ovr_config//cpu:x86_64"],
             name = target,
             srcs = [path],
-            headers = ["c/util/assert.h"],
+            headers = ["//hermetic_infra/hermit/tests/c:assert.h"],
             deps = [],
         )
     hermit_verify(
@@ -245,7 +248,7 @@ def hermit_c_test(
         target_compatible_with = ["ovr_config//cpu:x86_64"],
         name = bin_name,
         srcs = [path],
-        headers = ["c/util/assert.h"],
+        headers = ["//hermetic_infra/hermit/tests/c:assert.h"],
         deps = [],
     )
     build_test(

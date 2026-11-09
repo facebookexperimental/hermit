@@ -12,10 +12,14 @@
 def _set_package_default(_access):
     pass
 
+def _all():
+    return "public"
+
 network_access_utils = struct(
     NetworkAccess = struct(
         none = "none",
         public = "public",
     ),
     set_package_default = _set_package_default,
+    all = _all,
 )

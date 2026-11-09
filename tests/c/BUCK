@@ -1,6 +1,24 @@
 load("@fbcode_macros//build_defs:cpp_binary.bzl", "cpp_binary")
+load("@fbcode_macros//build_defs:export_files.bzl", "export_file")
 
 oncall("hermit")
+
+# Named by label from tests/BUCK and tests/helpers.bzl; a package may not
+# list another package's files as sources.
+export_file(
+    name = "just_spin.c",
+    src = "just_spin.c",
+)
+
+export_file(
+    name = "memoryPress.c",
+    src = "memoryPress.c",
+)
+
+export_file(
+    name = "assert.h",
+    src = "util/assert.h",
+)
 
 # These are guest programs for `hermit run`, not unit tests: each has its own
 # main(), several expect Hermit's virtualized results, and none speaks the

@@ -9,10 +9,17 @@ oncall("hermit")
 # Inputs not yet built by Buck are staged into staged/ (gitignored) by ./stage from a
 # cargo-built harness bundle: test-harness binaries, `test-harness build` fixtures, the
 # source snapshot cells read, compat run-state, and the backend install bundle.
+# ./stage writes staged/SOURCE_SHA last in both modes, so its presence at parse
+# time means a complete staging. Without one (a fresh checkout), point the
+# exports at a committed placeholder so `buck2 targets hermit//...` parses;
+# building :bundle in that state produces no usable bundle, and
+# validate-node --cells-only still refuses to run unstaged.
+_STAGED = bool(glob(["staged/SOURCE_SHA"]))
+
 [
     export_file(
         name = "staged-" + part,
-        src = "staged/" + part,
+        src = ("staged/" + part) if _STAGED else "unstaged-placeholder.txt",
     )
     for part in ["bin", "build", "hermit", "install", "run-state", "src", "SOURCE_SHA"]
 ]

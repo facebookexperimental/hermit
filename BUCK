@@ -32,8 +32,14 @@ rust_library(
         "inguest-engine/src/native/prelude.rs",
         "inguest-engine/src/observation.rs",
         "inguest-engine/src/runtime.rs",
-        "common/inguest/glibc_compat.rs",
     ],
+    # glibc_compat.rs lives in the //common package, so it cannot be a srcs
+    # path here. Map it to the same virtual path the #[path] module in
+    # inguest-engine/src/lib.rs resolves (../../common/inguest/...), so both
+    # builders compile identical sources.
+    mapped_srcs = {
+        "//hermetic_infra/hermit/common:glibc_compat.rs": "common/inguest/glibc_compat.rs",
+    },
     crate = "hermit_inguest_engine",
     crate_root = "inguest-engine/src/lib.rs",
     edition = "2024",
