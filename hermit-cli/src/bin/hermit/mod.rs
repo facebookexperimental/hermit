@@ -1518,6 +1518,275 @@ mod tests {
         assert!(bytes.is_empty());
     }
 
+    #[test]
+    fn owned_stdin_transfers_the_exact_file_and_bytes_once() {
+        use std::io::Read;
+        use std::io::Seek;
+        use std::io::SeekFrom;
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+
+        let expected = b"owned\0stdin\xff\nlast-without-newline";
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(expected).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let fd = file.as_raw_fd();
+        let metadata = file.metadata().unwrap();
+        let calls = std::cell::Cell::new(0);
+        let source_calls = &calls;
+        let mut stdin = super::OwnedStdin::new(move || {
+            source_calls.set(source_calls.get() + 1);
+            Ok(Some(file))
+        });
+        assert_eq!(calls.get(), 0);
+        let mut input = stdin.take().unwrap().unwrap();
+        assert_eq!(calls.get(), 1);
+        assert_eq!(input.as_raw_fd(), fd);
+        let actual_metadata = input.metadata().unwrap();
+        assert_eq!(actual_metadata.dev(), metadata.dev());
+        assert_eq!(actual_metadata.ino(), metadata.ino());
+        let error = stdin.take().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "owned-stdin-provider-already-consumed");
+        assert_eq!(calls.get(), 1);
+        let mut bytes = Vec::new();
+        input.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn owned_stdin_consumes_closed_input_and_source_errors_once() {
+        for closed in [true, false] {
+            let calls = std::cell::Cell::new(0);
+            let mut stdin = super::OwnedStdin::new(|| {
+                calls.set(calls.get() + 1);
+                if closed {
+                    Ok(None)
+                } else {
+                    Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+                }
+            });
+            assert_eq!(calls.get(), 0);
+            let first = stdin.take();
+            if closed {
+                assert!(first.unwrap().is_none());
+            } else {
+                assert_eq!(first.unwrap_err().raw_os_error(), Some(libc::EINVAL));
+            }
+            assert_eq!(calls.get(), 1);
+            let second = stdin.take().unwrap_err();
+            assert_eq!(second.kind(), std::io::ErrorKind::Other);
+            assert_eq!(second.to_string(), "owned-stdin-provider-already-consumed");
+            assert_eq!(calls.get(), 1);
+        }
+    }
+
+    #[test]
+    fn subcommand_refusals_leave_the_owned_stdin_source_unconsumed() {
+        use std::os::fd::AsRawFd;
+
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
+        for (argv, expected, refuse_host, expected_host_calls) in [
+            (
+                vec![
+                    "hermit",
+                    "--backend=kvm",
+                    "record",
+                    "--verify",
+                    "--",
+                    "/nonexistent/hermit-owned-stdin-guest",
+                ],
+                "the KVM backend is available only through",
+                false,
+                0,
+            ),
+            (
+                vec![
+                    "hermit",
+                    "run",
+                    "--",
+                    "/nonexistent/hermit-owned-stdin-guest",
+                ],
+                "owned-stdin-test-host-refusal",
+                true,
+                1,
+            ),
+            (
+                vec![
+                    "hermit",
+                    "--log=warn",
+                    "run",
+                    "--verify",
+                    "--cpu-profile=x86-64-v2",
+                    "--max-timeslice=disabled",
+                    "--no-rcb-time",
+                    "--",
+                    "/nonexistent/hermit-owned-stdin-guest",
+                ],
+                "--verify requires --log=info or a more verbose level; received --log=warn",
+                false,
+                1,
+            ),
+        ] {
+            let mut args = Args::try_parse_from(argv).unwrap();
+            let file = tempfile::tempfile().unwrap();
+            let fd = file.as_raw_fd();
+            let source_calls = std::cell::Cell::new(0);
+            let source_count = &source_calls;
+            let mut stdin = super::OwnedStdin::new(move || {
+                source_count.set(source_count.get() + 1);
+                Ok(Some(file))
+            });
+            let host_calls = std::cell::Cell::new(0);
+            let error = args
+                .command
+                .main_with_backend_and_host_admission_and_stdin(
+                    &args.global,
+                    &super::core_adapter::CoreApplicationAdapter,
+                    (),
+                    false,
+                    |_| {
+                        host_calls.set(host_calls.get() + 1);
+                        if refuse_host {
+                            Err(Error::msg("owned-stdin-test-host-refusal"))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    &mut stdin,
+                )
+                .unwrap_err();
+            assert!(error.to_string().starts_with(expected), "{error:#}");
+            assert_eq!(host_calls.get(), expected_host_calls);
+            assert_eq!(source_calls.get(), 0, "{error:#}");
+            // A refusal leaves the original source callable and its owner
+            // intact; it does not substitute, close or preconsume the input.
+            assert_eq!(stdin.take().unwrap().unwrap().as_raw_fd(), fd);
+            assert_eq!(source_calls.get(), 1);
+        }
+    }
+
+    #[test]
+    fn subcommand_consumes_the_supplied_stdin_error_at_the_run_boundary() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
+        let mut args = owned_stdin_verification_args();
+        let calls = std::cell::Cell::new(0);
+        let mut stdin = super::OwnedStdin::new(|| {
+            calls.set(calls.get() + 1);
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        });
+        let error = args
+            .command
+            .main_with_backend_and_host_admission_and_stdin(
+                &args.global,
+                &super::core_adapter::CoreApplicationAdapter,
+                (),
+                false,
+                |_| Ok(()),
+                &mut stdin,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EIO)
+        );
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            stdin.take().unwrap_err().to_string(),
+            "owned-stdin-provider-already-consumed"
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn subcommand_snapshots_the_supplied_stdin_bytes_for_repeated_reads() {
+        use std::io::Read;
+        use std::io::Seek;
+        use std::io::SeekFrom;
+        use std::io::Write;
+
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
+        let expected = b"explicit\0stdin\xff\nlast-without-newline";
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(expected).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let source_calls = &calls;
+        let mut stdin = super::OwnedStdin::new(move || {
+            source_calls.set(source_calls.get() + 1);
+            Ok(Some(file))
+        });
+        let mut args = owned_stdin_verification_args();
+        let error = args
+            .command
+            .main_with_backend_and_host_admission_and_stdin(
+                &args.global,
+                &super::core_adapter::CoreApplicationAdapter,
+                (),
+                false,
+                |_| Ok(()),
+                &mut stdin,
+            )
+            .unwrap_err();
+        assert_kvm_timeout_refusal(&error);
+        assert_eq!(calls.get(), 1);
+        for _ in 0..2 {
+            let (reserved, input) = crate::output_backend_stdin_reservation().unwrap();
+            assert!(reserved);
+            let mut input = input.expect("the supplied file was snapshotted");
+            let mut bytes = Vec::new();
+            input.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, expected);
+        }
+        assert_eq!(
+            stdin.take().unwrap_err().to_string(),
+            "owned-stdin-provider-already-consumed"
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn production_dispatch_and_run_wrappers_require_startup_stdin() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
+        let mut args = owned_stdin_verification_args();
+        let error = args
+            .command
+            .main_with_backend_and_host_admission(
+                &args.global,
+                &super::core_adapter::CoreApplicationAdapter,
+                (),
+                false,
+                |_| Ok(()),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "startup stdin was not captured exactly once"
+        );
+        let mut args = owned_stdin_verification_args();
+        let Subcommand::Run(run) = &mut args.command else {
+            unreachable!("the helper always parses run")
+        };
+        let error = run.main(&args.global).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "startup stdin was not captured exactly once"
+        );
+        assert!(!crate::output_backend_stdin_reservation().unwrap().0);
+    }
+
     #[derive(Debug, PartialEq, Eq)]
     struct EntryFdSnapshot {
         device: libc::dev_t,
