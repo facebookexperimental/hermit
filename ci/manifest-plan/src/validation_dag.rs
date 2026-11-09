@@ -9508,7 +9508,7 @@ sys.exit(37)
             step.timeout = crate::validation_dag_static::WORKSPACE_WALL_SECONDS
         });
         assert!(
-            hosted_wall.contains("not the hosted 2100s"),
+            hosted_wall.contains("not the hosted 3300s"),
             "{hosted_wall}"
         );
         let hosted_cpu = mutated("build.workspace_on_host", &|step| step.cpu_timeout += 1);

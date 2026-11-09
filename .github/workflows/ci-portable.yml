@@ -508,11 +508,11 @@ jobs:
     if: needs.select.outputs.build_debug != 'false'
     runs-on: ubuntu-latest
     # The selected debug DAG's critical path is setup.nextest (600s wall) then
-    # build.workspace_on_host (2100s wall since 2026-10-06; the measurement is
-    # in that node's description in ci/dag/validate.json), 2700s. Keep the
+    # build.workspace_on_host (3300s wall since 2026-11-09; the measurement is
+    # in that node's description in ci/dag/validate.json), 3900s. Keep the
     # hosted job outside that path plus at least 300s for setup and artifact
-    # overhead: 3000s.
-    timeout-minutes: 50
+    # overhead: 4200s.
+    timeout-minutes: 70
     outputs:
       e2e_matrix: ${{ steps.cells.outputs.matrix }}
       parity_archive_count: ${{ steps.cells.outputs.archive_count }}
