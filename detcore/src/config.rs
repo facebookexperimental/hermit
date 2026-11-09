@@ -582,7 +582,7 @@ mod tests {
         let payload = include_str!("store_exclusive.rs");
         let schedule = detcore_model::SCHEDULE_RS_SOURCE;
         let replayer = include_str!("scheduler/replayer.rs");
-        let host_input = include_str!("../../detcore-model/src/host_input.rs");
+        let host_input = detcore_model::HOST_INPUT_RS_SOURCE;
         let task_stat = include_str!("procfs/task_stat.rs");
         let digest = definition_digest(source, payload, schedule, replayer, host_input, task_stat);
         let resources = include_str!("resources.rs");
