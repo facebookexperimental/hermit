@@ -155,11 +155,10 @@ pub fn declaration_for_ledger(ledger: &str) -> Option<&'static Declaration> {
         .find(|declaration| declaration.ledger == ledger)
 }
 
-/// The node's pinned number of required tests: its `NEXTEST_EXPECTED_EXECUTED`.
-pub fn required_tests(declaration: &Declaration) -> Option<u64> {
-    crate::validation_dag_static::expected_nextest_count(declaration.node)
-}
-
+/// A declaration's required tests are derived, never pinned: the suite's
+/// listed population less its run gap rows (see `required`). The node's
+/// listed population as a whole is census-guarded against the last landed
+/// population by ci/census-check.sh.
 /// How a gap row's failing attempt must end, or that the node does not run it.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Outcome {
@@ -1559,7 +1558,8 @@ mod tests {
             declaration_for_ledger(declaration.ledger),
             Some(declaration)
         );
-        assert!(required_tests(declaration).is_some_and(|count| count > 0));
+        // Required tests are derived from the suite less the ledger (see
+        // `required`); no pinned total is asserted here any more.
         assert!(DECLARATIONS.iter().all(|declaration| {
             declaration.id_prefix.ends_with('$')
                 && is_test_id(&format!(

@@ -93,7 +93,7 @@ fn usage() -> &'static str {
      runs every other test once on the declared backend (HERMIT_TEST_BACKEND,\n      \
      NEXTEST_RETRIES=0) through ci/run-nextest-counted.sh, prints KNOWN-KVM-GAP for each gap\n      \
      row that failed as its row says, and writes the node's schema-4 structured results to\n      \
-     DAGRUN_TEST_COUNTS_PATH. NEXTEST_EXPECTED_EXECUTED is the number of required tests.\n      \
+     DAGRUN_TEST_COUNTS_PATH. NEXTEST_EXPECTED_EXECUTED, when set, pins the number of required tests.\n      \
      NEXTEST_ARGS select the suite and carry no filter expression: the node chooses its tests.\n      \
      Exits 0 only when every required test passed, the backend-proof test proved the backend,\n      \
      and every gap row it ran failed as its row says.\n\n\
@@ -535,7 +535,7 @@ fn plan(
     declaration: &Declaration,
     rows: &[Row],
     population: &BTreeSet<String>,
-    expected_required: usize,
+    expected_required: Option<usize>,
 ) -> Result<BTreeSet<String>, String> {
     let proof = format!(
         "{}{}",
@@ -575,14 +575,19 @@ fn plan(
         .difference(&gaps)
         .cloned()
         .collect::<BTreeSet<_>>();
-    if required.len() != expected_required {
-        return Err(format!(
-            "the run executes {} tests, {} of them gap rows, so {} are required ({} skipped rows are not run), but the node is pinned to {expected_required} (NEXTEST_EXPECTED_EXECUTED); a deleted row raises the pin, a new test raises it, and a new row needs a bound approval: update the pin with the change that moves it",
-            population.len(),
-            gaps.len(),
-            required.len(),
-            skipped.len()
-        ));
+    // With no pinned total (the DAG no longer declares one), the required
+    // set is derived: population less run gap rows. An explicitly supplied
+    // NEXTEST_EXPECTED_EXECUTED (a case-sliced run) is still honoured.
+    if let Some(expected_required) = expected_required {
+        if required.len() != expected_required {
+            return Err(format!(
+                "the run executes {} tests, {} of them gap rows, so {} are required ({} skipped rows are not run), but the run is pinned to {expected_required} (NEXTEST_EXPECTED_EXECUTED); a deleted row raises the pin, a new test raises it, and a new row needs a bound approval: update the pin with the change that moves it",
+                population.len(),
+                gaps.len(),
+                required.len(),
+                skipped.len()
+            ));
+        }
     }
     Ok(required)
 }
@@ -1167,12 +1172,17 @@ fn run(nextest_args: &[String]) -> Result<bool, String> {
         .map(str::to_string)
         .collect::<BTreeSet<_>>();
     let nextest_args = with_filter(nextest_args, skip_filter(declaration, &rows).as_deref());
-    let expected_required = env::var("NEXTEST_EXPECTED_EXECUTED")
-        .map_err(|_| {
-            "NEXTEST_EXPECTED_EXECUTED (the number of required tests) is not set".to_string()
-        })?
-        .parse::<usize>()
-        .map_err(|error| format!("NEXTEST_EXPECTED_EXECUTED: {error}"))?;
+    let expected_required = match env::var("NEXTEST_EXPECTED_EXECUTED") {
+        Ok(value) => Some(
+            value
+                .parse::<usize>()
+                .map_err(|error| format!("NEXTEST_EXPECTED_EXECUTED: {error}"))?,
+        ),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err("NEXTEST_EXPECTED_EXECUTED is not UTF-8".into());
+        }
+    };
     let population = listed_population(
         &nextest_list(&root, &nextest_args)?,
         declaration,
@@ -1495,11 +1505,10 @@ mod tests {
         for declaration in known_gaps::DECLARATIONS {
             let (rows, tests) = read_declared(&root, declaration).unwrap();
             assert_eq!(static_violations(declaration, &rows, &tests), None);
-            let required = known_gaps::required(declaration, &rows, &tests).len() as u64;
-            assert_eq!(
-                Some(required),
-                known_gaps::required_tests(declaration),
-                "{}: the suite less the ledger is not the node's pinned count",
+            let required = known_gaps::required(declaration, &rows, &tests);
+            assert!(
+                !required.is_empty(),
+                "{}: the suite less the ledger has no required tests",
                 declaration.ledger
             );
         }
@@ -1690,14 +1699,14 @@ mod tests {
         rows.push(skipped_row("s"));
         // a, b and proof are required; g and t2 are run as gaps; s is not run.
         assert_eq!(
-            plan(&DECLARATION, &rows, &population(), 3).unwrap().len(),
+            plan(&DECLARATION, &rows, &population(), Some(3)).unwrap().len(),
             3
         );
-        let error = plan(&DECLARATION, &rows, &population(), 4).unwrap_err();
+        let error = plan(&DECLARATION, &rows, &population(), Some(4)).unwrap_err();
         assert!(error.contains("1 skipped rows are not run"), "{error}");
         let mut with_s = population();
         with_s.insert(id("s"));
-        let error = plan(&DECLARATION, &rows, &with_s, 3).unwrap_err();
+        let error = plan(&DECLARATION, &rows, &with_s, Some(3)).unwrap_err();
         assert!(
             error.contains("skipped rows name tests the run would execute: pkg::suite$s"),
             "{error}"
@@ -1771,20 +1780,20 @@ mod tests {
     #[test]
     fn the_plan_holds_the_required_count_to_its_pin() {
         assert_eq!(
-            plan(&DECLARATION, &rows(), &population(), 3).unwrap().len(),
+            plan(&DECLARATION, &rows(), &population(), Some(3)).unwrap().len(),
             3
         );
-        let error = plan(&DECLARATION, &rows(), &population(), 4).unwrap_err();
+        let error = plan(&DECLARATION, &rows(), &population(), Some(4)).unwrap_err();
         assert!(error.contains("pinned to 4"), "{error}");
         let mut smaller = population();
         smaller.remove(&id("g"));
-        let error = plan(&DECLARATION, &rows(), &smaller, 3).unwrap_err();
+        let error = plan(&DECLARATION, &rows(), &smaller, Some(3)).unwrap_err();
         assert!(error.contains("would not execute"), "{error}");
         // The backend-proof test must be in the selection.
         let mut without_proof = population();
         without_proof.remove(&id("proof"));
         without_proof.insert(id("c"));
-        let error = plan(&DECLARATION, &rows(), &without_proof, 3).unwrap_err();
+        let error = plan(&DECLARATION, &rows(), &without_proof, Some(3)).unwrap_err();
         assert!(
             error.contains("backend-proof test pkg::suite$proof is not in the run's selection"),
             "{error}"

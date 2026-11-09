@@ -27,7 +27,6 @@ use serde::Deserialize;
 
 use crate::runner::E2E_KERNEL_VERSION_ENV;
 use crate::runner::E2E_MACHINE_SHORTNAME_ENV;
-use crate::validation_dag_static::NEXTEST_EXPECTED_COUNTS;
 use crate::validation_dag_static::StructuredResultProducerKind;
 
 pub const OUTPUT: &str = "ci/dag/validate.json";
@@ -1674,19 +1673,9 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
             hosted.job.push_str(HOSTED_VARIANT_SUFFIX);
             hosted.labels = vec![HOSTED_PORTABLE_LABEL.into()];
             hosted.fail_fast_family = Some(hosted.tag());
-            // A twin declares its own registered population, which differs
-            // from the local node's when the local node is split afterwards
-            // (materialize_shards).
-            if let Some((_, count)) = NEXTEST_EXPECTED_COUNTS
-                .iter()
-                .find(|(candidate, _)| *candidate == hosted.tag())
-            {
-                if hosted.env.contains_key("NEXTEST_EXPECTED_EXECUTED") {
-                    hosted
-                        .env
-                        .insert("NEXTEST_EXPECTED_EXECUTED".into(), count.to_string());
-                }
-            }
+            // Hosted twins carry no pinned population: each counted node is
+            // census-guarded on its own listed IDs (see
+            // validation_dag_static's note on the retired count table).
             let owner = hosted.tag();
             for result in hosted.result_manifests.iter_mut().flatten() {
                 if let ResultManifest::StructuredTestResults(result) = result {
@@ -1792,7 +1781,7 @@ pub const HERMIT_INTEGRATION_TAG: &str = "test.hermit_integration";
 /// its prepared selection, and narrows the authored filter to its own
 /// binaries, so a binary runs in exactly one shard.
 /// A binary added to the node joins the shard whose range holds its name; the
-/// shard's NEXTEST_EXPECTED_COUNTS entry then fails until it is updated. The
+/// shard's listed population is census-guarded like every counted node's. The
 /// hosted twin is made before this split and runs the whole node.
 ///
 /// The ranges and estimates are the per-binary sums of the PASS times of the
@@ -1964,13 +1953,6 @@ fn materialize_node_shards(cfg: &mut DagConfig, tag: &str, shards: &[Shard]) -> 
             .collect::<Vec<_>>()
             .join(" | ");
         shard.cmd = format!("{head}{FILTER}({selected}) & ({filter})'");
-        let expected = NEXTEST_EXPECTED_COUNTS
-            .iter()
-            .find_map(|(candidate, count)| (*candidate == shard_tag).then_some(*count))
-            .ok_or_else(|| format!("{shard_tag} has no NEXTEST_EXPECTED_COUNTS entry"))?;
-        shard
-            .env
-            .insert("NEXTEST_EXPECTED_EXECUTED".into(), expected.to_string());
         for result in shard.result_manifests.iter_mut().flatten() {
             if let ResultManifest::StructuredTestResults(result) = result {
                 result.owner = shard_tag.clone();
@@ -1984,7 +1966,7 @@ fn materialize_node_shards(cfg: &mut DagConfig, tag: &str, shards: &[Shard]) -> 
             " -- shard {position} of {count}, {first} to {last}"
         ));
         shard.description.push_str(&format!(
-            " SHARD {position} of {count} (validation_dag::SHARDED_NODES): the {} binaries from {first} to {last}, selected by binary(=NAME) on top of the authored filter. Each shard runs the same prepared selection, and each binary runs in one shard, serialized there. The {expected} tests and {estimate} s estimate are this shard's.",
+            " SHARD {position} of {count} (validation_dag::SHARDED_NODES): the {} binaries from {first} to {last}, selected by binary(=NAME) on top of the authored filter. Each shard runs the same prepared selection, and each binary runs in one shard, serialized there. The {estimate} s estimate is this shard's.",
             members.len()
         ));
         split.push(shard);
@@ -3458,35 +3440,6 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         })
         .collect::<Vec<_>>();
     expected.retain(|tag, _| crate::dag_source_ownership::is_admitted_core(tag));
-    let mut expected_counts = NEXTEST_EXPECTED_COUNTS
-        .iter()
-        .copied()
-        .collect::<BTreeMap<_, _>>();
-    // 43 since privileged-test.pmu_detcore_time_cases joined it
-    // (https://github.com/rrnewton/hermit/issues/3663). 41 since
-    // test.liteinst_strict and test.liteinst_strict_on_host were retired with
-    // the LiteInst host hybrid (https://github.com/rrnewton/hermit/issues/3520);
-    // 42 since test.record_replay joined it; 43 since
-    // test.pmu_integration_cases joined it.
-    // The M1 seven-identity and M2 eleven-identity targets each add one
-    // registry entry without altering existing CLI counts.
-    // The six-case inherited-terminal target adds one independently counted population.
-    // The two further shards of the local test.hermit_integration add two;
-    // privileged-cpuid.cpu_profile_v3 adds one more
-    // (https://github.com/rrnewton/hermit/issues/4243).
-    // The second PMU integration shard adds one.
-    // sabrecompat.sabre_examples, the archived SaBRe suite outside the smoke
-    // pair, adds one.
-    // privileged-test.deadline_slice_cap_kvm's required KVM tests add one.
-    // privileged-test.binder_cli_cases' two Binder cases add one (PR 4742).
-    if expected_counts.len() != 54 {
-        return Err(format!(
-            "Nextest expected-count registry has {} entries, expected 54",
-            expected_counts.len()
-        ));
-    }
-
-    expected_counts.retain(|tag, _| crate::dag_source_ownership::is_admitted_core(tag));
     let mut seen_by_kind = BTreeMap::<StructuredResultProducerKind, usize>::new();
     for step in &cfg.steps {
         let tag = step.tag();
@@ -3569,43 +3522,21 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
             (None, None, None) => {}
         }
 
-        match (
-            expected_counts.remove(tag.as_str()),
-            step.env.get("NEXTEST_EXPECTED_EXECUTED"),
-        ) {
-            (Some(expected_count), Some(actual)) if actual == &expected_count.to_string() => {}
-            (Some(expected_count), Some(actual)) => {
-                return Err(format!(
-                    "{tag} expects {expected_count} Nextest tests but declares {actual:?}"
-                ));
-            }
-            (Some(expected_count), None) => {
-                return Err(format!(
-                    "{tag} omits NEXTEST_EXPECTED_EXECUTED={expected_count}"
-                ));
-            }
-            (None, Some(actual)) => {
-                return Err(format!(
-                    "{tag} declares unexpected NEXTEST_EXPECTED_EXECUTED={actual:?}"
-                ));
-            }
-            (None, None) => {}
+        // Counted populations are census-guarded by identity (see
+        // validation_dag_static): no DAG step may carry a pinned
+        // NEXTEST_EXPECTED_EXECUTED. The counted wrapper derives that
+        // variable from the run's own inventory at run time; a value in
+        // the committed DAG would be a count pin again.
+        if let Some(actual) = step.env.get("NEXTEST_EXPECTED_EXECUTED") {
+            return Err(format!(
+                "{tag} declares retired NEXTEST_EXPECTED_EXECUTED={actual:?}; counted populations are census-guarded, never pinned"
+            ));
         }
     }
     if !expected.is_empty() {
         return Err(format!(
             "registered structured result producers are absent from the DAG: {}",
             expected.keys().copied().collect::<Vec<_>>().join(", ")
-        ));
-    }
-    if !expected_counts.is_empty() {
-        return Err(format!(
-            "Nextest expected-count steps are absent from the DAG: {}",
-            expected_counts
-                .keys()
-                .copied()
-                .collect::<Vec<_>>()
-                .join(", ")
         ));
     }
     let actual_group_counts = StructuredResultProducerKind::ALL
@@ -4763,15 +4694,13 @@ fn assert_m1_allocator_gate(cfg: &DagConfig) -> Result<(), String> {
             return Err(format!("M1 consumer lost prerequisite {required}"));
         }
     }
-    if consumer
-        .env
-        .get("NEXTEST_EXPECTED_EXECUTED")
-        .map(String::as_str)
-        != Some("4")
-        || consumer.integration_test_binaries.as_deref()
-            != Some(&["liteinst_allocator".to_owned()][..])
+    if consumer.env.contains_key("NEXTEST_EXPECTED_EXECUTED") {
+        return Err("M1 consumer declares a retired Nextest count pin".into());
+    }
+    if consumer.integration_test_binaries.as_deref()
+        != Some(&["liteinst_allocator".to_owned()][..])
     {
-        return Err("M1 consumer lost its four-test target population".into());
+        return Err("M1 consumer lost its allocator target population".into());
     }
     crate::nextest_build_selections::assert_command_selection(consumer)?;
     let command = crate::nextest_build_selections::execution_command(consumer)?;
@@ -4825,15 +4754,13 @@ fn assert_m2_stack_gate(cfg: &DagConfig) -> Result<(), String> {
             return Err(format!("M2 consumer lost prerequisite {required}"));
         }
     }
-    if consumer
-        .env
-        .get("NEXTEST_EXPECTED_EXECUTED")
-        .map(String::as_str)
-        != Some("9")
-        || consumer.integration_test_binaries.as_deref()
-            != Some(&["liteinst_stacks".to_owned()][..])
+    if consumer.env.contains_key("NEXTEST_EXPECTED_EXECUTED") {
+        return Err("stack consumer declares a retired Nextest count pin".into());
+    }
+    if consumer.integration_test_binaries.as_deref()
+        != Some(&["liteinst_stacks".to_owned()][..])
     {
-        return Err("stack consumer lost its nine-test target population".into());
+        return Err("stack consumer lost its stacks target population".into());
     }
     crate::nextest_build_selections::assert_command_selection(consumer)?;
     let command = crate::nextest_build_selections::execution_command(consumer)?;
@@ -7113,10 +7040,9 @@ sys.exit(37)
                 format!("{expected_filter}' -- --ignored"),
                 "{origin}"
             );
-            assert_eq!(
-                step.env["NEXTEST_EXPECTED_EXECUTED"],
-                cases.len().to_string().as_str(),
-                "{origin}"
+            assert!(
+                !step.env.contains_key("NEXTEST_EXPECTED_EXECUTED"),
+                "{origin}: counted populations are census-guarded, never pinned"
             );
             assert!(
                 !step.cmd.contains("test(=analyze_hello_race)"),
@@ -7782,7 +7708,7 @@ sys.exit(37)
         for hosted in committed.steps.iter().filter(|step| {
             step.group == "test"
                 && step.job.ends_with(HOSTED_VARIANT_SUFFIX)
-                && step.env.contains_key("NEXTEST_EXPECTED_EXECUTED")
+                && step.cmd.contains("run-nextest-counted.sh")
         }) {
             let local_tag = hosted
                 .tag()
@@ -7808,13 +7734,18 @@ sys.exit(37)
             let local_payload = payload(local);
             // The local Hermit integration node runs in shards. Each runs the
             // hosted twin's command with the authored filter narrowed to its
-            // own binaries; together they select every binary once, and
-            // execute the twin's population.
-            let mut local_count = None;
+            // own binaries; together they select every binary once. Each
+            // counted node (shards and twin alike) is census-guarded on its
+            // own listed IDs; no pinned total relates them any more.
+            assert!(
+                !hosted.env.contains_key("NEXTEST_EXPECTED_EXECUTED")
+                    && !local.env.contains_key("NEXTEST_EXPECTED_EXECUTED"),
+                "{} declares a retired Nextest count pin",
+                hosted.tag()
+            );
             let local_payload = if local_tag == HERMIT_INTEGRATION_TAG {
                 let mut unsharded = BTreeSet::new();
                 let mut selected = Vec::new();
-                let mut executed = 0;
                 for shard_tag in hermit_integration_shard_tags() {
                     let shard = committed
                         .steps
@@ -7841,9 +7772,10 @@ sys.exit(37)
                         local.env.get(crate::nextest_binaries::SELECTION_ENV),
                         "{shard_tag} changed its prepared selection"
                     );
-                    executed += shard.env["NEXTEST_EXPECTED_EXECUTED"]
-                        .parse::<usize>()
-                        .unwrap();
+                    assert!(
+                        !shard.env.contains_key("NEXTEST_EXPECTED_EXECUTED"),
+                        "{shard_tag} declares a retired Nextest count pin"
+                    );
                 }
                 assert_eq!(
                     Some(&selected),
@@ -7855,7 +7787,6 @@ sys.exit(37)
                     1,
                     "the shards differ outside their binaries"
                 );
-                local_count = Some(executed);
                 unsharded.pop_first().unwrap()
             } else {
                 local_payload
@@ -8006,25 +7937,11 @@ sys.exit(37)
                 hosted.tag(),
                 crate::nextest_binaries::SELECTION_ENV
             );
-            // Both counts are measured by listing. Each exact test(=NAME) term
-            // excludes at most one test, so the hosted twin executes exactly
-            // that many fewer only if every listed name exists and nothing
-            // else is excluded.
-            let hosted_only_skips = match local_tag.as_str() {
-                "test.cli" => HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS.len(),
-                "test.hermit_unit" => HOSTED_PORTABLE_CPUID_FAULTING_HERMIT_UNIT_TESTS.len(),
-                "test.rr_suite_contract" => HOSTED_PORTABLE_PMU_TIMER_RR_TESTS.len(),
-                "test.regular_crates" => HOSTED_PORTABLE_PMU_TIMER_REPLAY_TESTS.len(),
-                _ => 0,
-            };
-            let count =
-                |step: &Step| -> usize { step.env["NEXTEST_EXPECTED_EXECUTED"].parse().unwrap() };
-            assert_eq!(
-                count(hosted) + hosted_only_skips,
-                local_count.unwrap_or_else(|| count(local)),
-                "{} changed NEXTEST_EXPECTED_EXECUTED",
-                hosted.tag()
-            );
+            // The hosted-only exclusions above are exact test(=NAME) terms:
+            // each names at most one listed test, and the payload equality
+            // just asserted leaves nothing else excluded. How many tests
+            // that leaves is the census's business (listed IDs vs the last
+            // landed population), not a pinned total here.
         }
         assert_eq!(
             checked,
@@ -8991,28 +8908,24 @@ sys.exit(37)
     #[test]
     fn structured_result_counts_and_ownership_survive_generation_transforms() {
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
-        for (tag, mutation) in [
-            ("test.regular_crates", None),
-            ("test.cli", Some("999")),
-            ("quick.run_smoke", Some("1")),
-        ] {
+        // No counted step carries a pinned total any more: declaring the
+        // retired variable, on a counted node or any other, is refused by
+        // name. (The unmutated committed DAG passing is asserted by every
+        // caller of this function, e.g. the generation checks above.)
+        for (tag, value) in [("test.cli", "999"), ("quick.run_smoke", "1")] {
             let mut changed = committed.clone();
-            let step = changed
+            changed
                 .steps
                 .iter_mut()
                 .find(|step| step.tag() == tag)
-                .unwrap();
-            match mutation {
-                Some(value) => {
-                    step.env
-                        .insert("NEXTEST_EXPECTED_EXECUTED".into(), value.into());
-                }
-                None => {
-                    step.env.remove("NEXTEST_EXPECTED_EXECUTED");
-                }
-            }
+                .unwrap()
+                .env
+                .insert("NEXTEST_EXPECTED_EXECUTED".into(), value.into());
             let error = assert_structured_result_producers(&changed).unwrap_err();
-            assert!(error.contains(tag), "{error}");
+            assert!(
+                error.contains(tag) && error.contains("retired"),
+                "{error}"
+            );
         }
 
         let mut inline_count = committed.clone();

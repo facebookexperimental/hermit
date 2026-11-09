@@ -933,18 +933,14 @@ mod tests {
             // its completeness test, and its 57 fixtures with a Rust guest.
             // Plus signal_determinism's DBT thread-directed SIGKILL refusal test.
             // The local node runs in shards, which together execute the same.
-            let executed = |tag: &str| -> u64 {
-                let step = graph.steps.iter().find(|step| step.tag() == tag).unwrap();
-                step.env["NEXTEST_EXPECTED_EXECUTED"].parse().unwrap()
-            };
-            let population: u64 = if tag == crate::validation_dag::HERMIT_INTEGRATION_TAG {
-                crate::validation_dag::hermit_integration_shard_tags()
-                    .iter()
-                    .map(|shard| executed(shard))
-                    .sum()
-            } else {
-                executed(tag)
-            };
+            // The listed population is guarded at run time by the census
+            // (listed IDs vs the last landed population), not by a total
+            // asserted here; this test keeps the selection/binary identity
+            // assertions below.
+            assert!(
+                !step.env.contains_key("NEXTEST_EXPECTED_EXECUTED"),
+                "{tag} declares a retired Nextest count pin"
+            );
             // The ten DBT SIGKILL scenarios replace one aggregate test (+9),
             // and container_init_deadline gains the parent-died-before-arming
             // test (+1). And procfs_determinism's directory-alias
@@ -1029,7 +1025,7 @@ mod tests {
             // measured by the batch3 donor validate at f7ec284e.
             // image_archive's eleven local-image tests join the second
             // shard: 722 + 11 = 733, listed.
-            assert_eq!(population, 733);
+            // (Population total intentionally unasserted: census-guarded.)
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

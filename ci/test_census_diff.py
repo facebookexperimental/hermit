@@ -182,6 +182,26 @@ def test_wired_new_test_passes(tmp_path):
     assert r.returncode == 0 and "+pkg/bin/brand_new" in r.stdout and "added=1" in r.stdout
 
 
+def test_wired_removal_with_report_only_passes(tmp_path):
+    # Enforcement is opt-out, not opt-in: the same disappearance that fails
+    # by default is only a report with --report-only.
+    r = _check(tmp_path, ["pkg/bin/kept", "pkg/bin/gone_test"],
+               cand_ids=["pkg/bin/kept"], report_only=True)
+    assert r.returncode == 0 and "gone_test" in r.stderr and "report-only" in r.stderr
+
+
+def test_wired_missing_base_file_fails_closed(tmp_path):
+    # A supplied-but-missing base must never degrade to "everything added".
+    import uuid
+    root = tmp_path / uuid.uuid4().hex
+    root.mkdir(parents=True)
+    (root / "cand.listed-ids").write_text("pkg/bin/a\n")
+    r = subprocess.run(["bash", str(CHECK), "--base-listed", str(root / "absent.listed-ids"),
+                        "--candidate-listed", str(root / "cand.listed-ids")],
+                       capture_output=True, text=True)
+    assert r.returncode == 2 and "absent.listed-ids" in r.stderr and "refusing" in r.stderr
+
+
 def test_wired_no_base_is_report_only_and_passes(tmp_path):
     r = subprocess.run(["bash", str(CHECK), "--candidate-listed", "/dev/null"],
                        capture_output=True, text=True)

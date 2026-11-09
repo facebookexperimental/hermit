@@ -21471,19 +21471,15 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         Ok(())
     }
 
-    fn require_expected_nextest_count(
+    fn require_no_nextest_count_pin(
         tag: &str,
         environment: &BTreeMap<String, String>,
-        expected: usize,
     ) -> Result<(), String> {
         match environment.get("NEXTEST_EXPECTED_EXECUTED") {
-            Some(actual) if actual == &expected.to_string() => Ok(()),
             Some(actual) => Err(format!(
-                "retry bounds: {tag} must require exactly {expected} executed tests through its typed environment, got {actual:?}"
+                "retry bounds: {tag} declares retired NEXTEST_EXPECTED_EXECUTED={actual:?}; counted populations are census-guarded, never pinned"
             )),
-            None => Err(format!(
-                "retry bounds: {tag} must require exactly {expected} executed tests through its typed environment"
-            )),
+            None => Ok(()),
         }
     }
 
@@ -21597,136 +21593,20 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .find(|(lane, _)| *lane == "privileged")
         .map(|(_, cfg)| cfg)
         .ok_or("retry bounds: privileged lane is absent")?;
-    for (tag, expected) in [
-        ("privileged-only-test.pmu_buck_chaos_cases", 6usize),
-        // The shipped KVM selection contains 52 run_kvm_ declarations (35
-        // plus the two gettimeofday EFAULT regressions and the fifteen serial
-        // KVM waitid/wait4 regressions of
-        // https://github.com/rrnewton/hermit/pull/3266) and the unchanged
-        // initialized-VM setup control. The eight-mode timer, two-role
-        // retirement and six-mode reparenting tests each count as one
-        // selected test. run_kvm_numbers_guest_tasks_as_the_ptrace_backend
-        // makes 53 declarations, 54 selected.
-        // run_kvm_names_the_execve_filename_in_at_execfn_as_ptrace_does and
-        // run_kvm_futex_wait_on_an_unreadable_word_matches_linux make 55
-        // declarations, 56 selected.
-        // run_kvm_a_parked_sleep_carries_the_deadline_cap
-        // (https://github.com/rrnewton/hermit/issues/4156): 56 declarations,
-        // 57 selected.
-        // run_kvm_a_signal_to_a_guest_blocked_in_a_polled_call_acts_as_on_linux:
-        // 57 declarations, 58 selected.
-        // The seventeen run_kvm_timerfd_virtual_* tests
-        // (https://github.com/rrnewton/hermit/issues/1923): 74 declarations,
-        // 75 selected.
-        // run_kvm_cpuinfo_matches_cpuid
-        // (https://github.com/rrnewton/hermit/issues/4161): 75 declarations,
-        // 76 selected.
-        // run_kvm_fifo_with_a_host_peer_waits_in_the_kernel_as_on_linux
-        // (https://github.com/rrnewton/hermit/pull/4210 KVM follow-up): 76
-        // declarations, 77 selected.
-        // run_kvm_costs_one_host_syscall_per_guest_syscall
-        // (https://github.com/rrnewton/hermit/issues/4287): 77 declarations, 78 selected.
-        // run_kvm_a_sibling_may_exit_while_its_signal_is_taken
-        // (https://github.com/rrnewton/hermit/issues/4367): 78 declarations, 79 selected.
-        // run_kvm_notifies_a_child_exit_once_at_bitwise_parity
-        // (https://github.com/rrnewton/hermit/issues/4360): 79 declarations, 80 selected.
-        // run_kvm_rt_sigtimedwait_writes_its_siginfo_as_ptrace_does
-        // (https://github.com/rrnewton/hermit/issues/4293): 80 declarations,
-        // 81 selected.
-        // run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting
-        // (https://github.com/rrnewton/hermit/issues/4374): 81 declarations, 82 selected.
-        // The two KVM directory/procfs-size tests of d8c4c7e3
-        // (https://github.com/rrnewton/hermit/pull/4369): 84 selected.
-        // run_kvm_notifies_a_raw_child_exit_once_at_bitwise_parity, split out of
-        // run_kvm_notifies_a_child_exit_once_at_bitwise_parity
-        // (https://github.com/rrnewton/hermit/issues/4360): 84 declarations, 85 selected.
-        // run_kvm_flock_is_a_named_refusal_where_ptrace_excludes
-        // (https://github.com/rrnewton/reverie/issues/1069): 85 declarations, 86 selected.
-        // run_kvm_cpuid_rows_match_ptrace (KVM keeps no CPUID profile): 86
-        // declarations, 87 selected.
-        // run_kvm_kill_of_a_child_is_a_named_refusal_where_ptrace_kills
-        // (https://github.com/rrnewton/hermit/issues/4485): 87 declarations, 88 selected.
-        // run_kvm_a_parked_wait_leaves_nothing_to_refuse_an_exec (Detcore's
-        // empty-signal-boundary opt-in): 90 selected.
-        // run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec
-        // (replaced-request parked ownership): 91 selected.
-        // Package K slice P1's
-        // run_kvm_procfs_directories_are_served_only_in_a_container,
-        // run_kvm_calls_below_a_served_procfs_directory_are_refused_by_name and
-        // run_kvm_a_user_mount_covering_the_placeholder_by_any_spelling_leaves_none
-        // (https://github.com/rrnewton/hermit/issues/4604): 94 selected.
-        // run_kvm_a_group_exit_ends_a_sibling_signal_wait_without_sequentializing
-        // and run_kvm_a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity
-        // (https://github.com/rrnewton/hermit/issues/4798): 96 selected.
-        // run_kvm_relative_names_are_decided_by_the_guests_working_directory,
-        // run_kvm_dotdot_names_are_decided_by_where_they_lead,
-        // run_kvm_the_virtual_cpus_are_listed_by_every_spelling,
-        // run_kvm_descriptor_directory_links_are_read_relative_to_the_working_directory
-        // and run_kvm_dotdot_from_a_received_descriptor_finds_the_guests_own_files
-        // (https://github.com/rrnewton/hermit/issues/4541): 101 selected. And
-        // run_kvm_signal_permits_are_per_thread
-        // (https://github.com/rrnewton/hermit/issues/4899): 102 selected.
-        // run_kvm_virtual_timeout_is_reported_from_the_childs_note adds the
-        // 103rd selected test, including the non-CLI setup case. And
-        // run_kvm_scm_rights_receipt_is_the_same_whichever_finishes_first and
-        // run_kvm_scm_rights_exited_receivers_queue_goes_with_its_exit
-        // (https://github.com/rrnewton/hermit/issues/4930): 105 selected. And
-        // run_kvm_refuses_a_finite_soft_address_space_limit_before_the_guest_starts
-        // and run_kvm_an_exec_the_host_refuses_memory_for_is_a_policy_refusal_not_a_guest_enomem
-        // (https://github.com/rrnewton/reverie/issues/1225): 110 selected
-        // (with the KVM named refusals' three: 105 + 3 + 2). And
-        // package K slice K8-h's
-        // run_kvm_renders_fdinfo_as_linux_does_apart_from_named_differences and
-        // run_kvm_renders_proc_locks_from_the_lock_ledger
-        // (https://github.com/rrnewton/hermit/issues/4213): 112 selected.
-        // The rest of the KVM preemption timer flip (T2) selects
-        // run_kvm_chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting
-        // again and adds run_kvm_refuses_preemption_stack_traces_by_name,
-        // run_kvm_a_late_timer_event_refuses_the_run_by_name and
-        // run_kvm_a_late_timer_event_is_a_verify_infrastructure_error: 116.
-        // And run_kvm_a_late_timer_event_in_a_replay_refuses_the_run_by_name:
-        // 117. And run_kvm_blocking_inotify_reads_kvm_cannot_run_are_refused_by_name
-        // (https://github.com/rrnewton/hermit/issues/4768): 118. And K9a-h's
-        // main-stack maps test: 119. And the same K8-d dot-dot spellings
-        // test: 120. And the KVM default rustc link refusal, overlapping
-        // SCM_RIGHTS receipt refusal, hugetlbfs view refusal and unexchangeable
-        // robust word refusal tests, N4's smaps test and PRCTL phase 2's
-        // parent-death test: 126. And package K slice K10's
-        // run_kvm_the_callers_own_proc_directories_answer_as_linux: 127. And R1108
-        // (https://github.com/rrnewton/reverie/issues/1108) retires the default
-        // rustc link refusal and lists the shared file view beside a second
-        // thread, the exited-threads fork test and the fork refusal beside a live
-        // thread: 129. And package K slice F2-h's
-        // run_kvm_the_callers_own_link_targets_answer_as_linux: 130. And package K
-        // slice F2-d0's run_kvm_another_threads_directory_links_are_refused_by_name:
-        // 131. And its
-        // run_kvm_descriptor_links_through_a_descriptor_directory_answer_as_linux:
-        // 132. And SIGSHARE S2a's
-        // run_kvm_the_drain_decides_a_polled_call_from_the_backends_signal_state:
-        // 133. And package K item 2b slice 2b-1's
-        // run_kvm_another_processs_stat_and_comm_answer_as_linux: 134. And
-        // SIGSHARE S2b's
-        // run_kvm_a_wait_under_a_temporary_mask_ends_as_on_linux: 135. And SIGSHARE
-        // S4's run_kvm_a_child_exit_sigchld_reaches_a_one_thread_parent_as_on_linux
-        // and the seventeen SIGALRM receiver tests of #4929 slice 2: 153. And the
-        // #5221 review round's sigsuspend and masked-ppoll SIGALRM tests: 155.
-        // And slice 2b-2's run_kvm_another_processs_status_answers_as_linux: 156.
-        // And slice 2b-3's
-        // run_kvm_another_processs_cmdline_and_environ_answer_as_linux: 157.
-        // And PR #5273's run_kvm_procfs_system_directory_links_answer_as_linux
-        // and run_kvm_a_user_mount_over_proc_sys_keeps_its_links: 159.
-        // And run_kvm_hermit_init_stat_and_comm_answer_as_on_ptrace: 160.
-        // And run_kvm_procfs_system_directories_answer_as_on_ptrace: 161.
-        // And run_kvm_procfs_bind_mounts_are_the_directory_they_show: 162,
-        // matching the DAG pin in validation_dag_static.
-        ("privileged-only-test.cli_kvm", 162usize),
+    // These nodes' populations were the highest-churn count pins (the KVM
+    // selection's long recount trail ended at 162). They are now guarded
+    // by the per-node census (listed IDs vs the last landed population);
+    // a pinned total in the DAG must not return.
+    for tag in [
+        "privileged-only-test.pmu_buck_chaos_cases",
+        "privileged-only-test.cli_kvm",
     ] {
         let step = privileged
             .steps
             .iter()
             .find(|step| step.tag() == tag)
-            .ok_or_else(|| format!("retry bounds: exact-count node {tag} is absent"))?;
-        require_expected_nextest_count(tag, &step.env, expected)?;
+            .ok_or_else(|| format!("retry bounds: census-guarded node {tag} is absent"))?;
+        require_no_nextest_count_pin(tag, &step.env)?;
     }
     let buffered_mutation =
         "./ci/run-nextest-counted.sh -p fixture >\"$log\" 2>&1 || status=$?; cat \"$log\"";
@@ -21737,11 +21617,13 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             "retry bounds: buffered-output mutation did not fail by node name: {buffered_error}"
         ));
     }
-    let count_error = require_expected_nextest_count("test.fixture", &BTreeMap::new(), 7)
-        .expect_err("missing exact-count declaration mutation must be refused");
-    if !count_error.contains("test.fixture") || !count_error.contains("exactly 7") {
+    let mut pinned_fixture = BTreeMap::new();
+    pinned_fixture.insert("NEXTEST_EXPECTED_EXECUTED".to_string(), "7".to_string());
+    let count_error = require_no_nextest_count_pin("test.fixture", &pinned_fixture)
+        .expect_err("retired count-pin declaration mutation must be refused");
+    if !count_error.contains("test.fixture") || !count_error.contains("retired") {
         return Err(format!(
-            "retry bounds: exact-count mutation did not fail by node name: {count_error}"
+            "retry bounds: count-pin mutation did not fail by node name: {count_error}"
         ));
     }
     let attempts = validate_runtime::MAX_ATTEMPTS_PER_CELL as u64;

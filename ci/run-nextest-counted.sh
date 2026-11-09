@@ -328,14 +328,17 @@ function run_nextest {
             cleanup_nextest_config
             return 2
         fi
-        # Census gate (phase 2): diff this run's listed population against
-        # the base (last landed main) population the queue adapter cached.
-        # HERMIT_CENSUS_BASE_LISTED_IDS names that base .listed-ids file;
-        # HERMIT_CENSUS_DROPPED_FILE names Test-Dropped records dumped from
-        # `git log base..head`; HERMIT_CENSUS_REPORT_ONLY=1 downgrades an
-        # unrecorded disappearance to a report. With no base supplied the
-        # check is report-only and passes: the adapter integration point is
-        # exactly these variables, and no count pin is consulted either way.
+        # Census gate (phase 3, enforced): diff this run's listed population
+        # against the base (last landed main) population the queue adapter
+        # cached. HERMIT_CENSUS_BASE_LISTED_IDS names that base .listed-ids
+        # file; HERMIT_CENSUS_DROPPED_FILE names Test-Dropped records dumped
+        # from `git log base..head`. Enforcement is the default whenever a
+        # base is supplied: an unrecorded disappearance fails this node
+        # naming the IDs. HERMIT_CENSUS_REPORT_ONLY=1 is the explicit
+        # downgrade to a report. With no base supplied (the adapter has not
+        # cached one for this node yet) the check reports that and passes:
+        # the adapter integration point is exactly these variables, and no
+        # count pin is consulted either way.
         local -a census_args=(--candidate-listed "${DAGRUN_TEST_COUNTS_PATH}.listed-ids")
         [[ -n ${HERMIT_CENSUS_BASE_LISTED_IDS:-} ]] && census_args+=(--base-listed "$HERMIT_CENSUS_BASE_LISTED_IDS")
         [[ -n ${HERMIT_CENSUS_DROPPED_FILE:-} ]] && census_args+=(--dropped "$HERMIT_CENSUS_DROPPED_FILE")
