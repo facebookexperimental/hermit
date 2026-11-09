@@ -1,7 +1,15 @@
-import json, subprocess, sys
+import json, os, subprocess, sys
 from pathlib import Path
 
 TOOL = Path(__file__).parent / "census-diff"
+
+# Hermetic: the queue's real census env (HERMIT_CENSUS_BASE_*) must not
+# leak into these fixture runs. census-check reads
+# HERMIT_CENSUS_BASE_COMMIT as the expected base when no explicit
+# --expected-base-commit is passed, so a stamped fixture header would
+# be refused as stale against the candidate's real base.
+for _key in [k for k in os.environ if k.startswith("HERMIT_CENSUS_")]:
+    del os.environ[_key]
 
 
 def _run(tmp_path, base, cand, dropped=None):
@@ -373,7 +381,8 @@ def test_wired_case_selected_is_named_not_refused(tmp_path):
 def test_provenance_header_is_not_a_base_id(tmp_path):
     # census-diff fed a stamped base directly must not diff the header.
     r = _check_stamped(tmp_path, ["a"], ["a"], require=False, expected=None)
-    assert r.returncode == 0 and "added=0" in r.stdout
+    assert r.returncode == 0 and "added=0" in r.stdout, (
+        r.returncode, r.stdout, r.stderr)
 
 
 def test_wired_no_base_is_report_only_and_passes(tmp_path):
