@@ -47,6 +47,7 @@ cpp_binary(
 cpp_binary(
     name = "ipc_determinism",
     srcs = ["ipc_determinism.c"],
+    preprocessor_flags = ["-D_GNU_SOURCE"],
     labels = ["autodeps2_generated"],
 )
 
@@ -119,6 +120,7 @@ cpp_binary(
 cpp_binary(
     name = "resource_determinism",
     srcs = ["resource_determinism.c"],
+    preprocessor_flags = ["-D_GNU_SOURCE"],
     labels = ["autodeps2_generated"],
 )
 
