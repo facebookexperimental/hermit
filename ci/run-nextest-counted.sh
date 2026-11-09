@@ -347,8 +347,12 @@ function run_nextest {
         # truncated base, or an unstamped base is refused by name. Since
         # the count pins were deleted the census is the only disappearance
         # guard, so a counted node REQUIRES its base: with none supplied
-        # this node fails, unless HERMIT_CENSUS_ALLOW_NO_BASE=1 marks an
-        # explicit local/standalone run with no adapter.
+        # this node exits 75 (could-not-run: the adapter has not published
+        # a base, so no population verdict exists; validate requeues
+        # instead of failing), unless HERMIT_CENSUS_ALLOW_NO_BASE=1 marks
+        # an explicit local/standalone run with no adapter. A supplied
+        # but stale/truncated/unstamped base and a vanished ID stay
+        # product failures.
         # HERMIT_CENSUS_REPORT_ONLY is retired in counted nodes (phase-2
         # rollout lever): it is ignored here so a stale adapter setting
         # cannot silently downgrade enforcement; --report-only remains a
@@ -380,9 +384,20 @@ function run_nextest {
         if [[ ${HERMIT_CENSUS_REPORT_ONLY:-} == 1 ]]; then
             printf 'run-nextest-counted: HERMIT_CENSUS_REPORT_ONLY=1 is ignored in counted nodes since the count pins were deleted (census stays enforced)\n' >&2
         fi
-        if ! "$SCRIPT_DIR/census-check.sh" "${census_args[@]}"; then
+        local census_status=0
+        "$SCRIPT_DIR/census-check.sh" "${census_args[@]}" || census_status=$?
+        if (( census_status != 0 )); then
             printf 'run-nextest-counted: census gate refused this listed population (see census FAIL lines above)\n' >&2
             cleanup_nextest_config
+            # Exit 75 is the missing-base could-not-run refusal only
+            # (census-check.sh under --require-base with no base supplied):
+            # propagate it so validate classifies this node no-result
+            # (COULD_NOT_RUN/requeue) instead of a product failure. Every
+            # other census refusal (stale/truncated/provenance base,
+            # vanished ID) stays a product failure (return 1).
+            if (( census_status == 75 )); then
+                return 75
+            fi
             return 1
         fi
     fi

@@ -39,6 +39,12 @@
 # is refused as stale (census-base-stale). --report-only is a
 # manual/local debugging aid only; the counted wrapper never passes it.
 #
+# Exit codes: 0 pass, 1 unrecorded disappearance (census-diff), 2 usage /
+# supplied-base refusal (stale, truncated, provenance, suite-missing,
+# missing/empty base file), 75 missing base under --require-base (no base
+# supplied at all: could-not-run, requeue; validate maps node exit 75 to
+# no-result/COULD_NOT_RUN, every other nonzero to a product failure).
+#
 # With no --base-listed there is no base population in-node (the queue
 # adapter owns the cached base; see HERMIT_CENSUS_BASE_LISTED_IDS in
 # ci/run-nextest-counted.sh): the check reports that and passes, so wiring
@@ -92,8 +98,15 @@ if [[ -z $base_listed && -n $base_dir ]]; then
 fi
 if [[ -z $base_listed ]]; then
     if ((require_base && ! allow_no_base)); then
+        # Missing base is the one could-not-run refusal: the node cannot
+        # determine its population verdict because the queue adapter has
+        # not published a base, which is not a product failure. Exit 75
+        # (EX_TEMPFAIL) so validate classifies the node no-result
+        # (COULD_NOT_RUN) instead of FAILED. Every supplied-base refusal
+        # below (stale/truncated/provenance/suite-missing) and every
+        # vanished-ID FAIL stays a product failure.
         printf 'census-check: no base population supplied and --require-base is in force; the queue adapter must provide HERMIT_CENSUS_BASE_LISTED_IDS or HERMIT_CENSUS_BASE_DIR (local runs opt out explicitly with HERMIT_CENSUS_ALLOW_NO_BASE=1)\n' >&2
-        exit 2
+        exit 75
     fi
     printf 'census %s: report-only (no base population supplied; queue adapter has not provided HERMIT_CENSUS_BASE_LISTED_IDS or HERMIT_CENSUS_BASE_DIR)\n' "$suite" >&2
     exit 0
