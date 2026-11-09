@@ -24,6 +24,12 @@
 # Every hosted group must also preserve each constructed predecessor either in
 # the same selected group or in an earlier job whose artifacts/results it uses.
 # Exact set coverage alone cannot catch an edge that was reversed or dropped.
+#
+# release_shards is the one bucket with no consuming job: the first-party core
+# split emptied it and test-release was later deleted. The key stays for the
+# parsers that iterate it, but the guard refuses any entry there (see the
+# emptiness refusal below, before the coverage sets are computed) so a node
+# can never count as assigned to a job that does not exist.
 set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -93,6 +99,28 @@ shards_json=$(jq --argjson available "$(jq '[.dags[].steps[].tag]' <<<"$plan_jso
      .e2e_nodes[], .final_nodes[], .debug_shards[].nodes[],
      .release_shards[].nodes[]) |= resolve
 ' "$shards")
+
+# No hosted job consumes release_shards since test-release was deleted (the
+# first-party core split had already emptied the bucket). Refuse any entry:
+# the coverage sets below would count its nodes as "assigned to exactly one
+# hosted job" although no job would run them, making this guard's own
+# success sentence false. A future release shard must land together with
+# the job that consumes it (and a matching guard update).
+release_shards_empty() {
+    jq -e '(.release_shards // []) == []' <<<"$1" >/dev/null
+}
+# Pin both directions of the predicate so a future jq edit cannot silently
+# make this refusal vacuous (or always-on) without a red self-test here.
+if ! release_shards_empty '{"release_shards":[]}' ||
+    release_shards_empty '{"release_shards":[{"slug":"probe-rel","nodes":["test.fixture"]}]}'; then
+    echo "check-shard-coverage.sh: FAIL — release-shard emptiness guard misjudged a planted fixture" >&2
+    exit 1
+fi
+if ! release_shards_empty "$shards_json"; then
+    echo "check-shard-coverage.sh: FAIL — ci/portable-shards.json names release_shards, but no hosted job consumes them (test-release was removed); wire a consuming job or empty the bucket:" >&2
+    jq -r '.release_shards[] | "  \(.slug): \(.nodes | join(","))"' <<<"$shards_json" >&2
+    exit 1
+fi
 
 # Every node assigned by the shard map, across all job buckets.
 mapfile -t assigned < <(
