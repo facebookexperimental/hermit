@@ -6617,16 +6617,27 @@ fn scorecard_check_lock_override(lock: ScorecardCheckLock) -> Option<PathBuf> {
     }
 }
 
+/// The lock a spawned scorecard check takes. The self-test and unit tests
+/// take a private lock; production takes the real one. Pure, so the
+/// selection itself is unit-testable (in a test build `cfg!(test)` always
+/// picks Private, which would hide a broken self-test selection).
+fn scorecard_check_lock(in_self_test: bool, unit_test: bool) -> ScorecardCheckLock {
+    if in_self_test || unit_test {
+        ScorecardCheckLock::Private
+    } else {
+        ScorecardCheckLock::Real
+    }
+}
+
 fn check_scorecard(root: &Path) -> Result<CheckedScorecard<'_>, String> {
     // A unit test never takes the checkout's real write-back lock either:
     // that lock is shared by every worktree of the primary checkout, so a
     // live write-back elsewhere on the host would hold the test for the
     // check's 30 s lock timeout and then fail it.
-    let lock = if IN_SELF_TEST.load(std::sync::atomic::Ordering::Relaxed) || cfg!(test) {
-        ScorecardCheckLock::Private
-    } else {
-        ScorecardCheckLock::Real
-    };
+    let lock = scorecard_check_lock(
+        IN_SELF_TEST.load(std::sync::atomic::Ordering::Relaxed),
+        cfg!(test),
+    );
     check_scorecard_with_lock(root, lock)
 }
 
@@ -20528,8 +20539,14 @@ fn self_test(root: &Path) -> Result<(), String> {
             .expect("scorecard fixture has parent"),
     )
     .map_err(|e| format!("cannot create stale-scorecard fixture: {e}"))?;
-    fs::write(&stale_scorecard_command, "#!/bin/sh\nexit 1\n")
-        .map_err(|e| format!("cannot write stale-scorecard fixture: {e}"))?;
+    fs::write(
+        &stale_scorecard_command,
+        "#!/bin/sh\n\
+         printf '%s' \"${HERMIT_SCORECARD_WRITEBACK_LOCK-}\" > lock-observed.txt\n\
+         [ -z \"${HERMIT_SCORECARD_WRITEBACK_LOCK-}\" ] || : > \"$HERMIT_SCORECARD_WRITEBACK_LOCK\"\n\
+         exit 1\n",
+    )
+    .map_err(|e| format!("cannot write stale-scorecard fixture: {e}"))?;
     {
         use std::os::unix::fs::PermissionsExt;
         let mut permissions = fs::metadata(&stale_scorecard_command)
@@ -20541,6 +20558,28 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
     if check_scorecard(&stale_scorecard_root).is_ok() {
         return Err("plan-time scorecard check accepted a stale scorecard".into());
+    }
+    // This bracket runs in the real binary (not a test build), so it sees
+    // the lock the self-test path actually selected: it must be a private
+    // per-invocation lock under the temp dir, removed after the check. On
+    // the real shared lock the two DAG copies of this self-test time each
+    // other out (super-nightly 2026-11-09, Hermit 7d2eabd9).
+    let observed_lock = fs::read_to_string(stale_scorecard_root.join("lock-observed.txt"))
+        .map_err(|e| format!("cannot read the stale-scorecard fixture's observed lock: {e}"))?;
+    let observed_prefix = env::temp_dir()
+        .join("hermit-pressure-test-scorecard-lock-")
+        .to_string_lossy()
+        .into_owned();
+    if !observed_lock.starts_with(&observed_prefix) {
+        return Err(format!(
+            "self-test scorecard check did not take a private lock under {}: got {observed_lock:?}",
+            env::temp_dir().display()
+        ));
+    }
+    if Path::new(&observed_lock).exists() {
+        return Err(format!(
+            "self-test scorecard check left its private lock behind: {observed_lock}"
+        ));
     }
 
     // Batch execution must keep its generated checkout on the host-visible
@@ -26812,6 +26851,20 @@ mod scorecard_check_lock_tests {
     /// out on it (super-nightly 2026-11-09, Hermit 7d2eabd9).
     #[test]
     fn production_check_uses_real_lock_self_test_check_uses_private() {
+        // The selection itself: production (not self-test, not a unit test)
+        // keeps the real lock; the self-test path picks Private. Passing
+        // `unit_test: false` matters: in this test build cfg!(test) is true,
+        // so going through check_scorecard could not observe a selection
+        // that ignored the self-test flag.
+        assert_eq!(scorecard_check_lock(false, false), ScorecardCheckLock::Real);
+        assert_eq!(
+            scorecard_check_lock(true, false),
+            ScorecardCheckLock::Private
+        );
+        assert_eq!(
+            scorecard_check_lock(false, true),
+            ScorecardCheckLock::Private
+        );
         assert_eq!(
             scorecard_check_lock_override(ScorecardCheckLock::Real),
             None
