@@ -68,6 +68,8 @@ pub mod xstate_probe;
 pub use detcore::nonwaiting_write;
 #[cfg(test)]
 mod chosen_input_tests;
+#[cfg(all(test, target_arch = "x86_64"))]
+mod fatal_core_reader_tests;
 pub mod physical_exit_watch;
 pub mod preemption_admission;
 pub mod proc_mount;
@@ -4166,15 +4168,25 @@ pub fn launched_image(command: &Command) -> Option<detcore::LaunchImage> {
 /// which is where the offered thread's registers come from too. The core reads
 /// a thread only once a ptrace request of it has succeeded at its exit stop,
 /// which proves that it is stopped and traced by the calling thread, as
-/// `Stopped::new_unchecked` requires. The read changes no register: on a cache
-/// miss it keeps the kernel's registers as clean cache contents, as Reverie's
-/// own next read at that stop would.
+/// `Stopped::new_unchecked_on_ptracer_thread` requires. The read changes no
+/// register: on a cache miss it keeps the kernel's registers as clean cache
+/// contents, as Reverie's own next read at that stop would.
 pub(crate) fn install_fatal_core_register_reader() {
-    let _ = detcore::install_fatal_core_register_reader(|tid| {
-        safeptrace::Stopped::new_unchecked(safeptrace::Pid::from_raw(tid))
-            .getregs()
-            .ok()
-    });
+    let _ = detcore::install_fatal_core_register_reader(fatal_core_registers);
+}
+
+/// The reader [`install_fatal_core_register_reader`] installs: `tid`'s
+/// general registers through a ptracer-thread capability, which joins the
+/// generation, and so the register cache, that Reverie's backend holds the
+/// thread through, on every kernel. The native `Stopped::new_unchecked` needs
+/// a thread pidfd (Linux 6.9 or newer); where the kernel refuses one it makes
+/// a capability bound to no generation, whose reads bypass that cache. `None`
+/// when the capability cannot be made leaves the core the kernel's copy.
+fn fatal_core_registers(tid: i32) -> Option<libc::user_regs_struct> {
+    safeptrace::Stopped::new_unchecked_on_ptracer_thread(safeptrace::Pid::from_raw(tid))
+        .ok()?
+        .getregs()
+        .ok()
 }
 
 async fn dispatch_backend(
