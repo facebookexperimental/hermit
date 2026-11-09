@@ -2392,7 +2392,6 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
 
     let portable_workflow = parse_yaml(&root.join(".github/workflows/ci-portable.yml"))?;
     let debug_bound = workflow_job_timeout(&portable_workflow, "test-debug")? * 60;
-    let release_bound = workflow_job_timeout(&portable_workflow, "test-release")? * 60;
     let shards: JsonValue = serde_json::from_slice(
         &fs::read(root.join("ci/portable-shards.json")).map_err(|e| e.to_string())?,
     )
@@ -2406,10 +2405,7 @@ fn audit_budget_ordering(root: &Path) -> Result<(), String> {
         .map(|step| (format!("{}.{}", step.group, step.job), step))
         .collect::<std::collections::BTreeMap<_, _>>();
     let mut current = BTreeSet::new();
-    for (key, job, bound) in [
-        ("debug_shards", "test-debug", debug_bound),
-        ("release_shards", "test-release", release_bound),
-    ] {
+    for (key, job, bound) in [("debug_shards", "test-debug", debug_bound)] {
         for node in shards[key]
             .as_array()
             .into_iter()

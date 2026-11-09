@@ -399,7 +399,7 @@ prepared_nextest_artifact_contract() {
         grep -Fqx '            target/debug/nextest-cpu-wrapper \' <<<"$pack_step" &&
         grep -Fqx '            target/ci/nextest-binaries' <<<"$pack_step" || return 1
 
-    for job in test-debug strict-compat test-release; do
+    for job in test-debug strict-compat; do
         body=$(workflow_job_body "$job" "$workflow_text") || return 1
         grep -Fqx '          name: ${{ env.NEXTEST_ARTIFACT }}' <<<"$body" &&
             grep -Fqx '          tar --zstd -xf "$NEXTEST_TARBALL"' <<<"$body" &&
@@ -417,7 +417,7 @@ prepared_nextest_artifact_contract() {
         grep -Fqx '          require -f target/ci/nextest-binaries/current.json' <<<"$body"
 }
 
-# Every node of test-debug and test-release runs inside ci/run-hosted-node.sh's
+# Every node of test-debug runs inside ci/run-hosted-node.sh's
 # network namespace, where Cargo cannot download anything. lint.clippy compiles
 # against the locked registry crates and git checkouts, and every
 # prepared-Nextest consumer re-hashes each git dependency's Cargo checkout
@@ -428,7 +428,7 @@ prepared_nextest_artifact_contract() {
 # therefore run an unconditional `cargo fetch --locked` step before the step
 # that enters the namespace. strict-compat is not listed because neither of its
 # nodes runs Cargo or verifies the prepared-Nextest record.
-locked_source_jobs=(test-debug test-release)
+locked_source_jobs=(test-debug)
 locked_sources_fetched_contract() {
     local workflow_text=$1 job body step fetch_line enter_line
     for job in "${locked_source_jobs[@]}"; do
@@ -508,12 +508,10 @@ release_tree_consumers=(
     'build-complete|Pack full release prebuilt tree (artifact + resources + liteinst)'
     'test-debug|Unpack completed release tree'
     'strict-compat|Unpack prebuilt trees'
-    'test-release|Unpack full release prebuilt tree'
     'e2e|Unpack prebuilt trees'
-    'sabre_non_gated_parity|Unpack product and runner trees'
 )
 release_tree_consumer_contract() {
-    local workflow_text=$1 consumer step body required
+    local workflow_text=$1 consumer step
     if grep -v '^[[:space:]]*#' <<<"$workflow_text" | grep -Eq 'target/release|hermit-strict'; then
         return 1
     fi
@@ -522,15 +520,6 @@ release_tree_consumer_contract() {
         require_gate_contract "$step" &&
             grep -Fqx '          require -x target/ci/hermit' <<<"$step" || return 1
     done
-    step=$(workflow_job_step_body test-release 'Unpack full release prebuilt tree' "$workflow_text") || return 1
-    for required in \
-        '          require -s target/validate/libreverie_liteinst.so' \
-        '          require -s target/validate/libreverie_liteinst.so.revision'
-    do
-        grep -Fqx -- "$required" <<<"$step" || return 1
-    done
-    body=$(workflow_job_body sabre_non_gated_parity "$workflow_text") || return 1
-    grep -Fqx '      HERMIT_BIN: ${{ github.workspace }}/target/ci/hermit' <<<"$body"
 }
 
 # build-debug publishes the prepared-Nextest record inside build.workspace_on_host.
@@ -782,12 +771,9 @@ workflow_wiring_contract() {
     [[ $(workflow_global_env_value HERMIT_E2E_EMPTY_WORKDIR "$workflow_text") == /test ]] &&
         workflow_job_prepares_isolated_workdir test-debug "$workflow_text" &&
         workflow_job_prepares_isolated_workdir strict-compat "$workflow_text" &&
-        workflow_job_prepares_isolated_workdir test-release "$workflow_text" &&
         workflow_job_prepares_isolated_workdir e2e "$workflow_text" &&
-        workflow_job_prepares_isolated_workdir sabre_non_gated_parity "$workflow_text" &&
         workflow_job_uses_hosted_namespace_wrapper test-debug "$workflow_text" &&
         workflow_job_uses_hosted_namespace_wrapper strict-compat "$workflow_text" &&
-        workflow_job_uses_hosted_namespace_wrapper test-release "$workflow_text" &&
         workflow_job_uses_hosted_namespace_wrapper e2e "$workflow_text" &&
         workflow_e2e_uses_pinned_result_root "$workflow_text" &&
         workflow_e2e_prepares_btrfs "$workflow_text" &&
@@ -798,10 +784,9 @@ workflow_wiring_contract() {
         workflow_job_needs_exactly build-complete 'select,build-debug' "$workflow_text" &&
         workflow_job_needs_exactly test-debug 'select,build-debug,build-complete' "$workflow_text" &&
         workflow_job_needs_exactly strict-compat 'select,build-debug,build-complete,test-debug' "$workflow_text" &&
-        workflow_job_needs_exactly test-release 'select,build-complete' "$workflow_text" &&
         workflow_job_needs_exactly e2e 'select,build-debug,build-complete' "$workflow_text" &&
         workflow_job_needs_exactly regular \
-            'select,plan,preflight,checks,build-debug,build-complete,test-debug,strict-compat,test-release,e2e' \
+            'select,plan,preflight,checks,build-debug,build-complete,test-debug,strict-compat,e2e' \
             "$workflow_text" &&
         workflow_artifact_edge preflight name '${{ env.MANIFEST_PLAN_ARTIFACT }}' \
             build-debug name '${{ env.MANIFEST_PLAN_ARTIFACT }}' "$workflow_text" &&
@@ -817,8 +802,6 @@ workflow_wiring_contract() {
             strict-compat name '${{ env.DEBUG_ARTIFACT }}' "$workflow_text" &&
         workflow_artifact_edge build-complete name '${{ env.RELEASE_ARTIFACT }}' \
             strict-compat name '${{ env.RELEASE_ARTIFACT }}' "$workflow_text" &&
-        workflow_artifact_edge build-complete name '${{ env.RELEASE_ARTIFACT }}' \
-            test-release name '${{ env.RELEASE_ARTIFACT }}' "$workflow_text" &&
         workflow_artifact_edge build-debug name '${{ env.DEBUG_ARTIFACT }}' \
             e2e name '${{ env.DEBUG_ARTIFACT }}' "$workflow_text" &&
         workflow_artifact_edge build-complete name '${{ env.RELEASE_ARTIFACT }}' \
@@ -963,7 +946,7 @@ if ! release_tree_consumer_contract "$workflow_text"; then
     echo "check-shard-coverage.sh: FAIL — no executable workflow line may name target/release or target/ci/hermit-strict, and every release-tree consumer must require target/ci/hermit behind a counted gate that exits 1" >&2
     status=1
 fi
-stale_release_bin=${workflow_text/'      HERMIT_BIN: ${{ github.workspace }}/target/ci/hermit'/'      HERMIT_BIN: ${{ github.workspace }}/target/release/hermit'}
+stale_release_bin=${workflow_text/'          require -x target/ci/hermit'/'          require -x target/release/hermit'}
 if [[ $stale_release_bin == "$workflow_text" ]]; then
     echo "check-shard-coverage.sh: FAIL — release-binary mutation did not change the workflow" >&2
     status=1
@@ -1060,14 +1043,14 @@ for index in "${!fetch_from[@]}"; do
     fi
 done
 late_run_line='        run: ./ci/run-hosted-node.sh portable "${{ matrix.nodes }}"'
-if ! late_fetch=$(drop_job_step test-release "Fetch locked workspace dependencies" "$workflow_text") ||
-    ! late_fetch=$(mutate_job_step test-release 'Run shard nodes (${{ matrix.slug }})' "$late_run_line" \
+if ! late_fetch=$(drop_job_step test-debug "Fetch locked workspace dependencies" "$workflow_text") ||
+    ! late_fetch=$(mutate_job_step test-debug 'Run shard nodes (${{ matrix.slug }})' "$late_run_line" \
         "$late_run_line"$'\n      - name: Fetch locked workspace dependencies\n        run: cargo fetch --locked' "$late_fetch") ||
     [[ $late_fetch == "$workflow_text" ]]; then
-    echo "check-shard-coverage.sh: FAIL — locked-source late-fetch mutation did not change test-release" >&2
+    echo "check-shard-coverage.sh: FAIL — locked-source late-fetch mutation did not change test-debug" >&2
     status=1
 elif locked_sources_fetched_contract "$late_fetch"; then
-    echo "check-shard-coverage.sh: FAIL — locked-source guard accepted a test-release fetch after the namespace entry" >&2
+    echo "check-shard-coverage.sh: FAIL — locked-source guard accepted a test-debug fetch after the namespace entry" >&2
     status=1
 fi
 if ! prepared_nextest_producer_contract "$workflow_text"; then
@@ -1159,7 +1142,7 @@ fi
 # graph and artifact actions rather than accepting the shard-map-derived sets by
 # themselves. Remove one real needs edge and one real download independently;
 # each broken workflow must be refused.
-missing_need=${workflow_text/$'    needs: [select, build-complete]\n'/$'    needs: [select]\n'}
+missing_need=${workflow_text/$'    needs: [select, build-debug, build-complete]\n'/$'    needs: [select, build-complete]\n'}
 if [[ $missing_need == "$workflow_text" ]]; then
     echo "check-shard-coverage.sh: FAIL — needs-edge mutation did not change the workflow fixture" >&2
     status=1
