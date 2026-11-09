@@ -158,7 +158,7 @@ impl PreparedCohort {
 
     /// The build mode this cohort's record must name in a run whose mode
     /// is `run_mode`: the cohort's pin when it has one, else the run mode.
-    pub fn resolve_build_mode<'a>(self, run_mode: &'a str) -> &'a str {
+    pub fn resolve_build_mode(self, run_mode: &str) -> &str {
         self.pinned_build_mode().unwrap_or(run_mode)
     }
 }
