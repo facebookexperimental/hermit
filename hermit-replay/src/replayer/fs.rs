@@ -1746,8 +1746,9 @@ mod tests {
             unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
             0
         );
-        // SAFETY: ownership of each open pipe descriptor transfers exactly once.
-        let input = AsyncFd::new(unsafe { OwnedFd::from_raw_fd(pipe[0]) }).unwrap();
+        // SAFETY: ownership of each open pipe descriptor transfers exactly once,
+        // and the `AsyncFd` owns the read end's `OwnedFd` until it is dropped.
+        let input = unsafe { AsyncFd::register(OwnedFd::from_raw_fd(pipe[0])) }.unwrap();
         let output = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
         // AsyncFd readers must use a nonblocking descriptor. The write end
         // deliberately remains blocking to exercise temporary flag handling.

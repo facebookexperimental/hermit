@@ -11348,8 +11348,12 @@ fn fence_or_refuse(
 /// Wait until the process behind `pidfd` has exited, for at most `valve`;
 /// why not, otherwise.
 async fn wait_for_process_exit(pidfd: std::os::fd::OwnedFd, valve: Duration) -> Result<(), String> {
-    let fd = tokio::io::unix::AsyncFd::with_interest(pidfd, tokio::io::Interest::READABLE)
-        .map_err(|error| format!("its pidfd cannot be awaited: {error}"))?;
+    // SAFETY: the `AsyncFd` takes ownership of the `OwnedFd`, so the descriptor
+    // stays open and unchanged until the `AsyncFd` drops it.
+    let fd = unsafe {
+        tokio::io::unix::AsyncFd::register_with_interest(pidfd, tokio::io::Interest::READABLE)
+    }
+    .map_err(|error| format!("its pidfd cannot be awaited: {error}"))?;
     match tokio::time::timeout(valve, fd.readable()).await {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(error)) => Err(format!("waiting on its pidfd failed: {error}")),

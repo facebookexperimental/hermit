@@ -8,7 +8,6 @@
 
 #include <curl/curl.h>
 #include <fmt/format.h>
-#include <folly/Format.h>
 #include <gtest/gtest.h>
 #include <cstdlib>
 #include <cstring>

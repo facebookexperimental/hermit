@@ -10,7 +10,8 @@ load("@fbcode_macros//build_defs:export_files.bzl", "export_file")
 load("@fbcode_macros//build_defs:native_rules.bzl", "buck_sh_test")
 load("@fbcode_macros//build_defs:python_binary.bzl", "python_binary")
 load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
-load("@fbsource//tools/build_defs:testpilot_defs.bzl", "tpx_labels")
+load("@fbsource//tools/build_defs:testpilot_defs.bzl", "tpx_labels") # @oss-only
+# @fb-only: load("//hermetic_infra/hermit/fb-only/gated_tests:defs.bzl", "hermit_host_test")
 
 def build_test(
     name, bin_target, raw, run, no_sequentialize_threads, no_deterministic_io, record_and_replay, chaos, chaosreplay, tracereplay, tracereplay_chaos
@@ -36,9 +37,10 @@ def build_test(
     if run:
         # Run tests in hermit run mode, default settings:
         # TODO: add determinism-assertion by adding a hermit flag for running twice.
-        buck_sh_test(
-            # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
-            target_compatible_with = ["ovr_config//cpu:x86_64"],
+        buck_sh_test( # @oss-only
+        # @fb-only: hermit_host_test(
+            # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only. # @oss-only
+            target_compatible_with = ["ovr_config//cpu:x86_64"], # @oss-only
             name = "hermit_run_default__" + name,
             args = [
                 "run",
@@ -49,7 +51,7 @@ def build_test(
             ],
             env = common_env,
             test = "//hermetic_infra/hermit/hermit-cli:hermit",
-            labels = [tpx_labels.enable_artifact_reporting],
+            labels = [tpx_labels.enable_artifact_reporting], # @oss-only
         )
 
     # if strict:
@@ -120,9 +122,10 @@ def build_test(
         )
 
     if record_and_replay:
-        buck_sh_test(
-            # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
-            target_compatible_with = ["ovr_config//cpu:x86_64"],
+        buck_sh_test( # @oss-only
+        # @fb-only: hermit_host_test(
+            # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only. # @oss-only
+            target_compatible_with = ["ovr_config//cpu:x86_64"], # @oss-only
             name = "hermit_record_" + name,
             args = [
                 "record",
@@ -136,7 +139,7 @@ def build_test(
                 HERMIT_MODE = "record",
             ),
             test = "//hermetic_infra/hermit/hermit-cli:hermit",
-            labels = [tpx_labels.enable_artifact_reporting],
+            labels = [tpx_labels.enable_artifact_reporting], # @oss-only
         )
 
 def resolve_target_name(path, kind):
@@ -162,9 +165,10 @@ def hermit_verify_c_bin(path, name_suffix, guest_args = [], args = [], hermit_ar
     )
 
 def hermit_verify(name, guest, guest_args = [], args = [], hermit_args = [], env = {}):
-    buck_sh_test(
-        # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
-        target_compatible_with = ["ovr_config//cpu:x86_64"],
+    buck_sh_test( # @oss-only
+    # @fb-only: hermit_host_test(
+        # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only. # @oss-only
+        target_compatible_with = ["ovr_config//cpu:x86_64"], # @oss-only
         name = name,
         args = ["--hermit-bin=$(location //hermetic_infra/hermit/hermit-cli:hermit)"]
         + args
@@ -173,7 +177,7 @@ def hermit_verify(name, guest, guest_args = [], args = [], hermit_args = [], env
         + [guest]
         + guest_args,
         env = env,
-        labels = [tpx_labels.enable_artifact_reporting],
+        labels = [tpx_labels.enable_artifact_reporting], # @oss-only
         test = "//hermetic_infra/hermit/hermit-verify:hermit-verify",
     )
 

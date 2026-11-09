@@ -245,7 +245,8 @@ impl Stream {
         }
         use std::os::fd::FromRawFd;
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-        let fd = tokio::io::unix::AsyncFd::new(fd)?;
+        // SAFETY: the `AsyncFd` owns `fd`, which stays open until it is dropped.
+        let fd = unsafe { tokio::io::unix::AsyncFd::register(fd) }?;
         loop {
             let mut readiness = fd.readable().await?;
             self.drain()?;
