@@ -60,7 +60,7 @@ fn real_main() -> Result<(), String> {
     }
 
     let root = root
-        .unwrap_or_else(|| hermit_manifest_plan::compiled_manifest_dir().join("../.."))
+        .unwrap_or_else(|| hermit_manifest_plan::compiled_manifest_dir!().join("../.."))
         .canonicalize()
         .map_err(|error| format!("cannot resolve repository root: {error}"))?;
     let export = build_export(&root)?;

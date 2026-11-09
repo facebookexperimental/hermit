@@ -6353,7 +6353,7 @@ mod tests {
     use crate::logdiff_report::RecordEnvelopePolicy;
 
     fn repo_root() -> PathBuf {
-        crate::compiled_manifest_dir().join("../..")
+        crate::compiled_manifest_dir!().join("../..")
     }
 
     fn shipped_matrix() -> ParityMatrix {

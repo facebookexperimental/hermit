@@ -4520,7 +4520,7 @@ mod tests {
     /// all still have passed. Resolving by `.git` and then cross-checking
     /// against git's own answer removes the guess.
     fn repository_root() -> PathBuf {
-        let candidate = crate::compiled_manifest_dir()
+        let candidate = crate::compiled_manifest_dir!()
             .ancestors()
             .find(|candidate| candidate.join(".git").exists())
             .expect("locating the repository root by .git")

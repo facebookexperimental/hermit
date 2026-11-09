@@ -242,7 +242,7 @@ mod tests {
     /// moved input would silently stop selecting its self-test.
     #[test]
     fn every_trigger_names_a_tracked_path() {
-        let root = crate::compiled_manifest_dir().join("../..");
+        let root = crate::compiled_manifest_dir!().join("../..");
         let output = git_command()
             .arg("-C")
             .arg(&root)

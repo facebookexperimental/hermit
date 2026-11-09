@@ -2,20 +2,44 @@
 // buck_build cfg is set only by the Buck shim (--cfg=buck_build).
 #![allow(unexpected_cfgs)]
 
-/// The `ci/manifest-plan` directory Cargo built this crate from, used to
-/// derive the checkout root (`../..`) when no explicit root is given.
+/// The `ci/manifest-plan` directory Cargo built the calling crate from, used
+/// to derive the checkout root (`../..`) when no explicit root is given.
+/// Every caller is in this package (its binaries and its tests), so that is
+/// this crate's directory.
+///
+/// A macro, so `CARGO_MANIFEST_DIR` is read where it expands and never by
+/// this library's own build. scripts/validate.rs, dev-hermit's ci-hub.rs
+/// and check-series-rows.rs link the library, and the dev-hermit rust-script
+/// cache (ci-hub/validate/rust_script_cas.py) refuses to store a binary
+/// whose crates read compile-time environment that may hold a path. While
+/// this was a library function (2026-11-08 to 2026-11-09) it stored none of
+/// the three, and every validation compiled them from cold.
 ///
 /// Buck builds have no such directory: their staged source path is a
 /// build artifact, never a checkout, so under `buck_build` this fails
 /// closed and callers must pass an explicit root (`--root` at the
 /// harvest sites; coordinator decision 2026-11-08, dh-cqlkz).
-pub fn compiled_manifest_dir() -> std::path::PathBuf {
+#[macro_export]
+macro_rules! compiled_manifest_dir {
+    () => {
+        $crate::compiled_manifest_dir_from(option_env!("CARGO_MANIFEST_DIR"))
+    };
+}
+
+/// The body of [`compiled_manifest_dir!`], which supplies the calling
+/// crate's `CARGO_MANIFEST_DIR`. `option_env!` rather than `env!` there,
+/// because Buck need not set the variable and fails closed here instead.
+#[doc(hidden)]
+pub fn compiled_manifest_dir_from(cargo_manifest_dir: Option<&str>) -> std::path::PathBuf {
     #[cfg(not(buck_build))]
     {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        std::path::PathBuf::from(
+            cargo_manifest_dir.expect("Cargo sets CARGO_MANIFEST_DIR for every crate it compiles"),
+        )
     }
     #[cfg(buck_build)]
     {
+        let _ = cargo_manifest_dir;
         panic!(
             "Buck-built manifest-plan binary has no default checkout root: pass --root <HERMIT_CHECKOUT>"
         )

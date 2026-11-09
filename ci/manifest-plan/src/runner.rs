@@ -14702,7 +14702,7 @@ esac
 
     #[test]
     fn a_shipped_compat_row_runs_at_the_hosts_strictness_level() {
-        let root = crate::compiled_manifest_dir().join("../..");
+        let root = crate::compiled_manifest_dir!().join("../..");
         let cells = ManifestSet::load(&root)
             .unwrap()
             .select(&Selection {
@@ -14843,7 +14843,7 @@ esac
     /// verify cell keeps its retry.
     #[test]
     fn a_replay_cell_is_not_retried_after_a_product_failure() {
-        let root = crate::compiled_manifest_dir().join("../..");
+        let root = crate::compiled_manifest_dir!().join("../..");
         let manifests = ManifestSet::load(&root).unwrap();
         let cell = |mode: &str| {
             let mut cells = manifests
@@ -16814,7 +16814,7 @@ fi
 
     #[test]
     fn enabled_kvm_python_examples_keeps_its_measured_timeout() {
-        let root = crate::compiled_manifest_dir().join("../..");
+        let root = crate::compiled_manifest_dir!().join("../..");
         let defaults: ManifestDefaults = serde_yaml::from_str(
             &fs::read_to_string(root.join("tests/e2e/manifests/defaults.yaml")).unwrap(),
         )
@@ -16845,7 +16845,7 @@ fi
         // The cell whose remote failures came from an inexact counter
         // (https://github.com/rrnewton/hermit/issues/3794): a row that ran must
         // say whether the counter was exact, not only a withheld row's reason.
-        let root = crate::compiled_manifest_dir().join("../..");
+        let root = crate::compiled_manifest_dir!().join("../..");
         let cells = ManifestSet::load(&root)
             .unwrap()
             .select(&Selection {
@@ -16914,7 +16914,7 @@ fi
 
     #[test]
     fn shipped_readdir_order_identity_retains_its_resolved_timeouts() {
-        let root = crate::compiled_manifest_dir().join("../..");
+        let root = crate::compiled_manifest_dir!().join("../..");
         let cells = ManifestSet::load(&root)
             .unwrap()
             .select(&Selection {
@@ -16955,7 +16955,7 @@ fi
 
     #[test]
     fn shipped_plan_matches_the_frozen_timeout_calibration_partition() {
-        let root = crate::compiled_manifest_dir().join("../..");
+        let root = crate::compiled_manifest_dir!().join("../..");
         let manifests = ManifestSet::load(&root).unwrap();
         let required = manifests
             .select(&Selection {
@@ -22265,7 +22265,7 @@ backends_disabled:
     /// the debug Hermit that validate publishes, hashing that binary three
     /// times per cell costs more CPU than the guest runs do.
     fn ptrace_given_equalized_inputs_matches_ptrace(test: &str, candidate: &str) {
-        let root = crate::compiled_manifest_dir().join("../..");
+        let root = crate::compiled_manifest_dir!().join("../..");
         let root = root.canonicalize().unwrap();
         let hermit_bin = acceptance_hermit(&root);
         let scratch = root.join(format!(
@@ -23870,7 +23870,7 @@ exit "$(cat "$PWD/exit-status")"
                 "`--no-exec` skips the exec check: in-guest LiteInst refuses execve",
             ),
         ];
-        let root = crate::compiled_manifest_dir().join("../..");
+        let root = crate::compiled_manifest_dir!().join("../..");
         let manifests = ManifestSet::load(&root).unwrap();
         let cells = manifests
             .select(&Selection {
@@ -29750,7 +29750,7 @@ cp "{}" "$verdict"
 
     #[test]
     fn selected_supported_cells_do_not_override_the_hermetic_test_workdir() {
-        let root = crate::compiled_manifest_dir().join("../..");
+        let root = crate::compiled_manifest_dir!().join("../..");
         let manifests = ManifestSet::load(&root).unwrap();
         let mut overrides = Vec::new();
         for document in &manifests.documents {
@@ -29776,7 +29776,7 @@ cp "{}" "$verdict"
 
     #[test]
     fn every_selected_cell_can_honour_the_hermetic_test_workdir() {
-        let root = crate::compiled_manifest_dir().join("../..");
+        let root = crate::compiled_manifest_dir!().join("../..");
         let expected: JsonValue =
             serde_json::from_slice(&fs::read(root.join("ci/expected-e2e-plan.json")).unwrap())
                 .unwrap();

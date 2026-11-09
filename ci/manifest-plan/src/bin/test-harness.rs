@@ -453,7 +453,7 @@ fn root(repo_root: Option<&Path>) -> PathBuf {
             ))
         });
     }
-    let compiled = hermit_manifest_plan::compiled_manifest_dir().join("../..");
+    let compiled = hermit_manifest_plan::compiled_manifest_dir!().join("../..");
     compiled.canonicalize().unwrap_or_else(|error| {
         fail(format!(
             "the checkout this test-harness was built in, {}, is unusable: {error}; \
@@ -12222,7 +12222,7 @@ sys.exit(1 if failed else 0)
                 }
             }
         }
-        let checkout = hermit_manifest_plan::compiled_manifest_dir().join("../..");
+        let checkout = hermit_manifest_plan::compiled_manifest_dir!().join("../..");
         let fixture = std::env::temp_dir().join(format!(
             "hermit-harness-sync-cells-{label}-{}-{:?}",
             std::process::id(),
