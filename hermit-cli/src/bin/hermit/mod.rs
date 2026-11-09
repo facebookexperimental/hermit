@@ -1455,6 +1455,69 @@ mod tests {
     use super::classify_failure;
     use super::failure_exit_code;
 
+    fn owned_stdin_verification_args() -> Args {
+        Args::try_parse_from([
+            "hermit",
+            "--backend=kvm",
+            "--log=info",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--timeout=1",
+            "--cpu-profile=x86-64-v2",
+            "--max-timeslice=disabled",
+            "--no-rcb-time",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+            "--",
+            "/nonexistent/hermit-owned-stdin-guest",
+        ])
+        .unwrap()
+    }
+
+    fn assert_kvm_timeout_refusal(error: &Error) {
+        assert_eq!(
+            failure_exit_code(error),
+            detcore_model::HERMIT_POLICY_REFUSAL_EXIT
+        );
+        assert!(
+            error
+                .to_string()
+                .starts_with("--timeout is not qualified on the `Kvm` backend"),
+            "expected the real post-stdin timeout refusal: {error:#}"
+        );
+    }
+
+    #[test]
+    fn test_entry_supplies_owned_empty_stdin_to_verification() {
+        use std::io::Read;
+
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
+        let mut args = owned_stdin_verification_args();
+        let host_calls = std::cell::Cell::new(0);
+        let error = args
+            .command
+            .main_with_host_admission(&args.global, |_| {
+                host_calls.set(host_calls.get() + 1);
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(host_calls.get(), 1);
+        // This real policy check follows the stdin snapshot, but precedes any
+        // VM, host-availability probe or guest launch. Before the owned-input
+        // seam, libtest instead fails at the absent executable reservation.
+        assert_kvm_timeout_refusal(&error);
+        let (reserved, input) = crate::output_backend_stdin_reservation().unwrap();
+        assert!(reserved);
+        let mut input = input.expect("the test entry supplies an owned empty file");
+        assert!(input.metadata().unwrap().is_file());
+        let mut bytes = Vec::new();
+        input.read_to_end(&mut bytes).unwrap();
+        assert!(bytes.is_empty());
+    }
+
     #[derive(Debug, PartialEq, Eq)]
     struct EntryFdSnapshot {
         device: libc::dev_t,
