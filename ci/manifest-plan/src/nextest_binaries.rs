@@ -140,6 +140,44 @@ impl PreparedCohort {
             Some(_) => unreachable!("from_slug admits only registered cohorts"),
         }
     }
+
+    /// The build mode this cohort is pinned to regardless of the run's
+    /// mode, by cohort name only. The native-exec cohort has no Buck
+    /// harvest twins (option (d) substitutes only the default cohort's
+    /// detcore selections), so its binaries are Cargo-built in every run
+    /// and its record stays cargo-stamped and per-binary truthful; a buck
+    /// run is therefore mixed-mode, which the run record and ledger name
+    /// through [`cohort_build_modes`]. The default cohort follows the run.
+    pub fn pinned_build_mode(self) -> Option<&'static str> {
+        match self.slug {
+            None => None,
+            Some("native-exec") => Some("cargo"),
+            Some(_) => unreachable!("from_slug admits only registered cohorts"),
+        }
+    }
+
+    /// The build mode this cohort's record must name in a run whose mode
+    /// is `run_mode`: the cohort's pin when it has one, else the run mode.
+    pub fn resolve_build_mode<'a>(self, run_mode: &'a str) -> &'a str {
+        self.pinned_build_mode().unwrap_or(run_mode)
+    }
+}
+
+/// Every registered cohort's resolved build mode for a run in `run_mode`,
+/// as `(cohort name, build mode)` pairs in registration order. This is
+/// the mixed-mode disclosure the run record and ledger carry: a buck run
+/// whose native-exec cohort is pinned to cargo is named mixed, never
+/// pure buck.
+pub fn cohort_build_modes(run_mode: &str) -> Vec<(&'static str, String)> {
+    [DEFAULT_COHORT, NATIVE_EXEC_COHORT]
+        .into_iter()
+        .map(|cohort| {
+            (
+                cohort.name(),
+                cohort.resolve_build_mode(run_mode).to_string(),
+            )
+        })
+        .collect()
 }
 
 /// The cohort whose producer and consumer nodes `materialize` marks, by tag.
@@ -165,6 +203,17 @@ pub fn expected_build_mode() -> Result<String, String> {
         )),
         Err(_) => Ok("cargo".into()),
     }
+}
+
+/// The build mode `cohort`'s prepared record must name in this run: the
+/// whole-run [`expected_build_mode`], overridden by the cohort's pin
+/// ([`PreparedCohort::pinned_build_mode`]). Consumers check through this
+/// so a buck run accepts the native-exec cohort's truthful cargo record
+/// — the exemption is by cohort name only, never a general mode waive.
+pub fn expected_build_mode_for(cohort: PreparedCohort) -> Result<String, String> {
+    Ok(cohort
+        .resolve_build_mode(&expected_build_mode()?)
+        .to_string())
 }
 
 #[cfg_attr(not(buck_build), path = "../../cargo-guest-binaries.rs")]
@@ -2449,10 +2498,14 @@ pub fn unified_prebuild_command(
 }
 
 /// The exact payload a non-default cohort's prepare node runs: prepare the
-/// cohort under the run's build mode, then assert the published record, so
-/// every consumer's ancestry contains the cohort check by construction.
-/// The cohort's compile node built its test executables first (the prepare
-/// listings then compile only the test harnesses), mirroring the workspace
+/// cohort, then assert the published record, so every consumer's ancestry
+/// contains the cohort check by construction. A cohort with a pinned build
+/// mode ([`PreparedCohort::pinned_build_mode`]) prepares in that literal
+/// mode in every run — its binaries never come from the Buck harvest, so
+/// forwarding the run's mode would either refuse (buck) or mislabel the
+/// record; an unpinned cohort forwards the run's mode. The cohort's
+/// compile node built its test executables first (the prepare listings
+/// then compile only the test harnesses), mirroring the workspace
 /// compile/prepare split without the unified workspace build: a cohort
 /// selection must never widen to the workspace union.
 pub fn cohort_prepare_command(profile: &str, cohort: PreparedCohort) -> Result<String, String> {
@@ -2464,8 +2517,12 @@ pub fn cohort_prepare_command(profile: &str, cohort: PreparedCohort) -> Result<S
             "profile {profile} lists each selection separately and has no cohort prepare command"
         ));
     }
+    let build_mode = match cohort.pinned_build_mode() {
+        Some(pinned) => pinned.to_string(),
+        None => "\"${HERMIT_VALIDATE_BUILD_MODE:-cargo}\"".to_string(),
+    };
     Ok(format!(
-        "./ci/nextest-binaries.rs prepare {profile} --build-mode \"${{HERMIT_VALIDATE_BUILD_MODE:-cargo}}\" --cohort {slug} && ./ci/nextest-binaries.rs assert {profile} --cohort {slug}"
+        "./ci/nextest-binaries.rs prepare {profile} --build-mode {build_mode} --cohort {slug} && ./ci/nextest-binaries.rs assert {profile} --cohort {slug}"
     ))
 }
 
@@ -2936,11 +2993,14 @@ pub fn prepare(
     // The buck harvest names only the default cohort's detcore selections;
     // no non-default cohort has harvest twins. Refuse by name rather than
     // skip the substitution, which would publish a Cargo record under a
-    // buck build_mode.
+    // buck build_mode. A pinned cohort's producer passes its literal mode
+    // (see cohort_prepare_command), so reaching here with buck means a
+    // caller forwarded the run mode past the pin.
     if build_mode == "buck" && !cohort.is_default() {
         return Err(PreparationError::from(format!(
-            "buck build mode prepares only the default cohort; cohort {} has no buck harvest",
-            cohort.name()
+            "buck build mode prepares only the default cohort; cohort {} has no buck harvest and prepares in its pinned {} mode",
+            cohort.name(),
+            cohort.pinned_build_mode().unwrap_or("cargo")
         )));
     }
     let root = root.canonicalize().map_err(|e| e.to_string())?;
@@ -3309,7 +3369,7 @@ pub fn run(
         &value,
         &format!("prepared Nextest {operation}"),
         cohort,
-        &expected_build_mode()?,
+        &expected_build_mode_for(cohort)?,
         cohort.expected_feature_set(),
     )?;
     let record = artifacts.record_from(value)?;
@@ -3434,7 +3494,7 @@ pub fn assert_profile(
             format!("assert {profile} --prepared-by {producer}")
         },
         cohort,
-        &expected_build_mode()?,
+        &expected_build_mode_for(cohort)?,
         Some(&expected_feature_set),
     )?;
     let record = artifacts.record_from(value)?;
@@ -3467,7 +3527,7 @@ pub fn executable(root: &Path, package: &str, name: &str) -> Result<PathBuf, Str
         &value,
         "prepared executable lookup",
         cohort,
-        &expected_build_mode()?,
+        &expected_build_mode_for(cohort)?,
         cohort.expected_feature_set(),
     )?;
     let record = artifacts.record_from(value)?;
@@ -5731,6 +5791,70 @@ mod tests {
         assert!(
             check_prepared_cohort(&default_record, "run", DEFAULT_COHORT, "buck", None).is_err()
         );
+    }
+
+    #[test]
+    fn pinned_cohort_resolves_cargo_in_a_buck_run_by_name_only() {
+        // Option (ii): native-exec is pinned to cargo by cohort name, so a
+        // buck run's consumer expects its truthful cargo record, while the
+        // default cohort still follows the run mode exactly.
+        assert_eq!(NATIVE_EXEC_COHORT.pinned_build_mode(), Some("cargo"));
+        assert_eq!(DEFAULT_COHORT.pinned_build_mode(), None);
+        assert_eq!(NATIVE_EXEC_COHORT.resolve_build_mode("buck"), "cargo");
+        assert_eq!(NATIVE_EXEC_COHORT.resolve_build_mode("cargo"), "cargo");
+        assert_eq!(DEFAULT_COHORT.resolve_build_mode("buck"), "buck");
+        assert_eq!(DEFAULT_COHORT.resolve_build_mode("cargo"), "cargo");
+        // The mixed-mode disclosure names every cohort's resolved mode.
+        assert_eq!(
+            cohort_build_modes("buck"),
+            vec![
+                ("default", "buck".to_string()),
+                ("native-exec", "cargo".to_string())
+            ]
+        );
+        assert_eq!(
+            cohort_build_modes("cargo"),
+            vec![
+                ("default", "cargo".to_string()),
+                ("native-exec", "cargo".to_string())
+            ]
+        );
+        // End to end through the consumer check: the cargo-stamped
+        // native-exec record passes under the buck run's resolved mode,
+        // and a buck-stamped native-exec record (which prepare refuses
+        // to produce) is refused.
+        let native_features = NATIVE_EXEC_COHORT.expected_feature_set().unwrap();
+        let cargo_record = serde_json::json!({
+            "schema": RECORD_SCHEMA, "prepared_for": "full",
+            "cargo_profile": "validate", "build_mode": "cargo",
+            "feature_set": native_features,
+        });
+        check_prepared_cohort(
+            &cargo_record,
+            "prepared Nextest run",
+            NATIVE_EXEC_COHORT,
+            NATIVE_EXEC_COHORT.resolve_build_mode("buck"),
+            Some(native_features),
+        )
+        .unwrap();
+        let buck_record = serde_json::json!({
+            "schema": RECORD_SCHEMA, "prepared_for": "full",
+            "cargo_profile": "validate", "build_mode": "buck",
+            "feature_set": native_features,
+        });
+        assert!(check_prepared_cohort(
+            &buck_record,
+            "prepared Nextest run",
+            NATIVE_EXEC_COHORT,
+            NATIVE_EXEC_COHORT.resolve_build_mode("buck"),
+            Some(native_features),
+        )
+        .is_err());
+        // The pinned producer command carries the literal mode, never the
+        // run-mode forwarding that prepare would refuse under buck.
+        let command = cohort_prepare_command("full", NATIVE_EXEC_COHORT).unwrap();
+        assert!(command.contains("--build-mode cargo --cohort native-exec"), "{command}");
+        assert!(!command.contains("HERMIT_VALIDATE_BUILD_MODE"), "{command}");
     }
 
     #[test]
