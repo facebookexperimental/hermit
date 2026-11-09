@@ -571,6 +571,17 @@ jobs:
             exit 1
           fi
           echo "rust-script resolved: $(command -v rust-script) $(rust-script --version)"
+      # build.workspace_on_host reaches hermit-install, whose nested LiteInst
+      # build first resolves its declared sources with
+      # `cargo metadata --locked --offline`. That standalone workspace is not
+      # in the root build's initial download graph, so on a fresh runner its
+      # locked git/registry sources may still be absent when the offline call
+      # runs; run 42595572926 failed there with exit 101 before any test ran.
+      # Fetch both locked workspaces now, while this job is still online.
+      - name: Fetch locked workspace dependencies
+        run: |
+          cargo fetch --locked
+          cargo fetch --locked --manifest-path liteinst-runtime-build/Cargo.toml
       - name: Download manifest plan tools and rust-script binaries
         uses: actions/download-artifact@v4
         with:
