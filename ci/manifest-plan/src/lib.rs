@@ -55,6 +55,7 @@ pub mod ci_selection;
 pub mod cli_help;
 pub mod cpu_evidence;
 pub mod environmental_block;
+pub mod exec_safe_fs;
 pub mod executable_binding;
 mod git_environment;
 pub mod host_capability;
