@@ -203,8 +203,9 @@ rediscovered this on 2026-08-08. After running it, carry the CI sites too:
    the reviewed guard, the build refuses`. No `R ` lines means no reviewed
    runtime source changed. See `hermit-install/private-static/README.md`.
 
-Steps 2 and 3 are mechanical and should move into `--update-to-latest`; step 1
-is a judgement and should stay a human decision that the tool refuses to skip.
+Steps 2, 3 and 4 are mechanical and should move into `--update-to-latest`;
+step 1 is a judgement and should stay a human decision that the tool refuses to
+skip.
 
 ## Notes
 
