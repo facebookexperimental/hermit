@@ -8542,7 +8542,7 @@ pub enum SignalScope {
 /// (https://github.com/rrnewton/hermit/issues/5338), and brings the types
 /// `Resources` carries from resources.rs into the digest. 56 adds the
 /// wait-mask lifetime requests (`BeginWaitMask`, `EndWaitMask`,
-/// `WithdrawWaitMask`, `PopDeliveryMask`) of
+/// `WithdrawWaitMask`, `PopDeliveryMask`) and `DeliveryEntry` of
 /// https://github.com/rrnewton/hermit/pull/5259 and is current.
 pub(crate) const GLOBAL_RPC_REVISION: u32 = 56;
 
