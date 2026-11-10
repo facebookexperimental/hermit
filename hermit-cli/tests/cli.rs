@@ -74739,6 +74739,24 @@ fn proc_other_process_stat_native_with(
     let mut command = Command::new(proc_other_process_stat_guest());
     without_core_dumps(&mut command);
     configure(&mut command);
+    // A runner may ignore SIGPIPE/SIGXFSZ. Those dispositions survive exec
+    // and appear in a zombie's sigignore field; they are not guest inputs.
+    // SAFETY: only the child is changed, using async-signal-safe calls.
+    unsafe {
+        command.pre_exec(|| {
+            let mut default = std::mem::zeroed::<libc::sigaction>();
+            default.sa_sigaction = libc::SIG_DFL;
+            if libc::sigemptyset(&mut default.sa_mask) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for signal in [libc::SIGPIPE, libc::SIGXFSZ] {
+                if libc::sigaction(signal, &default, std::ptr::null_mut()) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
     let output = command
         .args(args)
         .stdin(Stdio::null())
