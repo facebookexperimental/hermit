@@ -188,6 +188,21 @@ rediscovered this on 2026-08-08. After running it, carry the CI sites too:
    ./scripts/validate.rs --self-test       # expect the Rust plan/pin-authority brackets to pass
    ```
 
+4. **Paste the private-static pin-bump report into the pull request body.**
+   The private-static producer admits the Reverie runtime sources whose rows it
+   derives from the pin itself, so a bump changes what it accepts without any
+   edit in `hermit-install/`. The report is where that change gets reviewed:
+
+   ```bash
+   python3 -B hermit-install/private-static/pin_bump_report.py <old-pin> <new-pin>
+   ```
+
+   It lists every derived Reverie row whose content changed, with both digests
+   and a diff stat. A changed `trap.rs` also gets its gate-block digests, and
+   a changed x86_64 block reads `CHANGED, review the gate block; differs from
+   the reviewed guard, the build refuses`. No `R ` lines means no reviewed
+   runtime source changed. See `hermit-install/private-static/README.md`.
+
 Steps 2 and 3 are mechanical and should move into `--update-to-latest`; step 1
 is a judgement and should stay a human decision that the tool refuses to skip.
 
