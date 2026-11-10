@@ -2999,6 +2999,20 @@ fn record_node_eventfd_epoll_sequence() {
     // Node issues madvise(MADV_DONTNEED), which record/replay used to refuse
     // (https://github.com/rrnewton/hermit/issues/3537). Replay must match the
     // recording bitwise, not just in its stdout.
+    //
+    // The recording of a Node/V8 boot is large. In three alone fbcode
+    // runner measurements (one job, retained-file cap raised to 512 MiB
+    // for measurement), the completed main-thread stream was 130,654,208
+    // allocated bytes in each run (`st_blocks * 512`; 130,653,336 bytes
+    // by `st_size`), or 124.6 MiB. Earlier full-node scans reported the
+    // live stream between 100,229,120 and 130,621,440 allocated bytes
+    // while it was still being written or at case end. The accompanying
+    // debug rendering contains thousands of `clock_gettime` records
+    // during the boot; whether those records account for the growth is
+    // a hypothesis, not an established cause. Real elapsed time can
+    // change the count of timed calls made in record mode, so size
+    // variation alone is not a determinism defect; replay still has to
+    // match the recording bitwise.
     canonical_record_replay_command(
         "node-eventfd-epoll-sequence",
         node,
