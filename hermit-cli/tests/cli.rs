@@ -26718,7 +26718,7 @@ const PTRACE_TEMPORARY_MASK_UNREAD: TargetExpectation = Diverges(KnownDivergence
 /// sends nothing (https://github.com/rrnewton/reverie/issues/1300), and W1 takes it once released; busy=
 /// names it. Before SIGSHARE S3b that copy merged into the child's, which no
 /// thread had taken, and was not seen.
-const PROCESS_SIGNAL_TARGET_CASES: [ProcessSignalTargetCase; 29] = [
+const PROCESS_SIGNAL_TARGET_CASES: [ProcessSignalTargetCase; 30] = [
     target_case(
         "chld-creator",
         "receiver=M interrupted=M\n",
@@ -26872,6 +26872,12 @@ const PROCESS_SIGNAL_TARGET_CASES: [ProcessSignalTargetCase; 29] = [
         "chld-suspend-keeps-out",
         "receiver=W1 interrupted=W1\n",
         Linux,
+        Linux,
+    ),
+    target_case(
+        "chld-ppoll-pending-temp",
+        "receiver=M interrupted=M\n",
+        PTRACE_POLLER_PASSED_OVER,
         Linux,
     ),
 ];

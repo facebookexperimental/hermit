@@ -172,6 +172,16 @@
  *                 W1 unblocks SIGALRM, and a final SIGALRM walks from W1 to
  *                 W1 (final=). revastra2's default-child-curr.c.
  *                 "steer=W2 pending=0 final=W1".
+ *   chld-ppoll-pending-temp
+ *                 M waits in ppoll() with SIGCHLD unblocked in both its
+ *                 own mask and the call's temporary mask; the temporary
+ *                 mask blocks SIGUSR2, which M's own mask admits. W2 posts
+ *                 a private SIGUSR2 to M once M waits, so it stays pending
+ *                 for M alone, and the child exits only once it sees that
+ *                 copy pending. Linux's wants_signal reads the installed
+ *                 (temporary) mask for both halves, so the blocked copy is
+ *                 not pending work and M, the thread named, takes the
+ *                 SIGCHLD in its call. "receiver=M interrupted=M".
  *   chld-ppoll-lets-in, chld-pselect-lets-in, chld-suspend-lets-in
  *                 chld-creator with M waiting in ppoll(), pselect() or
  *                 sigsuspend() instead of poll(): M's own mask blocks
@@ -270,38 +280,42 @@ struct mode {
    * blocks it). */
   enum call call;
   int temporary_blocks;
+  /* chld-ppoll-pending-temp: the temporary mask also blocks SIGUSR2, which
+   * W2 posts privately to M once M waits and the child confirms pending. */
+  int pending_temp;
 };
 
 static const struct mode MODES[] = {
-    {"chld-creator", CHILD_EXIT, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0, POLL, 0},
-    {"chld-walk", CHILD_EXIT, TAKEN, {1, 1, 0}, M, 0, 0, 0, 0, POLL, 0},
-    {"chld-worker", CHILD_EXIT, TAKEN, {0, 0, 0}, W1, 0, 0, 0, 0, POLL, 0},
-    {"chld-queued", CHILD_EXIT, QUEUED, {1, 1, 1}, W2, 0, 0, 0, 0, POLL, 0},
-    {"alrm-leader", ITIMER, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0, POLL, 0},
-    {"alrm-walk", ITIMER, TAKEN, {1, 1, 0}, M, 0, 0, 0, 0, POLL, 0},
-    {"alrm-queued", ITIMER, QUEUED, {1, 1, 1}, W1, 0, 0, 0, 0, POLL, 0},
-    {"posix-walk", POSIX_TIMER, TAKEN, {1, 1, 0}, M, 0, 0, 0, 0, POLL, 0},
-    {"alrm-ignored-blocked", ITIMER, QUEUED, {1, 1, 1}, W2, 1, 0, 0, 0, POLL, 0},
-    {"alrm-ignored-unblocked", ITIMER, HELD, {1, 1, 0}, W2, 1, 0, 0, 0, POLL, 0},
-    {"chld-curr-target", CHILD_EXIT, TAKEN, {1, 1, 0}, M, 0, 1, ITIMER, 0, POLL, 0},
-    {"alrm-curr-target", ITIMER, TAKEN, {1, 1, 0}, M, 0, 1, CHILD_EXIT, 0, POLL, 0},
-    {"posix-curr-target", POSIX_TIMER, TAKEN, {1, 1, 0}, M, 0, 1, CHILD_EXIT, 0, POLL, 0},
-    {"chld-sigwait", CHILD_EXIT, SIGWAIT, {1, 0, 1}, M, 0, 0, 0, 0, POLL, 0},
-    {"alrm-sigwait", ITIMER, SIGWAIT, {1, 0, 1}, M, 0, 0, 0, 0, POLL, 0},
-    {"posix-sigwait", POSIX_TIMER, SIGWAIT, {1, 0, 1}, M, 0, 0, 0, 0, POLL, 0},
-    {"chld-busy", CHILD_EXIT, BUSY, {1, 0, 0}, M, 0, 0, 0, 0, POLL, 0},
-    {"alrm-busy", ITIMER, BUSY, {1, 0, 0}, M, 0, 0, 0, 0, POLL, 0},
-    {"posix-busy", POSIX_TIMER, BUSY, {1, 0, 0}, M, 0, 0, 0, 0, POLL, 0},
-    {"coalesced-child-curr", CHILD_EXIT, COALESCED, {1, 0, 1}, M, 0, 1, ITIMER, 0, POLL, 0},
-    {"ignored-busy", CHILD_EXIT, BUSY, {1, 0, 0}, M, 0, 0, 0, 1, POLL, 0},
-    {"suppressed-child-curr", CHILD_EXIT, SUPPRESSED, {1, 0, 1}, M, 1, 1, ITIMER, 0, POLL, 0},
-    {"default-child-curr", CHILD_EXIT, DEFAULTED, {1, 0, 1}, M, 0, 1, ITIMER, 0, POLL, 0},
-    {"chld-ppoll-lets-in", CHILD_EXIT, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0, PPOLL, 0},
-    {"chld-ppoll-keeps-out", CHILD_EXIT, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0, PPOLL, 1},
-    {"chld-pselect-lets-in", CHILD_EXIT, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0, PSELECT, 0},
-    {"chld-pselect-keeps-out", CHILD_EXIT, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0, PSELECT, 1},
-    {"chld-suspend-lets-in", CHILD_EXIT, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0, SUSPEND, 0},
-    {"chld-suspend-keeps-out", CHILD_EXIT, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0, SUSPEND, 1},
+    {"chld-creator", CHILD_EXIT, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0, POLL, 0, 0},
+    {"chld-walk", CHILD_EXIT, TAKEN, {1, 1, 0}, M, 0, 0, 0, 0, POLL, 0, 0},
+    {"chld-worker", CHILD_EXIT, TAKEN, {0, 0, 0}, W1, 0, 0, 0, 0, POLL, 0, 0},
+    {"chld-queued", CHILD_EXIT, QUEUED, {1, 1, 1}, W2, 0, 0, 0, 0, POLL, 0, 0},
+    {"alrm-leader", ITIMER, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0, POLL, 0, 0},
+    {"alrm-walk", ITIMER, TAKEN, {1, 1, 0}, M, 0, 0, 0, 0, POLL, 0, 0},
+    {"alrm-queued", ITIMER, QUEUED, {1, 1, 1}, W1, 0, 0, 0, 0, POLL, 0, 0},
+    {"posix-walk", POSIX_TIMER, TAKEN, {1, 1, 0}, M, 0, 0, 0, 0, POLL, 0, 0},
+    {"alrm-ignored-blocked", ITIMER, QUEUED, {1, 1, 1}, W2, 1, 0, 0, 0, POLL, 0, 0},
+    {"alrm-ignored-unblocked", ITIMER, HELD, {1, 1, 0}, W2, 1, 0, 0, 0, POLL, 0, 0},
+    {"chld-curr-target", CHILD_EXIT, TAKEN, {1, 1, 0}, M, 0, 1, ITIMER, 0, POLL, 0, 0},
+    {"alrm-curr-target", ITIMER, TAKEN, {1, 1, 0}, M, 0, 1, CHILD_EXIT, 0, POLL, 0, 0},
+    {"posix-curr-target", POSIX_TIMER, TAKEN, {1, 1, 0}, M, 0, 1, CHILD_EXIT, 0, POLL, 0, 0},
+    {"chld-sigwait", CHILD_EXIT, SIGWAIT, {1, 0, 1}, M, 0, 0, 0, 0, POLL, 0, 0},
+    {"alrm-sigwait", ITIMER, SIGWAIT, {1, 0, 1}, M, 0, 0, 0, 0, POLL, 0, 0},
+    {"posix-sigwait", POSIX_TIMER, SIGWAIT, {1, 0, 1}, M, 0, 0, 0, 0, POLL, 0, 0},
+    {"chld-busy", CHILD_EXIT, BUSY, {1, 0, 0}, M, 0, 0, 0, 0, POLL, 0, 0},
+    {"alrm-busy", ITIMER, BUSY, {1, 0, 0}, M, 0, 0, 0, 0, POLL, 0, 0},
+    {"posix-busy", POSIX_TIMER, BUSY, {1, 0, 0}, M, 0, 0, 0, 0, POLL, 0, 0},
+    {"coalesced-child-curr", CHILD_EXIT, COALESCED, {1, 0, 1}, M, 0, 1, ITIMER, 0, POLL, 0, 0},
+    {"ignored-busy", CHILD_EXIT, BUSY, {1, 0, 0}, M, 0, 0, 0, 1, POLL, 0, 0},
+    {"suppressed-child-curr", CHILD_EXIT, SUPPRESSED, {1, 0, 1}, M, 1, 1, ITIMER, 0, POLL, 0, 0},
+    {"default-child-curr", CHILD_EXIT, DEFAULTED, {1, 0, 1}, M, 0, 1, ITIMER, 0, POLL, 0, 0},
+    {"chld-ppoll-lets-in", CHILD_EXIT, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0, PPOLL, 0, 0},
+    {"chld-ppoll-keeps-out", CHILD_EXIT, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0, PPOLL, 1, 0},
+    {"chld-pselect-lets-in", CHILD_EXIT, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0, PSELECT, 0, 0},
+    {"chld-pselect-keeps-out", CHILD_EXIT, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0, PSELECT, 1, 0},
+    {"chld-suspend-lets-in", CHILD_EXIT, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0, SUSPEND, 0, 0},
+    {"chld-suspend-keeps-out", CHILD_EXIT, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0, SUSPEND, 1, 0},
+    {"chld-ppoll-pending-temp", CHILD_EXIT, TAKEN, {0, 0, 0}, M, 0, 0, 0, 0, PPOLL, 0, 1},
 };
 
 static const struct mode* mode;
@@ -456,6 +470,41 @@ static pid_t fork_child(void) {
      * did: unconfirmed). */
     await_waiting(getppid(), creator_tid, -1);
     _exit(0);
+  }
+  return child;
+}
+
+/* chld-ppoll-pending-temp's child: exits only once SIGUSR2 is pending for
+ * its creator alone, as /proc shows it, so the private copy W2 posted is
+ * in place before the SIGCHLD exists (status 3 if it never is: the run
+ * ends unconfirmed at the reap). */
+static pid_t fork_pending_child(void) {
+  creator_tid = gettid();
+  pid_t child = fork();
+  if (child < 0) {
+    die("fork");
+  }
+  if (child == 0) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/task/%d/status", (int)getppid(),
+             (int)creator_tid);
+    for (int i = 0; i < 10000; i++) {
+      FILE* file = fopen(path, "r");
+      if (file) {
+        char buf[1024];
+        while (fgets(buf, sizeof(buf), file)) {
+          unsigned long pending = 0;
+          if (sscanf(buf, "SigPnd: %lx", &pending) == 1 &&
+              (pending & (1UL << (SIGUSR2 - 1)))) {
+            fclose(file);
+            _exit(0);
+          }
+        }
+        fclose(file);
+      }
+      sleep_ms(1);
+    }
+    _exit(3);
   }
   return child;
 }
@@ -707,6 +756,17 @@ static void* worker(void* arg) {
         mask(SIG_UNBLOCK, SIGALRM);
         acknowledge();
         break;
+      case 'p':
+        /* chld-ppoll-pending-temp, W2: once M waits in its ppoll (commanded
+         * only at the event, past every setup sleep of M's, so a sleeping M
+         * is in that ppoll), post the private SIGUSR2 the temporary mask
+         * blocks; it stays pending for M alone. No acknowledgement: M is
+         * in the call, and the child gates its exit on the pending copy. */
+        await_waiting(getpid(), tids[M], SYS_ppoll);
+        if (syscall(SYS_tgkill, getpid(), tids[M], SIGUSR2) != 0) {
+          die("tgkill");
+        }
+        break;
       case 'k':
         /* A sigsuspend mode, W2: once a handler has reported (bounded at
          * 2 s), end M's wait. A handler runs only after the child's exit,
@@ -791,6 +851,9 @@ static int wait_in_call(struct pollfd* fd, int signo) {
     sigaddset(&temporary, signo);
   } else {
     sigdelset(&temporary, signo);
+  }
+  if (mode->pending_temp) {
+    sigaddset(&temporary, SIGUSR2);
   }
   struct timespec bound = {0, 200 * 1000000L};
   int n;
@@ -1018,10 +1081,16 @@ int main(int argc, char** argv) {
     set_action(mode->busy_ignored ? SIGWINCH : SIGUSR2,
                mode->busy_ignored ? SIG_IGN : on_signal);
   }
+  if (mode->pending_temp) {
+    /* The privately posted SIGUSR2 needs a handler: M takes it once its
+     * ppoll ends and its own mask is back, after the SIGCHLD it waited
+     * for, so the first report byte is still the SIGCHLD's. */
+    set_action(SIGUSR2, on_signal);
+  }
   if (mode->blocks[M]) {
     mask(SIG_BLOCK, signo);
   }
-  if (mode->call != POLL && !mode->temporary_blocks) {
+  if (mode->call != POLL && !mode->temporary_blocks && !mode->pending_temp) {
     /* M's own mask blocks the signal; its call's temporary mask lets it in. */
     mask(SIG_BLOCK, signo);
   }
@@ -1096,8 +1165,11 @@ int main(int argc, char** argv) {
     if (mode->call == SUSPEND) {
       command(W2, 'k');
     }
+    if (mode->pending_temp) {
+      command(W2, 'p');
+    }
     if (forker == M) {
-      forked = fork_child();
+      forked = mode->pending_temp ? fork_pending_child() : fork_child();
     }
   } else {
     command(mode->shape == BUSY ? W2 : W1, 'a');
