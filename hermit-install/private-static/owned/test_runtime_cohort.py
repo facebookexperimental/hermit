@@ -842,6 +842,25 @@ class PinBumpReport(unittest.TestCase):
             text = cohort.format_pin_bump_report(old, new, rows)
             self.assertEqual([line.split()[1] for line in text.splitlines() if line.startswith('R ')], [TRAP])
 
+    def test_report_marks_a_changed_x86_64_gate_block_as_refused_by_the_build(self):
+        # coord7 finding 5: the verdict the ruled compensation depends on.
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            old = tree.rpin
+            raw = (tree.reverie / TRAP).read_bytes()
+            x86 = next(b for b in cohort.gate_shape(raw)['blocks'] if b['arch'] == 'x86_64' and b['contributes'])
+            cut = raw.index(b'\n', raw.index(b'\n', x86['start']) + 1) + 1
+            new = self.bump(tree, TRAP, raw[:cut] + b'    // x86_64 gate edit\n' + raw[cut:])
+            rows = cohort.pin_bump_report(tree.reverie, old, new)
+            self.assertEqual([row['path'] for row in rows], [TRAP])
+            self.assertNotEqual(rows[0]['gate']['old']['x86_64'], rows[0]['gate']['new']['x86_64'])
+            self.assertEqual(rows[0]['gate']['old']['aarch64'], rows[0]['gate']['new']['aarch64'])
+            gate = {line.split()[1]: line for line in cohort.format_pin_bump_report(old, new, rows).splitlines()
+                    if line.startswith('    gate ')}
+            self.assertTrue(gate['x86_64'].endswith(
+                'CHANGED, review the gate block; differs from the reviewed guard, the build refuses'), gate['x86_64'])
+            self.assertTrue(gate['aarch64'].endswith(' unchanged'), gate['aarch64'])
+
     def test_report_is_empty_when_no_reviewed_row_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             tree = PinnedTree(Path(directory))
