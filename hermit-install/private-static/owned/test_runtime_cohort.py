@@ -87,6 +87,9 @@ def _git_cat_file(owner, specs, limit):
 LIVE = D.parents[2]
 TRAP = 'reverie-inguest/src/trap.rs'
 ORDINARY_GATE = 'reverie-liteinst-artifact/src/private_static/selected_initializers/ordinary_gate.rs'
+MAPPED_ENTRY = 'detcore-liteinst/src/exec_initial/mapped_entry.rs'
+TERMINAL = 'reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs'
+ENTRY_NAMES = ('ENTRY_SOURCE', 'BOOTSTRAP_ENTRY_SOURCE')
 GIT_FIXTURE_ENV = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1',
                        GIT_AUTHOR_NAME='fixture', GIT_AUTHOR_EMAIL='fixture@example.invalid',
                        GIT_COMMITTER_NAME='fixture', GIT_COMMITTER_EMAIL='fixture@example.invalid',
@@ -130,6 +133,10 @@ class PinnedTree:
             if label == 'R':
                 self.write(self.reverie / path, live_reverie_object(TRAP) if path == TRAP
                            else ('runtime ' + path + '\n').encode())
+        self.entry_bytes = ('host ' + MAPPED_ENTRY + '\n').encode()
+        self.entry_pins = dict(zip(ENTRY_NAMES, (hashlib.sha256(b'alternative fixture entry\n').hexdigest(),
+                                               hashlib.sha256(self.entry_bytes).hexdigest())))
+        self.write(self.reverie / TERMINAL, self.terminal_source())
         self.write(self.reverie / 'README.md', b'not a reviewed row\n')
         self.rpin = self.commit(self.reverie)
         fixture_git(root, 'init', '-q')
@@ -139,6 +146,10 @@ class PinnedTree:
         self.write(root / 'tests/unrelated/Cargo.lock', b'[[package]]\nname = "unrelated"\n')
         self.locks(self.rpin)
         self.h_head = self.commit(root)
+
+    def terminal_source(self):
+        return ''.join('const %s: &str =\n    "%s";\n' % (name, digest)
+                       for name, digest in self.entry_pins.items()).encode()
 
     @staticmethod
     def write(path, raw):
@@ -589,6 +600,114 @@ class DerivedCohort(unittest.TestCase):
             tree.repin()
             with self.assertRaisesRegex(RuntimeError, 'trusted syscall gate shape: x86_64 block sha256 [0-9a-f]{64} '
                                         'differs from reviewed ' + cohort.TRUSTED_SYSCALL_X86_64_BLOCK_SHA256):
+                cohort.bind(tree.root, tree.h_head)
+
+
+class EntrySourcePins(unittest.TestCase):
+    """The gitlink's terminal literals must accept the committed Hermit entry."""
+
+    def refuse(self, tree, raw):
+        with self.assertRaises(RuntimeError) as failure:
+            cohort.derive(tree.root, tree.h_head)
+        message = str(failure.exception)
+        for text in ['runtime cohort derivation:', MAPPED_ENTRY, hashlib.sha256(raw).hexdigest(),
+                     tree.rpin, TERMINAL, *tree.entry_pins.keys(), *tree.entry_pins.values()]:
+            self.assertIn(text, message)
+
+    def test_each_named_alternative_accepts_the_committed_entry(self):
+        for accepted in ENTRY_NAMES:
+            with self.subTest(accepted=accepted), tempfile.TemporaryDirectory() as directory:
+                tree = PinnedTree(Path(directory))
+                other = next(name for name in ENTRY_NAMES if name != accepted)
+                tree.entry_pins[accepted] = hashlib.sha256(tree.entry_bytes).hexdigest()
+                tree.entry_pins[other] = hashlib.sha256(b'not this fixture entry').hexdigest()
+                tree.write(tree.reverie / TERMINAL, tree.terminal_source())
+                tree.commit(tree.reverie)
+                tree.repin()
+                self.assertEqual(cohort.bind(tree.root, tree.h_head)['runtime_R_pin'], tree.rpin)
+
+    def test_one_byte_committed_entry_change_refuses_with_both_named_pins(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            changed = bytes([tree.entry_bytes[0] ^ 1]) + tree.entry_bytes[1:]
+            tree.write(tree.root / MAPPED_ENTRY, changed)
+            tree.h_head = tree.commit(tree.root)
+            self.refuse(tree, changed)
+
+    def test_changed_accepting_literal_at_new_gitlink_refuses_with_both_named_pins(self):
+        for accepted in ENTRY_NAMES:
+            with self.subTest(accepted=accepted), tempfile.TemporaryDirectory() as directory:
+                tree = PinnedTree(Path(directory))
+                other = next(name for name in ENTRY_NAMES if name != accepted)
+                tree.entry_pins[accepted] = hashlib.sha256(tree.entry_bytes).hexdigest()
+                tree.entry_pins[other] = hashlib.sha256(b'other entry').hexdigest()
+                tree.write(tree.reverie / TERMINAL, tree.terminal_source())
+                tree.commit(tree.reverie)
+                tree.repin()
+                cohort.derive(tree.root, tree.h_head)
+                tree.entry_pins[accepted] = hashlib.sha256(b'changed literal entry').hexdigest()
+                tree.write(tree.reverie / TERMINAL, tree.terminal_source())
+                tree.commit(tree.reverie)
+                tree.repin()
+                self.refuse(tree, tree.entry_bytes)
+
+    def test_literal_names_count_and_shape_are_strict(self):
+        for change in ['missing', 'commented', 'duplicate', 'additional', 'short', 'uppercase', 'expression']:
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                tree = PinnedTree(Path(directory))
+                raw = tree.terminal_source()
+                first = tree.entry_pins['ENTRY_SOURCE'].encode()
+                if change == 'missing':
+                    raw = raw[raw.index(b'const BOOTSTRAP_ENTRY_SOURCE'):]
+                elif change == 'commented':
+                    at = raw.index(b'const BOOTSTRAP_ENTRY_SOURCE')
+                    raw = b'/*\n' + raw[:at] + b'*/\n' + raw[at:]
+                elif change == 'duplicate':
+                    raw += raw[:raw.index(b'const BOOTSTRAP_ENTRY_SOURCE')]
+                elif change == 'additional':
+                    raw += b'const NEW_ENTRY_SOURCE: &str = "' + first + b'";\n'
+                elif change == 'short':
+                    raw = raw.replace(first, first[:-1])
+                elif change == 'uppercase':
+                    raw = raw.replace(first, first.upper())
+                else:
+                    raw = raw.replace(b'"' + first + b'"', b'concat!("' + first + b'")')
+                tree.write(tree.reverie / TERMINAL, raw)
+                tree.commit(tree.reverie)
+                tree.repin()
+                with self.assertRaises(RuntimeError) as failure:
+                    cohort.derive(tree.root, tree.h_head)
+                for text in ['runtime cohort derivation:', tree.rpin, TERMINAL, 'ENTRY_SOURCE',
+                             'BOOTSTRAP_ENTRY_SOURCE', 'literal']:
+                    self.assertIn(text, str(failure.exception))
+
+    def test_missing_terminal_object_refuses_despite_worktree_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            fixture_git(tree.reverie, 'rm', '-q', '--cached', TERMINAL)
+            fixture_git(tree.reverie, 'commit', '-q', '-m', 'drop terminal object')
+            tree.repin()
+            self.assertTrue((tree.reverie / TERMINAL).is_file())
+            with self.assertRaisesRegex(RuntimeError, 'runtime cohort derivation: missing object R ' +
+                                        tree.rpin + ':' + TERMINAL):
+                cohort.derive(tree.root, tree.h_head)
+
+    def test_entry_check_reads_committed_bytes_not_worktree_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            changed = tree.entry_bytes + b'// committed change\n'
+            tree.write(tree.root / MAPPED_ENTRY, changed)
+            tree.h_head = tree.commit(tree.root)
+            tree.write(tree.root / MAPPED_ENTRY, tree.entry_bytes)
+            self.refuse(tree, changed)
+
+    def test_uncommitted_entry_edit_preserves_derivation_but_bind_refuses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            before = cohort.derive(tree.root, tree.h_head)
+            tree.write(tree.root / MAPPED_ENTRY, b'uncommitted entry edit\n')
+            self.assertEqual(cohort.derive(tree.root, tree.h_head), before)
+            with self.assertRaisesRegex(RuntimeError, 'one complete reviewed content cohort.*H ' + MAPPED_ENTRY):
                 cohort.bind(tree.root, tree.h_head)
 
 
