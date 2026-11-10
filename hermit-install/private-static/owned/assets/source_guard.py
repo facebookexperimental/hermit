@@ -10,7 +10,10 @@ def need(ok,message):
 
 
 def git(path,*args):
-    return subprocess.check_output(['git','-c','diff.autoRefreshIndex=false','-C',str(path),*args],env=dict(os.environ,GIT_OPTIONAL_LOCKS='0',GIT_NO_LAZY_FETCH='1'))
+    # Original objects only, as in full_pins: a commit or tree replace ref
+    # would let custody hash the checkout against a substitute tree.
+    return subprocess.check_output(['git','--no-replace-objects','-c','diff.autoRefreshIndex=false','-C',str(path),*args],
+                                   env=dict(os.environ,GIT_OPTIONAL_LOCKS='0',GIT_NO_LAZY_FETCH='1',GIT_NO_REPLACE_OBJECTS='1'))
 
 
 def tracked_source(path,expected_head,cargo_cache=False):
@@ -62,7 +65,7 @@ def full_pins(h,rpin,head):
                 'budget' in name.lower() and name.endswith(('.toml','.json','.sh')))
     names=[]
     # Original objects only: a replace ref must not substitute what a tracked
-    # manifest or lock says (tracked_source hashed the tree; this reads objects).
+    # manifest or lock says. git() above reads the same way for custody.
     exact=dict(os.environ,GIT_OPTIONAL_LOCKS='0',GIT_NO_LAZY_FETCH='1',GIT_NO_REPLACE_OBJECTS='1')
     listing=subprocess.check_output(['git','--no-replace-objects','-c','diff.autoRefreshIndex=false','-C',str(h),
                                      'ls-tree','-rz','--full-tree',head],env=exact)

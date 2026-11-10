@@ -637,6 +637,28 @@ class RunModeSourceClose(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'tracked blob changed'):
                 prepare.files_close(bound)
 
+    def test_commit_level_replace_ref_is_refused_by_the_snapshot(self):
+        # coord7 delta S1: refs/replace/<H_head> -> B, with B's tree checked
+        # out, must not let custody hash the working tree against B's tree
+        # while the pin readers read H_head's original tree.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / 'H').mkdir()
+            tree = manifest_tree(root / 'H')
+            original, other = tree.h_head, 'f' * 40
+            tree.write(tree.root / 'Cargo.toml', (
+                '[dependencies]\nreverie = { git = "https://github.com/rrnewton/reverie", rev = "%s" }\n'
+                % other).encode())
+            tree.locks(other)
+            replacement = tree.commit(tree.root)
+            fixture_git(tree.root, 'replace', original, replacement)
+            fixture_git(tree.root, 'reset', '-q', '--hard', original)
+            self.assertEqual(fixture_git(tree.root, 'rev-parse', 'HEAD'), original)
+            self.assertIn(other, (tree.root / 'Cargo.lock').read_text())
+            self.assertEqual(fixture_git(tree.root, 'status', '--porcelain'), '')
+            with self.assertRaisesRegex(RuntimeError, 'source index differs from HEAD'):
+                self.context(root, tree)
+
 
 class TrustedSyscallGateShape(unittest.TestCase):
     """Per-arch binding of the global_asm! blocks that fill the gate section."""
