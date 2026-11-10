@@ -465,14 +465,27 @@ mod tests {
             .and_then(Path::parent)
             .and_then(Path::parent)
             .unwrap();
+        // The cell comes from the committed expected plan, not a named backend.
+        // Backends have left core twice (SaBRe was archived, then DBT's cells
+        // were removed), and each time the backend named here broke this test.
+        // Any selected verify cell of c-programs/pid-probe on a backend other
+        // than ptrace serves; requalification_plan_bracket covers ptrace.
+        let cell = super::super::validate_cell_results::expected_plan(root)
+            .unwrap()
+            .into_iter()
+            .find(|cell| {
+                cell["test"] == "c-programs/pid-probe"
+                    && cell["mode"] == "verify"
+                    && cell["backend"] != "ptrace"
+            })
+            .expect("the expected plan selects a non-ptrace verify cell of c-programs/pid-probe");
+        let field = |name: &str| cell[name].as_str().unwrap().to_owned();
         let scratch = tempfile::tempdir().unwrap();
         let args = parse_argv(&[
             "--requalify-cell".into(),
-            "c-programs/pid-probe".into(),
-            "verify".into(),
-            // SaBRe is archived (ci/manifest-plan/src/archived.rs), so its cells
-            // are no longer selected per commit; use a selected DBT cell.
-            "dbt".into(),
+            field("test"),
+            field("mode"),
+            field("backend"),
             "--no-label-pr".into(),
         ])
         .unwrap();
@@ -483,18 +496,27 @@ mod tests {
         assert!(plan.second.is_none());
 
         let requested = DagManifest {
-            lane: "portable".into(),
-            category: "c-programs".into(),
-            test: Some("c-programs/pid-probe".into()),
-            mode: Some("verify".into()),
-            backend: Some("dbt".into()),
+            lane: field("lane"),
+            category: field("category"),
+            test: Some(field("test")),
+            mode: Some(field("mode")),
+            backend: Some(field("backend")),
         };
         let committed = super::super::validate_plan::validation_config(root).unwrap();
         let lane =
             dagrun::select_steps_by_labels(&committed, std::slice::from_ref(&requested.lane))
                 .unwrap();
         let owner = dagrun::result_manifest_owner(&lane.steps, &requested).unwrap();
-        let selected = dagrun::select_steps_by_tags(&lane, &[owner.tag()], false).unwrap();
+        let mut selected = dagrun::select_steps_by_tags(&lane, &[owner.tag()], false).unwrap();
+        // build_plan applies the default early-exit shape before sealing, so the
+        // expectation takes the same step, as requalification_plan_bracket's does.
+        super::super::collapse_fail_fast_families(&mut selected);
+        assert!(
+            plan.cfg
+                .steps
+                .iter()
+                .all(|step| step.fail_fast_family.is_none())
+        );
         // Exact bytes cover resource bounds, command argv and dependency order.
         assert_eq!(dag_to_json(&plan.cfg), dag_to_json(&selected));
         let prepared = SelectedEvidence::capture(root, &plan)
