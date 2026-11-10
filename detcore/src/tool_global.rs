@@ -8430,7 +8430,8 @@ pub enum SignalScope {
 /// before either decodes the other's messages. A change to either enum
 /// appends a revision (`config::tests::the_global_rpc_revision_matches_its_definitions`
 /// fails until it does). That test digests the two enums' bodies,
-/// `Resources`, the StoreExclusive payload's types, the scheduled event
+/// `Resources` and the types it carries from resources.rs, the
+/// StoreExclusive payload's types, the scheduled event
 /// and trace reply `TraceSchedEvent` carries, and the nested
 /// `HostFileIdentity`, and refuses a revision whose digests did not change, so no
 /// revision can be appended by hand. A change to another payload type defined
@@ -8492,8 +8493,11 @@ pub enum SignalScope {
 /// `GlobalResponse::WithReplayInstructionOffset` and
 /// `SchedEvent::instruction_offset`, which the event's bincode always
 /// writes and domain 4 covers (#4845, renumbered mechanically at each
-/// rebase) and is current.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 54;
+/// rebase). 55 adds the guest's mask and its ignored and caught sets to
+/// the in-guest sleep's owner-turn snapshot that `Resources` carries
+/// (https://github.com/rrnewton/hermit/issues/5338), and brings the types
+/// `Resources` carries from resources.rs into the digest; it is current.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 55;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a

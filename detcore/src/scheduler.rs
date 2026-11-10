@@ -2147,6 +2147,10 @@ pub struct Scheduler {
     /// process (`sigalrm`).
     sigalrm: sigalrm::SigalrmLedger,
 
+    /// Whether this run recorded the loss of a sleep woken for a signal whose
+    /// disposition nothing read (`note_sleep_wake_without_disposition`).
+    sleep_wake_without_disposition_noted: bool,
+
     /// The determinism losses this scheduler recorded (`note_determinism_loss`).
     #[cfg(test)]
     determinism_losses: Vec<String>,
@@ -6364,6 +6368,7 @@ impl Scheduler {
             real_timers: Default::default(),
             parked: Default::default(),
             sigalrm: Default::default(),
+            sleep_wake_without_disposition_noted: false,
             #[cfg(test)]
             determinism_losses: Vec::new(),
             #[cfg(test)]
@@ -15408,17 +15413,23 @@ impl Scheduler {
         }
         // The physical send has already happened. Preserve its real kernel
         // pending/ignored semantics, but never invent an interrupted sleep
-        // for an alarm this exact owner snapshot blocks or ignores. This
-        // covers both filed requests and sleeps already outside the queue.
-        if signal.raw() == libc::SIGALRM
-            && self
-                .in_guest_sleep_sigalrm(dettid)
-                .is_some_and(|(snapshot, _)| {
-                    snapshot.blocked
-                        || snapshot.disposition
-                            == crate::resources::SigalrmSleepDisposition::Ignored
-                })
+        // for a signal this exact owner snapshot blocks or ignores
+        // (`send_leaves_asleep`): an alarm, a child's exit SIGCHLD, or a POSIX
+        // timer's signal. This backend does not model signal targets, so the
+        // send was never classified (`discarded_when_sent_to`), and its woken
+        // sleep cannot read the guest's state to tell
+        // (`sleep_signal::SleepSignal::Held`): every wake returned EINTR,
+        // even for a default-ignored SIGCHLD Linux discards
+        // (https://github.com/rrnewton/hermit/issues/5338). This covers both
+        // filed requests and sleeps already outside the queue.
+        if self
+            .in_guest_sleep_sigalrm(dettid)
+            .is_some_and(|(snapshot, _)| snapshot.send_leaves_asleep(signal.raw()))
         {
+            debug!(
+                "[dtid {}] signal {} is blocked or ignored by its sleep's owner snapshot; leaving it.",
+                dettid, signal
+            );
             return;
         }
         debug!(
@@ -15773,10 +15784,47 @@ impl Scheduler {
                         dettid, signal
                     );
                 } else {
+                    self.note_sleep_wake_without_disposition(dettid, signal);
                     self.force_unblock_thread(dettid, rsrcs);
                 }
             }
         }
+    }
+
+    /// Record the determinism loss of a wake `wake_signaled_guest` is about
+    /// to force on `dettid`'s parked emulated `pause` or `nanosleep` for
+    /// `signal`, where nothing read the guest's disposition or mask for it:
+    /// the scheduler neither models signal targets nor runs the in-guest
+    /// delivery gate (`signal_sleep`), no process signal control publishes the
+    /// send (`child_exit_sink`), the woken sleep cannot read the guest's
+    /// state (`supports_blocked_wait_signal_interruption` off, so it answers
+    /// `SleepSignal::Held`, EINTR), and the sleep has no owner-turn snapshot
+    /// (`in_guest_sleep_sigalrm`). That is DBT and SaBRe. Linux leaves the
+    /// sleep asleep for a blocked or ignored signal, so the EINTR may be one
+    /// Linux never returns (https://github.com/rrnewton/hermit/issues/5338).
+    /// The wake is kept, so a program that runs on those backends today still
+    /// runs, but the run is marked and verification refuses to compare it.
+    /// Recorded once per run.
+    fn note_sleep_wake_without_disposition(&mut self, dettid: DetTid, signal: SigWrapper) {
+        if self.sleep_wake_without_disposition_noted
+            || self.models_signal_targets
+            || self.in_guest_signal_delivery
+            || self.signal_control_installed()
+            || self.backend.supports_blocked_wait_signal_interruption
+            || self.in_guest_sleep_sigalrm(dettid).is_some()
+        {
+            return;
+        }
+        let Some(sleep) = self.filed_signal_sleep(dettid) else {
+            return;
+        };
+        self.sleep_wake_without_disposition_noted = true;
+        self.note_determinism_loss(format!(
+            "HERMIT_UNCLASSIFIED_SIGNAL_WAKE_WITHOUT_DISPOSITION: [dtid {dettid}] signal {signal} \
+             woke its emulated {sleep:?} on a backend that reads neither the guest's disposition \
+             nor its mask for it, so the sleep returns EINTR even where Linux discards the \
+             signal or keeps it pending (https://github.com/rrnewton/hermit/issues/5338)"
+        ));
     }
 
     /// For a thread that `wake_signaled_guest` unblocked (`woken`) to take
@@ -54250,7 +54298,17 @@ mod test {
         fyi: &str,
         queued: bool,
     ) -> DetTid {
-        let target = DetTid::from_raw(100);
+        filed_sleep_on(scheduler, DetTid::from_raw(100), deadline, fyi, queued)
+    }
+
+    /// [`filed_sleep`] for thread `target`.
+    fn filed_sleep_on(
+        scheduler: &mut Scheduler,
+        target: DetTid,
+        deadline: LogicalTime,
+        fyi: &str,
+        queued: bool,
+    ) -> DetTid {
         register_known_thread(scheduler, target);
         let mut request = Resources::new(target);
         request.insert(ResourceID::SleepUntil(deadline), Permission::W);
@@ -56035,10 +56093,7 @@ mod test {
     }
 
     fn default_sleep_alarm_snapshot() -> crate::resources::InGuestSleepSigalrm {
-        crate::resources::InGuestSleepSigalrm {
-            disposition: crate::resources::SigalrmSleepDisposition::Default,
-            blocked: false,
-        }
+        crate::resources::InGuestSleepSigalrm::from_actions(0, 0, 0)
     }
 
     /// An in-guest SIGALRM sleep is recognized from the backend's
@@ -56277,20 +56332,12 @@ mod test {
     #[test]
     fn in_guest_ignored_and_blocked_alarm_preserve_filed_or_parked_sleep() {
         use crate::resources::InGuestSleepSigalrm;
-        use crate::resources::SigalrmSleepDisposition;
+        let alarm = kernel_signal_bit(libc::SIGALRM);
         for snapshot in [
-            InGuestSleepSigalrm {
-                disposition: SigalrmSleepDisposition::Ignored,
-                blocked: false,
-            },
-            InGuestSleepSigalrm {
-                disposition: SigalrmSleepDisposition::Default,
-                blocked: true,
-            },
-            InGuestSleepSigalrm {
-                disposition: SigalrmSleepDisposition::Handled,
-                blocked: true,
-            },
+            // Ignored, default and blocked, caught and blocked.
+            InGuestSleepSigalrm::from_actions(0, alarm, 0),
+            InGuestSleepSigalrm::from_actions(alarm, 0, 0),
+            InGuestSleepSigalrm::from_actions(alarm, 0, alarm),
         ] {
             for (deadline, fyi) in [
                 (LogicalTime::INDEFINITE, PAUSE_FYI),
@@ -56327,6 +56374,213 @@ mod test {
                 }
             }
         }
+    }
+
+    /// A scheduler send of a signal other than SIGALRM to an in-guest sleep
+    /// (a child's exit SIGCHLD, a POSIX timer's signal) wakes it only as
+    /// Linux's would: caught and unblocked. Blocked, it stays pending; with
+    /// its action `SIG_IGN`, or `SIG_DFL` for a default-ignored signal, Linux
+    /// discards it as it is sent. Before, this backend, which does not
+    /// classify its sends, woke every such sleep, and the woken sleep, which
+    /// cannot read the guest's state, returned EINTR: a `pause` returned at a
+    /// child's exit with its SIGCHLD at `SIG_DFL`
+    /// (https://github.com/rrnewton/hermit/issues/5338). The snapshots are
+    /// those the owner turn builds from the actions and mask it reads; an
+    /// unrelated signal's action changes nothing. SIGUSR1, whose default
+    /// action ends the process, is woken for at its default action as
+    /// before: that path is not this change's.
+    #[test]
+    fn in_guest_sleep_wakes_only_for_a_caught_unblocked_scheduler_signal() {
+        use crate::resources::InGuestSleepSigalrm;
+        for (signal, default_ignored) in [
+            (Signal::SIGCHLD, true),
+            (Signal::SIGURG, true),
+            (Signal::SIGUSR1, false),
+        ] {
+            let bit = kernel_signal_bit(signal as i32);
+            let other = kernel_signal_bit(libc::SIGWINCH) | kernel_signal_bit(libc::SIGUSR2);
+            for (label, snapshot, wakes) in [
+                (
+                    "default",
+                    InGuestSleepSigalrm::from_actions(0, 0, 0),
+                    !default_ignored,
+                ),
+                (
+                    "ignored",
+                    InGuestSleepSigalrm::from_actions(0, bit, 0),
+                    false,
+                ),
+                (
+                    "default, blocked",
+                    InGuestSleepSigalrm::from_actions(bit, 0, 0),
+                    false,
+                ),
+                (
+                    "caught, blocked",
+                    InGuestSleepSigalrm::from_actions(bit, 0, bit),
+                    false,
+                ),
+                (
+                    "default, others caught",
+                    InGuestSleepSigalrm::from_actions(0, 0, other),
+                    !default_ignored,
+                ),
+                ("caught", InGuestSleepSigalrm::from_actions(0, 0, bit), true),
+                (
+                    "caught, others ignored and blocked",
+                    InGuestSleepSigalrm::from_actions(other, other, bit),
+                    true,
+                ),
+            ] {
+                assert_eq!(
+                    snapshot.send_leaves_asleep(signal as i32),
+                    !wakes,
+                    "{signal} {label}"
+                );
+                for (deadline, fyi) in [
+                    (LogicalTime::INDEFINITE, PAUSE_FYI),
+                    (LogicalTime::from_nanos(20), NANOSLEEP_FYI),
+                ] {
+                    let context = format!("{signal} {label} {fyi}");
+                    let (mut scheduler, target, _) =
+                        in_guest_alarm_sleep(deadline, fyi, snapshot, false);
+                    scheduler.wake_signaled_guest(target, signal);
+                    let request = scheduler.next_turns[&target]
+                        .req
+                        .try_read()
+                        .unwrap()
+                        .unwrap();
+                    if wakes {
+                        assert!(scheduler.run_queue.contains_tid(target), "{context}");
+                        assert_eq!(
+                            scheduler.blocked.timed_waiters.thread_deadline(target),
+                            None,
+                            "{context}"
+                        );
+                        assert!(
+                            request
+                                .resources
+                                .contains_key(&ResourceID::InboundSignal(signal.into())),
+                            "{context}"
+                        );
+                    } else {
+                        assert!(!scheduler.run_queue.contains_tid(target), "{context}");
+                        assert_eq!(
+                            scheduler.blocked.timed_waiters.thread_deadline(target),
+                            Some(deadline),
+                            "{context}"
+                        );
+                        assert_eq!(
+                            request.in_guest_sigalrm_sleep(),
+                            Some((snapshot, deadline)),
+                            "{context}"
+                        );
+                        assert!(!scheduler.blocked.woken_sleeps.contains(&target));
+                    }
+                }
+                // A sleep still queued is left queued, its request unchanged.
+                if !wakes {
+                    let (mut scheduler, target, _) =
+                        in_guest_alarm_sleep(LogicalTime::INDEFINITE, PAUSE_FYI, snapshot, true);
+                    scheduler.wake_signaled_guest(target, signal);
+                    assert!(scheduler.run_queue.contains_tid(target));
+                    assert_eq!(
+                        scheduler.next_turns[&target]
+                            .req
+                            .try_read()
+                            .unwrap()
+                            .unwrap()
+                            .in_guest_sigalrm_sleep(),
+                        Some((snapshot, LogicalTime::INDEFINITE)),
+                        "{signal} {label} queued"
+                    );
+                }
+            }
+        }
+    }
+
+    /// On a backend that reads neither the guest's state nor a sleep
+    /// snapshot (DBT, SaBRe), a scheduler send still wakes a parked emulated
+    /// sleep, which then returns EINTR whether or not Linux would have
+    /// discarded or held the signal; the run records that as a named
+    /// determinism loss, once, so verification refuses to compare it
+    /// (https://github.com/rrnewton/hermit/issues/5338). An in-guest sleep
+    /// whose snapshot shows the signal caught wakes with no loss, and so does
+    /// a KVM sleep, whose process signal control's publication decides the
+    /// send's fate (`child_exit_sink`) before it reaches the same wake.
+    #[test]
+    fn a_sleep_woken_without_a_disposition_records_a_named_loss() {
+        const NAME: &str = "HERMIT_UNCLASSIFIED_SIGNAL_WAKE_WITHOUT_DISPOSITION";
+        let woken_for = |scheduler: &Scheduler, target: DetTid, signal: Signal| {
+            scheduler.run_queue.contains_tid(target)
+                && scheduler
+                    .blocked
+                    .timed_waiters
+                    .thread_deadline(target)
+                    .is_none()
+                && scheduler.next_turns[&target]
+                    .req
+                    .try_read()
+                    .unwrap()
+                    .unwrap()
+                    .resources
+                    .contains_key(&ResourceID::InboundSignal(signal.into()))
+        };
+        for backend in [BackendCapabilities::DBT, BackendCapabilities::SABRE] {
+            for (deadline, fyi) in [
+                (LogicalTime::INDEFINITE, PAUSE_FYI),
+                (LogicalTime::from_nanos(20), NANOSLEEP_FYI),
+            ] {
+                let config = Config {
+                    sequentialize_threads: true,
+                    ..Config::default()
+                }
+                .with_backend(|capabilities| *capabilities = backend);
+                let mut scheduler = Scheduler::new(&config);
+                assert!(!scheduler.models_signal_targets);
+                let target = filed_sleep(&mut scheduler, deadline, fyi, false);
+                scheduler.wake_signaled_guest(target, Signal::SIGCHLD);
+                assert!(woken_for(&scheduler, target, Signal::SIGCHLD), "{fyi}");
+                assert_eq!(scheduler.determinism_losses.len(), 1, "{fyi}");
+                assert!(
+                    scheduler.determinism_losses[0].starts_with(NAME),
+                    "{fyi}: {:?}",
+                    scheduler.determinism_losses
+                );
+                // Once per run: a second parked sleeper, another thread, is
+                // woken the same way and adds no second record.
+                let again =
+                    filed_sleep_on(&mut scheduler, DetTid::from_raw(101), deadline, fyi, false);
+                scheduler.wake_signaled_guest(again, Signal::SIGURG);
+                assert!(woken_for(&scheduler, again, Signal::SIGURG), "{fyi}");
+                assert_eq!(scheduler.determinism_losses.len(), 1, "{fyi}");
+            }
+        }
+        for (deadline, fyi) in [
+            (LogicalTime::INDEFINITE, PAUSE_FYI),
+            (LogicalTime::from_nanos(20), NANOSLEEP_FYI),
+        ] {
+            let control = Arc::new(signal_state_reader_tests::ScriptedControl::default());
+            let mut scheduler = signal_state_reader_tests::kvm_scheduler(&control, true);
+            let target = filed_sleep(&mut scheduler, deadline, fyi, false);
+            scheduler.wake_signaled_guest(target, Signal::SIGCHLD);
+            assert!(woken_for(&scheduler, target, Signal::SIGCHLD), "KVM {fyi}");
+            assert!(
+                scheduler.determinism_losses.is_empty(),
+                "KVM {fyi}: {:?}",
+                scheduler.determinism_losses
+            );
+        }
+        let caught = crate::resources::InGuestSleepSigalrm::from_actions(
+            0,
+            0,
+            kernel_signal_bit(libc::SIGCHLD),
+        );
+        let (mut scheduler, target, _) =
+            in_guest_alarm_sleep(LogicalTime::INDEFINITE, PAUSE_FYI, caught, false);
+        scheduler.wake_signaled_guest(target, Signal::SIGCHLD);
+        assert!(scheduler.run_queue.contains_tid(target));
+        assert!(scheduler.determinism_losses.is_empty());
     }
 
     #[test]
@@ -56612,10 +56866,11 @@ mod test {
 
     #[test]
     fn in_guest_handled_sleep_alarm_still_uses_existing_ledger() {
-        let snapshot = crate::resources::InGuestSleepSigalrm {
-            disposition: crate::resources::SigalrmSleepDisposition::Handled,
-            blocked: false,
-        };
+        let snapshot = crate::resources::InGuestSleepSigalrm::from_actions(
+            0,
+            0,
+            kernel_signal_bit(libc::SIGALRM),
+        );
         let (mut scheduler, target, _) =
             in_guest_alarm_sleep(LogicalTime::INDEFINITE, PAUSE_FYI, snapshot, false);
         scheduler.set_sigalrm_handled(target, true);

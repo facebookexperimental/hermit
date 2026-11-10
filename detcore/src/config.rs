@@ -396,6 +396,14 @@ mod tests {
         // 54 at this rebase onto main's 53 (RecordExecStrings), skipping
         // reserved 33 to 39 and 42 to 44; digest measured at this head).
         (54, "4a8fdaad9b3c03b7", "f013e36743d8d9e6"),
+        // Adds the guest's mask and its ignored and caught sets to the
+        // in-guest sleep's owner-turn snapshot (`InGuestSleepSigalrm`), which
+        // `Resources` carries (https://github.com/rrnewton/hermit/issues/5338),
+        // and brings the types `Resources` carries from resources.rs into its
+        // digest (domain 9, `RESOURCES_NESTED_WIRE`): the snapshot's fields
+        // had changed the request's layout with the digest unchanged. The
+        // enums' digest is unchanged; digest measured at this head.
+        (55, "4a8fdaad9b3c03b7", "f8b1309588141fd0"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -566,9 +574,32 @@ mod tests {
         ])
     }
 
+    /// The types resources.rs defines that `Resources` carries, directly or
+    /// through `ResourceID`'s variants, whose fields and variants decide the
+    /// positional (bincode) layout of every message holding a request
+    /// (`GlobalRequest::RequestResources`, `ParkedRequest`, ...): the
+    /// resource key and its payloads, the permission, and the in-guest
+    /// sleep's owner-turn snapshot. Before they were digested, the snapshot's
+    /// three added fields changed that layout with the fingerprint unchanged
+    /// (https://github.com/rrnewton/hermit/issues/5338). Types defined in
+    /// other files that `ResourceID` carries are not listed; covering every
+    /// payload's layout mechanically is minibeads dh-uxyyj.
+    const RESOURCES_NESTED_WIRE: [&str; 7] = [
+        "pub enum ResourceID {",
+        "pub enum Device {",
+        "pub struct ExternalOpId {",
+        "pub struct ChaosEpochTransition {",
+        "pub enum Permission {",
+        "pub(crate) enum SigalrmSleepDisposition {",
+        "pub(crate) struct InGuestSleepSigalrm {",
+    ];
+
+    /// A digest of `Resources` in `source` (resources.rs) and of the types
+    /// it carries from there (`RESOURCES_NESTED_WIRE`).
     fn resources_definition_digest(source: &str) -> String {
         let resources = definition(source, "pub struct Resources {").join("\n");
-        fnv_domains(&[(2, resources.as_bytes())])
+        let nested = wire_items(source, &RESOURCES_NESTED_WIRE);
+        fnv_domains(&[(2, resources.as_bytes()), (9, nested.as_bytes())])
     }
 
     /// The global RPC's revision names its enums and Resources as they are:
@@ -686,6 +717,32 @@ mod tests {
                 task_stat
             ),
             digest
+        );
+        // A field added to a type `Resources` carries from resources.rs, such
+        // as the in-guest sleep's owner-turn snapshot, changes the Resources
+        // digest: a peer built before the change encodes every request with
+        // the old layout (https://github.com/rrnewton/hermit/issues/5338,
+        // whose three snapshot fields once left the digest unchanged). Its
+        // documentation does not.
+        let resources_grown = resources.replacen(
+            "pub(crate) struct InGuestSleepSigalrm {\n",
+            "pub(crate) struct InGuestSleepSigalrm {\n    pub added: u64,\n",
+            1,
+        );
+        assert_ne!(resources_grown, resources);
+        assert_ne!(
+            resources_definition_digest(&resources_grown),
+            resources_digest
+        );
+        let resources_documented = resources.replacen(
+            "pub(crate) struct InGuestSleepSigalrm {\n",
+            "pub(crate) struct InGuestSleepSigalrm {\n    /// Documentation only.\n",
+            1,
+        );
+        assert_ne!(resources_documented, resources);
+        assert_eq!(
+            resources_definition_digest(&resources_documented),
+            resources_digest
         );
         // The event `TraceSchedEvent` carries is detcore-model's: a field
         // added to it, or a change to which fields its `Serialize` writes,
