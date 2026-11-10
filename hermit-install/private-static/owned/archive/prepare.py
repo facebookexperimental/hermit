@@ -105,7 +105,7 @@ spec=importlib.util.spec_from_file_location('existing_source_guard',c['helper'])
 g=importlib.util.module_from_spec(spec);spec.loader.exec_module(g)
 print(json.dumps({'H':g.tracked_source(c['H'],c['H_head']),
  'H_reverie':g.tracked_source(Path(c['H'])/'reverie',c['runtime_R_pin']),
- 'active_pins':g.full_pins(c['H'],c['runtime_R_pin']),
+ 'active_pins':g.full_pins(c['H'],c['runtime_R_pin'],c['H_head']),
  'tool_R':g.tracked_source(c['R'],c['tool_R_head'])},sort_keys=True))
 """
     inputs = {k: c[k] for k in ['H', 'H_head', 'R', 'tool_R_head', 'runtime_R_pin']}

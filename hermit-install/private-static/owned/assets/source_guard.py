@@ -48,24 +48,35 @@ def tracked_source(path,expected_head,cargo_cache=False):
     return {'head':expected_head,'tree':git(path,'rev-parse','HEAD^{tree}').decode().strip(),'files':entries,'untracked_empty_cargo_marker':extras==['.cargo-ok']}
 
 
-def full_pins(h,rpin):
+def full_pins(h,rpin,head):
     # Active textual pin occurrences in every tracked manifest/lock/BUCK and
-    # budget binding; historical CARRY comments are deliberately not rewritten.
+    # budget binding of HEAD's objects, never the working tree (dh-gygs2r);
+    # whole-tree custody is tracked_source's. Historical CARRY comments are
+    # deliberately not rewritten.
     h=Path(h);rows=[]
     import re
-    for raw in git(h,'ls-tree','-rz','--full-tree','HEAD').split(b'\0'):
+    def active(name):
+        # Files outside manifests may contain code literals or historical
+        # receipts. Restrict authority to active input formats.
+        return (name.endswith(('Cargo.toml','Cargo.lock')) or Path(name).name=='BUCK' or
+                'budget' in name.lower() and name.endswith(('.toml','.json','.sh')))
+    names=[]
+    for raw in git(h,'ls-tree','-rz','--full-tree',head).split(b'\0'):
         if not raw: continue
         header,name=raw.split(b'\t',1);mode,kind,oid=header.split();name=os.fsdecode(name)
-        if kind!=b'blob' or mode==b'120000': continue
-        text=(h/name).read_bytes()
+        if kind!=b'blob' or mode==b'120000' or not active(name): continue
+        names.append((name,oid.decode()))
+    stream=subprocess.run(['git','-C',str(h),'cat-file','--batch'],input=''.join(oid+'\n' for _,oid in names).encode(),
+                          stdout=subprocess.PIPE,check=True,env=dict(os.environ,GIT_OPTIONAL_LOCKS='0',GIT_NO_LAZY_FETCH='1')).stdout
+    at=0
+    for name,oid in names:
+        end=stream.index(b'\n',at);fields=stream[at:end].split();at=end+1
+        need(len(fields)==3 and fields[0].decode()==oid and fields[1]==b'blob','pin source object missing: '+name)
+        size=int(fields[2]);text=stream[at:at+size];at+=size+1
         if b'reverie' not in text.lower(): continue
         for n,line in enumerate(text.decode('utf-8',errors='replace').splitlines(),1):
             s=line.strip()
             if s.startswith(('#','//','/*','*','<!--')): continue
-            # Files outside manifests may contain code literals or historical
-            # receipts. Restrict authority to active input formats.
-            active=(name.endswith(('Cargo.toml','Cargo.lock')) or Path(name).name=='BUCK' or 'budget' in name.lower() and name.endswith(('.toml','.json','.sh')))
-            if not active: continue
             if 'budget' in name.lower() and re.match(r'expected_pin\s*=',s):
                 pins=re.findall(r'[0-9a-f]{40}',s)
                 need(pins==[rpin],'budget pin differs: '+name+':'+str(n));rows.append([name,n,line])
@@ -73,5 +84,6 @@ def full_pins(h,rpin):
                 pins=re.findall(r'(?:rev[=\s"\x27:]+|#)([0-9a-f]{40})',line)
                 need(pins and all(p==rpin for p in pins),'active Reverie pin differs/missing: '+name+':'+str(n))
                 rows.append([name,n,line])
+    need(at==len(stream),'pin source object stream differs')
     need(any(x[0].endswith('Cargo.toml') for x in rows) and any(x[0]=='Cargo.lock' for x in rows),'root manifest/lock pin authority missing')
     return rows

@@ -339,7 +339,7 @@ spec=importlib.util.spec_from_file_location('existing_source_guard',c['helper'])
 g=importlib.util.module_from_spec(spec);spec.loader.exec_module(g)
 print(json.dumps({'H':g.tracked_source(c['H'],c['H_head']),
  'H_reverie':g.tracked_source(Path(c['H'])/'reverie',c['runtime_R_pin']),
- 'active_pins':g.full_pins(c['H'],c['runtime_R_pin']),
+ 'active_pins':g.full_pins(c['H'],c['runtime_R_pin'],c['H_head']),
  'tool_R':g.tracked_source(c['R'],c['tool_R_head'])},sort_keys=True))
 """
     inputs = {k: c[k] for k in ['H', 'H_head', 'R', 'tool_R_head', 'runtime_R_pin']}
@@ -615,7 +615,7 @@ def bind_prepared(c, x):
     for name, digest in {
         'elf_metadata.py': 'c6fe4a6db783ca4af300e5cfbf595e545b17e746cd8594eccbf2ecb7c81215d5',
         'archive_metadata.py': 'd313a47a769e91e6d297c5452edf66b9129370f381c25e228385efdb01d60972',
-        'source_guard.py': 'd59d40226b115ce395ded5612ec4ec5f5afabace8bc81d847a4ea51e6020749f',
+        'source_guard.py': '331bda5cef71a7d0885e308ea1a3b1b9e1ac6aaec556e3b48f483d518622a3a7',
         'native_guard.py': 'd05e3d63b7c914d2e2794d97dbda4a7e94f5c904aa7cdf8515c37c1c0d4bdda5',
     }.items():
         need(sha(ASSETS / name) == digest, 'existing diagnostic helper changed')

@@ -2,6 +2,7 @@
 import hashlib
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import selectors
@@ -795,6 +796,70 @@ class PinBumpReport(unittest.TestCase):
             tree = PinnedTree(Path(directory))
             with self.assertRaisesRegex(RuntimeError, 'runtime cohort derivation: missing object R ' + 'e' * 40 + ':'):
                 cohort.pin_bump_report(tree.reverie, tree.rpin, 'e' * 40)
+
+
+class ActivePinsFromObjects(unittest.TestCase):
+    """source_guard.full_pins reads H_head's objects; a dirty tree is custody's refusal."""
+
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.spec_from_file_location('cohort_test_source_guard', D / 'assets/source_guard.py')
+        cls.guard = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.guard)
+
+    def tree(self, directory):
+        tree = PinnedTree(Path(directory))
+        tree.write(tree.root / 'Cargo.toml', ('[dependencies]\nreverie = { git = "https://github.com/rrnewton/reverie", '
+                                             'rev = "%s" }\n' % tree.rpin).encode())
+        tree.h_head = tree.commit(tree.root)
+        return tree
+
+    def test_committed_pins_agree_in_every_manifest_and_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = self.tree(directory)
+            rows = self.guard.full_pins(tree.root, tree.rpin, tree.h_head)
+            self.assertEqual(sorted({row[0] for row in rows}),
+                             ['Cargo.lock', 'Cargo.toml', 'liteinst-runtime-build/Cargo.lock'])
+
+    def test_committed_disagreeing_lock_is_refused_by_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = self.tree(directory)
+            self.guard.full_pins(tree.root, tree.rpin, tree.h_head)
+            tree.locks(tree.rpin, nested='f' * 40)
+            tree.h_head = tree.commit(tree.root)
+            with self.assertRaisesRegex(RuntimeError, 'active Reverie pin differs/missing: liteinst-runtime-build/Cargo.lock:4'):
+                self.guard.full_pins(tree.root, tree.rpin, tree.h_head)
+
+    def test_pins_are_read_at_the_named_head_not_the_checkout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = self.tree(directory)
+            pinned = tree.h_head
+            tree.locks(tree.rpin, nested='f' * 40)
+            later = tree.commit(tree.root)
+            self.assertEqual(self.guard.full_pins(tree.root, tree.rpin, pinned),
+                             self.tree_rows(tree, pinned))
+            with self.assertRaisesRegex(RuntimeError, 'active Reverie pin differs/missing: liteinst-runtime-build/Cargo.lock:4'):
+                self.guard.full_pins(tree.root, tree.rpin, later)
+
+    def tree_rows(self, tree, head):
+        rows = []
+        for name in ['Cargo.lock', 'Cargo.toml', 'liteinst-runtime-build/Cargo.lock']:
+            text = fixture_git_bytes(tree.root, 'cat-file', 'blob', head + ':' + name).decode()
+            rows += [[name, n, line] for n, line in enumerate(text.splitlines(), 1) if 'github.com/rrnewton/reverie' in line]
+        return rows
+
+    def test_dirty_working_tree_lock_is_irrelevant_to_pins_and_refused_by_custody(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = self.tree(directory)
+            committed = self.guard.full_pins(tree.root, tree.rpin, tree.h_head)
+            self.guard.tracked_source(tree.root, tree.h_head)
+            (tree.root / 'Cargo.lock').write_text(lock_text('f' * 40))
+            # Irrelevant to every pin and row reader: they read H_head's objects.
+            self.assertEqual(self.guard.full_pins(tree.root, tree.rpin, tree.h_head), committed)
+            self.assertEqual(cohort.bind(tree.root, tree.h_head)['runtime_R_pin'], tree.rpin)
+            # Refused by the snapshot's whole-tree custody, by name.
+            with self.assertRaisesRegex(RuntimeError, 'tracked blob changed: .*Cargo.lock'):
+                self.guard.tracked_source(tree.root, tree.h_head)
 
 
 class FixedPageData(unittest.TestCase):
