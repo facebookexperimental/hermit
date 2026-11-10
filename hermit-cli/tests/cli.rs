@@ -52801,7 +52801,10 @@ fn cpu_directory_reads_list_only_cpu0_on_every_path() {
 /// The first NVMe controller's `numa_node` reads -1
 /// (drivers/nvme/host/pci.c:2379 with include/linux/device.h:899-907), and
 /// a CXL DAX device's `target_node` 0 (drivers/dax/cxl.c:12-21 with
-/// include/linux/numa.h:57-64), beside no `numa_node`.
+/// include/linux/numa.h:57-64), beside no `numa_node`. That `numa_node` and
+/// the CPUs' `online` list seek as sysfs attributes do, to an end, data and
+/// hole a page in, before and after a read, whatever they show
+/// (fs/kernfs/file.c:885-910 and fs/sysfs/file.c:313-314).
 ///
 /// The same objects, looked up through symbolic links the test makes
 /// ([`sysfs_links`]), are found or not as by their own paths, also by an
@@ -52914,6 +52917,17 @@ fn absent_cpu_node_backlinks(backend: &str) {
         }
         Some(_) => "dax: no cxl device\n",
     });
+    expected.push_str(match nvme {
+        Some(_) => {
+            "nvme seek: end page, read 3, at 3, end page, data at 3 3, hole at 0 page, \
+             read there 0\n"
+        }
+        None => "nvme seek: no device\n",
+    });
+    expected.push_str(
+        "online seek: end page, read 2, at 2, end page, data at 3 3, hole at 0 page, \
+         read there 0\n",
+    );
     // Through the links.
     for (name, found, link_found) in [
         ("attribute", "ENOENT", "ok"),
@@ -53001,6 +53015,7 @@ fn absent_cpu_node_backlinks(backend: &str) {
             "statfs alias attribute: ok\n",
             "stat alias nodes/..: ok\n",
             "chdir alias nodes: ok\n",
+            ", end page, data at 3 3, hole at 0 page, read there 0\n",
         ] {
             assert!(native.contains(line), "{line:?} natively:\n{native}");
         }

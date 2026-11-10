@@ -11418,26 +11418,40 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         // A `seq_file` seeks only from the start or the position, before and
         // after the snapshot (`ProcfsFile::seeks_only_from_start_or_position`).
-        let seq_file = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            detfd.procfs_seeks_only_from_start_or_position()
+        // The end, and the data and hole before it, are the snapshot's, but
+        // for a sysfs attribute: there the kernel's `generic_file_llseek`
+        // measures them from the inode's size, `PAGE_SIZE` whatever the
+        // attribute shows (`kernfs_fop_llseek`, fs/kernfs/file.c:885-910, and
+        // `sysfs_add_file_mode_ns`, fs/sysfs/file.c:313-314, at v7.1), which the
+        // descriptor's stat at its open recorded. The position stays
+        // Detcore's own, at the bytes the guest was given.
+        let (seq_file, end) = guest.thread_state().with_detfd(call.fd(), |detfd| {
+            let attribute_size = detfd
+                .stat()
+                .filter(|stat| Some(stat.dev) == rendered_procfs::sys_device())
+                .and_then(|stat| usize::try_from(stat.size).ok());
+            (
+                detfd.procfs_seeks_only_from_start_or_position(),
+                attribute_size.unwrap_or(snapshot_len),
+            )
         })?;
         let requested = i128::from(call.offset());
         let new_offset = match call.whence() {
             Whence::SEEK_SET => requested,
             Whence::SEEK_CUR => current as i128 + requested,
             _ if seq_file => return Err(Errno::EINVAL.into()),
-            Whence::SEEK_END => snapshot_len as i128 + requested,
+            Whence::SEEK_END => end as i128 + requested,
             Whence::SEEK_DATA => {
-                if requested < 0 || requested >= snapshot_len as i128 {
+                if requested < 0 || requested >= end as i128 {
                     return Err(Errno::ENXIO.into());
                 }
                 requested
             }
             Whence::SEEK_HOLE => {
-                if requested < 0 || requested >= snapshot_len as i128 {
+                if requested < 0 || requested >= end as i128 {
                     return Err(Errno::ENXIO.into());
                 }
-                snapshot_len as i128
+                end as i128
             }
             _ => return Err(Errno::EINVAL.into()),
         };

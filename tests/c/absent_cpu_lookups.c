@@ -22,9 +22,10 @@
 // of memory tiering and of the NUMA and memory policy tunables, which are
 // NUMA's too, and reads the attributes such a kernel keeps with a value of
 // its own: the first NVMe controller's `numa_node`, and a CXL DAX device's
-// `target_node`. Given a directory, `backlinks DIRECTORY` last looks up the
-// same objects through the symbolic links the caller made there, by every
-// call that looks a path up (see `aliases`).
+// `target_node`, and seeks that `numa_node` and the CPUs' `online` list,
+// whose end is a page whatever they show. Given a directory, `backlinks
+// DIRECTORY` last looks up the same objects through the symbolic links the
+// caller made there, by every call that looks a path up (see `aliases`).
 //
 // The lookups name the absent entry absolutely, below it, relative to a
 // directory descriptor, through /sys/bus (including the processor driver's
@@ -259,6 +260,44 @@ static void node_value(const char *label, const char *devices, const char *name,
     print_contents(text, path);
 }
 
+/* `offset`, a seek's result, as printed: `page` for the page size, the
+ * errno's name for a failure. */
+static const char *offset_name(off_t offset, char *buffer, size_t size) {
+    if (offset < 0) {
+        return strerrorname_np(errno);
+    }
+    if (offset == sysconf(_SC_PAGESIZE)) {
+        return "page";
+    }
+    snprintf(buffer, size, "%lld", (long long)offset);
+    return buffer;
+}
+
+/* Seeks the sysfs attribute at `path` to its end, reads it from the start,
+ * then seeks to its end, to the data at 3 and to the hole at 0, and reads
+ * there: an attribute's end is its inode's size, a page, whatever it shows,
+ * and the position after a read is at the bytes read. */
+static void seeks(const char *label, const char *path) {
+    char text[64], end[32], at[32], end_after[32], data[32], hole[32];
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        printf("%s seek: %s\n", label, strerrorname_np(errno));
+        return;
+    }
+    const char *end_name = offset_name(lseek(fd, 0, SEEK_END), end, sizeof(end));
+    lseek(fd, 0, SEEK_SET);
+    ssize_t got = read(fd, text, sizeof(text));
+    const char *at_name = offset_name(lseek(fd, 0, SEEK_CUR), at, sizeof(at));
+    const char *end_after_name = offset_name(lseek(fd, 0, SEEK_END), end_after, sizeof(end_after));
+    const char *data_name = offset_name(lseek(fd, 3, SEEK_DATA), data, sizeof(data));
+    const char *hole_name = offset_name(lseek(fd, 0, SEEK_HOLE), hole, sizeof(hole));
+    ssize_t there = read(fd, text, sizeof(text));
+    close(fd);
+    printf("%s seek: end %s, read %zd, at %s, end %s, data at 3 %s, hole at 0 %s, read there "
+           "%zd\n",
+           label, end_name, got, at_name, end_after_name, data_name, hole_name, there);
+}
+
 /* Looks up, through the symbolic links the caller made in `directory`, the
  * objects looked up by their own paths above (`attribute`, the first PCI
  * device's `numa_node`; `control`, its `vendor`; `nodes`, the node
@@ -450,6 +489,15 @@ static int backlinks(const char *directory) {
     open_and_close("/sys/kernel/mm/numa/demotion_enabled");
     node_value("nvme", "/sys/class/nvme", "numa_node", NULL, NULL);
     node_value("dax", "/sys/bus/dax/devices", "target_node", "cxl", "numa_node");
+    char controller[256];
+    if (smallest_entry("/sys/class/nvme", controller, sizeof(controller))) {
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "/sys/class/nvme/%s/numa_node", controller);
+        seeks("nvme", path);
+    } else {
+        printf("nvme seek: no device\n");
+    }
+    seeks("online", "/sys/devices/system/cpu/online");
     if (directory != NULL) {
         aliases(directory);
     }
