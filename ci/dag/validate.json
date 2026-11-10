@@ -6833,6 +6833,13 @@
           "category": "c-programs",
           "test": "c-programs/procfs-identity-agreement",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/procfs-identity-agreement",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -50575,6 +50582,13 @@
           "test": "c-programs/procfs-identity-agreement",
           "mode": "verify",
           "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/procfs-identity-agreement",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",

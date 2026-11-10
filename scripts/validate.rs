@@ -20820,7 +20820,10 @@ mod nextest_timeout_tests {
                 // refuse; ptrace and KVM keep proving the new answers.
                 // 2994 again when the direct utility rows restore those four
                 // cells with no wrapper to exec.
-                assert_eq!(all.len(), 2994, "the original all-owner population is retained");
+                // 2995 with c-programs/procfs-identity-agreement verify/KVM
+                // (KVM's memory map lists every mapping since Reverie
+                // ce25725f, so the memfd's maps line agrees with stat).
+                assert_eq!(all.len(), 2995, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");
