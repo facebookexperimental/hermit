@@ -162,6 +162,15 @@ class PinnedTree:
         self.h_head = self.commit(self.root)
 
 
+def manifest_tree(directory):
+    """A PinnedTree whose root Cargo.toml also names the pin, as full_pins requires."""
+    tree = PinnedTree(Path(directory))
+    tree.write(tree.root / 'Cargo.toml', ('[dependencies]\nreverie = { git = "https://github.com/rrnewton/reverie", '
+                                         'rev = "%s" }\n' % tree.rpin).encode())
+    tree.h_head = tree.commit(tree.root)
+    return tree
+
+
 class ContentCohort(unittest.TestCase):
     def fixture(self,root):
         (root/'reverie').mkdir()
@@ -583,6 +592,52 @@ class DerivedCohort(unittest.TestCase):
                 cohort.bind(tree.root, tree.h_head)
 
 
+class RunModeSourceClose(unittest.TestCase):
+    """The prepared source snapshot survives the binding's JSON and run mode accepts it."""
+
+    def test_bind_result_survives_a_json_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            result = cohort.bind(tree.root, tree.h_head, tree.rpin)
+            self.assertEqual(json.loads(json.dumps(result)), result)
+
+    def context(self, root, tree):
+        prepare = load('prepare')
+        (root / 'bin').mkdir()
+        for name in ['cargo', 'rustc']:
+            (root / 'bin' / name).write_text('')
+        (root / 'home').mkdir()
+        (root / 'cargo-home').mkdir()
+        c = {'H': str(tree.root), 'H_head': tree.h_head, 'R': str(tree.reverie), 'tool_R_head': tree.rpin,
+             'runtime_R_pin': tree.rpin, 'python': sys.executable, 'home': str(root / 'home'),
+             'cargo': str(root / 'bin/cargo'), 'rustc': str(root / 'bin/rustc'),
+             'cargo_home': str(root / 'cargo-home'), 'target': str(root / 'target')}
+        path = str(root / 'bin') + ':/usr/bin:/bin'
+        c['host_tool_names'] = {name: shutil.which(name, path=path) for name in ['cc', 'c++', 'ar', 'ld']}
+        c['effective_environment'] = prepare.producer_environment(c)
+        c['git'] = str(Path(shutil.which('git', path=path)).resolve())
+        c['files'] = {}
+        c['cargo_configs'] = prepare.cargo_config_snapshot(c)
+        c['source_before'] = prepare.snapshot(c)
+        return prepare, c
+
+    def test_run_mode_files_close_accepts_the_reloaded_prepared_snapshot(self):
+        # coord7 finding 1: prepare saves snapshot() in the binding JSON and run
+        # mode compares a fresh snapshot() with the reloaded one. Nothing on
+        # that path is mocked here.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / 'H').mkdir()
+            tree = manifest_tree(root / 'H')
+            prepare, c = self.context(root, tree)
+            self.assertEqual(c['source_before']['runtime_content_cohort']['cohort'], cohort.DERIVED_COHORT)
+            bound = json.loads(json.dumps(c))
+            prepare.files_close(bound)
+            (tree.root / 'detcore-liteinst/build.rs').write_bytes(b'uncommitted edit\n')
+            with self.assertRaisesRegex(RuntimeError, 'tracked blob changed'):
+                prepare.files_close(bound)
+
+
 class TrustedSyscallGateShape(unittest.TestCase):
     """Per-arch binding of the global_asm! blocks that fill the gate section."""
 
@@ -808,11 +863,7 @@ class ActivePinsFromObjects(unittest.TestCase):
         spec.loader.exec_module(cls.guard)
 
     def tree(self, directory):
-        tree = PinnedTree(Path(directory))
-        tree.write(tree.root / 'Cargo.toml', ('[dependencies]\nreverie = { git = "https://github.com/rrnewton/reverie", '
-                                             'rev = "%s" }\n' % tree.rpin).encode())
-        tree.h_head = tree.commit(tree.root)
-        return tree
+        return manifest_tree(directory)
 
     def test_committed_pins_agree_in_every_manifest_and_lock(self):
         with tempfile.TemporaryDirectory() as directory:

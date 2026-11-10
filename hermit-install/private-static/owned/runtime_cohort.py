@@ -409,8 +409,11 @@ def bind(workspace, h_head, runtime_r_pin=None):
     derived = derive(workspace, h_head, runtime_r_pin)
     result = select(workspace, ((DERIVED_COHORT, derived['rows']),),
                     ' at H_head ' + derived['h_head'] + ', Reverie ' + derived['runtime_R_pin'])
+    # Lists, not tuples: this result is saved in the prepared binding's JSON
+    # and compared with a fresh one in run mode. derive() keeps its tuples.
     return dict(result, h_head=derived['h_head'], runtime_R_pin=derived['runtime_R_pin'],
-                rows=derived['rows'], lock_pins=derived['lock_pins'], gate=derived['gate'])
+                rows=[list(row) for row in derived['rows']], lock_pins=derived['lock_pins'],
+                gate=derived['gate'])
 
 
 MACRO = re.compile(rb'(?m)^[ \t]*(?:(?:core|std)::arch::)?global_asm![ \t]*\(')
