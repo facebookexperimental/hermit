@@ -18,6 +18,7 @@ use procfs::process::Process;
 use rand::Rng;
 use reverie::BackendCapabilities;
 use reverie::Error;
+use reverie::GlobalRPC;
 use reverie::Guest;
 use reverie::Pid;
 use reverie::Stack;
@@ -58,8 +59,14 @@ use crate::syscalls::helpers::keep_restart_block;
 use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::retry_nonblocking_syscall;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
+use crate::syscalls::pi_futex;
+use crate::syscalls::pi_futex::LockPiStep;
+use crate::syscalls::pi_futex::PiFutexState;
+use crate::syscalls::pi_futex::PiHandOver;
+use crate::syscalls::pi_futex::UnlockPiStep;
 use crate::syscalls::robust_list;
 use crate::tool_global::FutexAction;
+use crate::tool_global::GlobalState;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::await_exact_child_physical_exit;
 use crate::tool_global::cancel_exec;
@@ -84,6 +91,7 @@ use crate::tool_local::PendingVfork;
 use crate::tool_local::RobustListExit;
 use crate::tool_local::RobustListOwner;
 use crate::tool_local::RobustListWake;
+use crate::tool_local::ThreadState;
 use crate::types::ChildWaitExitClass;
 use crate::types::ChildWaitSelector;
 use crate::types::ChildWaitSpec;
@@ -94,6 +102,8 @@ use crate::types::FutexID;
 use crate::types::LogicalTime;
 use crate::types::SigWrapper;
 
+#[path = "affinity.rs"]
+mod affinity;
 #[path = "emulated_waitid.rs"]
 mod emulated_waitid;
 
@@ -122,9 +132,11 @@ const SCHED_ATTR_SIZE_VER1: u32 = 56; // adds sched_util_{min,max}
 /// or beyond this offset must be zero, and it is the value written back into
 /// `uattr->size` when the request is refused with E2BIG.
 const SCHED_ATTR_KERNEL_SIZE: u32 = SCHED_ATTR_SIZE_VER1;
-/// `sched_copy_attr` refuses a buffer larger than one page. Hermit is x86-64
-/// only, where PAGE_SIZE is 4096.
-const SCHED_ATTR_MAX_SIZE: u32 = 4096;
+/// `sched_copy_attr` and `sched_getattr` refuse a buffer larger than one page
+/// (kernel/sched/syscalls.c).
+fn sched_attr_max_size() -> u32 {
+    u32::try_from(crate::page::page_size()).expect("the page size fits in u32")
+}
 
 /// The scheduling policy Detcore presents as every thread's current one.
 ///
@@ -313,7 +325,7 @@ fn sched_attr_effective_size(declared: u32) -> Result<u32, ()> {
     } else {
         declared
     };
-    if !(SCHED_ATTR_SIZE_VER0..=SCHED_ATTR_MAX_SIZE).contains(&size) {
+    if !(SCHED_ATTR_SIZE_VER0..=sched_attr_max_size()).contains(&size) {
         return Err(());
     }
     Ok(size)
@@ -735,6 +747,75 @@ fn signal_default_action_ends_the_process(signal: SigWrapper) -> bool {
     )
 }
 
+/// Whether a run may retire a process's other threads in the turn that
+/// delivers a signal ending the process (`Scheduler::commit_fatal_delivery`):
+/// its threads are serialized, the kernel's signal state is the guest's own,
+/// from which the delivering thread reads that the kernel carries the default
+/// action out, and no gdbserver is attached, whose client decides the signal
+/// when it resumes the thread.
+pub(crate) fn retires_others_at_fatal_delivery(cfg: &Config) -> bool {
+    cfg.sequentialize_threads && cfg.backend.kernel_signal_state_is_guests && !cfg.gdbserver
+}
+
+/// Whether delivering `signal` to the calling thread now ends its process,
+/// by an action left at a default that terminates or dumps core: `None` when
+/// it does not, else whether the kernel's signal state also shows that
+/// resuming the thread with `signal` carries the action out
+/// ([`KernelSignalState::delivery_carries_out_a_fatal_default`]), asked only
+/// when `may_retire_others`. Detcore's copy of the dispositions answers the
+/// first question without a read for most deliveries (a handled or ignored
+/// signal); the kernel's state is read at most once.
+pub(crate) fn fatal_default_delivery<G, T>(
+    guest: &G,
+    signal: i32,
+    may_retire_others: bool,
+) -> Option<bool>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match fatal_delivery_observation(guest, signal, may_retire_others) {
+        FatalDeliveryObservation::Fatal { may_retire_others } => Some(may_retire_others),
+        FatalDeliveryObservation::Nonfatal | FatalDeliveryObservation::Unknown => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FatalDeliveryObservation {
+    Nonfatal,
+    Fatal { may_retire_others: bool },
+    Unknown,
+}
+
+/// Keep unavailable native/copy evidence distinct from a known nonfatal
+/// disposition. The old scheduler decision retains its exact Option mapping.
+pub(crate) fn fatal_delivery_observation<G, T>(
+    guest: &G,
+    signal: i32,
+    may_retire_others: bool,
+) -> FatalDeliveryObservation
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let copied = super::signal_shadow::copied_dispositions_for(guest, signal)
+        .map(|copied| default_action_ends_process(copied.ignored, copied.caught, signal));
+    if copied == Some(false) {
+        return FatalDeliveryObservation::Nonfatal;
+    }
+    let kernel = (copied.is_none() || may_retire_others)
+        .then(|| crate::syscalls::read_guest_thread_signal_state(guest).ok())
+        .flatten();
+    match copied.or_else(|| kernel.map(|state| state.default_action_ends_process(signal))) {
+        Some(true) => FatalDeliveryObservation::Fatal {
+            may_retire_others: may_retire_others
+                && kernel.is_some_and(|state| state.delivery_carries_out_a_fatal_default(signal)),
+        },
+        Some(false) => FatalDeliveryObservation::Nonfatal,
+        None => FatalDeliveryObservation::Unknown,
+    }
+}
+
 fn signal_has_uncatchable_default_disposition(signal: SigWrapper) -> bool {
     matches!(signal.raw(), libc::SIGKILL | libc::SIGSTOP)
 }
@@ -959,6 +1040,21 @@ pub(crate) struct KernelSignalState {
     pub(crate) caught: KernelSigset,
 }
 
+impl KernelSignalState {
+    /// The value of one of the three signal-mask fields of
+    /// `/proc/<pid>/status` that these sets carry (`SigBlk`, `SigIgn` or
+    /// `SigCgt`), for a reader that names the field as it names a `/proc`
+    /// line; `None` for any other name.
+    pub(crate) fn status_field(&self, field: &str) -> Option<KernelSigset> {
+        match field {
+            "SigBlk" => Some(self.blocked),
+            "SigIgn" => Some(self.ignored),
+            "SigCgt" => Some(self.caught),
+            _ => None,
+        }
+    }
+}
+
 /// [`KernelSignalState::default_action_ends_process`] given only the
 /// thread's ignored and caught sets, from wherever they come (the kernel's
 /// `/proc` view or Detcore's copy, `signal_shadow::copied_dispositions`).
@@ -1020,6 +1116,21 @@ impl KernelSignalState {
         Some(state)
     }
 
+    /// The signal sets a backend reports for a task (`reverie::SignalSets`:
+    /// `SigPnd`, `ShdPnd`, `SigBlk`, `SigIgn` and `SigCgt`, as Linux shows
+    /// them in the task's status file), in this type's terms, as
+    /// [`parse`](Self::parse) builds them from that file.
+    pub(crate) fn from_backend_sets(sets: &reverie::SignalSets) -> Self {
+        KernelSignalState {
+            pending: sets.pending | sets.shared_pending,
+            thread_pending: sets.pending,
+            shared_pending: sets.shared_pending,
+            blocked: sets.blocked,
+            ignored: sets.ignored,
+            caught: sets.caught,
+        }
+    }
+
     /// Signals whose delivery, while unblocked in `mask`, ends a blocking wait: a
     /// caught signal runs its handler, and a `SIG_DFL` signal terminates, dumps
     /// core, or stops the process. Ignored signals and the default-ignored
@@ -1055,6 +1166,14 @@ impl KernelSignalState {
     /// stops or continues. `SIGKILL` always does.
     pub(crate) fn default_action_ends_process(&self, signal: i32) -> bool {
         default_action_ends_process(self.ignored, self.caught, signal)
+    }
+
+    /// Whether resuming the thread from a delivery stop with `signal` makes
+    /// the kernel carry out its default action and end the process: the
+    /// thread does not block `signal`, which `ptrace_signal` would requeue,
+    /// and [`Self::default_action_ends_process`].
+    pub(crate) fn delivery_carries_out_a_fatal_default(&self, signal: i32) -> bool {
+        self.blocked & kernel_sigset_bit(signal) == 0 && self.default_action_ends_process(signal)
     }
 
     /// The job-control stop signals `SIGTSTP`, `SIGTTIN`, and `SIGTTOU` whose
@@ -1147,7 +1266,7 @@ impl KernelSignalState {
 }
 
 /// The signals whose default action ignores them.
-fn default_ignored_signals() -> KernelSigset {
+pub(crate) fn default_ignored_signals() -> KernelSigset {
     [libc::SIGCHLD, libc::SIGCONT, libc::SIGURG, libc::SIGWINCH]
         .into_iter()
         .fold(0, |set, signal| set | kernel_sigset_bit(signal))
@@ -1229,6 +1348,54 @@ pub(crate) fn host_signal_state_reads_refused() -> bool {
     }
 }
 
+/// Whether a host signal syscall that `site` would make to guest thread
+/// `tid` of process `pid` (or to the process, where `tid` is its leader) is
+/// refused: exactly where host signal state reads are
+/// ([`host_signal_state_reads_refused`]), because the backend's guest thread
+/// IDs do not name host tasks (KVM). There the number names an unrelated host
+/// task, if any, chosen by host thread-ID allocation, or one of Hermit's own
+/// (https://github.com/rrnewton/hermit/issues/4950), so the send must not
+/// happen. A refusal is logged by name (`host-signal-send`) and the caller
+/// skips the send, as a refused `/proc` read is skipped
+/// ([`read_kernel_signal_state`]). This is the send latch of SIGSHARE's
+/// design (section 7.3): every scheduler send on such a backend goes through
+/// the backend's publication instead, and this backstop catches a path that
+/// misses its gate. Only the test-only fault hooks log and go on; a send whose
+/// signal the guest would see ends the run instead
+/// ([`host_signal_send_refusal`]).
+pub(crate) fn host_signal_send_refused(site: &str, pid: i32, tid: i32, signal: i32) -> bool {
+    match host_signal_send_refusal(site, pid, tid, signal) {
+        Some(refusal) => {
+            error!("{}", refusal);
+            true
+        }
+        None => false,
+    }
+}
+
+/// [`host_signal_send_refused`]'s refusal as the message that ends the run, for
+/// a send whose signal the guest would see: `None` where the send may be made.
+/// Skipping such a send would silently lose a signal Linux delivers, a
+/// different guest result than Linux's, which principle 6 forbids; so the
+/// scheduler ends the run with it (`exit_on_scheduler_refusal`), as it ends
+/// the run for its other refusals (the coord7 review of
+/// <https://github.com/rrnewton/hermit/pull/5221>, finding 6).
+pub(crate) fn host_signal_send_refusal(
+    site: &str,
+    pid: i32,
+    tid: i32,
+    signal: i32,
+) -> Option<String> {
+    host_signal_state_reads_refused().then(|| {
+        format!(
+            "HERMIT_REFUSAL host-signal-send: {} would send host signal {} to guest thread {} \
+             (process {}): this backend's guest thread IDs do not name host tasks, so nothing \
+             was sent",
+            site, signal, tid, pid
+        )
+    })
+}
+
 /// Read `tid`'s signal state from the kernel.
 ///
 /// On a backend whose guest thread IDs do not name host tasks
@@ -1254,9 +1421,178 @@ pub(crate) fn read_kernel_signal_state(pid: Pid, tid: Pid) -> Result<KernelSigna
         });
         return Err(Errno::ENOSYS);
     }
-    let path = format!("/proc/{}/task/{}/status", pid.as_raw(), tid.as_raw());
-    let status = std::fs::read_to_string(path).map_err(|_| Errno::ESRCH)?;
+    let status = status_files::read(pid, tid)?;
     KernelSignalState::parse(&status).ok_or(Errno::EIO)
+}
+
+/// Drop thread `tid`'s open status files (`status_files`). Called when the
+/// thread exits; a later read of a reused TID opens the file afresh.
+pub(crate) fn forget_thread_status(tid: Pid) {
+    status_files::forget(tid);
+}
+
+/// Keep status files open from now on, in this process (`status_files`).
+/// Only a process that never shares a guest's descriptor table may call this:
+/// Hermit's own process, where Detcore traces the guest from outside. Detcore
+/// linked into a guest (the in-guest runtimes) never calls it, so it reads the
+/// path each time and no descriptor of its appears in the guest's table.
+pub(crate) fn keep_status_files_open() {
+    status_files::enable();
+}
+
+/// `/proc/<pid>/task/<tid>/status`, kept open per traced thread, so that a
+/// signal-state read is one pread(2) at offset 0 rather than an open(2),
+/// read(2) and close(2). A gated wait reads its thread's state at every turn,
+/// and every open(2) runs the host's file-open security hooks: measured on
+/// 2026-10-24, Hermit spent 20.7% of its samples opening this file and 18.5% in
+/// security_file_open alone, and on hosts where a BPF file-open hook takes its
+/// slow path (a mount walk and a contended map update) the same opens made the
+/// inherited-terminal poll tests of hermit-cli/tests/external_signal_interrupt.rs
+/// spend six times their ordinary system CPU.
+///
+/// An open procfs task file stays bound to the task it was opened for: after
+/// that thread exits it reads ESRCH, never a later task given the same TID. So
+/// a failed read drops the entry and opens the path once more, which reads
+/// exactly what reading the path did before this cache. At most `CAPACITY`
+/// files are kept, so a guest with many threads cannot exhaust Hermit's own
+/// descriptors; past that, reads open the path as before.
+///
+/// Files are kept only once `enable` has run in the process, which Hermit's
+/// own binary does at startup ([`keep_status_files_open`]). Where Detcore runs
+/// inside the guest (liteinst, in-guest-trap, DBT, SaBRe), a kept file would
+/// be a descriptor in the guest's own table, visible to it and inherited by its
+/// children; there nothing enables keeping, every read is the plain
+/// `read_to_string` of the path, and the map is never created (a `BTreeMap`,
+/// so no hasher state either).
+mod status_files {
+    use std::collections::BTreeMap;
+    use std::fs::File;
+    use std::os::unix::fs::FileExt;
+    use std::sync::Arc;
+    use std::sync::LazyLock;
+    use std::sync::Mutex;
+
+    use reverie::Pid;
+    use reverie::syscalls::Errno;
+
+    /// The most status files kept open at once.
+    pub(super) const CAPACITY: usize = 256;
+
+    /// The kept files, by (pid, tid).
+    type Kept = BTreeMap<(i32, i32), Arc<File>>;
+
+    static OPEN: LazyLock<Mutex<Kept>> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+    /// Whether this process keeps files (`enable`).
+    #[cfg(not(test))]
+    static KEEPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    #[cfg(test)]
+    thread_local! {
+        /// The switch for unit tests, per test thread, so that a test that
+        /// keeps no files runs beside one that keeps them.
+        static KEEPS_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Keep files from now on (`keep_status_files_open`).
+    pub(super) fn enable() {
+        #[cfg(not(test))]
+        KEEPS.store(true, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        KEEPS_FOR_TEST.with(|keeps| keeps.set(true));
+    }
+
+    fn enabled() -> bool {
+        #[cfg(not(test))]
+        {
+            KEEPS.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(test)]
+        {
+            KEEPS_FOR_TEST.with(|keeps| keeps.get())
+        }
+    }
+
+    fn open() -> std::sync::MutexGuard<'static, Kept> {
+        OPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The whole file, read from offset 0. procfs regenerates a status file
+    /// for every read that starts at offset 0.
+    fn read_whole(file: &File) -> std::io::Result<String> {
+        let mut bytes = Vec::with_capacity(4096);
+        loop {
+            let filled = bytes.len();
+            bytes.resize(filled + 4096, 0);
+            let read = file.read_at(&mut bytes[filled..], filled as u64)?;
+            bytes.truncate(filled + read);
+            if read == 0 {
+                break;
+            }
+        }
+        String::from_utf8(bytes)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    /// Thread `tid`'s status file text. `ESRCH` when it cannot be read, as
+    /// when the path could not be read before this cache.
+    pub(super) fn read(pid: Pid, tid: Pid) -> Result<String, Errno> {
+        if !enabled() {
+            let path = format!("/proc/{}/task/{}/status", pid.as_raw(), tid.as_raw());
+            return std::fs::read_to_string(path).map_err(|_| Errno::ESRCH);
+        }
+        let key = (pid.as_raw(), tid.as_raw());
+        let kept = open().get(&key).cloned();
+        if let Some(file) = kept {
+            if let Ok(text) = read_whole(&file)
+                && !text.is_empty()
+            {
+                return Ok(text);
+            }
+            open().remove(&key);
+        }
+        let path = format!("/proc/{}/task/{}/status", key.0, key.1);
+        let file = File::open(path).map_err(|_| Errno::ESRCH)?;
+        let text = read_whole(&file).map_err(|_| Errno::ESRCH)?;
+        let mut files = open();
+        if files.len() < CAPACITY {
+            files.insert(key, Arc::new(file));
+        }
+        Ok(text)
+    }
+
+    /// Drop every kept file of thread `tid`.
+    pub(super) fn forget(tid: Pid) {
+        if !enabled() {
+            return;
+        }
+        open().retain(|&(_, kept_tid), _| kept_tid != tid.as_raw());
+    }
+
+    /// How many files are kept open now.
+    #[cfg(test)]
+    pub(super) fn kept() -> usize {
+        open().len()
+    }
+
+    /// Whether a file of thread `tid` of process `pid` is kept open.
+    #[cfg(test)]
+    pub(super) fn keeps(pid: Pid, tid: Pid) -> bool {
+        open().contains_key(&(pid.as_raw(), tid.as_raw()))
+    }
+
+    /// The kept file of thread `tid` of process `pid`, if one is kept, for a
+    /// test to read without the fallback to the path.
+    #[cfg(test)]
+    pub(super) fn kept_file(pid: Pid, tid: Pid) -> Option<Arc<File>> {
+        open().get(&(pid.as_raw(), tid.as_raw())).cloned()
+    }
+
+    /// `read_whole`, for tests.
+    #[cfg(test)]
+    pub(super) fn read_kept(file: &File) -> std::io::Result<String> {
+        read_whole(file)
+    }
 }
 
 /// Why a blocked wait ended the run instead of returning to the guest
@@ -1376,6 +1712,214 @@ pub(crate) fn read_wait_signal_state(pid: Pid, tid: Pid) -> Result<KernelSignalS
     }
 }
 
+/// Whether Detcore reads a guest thread's signal state from the backend
+/// rather than from host `/proc`, on a backend with `backend`'s
+/// capabilities: exactly where the backend owns signal delivery because its
+/// guest threads are not host tasks (`provides_process_signal_control`,
+/// KVM), so `/proc/<pid>/task/<tid>` would describe an unrelated host task
+/// ([`refuses_host_signal_state_reads`]). There the backend reports the
+/// sets itself: per callback (`Guest::signal_sets`) and run-wide
+/// (`ProcessSignalControl::signal_sets`). Every other backend (ptrace,
+/// LiteInst, SaBRe, DBT) keeps its `/proc` read unchanged.
+pub(crate) fn reads_signal_state_from_backend(backend: &BackendCapabilities) -> bool {
+    backend.provides_process_signal_control
+}
+
+/// Whether a backend with `backend`'s capabilities restarts a guest call that
+/// a signal woke only by running the call again after `ERESTARTSYS`, and
+/// cannot hand the kernel's signal delivery Linux's other restart codes
+/// (`ERESTARTNOHAND`, `ERESTART_RESTARTBLOCK`): it owns signal delivery
+/// (`provides_process_signal_control`), so no kernel `handle_signal` sees the
+/// call's return, and it does not hand the delivery a restart errno
+/// (`supports_blocked_wait_signal_interruption`, which promises exactly that).
+/// True on KVM alone today.
+///
+/// Linux turns `ERESTARTNOHAND` and `ERESTART_RESTARTBLOCK` into `EINTR`
+/// whenever a handler runs, whatever `SA_RESTART` says, and restarts the call
+/// when none does (`handle_signal`, arch/x86/kernel/signal.c:266-270 at v6.17,
+/// and `arch_do_signal_or_restart`); `ERESTARTSYS` restarts after a handler
+/// with `SA_RESTART`. Where only `ERESTARTSYS` reaches the delivery, Detcore
+/// settles a woken `poll`, unmasked `ppoll` or recorded-socket wait itself at
+/// its return (`woken_poll_errno`) and keeps a `poll`'s end time for its rerun
+/// (`Detcore::keep_deadline_for_rerun`). Every site that decides so reads this
+/// one predicate (the coord7 review of
+/// <https://github.com/rrnewton/hermit/pull/5221>, finding 4). Once KVM can
+/// hand the delivery a restart errno (N8a), it declares
+/// `supports_blocked_wait_signal_interruption` and this turns false there.
+pub(crate) fn restarts_woken_calls_only_through_erestartsys(backend: &BackendCapabilities) -> bool {
+    backend.provides_process_signal_control && !backend.supports_blocked_wait_signal_interruption
+}
+
+#[cfg(test)]
+mod restarts_woken_calls_tests {
+    use crate::config::Config;
+
+    /// Residual R1 of the musereviewc review of
+    /// <https://github.com/rrnewton/hermit/pull/5221>: every row of the
+    /// capability table. A backend that leaves signal delivery to the kernel
+    /// (`provides_process_signal_control` false: ptrace, LiteInst,
+    /// InGuestTrap, SaBRe, DBT) hands `handle_signal` the call's own restart
+    /// code, so it never restarts only through `ERESTARTSYS`, whether or not
+    /// it also declares restart-errno delivery.
+    #[test]
+    fn only_a_backend_owning_delivery_without_restart_codes_restarts_through_erestartsys() {
+        for (owns_delivery, restart_codes, expected) in [
+            (true, false, true),
+            (true, true, false),
+            (false, true, false),
+            (false, false, false),
+        ] {
+            let config = Config::default().with_backend(|backend| {
+                backend.provides_process_signal_control = owns_delivery;
+                backend.supports_blocked_wait_signal_interruption = restart_codes;
+            });
+            assert_eq!(
+                super::restarts_woken_calls_only_through_erestartsys(&config.backend),
+                expected,
+                "owns_delivery={owns_delivery} restart_codes={restart_codes}"
+            );
+        }
+    }
+}
+
+/// The errno for a backend's answer that names no signal sets: the errno it
+/// gave (`ESRCH` for a task that is gone, `EAGAIN` for a read an exec
+/// overlapped), or `ENOSYS` where it does not report the fact, which callers
+/// already treat as an unreadable state.
+pub(crate) fn signal_sets_errno(error: reverie::FactError) -> Errno {
+    match error {
+        reverie::FactError::Errno(errno) => errno,
+        _ => Errno::ENOSYS,
+    }
+}
+
+/// The calling thread's signal state, from the backend where Detcore reads
+/// it there ([`reads_signal_state_from_backend`]: `Guest::signal_sets`, in
+/// this thread's own callback, while it is stopped), and `None` elsewhere,
+/// where the caller keeps its `/proc` read.
+fn backend_signal_state_of_caller<G, T>(guest: &G) -> Option<Result<KernelSignalState, Errno>>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    backend_signal_state_of(guest, guest.tid())
+}
+
+/// Guest thread `tid`'s signal state, from the backend where Detcore reads
+/// it there ([`reads_signal_state_from_backend`]: `Guest::signal_sets`,
+/// which names any live guest thread of this run, numbered as `Guest::tid`
+/// numbers it), and `None` elsewhere, where the caller keeps its `/proc`
+/// read.
+fn backend_signal_state_of<G, T>(guest: &G, tid: Pid) -> Option<Result<KernelSignalState, Errno>>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    reads_signal_state_from_backend(&guest.config().backend).then(|| {
+        guest
+            .signal_sets(tid)
+            .map(|sets| KernelSignalState::from_backend_sets(&sets))
+            .map_err(signal_sets_errno)
+    })
+}
+
+/// [`read_thread_signal_state`] of guest thread `tid` (of process `pid`, as
+/// the caller names it), read in a handler of any guest thread: from the
+/// backend where its guest threads are not host tasks
+/// ([`reads_signal_state_from_backend`]), so that no host task's `/proc`
+/// state reaches a decision there, and from `/proc` elsewhere, as before
+/// (SIGSHARE S3a).
+pub(crate) fn read_guest_task_signal_state<G, T>(
+    guest: &G,
+    pid: Pid,
+    tid: Pid,
+) -> Result<KernelSignalState, Errno>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    backend_signal_state_of(guest, tid).unwrap_or_else(|| read_thread_signal_state(pid, tid))
+}
+
+/// [`read_wait_signal_state`] of the calling thread, read from the backend
+/// where its guest threads are not host tasks
+/// ([`reads_signal_state_from_backend`]), with the same errors as
+/// [`read_guest_wait_signal_state`] there. Elsewhere it is exactly
+/// [`read_wait_signal_state`], which, unlike [`read_thread_wait_signal_state`],
+/// reads only `/proc/<pid>/task/<tid>` (SIGSHARE S3a).
+pub(crate) fn read_guest_group_wait_signal_state<G, T>(
+    guest: &G,
+) -> Result<KernelSignalState, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match backend_signal_state_of_caller(guest) {
+        None => read_wait_signal_state(guest.pid(), guest.tid()),
+        Some(read) => backend_wait_answer(guest.pid(), guest.tid(), read),
+    }
+}
+
+/// A blocked wait's reading of a backend's answer: the state, or
+/// `ERESTARTNOINTR` for a thread the backend no longer knows (`ESRCH`), which
+/// nothing observes, or the end of the run for any other failure, as for the
+/// `/proc` read.
+fn backend_wait_answer(
+    pid: Pid,
+    tid: Pid,
+    read: Result<KernelSignalState, Errno>,
+) -> Result<KernelSignalState, Error> {
+    match read {
+        Ok(state) => Ok(state),
+        Err(Errno::ESRCH) => Err(Errno::ERESTARTNOINTR.into()),
+        Err(errno) => Err(Error::Tool(anyhow::Error::new(
+            BlockedWaitSignalError::StateUnreadable { pid, tid, errno },
+        ))),
+    }
+}
+
+/// [`read_kernel_signal_state`] of the calling thread, read from the backend
+/// where its guest threads are not host tasks
+/// ([`reads_signal_state_from_backend`]), so that no host task's `/proc`
+/// state reaches a decision there.
+pub(crate) fn read_guest_signal_state<G, T>(guest: &G) -> Result<KernelSignalState, Errno>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    backend_signal_state_of_caller(guest)
+        .unwrap_or_else(|| read_kernel_signal_state(guest.pid(), guest.tid()))
+}
+
+/// [`read_thread_signal_state`] of the calling thread, read from the backend
+/// where its guest threads are not host tasks
+/// ([`reads_signal_state_from_backend`]), so that no host task's `/proc`
+/// state reaches a decision there.
+pub(crate) fn read_guest_thread_signal_state<G, T>(guest: &G) -> Result<KernelSignalState, Errno>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    backend_signal_state_of_caller(guest)
+        .unwrap_or_else(|| read_thread_signal_state(guest.pid(), guest.tid()))
+}
+
+/// [`read_thread_wait_signal_state`] of the calling thread, read from the
+/// backend where its guest threads are not host tasks
+/// ([`reads_signal_state_from_backend`]). There, a thread the backend no
+/// longer knows (`ESRCH`) ends the call with `ERESTARTNOINTR`, which nothing
+/// observes, and any other failure ends the run, as for the `/proc` read.
+pub(crate) fn read_guest_wait_signal_state<G, T>(guest: &G) -> Result<KernelSignalState, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match backend_signal_state_of_caller(guest) {
+        None => read_thread_wait_signal_state(guest.pid(), guest.tid()),
+        Some(read) => backend_wait_answer(guest.pid(), guest.tid(), read),
+    }
+}
+
 /// A test seam in front of the `/proc` read in [`read_kernel_signal_state`].
 #[cfg(test)]
 pub(crate) mod signal_state_read_seam {
@@ -1435,6 +1979,21 @@ pub(super) fn blocked_signal_mask() -> KernelSigset {
     })
 }
 
+/// Whether a managed child wait reads the guest's mask without replacing it
+/// (`block_signals_for_disposition`), and so restores nothing after:
+/// - on a backend whose application signals the runtime already holds while
+///   the callback runs (DBT, `requires_thread_directed_process_signals`);
+/// - under the in-guest delivery gate (A5 step 3c.1e B,
+///   <https://github.com/rrnewton/hermit/issues/4485>): the in-guest runtime
+///   runs every callback under its own mask, which blocks every blockable
+///   guest signal, so the guest's are held already; the query is answered from
+///   the guest's saved mask (`Guest::resume_signal_mask`'s record), and a
+///   block would make the mask the request publishes, and the guest resumes
+///   under, "every signal blocked" until the restore.
+fn reads_mask_in_place(config: &Config) -> bool {
+    config.backend.requires_thread_directed_process_signals || config.in_guest_signal_delivery
+}
+
 pub(super) async fn block_signals_for_disposition<G, T>(
     guest: &mut G,
     blocked_mask_addr: Addr<'_, KernelSigset>,
@@ -1446,24 +2005,17 @@ where
 {
     let block_signals = syscalls::RtSigprocmask::new()
         .with_how(libc::SIG_SETMASK)
-        .with_set(
-            (!guest
-                .config()
-                .backend
-                .requires_thread_directed_process_signals)
-                .then_some(blocked_mask_addr.cast()),
-        )
+        .with_set((!reads_mask_in_place(guest.config())).then_some(blocked_mask_addr.cast()))
         .with_oldset(Some(old_mask_addr.cast()))
         .with_sigsetsize(KERNEL_SIGSET_SIZE);
     guest.inject_with_retry(block_signals).await?;
     let guest_mask: KernelSigset = guest.memory().read_value(old_mask_addr)?;
-    if guest.config().backend.reports_child_exit_publication
-        || crate::scheduler::discarded_at_send::records(guest.config())
-    {
-        // While the private mask is installed, the kernel reports Detcore's
-        // mask for this thread; the scheduler's child-exit classification and
-        // its record of copies Linux discarded at send must read the guest's
-        // own (the Claude re-check of the R2b-1 design, R4-3).
+    if scheduler_reads_saved_guest_mask(guest.config()) {
+        // While the private mask is installed, the kernel (or, on KVM, the
+        // backend's signal state) reports Detcore's mask for this thread; the
+        // scheduler's child-exit classification and its record of copies
+        // Linux discarded at send must read the guest's own (the Claude
+        // re-check of the R2b-1 design, R4-3; SIGSHARE S4 for KVM).
         crate::tool_global::set_saved_guest_sigmask(guest, Some(guest_mask)).await;
     }
     Ok(guest_mask)
@@ -1477,11 +2029,7 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    if !guest
-        .config()
-        .backend
-        .requires_thread_directed_process_signals
-    {
+    if !reads_mask_in_place(guest.config()) {
         let old_mask: Addr<'_, KernelSigset> = old_mask_addr.into();
         let restore_signals = syscalls::RtSigprocmask::new()
             .with_how(libc::SIG_SETMASK)
@@ -1490,12 +2038,22 @@ where
             .with_sigsetsize(KERNEL_SIGSET_SIZE);
         guest.inject_with_retry(restore_signals).await?;
     }
-    if guest.config().backend.reports_child_exit_publication
-        || crate::scheduler::discarded_at_send::records(guest.config())
-    {
+    if scheduler_reads_saved_guest_mask(guest.config()) {
         crate::tool_global::set_saved_guest_sigmask(guest, None).await;
     }
     Ok(())
+}
+
+/// Whether the scheduler reads a thread's guest mask while a managed child
+/// wait holds it under Detcore's private mask (`saved_guest_sigmasks`): for
+/// its child-exit classification where publication is reported, or where it
+/// decides a controlled exit's notification from the backend's signal state
+/// (`reads_signal_state_from_backend`, SIGSHARE S4), and for its record of
+/// copies Linux discarded at send.
+fn scheduler_reads_saved_guest_mask(config: &Config) -> bool {
+    crate::scheduler::child_exit_publication(&config.backend).is_ok()
+        || reads_signal_state_from_backend(&config.backend)
+        || crate::scheduler::discarded_at_send::records(config)
 }
 
 async fn interrupted_child_wait_result<G, T, S>(
@@ -1580,12 +2138,32 @@ fn parse_futex_timeout(futex_op: i32, timeout: Timespec) -> Result<FutexTimeout,
     // FUTEX_WAIT_BITSET (e.g. 0x89) must still be recognized as the BITSET
     // command; comparing the raw op would misclassify it as relative and add
     // the absolute deadline to the current time (leaking the epoch).
-    if futex_op & libc::FUTEX_CMD_MASK == libc::FUTEX_WAIT_BITSET {
+    //
+    // FUTEX_LOCK_PI and FUTEX_LOCK_PI2 take absolute deadlines too
+    // (`futex_init_timeout`, kernel/futex/syscalls.c:147-157 at v6.16).
+    if matches!(
+        futex_op & libc::FUTEX_CMD_MASK,
+        libc::FUTEX_WAIT_BITSET | libc::FUTEX_LOCK_PI | libc::FUTEX_LOCK_PI2
+    ) {
         Ok(FutexTimeout::Absolute(LogicalTime::from_nanos(
             timeout_nanos,
         )))
     } else {
         Ok(FutexTimeout::Relative(timeout_nanos))
+    }
+}
+
+/// The clock an absolute futex deadline is measured on: CLOCK_REALTIME with
+/// FUTEX_CLOCK_REALTIME, and always for FUTEX_LOCK_PI, which `do_futex` gives
+/// `FLAGS_CLOCKRT` (kernel/futex/syscalls.c:114-116 at v6.16); otherwise
+/// CLOCK_MONOTONIC.
+fn futex_deadline_clock(futex_op: i32) -> syscalls::ClockId {
+    if futex_op & libc::FUTEX_CLOCK_REALTIME != 0
+        || futex_op & libc::FUTEX_CMD_MASK == libc::FUTEX_LOCK_PI
+    {
+        syscalls::ClockId::CLOCK_REALTIME
+    } else {
+        syscalls::ClockId::CLOCK_MONOTONIC
     }
 }
 
@@ -1652,7 +2230,8 @@ enum SchedYieldRoute {
 ///   that did not yield has had a turn. It changes no
 ///   priority, draws nothing from the chaos PRNG and consumes no recorded
 ///   preemption point, so a preemption replay under `--chaos` makes the same
-///   decision. A schedule replay keeps the weak yield it always had, and so
+///   decision. A schedule replay keeps the weak yield it always had, with or
+///   without `--chaos` (`Config::chaos_draws_schedule`), and so
 ///   does a backend that does not deliver the preemption timer
 ///   (`BackendCapabilities::delivers_preemption_timer_events`): there a thread handed the
 ///   turn that never makes a syscall would never give it back.
@@ -1664,7 +2243,7 @@ enum SchedYieldRoute {
 ///   over 32 seeds to fewer than the 7 of 8 classes the cell requires.
 ///   `StickyRandom` keeps its pick across turns, so it keeps the epoch.
 fn sched_yield_route(cfg: &Config) -> SchedYieldRoute {
-    if cfg.chaos && cfg.max_timeslice.is_none() {
+    if cfg.chaos_draws_schedule() && cfg.max_timeslice.is_none() {
         SchedYieldRoute::ChaosReprioritize
     } else if !cfg.chaos && cfg.replay_preemptions_from.is_some() {
         SchedYieldRoute::ReplayStrongYield
@@ -1704,11 +2283,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Ok(Some(deadline))
             }
             FutexTimeout::Absolute(deadline) => {
-                let clockid = if futex_flags & libc::FUTEX_CLOCK_REALTIME != 0 {
-                    syscalls::ClockId::CLOCK_REALTIME
-                } else {
-                    syscalls::ClockId::CLOCK_MONOTONIC
-                };
+                let clockid = futex_deadline_clock(futex_flags);
 
                 let mut stack = guest.stack().await;
                 let clock_output = syscalls::TimespecMutPtr(stack.reserve());
@@ -1784,6 +2359,86 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Before a clone that makes a process, where Detcore runs inside each
+    /// guest process: the record sequences of per-process files move to
+    /// Detcore's global state (`ThreadState::share_procfs_sequences`), so the
+    /// copies of the tool's state the fork makes share them, as Linux's
+    /// processes share the one `struct file` and `seq_file`. In-guest
+    /// LiteInst does so as it promotes (`promote_before_native_lifecycle`),
+    /// and DBT's runtime before its native fork; this covers SaBRe, whose
+    /// runtime promotes nothing. Only with sequentialized threads, whose turns
+    /// order every process's operations on the sequence.
+    fn share_procfs_sequences_before_copy<G: Guest<Self>>(&self, guest: &G) {
+        if self.cfg.sequentialize_threads
+            && !crate::syscalls::timerfd::detcore_runs_outside_the_guest(&guest.config().backend)
+        {
+            guest.thread_state().share_procfs_sequences();
+        }
+    }
+
+    /// Before a clone that makes a user namespace: Linux makes the caller's
+    /// effective user ID the new namespace's owner (`create_user_ns`,
+    /// kernel/user_namespace.c:82-136 in 6.17), and Detcore's record of user
+    /// namespaces (`scheduler::user_namespaces`) takes that owner to be the
+    /// real user ID every guest task has. It is, unless the caller runs, or
+    /// was forked from, an image of a set-user-ID file: Detcore makes the
+    /// credential-setting calls no-ops, so an exec is the one way a guest
+    /// task's effective ID comes to differ from its real one, which never
+    /// changes. The caller's IDs as the kernel beneath holds them (injected
+    /// `getuid` and `geteuid`, read before the clone, as `create_user_ns`
+    /// reads them) decide: true for a caller whose two differ, or that reads
+    /// either as the overflow ID 65534 (two such IDs may still differ), or
+    /// whose IDs cannot be read. Only once the clone has made the namespace is
+    /// that noted, for that namespace alone
+    /// (`UserNamespaces::note_owner_may_differ`), by the turn that registers
+    /// the new process: a clone that fails (EINVAL for `CLONE_NEWUSER` with
+    /// `CLONE_FS`; EPERM for a creator whose IDs its namespace does not map)
+    /// makes no namespace and notes nothing.
+    async fn user_namespace_owner_may_differ<G: Guest<Self>>(&self, guest: &mut G) -> bool {
+        /// `overflowuid`'s default, which an ID the caller's user namespace
+        /// does not map reads as.
+        const OVERFLOW_ID: i64 = 65534;
+        let uid = guest.inject(syscalls::Getuid::new()).await;
+        let euid = guest.inject(syscalls::Geteuid::new()).await;
+        !matches!((uid, euid), (Ok(uid), Ok(euid)) if uid == euid && uid != OVERFLOW_ID)
+    }
+
+    /// Make sure, once per thread, at its first clone, that Detcore's model
+    /// knows the guest-visible parent of the thread's process: where it does
+    /// not (`procfs::task_stat::TaskStatFacts::parent` is `None`), the
+    /// process's real parent is outside the guest's tree (the run's root,
+    /// and a `CLONE_PARENT` child of such a process), and the process's own
+    /// `getppid` answer, injected here, in its own turn, is recorded
+    /// (`Scheduler::record_external_parent`), as its first open of its own
+    /// rendered `stat` records it. A process it creates can then read that
+    /// parent in the process's rendered `stat` (package K item 2b slice
+    /// 2b-1): Linux reads it from `real_parent` at each read (`do_task_stat`)
+    /// and it does not change during the run. Not under record and replay,
+    /// where Detcore renders no procfs file.
+    async fn record_external_parent_at_clone<G: Guest<Self>>(&self, guest: &mut G) {
+        if self.cfg.recordreplay_modes || guest.thread_state().external_parent_checked {
+            return;
+        }
+        guest.thread_state_mut().external_parent_checked = true;
+        let Some(process) = guest.thread_state().detpid else {
+            return;
+        };
+        let facts = crate::tool_global::task_stat_facts(
+            guest,
+            crate::procfs::BoundTask {
+                process: process.as_raw(),
+                thread: None,
+            },
+        )
+        .await;
+        if facts.parent.is_some() || facts.process != Some(process.as_raw()) {
+            return;
+        }
+        if let Ok(parent) = guest.inject(syscalls::Getppid::new()).await {
+            crate::tool_global::record_external_parent(guest, process, parent as i32).await;
+        }
+    }
+
     /// Clone, clone3, fork, vfork system calls
     pub async fn handle_clone_family<G: Guest<Self>>(
         &self,
@@ -1794,6 +2449,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             && let Some(refusal) = self.clone3_set_tid_refusal(guest, clone).await
         {
             return refusal;
+        }
+        // Linux's EINVAL for the flags, on every backend, so that a backend
+        // is asked only for a clone Linux would perform and declines only
+        // one it cannot (`UnsupportedOperation::Clone`). A clone3's stack is
+        // checked against the user address limit the backend reports, the
+        // one its kernel's `access_ok` enforces (`clone3_args_einval`).
+        let user_limit = matches!(clone_family, syscalls::family::CloneFamily::Clone3(_))
+            .then(|| guest.user_address_limit().ok().map(|limit| limit.max_end))
+            .flatten();
+        if linux_refuses_clone_flags(&guest.memory(), &clone_family, user_limit) {
+            return Err(Errno::EINVAL.into());
         }
         // clone3's `struct clone_args` is read field by field
         // (`clone3_field`): Reverie's whole-struct read fails for a valid
@@ -1835,6 +2501,35 @@ impl<T: RecordOrReplay> Detcore<T> {
         // cloned thread's syscalls through this tool.
         let is_vfork = flags.contains(CloneFlags::CLONE_VFORK);
 
+        // D41 with IR-5 (A5 step 3c.1c): the first statement of the vfork
+        // branch, before `clone_flags` and `pending_vfork` are set, the
+        // descriptors promoted or the signal-state copy cloned, so a vfork not
+        // run leaves none of them for the death path's exit lifecycle to read.
+        if is_vfork && let Some(refused) = super::helpers::kernel_run_entry_refusal(guest)? {
+            return Err(refused);
+        }
+
+        // A clone that makes a user namespace makes it the caller's effective
+        // user ID's (`user_namespace_owner_may_differ`): read now, noted once
+        // the clone has made the namespace. Only where Detcore renders procfs
+        // files, whose access checks read the record of user namespaces: not
+        // under record and replay.
+        let user_namespace_owner_may_differ = flags.contains(CloneFlags::CLONE_NEWUSER)
+            && !flags.contains(CloneFlags::CLONE_THREAD)
+            && !self.cfg.recordreplay_modes
+            && self.user_namespace_owner_may_differ(guest).await;
+
+        // The caller's process's guest-visible parent, where its real parent
+        // is outside the guest's tree, before the clone makes a process that
+        // could read the caller's stat.
+        self.record_external_parent_at_clone(guest).await;
+
+        // The child's ID, when Detcore chooses the IDs: taken here, in this
+        // turn, before the vfork parent below gives the turn up.
+        let clone_plan = self
+            .plan_clone_id(guest, &Syscall::from(clone_family))
+            .await?;
+
         let ts = guest.thread_state_mut();
         assert_eq!(ts.clone_flags, None);
         assert!(ts.pending_vfork.is_none());
@@ -1851,14 +2546,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
+        let blocking_child_op_id = ExternalOpId::new(parent_dettid, ts.stats.syscall_count);
         if is_vfork {
             ts.pending_vfork = Some(PendingVfork {
                 parent_dettid,
+                op: blocking_child_op_id,
                 parent_detpid: ts.detpid.expect("detpid unset"),
                 child_tid_addr: ctid,
                 flags,
                 exit_signal,
                 child_priority_entropy,
+                user_namespace_owner_may_differ,
             });
         }
 
@@ -1873,15 +2571,25 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         if !flags.contains(CloneFlags::CLONE_THREAD) {
             self.promote_before_native_lifecycle(guest);
+            self.share_procfs_sequences_before_copy(guest);
         }
 
         // Actions shared with a new process are withdrawn from the
         // scheduler before the child exists.
         super::signal_shadow::before_clone(guest, flags.bits()).await;
 
+        // From here until it returns, the clone may have made a task the
+        // run's record does not name yet (a vfork child runs before its
+        // parent's clone returns), so it counts as one (`LiveTasks`). Noted
+        // in this turn, before the vfork parent below gives the turn up.
+        guest
+            .thread_state()
+            .live_tasks
+            .lock()
+            .expect("live tasks mutex poisoned")
+            .begin_clone(parent_dettid);
+
         trace!("[detcore, dtid {}] parent invoking clone.", parent_dettid);
-        let blocking_child_op_id =
-            ExternalOpId::new(parent_dettid, guest.thread_state().stats.syscall_count);
 
         // A CLONE_VFORK parent cannot resume until the child execs or exits.
         // Relinquish the parent's scheduler turn before entering that
@@ -1898,10 +2606,28 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let call = Syscall::from(clone_family);
         let sysno = call.number();
-        let maybe_res = guest.inject(call).await;
+        // A plan that leaves the kernel to number the child (or the guest
+        // to choose) issues the call as main does, with `CLONE_UNTRACED`
+        // cleared for a tracing backend; a chosen-ID plan issues it through
+        // `inject_clone_planned`, whose staged copy clears the flag itself.
+        let (maybe_res, untraced_refusal) = match clone_plan {
+            super::chosen_ids::ClonePlan::Kernel | super::chosen_ids::ClonePlan::GuestChosen => {
+                match inject_traced_clone(guest, clone_family, flags).await {
+                    CloneInjection::Ran(result) => (result, None),
+                    // No call ran. ENOMEM is what the guest gets with
+                    // --allow-unsupported-syscalls: a clone Linux could not complete.
+                    CloneInjection::Refused(reason) => (Err(Errno::ENOMEM), Some(reason)),
+                }
+            }
+            _ => (
+                self.inject_clone_planned(guest, call, clone_plan, is_vfork)
+                    .await,
+                None,
+            ),
+        };
         // Ask before anything else is injected: the next injection replaces
         // the backend's record.
-        let refusal = if maybe_res.is_err() {
+        let refusal = if maybe_res.is_err() && untraced_refusal.is_none() {
             guest.take_unsupported_refusal()
         } else {
             None
@@ -1911,10 +2637,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             let mut resources = Resources::new(parent_dettid);
             if maybe_res.is_err() {
                 // TODO-HUMAN-REVIEW(PR-1152): Review failed deferred-vfork cancellation.
-                // A deferred-spawn backend cannot infer failure from the absence of a registered
-                // child: a successful child also registers after this continuation. Report the
-                // known injected-syscall outcome explicitly so the scheduler can cancel the
-                // barrier and re-admit this parent before we propagate the original error below.
+                // The scheduler cannot infer failure from the absence of a registered child: a
+                // successful child may also register after this continuation. Report the known
+                // injected-syscall outcome explicitly so the scheduler can cancel the barrier and
+                // re-admit this parent before we propagate the original error below.
                 resources.insert(
                     ResourceID::VforkFailed(blocking_child_op_id),
                     Permission::RW,
@@ -1933,22 +2659,51 @@ impl<T: RecordOrReplay> Detcore<T> {
         let ts = guest.thread_state_mut();
         ts.clone_flags = None; // Unset, now that it has been read by the child.
         ts.pending_vfork = None;
+        // The clone returned, in this turn: the child it made, if any, is
+        // one of the run's tasks from here until a wait reaps its process.
+        let child = maybe_res.as_ref().ok().map(|&res| {
+            let child = DetTid::from_raw(res as i32);
+            let process = if flags.contains(CloneFlags::CLONE_THREAD) {
+                ts.detpid.expect("detpid unset")
+            } else {
+                child
+            };
+            (child, process)
+        });
+        ts.live_tasks
+            .lock()
+            .expect("live tasks mutex poisoned")
+            .end_clone(parent_dettid, child);
 
         // A backend that cannot create the child says so with a typed refusal
-        // (an in-guest backend runs one thread of the guest). Answering the
-        // guest with the refusal's errno would be an error Linux never gives
-        // a valid clone, so the run is refused instead, as for an exec the
-        // backend cannot perform.
-        if let (Some(refusal), Err(errno)) = (refusal, &maybe_res) {
-            tracing::error!(
-                "[detcore, dtid {parent_dettid}] {}; no child was created",
-                refusal.diagnostic
+        // (an in-guest backend runs one thread of the guest; KVM cannot give a
+        // child some of the sharing Linux allows). Answering the guest with
+        // the refusal's errno would be an error Linux never gives a valid
+        // clone, so the run is refused instead, as for an exec the backend
+        // cannot perform, and named on stderr when the run ends
+        // (`report_refusal_reason`).
+        let source = if refusal.is_some() {
+            "refused by the backend"
+        } else {
+            "refused"
+        };
+        let diagnostic = refusal
+            .map(|refusal| refusal.diagnostic.to_string())
+            .or(untraced_refusal);
+        if let (Some(diagnostic), Err(errno)) = (diagnostic, &maybe_res) {
+            let named = CloneFlags::from_bits_retain(flags.bits() & !0xff);
+            crate::syscalls::helpers::report_refusal_reason(
+                self.cfg.panic_on_unsupported_syscalls,
+                &format!(
+                    "[dtid {parent_dettid}] {sysno} {source}: {diagnostic} (flags {named:?}, \
+                     exit signal {exit_signal}). No child was created."
+                ),
             );
             if !self.cfg.panic_on_unsupported_syscalls {
                 crate::tool_global::report_unsupported_syscall(guest, sysno).await;
             }
             return self
-                .refuse_unserviceable_operation_because(guest, sysno, *errno, refusal.diagnostic)
+                .refuse_unserviceable_operation_because(guest, sysno, *errno, &diagnostic)
                 .await;
         }
 
@@ -1959,6 +2714,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             // inherited open file descriptions. Failed clone-family calls leave
             // the previously observed flock state authoritative.
             guest.thread_state().forget_flock_modes();
+        }
+        if !flags.contains(CloneFlags::CLONE_FILES) {
+            // The child's table is a copy of this one: the descriptions the
+            // lock ledger does not follow now have references it never saw
+            // taken. Marked here too, for the backends whose child is a copy of
+            // this tool state (`FileMetadata::fork_for` marks the child's).
+            guest.thread_state().mark_untracked_references_escaped();
         }
 
         // Match ordinary clone: the parent consumes the priority entropy after
@@ -1982,6 +2744,12 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         if !is_vfork {
             create_child_thread(guest, child_dettid, ctid, Some(flags), exit_signal, None).await;
+            // The clone made the namespace: note its owner, in the turn that
+            // registered the child (a vfork child notes its own at its
+            // registration, `Detcore::handle_thread_start`).
+            if user_namespace_owner_may_differ {
+                crate::tool_global::note_user_namespace_owner_may_differ(guest, child_dettid).await;
+            }
         }
 
         if let Some(address) = pidfd_address {
@@ -2038,6 +2806,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::SetTidAddress,
     ) -> Result<i64, Error> {
         let address = call.tidptr().map_or(0, |pointer| pointer.as_raw());
+        crate::reserved_input::expose_local_overlap(
+            guest,
+            address as u64,
+            4,
+            "clear-tid-reserved-reference",
+        )?;
         let result = self
             .record_or_replay(guest, Syscall::SetTidAddress(call))
             .await?;
@@ -2073,6 +2847,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let head = call.head().map(AddrMut::as_raw);
         let len = call.len();
+        if let Some(head) = head {
+            crate::reserved_input::expose_local_overlap(
+                guest,
+                head as u64,
+                len as u64,
+                "robust-list-reserved-reference",
+            )?;
+        }
         let res = self
             .record_or_replay(guest, Syscall::SetRobustList(call))
             .await?;
@@ -2102,10 +2884,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// Linux runs this from `mm_release()` while a task dies. Detcore performs
     /// the same walk and issues the wake against its own modeled waiter pool,
-    /// which is where precise-mode futex waiters actually live. Ptrace leaves
-    /// the atomic word transition to Linux on every backend that enters this
-    /// path ([`OwnerDeathPath`]), and the wake reaches a waiter only after
-    /// Linux has made it. The algorithm is in
+    /// which is where precise-mode futex waiters actually live. Where the
+    /// native exit walks the list too ([`OwnerDeathPath::Kernel`],
+    /// [`OwnerDeathPath::Barrier`]), Detcore leaves the atomic word transition
+    /// to Linux, and the wake reaches a waiter only after Linux has made it.
+    /// Where none does ([`OwnerDeathPath::Detcore`], KVM), Detcore makes each
+    /// transition itself with the guest's atomic compare-and-exchange, in this
+    /// thread's own turn, before its wake. The algorithm is in
     /// [`crate::syscalls::robust_list`]; this function only supplies guest
     /// memory and the scheduler wake.
     ///
@@ -2139,16 +2924,32 @@ impl<T: RecordOrReplay> Detcore<T> {
         let owner_tid = dettid.as_raw() as u32;
 
         let mut marked = HashMap::new();
+        let mut unsupported = None;
+        let transition = if path == OwnerDeathPath::Detcore {
+            OwnerWordTransition::Detcore {
+                unsupported: &mut unsupported,
+            }
+        } else {
+            OwnerWordTransition::Linux
+        };
         let mut effects = GuestRobustEffects::<'_, G, T> {
             guest,
             dettid,
             staged_wakes: None,
             marked: &mut marked,
+            transition,
             tool: PhantomData,
         };
         let outcome = robust_list::exit_robust_list(&mut effects, head, owner_tid).await;
-        if path == OwnerDeathPath::Barrier {
+        // A later exit_group of this group must not walk this list again: on
+        // DBT and KVM it walks at its grant, which may come before this
+        // thread's exit hook drops the registration.
+        if matches!(path, OwnerDeathPath::Barrier | OwnerDeathPath::Detcore) {
             guest.thread_state().mark_robust_list_walked_by_tool();
+        }
+        if let Some(errno) = unsupported {
+            self.refuse_unexchangeable_owner_word(guest, dettid, errno, OwnerDeath::Exit)
+                .await;
         }
         if outcome.head_unreadable {
             trace!(
@@ -2174,14 +2975,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// ended the group. A delivered signal
     /// may still be caught or ignored: Detcore must not mark a live owner's
     /// word, and that backend's native exit callback cannot tell which signal
-    /// ended the thread group.
+    /// ended the thread group. Nor on [`OwnerDeathPath::Detcore`], where
+    /// Detcore walks, stores and wakes at the exit itself, and for a signal
+    /// only once its default action is known to end the group
+    /// (`Self::walk_robust_lists_before_fatal_delivery`).
     pub(crate) async fn stage_thread_group_robust_list_wakes<G: Guest<Self>>(
         &self,
         guest: &mut G,
         reason: RobustListExit,
     ) {
         match self.robust_owner_death_path() {
-            None | Some(OwnerDeathPath::Barrier) => {}
+            None | Some(OwnerDeathPath::Barrier) | Some(OwnerDeathPath::Detcore) => {}
             Some(OwnerDeathPath::Kernel) => {
                 let staged = self
                     .read_thread_group_robust_list_wakes(guest, OwnerDeath::Exit)
@@ -2193,27 +2997,39 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Replay Linux's `exit_robust_list()` for each `(owner, head)` of the
     /// current thread group, in owner order, as that owner's list, waking at
-    /// once ([`OwnerDeathPath::Barrier`]). The threads the grant killed have not made
-    /// their native exits (`ThreadState::wait_for_exit_group_robust_walk`), so
-    /// every word reads as the guest left it.
+    /// once ([`OwnerDeathPath::Barrier`], [`OwnerDeathPath::Detcore`]). On
+    /// Barrier the threads the grant killed have not made their native exits
+    /// (`ThreadState::wait_for_exit_group_robust_walk`), so every word reads as
+    /// the guest left it, and Linux makes the transitions; on Detcore no
+    /// native exit ever walks, and Detcore makes them itself.
     async fn run_thread_group_robust_list_owner_death<G: Guest<Self>>(
         &self,
         guest: &mut G,
         heads: Vec<RobustListOwner>,
+        path: OwnerDeathPath,
     ) {
         // One group exit: a word Linux marks under one owner reads as marked
         // under every later one.
         let mut marked = HashMap::new();
+        let mut unsupported = None;
         for RobustListOwner {
             dettid: owner,
             head,
         } in heads
         {
+            let transition = if path == OwnerDeathPath::Detcore {
+                OwnerWordTransition::Detcore {
+                    unsupported: &mut unsupported,
+                }
+            } else {
+                OwnerWordTransition::Linux
+            };
             let mut effects = GuestRobustEffects::<'_, G, T> {
                 guest,
                 dettid: owner,
                 staged_wakes: None,
                 marked: &mut marked,
+                transition,
                 tool: PhantomData,
             };
             let outcome =
@@ -2224,7 +3040,72 @@ impl<T: RecordOrReplay> Detcore<T> {
                     owner, outcome,
                 );
             }
+            if let Some(errno) = unsupported {
+                self.refuse_unexchangeable_owner_word(guest, owner, errno, OwnerDeath::Exit)
+                    .await;
+            }
         }
+    }
+
+    /// The owner-word transitions of a thread group that dies as a whole,
+    /// where Detcore makes them itself ([`OwnerDeathPath::Detcore`]): at the
+    /// grant of the `Exit` request that ends the group (an exit_group, or a
+    /// SIGKILL a thread sends its own process), whose filing
+    /// (`ThreadState::file_exit_group_for_robust_lists`) kept the threads the
+    /// grant killed registered. Every registration current at the grant is
+    /// walked, in owner order, as `do_group_exit` makes each thread's own exit
+    /// walk its list (`do_exit`, `exit_mm_release`, `futex_exit_release`),
+    /// less a thread whose own exit Detcore already walked.
+    async fn run_granted_group_robust_list_owner_death<G: Guest<Self>>(&self, guest: &mut G) {
+        guest.thread_state().begin_exit_group_robust_walk();
+        let owners = guest.thread_state().robust_list_owners_for_exit_group();
+        guest
+            .thread_state()
+            .mark_robust_lists_walked_by_tool(&owners);
+        self.run_thread_group_robust_list_owner_death(guest, owners, OwnerDeathPath::Detcore)
+            .await;
+        guest.thread_state().finish_exit_group_robust_walk();
+    }
+
+    /// Refuse the run, by name, at a robust-list owner word the backend
+    /// cannot exchange atomically ([`robust_list::FutexCasOutcome::Unsupported`]),
+    /// where no Linux exit or exec will mark it ([`OwnerDeathPath::Detcore`]):
+    /// Linux marks such a word `FUTEX_OWNER_DIED` and wakes a waiter at its
+    /// owner's death, or at an exec once it can no longer fail, and skipping
+    /// it would leave that waiter parked for good. `death` words the message:
+    /// an exec walks only once it can no longer fail
+    /// (`Self::commit_exec_robust_lists`), so a failed exec never gets here.
+    async fn refuse_unexchangeable_owner_word<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        owner: DetTid,
+        errno: Errno,
+        death: OwnerDeath,
+    ) -> ! {
+        let message = match death {
+            OwnerDeath::Exit => format!(
+                "hermit: thread {owner} died owning a robust futex whose word this backend \
+                 cannot exchange atomically ({errno}); Linux marks that word \
+                 FUTEX_OWNER_DIED and wakes a waiter at the owner's death, and no Linux exit \
+                 does that for this backend's threads, so the run is refused \
+                 (https://github.com/rrnewton/hermit/issues/4529)"
+            ),
+            OwnerDeath::Exec => format!(
+                "hermit: an exec that can no longer fail walks thread {owner}'s robust list, \
+                 which holds a robust futex whose word this backend cannot exchange \
+                 atomically ({errno}); Linux marks that word FUTEX_OWNER_DIED and wakes a \
+                 waiter there (futex_exec_release), and no Linux exec does that for this \
+                 backend's threads, so the run is refused \
+                 (https://github.com/rrnewton/hermit/issues/4529)"
+            ),
+        };
+        tracing::error!("{message}");
+        let _ = std::io::Write::write_fmt(
+            &mut crate::util::RetryingStderr,
+            format_args!("{message}\n"),
+        );
+        crate::tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+            .await
     }
 
     /// How this backend orders owner-death wakes after Linux's walk, or `None`
@@ -2236,6 +3117,126 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// not model futexes at all.
     fn robust_owner_death_path(&self) -> Option<OwnerDeathPath> {
         owner_death_path(&self.cfg)
+    }
+
+    /// Whether a SIGKILL that a thread sends its own process walks the
+    /// process's robust lists at the grant of the `Exit` request it files
+    /// (`Self::reserve_controlled_self_sigkill_exit`, the only route such a
+    /// SIGKILL takes on a backend that cancels killed threads' RPCs), as an
+    /// exit_group does: on [`OwnerDeathPath::Detcore`], where no Linux exit
+    /// walks them. Elsewhere the sender records the lists for Linux's walk
+    /// (`Self::record_sigkill_robust_lists`) or the backend walks them.
+    pub(crate) fn sigkill_of_own_process_walks_robust_lists(&self) -> bool {
+        self.robust_owner_death_path() == Some(OwnerDeathPath::Detcore)
+    }
+
+    /// The walk of [`Self::sigkill_of_own_process_walks_robust_lists`], at the
+    /// grant: every registration of the sender's process, stored and woken in
+    /// the sender's turn, before the send that ends the process.
+    pub(crate) async fn walk_robust_lists_of_granted_sigkill<G: Guest<Self>>(&self, guest: &mut G) {
+        self.run_granted_group_robust_list_owner_death(guest).await;
+    }
+
+    /// Whether a successful exec gives the new image a robust-list state of
+    /// its own (`ThreadState::start_robust_list_process_for_exec`): on
+    /// [`OwnerDeathPath::Detcore`], where an exit_group filed by a thread the
+    /// exec killed would otherwise keep that thread's old registration listed
+    /// for a walk that stores into the new image.
+    pub(crate) fn exec_starts_a_new_robust_list_process(&self) -> bool {
+        self.robust_owner_death_path() == Some(OwnerDeathPath::Detcore)
+    }
+
+    /// Before the send of SIGKILL reservation `token`, record the robust list
+    /// of every thread the send kills (`Scheduler::sigkill_dying_threads`),
+    /// for its exit callback to walk ([`Self::sigkill_robust_list_wakes`]).
+    ///
+    /// Linux walks a dying thread's robust list in its own exit, before its
+    /// address space goes away (`exit_mm_release`, `futex_exit_release`,
+    /// `exit_robust_list`), however the thread dies. A SIGKILL leaves no stop
+    /// at which Detcore could read the list, and the exit callback comes after
+    /// the address space is gone, so the sender reads it here, in its own turn.
+    /// Nothing changes the list between this read and Linux's walk: the
+    /// victims run no guest code again, and no other guest thread takes a turn
+    /// before the send. Only the backends whose exit callback follows Linux's
+    /// walk need it ([`OwnerDeathPath::Kernel`]), and those run Detcore in the
+    /// tracer, which may read every guest's memory.
+    pub(crate) async fn record_sigkill_robust_lists<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        token: u64,
+    ) {
+        if self.robust_owner_death_path() != Some(OwnerDeathPath::Kernel) {
+            return;
+        }
+        let mut lists = Vec::new();
+        for (tid, mm) in crate::tool_global::sigkill_dying_threads(guest, token).await {
+            if let Some(list) = robust_list::record_robust_list(tid.as_raw()).await {
+                lists.push((tid, mm, list));
+            }
+        }
+        if !lists.is_empty() {
+            crate::tool_global::record_sigkill_robust_lists(guest, token, lists).await;
+        }
+    }
+
+    /// In the exit callback of a thread a SIGKILL ended, replay Linux's
+    /// `exit_robust_list` over the list the SIGKILL's sender recorded for it
+    /// ([`Self::record_sigkill_robust_lists`]) and deliver its wakes: one
+    /// waiter per futex Linux marked `FUTEX_OWNER_DIED` with `FUTEX_WAITERS`
+    /// set, and one per pending word that held no owner. Linux has made every
+    /// owner-word transition by now, as for the other exits on this path. A
+    /// victim's wakes are held until every victim of the send is accounted and
+    /// then run in victim order (`Scheduler::retain_sigkill_victim_wakes`); the
+    /// sender of a send that ended its own process still holds its `Exit`
+    /// grant, so its wakes run at once, before any other thread takes a turn.
+    pub(crate) async fn sigkill_robust_list_wakes<R: GlobalRPC<GlobalState>>(
+        &self,
+        global_state: &R,
+        thread_state: &ThreadState<T::ThreadState>,
+        exit_signal: Option<i32>,
+    ) {
+        if exit_signal != Some(libc::SIGKILL)
+            || self.robust_owner_death_path() != Some(OwnerDeathPath::Kernel)
+            // A list staged for this exit is delivered by the staged path.
+            || thread_state.has_matching_robust_list_exit(exit_signal)
+        {
+            return;
+        }
+        let time = thread_state.thread_logical_time.clone();
+        let mm = thread_state.mm_id;
+        let Some(list) =
+            crate::tool_global::take_sigkill_robust_list(time.clone(), global_state, mm).await
+        else {
+            return;
+        };
+        let dettid = thread_state.dettid;
+        // The owner word holds the TID the kernel gave the thread, which is the
+        // raw `DetTid` (see `Self::run_robust_list_owner_death`).
+        let (futexes, outcome) =
+            robust_list::owner_death_wakes_in_snapshot(&list, dettid.as_raw() as u32, |address| {
+                thread_state.futex_id(address, false)
+            })
+            .await;
+        if outcome.head_unreadable || outcome.aborted || outcome.next_faulted || outcome.truncated {
+            trace!(
+                "[detcore, dtid {}] SIGKILLed thread's robust-list walk stopped early: {:?}",
+                dettid, outcome,
+            );
+        }
+        let wakes: Vec<(DetTid, RobustListWake)> = futexes
+            .into_iter()
+            .map(|futex| (dettid, RobustListWake { futex }))
+            .collect();
+        let identities: Vec<FutexID> = wakes.iter().map(|(_, wake)| wake.futex).collect();
+        let counts =
+            crate::tool_global::robust_list_wakes_after_exit(time, global_state, mm, wakes).await;
+        // A held batch is answered with no counts and logged when it runs.
+        for (futex, count) in identities.into_iter().zip(counts) {
+            info!(
+                "[detcore, dtid {}] robust-list owner death woke {} waiter(s) on futex {:?} after physical exit",
+                dettid, count, futex,
+            );
+        }
     }
 
     /// The owner-death wakes a successful execve makes Linux deliver, in
@@ -2262,8 +3263,153 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// The owner-death wakes Linux's `exit_robust_list` would make for every
     /// registered robust list in the current thread group, read without
-    /// changing guest memory: Linux makes the owner-word transitions. Callers
-    /// decide whether Detcore models owner death at all
+    /// changing guest memory, held for the caller to deliver: Linux makes the
+    /// owner-word transitions ([`Self::robust_list_wakes_of`]). A thread whose
+    /// own exit Detcore already walked (its head stays registered while an
+    /// exit_group is filed) is left out, as an exit_group's walk leaves it
+    /// out, so no list is walked twice (Claude review of
+    /// https://github.com/rrnewton/hermit/pull/4352, F4).
+    async fn read_thread_group_robust_list_wakes<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        death: OwnerDeath,
+    ) -> Vec<(DetTid, Vec<RobustListWake>)> {
+        let owners = guest.thread_state().robust_list_owners_for_exit_group();
+        self.robust_list_wakes_of(guest, death, owners, false).await
+    }
+
+    /// At the entry of an exec, where Detcore walks the robust lists itself
+    /// ([`OwnerDeathPath::Detcore`]): keep what the walk needs for the exec's
+    /// point of no return ([`Self::commit_exec_robust_lists`]), the old
+    /// image's `memory_metadata` and `mm_id` and the registrations to walk,
+    /// read now, before the entry gives the thread the new image's state. A
+    /// walk of lists that hold no entry and no pending entry would change
+    /// nothing, so nothing is kept for one. Every other guest thread is held
+    /// off from here to the point of no return, so the registrations cannot
+    /// change in between.
+    fn plan_exec_robust_lists<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        memory_metadata: &Arc<Mutex<MemoryMetadata>>,
+        mm_id: crate::types::MmId,
+    ) {
+        let owners = guest.thread_state().robust_list_owners_for_exit_group();
+        if !owners
+            .iter()
+            .any(|owner| robust_list_holds_an_entry(guest, owner.head))
+        {
+            return;
+        }
+        guest.thread_state_mut().exec_robust_commit = Some(crate::tool_local::ExecRobustCommit {
+            owners,
+            memory_metadata: Arc::clone(memory_metadata),
+            mm_id,
+        });
+    }
+
+    /// The robust-list walk an exec owes where Detcore walks the lists itself
+    /// ([`OwnerDeathPath::Detcore`], KVM), made where Linux makes it: once the
+    /// exec can no longer fail, with the old image still mapped. The backend
+    /// calls `Tool::handle_exec_commit` there, after it has read the path,
+    /// argv and envp and validated the new image, before it replaces the
+    /// image; Linux's `begin_new_exec` passes `point_of_no_return`, ends the
+    /// other threads in `de_thread`, and walks the lists from `exec_mmap`'s
+    /// `exec_mm_release` (`futex_exec_release`), after `do_execveat_common`
+    /// copied the strings (fs/exec.c). So a failed exec walks nothing, and no
+    /// store can change a string the exec copies. Every list kept at the
+    /// exec's entry ([`Self::plan_exec_robust_lists`]) is walked, the caller's
+    /// last and as the thread group ID's ([`Self::robust_list_wakes_of`]),
+    /// each word stored with the guest's compare-and-exchange; a word the
+    /// backend cannot exchange refuses the run by name, at this point and so
+    /// only for an exec that succeeds. The walk's wakes name the old image's
+    /// futexes, and wait for the new image's first callback
+    /// (`ThreadState::stage_robust_list_wakes_for_exec`).
+    pub(crate) async fn commit_exec_robust_lists<G: Guest<Self>>(&self, guest: &mut G) {
+        let Some(crate::tool_local::ExecRobustCommit {
+            owners,
+            memory_metadata,
+            mm_id,
+        }) = guest.thread_state_mut().exec_robust_commit.take()
+        else {
+            return;
+        };
+        // The exec's entry gave the thread the new image's mapping model and
+        // address-space identity; the walk's futex keys are the old image's.
+        let (new_memory_metadata, new_mm_id) = {
+            let thread_state = guest.thread_state_mut();
+            (
+                std::mem::replace(&mut thread_state.memory_metadata, memory_metadata),
+                std::mem::replace(&mut thread_state.mm_id, mm_id),
+            )
+        };
+        // A thread the exec ends must not walk its list again at its own exit.
+        guest
+            .thread_state()
+            .mark_robust_lists_walked_by_tool(&owners);
+        let wakes = self
+            .robust_list_wakes_of(guest, OwnerDeath::Exec, owners, true)
+            .await;
+        let thread_state = guest.thread_state_mut();
+        thread_state.memory_metadata = new_memory_metadata;
+        thread_state.mm_id = new_mm_id;
+        thread_state.stage_robust_list_wakes_for_exec(wakes);
+    }
+
+    /// Refuse the run, by name, when a successful exec's new image starts
+    /// with its robust-list walk unmade: the backend replaced the image
+    /// without calling `Tool::handle_exec_commit`, so the walk Linux makes at
+    /// the exec ([`Self::commit_exec_robust_lists`]) never ran, and a waiter
+    /// on a word the old image owned would stay parked for good.
+    pub(crate) async fn refuse_unwalked_exec<G: Guest<Self>>(&self, guest: &mut G) -> ! {
+        let dettid = guest.thread_state().dettid;
+        let message = format!(
+            "hermit: thread {dettid}'s exec replaced its image without the backend reporting \
+             the exec's point of no return (Tool::handle_exec_commit), so the robust-list walk \
+             Linux makes there did not run, and the run is refused \
+             (https://github.com/rrnewton/hermit/issues/4529)"
+        );
+        tracing::error!("{message}");
+        let _ = std::io::Write::write_fmt(
+            &mut crate::util::RetryingStderr,
+            format_args!("{message}\n"),
+        );
+        crate::tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+            .await
+    }
+
+    /// Refuse the run, by name, when the backend reported that an exec could
+    /// no longer fail (`Tool::handle_exec_commit`, which made the robust-list
+    /// walk) and the exec then failed: the walk's stores are made, and Linux
+    /// makes none for an exec that fails.
+    async fn refuse_failed_committed_exec<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        errno: impl std::fmt::Display,
+    ) -> ! {
+        let dettid = guest.thread_state().dettid;
+        let message = format!(
+            "hermit: thread {dettid}'s exec failed ({errno}) after the backend reported that it \
+             could no longer fail (Tool::handle_exec_commit) and its robust lists were walked; \
+             Linux walks nothing at a failed exec, so the run is refused \
+             (https://github.com/rrnewton/hermit/issues/4529)"
+        );
+        tracing::error!("{message}");
+        let _ = std::io::Write::write_fmt(
+            &mut crate::util::RetryingStderr,
+            format_args!("{message}\n"),
+        );
+        crate::tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+            .await
+    }
+
+    /// Walk each of `owners`' robust lists as Linux's `exit_robust_list`
+    /// does, returning each owner's owner-death wakes, held for the caller to
+    /// deliver. With `detcore_stores` false the walk only reads guest memory:
+    /// Linux makes the owner-word transitions. With it true
+    /// ([`OwnerDeathPath::Detcore`]), Detcore makes them, with the guest's
+    /// atomic compare-and-exchange, and a word the backend cannot exchange
+    /// refuses the run by name (`Self::refuse_unexchangeable_owner_word`).
+    /// Callers decide whether Detcore models owner death at all
     /// ([`Self::robust_owner_death_path`]).
     ///
     /// Each list is walked as its owner's, with that owner's TID, except the
@@ -2272,20 +3418,16 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// `exec_mm_release` walks its list, so `handle_futex_death` compares the
     /// owner words with the thread group ID and leaves a word the caller owns
     /// under its old TID alone (fs/exec.c, kernel/futex/core.c).
-    async fn read_thread_group_robust_list_wakes<G: Guest<Self>>(
+    async fn robust_list_wakes_of<G: Guest<Self>>(
         &self,
         guest: &mut G,
         death: OwnerDeath,
+        owners: Vec<RobustListOwner>,
+        detcore_stores: bool,
     ) -> Vec<(DetTid, Vec<RobustListWake>)> {
         let caller = guest.thread_state().dettid;
         let tgid = guest.thread_state().detpid.expect("detpid unset");
-        // A thread whose own exit Detcore already walked (its head stays
-        // registered while an exit_group is filed) is left out, as an
-        // exit_group's walk leaves it out, so no list is walked twice (Claude
-        // review of https://github.com/rrnewton/hermit/pull/4352, F4).
-        let mut heads: Vec<(DetTid, usize)> = guest
-            .thread_state()
-            .robust_list_owners_for_exit_group()
+        let mut heads: Vec<(DetTid, usize)> = owners
             .into_iter()
             .map(|owner| (owner.dettid, owner.head))
             .collect();
@@ -2299,6 +3441,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let mut staged = Vec::with_capacity(heads.len());
         let mut marked = HashMap::new();
+        let mut unsupported = None;
         for (owner, head) in heads {
             let walked_as = if death == OwnerDeath::Exec && owner == caller {
                 tgid.as_raw()
@@ -2306,11 +3449,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                 owner.as_raw()
             };
             let mut wakes = Vec::new();
+            let transition = if detcore_stores {
+                OwnerWordTransition::Detcore {
+                    unsupported: &mut unsupported,
+                }
+            } else {
+                OwnerWordTransition::Linux
+            };
             let mut effects = GuestRobustEffects::<'_, G, T> {
                 guest,
                 dettid: owner,
                 staged_wakes: Some(&mut wakes),
                 marked: &mut marked,
+                transition,
                 tool: PhantomData,
             };
             let outcome = robust_list::exit_robust_list(&mut effects, head, walked_as as u32).await;
@@ -2319,6 +3470,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                     "[detcore, dtid {}] could not stage complete robust-list owner-death effects: {:?}",
                     owner, outcome,
                 );
+            }
+            if let Some(errno) = unsupported {
+                self.refuse_unexchangeable_owner_word(guest, owner, errno, death)
+                    .await;
             }
             staged.push((owner, wakes));
         }
@@ -2350,6 +3505,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await;
         }
+        // The leader's raw exit is the exit code its zombie keeps
+        // (`task_struct::exit_code`, `(status & 0xff) << 8`, kernel/exit.c:1069
+        // in 6.17), which the process's `stat` shows unless the group later
+        // dies as a whole (`Scheduler::record_exit_code`). Recorded in its
+        // turn, before the exit that makes it a zombie.
+        let state = guest.thread_state();
+        if let Some(process) = state.detpid
+            && process.as_raw() == state.dettid.as_raw()
+        {
+            crate::tool_global::record_exit_code(guest, process, (call.status() & 0xff) << 8).await;
+        }
         let request = guest.thread_state().mk_request(
             ResourceID::Exit {
                 group: false,
@@ -2359,6 +3525,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             Permission::RW,
         );
         resource_request(guest, request).await;
+        // Granted: still one of the run's tasks until the grant is committed
+        // below (`LiveTasks`).
+        let dettid = guest.thread_state().dettid;
+        guest
+            .thread_state()
+            .live_tasks
+            .lock()
+            .expect("live tasks mutex poisoned")
+            .note_exit(dettid);
         self.run_robust_list_owner_death(guest).await;
         // A leader whose group lives on is a zombie from here until its last
         // sibling leaves, and its backend reports its exit only then: it
@@ -2393,6 +3568,28 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await;
         }
+        // A table's last holder takes it with its exit: after the grant, just
+        // before the native exit, as an exit_group does
+        // (`Self::release_table_at_exit`).
+        self.release_table_at_exit(guest, false).await;
+        // The grant is committed: the last thing this thread does in its turn
+        // before the native exit, after which, with sequentialized threads,
+        // it never runs again. Where the backend reports the exit complete
+        // afterwards (`BackendCapabilities::runs_exit_robust_list`: its exit
+        // hook comes after the kernel's `mm_release`), a thread that does not
+        // lead its process leaves the run's tasks here, its report awaited
+        // before any off-turn binder call is issued. A leader stays, a zombie,
+        // until a wait reaps its process, as does every thread elsewhere
+        // (`LiveTasks::commit_thread_exit`).
+        if self.cfg.sequentialize_threads && self.cfg.backend.runs_exit_robust_list {
+            let detpid = guest.thread_state().detpid.expect("detpid unset");
+            guest
+                .thread_state()
+                .live_tasks
+                .lock()
+                .expect("live tasks mutex poisoned")
+                .commit_thread_exit(dettid, detpid);
+        }
         // It's ok here that we skip running the posthook:
         guest.tail_inject(call).await
     }
@@ -2403,6 +3600,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::ExitGroup,
     ) -> Result<i64, Error> {
+        crate::reserved_input::before_exit_group(guest)?;
         // One of the last points where this process's unsent warnings can
         // still be reported (`crate::guest_log`).
         crate::guest_log::flush_unsent();
@@ -2421,6 +3619,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await;
         }
+        // The exit code the zombie keeps until it is reaped, which its
+        // rendered `/proc/<pid>/stat` shows (field 52): `exit_group` passes
+        // the status shifted left by 8 to `do_group_exit` (kernel/exit.c:1113
+        // in 6.17), on every backend (`Scheduler::record_exit_code`).
+        if let Some(process) = guest.thread_state().detpid {
+            crate::tool_global::record_exit_code(guest, process, (call.status() & 0xff) << 8).await;
+        }
         // On [`OwnerDeathPath::Barrier`] the walk follows the grant and wakes
         // at once, as an exit does (`Self::run_robust_list_owner_death`):
         // nothing can call the exit_group off, the grant logically kills the
@@ -2438,8 +3643,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         // native exit would otherwise let Linux mark and clear its words before
         // the walk reads them. The lists stay mapped until the native
         // exit_group.
-        let barrier = self.robust_owner_death_path() == Some(OwnerDeathPath::Barrier);
-        if barrier {
+        //
+        // On [`OwnerDeathPath::Detcore`] the walk follows the grant too, and
+        // stores each owner word itself: no Linux exit will. Filing keeps the
+        // killed threads' registrations for the walk however early their exit
+        // hooks run.
+        let path = self.robust_owner_death_path();
+        if matches!(
+            path,
+            Some(OwnerDeathPath::Barrier) | Some(OwnerDeathPath::Detcore)
+        ) {
             guest.thread_state().file_exit_group_for_robust_lists();
         }
         let request = guest.thread_state().mk_request(
@@ -2451,16 +3664,41 @@ impl<T: RecordOrReplay> Detcore<T> {
             Permission::RW,
         );
         resource_request(guest, request).await;
-        if barrier {
-            guest.thread_state().begin_exit_group_robust_walk();
-            let owners = guest.thread_state().robust_list_owners_for_exit_group();
-            self.run_thread_group_robust_list_owner_death(guest, owners)
+        // Every task of the process exited, each counted among the run's
+        // tasks until a wait reaps it (`LiveTasks`).
+        let detpid = guest.thread_state().detpid.expect("detpid unset");
+        guest
+            .thread_state()
+            .live_tasks
+            .lock()
+            .expect("live tasks mutex poisoned")
+            .note_process_exit(detpid);
+        match path {
+            Some(OwnerDeathPath::Barrier) => {
+                guest.thread_state().begin_exit_group_robust_walk();
+                let owners = guest.thread_state().robust_list_owners_for_exit_group();
+                self.run_thread_group_robust_list_owner_death(
+                    guest,
+                    owners,
+                    OwnerDeathPath::Barrier,
+                )
                 .await;
-            guest.thread_state().finish_exit_group_robust_walk();
-        } else {
-            self.stage_thread_group_robust_list_wakes(guest, RobustListExit::ExitGroup)
-                .await
+                guest.thread_state().finish_exit_group_robust_walk();
+            }
+            Some(OwnerDeathPath::Detcore) => {
+                self.run_granted_group_robust_list_owner_death(guest).await
+            }
+            Some(OwnerDeathPath::Kernel) | None => {
+                self.stage_thread_group_robust_list_wakes(guest, RobustListExit::ExitGroup)
+                    .await
+            }
         }
+        // Every thread of the process exits with it: a table only they held
+        // goes with this exit, once the grant has logically ended the other
+        // threads, so none of them runs again against a table Detcore has let
+        // go, and before the native exit_group, so no turn runs between
+        // (`Self::release_table_at_exit`).
+        self.release_table_at_exit(guest, true).await;
         // It's ok here that we skip running the posthook:
         guest.tail_inject(call).await
     }
@@ -2489,12 +3727,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// so none runs guest code before the native delivery (Claude re-check of
     /// https://github.com/rrnewton/hermit/pull/4387).
     ///
-    /// One path can still run a sibling first: an exit parked behind a
-    /// sibling's signal-delivery permit (`Scheduler::exit_awaits_sibling_permit`).
-    /// DynamoRIO reads the action again when it delivers, so after the grant
-    /// the action is read again and, if a sibling changed it, set back to
-    /// `SIG_DFL` in this dying process, and the delivery carries out the
-    /// committed decision (Codex review of
+    /// Should a sibling still run first, its action change must not undo the
+    /// decision. DynamoRIO reads the action again when it delivers, so after
+    /// the grant the action is read again and, if a sibling changed it, set
+    /// back to `SIG_DFL` in this dying process, and the delivery carries out
+    /// the committed decision (Codex review of
     /// https://github.com/rrnewton/hermit/pull/4387, P1).
     ///
     /// The gate is this backend's: DynamoRIO carries out a default action in
@@ -2574,11 +3811,98 @@ impl<T: RecordOrReplay> Detcore<T> {
         if barrier {
             guest.thread_state().begin_exit_group_robust_walk();
             let owners = guest.thread_state().robust_list_owners_for_exit_group();
-            self.run_thread_group_robust_list_owner_death(guest, owners)
+            self.run_thread_group_robust_list_owner_death(guest, owners, OwnerDeathPath::Barrier)
                 .await;
             guest.thread_state().finish_exit_group_robust_walk();
         }
         true
+    }
+
+    /// Before a signal whose delivery ends the thread group by its default
+    /// action, on a backend where Detcore makes the owner-word transitions
+    /// ([`OwnerDeathPath::Detcore`], KVM): walk every registered robust list
+    /// of the group, as each thread's death in `do_group_exit` walks its own,
+    /// storing and waking in this, the delivering thread's, `InboundSignal`
+    /// turn. Returns whether it walked; the caller then returns from the
+    /// delivery hook at once, without the post-handler hook, which could end
+    /// this turn and let a thread of the dying group run guest code after its
+    /// list was walked (`Detcore::inbound_delivered`). The backend carries the
+    /// default action out as soon as the hook returns, so no guest code runs
+    /// between this walk and the group's end, as none does in Linux between
+    /// `complete_signal` queueing SIGKILL to every thread of the group and
+    /// their exits' walks.
+    ///
+    /// A signal that is caught, ignored, or whose default is not to end the
+    /// process (`signal_default_action_ends_the_process`) leaves every word
+    /// alone, as Linux does. A walk of lists that hold no entry and no pending
+    /// entry changes nothing, so the action, which costs an injected call to
+    /// read, is read only when some list holds one (glibc registers a list for
+    /// every thread, but holds entries in it only while a robust mutex is
+    /// locked), and nothing changes for a group none of whose lists holds
+    /// one. No Linux exit walks the lists for this backend's threads, so the
+    /// decision cannot be guessed: an action that cannot be read refuses the
+    /// run by name (`Self::refuse_unreadable_fatal_action`).
+    pub(crate) async fn walk_robust_lists_before_fatal_delivery<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: SigWrapper,
+    ) -> bool {
+        if self.robust_owner_death_path() != Some(OwnerDeathPath::Detcore)
+            || !signal_default_action_ends_the_process(signal)
+        {
+            return false;
+        }
+        let owners = guest.thread_state().robust_list_owners_for_exit_group();
+        if !owners
+            .iter()
+            .any(|owner| robust_list_holds_an_entry(guest, owner.head))
+        {
+            return false;
+        }
+        match self.signal_is_left_at_default(guest, signal).await {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(error) => {
+                self.refuse_unreadable_fatal_action(guest, signal, error)
+                    .await
+            }
+        }
+        guest
+            .thread_state()
+            .mark_robust_lists_walked_by_tool(&owners);
+        self.run_thread_group_robust_list_owner_death(guest, owners, OwnerDeathPath::Detcore)
+            .await;
+        true
+    }
+
+    /// Refuse the run, by name, when the action for `signal`, whose default
+    /// ends the thread group, cannot be read while a robust list of the group
+    /// holds an entry, on a backend where Detcore makes the owner-word
+    /// transitions ([`OwnerDeathPath::Detcore`]). Linux walks every list of
+    /// the group when the action is the default and none when it is not, and
+    /// no Linux exit walks them for this backend's threads, so guessing either
+    /// way could leave a waiter parked for good or mark a live owner's word.
+    async fn refuse_unreadable_fatal_action<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: SigWrapper,
+        error: Error,
+    ) -> ! {
+        let dettid = guest.thread_state().dettid;
+        let message = format!(
+            "hermit: thread {dettid} took {signal}, whose default action ends its thread group, \
+             while a robust list of the group holds an entry, and the signal's action cannot \
+             be read ({error}); Linux walks every robust list of the group when the action is \
+             the default, and no Linux exit walks them for this backend's threads, so the run \
+             is refused (https://github.com/rrnewton/hermit/issues/4529)"
+        );
+        tracing::error!("{message}");
+        let _ = std::io::Write::write_fmt(
+            &mut crate::util::RetryingStderr,
+            format_args!("{message}\n"),
+        );
+        crate::tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+            .await
     }
 
     /// Set the guest's action for `signal` to `SIG_DFL`.
@@ -2661,12 +3985,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             match classify_futex_command(call.futex_op()) {
                 FutexCommand::Served => {}
                 FutexCommand::NoSys => return Err(Error::Errno(Errno::ENOSYS)),
-                FutexCommand::PriorityInheritance(name) => {
+                FutexCommand::RequeuePi(name) => {
                     return self
                         .refuse_futex_command(
                             guest,
                             name,
-                            "Detcore does not emulate priority-inheritance futexes",
+                            "Detcore does not emulate requeue-PI futexes (PI condition variables)",
                         )
                         .await;
                 }
@@ -2680,6 +4004,22 @@ impl<T: RecordOrReplay> Detcore<T> {
             && !matches!(self.cfg.debug_futex_mode, BlockingMode::External)
         {
             let command = call.futex_op() & libc::FUTEX_CMD_MASK;
+            // The priority-inheritance lock commands read and write their word
+            // themselves, NULL included (EFAULT), and park on the precise
+            // model's waiter pool, which polling mode does not keep.
+            if let Some(name) = pi_lock_command_name(command) {
+                if matches!(self.cfg.debug_futex_mode, BlockingMode::Polling) {
+                    return self
+                        .refuse_futex_command(guest, name, POLLING_REFUSAL)
+                        .await;
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                return if command == libc::FUTEX_UNLOCK_PI {
+                    self.handle_futex_unlock_pi(guest, call).await
+                } else {
+                    self.handle_futex_lock_pi(guest, call, command).await
+                };
+            }
             // FUTEX_WAKE and FUTEX_WAKE_BITSET only key their word too, and a
             // requeue can leave a modeled waiter on any admitted private key,
             // NULL or unmapped included, which a wake must still reach.
@@ -2726,7 +4066,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Error::Errno(Errno::EINVAL));
         }
         if !self.cfg.sequentialize_threads {
-            return Ok(guest.inject(call).await?);
+            return crate::syscalls::helpers::inject_keeping_kernel_restart(guest, call).await;
         }
         let polling = match self.cfg.debug_futex_mode {
             BlockingMode::External => {
@@ -2811,10 +4151,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Err(Error::Errno(Errno::EAGAIN))
                 } else {
                     let maybe_timeout_lt = self.futex_deadline(guest, call, deadline).await?;
+                    // D50 reader 9 (A5 step 3c.1c): the capability, or the
+                    // in-guest delivery gate, which decides by the design's
+                    // deliverable set under the thread's published mask.
+                    let gated = guest.config().in_guest_signal_delivery;
                     let signal_interruption = guest
                         .config()
                         .backend
-                        .supports_blocked_wait_signal_interruption;
+                        .supports_blocked_wait_signal_interruption
+                        || gated;
                     // Whether this wait was woken for a signal and is checking again.
                     let mut rewait = false;
                     // The signals the scheduler committed to this waiter at that wake
@@ -2867,45 +4212,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                         // can change the dispositions at any time, so the scheduler
                         // reads them when it commits a wake, not here
                         // (https://github.com/rrnewton/hermit/issues/3146).
-                        let signal_watch = if signal_interruption {
-                            // A failed read is never the call's errno
-                            // (`read_wait_signal_state`).
-                            let state = match read_wait_signal_state(guest.pid(), guest.tid()) {
-                                Ok(state) => state,
-                                Err(error) => break Err(error),
-                            };
-                            // A timed futex wait lets a default job-control stop
-                            // wait for its deadline (`KernelSignalState::interrupting_wait`).
-                            let defers_default_stops = call.restart_keeps_deadline();
-                            let host_timed = host_timed_signals(guest).await;
-                            let committed = std::mem::take(&mut committed_wake);
-                            let held = futex_wait_held_after_wake(host_timed, committed);
-                            let pending = futex_wait_pending_signals(
+                        let signal_watch = match self
+                            .futex_wait_signal_watch(
                                 guest,
-                                &state,
-                                state.pending_interrupting(state.blocked, defers_default_stops),
-                                held,
-                                host_timed,
-                                committed,
+                                call,
+                                gated,
+                                signal_interruption,
+                                &mut committed_wake,
                             )
-                            .await;
-                            if pending != 0 {
-                                let errno = call.kernel_restart_errno();
-                                trace!(
-                                    "[detcore, dtid {}] futex wait interrupted by pending signals {:#x}: {:?}",
-                                    &dettid, pending, errno
-                                );
-                                break Err(Error::Errno(errno));
-                            }
-                            Some(FutexSignalWatch {
-                                unblocked: !state.blocked
-                                    & !kernel_sigset_bit(reverie::PERF_EVENT_SIGNAL as i32),
-                                defers_default_stops,
-                                pid: guest.pid().as_raw(),
-                                tid: guest.tid().as_raw(),
-                            })
-                        } else {
-                            None
+                            .await
+                        {
+                            Ok(watch) => watch,
+                            Err(error) => break Err(error),
                         };
                         if rewait {
                             // No signal is pending for this thread, so Linux's
@@ -2994,6 +4312,377 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// The check a precise futex wait makes before it parks, and again in its
+    /// own turn after the scheduler woke it for a signal (see
+    /// `Self::handle_futex_blocking`): `Err` with the call's restart errno
+    /// when a signal pending for this thread ends the wait, otherwise what the
+    /// scheduler watches while the thread is parked. `committed_wake` holds the
+    /// signals the scheduler committed to this waiter at its last wake, which
+    /// this check counts and clears.
+    async fn futex_wait_signal_watch<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Futex,
+        gated: bool,
+        signal_interruption: bool,
+        committed_wake: &mut KernelSigset,
+    ) -> Result<Option<FutexSignalWatch>, Error> {
+        let dettid = guest.thread_state().dettid;
+        if gated {
+            // Under the gate: a deliverable signal pending at
+            // the park, or still pending after a wake, ends the
+            // wait with the futex's restart errno, its end
+            // recorded for the restart checkpoint (D40).
+            let state = read_guest_group_wait_signal_state(guest)?;
+            let mask = super::helpers::gated_own_mask(guest, state.blocked);
+            if let Some(end) = crate::wait_signal_end::wait_end(
+                &state,
+                mask,
+                guest.config().in_guest_reserved_signals,
+            ) {
+                let errno = call.kernel_restart_errno();
+                trace!(
+                    "[detcore, dtid {}] futex wait ended under the in-guest delivery gate by {:?}: {:?}",
+                    &dettid, end, errno
+                );
+                guest.thread_state_mut().wait_signal_end = Some(end);
+                return Err(Error::Errno(errno));
+            }
+            // The futex wait files no `Resources` request, so
+            // it publishes the guest's mask itself, before its
+            // wait request, as every request does under the gate
+            // (step 3c.1b, carried into 3c.1c): the scheduler's
+            // readers then see this wait's mask, not an earlier
+            // request's. None clears the entry, as at a request.
+            let published =
+                crate::tool_global::publish_request_guest_mask(guest, &Resources::new(dettid));
+            crate::tool_global::set_saved_guest_sigmask(guest, published).await;
+            Ok(Some(FutexSignalWatch {
+                unblocked: !mask & !kernel_sigset_bit(reverie::PERF_EVENT_SIGNAL as i32),
+                defers_default_stops: call.restart_keeps_deadline(),
+                pid: guest.pid().as_raw(),
+                tid: guest.tid().as_raw(),
+            }))
+        } else if signal_interruption {
+            // A failed read is never the call's errno
+            // (`read_wait_signal_state`).
+            let state = read_guest_group_wait_signal_state(guest)?;
+            // A timed futex wait lets a default job-control stop
+            // wait for its deadline (`KernelSignalState::interrupting_wait`).
+            let defers_default_stops = call.restart_keeps_deadline();
+            let host_timed = host_timed_signals(guest).await;
+            let committed = std::mem::take(committed_wake);
+            let held = futex_wait_held_after_wake(host_timed, committed);
+            let pending = futex_wait_pending_signals(
+                guest,
+                &state,
+                state.pending_interrupting(state.blocked, defers_default_stops),
+                held,
+                host_timed,
+                committed,
+            )
+            .await;
+            if pending != 0 {
+                let errno = call.kernel_restart_errno();
+                trace!(
+                    "[detcore, dtid {}] futex wait interrupted by pending signals {:#x}: {:?}",
+                    &dettid, pending, errno
+                );
+                return Err(Error::Errno(errno));
+            }
+            Ok(Some(FutexSignalWatch {
+                unblocked: !state.blocked & !kernel_sigset_bit(reverie::PERF_EVENT_SIGNAL as i32),
+                defers_default_stops,
+                pid: guest.pid().as_raw(),
+                tid: guest.tid().as_raw(),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// What the scheduler holds for the PI futex `futexid`, whose word holds
+    /// `word` (`Scheduler::pi_futex_state`), or `None` for a logically killed
+    /// caller, which the scheduler answers with a plain value and which never
+    /// returns to the guest.
+    async fn pi_futex_state<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        futexid: &FutexID,
+        word: u32,
+    ) -> Option<PiFutexState> {
+        match futex_action(
+            guest,
+            FutexAction::PiState(pi_futex::word_owner(word)),
+            futexid,
+            word as i32,
+            u32::MAX,
+        )
+        .await
+        {
+            Some(SchedValue::PiFutex(state)) => Some(state),
+            _ => None,
+        }
+    }
+
+    /// FUTEX_LOCK_PI, FUTEX_LOCK_PI2 and FUTEX_TRYLOCK_PI, as Linux's
+    /// `futex_lock_pi` (kernel/futex/pi.c:918-1125 at v6.16), in its order:
+    /// - a LOCK_PI or LOCK_PI2 timeout is copied and checked first (`EFAULT`,
+    ///   `EINVAL`), by `sys_futex` (kernel/futex/syscalls.c:168-175). It is an
+    ///   absolute deadline, on CLOCK_REALTIME for LOCK_PI and on CLOCK_MONOTONIC
+    ///   for LOCK_PI2 unless it sets FUTEX_CLOCK_REALTIME (`futex_init_timeout`,
+    ///   syscalls.c:147-157). TRYLOCK_PI takes none (`futex_cmd_has_timeout`);
+    /// - the word is keyed for writing (`get_futex_key`: `EINVAL` misaligned,
+    ///   `EFAULT`) and read (`EFAULT`);
+    /// - `pi_futex::lock_pi_step` decides, as `futex_lock_pi_atomic` does, from
+    ///   the word and the scheduler's state for it; a word it changes is written
+    ///   with the guest's permissions (`EFAULT`);
+    /// - a blocked caller parks as a PI waiter behind the owner. It ends handed
+    ///   the lock (0), at its deadline (`ETIMEDOUT`), or for a pending signal
+    ///   with `ERESTARTNOINTR`, which the kernel always restarts (pi.c:1124);
+    ///   the restarted call starts over and reads its absolute deadline again,
+    ///   as Linux's does.
+    ///
+    /// A waiter handed the lock by its owner's death writes its own TID into the
+    /// word (`pi_futex::owner_death_word`). A waiter handed the lock and then
+    /// signalled before its turn keeps the lock, as Linux's
+    /// `rt_mutex_cleanup_proxy_lock` keeps it (pi.c:1067-1068).
+    ///
+    /// The word holds a TID as the caller's PID namespace numbers it. Detcore's
+    /// thread IDs are the container namespace's, so a caller in a nested PID
+    /// namespace is refused by name.
+    ///
+    /// The read and write of the word are atomic with respect to the guest:
+    /// Detcore runs one guest thread at a time and this one holds the turn, so
+    /// none of the kernel's compare-and-exchange retries arises. A word in a
+    /// file-backed shared mapping, which a process outside Hermit could change,
+    /// is refused by name, as FUTEX_WAKE_OP's is.
+    // TODO-HUMAN-REVIEW(#4616): Review the emulated priority-inheritance lock:
+    // its word transitions, first-in-first-out waiter order and owner-death
+    // hand-over.
+    async fn handle_futex_lock_pi<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Futex,
+        command: i32,
+    ) -> Result<i64, Error> {
+        let trylock = command == libc::FUTEX_TRYLOCK_PI;
+        let name = pi_lock_command_name(command).expect("a PI lock command");
+        if guest.thread_state().nested_pid_namespace {
+            return self
+                .refuse_futex_command(guest, name, NESTED_PID_NAMESPACE_REFUSAL)
+                .await;
+        }
+        if !trylock && let Some(timeout) = call.timeout() {
+            let timeout = read_user_timespec(guest, timeout.as_raw())?;
+            if !futex_timespec_is_valid(timeout) {
+                return Err(Error::Errno(Errno::EINVAL));
+            }
+        }
+        let private = call.futex_op() & libc::FUTEX_PRIVATE_FLAG != 0;
+        let uaddr = futex_uaddr(&call);
+        let futexid = futex_key(guest, uaddr, private, KeyAccess::Write).await?;
+        if futex_word_is_file_backed(guest, uaddr) {
+            return self
+                .refuse_futex_command(guest, name, FILE_BACKED_WORD_REFUSAL)
+                .await;
+        }
+        let dettid = guest.thread_state().dettid;
+        let caller = pi_futex::guest_tid(dettid);
+        let gated = guest.config().in_guest_signal_delivery;
+        let signal_interruption = guest
+            .config()
+            .backend
+            .supports_blocked_wait_signal_interruption
+            || gated;
+        // The deadline, computed once, at the first park.
+        let mut deadline: Option<Option<LogicalTime>> = None;
+        let mut committed_wake: KernelSigset = 0;
+        // The signal check made after a wake for a signal, before the word is
+        // read again.
+        let mut rewait_watch: Option<Option<FutexSignalWatch>> = None;
+        let mut requested = false;
+        let res = loop {
+            let word = match read_futex_word(guest, uaddr) {
+                Ok(word) => word as u32,
+                Err(error) => break Err(error),
+            };
+            let Some(state) = self.pi_futex_state(guest, &futexid, word).await else {
+                break Err(Error::Errno(Errno::ERESTARTNOINTR));
+            };
+            let step = pi_futex::lock_pi_step(word, caller, state, trylock);
+            trace!(
+                "[detcore, dtid {}] {:?} on the word at {:#x}, holding {:#x}, with {:?}: {:?}",
+                dettid,
+                pi_lock_command_name(command),
+                uaddr,
+                word,
+                state,
+                step
+            );
+            let (owner, write) = match step {
+                LockPiStep::Fail { errno, write } => {
+                    break write
+                        .map_or(Ok(()), |value| write_futex_word(guest, uaddr, value))
+                        .and(Err(Error::Errno(errno)));
+                }
+                LockPiStep::Acquire(value) => {
+                    break write_futex_word(guest, uaddr, value).map(|()| 0);
+                }
+                LockPiStep::Block { owner, write } => (owner, write),
+            };
+            if let Some(value) = write
+                && let Err(error) = write_futex_word(guest, uaddr, value)
+            {
+                break Err(error);
+            }
+            let signal_watch = match rewait_watch.take() {
+                Some(watch) => watch,
+                None => match self
+                    .futex_wait_signal_watch(
+                        guest,
+                        call,
+                        gated,
+                        signal_interruption,
+                        &mut committed_wake,
+                    )
+                    .await
+                {
+                    Ok(watch) => watch,
+                    Err(error) => break Err(error),
+                },
+            };
+            let timeout = match deadline {
+                Some(timeout) => timeout,
+                None => {
+                    let timeout = if trylock {
+                        None
+                    } else {
+                        match self
+                            .futex_timeout_deadline(guest, call.futex_op(), call.timeout())
+                            .await
+                        {
+                            Ok(timeout) => timeout,
+                            Err(error) => break Err(error),
+                        }
+                    };
+                    *deadline.insert(timeout)
+                }
+            };
+            requested = true;
+            let answer = futex_action(
+                guest,
+                FutexAction::PiLockWait(timeout, signal_watch, owner),
+                &futexid,
+                word as i32,
+                u32::MAX,
+            )
+            .await;
+            match futex_action(guest, FutexAction::PiTake, &futexid, 0, u32::MAX).await {
+                Some(SchedValue::PiTaken(Some(PiHandOver::Unlock))) => break Ok(0),
+                Some(SchedValue::PiTaken(Some(PiHandOver::OwnerDeath))) => {
+                    break write_futex_word(guest, uaddr, pi_futex::owner_death_word(caller))
+                        .map(|()| 0);
+                }
+                _ => {}
+            }
+            match answer {
+                Some(SchedValue::TimeOut) => break Err(Error::Errno(Errno::ETIMEDOUT)),
+                Some(SchedValue::Signaled(committed)) if signal_interruption => {
+                    // Linux's waiter stays queued unless the signal is still
+                    // pending in its own turn: check that first, then decide
+                    // again from the word.
+                    committed_wake = committed;
+                    match self
+                        .futex_wait_signal_watch(
+                            guest,
+                            call,
+                            gated,
+                            signal_interruption,
+                            &mut committed_wake,
+                        )
+                        .await
+                    {
+                        Ok(watch) => rewait_watch = Some(watch),
+                        Err(error) => break Err(error),
+                    }
+                }
+                // A wake for a signal where the backend does not report the
+                // kernel's signal state, or a logically killed caller, which
+                // never returns to the guest: the kernel restarts the call.
+                _ => break Err(Error::Errno(Errno::ERESTARTNOINTR)),
+            }
+        };
+        if requested {
+            futex_action(guest, FutexAction::WaitFinished, &futexid, 0, u32::MAX).await;
+        }
+        res
+    }
+
+    /// FUTEX_UNLOCK_PI, as Linux's `futex_unlock_pi` (kernel/futex/pi.c:1132-1293
+    /// at v6.16), in its order: the word is read first (`EFAULT`), only the
+    /// thread it names may unlock it (`EPERM`), then it is keyed for writing
+    /// (`EINVAL` misaligned, `EFAULT`), and `pi_futex::unlock_pi_step` decides:
+    /// 0 for a word with no waiter, a hand-over to the longest PI waiter, whose
+    /// TID is written with `FUTEX_WAITERS` before it is woken (`wake_futex_pi`),
+    /// or `EINVAL` where the word and the queued waiters disagree. The word is
+    /// written with the guest's permissions (`EFAULT`), atomically with respect
+    /// to the guest for the reason `Self::handle_futex_lock_pi` gives.
+    // TODO-HUMAN-REVIEW(#4616): Review the emulated priority-inheritance unlock
+    // and its hand-over to the longest waiter.
+    async fn handle_futex_unlock_pi<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Futex,
+    ) -> Result<i64, Error> {
+        if guest.thread_state().nested_pid_namespace {
+            return self
+                .refuse_futex_command(guest, "FUTEX_UNLOCK_PI", NESTED_PID_NAMESPACE_REFUSAL)
+                .await;
+        }
+        let uaddr = futex_uaddr(&call);
+        let word = read_futex_word(guest, uaddr)? as u32;
+        let dettid = guest.thread_state().dettid;
+        if pi_futex::word_owner(word) != pi_futex::guest_tid(dettid) {
+            return Err(Error::Errno(Errno::EPERM));
+        }
+        let private = call.futex_op() & libc::FUTEX_PRIVATE_FLAG != 0;
+        let futexid = futex_key(guest, uaddr, private, KeyAccess::Write).await?;
+        if futex_word_is_file_backed(guest, uaddr) {
+            return self
+                .refuse_futex_command(guest, "FUTEX_UNLOCK_PI", FILE_BACKED_WORD_REFUSAL)
+                .await;
+        }
+        let Some(state) = self.pi_futex_state(guest, &futexid, word).await else {
+            return Err(Error::Errno(Errno::ERESTARTNOINTR));
+        };
+        let step = pi_futex::unlock_pi_step(dettid, state);
+        trace!(
+            "[detcore, dtid {}] FUTEX_UNLOCK_PI on the word at {:#x}, holding {:#x}, with {:?}: {:?}",
+            dettid, uaddr, word, state, step
+        );
+        match step {
+            UnlockPiStep::Fail(errno) => Err(Error::Errno(errno)),
+            UnlockPiStep::Release => write_futex_word(guest, uaddr, 0).map(|()| 0),
+            UnlockPiStep::HandOff { write, .. } => {
+                write_futex_word(guest, uaddr, write)?;
+                // The state was read in this turn, so its next owner is still
+                // queued; a logically killed caller is answered EINTR instead.
+                let woken = match futex_action(guest, FutexAction::PiHandOff, &futexid, 0, u32::MAX)
+                    .await
+                {
+                    Some(SchedValue::Value(1)) => 1,
+                    Some(SchedValue::Value(e)) if e == nix::errno::Errno::EINTR as u64 => 0,
+                    other => panic!("impossible answer to a PI futex hand-over: {:?}", other),
+                };
+                if self.cfg.yields_after_futex_wake(woken) {
+                    guest.thread_state_mut().yield_after_futex_wake = true;
+                }
+                Ok(0)
+            }
+        }
+    }
+
     /// FUTEX_WAKE and FUTEX_WAKE_BITSET, as Linux's `futex_wake`
     /// (kernel/futex/waitwake.c): `-EINVAL` for a zero bitset, then the word is
     /// keyed for reading (`futex_key`) and never read, and up to `val` modeled
@@ -3025,6 +4714,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         .expect("futex wake must return value")
         {
             SchedValue::Value(num) => num,
+            // `futex_wake` stops with EINVAL at a PI waiter, after waking those
+            // before it (kernel/futex/waitwake.c:180-199).
+            SchedValue::PiWaiterReached { woken } => {
+                if self.cfg.yields_after_futex_wake(woken) {
+                    guest.thread_state_mut().yield_after_futex_wake = true;
+                }
+                return Err(Error::Errno(Errno::EINVAL));
+            }
             other => panic!("impossible answer to a futex wake: {:?}", other),
         };
         let _ = futex_action(guest, FutexAction::WakeFinished(0), &futexid, 0, bitset).await;
@@ -3089,6 +4786,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             // A logically killed or replaced caller is answered with a plain value, as
             // its wakes are; it never returns to the guest.
             Some(SchedValue::Value(num)) => num,
+            // `futex_requeue` stops with EINVAL at a PI waiter, keeping what it
+            // woke and moved before it (kernel/futex/requeue.c:585-603).
+            Some(SchedValue::PiWaiterReached { woken }) => {
+                if self.cfg.yields_after_futex_wake(woken) {
+                    guest.thread_state_mut().yield_after_futex_wake = true;
+                }
+                return Err(Error::Errno(Errno::EINVAL));
+            }
             other => panic!("impossible answer to a futex requeue: {:?}", other),
         };
         let _ = futex_action(
@@ -3142,29 +4847,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !op.has_known_operation() {
             return Err(Error::Errno(Errno::ENOSYS));
         }
-        if matches!(
-            guest.thread_state().futex_id(uaddr2, false),
-            FutexID::Shared {
-                object: SharedMemoryObjectId::File { .. } | SharedMemoryObjectId::OpenFile { .. },
-                ..
-            }
-        ) {
+        if futex_word_is_file_backed(guest, uaddr2) {
             return self
-                .refuse_futex_command(
-                    guest,
-                    "FUTEX_WAKE_OP",
-                    "its word is in a file-backed shared mapping that a process outside Hermit \
-                     could update concurrently, and Detcore cannot apply the operation atomically",
-                )
+                .refuse_futex_command(guest, "FUTEX_WAKE_OP", FILE_BACKED_WORD_REFUSAL)
                 .await;
         }
         let old = read_futex_word(guest, uaddr2)?;
         let new = op.apply(old).expect("operation was checked to be known");
-        let word2 = AddrMut::<libc::c_int>::from_raw(uaddr2).ok_or(Errno::EFAULT)?;
-        guest
-            .memory()
-            .write_value(word2, &new)
-            .map_err(|_| Error::Errno(Errno::EFAULT))?;
+        write_futex_word(guest, uaddr2, new as u32)?;
         let Some(wake2) = op.compare(old) else {
             return Err(Error::Errno(Errno::ENOSYS));
         };
@@ -3177,6 +4867,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await
             {
                 Some(SchedValue::Value(num)) => num,
+                // `futex_wake_op` stops with EINVAL at a PI waiter, after the
+                // operation (kernel/futex/waitwake.c:301-303, 315-317).
+                Some(SchedValue::PiWaiterReached { woken: num }) => {
+                    if self.cfg.yields_after_futex_wake(woken + num) {
+                        guest.thread_state_mut().yield_after_futex_wake = true;
+                    }
+                    return Err(Error::Errno(Errno::EINVAL));
+                }
                 other => panic!("impossible answer to a futex wake: {:?}", other),
             };
             let _ = futex_action(guest, FutexAction::WakeFinished(0), &futex, 0, u32::MAX).await;
@@ -3307,6 +5005,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.exec_image_at(guest, libc::AT_FDCWD, &path)
     }
 
+    /// The name this image's exec gave it as Linux names it from the
+    /// filename the exec was given (`kbasename(bprm->filename)`,
+    /// `procfs::task_stat::TaskComm::of_exec_filename`), read from the
+    /// image's `AT_EXECFN`, which points at a copy of that filename on its
+    /// initial stack (`create_elf_tables`). `None` where the auxiliary vector
+    /// has no such entry or its string cannot be read.
+    pub(crate) fn execfn_comm<G: Guest<Self>>(
+        &self,
+        guest: &G,
+    ) -> Option<crate::procfs::task_stat::TaskComm> {
+        use std::os::unix::ffi::OsStrExt;
+
+        use reverie::syscalls::FromToRaw;
+        let address = guest.auxv().at_execfn()?.as_raw();
+        let path: std::path::PathBuf = Option::<syscalls::PathPtr>::from_raw(address)?
+            .read(&guest.memory())
+            .ok()?;
+        Some(crate::procfs::task_stat::TaskComm::of_exec_filename(
+            path.as_os_str().as_bytes(),
+        ))
+    }
+
     /// `Self::exec_image` for a `path` the caller already read from the
     /// guest: public for a backend that runs the native `execve` outside
     /// Detcore's handler, prepares the exec itself (`crate::prepare_exec`)
@@ -3350,6 +5070,120 @@ impl<T: RecordOrReplay> Detcore<T> {
         crate::exec_record::ExecRecord::resolve(&root, &cwd, &spelled)
     }
 
+    /// [`Self::exec_image`] where the tool cannot read the guest's procfs
+    /// directory but sees the guest's files in its own filesystem view
+    /// (`Detcore::exec_record_root` is `/`: KVM, whose executor opens every
+    /// absolute guest path in the tool's own view), resolved as that
+    /// executor resolves the exec (reverie-linuxemu's
+    /// `resolve_guest_exec_image`): an absolute path as it is, a relative one
+    /// with a slash from the working directory the calling thread's own
+    /// `getcwd` gives, and an exec of the caller's own `exe` link spelled
+    /// under `/proc` the image it executes. Only an ELF image is recorded:
+    /// `None` for a script (the executor reads its interpreter its own way),
+    /// for a name without a slash (which the executor searches on `PATH`,
+    /// where Linux does not), for a path relative to a directory descriptor
+    /// or empty (`AT_EMPTY_PATH`), for any other path under `/proc` (the
+    /// tool's `/proc` is not the guest's), in a nested PID namespace, and for
+    /// the tool's own image, which a path through the tool's `/proc` could
+    /// have led to. Without a record the new image's `exe` link is the
+    /// executor's, as before (`Detcore::readlink_own_task_link`); with one,
+    /// Detcore answers only while it names the image exactly, and the
+    /// executor holds the image open, so its inode cannot be reused meanwhile.
+    async fn exec_image_without_procfs<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &syscalls::Execveat,
+    ) -> Option<crate::exec_record::ExecRecord> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        if crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend)
+            || guest.thread_state().nested_pid_namespace
+        {
+            return None;
+        }
+        let root = self.exec_record_root(guest)?;
+        let path: std::path::PathBuf = call.path()?.read(&guest.memory()).ok()?;
+        if path.as_os_str().is_empty()
+            || (!path.is_absolute() && call.dirfd() != libc::AT_FDCWD)
+            || (!path.is_absolute() && path.components().count() < 2)
+        {
+            return None;
+        }
+        let cwd = if path.is_absolute() {
+            None
+        } else {
+            let directory = self.injected_working_directory(guest, None, 0).await.ok()?;
+            Some(std::path::PathBuf::from(
+                <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(directory),
+            ))
+            .filter(|directory| directory.is_absolute())
+        };
+        let spelled = match &cwd {
+            Some(cwd) => cwd.join(&path),
+            None => path.clone(),
+        };
+        let own_pid = self.own_detpid(guest).as_raw();
+        if spelled.starts_with("/proc") {
+            return match crate::syscalls::namespace::exe_link_subject(
+                spelled.as_os_str().as_bytes(),
+                own_pid,
+            ) {
+                Some(crate::syscalls::namespace::ExeLinkSubject::Own) => {
+                    guest.thread_state().exe.as_deref().cloned()
+                }
+                _ => None,
+            };
+        }
+        let record = crate::exec_record::ExecRecord::resolve_from(&root, cwd.as_deref(), &path)?;
+        // The file the path names itself, which the record is only where it
+        // is no script (a script's record is its interpreter's).
+        let named = std::fs::metadata(root.join(spelled.strip_prefix("/").ok()?))
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()));
+        let tool_image = std::fs::metadata("/proc/self/exe")
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()));
+        (Some(record.identity()) == named && Some(record.identity()) != tool_image)
+            .then_some(record)
+    }
+
+    /// The effective user and group ids Linux gives the guest at an exec of
+    /// `record` (`crate::secure_exec::effective_ids_for_virtual_root`;
+    /// anything but (0, 0) runs in secure-execution mode), from the image's
+    /// set-id bits as the guest's namespaces show them and the task's
+    /// `no_new_privs`. The flag is the kernel's, read from the task's status,
+    /// where guest threads are host tasks the tool can name; otherwise it is
+    /// Detcore's own record, in which no guest sets it (Detcore answers
+    /// `PR_SET_NO_NEW_PRIVS` with ENOSYS, `handle_prctl`). `None` where the
+    /// image or the flag cannot be read, as after a guest `chroot`
+    /// (`Self::exec_record_root`).
+    fn exec_effective_ids<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        record: Option<&crate::exec_record::ExecRecord>,
+    ) -> Option<(u32, u32)> {
+        let record = record?;
+        let root = self.exec_record_root(guest)?;
+        let image =
+            crate::secure_exec::set_id_image(&root.join(record.exe.strip_prefix("/").ok()?))?;
+        if !image.has_set_id_bits() {
+            return Some((0, 0));
+        }
+        let no_new_privs =
+            if crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend) {
+                let status =
+                    crate::util::raw_read_file(&self.guest_task_directory(guest)?.join("status"))
+                        .ok()?;
+                crate::secure_exec::no_new_privs(&status)?
+            } else {
+                false
+            };
+        Some(crate::secure_exec::effective_ids_for_virtual_root(
+            &image,
+            no_new_privs,
+        ))
+    }
+
     /// Execveat system call.  Doesn't return if successful.
     pub async fn handle_execveat<G: Guest<Self>>(
         &self,
@@ -3368,17 +5202,68 @@ impl<T: RecordOrReplay> Detcore<T> {
                 thread_state.mm_id,
             )
         };
-        let (new_metadata, closed_open_files, exec_fd_blocking) = {
+        let (mut new_metadata, closed_open_files, exec_fd_blocking) = {
             let metadata = old_metadata.lock().unwrap();
-            let new_metadata = metadata.for_exec(dettid);
+            // The exec'ing thread leads its process from here, alone.
+            let mut new_metadata = metadata.for_exec(dettid);
+            new_metadata.hold_alone(detpid);
             (
                 new_metadata.clone(),
                 metadata.open_files_closed_on_exec(table_is_shared),
                 new_metadata.exec_blocking_overrides(),
             )
         };
+        // The permitted set before the exec, for `commit_creds`'s comparison
+        // at the new image's first callback (`Detcore::handle_post_exec`):
+        // read only where Detcore holds a parent-death signal for this task,
+        // the one thing the comparison can clear, and before anything
+        // prepares the exec, so that a refusal leaves it as it was. A set
+        // that cannot be read is refused by name
+        // (`commit_creds::UNREADABLE_PERMITTED_SET`). A borrowed scratch that
+        // could not be put back has had the failure policy applied already
+        // (`Detcore::inject_capget`), and its error returns as it is.
+        let permitted_before = if guest.thread_state().holds_parent_death_signal {
+            match Self::inject_permitted_capabilities(guest).await? {
+                Some(permitted) => Some(permitted),
+                None => {
+                    let reason = crate::commit_creds::UNREADABLE_PERMITTED_SET;
+                    crate::syscalls::helpers::report_refusal_reason(
+                        self.cfg.panic_on_unsupported_syscalls,
+                        &format!("[dtid {dettid}] execveat refused: {reason}"),
+                    );
+                    if !self.cfg.panic_on_unsupported_syscalls {
+                        crate::tool_global::report_unsupported_syscall(
+                            guest,
+                            syscalls::Sysno::execveat,
+                        )
+                        .await;
+                    }
+                    return self
+                        .refuse_unserviceable_operation_because(
+                            guest,
+                            syscalls::Sysno::execveat,
+                            Errno::EOPNOTSUPP,
+                            reason,
+                        )
+                        .await;
+                }
+            }
+        } else {
+            None
+        };
+        // The close-on-exec descriptors this exec drops from the old table go
+        // at the new image's first callback, if the exec succeeds
+        // (`Detcore::release_exec_dropped_descriptors`).
+        self.keep_table_for_exec(guest, &old_metadata, &mut new_metadata, detpid);
         let preserve_exec_fd_status = guest.config().backend.rediscovers_descriptors_after_exec;
-        let exe = self.exec_image(guest, &call);
+        let exe = match self.exec_image(guest, &call) {
+            Some(exe) => Some(exe),
+            None => self.exec_image_without_procfs(guest, &call).await,
+        };
+        // Decided before the exec, from the image as it is now, and compared
+        // with the new image's own `AT_SECURE` at its first callback.
+        guest.thread_state_mut().exec_effective_ids = self.exec_effective_ids(guest, exe.as_ref());
+        guest.thread_state_mut().exec_permitted_before = permitted_before;
 
         prepare_exec(
             guest,
@@ -3412,13 +5297,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         // on DBT Detcore never sees the execve, and a word the native client
         // does not rewrite to a TID Linux knows is never marked
         // (https://github.com/rrnewton/hermit/issues/4268).
+        //
+        // Where no Linux exec walks the lists at all ([`OwnerDeathPath::Detcore`],
+        // KVM), Detcore walks them itself, and only where Linux does: at the
+        // exec's point of no return, which the backend reports through
+        // `Tool::handle_exec_commit` after it has read the strings the exec
+        // copies, with the old image still mapped
+        // (`Self::commit_exec_robust_lists`). Here, at the entry, it only
+        // keeps what that walk needs from the old image
+        // (`Self::plan_exec_robust_lists`). This thread holds its turn from
+        // here through the exec, so no other guest thread runs in between.
         let exec_robust_wakes = match self.robust_owner_death_path() {
             Some(OwnerDeathPath::Kernel) => Some(
                 self.read_thread_group_robust_list_wakes(guest, OwnerDeath::Exec)
                     .await,
             ),
+            Some(OwnerDeathPath::Detcore) => {
+                self.plan_exec_robust_lists(guest, &old_memory_metadata, old_mm_id);
+                None
+            }
             Some(OwnerDeathPath::Barrier) | None => None,
         };
+        let exec_walk_planned = guest.thread_state().exec_robust_commit.is_some();
         let old_robust_list_head;
         // The exec'ing thread leads its process after a successful exec, so
         // the table exec gives it is the process's (`process_files`), also
@@ -3453,8 +5353,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             // The old image runs on, and so do its robust-mutex owners.
             thread_state.take_robust_list_wakes_for_exec();
         }
+        // A failed exec never reached its point of no return, so the walk it
+        // would have owed is dropped unmade, as Linux makes none. One that is
+        // gone was made: the backend reported the point of no return, and
+        // then the exec failed.
+        if exec_walk_planned && guest.thread_state_mut().exec_robust_commit.take().is_none() {
+            self.refuse_failed_committed_exec(guest, errno).await;
+        }
 
         cancel_exec(guest).await;
+        // The old image runs on: no new image will compare the decision.
+        guest.thread_state_mut().exec_effective_ids = None;
+        guest.thread_state_mut().exec_permitted_before = None;
         for (open_file_id, port) in released_ports {
             self.restore_port_for_open_file(guest, open_file_id, port)
                 .await;
@@ -3684,35 +5594,60 @@ impl<T: RecordOrReplay> Detcore<T> {
         clone: &syscalls::Clone3,
     ) -> Option<Result<i64, Error>> {
         // Refuse only a call the kernel would accept as far as `set_tid` goes:
-        // any other shape goes to the kernel, whose own error stands, so a
-        // refusal never replaces an E2BIG, EINVAL, EFAULT or EPERM Linux
-        // would give for these arguments. `struct clone_args` gained `set_tid`
-        // (offset 64) and `set_tid_size` (offset 72) with its second version,
-        // 80 bytes.
-        const CLONE_ARGS_SIZE_VER1: usize = 80;
+        // any other shape goes to the kernel, whose own error stands. The
+        // exceptions are deliberate, on the conservative side: a struct or
+        // array Detcore cannot read although the kernel may is refused before
+        // the kernel's later checks are known (EFAULT under
+        // --allow-unsupported-syscalls), and so is CLONE_NEWTIME on a kernel
+        // before 6.3, which refuses it with EINVAL. `struct clone_args`
+        // carries `set_tid` at offset 64 and `set_tid_size` at offset 72.
+        // The kernel zero-extends a shorter struct, so one of 73 bytes or
+        // more can name a set_tid; a shorter one names none or is EINVAL.
+        const SET_TID_SIZE_OFFSET: usize = 72;
         // The kernel's limit on PID namespace nesting (MAX_PID_NS_LEVEL).
         const MAX_SET_TID: u64 = 32;
         let size = clone.size();
         let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
-        if size < CLONE_ARGS_SIZE_VER1 || size > page {
+        if size <= SET_TID_SIZE_OFFSET || size > page {
             return None;
         }
         // The kernel copies all `size` bytes first: a fault there is its
         // EFAULT. A nonzero tail beyond the fields this code knows is not
         // read as a reason to let the call through, since a newer kernel may
         // accept it.
-        let mut raw = vec![0u8; size];
+        // Read as copy_from_user reads it, with the guest's own access
+        // (`chosen_ids::read_clone_args`). A struct every kernel refuses
+        // (proved to fault included) goes to the kernel. One Detcore cannot
+        // read although the kernel may (a page mapped writable, not readable,
+        // or a mapped page 0) cannot be checked, so it is refused below.
+        let witness = super::chosen_ids::FaultWitness::for_backend(
+            &guest.config().backend,
+            guest.tid().as_raw(),
+        );
         let memory = guest.memory();
-        memory
-            .read_exact(Addr::<u8>::from_raw(clone.args()?.as_raw())?, &mut raw)
-            .ok()?;
+        let mut raw = match super::chosen_ids::read_clone_args(&memory, witness, clone) {
+            super::chosen_ids::Clone3Read::Bytes(bytes) => bytes,
+            super::chosen_ids::Clone3Read::Refused => return None,
+            super::chosen_ids::Clone3Read::Unreadable { .. } => {
+                return Some(
+                    self.refuse_unchecked_set_tid(
+                        guest,
+                        "clone3's struct clone_args cannot be read with the guest's own access",
+                    )
+                    .await,
+                );
+            }
+        };
+        // Zero-extended, as the kernel extends a shorter struct.
+        if raw.len() < super::chosen_ids::CLONE_ARGS_SIZE_VER2 {
+            raw.resize(super::chosen_ids::CLONE_ARGS_SIZE_VER2, 0);
+        }
         let field = |offset: usize| u64::from_ne_bytes(raw[offset..offset + 8].try_into().unwrap());
         let flags = field(0);
         let exit_signal = field(32);
         let set_tid = field(64);
         let set_tid_size = field(72);
-        // An exit signal must be a signal number, with nothing in CSIGNAL.
-        if exit_signal > 64 || flags & 0xff != 0 {
+        if !clone3_signal_fields_valid(flags, exit_signal) {
             return None;
         }
         if set_tid_size == 0 || set_tid_size > MAX_SET_TID {
@@ -3721,13 +5656,35 @@ impl<T: RecordOrReplay> Detcore<T> {
         // The kernel copies the whole array next (EFAULT) and takes no entry
         // below 1 (EINVAL).
         let mut tids = vec![0 as libc::pid_t; set_tid_size as usize];
-        memory
-            .read_values(Addr::<libc::pid_t>::from_raw(set_tid as usize)?, &mut tids)
-            .ok()?;
+        if !super::chosen_ids::within_user_memory(
+            set_tid as usize,
+            tids.len() * std::mem::size_of::<libc::pid_t>(),
+        ) {
+            return None;
+        }
+        if set_tid == 0 {
+            // Linux: EINVAL, before reading anything.
+            return None;
+        }
+        // A fault the kernel must take too is its EFAULT. Otherwise an array
+        // Detcore cannot read (a page mapped writable, not readable) may
+        // still be read by the kernel: it is refused below, once the checks
+        // that need no entry have passed, since its ids cannot be checked.
+        let read =
+            super::chosen_ids::read_pid_array(&memory, set_tid as usize, &mut tids).is_some();
+        if !read
+            && super::chosen_ids::range_faults(
+                witness,
+                set_tid as usize,
+                tids.len() * std::mem::size_of::<libc::pid_t>(),
+            )
+        {
+            return None;
+        }
         // With CLONE_NEWPID the first entry is the pid in the new namespace,
         // which must be 1 since that namespace has no init yet (EINVAL).
         let newpid = flags & libc::CLONE_NEWPID as u64 != 0;
-        if tids.iter().any(|tid| *tid < 1) || (newpid && tids[0] != 1) {
+        if read && (tids.iter().any(|tid| *tid < 1) || (newpid && tids[0] != 1)) {
             return None;
         }
         // Choosing a pid takes CAP_SYS_ADMIN or CAP_CHECKPOINT_RESTORE over
@@ -3742,12 +5699,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             thread.detpid.expect("detpid unset"),
             thread.dettid
         );
-        let capabilities = std::fs::read_to_string(status).ok().and_then(|status| {
-            status
-                .lines()
-                .find_map(|line| line.strip_prefix("CapEff:"))
-                .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
-        });
+        // Only where host tasks describe guest threads: elsewhere (KVM) that
+        // file is an unrelated host task's, so the set counts as unread.
+        let host_readable = matches!(witness, super::chosen_ids::FaultWitness::HostMaps(_));
+        let capabilities = host_readable
+            .then(|| std::fs::read_to_string(status).ok())
+            .flatten()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("CapEff:"))
+                    .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+            });
         let pid_capabilities = (1u64 << CAP_SYS_ADMIN) | (1u64 << CAP_CHECKPOINT_RESTORE);
         if capabilities.is_some_and(|mask| mask & pid_capabilities == 0) {
             return None;
@@ -3769,6 +5732,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Hermit's container, which Detcore does not track.
         if set_tid_size <= u64::from(newpid) {
             return None;
+        }
+        if !read {
+            return Some(
+                self.refuse_unchecked_set_tid(
+                    guest,
+                    "clone3 set_tid's array cannot be read with the guest's own access",
+                )
+                .await,
+            );
         }
         let tid = tids[usize::from(newpid)];
         if !crate::tool_global::thread_id_refused(guest, DetTid::from_raw(tid)).await {
@@ -3796,6 +5768,33 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await,
         )
+    }
+
+    /// Refuse a `clone3` whose `set_tid` Detcore cannot check against the
+    /// run's earlier tasks, because `what` cannot be read with the guest's own
+    /// access while the kernel may read it: the conservative side, since a
+    /// reused id would merge two tasks' state in Detcore. With
+    /// `--allow-unsupported-syscalls` the call fails with `EFAULT`.
+    async fn refuse_unchecked_set_tid<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        what: &str,
+    ) -> Result<i64, Error> {
+        let message = format!(
+            "hermit: {what}, so Detcore cannot check its set_tid against the run's earlier tasks \
+             (https://github.com/rrnewton/hermit/issues/4370)"
+        );
+        tracing::error!(
+            "[detcore, dtid {}] {}",
+            guest.thread_state().dettid,
+            message
+        );
+        if guest.config().panic_on_unsupported_syscalls {
+            use std::io::Write as _;
+            let _ = writeln!(crate::util::RetryingStderr, "{message}");
+        }
+        self.refuse_unserviceable_operation(guest, reverie::syscalls::Sysno::clone3, Errno::EFAULT)
+            .await
     }
 
     /// Refuse by name a call from a nested PID namespace whose pids Detcore
@@ -4529,11 +6528,19 @@ impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#546)
     /// Accept valid affinity masks without changing the host scheduler.
+    /// Under `--virtual-cpus` the mask is checked and kept as Linux does
+    /// (`virtual_sched_setaffinity`); Hermit's historical single CPU accepts
+    /// any readable mask and stays CPU 0.
     pub async fn handle_sched_setaffinity<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::SchedSetaffinity,
     ) -> Result<i64, Error> {
+        if let Some(cpus) = self.cfg.virtual_cpus {
+            return self
+                .virtual_sched_setaffinity(guest, call, cpus.get())
+                .await;
+        }
         let size_bytes = call.len() as usize;
         if size_bytes == 0 {
             return Err(Errno::EINVAL.into());
@@ -4564,11 +6571,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// (`kernel_max` 127), so an 8-byte set, which `CPU_ALLOC` gives for the
     /// one CPU that `sysconf(_SC_NPROCESSORS_CONF)` reports, receives its
     /// first 8 bytes (<https://github.com/rrnewton/hermit/issues/4160>).
+    /// Under `--virtual-cpus` it is the named task's mask over the machine's
+    /// CPUs (`virtual_sched_getaffinity`).
     pub async fn handle_sched_getaffinity<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::SchedGetaffinity,
     ) -> Result<i64, Error> {
+        if let Some(cpus) = self.cfg.virtual_cpus {
+            return self
+                .virtual_sched_getaffinity(guest, call, cpus.get())
+                .await;
+        }
         let size_bytes: usize = call.len() as usize;
         if size_bytes == 0 || !size_bytes.is_multiple_of(std::mem::size_of::<libc::c_ulong>()) {
             return Err(Errno::EINVAL.into());
@@ -4923,6 +6937,49 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 }
 
+/// Whether the robust list registered at `head` holds an entry or a pending
+/// entry, as the first reads of Linux's `exit_robust_list` find it: false for
+/// an empty list with no pending entry, whose walk changes nothing, and for a
+/// head that cannot be read, whose walk stops before any change.
+fn robust_list_holds_an_entry<G, T>(guest: &G, head: usize) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let read = |offset: usize| {
+        head.checked_add(offset)
+            .and_then(Addr::<u64>::from_raw)
+            .and_then(|at| guest.memory().read_value::<_, u64>(at).ok())
+    };
+    match (
+        read(robust_list::HEAD_LIST_OFFSET),
+        read(robust_list::HEAD_FUTEX_OFFSET_OFFSET),
+        read(robust_list::HEAD_LIST_OP_PENDING_OFFSET),
+    ) {
+        (Some(first), Some(_), Some(pending)) => {
+            robust_list::RobustEntry::decode(first).address != head
+                || !robust_list::RobustEntry::decode(pending).is_null()
+        }
+        _ => false,
+    }
+}
+
+/// Who makes the owner-word transition `handle_futex_death` performs.
+enum OwnerWordTransition<'a> {
+    /// The backend's native task exit ([`OwnerDeathPath::Kernel`],
+    /// [`OwnerDeathPath::Barrier`]): Detcore only reads the words.
+    Linux,
+    /// Detcore itself, with the guest's atomic compare-and-exchange
+    /// ([`OwnerDeathPath::Detcore`]), only ever where Linux would have made
+    /// it: at a death, or at an exec that can no longer fail.
+    Detcore {
+        /// What the guest compare-and-exchange answered when it could not
+        /// make an exchange Linux would have made
+        /// ([`robust_list::FutexCasOutcome::Unsupported`]).
+        unsupported: &'a mut Option<Errno>,
+    },
+}
+
 /// The one real implementation of [`robust_list::RobustDeathEffects`]: guest
 /// memory plus a wake against Detcore's modeled futex waiter pool.
 ///
@@ -4934,11 +6991,14 @@ struct GuestRobustEffects<'a, G, T> {
     staged_wakes: Option<&'a mut Vec<RobustListWake>>,
     /// The words this exit's walks found owned by their dying owner, keyed as
     /// futexes (so two mappings of one shared page are one word), with the
-    /// value Linux's walk stores there. Detcore does not store it, so a later
-    /// read of the same word, through another entry or another owner's list
-    /// in the same group exit, sees this value, as it would after Linux's
-    /// store.
+    /// value Linux's walk stores there. Where Linux makes the transition
+    /// Detcore does not store it, so a later read of the same word, through
+    /// another entry or another owner's list in the same group exit, sees this
+    /// value, as it would after Linux's store. Where Detcore stores it
+    /// ([`OwnerWordTransition::Detcore`]), memory holds it, and this is not
+    /// consulted.
     marked: &'a mut HashMap<FutexID, u32>,
+    transition: OwnerWordTransition<'a>,
     tool: PhantomData<T>,
 }
 
@@ -4955,6 +7015,10 @@ where
     fn read_u32(&mut self, address: usize) -> Option<u32> {
         let at = Addr::<u32>::from_raw(address)?;
         let value = self.guest.memory().read_value::<_, u32>(at).ok()?;
+        if matches!(self.transition, OwnerWordTransition::Detcore { .. }) {
+            // Detcore's own stores are in memory already.
+            return Some(value);
+        }
         let futexid = self.guest.thread_state().futex_id(address, false);
         Some(self.marked.get(&futexid).copied().unwrap_or(value))
     }
@@ -4966,6 +7030,41 @@ where
         desired: u32,
     ) -> robust_list::FutexCasOutcome {
         use robust_list::FutexCasOutcome;
+
+        if let OwnerWordTransition::Detcore { unsupported } = &mut self.transition {
+            // No Linux exit or exec will make this transition, so Detcore makes
+            // it, in the dying or exec'ing thread's turn, with the guest's
+            // atomic exchange: Linux's `futex_cmpxchg_value_locked`. Never a
+            // separate read and write, which a process sharing the mapping
+            // outside Hermit's scheduler could interleave.
+            let Some(at) = AddrMut::<u32>::from_raw(address) else {
+                return FutexCasOutcome::Faulted;
+            };
+            return match self
+                .guest
+                .memory()
+                .compare_exchange_u32(at, expected, desired)
+            {
+                Ok(observed) if observed == expected => {
+                    // Deliberately DEBUG, not INFO: this line carries a raw
+                    // guest address, and INFO is the surface `--verify-strict`
+                    // compares.
+                    debug!(
+                        "[detcore, dtid {}] robust-list owner death: marked futex word {:#x} {:#x} -> {:#x}",
+                        self.dettid, address, expected, desired,
+                    );
+                    FutexCasOutcome::Matched
+                }
+                Ok(observed) => FutexCasOutcome::Changed(observed),
+                // `fault_in_user_writeable()` fails: `return -1`. (A misaligned
+                // word, EINVAL, was refused before any access.)
+                Err(Errno::EFAULT | Errno::EINVAL) => FutexCasOutcome::Faulted,
+                Err(errno) => {
+                    **unsupported = Some(errno);
+                    FutexCasOutcome::Unsupported
+                }
+            };
+        }
 
         let Some(read_at) = Addr::<u32>::from_raw(address) else {
             return FutexCasOutcome::Faulted;
@@ -5019,10 +7118,15 @@ where
         .await
         {
             Some(SchedValue::Value(count)) => count,
+            // A FUTEX_LOCK_PI waiter first in the queue stops the wake: Linux's
+            // `futex_wake` answers EINVAL, which `handle_futex_death` ignores.
+            Some(SchedValue::PiWaiterReached { woken }) => woken,
             // A wake never carries a timeout, and a cancelled RPC wakes nobody.
             Some(SchedValue::TimeOut)
             | Some(SchedValue::Signaled(_))
             | Some(SchedValue::Requeued { .. })
+            | Some(SchedValue::PiFutex(_))
+            | Some(SchedValue::PiTaken(_))
             | None => 0,
         };
         // Guest-level identities only: dettid, the modeled futex key, and a
@@ -5065,6 +7169,11 @@ enum OwnerDeath {
 /// `owner_death_path_is_tied_to_the_backends_that_have_its_properties` fails
 /// if another backend starts to set it (Claude review of
 /// https://github.com/rrnewton/hermit/pull/4277 at 65138a17, N4).
+///
+/// The Detcore path is checked last: a backend whose native exit runs Linux's
+/// walk, through either of the first two, never gets it, even if it also set
+/// `kernel_never_walks_robust_lists`, so a word is never marked twice (the
+/// same test pins that too).
 fn owner_death_path(cfg: &Config) -> Option<OwnerDeathPath> {
     if !cfg.sequentialize_threads || cfg.debug_futex_mode != BlockingMode::Precise {
         return None;
@@ -5073,14 +7182,17 @@ fn owner_death_path(cfg: &Config) -> Option<OwnerDeathPath> {
         Some(OwnerDeathPath::Kernel)
     } else if cfg.backend.requires_thread_directed_process_signals {
         Some(OwnerDeathPath::Barrier)
+    } else if cfg.backend.kernel_never_walks_robust_lists {
+        Some(OwnerDeathPath::Detcore)
     } else {
         None
     }
 }
 
-/// How Detcore orders its modeled owner-death wakes after Linux's own walk.
-/// In both, Linux changes each owner word to `FUTEX_OWNER_DIED` in the native
-/// exit, and Detcore only reads the words.
+/// How Detcore orders its modeled owner-death wakes against the owner-word
+/// transitions. In the first two, Linux changes each owner word to
+/// `FUTEX_OWNER_DIED` in the native exit, and Detcore only reads the words; in
+/// the third no native exit walks the list, and Detcore changes them itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OwnerDeathPath {
     /// The backend's exit callback comes after the native exit
@@ -5097,6 +7209,20 @@ enum OwnerDeathPath {
     /// done (`ThreadState::wait_for_exit_group_robust_walk`), so that walk reads
     /// every word as the guest left it.
     Barrier,
+    /// No Linux task exits for a guest thread
+    /// (`BackendCapabilities::kernel_never_walks_robust_lists`, KVM), so no
+    /// kernel walk ever marks a word. Detcore makes Linux's whole walk itself,
+    /// in the dying thread's own turn: each transition with the guest's
+    /// atomic compare-and-exchange, and each wake at once, against its
+    /// modeled waiter pool, before any other thread can run. An exec walks
+    /// once it can no longer fail, at the point the backend reports through
+    /// `Tool::handle_exec_commit`, and holds its wakes until the new image's
+    /// first callback; an exec that fails walks nothing. An exit_group and a
+    /// SIGKILL of the caller's own process are filed first, as on
+    /// [`Self::Barrier`], so the threads the grant kills keep their
+    /// registrations for its walk; a delivery whose default action ends the
+    /// group walks in its own turn and returns without the post-handler hook.
+    Detcore,
 }
 
 /// How precise and polling futex modes answer a futex command, decided as
@@ -5105,15 +7231,21 @@ enum OwnerDeathPath {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FutexCommand {
     /// Emulated: FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAKE, FUTEX_WAKE_BITSET,
-    /// FUTEX_REQUEUE, FUTEX_CMP_REQUEUE and FUTEX_WAKE_OP.
+    /// FUTEX_REQUEUE, FUTEX_CMP_REQUEUE, FUTEX_WAKE_OP, and the
+    /// priority-inheritance lock commands FUTEX_LOCK_PI, FUTEX_LOCK_PI2,
+    /// FUTEX_TRYLOCK_PI and FUTEX_UNLOCK_PI (`Detcore::handle_futex_lock_pi`,
+    /// `Detcore::handle_futex_unlock_pi`).
     Served,
     /// `-ENOSYS`, exactly as Linux: FUTEX_CLOCK_REALTIME with any command but
     /// FUTEX_WAIT_BITSET, FUTEX_WAIT_REQUEUE_PI or FUTEX_LOCK_PI2; the removed
     /// FUTEX_FD; and any unknown command.
     NoSys,
-    /// A priority-inheritance command, which Detcore does not emulate; refused
-    /// by name (`Detcore::refuse_futex_command`).
-    PriorityInheritance(&'static str),
+    /// FUTEX_WAIT_REQUEUE_PI or FUTEX_CMP_REQUEUE_PI, the requeue-PI pair that
+    /// moves a condition variable's waiters onto a PI mutex. Detcore does not
+    /// emulate it; refused by name (`Detcore::refuse_futex_command`). glibc's
+    /// condition variables have not issued it since glibc 2.25: they wait on
+    /// their own words and then lock the mutex.
+    RequeuePi(&'static str),
 }
 
 /// [`FutexCommand`] for a raw `futex_op`.
@@ -5135,20 +7267,76 @@ pub(crate) fn classify_futex_command(futex_op: i32) -> FutexCommand {
         | libc::FUTEX_WAKE_BITSET
         | libc::FUTEX_REQUEUE
         | libc::FUTEX_CMP_REQUEUE
-        | libc::FUTEX_WAKE_OP => FutexCommand::Served,
-        libc::FUTEX_LOCK_PI => FutexCommand::PriorityInheritance("FUTEX_LOCK_PI"),
-        libc::FUTEX_LOCK_PI2 => FutexCommand::PriorityInheritance("FUTEX_LOCK_PI2"),
-        libc::FUTEX_UNLOCK_PI => FutexCommand::PriorityInheritance("FUTEX_UNLOCK_PI"),
-        libc::FUTEX_TRYLOCK_PI => FutexCommand::PriorityInheritance("FUTEX_TRYLOCK_PI"),
-        libc::FUTEX_WAIT_REQUEUE_PI => FutexCommand::PriorityInheritance("FUTEX_WAIT_REQUEUE_PI"),
-        libc::FUTEX_CMP_REQUEUE_PI => FutexCommand::PriorityInheritance("FUTEX_CMP_REQUEUE_PI"),
+        | libc::FUTEX_WAKE_OP
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | libc::FUTEX_LOCK_PI
+        | libc::FUTEX_LOCK_PI2
+        | libc::FUTEX_TRYLOCK_PI
+        | libc::FUTEX_UNLOCK_PI => FutexCommand::Served,
+        libc::FUTEX_WAIT_REQUEUE_PI => FutexCommand::RequeuePi("FUTEX_WAIT_REQUEUE_PI"),
+        libc::FUTEX_CMP_REQUEUE_PI => FutexCommand::RequeuePi("FUTEX_CMP_REQUEUE_PI"),
         _ => FutexCommand::NoSys,
     }
 }
 
-/// Why `--debug-futex-mode polling` refuses FUTEX_REQUEUE, FUTEX_CMP_REQUEUE and
-/// FUTEX_WAKE_OP.
+/// Why `--debug-futex-mode polling` refuses FUTEX_REQUEUE, FUTEX_CMP_REQUEUE,
+/// FUTEX_WAKE_OP and the priority-inheritance lock commands.
 const POLLING_REFUSAL: &str = "--debug-futex-mode polling does not model futex waiter lists";
+
+/// The name of a priority-inheritance lock command (FUTEX_LOCK_PI,
+/// FUTEX_LOCK_PI2, FUTEX_TRYLOCK_PI, FUTEX_UNLOCK_PI), or `None` for any other.
+fn pi_lock_command_name(command: i32) -> Option<&'static str> {
+    match command {
+        libc::FUTEX_LOCK_PI => Some("FUTEX_LOCK_PI"),
+        libc::FUTEX_LOCK_PI2 => Some("FUTEX_LOCK_PI2"),
+        libc::FUTEX_TRYLOCK_PI => Some("FUTEX_TRYLOCK_PI"),
+        libc::FUTEX_UNLOCK_PI => Some("FUTEX_UNLOCK_PI"),
+        _ => None,
+    }
+}
+
+/// Whether the futex word at `address` lies in a file-backed shared mapping,
+/// which a process outside Hermit can update concurrently. Detcore changes a
+/// word with a separate read and write, which Linux's locked instruction does
+/// not, so the commands that change their word refuse such a one.
+fn futex_word_is_file_backed<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    guest: &G,
+    address: usize,
+) -> bool {
+    matches!(
+        guest.thread_state().futex_id(address, false),
+        FutexID::Shared {
+            object: SharedMemoryObjectId::File { .. } | SharedMemoryObjectId::OpenFile { .. },
+            ..
+        }
+    )
+}
+
+/// Write a futex word as a user-mode store does, which is what Linux's
+/// `futex_cmpxchg_value_locked` and `futex_atomic_op_inuser` do: exactly four
+/// bytes with the guest's own permissions, `-EFAULT` if the word cannot be
+/// written.
+fn write_futex_word<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    guest: &mut G,
+    address: usize,
+    value: u32,
+) -> Result<(), Error> {
+    let word = AddrMut::<u32>::from_raw(address).ok_or(Errno::EFAULT)?;
+    guest
+        .memory()
+        .write_value(word, &value)
+        .map_err(|_| Error::Errno(Errno::EFAULT))
+}
+
+/// Why the priority-inheritance lock commands refuse a caller in a nested PID
+/// namespace, whose futex words hold TIDs Detcore does not translate.
+const NESTED_PID_NAMESPACE_REFUSAL: &str = "the caller is in a nested PID namespace, whose \
+     priority-inheritance futex words hold TIDs Detcore does not translate";
+
+/// Why a command that changes its futex word refuses a word in a file-backed
+/// shared mapping (`futex_word_is_file_backed`).
+const FILE_BACKED_WORD_REFUSAL: &str = "its word is in a file-backed shared mapping that a process \
+     outside Hermit could update concurrently, and Detcore cannot apply the operation atomically";
 
 /// The `val2` of FUTEX_REQUEUE, FUTEX_CMP_REQUEUE and FUTEX_WAKE_OP, which the
 /// syscall passes in the timeout argument: `sys_futex` hands
@@ -5184,7 +7372,7 @@ enum KeyAccess {
 /// kernel, which is also the guest's kernel: a private FUTEX_WAKE with count 0
 /// keys the word without touching it and fails with EFAULT exactly when
 /// `access_ok` refuses it.
-fn user_ptr_max() -> usize {
+pub(crate) fn user_ptr_max() -> usize {
     static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MAX.get_or_init(|| {
         let accepted = |address: usize| {
@@ -5203,8 +7391,15 @@ fn user_ptr_max() -> usize {
             ret >= 0
         };
         // Binary search over 4-aligned addresses: 0 is accepted, and an address
-        // with the top bit set never is.
-        let (mut ok, mut bad) = (0usize, 1usize << 63);
+        // past the largest user address space never is. The bound stays below
+        // any tag bits (arm64's top byte, x86's bits 57 to 62), so the search
+        // stays monotone even if Hermit itself ran with tagging enabled.
+        let bad_start = if cfg!(target_arch = "aarch64") {
+            1usize << 55
+        } else {
+            1usize << 57
+        };
+        let (mut ok, mut bad) = (0usize, bad_start);
         while bad - ok > 4 {
             let mid = (ok + (bad - ok) / 2) & !3;
             if accepted(mid) { ok = mid } else { bad = mid }
@@ -5695,9 +7890,13 @@ mod tests {
 
     use super::*;
 
-    /// The Kernel path is ptrace's, and the Barrier path is DBT's alone: a
-    /// backend gets the Barrier path only by setting a flag whose other
-    /// properties it must then have (`owner_death_path`).
+    /// The Kernel path is ptrace's, the Barrier path is DBT's alone, and the
+    /// Detcore path is KVM's alone: a backend gets the Barrier path only by
+    /// setting a flag whose other properties it must then have, and the
+    /// Detcore path only by stating that no kernel walk runs
+    /// (`owner_death_path`). A backend whose native exit does run Linux's walk
+    /// keeps its path even if it also claimed that none runs, so a word is
+    /// never marked by Detcore and by Linux both.
     #[test]
     fn owner_death_path_is_tied_to_the_backends_that_have_its_properties() {
         let path = |backend: reverie::BackendCapabilities| {
@@ -5714,12 +7913,27 @@ mod tests {
             path(reverie::BackendCapabilities::DBT),
             Some(OwnerDeathPath::Barrier)
         );
+        assert_eq!(
+            path(reverie::BackendCapabilities::KVM),
+            Some(OwnerDeathPath::Detcore)
+        );
         for backend in [
-            reverie::BackendCapabilities::KVM,
             reverie::BackendCapabilities::SABRE,
             reverie::BackendCapabilities::LITEINST_IN_GUEST,
         ] {
             assert_eq!(path(backend), None, "{backend:?}");
+        }
+        for (backend, kept) in [
+            (reverie::BackendCapabilities::PTRACE, OwnerDeathPath::Kernel),
+            (
+                reverie::BackendCapabilities::E9PATCH,
+                OwnerDeathPath::Kernel,
+            ),
+            (reverie::BackendCapabilities::DBT, OwnerDeathPath::Barrier),
+        ] {
+            let mut claimed = backend;
+            claimed.kernel_never_walks_robust_lists = true;
+            assert_eq!(path(claimed), Some(kept), "{backend:?}");
         }
     }
 
@@ -5849,6 +8063,16 @@ mod tests {
                 },
                 SchedYieldRoute::WeakYield,
             ),
+            // A schedule replay draws no priority, even with the timer off.
+            (
+                Config {
+                    chaos: true,
+                    max_timeslice: None,
+                    replay_schedule_from: path(),
+                    ..Config::default()
+                },
+                SchedYieldRoute::WeakYield,
+            ),
             (
                 Config {
                     replay_schedule_from: path(),
@@ -5925,6 +8149,131 @@ mod tests {
         assert!(host_signal_state_reads_refused());
         assert_eq!(read_kernel_signal_state(pid, tid), Err(Errno::ENOSYS));
         assert_eq!(read_thread_signal_state(pid, tid), Err(Errno::ENOSYS));
+    }
+
+    /// SIGSHARE S3a-2's send latch: a host signal send to a guest thread ID
+    /// is allowed where guest thread IDs name host tasks, and refused, by
+    /// name, once the refusal is latched for a backend whose do not (KVM,
+    /// https://github.com/rrnewton/hermit/issues/4950). Every guarded send
+    /// (the unignore re-queue, the host-timed parent-death kill,
+    /// `--stacktrace-signal` and the two fault hooks) asks this before it
+    /// sends.
+    #[test]
+    fn a_latched_refusal_refuses_every_host_signal_send() {
+        refuse_host_signal_state_reads(&BackendCapabilities::PTRACE);
+        assert!(!host_signal_send_refused("a test", 1, 1, libc::SIGUSR1));
+        refuse_host_signal_state_reads(&BackendCapabilities::KVM);
+        assert!(host_signal_send_refused("a test", 1, 1, libc::SIGUSR1));
+        assert!(host_signal_send_refused("a test", 1, 2, libc::SIGKILL));
+    }
+
+    /// A kept status file is read afresh each time: a signal blocked after
+    /// the first read shows in the second, which reuses the kept file, and the
+    /// thread's exit hook drops it (`forget_thread_status`).
+    #[test]
+    fn a_kept_status_file_reads_the_current_state_until_its_thread_is_forgotten() {
+        std::thread::spawn(|| {
+            status_files::enable();
+            let pid = Pid::from_raw(unsafe { libc::getpid() });
+            let tid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
+            let usr2 = crate::scheduler::kernel_signal_bit(libc::SIGUSR2);
+            let before = read_kernel_signal_state(pid, tid).unwrap();
+            assert_eq!(before.blocked & usr2, 0);
+            assert!(status_files::keeps(pid, tid));
+            // SAFETY: changes only this spawned thread's own mask.
+            unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGUSR2);
+                assert_eq!(
+                    libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()),
+                    0
+                );
+            }
+            let after = read_kernel_signal_state(pid, tid).unwrap();
+            assert_eq!(after.blocked & usr2, usr2);
+            assert!(status_files::keeps(pid, tid));
+            forget_thread_status(tid);
+            assert!(!status_files::keeps(pid, tid));
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// Until keeping is enabled, which only Hermit's own process does, a read
+    /// keeps no file: no descriptor of this process names the thread's status
+    /// file afterwards. Detcore linked into a guest is in this state, so its
+    /// reads leave nothing in the guest's descriptor table.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // a host unit test lists its own descriptors
+    fn without_keeping_a_read_leaves_no_descriptor_open() {
+        std::thread::spawn(|| {
+            let pid = Pid::from_raw(unsafe { libc::getpid() });
+            let tid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
+            assert!(read_kernel_signal_state(pid, tid).is_ok());
+            assert!(read_kernel_signal_state(pid, tid).is_ok());
+            assert!(status_files::kept_file(pid, tid).is_none());
+            let status = format!("/proc/{}/task/{}/status", pid.as_raw(), tid.as_raw());
+            for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
+                let target = std::fs::read_link(entry.unwrap().path()).unwrap_or_default();
+                assert_ne!(target.to_str(), Some(status.as_str()));
+            }
+            forget_thread_status(tid);
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// A kept status file stays bound to the thread it was opened for: once
+    /// that thread has exited, the kept file is unreadable (`ESRCH`), so a
+    /// read never takes a later thread's state from it. The read then drops
+    /// the file and reads the path, as it did before files were kept: `ESRCH`
+    /// while the TID is free, or the state of a thread that reused it (other
+    /// tests in this process start threads concurrently).
+    #[test]
+    fn a_kept_status_file_of_an_exited_thread_is_unreadable_and_dropped() {
+        status_files::enable();
+        let pid = Pid::from_raw(unsafe { libc::getpid() });
+        let (tid, kept) = std::thread::spawn(move || {
+            status_files::enable();
+            let tid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
+            assert!(read_kernel_signal_state(pid, tid).is_ok());
+            let kept = status_files::kept_file(pid, tid).expect("the read keeps its file");
+            (tid, kept)
+        })
+        .join()
+        .unwrap();
+        // join() returns before the kernel has finished tearing the thread
+        // down; until then the kept file still reads it (as its path would).
+        // Every read names that thread, and the file becomes unreadable.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let error = loop {
+            match status_files::read_kept(&kept) {
+                Ok(text) => {
+                    let own = format!("\nPid:\t{}\n", tid.as_raw());
+                    assert!(text.contains(&own), "{text}");
+                    assert!(std::time::Instant::now() < deadline, "{text}");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
+        match read_kernel_signal_state(pid, tid) {
+            Err(errno) => {
+                assert_eq!(errno, Errno::ESRCH);
+                assert!(!status_files::keeps(pid, tid));
+            }
+            // A thread of another test took the TID: the read is the path's.
+            Ok(_) => {
+                // The kept file, if any, is the reopened one (the cache may be
+                // full of other tests' threads, which never run the exit hook).
+                if let Some(now) = status_files::kept_file(pid, tid) {
+                    assert!(!Arc::ptr_eq(&now, &kept));
+                }
+            }
+        }
+        assert!(status_files::kept() <= status_files::CAPACITY);
     }
     use crate::config::Config;
     use crate::tool_global::GlobalRequest;
@@ -6544,6 +8893,78 @@ mod tests {
         }
     }
 
+    /// Only a serialized run on a backend whose kernel signal state is the
+    /// guest's own, with no gdbserver attached, retires threads at a fatal
+    /// delivery.
+    #[test]
+    fn only_serialized_ptrace_runs_without_a_gdbserver_retire_at_a_fatal_delivery() {
+        let ptrace = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        }
+        .with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE);
+        assert!(retires_others_at_fatal_delivery(&ptrace));
+        for (case, cfg) in [
+            (
+                "gdbserver",
+                Config {
+                    gdbserver: true,
+                    ..ptrace.clone()
+                },
+            ),
+            (
+                "unserialized",
+                Config {
+                    sequentialize_threads: false,
+                    ..ptrace.clone()
+                },
+            ),
+            (
+                "DBT",
+                ptrace
+                    .clone()
+                    .with_backend(|backend| *backend = reverie::BackendCapabilities::DBT),
+            ),
+        ] {
+            assert!(!retires_others_at_fatal_delivery(&cfg), "{case}");
+        }
+    }
+
+    /// A delivery stop's signal ends the process only when it is unblocked
+    /// and left at a default that terminates or dumps core.
+    #[test]
+    fn only_an_unblocked_default_fatal_delivery_ends_the_process() {
+        let abrt = kernel_sigset_bit(libc::SIGABRT);
+        let default = KernelSignalState::default();
+        assert!(default.delivery_carries_out_a_fatal_default(libc::SIGABRT));
+        assert!(default.delivery_carries_out_a_fatal_default(libc::SIGSEGV));
+        for signal in [libc::SIGCHLD, libc::SIGWINCH, libc::SIGTSTP, libc::SIGCONT] {
+            assert!(
+                !default.delivery_carries_out_a_fatal_default(signal),
+                "{signal}"
+            );
+        }
+        for state in [
+            KernelSignalState {
+                blocked: abrt,
+                ..Default::default()
+            },
+            KernelSignalState {
+                caught: abrt,
+                ..Default::default()
+            },
+            KernelSignalState {
+                ignored: abrt,
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                !state.delivery_carries_out_a_fatal_default(libc::SIGABRT),
+                "{state:?}"
+            );
+        }
+    }
+
     /// signal(7): the signals whose default action is to terminate or dump
     /// core end the process; those ignored, stopping or continuing by
     /// default do not, and SIGKILL never reaches a delivery callback
@@ -6740,9 +9161,9 @@ mod tests {
 
     /// `do_futex` (kernel/futex/syscalls.c): FUTEX_CLOCK_REALTIME only with
     /// FUTEX_WAIT_BITSET, FUTEX_WAIT_REQUEUE_PI or FUTEX_LOCK_PI2, else -ENOSYS;
-    /// the removed FUTEX_FD and unknown commands are -ENOSYS; the PI commands are
-    /// refused by name; the rest are emulated
-    /// (https://github.com/rrnewton/hermit/issues/3958).
+    /// the removed FUTEX_FD and unknown commands are -ENOSYS; the requeue-PI
+    /// commands are refused by name; the rest, the PI lock commands included,
+    /// are emulated (https://github.com/rrnewton/hermit/issues/3958).
     #[test]
     fn futex_commands_are_classified_as_linux_dispatches_them() {
         use FutexCommand::*;
@@ -6775,26 +9196,87 @@ mod tests {
         for cmd in [libc::FUTEX_FD, 14, 99, libc::FUTEX_CMD_MASK] {
             assert_eq!(classify_futex_command(cmd), NoSys, "cmd {cmd}");
         }
-        assert_eq!(
-            classify_futex_command(libc::FUTEX_LOCK_PI | private),
-            PriorityInheritance("FUTEX_LOCK_PI")
-        );
+        for cmd in [
+            libc::FUTEX_LOCK_PI,
+            libc::FUTEX_LOCK_PI2,
+            libc::FUTEX_TRYLOCK_PI,
+            libc::FUTEX_UNLOCK_PI,
+        ] {
+            assert_eq!(classify_futex_command(cmd), Served, "cmd {cmd}");
+            assert_eq!(classify_futex_command(cmd | private), Served, "cmd {cmd}");
+        }
         assert_eq!(
             classify_futex_command(libc::FUTEX_LOCK_PI2 | realtime),
-            PriorityInheritance("FUTEX_LOCK_PI2")
+            Served
         );
+        for cmd in [
+            libc::FUTEX_LOCK_PI,
+            libc::FUTEX_TRYLOCK_PI,
+            libc::FUTEX_UNLOCK_PI,
+        ] {
+            assert_eq!(classify_futex_command(cmd | realtime), NoSys, "cmd {cmd}");
+        }
         assert_eq!(
-            classify_futex_command(libc::FUTEX_LOCK_PI | realtime),
-            NoSys
+            classify_futex_command(libc::FUTEX_WAIT_REQUEUE_PI | realtime),
+            RequeuePi("FUTEX_WAIT_REQUEUE_PI")
         );
         for (cmd, name) in [
-            (libc::FUTEX_UNLOCK_PI, "FUTEX_UNLOCK_PI"),
-            (libc::FUTEX_TRYLOCK_PI, "FUTEX_TRYLOCK_PI"),
             (libc::FUTEX_WAIT_REQUEUE_PI, "FUTEX_WAIT_REQUEUE_PI"),
             (libc::FUTEX_CMP_REQUEUE_PI, "FUTEX_CMP_REQUEUE_PI"),
         ] {
-            assert_eq!(classify_futex_command(cmd), PriorityInheritance(name));
+            assert_eq!(classify_futex_command(cmd), RequeuePi(name));
         }
+        assert_eq!(
+            classify_futex_command(libc::FUTEX_CMP_REQUEUE_PI | realtime),
+            NoSys
+        );
+    }
+
+    /// `futex_init_timeout` and `do_futex` (kernel/futex/syscalls.c:114-116,
+    /// 147-157 at v6.16): FUTEX_WAIT's timeout is relative; FUTEX_WAIT_BITSET's,
+    /// FUTEX_LOCK_PI's and FUTEX_LOCK_PI2's are absolute. FUTEX_LOCK_PI's is
+    /// always on CLOCK_REALTIME, the others' only with FUTEX_CLOCK_REALTIME.
+    #[test]
+    fn futex_deadlines_are_measured_as_linux_measures_them() {
+        let one_second = Timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        };
+        let realtime = libc::FUTEX_CLOCK_REALTIME;
+        assert_eq!(
+            parse_futex_timeout(libc::FUTEX_WAIT, one_second),
+            Ok(FutexTimeout::Relative(1_000_000_000))
+        );
+        for cmd in [
+            libc::FUTEX_WAIT_BITSET,
+            libc::FUTEX_LOCK_PI,
+            libc::FUTEX_LOCK_PI2,
+            libc::FUTEX_LOCK_PI | libc::FUTEX_PRIVATE_FLAG,
+        ] {
+            assert_eq!(
+                parse_futex_timeout(cmd, one_second),
+                Ok(FutexTimeout::Absolute(LogicalTime::from_nanos(
+                    1_000_000_000
+                ))),
+                "cmd {cmd}"
+            );
+        }
+        assert_eq!(
+            futex_deadline_clock(libc::FUTEX_LOCK_PI),
+            syscalls::ClockId::CLOCK_REALTIME
+        );
+        assert_eq!(
+            futex_deadline_clock(libc::FUTEX_LOCK_PI2),
+            syscalls::ClockId::CLOCK_MONOTONIC
+        );
+        assert_eq!(
+            futex_deadline_clock(libc::FUTEX_LOCK_PI2 | realtime),
+            syscalls::ClockId::CLOCK_REALTIME
+        );
+        assert_eq!(
+            futex_deadline_clock(libc::FUTEX_WAIT_BITSET),
+            syscalls::ClockId::CLOCK_MONOTONIC
+        );
     }
 
     /// FUTEX_WAKE_OP's encoding, as `futex_atomic_op_inuser` decodes it: 12-bit
@@ -7106,7 +9588,10 @@ mod tests {
         // Measured native: size 1, 47 and 4097 all give E2BIG.
         assert_eq!(sched_attr_effective_size(1), Err(()));
         assert_eq!(sched_attr_effective_size(SCHED_ATTR_SIZE_VER0 - 1), Err(()));
-        assert_eq!(sched_attr_effective_size(SCHED_ATTR_MAX_SIZE + 1), Err(()));
+        assert_eq!(
+            sched_attr_effective_size(sched_attr_max_size() + 1),
+            Err(())
+        );
     }
 
     #[test]
@@ -7116,7 +9601,7 @@ mod tests {
             SCHED_ATTR_SIZE_VER0,
             SCHED_ATTR_SIZE_VER1,
             SCHED_ATTR_SIZE_VER1 + 1,
-            SCHED_ATTR_MAX_SIZE,
+            sched_attr_max_size(),
         ] {
             assert_eq!(sched_attr_effective_size(size), Ok(size), "size {}", size);
         }
@@ -7561,6 +10046,193 @@ pub(crate) fn real_uid(tid: i32) -> Option<u32> {
         .ok()
 }
 
+/// The sizes of the three versions of `struct clone_args`
+/// (`CLONE_ARGS_SIZE_VER0` to `_VER2`, include/uapi/linux/sched.h): the
+/// smallest `clone3` accepts, the one with `set_tid`, and the one v6.16 reads.
+const CLONE_ARGS_SIZE_VER0: usize = 64;
+const CLONE_ARGS_SIZE_VER1: usize = 80;
+const CLONE_ARGS_SIZE_VER2: usize = 88;
+
+/// The most bytes of a `struct clone_args` [`inject_traced_clone3`] stages,
+/// within the guest stack scratch's capacity.
+const CLONE3_STAGED_MAX: usize = 512;
+
+/// What [`inject_traced_clone`] did with a clone-family call.
+enum CloneInjection {
+    /// The call ran, with this result.
+    Ran(Result<i64, Errno>),
+    /// The call did not run: the reason it cannot be made traced.
+    Refused(String),
+}
+
+/// Injects the guest's `clone_family` call with `CLONE_UNTRACED` cleared.
+///
+/// `CLONE_UNTRACED` keeps a tracer from attaching to the child
+/// (`kernel_clone`, kernel/fork.c). No guest task has a tracer of its own:
+/// Detcore answers every guest `ptrace` with `EPERM`
+/// (`is_privileged_observation_refused_syscall`), and natively an untraced
+/// program has none either, so for the guest the flag changes nothing. Under
+/// a tracing backend every guest task must be traced: Detcore admits the
+/// child to its scheduler as the clone returns and waits for it to take its
+/// first turn, which an untraced child never does, so the run waited forever.
+/// Cleared, the child is traced like every other and runs as it would
+/// natively. A backend that does not trace children ignores the flag, so the
+/// call is the same there. `flags` are the call's, as
+/// [`Detcore::handle_clone_family`] read them.
+async fn inject_traced_clone<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    guest: &mut G,
+    clone_family: syscalls::family::CloneFamily,
+    flags: CloneFlags,
+) -> CloneInjection {
+    use syscalls::family::CloneFamily;
+    if !flags.contains(CloneFlags::CLONE_UNTRACED) {
+        return CloneInjection::Ran(
+            crate::reserved_input::inject_original_clone(guest, Syscall::from(clone_family)).await,
+        );
+    }
+    match clone_family {
+        CloneFamily::Clone(clone) => {
+            let traced = clone.with_flags(clone.flags() - nix::sched::CloneFlags::CLONE_UNTRACED);
+            CloneInjection::Ran(
+                crate::reserved_input::inject_original_clone(guest, Syscall::Clone(traced)).await,
+            )
+        }
+        CloneFamily::Clone3(clone) => inject_traced_clone3(guest, clone).await,
+        #[cfg(not(target_arch = "aarch64"))]
+        CloneFamily::Fork(_) | CloneFamily::Vfork(_) => {
+            unreachable!("fork and vfork take no flags")
+        }
+    }
+}
+
+/// [`inject_traced_clone`] of a `clone3` call, whose flags are in the guest's
+/// `struct clone_args`. That struct is left as it is: a copy without
+/// `CLONE_UNTRACED` is staged in the guest stack scratch, with the bytes under
+/// it saved and put back after the call, as Detcore stages a pre-call lookup
+/// buffer there. On ptrace that is below the red zone; a child that does not
+/// share the caller's memory keeps the copy there, below its stack pointer,
+/// where the ABI lets a signal frame write. Other backends lend an arena of
+/// their own.
+///
+/// The copy holds every byte up to the guest's last nonzero one, and at
+/// least those the kernel reads, so the kernel judges it as it would the
+/// guest's struct (`copy_clone_args_from_user`, kernel/fork.c). A call the
+/// kernel fails before reading the struct (no struct, one it cannot read, a
+/// size it refuses) is injected as the guest made it and fails as natively.
+/// Two calls are refused by name rather than run untraced: one whose nonzero
+/// bytes do not fit the scratch, and one whose pointers lead into it.
+async fn inject_traced_clone3<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    guest: &mut G,
+    clone: syscalls::Clone3,
+) -> CloneInjection {
+    let size = clone.size();
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096);
+    let mut bytes = vec![0_u8; size];
+    let readable = clone.args().is_some_and(|args| {
+        (CLONE_ARGS_SIZE_VER0..=page).contains(&size)
+            && crate::syscalls::read_guest_exact(&guest.memory(), args.cast(), &mut bytes).is_ok()
+    });
+    if !readable {
+        return CloneInjection::Ran(
+            crate::reserved_input::inject_original_clone(guest, Syscall::Clone3(clone)).await,
+        );
+    }
+    let refused = |why: &str| {
+        CloneInjection::Refused(format!(
+            "clone3 with CLONE_UNTRACED: hermit must trace the child, so it clears the flag in a \
+             copy of clone_args staged below the stack pointer, but {why}"
+        ))
+    };
+    let nonzero = bytes
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .map_or(0, |last| last + 1);
+    let len = nonzero.max(size.min(CLONE_ARGS_SIZE_VER2));
+    if len > CLONE3_STAGED_MAX {
+        return refused(&format!(
+            "its nonzero bytes run past the {CLONE3_STAGED_MAX} that can be staged"
+        ));
+    }
+    let mut copy = [0_u8; CLONE3_STAGED_MAX];
+    copy[..len].copy_from_slice(&bytes[..len]);
+    let field = |copy: &[u8], offset: usize| {
+        u64::from_ne_bytes(copy[offset..offset + 8].try_into().unwrap())
+    };
+    let traced = field(&copy, 0) & !CloneFlags::CLONE_UNTRACED.bits();
+    copy[..8].copy_from_slice(&traced.to_ne_bytes());
+
+    // `GuestStack` starts its allocations 128 bytes below the stack pointer.
+    let rsp = guest.regs().await.rsp as usize;
+    let Some(start) = rsp.checked_sub(128 + CLONE3_STAGED_MAX) else {
+        return refused("the stack pointer is too low to stage it");
+    };
+    let staged = start..start + CLONE3_STAGED_MAX;
+    // What the kernel writes through the struct's pointers (pidfd, child_tid,
+    // parent_tid) or reads through set_tid, which the restore below would
+    // erase or the copy has already overwritten.
+    let set_tid_bytes = if len >= CLONE_ARGS_SIZE_VER1 {
+        field(&copy, 72).saturating_mul(4)
+    } else {
+        0
+    };
+    let pointed = [
+        (field(&copy, 8), 4),
+        (field(&copy, 16), 4),
+        (field(&copy, 24), 4),
+        (field(&copy, 64), set_tid_bytes),
+    ];
+    if pointed.iter().any(|&(address, bytes)| {
+        let address = address as usize;
+        bytes > 0 && address < staged.end && address.saturating_add(bytes as usize) > staged.start
+    }) {
+        return refused("one of its pointers leads into the staged copy");
+    }
+
+    let mut stack = guest.stack().await;
+    let scratch: Addr<[u8; CLONE3_STAGED_MAX]> = stack.push(copy);
+    let mut saved = [0_u8; CLONE3_STAGED_MAX];
+    if let Err(errno) = crate::syscalls::read_guest_exact(
+        &guest.memory(),
+        AddrMut::from_raw(scratch.as_raw()).expect("a nonzero address"),
+        &mut saved,
+    ) {
+        return refused(&format!("the stack below it cannot be read ({errno})"));
+    }
+    let guard = match stack.commit() {
+        Ok(guard) => guard,
+        Err(errno) => {
+            restore_staged_clone_args(guest, scratch, &saved);
+            return refused(&format!("the stack below it cannot be written ({errno})"));
+        }
+    };
+    let result = crate::reserved_input::inject_original_clone(
+        guest,
+        Syscall::Clone3(
+            clone
+                .with_args(AddrMut::from_raw(scratch.as_raw()))
+                .with_size(len),
+        ),
+    )
+    .await;
+    restore_staged_clone_args(guest, scratch, &saved);
+    drop(guard);
+    CloneInjection::Ran(result)
+}
+
+/// Puts back the guest bytes that [`inject_traced_clone3`] staged its copy
+/// over.
+fn restore_staged_clone_args<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    guest: &mut G,
+    scratch: Addr<[u8; CLONE3_STAGED_MAX]>,
+    saved: &[u8; CLONE3_STAGED_MAX],
+) {
+    let restored = AddrMut::<u8>::from_raw(scratch.as_raw())
+        .is_some_and(|scratch| guest.memory().write_exact(scratch, saved).is_ok());
+    if !restored {
+        info!("Could not restore the guest bytes under a staged clone_args.");
+    }
+}
+
 /// The 8-byte field at `offset` of a clone3 call's `struct clone_args`,
 /// which may be any size the kernel accepts from 64 bytes (its first
 /// version) up: read alone, so that a shorter struct at the end of a mapping
@@ -7571,14 +10243,302 @@ fn clone3_field<M: MemoryAccess>(
     clone: &syscalls::Clone3,
     offset: usize,
 ) -> Option<u64> {
-    const CLONE_ARGS_SIZE_VER0: usize = 64;
     if clone.size() < CLONE_ARGS_SIZE_VER0 || offset + 8 > clone.size() {
         return None;
     }
-    let base = clone.args()?.as_raw();
-    memory
-        .read_value(Addr::<u64>::from_raw(base + offset)?)
-        .ok()
+    let field = clone.args()?.as_raw().checked_add(offset)?;
+    // Past user memory there is nothing to read, and a read's address
+    // arithmetic near the top of the address space would overflow.
+    if !super::chosen_ids::within_user_memory(field, std::mem::size_of::<u64>()) {
+        return None;
+    }
+    memory.read_value(Addr::<u64>::from_raw(field)?).ok()
+}
+
+/// Whether a `clone3`'s exit signal and the low byte of its flags pass the
+/// kernel's checks: the exit signal is a signal number, and the flags hold
+/// nothing in `CSIGNAL` but `CLONE_NEWTIME`, which `clone3` accepts from
+/// Linux 6.3 (`clone3_args_valid`). On an older kernel, which refuses
+/// `CLONE_NEWTIME` with EINVAL, a refusal after this is the conservative
+/// side.
+fn clone3_signal_fields_valid(flags: u64, exit_signal: u64) -> bool {
+    const CSIGNAL: u64 = 0xff;
+    const CLONE_NEWTIME: u64 = 0x80;
+    exit_signal <= 64 && flags & CSIGNAL & !CLONE_NEWTIME == 0
+}
+
+#[cfg(test)]
+mod clone3_signal_fields_tests {
+    /// CLONE_NEWTIME is the one CSIGNAL bit clone3 accepts in its flags;
+    /// every other one, or an exit signal above 64, is the kernel's EINVAL.
+    #[test]
+    fn clone3_accepts_only_clone_newtime_among_the_csignal_bits() {
+        assert!(super::clone3_signal_fields_valid(0x80, 17));
+        assert!(super::clone3_signal_fields_valid(0, 64));
+        for bit in 0..7 {
+            assert!(!super::clone3_signal_fields_valid(1 << bit, 17), "{bit}");
+        }
+        assert!(!super::clone3_signal_fields_valid(0, 65));
+    }
+}
+
+/// Whether Linux refuses `clone_family` with EINVAL, from its flags and its
+/// `struct clone_args` alone, before it reads anything else or creates
+/// anything. A `clone3` is decided only where no check the kernel makes first
+/// could fail another way: its struct, of a size the kernel takes, is read
+/// whole with the guest's own access, as `copy_from_user` reads it, has no
+/// nonzero tail past the fields known here (E2BIG), and names no `set_tid`
+/// array, whose copy could fault (EFAULT). Linux's EINVALs that depend on the
+/// caller's state, `CLONE_PARENT` from a namespace's init and a thread after
+/// `unshare(CLONE_NEWPID)`, are left to the backend. `user_limit` is the
+/// guest's user address limit, as its backend reports it
+/// (`Guest::user_address_limit`), if it does.
+fn linux_refuses_clone_flags<M: MemoryAccess>(
+    memory: &M,
+    clone_family: &syscalls::family::CloneFamily,
+    user_limit: Option<u64>,
+) -> bool {
+    match clone_family {
+        // `clone` takes the low 32 bits of its argument, less the exit signal
+        // in the low byte, and writes a pidfd where it writes the parent's tid.
+        syscalls::family::CloneFamily::Clone(clone) => {
+            clone_flags_einval(u64::from(clone.flags().bits() as u32) & !0xff, true)
+        }
+        syscalls::family::CloneFamily::Clone3(clone) => {
+            let size = clone.size();
+            let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(0);
+            let mut bytes = vec![0u8; size.min(page)];
+            (CLONE_ARGS_SIZE_VER0..=page).contains(&size)
+                && clone
+                    .args()
+                    .and_then(|args| Addr::<u8>::from_raw(args.as_raw()))
+                    .filter(|args| super::chosen_ids::within_user_memory(args.as_raw(), size))
+                    .is_some_and(|args| {
+                        memory.read_exact_with_user_access(args, &mut bytes).is_ok()
+                    })
+                && clone3_args_einval(&bytes, user_limit)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        _ => false,
+    }
+}
+
+/// Whether Linux refuses a clone with these `flags` with EINVAL, whatever the
+/// caller's state: the check of `kernel_clone` for a pidfd written where the
+/// parent's tid goes (`pidfd_is_parent_tid`), and the checks `copy_process`
+/// makes first, at Linux v6.17:
+/// https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/fork.c?h=v6.17#n2582
+/// https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/fork.c?h=v6.17#n1935
+fn clone_flags_einval(flags: u64, pidfd_is_parent_tid: bool) -> bool {
+    let flags = CloneFlags::from_bits_retain(flags);
+    let thread = flags.contains(CloneFlags::CLONE_THREAD);
+    (flags.contains(CloneFlags::CLONE_PIDFD | CloneFlags::CLONE_PARENT_SETTID)
+        && pidfd_is_parent_tid)
+        || flags.contains(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_FS)
+        || flags.contains(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_FS)
+        || (thread && !flags.contains(CloneFlags::CLONE_SIGHAND))
+        || (flags.contains(CloneFlags::CLONE_SIGHAND) && !flags.contains(CloneFlags::CLONE_VM))
+        || (thread && flags.intersects(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWPID))
+        || flags.contains(CloneFlags::CLONE_PIDFD | CloneFlags::CLONE_DETACHED)
+}
+
+/// Whether Linux refuses a `clone3` whose `struct clone_args` is `bytes` with
+/// EINVAL before it creates anything: the checks of
+/// `copy_clone_args_from_user` and `clone3_args_valid`, then
+/// [`clone_flags_einval`]. False wherever another error could come first, a
+/// nonzero tail (E2BIG) or a `set_tid` copy (EFAULT):
+/// https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/fork.c?h=v6.17#n2768
+/// https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/fork.c?h=v6.17#n2849
+///
+/// `clone3_stack_valid` refuses a stack range that `access_ok` refuses,
+/// one whose end passes the user address limit (`__access_ok` and
+/// `valid_user_address`, arch/x86/include/asm/uaccess_64.h:56-57 and 98-107
+/// at v6.17). That limit is the kernel's (four- or five-level paging on a
+/// host), so it is decided only from `user_limit`, the guest's limit as its
+/// backend reports it, and left to the backend without one:
+/// https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/fork.c?h=v6.17#n2829
+fn clone3_args_einval(bytes: &[u8], user_limit: Option<u64>) -> bool {
+    const CLONE_CLEAR_SIGHAND: u64 = 1 << 32;
+    const CLONE_INTO_CGROUP: u64 = 1 << 33;
+    if bytes
+        .iter()
+        .skip(CLONE_ARGS_SIZE_VER2)
+        .any(|byte| *byte != 0)
+    {
+        return false;
+    }
+    let field = |offset: usize| {
+        let mut word = [0u8; 8];
+        for (i, byte) in word.iter_mut().enumerate() {
+            *byte = bytes.get(offset + i).copied().unwrap_or(0);
+        }
+        u64::from_ne_bytes(word)
+    };
+    let (flags, exit_signal, stack, stack_size) = (field(0), field(32), field(40), field(48));
+    let (set_tid, set_tid_size) = (field(64), field(72));
+    let into_cgroup = flags & CLONE_INTO_CGROUP != 0;
+    if set_tid_size > 32
+        || (set_tid == 0) != (set_tid_size == 0)
+        || exit_signal > 64
+        || (into_cgroup && (field(80) > i32::MAX as u64 || bytes.len() < CLONE_ARGS_SIZE_VER2))
+    {
+        return true;
+    }
+    if set_tid != 0 {
+        return false;
+    }
+    let sighand = libc::CLONE_SIGHAND as u64 | CLONE_CLEAR_SIGHAND;
+    flags & !(0xffff_ffff | CLONE_CLEAR_SIGHAND | CLONE_INTO_CGROUP) != 0
+        || !clone3_signal_fields_valid(flags, exit_signal)
+        || flags & libc::CLONE_DETACHED as u64 != 0
+        || flags & sighand == sighand
+        || (flags & (libc::CLONE_THREAD | libc::CLONE_PARENT) as u64 != 0 && exit_signal != 0)
+        || (stack == 0) != (stack_size == 0)
+        || stack.checked_add(stack_size).is_none()
+        || (stack != 0 && user_limit.is_some_and(|limit| stack + stack_size > limit))
+        || clone_flags_einval(flags, field(8) == field(24))
+}
+
+#[cfg(test)]
+mod linux_clone_einval_tests {
+    use super::clone_flags_einval;
+    use super::clone3_args_einval;
+
+    const VM: u64 = libc::CLONE_VM as u64;
+    const FS: u64 = libc::CLONE_FS as u64;
+    const FILES: u64 = libc::CLONE_FILES as u64;
+    const SIGHAND: u64 = libc::CLONE_SIGHAND as u64;
+    const THREAD: u64 = libc::CLONE_THREAD as u64;
+    const PIDFD: u64 = 0x1000;
+    const PARENT_SETTID: u64 = libc::CLONE_PARENT_SETTID as u64;
+    /// glibc's pthread_create flags, less the tid and TLS flags.
+    const PTHREAD: u64 = VM | FS | FILES | SIGHAND | THREAD | libc::CLONE_SYSVSEM as u64;
+
+    /// Exactly copy_process's first checks and kernel_clone's pidfd check
+    /// refuse: never the sharing Linux allows, such as a process with
+    /// CLONE_VM and CLONE_FS, CLONE_FILES or CLONE_SIGHAND, or a thread
+    /// without CLONE_FS, CLONE_FILES or CLONE_SYSVSEM.
+    #[test]
+    fn only_the_kernels_flag_rules_refuse() {
+        let newns = libc::CLONE_NEWNS as u64;
+        let newuser = libc::CLONE_NEWUSER as u64;
+        let newpid = libc::CLONE_NEWPID as u64;
+        let detached = libc::CLONE_DETACHED as u64;
+        for (flags, pidfd_is_parent_tid, einval) in [
+            (0, true, false),
+            (VM | libc::CLONE_VFORK as u64, true, false),
+            (PTHREAD, true, false),
+            (VM | SIGHAND | THREAD, true, false),
+            (VM | FS, true, false),
+            (VM | FILES, true, false),
+            (VM | SIGHAND, true, false),
+            (VM | SIGHAND | THREAD | newns, true, false),
+            (PIDFD | PTHREAD, true, false),
+            (PIDFD | PARENT_SETTID, false, false),
+            (newns | FS, true, true),
+            (newuser | FS, true, true),
+            (VM | FS | FILES | THREAD, true, true),
+            (SIGHAND, true, true),
+            (PTHREAD | newpid, true, true),
+            (VM | SIGHAND | THREAD | newuser, true, true),
+            (PIDFD | PARENT_SETTID, true, true),
+            (PIDFD | detached, true, true),
+        ] {
+            assert_eq!(
+                clone_flags_einval(flags, pidfd_is_parent_tid),
+                einval,
+                "{flags:#x} {pidfd_is_parent_tid}"
+            );
+        }
+    }
+
+    /// A clone_args of `len` bytes with these fields, the rest zero.
+    fn args(len: usize, fields: &[(usize, u64)]) -> Vec<u8> {
+        let mut bytes = vec![0u8; len];
+        for (offset, value) in fields {
+            bytes[*offset..*offset + 8].copy_from_slice(&value.to_ne_bytes());
+        }
+        bytes
+    }
+
+    /// clone3's own checks refuse first, in their order: a set_tid shape,
+    /// the exit signal, CLONE_INTO_CGROUP's field, then flags clone3 does not
+    /// take, CLONE_SIGHAND with CLONE_CLEAR_SIGHAND, an exit signal for a
+    /// thread and an unpaired or overflowing stack. Where the kernel could
+    /// fail another way first, a nonzero tail (E2BIG) or a set_tid array to
+    /// copy (EFAULT), nothing is decided.
+    #[test]
+    fn clone3_decides_only_what_the_kernel_checks_first() {
+        let sigchld = libc::SIGCHLD as u64;
+        let fork = [(32, sigchld)];
+        for (bytes, einval) in [
+            (args(64, &fork), false),
+            (args(88, &[(0, PTHREAD), (40, 0x1000), (48, 0x1000)]), false),
+            (args(88, &[(0, 0x80), (32, sigchld)]), false),
+            (args(128, &[(0, VM | FS), (32, sigchld)]), false),
+            (args(88, &[(0, PTHREAD), (32, sigchld)]), true),
+            (
+                args(88, &[(0, libc::CLONE_PARENT as u64), (32, sigchld)]),
+                true,
+            ),
+            (args(88, &[(0, 0x11)]), true),
+            (args(88, &[(0, libc::CLONE_DETACHED as u64)]), true),
+            (args(88, &[(0, VM | SIGHAND | (1 << 32))]), true),
+            (args(88, &[(0, 1 << 34)]), true),
+            (args(88, &[(32, 65)]), true),
+            (args(88, &[(40, 0x1000)]), true),
+            (args(88, &[(48, 0x1000)]), true),
+            (args(88, &[(40, u64::MAX), (48, 2)]), true),
+            (args(88, &[(64, 0x1000)]), true),
+            (args(88, &[(72, 1)]), true),
+            (args(88, &[(64, 0x1000), (72, 33)]), true),
+            (args(80, &[(0, 1 << 33)]), true),
+            (args(88, &[(0, 1 << 33), (80, 1 << 31)]), true),
+            (args(88, &[(0, 1 << 33), (80, 3)]), false),
+            (args(88, &[(0, THREAD), (64, 0x1000), (72, 1)]), false),
+            (args(96, &[(0, THREAD), (88, 1)]), false),
+            (args(96, &[(0, THREAD)]), true),
+            (
+                args(88, &[(0, PIDFD | PARENT_SETTID), (8, 8), (24, 8)]),
+                true,
+            ),
+            (
+                args(88, &[(0, PIDFD | PARENT_SETTID), (8, 8), (24, 16)]),
+                false,
+            ),
+            (
+                args(64, &[(0, libc::CLONE_NEWNS as u64 | FS), (32, sigchld)]),
+                true,
+            ),
+        ] {
+            assert_eq!(clone3_args_einval(&bytes, None), einval, "{bytes:x?}");
+        }
+    }
+
+    /// A stack whose end passes the user address limit the backend reports
+    /// is refused, as `access_ok` refuses it: one in the kernel's half, and
+    /// one a byte past the limit. One that ends at the limit is not, and
+    /// without a reported limit nothing is decided from the stack's place.
+    #[test]
+    fn clone3_refuses_a_stack_past_the_reported_user_limit() {
+        let sigchld = libc::SIGCHLD as u64;
+        let limit = (1_u64 << 47) - 4096;
+        let stack = |base: u64, size: u64| args(88, &[(32, sigchld), (40, base), (48, size)]);
+        for (bytes, user_limit, einval) in [
+            (stack(0xffff_8000_0000_0000, 0x1000), Some(limit), true),
+            (stack(0xffff_8000_0000_0000, 0x1000), None, false),
+            (stack(limit - 0x1000, 0x1001), Some(limit), true),
+            (stack(limit - 0x1000, 0x1000), Some(limit), false),
+            (stack(0x7000_0000, 0x1000), Some(limit), false),
+            (args(88, &[(32, sigchld)]), Some(limit), false),
+        ] {
+            assert_eq!(
+                clone3_args_einval(&bytes, user_limit),
+                einval,
+                "{bytes:x?} {user_limit:?}"
+            );
+        }
+    }
 }
 
 /// Where a `CLONE_PIDFD` clone writes the new process's pidfd (`clone`'s
@@ -7614,4 +10574,208 @@ fn clone_pidfd_address<M: MemoryAccess>(
         return None;
     }
     address
+}
+
+/// A5 step 3c.1e B (<https://github.com/rrnewton/hermit/issues/4485>): a
+/// managed child wait under the in-guest delivery gate reads the guest's mask
+/// without replacing it and restores nothing, so the mask its requests publish
+/// while it parks, and the one the guest resumes under, is the guest's own,
+/// never "every signal blocked".
+#[cfg(test)]
+mod disposition_mask_tests {
+    use std::sync::Mutex;
+
+    use reverie::Errno;
+    use reverie::Error;
+    use reverie::GlobalRPC;
+    use reverie::GlobalTool;
+    use reverie::Guest;
+    use reverie::Pid;
+    use reverie::syscalls::Addr;
+    use reverie::syscalls::AddrMut;
+    use reverie::syscalls::LocalMemory;
+    use reverie::syscalls::MemoryAccess;
+    use reverie::syscalls::SyscallInfo;
+
+    use super::*;
+    use crate::tool_global::GlobalState;
+
+    const GUEST_MASK: KernelSigset = (1 << (libc::SIGUSR1 - 1)) | (1 << (libc::SIGHUP - 1));
+
+    struct UnusedStack;
+    struct UnusedStackGuard;
+    impl Drop for UnusedStackGuard {
+        fn drop(&mut self) {}
+    }
+    impl reverie::Stack for UnusedStack {
+        type StackGuard = UnusedStackGuard;
+        fn size(&self) -> usize {
+            panic!("the disposition mask uses the caller's addresses")
+        }
+        fn capacity(&self) -> usize {
+            panic!("the disposition mask uses the caller's addresses")
+        }
+        fn push<'a, V>(&mut self, _: V) -> Addr<'a, V> {
+            panic!("the disposition mask uses the caller's addresses")
+        }
+        fn reserve<'a, V>(&mut self) -> AddrMut<'a, V> {
+            panic!("the disposition mask uses the caller's addresses")
+        }
+        fn commit(self) -> Result<Self::StackGuard, Errno> {
+            panic!("the disposition mask uses the caller's addresses")
+        }
+    }
+
+    /// A thread whose backend answers each injected `rt_sigprocmask` as the
+    /// kernel would for a thread whose mask is `mask`, and records the
+    /// `(how, set given)` of each.
+    struct MaskGuest {
+        config: Config,
+        thread: crate::ThreadState<()>,
+        mask: KernelSigset,
+        calls: Mutex<Vec<(i32, bool)>>,
+    }
+
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for MaskGuest {
+        async fn send_rpc(
+            &self,
+            message: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            panic!("the disposition mask sends no RPC here: {:?}", message.2)
+        }
+        fn config(&self) -> &Config {
+            &self.config
+        }
+    }
+
+    #[reverie::tool]
+    impl Guest<Detcore> for MaskGuest {
+        type Memory = LocalMemory;
+        type Stack = UnusedStack;
+        fn tid(&self) -> Pid {
+            Pid::from_raw(41)
+        }
+        fn pid(&self) -> Pid {
+            Pid::from_raw(41)
+        }
+        fn ppid(&self) -> Option<Pid> {
+            None
+        }
+        fn memory(&self) -> LocalMemory {
+            LocalMemory::new()
+        }
+        fn thread_state(&self) -> &crate::ThreadState<()> {
+            &self.thread
+        }
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+            &mut self.thread
+        }
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            panic!("no registers are read")
+        }
+        async fn stack(&mut self) -> UnusedStack {
+            panic!("the disposition mask uses the caller's addresses")
+        }
+        async fn daemonize(&mut self) {
+            panic!("no daemonize")
+        }
+        async fn inject<S: SyscallInfo>(&mut self, call: S) -> Result<i64, Errno> {
+            assert_eq!(call.number(), syscalls::Sysno::rt_sigprocmask);
+            let args = call.into_parts().1;
+            let (how, set, old) = (args.arg0 as i32, args.arg1, args.arg2);
+            self.calls.lock().unwrap().push((how, set != 0));
+            let previous = self.mask;
+            if set != 0 {
+                let set: KernelSigset = LocalMemory::new()
+                    .read_value(Addr::<KernelSigset>::from_raw(set).unwrap())
+                    .unwrap();
+                self.mask = set;
+            }
+            if old != 0 {
+                LocalMemory::new()
+                    .write_value(AddrMut::<KernelSigset>::from_raw(old).unwrap(), &previous)
+                    .unwrap();
+            }
+            Ok(0)
+        }
+        async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> reverie::Never {
+            panic!("no tail injection")
+        }
+        fn set_timer(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("no timer")
+        }
+        fn set_timer_precise(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
+            panic!("no timer")
+        }
+        fn read_clock(&mut self) -> Result<u64, Error> {
+            panic!("no clock")
+        }
+    }
+
+    fn mask_guest(gate: bool) -> MaskGuest {
+        let mut config = Config {
+            sequentialize_threads: true,
+            max_timeslice: None,
+            in_guest_signal_delivery: gate,
+            ..Config::default()
+        };
+        config.backend = reverie::BackendCapabilities::LITEINST_IN_GUEST;
+        let detpid = DetPid::from_raw(41);
+        let mut thread = crate::ThreadState::new(detpid, &config, ());
+        thread.detpid = Some(detpid);
+        MaskGuest {
+            config,
+            thread,
+            mask: GUEST_MASK,
+            calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Under the gate the wait's mask step is a query and its restore is
+    /// nothing, so the guest's mask stays its own throughout; with the gate
+    /// off the in-guest backend keeps today's block and restore. Mutation:
+    /// "the block left in place under the gate" (the gated row's mask is the
+    /// blocked set while the wait runs, and its calls show a set).
+    #[tokio::test]
+    async fn a_gated_managed_wait_reads_the_guest_mask_without_replacing_it() {
+        for (gate, calls_during, mask_during, calls_after) in [
+            (
+                true,
+                vec![(libc::SIG_SETMASK, false)],
+                GUEST_MASK,
+                vec![(libc::SIG_SETMASK, false)],
+            ),
+            (
+                false,
+                vec![(libc::SIG_SETMASK, true)],
+                blocked_signal_mask(),
+                vec![(libc::SIG_SETMASK, true), (libc::SIG_SETMASK, true)],
+            ),
+        ] {
+            let mut guest = mask_guest(gate);
+            let blocked = blocked_signal_mask();
+            let mut old = 0 as KernelSigset;
+            let blocked_addr =
+                Addr::<KernelSigset>::from_raw(&blocked as *const _ as usize).unwrap();
+            let old_addr = AddrMut::<KernelSigset>::from_raw(&mut old as *mut _ as usize).unwrap();
+            let read = block_signals_for_disposition(&mut guest, blocked_addr, old_addr)
+                .await
+                .unwrap();
+            assert_eq!(read, GUEST_MASK, "gate={gate}");
+            assert_eq!(*guest.calls.lock().unwrap(), calls_during, "gate={gate}");
+            assert_eq!(
+                guest.mask, mask_during,
+                "gate={gate}: the mask while the wait runs"
+            );
+            restore_signals_after_disposition(&mut guest, old_addr)
+                .await
+                .unwrap();
+            assert_eq!(*guest.calls.lock().unwrap(), calls_after, "gate={gate}");
+            assert_eq!(
+                guest.mask, GUEST_MASK,
+                "gate={gate}: the mask after the wait"
+            );
+        }
+    }
 }

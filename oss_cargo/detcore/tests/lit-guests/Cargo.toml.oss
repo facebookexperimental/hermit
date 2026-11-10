@@ -3,12 +3,17 @@
 
 [package]
 name = "hermit-lit-guests"
-version = "0.5.3"
+version = "0.5.5"
 edition = "2021"
 description = "The Rust programs detcore/tests/lit's fixtures run as %me, for hermit-cli/tests/lit.rs."
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
 publish = false
+
+[[bin]]
+name = "lit_chaos_schedule_replay"
+path = "../lit/chaos_schedule_replay/main.rs"
+test = false
 
 [[bin]]
 name = "lit_child_should_inherit_fds"

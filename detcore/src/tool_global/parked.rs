@@ -126,8 +126,7 @@ impl GlobalState {
                     guest_time.inherited_nanos(),
                 );
             }
-            let now = self.global_time.lock().unwrap().as_nanos();
-            sched.apply_signal_dequeue(pid, dequeue, now)
+            sched.apply_signal_dequeue(pid, tid, dequeue)
         });
         if let Err(error) = result {
             sched.fail_parked(tid, ProtocolFailure::Timer(error));
@@ -284,6 +283,9 @@ where
     // A parked request publishes the guest's mask as an ordinary one does
     // (`resource_request`).
     resources.guest_signal_mask = publish_request_guest_mask(guest, &resources);
+    // Direct parked callers bypass resource_request. Retain the local fact
+    // across cancellation, as the ordinary request and exit paths do.
+    resources.passes_descriptors_out |= guest.thread_state().passed_descriptors_out_unreported;
     let pid = guest.thread_state().detpid.expect("registered process");
     let response = send_and_update_time(
         guest,
@@ -327,7 +329,14 @@ where
                     ObservationFinish::ResumeSameWait
                 }
                 reverie::SignalObservationStop::Caught(selection) => {
-                    ObservationFinish::InterruptForCaught { selection }
+                    ObservationFinish::InterruptForCaught {
+                        selection,
+                        // The removal the selection made.
+                        dequeue: observation.steps.iter().rev().find_map(|step| match step {
+                            reverie::SignalObservationStep::Caught { dequeue } => Some(*dequeue),
+                            _ => None,
+                        }),
+                    }
                 }
                 reverie::SignalObservationStop::Fatal(selection) => {
                     ObservationFinish::Terminate { selection }

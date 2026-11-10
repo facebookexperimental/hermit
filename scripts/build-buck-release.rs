@@ -1,7 +1,7 @@
 #!/usr/bin/env -S rust-script --force
 //! ```cargo
 //! [dependencies]
-//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "bfd648864b74d14b96cd3af9e36f04186aca7075" }
+//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "cc487cc3c65015ba798f295fd3d02ed3d71281a8" }
 //! detcore-model = { path = "../detcore-model" }
 //! hermit-manifest-plan = { path = "../ci/manifest-plan" }
 //! flate2 = "=1.1.10"
@@ -18,8 +18,6 @@
  */
 //! Build and shadow-validate the feature-complete Buck release binary.
 
-#[path = "lib/reverie_dbt_inventory.rs"]
-mod reverie_dbt_inventory;
 #[path = "lib/rust_script_prelude.rs"]
 mod rust_script_prelude;
 #[allow(dead_code)]
@@ -101,11 +99,7 @@ const RELEASE_NEEDED_LIBRARIES: [&str; 5] = [
     "libunwind-x86_64.so.8",
 ];
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-const GENERATED_MARKERS: [&str; 3] = [
-    "name = \"reverie-dbt-0.5-materialized-manifest\"",
-    "manifest_dir = \":reverie-dbt-0.5-materialized-manifest\"",
-    "load(\"@shim//build_defs:materialized_manifest.bzl\", \"materialized_manifest\")",
-];
+#[cfg(test)]
 const REQUIRED_RESOURCES: [(&str, bool); 11] = [
     ("rsrcs/libdetcore_dbt.so", false),
     ("rsrcs/libdetcore_sabre.so", false),
@@ -116,6 +110,15 @@ const REQUIRED_RESOURCES: [(&str, bool); 11] = [
     ("rsrcs/sabre", true),
     ("rsrcs/e9patch", true),
     ("rsrcs/e9tool", true),
+    ("rsrcs/hermit-runtime/libunwind-x86_64.so.8", false),
+    ("rsrcs/hermit-runtime/libunwind.so.8", false),
+];
+
+const CORE_REQUIRED_RESOURCES: [(&str, bool); 6] = [
+    ("rsrcs/libdetcore_liteinst.so", false),
+    ("rsrcs/libreverie_liteinst.so", false),
+    ("rsrcs/libreverie_liteinst.so.revision", false),
+    ("rsrcs/libdetcore_liteinst.package.json", false),
     ("rsrcs/hermit-runtime/libunwind-x86_64.so.8", false),
     ("rsrcs/hermit-runtime/libunwind.so.8", false),
 ];
@@ -300,7 +303,7 @@ where
                 .to_owned()
         })?,
         safehermit: safehermit.ok_or_else(|| {
-            "missing --safehermit; provide dev-hermit/bin/safehermit explicitly".to_owned()
+            "missing --safehermit; provide the path to a safehermit wrapper explicitly".to_owned()
         })?,
     }))
 }
@@ -556,11 +559,12 @@ fn canonical_build_date(value: &str) -> bool {
     year > 0 && (1..=days).contains(&day)
 }
 
-fn validate_build_info(
+fn validate_build_info_with_features(
     info: &BuildInfo,
     expected_version: &str,
     expected_sha: &str,
     description: &str,
+    required_features: BuildFeatures,
 ) -> Result<(), String> {
     if info.schema != BuildInfo::SCHEMA {
         return Err(format!(
@@ -573,11 +577,6 @@ fn validate_build_info(
         .build_date
         .as_deref()
         .ok_or_else(|| format!("{description} omits build_date"))?;
-    let required_features = BuildFeatures {
-        dbt: true,
-        e9patch: true,
-        sabre: true,
-    };
     if info.git_sha == "unknown" {
         return Err(format!(
             "{description} names no revision: regular builds do not stamp one; build Cargo with HERMIT_STAMP_GIT_SHA=1, or Buck with -c hermit_release.hermit_sha=<12-hex HEAD>"
@@ -594,12 +593,52 @@ fn validate_build_info(
         || info.features != required_features
     {
         return Err(format!(
-            "{description} does not match canonical version/date/12-character SHA/dbt+e9patch+sabre build facts"
+            "{description} does not match canonical version/date/12-character SHA/selected feature build facts"
         ));
     }
     Ok(())
 }
 
+fn validate_core_build_info(
+    info: &BuildInfo,
+    version: &str,
+    sha: &str,
+    description: &str,
+) -> Result<(), String> {
+    validate_build_info_with_features(
+        info,
+        version,
+        sha,
+        description,
+        BuildFeatures {
+            dbt: false,
+            e9patch: false,
+            sabre: false,
+        },
+    )
+}
+
+#[cfg(test)]
+fn validate_build_info(
+    info: &BuildInfo,
+    version: &str,
+    sha: &str,
+    description: &str,
+) -> Result<(), String> {
+    validate_build_info_with_features(
+        info,
+        version,
+        sha,
+        description,
+        BuildFeatures {
+            dbt: true,
+            e9patch: true,
+            sabre: true,
+        },
+    )
+}
+
+#[cfg(test)]
 fn decode_build_info(
     text: &str,
     expected_version: &str,
@@ -608,6 +647,17 @@ fn decode_build_info(
 ) -> Result<BuildInfo, String> {
     let info: BuildInfo = decode_typed_json(text, description)?;
     validate_build_info(&info, expected_version, expected_sha, description)?;
+    Ok(info)
+}
+
+fn decode_core_build_info(
+    text: &str,
+    expected_version: &str,
+    expected_sha: &str,
+    description: &str,
+) -> Result<BuildInfo, String> {
+    let info: BuildInfo = decode_typed_json(text, description)?;
+    validate_core_build_info(&info, expected_version, expected_sha, description)?;
     Ok(info)
 }
 
@@ -644,7 +694,7 @@ fn exact_provenance(root: &Path, cargo_build_info: &BuildInfo) -> Result<Provena
         );
     }
     let expected_hermit_sha = short;
-    validate_build_info(
+    validate_core_build_info(
         cargo_build_info,
         &version,
         &expected_hermit_sha,
@@ -689,7 +739,7 @@ fn exact_provenance(root: &Path, cargo_build_info: &BuildInfo) -> Result<Provena
     }
     for manifest in [
         "detcore/Cargo.toml",
-        "detcore-dbt/Cargo.toml",
+        "inguest-engine/Cargo.toml",
         "hermit-cli/Cargo.toml",
     ] {
         let text = fs::read_to_string(root.join(manifest))
@@ -1432,26 +1482,46 @@ fn publish_unwind_buck_input(
     Ok(input)
 }
 
-fn verify_generated_buck(text: &str) -> Result<(), String> {
-    for marker in GENERATED_MARKERS {
-        let count = text.match_indices(marker).count();
-        if count != 1 {
+fn verify_generated_core_buck(text: &str, aliases: &str) -> Result<(), String> {
+    if !text.contains("rust_library(") {
+        return Err("generated core Buck graph has no Rust library definitions".into());
+    }
+    let mut names = BTreeSet::new();
+    for name in aliases
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
+        if !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+            || !names.insert(name)
+        {
             return Err(format!(
-                "generated Buck graph is stale/partial: marker {marker:?} occurs {count} times; rerun bootstrap/regenerate-rust-deps"
+                "shared-cell alias inventory has a malformed or duplicate name: {name:?}"
             ));
         }
     }
-    let mapped_files = text
-        .lines()
-        .filter(|line| {
-            line.trim_start().starts_with('"') && line.contains(": \"vendor/reverie-dbt-0.5.3/")
-        })
-        .count();
-    if mapped_files != reverie_dbt_inventory::REVERIE_DBT_FILES {
-        return Err(format!(
-            "generated reverie-dbt manifest map has {mapped_files} files, expected {}; rerun regeneration and inspect the pin",
-            reverie_dbt_inventory::REVERIE_DBT_FILES
-        ));
+    if names.is_empty() {
+        return Err("shared-cell alias inventory is empty".into());
+    }
+    for name in names {
+        let marker = format!("name = \"{name}\"");
+        if text.match_indices(&marker).count() != 1 {
+            return Err(format!(
+                "generated core Buck graph lacks the unique shared-cell alias {name}"
+            ));
+        }
+    }
+    for marker in [
+        "reverie-dbt-0.5-materialized-manifest",
+        "vendor/reverie-dbt-0.5.4/",
+    ] {
+        if text.contains(marker) {
+            return Err(format!(
+                "generated core Buck graph still carries external SDK input {marker}"
+            ));
+        }
     }
     Ok(())
 }
@@ -1850,7 +1920,7 @@ fn validate_release_candidate_version(
     )?;
     let output_text = String::from_utf8(output.stdout)
         .map_err(|error| format!("release version probe emitted non-UTF-8 JSON: {error}"))?;
-    let build_info = decode_build_info(
+    let build_info = decode_core_build_info(
         output_text.trim(),
         &version,
         &hermit_sha,
@@ -1860,7 +1930,7 @@ fn validate_release_candidate_version(
         return Err("release candidate version JSON build date differs from metadata".to_owned());
     }
     let receipt_text = format!(
-        "candidate_validation_schema\thermit-buck-release-candidate/v1\ncandidate\t{}\ncandidate_sha256\t{}\nversion\t{}\nbuild_date\t{}\nhermit_sha\t{}\nreverie_sha\t{}\nfeatures\tdbt,e9patch,sabre\nversion_probe_timeout_seconds\t10\n",
+        "candidate_validation_schema\thermit-buck-release-candidate/v1\ncandidate\t{}\ncandidate_sha256\t{}\nversion\t{}\nbuild_date\t{}\nhermit_sha\t{}\nreverie_sha\t{}\nfeatures\tcore\nversion_probe_timeout_seconds\t10\n",
         candidate.display(),
         candidate_sha256,
         version,
@@ -2790,6 +2860,7 @@ fn run_release_evidence_verdict(arguments: &[String]) -> Result<(), String> {
     release_evidence_verdict(summary_exit, reconciliation_exit, candidate_exit)
 }
 
+#[cfg(test)]
 fn verify_install_bundle(
     bundle: &Path,
     reverie_sha: &str,
@@ -2822,6 +2893,48 @@ fn verify_install_bundle(
         return Err(format!(
             "Cargo install bundle Reverie mismatch: sabre.revision={} expected={reverie_sha}; rebuild it at this pin",
             sabre_revision.trim()
+        ));
+    }
+    hashes.sort();
+    Ok(hashes)
+}
+
+fn verify_core_install_bundle(
+    bundle: &Path,
+    reverie_sha: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let bundle = require_absolute_directory(bundle, "Cargo install bundle")?;
+    let mut hashes = Vec::new();
+    for (relative, executable) in CORE_REQUIRED_RESOURCES {
+        let path = bundle.join(relative);
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            format!(
+                "Cargo install bundle is incomplete: {} is unavailable ({error}); rebuild hermit-install",
+                path.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.len() == 0
+            || (executable && metadata.permissions().mode() & 0o111 == 0)
+        {
+            return Err(format!(
+                "Cargo install bundle is incomplete: {} has the wrong type/size/mode; rebuild hermit-install",
+                path.display()
+            ));
+        }
+        hashes.push((relative.to_owned(), sha256(&path)?));
+    }
+    let liteinst_revision = fs::read_to_string(
+        bundle.join("rsrcs/libreverie_liteinst.so.revision"),
+    )
+    .map_err(|error| {
+        format!("Cargo install bundle lacks readable libreverie_liteinst.so.revision: {error}")
+    })?;
+    if liteinst_revision.trim() != reverie_sha {
+        return Err(format!(
+            "Cargo install bundle Reverie mismatch: libreverie_liteinst.so.revision={} expected={reverie_sha}; rebuild it at this pin",
+            liteinst_revision.trim()
         ));
     }
     hashes.sort();
@@ -3570,7 +3683,12 @@ fn verify_closed_report_shape(value: &Value) -> Result<(), String> {
                     stats,
                     &format!("runtime.{run}"),
                     &["scheduler_turns", "virtual_nanoseconds"],
-                    &["scheduler_turns", "virtual_nanoseconds", "syscalls", "dispatch"],
+                    &[
+                        "scheduler_turns",
+                        "virtual_nanoseconds",
+                        "syscalls",
+                        "dispatch",
+                    ],
                 )?;
             }
         }
@@ -4459,13 +4577,13 @@ fn verify_retained_candidate_evidence(
 ) -> Result<RetainedCandidateEvidence, String> {
     let cargo_version = read_retained_text(evidence_dir, "cargo-version.json")?;
     let buck_version = read_retained_text(evidence_dir, "buck-version.json")?;
-    let cargo_info = decode_build_info(
+    let cargo_info = decode_core_build_info(
         &cargo_version,
         expected_version,
         expected_sha,
         "retained Cargo version JSON",
     )?;
-    let buck_info = decode_build_info(
+    let buck_info = decode_core_build_info(
         &buck_version,
         expected_version,
         expected_sha,
@@ -4480,7 +4598,7 @@ fn verify_retained_candidate_evidence(
     let cargo_help = read_retained_text(evidence_dir, "cargo-help.txt")?;
     let buck_help = read_retained_text(evidence_dir, "buck-help.txt")?;
     require_equal("retained exact help text", &cargo_help, &buck_help)?;
-    for backend in ["ptrace", "dbt", "liteinst", "sabre", "kvm", "e9patch"] {
+    for backend in ["ptrace", "liteinst", "in-guest-trap", "kvm"] {
         if !buck_help.contains(backend) {
             return Err(format!(
                 "retained Buck CLI capability output omits backend spelling {backend}"
@@ -4604,9 +4722,10 @@ fn recompute_final_receipt(
     {
         return Err("DotSlash or Buck2 version output changed during shadow validation".to_owned());
     }
-    let resources = verify_install_bundle(&context.cargo_bundle.install, &provenance.reverie_sha)?
-        .into_iter()
-        .collect::<BTreeMap<_, _>>();
+    let resources =
+        verify_core_install_bundle(&context.cargo_bundle.install, &provenance.reverie_sha)?
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
     let facts = FinalReceiptFacts {
         result: "pass".to_owned(),
         evidence_identity: context
@@ -4783,9 +4902,9 @@ fn validate_dag_provenance(root: &Path) -> Result<(Provenance, BuildInfo), Strin
         build_date: Some(build_date),
         git_sha: hermit_sha,
         features: BuildFeatures {
-            dbt: true,
-            e9patch: true,
-            sabre: true,
+            dbt: false,
+            e9patch: false,
+            sabre: false,
         },
     };
     let provenance = exact_provenance(root, &info)?;
@@ -5096,9 +5215,11 @@ fn build_validate_dag_artifact(dotslash: &Path) -> Result<(), String> {
         "deterministic Rust dependency regeneration",
     )?;
     let generated_buck = root.join("shim/third-party/rust/BUCK");
-    verify_generated_buck(
+    verify_generated_core_buck(
         &fs::read_to_string(&generated_buck)
             .map_err(|error| format!("generated BUCK is unreadable: {error}"))?,
+        &fs::read_to_string(root.join("shim/third-party/rust/shared-cell-aliases.txt"))
+            .map_err(|error| format!("shared-cell source inventory is unreadable: {error}"))?,
     )?;
     let generated_hash = sha256(&generated_buck)?;
 
@@ -5247,7 +5368,7 @@ fn build_validate_dag_artifact(dotslash: &Path) -> Result<(), String> {
     if !version.stderr.is_empty() {
         return Err("Buck validate candidate version probe wrote unexpected stderr".into());
     }
-    let observed = decode_build_info(
+    let observed = decode_core_build_info(
         &String::from_utf8(version.stdout)
             .map_err(|error| format!("Buck validate version output was not UTF-8: {error}"))?,
         &provenance.version,
@@ -5366,7 +5487,7 @@ fn run(options: Options, cgroups: BoxedCgroups) -> Result<(), String> {
             .map_err(|error| format!("failed to read hermit-cli/Cargo.toml: {error}"))?,
     )?;
     let expected_short_sha = git(&root, &["rev-parse", "--short=12", "HEAD"])?;
-    let cargo_build_info = decode_build_info(
+    let cargo_build_info = decode_core_build_info(
         &cargo_version_json,
         &expected_version,
         &expected_short_sha,
@@ -5376,7 +5497,7 @@ fn run(options: Options, cgroups: BoxedCgroups) -> Result<(), String> {
     if provenance.hermit_full_sha != preflight_full_sha {
         return Err("Hermit HEAD changed while shadow validation was starting".to_owned());
     }
-    verify_install_bundle(&cargo_bundle.install, &provenance.reverie_sha)?;
+    verify_core_install_bundle(&cargo_bundle.install, &provenance.reverie_sha)?;
     let lzma_input = require_lzma_link_input()?;
     let lzma_input_hash = sha256(&lzma_input)?;
     let lzma_buck_input = publish_lzma_buck_input(&root, &evidence_dir, &lzma_input)?;
@@ -5421,9 +5542,11 @@ fn run(options: Options, cgroups: BoxedCgroups) -> Result<(), String> {
         "deterministic Rust dependency regeneration",
     )?;
     let generated_buck = root.join("shim/third-party/rust/BUCK");
-    verify_generated_buck(
+    verify_generated_core_buck(
         &fs::read_to_string(&generated_buck)
             .map_err(|error| format!("generated BUCK is unreadable: {error}"))?,
+        &fs::read_to_string(root.join("shim/third-party/rust/shared-cell-aliases.txt"))
+            .map_err(|error| format!("shared-cell source inventory is unreadable: {error}"))?,
     )?;
     let generated_buck_hash = sha256(&generated_buck)?;
 
@@ -5528,7 +5651,7 @@ fn run(options: Options, cgroups: BoxedCgroups) -> Result<(), String> {
     .stdout;
     retain_candidate_text(&evidence_dir, "buck-version.json", &buck_version_output)?;
     let buck_version_json = read_retained_text(&evidence_dir, "buck-version.json")?;
-    let buck_build_info = decode_build_info(
+    let buck_build_info = decode_core_build_info(
         &buck_version_json,
         &provenance.version,
         &provenance.hermit_sha,
@@ -5571,7 +5694,7 @@ fn run(options: Options, cgroups: BoxedCgroups) -> Result<(), String> {
     retain_candidate_text(&evidence_dir, "buck-help.txt", &buck_help_output)?;
     let buck_help = read_retained_text(&evidence_dir, "buck-help.txt")?;
     require_equal("backend capability/help inventory", &cargo_help, &buck_help)?;
-    for backend in ["ptrace", "dbt", "liteinst", "sabre", "kvm", "e9patch"] {
+    for backend in ["ptrace", "liteinst", "in-guest-trap", "kvm"] {
         if !buck_help.contains(backend) {
             return Err(format!(
                 "Buck CLI capability output omits backend spelling {backend}"
@@ -5966,7 +6089,7 @@ mod tests {
         installed.unwrap();
     }
 
-    fn write_complete_install(root: &Path, reverie_sha: &str) {
+    fn write_legacy_complete_install(root: &Path, reverie_sha: &str) {
         fs::create_dir_all(root.join("rsrcs/dynamorio/bin64")).unwrap();
         for (relative, executable) in REQUIRED_RESOURCES {
             let path = root.join(relative);
@@ -5989,6 +6112,41 @@ mod tests {
             Command::new("python3")
                 .arg(source_root().join("ci/test_packaged_detcore.py"))
                 .arg("--write-fixture")
+                .arg(root)
+                .arg(reverie_sha),
+            "write synthetic packaging receipt reader fixture",
+        )
+        .unwrap();
+    }
+
+    fn write_complete_install(root: &Path, reverie_sha: &str) {
+        fs::create_dir_all(root.join("rsrcs")).unwrap();
+        fs::create_dir_all(root.join("licenses")).unwrap();
+        for relative in ["LICENSE", "licenses/LICENSE"] {
+            fs::write(root.join(relative), b"fixture license\n").unwrap();
+        }
+        write_executable(&root.join("hermit"), b"#!/bin/sh\nexit 0\n");
+        for (relative, executable) in CORE_REQUIRED_RESOURCES {
+            let path = root.join(relative);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            if executable {
+                write_executable(&path, b"#!/bin/sh\nexit 0\n");
+            } else {
+                fs::write(&path, format!("fixture:{relative}\n")).unwrap();
+            }
+        }
+        fs::write(
+            root.join("rsrcs/libreverie_liteinst.so.revision"),
+            format!("{reverie_sha}\n"),
+        )
+        .unwrap();
+        fs::write(root.join("README.txt"), b"generation-one\n").unwrap();
+        checked_output(
+            Command::new("python3")
+                .arg(source_root().join("ci/test_packaged_detcore.py"))
+                .arg("--write-core-fixture")
                 .arg(root)
                 .arg(reverie_sha),
             "write synthetic packaging receipt reader fixture",
@@ -6048,13 +6206,24 @@ mod tests {
         path
     }
 
-    fn build_info_json() -> String {
+    fn legacy_build_info_json() -> String {
         serde_json::json!({
             "schema": BuildInfo::SCHEMA,
             "version": "0.2.0",
             "build_date": "2026-09-22",
             "git_sha": "0123456789ab",
             "features": {"dbt": true, "e9patch": true, "sabre": true}
+        })
+        .to_string()
+    }
+
+    fn build_info_json() -> String {
+        serde_json::json!({
+            "schema": BuildInfo::SCHEMA,
+            "version": "0.2.0",
+            "build_date": "2026-09-22",
+            "git_sha": "0123456789ab",
+            "features": {"dbt": false, "e9patch": false, "sabre": false}
         })
         .to_string()
     }
@@ -6115,7 +6284,7 @@ mod tests {
 
     fn write_retained_candidate_fixture(root: &Path) -> BuildInfo {
         let version = build_info_json();
-        let help = "ptrace dbt liteinst sabre kvm e9patch\n";
+        let help = "ptrace liteinst in-guest-trap kvm\n";
         let host = host_capabilities_json("arch prctl = ok");
         for (name, contents) in [
             ("cargo-version.json", version.as_str()),
@@ -6144,7 +6313,7 @@ mod tests {
         ] {
             write_report(root, name, &record);
         }
-        decode_build_info(&version, "0.2.0", "0123456789ab", "fixture build info").unwrap()
+        decode_core_build_info(&version, "0.2.0", "0123456789ab", "fixture build info").unwrap()
     }
 
     fn write_fixture_receipt(
@@ -6208,7 +6377,7 @@ mod tests {
 
     #[test]
     fn build_info_uses_closed_producer_schema_and_exact_semantics() {
-        let good = build_info_json();
+        let good = legacy_build_info_json();
         decode_build_info(&good, "0.2.0", "0123456789ab", "fixture").unwrap();
         for (name, value) in [
             ("malformed", "{".to_owned()),
@@ -6316,32 +6485,13 @@ mod tests {
 
     #[test]
     fn stale_generated_graph_is_refused() {
-        assert!(verify_generated_buck("# stale\n").is_err());
-    }
-
-    #[test]
-    fn generated_graph_must_map_the_pinned_reverie_dbt_inventory() {
-        let graph = |files: usize| {
-            let mut text = GENERATED_MARKERS.join("\n");
-            for index in 0..files {
-                text.push_str(&format!(
-                    "\n    \"f{index}\": \"vendor/reverie-dbt-0.5.3/f{index}\","
-                ));
-            }
-            text
-        };
-        let pinned = reverie_dbt_inventory::REVERIE_DBT_FILES;
-        assert_eq!(verify_generated_buck(&graph(pinned)), Ok(()));
-        for found in [pinned - 1, pinned + 1] {
-            assert_eq!(
-                verify_generated_buck(&graph(found)),
-                Err(format!(
-                    "generated reverie-dbt manifest map has {found} files, expected {pinned}; \
-                     rerun regeneration and inspect the pin"
-                )),
-                "{found}"
-            );
-        }
+        // A stale or partial graph is refused even when its alias inventory is
+        // valid. (The reverie-dbt manifest-map inventory this test also pinned
+        // left core with DBT in the third-party split.)
+        assert_eq!(
+            verify_generated_core_buck("# stale\n", "liteinst2\n"),
+            Err("generated core Buck graph has no Rust library definitions".into())
+        );
     }
 
     #[test]
@@ -6684,7 +6834,7 @@ mod tests {
         fs::write(
             &source,
             format!(
-                "#include <stdio.h>\nint main(void) {{ puts(\"{{\\\"schema\\\":1,\\\"version\\\":\\\"0.2.0\\\",\\\"build_date\\\":\\\"2026-09-23\\\",\\\"git_sha\\\":\\\"{hermit_sha}\\\",\\\"features\\\":{{\\\"dbt\\\":true,\\\"e9patch\\\":true,\\\"sabre\\\":true}}}}\"); return 0; }}\n"
+                "#include <stdio.h>\nint main(void) {{ puts(\"{{\\\"schema\\\":1,\\\"version\\\":\\\"0.2.0\\\",\\\"build_date\\\":\\\"2026-09-23\\\",\\\"git_sha\\\":\\\"{hermit_sha}\\\",\\\"features\\\":{{\\\"dbt\\\":false,\\\"e9patch\\\":false,\\\"sabre\\\":false}}}}\"); return 0; }}\n"
             ),
         )
         .unwrap();
@@ -6735,7 +6885,7 @@ mod tests {
         fs::write(
             &rewriting,
             format!(
-                "#include <stdio.h>\nint main(int argc, char **argv) {{ (void)argc; if (rename(\"{}\", argv[0]) != 0) return 1; puts(\"{{\\\"schema\\\":1,\\\"version\\\":\\\"0.2.0\\\",\\\"build_date\\\":\\\"2026-09-23\\\",\\\"git_sha\\\":\\\"{hermit_sha}\\\",\\\"features\\\":{{\\\"dbt\\\":true,\\\"e9patch\\\":true,\\\"sabre\\\":true}}}}\"); return 0; }}\n",
+                "#include <stdio.h>\nint main(int argc, char **argv) {{ (void)argc; if (rename(\"{}\", argv[0]) != 0) return 1; puts(\"{{\\\"schema\\\":1,\\\"version\\\":\\\"0.2.0\\\",\\\"build_date\\\":\\\"2026-09-23\\\",\\\"git_sha\\\":\\\"{hermit_sha}\\\",\\\"features\\\":{{\\\"dbt\\\":false,\\\"e9patch\\\":false,\\\"sabre\\\":false}}}}\"); return 0; }}\n",
                 replacement.display()
             ),
         )
@@ -7102,7 +7252,7 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         fs::write(
-            install.join("rsrcs/unprobed-resource"),
+            install.join("README.txt"),
             b"mutated-during-copy\n",
         )
         .unwrap();
@@ -7247,7 +7397,7 @@ mod tests {
 
         let version_path = fixture.join("buck-version.json");
         let original_version = fs::read(&version_path).unwrap();
-        let changed_version = build_info_json().replacen("\"dbt\":true", "\"dbt\":false", 1);
+        let changed_version = build_info_json().replacen("\"dbt\":false", "\"dbt\":true", 1);
         assert_ne!(changed_version, build_info_json());
         fs::write(&version_path, changed_version).unwrap();
         assert!(
@@ -7260,7 +7410,7 @@ mod tests {
         let original_help = fs::read(&help_path).unwrap();
         fs::write(
             &help_path,
-            b"ptrace dbt liteinst sabre kvm e9patch changed\n",
+            b"ptrace liteinst in-guest-trap kvm changed\n",
         )
         .unwrap();
         assert!(
@@ -7292,20 +7442,20 @@ mod tests {
         // bundle must never be accepted as a complete backend resource set.
         assert!(verify_install_bundle(&root, &reverie_sha).is_err());
 
-        write_complete_install(&root, &reverie_sha);
+        write_legacy_complete_install(&root, &reverie_sha);
         verify_install_bundle(&root, &reverie_sha).unwrap();
 
         let missing = root.join("rsrcs/libdetcore_dbt.so");
         fs::remove_file(&missing).unwrap();
         assert!(verify_install_bundle(&root, &reverie_sha).is_err());
-        write_complete_install(&root, &reverie_sha);
+        write_legacy_complete_install(&root, &reverie_sha);
 
         let executable = root.join("rsrcs/sabre");
         let mut permissions = fs::metadata(&executable).unwrap().permissions();
         permissions.set_mode(0o644);
         fs::set_permissions(&executable, permissions).unwrap();
         assert!(verify_install_bundle(&root, &reverie_sha).is_err());
-        write_complete_install(&root, &reverie_sha);
+        write_legacy_complete_install(&root, &reverie_sha);
 
         fs::write(
             root.join("rsrcs/sabre.revision"),
@@ -7401,7 +7551,7 @@ mod tests {
 
         // A caller install that changes between the two publications is still
         // refused as mixed input rather than published.
-        fs::write(caller.join("rsrcs/unprobed-resource"), b"generation-two\n").unwrap();
+        fs::write(caller.join("README.txt"), b"generation-two\n").unwrap();
         let changed_evidence = root.join("changed-evidence");
         fs::create_dir_all(&changed_evidence).unwrap();
         let changed = publish_buck_shadow_bundle(
@@ -7477,7 +7627,7 @@ set -e
 for last; do :; done
 case "$FAKE_CP_MODE" in
 stage-source)
-    case "$last" in */install/) printf x >>"${{last}}rsrcs/libdetcore_dbt.so" ;; esac ;;
+    case "$last" in */install/) printf x >>"${{last}}rsrcs/libdetcore_liteinst.so" ;; esac ;;
 stage-overlay)
     case "$last" in */install/rsrcs/)
         chmod u+w "${{last}}hermit-runtime/{UNWIND_CORE_SONAME}"
@@ -8153,9 +8303,9 @@ esac
     #[test]
     fn release_buck_target_uses_declared_library_dependencies_and_exact_rpath() {
         let buck = fs::read_to_string(source_root().join("hermit-cli/BUCK")).unwrap();
-        assert!(buck.contains("\"gh_facebook_buck2_shims_meta//third-party/xz:lzma\""));
+        assert!(buck.contains("\"fbsource//third-party/xz:lzma\""));
         assert!(
-            buck.contains("\"gh_facebook_buck2_shims_meta//third-party/libunwind:unwind-ptrace\"")
+            buck.contains("\"fbsource//third-party/libunwind:unwind-ptrace\"")
         );
         assert!(buck.contains("deps = [release_lzma_target, release_unwind_target] + ["));
         assert!(buck.contains("link-arg=-Wl,--disable-new-dtags"));
@@ -9120,5 +9270,47 @@ esac
         fs::write(&summary, b"summary-fixture\n").unwrap();
         assert!(verify_retained_buck_log_summary(&buck, &root, &event, &summary).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn core_build_facts_require_all_external_features_absent() {
+        let text = build_info_json();
+        decode_core_build_info(&text, "0.2.0", "0123456789ab", "core fixture").unwrap();
+        for feature in ["dbt", "e9patch", "sabre"] {
+            let mut info: BuildInfo = decode_typed_json(&text, "core fixture").unwrap();
+            match feature {
+                "dbt" => info.features.dbt = true,
+                "e9patch" => info.features.e9patch = true,
+                _ => info.features.sabre = true,
+            }
+            assert!(
+                validate_core_build_info(&info, "0.2.0", "0123456789ab", "core fixture").is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn core_generated_graph_requires_real_first_party_aliases_and_refuses_sdk_copy() {
+        let graph = "rust_library(\n name = \"liteinst2\"\n)\n";
+        assert_eq!(verify_generated_core_buck(graph, "liteinst2\n"), Ok(()));
+        assert!(verify_generated_core_buck(graph, "liteinst2\nthiserror\n").is_err());
+        for aliases in [
+            "",
+            "# comment only\n",
+            "liteinst2\nliteinst2\n",
+            "liteinst2 extra\n",
+            "../liteinst2\n",
+        ] {
+            assert!(
+                verify_generated_core_buck(graph, aliases).is_err(),
+                "{aliases:?}"
+            );
+        }
+        assert!(
+            verify_generated_core_buck(
+                &(graph.to_owned() + "vendor/reverie-dbt-0.5.4/"),
+                "liteinst2\n"
+            )
+            .is_err()
+        );
     }
 }

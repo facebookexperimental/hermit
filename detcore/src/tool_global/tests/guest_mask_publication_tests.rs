@@ -157,6 +157,8 @@ struct Filed {
     /// A rejoin (`Resources::is_rejoin`), which the scheduler records when it
     /// readmits the thread, not when it is filed.
     rejoin: bool,
+    /// Whether this request publishes that a descriptor may have escaped.
+    passes_descriptors_out: bool,
 }
 
 /// A guest thread whose requests reach a real scheduler, which records the
@@ -214,6 +216,7 @@ impl PublishingGuest {
             sigblk,
             recorded: scheduler.published_guest_sigmask(resources.tid),
             rejoin: resources.is_rejoin(),
+            passes_descriptors_out: resources.passes_descriptors_out,
         });
     }
 
@@ -369,6 +372,28 @@ fn request(rid: ResourceID, fyi: &str) -> Resources {
     resources.insert(rid, Permission::RW);
     resources.fyi(fyi);
     resources
+}
+
+/// Direct parked callbacks bypass the ordinary resource-request helper. They
+/// must still report an earlier send's export before admitting another turn.
+#[tokio::test]
+async fn direct_parked_requests_publish_descriptor_exports() {
+    for exported in [false, true] {
+        for parked in [false, true] {
+            for parent in ["pause", "polled scalar read"] {
+                let mut guest = publishing_guest(true, parked);
+                guest.thread.passed_descriptors_out_unreported = exported;
+                file_parent(&mut guest, parent).await;
+                let filed = guest.last();
+                assert_eq!(filed.parked, parked, "{parent}");
+                assert_eq!(
+                    filed.passes_descriptors_out, exported,
+                    "{parent}, parked={parked}: the first request must publish the export"
+                );
+                assert_eq!(guest.filed.lock().unwrap().len(), 1);
+            }
+        }
+    }
 }
 
 /// The masks a parent's request is expected to publish.
@@ -795,8 +820,10 @@ async fn proc_status_sigblk_shows_the_published_mask_under_the_gate() {
         file.bind_thread_identity(THREAD.as_raw(), THREAD.as_raw(), 1);
         let mask_thread = file.status_mask_thread(&contents);
         assert_eq!(mask_thread, Some(THREAD.as_raw()), "{case}");
-        let published_sigblk =
-            crate::syscalls::status_published_sigblk(&mut guest, mask_thread).await;
+        let published_sigblk = crate::syscalls::status_published_sigblk(&mut guest, mask_thread)
+            .await
+            .expect("no refusal")
+            .sigblk;
         file.initialize(
             contents.clone(),
             crate::procfs::ProcfsSnapshotContext {

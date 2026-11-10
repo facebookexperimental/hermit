@@ -46,10 +46,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -106,9 +105,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: This determinism cell calibrates the ptrace strict-verify baseline; qualify DBT separately
           sabre: This determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately
           liteinst: This determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -118,10 +117,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -192,10 +190,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -242,9 +239,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: This determinism cell calibrates the ptrace strict-verify baseline; qualify DBT separately
           sabre: This determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately
           liteinst: This determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -254,10 +251,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -311,9 +307,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: DBT was observed emitting a raw host tid in DETLOG records; this fixture is the gate for enabling it
           sabre: Not yet qualified for the pid-identity fixture
           liteinst: Not yet qualified for the pid-identity fixture
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -323,10 +319,9 @@ test:
         backends_disabled:
           native: Native pids are host values by definition; this fixture asserts virtualization
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the pid-identity contract
           dbt: Record/replay qualification is separate from the pid-identity contract
           kvm: Record/replay qualification is separate from the pid-identity contract
           sabre: Record/replay qualification is separate from the pid-identity contract
@@ -397,10 +392,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -471,10 +465,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -521,9 +514,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify DBT separately
           sabre: This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately
           liteinst: This condvar/futex determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -537,10 +530,9 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the strict-verification determinism cell
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -595,11 +587,14 @@ test:
     modes:
       verify:
         ci: true
+        # KVM qualified 2026-10-29: 21 of 21 canonical strict verify pairs at Hermit
+        # a69361ae, the tree that enabled this cell (bitwise parity, 215 INFO records
+        # each side); stdout and every syscall return value identical to ptrace's.
         backends_enabled:
           - ptrace
+          - dbt
+          - kvm
         backends_disabled:
-          dbt: This determinism cell calibrates the ptrace strict-verify baseline; qualify DBT separately
-          kvm: This determinism cell calibrates the ptrace strict-verify baseline; qualify KVM separately
           sabre: This determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately
           liteinst: This determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -609,10 +604,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -680,10 +674,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -777,14 +770,15 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
           sabre: false
           kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
           - kvm
         backends_disabled:
-          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
@@ -795,10 +789,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe

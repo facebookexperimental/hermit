@@ -72,6 +72,14 @@
         cargo = rustToolchain;
         rustc = rustToolchain;
       };
+      # Deterministic Rust builds (issue 5031): remap the build directory
+      # out of panic/debug paths, force a single codegen unit and disable
+      # incremental codegen so the binaries do not depend on the build
+      # host's paths or parallelism. $PWD is the unpacked source root when
+      # preBuild runs.
+      deterministicRustFlags = ''
+        export RUSTFLAGS="--remap-path-prefix=$PWD=/build/source -C codegen-units=1 -C incremental=false"
+      '';
       rustScriptVersion = "0.36.0";
       rustScript = pinnedRustPlatform.buildRustPackage {
         pname = "rust-script";
@@ -83,6 +91,7 @@
           hash = "sha256-Bb8ULD2MmZiSW/Tx5vAAHv95OMJ0EdWgR+NFhBkTlDU=";
         };
         cargoHash = "sha256-kxnylNZ8FsaR2S1o/p7qtlaXsBLDNv2PsFye0rcf/+A=";
+        preBuild = deterministicRustFlags;
         doCheck = false;
       };
       cargoNextestVersion = "0.9.100";
@@ -96,6 +105,7 @@
           hash = "sha256-MbgX/n6TC5hz66gvRAc7A0xFWbF2Ec68gMxCgPFpeoQ=";
         };
         cargoHash = "sha256-jRBFjJB38JI9whFpImYlMx0znQj1+cdeu4Nc+nYc7OI=";
+        preBuild = deterministicRustFlags;
         cargoBuildFlags = [ "-p" "cargo-nextest" ];
         cargoTestFlags = [ "-p" "cargo-nextest" ];
         # The pinned nixpkgs cargo-auditable predates Rust edition 2024.
@@ -119,12 +129,22 @@
       # provider while retaining the packages' runtime closures in the image.
       commandFixtureTools = {
         iostat = "${pkgs.sysstat}/bin/iostat";
+        ip = "${pkgs.iproute2}/bin/ip";
         lsmod = "${pkgs.kmod}/bin/lsmod";
         mpstat = "${pkgs.sysstat}/bin/mpstat";
         numactl = "${pkgs.numactl}/bin/numactl";
         numastat = "${pkgs.numactl}/bin/numastat";
         pidstat = "${pkgs.sysstat}/bin/pidstat";
+        sar = "${pkgs.sysstat}/bin/sar";
         ss = "${pkgs.iproute2}/bin/ss";
+        # jdk_headless is in guestTools for its closure, but its /bin links
+        # are not merged into the image root, so link the two compat rows'
+        # programs explicitly.
+        java = "${pkgs.jdk_headless}/bin/java";
+        javac = "${pkgs.jdk_headless}/bin/javac";
+        # The gcc wrapper in guestTools does not merge gcov into /bin; the
+        # unwrapped compiler carries it.
+        gcov = "${pkgs.gcc.cc}/bin/gcov";
       };
       commandFixtureLinks = pkgs.lib.concatStringsSep "\n" (pkgs.lib.mapAttrsToList
         (name: provider: ''
@@ -148,6 +168,18 @@
         bash coreutils diffutils findutils gnugrep gnused gawk
         openssl zstd gnutar gzip xz jq sqlite git perl python3 redis
         lua5_4 gnum4 nodejs openssh ruby tcl util-linux procps
+        # The strict compatibility corpus (tests/e2e/manifests/compat.yaml)
+        # runs in this root, so every program its rows name lives here, not
+        # on the host. Measured marginal closure at the pinned nixpkgs
+        # revision, 2026-10-30: the small packages below total about 23 MiB
+        # unpacked; clang (1.4 GiB) and jdk_headless (567 MiB) are the rest.
+        # crc32 is the perl Archive-Zip script, as it is on the host.
+        bc cpio dos2unix file zip unzip wget gettext lsof cscope flex
+        gnupatch attr acl time perlPackages.ArchiveZip libxml2.bin
+        clang jdk_headless
+        # The KVM SP1 Go os/exec cell runs the go toolchain as its guest; it
+        # was the image's only missing toolchain (coordinator, 2026-11-01).
+        go
         # These outputs are not implied by their runtime libraries.
         bzip2.bin curl.bin glibc.bin hostname
       ];
@@ -166,7 +198,18 @@
       # image closure (libunwind's runtime and dev outputs reference it) but
       # not on LIBRARY_PATH, which made the link fail with
       # `unable to find library -llzma`.
-      nativeLibs = with pkgs; [ libunwind elfutils zlib openssl xz ];
+      # abseil-cpp, gtest and gbenchmark carry the C++ test dependencies of
+      # the vendored gVisor syscall tests (third-party/gvisor-syscall-tests):
+      # on the host they resolve through shim//third-party pkg-config system
+      # libraries, so inside this image they must come from these pinned
+      # packages instead. At this nixpkgs revision the GoogleTest and Google
+      # Benchmark attributes are `gtest` and `gbenchmark`; their pkg-config
+      # names are unchanged (gtest/gmock, benchmark, and the 23 absl_*
+      # components the shim enumerates, all present in the dev outputs).
+      # gbenchmark ships no `dev` output (headers and the static libraries
+      # live in `out`), so the buildTools mapping below resolves the `dev`
+      # output with a fallback instead of naming it directly.
+      nativeLibs = with pkgs; [ libunwind elfutils zlib openssl xz abseil-cpp gtest gbenchmark ];
       # ⚠️ unixtools.xxd IS A BUILD DEPENDENCY, NOT A CONVENIENCE. e9patch's Makefile
       # generates two C sources by running `xxd -i` over its loader binaries
       # (Makefile:73 and :79). Without it the build dies at `Error 127` -- command not
@@ -178,7 +221,7 @@
       buildTools = with pkgs; [
         rustToolchain gcc binutils gnumake cmake pkg-config rustScript cargoNextest
         unixtools.xxd
-      ] ++ nativeLibs ++ map (package: package.dev) nativeLibs;
+      ] ++ nativeLibs ++ map (package: pkgs.lib.getOutput "dev" package) nativeLibs;
     in
     {
       packages.${system} = {
@@ -208,7 +251,7 @@
             chmod 1777 tmp var/tmp
             chmod 0700 root
             printf 'root:x:0:0:root:/root:/bin/bash\nnobody:x:65534:65534:nobody:/nonexistent:/sbin/nologin\n' > etc/passwd
-            printf 'root:x:0:\nnobody:x:65534:\n' > etc/group
+            printf 'root:x:0:\nnogroup:x:65534:\nnobody:x:65534:\n' > etc/group
             ln -s "${pkgs.glibc}/lib/ld-linux-x86-64.so.2" lib64/ld-linux-x86-64.so.2
 
             # Selected portable cells name these FHS paths literally. Nix
@@ -216,10 +259,22 @@
             # /usr/bin/env; add exactly the audited compatibility paths.
             mkdir -p bin
             ln -s "${archCoreutils}/bin/arch" bin/arch
+            # The compat corpus's uptime row uses `uptime -p`, which only
+            # procps' uptime spells; coreutils' uptime (merged into /bin
+            # above) has no -p. Point /bin/uptime at procps, as on the host.
+            ln -sfnT "${pkgs.procps}/bin/uptime" bin/uptime
+            # The compat corpus's clang must not become the build's compiler:
+            # merged into /bin, the clang wrapper's cc/c++ win over gcc's, and
+            # the SaBRe build (cc + CMake) then compiles with Clang and refuses
+            # its own flags under -Werror. Keep /bin/cc and /bin/c++ on gcc, as
+            # before the corpus moved in; clang stays available as clang.
+            ln -sfnT "${pkgs.gcc}/bin/cc" bin/cc
+            ln -sfnT "${pkgs.gcc}/bin/c++" bin/c++
             ${commandFixtureLinks}
             for path in ${pkgs.lib.escapeShellArgs requiredGuestPaths}; do
               command="''${path##*/}"
               if [ "$command" = nodejs ]; then command=node; fi
+              mkdir -p ".''${path%/*}"
               ln -s "/bin/$command" ".''${path}"
             done
           '';

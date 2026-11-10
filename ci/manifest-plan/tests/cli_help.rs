@@ -369,7 +369,7 @@ fn test_harness_source_snapshot_flags_redirect_misuse() {
         ),
         (
             vec!["expected-plan", "--format", "json"],
-            "expected-plan accepts only --repo-root DIR and --source-sha SHA",
+            "expected-plan accepts only --repo-root DIR, --source-sha SHA and --execution-owner OWNER",
         ),
         (
             vec!["plan", "--repo-root", "/nonexistent-hermit-root"],
@@ -545,7 +545,7 @@ fn test_harness_refuses_the_removed_parity_reference_flag() {
 #[test]
 fn test_harness_selftest_refuses_anything_but_one_known_name() {
     const NAMES: &str =
-        "scorecard, scorecard_commands, pressure_test, validate_rs, manifest_cli, dbt_budget";
+        "scorecard, scorecard_commands, pressure_test, validate_rs, manifest_cli, core_build";
     let harness = env!("CARGO_BIN_EXE_test-harness");
     let directory = non_repository_dir("selftest-refusals");
     for (arguments, refusal) in [
@@ -781,7 +781,7 @@ fn generate_parity_cells_refuses_conflicting_or_repeated_modes() {
         .join("../..")
         .canonicalize()
         .expect("repository root");
-    let snapshot = root.join("ci/compat-envelope/parity-cells.json");
+    let snapshot = root.join("ci/compat-envelope/parity-cells/applications.json");
     let before = std::fs::read(&snapshot).expect("read the committed snapshot");
     let modified_before = std::fs::metadata(&snapshot)
         .and_then(|metadata| metadata.modified())
@@ -826,7 +826,7 @@ fn generate_parity_cells_refuses_conflicting_or_repeated_modes() {
     assert!(check.status.success(), "{check:?}");
     assert!(
         String::from_utf8_lossy(&check.stdout)
-            .starts_with("ci/compat-envelope/parity-cells.json is canonical and fresh\n"),
+            .starts_with("ci/compat-envelope/parity-cells/ is canonical and fresh\n"),
         "{check:?}"
     );
 }

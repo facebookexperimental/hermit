@@ -1,0 +1,1712 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// All rights reserved.
+// Licensed under the BSD-style license in the LICENSE file.
+
+//! The access trace (`--record-access-trace-to`) end to end, on the ptrace
+//! backend. A trace must observe without changing the run: replaying one
+//! recorded schedule with and without it gives the same re-recorded
+//! schedule, stdout, exit status and DETLOG INFO count. And every index in
+//! it must name the matching event of the run's own recorded schedule.
+
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
+use std::process::Output;
+use std::sync::OnceLock;
+
+use detcore_model::access_trace::Access;
+use detcore_model::access_trace::AccessTrace;
+use detcore_model::access_trace::ChannelId;
+use detcore_model::access_trace::ChannelKind;
+use detcore_model::access_trace::EdgeKind;
+use detcore_model::access_trace::EdgeRecord;
+use detcore_model::access_trace::FdOp;
+use detcore_model::access_trace::FileKind;
+use detcore_model::access_trace::LifetimeOp;
+use detcore_model::access_trace::ObservedSignalDisposition;
+use detcore_model::access_trace::SyncObject;
+use detcore_model::access_trace::SyscallRecord;
+use detcore_model::access_trace::Task;
+use detcore_model::access_trace::TimerOp;
+use detcore_model::access_trace::TraceRecord;
+use detcore_model::access_trace::read_access_trace;
+
+use super::hermit_run_guard;
+use super::hermit_test;
+
+const EPOCH: &str = "--epoch=2026-01-01T00:00:00Z";
+
+/// The guests, compiled once per test process beneath the target directory
+/// (the run container replaces /tmp).
+struct Guests {
+    /// `tests/c/simple/racewrite_nostdlib.c`: two processes race to write.
+    racewrite: PathBuf,
+    /// `tests/fixtures/access_trace_mix.c`: two threads race over a mutex, a
+    /// pipe, a file, a mapping, a timer, a signal and a child.
+    mix: PathBuf,
+    /// `tests/fixtures/access_trace_pipes.c`: a packet pipe, an F_SETFL and
+    /// a write larger than a pipe.
+    pipes: PathBuf,
+    /// One supplied cache input shared by every compared run, if the host
+    /// has a cache. The default container makes a new copy for each run,
+    /// whose inode and mtime differ in the recorded host-input metadata.
+    ld_so_cache: Option<PathBuf>,
+    /// `tests/fixtures/futex_ping_pong.c`: two threads hand a futex word
+    /// back and forth.
+    ping_pong: PathBuf,
+    /// `tests/fixtures/access_trace_open_kinds.c`: opens a regular file,
+    /// /dev/null and a pipe for writing.
+    open_kinds: PathBuf,
+    /// racewrite again, at a fixed address (`-no-pie`), and the address of
+    /// the global both processes write, `chosen`.
+    racewrite_fixed: (PathBuf, u64),
+    /// `tests/fixtures/watch_sigtrap_blocked.c`, at a fixed address, and its
+    /// global `watched`, which a worker that blocks SIGTRAP writes.
+    sigtrap_blocked: (PathBuf, u64),
+    /// `tests/fixtures/watch_sigtrap_ignored.c`, at a fixed address, and its
+    /// global `watched`, which it writes after ignoring SIGTRAP.
+    sigtrap_ignored: (PathBuf, u64),
+    /// `tests/fixtures/watch_exec_into.c` (position independent, so nothing
+    /// of it sits at the other's address), which execs its argument, and
+    /// `tests/fixtures/watch_store_first_nostdlib.c`, at a fixed address,
+    /// whose first instructions store its global `watched`.
+    exec_into: PathBuf,
+    /// `tests/fixtures/watch_exec_blocked.c`: the same launcher, but it
+    /// blocks SIGTRAP before it execs, so the new image cannot re-arm.
+    exec_blocked: PathBuf,
+    store_first: (PathBuf, u64),
+    /// `tests/fixtures/watch_store_unblock_store_nostdlib.c`, at a fixed
+    /// address: stores its global `watched`, unblocks SIGTRAP, stores
+    /// again.
+    store_unblock_store: (PathBuf, u64),
+}
+
+/// The address of `symbol` in the non-PIE executable `binary`.
+fn symbol_address(binary: &Path, symbol: &str) -> u64 {
+    let output = Command::new("nm").arg(binary).output().expect("run nm");
+    assert!(output.status.success(), "nm {}", binary.display());
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            (fields.len() == 3 && fields[2] == symbol)
+                .then(|| u64::from_str_radix(fields[0], 16).unwrap())
+        })
+        .unwrap_or_else(|| panic!("no symbol {symbol} in {}", binary.display()))
+}
+
+fn guests() -> &'static Guests {
+    static GUESTS: OnceLock<Guests> = OnceLock::new();
+    GUESTS.get_or_init(|| {
+        let root = tempfile::Builder::new()
+            .prefix("access-trace-")
+            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("guest directory")
+            .keep();
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli is inside the repository");
+        let compile = |source: PathBuf, flags: &[&str], name: &str| {
+            let output = root.join(name);
+            let status = Command::new("cc")
+                .args(flags)
+                .arg(&source)
+                .arg("-o")
+                .arg(&output)
+                .status()
+                .expect("run cc");
+            assert!(status.success(), "compiling {} failed", source.display());
+            output
+        };
+        let ld_so_cache = match fs::read("/etc/ld.so.cache") {
+            Ok(contents) => {
+                let path = root.join("ld.so.cache");
+                fs::write(&path, contents).expect("snapshot the guest's dynamic-linker cache");
+                Some(path)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("read the host's dynamic-linker cache: {error}"),
+        };
+        Guests {
+            racewrite: compile(
+                repository.join("tests/c/simple/racewrite_nostdlib.c"),
+                &["-g", "-nostdlib"],
+                "racewrite",
+            ),
+            mix: compile(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/access_trace_mix.c"),
+                &["-O0", "-g", "-pthread", "-D_GNU_SOURCE"],
+                "mix",
+            ),
+            pipes: compile(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/access_trace_pipes.c"),
+                &["-O0", "-g", "-D_GNU_SOURCE"],
+                "pipes",
+            ),
+            ld_so_cache,
+            ping_pong: compile(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/futex_ping_pong.c"),
+                &["-O0", "-g", "-pthread"],
+                "ping_pong",
+            ),
+            open_kinds: compile(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/access_trace_open_kinds.c"),
+                &["-O0", "-g"],
+                "open_kinds",
+            ),
+            racewrite_fixed: {
+                let binary = compile(
+                    repository.join("tests/c/simple/racewrite_nostdlib.c"),
+                    &["-g", "-nostdlib", "-no-pie"],
+                    "racewrite_fixed",
+                );
+                let chosen = symbol_address(&binary, "chosen");
+                (binary, chosen)
+            },
+            sigtrap_blocked: {
+                let binary = compile(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/watch_sigtrap_blocked.c"),
+                    &["-O0", "-g", "-pthread", "-no-pie"],
+                    "sigtrap_blocked",
+                );
+                let watched = symbol_address(&binary, "watched");
+                (binary, watched)
+            },
+            exec_into: compile(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/watch_exec_into.c"),
+                &["-O0", "-g", "-fPIE", "-pie"],
+                "exec_into",
+            ),
+            exec_blocked: compile(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/watch_exec_blocked.c"),
+                &["-O0", "-g", "-fPIE", "-pie"],
+                "exec_blocked",
+            ),
+            store_first: {
+                let binary = compile(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/watch_store_first_nostdlib.c"),
+                    &["-O0", "-g", "-nostdlib", "-static", "-no-pie"],
+                    "store_first",
+                );
+                let watched = symbol_address(&binary, "watched");
+                (binary, watched)
+            },
+            store_unblock_store: {
+                let binary = compile(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/watch_store_unblock_store_nostdlib.c"),
+                    &["-O0", "-g", "-nostdlib", "-static", "-no-pie"],
+                    "store_unblock_store",
+                );
+                let watched = symbol_address(&binary, "watched");
+                (binary, watched)
+            },
+            sigtrap_ignored: {
+                let binary = compile(
+                    Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("tests/fixtures/watch_sigtrap_ignored.c"),
+                    &["-O0", "-g", "-no-pie"],
+                    "sigtrap_ignored",
+                );
+                let watched = symbol_address(&binary, "watched");
+                (binary, watched)
+            },
+        }
+    })
+}
+
+fn run(args: &[String]) -> Output {
+    let mut args = args.to_vec();
+    if let Some(cache) = &guests().ld_so_cache {
+        // Keep the entire recorded file comparable, including input identity.
+        // This explicit mount replaces the implicit cache mount/provenance;
+        // the test covers one fixed supplied input, not default cache copying.
+        let guest = args.iter().position(|arg| arg == "--").unwrap();
+        args.insert(
+            guest,
+            format!(
+                "--mount=type=bind,source={},target=/etc/ld.so.cache,readonly",
+                cache.display()
+            ),
+        );
+    }
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command.args(&args);
+    hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command)
+}
+
+fn path_arg(flag: &str, path: &Path) -> String {
+    format!("{flag}={}", path.display())
+}
+
+/// One run, its schedule recorded, and what it left.
+struct Replay {
+    output: Output,
+    events: Vec<u8>,
+    /// The INFO messages `--verify-strict` compares (`BitwiseInfoV1`: the
+    /// wall-clock prefix removed, marked host addresses ordinalized).
+    info: Vec<String>,
+    trace: Option<AccessTrace>,
+}
+
+/// The global events of a re-recorded schedule, whether the record was
+/// written plain or in the `incomplete_preemption_record` envelope.
+/// Narrower authority, stated plainly: these tests consume only the
+/// global event stream (to name the trace's own events), never the
+/// record as faithful-replay evidence — a record whose priority rows
+/// were omitted stays refused for that, and this reader does not
+/// change it.
+fn recorded_global_events(events: &[u8]) -> Vec<serde_json::Value> {
+    let value: serde_json::Value = serde_json::from_slice(events).unwrap();
+    let mut record = &value;
+    if let Some(inner) = record
+        .get("rcb_history")
+        .and_then(|envelope| envelope.get("recording"))
+    {
+        record = inner;
+    }
+    if let Some(inner) = record
+        .get("slice_boundary_recording")
+        .and_then(|envelope| envelope.get("preemptions"))
+    {
+        record = inner;
+    }
+    if let Some(envelope) = record.get("incomplete_preemption_record") {
+        record = &envelope["record"];
+    }
+    record["global"].as_array().expect("global events").clone()
+}
+
+/// Record `guest` once under chaos, so the schedule interleaves its threads.
+fn record(guest: &Path, directory: &Path) -> PathBuf {
+    run_traced(guest, directory, "recorded", None, None);
+    directory.join("recorded.events")
+}
+
+/// Run `guest` under chaos at INFO level, recording its schedule, replaying
+/// `schedule` when given, and with the trace written when `trace` gives
+/// its first index.
+fn run_traced(
+    guest: &Path,
+    directory: &Path,
+    name: &str,
+    schedule: Option<&Path>,
+    trace: Option<u64>,
+) -> Replay {
+    run_traced_with(guest, directory, name, schedule, trace, &[])
+}
+
+/// [`run_traced`] with `extra` arguments to `hermit run`.
+fn run_traced_with(
+    guest: &Path,
+    directory: &Path,
+    name: &str,
+    schedule: Option<&Path>,
+    trace: Option<u64>,
+    extra: &[String],
+) -> Replay {
+    let events = directory.join(format!("{name}.events"));
+    let log = directory.join(format!("{name}.log"));
+    let trace_path = directory.join(format!("{name}.access"));
+    let mut args = vec![
+        "--log=info".to_string(),
+        path_arg("--log-file", &log),
+        "run".to_string(),
+        EPOCH.to_string(),
+        "--chaos".to_string(),
+        "--sched-seed=3".to_string(),
+        path_arg("--record-preemptions-to", &events),
+    ];
+    if let Some(schedule) = schedule {
+        args.push(path_arg("--replay-schedule-from", schedule));
+    }
+    if let Some(from) = trace {
+        args.push(path_arg("--record-access-trace-to", &trace_path));
+        args.push(format!("--access-trace-from={from}"));
+    }
+    args.extend(extra.iter().cloned());
+    args.extend(["--".to_string(), guest.display().to_string()]);
+    let output = run(&args);
+    assert!(output.status.success(), "{args:?}: {output:?}");
+    let mut info = Vec::new();
+    detcore::logdiff::write_bitwise_info_v1_bytes(
+        &fs::read(&log).expect("no log"),
+        name,
+        &mut info,
+    )
+    .expect("the log is not comparable");
+    Replay {
+        output,
+        events: fs::read(&events).expect("no recorded schedule"),
+        info: String::from_utf8(info)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect(),
+        trace: trace.map(|_| {
+            read_access_trace(fs::read(&trace_path).expect("no trace").as_slice())
+                .expect("trace does not parse")
+        }),
+    }
+}
+
+/// Replay `schedule`, re-recording it, with the trace from `trace`.
+fn replay(
+    guest: &Path,
+    schedule: &Path,
+    directory: &Path,
+    name: &str,
+    trace: Option<u64>,
+) -> Replay {
+    run_traced(guest, directory, name, Some(schedule), trace)
+}
+
+/// The one stderr line that measures the host: on a host whose
+/// retired-branch counter fails Reverie's validation, Hermit warns with the
+/// counts the check measured, which differ run to run. The filter takes the
+/// warning's own prefix, so it follows the warning's wording.
+const HOST_PMU_LINE: &str = hermit::canonical_verdict::INEXACT_BRANCH_COUNTER_WARNING;
+
+/// Stderr without the host line, and how many lines that dropped.
+fn guest_stderr(output: &Output) -> (Vec<String>, usize) {
+    let all: Vec<String> = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let kept: Vec<String> = all
+        .iter()
+        .filter(|line| !line.starts_with(HOST_PMU_LINE))
+        .cloned()
+        .collect();
+    let dropped = all.len() - kept.len();
+    (kept, dropped)
+}
+
+/// The two runs show the same thing: exit status, stdout, stderr (but for
+/// that host line), the
+/// recorded schedule (every event, its thread and its virtual time) and
+/// the INFO messages `--verify-strict` compares.
+fn assert_same_run(plain: &Replay, traced: &Replay, what: &str) {
+    assert_eq!(traced.output.status, plain.output.status, "{what}");
+    assert_eq!(traced.output.stdout, plain.output.stdout, "{what}");
+    // Both runs drop the same number of host lines, so the filter cannot
+    // hide a line only one run printed.
+    assert_eq!(
+        guest_stderr(&traced.output),
+        guest_stderr(&plain.output),
+        "{what}"
+    );
+    assert!(
+        traced.events == plain.events,
+        "{what}: the traced run recorded another schedule"
+    );
+    assert!(!plain.info.is_empty(), "{what}: no INFO records to compare");
+    assert!(
+        traced.info == plain.info,
+        "{what}: the INFO records differ, first at {:?}",
+        traced
+            .info
+            .iter()
+            .zip(&plain.info)
+            .position(|(a, b)| a != b)
+            .unwrap_or(traced.info.len().min(plain.info.len()))
+    );
+    let trace = traced.trace.as_ref().expect("traced run");
+    assert!(trace.end.is_some(), "{what}: the trace has no end line");
+}
+
+fn syscalls(trace: &AccessTrace) -> impl Iterator<Item = &SyscallRecord> {
+    trace.records.iter().filter_map(|record| match record {
+        TraceRecord::Syscall(syscall) => Some(syscall),
+        _ => None,
+    })
+}
+
+/// The records analyze's race finder reads to leave a pipe's data edges out
+/// (`races::data_edges`), from a real run of
+/// tests/fixtures/access_trace_pipes.c. pipe2 with O_DIRECT keeps the flag
+/// in its second argument and notes both ends it made, and the packet
+/// pipe's second read gets the second write's bytes (the guest says so):
+/// the first read dropped the rest of the first packet. A successful fcntl
+/// F_SETFL notes the open file of the end it changed. A write through a
+/// reopen of a pipe end by /proc/self/fd names a pipe channel without a
+/// pair identity, on a description other than the pipe's own; a forked
+/// child holding no end that reopens the parent's end through
+/// /proc/<parent>/fd writes to a FIFO channel, and so does a thread with a
+/// descriptor table of its own that reopens it through
+/// /proc/<pid>/task/<tid>/fd. A write larger than
+/// the pipe, which a child drains while it blocks, is one record with its
+/// whole length and result, though it went in in parts; it waited, so its
+/// return is not the event after its entry, while each small write's is.
+#[test]
+fn the_trace_shows_what_leaves_a_pipes_data_edges_out() {
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let traced = run_traced(&guests().pipes, directory.path(), "traced", None, Some(0));
+    let stdout = String::from_utf8_lossy(&traced.output.stdout);
+    assert!(stdout.contains("packet pipe second read: BBBB"), "{stdout}");
+    let trace = traced.trace.expect("traced run");
+    let calls: Vec<&SyscallRecord> = syscalls(&trace).collect();
+    let ends = |call: &SyscallRecord| -> Vec<_> {
+        call.accesses
+            .iter()
+            .filter_map(|access| match access {
+                Access::Fd {
+                    open_file: Some(open_file),
+                    op: FdOp::Open { .. },
+                    ..
+                } => Some(*open_file),
+                _ => None,
+            })
+            .collect()
+    };
+    let pipes: Vec<&&SyscallRecord> = calls
+        .iter()
+        .filter(|call| call.sysno.name() == "pipe2" && call.result == Some(0))
+        .collect();
+    assert_eq!(pipes.len(), 6, "{pipes:?}");
+    assert_ne!(
+        pipes[0].args[1] & libc::O_DIRECT as u64,
+        0,
+        "{:?}",
+        pipes[0]
+    );
+    assert_eq!(
+        pipes[1].args[1] & libc::O_DIRECT as u64,
+        0,
+        "{:?}",
+        pipes[1]
+    );
+    for pipe in &pipes {
+        assert_eq!(ends(pipe).len(), 2, "{pipe:?}");
+    }
+    let setfl = calls
+        .iter()
+        .find(|call| call.sysno.name() == "fcntl" && call.args[1] == libc::F_SETFL as u64)
+        .expect("the trace has the F_SETFL");
+    assert_eq!(setfl.result, Some(0));
+    assert!(
+        setfl.accesses.iter().any(|access| matches!(
+            access,
+            Access::Fd { open_file: Some(open_file), op: FdOp::Use, .. }
+                if ends(pipes[1]).contains(open_file)
+        )),
+        "{setfl:?}"
+    );
+    // The reopen through /proc/self/fd is a new description the trace gives
+    // no pair identity: a pipe write through it names no channel.
+    assert!(
+        stdout.contains("reopened pipe first read: XXXX"),
+        "{stdout}"
+    );
+    let reopened = calls
+        .iter()
+        .find(|call| {
+            call.sysno.name() == "write"
+                && call.args[2] == 4
+                && call
+                    .accesses
+                    .iter()
+                    .any(|access| matches!(access, Access::Channel { id: None, .. }))
+        })
+        .expect("the write through the reopened end");
+    assert!(
+        reopened.accesses.iter().all(|access| !matches!(
+            access,
+            Access::Channel { open_file, .. } if ends(pipes[2]).contains(open_file)
+        )),
+        "{reopened:?}"
+    );
+    // A child that holds no end of the pipe reopens the parent's end through
+    // /proc/<parent>/fd: a FIFO by its mode, written from another process.
+    assert!(
+        stdout.contains("reopened by a child holding no end, first read: XXXX"),
+        "{stdout}"
+    );
+    let child_write = calls
+        .iter()
+        .find(|call| call.sysno.name() == "write" && call.pid != pipes[3].pid && call.args[2] == 4)
+        .expect("the child's write through its reopen");
+    assert!(
+        child_write.accesses.iter().any(|access| matches!(
+            access,
+            Access::Channel {
+                channel: ChannelKind::Fifo,
+                ..
+            }
+        )),
+        "{child_write:?}"
+    );
+    // A thread with a descriptor table of its own (CLONE_THREAD without
+    // CLONE_FILES) reopens the main thread's end through
+    // /proc/<pid>/task/<tid>/fd: a FIFO too, though under the same process.
+    assert!(
+        stdout.contains("reopened by a thread with its own descriptor table, first read: TTTT"),
+        "{stdout}"
+    );
+    let thread_write = calls
+        .iter()
+        .find(|call| {
+            call.sysno.name() == "write"
+                && call.pid == pipes[4].pid
+                && call.tid != pipes[4].tid
+                && call.args[2] == 4
+        })
+        .expect("the thread's write through its reopen");
+    assert!(
+        thread_write.accesses.iter().any(|access| matches!(
+            access,
+            Access::Channel {
+                channel: ChannelKind::Fifo,
+                ..
+            }
+        )),
+        "{thread_write:?}"
+    );
+    let size = 3 * 65536;
+    let large: Vec<&&SyscallRecord> = calls
+        .iter()
+        .filter(|call| call.sysno.name() == "write" && call.args[2] == size)
+        .collect();
+    assert_eq!(large.len(), 1, "{large:?}");
+    assert_eq!(large[0].result, Some(size as i64));
+    // It waited for room, so its return is not the event after its entry;
+    // the small writes, which did not wait, return at the next event.
+    assert!(
+        large[0].post.is_some_and(|post| post > large[0].pre + 1),
+        "{:?}",
+        large[0]
+    );
+    for small in calls
+        .iter()
+        .filter(|call| call.sysno.name() == "write" && call.args[2] <= 8 && call.args[0] == 4)
+    {
+        assert_eq!(small.post, Some(small.pre + 1), "{small:?}");
+    }
+    assert!(
+        large[0].accesses.iter().any(|access| matches!(
+            access,
+            Access::Channel { id: Some(ChannelId::Pair(first)), .. }
+                if ends(pipes[5]).first() == Some(first)
+        )),
+        "{:?}",
+        large[0]
+    );
+}
+
+/// A trace names in its header the settings under which a descriptor can
+/// be recorded without its file type: none in an ordinary run, and
+/// `--no-virtualize-metadata` in one without metadata virtualization. In that
+/// run, the write of tests/fixtures/access_trace_pipes.c's child that holds no
+/// end, through its reopen of the parent's pipe end, names no channel at all,
+/// which is why analyze's race finder gives no pipe edge in such a trace
+/// (`races::untyped_descriptors`).
+#[test]
+fn a_trace_names_the_settings_that_leave_descriptors_untyped() {
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let typed = run_traced(&guests().pipes, directory.path(), "typed", None, Some(0));
+    assert_eq!(
+        typed.trace.expect("traced run").header.untyped_descriptors,
+        Some(Vec::new())
+    );
+    let events = directory.path().join("untyped.events");
+    let trace_path = directory.path().join("untyped.access");
+    let args = vec![
+        "run".to_string(),
+        EPOCH.to_string(),
+        "--chaos".to_string(),
+        "--sched-seed=3".to_string(),
+        "--no-virtualize-metadata".to_string(),
+        path_arg("--record-preemptions-to", &events),
+        path_arg("--record-access-trace-to", &trace_path),
+        "--access-trace-from=0".to_string(),
+        "--".to_string(),
+        guests().pipes.display().to_string(),
+    ];
+    let output = run(&args);
+    assert!(output.status.success(), "{args:?}: {output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("reopened by a child holding no end, first read: XXXX"),
+        "{stdout}"
+    );
+    let trace = read_access_trace(fs::read(&trace_path).expect("no trace").as_slice())
+        .expect("trace does not parse");
+    assert_eq!(
+        trace.header.untyped_descriptors,
+        Some(vec!["--no-virtualize-metadata".to_string()])
+    );
+    let calls: Vec<&SyscallRecord> = syscalls(&trace).collect();
+    let pipes: Vec<&&SyscallRecord> = calls
+        .iter()
+        .filter(|call| call.sysno.name() == "pipe2" && call.result == Some(0))
+        .collect();
+    let child_write = calls
+        .iter()
+        .find(|call| call.sysno.name() == "write" && call.pid != pipes[3].pid && call.args[2] == 4)
+        .expect("the child's write through its reopen");
+    assert!(
+        child_write
+            .accesses
+            .iter()
+            .all(|access| !matches!(access, Access::Channel { .. })),
+        "{child_write:?}"
+    );
+}
+
+/// Each open note names the file its call opened and that file's kind, from
+/// its mode: a regular file in the run's /tmp, /dev/null (a character
+/// device) and a new pipe's two ends (a FIFO). Detcore notes an open when it
+/// installs the descriptor, before the open's handler sets its path, and
+/// brings the note up to date after (`ThreadState::note_opened_path`).
+/// These are the facts analyze's output matching reads
+/// (`races::not_provably_regular`): it exempts the regular file and
+/// /dev/null opened for writing, and a pipe it creates.
+#[test]
+fn an_open_note_names_the_opened_files_path_and_kind() {
+    let _guard = hermit_run_guard();
+    let guest = &guests().open_kinds;
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let traced = run_traced(guest, directory.path(), "traced", None, Some(0));
+    let trace = traced.trace.expect("traced run");
+    let opens: Vec<(&str, Option<String>, Option<FileKind>)> = syscalls(&trace)
+        .flat_map(|call| {
+            call.accesses.iter().filter_map(move |access| match access {
+                Access::Fd {
+                    op: FdOp::Open { path, kind },
+                    ..
+                } => Some((call.sysno.name(), path.clone(), *kind)),
+                _ => None,
+            })
+        })
+        .collect();
+    assert!(
+        opens.iter().any(|(_, path, kind)| {
+            path.as_deref()
+                .is_some_and(|path| path.starts_with("/tmp/access_trace_open_kinds."))
+                && *kind == Some(FileKind::Regular)
+        }),
+        "{opens:?}"
+    );
+    assert!(
+        opens.iter().any(|(_, path, kind)| {
+            path.as_deref() == Some("/dev/null") && *kind == Some(FileKind::CharDevice)
+        }),
+        "{opens:?}"
+    );
+    assert_eq!(
+        opens
+            .iter()
+            .filter(|(call, _, kind)| *call == "pipe2" && *kind == Some(FileKind::Fifo))
+            .count(),
+        2,
+        "{opens:?}"
+    );
+}
+
+/// The trace changes nothing a run shows, whether the run follows a
+/// recorded schedule or makes its own under chaos: exit status, stdout,
+/// stderr, the recorded schedule and the INFO messages are those of the
+/// same run without it. And the run that makes its own schedule writes the
+/// same records as a replay of that schedule: its trace is not only a header
+/// and an end line.
+#[test]
+fn an_access_trace_leaves_a_replayed_run_unchanged() {
+    let _guard = hermit_run_guard();
+    for guest in [&guests().racewrite, &guests().mix] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let schedule = record(guest, directory.path());
+        let plain = replay(guest, &schedule, directory.path(), "plain", None);
+        let traced = replay(guest, &schedule, directory.path(), "traced", Some(0));
+        assert_same_run(&plain, &traced, &format!("replay of {guest:?}"));
+        let fresh = run_traced(guest, directory.path(), "fresh", None, None);
+        let fresh_traced = run_traced(guest, directory.path(), "fresh_traced", None, Some(0));
+        assert_same_run(&fresh, &fresh_traced, &format!("chaos run of {guest:?}"));
+
+        let fresh_trace = fresh_traced.trace.as_ref().unwrap();
+        assert!(
+            syscalls(fresh_trace).count() > 2,
+            "chaos run of {guest:?}: the trace has {} records",
+            fresh_trace.records.len()
+        );
+        assert_eq!(
+            fresh_trace.end.as_ref().map(|end| end.records),
+            Some(fresh_trace.records.len() as u64)
+        );
+        let fresh_replayed = replay(
+            guest,
+            &directory.path().join("fresh_traced.events"),
+            directory.path(),
+            "fresh_replayed",
+            Some(0),
+        );
+        let (fresh_records, replayed_records) = (
+            comparable(&fresh_trace.records),
+            comparable(&fresh_replayed.trace.as_ref().unwrap().records),
+        );
+        assert!(
+            fresh_records == replayed_records,
+            "chaos run of {guest:?}: its trace and a replay's differ, first at record {:?}",
+            fresh_records
+                .iter()
+                .zip(&replayed_records)
+                .position(|(a, b)| a != b)
+                .unwrap_or(fresh_records.len().min(replayed_records.len()))
+        );
+    }
+}
+
+/// The records with the root thread's first execve's argument registers
+/// cleared: Hermit's launcher issues that call, so they point into its own
+/// memory, which address-space randomization places anew each run. Every
+/// other field of that record, and every other record, is kept.
+fn comparable(records: &[TraceRecord]) -> Vec<TraceRecord> {
+    let mut records = records.to_vec();
+    if let Some(TraceRecord::Syscall(call)) = records
+        .iter_mut()
+        .find(|record| matches!(record, TraceRecord::Syscall(_)))
+        && call.sysno.name() == "execve"
+        && call.nth == 1
+    {
+        call.args = [0; 6];
+    }
+    records
+}
+
+/// Every index names the matching event of the run's own recorded schedule:
+/// a syscall's prehook and posthook events are its thread's, of its syscall,
+/// and a signal's event is SignalReceived. The records name what the mixed
+/// guest does.
+#[test]
+fn access_trace_indices_name_the_runs_own_events() {
+    let _guard = hermit_run_guard();
+    let guest = &guests().mix;
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let schedule = record(guest, directory.path());
+    let traced = replay(guest, &schedule, directory.path(), "traced", Some(0));
+    assert!(traced.output.status.success(), "{:?}", traced.output);
+    let trace = traced.trace.expect("traced replay");
+    let events = recorded_global_events(&traced.events);
+    let events = &events;
+    assert_eq!(
+        trace.end.as_ref().map(|end| end.events),
+        Some(events.len() as u64)
+    );
+
+    let syscall_event = |index: u64, tid: i32, number: i64, phase: &str| {
+        let event = &events[index as usize];
+        assert_eq!(event["dettid"], tid, "event {index}: {event}");
+        assert_eq!(
+            event["op"]["Syscall"],
+            serde_json::json!([number, phase]),
+            "event {index}: {event}"
+        );
+    };
+    let mut syscall_count = 0;
+    for record in &trace.records {
+        match record {
+            TraceRecord::Syscall(call) => {
+                syscall_count += 1;
+                let tid = call.tid.as_raw();
+                let number = call.sysno as i64;
+                syscall_event(call.pre, tid, number, "Prehook");
+                if let Some(post) = call.post {
+                    assert!(post > call.pre);
+                    syscall_event(post, tid, number, "Posthook");
+                }
+            }
+            TraceRecord::Signal(signal) => {
+                let event = &events[signal.event as usize];
+                assert_eq!(event["dettid"], signal.tid.as_raw(), "{event}");
+                assert!(event["op"].get("SignalReceived").is_some(), "{event}");
+            }
+            TraceRecord::Edge(edge) => {
+                assert!(edge.from.event < edge.to.event, "{edge:?}");
+                for end in [edge.from, edge.to] {
+                    assert_eq!(
+                        events[end.event as usize]["dettid"],
+                        end.tid.as_raw(),
+                        "{edge:?}"
+                    );
+                }
+            }
+            other => panic!("unexpected record {other:?}"),
+        }
+    }
+    assert!(syscall_count > 50, "only {syscall_count} syscall records");
+
+    // A thread's nth counts its syscalls: each thread's records count up by
+    // one, in order of their prehooks.
+    let mut by_thread: std::collections::BTreeMap<i32, Vec<(u64, u64)>> = Default::default();
+    for call in syscalls(&trace) {
+        by_thread
+            .entry(call.tid.as_raw())
+            .or_default()
+            .push((call.pre, call.nth));
+    }
+    // Absolute, too: each thread's first syscall is its first, the unit of
+    // `--happens-before` `SyscallCount`. The root thread's is the execve.
+    for (tid, mut calls) in by_thread {
+        calls.sort_unstable();
+        assert_eq!(calls[0].1, 1, "thread {tid}'s first syscall: {calls:?}");
+        for pair in calls.windows(2) {
+            assert_eq!(pair[1].1, pair[0].1 + 1, "thread {tid}: {calls:?}");
+        }
+    }
+    let first = syscalls(&trace).min_by_key(|call| call.pre).unwrap();
+    assert_eq!((first.sysno.name(), first.nth), ("execve", 1), "{first:?}");
+
+    let find = |name: &str| -> Vec<&SyscallRecord> {
+        syscalls(&trace)
+            .filter(|call| call.sysno.name() == name)
+            .collect()
+    };
+    let has =
+        |call: &SyscallRecord, wanted: &dyn Fn(&Access) -> bool| call.accesses.iter().any(wanted);
+    // A dup2 onto a free number dups without a close; one onto an open
+    // number closes it first.
+    // aarch64's C library makes dup2(3) a dup3 call: the generic syscall
+    // table (include/uapi/asm-generic/unistd.h) has no dup2.
+    let dup2 = find(if cfg!(target_arch = "x86_64") {
+        "dup2"
+    } else {
+        "dup3"
+    });
+    let ops = |call: &SyscallRecord| -> Vec<FdOp> {
+        call.accesses
+            .iter()
+            .filter_map(|a| match a {
+                Access::Fd { op, .. } => Some(op.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let dup = FdOp::Dup {
+        source: dup2[0].args[0] as i32,
+    };
+    assert_eq!(ops(dup2[0]), vec![FdOp::Use, dup], "{dup2:?}");
+    let onto_open = dup2
+        .iter()
+        .find(|call| ops(call).contains(&FdOp::Close))
+        .expect("a dup2 onto an open number");
+    assert_eq!(
+        ops(onto_open),
+        vec![
+            FdOp::Use,
+            FdOp::Close,
+            FdOp::Dup {
+                source: onto_open.args[0] as i32
+            }
+        ]
+    );
+    // The guest's file is created in the run's own /tmp, which no other run
+    // shares: every run draws the same name for it, and in a shared working
+    // directory a concurrent run's file made the O_EXCL create fail and the
+    // schedule change. Read the paths the guest gave from the INFO messages
+    // (`openat(-100, <addr> -> "<path>", ...)`).
+    let file_paths: Vec<&str> = traced
+        .info
+        .iter()
+        .filter_map(|line| {
+            let (_, rest) = line.split_once("-> \"")?;
+            let (path, _) = rest.split_once('"')?;
+            path.contains("access_trace_mix.").then_some(path)
+        })
+        .collect();
+    assert!(
+        !file_paths.is_empty(),
+        "no INFO message names the guest's file"
+    );
+    assert!(
+        file_paths.iter().all(|path| path.starts_with("/tmp/")),
+        "{file_paths:?}"
+    );
+    // close_range closes both pipe ends, and the channel behind each.
+    let close_range = find("close_range");
+    assert_eq!(close_range.len(), 1, "{close_range:?}");
+    assert_eq!(ops(close_range[0]), vec![FdOp::Close, FdOp::Close]);
+    let channel_closes = close_range[0]
+        .accesses
+        .iter()
+        .filter(|a| {
+            matches!(
+                a,
+                Access::Channel {
+                    id: Some(ChannelId::Pair(_)),
+                    op: detcore_model::access_trace::ChannelOp::Close,
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(channel_closes, 2, "{close_range:?}");
+    // A write to the pipe names the pipe by its read end.
+    assert!(
+        find("write").iter().any(|call| has(call, &|a| matches!(
+            a,
+            Access::Channel {
+                id: Some(ChannelId::Pair(_)),
+                ..
+            }
+        ))),
+        "no pipe write carries the pipe's identity"
+    );
+    // The racing lines on stdout are in the trace.
+    let lines: Vec<Vec<u8>> = find("write")
+        .iter()
+        .filter_map(|call| call.out_bytes.clone())
+        .collect();
+    assert!(lines.contains(&b"a 0\n".to_vec()), "{lines:?}");
+    assert!(lines.contains(&b"b 15\n".to_vec()), "{lines:?}");
+    // A clock read carries the timespec it returned.
+    let clocks = find("clock_gettime");
+    assert!(!clocks.is_empty(), "no clock_gettime");
+    for call in clocks.iter().filter(|call| call.result == Some(0)) {
+        assert_eq!(call.returned.map(|r| r.len), Some(16), "{call:?}");
+    }
+    // The file read returned three bytes.
+    assert!(
+        find("read")
+            .iter()
+            .any(|call| call.returned.is_some_and(|r| r.len == 3)),
+        "no three-byte read"
+    );
+    for (name, op) in [
+        ("timer_create", TimerOp::Create),
+        ("timer_settime", TimerOp::Set),
+        ("timer_delete", TimerOp::Delete),
+    ] {
+        assert!(
+            find(name).iter().any(|call| has(call, &|a| matches!(
+                a,
+                Access::Timer { op: got, .. } if *got == op
+            ))),
+            "{name}"
+        );
+    }
+    assert!(
+        syscalls(&trace).any(|call| has(call, &|a| matches!(
+            a,
+            Access::Lifetime {
+                target: Task::Thread(_),
+                op: LifetimeOp::Create
+            }
+        ))),
+        "no thread creation"
+    );
+    assert!(
+        find("wait4").iter().any(|call| has(call, &|a| matches!(
+            a,
+            Access::Lifetime {
+                op: LifetimeOp::Wait,
+                ..
+            }
+        ))),
+        "no reaped child"
+    );
+    let exit_group = find("exit_group");
+    assert!(
+        exit_group
+            .iter()
+            .any(|call| call.post.is_none() && !call.accesses.is_empty()),
+        "{exit_group:?}"
+    );
+    assert!(
+        trace.records.iter().any(|record| matches!(
+            record,
+            TraceRecord::Signal(signal)
+                if signal.signo == libc::SIGUSR1 && signal.observed_disposition == ObservedSignalDisposition::Handler
+        )),
+        "no handled SIGUSR1"
+    );
+}
+
+/// `--access-trace-from=N` leaves out exactly the records whose last event
+/// comes before N; the rest are those of the whole trace. With
+/// `--access-trace-max-records`, the trace stops after that many and has
+/// no end line.
+#[test]
+fn access_trace_from_leaves_out_only_earlier_records() {
+    let _guard = hermit_run_guard();
+    let guest = &guests().mix;
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let schedule = record(guest, directory.path());
+    let whole = replay(guest, &schedule, directory.path(), "whole", Some(0))
+        .trace
+        .unwrap();
+    let from = 300;
+    let part = replay(guest, &schedule, directory.path(), "part", Some(from))
+        .trace
+        .unwrap();
+    let last_event = |record: &TraceRecord| match record {
+        TraceRecord::Syscall(call) => call.post.unwrap_or(call.pre),
+        TraceRecord::Signal(signal) => signal.event,
+        TraceRecord::Edge(edge) => edge.to.event,
+        other => panic!("unexpected record {other:?}"),
+    };
+    assert_eq!(part.header.from, from);
+    let kept: Vec<&TraceRecord> = whole
+        .records
+        .iter()
+        .filter(|record| last_event(record) >= from)
+        .collect();
+    assert!(!kept.is_empty() && kept.len() < whole.records.len());
+    assert_eq!(part.records.iter().collect::<Vec<_>>(), kept);
+    assert_eq!(part.end.unwrap().events, whole.end.unwrap().events);
+
+    // A cap of five writes the part's first five records and no end line,
+    // so a reader sees the trace cut short.
+    let capped_path = directory.path().join("capped.access");
+    let args = [
+        "run".to_string(),
+        EPOCH.to_string(),
+        "--chaos".to_string(),
+        "--sched-seed=3".to_string(),
+        path_arg("--replay-schedule-from", &schedule),
+        path_arg(
+            "--record-preemptions-to",
+            &directory.path().join("capped.events"),
+        ),
+        path_arg("--record-access-trace-to", &capped_path),
+        format!("--access-trace-from={from}"),
+        "--access-trace-max-records=5".to_string(),
+        "--".to_string(),
+        guest.display().to_string(),
+    ];
+    let output = run(&args);
+    assert!(output.status.success(), "{args:?}: {output:?}");
+    let capped = read_access_trace(fs::read(&capped_path).unwrap().as_slice()).unwrap();
+    assert_eq!(capped.records, part.records[..5]);
+    assert!(capped.end.is_none(), "{:?}", capped.end);
+    // Hermit says once why the trace ends early, naming it and the cap.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let warnings: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("reached --access-trace-max-records=5"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{stderr}");
+    assert!(
+        warnings[0].contains(&capped_path.display().to_string()),
+        "{stderr}"
+    );
+
+    // `--access-trace-max-bytes` bounds the file: room for the header and
+    // the part's first seven records, plus one byte short of the eighth,
+    // keeps those seven and no end line.
+    let whole_bytes = fs::read(directory.path().join("part.access")).unwrap();
+    let seven: usize = whole_bytes
+        .split_inclusive(|b| *b == b'\n')
+        .take(8)
+        .map(<[u8]>::len)
+        .sum();
+    let eighth = whole_bytes[seven..]
+        .split_inclusive(|b| *b == b'\n')
+        .next()
+        .unwrap()
+        .len();
+    let max_bytes = seven + eighth - 1;
+    let bounded_path = directory.path().join("bounded.access");
+    let mut args = args.to_vec();
+    args[5] = path_arg(
+        "--record-preemptions-to",
+        &directory.path().join("bounded.events"),
+    );
+    args[6] = path_arg("--record-access-trace-to", &bounded_path);
+    args[8] = format!("--access-trace-max-bytes={max_bytes}");
+    let output = run(&args);
+    assert!(output.status.success(), "{args:?}: {output:?}");
+    let bounded_bytes = fs::read(&bounded_path).unwrap();
+    assert_eq!(bounded_bytes, whole_bytes[..seven], "{args:?}");
+    let bounded = read_access_trace(bounded_bytes.as_slice()).unwrap();
+    assert_eq!(bounded.records, part.records[..7]);
+    assert!(bounded.end.is_none(), "{:?}", bounded.end);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let warnings: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains(&format!("reached --access-trace-max-bytes={max_bytes};")))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{stderr}");
+    assert!(
+        warnings[0].contains(&bounded_path.display().to_string()),
+        "{stderr}"
+    );
+}
+
+fn edges(trace: &AccessTrace) -> Vec<&EdgeRecord> {
+    trace
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            TraceRecord::Edge(edge) => Some(edge),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The event at `index` of a re-recorded schedule, as JSON.
+fn event_at(events: &[serde_json::Value], index: u64) -> &serde_json::Value {
+    &events[index as usize]
+}
+
+fn is_futex(event: &serde_json::Value, phase: &str) -> bool {
+    event["op"]["Syscall"] == serde_json::json!([libc::SYS_futex, phase])
+}
+
+/// Two threads hand a futex word back and forth ten times. Each blocking
+/// wait is ended by the other thread's wake, so the futex edges alternate
+/// direction, and each runs from the waker's FUTEX_WAKE prehook to the
+/// waiter's FUTEX_WAIT posthook in the run's own schedule. The worker's
+/// creation is an edge from main's clone to the worker's first event.
+#[test]
+fn a_futex_ping_pong_yields_alternating_wake_edges() {
+    let _guard = hermit_run_guard();
+    let guest = &guests().ping_pong;
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let schedule = record(guest, directory.path());
+    let traced = replay(guest, &schedule, directory.path(), "traced", Some(0));
+    assert!(traced.output.status.success(), "{:?}", traced.output);
+    assert_eq!(traced.output.stdout, b"10 rounds\n");
+    let trace = traced.trace.unwrap();
+    let events = recorded_global_events(&traced.events);
+    let events = &events;
+
+    let wakes: Vec<&EdgeRecord> = edges(&trace)
+        .into_iter()
+        .filter(|edge| edge.kind == EdgeKind::FutexWake)
+        .collect();
+    assert!(
+        wakes.len() >= 18,
+        "only {} wake edges: {wakes:?}",
+        wakes.len()
+    );
+    for edge in &wakes {
+        assert_ne!(edge.from.tid, edge.to.tid, "{edge:?}");
+        assert!(edge.from.event < edge.to.event, "{edge:?}");
+        let (from, to) = (
+            event_at(events, edge.from.event),
+            event_at(events, edge.to.event),
+        );
+        assert_eq!(from["dettid"], edge.from.tid.as_raw(), "{edge:?}");
+        assert!(is_futex(from, "Prehook"), "{edge:?}: {from}");
+        assert_eq!(to["dettid"], edge.to.tid.as_raw(), "{edge:?}");
+        assert!(is_futex(to, "Posthook"), "{edge:?}: {to}");
+        assert!(matches!(edge.object, SyncObject::Futex(_)), "{edge:?}");
+    }
+    for pair in wakes.windows(2) {
+        assert!(pair[0].to.event < pair[1].from.event, "{pair:?}");
+        assert_eq!(
+            pair[0].to.tid, pair[1].from.tid,
+            "the woken thread wakes next: {pair:?}"
+        );
+        assert_eq!(pair[0].from.tid, pair[1].to.tid, "{pair:?}");
+    }
+
+    let creates: Vec<&EdgeRecord> = edges(&trace)
+        .into_iter()
+        .filter(|edge| edge.kind == EdgeKind::Create)
+        .collect();
+    assert_eq!(creates.len(), 1, "{creates:?}");
+    let create = creates[0];
+    let first = events
+        .iter()
+        .position(|event| event["dettid"] == create.to.tid.as_raw())
+        .unwrap();
+    assert_eq!(create.to.event, first as u64, "the child's first event");
+    assert_eq!(create.object, SyncObject::Thread(create.to.tid));
+    let clone = event_at(events, create.from.event);
+    assert_eq!(clone["dettid"], create.from.tid.as_raw());
+    assert_eq!(clone["op"]["Syscall"][1], "Prehook", "{clone}");
+}
+
+/// The mixed guest's other edges: a timer's expiry is a signal edge from
+/// its timer_settime to the delivery, the reaped child's exit is an edge
+/// to the parent's wait4 return, and a join that waited is an exit edge
+/// to the joiner's futex return.
+#[test]
+fn signal_child_exit_and_join_edges_name_their_events() {
+    let _guard = hermit_run_guard();
+    let guest = &guests().mix;
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let schedule = record(guest, directory.path());
+    let traced = replay(guest, &schedule, directory.path(), "traced", Some(0));
+    assert!(traced.output.status.success(), "{:?}", traced.output);
+    let trace = traced.trace.unwrap();
+    let events = recorded_global_events(&traced.events);
+    let events = &events;
+    let of_kind = |kind: EdgeKind| -> Vec<&EdgeRecord> {
+        edges(&trace)
+            .into_iter()
+            .filter(|edge| edge.kind == kind)
+            .collect()
+    };
+    let syscall_at = |index: u64| -> (i64, String) {
+        let op = &event_at(events, index)["op"]["Syscall"];
+        (
+            op[0].as_i64().unwrap_or(-1),
+            op[1].as_str().unwrap_or("").to_string(),
+        )
+    };
+
+    let signal = of_kind(EdgeKind::Signal);
+    assert_eq!(signal.len(), 1, "{signal:?}");
+    assert_eq!(
+        syscall_at(signal[0].from.event),
+        (libc::SYS_timer_settime, "Prehook".to_string())
+    );
+    assert_eq!(
+        event_at(events, signal[0].to.event)["op"]["SignalReceived"],
+        "SIGUSR1"
+    );
+
+    let child = of_kind(EdgeKind::ChildExit);
+    assert_eq!(child.len(), 1, "{child:?}");
+    assert_eq!(
+        syscall_at(child[0].to.event),
+        (libc::SYS_wait4, "Posthook".to_string())
+    );
+    let SyncObject::Process(pid) = child[0].object else {
+        panic!("{child:?}");
+    };
+    let last_of_child = events
+        .iter()
+        .rposition(|event| event["dettid"] == pid.as_raw())
+        .unwrap();
+    assert_eq!(
+        child[0].from.event, last_of_child as u64,
+        "the child's last event"
+    );
+
+    // Main joins worker a while it still runs (it lingers), so the join's
+    // futex wait ends at a's exit: an edge from a's last event to main's
+    // futex return.
+    let joins = of_kind(EdgeKind::ExitJoin);
+    assert!(!joins.is_empty(), "no join waited for its thread");
+    let main = events[0]["dettid"].as_i64().unwrap() as i32;
+    for join in joins {
+        assert_eq!(join.to.tid.as_raw(), main, "{join:?}");
+        assert_eq!(
+            syscall_at(join.to.event),
+            (libc::SYS_futex, "Posthook".to_string())
+        );
+        let last_of_thread = events
+            .iter()
+            .rposition(|event| event["dettid"] == join.from.tid.as_raw())
+            .unwrap();
+        assert_eq!(join.from.event as usize, last_of_thread, "{join:?}");
+    }
+    assert_eq!(
+        of_kind(EdgeKind::Create).len(),
+        3,
+        "two threads and a child"
+    );
+}
+
+/// The trace's records but for the watch's own (the end line, whose record
+/// count counts them too, is not among them). The first execve's arguments
+/// are blanked: it is Hermit's launcher starting the guest, whose pointers
+/// are into Hermit's own command line, which `--watch` lengthens. Every
+/// other record, a guest's own execve included, is compared as written.
+fn without_watch_records(trace: &AccessTrace) -> Vec<TraceRecord> {
+    let mut launcher = true;
+    trace
+        .records
+        .iter()
+        .filter(|record| {
+            !matches!(
+                record,
+                TraceRecord::WatchHit(_) | TraceRecord::WatchSummary(_)
+            )
+        })
+        .cloned()
+        .map(|mut record| {
+            if let TraceRecord::Syscall(call) = &mut record
+                && call.sysno.name() == "execve"
+                && std::mem::take(&mut launcher)
+            {
+                assert_eq!(call.nth, 1, "the launcher's execve is its first call");
+                call.args = [0; 6];
+            }
+            record
+        })
+        .collect()
+}
+
+/// `--watch` on racewrite's global, which the parent and the forked child
+/// each write once, reports one hit from each, at the global and after the
+/// store, and both processes' threads armed. The watch changes nothing else:
+/// replaying one recorded schedule, and running afresh under chaos, with and
+/// without it give the same exit status, stdout, stderr, recorded schedule,
+/// INFO messages and every other trace record.
+#[test]
+fn watch_hits_name_both_writers_and_leave_the_run_unchanged() {
+    let _guard = hermit_run_guard();
+    let (guest, chosen) = &guests().racewrite_fixed;
+    let watch = vec![format!("--watch={chosen:#x}:8:w")];
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let schedule = record(guest, directory.path());
+    let runs = [(Some(schedule.as_path()), "replay"), (None, "chaos")];
+    for (schedule, what) in runs {
+        let plain = run_traced_with(
+            guest,
+            directory.path(),
+            &format!("{what}_plain"),
+            schedule,
+            Some(0),
+            &[],
+        );
+        let watched = run_traced_with(
+            guest,
+            directory.path(),
+            &format!("{what}_watched"),
+            schedule,
+            Some(0),
+            &watch,
+        );
+        assert_same_run(&plain, &watched, what);
+        let (plain, watched) = (plain.trace.unwrap(), watched.trace.unwrap());
+        assert_eq!(
+            without_watch_records(&watched),
+            without_watch_records(&plain),
+            "{what}: the watch changed another record"
+        );
+        let hits: Vec<_> = watched
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                TraceRecord::WatchHit(hit) => Some(hit),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(hits.len(), 2, "{what}: {hits:?}");
+        assert!(
+            hits.iter().all(|hit| hit.addr == *chosen && hit.slot == 0),
+            "{what}"
+        );
+        assert!(hits.iter().all(|hit| !hit.stack.is_empty()), "{what}");
+        assert_ne!(hits[0].tid, hits[1].tid, "{what}: one hit from each writer");
+        let summaries: Vec<_> = watched
+            .records
+            .iter()
+            .filter_map(|record| match record {
+                TraceRecord::WatchSummary(summary) => Some(summary),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(summaries.len(), 2, "{what}: {summaries:?}");
+        for hit in &hits {
+            let summary = summaries.iter().find(|s| s.tid == hit.tid).unwrap();
+            assert_eq!(
+                (summary.hits, summary.recorded, summary.unarmed),
+                (1, 1, None)
+            );
+            assert!(summary.armed_before.is_some(), "{what}: {summary:?}");
+        }
+    }
+}
+
+/// A worker that blocks SIGTRAP at every stop never arms its watches: the
+/// run completes, the trace's summary for it says why, and Hermit says so on
+/// stderr, so a reader does not take its missing hits for an absent access.
+#[test]
+fn a_thread_that_blocks_sigtrap_never_arms_and_the_trace_says_so() {
+    let _guard = hermit_run_guard();
+    let (guest, watched) = &guests().sigtrap_blocked;
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let run = run_traced_with(
+        guest,
+        directory.path(),
+        "blocked",
+        None,
+        Some(0),
+        &[format!("--watch={watched:#x}:8:w")],
+    );
+    assert_eq!(String::from_utf8_lossy(&run.output.stdout), "2\n");
+    let trace = run.trace.unwrap();
+    let summaries: Vec<_> = trace
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            TraceRecord::WatchSummary(summary) => Some(summary),
+            _ => None,
+        })
+        .collect();
+    let unarmed: Vec<_> = summaries
+        .iter()
+        .filter(|s| s.armed_before.is_none())
+        .collect();
+    assert_eq!(unarmed.len(), 1, "{summaries:?}");
+    assert_eq!(
+        unarmed[0].unarmed,
+        Some(detcore_model::access_trace::WatchUnarmed::SigtrapBlocked)
+    );
+    assert_eq!(unarmed[0].hits, 0, "an unarmed thread reports no hit");
+    let stderr = String::from_utf8_lossy(&run.output.stderr);
+    assert!(
+        stderr.contains("--watch: some watch intervals were never armed")
+            && stderr.contains(&format!("thread {} (SigtrapBlocked)", unarmed[0].tid)),
+        "{stderr}"
+    );
+}
+
+/// A hit that resets the guest's SIGTRAP action (the guest ignores SIGTRAP,
+/// and the hit's forced SIGTRAP resets that to the default) stops the run
+/// with Hermit's refusal status, naming the thread and what Reverie says the
+/// SIGTRAP did (that it reset the action, or that it could not tell),
+/// instead of running on with a guest the watch changed.
+#[test]
+fn a_hit_that_resets_an_ignored_sigtrap_stops_the_run() {
+    let _guard = hermit_run_guard();
+    let (guest, watched) = &guests().sigtrap_ignored;
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let output = run(&[
+        "run".to_string(),
+        EPOCH.to_string(),
+        path_arg(
+            "--record-preemptions-to",
+            &directory.path().join("p.events"),
+        ),
+        path_arg(
+            "--record-access-trace-to",
+            &directory.path().join("p.access"),
+        ),
+        format!("--watch={watched:#x}:8:w"),
+        "--".to_string(),
+        guest.display().to_string(),
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "{output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("hermit: --watch refused: a watchpoint hit on thread")
+            && ["ActionReset", "Unknown"].iter().any(|state| {
+                stderr.contains(&format!(
+                    "may have changed the guest's SIGTRAP state ({state})"
+                ))
+            }),
+        "{stderr}"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "the guest stopped before it printed"
+    );
+}
+
+/// Exec clears a thread's debug registers, and the new image's first
+/// instructions can store to a watched global before its first syscall. The
+/// thread arms again at the exec itself, so that store is reported: one hit,
+/// by the thread that exec'd, after the exec's event.
+#[test]
+fn a_watch_survives_exec_into_an_image_that_stores_first() {
+    let _guard = hermit_run_guard();
+    let guests = guests();
+    let (store_first, watched) = &guests.store_first;
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let trace_path = directory.path().join("exec.access");
+    let args = vec![
+        "run".to_string(),
+        EPOCH.to_string(),
+        path_arg(
+            "--record-preemptions-to",
+            &directory.path().join("exec.events"),
+        ),
+        path_arg("--record-access-trace-to", &trace_path),
+        format!("--watch={watched:#x}:8:w"),
+        "--".to_string(),
+        guests.exec_into.display().to_string(),
+        store_first.display().to_string(),
+    ];
+    let output = run(&args);
+    assert!(output.status.success(), "{args:?}: {output:?}");
+    let trace = read_access_trace(fs::read(&trace_path).expect("no trace").as_slice())
+        .expect("trace does not parse");
+    let execs: Vec<&SyscallRecord> = trace
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            TraceRecord::Syscall(call) if call.sysno.name() == "execve" => Some(call),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(execs.len(), 2, "the launcher's and the guest's: {execs:?}");
+    let hits: Vec<_> = trace
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            TraceRecord::WatchHit(hit) => Some(hit),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!((hits[0].tid, hits[0].addr), (execs[1].tid, *watched));
+    assert!(hits[0].after > execs[1].pre, "{hits:?} {execs:?}");
+}
+
+/// The blocked twin of the exec case above: the launcher arms, blocks
+/// SIGTRAP, then execs the same first-store image. Exec clears the debug
+/// registers and the new image cannot re-arm, so its store is uncovered.
+/// That interval must be reported (a second summary for the thread and
+/// the incomplete-coverage warning) without erasing the first image's
+/// armed interval. The unblocked case above is the positive re-arm
+/// control: exactly one hit and no such interval.
+#[test]
+fn a_blocked_rearm_after_exec_reports_the_uncovered_interval() {
+    let _guard = hermit_run_guard();
+    let guests = guests();
+    let (store_first, watched) = &guests.store_first;
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let trace_path = directory.path().join("exec-blocked.access");
+    let args = vec![
+        "run".to_string(),
+        EPOCH.to_string(),
+        path_arg(
+            "--record-preemptions-to",
+            &directory.path().join("exec-blocked.events"),
+        ),
+        path_arg("--record-access-trace-to", &trace_path),
+        format!("--watch={watched:#x}:8:w"),
+        "--".to_string(),
+        guests.exec_blocked.display().to_string(),
+        store_first.display().to_string(),
+    ];
+    let output = run(&args);
+    assert!(output.status.success(), "{args:?}: {output:?}");
+    let trace = read_access_trace(fs::read(&trace_path).expect("no trace").as_slice())
+        .expect("trace does not parse");
+    let execs: Vec<&SyscallRecord> = trace
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            TraceRecord::Syscall(call) if call.sysno.name() == "execve" => Some(call),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(execs.len(), 2, "the launcher's and the guest's: {execs:?}");
+    let tid = execs[1].tid;
+    let hits: Vec<_> = trace
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            TraceRecord::WatchHit(hit) => Some(hit),
+            _ => None,
+        })
+        .collect();
+    assert!(hits.is_empty(), "the uncovered store has no hit: {hits:?}");
+    let summaries: Vec<_> = trace
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            TraceRecord::WatchSummary(summary) if summary.tid == tid => Some(summary),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(summaries.len(), 2, "{summaries:?}");
+    assert!(
+        summaries[0].armed_before.is_some() && summaries[0].unarmed.is_none(),
+        "the first image's armed interval is kept: {summaries:?}"
+    );
+    assert_eq!(summaries[1].armed_before, None, "{summaries:?}");
+    assert_eq!(
+        summaries[1].unarmed,
+        Some(detcore_model::access_trace::WatchUnarmed::SigtrapBlocked),
+        "{summaries:?}"
+    );
+    assert_eq!(summaries[1].hits, 0, "{summaries:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--watch: some watch intervals were never armed")
+            && stderr.contains(&format!("thread {tid} (SigtrapBlocked)")),
+        "{stderr}"
+    );
+}
+
+/// The recovery twin: the blocked launcher execs an image that stores,
+/// unblocks SIGTRAP, and stores again. Only the second store is
+/// observed, and resuming observation must not erase the uncovered
+/// interval: three summaries for the thread (armed, uncovered, armed),
+/// one hit, and the incomplete-coverage warning.
+#[test]
+fn a_recovered_rearm_after_exec_keeps_the_uncovered_interval() {
+    let _guard = hermit_run_guard();
+    let guests = guests();
+    let (target, watched) = &guests.store_unblock_store;
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let trace_path = directory.path().join("exec-recovered.access");
+    let args = vec![
+        "run".to_string(),
+        EPOCH.to_string(),
+        path_arg(
+            "--record-preemptions-to",
+            &directory.path().join("exec-recovered.events"),
+        ),
+        path_arg("--record-access-trace-to", &trace_path),
+        format!("--watch={watched:#x}:8:w"),
+        "--".to_string(),
+        guests.exec_blocked.display().to_string(),
+        target.display().to_string(),
+    ];
+    let output = run(&args);
+    assert!(output.status.success(), "{args:?}: {output:?}");
+    let trace = read_access_trace(fs::read(&trace_path).expect("no trace").as_slice())
+        .expect("trace does not parse");
+    let execs: Vec<&SyscallRecord> = trace
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            TraceRecord::Syscall(call) if call.sysno.name() == "execve" => Some(call),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(execs.len(), 2, "the launcher's and the guest's: {execs:?}");
+    let tid = execs[1].tid;
+    let hits: Vec<_> = trace
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            TraceRecord::WatchHit(hit) => Some(hit),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(hits.len(), 1, "only the post-unblock store: {hits:?}");
+    assert_eq!((hits[0].tid, hits[0].addr), (tid, *watched));
+    let summaries: Vec<_> = trace
+        .records
+        .iter()
+        .filter_map(|record| match record {
+            TraceRecord::WatchSummary(summary) if summary.tid == tid => Some(summary),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(summaries.len(), 3, "{summaries:?}");
+    assert!(
+        summaries[0].armed_before.is_some() && summaries[0].unarmed.is_none(),
+        "the launcher image's armed interval is kept: {summaries:?}"
+    );
+    assert_eq!(summaries[1].armed_before, None, "{summaries:?}");
+    assert_eq!(
+        summaries[1].unarmed,
+        Some(detcore_model::access_trace::WatchUnarmed::SigtrapBlocked),
+        "{summaries:?}"
+    );
+    assert_eq!(summaries[1].hits, 0, "{summaries:?}");
+    assert!(
+        summaries[2].armed_before.is_some()
+            && summaries[2].unarmed.is_none()
+            && summaries[2].hits == 1,
+        "observation resumed after the unblock: {summaries:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--watch: some watch intervals were never armed")
+            && stderr.contains(&format!("thread {tid} (SigtrapBlocked)")),
+        "{stderr}"
+    );
+}

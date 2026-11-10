@@ -1,0 +1,222 @@
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <errno.h>
+#include <linux/capability.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <string>
+#include <vector>
+
+#include "gmock/gmock.h"
+#include "gtest/gtest.h"
+#include "absl/algorithm/container.h"
+#include "absl/strings/str_format.h"
+#include "test/util/capability_util.h"
+#include "test/util/cleanup.h"
+#include "test/util/fs_util.h"
+#include "test/util/linux_capability_util.h"
+#include "test/util/logging.h"
+#include "test/util/multiprocess_util.h"
+#include "test/util/posix_error.h"
+#include "test/util/proc_util.h"
+#include "test/util/test_util.h"
+#include "test/util/thread_util.h"
+
+namespace gvisor {
+namespace testing {
+
+namespace {
+
+PosixErrorOr<ProcLimitsEntry> GetProcLimitEntryByType(LimitType limit_type) {
+  ASSIGN_OR_RETURN_ERRNO(std::string proc_self_limits,
+                         GetContents("/proc/self/limits"));
+  ASSIGN_OR_RETURN_ERRNO(auto entries, ParseProcLimits(proc_self_limits));
+  auto it = absl::c_find_if(entries, [limit_type](const ProcLimitsEntry& v) {
+    return v.limit_type == limit_type;
+  });
+  if (it == entries.end()) {
+    return PosixError(ENOENT, absl::StrFormat("limit type \"%s\" not found",
+                                              LimitTypeToString(limit_type)));
+  }
+  return *it;
+}
+
+TEST(RlimitTest, SetRlimitHigher) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_RESOURCE)));
+
+  struct rlimit rl = {};
+  EXPECT_THAT(getrlimit(RLIMIT_NOFILE, &rl), SyscallSucceeds());
+
+  // Lower the rlimit first, as it may be equal to /proc/sys/fs/nr_open, in
+  // which case even users with CAP_SYS_RESOURCE can't raise it.
+  rl.rlim_cur--;
+  rl.rlim_max--;
+  ASSERT_THAT(setrlimit(RLIMIT_NOFILE, &rl), SyscallSucceeds());
+
+  // Now verify we can read the changed values via /proc/self/limits
+  const ProcLimitsEntry limit_entry = ASSERT_NO_ERRNO_AND_VALUE(
+      GetProcLimitEntryByType(LimitType::kNumberOfFiles));
+  EXPECT_EQ(rl.rlim_cur, limit_entry.cur_limit);
+  EXPECT_EQ(rl.rlim_max, limit_entry.max_limit);
+
+  rl.rlim_max++;
+  EXPECT_THAT(setrlimit(RLIMIT_NOFILE, &rl), SyscallSucceeds());
+}
+
+TEST(RlimitTest, UnprivilegedSetRlimit) {
+  // Drop privileges if necessary.
+  AutoCapability cap(CAP_SYS_RESOURCE, false);
+
+  // Lowering the hard limit is irreversible without CAP_SYS_RESOURCE, so use a
+  // subprocess. Zero is valid regardless of the inherited limit and does not
+  // affect already-open descriptors.
+  EXPECT_THAT(InForkedProcess([] {
+                struct rlimit rl = {};
+                TEST_PCHECK(setrlimit(RLIMIT_NOFILE, &rl) == 0);
+
+                struct rlimit rl2 = {};
+                TEST_PCHECK(getrlimit(RLIMIT_NOFILE, &rl2) == 0);
+                TEST_CHECK(rl2.rlim_cur == 0);
+                TEST_CHECK(rl2.rlim_max == 0);
+
+                rl.rlim_max = 1;
+                TEST_CHECK_ERRNO(setrlimit(RLIMIT_NOFILE, &rl), EPERM);
+              }),
+              IsPosixErrorOkAndHolds(0));
+}
+
+TEST(RlimitTest, SetSoftRlimitAboveHard) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_RESOURCE)));
+
+  struct rlimit rl = {};
+  EXPECT_THAT(getrlimit(RLIMIT_NOFILE, &rl), SyscallSucceeds());
+
+  rl.rlim_cur = rl.rlim_max + 1;
+  EXPECT_THAT(setrlimit(RLIMIT_NOFILE, &rl), SyscallFailsWithErrno(EINVAL));
+}
+
+TEST(RlimitTest, RlimitNProc) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+
+  // The native test can be run in a user namespace without a mapping for
+  // kNobody or there can be other processes that are running from the kNobody
+  // user.
+  SKIP_IF(GvisorPlatform() == Platform::kNative);
+
+  // Run the test in a sub-thread to avoid changing UID of the current thread.
+  ScopedThread([&] {
+    constexpr int kNobody = 65534;
+    EXPECT_THAT(syscall(SYS_setuid, kNobody), SyscallSucceeds());
+
+    struct rlimit rl = {};
+    EXPECT_THAT(getrlimit(RLIMIT_NPROC, &rl), SyscallSucceeds());
+
+    constexpr int kNProc = 10;
+    rl.rlim_cur = kNProc;
+    EXPECT_THAT(setrlimit(RLIMIT_NPROC, &rl), SyscallSucceeds());
+
+    constexpr int kIterations = 2;
+    // Run test actions a few times to check that processes are not leaked.
+    for (int iter = 0; iter < kIterations; iter++) {
+      pid_t pids[kNProc];
+      for (int i = 0; i < kNProc; i++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+          // Child process: Wait passively until the parent terminates us.
+          while (true) {
+            pause();
+          }
+        }
+        // Parent process: Record the child's PID and continue the test.
+        EXPECT_THAT(pid, SyscallSucceeds());
+        pids[i] = pid;
+      }
+      auto cleanup = Cleanup([pids] {
+        for (int i = 0; i < kNProc; i++) {
+          if (pids[i] < 0) {
+            continue;
+          }
+          EXPECT_THAT(kill(pids[i], SIGKILL), SyscallSucceeds());
+          EXPECT_THAT(waitpid(pids[i], nullptr, 0), SyscallSucceeds());
+        }
+      });
+      pid_t pid = fork();
+      if (pid == 0) {
+        _exit(1);
+      }
+      EXPECT_THAT(pid, SyscallFailsWithErrno(EAGAIN));
+    }
+  }).Join();
+}
+
+TEST(RlimitTest, SetRlimitRtPrio) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_RESOURCE)));
+
+  struct rlimit old_rl = {};
+  EXPECT_THAT(getrlimit(RLIMIT_RTPRIO, &old_rl), SyscallSucceeds());
+
+  struct rlimit rl = {
+      .rlim_cur = 5,
+      .rlim_max = 10,
+  };
+  int const ret = setrlimit(RLIMIT_RTPRIO, &rl);
+  if (ret == -1 && rl.rlim_max > old_rl.rlim_max) {
+    // In a non-init user namespace, raising rlim_max above the current hard
+    // limit fails with EPERM because CAP_SYS_RESOURCE is required in the
+    // initial user namespace.
+    EXPECT_EQ(errno, EPERM);
+    return;
+  }
+  EXPECT_THAT(ret, SyscallSucceeds());
+
+  EXPECT_THAT(getrlimit(RLIMIT_RTPRIO, &rl), SyscallSucceeds());
+  EXPECT_EQ(rl.rlim_cur, 5);
+  EXPECT_EQ(rl.rlim_max, 10);
+}
+
+TEST(RlimitTest, SetRlimitMsgqueue) {
+  struct rlimit rl = {};
+  ASSERT_THAT(getrlimit(RLIMIT_MSGQUEUE, &rl), SyscallSucceeds());
+  EXPECT_THAT(setrlimit(RLIMIT_MSGQUEUE, &rl), SyscallSucceeds());
+
+  if (rl.rlim_cur > 0) {
+    rl.rlim_cur--;
+  }
+  EXPECT_THAT(setrlimit(RLIMIT_MSGQUEUE, &rl), SyscallSucceeds());
+
+  struct rlimit got = {};
+  EXPECT_THAT(getrlimit(RLIMIT_MSGQUEUE, &got), SyscallSucceeds());
+  EXPECT_EQ(got.rlim_cur, rl.rlim_cur);
+  EXPECT_EQ(got.rlim_max, rl.rlim_max);
+}
+
+TEST(RlimitTest, ParseProcPidLimits) {
+  auto proc_self_limits =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/limits"));
+  auto entries = ASSERT_NO_ERRNO_AND_VALUE(ParseProcLimits(proc_self_limits));
+  EXPECT_EQ(entries.size(), LimitTypes.size());
+}
+
+}  // namespace
+
+}  // namespace testing
+}  // namespace gvisor

@@ -348,6 +348,371 @@ fn record_replay_locks_a_file_created_on_a_guest_private_tmpfs() {
     );
 }
 
+/// Issue 5007 mode (b): the guest creates a file itself, then opens the
+/// *existing* file by a relative path (no `O_CREAT`) and flocks the
+/// descriptor — the JVM lock-file pattern. Replay must materialize or
+/// register that recorded flock target; it must not panic with "cannot
+/// replay flock side effects for descriptor N outside the replay root".
+#[test]
+fn record_replay_flocks_a_self_created_file_opened_by_relative_path() {
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let mountpoint = tempfile::tempdir().expect("failed to create guest workdir");
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "start", "--verify", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg(format!("--workdir={}", mountpoint.path().display()))
+        .args([
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf x > 9 && exec 9<>9 && flock -n 9 && echo locked && rm 9",
+        ]);
+    let output = command_output(
+        command,
+        "record/replay of flock on a self-created relative-path file",
+    );
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined_output.contains("cannot replay flock side effects"),
+        "replay panicked on the recorded flock target:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("locked\n"),
+        "the guest did not take its lock:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("Success: replay matched recording."),
+        "Hermit did not report matching replay:\n{combined_output}"
+    );
+}
+
+/// A fifo the guest creates and then flocks (the JVM perf-data file
+/// pattern behind dh-gg5uv): the recorder marks a fifo open with no
+/// materialization. Replay must put a real descriptor for that fifo
+/// in the guest — it exists beneath the replay root because replay
+/// itself injected the recorded mkfifo — and take the lock for real,
+/// not panic with "cannot replay flock side effects" and not lock a
+/// placeholder in the fifo's place.
+#[test]
+fn record_replay_flocks_a_guest_created_fifo() {
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let mountpoint = tempfile::tempdir().expect("failed to create guest workdir");
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "start", "--verify", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg(format!("--workdir={}", mountpoint.path().display()))
+        .args([
+            "--",
+            "/bin/sh",
+            "-c",
+            "mkfifo p && exec 9<>p && flock -n 9 && echo locked",
+        ]);
+    let output = command_output(command, "record/replay of flock on a guest-created fifo");
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !combined_output.contains("cannot replay flock side effects"),
+        "replay panicked on the recorded flock target:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("locked\n"),
+        "the guest did not take its lock:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("Success: replay matched recording."),
+        "Hermit did not report matching replay:\n{combined_output}"
+    );
+}
+
+/// The JVM hsperfdata shape from dh-gg5uv's landing validation: a
+/// non-leader thread changes into a perf directory, creates and closes
+/// its PID-named file by a bare relative path, then reopens that same
+/// bare path read-only and flocks it. Replay must resolve both opens
+/// against the opening thread's base directory, not the leader's state
+/// at the later flock.
+#[test]
+fn record_replay_flocks_thread_reopened_relative_file_after_chdir() {
+    let combined_output = flock_guest_output(
+        concat!(
+            "cat > reopen.py <<'PY'\n",
+            "import fcntl, os, threading\n",
+            "\n",
+            "def worker():\n",
+            "    os.chdir(\"perf\")\n",
+            "    created = os.open(\"9\", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)\n",
+            "    os.close(created)\n",
+            "    fd = os.open(\"9\", os.O_RDONLY | os.O_CLOEXEC)\n",
+            "    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n",
+            "    print(\"locked-thread-reopen-9\", flush=True)\n",
+            "\n",
+            "thread = threading.Thread(target=worker)\n",
+            "thread.start()\n",
+            "thread.join()\n",
+            "PY\n",
+            "mkdir perf && python3 reopen.py"
+        ),
+        "record/replay of thread reopened relative flock after chdir",
+    );
+    assert!(
+        !combined_output.contains("cannot replay flock side effects"),
+        "replay panicked on the recorded flock target:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("locked-thread-reopen-9\n"),
+        "the guest did not take its lock:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("Success: replay matched recording."),
+        "Hermit did not report matching replay:\n{combined_output}"
+    );
+}
+
+/// Runs one record/verify of a shell flock guest and returns its combined
+/// output, for the fifo lock-domain tests below.
+fn flock_guest_output(script: &str, what: &str) -> String {
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let mountpoint = tempfile::tempdir().expect("failed to create guest workdir");
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "start", "--verify", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg(format!("--workdir={}", mountpoint.path().display()))
+        .args(["--", "/bin/sh", "-c", script]);
+    let output = command_output(command, what);
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+/// The lock a replayed `flock` takes must be on the recorded object, not
+/// on its placeholder: two distinct fifos are distinct lock domains, so
+/// locking both must succeed exactly as recorded. Placeholders are all
+/// `anon_inode:[eventfd]`, and locking those instead (dh-gg5uv review)
+/// made the second lock falsely contend with the first.
+#[test]
+fn record_replay_locks_two_guest_created_fifos() {
+    let combined_output = flock_guest_output(
+        "mkfifo p q && exec 9<>p 8<>q && flock -n 9 && flock -n 8 && echo both-locked",
+        "record/replay of locks on two guest-created fifos",
+    );
+    assert!(
+        combined_output.contains("both-locked\n"),
+        "the guest did not take both locks:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("Success: replay matched recording."),
+        "Hermit did not report matching replay:\n{combined_output}"
+    );
+}
+
+/// The converse: one fifo is one lock domain, so while the shell's
+/// descriptor holds an exclusive lock, a contender opening the same fifo
+/// separately must fail nonblocking exactly as recorded. A replay that
+/// locked two different placeholders would let the contender win and
+/// diverge from the recording.
+#[test]
+fn record_replay_fifo_lock_excludes_a_contender() {
+    let combined_output = flock_guest_output(
+        "mkfifo p && exec 9<>p && flock -n 9 && echo locked; \
+         flock -n p -c true && echo contender-won || echo contender-blocked",
+        "record/replay of fifo lock contention",
+    );
+    assert!(
+        combined_output.contains("locked\n"),
+        "the guest did not take its lock:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("contender-blocked\n")
+            && !combined_output.contains("contender-won"),
+        "the contender was not excluded by the fifo lock:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("Success: replay matched recording."),
+        "Hermit did not report matching replay:\n{combined_output}"
+    );
+}
+
+/// One recorded open is one lock domain however many descriptors
+/// alias it: locking through a dup'ed descriptor and again through
+/// the original succeeds both times natively (the second call names
+/// the lock the shared open file description already holds). Replay
+/// must not give the two descriptors separate open file descriptions
+/// to lock against each other (dh-gg5uv re-review).
+#[test]
+fn record_replay_locks_a_fifo_through_dup_aliases() {
+    let combined_output = flock_guest_output(
+        "mkfifo p && exec 9<>p && exec 8<&9 && flock -n 9 && flock -n 8 && echo alias-locked",
+        "record/replay of fifo locks through dup aliases",
+    );
+    assert!(
+        combined_output.contains("alias-locked\n"),
+        "the guest did not lock through both aliases:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("Success: replay matched recording."),
+        "Hermit did not report matching replay:\n{combined_output}"
+    );
+}
+
+/// A lock taken and released through an inherited descriptor is gone
+/// afterwards: a contender opening the fifo after the unlock takes
+/// it. Replay must neither lose the lock early (contender wins while
+/// the opener still holds the descriptor) nor keep it past the
+/// recorded unlock (contender blocked after release).
+#[test]
+fn record_replay_fifo_unlock_releases_for_a_contender() {
+    let combined_output = flock_guest_output(
+        "mkfifo p && exec 9<>p && flock -n 9 && flock -u 9 && flock -n p -c true && echo relocked",
+        "record/replay of fifo unlock and contender relock",
+    );
+    assert!(
+        combined_output.contains("relocked\n"),
+        "the contender did not lock after the recorded unlock:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("Success: replay matched recording."),
+        "Hermit did not report matching replay:\n{combined_output}"
+    );
+}
+
+/// A recording's guest gets a private, empty `/dev/shm`, as `hermit run`'s
+/// does: it neither sees the host's objects nor leaves its own there, and its
+/// replay matches.
+#[test]
+fn record_replay_gives_the_guest_a_private_dev_shm() {
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    // Removed when dropped, however the test ends.
+    let host_object = tempfile::Builder::new()
+        .prefix("hermit-record-host-object-")
+        .tempfile_in("/dev/shm")
+        .expect("failed to create a host /dev/shm object");
+    let host_object = host_object.path();
+    let guest_object = format!("hermit-record-guest-object-{}", std::process::id());
+    let script = format!(
+        "ls -A /dev/shm | wc -l && test ! -e {} && echo guest > /dev/shm/{guest_object} \
+         && ls /dev/shm",
+        host_object.display()
+    );
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "start", "--verify", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .args(["--", "/bin/sh", "-c", &script]);
+    let output = command_output(command, "record/replay in a private /dev/shm");
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(&format!("0\n{guest_object}\n")),
+        "the guest's /dev/shm was not private and empty:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("Success: replay matched recording."),
+        "Hermit did not report matching replay:\n{combined_output}"
+    );
+    assert!(
+        !Path::new("/dev/shm").join(&guest_object).exists(),
+        "the guest's object reached the host's /dev/shm"
+    );
+}
+
+/// A recording's guest gets its own IPC namespace and `/dev/mqueue`, as
+/// `hermit run`'s does: it neither lists the host's message queues nor leaves
+/// its own in the host's namespace, and its replay matches.
+#[test]
+fn record_replay_gives_the_guest_a_private_ipc_namespace() {
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let host_queue =
+        Path::new("/dev/mqueue").join(format!("hermit-record-host-queue-{}", std::process::id()));
+    // One one-byte message at most, far below the user's RLIMIT_MSGQUEUE.
+    let c_name = std::ffi::CString::new(format!(
+        "/{}",
+        host_queue.file_name().unwrap().to_str().unwrap()
+    ))
+    .unwrap();
+    // SAFETY: an all-zero mq_attr is valid; the fields set are the ones
+    // mq_open reads.
+    let mut attributes: libc::mq_attr = unsafe { std::mem::zeroed() };
+    attributes.mq_maxmsg = 1;
+    attributes.mq_msgsize = 1;
+    // SAFETY: the name is NUL-terminated and the attributes outlive the call.
+    let queue = unsafe {
+        libc::mq_open(
+            c_name.as_ptr(),
+            libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+            0o600,
+            &mut attributes as *mut libc::mq_attr,
+        )
+    };
+    assert!(
+        queue != -1,
+        "failed to create a host message queue: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: the descriptor was just opened here.
+    unsafe { libc::mq_close(queue) };
+    assert!(
+        host_queue.exists(),
+        "/dev/mqueue is not the mqueue mount of this process's IPC namespace"
+    );
+    // Removed when dropped, however the test ends.
+    struct Remove<'a>(&'a Path);
+    impl Drop for Remove<'_> {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(self.0);
+        }
+    }
+    let _remove = Remove(&host_queue);
+    let guest_queue = format!("hermit-record-guest-queue-{}", std::process::id());
+    let script = format!(
+        "ls -A /dev/mqueue | wc -l && : > /dev/mqueue/{guest_queue} && ls /dev/mqueue \
+         && rm /dev/mqueue/{guest_queue}"
+    );
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["record", "start", "--verify", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .args(["--", "/bin/sh", "-c", &script]);
+    let output = command_output(command, "record/replay in a private IPC namespace");
+    let combined_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(&format!("0\n{guest_queue}\n")),
+        "the guest's /dev/mqueue was not its own and empty:\n{combined_output}"
+    );
+    assert!(
+        combined_output.contains("Success: replay matched recording."),
+        "Hermit did not report matching replay:\n{combined_output}"
+    );
+    assert!(host_queue.exists(), "the guest removed the host's queue");
+}
+
 /// Records `script` with standard output `record_stdout`, then lets `prepare`
 /// reset host state and replays the recording with `--autopilot` and standard
 /// output `replay_stdout`, returning the replay's output.
@@ -811,6 +1176,401 @@ fn shared_own_getters_preserve_record_replay_stream() {
     assert_eq!(outputs.left.stderr_bytes, 0);
 }
 
+/// A guest that connects a socket to its own listener, sends that socket
+/// over a `socketpair` and closes its descriptor, so that only the queued
+/// message holds it, then accepts the connection and sends another
+/// descriptor through the accepted socket before it receives the connecting
+/// one, and through it the other descriptor. It prints the numbers of the
+/// accepted socket, the descriptor it sent through it, the connecting
+/// socket received and the descriptor received through that.
+const QUEUED_CONNECTION_SOURCE: &str = r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+static void die(const char* what) {
+  fprintf(stderr, "queued-connection: %s: %s\n", what, strerror(errno));
+  exit(1);
+}
+
+static void send_descriptor(int socket, int fd) {
+  char byte = 'x';
+  char control[CMSG_SPACE(sizeof(int))];
+  memset(control, 0, sizeof(control));
+  struct iovec vector = {.iov_base = &byte, .iov_len = 1};
+  struct msghdr message = {
+      .msg_iov = &vector,
+      .msg_iovlen = 1,
+      .msg_control = control,
+      .msg_controllen = sizeof(control),
+  };
+  struct cmsghdr* header = CMSG_FIRSTHDR(&message);
+  header->cmsg_level = SOL_SOCKET;
+  header->cmsg_type = SCM_RIGHTS;
+  header->cmsg_len = CMSG_LEN(sizeof(int));
+  memcpy(CMSG_DATA(header), &fd, sizeof(fd));
+  if (sendmsg(socket, &message, 0) != 1) {
+    die("sendmsg");
+  }
+}
+
+static int receive_descriptor(int socket) {
+  char byte = 0;
+  char control[CMSG_SPACE(sizeof(int))];
+  struct iovec vector = {.iov_base = &byte, .iov_len = 1};
+  struct msghdr message = {
+      .msg_iov = &vector,
+      .msg_iovlen = 1,
+      .msg_control = control,
+      .msg_controllen = sizeof(control),
+  };
+  if (recvmsg(socket, &message, 0) != 1) {
+    die("recvmsg");
+  }
+  struct cmsghdr* header = CMSG_FIRSTHDR(&message);
+  if (header == NULL || header->cmsg_type != SCM_RIGHTS) {
+    die("no descriptor");
+  }
+  int received;
+  memcpy(&received, CMSG_DATA(header), sizeof(received));
+  return received;
+}
+
+int main(void) {
+  static const char abstract[] = "\0hermit-record-replay-queued-connection";
+  struct sockaddr_un name = {.sun_family = AF_UNIX};
+  memcpy(name.sun_path, abstract, sizeof(abstract) - 1);
+  socklen_t length = offsetof(struct sockaddr_un, sun_path) + sizeof(abstract) - 1;
+  int listener = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (listener < 0 || bind(listener, (struct sockaddr*)&name, length) != 0 ||
+      listen(listener, 1) != 0) {
+    die("listener");
+  }
+  int connecting = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  if (connecting < 0 || connect(connecting, (struct sockaddr*)&name, length) != 0) {
+    die("connect");
+  }
+  int pair[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) {
+    die("socketpair");
+  }
+  send_descriptor(pair[0], connecting);
+  close(connecting);
+  int accepted = accept(listener, NULL, NULL);
+  if (accepted < 0) {
+    die("accept");
+  }
+  int carried = open("/dev/null", O_RDONLY);
+  if (carried < 0) {
+    die("open");
+  }
+  send_descriptor(accepted, carried);
+  int connection = receive_descriptor(pair[1]);
+  int received = receive_descriptor(connection);
+  printf("accepted=%d carried=%d connection=%d received=%d\n", accepted, carried, connection,
+         received);
+  return 0;
+}
+"#;
+
+/// Under record and replay a queued `SCM_RIGHTS` message keeps the ownership
+/// the existing recordings were made with, which keeps nothing alive
+/// (https://github.com/rrnewton/hermit/issues/4930). In
+/// [`QUEUED_CONNECTION_SOURCE`] only the queued message holds the connecting
+/// socket when the listener accepts its connection, so the accepted socket is
+/// not paired with it, as before, and the send through the accepted socket
+/// queues nothing: it takes no `fstat` through the recording, an event no
+/// recording made before would hold, and its replay would then diverge. The
+/// receipt through the connecting socket still takes its own `fstat`, and
+/// the recording replays, at L2. Each run's log names the calls and the
+/// `fstat` each took between them.
+#[test]
+fn record_replay_keeps_the_ownership_recordings_were_made_with() {
+    let _guard = hermit_record_lock();
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let source = build.path().join("queued_connection.c");
+    fs::write(&source, QUEUED_CONNECTION_SOURCE).expect("write the guest's source");
+    let guest = build.path().join("queued_connection");
+    let compilation = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("compile the queued-connection guest");
+    assert!(compilation.status.success(), "{compilation:?}");
+
+    let data = tempfile::tempdir().unwrap();
+    let verdict = data.path().join("verify.json");
+    let mut command = Command::new("timeout");
+    command
+        .env("HERMIT_MODE", "record")
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=info",
+            "--backend=ptrace",
+            "record",
+            "start",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--record-timeout=30",
+        ])
+        .arg(format!("--verify-json={}", verdict.display()))
+        .arg(format!("--data-dir={}", data.path().display()))
+        .arg("--")
+        .arg(&guest);
+    let output =
+        hermit_test::hermit_output_attempts("record/replay queued connection", 1, &mut command);
+    assert!(output.status.success(), "{command:?}: {output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Success: replay matched recording."),
+        "{output:?}"
+    );
+    let report: hermit::canonical_verdict::VerificationReport =
+        serde_json::from_slice(&fs::read(verdict).unwrap()).unwrap();
+    assert_eq!(report.verdict, hermit::canonical_verdict::Verdict::Matched);
+    assert!(report.verified && report.bitwise_parity);
+
+    // The events each run took through the recording, from their logs.
+    let recording = tempfile::tempdir().unwrap();
+    let logs = tempfile::tempdir().unwrap();
+    let record_log = logs.path().join("record.log");
+    let replay_log = logs.path().join("replay.log");
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=info", "--backend=ptrace"])
+        .arg(format!("--log-file={}", record_log.display()))
+        .args(["record", "start", "--strict", "--record-timeout=30"])
+        .arg(format!("--data-dir={}", recording.path().display()))
+        .arg("--")
+        .arg(&guest);
+    let recorded = command_output(record, "recording of the queued-connection guest");
+    let mut replay = Command::new("timeout");
+    replay
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg("--log=info")
+        .arg(format!("--log-file={}", replay_log.display()))
+        .args(["replay", "--autopilot"])
+        .arg(format!("--data-dir={}", recording.path().display()));
+    let replayed = command_output(replay, "replay of the queued-connection guest");
+    let stdout = String::from_utf8_lossy(&recorded.stdout).into_owned();
+    assert_eq!(String::from_utf8_lossy(&replayed.stdout), stdout);
+    let number = |key: &str| {
+        stdout
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix(key))
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or_else(|| panic!("no {key} in the guest's output: {stdout}"))
+    };
+    let accepted = number("accepted=");
+    let connection = number("connection=");
+    let received = number("received=");
+    for (label, log) in [("recording", &record_log), ("replay", &replay_log)] {
+        let log = fs::read_to_string(log).unwrap_or_else(|error| panic!("{label} log: {error}"));
+        // The `fstat`s a call took through the recording: the lines from its
+        // entry to its result.
+        let fstats_of = |call: &str| -> Vec<&str> {
+            let mut lines = log
+                .lines()
+                .skip_while(|line| !line.contains(&format!("inbound syscall: {call}")));
+            let entry = lines
+                .next()
+                .unwrap_or_else(|| panic!("the {label} log has no {call}...:\n{log}"));
+            assert!(entry.contains("inbound syscall"));
+            lines
+                .take_while(|line| !line.contains("finish syscall"))
+                .filter(|line| line.contains("Taking fstat through the recording"))
+                .collect()
+        };
+        let receipt = fstats_of(&format!("recvmsg({connection}, "));
+        assert!(
+            receipt.len() == 1 && receipt[0].ends_with(&format!("classify fd {received}.")),
+            "the {label}'s receipt through the connecting socket took one fstat, of the \
+             descriptor it received: {receipt:?}"
+        );
+        assert_eq!(
+            fstats_of(&format!("sendmsg({accepted}, ")),
+            Vec::<&str>::new(),
+            "the {label}'s send through the accepted socket took an fstat through the \
+             recording, which recordings made before lack"
+        );
+    }
+}
+
+/// A guest that sends a message of data alone and then one carrying an
+/// eventfd holding 5, which it keeps, over a datagram `socketpair`, reads the
+/// data with `preadv2` at the current offset, receives the eventfd and reads
+/// it. It prints the bytes the `preadv2` read and what the eventfd's read
+/// returned; Linux 7.1.3 prints `data=1 read=8 value=5`.
+const PREADV2_DATA_THEN_EVENTFD_SOURCE: &str = r#"
+#define _GNU_SOURCE
+#include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/eventfd.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+#include <unistd.h>
+
+static void die(const char* what) {
+  fprintf(stderr, "preadv2-data-then-eventfd: %s: %s\n", what, strerror(errno));
+  exit(1);
+}
+
+int main(void) {
+  int pair[2];
+  if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) != 0) {
+    die("socketpair");
+  }
+  int counter = eventfd(5, 0);
+  if (counter < 0 || write(pair[0], "d", 1) != 1) {
+    die("eventfd");
+  }
+  char byte = 'x';
+  char control[CMSG_SPACE(sizeof(int))];
+  memset(control, 0, sizeof(control));
+  struct iovec vector = {.iov_base = &byte, .iov_len = 1};
+  struct msghdr message = {
+      .msg_iov = &vector,
+      .msg_iovlen = 1,
+      .msg_control = control,
+      .msg_controllen = sizeof(control),
+  };
+  struct cmsghdr* header = CMSG_FIRSTHDR(&message);
+  header->cmsg_level = SOL_SOCKET;
+  header->cmsg_type = SCM_RIGHTS;
+  header->cmsg_len = CMSG_LEN(sizeof(int));
+  memcpy(CMSG_DATA(header), &counter, sizeof(counter));
+  if (sendmsg(pair[0], &message, 0) != 1) {
+    die("sendmsg");
+  }
+  char data = 0;
+  struct iovec into = {.iov_base = &data, .iov_len = 1};
+  ssize_t read_data = preadv2(pair[1], &into, 1, -1, 0);
+  memset(control, 0, sizeof(control));
+  message.msg_controllen = sizeof(control);
+  if (recvmsg(pair[1], &message, 0) != 1) {
+    die("recvmsg");
+  }
+  header = CMSG_FIRSTHDR(&message);
+  if (header == NULL || header->cmsg_type != SCM_RIGHTS) {
+    die("no descriptor");
+  }
+  int received;
+  memcpy(&received, CMSG_DATA(header), sizeof(received));
+  uint64_t value = 0;
+  ssize_t read_value = read(received, &value, sizeof(value));
+  printf("data=%zd read=%zd value=%llu\n", read_data, read_value, (unsigned long long)value);
+  return 0;
+}
+"#;
+
+/// Under record and replay the receive rules are those existing recordings
+/// were made with (https://github.com/rrnewton/hermit/issues/4930): a
+/// `preadv2` at the current offset leaves a socket's queue in lockstep, as
+/// it did, so in [`PREADV2_DATA_THEN_EVENTFD_SOURCE`] the receipt joins the
+/// eventfd its sender keeps, which reads 8 bytes holding 5, as on Linux, and
+/// takes no step a recording made before lacks: a recording made before this
+/// change replays after it. Where the `preadv2` put the queue out of lockstep
+/// instead, the received eventfd joined nothing, was refused, and the read
+/// failed, and a replay of an older recording diverged at that receipt. The
+/// run records and replays at L2.
+#[test]
+fn record_replay_keeps_the_receive_rules_recordings_were_made_with() {
+    let _guard = hermit_record_lock();
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let source = build.path().join("preadv2_data_then_eventfd.c");
+    fs::write(&source, PREADV2_DATA_THEN_EVENTFD_SOURCE).expect("write the guest's source");
+    let guest = build.path().join("preadv2_data_then_eventfd");
+    let compilation = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("compile the preadv2 guest");
+    assert!(compilation.status.success(), "{compilation:?}");
+
+    let data = tempfile::tempdir().unwrap();
+    let verdict = data.path().join("verify.json");
+    let mut command = Command::new("timeout");
+    command
+        .env("HERMIT_MODE", "record")
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=info",
+            "--backend=ptrace",
+            "record",
+            "start",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--record-timeout=30",
+        ])
+        .arg(format!("--verify-json={}", verdict.display()))
+        .arg(format!("--data-dir={}", data.path().display()))
+        .arg("--")
+        .arg(&guest);
+    let output = hermit_test::hermit_output_attempts("record/replay preadv2", 1, &mut command);
+    assert!(output.status.success(), "{command:?}: {output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Success: replay matched recording."),
+        "{output:?}"
+    );
+    let report: hermit::canonical_verdict::VerificationReport =
+        serde_json::from_slice(&fs::read(verdict).unwrap()).unwrap();
+    assert_eq!(report.verdict, hermit::canonical_verdict::Verdict::Matched);
+    assert!(report.verified && report.bitwise_parity);
+
+    let recording = tempfile::tempdir().unwrap();
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--backend=ptrace",
+            "record",
+            "start",
+            "--strict",
+            "--record-timeout=30",
+        ])
+        .arg(format!("--data-dir={}", recording.path().display()))
+        .arg("--")
+        .arg(&guest);
+    let recorded = command_output(record, "recording of the preadv2 guest");
+    let mut replay = Command::new("timeout");
+    replay
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["replay", "--autopilot"])
+        .arg(format!("--data-dir={}", recording.path().display()));
+    let replayed = command_output(replay, "replay of the preadv2 guest");
+    assert_eq!(
+        String::from_utf8_lossy(&recorded.stdout),
+        "data=1 read=8 value=5\n",
+        "the recording's receipt joins the sender's eventfd"
+    );
+    assert_eq!(
+        recorded.stdout, replayed.stdout,
+        "the replay prints the same"
+    );
+}
+
 /// `canonical_record_replay_command`, repeated only when an attempt ends in a
 /// typed PMU skid-overshoot refusal (`skid_overshoot_refusal`), at most
 /// `max_attempts` times in all (https://github.com/rrnewton/hermit/issues/1845).
@@ -842,8 +1602,10 @@ fn canonical_record_replay_command_configured(
     hermit_global: &[&str],
 ) -> String {
     let label = format!("canonical record/replay for {name}");
-    let (attempt, output, (rendered, verdict_path, _dirs)) =
-        retry_typed_skid_refusal(name, max_attempts, || {
+    let (attempt, output, (rendered, verdict_path, _dirs)) = retry_typed_skid_refusal(
+        name,
+        max_attempts,
+        || {
             let data_dir =
                 tempfile::tempdir().expect("failed to create Hermit recording directory");
             let verdict_dir = tempfile::tempdir().expect("failed to create verification directory");
@@ -876,7 +1638,9 @@ fn canonical_record_replay_command_configured(
                 .output()
                 .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
             (output, (rendered, verdict_path, (data_dir, verdict_dir)))
-        });
+        },
+        &|_| {},
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
@@ -3531,6 +4295,41 @@ fn record_vfork_child_waiting_for_another_thread() {
     }
 }
 
+/// A thread blocked in poll() on a pipe beside a thread that sleeps 100 us at
+/// a time until the poller has read every byte records and replays at bitwise
+/// parity. Record runs the poll in the background, and the sleeper, whose
+/// sleeps are shorter than one scheduler turn's charge (500 us, fixed under
+/// record), is runnable at every turn. Record readmitted a finished background call
+/// only once nothing but pollers was queued, so it never readmitted the
+/// poller, and the recording ran until `--record-timeout`. Now record
+/// readmits it in the first scheduler pass that finds it finished and logs
+/// that turn for replay to follow.
+#[test]
+fn record_poller_beside_a_short_sleeper() {
+    let _guard = hermit_record_lock();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest build directory");
+    let guest = build.path().join("poller_beside_short_sleeper");
+    let output = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+        .arg(repository.join("tests/c/poller_beside_short_sleeper.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the poller_beside_short_sleeper guest");
+    assert!(
+        output.status.success(),
+        "guest compilation failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = canonical_record_replay_command("poller beside a short sleeper", &guest, &[]);
+    let line = "polled 5 of 5 bytes\n";
+    assert!(output.contains(line), "missing {line:?} in:\n{output}");
+}
+
 #[test]
 fn record_poll_partial_revents_copyout() {
     let _guard = hermit_record_lock();
@@ -4436,7 +5235,7 @@ fn record_masked_epoll_pwait2_whose_timeout_is_in_the_red_zone() {
 /// .config/nextest.toml). So retries are visible only when the test fails,
 /// and a rise in the refusal rate would show only as more failures at the
 /// bound, as for the cli.rs PMU spinner cases.
-const BUSY_SIBLING_SKID_MAX_ATTEMPTS: u32 = 5;
+const BUSY_SIBLING_SKID_MAX_ATTEMPTS: u32 = detcore_model::SKID_RETRY_MAX_ATTEMPTS;
 
 /// A masked zero-timespec epoll_pwait2 beside a sibling that loops without a
 /// system call: the call keeps its turn. In the background it would wait
@@ -4656,6 +5455,1012 @@ fn record_socketpair_read_after_clearing_nonblocking_waits_for_its_writer() {
         })
         .collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Records `program` under `hermit record start` with `record_args` and then
+/// replays it with `hermit replay --autopilot`, each under a timeout. Returns
+/// the recording's stdout when both phases exit 0 and the replay prints the
+/// same stdout, and otherwise a description of the failure.
+fn record_then_replay_stdout(program: &Path, record_args: &[&str]) -> Result<String, String> {
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "record", "start", "--record-timeout=30"])
+        .args(record_args)
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg("--")
+        .arg(program);
+    let mut replay = Command::new("timeout");
+    replay
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "replay", "--autopilot"])
+        .arg(format!("--data-dir={}", data_dir.path().display()));
+    let mut stdouts = Vec::new();
+    for (phase, mut command) in [("record", record), ("replay", replay)] {
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        if !output.status.success() {
+            return Err(format!(
+                "{record_args:?} {phase}: status {}\nstdout:\n{stdout}stderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        stdouts.push(stdout);
+    }
+    if stdouts[0] != stdouts[1] {
+        return Err(format!(
+            "{record_args:?}: replay printed {:?}, the recording {:?}",
+            stdouts[1], stdouts[0]
+        ));
+    }
+    Ok(stdouts.swap_remove(0))
+}
+
+/// `hermit record start --chaos --seed=N` records under chaos scheduling, and
+/// the recording stores the schedule so that its replay follows it (see
+/// `tests/c/record_replay_chaos_race.c`, whose output is its interleaving).
+/// Before, record had no chaos mode, so a failure that only a chaos seed
+/// provokes could not be captured as a recording and replayed under a
+/// debugger. Each seed's replay must print its recording's interleaving, and
+/// the seeds must between them record more than one interleaving, which the
+/// default scheduler alone never does.
+#[test]
+fn record_chaos_schedule_replays_under_its_seed() {
+    let _guard = hermit_record_lock();
+    let program = &workload("c_record_replay_chaos_race").path;
+    let mut failures = Vec::new();
+    let mut interleavings = std::collections::BTreeSet::new();
+    for seed in 1..=4 {
+        let seed = format!("--seed={seed}");
+        match record_then_replay_stdout(program, &["--chaos", &seed]) {
+            Ok(stdout) => {
+                interleavings.insert(stdout);
+            }
+            Err(failure) => failures.push(failure),
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert!(
+        interleavings.len() > 1,
+        "four chaos seeds recorded one interleaving: {interleavings:?}"
+    );
+}
+
+/// Descriptors received over `SCM_RIGHTS` (see
+/// `tests/c/record_replay_scm_rights.c pipe`): pipe ends sent within the
+/// process and a memfd and pipe end sent by a forked child. Detcore records
+/// each received descriptor by probing it through the recording (`F_GETFD`,
+/// `F_GETFL`, `fstat`), and names the open file a self-sent end carries from
+/// the `fstat` each send through the socketpair takes through the recording
+/// too. A probe that ran live in both phases would let replay, which holds
+/// placeholders where the recording held the received files, find no alias
+/// for the write end, take probes the recording did not, and stop with a
+/// desynchronized stream. Both phases
+/// must print what a native run prints: the received write end is blocking and
+/// reaches the pipe, a blocking read through the received read end waits for a
+/// writer that sleeps first, and the child's descriptors read back its bytes.
+#[test]
+fn record_replay_registers_descriptors_received_over_scm_rights() {
+    let _guard = hermit_record_lock();
+    let failures = record_replay_output_failures(
+        "scm-rights-pipe",
+        &workload("c_record_replay_scm_rights").path,
+        &["pipe"],
+        "pipe write end: distinct=1 nonblock=0\n\
+         pipe write end: read=through\n\
+         pipe read end: cloexec=1 nonblock=0\n\
+         pipe read end: read=late\n\
+         child memfd: read=memfd\n\
+         child pipe: read=child\n\
+         child: exit=0\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Descriptors received over connections a guest made to its own abstract
+/// `AF_UNIX` listener (see `tests/c/record_replay_scm_rights.c stream`): six
+/// threads wait in blocking `recvmsg` calls while the main thread sends each a
+/// pipe end, in the reverse of their thread order, opening an eventfd after
+/// each send. Record used to run those receives outside the scheduler turn as
+/// external I/O, so the kernel installed each descriptor when its send ran,
+/// while replay reserved it when the receive rejoined the schedule, in thread
+/// order and after other threads' opens; every replay stopped with "replay FD
+/// namespace diverged". A socket whose peer is a guest is now polled in the
+/// caller's turn, as a socketpair end is. The first receiver's infinite poll
+/// on a received pipe end and its socket is a `poll` call, which still runs
+/// as before (polling such a `poll` in the turn is left out). After that poll
+/// and its pipe read, the receiver acknowledges completion on the same socket.
+/// The sender waits for that byte before sending its goodbye, so the fixed
+/// readiness output does not rely on the second 10 ms sleep ordering the two.
+/// Each record and replay of each of three rounds must print the expected
+/// native output.
+#[test]
+fn record_replay_receives_descriptors_over_a_guests_own_unix_listener() {
+    let _guard = hermit_record_lock();
+    let failures: Vec<String> = (1..=3)
+        .flat_map(|round| {
+            record_replay_output_failures(
+                &format!("scm-rights-stream round {round}"),
+                &workload("c_record_replay_scm_rights").path,
+                &["stream"],
+                "stream poll: ready=1 pipe=1 socket=0 read=late\n\
+                 stream socket: recv=bye\n\
+                 stream: received=abcdef\n",
+            )
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Eventfds received over `SCM_RIGHTS` (see
+/// `tests/c/record_replay_scm_rights.c eventfd`). Replay applies eventfd reads
+/// and writes in the kernel, and it held an eventfd placeholder, with its own
+/// count, where the recording held each received descriptor: a count written
+/// through a received descriptor never reached the original's reader, whose
+/// blocking read waited until replay refused the run. Replay now makes a
+/// received descriptor that the recording found to alias one in the table a
+/// live duplicate of it, and serves the remaining placeholders' eventfd
+/// operations from the log. Both phases must print what a native run prints
+/// for the aliases. An eventfd whose sender closed its copy, and one from a
+/// child, are anonymous inodes Detcore does not record (its known gap,
+/// `c-programs/scm-rights-received-anon-inodes`): both phases must fail their
+/// reads with the same EBADF.
+#[test]
+fn record_replay_keeps_eventfds_received_over_scm_rights_coherent() {
+    let _guard = hermit_record_lock();
+    let failures = record_replay_output_failures(
+        "scm-rights-eventfd",
+        &workload("c_record_replay_scm_rights").path,
+        &["eventfd"],
+        "eventfd alias: original read 5\n\
+         eventfd alias: received read 7\n\
+         eventfd closed sender: received read=-1 errno=EBADF\n\
+         eventfd child: exit=0\n\
+         eventfd child: received read=-1 errno=EBADF\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// An inotify instance received over `SCM_RIGHTS` after its sender closed its
+/// copy (see `tests/c/record_replay_scm_rights.c inotify`). `fstat` cannot
+/// tell one anonymous inode from another, so Detcore reads the received
+/// descriptor's link to find an inotify instance, which it records as one.
+/// That link was read live in both phases, and replay, whose slot holds a
+/// stand-in eventfd, read `anon_inode:[eventfd]`, left the descriptor
+/// unrecorded and stopped at the read the recording served. The link is now
+/// read through the recording. Both phases must print what a native run
+/// prints: the one `IN_CREATE` event for the created file.
+#[test]
+fn record_replay_reads_an_inotify_instance_received_over_scm_rights() {
+    let _guard = hermit_record_lock();
+    let failures = record_replay_output_failures(
+        "scm-rights-inotify",
+        &workload("c_record_replay_scm_rights").path,
+        &["inotify"],
+        "inotify: events=1 mask=0x100 name=created\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// `MAP_SHARED` mappings of one memfd in one process (see
+/// `tests/c/record_replay_scm_rights.c memfd`): two whole mappings, one at an
+/// offset through the descriptor received over a socketpair, and one a thread
+/// makes. Replay mapped a recorded file mapping as anonymous memory filled with
+/// the recorded bytes, so each mapping used to be a separate copy, and a write
+/// through one never reached the others; the guest then read stale bytes, took
+/// another path and replay diverged. Replay now maps every shared mapping of
+/// the file as a view of one memfd that backs it. Both phases must print what
+/// a native run prints.
+#[test]
+fn record_replay_shares_memory_between_mappings_of_one_memfd() {
+    let _guard = hermit_record_lock();
+    let failures = record_replay_output_failures(
+        "scm-rights-memfd",
+        &workload("c_record_replay_scm_rights").path,
+        &["memfd"],
+        "memfd: second sees hello\n\
+         memfd: first sees helloworld\n\
+         memfd: offset mapping reaches page two\n\
+         memfd: thread's mapping reaches helloworldthread\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Exercise the admission gate with a current recording whose metadata is
+/// retagged as 0x199, before mmap events carried shared file identities. This
+/// tests version refusal, not decoding of an authentic older event stream.
+#[test]
+fn shared_mapping_replay_refuses_metadata_retagged_as_0x199() {
+    let _guard = hermit_record_lock();
+    let data = tempfile::tempdir().expect("create shared-mapping recording directory");
+    let expected = b"overlap: high sees from low\noverlap: low sees from high\n";
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=off",
+            "record",
+            "start",
+            "--record-timeout=30",
+            "--data-dir",
+        ])
+        .arg(data.path())
+        .arg("--")
+        .arg(&workload("c_record_replay_shared_mappings").path)
+        .arg("overlap");
+    let recorded = command_output(record, "shared-mapping version-gate recording");
+    assert_eq!(recorded.stdout, expected);
+    let replay_command = || {
+        let mut replay = Command::new("timeout");
+        replay
+            .args(["--kill-after=5s", "45s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args(["--log=off", "replay", "--autopilot", "--data-dir"])
+            .arg(data.path());
+        replay
+    };
+    let replayed = command_output(replay_command(), "current shared-mapping recording replay");
+    assert_eq!(replayed.stdout, expected);
+
+    let recording_id = fs::read_to_string(data.path().join("last")).expect("recording ID");
+    let metadata_path = data.path().join(recording_id.trim()).join("metadata.json");
+    let mut metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(&metadata_path).expect("read metadata"))
+            .expect("parse metadata");
+    assert_eq!(metadata["version"], 0x19e, "RECORD_VERSION moved");
+    metadata["version"] = serde_json::json!(0x199);
+    fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
+    let mut replay = replay_command();
+    let refused = hermit_test::hermit_output(&format!("{replay:?}"), &mut replay);
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        !refused.status.success(),
+        "0x199 metadata was accepted: {stderr}"
+    );
+    assert!(stderr.contains("Version mismatch"), "{stderr}");
+    assert!(
+        refused.stdout.is_empty(),
+        "guest ran before version refusal"
+    );
+}
+
+/// The length of the memfd mapping the `placement-*` modes of
+/// `tests/c/record_replay_shared_mappings.c` make: 4 MiB and 5 pages, which
+/// no other mapping of the workload has.
+const PLACEMENT_LEN: usize = (1024 + 5) * 4096;
+
+/// How replay names a recorded mapping whose range the replayed guest
+/// already maps (`MAPPING_PLACEMENT_REFUSAL` in hermit-replay).
+const MAPPING_PLACEMENT_REFUSAL: &str = "replay refused: the address range a recorded \
+    mapping occupied is already mapped in the replayed guest";
+
+/// Rewrites the recorded address of the one successful mmap of `len`
+/// recorded bytes in `recording`'s root event stream to `address`. The
+/// stream is decoded and encoded again with the record format's own reader
+/// and writer; an address has a fixed width, so the stream keeps its size.
+fn rewrite_recorded_mmap_address(recording: &Path, len: usize, address: usize) {
+    use hermit_record_format::event::SyscallEvent;
+    use hermit_record_format::event_stream::EventReader;
+    use hermit_record_format::event_stream::EventStreamId;
+    use hermit_record_format::event_stream::EventWriter;
+
+    let root = EventStreamId::root();
+    let mut reader = EventReader::open(recording, &root).expect("open the root event stream");
+    let mut events = Vec::new();
+    while let Ok(event) = reader.next_event() {
+        events.push(event);
+    }
+    let mut debug_events = Vec::new();
+    while let Ok(event) = reader.next_debug_event() {
+        debug_events.push(event);
+    }
+    drop(reader);
+    let mut rewritten = 0;
+    for event in &mut events {
+        if let Ok(SyscallEvent::Mmap(mmap)) = &mut event.event
+            && mmap.buf.len() == len
+        {
+            mmap.addr = address;
+            rewritten += 1;
+        }
+    }
+    assert_eq!(rewritten, 1, "mmap events of {len} recorded bytes");
+
+    let scratch = tempfile::tempdir().expect("create the rewritten stream's directory");
+    let mut writer = EventWriter::create(scratch.path(), &root).expect("create the stream");
+    for event in events {
+        writer.push_event(event).expect("write an event");
+    }
+    for event in debug_events {
+        writer.push_debug_event(event).expect("write a debug event");
+    }
+    writer.finish().expect("finish the rewritten stream");
+    for entry in fs::read_dir(scratch.path().join("thread")).unwrap() {
+        let entry = entry.unwrap();
+        let original = recording.join("thread").join(entry.file_name());
+        assert_eq!(
+            fs::metadata(&original).unwrap().len(),
+            entry.metadata().unwrap().len(),
+            "{} changed size when rewritten",
+            original.display()
+        );
+        fs::copy(entry.path(), &original).unwrap();
+    }
+}
+
+/// Records `tests/c/record_replay_shared_mappings.c placement-<kind>`,
+/// rewrites the recorded address of its memfd mapping to the address the
+/// guest printed for `target` (`hole` or `occupant`), and replays it.
+/// Returns what the recording printed and the replay's output.
+fn replay_placement(kind: &str, target: &str) -> (String, Output) {
+    let data = tempfile::tempdir().expect("create placement recording directory");
+    let mode = format!("placement-{kind}");
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=off",
+            "record",
+            "start",
+            "--record-timeout=30",
+            "--data-dir",
+        ])
+        .arg(data.path())
+        .arg("--")
+        .arg(&workload("c_record_replay_shared_mappings").path)
+        .arg(&mode);
+    let recorded = command_output(record, "placement recording");
+    let recorded = String::from_utf8(recorded.stdout).expect("placement output is UTF-8");
+    assert!(
+        recorded.contains(&format!("{mode}: mapping reads ")) && !recorded.contains("FAILED"),
+        "{recorded}"
+    );
+    let prefix = format!("{mode}: {target} 0x");
+    let address = recorded
+        .lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .and_then(|hex| usize::from_str_radix(hex, 16).ok())
+        .unwrap_or_else(|| panic!("no {target} address in {recorded}"));
+
+    let id = fs::read_to_string(data.path().join("last")).expect("recording ID");
+    rewrite_recorded_mmap_address(&data.path().join(id.trim()), PLACEMENT_LEN, address);
+
+    let mut replay = Command::new("timeout");
+    replay
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "replay", "--autopilot", "--data-dir"])
+        .arg(data.path());
+    let replayed = hermit_test::hermit_output(&format!("{replay:?}"), &mut replay);
+    (recorded, replayed)
+}
+
+/// A recorded mapping whose range is free in the replayed guest is placed
+/// there, though Linux would not take the address as a hint. The range is
+/// the guest's hole, directly below a `MAP_GROWSDOWN` mapping whose guard
+/// gap keeps Linux from placing anything there without a fixed address,
+/// just as a file system that aligns large mappings refused the free
+/// recorded range of the JDK's 142 MB `lib/modules` mapping, flush below
+/// the next mapping, in compat/java [replay/ptrace]. Replay passed the
+/// recorded address as a hint and failed its "Failed to inject mmap at
+/// desired address" assertion.
+fn assert_placed_in_free_range(kind: &str) {
+    let (recorded, replayed) = replay_placement(kind, "hole");
+    assert!(
+        recorded.contains(&format!(
+            "placement-{kind}: a hint at the hole is refused\n"
+        )),
+        "precondition not met: Linux took a hint at the hole below the MAP_GROWSDOWN \
+         mapping (is the kernel booted with stack_guard_gap=0?), so this replay cannot \
+         show that replay places a mapping Linux would move: {recorded}"
+    );
+    assert!(
+        replayed.status.success(),
+        "replay into the free recorded range failed: {}\nstderr:\n{}",
+        replayed.status,
+        String::from_utf8_lossy(&replayed.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&replayed.stdout), recorded);
+}
+
+/// A recorded mapping whose range the replayed guest already maps, here an
+/// anonymous mapping of its own of the same 4 MiB size, is refused by name
+/// with the kernel's `EEXIST`. Replay used to pass the recorded address as
+/// a hint, so Linux put the mapping elsewhere and replay failed its "Failed
+/// to inject mmap at desired address" assertion instead.
+fn assert_occupied_range_refused(kind: &str) {
+    let (_, replayed) = replay_placement(kind, "occupant");
+    let stderr = String::from_utf8_lossy(&replayed.stderr);
+    assert!(
+        !replayed.status.success(),
+        "replay over an occupied range succeeded: {stderr}"
+    );
+    assert!(stderr.contains(MAPPING_PLACEMENT_REFUSAL), "{stderr}");
+    assert!(
+        stderr.contains("MAP_FIXED_NOREPLACE failed with EEXIST"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("Failed to inject mmap"), "{stderr}");
+}
+
+#[test]
+fn record_replay_places_a_shared_mapping_in_its_free_recorded_range() {
+    let _guard = hermit_record_lock();
+    assert_placed_in_free_range("shared");
+}
+
+/// `MAP_SHARED_VALIDATE` refuses `MAP_FIXED_NOREPLACE` with `EOPNOTSUPP`;
+/// replay places such a mapping as `MAP_SHARED`.
+#[test]
+fn record_replay_places_a_shared_validate_mapping_in_its_free_recorded_range() {
+    let _guard = hermit_record_lock();
+    assert_placed_in_free_range("validate");
+}
+
+#[test]
+fn record_replay_places_a_private_file_mapping_in_its_free_recorded_range() {
+    let _guard = hermit_record_lock();
+    assert_placed_in_free_range("private");
+}
+
+#[test]
+fn record_replay_refuses_a_shared_mapping_over_an_occupied_recorded_range() {
+    let _guard = hermit_record_lock();
+    assert_occupied_range_refused("shared");
+}
+
+/// The occupied range again for `MAP_SHARED_VALIDATE`, which replay places
+/// as `MAP_SHARED | MAP_FIXED_NOREPLACE`.
+#[test]
+fn record_replay_refuses_a_shared_validate_mapping_over_an_occupied_recorded_range() {
+    let _guard = hermit_record_lock();
+    assert_occupied_range_refused("validate");
+}
+
+#[test]
+fn record_replay_refuses_a_private_file_mapping_over_an_occupied_recorded_range() {
+    let _guard = hermit_record_lock();
+    assert_occupied_range_refused("private");
+}
+
+/// The replay of `tests/c/record_replay_shared_mappings.c` in `mode`, which
+/// both phases must print as `expected`, as a native run prints it. Replay
+/// backs each recorded shared file with one file of its own and maps every
+/// shared mapping of it as a view of that file at the recorded offset, so
+/// the mappings share exactly the pages Linux shared while recording.
+fn shared_mappings_failures(mode: &str, expected: &str) -> Vec<String> {
+    record_replay_output_failures(
+        &format!("shared-mappings-{mode}"),
+        &workload("c_record_replay_shared_mappings").path,
+        &[mode],
+        expected,
+    )
+}
+
+/// Two mappings that overlap, file pages [0, 2) and then [1, 3), share page 1,
+/// though neither holds the other's whole range.
+#[test]
+fn record_replay_shares_the_page_two_overlapping_mappings_hold() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "overlap",
+        "overlap: high sees from low\noverlap: low sees from high\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The overlapping mappings above, made in the other order: [1, 3) first.
+#[test]
+fn record_replay_shares_the_page_two_overlapping_mappings_hold_made_in_reverse() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "overlap-reverse",
+        "overlap-reverse: high sees from low\noverlap-reverse: low sees from high\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A mapping of file pages [0, 2) made after one of page 0 and one of page 1
+/// shares each page with the mapping that holds it, though no earlier mapping
+/// holds its whole range.
+#[test]
+fn record_replay_shares_a_mapping_across_two_adjacent_ones() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "adjacent-span",
+        "adjacent-span: span sees left and right\nadjacent-span: pieces see LEFT and RIGHT\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A two-page mapping whose first page was unmapped still shares its second
+/// page with a later mapping of that page, though nothing is mapped any more
+/// at the address the first mapping started at.
+#[test]
+fn record_replay_shares_the_page_left_after_a_mapping_lost_its_head() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "head-unmap",
+        "head-unmap: survivor sees new view\nhead-unmap: new view sees survivor\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A two-page mapping whose last page was unmapped shares its first page with
+/// a later mapping of both pages, and the later mapping's second page, which
+/// the first no longer maps, with a third mapping of it.
+#[test]
+fn record_replay_shares_the_page_left_after_a_mapping_lost_its_tail() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "tail-unmap",
+        "tail-unmap: survivor sees new view\ntail-unmap: new view sees survivor\ntail-unmap: third view sees page one\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A mapping that mremap moved still shares its pages with a later mapping of
+/// the file.
+#[test]
+fn record_replay_shares_a_mapping_mremap_moved() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "moved-source",
+        "moved-source: moved mapping sees new view\nmoved-source: new view sees moved\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A pwrite through the descriptor between two mappings of a page reaches the
+/// second mapping: replay writes each mapping's recorded bytes, the page as
+/// the write left it, to the file's backing when it maps it.
+#[test]
+fn record_replay_maps_what_a_pwrite_left_in_a_mapped_file() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "pwrite-remap",
+        "pwrite-remap: first view sees before\npwrite-remap: second view sees after!\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A pwrite through the descriptor reaches a mapping made before it, as it
+/// reaches the page cache under Linux. Replay applies the write to the file's
+/// backing when the descriptor names a replay object of its own, here the
+/// guest's memfd.
+#[test]
+fn record_replay_shows_a_pwrite_through_an_older_mapping() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "pwrite-old-view",
+        "pwrite-old-view: first view sees before\npwrite-old-view: first view then sees after!\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A forked child that maps the file again shares it with the parent's
+/// mapping, as one page cache serves both under Linux.
+#[test]
+fn record_replay_shares_a_file_a_forked_child_maps_again() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "fork-child",
+        "fork-child: child's mapping sees parent\nfork-child: parent sees child!\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The standard output of recording `tests/c/record_replay_shared_mappings.c`
+/// in `mode` and of replaying it, each of which must exit 0, for a test that
+/// compares the two phases rather than checking one fixed output.
+fn shared_mappings_stdouts(mode: &str) -> [String; 2] {
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let data_dir = format!("--data-dir={}", data_dir.path().display());
+    let program = &workload("c_record_replay_shared_mappings").path;
+    let record = ["record", "start", "--record-timeout=30"].as_slice();
+    let replay = ["replay", "--autopilot"].as_slice();
+    [("record", record), ("replay", replay)].map(|(phase, hermit_args)| {
+        let mut command = Command::new("timeout");
+        command
+            .args(["--kill-after=5s", "45s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .arg("--log=off")
+            .args(hermit_args)
+            .arg(&data_dir);
+        if phase == "record" {
+            command.arg("--").arg(program).arg(mode);
+        }
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "shared-mappings-{mode} {phase}: status {}\nstdout:\n{stdout}stderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        stdout
+    })
+}
+
+/// A guest that reopens its `/dev/zero` mapping's object through
+/// `/proc/self/map_files` gets the same answer in replay as in recording, and
+/// no descriptor for the object, so replay never has to share or split an
+/// object it did not record.
+///
+/// Known divergence from Linux, pinned by the last assertion: Hermit's
+/// `/proc` has no `map_files`, so readlink and open both fail with ENOENT
+/// (<https://github.com/rrnewton/hermit/issues/5143>).
+/// Linux shows the link, `/dev/zero (deleted)`, and refuses the open with
+/// EPERM unless the caller has CAP_CHECKPOINT_RESTORE or CAP_SYS_ADMIN in the
+/// initial user namespace (`proc_map_files_get_link`, fs/proc/base.c), which
+/// a Hermit guest, always in a user namespace of its own, never has. A change
+/// that gives Hermit's `/proc` a `map_files` should change the pinned lines,
+/// and nothing else here.
+#[test]
+fn record_replay_answers_a_dev_zero_objects_map_files_alike() {
+    let _guard = hermit_record_lock();
+    let [record, replay] = shared_mappings_stdouts("dev-zero-map-files");
+    assert_eq!(
+        replay, record,
+        "replay answered map_files differently from the recording"
+    );
+    assert!(
+        record.contains("dev-zero-map-files: reopen fails with ")
+            && !record.contains("reopened mapping"),
+        "the guest opened its /dev/zero object through map_files:\n{record}"
+    );
+    // Current Hermit behaviour, not Linux's: see above.
+    assert_eq!(
+        record,
+        "dev-zero-map-files: readlink fails with ENOENT\n\
+         dev-zero-map-files: reopen fails with ENOENT\n"
+    );
+}
+
+/// Two `MAP_SHARED` mappings of one `/dev/zero` descriptor share nothing:
+/// Linux gives each a new shmem object of its own (`mmap_zero` calls
+/// `shmem_zero_setup`). Replay used to key every shared mapping by the
+/// descriptor's device and inode, so both mappings were views of one backing
+/// and a store through the first was read through the second.
+#[test]
+fn record_replay_keeps_two_dev_zero_mappings_apart() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "dev-zero",
+        "dev-zero: second sees zeros\ndev-zero: first sees first\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A forked child's copy of a `MAP_SHARED` mapping of `/dev/zero` is the
+/// same shmem object, so the parent reads the child's store through its own
+/// mapping, while a mapping the child makes of the descriptor again is a new
+/// object, zero-filled.
+#[test]
+fn record_replay_shares_a_dev_zero_mapping_with_a_forked_childs_copy() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "dev-zero-fork",
+        "dev-zero-fork: child's copy sees parent\n\
+         dev-zero-fork: child's new mapping sees zeros\n\
+         dev-zero-fork: parent sees child\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The total size of the files beneath `dir`.
+fn tree_size(dir: &Path) -> u64 {
+    fs::read_dir(dir)
+        .unwrap_or_else(|error| panic!("read {}: {error}", dir.display()))
+        .map(|entry| {
+            let entry = entry.expect("read a directory entry");
+            let metadata = entry.metadata().expect("stat a recording file");
+            if metadata.is_dir() {
+                tree_size(&entry.path())
+            } else {
+                metadata.len()
+            }
+        })
+        .sum()
+}
+
+/// Recording reads no byte of a new `MAP_SHARED` mapping of `/dev/zero`: the
+/// new shmem object holds zeros, as replay's new backing does, and reading it
+/// through `/proc/<pid>/mem` would fault in every page of the guest's
+/// mapping during the recorded run. The guest cannot see that residency
+/// under Hermit (Detcore reports every page resident to `mincore` and no
+/// faults to `getrusage`), but the recording would carry the bytes it read:
+/// the recording of a guest with a 32 MiB mapping (some 5 MiB, most of it the
+/// bytes of the loader's and libc's file mappings) stays below 32 MiB only
+/// when none of that mapping's bytes are read.
+#[test]
+fn record_replay_reads_no_byte_of_a_new_dev_zero_mapping() {
+    let _guard = hermit_record_lock();
+    let data = tempfile::tempdir().expect("create a recording directory");
+    let expected = b"dev-zero-large: first page sees zeros, last byte 0\n";
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=off",
+            "record",
+            "start",
+            "--record-timeout=30",
+            "--data-dir",
+        ])
+        .arg(data.path())
+        .arg("--")
+        .arg(&workload("c_record_replay_shared_mappings").path)
+        .arg("dev-zero-large");
+    let recorded = command_output(record, "large /dev/zero mapping recording");
+    assert_eq!(recorded.stdout, expected);
+    let size = tree_size(data.path());
+    assert!(
+        size < 32 << 20,
+        "the recording holds {size} bytes: it read the new mapping's pages"
+    );
+    let mut replay = Command::new("timeout");
+    replay
+        .args(["--kill-after=5s", "45s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "replay", "--autopilot", "--data-dir"])
+        .arg(data.path());
+    let replayed = command_output(replay, "large /dev/zero mapping replay");
+    assert_eq!(replayed.stdout, expected);
+}
+
+/// A `MAP_SHARED` mapping of `/dev/zero` at a nonzero offset is a shmem
+/// object as long as the mapping, whose pages past that length fault SIGBUS,
+/// which no replay mapping reproduces. The guest records as it runs natively,
+/// and the recording is one replay refuses by name, before it starts the
+/// guest.
+#[test]
+fn record_replay_refuses_a_dev_zero_mapping_at_an_offset() {
+    let _guard = hermit_record_lock();
+    let (failures, stderrs) = record_replay_output_failures_with(
+        "shared-mappings-dev-zero-offset",
+        &workload("c_record_replay_shared_mappings").path,
+        &["dev-zero-offset"],
+        &|_| {},
+        &[],
+        "dev-zero-offset: first page sees zeros\n",
+    );
+    assert_eq!(failures.len(), 1, "{}", failures.join("\n"));
+    assert!(
+        failures[0].starts_with("shared-mappings-dev-zero-offset replay"),
+        "{}",
+        failures[0]
+    );
+    let stderr = stderrs.last().expect("the replay's stderr");
+    assert!(
+        stderr.contains("This recording cannot be replayed faithfully")
+            && stderr.contains("of /dev/zero (at offset 4096"),
+        "{stderr}"
+    );
+}
+
+/// A guest whose descriptor table is full at its soft limit still replays its
+/// shared mappings. Hermit runs with a soft limit of 256 descriptors, which
+/// the guest inherits and fills; Detcore's virtual limit leaves that kernel
+/// limit alone. Replay needs a free slot for the guest to open the file's
+/// backing, so it raises the guest's soft limit for it and puts it back
+/// before the guest runs: the guest's table is still full afterwards.
+#[test]
+fn record_replay_shares_a_mapping_made_with_a_full_descriptor_table() {
+    let _guard = hermit_record_lock();
+    let (failures, _) = record_replay_output_failures_with(
+        "shared-mappings-near-limit",
+        &workload("c_record_replay_shared_mappings").path,
+        &["near-limit"],
+        &|command| {
+            // SAFETY: setrlimit is async-signal-safe, and the closure touches
+            // nothing else of the forked child's.
+            unsafe {
+                command.pre_exec(|| {
+                    let mut limit = libc::rlimit {
+                        rlim_cur: 0,
+                        rlim_max: 0,
+                    };
+                    if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    limit.rlim_cur = limit.rlim_cur.min(256);
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        },
+        &[],
+        "near-limit: second sees at limit\nnear-limit: the table is still full\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A write through a descriptor of a thread whose table is its own (cloned
+/// without `CLONE_FILES`) reaches that thread's mapping of the file: replay
+/// finds the written file in the writing thread's table, where the number
+/// names another memfd in the leader's.
+#[test]
+fn record_replay_shows_a_write_through_a_threads_own_descriptor_table() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "private-table",
+        "private-table: worker's mapping sees worker\n\
+         private-table: leader's memfd is untouched\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A child in a PID namespace of its own that maps the file again shares it
+/// with the mapping it inherited and with its parent's: PID namespaces do not
+/// divide a file's pages, and replay keeps one backing per recorded file for
+/// the whole replay.
+#[test]
+fn record_replay_shares_a_file_a_child_in_a_new_pid_namespace_maps_again() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "nested-pidns",
+        "nested-pidns: child is pid 1 and sees parent\n\
+         nested-pidns: child's inherited mapping sees child!\n\
+         nested-pidns: parent sees child!\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A shared mapping made through a descriptor opened read-only cannot be made
+/// writable, as Linux refuses with EACCES, while one made through a
+/// descriptor opened for reading and writing can: replay opens the file's
+/// backing with the recorded descriptor's access mode.
+#[test]
+fn record_replay_refuses_to_make_a_read_only_shared_mapping_writable() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "read-only-mprotect",
+        "read-only-mprotect: read-only descriptor: EACCES\n\
+         read-only-mprotect: read-write descriptor: made writable, sees contents\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Opening a shared file with O_TRUNC must clear its existing views before
+/// advice can refill them. Refilling never grants guest write permission to a
+/// mapping originally made through a read-only descriptor.
+#[test]
+fn record_replay_preserves_read_only_shared_pages_after_truncate_and_advice() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "read-only-truncate-advice",
+        "read-only-truncate-advice: before advice: zero\n\
+         read-only-truncate-advice: after advice: zero\n\
+         read-only-truncate-advice: mprotect: EACCES\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A guest that chroots into a directory below the replay root and maps the
+/// file again shares it with the mapping it made before: the backing belongs
+/// to the replay, not to the root the guest sees, and the chrooted guest
+/// opens it through a link into its own root made for that open.
+#[test]
+fn record_replay_shares_a_file_a_chrooted_guest_maps_again() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "chroot",
+        "chroot: the new mapping sees outside\n\
+         chroot: the old mapping sees inside!\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A guest that asks for a seccomp filter killing the calls a descriptor
+/// hand-off by receive would inject gets none, in record and in replay
+/// (Detcore refuses every filter), and its shared mappings replay: replay
+/// hands it the backing to open by name, with no such call.
+#[test]
+fn record_replay_shares_mappings_of_a_guest_that_asked_for_a_seccomp_filter() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "seccomp-filter",
+        "seccomp-filter: no_new_privs ENOSYS, install EOPNOTSUPP\n\
+         seccomp-filter: second sees filtered\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Installs, in the process about to exec, a seccomp filter that allows every
+/// call but `acct(2)`, which fails with EPERM: selective by action, and one
+/// that neither Hermit nor the guest makes.
+fn install_acct_refusing_filter() -> std::io::Result<()> {
+    let filter = [
+        // A = seccomp_data.nr
+        libc::sock_filter {
+            code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 1,
+            k: libc::SYS_acct as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        },
+    ];
+    let program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr().cast_mut(),
+    };
+    // SAFETY: prctl and seccomp are async-signal-safe, and `program` names
+    // `filter`, which outlives both calls.
+    unsafe {
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+            || libc::syscall(
+                libc::SYS_seccomp,
+                libc::SECCOMP_SET_MODE_FILTER,
+                0,
+                &raw const program,
+            ) != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// A replay under a seccomp filter Hermit inherited from whatever launched
+/// it, which `--unsafe-ignore-host-seccomp` admits (as a library caller of
+/// replay is not checked), refuses its first shared file mapping by name
+/// before it adds any call to the guest: the filter allowed every recorded
+/// call, but is not known to allow the calls replay would add, and could kill
+/// or trap one. Record, which adds none, runs as natively.
+#[test]
+fn record_replay_refuses_shared_mappings_under_an_inherited_seccomp_filter() {
+    let _guard = hermit_record_lock();
+    let (failures, stderrs) = record_replay_output_failures_with(
+        "shared-mappings-inherited-filter",
+        &workload("c_record_replay_shared_mappings").path,
+        &["overlap"],
+        &|command| {
+            // SAFETY: the closure makes only async-signal-safe calls.
+            unsafe { command.pre_exec(install_acct_refusing_filter) };
+        },
+        &["--unsafe-ignore-host-seccomp"],
+        "overlap: high sees from low\noverlap: low sees from high\n",
+    );
+    assert_eq!(failures.len(), 1, "{}", failures.join("\n"));
+    assert!(
+        failures[0].starts_with("shared-mappings-inherited-filter replay"),
+        "{}",
+        failures[0]
+    );
+    let stderr = stderrs.last().expect("the replay's stderr");
+    assert!(
+        stderr.contains("replay cannot make a MAP_SHARED file mapping share")
+            && stderr.contains("admit the calls that make the view")
+            && stderr.contains("Seccomp_filters: 1"),
+        "{stderr}"
+    );
 }
 
 /// A guest that accepts its own loopback TCP connections (see
@@ -4899,9 +6704,10 @@ fn replays_of_a_threaded_tcp_accept_recording_agree() {
 }
 
 /// As `replays_of_a_threaded_tcp_accept_recording_agree`, but the guest
-/// accepts through a listener it received over `SCM_RIGHTS`. Detcore does not
-/// track a received descriptor, so replay must hold the scheduler for the
-/// accept because of the call itself, not because it knows the listener.
+/// accepts through a listener it received over `SCM_RIGHTS`. Detcore registers
+/// the received descriptor as an alias of the listener, which the send marked
+/// as exported, so the accept runs outside the turn and replay must hold the
+/// scheduler for it because of the call itself.
 #[test]
 fn replays_of_a_threaded_tcp_accept_recording_agree_for_a_received_listener() {
     assert_threaded_accept_replays_agree(&["scm-rights"]);

@@ -928,6 +928,20 @@ impl AuthenticatedValidationAdmission {
             {
                 self.verify_disjoint_main(root)?;
             }
+            // A merge-queue run admitted against B, the base the queue
+            // built the target on, after main moved to M. The queue owns
+            // freshness and re-decides stale candidates itself, so no
+            // disjointness or delta condition applies; this re-proves
+            // only that the floor is exactly merge-base(target, M), so
+            // the floor and every pin base stay on the landing line the
+            // target actually descends from.
+            ("validate", "queue-base")
+                if self.floor.sha != self.floor.observed_main_sha
+                    && self.floor.observed_main_sha != self.authority.target
+                    && self.floor.sha != self.authority.target =>
+            {
+                self.verify_queue_base(root)?;
+            }
             ("frozen-validate", "frozen-target") if self.floor.sha == self.authority.target => {}
             _ => {
                 return Err(
@@ -966,6 +980,34 @@ impl AuthenticatedValidationAdmission {
             return Err(format!(
                 "disjoint-main floor claims {claimed} first-parent main commits but Git counts {}",
                 proof.main_delta_commits
+            ));
+        }
+        Ok(())
+    }
+
+    /// The one condition of a `queue-base` floor, from Git, failing
+    /// closed on any error: the floor B is exactly the merge base of
+    /// the target and the observed main M. That equality is what
+    /// keeps every floor-based check reading its base from the
+    /// landing-line commit the target descends from, however far main
+    /// has since moved and whatever that move touched. Freshness
+    /// beyond this is the merge queue's decision, not this driver's:
+    /// a target that contained M would have merge base M itself and
+    /// is a current-main run, never this kind.
+    fn verify_queue_base(&self, root: &Path) -> Result<(), String> {
+        let actual = git(
+            root,
+            &[
+                "merge-base",
+                &self.authority.target,
+                &self.floor.observed_main_sha,
+            ],
+        )?;
+        if actual != self.floor.sha {
+            return Err(format!(
+                "queue-base floor {} is not the merge base of target {} and \
+                 observed main {}: Git counts {actual}",
+                self.floor.sha, self.authority.target, self.floor.observed_main_sha
             ));
         }
         Ok(())
@@ -1692,6 +1734,94 @@ for entry in Path('/proc/self/fd').iterdir():
         );
     }
 
+    /// A target built by the merge queue on base B is admitted after main
+    /// moved to M when B is exactly merge-base(target, M), however far or
+    /// however overlapping main's move was: the queue owns freshness, so
+    /// no disjointness, delta bound, or floor-sensitive condition applies.
+    /// The floor and pin base stay B, and observed_main_sha stays M.
+    #[test]
+    fn queue_base_floor_admits_only_the_exact_merge_base() {
+        let f = Fixture::new();
+        let before = f.commit_files(
+            "before the queue base",
+            &["src/lib.rs", "docs/a.md", "Cargo.lock", "README"],
+        );
+        let base = f.commit_files("queue base B", &["README"]);
+        // Main moves on the very file the target edits, and on a pin file:
+        // a disjoint-main floor must refuse both, a queue-base floor must
+        // admit, because the queue re-decides freshness itself.
+        let overlap = f.commit_files("main edits the target's file", &["src/lib.rs"]);
+        let moved = f.commit_files("main bumps the lockfile", &["Cargo.lock"]);
+        let main_from = |from: &str, name: &str, files: &[&str]| {
+            f.checkout(from);
+            f.commit_files(name, files)
+        };
+        let target = main_from(&base, "target change", &["src/lib.rs"]);
+        let queue_status = |target: &str, floor: &str, observed: &str| {
+            let mut status = f.authority(target, floor);
+            status["admission_floor"]["kind"] = "queue-base".into();
+            status["admission_floor"]["observed_main_sha"] = observed.into();
+            status
+        };
+        let admit_at = |status: &Value, target: &str| {
+            f.checkout(target);
+            f.admit(status, target)
+        };
+        let refused = |status: Value, target: &str| admit_at(&status, target).unwrap_err();
+
+        let admitted = admit_at(&queue_status(&target, &base, &moved), &target).unwrap();
+        assert_eq!(admitted.floor().kind, "queue-base");
+        assert_eq!(admitted.floor().sha, base);
+        assert_eq!(admitted.floor().observed_main_sha, moved);
+        assert_eq!(admitted.floor().main_delta_commits, None);
+        assert!(admitted.canonical());
+        admitted.verify_source(&f.0).unwrap();
+        // One main move in, the same floor already admitted.
+        admit_at(&queue_status(&target, &base, &overlap), &target).unwrap();
+
+        // A claimed base that is not the merge base: an older ancestor,
+        // and a commit the target does not contain at all.
+        let e = refused(queue_status(&target, &before, &moved), &target);
+        assert!(e.contains("queue-base") && e.contains("merge base"), "{e}");
+        let side = main_from(&before, "side base", &["docs/side.md"]);
+        let e = refused(queue_status(&target, &side, &moved), &target);
+        assert!(e.contains("queue-base") && e.contains("merge base"), "{e}");
+        // A target that contains M is a current-main run.
+        let on_main = main_from(&moved, "target rebased onto M", &["src/lib.rs"]);
+        let e = refused(queue_status(&on_main, &moved, &moved), &on_main);
+        assert!(
+            e.contains("does not match its authenticated authority kind"),
+            "{e}"
+        );
+        // B == M is not this kind.
+        let e = refused(queue_status(&target, &base, &base), &target);
+        assert!(
+            e.contains("does not match its authenticated authority kind"),
+            "{e}"
+        );
+        // A target that is B itself is a main-ancestor run.
+        let e = refused(queue_status(&base, &base, &moved), &base);
+        assert!(
+            e.contains("does not match its authenticated authority kind"),
+            "{e}"
+        );
+        // No delta count rides on this kind.
+        let mut counted = queue_status(&target, &base, &moved);
+        counted["admission_floor"]["main_delta_commits"] = 2.into();
+        let e = refused(counted, &target);
+        assert!(e.contains("if and only if"), "{e}");
+        // Only ordinary validation authority may select it.
+        let mut frozen = queue_status(&target, &base, &moved);
+        frozen["holder"]["kind"] = "frozen-validate".into();
+        frozen["admissible"] = false.into();
+        frozen["reason_code"] = "canonical-holder-kind-not-validate".into();
+        let e = refused(frozen, &target);
+        assert!(
+            e.contains("does not match its authenticated authority kind"),
+            "{e}"
+        );
+    }
+
     /// A passing row admitted on a disjoint-main floor is never reused by
     /// tree, neither as a cache hit nor as a `--selective` baseline, even when
     /// its evidence decodes and matches the admission that would reuse it.
@@ -1767,6 +1897,80 @@ for entry in Path('/proc/self/fd').iterdir():
         assert_eq!(baseline(&current_row).as_deref(), Some(target.as_str()));
         assert!(hit(&disjoint_row).is_none());
         assert_eq!(baseline(&disjoint_row), None);
+    }
+
+    /// A passing row admitted on a queue-base floor is never reused by
+    /// tree either: its claim (the floor is merge-base(target, M)) is a
+    /// Git fact the reuse reader decodes but does not prove, exactly as
+    /// for disjoint-main. The same row on a current-main floor is a hit.
+    #[test]
+    fn queue_base_rows_are_never_reused_by_tree() {
+        let f = Fixture::new();
+        std::fs::write(f.0.join(".gitignore"), "ignored/\n").unwrap();
+        f.command(&["add", ".gitignore"]);
+        let base = f.commit_files("queue base B", &["README"]);
+        let moved = f.commit_files("main moves on docs only", &["docs/a.md"]);
+        f.checkout(&base);
+        let target = f.commit_files("target change", &["src/lib.rs"]);
+        let mut queue = f.authority(&target, &base);
+        queue["admission_floor"]["kind"] = "queue-base".into();
+        queue["admission_floor"]["observed_main_sha"] = moved.as_str().into();
+        let current = f.authority(&target, &base);
+        let canonical = crate::validate_plan::validation_config(&source_root()).unwrap();
+        let state = VerifiedStateRoot::fixture(&f.0);
+        let key_tree = f.command(&["rev-parse", &format!("{target}^{{tree}}")]);
+        let key = crate::validate_history::CacheKey {
+            tree: &key_tree,
+            profile: "full",
+            host: "fixture-host",
+            toolchain: "rustc fixture",
+            release_builder: crate::RELEASE_BUILDER_CARGO,
+        };
+        let row_for = |status: &Value, name: &str| {
+            let proof = f.admit(status, &target).unwrap();
+            let view = BoundExecutionPlan::bind(&canonical, None, Some(&proof)).unwrap();
+            let log_path = f.0.join(format!("ignored/validate/{name}.log"));
+            let log = state.create(&state.locator(&log_path).unwrap()).unwrap();
+            log.write_exact(b"driver log\n").unwrap();
+            let retained = view
+                .retain(&proof, &f.0, &state, name, "2026-10-12T15:00:00Z", &log)
+                .unwrap();
+            assert!(view.cache_matches(&proof, &retained.evidence), "{name}");
+            let AdmissionEvidence::V2(v2) = &retained.evidence else {
+                panic!("new emission must be v2")
+            };
+            let row = serde_json::json!({"result":"pass","commit":target,"tree":key_tree,
+                "host":"fixture-host","profile":"full","toolchain":"rustc fixture",
+                "selection_mode":"full","commit_anchored":true,"tree_dirty":false,
+                "failures":0,"finished_at":"2026-10-12T15:20:00Z","schema_version":10,
+                "producer":"hermit-validate-rs","executed_nodes":76,"executed_tests":2129,
+                "passed_tests":2129,"gates_expected":76,"gates_run":76,
+                "coverage":{"planned_test_nodes":20,"executed_test_nodes":20,"absent_nodes":[]},
+                "release_builder":crate::RELEASE_BUILDER_CARGO,
+                "e2e_payload":crate::e2e_payload_identity(crate::RELEASE_BUILDER_CARGO),
+                "run_id":v2.context.run_id,"started_at":v2.context.started_at,
+                "log_file":log_path,"log_identity":log.locator,
+                "admission_floor_evidence":retained.evidence,
+                "cell_results":{"run_id":v2.context.run_id}});
+            crate::validate_history::admission_cache_row(&row.to_string()).unwrap()
+        };
+        let current_row = row_for(&current, "current-run");
+        let queue_row = row_for(&queue, "queue-run");
+        let hit = |row: &Value| {
+            crate::validate_history::cache_lookup(std::slice::from_ref(row), "pass", &key)
+        };
+        let baseline = |row: &Value| {
+            crate::validate_history::selective_baseline(
+                std::slice::from_ref(row),
+                None,
+                "",
+                &|_| true,
+            )
+        };
+        assert_eq!(hit(&current_row).unwrap().commit, target);
+        assert_eq!(baseline(&current_row).as_deref(), Some(target.as_str()));
+        assert!(hit(&queue_row).is_none());
+        assert_eq!(baseline(&queue_row), None);
     }
 
     /// Every file a floor-based check (pre.reverie_pin, pre.reverie_pin_on_host,
@@ -2526,6 +2730,25 @@ for entry in Path('/proc/self/fd').iterdir():
         };
         install(&echo);
         assert!(call().is_ok());
+        // The v2 base-observation contract (S27) is accepted during the
+        // transition, but only with its named ref and SHA: a v2 missing
+        // either is indistinguishable from an unproven helper claim.
+        let mut v2 = echo.clone();
+        v2["base_observation"] = serde_json::json!({
+            "contract": "post-run-local-main-merge-base/v2",
+            "observed_base_ref": "refs/remotes/origin/integration",
+            "observed_base_sha": "a".repeat(40),
+        });
+        install(&v2);
+        assert!(call().is_ok());
+        let mut bad_v2 = v2.clone();
+        bad_v2["base_observation"]
+            .as_object_mut()
+            .unwrap()
+            .remove("observed_base_ref");
+        install(&bad_v2);
+        assert!(call().is_err());
+        install(&echo);
         let mut altered = evidence.clone();
         let AdmissionEvidence::V2(ref mut changed) = altered else {
             panic!("new emission must be v2")
@@ -2641,7 +2864,7 @@ for entry in Path('/proc/self/fd').iterdir():
 
     #[test]
     fn admission_tee_writes_created_descriptor_even_after_path_swap_and_refuses_receipt() {
-        use std::io::Write;
+        use std::io::{Read, Write};
         let f = Fixture::new();
         let state = VerifiedStateRoot::fixture(&f.0);
         let locator = WorkspaceLocatorV2 {
@@ -2652,13 +2875,21 @@ for entry in Path('/proc/self/fd').iterdir():
         let moved = f.0.join("ignored/validate/actual.log");
         std::fs::rename(f.0.join(&locator.path), &moved).unwrap();
         std::fs::write(f.0.join(&locator.path), b"foreign file\n").unwrap();
-        let mut tee = crate::spawn_durable_tee(&log.file).unwrap();
+        let mut tee =
+            crate::spawn_durable_tee(&log.file, std::process::Stdio::piped()).unwrap();
         tee.stdin
             .take()
             .unwrap()
             .write_all(b"actual descriptor bytes\n")
             .unwrap();
+        let mut stdout = Vec::new();
+        tee.stdout
+            .take()
+            .unwrap()
+            .read_to_end(&mut stdout)
+            .unwrap();
         assert!(tee.wait().unwrap().success());
+        assert_eq!(stdout, b"actual descriptor bytes\n");
         assert_eq!(std::fs::read(moved).unwrap(), b"actual descriptor bytes\n");
         assert_eq!(
             std::fs::read(f.0.join(&locator.path)).unwrap(),

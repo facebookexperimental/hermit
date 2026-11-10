@@ -41,6 +41,8 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use crate::random::splitmix64;
+
 /// The variable that enables race probes and lists their settings.
 pub const RACE_PROBE_ENV: &str = "HERMIT_RACE_PROBE";
 
@@ -72,15 +74,31 @@ pub(crate) const FIFO_STAGING_RECLAIM: &str = "fifo_staging_reclaim";
 /// threads another guest thread can replace that directory's descriptor in
 /// between, as host timing alone can let it.
 pub(crate) const PROCFS_SPELLING_RESOLVED: &str = "procfs_spelling_resolved";
+/// A wait at the end of Detcore's thread exit hook, after its last call to
+/// the global state and before the backend releases the thread's state, and
+/// with it the descriptor table it may be the last to hold: the backend runs
+/// that hook at no particular point of the guest's schedule (KVM after the
+/// parent can already wait for the child), so the release comes late, as
+/// host timing alone can make it. Only in builds with debug assertions (the
+/// debug and validate profiles), as is [`RECEIPT_DECISION`]; both wait
+/// through [`delay_on_any_backend`].
+pub(crate) const EXIT_HOOK_TAIL: &str = "exit_hook_tail";
+/// A wait in the recording of a descriptor received over `SCM_RIGHTS`,
+/// before the receipt decides how to record it
+/// (`Detcore::record_received_facts`): exited senders' exit hooks run
+/// meanwhile, as they can while a receive's probes wait for the host.
+pub(crate) const RECEIPT_DECISION: &str = "receipt_decision";
 
 /// Every probe point, for validating a configuration.
-const POINTS: [&str; 6] = [
+const POINTS: [&str; 8] = [
     BG_PRE_CALL,
     BG_POST_CALL,
     BG_HARVEST_SKIP,
     FIFO_STAGING_MAPPED,
     FIFO_STAGING_RECLAIM,
     PROCFS_SPELLING_RESOLVED,
+    EXIT_HOOK_TAIL,
+    RECEIPT_DECISION,
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -220,7 +238,7 @@ impl Probes {
             return Some(Perturbation::Hold(self.hold_dir.as_ref()?.join(point)));
         }
         let visit = self.counter.fetch_add(1, Ordering::Relaxed);
-        let r = splitmix(self.seed ^ splitmix(visit));
+        let r = splitmix64(self.seed ^ splitmix64(visit));
         let unit = (r >> 11) as f64 / (1u64 << 53) as f64;
         if unit >= spec.probability {
             return None;
@@ -230,7 +248,7 @@ impl Probes {
             + if span == 0 {
                 0
             } else {
-                splitmix(r) % (span + 1)
+                splitmix64(r) % (span + 1)
             };
         Some(Perturbation::Wait(Duration::from_millis(ms)))
     }
@@ -254,13 +272,6 @@ fn probes() -> Option<&'static Probes> {
         .as_ref()
 }
 
-fn splitmix(mut z: u64) -> u64 {
-    z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
-}
-
 fn choose(point: &str) -> Option<Perturbation> {
     let perturbation = probes()?.choose(point)?;
     tracing::debug!(target: "race_probe", "race_probe: {point} perturbed ({perturbation:?})");
@@ -276,6 +287,32 @@ pub(crate) async fn delay(point: &str) {
     }
 }
 
+/// A wait at `point`, when configured, in Detcore code that every backend
+/// runs ([`EXIT_HOOK_TAIL`], [`RECEIPT_DECISION`]). Where the tool runs
+/// inside the guest's process (`in_guest`: the in-guest backends), whose
+/// threads must touch no thread-local state a runtime keeps, it blocks the
+/// calling thread and touches none: the disabled path is only [`choose`]'s
+/// read of an initialized `OnceLock`. Elsewhere it waits on Tokio's timer
+/// where the calling task runs on a Tokio runtime (the ptrace tracer, whose
+/// one thread serves every guest task), so that only that task waits, and
+/// blocks the calling thread where none runs (KVM drives each guest
+/// process's and thread's tool on a thread of its own), which then serves
+/// that task alone.
+#[cfg(debug_assertions)]
+pub(crate) async fn delay_on_any_backend(point: &str, in_guest: bool) {
+    let Some(perturbation) = choose(point) else {
+        return;
+    };
+    let on_tokio = !in_guest && tokio::runtime::Handle::try_current().is_ok();
+    match perturbation {
+        Perturbation::Wait(wait) if wait.is_zero() => {}
+        Perturbation::Wait(wait) if on_tokio => tokio::time::sleep(wait).await,
+        Perturbation::Wait(wait) => std::thread::sleep(wait),
+        Perturbation::Hold(release) if on_tokio => hold(point, &release).await,
+        Perturbation::Hold(release) => hold_blocking(point, &release),
+    }
+}
+
 /// Waits until `release` exists, saying so on stderr unless it already does.
 async fn hold(point: &str, release: &Path) {
     if release.exists() {
@@ -287,6 +324,21 @@ async fn hold(point: &str, release: &Path) {
     );
     while !release.exists() {
         tokio::time::sleep(HOLD_POLL).await;
+    }
+}
+
+/// [`hold`], blocking the calling thread.
+#[cfg(debug_assertions)]
+fn hold_blocking(point: &str, release: &Path) {
+    if release.exists() {
+        return;
+    }
+    eprintln!(
+        "race_probe: {point} holding until {} exists",
+        release.display()
+    );
+    while !release.exists() {
+        std::thread::sleep(HOLD_POLL);
     }
 }
 

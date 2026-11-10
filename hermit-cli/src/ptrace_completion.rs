@@ -15,6 +15,7 @@ use std::any::TypeId;
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::ffi::CStr;
 use std::fmt;
 use std::fs::File;
 use std::future::Future;
@@ -24,6 +25,7 @@ use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Mutex;
@@ -35,6 +37,7 @@ use std::thread::ThreadId;
 use std::time::Duration;
 use std::time::Instant;
 
+use reverie_ptrace::CapturedPrefix;
 use reverie_ptrace::PtraceCallbackDiagnostic;
 use reverie_ptrace::PtraceRunFailure;
 use reverie_ptrace::PtraceTerminationHandle;
@@ -45,6 +48,7 @@ use serde::Serialize;
 use crate::Error;
 use crate::FailureKind;
 use crate::GuestTimedOut;
+use crate::SchedulerEndedRun;
 
 const ATTEMPT_BUDGET: Duration = Duration::from_secs(2);
 static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
@@ -127,6 +131,7 @@ impl fmt::Debug for HermitPtraceFailure {
             .field("failure", &self.failure)
             .field("scheduler", &self.cleanup.scheduler)
             .field("preemption_recording", &self.cleanup.preemption_recording)
+            .field("summary", &self.cleanup.summary)
             .field("callbacks", &self.callbacks)
             .field("timeout_during_cleanup", &self.timeout_during_cleanup)
             .finish()
@@ -318,19 +323,16 @@ impl std::error::Error for RecoveryRefusal {}
 struct OriginNumbers {
     thread: ThreadId,
     pid: u32,
-    namespace_dev: u64,
-    namespace_ino: u64,
+    namespace: PidNamespace,
 }
 impl OriginNumbers {
-    fn current() -> Result<(Self, File), RecoveryRefusal> {
-        let file = File::open("/proc/self/ns/pid").map_err(RecoveryRefusal::Identity)?;
-        let meta = file.metadata().map_err(RecoveryRefusal::Identity)?;
+    fn current() -> Result<(Self, Option<File>), RecoveryRefusal> {
+        let (namespace, file) = open_pid_namespace().map_err(RecoveryRefusal::Identity)?;
         Ok((
             Self {
                 thread: std::thread::current().id(),
                 pid: std::process::id(),
-                namespace_dev: meta.dev(),
-                namespace_ino: meta.ino(),
+                namespace,
             },
             file,
         ))
@@ -342,6 +344,100 @@ impl OriginNumbers {
         } else {
             Err(RecoveryRefusal::WrongIdentity)
         }
+    }
+}
+
+/// The PID namespace a process is in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PidNamespace {
+    /// The device and inode of its `/proc/<pid>/ns/pid` file.
+    Inode(u64, u64),
+    /// The only one: a kernel built without PID namespaces (`CONFIG_PID_NS`
+    /// unset, as Android's kernels are) has one, which every process shares,
+    /// and its procfs lists no `ns/pid` entry.
+    Only,
+}
+
+/// The calling process's PID namespace, with its `ns/pid` file opened, which
+/// a caller holds while it records the namespace's identity so that no later
+/// namespace can take that identity (none where the kernel has only the one).
+/// An error when `/proc` cannot say.
+///
+/// Both lookups happen in the caller's own `ns` directory, held open and
+/// checked to be procfs, so neither a filesystem mounted over it nor a mount
+/// change between the lookups passes as a missing entry. A missing `pid`
+/// entry means the kernel has no PID namespaces only when the `mnt` entry,
+/// which every kernel lists, is there.
+pub(crate) fn open_pid_namespace() -> std::io::Result<(PidNamespace, Option<File>)> {
+    // A path handle (`O_PATH`), which needs only search permission: reading
+    // the directory needs the right to inspect its process, which a thread
+    // whose thread group leader has exited no longer has over the leader.
+    // SAFETY: the path is a C string, and a returned descriptor is owned here.
+    let fd = unsafe {
+        libc::open(
+            c"/proc/self/ns".as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just opened and nothing else owns it.
+    let directory = unsafe { File::from_raw_fd(fd) };
+    match open_entry(&directory, c"pid") {
+        Ok(file) => {
+            let meta = file.metadata()?;
+            Ok((PidNamespace::Inode(meta.dev(), meta.ino()), Some(file)))
+        }
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && is_procfs(&directory)
+                && has_entry(&directory, c"mnt") =>
+        {
+            Ok((PidNamespace::Only, None))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Opens the entry `name` of `directory`.
+fn open_entry(directory: &File, name: &CStr) -> std::io::Result<File> {
+    // SAFETY: `name` is a C string, and a returned descriptor is owned here.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` was just opened and nothing else owns it.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Whether `directory` is on procfs.
+fn is_procfs(directory: &File) -> bool {
+    // SAFETY: an all-zero `statfs` is a valid value, and `fstatfs` writes only
+    // the struct it is given.
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    let found = unsafe { libc::fstatfs(directory.as_raw_fd(), &mut fs) } == 0;
+    found && fs.f_type == libc::PROC_SUPER_MAGIC
+}
+
+/// Whether `directory` has an entry `name`.
+fn has_entry(directory: &File, name: &CStr) -> bool {
+    // SAFETY: an all-zero `stat` is a valid value, `name` is a C string, and
+    // `fstatat` writes only the struct it is given.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        ) == 0
     }
 }
 
@@ -387,11 +483,50 @@ impl OriginalProcess {
     }
 }
 
+/// The result a run that ended with a scheduler terminal outcome reports in
+/// place of the guest status it never had: the outcome's status
+/// ([`detcore::TerminalOutcome::exit_status`]), with the output the guest
+/// wrote before it. `None` when the run kept no output to report.
+pub(crate) trait TerminalOutcomeResult: Sized {
+    fn terminal_outcome(
+        outcome: detcore::TerminalOutcome,
+        captured: Option<&CapturedPrefix>,
+    ) -> Option<Self>;
+}
+impl TerminalOutcomeResult for reverie::ExitStatus {
+    fn terminal_outcome(
+        outcome: detcore::TerminalOutcome,
+        _: Option<&CapturedPrefix>,
+    ) -> Option<Self> {
+        Some(reverie::ExitStatus::Exited(outcome.exit_status()))
+    }
+}
+impl TerminalOutcomeResult for reverie::process::Output {
+    fn terminal_outcome(
+        outcome: detcore::TerminalOutcome,
+        captured: Option<&CapturedPrefix>,
+    ) -> Option<Self> {
+        let captured = captured?;
+        Some(reverie::process::Output {
+            status: reverie::ExitStatus::Exited(outcome.exit_status()),
+            stdout: captured.stdout().to_vec(),
+            stderr: captured.stderr().to_vec(),
+        })
+    }
+}
+
 pub(crate) struct Control {
     termination: RefCell<Option<PtraceTerminationHandle>>,
     timeout: Option<(Instant, Duration)>,
     expired: Cell<bool>,
     received_failure: Cell<bool>,
+    /// The guest processes still running when the timeout expired, read once
+    /// at expiry (`timeout_survivors`), before the termination kills them.
+    survivors: RefCell<Option<String>>,
+    /// The run's root guest process, once the tracer has spawned it: a
+    /// survivor whose parent is Hermit but which is not the root was orphaned
+    /// and re-parented to Hermit, as it is when Hermit is the container's init.
+    root: Cell<Option<i32>>,
     cancellation_deadline: Cell<Option<Instant>>,
     global_cleanup_deadline: Cell<Option<Instant>>,
     stage: Cell<HermitCleanupStage>,
@@ -406,6 +541,8 @@ impl Control {
             timeout: timeout.map(|d| (Instant::now() + d, d)),
             expired: Cell::new(false),
             received_failure: Cell::new(false),
+            survivors: RefCell::new(None),
+            root: Cell::new(None),
             cancellation_deadline: Cell::new(None),
             global_cleanup_deadline: Cell::new(None),
             stage: Cell::new(HermitCleanupStage::Startup),
@@ -421,11 +558,28 @@ impl Control {
             self.publish_timeout();
         }
     }
+    /// Let the scheduler hand this run's terminal outcome (a guest deadlock,
+    /// a virtual timeout) to the run instead of exiting the process, while the
+    /// returned guard lives: the unwind publishes the termination that tears
+    /// the parked guest down, as `--timeout` does, and reports whether it
+    /// became the run's cause. Only a run with a termination handle installs
+    /// it. The scheduler task runs on this thread (the run's current-thread
+    /// runtime), where the guard installs it.
+    fn unwind_terminal_outcomes(&self) -> Option<detcore::TerminalOutcomeUnwindGuard> {
+        let handle = self.termination.borrow().clone()?;
+        Some(detcore::TerminalOutcomeUnwindGuard::install(Box::new(
+            move |outcome| {
+                handle.terminate(reverie::Error::Tool(Error::new(SchedulerEndedRun::new(
+                    outcome, None,
+                ))))
+            },
+        )))
+    }
     fn publish_timeout(&self) {
         if let (Some(handle), Some((_, limit))) = (self.termination.borrow().as_ref(), self.timeout)
         {
             // Reverie preserves an earlier Tool failure as primary.
-            handle.terminate(reverie::Error::Tool(Error::new(GuestTimedOut { limit })));
+            handle.terminate(reverie::Error::Tool(Error::new(self.timed_out(limit))));
         }
     }
     /// Mark the run timed out if `now` is at or past its deadline. The caller
@@ -434,17 +588,23 @@ impl Control {
     fn expire_if_due(&self, now: Instant) {
         if !self.expired.get() && self.timeout.is_some_and(|(at, _)| now >= at) {
             self.expired.set(true);
+            *self.survivors.borrow_mut() =
+                crate::timeout_survivors::traced_processes_now(self.root.get());
             if !self.received_failure.get() {
                 let mut snapshot = self.snapshot.borrow_mut();
                 snapshot.kind = FailureKind::RunTimeout;
-                snapshot.primary = GuestTimedOut {
-                    limit: self.timeout.unwrap().1,
-                }
-                .to_string();
+                snapshot.primary = self.timed_out(self.timeout.unwrap().1).to_string();
             }
             self.publish_timeout();
             self.cancellation_deadline
                 .set(Some(Instant::now() + ATTEMPT_BUDGET));
+        }
+    }
+    /// The timeout failure, naming the guest processes read at expiry.
+    fn timed_out(&self, limit: Duration) -> GuestTimedOut {
+        GuestTimedOut {
+            limit,
+            survivors: self.survivors.borrow().clone(),
         }
     }
     async fn yield_checkpoint(&self) {
@@ -477,7 +637,7 @@ struct Driver {
 struct Entry {
     key: u64,
     origin: OriginNumbers,
-    _namespace: File,
+    _namespace: Option<File>,
     original_process: OriginalProcess,
     result_type: TypeId,
     driver: RefCell<ManuallyDrop<Driver>>,
@@ -618,7 +778,7 @@ fn drive<T: 'static>(entry: Rc<Entry>, recovery: bool) -> Result<T, Error> {
                 if let Poll::Ready(result) = polled {
                     let result = match (result, control.timeout) {
                         (Ok(_), Some((_, limit))) if control.expired.get() => {
-                            Err(Error::new(GuestTimedOut { limit }))
+                            Err(Error::new(control.timed_out(limit)))
                         }
                         (result, _) => result,
                     };
@@ -711,33 +871,184 @@ fn drive<T: 'static>(entry: Rc<Entry>, recovery: bool) -> Result<T, Error> {
     }
 }
 
+/// How a waited run ended: finished, with the status and global state the
+/// caller cleans up, or stopped by `--timeout`, whose partial summary the
+/// caller reports ([`TimedOutRun::finish`]). Any other failed run is cleaned
+/// up while waiting, and is the wait's error.
+pub(crate) enum Waited<R> {
+    Finished(R, detcore::GlobalState),
+    TimedOut(TimedOutRun),
+}
+impl<R> Waited<R> {
+    /// The finished run, or a stopped run's failure, its summary logged as a
+    /// finished run's is by `clean_up(false, &None)`.
+    pub(crate) async fn into_finished(self) -> Result<(R, detcore::GlobalState), Error> {
+        match self {
+            Waited::Finished(result, global_state) => Ok((result, global_state)),
+            Waited::TimedOut(run) => Err(run.finish(false, None, None).await),
+        }
+    }
+}
+
+/// A run `--timeout` stopped before the guest exited, with its global state
+/// kept for the partial summary.
+pub(crate) struct TimedOutRun {
+    limit: Duration,
+    failure: PtraceRunFailure,
+    callbacks: Vec<PtraceCallbackDiagnostic>,
+    global_state: detcore::GlobalState,
+    control: Rc<Control>,
+}
+impl TimedOutRun {
+    /// Clean the run up with its partial summary
+    /// (`GlobalState::clean_up_after_run_timeout`), reported where the
+    /// caller's summary of a finished run goes, and return its failure.
+    pub(crate) async fn finish(
+        self,
+        print_summary: bool,
+        summary_json: Option<&Path>,
+        dispatch_stats: Option<reverie::DispatchStats>,
+    ) -> Error {
+        let Self {
+            limit,
+            failure,
+            callbacks,
+            global_state,
+            control,
+        } = self;
+        let cleanup = global_state
+            .clean_up_after_run_timeout(
+                limit.as_secs(),
+                print_summary,
+                summary_json,
+                dispatch_stats,
+            )
+            .await;
+        HermitPtraceFailure {
+            failure,
+            cleanup,
+            callbacks,
+            timeout_during_cleanup: control.expired.get(),
+        }
+        .into()
+    }
+}
+
+/// Wait for the run. A terminal outcome the scheduler hands this run
+/// (`detcore::TerminalOutcomeUnwindGuard`: a guest deadlock, a virtual
+/// timeout) is torn down like a `--timeout` and completes with the outcome's
+/// status; `GlobalState::terminal_outcome` then says the status is that, not
+/// the guest's.
 pub(crate) async fn wait(
     tracer: reverie_ptrace::Tracer<detcore::GlobalState>,
     control: Rc<Control>,
 ) -> Result<(reverie::ExitStatus, detcore::GlobalState), Error> {
-    control.register(tracer.termination_handle());
-    consume(tracer.wait_completion().await, control).await
+    wait_outcome(tracer, control).await?.into_finished().await
 }
+/// [`wait`], with the guest's output; a terminal outcome keeps the output the
+/// guest wrote before it.
 pub(crate) async fn wait_with_output(
     tracer: reverie_ptrace::Tracer<detcore::GlobalState>,
     control: Rc<Control>,
 ) -> Result<(reverie::process::Output, detcore::GlobalState), Error> {
+    wait_with_output_outcome(tracer, control)
+        .await?
+        .into_finished()
+        .await
+}
+/// [`wait`], handing a run `--timeout` stopped back to the caller.
+pub(crate) async fn wait_outcome(
+    tracer: reverie_ptrace::Tracer<detcore::GlobalState>,
+    control: Rc<Control>,
+) -> Result<Waited<reverie::ExitStatus>, Error> {
+    control.root.set(Some(tracer.guest_pid().as_raw()));
     control.register(tracer.termination_handle());
+    let _unwind = control.unwind_terminal_outcomes();
+    consume(tracer.wait_completion().await, control).await
+}
+/// [`wait_with_output`], handing a run `--timeout` stopped back to the caller.
+pub(crate) async fn wait_with_output_outcome(
+    tracer: reverie_ptrace::Tracer<detcore::GlobalState>,
+    control: Rc<Control>,
+) -> Result<Waited<reverie::process::Output>, Error> {
+    control.root.set(Some(tracer.guest_pid().as_raw()));
+    control.register(tracer.termination_handle());
+    let _unwind = control.unwind_terminal_outcomes();
     consume(tracer.wait_with_output_completion().await, control).await
 }
-async fn consume<R>(
+/// The `--timeout` bound, when the deadline's own termination
+/// (`Control::publish_timeout`) is the run's primary failure, not one that
+/// followed an earlier failure.
+fn stopped_by_run_timeout(failure: &PtraceRunFailure) -> Option<Duration> {
+    match failure.primary() {
+        reverie::Error::Tool(inner) => inner.downcast_ref::<GuestTimedOut>().map(|t| t.limit),
+        _ => None,
+    }
+}
+/// The outcome of a failed run that is a clean terminal-outcome teardown: the
+/// unwind's cause is the `primary`, so no earlier failure of the run is
+/// hidden, and the teardown recorded no failure of its own (`secondaries`: a
+/// capture drain or cleanup error), so the captured output is the whole
+/// output. Any other teardown stays a failed run, which
+/// `classify_ptrace_primary` reports as Hermit's.
+pub(crate) fn clean_terminal_outcome(
+    primary: &reverie::Error,
+    secondaries: usize,
+) -> Option<detcore::TerminalOutcome> {
+    match primary {
+        reverie::Error::Tool(inner) if secondaries == 0 => inner
+            .downcast_ref::<SchedulerEndedRun>()
+            .map(|ended| ended.outcome),
+        _ => None,
+    }
+}
+/// What a failed run completes with instead: the terminal outcome's result
+/// when its teardown was clean ([`clean_terminal_outcome`]) and kept what the
+/// caller asked for. `None` leaves it a failed run, whose primary
+/// `classify_ptrace_primary` reports as Hermit's failure (125): a terminal
+/// outcome whose teardown recorded `secondaries` failures of its own among
+/// them.
+pub(crate) fn completed_terminal_outcome<R: TerminalOutcomeResult>(
+    primary: &reverie::Error,
+    secondaries: usize,
+    captured: Option<&CapturedPrefix>,
+) -> Option<R> {
+    let outcome = clean_terminal_outcome(primary, secondaries)?;
+    R::terminal_outcome(outcome, captured)
+}
+async fn consume<R: TerminalOutcomeResult>(
     mut outcome: ToolRunOutcome<detcore::GlobalState, R>,
     control: Rc<Control>,
-) -> Result<(R, detcore::GlobalState), Error> {
+) -> Result<Waited<R>, Error> {
     loop {
         match outcome {
             ToolRunOutcome::Complete(completion) => {
                 let callbacks = completion.callback_diagnostics().to_vec();
                 control.termination.borrow_mut().take();
                 return match completion.result {
-                    Ok(result) => Ok((result, completion.global_state)),
+                    Ok(result) => Ok(Waited::Finished(result, completion.global_state)),
+                    Err(failure)
+                        if let Some(result) = completed_terminal_outcome::<R>(
+                            failure.primary(),
+                            failure.secondary().len(),
+                            failure.captured_prefix(),
+                        ) =>
+                    {
+                        // The terminal outcome, not a failed run: the caller
+                        // finishes the run (summary, recording) as for an exit.
+                        Ok(Waited::Finished(result, completion.global_state))
+                    }
                     Err(failure) => {
                         control.global_failure(&failure, callbacks.clone());
+                        if let Some(limit) = stopped_by_run_timeout(&failure) {
+                            return Ok(Waited::TimedOut(TimedOutRun {
+                                limit,
+                                failure,
+                                callbacks,
+                                global_state: completion.global_state,
+                                control,
+                            }));
+                        }
                         let cleanup = completion
                             .global_state
                             .clean_up_after_backend_failure()

@@ -30,13 +30,20 @@
 //!    in state 3 ([`Scheduler::sigkill_fence_holds`]), so the physical death is
 //!    settled before the next guest instruction; host timing decides only how
 //!    long the pause lasts.
+//!
+//! A thread's own delivery of a signal whose default action ends its process
+//! kills the process's other threads the same way, so they are retired as
+//! committed victims in that delivery turn
+//! ([`Scheduler::retire_fatal_delivery_victims`]).
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 
 use tracing::info;
 
 use super::Scheduler;
+use crate::syscalls::robust_list::RobustListSnapshot;
 use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::FutexID;
@@ -54,12 +61,17 @@ pub(crate) struct SigkillVictim {
 #[derive(Debug)]
 struct Reservation {
     victims: Vec<SigkillVictim>,
+    /// The thread that sends it.
+    sender: DetTid,
     /// The target's real uid, read by the sender before the send, for the
     /// parent's `CLD_KILLED` siginfo.
     uid: u32,
     /// Whether the victims include the sender's own process: such a send is
     /// committed at the sender's `Exit` grant, before it is sent.
     includes_sender: bool,
+    /// Native group intents installed before the reservation reply can let
+    /// the sender await or issue its kill. The registry retains late members.
+    input_freezes: Vec<reverie::reserved_input::InputFreezeCohort>,
 }
 
 /// A reserved send: its token, and whether the victims include the sender's
@@ -199,6 +211,11 @@ pub(crate) struct SigkillRetirement {
     retained_wakes: BTreeMap<(DetTid, u64), Vec<(DetTid, FutexID)>>,
     /// The next batch position of each victim with retained batches.
     wake_batches: BTreeMap<DetTid, u64>,
+    /// The robust lists a sender recorded before its send for the threads the
+    /// send kills, keyed by thread and address space, with the reservation's
+    /// token, until each thread's exit callback takes its own
+    /// ([`Scheduler::take_sigkill_robust_list`]).
+    robust_lists: HashMap<(DetTid, MmId), (u64, RobustListSnapshot)>,
     /// Victims whose first consuming receipt was counted (held or committed):
     /// a later deregistration of the same thread changes nothing. Forgotten
     /// when a new thread registers on the tid (`forget_committed_exit`).
@@ -241,12 +258,7 @@ impl Scheduler {
             .iter()
             .copied()
             .filter(|process| self.thread_tree.process_group(*process) == Some(pgid))
-            .filter(|process| {
-                self.thread_tree
-                    .my_thread_group(process)
-                    .into_iter()
-                    .any(|tid| self.next_turns.contains_key(&tid))
-            })
+            .filter(|process| self.live_process_threads(*process).next().is_some())
             .collect();
         members.sort();
         self.reserve_sigkill_processes(sender, &members, uid)
@@ -283,57 +295,49 @@ impl Scheduler {
             }
             let own = self.registered_process(sender) == Some(*target);
             includes_sender |= own;
-            let mut threads: Vec<DetTid> = self
-                .thread_tree
-                .my_thread_group(target)
-                .into_iter()
-                .filter(|tid| self.next_turns.contains_key(tid))
-                .collect();
-            if threads.is_empty() {
-                return Err(SigkillRefusal::NoTarget);
-            }
-            // The sender's own thread is not a victim: its send does not
-            // return, and its death is covered as an `exit_group` caller's.
-            threads.retain(|tid| *tid != sender);
-            threads.sort();
-            for tid in threads {
-                if self.sigkill.reserved.contains_key(&tid) {
-                    return Err(SigkillRefusal::AlreadyReserved(tid));
+            match self.kill_victims(sender, *target) {
+                Ok(of_target) => victims.extend(of_target),
+                Err(refusal) => {
+                    match refusal {
+                        // A recording made now could not replay this kill: the
+                        // victim's operation may have a recorded result whose
+                        // rejoin will never be consumed. Replay refuses it
+                        // before starting the guest.
+                        SigkillRefusal::BackgroundOperation(tid) => {
+                            crate::detlog::record_replay_refusal(&format!(
+                                "a SIGKILL victim, thread {tid}, had a background operation in flight during record or replay, so its death is retired at its host-timed deregistration (https://github.com/rrnewton/hermit/issues/3994)"
+                            ))
+                        }
+                        SigkillRefusal::UnknownAddressSpace(tid) => {
+                            crate::detlog::write_loss_notice(&format!(
+                                "a SIGKILL victim, thread {tid}, has no recorded address-space identity, so its death is retired at its host-timed deregistration (https://github.com/rrnewton/hermit/issues/3994)"
+                            ))
+                        }
+                        _ => {}
+                    }
+                    return Err(refusal);
                 }
-                // A vfork parent whose child has not reached a release edge is
-                // still in the kernel's vfork wait: its vfork has not returned,
-                // so no result was or will be recorded for it, and the kill
-                // replays as it recorded.
-                let in_unreturned_vfork = self.vfork_barriers.contains_key(&tid)
-                    && !self.released_vfork_barriers.contains(&tid);
-                if self.recordreplay_modes
-                    && self.blocked.external_io_blockers.contains_key(&tid)
-                    && !in_unreturned_vfork
-                {
-                    // A recording made now could not replay this kill: the
-                    // victim's operation may have a recorded result whose
-                    // rejoin will never be consumed. Replay refuses it before
-                    // starting the guest.
-                    crate::detlog::record_replay_refusal(&format!(
-                        "a SIGKILL victim, thread {tid}, had a background operation in flight during record or replay, so its death is retired at its host-timed deregistration (https://github.com/rrnewton/hermit/issues/3994)"
-                    ));
-                    return Err(SigkillRefusal::BackgroundOperation(tid));
-                }
-                let Some(mm) = self.thread_mm(tid) else {
-                    crate::detlog::write_loss_notice(&format!(
-                        "a SIGKILL victim, thread {tid}, has no recorded address-space identity, so its death is retired at its host-timed deregistration (https://github.com/rrnewton/hermit/issues/3994)"
-                    ));
-                    return Err(SigkillRefusal::UnknownAddressSpace(tid));
-                };
-                victims.push(SigkillVictim {
-                    tid,
-                    process: *target,
-                    mm,
-                });
             }
         }
         let token = self.sigkill.next_token;
         self.sigkill.next_token += 1;
+        let mut input_freezes = Vec::new();
+        if let Some(control) = &self.reserved_input_control {
+            let mut frozen_processes = BTreeSet::new();
+            for victim in &victims {
+                if !frozen_processes.insert(victim.process) {
+                    continue;
+                }
+                let own = self.registered_process(sender) == Some(victim.process);
+                let owner = if own { sender } else { victim.tid };
+                let task = *self.reserved_input_tasks.get(&owner).unwrap_or_else(|| {
+                    panic!("reserved-input SIGKILL reservation lacks native binding for {owner}")
+                });
+                input_freezes.push(control.freeze_group(task, !own).unwrap_or_else(|error| {
+                    panic!("reserved-input SIGKILL reservation freeze failed: {error}")
+                }));
+            }
+        }
         for victim in &victims {
             self.sigkill.reserved.insert(victim.tid, token);
         }
@@ -341,8 +345,10 @@ impl Scheduler {
             token,
             Reservation {
                 victims,
+                sender,
                 uid,
                 includes_sender,
+                input_freezes,
             },
         );
         Ok(SigkillReservation {
@@ -351,9 +357,114 @@ impl Scheduler {
         })
     }
 
+    /// The live threads of `target` other than `sender` that a kill of
+    /// `target` retires, in tid order, each with the address-space identity
+    /// it registered with. The sender's own thread is never a victim: a
+    /// SIGKILL it sends to its own process does not return, and its death is
+    /// covered as an `exit_group` caller's; at a fatal delivery it leaves at
+    /// its own exit report. A thread that cannot be retired at the committed
+    /// turn refuses the whole kill, which keeps the host-timed path.
+    fn kill_victims(
+        &self,
+        sender: DetTid,
+        target: DetPid,
+    ) -> Result<Vec<SigkillVictim>, SigkillRefusal> {
+        // `live_process_threads`, not the bare thread tree: it names the
+        // threads whose recorded leader is `target`, so a thread id that a
+        // thread of `target` once had and another process now reuses (its
+        // leader is that process) is not retired with `target`.
+        let mut threads: Vec<DetTid> = self.live_process_threads(target).collect();
+        if threads.is_empty() {
+            return Err(SigkillRefusal::NoTarget);
+        }
+        threads.retain(|tid| *tid != sender);
+        let mut victims = Vec::with_capacity(threads.len());
+        for tid in threads {
+            if self.sigkill.reserved.contains_key(&tid) {
+                return Err(SigkillRefusal::AlreadyReserved(tid));
+            }
+            // A vfork parent whose child has not reached a release edge is
+            // still in the kernel's vfork wait: its vfork has not returned, so
+            // no result was or will be recorded for it, and the kill replays
+            // as it recorded.
+            let in_unreturned_vfork = self.vfork_barriers.contains_key(&tid)
+                && !self.released_vfork_barriers.contains(&tid);
+            if self.recordreplay_modes
+                && self.blocked.external_io_blockers.contains_key(&tid)
+                && !in_unreturned_vfork
+            {
+                return Err(SigkillRefusal::BackgroundOperation(tid));
+            }
+            let Some(mm) = self.thread_mm(tid) else {
+                return Err(SigkillRefusal::UnknownAddressSpace(tid));
+            };
+            victims.push(SigkillVictim {
+                tid,
+                process: target,
+                mm,
+            });
+        }
+        Ok(victims)
+    }
+
+    /// Retire, in `sender`'s delivery turn of a signal whose default action
+    /// ends its process, the process's other live threads as committed
+    /// victims (states 2 to 4 above, with no reservation: the kernel kills
+    /// none of them before the delivering thread resumes). Each is retired in
+    /// tid order, its late requests are never answered, its deregistration is
+    /// only accounted, and turn selection waits until every one is accounted.
+    /// The process itself still ends at `sender`'s own exit report, which
+    /// keeps the parent's notification on its existing path. Returns the
+    /// victims; none where the kill would be refused, which keeps the
+    /// host-timed retirement and, when a thread is the reason, names it as a
+    /// determinism loss.
+    pub(crate) fn retire_fatal_delivery_victims(&mut self, sender: DetTid) -> Vec<SigkillVictim> {
+        let Some(process) = self.registered_process(sender) else {
+            return Vec::new();
+        };
+        if !retires_sigkill_at_the_kill_turn(&self.backend) {
+            return Vec::new();
+        }
+        let victims = match self.kill_victims(sender, process) {
+            Ok(victims) => victims,
+            Err(refusal) => {
+                let held = match refusal {
+                    SigkillRefusal::BackgroundOperation(tid) => Some((
+                        tid,
+                        "had a background operation in flight during record or replay",
+                    )),
+                    SigkillRefusal::UnknownAddressSpace(tid) => {
+                        Some((tid, "has no recorded address-space identity"))
+                    }
+                    _ => None,
+                };
+                if let Some((tid, why)) = held {
+                    crate::detlog::write_loss_notice(&format!(
+                        "a fatal signal's delivery ends process {process}, whose thread {tid} {why}, so the process's threads leave at their host-timed exit reports"
+                    ));
+                }
+                return Vec::new();
+            }
+        };
+        for victim in &victims {
+            info!(
+                "[scheduler] retiring dettid {} of process {} at its fatal signal's delivery",
+                victim.tid, victim.process
+            );
+            self.sigkill.unaccounted.insert(victim.tid);
+            self.logically_kill_thread(&victim.tid, &victim.process, victim.mm);
+        }
+        victims
+    }
+
     /// Route a consuming receipt of `tid` (its deregistration, after its final
     /// accounting): see [`SigkillReceipt`].
     pub(crate) fn route_sigkill_receipt(&mut self, tid: DetTid) -> SigkillReceipt {
+        // The thread's exit callback, which takes its recorded robust list,
+        // came before this receipt: whatever is left was never wanted.
+        self.sigkill
+            .robust_lists
+            .retain(|(owner, _), _| *owner != tid);
         if self.sigkill.reserved.contains_key(&tid) {
             self.sigkill.held_receipts.insert(tid);
             self.sigkill.accounted.insert(tid);
@@ -388,6 +499,25 @@ impl Scheduler {
             self.sigkill.reserved.remove(&victim.tid);
         }
         if !sent {
+            if let Some(control) = &self.reserved_input_control {
+                for cohort in reservation.input_freezes {
+                    // The native send failed and this reservation commits no
+                    // logical retirement. Cancel only if the owned registry
+                    // also proves no native terminal effect. A death already
+                    // observed remains frozen for its ordinary exact fence.
+                    if let Err(error) = control.cancel_freeze_before_effect(cohort) {
+                        assert_eq!(
+                            error.reason(),
+                            "input-retirement-has-native-effect",
+                            "reserved-input failed-send intent could not be accounted"
+                        );
+                    }
+                }
+            }
+            // No thread died, so no robust list is walked.
+            self.sigkill
+                .robust_lists
+                .retain(|_, (recorded_for, _)| *recorded_for != token);
             // No kill happened: wakes and a receipt that arrived meanwhile
             // take the ordinary path now.
             let victims: BTreeSet<DetTid> = reservation.victims.iter().map(|v| v.tid).collect();
@@ -430,6 +560,10 @@ impl Scheduler {
             // deadlock check (https://github.com/rrnewton/hermit/issues/3904):
             // a reserved send does not reach the per-send notification.
             self.record_committed_sigkill(victim.tid, Some(victim.process));
+            // The group dies of SIGKILL, which never dumps core: its zombie
+            // keeps the signal as its exit code, recorded at this turn,
+            // where it is retired, not at its host-timed deregistration.
+            self.record_exit_code(victim.process, libc::SIGKILL);
         }
         for victim in &reservation.victims {
             info!(
@@ -457,7 +591,12 @@ impl Scheduler {
         let cohort = (processes.len() > 1).then_some(token);
         for process in processes {
             if !already_notified.contains(&process) {
-                self.own_killed_child_notification(process, reservation.uid, cohort);
+                self.own_killed_child_notification(
+                    process,
+                    reservation.uid,
+                    cohort,
+                    reservation.sender,
+                );
             }
         }
         // A report the notification did not consume is forgotten, as
@@ -473,8 +612,15 @@ impl Scheduler {
     /// parent's SIGCHLD, a hold until the kernel's publication; otherwise
     /// Linux's siginfo (`CLD_KILLED`, `SIGKILL`) on the scheduler's copy, and
     /// the child-exit timer. The first copy delivered stands for the exit
-    /// (`child_exit_sigchld`).
-    fn own_killed_child_notification(&mut self, process: DetPid, uid: u32, cohort: Option<u64>) {
+    /// (`child_exit_sigchld`). `sender` sent the SIGKILL, in its committed
+    /// turn, which fences the parent's copy (`SigchldFence::by`).
+    fn own_killed_child_notification(
+        &mut self,
+        process: DetPid,
+        uid: u32,
+        cohort: Option<u64>,
+        sender: DetTid,
+    ) {
         let Some(parent) = self.thread_tree.parent_process(&process) else {
             return;
         };
@@ -490,10 +636,11 @@ impl Scheduler {
         ) {
             return;
         }
-        let notification = if self.backend.reports_child_exit_publication {
-            self.classify_child_exit_notification(process, parent)
-        } else {
-            super::ChildExitNotification::Undecided
+        let notification = match self.child_exit_publication() {
+            Ok(super::ChildExitPublication::Reported) => {
+                self.classify_child_exit_notification(process, parent)
+            }
+            Err(_) => super::ChildExitNotification::Undecided,
         };
         match notification {
             super::ChildExitNotification::None | super::ChildExitNotification::Discard => {
@@ -501,6 +648,9 @@ impl Scheduler {
                     self.child_exit_publications_pending.insert(process);
                     self.sigkill.unpublished.insert(process);
                 }
+                // A discarded copy is pending at a point the schedule fixes;
+                // an ignored one is never sent (`fence_child_exit_sigchld`).
+                self.fence_child_exit_sigchld(parent, Some(notification), sender);
             }
             super::ChildExitNotification::Deliver | super::ChildExitNotification::Undecided => {
                 // The kernel sends the parent its own SIGCHLD too, once the
@@ -509,11 +659,14 @@ impl Scheduler {
                 // returns (`CommitSigkill`), so the kernel's copy is pending at
                 // a point the schedule fixes and is delivered first; the
                 // scheduler's copy then sends nothing (`child_exit_sigchld`).
-                if self.backend.reports_child_exit_publication
+                if self.child_exit_publication().is_ok()
                     && !self.child_exit_publications_completed.remove(&process)
                 {
                     self.child_exit_publications_pending.insert(process);
                     self.sigkill.unpublished.insert(process);
+                }
+                if self.child_exit_publication().is_ok() {
+                    self.fence_child_exit_sigchld(parent, Some(notification), sender);
                 }
                 self.child_exit_sigchld.exit_status.insert(
                     process,
@@ -547,6 +700,54 @@ impl Scheduler {
                 );
             }
         }
+    }
+
+    /// Retire every thread still registered, in DetTid order, as a committed
+    /// victim of a kill the scheduler does not send itself: the termination
+    /// that unwinds the guest at a terminal outcome (`unwind_terminal_outcome`)
+    /// kills every guest thread, and their deaths reach the scheduler as
+    /// deregistrations in the order the host reports them. Retired here, each death is then
+    /// only accounted ([`Self::route_sigkill_receipt`]), so the log the run
+    /// ends with, and the scheduler's state, do not depend on that order. The
+    /// scheduler grants no turn after this. As for a committed SIGKILL
+    /// ([`Self::commit_sigkill`]), every victim process is marked dying and
+    /// its exit granted before any is retired, so re-parenting passes over a
+    /// subreaper that dies too, and a parent-death signal is held, not sent,
+    /// as at any committed exit (nothing drains it before the guest is gone).
+    ///
+    /// Not retired here: every thread on a backend that does not retire a
+    /// kill's victims at the kill turn, and one with no recorded process or
+    /// address-space identity (a named determinism loss), which keep their
+    /// host-timed deregistrations, and a thread reserved by a send, whose
+    /// deregistration is a held receipt that retires nothing.
+    pub(crate) fn retire_threads_at_unwind(&mut self) -> Vec<DetTid> {
+        if !retires_sigkill_at_the_kill_turn(&self.backend) {
+            return Vec::new();
+        }
+        let mut victims = Vec::new();
+        for &tid in self.next_turns.keys() {
+            if self.sigkill.reserved.contains_key(&tid) {
+                continue;
+            }
+            let (Some(process), Some(mm)) = (self.registered_process(tid), self.thread_mm(tid))
+            else {
+                crate::detlog::write_loss_notice(&format!(
+                    "thread {tid}, killed by the unwind of a terminal outcome, has no recorded process or address-space identity, so its death is retired at its host-timed deregistration"
+                ));
+                continue;
+            };
+            victims.push(SigkillVictim { tid, process, mm });
+        }
+        for victim in &victims {
+            self.sigkill.dying.insert(victim.process);
+            self.thread_tree.granted_exits.insert(victim.process);
+        }
+        for victim in &victims {
+            self.sigkill.unaccounted.insert(victim.tid);
+            self.logically_kill_thread(&victim.tid, &victim.process, victim.mm);
+        }
+        self.sigkill.dying.clear();
+        victims.into_iter().map(|victim| victim.tid).collect()
     }
 
     /// Whether a committed victim's physical exit is still unaccounted, so no
@@ -607,6 +808,26 @@ impl Scheduler {
         }
     }
 
+    /// Whether a guest's reserved SIGKILL owns `process`'s deaths: a reserved
+    /// send names one of its threads. Such a send retires every thread it
+    /// names at its kill turn, so a death it caused, reported before that
+    /// turn, is never a signal death to wait for at a deregistration
+    /// (`Scheduler::note_signal_killed_group`); after the turn no thread of
+    /// the process is left to wait for.
+    ///
+    /// A committed send's record in `sigkilled_processes` does not count: a
+    /// send that could not be reserved (`SigkillRefusal`) is recorded there
+    /// after the physical send but retires nothing, and its victims' deaths
+    /// arrive at their deregistrations like any other signal death.
+    pub(crate) fn sigkill_owns_process(&self, process: DetPid) -> bool {
+        self.sigkill.reservations.values().any(|reservation| {
+            reservation
+                .victims
+                .iter()
+                .any(|victim| victim.process == process)
+        })
+    }
+
     /// Whether `process` is a victim of the SIGKILL being committed right now.
     pub(crate) fn is_dying_sigkill_victim(&self, process: DetPid) -> bool {
         self.sigkill.dying.contains(&process)
@@ -620,6 +841,61 @@ impl Scheduler {
     /// admitted.
     pub(crate) fn is_unaccounted_sigkill_victim(&self, tid: DetTid) -> bool {
         self.sigkill.unaccounted.contains(&tid)
+    }
+
+    /// The threads reservation `token`'s send kills, each with the address
+    /// space it registered with, in tid order: its victims, and its sender too
+    /// when the send ends the sender's own process. Empty for a token that is
+    /// not reserved.
+    pub(crate) fn sigkill_dying_threads(&self, token: u64) -> Vec<(DetTid, MmId)> {
+        let Some(reservation) = self.sigkill.reservations.get(&token) else {
+            return Vec::new();
+        };
+        let mut dying: Vec<(DetTid, MmId)> = reservation
+            .victims
+            .iter()
+            .map(|victim| (victim.tid, victim.mm))
+            .collect();
+        if reservation.includes_sender
+            && let Some(mm) = self.thread_mm(reservation.sender)
+        {
+            dying.push((reservation.sender, mm));
+        }
+        dying.sort_by_key(|(tid, _)| *tid);
+        dying
+    }
+
+    /// Keep the robust lists the sender of reservation `token` recorded before
+    /// its send, for the threads it kills (`Self::sigkill_dying_threads`) whose
+    /// receipt has not come; a list for any other thread is dropped. They are
+    /// kept apart from the reservation, which the commit removes before the
+    /// victims' exit callbacks take them.
+    pub(crate) fn record_sigkill_robust_lists(
+        &mut self,
+        token: u64,
+        lists: Vec<(DetTid, MmId, RobustListSnapshot)>,
+    ) {
+        let dying = self.sigkill_dying_threads(token);
+        for (tid, mm, list) in lists {
+            // A victim whose receipt already came died on its own before the
+            // send, and walked its own list then; nothing would take this.
+            if dying.contains(&(tid, mm)) && !self.sigkill.accounted.contains(&tid) {
+                self.sigkill.robust_lists.insert((tid, mm), (token, list));
+            }
+        }
+    }
+
+    /// The robust list recorded for thread `tid` of address space `mm` before
+    /// the SIGKILL that killed it, taken by its exit callback.
+    pub(crate) fn take_sigkill_robust_list(
+        &mut self,
+        tid: DetTid,
+        mm: MmId,
+    ) -> Option<RobustListSnapshot> {
+        self.sigkill
+            .robust_lists
+            .remove(&(tid, mm))
+            .map(|(_token, list)| list)
     }
 
     /// Retain a victim's non-empty owner-death wake batch instead of running
@@ -673,9 +949,25 @@ impl Scheduler {
             .retain(|victim, _| retained.keys().any(|(tid, _)| tid == victim));
     }
 
+    /// Whether futex wakes a SIGKILL victim's exit left are retained until
+    /// the fence lifts (`run_retained_sigkill_wakes`).
+    pub(crate) fn has_retained_sigkill_wakes(&self) -> bool {
+        !self.sigkill.retained_wakes.is_empty()
+    }
+
     /// Once no committed victim's physical exit is outstanding, run every
     /// retained wake batch, before step2 drains anything.
     pub(crate) fn run_retained_sigkill_wakes(&mut self) {
+        if !self.sigkill_fence_holds() {
+            let accounted: Vec<_> = self
+                .sigkill
+                .accounted
+                .iter()
+                .filter(|tid| !self.sigkill.reserved.contains_key(tid))
+                .copied()
+                .collect();
+            self.settle_reserved_input_fence(&accounted);
+        }
         if !self.sigkill_fence_holds() && !self.sigkill.retained_wakes.is_empty() {
             self.run_retained_wakes_of(|_| true);
         }
@@ -705,6 +997,126 @@ mod tests {
 
     fn live(scheduler: &Scheduler, tid: i32) -> bool {
         scheduler.next_turns.contains_key(&DetTid::from_raw(tid))
+    }
+
+    /// A sender's recorded robust lists are kept for exactly the threads its
+    /// send kills, each taken once by that thread's exit callback.
+    #[test]
+    fn recorded_robust_lists_are_kept_for_the_threads_the_send_kills() {
+        let mut scheduler = family();
+        let [sender, target, worker] = [2, 3, 4].map(DetTid::from_raw);
+        let mm = |tid: DetTid| MmId::initial(tid);
+        let token = scheduler
+            .reserve_sigkill(sender, DetPid::from_raw(3), 0)
+            .unwrap()
+            .token;
+        assert_eq!(
+            scheduler.sigkill_dying_threads(token),
+            vec![(target, mm(target)), (worker, mm(worker))]
+        );
+        let list = RobustListSnapshot::default;
+        scheduler.record_sigkill_robust_lists(
+            token,
+            vec![
+                (sender, mm(sender), list()),
+                (target, mm(target), list()),
+                (worker, mm(sender), list()),
+                (worker, mm(worker), list()),
+            ],
+        );
+        scheduler.commit_sigkill(token, true);
+        // The sender survives, and a list under another address space is no
+        // thread's this send kills.
+        assert!(
+            scheduler
+                .take_sigkill_robust_list(sender, mm(sender))
+                .is_none()
+        );
+        assert!(
+            scheduler
+                .take_sigkill_robust_list(worker, mm(sender))
+                .is_none()
+        );
+        assert!(
+            scheduler
+                .take_sigkill_robust_list(worker, mm(worker))
+                .is_some()
+        );
+        assert!(
+            scheduler
+                .take_sigkill_robust_list(worker, mm(worker))
+                .is_none()
+        );
+        // A receipt drops a list its thread never took.
+        scheduler.route_sigkill_receipt(target);
+        assert!(
+            scheduler
+                .take_sigkill_robust_list(target, mm(target))
+                .is_none()
+        );
+    }
+
+    /// An unwound send kills nobody, so it keeps none of its lists; a victim
+    /// that died before the record keeps none either; a send that ends its
+    /// sender's own process records the sender's list too.
+    #[test]
+    fn an_unwound_send_keeps_no_robust_list_and_a_self_send_keeps_the_senders() {
+        let mut scheduler = family();
+        let [sender, target, worker] = [2, 3, 4].map(DetTid::from_raw);
+        let mm = |tid: DetTid| MmId::initial(tid);
+        let token = scheduler
+            .reserve_sigkill(sender, DetPid::from_raw(3), 0)
+            .unwrap()
+            .token;
+        scheduler.record_sigkill_robust_lists(
+            token,
+            vec![(target, mm(target), RobustListSnapshot::default())],
+        );
+        scheduler.commit_sigkill(token, false);
+        assert!(
+            scheduler
+                .take_sigkill_robust_list(target, mm(target))
+                .is_none()
+        );
+
+        let own = scheduler
+            .reserve_sigkill(worker, DetPid::from_raw(3), 0)
+            .unwrap();
+        assert!(own.includes_sender);
+        assert_eq!(
+            scheduler.sigkill_dying_threads(own.token),
+            vec![(target, mm(target)), (worker, mm(worker))]
+        );
+
+        // A victim that died on its own before the record keeps none.
+        let mut scheduler = family();
+        let token = scheduler
+            .reserve_sigkill(sender, DetPid::from_raw(3), 0)
+            .unwrap()
+            .token;
+        assert_eq!(
+            scheduler.route_sigkill_receipt(target),
+            SigkillReceipt::Held
+        );
+        scheduler.record_sigkill_robust_lists(
+            token,
+            vec![
+                (target, mm(target), RobustListSnapshot::default()),
+                (worker, mm(worker), RobustListSnapshot::default()),
+            ],
+        );
+        scheduler.commit_sigkill(token, true);
+        assert!(
+            scheduler
+                .take_sigkill_robust_list(target, mm(target))
+                .is_none()
+        );
+        assert!(
+            scheduler
+                .take_sigkill_robust_list(worker, mm(worker))
+                .is_some()
+        );
+        scheduler.route_sigkill_receipt(worker);
     }
 
     /// The commit retires every thread of the target at the sending turn, and

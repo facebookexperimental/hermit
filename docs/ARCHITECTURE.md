@@ -23,9 +23,9 @@ The most important boundary is:
 These rules bind every backend and every change, and a review checks a change
 against them (owner, 2026-10-15). A *backend* is a Reverie implementation of
 the `Tool`/`Guest` contract (ptrace, dbt, in-guest-trap, liteinst, sabre,
-e9patch, kvm); the *tool* is Detcore. Known violations are listed in the
-[backend architecture audit](https://github.com/rrnewton/dev-hermit/blob/main/ai_docs/2026-10-15-kvm-backend-architecture-audit.md)
-and tracked from https://github.com/rrnewton/hermit/issues/4485.
+e9patch, kvm); the *tool* is Detcore. Known violations are tracked from
+https://github.com/rrnewton/hermit/issues/4485 and its successor
+https://github.com/rrnewton/hermit/issues/4659.
 
 1. **A backend only intercepts.** It hooks guest syscalls and other events and
    delivers them to the tool through the standard callbacks. How it hooks, and
@@ -136,8 +136,8 @@ time) stays in the hermit process.
 | **dbt** | DynamoRIO pre-syscall event in a DynamoRIO client (`reverie-dbt`, `detcore-dbt`) | Inside the guest, in the DynamoRIO client | Experimental; handles clone, fork, exec and signals in its own C client, contrary to principle 4 |
 | **in-guest-trap** | A seccomp filter turns every syscall into `SIGSYS`, and a handler inside the guest calls Detcore (`reverie-inguest`) | Inside the guest, in a preloaded runtime | Experimental; `fork` only: `execve` and thread creation are refused, signal handling is limited, and no preemption timer yet |
 | **liteinst** | in-guest-trap plus run-time patching: a syscall site that has trapped once is rewritten to jump straight to the handler (`reverie-liteinst`, `liteinst2`) | As in-guest-trap | Experimental; the same runtime as in-guest-trap with site patching on, so it has the same limits |
-| **sabre** | Load-time rewriting of syscall sites by the SaBRe loader, with a ptrace supervisor as the backstop for sites it missed (`reverie-sabre`, `detcore-sabre`) | Inside the guest, in a SaBRe plugin | Experimental |
-| **e9patch** | Ahead-of-time empty rewrite of the main ELF's candidate sites, then the ordinary ptrace path | In the tracer, as ptrace | Experimental; see below |
+| **sabre** | Load-time rewriting of syscall sites by the SaBRe loader, with a ptrace supervisor as the backstop for sites it missed (`reverie-sabre`, `detcore-sabre`) | Inside the guest, in a SaBRe plugin | Archived (nightly only) since 2026-10-25: builds and has a per-commit smoke test, no feature work; see `ci/manifest-plan/src/archived.rs` |
+| **e9patch** | Ahead-of-time empty rewrite of the main ELF's candidate sites, then the ordinary ptrace path | In the tracer, as ptrace | Archived (nightly only) since 2026-10-25: preprocessing, not a backend, with per-commit build and contract checks and no feature work; see below |
 | **kvm** | The guest runs in a KVM virtual machine and traps by VM exit (`reverie-kvm`) | In the hermit process, driven by the KVM executor | Experimental; the executor implements part of the Linux personality itself, including an allowlisted `/proc`, contrary to principles 2 and 3 |
 
 in-guest-trap and liteinst are one runtime with a switch: Hermit sets
@@ -182,8 +182,8 @@ per-backend results is paused until that is consolidated. The target layout:
 - **One container.** Every guest launch should go through
   `launch_in_container` and `complete_container_config` in
   `hermit-cli/src/bin/hermit/`. All seven backends use it for `hermit run`
-  today. Record, replay and `--namespace-only`
-  still build their own containers and are to move onto it
+  today. Record, replay, `--namespace-only`
+  and `sabre strace` still build their own containers and are to move onto it
   (https://github.com/rrnewton/hermit/issues/4009).
 - **One in-guest runtime.** `reverie-inguest` owns the seccomp filter, the
   single `SIGSYS` handler, the dispatcher, the handler driver, the RPC client,
@@ -703,9 +703,15 @@ synthesize a full virtual filesystem, Detcore takes a **snapshot-and-normalize**
 approach for a small allow-list of volatile files (`detcore/src/procfs.rs`):
 
 - `/proc/self/stat` — a fixed set of volatile numeric fields (the page-fault
-  counters, `utime`/`stime`/`cutime`/`cstime`, `itrealvalue`, `starttime`, the
-  last-run `processor`, and the trailing delay/guest-time accounting fields) are
-  rewritten to `0`, while the `comm` string and structural fields are preserved.
+  counters, `itrealvalue`, `starttime`, the last-run `processor`, and the
+  trailing delay/guest-time accounting fields) are rewritten to `0`, while the
+  `comm` string and structural fields are preserved. Where Detcore renders the
+  reader's own process's `stat`, `utime`/`stime`/`cutime`/`cstime` are its
+  logical CPU accounting, the one `times(2)`, `getrusage(2)` and the CPU-time
+  clocks report; elsewhere they are `0`.
+- `/proc/<pid>/schedstat` — the task's runtime from the same accounting, for
+  a thread of the reader's own process where its `stat` is rendered (else
+  `0`), and `0` for the run-queue wait and the run count.
 - `/proc/self/status` — the CPU affinity mask/list are pinned to virtual CPU 0,
   and `voluntary_ctxt_switches` and `nonvoluntary_ctxt_switches` are pinned to
   `0`.
@@ -718,6 +724,128 @@ and stores the sanitized buffer on the open file description. Subsequent
 sequential reads return slices from that immutable snapshot using a shared
 logical offset, so partial reads of that one snapshot are consistent.
 
+A process's own `maps` (`/proc/self/maps`, `thread-self`, its pid or
+`task/<tid>`) is not captured where the backend reports its memory map
+(`Guest::memory_map`; package K slice K9a of
+<https://github.com/rrnewton/hermit/issues/4213>) and Detcore renders procfs
+(outside record and replay, and before any `chroot`). The open binds the file
+to the task its path names and to that task's address space, as Detcore's
+process table identifies them. At the first read, a bound file whose task is
+gone, or whose number another task holds by then, fails ESRCH, as Linux's read
+does; otherwise, where the reader holds the bound address space, Detcore
+prints each listed mapping as Linux's `show_map_vma` does
+(`detcore/src/procfs/memory_map.rs`), and the result takes the same identity
+rewrite. The process table identifies an address space by the number of the
+task that made it and an exec count (`MmId`), which a reused number can
+repeat: on ptrace, once the kernel's pid space wraps, a task that shares a
+reaped task's address space (a `CLONE_VM` child that is not a thread) can open
+its maps and then fork a child that gets the reaped task's number, whose
+address space then has the same identity, so that child reads its own map
+through the inherited descriptor where Linux prints its parent's. LinuxEmu
+never reuses a task's number. A `stat` of a bound descriptor reports size 0,
+as Linux's does. The kernel's file stays unread, so Detcore keeps the kernel's
+position at the file's cursor after every read and seek, as a read of it would
+move it: on ptrace `fdinfo` shows Linux's position (KVM shows no `fdinfo` for
+the file), and a descriptor of the open file that Detcore records as an open
+file of its own (one received over `SCM_RIGHTS` that it does not join) reads
+the kernel's file on from there. On ptrace each such seek walks the mappings
+up to the position, which grows with the square of the file's size for a guest
+that reads it in small pieces (a guest with 20,000 mappings that reads its
+982 KB file 1 KiB at a time spends 1.05 to 1.40 s more system time a pass,
+about 1.3 ms a read at a position of 0.5 MB; one with 5,000 no measurable
+time), and once the task is reaped, the kernel refuses the seek and its
+position falls to 0. On ptrace the map is the kernel's own text, so the file
+reads as before but for a `[uprobes]` line, which is left out of this file
+only (it stays in `smaps`, `numa_maps` and every `maps` captured from the
+kernel): the kernel adds that page to a process when a uprobe installed by
+something else on the host fires in it, so it can be there in one run and not
+in the next. On KVM the map lists
+the mappings of the stack window that LinuxEmu keeps, `[stack]` and the parts a
+split left of it, exactly as Linux prints them, so glibc's `pthread_getattr_np`
+finds the main thread's stack as on Linux. The image, the interpreter, the
+vDSO, the heap and every `mmap(2)` mapping are missing, a named difference of
+the KVM provider (<https://github.com/rrnewton/reverie/issues/1211>), and the
+lowest line starts where LinuxEmu's window does, 8 MiB less a page below the
+stack's top. Once LinuxEmu loses track of the window (an `mprotect(2)` across
+a hole in it, which it refuses whole, or a change a `vfork` partner made), its
+map lists nothing, and the file is again LinuxEmu's one invented `[stack]` line
+over the whole window, in the process and the children it forks, until it
+executes another program. On KVM only `self` and the pid spelling open:
+`thread-self` and `task/<tid>` fail with EACCES, as before this rendering, as
+LinuxEmu's synthetic path table has no entry for them, and so do
+`/proc/self/../self/maps` and `open("/proc/self", O_DIRECTORY)`, through which
+an `openat` would reach the file; a reopen through `/proc/self/fd/N` reads the
+invented line, where Linux reads a fresh map. A descriptor received over
+`SCM_RIGHTS` on KVM is not bound: it reads the invented line while the task
+that opened it is a zombie (Linux reads nothing) and once that task is reaped
+(Linux fails ESRCH), and a process that sends its own descriptor to itself
+reads the invented line through the received copy and the rendered map
+through the original, where Linux's two descriptors share one open file, its
+contents and its position. The descriptor there is
+still LinuxEmu's in-memory file, so `mmap(2)` of it maps the invented line,
+where Linux refuses with ENODEV, and a `stat` of its path or its descriptor
+link reports that line's length; package K slice K10 removes that file.
+Another process's `maps`, which the open does not bind, and a descriptor read
+where the reader does not hold the bound address space (in another process
+that inherited it, or after an `exec`), are captured from the kernel as above.
+
+Where the guest's procfs is not the kernel's (KVM), there is no kernel
+`smaps`, `smaps_rollup` or `numa_maps` to sanitize, and Detcore renders each
+process's itself from the backend's memory map (package K slice N4 of
+<https://github.com/rrnewton/hermit/issues/4213>,
+`detcore/src/procfs/memory_map/smaps.rs`): a per-process file Detcore opens
+with a placeholder, as it does `statm`, whose open binds the task and its
+address space as a `maps` does, and whose first read prints what Linux's
+`show_smap`, `show_smaps_rollup` and `show_numa_map` print for the listed
+mappings, which the same sanitizers then normalize, so that the guest reads,
+for each mapping, the bytes ptrace's sanitized file gives. The fields the
+memory map does not list are derived from facts the same way on every
+backend: `KernelPageSize` and `MMUPageSize` from the page size;
+`THPeligible` from the host's transparent huge page settings, which a KVM
+guest reads in sysfs too and which ptrace's sanitized file also follows, the
+mapping's size and alignment, and whether the address space disabled huge
+pages (`PR_GET_THP_DISABLE`, asked of the backend), as Linux's
+`thp_vma_allowable_orders` decides it for an anonymous mapping (Detcore
+answers `MADV_HUGEPAGE` itself and never passes it on); `ProtectionKey`
+where the kernel serving the process enables protection keys
+(`arch_pkeys_enabled`), which Detcore asks of that kernel through the
+backend with a `pkey_mprotect` that changes nothing (key 0 of a page no
+mapping can hold: EINVAL without keys, ENOMEM with them); the initial
+stack's `VmFlags` from `setup_arg_pages`' flags and its protection;
+`numa_maps`' policy `default`, Detcore's one-node model, which records no
+policy; and its `kernelpagesize_kB`, which Linux prints only for a mapping
+with a resident page, for the initial stack, which holds one from exec on.
+What cannot be derived is refused by name through the unsupported-operation
+policy, never printed as a plausible value: any mapping but the initial
+stack (whose flags depend on how it was made, and whose residency is the
+host's); a listed mapping that `madvise(2)` access-pattern, fork or dump
+advice or `mlock(2)` reached (`MemoryMetadata::mapping_flags_changed`), and,
+in `numa_maps`, one that advice that discards pages reached
+(`MADV_DONTNEED`, `MADV_DONTNEED_LOCKED`, `MADV_GUARD_INSTALL`,
+`MADV_WIPEONFORK`: `MemoryMetadata::pages_discarded`), while advice on a
+mapping the memory map does not list refuses nothing; a kernel that enables
+protection keys, whose keys follow calls Detcore does not record
+(`mprotect(PROT_EXEC)` alone gives the execute-only key); `smaps_rollup` from
+a memory map that lists only some mappings (its header spans the whole
+address space); another process's file (the memory map describes the
+reader's own process only); and a read where the reader does not hold the
+bound address space. On KVM the memory map lists the stack window only, so
+`smaps` and `numa_maps` list `[stack]` alone, a named difference
+(<https://github.com/rrnewton/reverie/issues/1211>), with every byte of its
+block and row the same as ptrace's but for three named differences: its range
+and size, which LinuxEmu's window decides; the `ProtectionKey` line, which
+KVM's kernel does not print because it enables no protection keys (its vCPU
+runs with CR4.PKE clear, and LinuxEmu answers the protection-key calls as
+Linux on such a CPU), where the host kernel beneath ptrace prints one; and,
+on a host whose transparent huge page setting is `always`, `THPeligible`,
+which follows the mapping's size, so that KVM's 8188 kB window prints 1
+where a native-sized stack prints 0. `smaps_rollup`, a stack a split left in
+parts, advice that sets flags on the stack, and `numa_maps` after advice
+that discards the stack's pages are refused. Elsewhere the kernel's three
+files are captured and sanitized as above, as before Detcore rendered any:
+every spelling of them is the kernel's, decided from the backend's
+capabilities before any request to the global tool.
+
 This is not a complete host-independent representation of any of the three
 files. Fields not listed above remain exactly as the host kernel reported them,
 and a separately opened file receives a separate snapshot. The normalized
@@ -727,6 +855,43 @@ field and other external inputs remaining unchanged.
 This is deliberately a narrow allow-list of *observed* volatile fields, not a
 general procfs emulation: files and fields outside the list still read through to
 the host kernel and remain potential determinism boundaries.
+
+### CPU identity
+
+By default a run presents one CPU and one NUMA node, whichever host CPUs the
+tracer may use: `sched_getaffinity`, `getcpu` (the system call and the vDSO entry Reverie
+patches), the CPU and node lists under `/sys/devices/system`, `Cpus_allowed` in
+`/proc/self/status`, the last-run CPU in `/proc/self/stat`, the CPUID APIC
+IDs and RDTSCP's CPU ID all name CPU 0 and node 0. Listings of
+`/sys/devices/system/cpu`, `/sys/devices/system/node`, their `/sys/bus`
+counterparts and `cpufreq` show only number 0 by default. With
+`--virtual-cpus=N`, CPU and policy names range from 0 through N-1; there is
+still only node 0. A lookup of an omitted `cpuN`, `nodeN` or `policyN`, or a
+name below one, finds nothing; so do node0's omitted `cpuN` links, the
+processor driver's and a memory block's omitted `nodeN` link. These filters
+apply to sysfs objects, not ordinary directories mounted over their paths. A spelling with `..` or another symbolic link that reaches one of them
+is the kernel's to resolve and is not refused. Under record and replay the
+listings and lookups are the host's. `rseq` is refused with ENOSYS under the
+default policy, as a kernel without rseq answers. Under
+`--allow-unsupported-syscalls` it reaches the kernel, which writes the CPU and
+node a thread runs on into a registered area (Linux v6.16
+`rseq_update_cpu_node_id`, kernel/rseq.c), so a guest that registers one there
+sees the host CPU.
+
+The ptrace backend also cannot trap one more source. The kernel loads the CPU
+and node numbers into the limit of a per-CPU segment and into `TSC_AUX` (v6.16
+`setup_getcpu`, arch/x86/kernel/cpu/common.c, through `vdso_encode_cpunode`),
+and an `lsl` of that segment, or RDPID where the CPU has it, reads them back
+(`vdso_read_cpunode`, arch/x86/include/asm/segment.h). Neither instruction
+traps, so code that runs one itself sees the host CPU. That differs between
+runs: a run that pins its threads (`--pin-threads`, implied by a maximum
+timeslice with sequentialized threads) is pinned to a randomly chosen core of
+the tracer's allowed set, and an unpinned one can migrate. glibc and the
+dynamic loader do not run them; they reach the CPU number through `getcpu`.
+Closing it needs the instruction rewritten before it runs (e9patch
+preprocessing) or a backend that owns the guest's segment table and `TSC_AUX`
+(KVM). Memory blocks under `/sys/devices/system/memory` that belong to other
+nodes are still listed, and their own files name the node.
 
 ### Futexes
 
@@ -961,6 +1126,8 @@ The main implementation entry points are:
 | Resource identities and requests | `detcore/src/resources.rs` |
 | FD model | `detcore/src/fd.rs` |
 | Deterministic procfs snapshots | `detcore/src/procfs.rs`, `detcore/src/syscalls/files.rs` |
+| A process's own `maps` from the backend's memory map | `detcore/src/procfs/memory_map.rs` |
+| A process's `smaps`, `smaps_rollup` and `numa_maps` from the backend's memory map | `detcore/src/procfs/memory_map/smaps.rs` |
 | Logical time | `detcore-model/src/time.rs`, `detcore/src/syscalls/time.rs` |
 | Signal handling | `detcore/src/syscalls/signal.rs` |
 | CPUID table | `detcore/src/cpuid.rs` |

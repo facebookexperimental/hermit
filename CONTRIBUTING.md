@@ -20,6 +20,16 @@ We actively welcome your pull requests.
 5. Make sure your code lints.
 6. If you haven't already, complete the Contributor License Agreement ("CLA").
 
+GitHub-hosted portable CI (`.github/workflows/ci-portable.yml`) runs
+automatically on pull requests opened by anyone other than the project bot,
+from a branch or a fork, once the pull request is out of draft. A run for a
+fork pull request waits for a maintainer to approve it in the Actions tab; the
+maintainer first reads the pull request's `.github/` changes, because GitHub
+runs the workflow files from the pull request itself. The privileged
+(self-hosted, PMU/KVM) workflows are not triggered by pull requests: a
+maintainer dispatches them after reviewing the change. CI results are
+supplemental evidence; local validation (below) is what a reviewer looks for.
+
 ## Local Validation Protocol
 
 Every change must be **locally validated before it is pushed**. The single
@@ -28,6 +38,15 @@ entry point is:
 ```bash
 ./scripts/validate.rs
 ```
+
+A bare invocation runs selective validation: docs-only changes skip,
+a change confined to the DBT crates (`detcore-dbt/**`, `detcore-dbt-cdylib/**`,
+or `reverie-dbt/**` in an expanded Reverie pin) runs the common-core nodes
+plus every E2E bucket containing a DBT cell, and everything else runs the
+full label. It fails safe to the full label when no trustworthy baseline
+exists. Scoped kvm, ptrace, liteinst, sabre and e9patch routes are residual
+future work, not v1 routes. Run `./scripts/validate.rs --all` for the
+complete suite.
 
 `scripts/validate.rs portable-only` is the local mirror of the required
 `.github/workflows/ci-portable.yml` workflow: it runs the same build, lint,
@@ -61,12 +80,33 @@ Protocol for every PR:
    owning CI workflow in the same PR so they stay in lockstep, and update the
    mapping table in `docs/ci-validate-alignment.md`. See the "Reconciliation
    checklist for test-adding PRs" in that document.
-3. A full green `scripts/validate.rs` delegates to `ci-hub apply-local-label` after its
-   ledger row is written. Do not add **`locally-validated`** by hand: the applier
-   re-reads the counted exact-head row, hashes its log, publishes an immutable
-   receipt, and only then comments and labels. The command can also be run
-   manually to backfill a validated head. Re-run validation after any subsequent
-   push; the push invalidates both the prior receipt and label.
+3. Inside the maintainers' `dev-hermit` harness, a full green
+   `scripts/validate.rs --all` delegates to `ci-hub apply-local-label` after its
+   ledger row is written. Do not add **`locally-validated`** by hand there: the
+   applier re-reads the counted exact-head row, hashes its log, publishes an
+   immutable receipt, and only then comments and labels. The command can also
+   be run manually to backfill a validated head. Re-run validation after any
+   subsequent push; the push invalidates both the prior receipt and label.
+4. **Outside that harness** (a plain clone of this repository, including
+   contributors' automation), `./scripts/validate.rs` runs the same plan
+   (`--show-plan` lists it) and records its result in the standalone ledger
+   under `ci/validate-ledger/`, but it cannot publish a receipt or apply the
+   label, and says so ("not applying locally-validated"). The pinned-root
+   nodes need Podman and the locally built pinned image (`ci/hermetic/README.md`,
+   `ci/hermetic/build-image.sh`); PMU and KVM cells need a host that has them.
+   To have the run recorded, post one pull-request comment headed
+   `Local validation` that contains:
+   - the exact 40-hex head commit you validated;
+   - the command and level (`./scripts/validate.rs`, or `portable-only` when
+     the host cannot run the full level);
+   - the run's final summary line and its `FINAL_VALIDATE_STATUS:` line;
+   - the host's relevant capabilities (kernel version, PMU yes/no, KVM yes/no)
+     and any check that could not run;
+   - the standalone ledger row the run appended under `ci/validate-ledger/`.
+
+   A maintainer checks that the commit is the pull request's current head and
+   the status is a pass, then applies `locally-validated`. A later push
+   invalidates it, as above.
 
 A PR that changes code but is missing the `locally-validated` label — or whose
 description does not account for any check that could not run locally — is not

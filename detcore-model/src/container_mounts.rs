@@ -280,7 +280,11 @@ impl ContainerMountTable {
     /// by unrelated host activity between runs, and a row added or removed
     /// renumbers every later row. Where Hermit is given an image root
     /// (`--image`), every mount below that root is Hermit's own, so nothing is
-    /// hidden there.
+    /// hidden there. hermit-cli also leaves the `uid=` and `gid=` superblock
+    /// options out of the rows of the filesystems its plan mounts afresh,
+    /// which only the container's root can own: Linux prints a tmpfs's owner
+    /// as the initial user namespace sees it, so they would name the host
+    /// user who ran Hermit where the same mount by root names no one.
     pub fn select(
         namespace: &[ContainerMount],
         installed: &BTreeSet<u64>,

@@ -167,6 +167,16 @@ fn select_nodes(selector: &Path, files: &[String]) -> (String, Vec<String>) {
     let out = child
         .wait_with_output()
         .unwrap_or_else(|e| fail(&format!("selector wait: {e}")));
+    // A failed selector run must refuse here, not be ingested: its failure
+    // record parses as {decision: full, nodes: null}, which would
+    // otherwise credit this sample with zero nodes.
+    if !out.status.success() {
+        fail(&format!(
+            "selector failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
     let v: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
         fail(&format!(
             "selector emitted non-JSON: {e}: {}",

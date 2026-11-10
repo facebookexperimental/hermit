@@ -910,7 +910,10 @@ static void nonleader_exec_child(void) {
 /* The J construction with a process-directed SI_QUEUE send in a process with
  * two live threads. */
 static void forged_shared(void) {
-  install(SIGUSR1, 1);
+  /* A recording handler, not SIG_IGN, so the test proves delivery to the
+   * parked worker the sender's blocked mask leaves as Linux's choice, not
+   * only that the send was admitted. */
+  install(SIGUSR1, 0);
   pthread_t th;
   pthread_create(&th, 0, parked_worker, (void *)(intptr_t)200);
   mask(SIG_BLOCK, SIGUSR1);
@@ -921,8 +924,9 @@ static void forged_shared(void) {
   si.si_code = SI_QUEUE;
   si.si_value.sival_ptr = (void *)(uintptr_t)VALUE;
   int r = (int)syscall(SYS_rt_sigqueueinfo, getpid(), SIGUSR1, &si);
-  printf("forged_shared queue=%d\n", r);
   pthread_join(th, 0);
+  printf("forged_shared queue=%d deliveries=%d on_worker=%d\n", r, n,
+         n > 0 && rthread[0] == wtid);
 }
 
 /* The Codex review of https://github.com/rrnewton/hermit/pull/4491. */

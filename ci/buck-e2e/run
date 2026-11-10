@@ -29,8 +29,9 @@
 # HEAD must be the staged SOURCE_SHA with no uncommitted changes to tracked files before
 # the run, after it, and after judging it: Buck builds the release hermit from the working
 # tree, and every row records SOURCE_SHA as a clean source tree.
-# Tpx retries a failed cell once (--retry 1); cells pass --no-retry to the harness, and
-# ingest.py turns a retried cell's executions into attempts 1 and 2. EXTRA args go to
+# The harness owns retries (owner policy, 2026-10-30): Tpx retries are off
+# (--retry 0) and the harness retries a failed cell once itself; ingest.py
+# numbers harness attempts in order. EXTRA args go to
 # every `buck2 test` before the `--` (e.g. @shim/modes/hybrid).
 # An RE worker can lack a capability a cell needs that the plan cannot route on, because
 # workers differ: `hermit run --strict` on ptrace refuses where the branch counter is
@@ -126,7 +127,7 @@ for previous in re local all rerun-local; do
     rm -f -- "$work/$previous".{log,rc,test_id,times,event-log.pb.zst}
 done
 extra=("$@")
-tpx=(-- --retry 1 --no-retry-on-skip)
+tpx=(-- --retry 0 --no-retry-on-skip)
 
 invoke() { # invoke NAME TARGET... [buck2 args...]: one `buck2 test`, its exit status in NAME.rc
     local name=$1
@@ -152,6 +153,15 @@ collect() { # collect NAME...: append each invocation's test-run id to ids, or e
             tail -20 "$work/$r.log" >&2
             exit 1
         fi
+        # An invocation that ran no tests leaves a test-run id that Tpx keeps no results
+        # for ("Run ID ... not found"), so it gives ingest nothing to read. Since the
+        # third-party split no cell routes to RE (only DBT's did), and hybrid's RE group is
+        # empty. Ingest still needs a row for every plan cell, so a group that should have
+        # run cells and ran none still fails there, naming the cells.
+        if [[ $rc == 0 ]] && grep -aq 'NO TESTS RAN' "$work/$r.log"; then
+            echo "ci/buck-e2e/run: buck2 test ($r) ran no tests; its test-run id $(cat "$work/$r.test_id") has no results to ingest" >&2
+            continue
+        fi
         ids+=("$(cat "$work/$r.test_id")")
         # Read by ingest.py only to name why an execution wrote no row.
         if [[ -s $work/$r.event-log.pb.zst ]]; then
@@ -161,6 +171,10 @@ collect() { # collect NAME...: append each invocation's test-run id to ids, or e
 }
 
 ingest() { # ingest: rows for every invocation in ids, and the cells withheld on RE that run again locally
+    if ((${#ids[@]} == 0)); then
+        echo "ci/buck-e2e/run: no buck2 test invocation ran any test; the run has no verdict" >&2
+        exit 1
+    fi
     python3 "$here/ingest.py" --plan "$root/ci/expected-e2e-plan.json" --out "$out" --work "$work/artifacts" \
         --local-artifacts "$root/buck-out/v2/test/execution" --withheld-on-re "$work/withheld-on-re" \
         --withheld-retries "$work/withheld-retries" "${failed_logs[@]}" \
@@ -196,7 +210,7 @@ if [[ -s $work/withheld-on-re || -s $work/withheld-retries ]]; then
             "${retries[*]}" >&2
         tpx=(-- --retry 0 --no-retry-on-skip)
         invoke retry-local "${retries[@]/#/"//ci/buck-e2e:"}" -c hermit_e2e.routing=local
-        tpx=(-- --retry 1 --no-retry-on-skip)
+        tpx=(-- --retry 0 --no-retry-on-skip)
         reruns+=(retry-local)
     fi
     collect "${reruns[@]}"

@@ -25,6 +25,7 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
+use detcore_model::TerminalOutcome;
 use detcore_model::summary::RunSummary;
 use hermit::Backend;
 use hermit::Context;
@@ -35,7 +36,6 @@ use hermit::canonical_verdict::LogCompareStrictness;
 use hermit::canonical_verdict::RunFailure;
 use hermit::canonical_verdict::VerificationRun;
 use hermit::host_input_change::read_host_inputs;
-#[cfg(feature = "dbt")]
 pub(crate) use hermit::verify_run_record::DBT_STATS;
 pub(crate) use hermit::verify_run_record::DbtRunRecord;
 pub(crate) use hermit::verify_run_record::HOST_INPUTS;
@@ -158,6 +158,20 @@ impl VerifyRunWriter {
         file.write_all(bytes)
             .and_then(|()| file.sync_all())
             .with_context(|| format!("writing {}", path.display()))
+    }
+
+    /// Fixed native-payload storage, shared by the admitted saved driver and
+    /// immutable backend evidence artifacts. The caller cannot choose another
+    /// filename or publish a record through this operation.
+    pub(crate) fn write_native_evidence(
+        &self,
+        evidence: &super::backend_hook::SavedNativeEvidence,
+    ) -> Result<super::backend_hook::SavedNativeArtifact, Error> {
+        self.write(DBT_STATS, evidence.raw())?;
+        Ok(super::backend_hook::SavedNativeArtifact {
+            path: self.path(DBT_STATS),
+            initialization_records: evidence.initialization_records(),
+        })
     }
 
     /// Write the record last, and synchronize the directory, so a reader that
@@ -296,15 +310,117 @@ pub(crate) fn compare(
     verify_allow: VerifyAllow,
     verify_log_dir: Option<&Path>,
 ) -> Result<ExitStatus, Error> {
+    compare_with_application(
+        directories,
+        verify_json,
+        verify_allow,
+        verify_log_dir,
+        None,
+        |_, _| {
+            Err(Error::msg(
+                "ordinary core comparison has no executable-selected native decoder",
+            ))
+        },
+    )
+}
+
+#[derive(Clone, Copy)]
+struct SavedApplication {
+    name: &'static str,
+    evidence: super::backend_hook::EvidenceRequirement,
+    transport: super::backend_hook::VerificationLogTransport,
+    native_identity_diagnostic: Option<&'static str>,
+}
+
+/// Only the executable's statically linked adapter can admit its named saved
+/// records. Ordinary core comparison continues to reject unknown backends.
+pub(super) fn compare_for_adapter<A: super::backend_hook::BackendAdapter>(
+    directories: [&Path; 2],
+    verify_json: Option<&Path>,
+    verify_allow: VerifyAllow,
+    verify_log_dir: Option<&Path>,
+    adapter: &A,
+) -> Result<ExitStatus, Error> {
+    compare_with_application(
+        directories,
+        verify_json,
+        verify_allow,
+        verify_log_dir,
+        Some(SavedApplication {
+            name: A::NAME,
+            evidence: A::EVIDENCE,
+            transport: A::LOG_TRANSPORT,
+            native_identity_diagnostic: A::NATIVE_IDENTITY_DIAGNOSTIC,
+        }),
+        |first, second| {
+            let restore = |run: &VerifyRunDirectory| -> Result<A::Facts, Error> {
+                let metadata = run.record.dbt.ok_or_else(|| {
+                    Error::msg(format!(
+                        "{} is a native run whose record has no native evidence section",
+                        run.directory.display()
+                    ))
+                })?;
+                let raw = fs::read(run.directory.join(DBT_STATS));
+                adapter.restore_native_evidence(super::backend_hook::SavedNativeEvidenceRef {
+                    raw: raw.as_ref().map(Vec::as_slice),
+                    initialization_records: metadata.initialization_records,
+                })
+            };
+            let first = restore(first)?;
+            let second = restore(second)?;
+            A::EVIDENCE.validate(adapter.pair_evidence(&first, &second)?)
+        },
+    )
+}
+
+fn compare_with_application(
+    directories: [&Path; 2],
+    verify_json: Option<&Path>,
+    verify_allow: VerifyAllow,
+    verify_log_dir: Option<&Path>,
+    application: Option<SavedApplication>,
+    native_evidence: impl FnOnce(
+        &VerifyRunDirectory,
+        &VerifyRunDirectory,
+    ) -> Result<super::backend_hook::PairEvidence, Error>,
+) -> Result<ExitStatus, Error> {
     // Stamp the invocation-bound no-result first, as `run --verify` does, so
     // a reused path never shows an earlier verdict.
     if let Some(path) = verify_json {
         write_pending_verification_json(path)?;
     }
+    if let Some(application) = application {
+        super::backend_hook::validate_name(application.name)?;
+        application.transport.validate(application.evidence)?;
+    }
     let run1 = VerifyRunDirectory::read(directories[0])?;
     let record1 = &run1.record;
-    let backend = <Backend as clap::ValueEnum>::from_str(&record1.backend, false)
-        .map_err(|error| Error::msg(format!("unknown backend {}: {error}", record1.backend)))?;
+    let (backend, application_backend) = match application {
+        Some(application) => {
+            anyhow::ensure!(
+                record1.backend == application.name && record1.role == RunRole::Run,
+                "saved backend `{}` does not match executable-selected backend `{}`",
+                record1.backend,
+                application.name
+            );
+            if application.evidence == super::backend_hook::EvidenceRequirement::Common {
+                anyhow::ensure!(
+                    record1.dbt.is_none(),
+                    "a Common saved run cannot contain native evidence metadata"
+                );
+            }
+            // This value is not a physical/backend fallback: the common
+            // conclusion receives the exact application identity below, as on
+            // the live statically selected path. No builtin is executed.
+            (Backend::Ptrace, Some(application.name))
+        }
+        None => (
+            <Backend as clap::ValueEnum>::from_str(&record1.backend, false).map_err(|error| {
+                Error::msg(format!("unknown backend {}: {error}", record1.backend))
+            })?,
+            None,
+        ),
+    };
     if let Some(verdict) = record1.exact_branch_counter.clone() {
         record_exact_branch_counter(verdict);
         // The pending stamp predates the verdict; restamp it with the verdict,
@@ -329,6 +445,8 @@ pub(crate) fn compare(
         status: status1,
         skid_overshoots: skid1,
         forwarded_syscalls: forwarded1,
+        guest_deadlock: guest_deadlock1,
+        virtual_timeout_ns: virtual_timeout1,
     } = record1.outcome
     else {
         retain(&[&run1])?;
@@ -342,15 +460,20 @@ pub(crate) fn compare(
         )?);
     };
     let out1 = run1.output(status1)?;
+    let outcome1 = TerminalOutcome::from_fields(guest_deadlock1, virtual_timeout1);
     // Prepared where `run --verify` prepares them, and queued the same way:
     // by every return below that does not verify the runs.
     let mut signal_reports = SignalTerminationReports::default();
     signal_reports.prepare("run 1", out1.status, &run1.directory.join(LOG));
+    // A run 1 that ended with a terminal outcome (a deadlock under Hermit's
+    // model, a virtual timeout) passes `--verify-allow` as `run --verify`'s
+    // does (`rejected_first_run`): neither is a guest result, so the default
+    // `success` refuses it.
     if let Some(error) =
         reject_first_run(verify_json, verify_allow, &out1, skid1, summary1.as_ref())
     {
         retain(&[&run1])?;
-        return Err(error);
+        return Err(super::run::rejected_first_run(error, outcome1));
     }
 
     let run2 = match VerifyRunDirectory::read(directories[1]) {
@@ -394,6 +517,8 @@ pub(crate) fn compare(
         status: status2,
         skid_overshoots: skid2,
         forwarded_syscalls: forwarded2,
+        guest_deadlock: guest_deadlock2,
+        virtual_timeout_ns: virtual_timeout2,
     } = record2.outcome
     else {
         retain(&[&run1, &run2])?;
@@ -407,6 +532,21 @@ pub(crate) fn compare(
         )?);
     };
     let out2 = run2.output(status2)?;
+    if let Some(application) = application {
+        if application.evidence == super::backend_hook::EvidenceRequirement::Common {
+            anyhow::ensure!(
+                record2.dbt.is_none(),
+                "a Common saved run cannot contain native evidence metadata"
+            );
+        }
+        let requires_socket =
+            application.transport == super::backend_hook::VerificationLogTransport::InGuestSocket;
+        anyhow::ensure!(
+            forwarded1.is_some() == requires_socket && forwarded2.is_some() == requires_socket,
+            "saved backend `{}` omitted or changed its declared verification log transport",
+            application.name
+        );
+    }
     if let Some(forwarded1) = forwarded1 {
         let forwarded2 = forwarded2
             .ok_or_else(|| Error::msg("run 2 forwarded no DETLOG records where run 1 did"))?;
@@ -414,11 +554,7 @@ pub(crate) fn compare(
             anyhow::bail!(
                 "{} verification captured no syscall DETLOG records: run1={forwarded1}, \
                  run2={forwarded2}",
-                if backend == Backend::Sabre {
-                    "SaBRe"
-                } else {
-                    "LiteInst"
-                }
+                application_backend.unwrap_or("LiteInst")
             );
         }
     }
@@ -440,32 +576,56 @@ pub(crate) fn compare(
         Ok(tempfile::TempPath::try_from_path(target)?)
     };
     let logs = [link(&run1, "run1.log")?, link(&run2, "run2.log")?];
-    let outcome = if backend == Backend::Dbt {
-        conclude_dbt([&run1, &run2], [&out1, &out2], logs, verify_json)?
+    let native_selected = application.is_some_and(|application| {
+        application.evidence == super::backend_hook::EvidenceRequirement::NativeCounters
+    });
+    let evidence = if native_selected {
+        match native_evidence(&run1, &run2)? {
+            super::backend_hook::PairEvidence::NativeCounters { first, second } => {
+                Some(super::verify::NativeEvidenceComparison::new(
+                    application_backend.expect("static native identity"),
+                    &first,
+                    &second,
+                ))
+            }
+            super::backend_hook::PairEvidence::Common => {
+                return Err(Error::new(hermit::BackendRunFailure)
+                    .context("backend omitted or changed its predeclared verification evidence"));
+            }
+        }
     } else {
+        None
+    };
+    let outcome = {
         let [log1, log2] = logs;
         conclude_verification(
             VerificationConclusion {
                 verify_json,
                 comparison_options: comparison_options(record1.comparison),
-                #[cfg(feature = "dbt")]
-                dbt: None,
+                evidence,
+                native_identity_diagnostic: application
+                    .and_then(|application| application.native_identity_diagnostic),
                 backend,
+                application_backend,
                 passthru_opt: record1.passthru_opt,
+                // A `--verify-run` record does not say.
+                rewrite_exclusives: None,
             },
             CompletedVerificationRun {
                 output: &out1,
                 log: log1,
                 skid_overshoots: skid1,
                 summary: summary1,
-                host_inputs: Some(read_host_inputs(&run1.directory.join(HOST_INPUTS))),
+                host_inputs: (!native_selected)
+                    .then(|| read_host_inputs(&run1.directory.join(HOST_INPUTS))),
             },
             CompletedVerificationRun {
                 output: &out2,
                 log: log2,
                 skid_overshoots: skid2,
                 summary: summary2,
-                host_inputs: Some(read_host_inputs(&run2.directory.join(HOST_INPUTS))),
+                host_inputs: (!native_selected)
+                    .then(|| read_host_inputs(&run2.directory.join(HOST_INPUTS))),
             },
         )?
     };
@@ -480,7 +640,7 @@ pub(crate) fn compare(
     // adapter shows run 1's output after a match, and the others also after
     // a divergence where both runs' output agreed.
     if !outcome.verified() {
-        if backend != Backend::Dbt {
+        if !native_selected {
             emit_compared_guest_output(false, &out1, &out2)?;
         }
         return outcome.into_exit_status();
@@ -490,6 +650,14 @@ pub(crate) fn compare(
         eprintln!(":: Backend: KVM (reverie-kvm KvmGuest<Detcore>)");
     }
     emit_compared_guest_output(true, &out1, &out2)?;
+    // Compared runs (an explicit `--verify-allow` of failure or both) that
+    // both ended with the same terminal outcome end with it, as `run --verify`
+    // ends.
+    if let Some(outcome) = outcome1
+        && outcome1 == TerminalOutcome::from_fields(guest_deadlock2, virtual_timeout2)
+    {
+        return Err(Error::new(super::container::SchedulerOutcome(outcome)));
+    }
     Ok(outcome.guest_status)
 }
 
@@ -505,10 +673,20 @@ fn compare_recording_and_replay(
     retain: &dyn Fn(&[&VerifyRunDirectory]) -> Result<(), Error>,
 ) -> Result<ExitStatus, Error> {
     let completed = |run: &VerifyRunDirectory, label: &str| match &run.record.outcome {
-        VerifyRunOutcome::Completed { status, .. } => run.output(*status),
+        VerifyRunOutcome::Completed {
+            status,
+            guest_deadlock,
+            virtual_timeout_ns,
+            ..
+        } => run.output(*status).map(|output| {
+            (
+                output,
+                TerminalOutcome::from_fields(*guest_deadlock, *virtual_timeout_ns),
+            )
+        }),
         outcome => Err(Error::msg(format!("{label} did not complete: {outcome:?}"))),
     };
-    let recording = match completed(run1, "the recording") {
+    let (recording, recording_outcome) = match completed(run1, "the recording") {
         Ok(output) => output,
         Err(error) => {
             retain(&[run1])?;
@@ -536,7 +714,7 @@ fn compare_recording_and_replay(
             record2.comparison,
         );
     }
-    let replay = match completed(&run2, "the replay") {
+    let (replay, replay_outcome) = match completed(&run2, "the replay") {
         Ok(output) => output,
         Err(error) => {
             retain(&[run1, &run2])?;
@@ -568,7 +746,10 @@ fn compare_recording_and_replay(
         Ok(_) if read_verified(verify_json) => retain(&[run1])?,
         _ => retain(&[run1, &run2])?,
     }
-    status
+    // A matched pair returns the recording's status; when both runs ended
+    // with the same terminal outcome that status is the outcome's, reported
+    // as the outcome, as `record start --verify` reports it.
+    super::record_start::ended_pair_outcome(status?, recording_outcome, replay_outcome)
 }
 
 /// Whether the report at `verify_json` says the runs were verified; false
@@ -600,66 +781,346 @@ fn retain_logs(logs: &Path, runs: &[&VerifyRunDirectory]) -> Result<(), Error> {
     Ok(())
 }
 
-/// Compare two completed DBT runs as `run_dbt` compares its two
-/// (`backends::conclude_dbt_verification`): the logs, then the counted-branch
-/// clocks and the typed statistics in each directory's [`DBT_STATS`].
-#[cfg(feature = "dbt")]
-fn conclude_dbt(
-    runs: [&VerifyRunDirectory; 2],
-    outputs: [&Output; 2],
-    logs: [tempfile::TempPath; 2],
-    verify_json: Option<&Path>,
-) -> Result<super::verify::VerificationOutcome, Error> {
-    use super::backends::DbtCompletedRun;
-    use super::backends::DbtConclusion;
-    use super::backends::conclude_dbt_verification;
-    use super::backends::require_dbt_stats;
-
-    let [log1, log2] = logs;
-    let completed = |run: &VerifyRunDirectory, output, log| -> Result<DbtCompletedRun<'_>, Error> {
-        let record = run.record.dbt.ok_or_else(|| {
-            Error::msg(format!(
-                "{} is a DBT run whose record has no DBT section",
-                run.directory.display()
-            ))
-        })?;
-        Ok(DbtCompletedRun {
-            output,
-            log,
-            stats: require_dbt_stats(&reverie_dbt::backend_stats::DbtStatsCapture::read(
-                &run.directory.join(DBT_STATS),
-            ))?,
-            initialization_records: usize::try_from(record.initialization_records)?,
-        })
-    };
-    let comparison = runs[0].record.comparison;
-    conclude_dbt_verification(
-        completed(runs[0], outputs[0], log1)?,
-        completed(runs[1], outputs[1], log2)?,
-        DbtConclusion {
-            verify_json,
-            verify_verbose: comparison.diagnostic_full_trace,
-            compare_io_buffers: comparison.compare_io_buffers,
-            virtualize_time: comparison.virtualize_time,
-            keep_logs: false,
-            caller_owns_logs: true,
-        },
-    )
-}
-
-#[cfg(not(feature = "dbt"))]
-fn conclude_dbt(
-    _runs: [&VerifyRunDirectory; 2],
-    _outputs: [&Output; 2],
-    _logs: [tempfile::TempPath; 2],
-    _verify_json: Option<&Path>,
-) -> Result<super::verify::VerificationOutcome, Error> {
-    anyhow::bail!("these --verify-run directories are DBT runs, and this Hermit has no DBT backend")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Synthetic adapter facts qualify the core's saved comparison boundary,
+    /// not any runtime decoder or guest. The actual native decoder has its own
+    /// backend-owned controls; this adapter must never be physically prepared.
+    #[derive(Default)]
+    struct SavedNativeControl {
+        restored: std::cell::Cell<usize>,
+        changed_dimension: Option<usize>,
+        omit_evidence: bool,
+    }
+
+    impl super::super::backend_hook::BackendAdapter for SavedNativeControl {
+        const NAME: &'static str = "saved-native-control";
+        const EVIDENCE: super::super::backend_hook::EvidenceRequirement =
+            super::super::backend_hook::EvidenceRequirement::NativeCounters;
+        const CAPABILITIES: reverie::BackendCapabilities = reverie::BackendCapabilities::PTRACE;
+        const LOG_TRANSPORT: super::super::backend_hook::VerificationLogTransport =
+            super::super::backend_hook::VerificationLogTransport::NativeEvidence;
+        type Options = ();
+        type Session = ();
+        type Pending = ();
+        type Facts = super::super::backend_hook::NativeFacts;
+
+        fn parse(&self, _: &clap::ArgMatches) -> Result<(), clap::Error> {
+            Ok(())
+        }
+        fn validate_mode(&self, mode: super::super::backend_hook::Mode) -> Result<(), Error> {
+            match mode {
+                super::super::backend_hook::Mode::Ordinary
+                | super::super::backend_hook::Mode::VerificationPair
+                | super::super::backend_hook::Mode::SavedVerification => Ok(()),
+            }
+        }
+        fn prepare(&self, _: (), _: super::super::backend_hook::Prepare<'_>) -> Result<(), Error> {
+            panic!("offline comparison must not prepare a physical run")
+        }
+        fn execute(
+            &self,
+            _: &mut (),
+            _: super::super::backend_hook::Execute<'_>,
+        ) -> Result<super::super::backend_hook::Execution<()>, Error> {
+            panic!("offline comparison must not execute a physical run")
+        }
+        fn finish(
+            &self,
+            _: (),
+            _: super::super::backend_hook::Observation<'_>,
+        ) -> Result<Self::Facts, Error> {
+            panic!("offline comparison must not finish a physical run")
+        }
+        fn restore_native_evidence(
+            &self,
+            evidence: super::super::backend_hook::SavedNativeEvidenceRef<'_>,
+        ) -> Result<Self::Facts, Error> {
+            let raw = evidence
+                .raw()
+                .map_err(|error| Error::msg(format!("synthetic saved read failed: {error}")))?;
+            anyhow::ensure!(
+                raw == b"synthetic raw native control",
+                "synthetic native payload changed"
+            );
+            let mut facts = super::super::backend_hook::NativeFacts {
+                counted_branches: 7,
+                intercepted_syscalls: 4,
+                rewritten_syscalls: 3,
+                stdin_reads: 2,
+                memory_hash_fold: 19,
+                initialization_records: usize::try_from(evidence.initialization_records())?,
+                statistics_diagnostic: "synthetic complete native observations".to_owned(),
+            };
+            let restored = self.restored.get();
+            self.restored.set(restored + 1);
+            if restored == 1 {
+                match self.changed_dimension {
+                    None => {}
+                    Some(0) => facts.counted_branches += 1,
+                    Some(1) => facts.intercepted_syscalls += 1,
+                    Some(2) => facts.rewritten_syscalls += 1,
+                    Some(3) => facts.stdin_reads += 1,
+                    Some(4) => facts.memory_hash_fold += 1,
+                    Some(5) => facts.initialization_records += 1,
+                    Some(_) => unreachable!(),
+                }
+            }
+            Ok(facts)
+        }
+        fn pair_evidence(
+            &self,
+            first: &Self::Facts,
+            second: &Self::Facts,
+        ) -> Result<super::super::backend_hook::PairEvidence, Error> {
+            Ok(if self.omit_evidence {
+                super::super::backend_hook::PairEvidence::Common
+            } else {
+                super::super::backend_hook::PairEvidence::NativeCounters {
+                    first: first.clone(),
+                    second: second.clone(),
+                }
+            })
+        }
+    }
+
+    fn saved_comparison_record(name: &str, native: bool) -> VerifyRunRecord {
+        VerifyRunRecord {
+            schema: SCHEMA,
+            backend: name.to_owned(),
+            comparison: RecordedComparison {
+                strictness: LogCompareStrictness::Canonical,
+                diagnostic_full_trace: false,
+                compare_io_buffers: true,
+                virtualize_time: true,
+            },
+            passthru_opt: false,
+            epoch: "2026-01-01T00:00:00Z".to_owned(),
+            exact_branch_counter: None,
+            dbt: native.then_some(DbtRunRecord {
+                initialization_records: 1,
+            }),
+            role: RunRole::Run,
+            outcome: VerifyRunOutcome::Completed {
+                status: RecordedStatus::Exited { code: 0 },
+                skid_overshoots: 0,
+                forwarded_syscalls: None,
+                guest_deadlock: false,
+                virtual_timeout_ns: None,
+            },
+        }
+    }
+
+    fn write_saved_comparison_control(directory: &Path, record: &VerifyRunRecord) {
+        let writer = VerifyRunWriter::create(directory).unwrap();
+        writer
+            .write(
+                LOG,
+                b"1970-01-01T00:00:00.000000Z INFO detcore: synthetic static-adapter record\n",
+            )
+            .unwrap();
+        writer.write(STDOUT, b"").unwrap();
+        writer.write(STDERR, b"").unwrap();
+        if record.dbt.is_some() {
+            writer
+                .write(DBT_STATS, b"synthetic raw native control")
+                .unwrap();
+        } else {
+            writer.write(HOST_INPUTS, b"{\"records\":0}\n").unwrap();
+        }
+        writer.commit(record).unwrap();
+    }
+
+    fn saved_comparison_report(path: &Path) -> serde_json::Value {
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn named_saved_comparison_keeps_all_native_dimensions_and_refuses_missing_evidence() {
+        use super::super::backend_hook::BackendAdapter;
+
+        for dimension in [None, Some(0), Some(1), Some(2), Some(3), Some(4), Some(5)] {
+            let parent = tempfile::tempdir().unwrap();
+            let directories = [parent.path().join("first"), parent.path().join("second")];
+            let report = parent.path().join("report.json");
+            let record = saved_comparison_record(SavedNativeControl::NAME, true);
+            for directory in &directories {
+                write_saved_comparison_control(directory, &record);
+            }
+            let adapter = SavedNativeControl {
+                changed_dimension: dimension,
+                ..Default::default()
+            };
+            let status = compare_for_adapter(
+                [&directories[0], &directories[1]],
+                Some(&report),
+                VerifyAllow::Success,
+                None,
+                &adapter,
+            )
+            .unwrap();
+            assert_eq!(adapter.restored.get(), 2);
+            assert_eq!(status.success(), dimension.is_none());
+            let report = saved_comparison_report(&report);
+            assert_eq!(report["verified"], dimension.is_none());
+            assert_eq!(
+                report["verdict"],
+                if dimension.is_none() {
+                    "matched"
+                } else {
+                    "diverged"
+                }
+            );
+            assert_eq!(report["comparison"]["record_envelope"], "all_records_v1");
+            assert_eq!(report["comparison"]["strictness"], "canonical");
+            assert_eq!(report["dbt_counted_branches"]["left"], 7);
+            assert_eq!(
+                report["dbt_counted_branches"]["right"],
+                if dimension == Some(0) { 8 } else { 7 }
+            );
+        }
+        for missing in ["metadata", "payload", "evidence_kind", "empty_payload"] {
+            let parent = tempfile::tempdir().unwrap();
+            let directories = [parent.path().join("first"), parent.path().join("second")];
+            let report = parent.path().join("report.json");
+            let mut first = saved_comparison_record(SavedNativeControl::NAME, true);
+            if missing == "metadata" {
+                first.dbt = None;
+            }
+            write_saved_comparison_control(&directories[0], &first);
+            write_saved_comparison_control(
+                &directories[1],
+                &saved_comparison_record(SavedNativeControl::NAME, true),
+            );
+            if missing == "payload" {
+                fs::remove_file(directories[0].join(DBT_STATS)).unwrap();
+            }
+            if missing == "empty_payload" {
+                fs::write(directories[0].join(DBT_STATS), b"").unwrap();
+            }
+            fs::write(&report, b"{\"verified\":true}").unwrap();
+            let adapter = SavedNativeControl {
+                omit_evidence: missing == "evidence_kind",
+                ..Default::default()
+            };
+            let result = compare_for_adapter(
+                [&directories[0], &directories[1]],
+                Some(&report),
+                VerifyAllow::Success,
+                None,
+                &adapter,
+            );
+            assert!(result.is_err(), "missing {missing} must refuse");
+            let report = saved_comparison_report(&report);
+            assert_eq!(report["verdict"], "no_result");
+            assert_eq!(report["verified"], false);
+            assert_eq!(report["bitwise_parity"], false);
+            assert!(report.get("dbt_counted_branches").is_none());
+        }
+    }
+
+    #[test]
+    fn named_saved_comparison_has_exact_identity_roles_options_and_transport() {
+        use super::super::backend_hook::EvidenceRequirement;
+        use super::super::backend_hook::VerificationLogTransport;
+
+        for defect in [
+            None,
+            Some("first_name"),
+            Some("missing_name"),
+            Some("second_name"),
+            Some("first_role"),
+            Some("second_role"),
+            Some("epoch"),
+            Some("comparison"),
+            Some("native_first"),
+            Some("native_second"),
+            Some("unexpected_socket"),
+            Some("missing_socket"),
+            Some("empty_socket"),
+        ] {
+            let parent = tempfile::tempdir().unwrap();
+            let directories = [parent.path().join("first"), parent.path().join("second")];
+            let report = parent.path().join("report.json");
+            let mut first = saved_comparison_record("saved-common-control", false);
+            let mut second = first.clone();
+            let mut transport = VerificationLogTransport::CoordinatorTracing;
+            match defect {
+                None => {}
+                Some("first_name") => first.backend = "ptrace".to_owned(),
+                Some("missing_name") => first.backend.clear(),
+                Some("second_name") => second.backend = "ptrace".to_owned(),
+                Some("first_role") => first.role = RunRole::Record,
+                Some("second_role") => second.role = RunRole::Replay,
+                Some("epoch") => second.epoch = "2026-01-02T00:00:00Z".to_owned(),
+                Some("comparison") => second.comparison.compare_io_buffers = false,
+                Some("native_first") => {
+                    first.dbt = Some(DbtRunRecord {
+                        initialization_records: 1,
+                    })
+                }
+                Some("native_second") => {
+                    second.dbt = Some(DbtRunRecord {
+                        initialization_records: 1,
+                    })
+                }
+                Some("unexpected_socket" | "empty_socket") => {
+                    let count = if defect == Some("empty_socket") { 0 } else { 1 };
+                    for record in [&mut first, &mut second] {
+                        let VerifyRunOutcome::Completed {
+                            forwarded_syscalls, ..
+                        } = &mut record.outcome
+                        else {
+                            unreachable!()
+                        };
+                        *forwarded_syscalls = Some(count);
+                    }
+                    if defect == Some("empty_socket") {
+                        transport = VerificationLogTransport::InGuestSocket;
+                    }
+                }
+                Some("missing_socket") => transport = VerificationLogTransport::InGuestSocket,
+                _ => unreachable!(),
+            }
+            write_saved_comparison_control(&directories[0], &first);
+            write_saved_comparison_control(&directories[1], &second);
+            fs::write(&report, b"{\"verified\":true}").unwrap();
+            let result = compare_with_application(
+                [&directories[0], &directories[1]],
+                Some(&report),
+                VerifyAllow::Success,
+                None,
+                Some(SavedApplication {
+                    name: "saved-common-control",
+                    evidence: EvidenceRequirement::Common,
+                    transport,
+                    native_identity_diagnostic: None,
+                }),
+                |_, _| panic!("Common saved comparison must not invoke a native decoder"),
+            );
+            assert_eq!(result.is_ok(), defect.is_none(), "{defect:?}: {result:?}");
+            let value = saved_comparison_report(&report);
+            assert_eq!(value["verified"], defect.is_none(), "{defect:?}: {value}");
+            if defect.is_some() {
+                assert_eq!(value["verdict"], "no_result", "{defect:?}: {value}");
+            } else {
+                assert_eq!(value["verdict"], "matched");
+                let ordinary = compare(
+                    [&directories[0], &directories[1]],
+                    Some(&report),
+                    VerifyAllow::Success,
+                    None,
+                );
+                assert!(
+                    format!("{:#}", ordinary.unwrap_err())
+                        .contains("unknown backend saved-common-control")
+                );
+                assert_eq!(saved_comparison_report(&report)["verdict"], "no_result");
+            }
+        }
+    }
 
     #[test]
     fn a_recorded_status_round_trips() {
@@ -697,6 +1158,8 @@ mod tests {
                 status: RecordedStatus::Exited { code: 0 },
                 skid_overshoots: 0,
                 forwarded_syscalls: None,
+                guest_deadlock: false,
+                virtual_timeout_ns: None,
             },
         };
         let json = serde_json::to_value(&record).unwrap();

@@ -42,6 +42,34 @@ static ALLOC: test_allocator::Global = test_allocator::Global;
 /// weekly `mem_race` PMU gates, whose premise is that preemption is driven by
 /// retired conditional branches, so an extra load or a dropped bounds check moves
 /// the numbers they pin.
+/// Run the calling test in a child process of its own, returning true when
+/// this invocation is the parent and the caller must return at once. The
+/// Detcore runs below fork this process and clone it into containers; in
+/// the shared libtest binary those forks can inherit a sibling session's
+/// locks and wedge, so each test starts from a process running only itself,
+/// as nextest already runs it.
+fn isolated_child() -> bool {
+    const CHILD: &str = "HERMIT_PARALLELISM_DETCORE_CHILD";
+    let case = std::thread::current()
+        .name()
+        .unwrap_or_default()
+        .to_string();
+    if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new(&case)) {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &case, "--nocapture", "--test-threads=1"])
+        .env(CHILD, &case)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "{output:?}"
+    );
+    true
+}
+
 pub(crate) struct SharedCells(Arc<[UnsafeCell<u64>]>);
 
 // SAFETY: the workers only ever write cells whose index came from the shared
@@ -198,6 +226,9 @@ mod mem_race {
     /// Two threads print different characters, interleaved.
     #[allow(dead_code)]
     pub fn detcore(cfg: &detcore::Config) {
+        if super::isolated_child() {
+            return;
+        }
         fn run_seq_mode() {
             eprintln!("Running sequentialized, deterministically.");
             let switches = raw();
@@ -291,6 +322,9 @@ mod mem_print_race {
     /// Two threads print different characters, interleaved.
     #[allow(dead_code)]
     pub fn detcore(cfg: &detcore::Config) {
+        if super::isolated_child() {
+            return;
+        }
         eprintln!("Running detcore test with {} chunks", CHUNKS);
         let cfg = detcore_testutils::prepare_ptrace_timer_config(cfg.clone());
         let (output, _state) = if cfg.sequentialize_threads {
@@ -326,6 +360,31 @@ mod futex_wait_parent {
 
     #[test]
     fn raw() {
+        // This baseline ends by exiting its own process (below), which is
+        // the whole point of the raw comparison: under nextest that process
+        // is the test's own, but under `cargo test` it is the shared test
+        // binary, and exiting would silently end every later test. Run the
+        // body in a child process and check it reached its final print.
+        const CHILD: &str = "HERMIT_FUTEX_WAIT_PARENT_RAW_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "futex_wait_parent::raw",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("Parent thread: done with futex wait"),
+                "{output:?}"
+            );
+            return;
+        }
         let sem = Arc::new(AtomicU32::new(1000));
         let ptr = sem.as_ptr();
         let ptr2 = ptr as usize;

@@ -89,9 +89,9 @@ hello
 
 === Virtual random bytes are stable across runs ===
 hermit: virtual-time epoch=... source=host-now; reproduce with --epoch=...
- 29 72 bb 04 4d 96 df 28
+ a5 cb fe 1d c3 5b 5e 2d
 hermit: virtual-time epoch=... source=host-now; reproduce with --epoch=...
- 29 72 bb 04 4d 96 df 28
+ a5 cb fe 1d c3 5b 5e 2d
 
 === Virtual wall-clock time is stable across runs ===
 -- both runs use --epoch=2026-01-01T00:00:00Z --

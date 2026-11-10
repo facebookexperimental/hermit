@@ -605,6 +605,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
         );
     }
     let context = RunContext {
+        command_bindings: BTreeMap::new(),
         root: options.repo_root.clone(),
         hermit_bin: options.repo_root.join("target/debug/hermit"),
         result_root: options.work_root.join("results"),
@@ -629,6 +630,7 @@ fn cmd_run(args: &[String]) -> ExitCode {
         timeout_multipliers: TimeoutMultipliers::default(),
         scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
         isolated_workdir: None,
+        shares_ld_so_cache: false,
     };
     let pin_cpu = match options.pin_cpu.or_else(first_allowed_cpu) {
         Some(cpu) => cpu,

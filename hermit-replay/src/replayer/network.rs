@@ -11,14 +11,17 @@ use reverie::Guest;
 use reverie::syscalls::Accept4;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::EpollPwait;
+#[cfg(target_arch = "x86_64")]
 use reverie::syscalls::EpollWait;
 use reverie::syscalls::MemoryAccess;
+#[cfg(target_arch = "x86_64")]
 use reverie::syscalls::Poll;
 use reverie::syscalls::PollFd;
 use reverie::syscalls::Ppoll;
 use reverie::syscalls::Pselect6;
 use reverie::syscalls::Recvfrom;
 use reverie::syscalls::Recvmsg;
+#[cfg(target_arch = "x86_64")]
 use reverie::syscalls::Select;
 use reverie::syscalls::SockFlag;
 use reverie::syscalls::Syscall;
@@ -26,6 +29,8 @@ use reverie::syscalls::Timespec;
 use reverie::syscalls::family::SockOptFamily;
 
 use super::Replayer;
+#[cfg(target_arch = "x86_64")]
+use crate::event::InterruptedPoll;
 use crate::event::PollEvent;
 use crate::event::PpollEvent;
 use crate::event::SelectEvent;
@@ -77,6 +82,7 @@ fn replay_pollfds<M: MemoryAccess>(
     Ok(())
 }
 
+#[cfg(target_arch = "x86_64")]
 fn replay_poll_event<M: MemoryAccess>(
     memory: &mut M,
     fds_address: Option<AddrMut<'_, PollFd>>,
@@ -248,7 +254,19 @@ fn scm_rights_fds(control: &[u8]) -> Vec<i32> {
     fds
 }
 
+/// A replay divergence is an internal error (dh-mvz7y): print the ERROR
+/// line and exit with the internal-failure status, never panic.
+/// `HERMIT_INTERNAL_FAILURE_EXIT` in detcore-model (125): hermit-replay does
+/// not depend on detcore-model, so the pinned value is spelled here.
+const REPLAY_DESYNC_EXIT: i32 = 125;
+
+fn diverged(context: &str) -> ! {
+    eprintln!("ERROR HERMIT_REPLAY_DESYNC {context}");
+    std::process::exit(REPLAY_DESYNC_EXIT);
+}
+
 impl Replayer {
+    #[cfg(target_arch = "x86_64")]
     pub(super) async fn handle_epoll_wait<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -327,18 +345,41 @@ impl Replayer {
         Ok(event.updated as i64)
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub(super) async fn handle_poll<G: Guest<Self>>(
         &self,
         guest: &mut G,
         syscall: Poll,
     ) -> Result<i64, Errno> {
         let event = next_event!(guest, Poll)?;
-        replay_poll_event(
+        let result = replay_poll_event(
             &mut guest.memory(),
             syscall.fds(),
             syscall.nfds() as usize,
             event,
-        )
+        );
+        guest.thread_state_mut().interrupted_poll =
+            InterruptedPoll::after(syscall.fds(), syscall.nfds(), &result);
+        result
+    }
+
+    /// The kernel's restart of `poll` (`InterruptedPoll`), served from the
+    /// outputs the recorder recorded for it.
+    pub(super) async fn handle_restarted_poll<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        poll: InterruptedPoll,
+    ) -> Result<i64, Errno> {
+        let event = next_event!(guest, Poll)?;
+        let result = replay_poll_event(
+            &mut guest.memory(),
+            poll.fds_address(),
+            poll.nfds as usize,
+            event,
+        );
+        guest.thread_state_mut().interrupted_poll =
+            InterruptedPoll::after(poll.fds_address(), poll.nfds, &result);
+        result
     }
 
     pub(super) async fn handle_ppoll<G: Guest<Self>>(
@@ -356,6 +397,7 @@ impl Replayer {
         )
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub(super) async fn handle_select<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -400,27 +442,31 @@ impl Replayer {
         // address prefix. These writes succeeded during recording into the
         // same address space, so a failure here means replay has diverged.
         if let Some(addr_len) = event.addr_len {
-            let len_address = syscall
-                .addrlen()
-                .expect("replay diverged: recorded accept4 wrote addrlen, replay passed none");
+            let Some(len_address) = syscall.addrlen() else {
+                diverged("replay diverged: recorded accept4 wrote addrlen, replay passed none")
+            };
             guest
                 .memory()
                 .write_value(len_address.cast::<libc::socklen_t>(), &addr_len)
                 .unwrap_or_else(|error| {
-                    panic!("replay diverged: cannot write the recorded accept4 addrlen: {error}")
+                    diverged(&format!(
+                        "replay diverged: cannot write the recorded accept4 addrlen: {error}"
+                    ))
                 });
         }
         if !event.addr.is_empty() {
-            let sockaddr = syscall.sockaddr().expect(
-                "replay diverged: recorded accept4 wrote a peer address, replay passed none",
-            );
+            let Some(sockaddr) = syscall.sockaddr() else {
+                diverged(
+                    "replay diverged: recorded accept4 wrote a peer address, replay passed none",
+                )
+            };
             guest
                 .memory()
                 .write_exact(sockaddr.cast::<u8>(), &event.addr)
                 .unwrap_or_else(|error| {
-                    panic!(
+                    diverged(&format!(
                         "replay diverged: cannot write the recorded accept4 peer address: {error}"
-                    )
+                    ))
                 });
         }
 
@@ -470,7 +516,7 @@ impl Replayer {
         let event = next_event!(guest, Recvmsg)?;
         let cloexec = syscall.flags() & libc::MSG_CMSG_CLOEXEC != 0;
         for fd in scm_rights_fds(&event.control) {
-            self.reserve_replay_fd(guest, fd, cloexec).await;
+            self.reserve_received_stand_in(guest, fd, cloexec).await;
         }
 
         let message_address = syscall.msg().ok_or(Errno::EFAULT)?;
@@ -521,6 +567,8 @@ mod tests {
 
     use super::*;
 
+    // `poll` and its event exist only on x86_64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn replay_poll_restores_outputs_before_returning_efault() {
         let mut output = libc::pollfd {
@@ -588,6 +636,8 @@ mod tests {
         assert_eq!(timeout, recorded_timeout);
     }
 
+    // `poll` and its event exist only on x86_64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn replay_poll_restores_outputs_before_returning_eintr() {
         let mut output = libc::pollfd {
@@ -616,6 +666,8 @@ mod tests {
         assert_eq!(output.revents, 0);
     }
 
+    // `poll` and its event exist only on x86_64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn replay_einval_performs_no_pollfd_write() {
         let event = PollEvent {
@@ -791,6 +843,8 @@ mod current_main_tests {
         assert_eq!(output_timeout, original_timeout);
     }
 
+    // `poll` and its event exist only on x86_64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn replay_poll_restores_fds_before_returning_a_recorded_error() {
         // THE ORDERING IS THE FIX. The old replayer returned the recorded error
@@ -826,6 +880,8 @@ mod current_main_tests {
         );
     }
 
+    // `poll` and its event exist only on x86_64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn replay_poll_early_error_with_pollfd_pointer_performs_no_fd_write() {
         let event = PollEvent {

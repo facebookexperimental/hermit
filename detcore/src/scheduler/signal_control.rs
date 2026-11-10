@@ -19,6 +19,10 @@ use reverie::BackendSignalControlMode;
 use reverie::ChildExitPublication;
 use reverie::ChildExitPublicationResult;
 use reverie::ExitStatus;
+use reverie::OrphanPlacement;
+use reverie::OrphanPlacementResult;
+use reverie::OrphanReaper;
+use reverie::PlacedOrphanEffect;
 use reverie::SignalBoundaryOutcome;
 use reverie::SignalBoundaryReceipt;
 use reverie::SignalDeliveryPermit;
@@ -288,6 +292,16 @@ impl Scheduler {
         {
             return Err(reverie::syscalls::Errno::EINVAL.into());
         }
+        // A backend that places orphans where Detcore names
+        // (`places_orphans`) holds each exit's children for that placement
+        // only once asked to, before it installs the control: from then on
+        // Detcore's re-parenting decides the parent its waits and `getppid`
+        // see (`Scheduler::reparent_orphans`). A backend that reports the
+        // capability but refuses the opt-in contradicts itself, which is
+        // refused rather than run with two parents for an orphan.
+        if self.backend.places_orphans {
+            control.process.enable_orphan_placement()?;
+        }
         self.parked.control = Some(control);
         Ok(BackendSignalControlMode::ToolControlled)
     }
@@ -300,6 +314,25 @@ impl Scheduler {
         self.parked.control.is_some()
     }
 
+    /// Answers the backend's request for a delivery permit at a real
+    /// user-return boundary of `task`.
+    ///
+    /// A permit belongs to one thread. Linux delivers each thread's signals
+    /// on that thread's own return to user mode (`exit_to_user_mode_loop`
+    /// runs `arch_do_signal_or_restart` for the returning thread alone), and
+    /// `get_signal` holds the process's `siglock` only around the dequeue,
+    /// never across another thread's delivery. So a permit another thread of
+    /// the process holds is no reason to decline: its own boundary waiting
+    /// for its `InboundSignal` turn, an observed parked wait, or a committed
+    /// exit. Declining a boundary that has an eligible signal makes
+    /// reverie-kvm ask again until its bound and then fail the run
+    /// (https://github.com/rrnewton/hermit/issues/4899).
+    ///
+    /// It declines only where no delivery can be committed: without an
+    /// installed control, after a backend failure, for a logically killed
+    /// thread, and for a thread that does not hold the serial grant. A thread
+    /// that already holds a permit gets that same permit back; one thread
+    /// never holds two.
     pub(crate) fn authorize_signal_boundary(
         &mut self,
         task: SignalTaskIdentity,
@@ -333,14 +366,6 @@ impl Scheduler {
         if expected != task || !self.rpc_incarnation_matches(tid, mm) {
             return Err(reverie::syscalls::Errno::EINVAL.into());
         }
-        if self
-            .parked
-            .permits
-            .values()
-            .any(|p| p.task.process == task.process)
-        {
-            return Ok(None);
-        }
         let sequence = self
             .parked
             .nonce
@@ -357,14 +382,187 @@ impl Scheduler {
         Ok(Some(permit))
     }
 
+    /// Carries out Detcore's re-parenting of `exited`'s orphans
+    /// (`Scheduler::reparent_orphans`) in the backend's records, which a
+    /// backend that emulates waits keeps (`places_orphans`): each of
+    /// `orphans`, a `(child, zombie)` pair in pid order, moves to `reaper`, or
+    /// to the namespace init where Detcore found no reaper
+    /// (`ProcessSignalControl::place_orphans`). Detcore made every decision
+    /// already; the backend only moves its family records and announces each
+    /// zombie to the reaper, and its receipt must report exactly what Detcore
+    /// decided. A zombie the reaper reaps at once (it ignores `SIGCHLD`, or
+    /// sets `SA_NOCLDWAIT`: `reaps_children_automatically`) leaves no status
+    /// to wait for, so its shadow is consumed here, as a non-waitable child
+    /// exit's is (`finish_child_exit_publication`). A refused placement, a
+    /// receipt that disagrees, or a failure after the backend committed it
+    /// (forwarded as a publication failure of the reaper) ends the run as a
+    /// backend failure, before any other turn.
+    pub(super) fn place_orphans_in_backend(
+        &mut self,
+        exited: DetPid,
+        reaper: Option<DetPid>,
+        orphans: &[(DetPid, bool)],
+    ) {
+        // A run whose backend already failed is ending; its records are not
+        // asked to change any more.
+        if self.backend_failed() {
+            return;
+        }
+        if let Err(failure) = self.try_place_orphans(exited, reaper, orphans) {
+            tracing::error!(
+                "[scheduler] the backend's placement of the orphans of exited process {} failed: {:?}",
+                exited,
+                failure
+            );
+            if let Some(wake) =
+                self.report_backend_failure_location(super::BackendFailureLocation {
+                    pid: reverie::Pid::from_raw(exited.as_raw()),
+                    tid: None,
+                    phase: "KVM orphan placement",
+                })
+            {
+                // GlobalTool and the daemon send these only after dropping the
+                // scheduler mutex (`flush_signal_failures`).
+                self.parked.failure_wakes.push(wake);
+            }
+        }
+    }
+
+    /// Asks a placing backend (`places_orphans`) to place no orphan of
+    /// `exited`, where Detcore decided none for that exit
+    /// (`Scheduler::reparent_orphans`), so that the backend's record cannot
+    /// silently disagree: the backend holds every child an exit leaves until
+    /// it is told where that child goes, and it sends a held child it was not
+    /// told about to the namespace init and names it in its receipt
+    /// (`ProcessSignalControl::place_orphans`), which `try_place_orphans`
+    /// then refuses as longer than Detcore's decision, ending the run as a
+    /// backend failure rather than leave the child with a parent Detcore does
+    /// not know. Once per exit (`placed_exits`), and only for an exit whose
+    /// final transition the backend has reported (`terminal_processes`):
+    /// before that report the backend holds nothing for it.
+    pub(super) fn place_no_orphans_in_backend(&mut self, exited: DetPid) {
+        if !self.backend.places_orphans || !self.signal_control_installed() {
+            return;
+        }
+        let Ok(identity) = self.real_timers.retained_process_identity(exited) else {
+            return;
+        };
+        let key = ProcessGeneration::from_backend(identity);
+        if !self.parked.terminal_processes.contains_key(&key)
+            || self.parked.placed_exits.contains(&key)
+        {
+            return;
+        }
+        self.place_orphans_in_backend(exited, None, &[]);
+    }
+
+    fn try_place_orphans(
+        &mut self,
+        exited: DetPid,
+        reaper: Option<DetPid>,
+        orphans: &[(DetPid, bool)],
+    ) -> Result<(), ProtocolFailure> {
+        let control = self
+            .parked
+            .control
+            .clone()
+            .ok_or(ProtocolFailure::Identity)?;
+        // The exited process and a zombie orphan were retired here or
+        // earlier; their numeric pids still name these generations, as a
+        // process is not replaced under its pid before it is reaped.
+        let exited_identity = self.real_timers.retained_process_identity(exited)?;
+        self.parked
+            .placed_exits
+            .insert(ProcessGeneration::from_backend(exited_identity));
+        let target = match reaper {
+            Some(reaper) => OrphanReaper::Process(self.real_timers.process_identity(reaper)?),
+            None => OrphanReaper::NamespaceInit,
+        };
+        let placements = orphans
+            .iter()
+            .map(|(child, _)| {
+                Ok(OrphanPlacement {
+                    child: self.real_timers.retained_process_identity(*child)?,
+                    reaper: target,
+                })
+            })
+            .collect::<Result<Vec<_>, ProtocolFailure>>()?;
+        let (receipt, failed_after_commit) =
+            match control.process.place_orphans(exited_identity, &placements) {
+                OrphanPlacementResult::Committed(receipt) => (receipt, false),
+                OrphanPlacementResult::FailedAfterCommit { receipt, .. } => (receipt, true),
+                OrphanPlacementResult::RejectedBeforeCommit(errno) => {
+                    return Err(match errno {
+                        reverie::syscalls::Errno::EAGAIN => ProtocolFailure::Phase,
+                        reverie::syscalls::Errno::ENOSYS => ProtocolFailure::Unsupported,
+                        _ => ProtocolFailure::Identity,
+                    });
+                }
+            };
+        if failed_after_commit && let OrphanReaper::Process(reaper) = target {
+            // The backend retains the failed announcement as the reaper's
+            // publication failure; forward it (`flush_signal_failures`).
+            self.parked.failures.push(reaper);
+        }
+        if receipt.exited == exited_identity && receipt.placed.len() > placements.len() {
+            let unplaced: Vec<i32> = receipt.placed[placements.len()..]
+                .iter()
+                .map(|placed| placed.child.tgid.as_raw())
+                .collect();
+            tracing::error!(
+                "[scheduler] the backend held children {:?} of exited process {} that Detcore did not place (it decided {} orphans): their parent would differ from Detcore's",
+                unplaced,
+                exited,
+                placements.len()
+            );
+        }
+        if receipt.exited != exited_identity || receipt.placed.len() != placements.len() {
+            return Err(ProtocolFailure::Identity);
+        }
+        let reaps_automatically =
+            reaper.is_some_and(|reaper| self.thread_tree.reaps_children_automatically(reaper));
+        for ((placement, (child, zombie)), placed) in
+            placements.iter().zip(orphans).zip(&receipt.placed)
+        {
+            if placed.child != placement.child || placed.reaper != placement.reaper {
+                return Err(ProtocolFailure::Identity);
+            }
+            let agrees = match (placement.reaper, *zombie, placed.effect) {
+                (OrphanReaper::NamespaceInit, _, PlacedOrphanEffect::NamespaceInit) => true,
+                (OrphanReaper::Process(_), false, PlacedOrphanEffect::Live) => true,
+                (OrphanReaper::Process(_), true, PlacedOrphanEffect::Zombie(_)) => {
+                    !reaps_automatically
+                }
+                (OrphanReaper::Process(_), true, PlacedOrphanEffect::AutoReaped) => {
+                    reaps_automatically
+                }
+                // Its announcement failed after the placement committed.
+                (OrphanReaper::Process(_), true, PlacedOrphanEffect::ZombieUnannounced) => {
+                    failed_after_commit
+                }
+                _ => false,
+            };
+            if !agrees {
+                return Err(ProtocolFailure::Identity);
+            }
+            if placed.effect == PlacedOrphanEffect::AutoReaped
+                && let Some(reaper) = reaper
+                && !self.consume_child_wait(reaper, *child)
+            {
+                return Err(ProtocolFailure::Identity);
+            }
+        }
+        if failed_after_commit {
+            return Err(ProtocolFailure::Phase);
+        }
+        Ok(())
+    }
+
     fn final_exit_after_boundary(&mut self, tid: DetTid, process: DetPid, group: bool) -> bool {
         if group {
             return true;
         }
-        self.thread_tree
-            .my_thread_group(&process)
-            .into_iter()
-            .filter(|member| self.next_turns.contains_key(member))
+        self.live_process_threads(process)
             .all(|member| member == tid)
     }
 
@@ -565,6 +763,10 @@ impl Scheduler {
             {
                 return Err(ProtocolFailure::Identity);
             }
+            // Any thread's outstanding permit is a leak here, not a policy:
+            // each thread's own receipt settles its permit before that
+            // thread's worker ends, and the backend reports retirement only
+            // after the leader has joined every worker.
             if self
                 .parked
                 .permits
@@ -588,6 +790,17 @@ impl Scheduler {
         };
         if terminal.process != event.process || terminal.status != event.status {
             return Err(ProtocolFailure::Identity);
+        }
+        // A group exit can retire siblings that held permits of their own.
+        // Each one's receipt has released its permit by now, for the reason
+        // above, so one still outstanding is a leak.
+        if self
+            .parked
+            .permits
+            .values()
+            .any(|permit| permit.task.process == event.process)
+        {
+            return Err(ProtocolFailure::Phase);
         }
         match terminal.class {
             FinalProcessClass::Root | FinalProcessClass::DirectParentTerminal { .. } => {
@@ -758,6 +971,10 @@ impl Scheduler {
             if receipt.completion != completion {
                 return Err(ProtocolFailure::Identity);
             }
+            // The scheduler's own decision at the exit grant, if it took one
+            // (SIGSHARE S4), is checked against the effect here, inside the
+            // barrier, and the effect kept for the child's `ChildExit` timer.
+            self.check_child_exit_publication(&receipt);
             // Waitability, never the signal-publication effect, decides whether
             // scheduler shadow state survives. A waitable child remains until
             // the Tool injects the backend wait (including WNOWAIT handling);
@@ -846,74 +1063,21 @@ impl Scheduler {
         })
     }
 
-    /// The thread-group leader of `tid` (itself when it leads, or when it is
-    /// unknown), as `fail_parked` names a thread's process.
-    fn permit_leader(&self, tid: DetTid) -> DetTid {
-        self.thread_tree
-            .thread_to_leader
-            .get(&tid)
-            .copied()
-            .unwrap_or(tid)
-    }
-
-    /// Whether `tid`'s controlled exit must wait because another thread of its
-    /// process holds a delivery permit: that thread is at a signal boundary,
-    /// waiting for its `InboundSignal` turn, and the protocol allows one
-    /// boundary per process at a time, so `reserve_exit_boundary` would refuse
-    /// the exit as a protocol failure. The exit waits instead, and the
-    /// permit's release re-admits it (`admit_exits_released_by`), as Linux
-    /// lets a thread exit while a sibling handles a signal
-    /// (https://github.com/rrnewton/hermit/issues/4367).
-    pub(crate) fn exit_awaits_sibling_permit(&self, tid: DetTid, process: DetPid) -> bool {
-        if self.parked.control.is_none() {
-            return false;
-        }
-        let Some((_, task)) = self.real_timers.task_identity(process, tid) else {
-            return false;
-        };
-        self.parked
-            .permits
-            .iter()
-            .any(|(holder, permit)| *holder != tid && permit.task.process == task.process)
-    }
-
-    /// Admit, at the next drain and at the front of its band, every exit that
-    /// waited (`exit_awaits_sibling_permit`) for the permit `holder` just
-    /// released, once no other permit of `process` remains. Called at every
-    /// release of a permit, so no waiter outlives the permits it waits for.
-    /// Each release is ordered before the next selection, so the drain that
-    /// admits the exit is a deterministic one (`admit_to_run_queue`): the
-    /// delivery receipt arrives while `holder` holds its turn, before it files
-    /// its next request, and an observation's release runs in the scheduler's
-    /// own control drain, while the observed thread's empty request holds the
-    /// scheduler.
-    pub(super) fn admit_exits_released_by(&mut self, holder: DetTid, process: SignalProcessId) {
-        if self
-            .parked
-            .permits
-            .values()
-            .any(|permit| permit.task.process == process)
-        {
-            return;
-        }
-        let leader = self.permit_leader(holder);
-        let ready: Vec<DetTid> = self
-            .parked
-            .exits_awaiting_permit
-            .iter()
-            .copied()
-            .filter(|waiter| self.permit_leader(*waiter) == leader)
-            .collect();
-        for waiter in ready {
-            self.parked.exits_awaiting_permit.remove(&waiter);
-            self.admit_to_run_queue(waiter, super::AdmitIntent::Fixed(super::AdmitSide::Front));
-        }
-    }
-
     /// Fence one scheduler-committed exit until KVM reports the exact terminal
     /// boundary after committing its process-family snapshot. The selected
     /// `(tid, request, response)` transaction is the authority here: step 5
     /// has not yet made `parked.running` name this task.
+    ///
+    /// The exit's permit is the exiting thread's own, so a delivery permit
+    /// another thread of the process holds does not hold the exit back:
+    /// Linux lets a thread exit, or a group exit begin, while a sibling is
+    /// about to take a signal. A single thread's terminal receipt retires that
+    /// thread alone. A group's retires its live siblings, and each sibling's
+    /// own receipt then settles that sibling's permit before the backend
+    /// retires the process (`consume_signal_boundary`). One committed exit of
+    /// a process is still fenced at a time: the fence is a control barrier,
+    /// so no second exit of the process can be granted while it stands, and a
+    /// second fence would mean that the barrier failed.
     pub(crate) fn reserve_exit_boundary(
         &mut self,
         tid: DetTid,
@@ -937,11 +1101,6 @@ impl Scheduler {
             .ok_or(ProtocolFailure::Identity)?;
         if expected_mm != mm
             || !self.rpc_incarnation_matches(tid, mm)
-            || self
-                .parked
-                .permits
-                .values()
-                .any(|permit| permit.task.process == task.process)
             || self
                 .parked
                 .exit_fences
@@ -1002,13 +1161,48 @@ impl Scheduler {
         Ok(ExitReserveMode::Controlled)
     }
 
+    /// Whether the exit of `child` reserved its publication to a live parent
+    /// (`prepare_child_exit_reservation`) and awaits its terminal status: the
+    /// reservation `reserve_exit_boundary` installed for the grant now being
+    /// committed.
+    pub(super) fn child_exit_reserved(&self, child: DetPid) -> bool {
+        self.parked
+            .child_exit_reservations
+            .values()
+            .any(|reservation| {
+                reservation.child.tgid.as_raw() == child.as_raw()
+                    && matches!(
+                        reservation.phase,
+                        ChildExitReservationPhase::AwaitingTerminalStatus
+                    )
+            })
+    }
+
+    /// Whether `process`'s final transition is already recorded, with exit
+    /// status `status` (`record_final_process_transition`).
+    fn final_transition_recorded(&self, process: SignalProcessId, status: ExitStatus) -> bool {
+        self.parked
+            .terminal_processes
+            .get(&ProcessGeneration::from_backend(process))
+            .is_some_and(|terminal| terminal.process == process && terminal.status == status)
+    }
+
+    /// Consume a backend's signal-boundary receipt. A terminal receipt that
+    /// ended its process without a committed exit of its own (no exit fence:
+    /// the default action of a fatal signal, not an `exit`, an `exit_group`
+    /// or a `SIGKILL` the process sent itself, whose grant fenced the exit),
+    /// and that is not a committed group's follower, comes back as the
+    /// process's [`SignalDeath`], for the caller to let go of its threads'
+    /// descriptor tables (`GlobalState::release_tables_at_death`) while the
+    /// control barrier it installed (the child's exit reservation, or the
+    /// process's retirement) still holds every later turn.
     pub(crate) fn consume_signal_boundary(
         &mut self,
         receipt: SignalBoundaryReceipt,
-    ) -> Result<(), reverie::Error> {
+    ) -> Result<Option<SignalDeath>, reverie::Error> {
         let tid = DetTid::from_raw(receipt.permit.task.tid.as_raw());
         if self.parked.completed.get(&tid) == Some(&receipt) {
-            return Ok(());
+            return Ok(None);
         }
         if self.parked.permits.get(&tid) != Some(&receipt.permit) {
             return Err(reverie::syscalls::Errno::EINVAL.into());
@@ -1030,6 +1224,7 @@ impl Scheduler {
         // changing any membership or consuming the permit.
         let mut retire = Vec::new();
         let mut final_transition = None;
+        let mut death = None;
         if let SignalBoundaryOutcome::Terminated { group, wait_status } = receipt.outcome {
             let pid = DetPid::from_raw(receipt.permit.task.process.tgid.as_raw());
             let current = self.real_timers.task_identity(pid, tid);
@@ -1042,42 +1237,76 @@ impl Scheduler {
                 None if !self.next_turns.contains_key(&tid) => {}
                 _ => return Err(reverie::syscalls::Errno::EINVAL.into()),
             }
-            let targets = if group {
-                self.thread_tree.my_thread_group(&pid)
-            } else {
-                vec![tid]
-            };
-            for target in targets {
-                if !self.next_turns.contains_key(&target) {
-                    continue;
-                }
-                let (mm, identity) = self
-                    .real_timers
-                    .task_identity(pid, target)
-                    .ok_or(reverie::syscalls::Errno::EINVAL)?;
-                if identity.process != receipt.permit.task.process
-                    || !self.rpc_incarnation_matches(target, mm)
-                {
-                    return Err(reverie::syscalls::Errno::EINVAL.into());
-                }
-                retire.push((target, pid, mm));
-            }
-            final_transition = self
-                .record_final_process_transition(
-                    tid,
-                    pid,
-                    group,
+            // Permits are per thread, so a sibling can hold one when another
+            // member's terminal receipt commits the group exit. That receipt
+            // retired the sibling and recorded the process's final transition;
+            // the sibling's own receipt for the same group exit (reverie-kvm's
+            // committed-group follower) only settles its permit below.
+            let settles_committed_group_exit = group
+                && exit_fence.is_none()
+                && current.is_none()
+                && self.final_transition_recorded(
                     receipt.permit.task.process,
                     ExitStatus::from_raw(wait_status),
-                )
-                .map_err(|_| reverie::syscalls::Errno::EINVAL)?;
+                );
+            if !settles_committed_group_exit {
+                // A group exit at a delivery boundary is the process's end:
+                // its wait status, the backend's winner in wait(2) encoding
+                // (the signal, with `0x80` where the death dumped core), is
+                // the code its zombie keeps (`Self::record_exit_code`),
+                // recorded here, where the process is retired.
+                if group {
+                    self.record_exit_code(pid, wait_status);
+                }
+                // The exiting process's own live threads; the retire list is
+                // sorted below, so their order here decides nothing.
+                let targets: Vec<DetTid> = if group {
+                    self.live_process_threads(pid).collect()
+                } else {
+                    vec![tid]
+                };
+                for target in targets {
+                    if !self.next_turns.contains_key(&target) {
+                        continue;
+                    }
+                    let (mm, identity) = self
+                        .real_timers
+                        .task_identity(pid, target)
+                        .ok_or(reverie::syscalls::Errno::EINVAL)?;
+                    if identity.process != receipt.permit.task.process
+                        || !self.rpc_incarnation_matches(target, mm)
+                    {
+                        return Err(reverie::syscalls::Errno::EINVAL.into());
+                    }
+                    retire.push((target, pid, mm));
+                }
+                final_transition = self
+                    .record_final_process_transition(
+                        tid,
+                        pid,
+                        group,
+                        receipt.permit.task.process,
+                        ExitStatus::from_raw(wait_status),
+                    )
+                    .map_err(|_| reverie::syscalls::Errno::EINVAL)?;
+                if exit_fence.is_none() && final_transition.is_some() {
+                    let mut threads: Vec<DetTid> =
+                        retire.iter().map(|(target, _, _)| *target).collect();
+                    threads.push(tid);
+                    threads.sort_unstable();
+                    threads.dedup();
+                    death = Some(SignalDeath {
+                        process: pid,
+                        threads,
+                    });
+                }
+            }
         }
         // Cleanup/failure may already have logically killed the task. Exact
         // duplicates remain recognizable after timer/task retirement. No turn
-        // or membership is created by this consuming notification.
-        if let Some(released) = self.parked.permits.remove(&tid) {
-            self.admit_exits_released_by(tid, released.task.process);
-        }
+        // or membership is created by this consuming notification. Releasing
+        // this thread's permit changes no other thread's: each holds its own.
+        self.parked.permits.remove(&tid);
         if exit_fence.is_some() {
             self.parked.exit_fences.remove(&tid);
         }
@@ -1087,10 +1316,22 @@ impl Scheduler {
             turn.protocol.owner = NextTurnOwner::Ordinary;
         }
         retire.sort_unstable_by_key(|(target, _, _)| *target);
+        // A fatal signal that ends the process here was taken at a delivery
+        // boundary Detcore permitted, and this receipt is consumed before any
+        // other turn: a death the schedule ordered, as an `Exit` grant is.
+        // The retirements below decide its parent-death signals and its
+        // orphans' new parent as at such a grant (`signal_boundary_deaths`).
+        let signal_death = death.as_ref().map(|death| death.process);
+        if let Some(process) = signal_death {
+            self.signal_boundary_deaths.insert(process);
+        }
         for (target, pid, mm) in retire {
             // Existing deferred queue removals, pending-RPC cancellation,
             // clear-TID wakeups and physical-hook admission stay authoritative.
             self.logically_kill_thread(&target, &pid, mm);
+        }
+        if let Some(process) = signal_death {
+            self.signal_boundary_deaths.remove(&process);
         }
         if let Some(FinalProcessClass::DirectParentTerminal { parent }) = final_transition {
             // The backend classifies this as run-teardown state and never emits
@@ -1106,8 +1347,18 @@ impl Scheduler {
         if exit_fence.is_some() {
             self.wake_control_waiter();
         }
-        Ok(())
+        Ok(death)
     }
+}
+
+/// A process a terminal receipt ended without a committed exit of its own: by
+/// the default action of a fatal signal (`Scheduler::consume_signal_boundary`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SignalDeath {
+    /// The process that ended.
+    pub(crate) process: DetPid,
+    /// Its threads the receipt ended, the receipt's own included, in order.
+    pub(crate) threads: Vec<DetTid>,
 }
 
 /// Never call the backend's RunFailure publisher with the scheduler mutex held:

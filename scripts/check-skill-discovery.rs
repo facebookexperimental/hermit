@@ -251,6 +251,26 @@ fn require_contained(root: &Path, path: &Path, purpose: &str) -> Result<PathBuf,
     Ok(canonical_path)
 }
 
+/// Claude Code reads AGENTS.md natively, so CLAUDE.md is optional: a symlink
+/// is refused, and a regular file must open with `@AGENTS.md` (any Claude-only
+/// lines follow it).
+fn require_claude_policy(root: &Path) -> Result<(), String> {
+    let path = root.join("CLAUDE.md");
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("inspect {}: {error}", path.display())),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{}: CLAUDE.md must not be a symlink; Claude Code reads AGENTS.md natively", path.display()));
+    }
+    let text = fs::read_to_string(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    if text.lines().next() != Some("@AGENTS.md") {
+        return Err(format!("{}: a regular CLAUDE.md must start with @AGENTS.md", path.display()));
+    }
+    Ok(())
+}
+
 fn require_internal_symlink(
     root: &Path,
     path: &Path,
@@ -295,14 +315,9 @@ fn containment_regression_test() -> Result<(), String> {
     })?;
     fs::write(root.join("AGENTS.md"), "fixture policy\n")
         .map_err(|error| format!("write positive fixture: {error}"))?;
-    symlink("AGENTS.md", root.join("CLAUDE.md"))
-        .map_err(|error| format!("create positive fixture symlink: {error}"))?;
-    require_internal_symlink(
-        &root,
-        &root.join("CLAUDE.md"),
-        Path::new("AGENTS.md"),
-        "positive fixture",
-    )?;
+    fs::write(root.join("CLAUDE.md"), "@AGENTS.md\n")
+        .map_err(|error| format!("write positive fixture: {error}"))?;
+    require_claude_policy(&root)?;
     symlink("missing", root.join("dangling"))
         .map_err(|error| format!("create dangling fixture symlink: {error}"))?;
     if require_internal_symlink(
@@ -484,12 +499,7 @@ fn check(root: &Path) -> Result<(), String> {
     require_contained(root, &root.join(".claude"), "canonical ancestor")?;
     require_real_dir(&root.join(".llms"), "Claude compatibility ancestor")?;
     require_contained(root, &root.join(".llms"), "Claude compatibility ancestor")?;
-    require_internal_symlink(
-        root,
-        &root.join("CLAUDE.md"),
-        Path::new("AGENTS.md"),
-        "Claude policy link",
-    )?;
+    require_claude_policy(root)?;
     let llms_root = root.join(".llms/skills");
     require_internal_symlink(
         root,

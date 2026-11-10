@@ -23,7 +23,10 @@ use crate::tool_local::ResourceLimit;
 const CLOCK_TICKS_PER_SECOND: u64 = 100;
 const NANOS_PER_CLOCK_TICK: u64 = 1_000_000_000 / CLOCK_TICKS_PER_SECOND;
 
-fn clock_ticks(duration: crate::types::LogicalTime) -> u64 {
+/// `duration` in clock ticks (`USER_HZ`), truncated, as Linux's
+/// `nsec_to_clock_t` converts the CPU times `times(2)` and a process's `stat`
+/// report (kernel/time/time.c:733-736 at v6.16).
+pub(crate) fn clock_ticks(duration: crate::types::LogicalTime) -> u64 {
     duration.as_nanos() / NANOS_PER_CLOCK_TICK
 }
 
@@ -244,16 +247,42 @@ impl<T: RecordOrReplay> Detcore<T> {
             maximum: requested.rlim_max,
         };
         let resource_limits = guest.thread_state().resource_limits.clone();
-        let mut limits = resource_limits
-            .lock()
-            .expect("resource limits mutex poisoned");
-        let previous = limits.get(resource).ok_or(Errno::EINVAL)?;
-        validate_resource_limit_mutation(resource, previous, requested)
-            .inspect_err(|errno| warn_refused_cpu_limit(guest, "setrlimit", resource, *errno))?;
-        if requested != previous {
-            limits.set(resource, requested);
-        }
+        let previous = {
+            let mut limits = resource_limits
+                .lock()
+                .expect("resource limits mutex poisoned");
+            let previous = limits.get(resource).ok_or(Errno::EINVAL)?;
+            validate_resource_limit_mutation(resource, previous, requested).inspect_err(
+                |errno| warn_refused_cpu_limit(guest, "setrlimit", resource, *errno),
+            )?;
+            if requested != previous {
+                limits.set(resource, requested);
+            }
+            previous
+        };
+        self.publish_rss_limit(guest, resource, previous, requested)
+            .await;
         Ok(0)
+    }
+
+    /// Tell Detcore's process table a process's new soft `RLIMIT_RSS`
+    /// (`Scheduler::set_rss_limit`), which a rendered `/proc/<pid>/stat` shows
+    /// whoever reads it (field 25): after a `setrlimit` or `prlimit64` of the
+    /// caller's own process changed it from `previous` to `requested`.
+    // The syscall resource argument is unsigned; libc exposes RLIMIT_RSS as
+    // u32 on GNU and i32 on musl, with the same nonnegative Linux value.
+    #[allow(clippy::unnecessary_cast)]
+    async fn publish_rss_limit<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        resource: u32,
+        previous: ResourceLimit,
+        requested: ResourceLimit,
+    ) {
+        if resource == libc::RLIMIT_RSS as u32 && requested.current != previous.current {
+            let process = self.own_detpid(guest);
+            crate::tool_global::set_rss_limit(guest, process, requested.current).await;
+        }
     }
 
     /// Virtualize `prlimit64(2)` for the current guest process.
@@ -341,6 +370,11 @@ impl<T: RecordOrReplay> Detcore<T> {
 
             previous
         };
+
+        if let Some(requested) = requested {
+            self.publish_rss_limit(guest, resource, previous, requested)
+                .await;
+        }
 
         if let Some(address) = call.old_rlim() {
             let previous = libc::rlimit64 {

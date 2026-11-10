@@ -24,10 +24,10 @@ use clap::Parser;
 use hermit::Error;
 use hermit::ExitStatus;
 
-use crate::global_opts::GlobalOpts;
-use crate::podman_store::PodmanStore;
-use crate::podman_store::ResolvedImage;
-use crate::run::RunOpts;
+use crate::app::global_opts::GlobalOpts;
+use crate::app::podman_store::PodmanStore;
+use crate::app::podman_store::ResolvedImage;
+use crate::app::run::RunOpts;
 
 #[derive(Debug, Parser)]
 pub struct OciOpts {
@@ -48,6 +48,10 @@ enum OciSubcommand {
     /// Download an image into the local store (the only networked subcommand).
     #[clap(name = "pull")]
     Pull(PullOpts),
+
+    /// Remove materialized rootfs caches no local image references any more.
+    #[clap(name = "prune")]
+    Prune(PruneOpts),
 
     /// Run a program deterministically against an image's filesystem.
     #[clap(name = "run", trailing_var_arg = true)]
@@ -71,6 +75,13 @@ struct InspectOpts {
 struct PullOpts {
     /// Image reference to download.
     image: String,
+}
+
+#[derive(Debug, Parser)]
+struct PruneOpts {
+    /// List what would be removed without removing it.
+    #[clap(long, short = 'n')]
+    dry_run: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -157,6 +168,7 @@ impl OciOpts {
             OciSubcommand::Ls(opts) => opts.main(),
             OciSubcommand::Inspect(opts) => opts.main(),
             OciSubcommand::Pull(opts) => opts.main(),
+            OciSubcommand::Prune(opts) => opts.main(),
             OciSubcommand::Run(opts) => opts.main(global),
         }
     }
@@ -203,6 +215,53 @@ impl PullOpts {
     }
 }
 
+impl PruneOpts {
+    fn main(&self) -> Result<ExitStatus, Error> {
+        let store = require_store()?;
+        let live_refs: Vec<String> = store
+            .list(true)?
+            .iter()
+            .map(|image| image.id.clone())
+            .collect();
+        let live = crate::app::image::live_cache_keys(&live_refs)?;
+        let Some(base) = crate::app::image::cache_base()? else {
+            println!("No OCI rootfs cache to prune.");
+            return Ok(ExitStatus::SUCCESS);
+        };
+        let mut removed = 0usize;
+        for entry in std::fs::read_dir(&base)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if live.contains(&name) {
+                continue;
+            }
+            // An in-progress local materialization staging directory is
+            // not an unreferenced cache; its owner cleans it up.
+            if name.contains(".staging-") {
+                continue;
+            }
+            if self.dry_run {
+                println!("would remove {}", entry.path().display());
+            } else {
+                std::fs::remove_dir_all(entry.path())?;
+                println!("removed {}", entry.path().display());
+            }
+            removed += 1;
+        }
+        println!(
+            "{} {} unreferenced rootfs cache(s); {} kept.",
+            if self.dry_run {
+                "Would remove"
+            } else {
+                "Removed"
+            },
+            removed,
+            live.len()
+        );
+        Ok(ExitStatus::SUCCESS)
+    }
+}
+
 /// Print the resolution result and the parts of the image config that change
 /// how hermit runs the guest.
 fn report(store: &PodmanStore, image: &ResolvedImage) -> Result<(), Error> {
@@ -239,10 +298,8 @@ fn report(store: &PodmanStore, image: &ResolvedImage) -> Result<(), Error> {
         println!("entrypoint: {:?}", config.entrypoint);
     }
     if !config.cmd.is_empty() {
-        // hermit always requires an explicit guest program, so say so rather
-        // than let the reader assume `hermit oci run <ref>` would use this.
         println!(
-            "cmd:        {:?}  (informational; hermit requires an explicit program)",
+            "cmd:        {:?}  (default program when `oci run` is given none)",
             config.cmd
         );
     }
@@ -262,6 +319,9 @@ fn report(store: &PodmanStore, image: &ResolvedImage) -> Result<(), Error> {
 impl OciRunOpts {
     fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         self.run.refuse_unready_exec_stop()?;
+        // Every `hermit oci run` runs from an image, so this is refused
+        // before the store is opened or the reference resolved.
+        self.run.refuse_exclusive_rewrite_for_image_launch(true)?;
         // `hermit oci run` takes its image as a positional; the inherited
         // `--image` flag would be a second, unresolved way to say the same
         // thing. Reject the ambiguity rather than silently picking one.
@@ -284,6 +344,24 @@ impl OciRunOpts {
                  run `hermit run --image <ID> {option} ...` instead.",
                 self.image_ref
             )));
+        }
+        // Local image inputs are `hermit run --image` material, not store
+        // references; refuse them before any store (podman) access.
+        match crate::app::image_source::parse_image_source(&self.image_ref) {
+            crate::app::image_source::ImageSourceRef::Local { .. } => {
+                return Err(Error::msg(format!(
+                    "`hermit oci run` resolves references from the local podman \
+                     store; {:?} is a local image input. Run it with \
+                     `hermit run --image={} -- <program>` instead.",
+                    self.image_ref, self.image_ref
+                )));
+            }
+            crate::app::image_source::ImageSourceRef::BareRelative { kind, remainder } => {
+                return Err(crate::app::image_source::bare_relative_error(
+                    kind, &remainder,
+                ));
+            }
+            crate::app::image_source::ImageSourceRef::StoreReference => {}
         }
         let store = require_store()?;
         // Resolution never contacts a registry unless --pull was asked for, so
@@ -376,6 +454,42 @@ mod tests {
         }
     }
 
+    /// `hermit oci run --rewrite-exclusives` is refused by name before any
+    /// image store is needed, so the refusal holds on a host without one.
+    #[test]
+    fn oci_run_refuses_the_exclusive_rewrite_before_resolving_the_image() {
+        use clap::CommandFactory;
+        let argv = [
+            "hermit",
+            "oci",
+            "run",
+            "--rewrite-exclusives",
+            "example.invalid/image:tag",
+            "--epoch=2000-12-31T23:59:59Z",
+            "--",
+            "/nonexistent-oci-guest",
+        ];
+        let matches = crate::app::Args::command()
+            .try_get_matches_from(argv)
+            .unwrap();
+        let args = crate::app::args_from_matches_with_clock(&matches, || {
+            panic!("an explicit epoch must not sample the host clock")
+        })
+        .unwrap();
+        let crate::app::Subcommand::Oci(oci) = args.command else {
+            panic!("expected oci subcommand");
+        };
+        let OciSubcommand::Run(mut options) = oci.command else {
+            panic!("expected embedded run subcommand");
+        };
+        let error = options.main(&args.global).unwrap_err();
+        assert!(
+            format!("{error:#}")
+                .contains("a guest run from an OCI image (--image, hermit oci run)"),
+            "{error:#}"
+        );
+    }
+
     #[test]
     fn oci_run_forwards_maximum_source_to_timerless_config_validation() {
         use clap::CommandFactory;
@@ -387,7 +501,7 @@ mod tests {
         ] {
             let mut argv = vec![
                 "hermit",
-                "--backend=dbt",
+                "--backend=liteinst",
                 "oci",
                 "run",
                 "example.invalid/image:tag",
@@ -395,12 +509,14 @@ mod tests {
             ];
             argv.extend(maximum);
             argv.extend(["--", "/nonexistent-oci-preemption-guest"]);
-            let matches = crate::Args::command().try_get_matches_from(argv).unwrap();
-            let args = crate::args_from_matches_with_clock(&matches, || {
+            let matches = crate::app::Args::command()
+                .try_get_matches_from(argv)
+                .unwrap();
+            let args = crate::app::args_from_matches_with_clock(&matches, || {
                 panic!("an explicit epoch must not sample the host clock")
             })
             .unwrap();
-            let crate::Subcommand::Oci(oci) = args.command else {
+            let crate::app::Subcommand::Oci(oci) = args.command else {
                 panic!("expected oci subcommand");
             };
             let OciSubcommand::Run(mut options) = oci.command else {
@@ -409,20 +525,21 @@ mod tests {
             // Use the same global selection RunOpts::main installs, without
             // resolving an OCI store or claiming this backend supports images.
             options.run.set_backend(args.global.backend);
-            assert_eq!(options.run.global_backend_arg(), " --backend=dbt");
+            assert_eq!(options.run.global_backend_arg(), " --backend=liteinst");
             let result = options.run.validate_args();
             if refuses {
                 let error = result.unwrap_err();
                 let message = format!("{error:#}");
                 assert!(
                     error
-                        .downcast_ref::<crate::container::PolicyRefusal>()
+                        .downcast_ref::<crate::app::container::PolicyRefusal>()
                         .is_some(),
                     "{message}"
                 );
                 assert!(
-                    message
-                        .contains("unsupported_preemption: --backend=dbt refuses --max-timeslice"),
+                    message.contains(
+                        "unsupported_preemption: --backend=liteinst refuses --max-timeslice"
+                    ),
                     "{message}"
                 );
                 assert_eq!(
@@ -430,7 +547,28 @@ mod tests {
                     Some(200_000_000)
                 );
             } else {
-                result.unwrap();
+                // The inherited maximum passes the timer check: only an
+                // explicit request is refused for want of a timer. A build
+                // with the in-guest runtime then refuses any maximum on
+                // in-guest LiteInst, in the later in-guest check, which
+                // `in_guest_trap_refuses_the_options_liteinst_refuses` covers.
+                if cfg!(feature = "liteinst") && maximum.is_none() {
+                    let error = result.unwrap_err();
+                    let message = format!("{error:#}");
+                    assert!(
+                        error
+                            .downcast_ref::<crate::app::container::PolicyRefusal>()
+                            .is_some(),
+                        "{message}"
+                    );
+                    assert!(
+                        message.contains("pass --max-timeslice=disabled"),
+                        "{message}"
+                    );
+                    assert!(!message.contains("unsupported_preemption"), "{message}");
+                } else {
+                    result.unwrap();
+                }
                 assert_eq!(
                     options.run.det_opts.det_config.max_timeslice.map(u64::from),
                     if maximum.is_none() {

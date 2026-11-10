@@ -145,9 +145,9 @@ pub fn current() -> BuildInfo {
         build_date,
         git_sha,
         features: BuildFeatures {
-            dbt: cfg!(feature = "dbt"),
-            e9patch: cfg!(feature = "e9patch"),
-            sabre: cfg!(feature = "sabre"),
+            dbt: false,
+            e9patch: false,
+            sabre: false,
         },
     }
 }

@@ -594,6 +594,7 @@ mod tests {
     /// here and in `MachineDescription`.
     #[test]
     fn fixed_procfs_files_have_their_documented_values() {
+        let pipe_max_size = format!("{}\n", crate::syscalls::deterministic_pipe_capacity_bytes());
         use FixedProcfsFile::*;
         let expected = [
             (
@@ -691,7 +692,8 @@ mod tests {
             (DentryState, "0\t0\t45\t0\t0\t0\n"),
             (AioNr, "0\n"),
             (AioMaxNr, "65536\n"),
-            (PipeMaxSize, "8192\n"),
+            // Two of the host's pages: 8192 on x86-64.
+            (PipeMaxSize, pipe_max_size.as_str()),
         ];
         for (file, text) in expected {
             assert_eq!(contents(file), text, "{file:?}");

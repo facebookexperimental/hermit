@@ -16,11 +16,19 @@
 //! | test | pre-fix behavior it stops |
 //! | --- | --- |
 //! | [`flock_excludes_a_second_open_and_a_second_process`] | the no-op: every `flock` returned 0 |
-//! | [`contended_blocking_upgrade_is_refused_without_losing_the_shared_lock`] | the `LOCK_NB` probe destroyed the caller's `LOCK_SH` |
-//! | [`contended_blocking_upgrade_is_fail_closed_under_strict`] | refusal policy ignored two of three config knobs |
-//! | [`blocking_upgrade_on_received_fd_preserves_unknown_lock_state`] | the probe destroyed a lock received through `SCM_RIGHTS` |
-//! | [`dbt_forked_child_blocking_flock_fails_closed_without_deadlock`] | a copied DBT child ran blocking flock natively and deadlocked |
-//! | [`dbt_forked_child_preserves_safe_flock_operations`] | copied-child refusal overmatched malformed, nonblocking, and unlock operations |
+//! | [`contended_blocking_upgrade_waits_for_the_release`] | a contended blocking flock was refused, where Linux waits (Detcore's flock model, the kvm lane's slice SP2) |
+//! | [`contended_blocking_upgrade_waits_at_l2_under_strict`] | the same wait, deterministic at L2 |
+//! | [`kernel_path_contended_blocking_upgrade_restores_the_shared_lock_and_is_refused`] | on a file the kernel decides, the `LOCK_NB` probe of a refused blocking conversion destroyed the shared lock the caller held |
+//! | [`kernel_path_contended_blocking_upgrade_is_fail_closed_under_strict`] | the same refusal handed back an errno, or a timeout, under a fail-closed run |
+//! | [`kernel_path_unknown_state_blocking_upgrade_is_refused_before_any_probe`] | a blocking conversion through a description of unknown mode was probed, which could delete a lock Detcore cannot restore |
+//! | [`an_outside_lock_refuses_the_mirror_and_the_model_lets_the_grant_go`] | after a refused mirror the model kept the grant the guest was told it did not get |
+//! | [`a_received_description_holds_the_senders_lock`] | a description received through `SCM_RIGHTS` lost, or kept, its lock other than as Linux does |
+//! | [`a_private_table_closing_every_descriptor_frees_the_lock_on_ptrace`] | a description a private-table thread had referenced kept its lock in the model after every descriptor closed |
+//! | [`a_job_control_stop_of_a_waiter_is_refused_by_name_on_ptrace`] | a stopped waiter stayed queued, and was granted while Linux kept it stopped |
+//! | [`an_exec_ends_the_flock_wait_of_a_thread_it_kills_on_ptrace`] | a waiter an exec killed stayed queued, took the lock, and kept it for the rest of the run, or left a request blocked under its own forever |
+//! | [`a_waiter_kept_by_a_mapping_alone_is_refused_by_name_on_ptrace`] | a waiting call whose descriptor a sibling closed while a mapping kept its description returned 0 with no lock on the host, where the kernel then granted a conflicting lock |
+//! | [`dbt_copied_vfork_child_refuses_every_flock_by_name`] | a copied DBT vfork child ran `LOCK_NB` and `LOCK_UN` natively, changing locks behind the flock model |
+//! | [`dbt_forked_child_preserves_safe_flock_operations`] | copied-child refusal overmatched malformed, nonblocking, and unlock operations; a DBT fork child's calls now reach the flock model |
 //! | [`dbt_nested_vfork_child_blocking_flock_reaches_the_copied_policy`] | a copied fork child's vfork path was assumed to bypass the copied-syscall flock guard |
 //! | [`failed_process_clone_preserves_known_flock_state`] | a failed clone made an unlocked descriptor permanently unknown |
 //! | [`pidfd_getfd_alias_mutation_invalidates_source_flock_authority`] | a pidfd_getfd duplicate unlocked its source OFD while the source cache stayed stale and restored the released lock |
@@ -37,13 +45,22 @@
 //! | [`replay_reissues_every_flock_for_a_materialized_file`] | replay consumed the recorded return and took no lock |
 //! | [`replay_refuses_flock_for_a_non_materialized_file`] | replay reported success while locking only a placeholder |
 //! | [`replay_reissues_pidfd_getfd_success_and_failure`] | replay consumed pidfd_getfd results without reproducing descriptor side effects |
-//! | [`recording_refuses_a_contended_blocking_flock`] | record mode silently accepted the ordinary-run compatibility fallback |
+//! | [`recording_and_replay_wait_for_a_contended_blocking_flock`] | record mode refused a contended blocking flock that Linux waits for |
 //! | [`pre_flock_recordings_are_refused_by_the_version_gate`] | a 0x10b recording has no flock event and desynchronized |
+//! | [`flock_model_matches_linux_at_l2_on_ptrace`] and [`flock_model_matches_linux_at_l2_on_kvm`] | flock between processes was refused on KVM, and a blocking waiter was refused everywhere |
+//! | [`a_mapping_keeps_the_lock_after_the_last_close_on_ptrace`] | the model released a lock at the last close while a mapping kept it |
+//! | [`kvm_refuses_the_last_close_of_a_mapped_locked_description`] | the same release on KVM, where no host lock can decide the file |
+//! | [`a_description_shared_before_its_first_flock_keeps_the_kernel_path_on_ptrace`] | the model released a lock at a last reference it could not see |
+//! | [`kvm_refuses_a_flock_through_a_description_shared_before_its_first_flock`] | the same on KVM |
+//! | [`record_and_replay_reproduce_the_flock_model`] | the flock model's mirrors were not recorded, or not re-issued in replay |
+//! | [`the_flock_utility_shell_pattern_keeps_the_kernel_path_on_ptrace`] | the shell's `exec 9>lockfile; flock -n 9` was decided from references the model never saw |
+//! | [`kvm_refuses_the_flock_utility_shell_pattern_by_name`] | the same on KVM, where no host lock can decide the file |
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
 
 use std::fs;
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -55,16 +72,6 @@ use std::sync::OnceLock;
 /// `hermit record` writes to shared per-run state; serialize the record/replay
 /// cases the same way `record_replay.rs` does.
 static RECORD_LOCK: Mutex<()> = Mutex::new(());
-#[cfg(feature = "dbt")]
-const DBT_VFORK_FLOCK_REFUSAL: &str =
-    "detcore-dbt: refusing vfork/CLONE_VFORK while an open file description may hold a flock";
-#[cfg(feature = "dbt")]
-const DBT_COPIED_PIDFD_GETFD_REFUSAL: &str = "detcore-dbt: refusing pidfd_getfd in copied child";
-#[cfg(feature = "dbt")]
-const DBT_COPIED_RECVMSG_REFUSAL: &str = "detcore-dbt: refusing recvmsg/recvmmsg in copied child";
-#[cfg(feature = "dbt")]
-const DBT_PROCESS_CLONE_FILES_REFUSAL: &str =
-    "detcore-dbt: refusing process clone with CLONE_FILES without CLONE_THREAD";
 
 fn record_lock() -> MutexGuard<'static, ()> {
     RECORD_LOCK
@@ -78,30 +85,40 @@ fn repository() -> &'static Path {
         .expect("hermit-cli should be inside the repository")
 }
 
+/// Compile `tests/c/<name>.c` into this test binary's build directory.
+fn compile(name: &str) -> PathBuf {
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("flock-exclusion-{}", std::process::id()));
+    fs::create_dir_all(&build_root).expect("failed to create the flock guest build directory");
+    let binary = build_root.join(name);
+    let source = repository().join(format!("tests/c/{name}.c"));
+    let compile = Command::new("cc")
+        .args(["-O1", "-std=c11", "-Wall", "-Wextra", "-Werror"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&binary)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to start cc for {}: {error}", source.display()));
+    assert!(
+        compile.status.success(),
+        "failed to compile {}:\n{}",
+        source.display(),
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    binary
+}
+
 /// Compile `tests/c/flock_exclusion.c` once per test binary.
 fn guest() -> &'static Path {
     static GUEST: OnceLock<PathBuf> = OnceLock::new();
-    GUEST.get_or_init(|| {
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("flock-exclusion-{}", std::process::id()));
-        fs::create_dir_all(&build_root).expect("failed to create the flock guest build directory");
-        let binary = build_root.join("flock_exclusion");
-        let source = repository().join("tests/c/flock_exclusion.c");
-        let compile = Command::new("cc")
-            .args(["-O1", "-std=c11", "-Wall", "-Wextra", "-Werror"])
-            .arg(&source)
-            .arg("-o")
-            .arg(&binary)
-            .output()
-            .unwrap_or_else(|error| panic!("failed to start cc for {}: {error}", source.display()));
-        assert!(
-            compile.status.success(),
-            "failed to compile {}:\n{}",
-            source.display(),
-            String::from_utf8_lossy(&compile.stderr)
-        );
-        binary
-    })
+    GUEST.get_or_init(|| compile("flock_exclusion"))
+}
+
+/// Compile `tests/c/flock_shared_exclusive.c`, the flock model's
+/// cross-process guest, once per test binary.
+fn model_guest() -> &'static Path {
+    static GUEST: OnceLock<PathBuf> = OnceLock::new();
+    GUEST.get_or_init(|| compile("flock_shared_exclusive"))
 }
 
 struct Run {
@@ -162,6 +179,112 @@ fn hermit_run_backend_timeout(
     ))
 }
 
+/// The directory in which every run of the flock model's guest, native or
+/// under Hermit, keeps its lock files: each run's `TMPDIR` is a fresh
+/// directory in it, and under Hermit the guest's private `/tmp` is a
+/// directory Hermit makes in that `TMPDIR`. The native output is the
+/// reference every backend must print, so both sides need a filesystem on
+/// which a file mapping keeps the open file description the guest locked, as
+/// Linux's file-description semantics say: `mmap` takes a reference to the
+/// mapped `struct file` (`__mmap_new_file_vma`, mm/vma.c in v6.17), so the
+/// last `fput` (`__fput`, fs/file_table.c), whose `locks_remove_file`
+/// removes the description's flock (fs/locks.c), waits for the last
+/// `munmap` (`remove_vma`, mm/vma.c). Overlayfs breaks that: `ovl_mmap`
+/// (fs/overlayfs/file.c) maps the backing file through `backing_file_mmap`
+/// (fs/backing-file.c), whose `vma_set_file` (mm/util.c) swaps the overlay
+/// file for the backing one and drops the mapping's reference to the overlay
+/// file, so the overlay description's last close removes its lock while the
+/// mapping lives. The validate pinned root's `/tmp` is the container's
+/// overlayfs root, where the guest's `mmap-close` and `waiter-mapped` checks
+/// fail natively (`child LOCK_EX|LOCK_NB with the mapping left = ok`). So the
+/// directory is in the build's own `CARGO_TARGET_TMPDIR`, which the pinned
+/// root binds from the host, and a directory on overlayfs is refused rather
+/// than compared.
+fn flock_scratch_root() -> &'static Path {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        let root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("flock-scratch-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("failed to create the flock scratch root");
+        let path = std::ffi::CString::new(root.as_os_str().as_encoded_bytes())
+            .expect("the flock scratch root has no NUL byte");
+        // SAFETY: `path` is a NUL-terminated string and `stat` a writable
+        // statfs buffer, both live for the call.
+        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::statfs(path.as_ptr(), &mut stat) },
+            0,
+            "statfs {}: {}",
+            root.display(),
+            std::io::Error::last_os_error()
+        );
+        assert_ne!(
+            stat.f_type,
+            libc::OVERLAYFS_SUPER_MAGIC,
+            "{} is on overlayfs, where a mapping does not keep the open file description \
+             the guest locked (ovl_mmap maps the backing file), so the native reference \
+             would not show Linux's flock semantics",
+            root.display()
+        );
+        root
+    })
+}
+
+/// Run the flock model's guest (`tests/c/flock_shared_exclusive.c`)
+/// `scenario` under `hermit run` on `backend`, with `/proc/locks` visible
+/// (`--proc=standard`) and `extra` inserted before `--`, keeping its files
+/// where the native reference keeps its own ([`flock_scratch_root`]).
+fn hermit_run_model(backend: &str, log: &str, extra: &[&str], scenario: &str) -> Run {
+    let scratch = tempfile::tempdir_in(flock_scratch_root())
+        .expect("failed to create the Hermit flock scratch directory");
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after", "10s", "300s"])
+        .arg(hermit_test::hermit_binary())
+        .arg(format!("--log={log}"))
+        .args([
+            &format!("--backend={backend}"),
+            "run",
+            "--base-env=minimal",
+            "--proc=standard",
+        ])
+        .args(extra)
+        .arg("--")
+        .arg(model_guest())
+        .arg(scenario)
+        .env("TMPDIR", scratch.path());
+    hermit_test::configure_guest_execution(&mut command);
+    finish(hermit_test::hermit_output(
+        &format!("{command:?}"),
+        &mut command,
+    ))
+}
+
+/// The flock model's guest `scenario`, run natively: the output every
+/// backend must print, from a lock file on a filesystem with Linux's
+/// file-description semantics ([`flock_scratch_root`]).
+fn native_model_run(scenario: &str) -> Run {
+    let scratch = tempfile::tempdir_in(flock_scratch_root())
+        .expect("failed to create the native flock scratch directory");
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after", "10s", "120s"])
+        .arg(model_guest())
+        .arg(scenario)
+        .env("TMPDIR", scratch.path());
+    let run = finish(
+        command
+            .output()
+            .unwrap_or_else(|error| panic!("failed to start {command:?}: {error}")),
+    );
+    assert!(
+        run.status.success(),
+        "the native flock model guest failed; the comparison would prove nothing\n{}",
+        run.combined()
+    );
+    run
+}
+
 /// Mutual exclusion, the property the pre-#2373 no-op removed outright: under
 /// the no-op every `flock` returned 0, so both the second open file description
 /// and the second process "acquired" a lock the first process was holding, and
@@ -201,42 +324,33 @@ fn flock_excludes_a_second_open_and_a_second_process() {
     );
 }
 
-/// A contended BLOCKING `LOCK_SH` -> `LOCK_EX` conversion must be refused
-/// without costing the caller the lock it already holds.
+const UPGRADE_WAITS_MARKERS: [&str; 5] = [
+    "flock-upgrade-parent-holds-shared",
+    "flock-upgrade-contender-holds-shared",
+    "flock-upgrade-acquired-after-the-release",
+    "flock-upgrade-holds-exclusive",
+    "flock-upgrade-ok",
+];
+
+/// A contended BLOCKING `LOCK_SH` -> `LOCK_EX` conversion waits, as on Linux,
+/// and is granted at the contender's release (Detcore's flock model, the kvm
+/// lane's slice SP2). Linux deletes the caller's shared lock before it finds
+/// the conflict (`flock_lock_inode`), so the caller waits holding nothing;
+/// the exclusive lock it ends with then excludes a fresh open.
 ///
-/// Detcore rewrites a blocking request to `LOCK_NB` so a guest thread cannot
-/// park in the kernel where the deterministic scheduler cannot see it. Linux
-/// converts a lock non-atomically -- `flock_lock_inode` deletes the caller's
-/// existing lock before it scans for a conflict -- so that rewrite silently
-/// destroys a `LOCK_SH` the guest is relying on and then reports `EWOULDBLOCK`.
-/// Natively the guest never sees that state, because a blocking request sleeps
-/// and eventually acquires.
-///
-/// The guest measures survival through a fresh open file description after
-/// releasing the separate shared contender, so the probe can only be answered
-/// by the original lock. Keeping both descriptions in one process ensures this
-/// test exercises the known-mode restore path; the separate SCM_RIGHTS test
-/// below covers state whose history Detcore did not observe. Pre-fix control:
-/// with the
-/// restore suppressed, the probe acquires and the guest prints
-/// `FAIL: the refused upgrade destroyed this process's shared lock`.
+/// Before the model Detcore probed the kernel with `LOCK_NB` and refused the
+/// contended call (ENOLCK under `--allow-unsupported-syscalls`), so this
+/// guest printed `FAIL: the contended blocking LOCK_EX upgrade failed
+/// (errno=37)`.
 #[test]
-fn contended_blocking_upgrade_is_refused_without_losing_the_shared_lock() {
-    let run = hermit_run("off", &["--allow-unsupported-syscalls"], "upgrade");
+fn contended_blocking_upgrade_waits_for_the_release() {
+    let run = hermit_run("off", &["--allow-unsupported-syscalls"], "upgrade-waits");
     assert!(
         run.status.success(),
         "non-strict upgrade run failed\n{}",
         run.combined()
     );
-    for marker in [
-        "flock-upgrade-parent-holds-shared",
-        "flock-upgrade-contender-holds-shared",
-        // Non-strict policy: the guest gets a normal errno rather than a
-        // fail-closed shutdown. ENOLCK is 37 on Linux/x86_64.
-        "flock-upgrade-refused errno=37",
-        "flock-upgrade-preserved-shared-lock",
-        "flock-upgrade-ok",
-    ] {
+    for marker in UPGRADE_WAITS_MARKERS {
         assert!(
             run.stdout.contains(marker),
             "missing {marker}\n{}",
@@ -245,81 +359,130 @@ fn contended_blocking_upgrade_is_refused_without_losing_the_shared_lock() {
     }
 }
 
-/// The same contention under a fail-closed run must stop the run rather than
-/// hand back an errno.
-///
-/// `--strict` sets `panic_on_unsupported_syscalls`, which the CLI couples to
-/// `shutdown_on_unsupported_syscall`, so the refusal goes through
-/// `Detcore::refuse_unserviceable_operation` and terminates. Asserting the
-/// diagnostic as well as the exit status keeps this from passing on an
-/// unrelated failure: a timeout or a broken guest would exit non-zero too.
+/// The same wait under a fail-closed strict run, at L2: the waiter and the
+/// contender's release are ordered by Detcore's schedule, so the two runs of
+/// `--verify --verify-strict` match exactly.
 #[test]
-fn contended_blocking_upgrade_is_fail_closed_under_strict() {
-    let run = hermit_run("error", &["--strict"], "upgrade");
-    // ⚠️ 122 IS "HERMIT REFUSED", NOT "HERMIT BROKE", AND NOT THE GUEST'S 1.
-    // This assertion read `Some(1)` because `unrecoverable_shutdown` used to
-    // `exit(1)`. That made the parent's classifier -- whose arm is documented
-    // "the child died with a status it did not pick" -- report
-    // `class=container-child-exit` and 125 for a shutdown that worked exactly as
-    // designed, sending a reader to hunt a defect in the refusal path. `1` was
-    // no better as a target: it is the commonest guest exit status, so it cannot
-    // distinguish "hermit refused" from "your program returned 1".
-    //
-    // Imported rather than written out: a copied exit code is what left eight
-    // cli tests asserting a stale value for a day after the product moved.
-    assert_eq!(
-        run.status.code(),
-        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
-        "a contended blocking flock upgrade must fail closed as a POLICY REFUSAL, not time out or die for an unrelated reason\n{}",
-        run.combined()
-    );
-    // The class is asserted too, because the code alone cannot carry it: every
-    // value in 0..=255 is a legal guest status, so only the marker is exclusive.
-    assert!(
-        run.combined()
-            .contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
-        "the refusal must be machine-readable as a refusal, not as a failure\n{}",
-        run.combined()
+fn contended_blocking_upgrade_waits_at_l2_under_strict() {
+    let run = hermit_run(
+        "info",
+        &["--strict", "--verify", "--verify-strict"],
+        "upgrade-waits",
     );
     assert!(
-        run.stdout.contains("flock-upgrade-contender-holds-shared"),
-        "the strict run did not reach the contended upgrade\n{}",
+        run.status.success(),
+        "strict --verify upgrade run failed\n{}",
         run.combined()
     );
+    for marker in UPGRADE_WAITS_MARKERS {
+        assert!(
+            run.stdout.contains(marker),
+            "missing {marker}\n{}",
+            run.combined()
+        );
+    }
     assert!(
-        !run.stdout.contains("flock-upgrade-ok"),
-        "the strict run completed the upgrade scenario instead of failing closed\n{}",
-        run.combined()
-    );
-    assert!(
-        run.stderr.contains("blocking flock(fd=")
-            && run.stderr.contains(
-                "Refusing rather than granting a lock another guest holds. LOCK_NB is the \
-                 supported form where the backend supports flock at all; ENOLCK is returned \
-                 instead only under --allow-unsupported-syscalls."
-            ),
-        "the strict run did not report the specific flock refusal\n{}",
+        run.combined().contains("bitwise parity established"),
+        "the upgrade run did not verify at L2\n{}",
         run.combined()
     );
 }
 
-/// A descriptor received through `SCM_RIGHTS` can already hold a lock, but its
-/// acquisition history is outside Detcore's descriptor model. A blocking
-/// conversion must therefore be refused before issuing the destructive
-/// nonblocking probe. The guest proves the received shared lock still excludes
-/// a fresh open file description after the refusal.
+const KERNEL_UPGRADE_REFUSAL: &str = "Refusing rather than granting a lock another guest holds. \
+     LOCK_NB is the supported form where the backend supports flock at all; ENOLCK is returned \
+     instead only under --allow-unsupported-syscalls.";
+
+/// On a file the kernel decides (a description of it was shared with a child
+/// before its first flock, which Detcore's flock model cannot follow), a
+/// contended BLOCKING `LOCK_SH` -> `LOCK_EX` conversion is still probed with
+/// `LOCK_NB`, as before the model: Linux's conversion deletes the caller's
+/// shared lock before it finds the conflict (`flock_lock_inode`), so Detcore
+/// restores that lock and then refuses the call by name. The guest proves
+/// the restored lock through a fresh open after the contender's release.
+/// Pre-fix control: with the restore suppressed, the probe acquires and the
+/// guest prints `FAIL: the refused upgrade destroyed this description's
+/// shared lock`. (The Claude review of the kvm lane's slice SP2: the model's
+/// tests had moved off this path.)
 #[test]
-fn blocking_upgrade_on_received_fd_preserves_unknown_lock_state() {
-    let run = hermit_run("error", &["--allow-unsupported-syscalls"], "received");
+fn kernel_path_contended_blocking_upgrade_restores_the_shared_lock_and_is_refused() {
+    let run = hermit_run("error", &["--allow-unsupported-syscalls"], "kernel-upgrade");
     assert!(
         run.status.success(),
-        "received-fd upgrade run failed\n{}",
+        "kernel-path upgrade run failed\n{}",
         run.combined()
     );
     for marker in [
-        "flock-received-upgrade-refused errno=37",
-        "flock-received-upgrade-preserved-shared-lock",
-        "flock-received-upgrade-ok",
+        "flock-kernel-upgrade-contender-holds-shared",
+        "flock-kernel-upgrade-holds-shared",
+        // ENOLCK is 37 on Linux/x86_64.
+        "flock-kernel-upgrade-refused errno=37",
+        "flock-kernel-upgrade-preserved-shared-lock",
+        "flock-kernel-upgrade-ok",
+    ] {
+        assert!(
+            run.stdout.contains(marker),
+            "missing {marker}\n{}",
+            run.combined()
+        );
+    }
+    assert!(
+        run.stderr.contains("blocking flock(fd=") && run.stderr.contains(KERNEL_UPGRADE_REFUSAL),
+        "the run did not take the kernel path's contended refusal\n{}",
+        run.combined()
+    );
+}
+
+/// The same contention under a fail-closed run stops the run as a policy
+/// refusal, with its reason, rather than hand back an errno.
+#[test]
+fn kernel_path_contended_blocking_upgrade_is_fail_closed_under_strict() {
+    let run = hermit_run("error", &["--strict"], "kernel-upgrade");
+    assert_eq!(
+        run.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "a contended blocking flock upgrade on the kernel path must fail closed as a policy \
+         refusal\n{}",
+        run.combined()
+    );
+    assert!(
+        run.combined()
+            .contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "the refusal must be machine-readable as a refusal\n{}",
+        run.combined()
+    );
+    assert!(
+        run.stdout.contains("flock-kernel-upgrade-holds-shared")
+            && !run.stdout.contains("flock-kernel-upgrade-ok"),
+        "the strict run did not stop at the contended upgrade\n{}",
+        run.combined()
+    );
+    assert!(
+        run.stderr.contains(KERNEL_UPGRADE_REFUSAL),
+        "the strict run did not report the kernel path's contended refusal\n{}",
+        run.combined()
+    );
+}
+
+/// A blocking conversion through a description shared before its first
+/// flock, whose shared lock a child took through that same description: the
+/// caller's Detcore cannot know the description's mode, so a `LOCK_NB` probe
+/// could delete a lock it cannot restore, and the kernel path refuses the
+/// call by name before any probe. The child's shared lock still excludes a
+/// fresh open after the contender's release.
+#[test]
+fn kernel_path_unknown_state_blocking_upgrade_is_refused_before_any_probe() {
+    let run = hermit_run("error", &["--allow-unsupported-syscalls"], "kernel-unknown");
+    assert!(
+        run.status.success(),
+        "kernel-path unknown-state run failed\n{}",
+        run.combined()
+    );
+    for marker in [
+        "flock-kernel-unknown-child-holds-shared",
+        "flock-kernel-unknown-contender-holds-shared",
+        "flock-kernel-unknown-refused errno=37",
+        "flock-kernel-unknown-preserved-shared-lock",
+        "flock-kernel-unknown-ok",
     ] {
         assert!(
             run.stdout.contains(marker),
@@ -334,28 +497,60 @@ fn blocking_upgrade_on_received_fd_preserves_unknown_lock_state() {
              backend supports flock at all; ENOLCK is returned instead only under \
              --allow-unsupported-syscalls."
         ),
-        "the run did not take the unknown-state refusal path\n{}",
+        "the run did not take the unknown-state refusal\n{}",
         run.combined()
     );
 }
 
-/// A copied DBT fork child cannot enter the Rust Detcore syscall handler. Its
-/// blocking flock must therefore fail closed before reaching the kernel; otherwise
-/// it sleeps behind the parent lock while the parent waits for the child.
-#[cfg(feature = "dbt")]
+/// A process outside the run (this test) holds `LOCK_EX` on the file. The
+/// flock model grants the guest's `LOCK_EX|LOCK_NB`, its host mirror finds the
+/// outside lock, and the call is refused by name, `ENOLCK` under
+/// `--allow-unsupported-syscalls`. The model then lets its grant go, as the
+/// guest holds no lock, so a second description's `LOCK_SH|LOCK_NB` is granted
+/// by the model and refused the same way, never answered EWOULDBLOCK from a
+/// lock the first description does not hold (the Claude review of the kvm
+/// lane's slice SP2: the model kept the grant). A fail-closed run ends at the
+/// first refusal.
 #[test]
-#[ignore = "https://github.com/rrnewton/hermit/issues/4173: DBT kills the run (exit 137) on the refused fork child's flock instead of a clean refusal"]
-fn dbt_forked_child_blocking_flock_fails_closed_without_deadlock() {
-    let run = hermit_run_backend_timeout("dbt", "error", &[], "fork-blocking-refusal", "5s");
+fn an_outside_lock_refuses_the_mirror_and_the_model_lets_the_grant_go() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the outside-holder directory");
+    let path = directory.path().join("outside-holder");
+    let holder = fs::File::create(&path).expect("failed to create the outside-holder file");
+    // SAFETY: `holder` owns a valid descriptor.
     assert_eq!(
-        run.status.code(),
-        Some(0),
-        "copied DBT child flock must return ENOLCK, not time out or run natively\n{}",
+        unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "the outside holder's LOCK_EX: {}",
+        std::io::Error::last_os_error()
+    );
+    let run_with = |policy: &str| {
+        let mut command = Command::new("timeout");
+        command
+            .args(["--kill-after", "10s", "120s"])
+            .arg(hermit_test::hermit_binary())
+            .arg("--log=error")
+            .args(["--backend=ptrace", "run", "--base-env=minimal", policy])
+            .arg("--")
+            .arg(guest())
+            .arg("outside-holder")
+            .arg(&path);
+        hermit_test::configure_guest_execution(&mut command);
+        finish(hermit_test::hermit_output(
+            &format!("{command:?}"),
+            &mut command,
+        ))
+    };
+    let run = run_with("--allow-unsupported-syscalls");
+    assert!(
+        run.status.success(),
+        "outside-holder run failed\n{}",
         run.combined()
     );
     for marker in [
-        "flock-fork-child-blocking-refused errno=37",
-        "flock-fork-child-refusal-ok",
+        "flock-outside-first errno=37",
+        "flock-outside-second errno=37",
+        "flock-outside-holder-ok",
     ] {
         assert!(
             run.stdout.contains(marker),
@@ -363,27 +558,49 @@ fn dbt_forked_child_blocking_flock_fails_closed_without_deadlock() {
             run.combined()
         );
     }
-}
-
-/// Copied DBT children still use the kernel for operations that cannot block:
-/// malformed operations retain EINVAL, nonblocking locks retain their real
-/// result, and unlock changes the shared open file description.
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_forked_child_preserves_safe_flock_operations() {
-    let run = hermit_run_backend_timeout("dbt", "error", &[], "fork-safe-operations", "5s");
+    let run = run_with("--strict");
     assert_eq!(
         run.status.code(),
-        Some(0),
-        "copied DBT child safe flock operations changed or timed out\n{}",
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "the refused mirror must end a fail-closed run\n{}",
+        run.combined()
+    );
+    assert!(
+        run.stderr
+            .contains("a lock its model does not know holds the file on the host")
+            && !run.stdout.contains("flock-outside-first"),
+        "the fail-closed run did not stop at the refused mirror\n{}",
+        run.combined()
+    );
+    drop(holder);
+}
+
+/// A description received through `SCM_RIGHTS` is the sender's: it holds
+/// the sender's shared lock, which excludes a fresh open's exclusive lock, and
+/// a contended nonblocking conversion through it deletes that lock before it
+/// fails, as Linux's conversion does (`flock_lock_inode`). The receipt joins
+/// the description its sender's table modeled, and the lock ledger counted
+/// the copy in flight, so Detcore's flock model follows the description
+/// throughout (the kvm lane's slice SP2). Before the model, Detcore refused a
+/// blocking conversion through a received description whose lock history it
+/// had not observed.
+#[test]
+fn a_received_description_holds_the_senders_lock() {
+    let run = hermit_run(
+        "info",
+        &["--strict", "--verify", "--verify-strict"],
+        "received",
+    );
+    assert!(
+        run.status.success(),
+        "received-description run failed\n{}",
         run.combined()
     );
     for marker in [
-        "flock-fork-child-malformed-einval",
-        "flock-fork-child-nonblocking-contended errno=11",
-        "flock-fork-child-nonblocking-ok",
-        "flock-fork-child-unlock-ok",
-        "flock-fork-child-safe-operations-ok",
+        "flock-received-holds-the-shared-lock",
+        "flock-received-upgrade-would-block errno=11",
+        "flock-received-upgrade-dropped-the-shared-lock",
+        "flock-received-upgrade-ok",
     ] {
         assert!(
             run.stdout.contains(marker),
@@ -391,87 +608,6 @@ fn dbt_forked_child_preserves_safe_flock_operations() {
             run.combined()
         );
     }
-}
-
-/// A copied DBT fork child is already outside the ordinary Detcore syscall
-/// path. Its nested vfork child nevertheless reaches the copied-syscall policy
-/// on the pinned Reverie runtime, where blocking flock returns ENOLCK before
-/// reaching the kernel. Native Linux times out on the identical operation.
-///
-/// The exact event shape distinguishes this from both ordinary Detcore flock
-/// handling and the root-process vfork guard: only the root's two setup and two
-/// cleanup flocks appear as Detcore inbound events, while the nested child
-/// reports ENOLCK and exits.
-/// Removing only `copied_child_flock_action`'s blocking refusal makes the DBT
-/// half time out with status 124, just like the native control.
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_nested_vfork_child_blocking_flock_reaches_the_copied_policy() {
-    let mut native = Command::new("timeout");
-    native
-        .args(["--kill-after", "1s", "2s"])
-        .arg(guest())
-        .arg("fork-vfork-blocking");
-    let native = finish(hermit_test::hermit_output(
-        &format!("{native:?}"),
-        &mut native,
-    ));
-    assert_eq!(
-        native.status.code(),
-        Some(124),
-        "the native control must block in the kernel or the DBT comparison proves nothing\n{}",
-        native.combined()
-    );
-    assert!(
-        native.stdout.contains("flock-fork-vfork-child-entered"),
-        "the native control never reached the copied-fork-child analogue\n{}",
-        native.combined()
-    );
-
-    let run = hermit_run_backend_timeout("dbt", "info", &[], "fork-vfork-blocking", "5s");
-    assert_eq!(
-        run.status.code(),
-        Some(0),
-        "the copied-syscall flock guard did not stop the nested vfork child before the kernel block\n{}",
-        run.combined()
-    );
-    for marker in [
-        "flock-fork-vfork-child-entered",
-        "flock-nested-vfork-blocking-refused errno=37",
-        "flock-fork-vfork-copied-policy-ok",
-    ] {
-        assert!(
-            run.stdout.contains(marker),
-            "missing {marker}\n{}",
-            run.combined()
-        );
-    }
-    assert_eq!(
-        run.stderr.matches("inbound syscall: flock").count(),
-        4,
-        "the nested flock unexpectedly entered the ordinary Detcore syscall handler\n{}",
-        run.combined()
-    );
-    assert!(
-        !run.stderr.contains(
-            "detcore-dbt: refusing vfork while an open file description may hold a flock"
-        ),
-        "the root-process vfork guard fired instead of the copied-child flock policy\n{}",
-        run.combined()
-    );
-    assert!(
-        !run.stderr.contains(&format!(
-            "unsupported syscall {} in copied child",
-            libc::SYS_vfork
-        )),
-        "the nested vfork itself was refused instead of preserving its safe copied-child path\n{}",
-        run.combined()
-    );
-    assert!(
-        !run.stderr.contains("blocking flock(fd="),
-        "the nested flock unexpectedly reached the ordinary Detcore refusal path\n{}",
-        run.combined()
-    );
 }
 
 fn assert_failed_clone_preserves_known_flock_state(backend: &str) {
@@ -503,12 +639,6 @@ fn failed_process_clone_preserves_known_flock_state() {
     assert_failed_clone_preserves_known_flock_state("ptrace");
 }
 
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_failed_process_clone_preserves_known_flock_state() {
-    assert_failed_clone_preserves_known_flock_state("dbt");
-}
-
 fn assert_pidfd_getfd_alias_mutation_invalidates_source_flock_authority(backend: &str) {
     let run = hermit_run_backend(
         backend,
@@ -523,7 +653,7 @@ fn assert_pidfd_getfd_alias_mutation_invalidates_source_flock_authority(backend:
     );
     for marker in [
         "flock-pidfd-duplicate-unlocked",
-        "flock-pidfd-source-upgrade-refused errno=37",
+        "flock-pidfd-source-upgrade-would-block errno=11",
         "flock-pidfd-stale-restore-absent",
         "flock-pidfd-failed-getfd-preserved errno=9",
         "flock-pidfd-valid-pidfd-valid-targetfd-flags-precedence errno=22",
@@ -544,10 +674,11 @@ fn assert_pidfd_getfd_alias_mutation_invalidates_source_flock_authority(backend:
 }
 
 /// A self `pidfd_getfd` result aliases the source open file description. After
-/// the duplicate releases its lock, Detcore must not let the source's stale
-/// cache restore that lock during a refused blocking conversion. Failed calls
-/// preserve source authority, and duplicating an unrelated descriptor does not
-/// poison an independently held lock.
+/// the duplicate releases its lock, the source holds none: a nonblocking
+/// conversion through it finds only the contender's lock, and no stale state
+/// restores the released one. Failed calls preserve source authority, and
+/// duplicating an unrelated descriptor does not poison an independently held
+/// lock.
 #[test]
 fn pidfd_getfd_alias_mutation_invalidates_source_flock_authority() {
     assert_pidfd_getfd_alias_mutation_invalidates_source_flock_authority("ptrace");
@@ -589,7 +720,7 @@ fn assert_transferred_lock_state_is_unknown_to_the_sender(backend: &str) {
         for marker in [
             "flock-sender-locked-after-fork",
             "flock-receiver-unlocked-transferred-lock",
-            "flock-sender-upgrade-refused errno=37",
+            "flock-sender-upgrade-would-block errno=11",
             "flock-transfer-release-remained-unlocked",
             "flock-sent-after-fork-ok",
         ] {
@@ -603,8 +734,9 @@ fn assert_transferred_lock_state_is_unknown_to_the_sender(backend: &str) {
 }
 
 /// A successful SCM_RIGHTS transfer creates another process that can mutate the
-/// same open file description. Once the receiver unlocks it, the sender must not
-/// restore its stale pre-transfer shared mode during a later failed conversion.
+/// same open file description. Once the receiver unlocks it, the sender holds
+/// no stale lock: its nonblocking conversion finds only a contender's, and
+/// after that contender's unlock a fresh open takes the exclusive lock.
 #[test]
 fn transferred_lock_state_is_unknown_to_the_sender() {
     assert_transferred_lock_state_is_unknown_to_the_sender("ptrace");
@@ -632,11 +764,14 @@ fn failed_send_preserves_known_flock_state() {
     }
 }
 
-/// A positive sendmmsg result says at least one message was consumed, but mutable
-/// guest metadata cannot safely identify a narrower descriptor set across a
-/// deschedule. The conservative rule makes all cached flock modes unknown.
+/// A positive sendmmsg result says at least one message was consumed. The
+/// description the sent message carried was joined by its receiver, which
+/// unlocked it, and the unsent one, which the second message's unreadable
+/// control data never carried, stayed with the sender: Detcore's flock model
+/// follows both, and grants each one's uncontended blocking conversion, as
+/// Linux does. Before the model the conservative rule refused both.
 #[test]
-fn partial_sendmmsg_invalidates_all_flock_state() {
+fn partial_sendmmsg_keeps_both_descriptions_in_the_flock_model() {
     let run = hermit_run(
         "error",
         &["--allow-unsupported-syscalls"],
@@ -649,7 +784,7 @@ fn partial_sendmmsg_invalidates_all_flock_state() {
     );
     for marker in [
         "flock-partial-sendmmsg-sent-one",
-        "flock-partial-sendmmsg-invalidated-all",
+        "flock-partial-sendmmsg-both-granted",
     ] {
         assert!(
             run.stdout.contains(marker),
@@ -657,68 +792,6 @@ fn partial_sendmmsg_invalidates_all_flock_state() {
             run.combined()
         );
     }
-}
-
-/// A DBT vfork child is not observable by the external runtime before it execs
-/// or exits. If an inherited open file description already holds a flock, a
-/// blocking conversion in that child can deadlock the complete process tree.
-/// Refuse that unsafe vfork before copying, while still allowing vfork when no
-/// known flock is held. The exact exit and diagnostic distinguish refusal from
-/// a timeout.
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_vfork_child_flock_fails_closed_without_deadlock() {
-    let run = hermit_run_backend_timeout("dbt", "info", &[], "vfork-upgrade", "5s");
-    assert_eq!(
-        run.status.code(),
-        Some(101),
-        "copied DBT vfork flock must fail closed with exit 101, not time out or return\n{}",
-        run.combined()
-    );
-    assert!(
-        run.stderr.contains(DBT_VFORK_FLOCK_REFUSAL),
-        "copied DBT vfork did not report the flock refusal\n{}",
-        run.combined()
-    );
-}
-
-/// A successful process fork makes inherited flock state unknown. Unknown
-/// alone no longer refuses; this scenario took `LOCK_SH|LOCK_NB` before the
-/// fork, so a lock was granted through the description and may still be held,
-/// and the same vfork guard must refuse rather than let the unobservable child
-/// block in the kernel or change that lock natively.
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_vfork_with_unknown_flock_state_fails_closed_without_deadlock() {
-    // Eight seconds provides policy margin over the censored five-second
-    // failures under load; it does not establish that the stall is fixed.
-    // The per-test CPU and wall limits still contain a persistent stall.
-    let run = hermit_run_backend_timeout("dbt", "info", &[], "vfork-unknown-upgrade", "8s");
-    assert_eq!(
-        run.status.code(),
-        Some(101),
-        "DBT vfork with unknown flock state must fail closed, not time out\n{}",
-        run.combined()
-    );
-    assert!(
-        run.stderr.contains(DBT_VFORK_FLOCK_REFUSAL),
-        "DBT vfork with unknown flock state missed its refusal diagnostic\n{}",
-        run.combined()
-    );
-}
-
-/// When no descriptor can possibly carry flock state, ordinary DBT vfork remains
-/// available. This brackets the conservative pre-copy refusal above.
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_vfork_without_flock_state_still_runs() {
-    let run = hermit_run_backend_timeout("dbt", "error", &[], "vfork-no-flock-state", "5s");
-    assert_eq!(
-        run.status.code(),
-        Some(0),
-        "DBT vfork without possible flock state must remain available\n{}",
-        run.combined()
-    );
 }
 
 /// Run `pipe-fork-vfork` at L2 on `backend`: `--strict --verify
@@ -781,228 +854,6 @@ fn pipe_fork_then_vfork_runs_at_l2() {
     assert_pipe_fork_then_vfork_runs_at_l2("ptrace");
 }
 
-/// The same guest on DBT. Before the guard asked whether a lock was ever
-/// granted, the fork invalidated the pipe's flock cache, and an invalidated
-/// description refused the vfork with exit 101 and
-/// [`DBT_VFORK_FLOCK_REFUSAL`]: every DBT `make -j4` and `make -j8` cell
-/// stopped there in its first run.
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_pipe_fork_then_vfork_runs_at_l2() {
-    assert_pipe_fork_then_vfork_runs_at_l2("dbt");
-}
-
-/// The negative controls for the two cases above: the same guest with a
-/// `LOCK_EX` taken on the pipe, before the fork (a mode the fork then makes
-/// unknown) or after it (a grant served while the mode was already unknown).
-/// Either way the description may hold a lock a copied vfork child could
-/// change behind Detcore's back, so the vfork must still be refused.
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_vfork_after_a_pipe_lock_and_a_fork_fails_closed() {
-    for scenario in ["locked-pipe-fork-vfork", "pipe-fork-locked-vfork"] {
-        let run = hermit_run_backend_timeout("dbt", "info", &[], scenario, "8s");
-        assert_eq!(
-            run.status.code(),
-            Some(101),
-            "DBT {scenario} must fail closed with exit 101, not time out or run\n{}",
-            run.combined()
-        );
-        assert!(
-            run.stderr.contains(DBT_VFORK_FLOCK_REFUSAL),
-            "DBT {scenario} missed the vfork flock refusal\n{}",
-            run.combined()
-        );
-        assert!(
-            !run.stdout.contains("flock-pipe-fork-vfork-ok"),
-            "DBT {scenario} completed the vfork it must refuse\n{}",
-            run.combined()
-        );
-    }
-}
-
-/// A forked holder takes `LOCK_SH` on a fresh description, so its Detcore
-/// holds a known mode for it. The parent's vfork passes the up-front guard
-/// (nothing the parent holds was ever locked), and its copied child calls
-/// `pidfd_getfd` on the holder's descriptor, then `LOCK_UN`. Natively that
-/// would release the holder's lock under its held claim. DBT never runs the
-/// copied child's `pidfd_getfd`, under any policy (base refused this shape at
-/// the vfork under every policy): `run --strict` ends the run with exit 101
-/// and the named refusal; the `--allow-unsupported-syscalls` opt-out names
-/// the refusal and answers EPERM, and the guest goes on. Not `--verify`:
-/// evidence capture refuses the call on its own in verify runs, which would
-/// hide a missing refusal.
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_copied_child_pidfd_getfd_is_refused_under_every_policy() {
-    let run = hermit_run_backend_timeout("dbt", "info", &["--strict"], "copied-pidfd-getfd", "30s");
-    assert_eq!(
-        run.status.code(),
-        Some(101),
-        "--strict: a copied child's pidfd_getfd must fail closed with exit 101\n{}",
-        run.combined()
-    );
-    assert!(
-        run.stderr.contains(DBT_COPIED_PIDFD_GETFD_REFUSAL),
-        "--strict: the copied child's pidfd_getfd missed its named refusal\n{}",
-        run.combined()
-    );
-    assert!(
-        !run.stdout.contains("reached pidfd_getfd") && !run.stdout.contains("refused errno"),
-        "--strict: the copied child's pidfd_getfd ran or returned\n{}",
-        run.combined()
-    );
-    let run = hermit_run_backend_timeout(
-        "dbt",
-        "info",
-        &["--allow-unsupported-syscalls"],
-        "copied-pidfd-getfd",
-        "30s",
-    );
-    assert_eq!(
-        run.status.code(),
-        Some(0),
-        "--allow-unsupported-syscalls: the copied child's pidfd_getfd must answer EPERM\n{}",
-        run.combined()
-    );
-    assert!(
-        run.stderr.contains(DBT_COPIED_PIDFD_GETFD_REFUSAL)
-            && run
-                .stdout
-                .contains("flock-copied-pidfd-getfd-refused errno=EPERM"),
-        "--allow-unsupported-syscalls: the copied child's pidfd_getfd was not refused with EPERM\n{}",
-        run.combined()
-    );
-}
-
-/// Codex's SCM_RIGHTS sequence: the parent opens `/dev/urandom` (promoted to
-/// DBT's shared model at the fork), a forked holder takes `LOCK_SH` on it, so
-/// the shared model holds a known mode, and sends it over a socketpair; the
-/// parent closes its own copy and vforks, which the up-front guard admits
-/// (nothing the parent still holds was locked through it). The copied child
-/// would receive the description natively and unlock it under the holder's
-/// claim. DBT never runs the copied child's `recvmsg`: `--strict` ends the
-/// run with exit 101 and the named refusal; `--allow-unsupported-syscalls`
-/// names the refusal and answers EPERM.
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_copied_child_recvmsg_import_is_refused_under_every_policy() {
-    let run =
-        hermit_run_backend_timeout("dbt", "info", &["--strict"], "copied-recvmsg-import", "30s");
-    assert_eq!(
-        run.status.code(),
-        Some(101),
-        "--strict: a copied child's recvmsg must fail closed with exit 101\n{}",
-        run.combined()
-    );
-    assert!(
-        run.stderr.contains(DBT_COPIED_RECVMSG_REFUSAL)
-            && !run.stdout.contains("reached recvmsg")
-            && !run.stdout.contains("refused errno"),
-        "--strict: the copied child's recvmsg was not refused by name\n{}",
-        run.combined()
-    );
-    let run = hermit_run_backend_timeout(
-        "dbt",
-        "info",
-        &["--allow-unsupported-syscalls"],
-        "copied-recvmsg-import",
-        "30s",
-    );
-    assert_eq!(
-        run.status.code(),
-        Some(0),
-        "--allow-unsupported-syscalls: the copied child's recvmsg must answer EPERM\n{}",
-        run.combined()
-    );
-    assert!(
-        run.stderr.contains(DBT_COPIED_RECVMSG_REFUSAL)
-            && run
-                .stdout
-                .contains("flock-copied-recvmsg-import-refused errno=EPERM"),
-        "--allow-unsupported-syscalls: the copied child's recvmsg was not refused with EPERM\n{}",
-        run.combined()
-    );
-}
-
-/// The copied-child OFD refusal covers only lock changes. A copied vfork
-/// child's `F_OFD_GETLK` (a query) and POSIX `F_SETLK` (a process-owned lock
-/// the ledger does not record) still run natively under `--strict`.
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_copied_child_ofd_getlk_and_posix_locks_stay_native() {
-    let run =
-        hermit_run_backend_timeout("dbt", "info", &["--strict"], "copied-native-locks", "30s");
-    assert_eq!(
-        run.status.code(),
-        Some(0),
-        "a copied child's F_OFD_GETLK and POSIX F_SETLK must run\n{}",
-        run.combined()
-    );
-    assert!(
-        run.stdout.contains("flock-copied-native-locks-ok"),
-        "the copied child's native lock calls did not complete\n{}",
-        run.combined()
-    );
-}
-
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_clone_vfork_forms_fail_closed_before_copy() {
-    for scenario in ["clone-vfork-upgrade", "clone3-vfork-upgrade"] {
-        let run = hermit_run_backend_timeout("dbt", "info", &[], scenario, "5s");
-        assert_eq!(
-            run.status.code(),
-            Some(101),
-            "DBT {scenario} must fail closed before copying, not time out or return\n{}",
-            run.combined()
-        );
-        assert!(
-            run.stderr.contains(DBT_VFORK_FLOCK_REFUSAL),
-            "DBT {scenario} missed the vfork-family refusal diagnostic\n{}",
-            run.combined()
-        );
-    }
-}
-
-#[cfg(feature = "dbt")]
-#[test]
-fn dbt_process_clone_files_is_refused_before_copied_child_mutation() {
-    for scenario in ["clone-files-process", "clone3-files-process"] {
-        let native = finish(hermit_test::hermit_output(
-            "hermit run",
-            Command::new(guest()).arg(scenario),
-        ));
-        assert!(
-            native.status.success()
-                && native
-                    .stdout
-                    .contains(&format!("flock-{scenario}-shared-mutation-observed")),
-            "native {scenario} did not prove CLONE_FILES table sharing\n{}",
-            native.combined()
-        );
-
-        let run = hermit_run_backend_timeout("dbt", "info", &[], scenario, "5s");
-        assert_eq!(
-            run.status.code(),
-            Some(101),
-            "DBT {scenario} must fail closed before copying\n{}",
-            run.combined()
-        );
-        assert!(
-            run.stderr.contains(DBT_PROCESS_CLONE_FILES_REFUSAL),
-            "DBT {scenario} missed the shared-files pre-copy diagnostic\n{}",
-            run.combined()
-        );
-        assert!(
-            !run.stdout
-                .contains(&format!("flock-{scenario}-shared-mutation-observed")),
-            "DBT {scenario} executed the copied child's descriptor mutation\n{}",
-            run.combined()
-        );
-    }
-}
-
 /// Replay must take the kernel lock again for a materialized file, not merely
 /// repeat the recorded return value.
 ///
@@ -1022,11 +873,14 @@ fn replay_reissues_every_flock_for_a_materialized_file() {
     let _guard = record_lock();
     let data_dir = tempfile::tempdir().expect("failed to create the flock recording directory");
 
+    // `--log=debug` here too: the recording's own injections are the flock
+    // calls Detcore's model made on the host (its mirrors), which replay must
+    // re-issue one for one.
     let mut record = Command::new("timeout");
     record
         .args(["--kill-after", "10s", "180s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=off", "record", "start", "--record-timeout=120"])
+        .args(["--log=debug", "record", "start", "--record-timeout=120"])
         .arg(format!("--data-dir={}", data_dir.path().display()))
         .args(["--"])
         .arg(guest())
@@ -1045,6 +899,10 @@ fn replay_reissues_every_flock_for_a_materialized_file() {
         "the recorded run did not complete the exclusion scenario\n{}",
         recorded.combined()
     );
+    let recorded_mirrors = recorded
+        .stderr
+        .matches("beginning inject of syscall: flock")
+        .count();
 
     // `--log=debug` surfaces reverie's injection of each syscall the replayer
     // re-issues. That line is the witness that the kernel really performed the
@@ -1071,16 +929,20 @@ fn replay_reissues_every_flock_for_a_materialized_file() {
         .matches("beginning inject of syscall: flock")
         .count();
     assert!(
-        requested > 0,
-        "the replayed guest issued no flock calls at all; the probe is measuring nothing\n{}",
+        requested > 0 && recorded_mirrors > 0,
+        "the guest issued no flock calls, or the model mirrored none; the probe is measuring \
+         nothing\n{}",
         replayed.combined()
     );
+    // Detcore's flock model answers a call that changes no lock (a `LOCK_NB`
+    // conflict) without the kernel, and mirrors every other on the host; each
+    // mirror is a recorded event.
     assert_eq!(
         injected,
-        requested,
-        "replay re-issued {injected} of {requested} flock calls to the kernel; a replayed \
-         flock that is not re-issued establishes no lock, so the replayed run only claims to \
-         hold one\n{}",
+        recorded_mirrors,
+        "replay re-issued {injected} of the recording's {recorded_mirrors} flock mirrors \
+         ({requested} guest flock calls); a replayed mirror that is not re-issued establishes \
+         no lock, so the replayed run only claims to hold one\n{}",
         replayed.combined()
     );
 
@@ -1222,12 +1084,12 @@ fn replay_refuses_flock_for_a_non_materialized_file() {
     );
 }
 
-/// Record/replay is fail-closed and has no compatibility opt-out. A contended
-/// blocking flock therefore invalidates the recording after Detcore restores
-/// the shared lock that its nonblocking probe temporarily displaced. It must
-/// not silently record the compatibility-mode `ENOLCK` fallback.
+/// A contended blocking flock waits under record as in a run (Detcore's flock
+/// model), and replay reproduces the wait from the recording: the guest's
+/// output is the same in both. Before the model, record mode refused the
+/// call, as record and replay have no compatibility opt-out.
 #[test]
-fn recording_refuses_a_contended_blocking_flock() {
+fn recording_and_replay_wait_for_a_contended_blocking_flock() {
     let _guard = record_lock();
     let data_dir = tempfile::tempdir().expect("failed to create the flock recording directory");
 
@@ -1239,37 +1101,44 @@ fn recording_refuses_a_contended_blocking_flock() {
         .arg(format!("--data-dir={}", data_dir.path().display()))
         .args(["--"])
         .arg(guest())
-        .arg("upgrade");
+        .arg("upgrade-waits");
     let recorded = finish(hermit_test::hermit_output(
         &format!("{record:?}"),
         &mut record,
     ));
-    assert_ne!(
-        recorded.status.code(),
-        Some(124),
-        "recording the contended flock upgrade wedged\n{}",
-        recorded.combined()
-    );
     assert!(
-        !recorded.status.success(),
-        "recording accepted a deterministic fallback that record/replay's fail-closed policy forbids\n{}",
+        recorded.status.success(),
+        "recording the contended flock upgrade failed\n{}",
         recorded.combined()
     );
-    for marker in [
-        "flock-upgrade-parent-holds-shared",
-        "flock-upgrade-contender-holds-shared",
-    ] {
+    for marker in UPGRADE_WAITS_MARKERS {
         assert!(
             recorded.stdout.contains(marker),
-            "recording never reached the contended conversion; refusal would prove nothing\n{}",
+            "the recorded run missed {marker}\n{}",
             recorded.combined()
         );
     }
+
+    let mut replay = Command::new("timeout");
+    replay
+        .args(["--kill-after", "10s", "180s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=error", "replay", "--autopilot"])
+        .arg(format!("--data-dir={}", data_dir.path().display()));
+    let replayed = finish(hermit_test::hermit_output(
+        &format!("{replay:?}"),
+        &mut replay,
+    ));
     assert!(
-        !recorded.stdout.contains("flock-upgrade-refused errno=37")
-            && recorded.stderr.contains("unsupported syscall: flock"),
-        "recording did not fail closed at the unsupported blocking flock\n{}",
-        recorded.combined()
+        replayed.status.success(),
+        "replaying the contended flock upgrade failed\n{}",
+        replayed.combined()
+    );
+    assert_eq!(
+        replayed.stdout,
+        recorded.stdout,
+        "replay printed other output than the recording\n{}",
+        replayed.combined()
     );
 }
 
@@ -1340,7 +1209,7 @@ fn pre_flock_recordings_are_refused_by_the_version_gate() {
         .as_u64()
         .expect("recording metadata has no numeric version");
     assert_eq!(
-        current, 0x186,
+        current, 0x19e,
         "RECORD_VERSION moved; point this test at the current and pre-flock epochs"
     );
     metadata["version"] = serde_json::json!(0x10b);
@@ -1376,4 +1245,544 @@ fn find_metadata(data_dir: &Path) -> PathBuf {
         }
     }
     panic!("no recording metadata.json below {}", data_dir.display());
+}
+
+/// Every cross-process flock case of the flock model's guest at L2, with the
+/// output native Linux prints: shared and exclusive locks between processes,
+/// `LOCK_NB` conflicts, a conversion that drops the held lock first, blocking
+/// waiters woken at a release, a last close and an exit, a fork's copy of a
+/// locked description, the wake order of two exclusive waiters and of mixed
+/// ones, the rows `/proc/locks` shows (a blocked request's `->` row
+/// included), a lock taken before children are forked and exec'd (rustup's
+/// pattern), a signal that ends a waiting call with `EINTR` or restarts it
+/// under `SA_RESTART`, a waiting thread woken by a release in another
+/// thread of its process, a waiting call whose descriptor a sibling closes or
+/// replaces, and the Claude review's wake-order cases (a blocking upgrade that
+/// blocks ahead of the waiter its conversion woke, a cancelled waiter that
+/// wakes the requests blocked under it, a retry that converts its
+/// description's lock, and a release through the waiting call's own
+/// description before its retry), with an unrelated file's OFD lock whose
+/// `/proc/locks` row stays while those waiting calls end. Then the guest's
+/// `ebadf`, which `all` leaves out because replay refuses its call: a flock
+/// through a number that names nothing fails with EBADF, and the unrelated
+/// row stays (slice SP2's third round; the row went, on main too). Before
+/// Detcore's flock model a blocking waiter was refused on every backend, and
+/// KVM refused every flock; before the review, a release handed the lock to
+/// waiters in its own turn, in the order they first blocked, which no Linux
+/// schedule does.
+fn assert_flock_model_matches_linux_at_l2(backend: &str) {
+    for scenario in ["all", "ebadf"] {
+        let native = native_model_run(scenario);
+        let run = hermit_run_model(
+            backend,
+            "info",
+            &["--strict", "--verify", "--verify-strict"],
+            scenario,
+        );
+        assert!(
+            run.status.success(),
+            "{backend} strict --verify flock model run of {scenario} failed\n{}",
+            run.combined()
+        );
+        assert!(
+            run.combined().contains("bitwise parity established"),
+            "{backend} flock model run of {scenario} did not verify at L2\n{}",
+            run.combined()
+        );
+        assert_eq!(
+            run.stdout,
+            native.stdout,
+            "{backend} printed other answers than native Linux for {scenario}\n{}",
+            run.combined()
+        );
+    }
+    // A waiter a signal interrupts asks whether a job-control stop is pending
+    // (`flock_wait_stopped`): on KVM through the backend's signal state, never
+    // a host `/proc` read of an unrelated host task, which Detcore refuses and
+    // logs at ERROR (SIGSHARE S2). A run under --verify keeps its logs to
+    // itself, so this one runs once, logging to its own stderr.
+    let native = native_model_run("signal-interrupts");
+    let run = hermit_run_model(backend, "info", &["--strict"], "signal-interrupts");
+    assert!(
+        run.status.success(),
+        "{backend} strict flock model run of signal-interrupts failed\n{}",
+        run.combined()
+    );
+    assert_eq!(
+        run.stdout,
+        native.stdout,
+        "{backend} printed other answers than native Linux for signal-interrupts\n{}",
+        run.combined()
+    );
+    assert!(
+        run.combined().contains("INFO"),
+        "{backend}: the signal-interrupts run logged nothing to its stderr\n{}",
+        run.combined()
+    );
+    assert!(
+        !run.combined()
+            .contains("refused a host /proc signal state read"),
+        "{backend} flock model run of signal-interrupts reached a refused host /proc read\n{}",
+        run.combined()
+    );
+}
+
+#[test]
+fn flock_model_matches_linux_at_l2_on_ptrace() {
+    assert_flock_model_matches_linux_at_l2("ptrace");
+}
+
+#[test]
+fn flock_model_matches_linux_at_l2_on_kvm() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping: /dev/kvm is absent");
+        return;
+    }
+    assert_flock_model_matches_linux_at_l2("kvm");
+}
+
+/// A thread with a descriptor table of its own (`CLONE_THREAD` without
+/// `CLONE_FILES`), its process and a forked child close every descriptor of a
+/// locked description, and a fresh open then takes the lock, natively. The
+/// lock ledger cannot tell such a process's tables apart, so the file leaves
+/// the model, and the kernel, which knows the lock went, decides it, where a
+/// model answer resting on a reference the ledger never saw go said
+/// EWOULDBLOCK (Codex review of the kvm lane's slice SP2). KVM refuses the
+/// thread by name.
+#[test]
+fn a_private_table_closing_every_descriptor_frees_the_lock_on_ptrace() {
+    let native = native_model_run("private-table-close");
+    let run = hermit_run_model(
+        "ptrace",
+        "info",
+        &["--strict", "--verify", "--verify-strict"],
+        "private-table-close",
+    );
+    assert!(
+        run.status.success(),
+        "ptrace private-table-close run failed\n{}",
+        run.combined()
+    );
+    assert_eq!(
+        run.stdout,
+        native.stdout,
+        "ptrace printed other answers than native Linux\n{}",
+        run.combined()
+    );
+}
+
+/// A job-control stop takes a waiter out of the queue, and Linux queues the
+/// call again only once SIGCONT continues it (the guest's `stopped-waiter`,
+/// natively). Detcore does not represent job-control stops
+/// (https://github.com/rrnewton/hermit/issues/4944): on ptrace the stopped
+/// thread is not held, and would restart the call and retry for the lock at
+/// once, so the interrupted wait is refused by name instead (Codex review of
+/// the kvm lane's slice SP2). KVM refuses the stop by name.
+#[test]
+fn a_job_control_stop_of_a_waiter_is_refused_by_name_on_ptrace() {
+    let native = native_model_run("stopped-waiter");
+    assert!(
+        native
+            .stdout
+            .contains("stopped-waiter: rows while the second waiter is stopped = WRITE ->READ"),
+        "natively the stopped waiter left the queue\n{}",
+        native.combined()
+    );
+    let run = hermit_run_model("ptrace", "error", &["--strict"], "stopped-waiter");
+    assert_eq!(
+        run.status.code(),
+        Some(122),
+        "ptrace must refuse the stopped waiter's call by name\n{}",
+        run.combined()
+    );
+    assert!(
+        run.stderr
+            .contains("a job-control stop interrupted this waiting flock"),
+        "ptrace refused the stopped waiter's call without its reason\n{}",
+        run.combined()
+    );
+}
+
+/// The refusal of a waiting call whose descriptor was closed or replaced
+/// while another reference kept the description it took.
+const WAITER_KEPT_BY_ANOTHER_REFERENCE: &str = "the waiting call's descriptor was closed or \
+     replaced while it waited, and another reference (another process's table, a mapping, a \
+     copy in flight) keeps the open file description the call took";
+
+/// A sibling closes the descriptor a waiting call took while a mapping of its
+/// open file description remains (the guest's `waiter-mapped`, natively):
+/// Linux's call takes the lock at the release, and the mapping keeps it after
+/// the call returns, so another description's `LOCK_EX|LOCK_NB` fails until
+/// the munmap. No descriptor names the description any longer, through which
+/// Detcore could place the lock on the host, so the call is refused by name;
+/// under `--allow-unsupported-syscalls` it fails with ENOLCK, and the model,
+/// like the host, then holds no lock for the description, so the child's
+/// `LOCK_EX|LOCK_NB` succeeds. Before the Claude review of the kvm lane's
+/// slice SP2's second round, the call returned 0 with no lock on the host,
+/// and the kernel, which decided the file from then on, granted the child's
+/// conflicting lock. KVM refuses the thread of a process with a shared file
+/// mapping, so it cannot run this.
+fn assert_a_waiter_kept_by_a_mapping_alone_is_refused_by_name(backend: &str) {
+    let native = native_model_run("waiter-mapped");
+    assert!(
+        native.stdout.contains(
+            "waiter-mapped: child LOCK_EX|LOCK_NB while the mapping remains = EWOULDBLOCK"
+        ),
+        "natively the mapping kept the waiting call's lock\n{}",
+        native.combined()
+    );
+    let run = hermit_run_model(backend, "error", &["--strict"], "waiter-mapped");
+    // The unsupported-operation policy's exit: DBT's runtime ends the run
+    // with 101, as its copied-child refusals do.
+    let refused = if backend == "dbt" { 101 } else { 122 };
+    assert_eq!(
+        run.status.code(),
+        Some(refused),
+        "{backend} must refuse the waiting call by name\n{}",
+        run.combined()
+    );
+    assert!(
+        run.stderr.contains(WAITER_KEPT_BY_ANOTHER_REFERENCE),
+        "{backend} refused the waiting call without its reason\n{}",
+        run.combined()
+    );
+    assert!(
+        !run.stdout.contains("while the mapping remains"),
+        "{backend} went on after refusing the waiting call\n{}",
+        run.combined()
+    );
+    let run = hermit_run_model(
+        backend,
+        "error",
+        &["--allow-unsupported-syscalls"],
+        "waiter-mapped",
+    );
+    for marker in [
+        "FAIL waiter-mapped: the waiting call after the release = errno=37, expected ok",
+        "FAIL waiter-mapped: child LOCK_EX|LOCK_NB while the mapping remains = ok, expected \
+         EWOULDBLOCK",
+        "waiter-mapped: child LOCK_EX|LOCK_NB after the munmap = ok",
+    ] {
+        assert!(
+            run.stdout.contains(marker),
+            "{backend} --allow-unsupported-syscalls: missing {marker}\n{}",
+            run.combined()
+        );
+    }
+    assert!(
+        run.stderr.contains(WAITER_KEPT_BY_ANOTHER_REFERENCE),
+        "{backend} --allow-unsupported-syscalls: the ENOLCK came without its reason\n{}",
+        run.combined()
+    );
+}
+
+#[test]
+fn a_waiter_kept_by_a_mapping_alone_is_refused_by_name_on_ptrace() {
+    assert_a_waiter_kept_by_a_mapping_alone_is_refused_by_name("ptrace");
+}
+
+/// An exec kills the caller's other threads before it closes the
+/// close-on-exec descriptors (`de_thread`): a thread waiting for `LOCK_EX`
+/// behind its process's lock leaves the queue with it, which wakes another
+/// process's request blocked under the thread's, and that process takes the
+/// lock once the exec closes the holder's descriptor (the guest's
+/// `exec-waiter`, natively). Before the Claude review of the kvm lane's slice
+/// SP2, the killed thread's request stayed queued and took the lock at the
+/// exec's close, for the rest of the run; with waiters that retry in their
+/// own turns and without the exec taking the request out, the other process
+/// would wait forever under it. KVM hangs at an exec while another thread of
+/// the process is blocked, in a flock or a pipe read alike
+/// (https://github.com/rrnewton/hermit/issues/4904), so this runs on ptrace.
+#[test]
+fn an_exec_ends_the_flock_wait_of_a_thread_it_kills_on_ptrace() {
+    let native = native_model_run("exec-waiter");
+    let run = hermit_run_model(
+        "ptrace",
+        "info",
+        &["--strict", "--verify", "--verify-strict"],
+        "exec-waiter",
+    );
+    assert!(
+        run.status.success(),
+        "ptrace exec-waiter run failed\n{}",
+        run.combined()
+    );
+    assert!(
+        run.combined().contains("bitwise parity established"),
+        "ptrace exec-waiter run did not verify at L2\n{}",
+        run.combined()
+    );
+    assert_eq!(
+        run.stdout,
+        native.stdout,
+        "ptrace printed other answers than native Linux\n{}",
+        run.combined()
+    );
+}
+
+/// A mapping keeps a description, and its flock lock, after the description's
+/// last descriptor closes, until the mapping goes. Where the backend's
+/// descriptions are the host's, the model leaves the file to the kernel at
+/// that close, which keeps the lock until `munmap`, as native Linux does.
+#[test]
+fn a_mapping_keeps_the_lock_after_the_last_close_on_ptrace() {
+    let native = native_model_run("mmap-close");
+    let run = hermit_run_model(
+        "ptrace",
+        "info",
+        &["--strict", "--verify", "--verify-strict"],
+        "mmap-close",
+    );
+    assert!(
+        run.status.success(),
+        "ptrace mmap-close run failed\n{}",
+        run.combined()
+    );
+    assert_eq!(
+        run.stdout,
+        native.stdout,
+        "ptrace printed other answers than native Linux\n{}",
+        run.combined()
+    );
+}
+
+/// On KVM no host lock can decide the file, and Detcore cannot place the
+/// release a mapping defers: the last close of a locked, mapped description is
+/// refused by name, whose policy ends the run.
+#[test]
+fn kvm_refuses_the_last_close_of_a_mapped_locked_description() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping: /dev/kvm is absent");
+        return;
+    }
+    let run = hermit_run_model("kvm", "error", &["--strict"], "mmap-close");
+    assert_eq!(
+        run.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "KVM did not refuse the close by name\n{}",
+        run.combined()
+    );
+    assert!(
+        run.stderr.contains("close refused")
+            && run
+                .stderr
+                .contains("Linux keeps the lock until the last mapping goes"),
+        "KVM's refusal did not name the mapping\n{}",
+        run.combined()
+    );
+    assert!(
+        run.stdout.contains("mmap-close: parent LOCK_EX = ok")
+            && !run.stdout.contains("with the mapping left"),
+        "the KVM run did not stop at the close\n{}",
+        run.combined()
+    );
+}
+
+/// A descriptor opened before a fork and locked in the child (the shell's
+/// `exec 9>lockfile; flock -n 9`): Detcore never saw every reference to that
+/// description, so its flock model leaves the file to the kernel, as before
+/// the model, where the backend's descriptions are the host's.
+#[test]
+fn a_description_shared_before_its_first_flock_keeps_the_kernel_path_on_ptrace() {
+    let native = native_model_run("shell");
+    let run = hermit_run_model(
+        "ptrace",
+        "info",
+        &["--strict", "--verify", "--verify-strict"],
+        "shell",
+    );
+    assert!(
+        run.status.success(),
+        "ptrace shell-pattern run failed\n{}",
+        run.combined()
+    );
+    assert_eq!(
+        run.stdout,
+        native.stdout,
+        "ptrace printed other answers than native Linux\n{}",
+        run.combined()
+    );
+}
+
+/// The same pattern on KVM, where no host lock can decide the file: refused by
+/// name, with the reason.
+#[test]
+fn kvm_refuses_a_flock_through_a_description_shared_before_its_first_flock() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping: /dev/kvm is absent");
+        return;
+    }
+    let run = hermit_run_model("kvm", "error", &["--strict"], "shell");
+    assert_eq!(
+        run.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "KVM did not refuse the flock by name\n{}",
+        run.combined()
+    );
+    assert!(
+        run.stderr.contains("flock(fd=9")
+            && run
+                .stderr
+                .contains("was shared with another process before its first flock"),
+        "KVM's refusal did not give its reason\n{}",
+        run.combined()
+    );
+}
+
+/// The flock model under record and replay: the recording holds the identity
+/// probes and the model's mirrors, replay re-issues each mirror, and both
+/// print what native Linux prints.
+#[test]
+fn record_and_replay_reproduce_the_flock_model() {
+    let _guard = record_lock();
+    let native = native_model_run("all");
+    let data_dir = tempfile::tempdir().expect("failed to create the flock recording directory");
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after", "10s", "300s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=error",
+            "record",
+            "start",
+            "--record-timeout=240",
+            "--proc=standard",
+        ])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .arg("--")
+        .arg(model_guest())
+        .arg("all");
+    let recorded = finish(hermit_test::hermit_output(
+        &format!("{record:?}"),
+        &mut record,
+    ));
+    assert!(
+        recorded.status.success(),
+        "recording the flock model guest failed\n{}",
+        recorded.combined()
+    );
+    assert_eq!(
+        recorded.stdout,
+        native.stdout,
+        "the recorded run printed other answers than native Linux\n{}",
+        recorded.combined()
+    );
+    let mut replay = Command::new("timeout");
+    replay
+        .args(["--kill-after", "10s", "300s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=error", "replay", "--autopilot"])
+        .arg(format!("--data-dir={}", data_dir.path().display()));
+    let replayed = finish(hermit_test::hermit_output(
+        &format!("{replay:?}"),
+        &mut replay,
+    ));
+    assert!(
+        replayed.status.success(),
+        "replaying the flock model guest failed\n{}",
+        replayed.combined()
+    );
+    assert_eq!(
+        replayed.stdout,
+        recorded.stdout,
+        "replay printed other answers than the recording\n{}",
+        replayed.combined()
+    );
+}
+
+/// The shell's own pattern with util-linux's flock(1): `exec 9>lockfile;
+/// flock -n 9` locks the description the shell opened, through a child that
+/// inherited it, and the shell's descriptor keeps the lock after that child
+/// exits; another open of the file is then refused with `LOCK_NB` until the
+/// shell closes 9.
+const FLOCK_UTILITY_SCRIPT: &str = r#"set -e
+lock="$1/lockfile"
+exec 9>"$lock"
+flock -n 9 && echo "flock -n 9: locked"
+flock -n "$lock" -c true || echo "another open: would block"
+exec 9>&-
+flock -n "$lock" -c 'echo "another open after the close: locked"'
+"#;
+
+const FLOCK_UTILITY_OUTPUT: &str = "flock -n 9: locked\nanother open: would block\n\
+                                    another open after the close: locked\n";
+
+/// Run [`FLOCK_UTILITY_SCRIPT`] under `hermit run` on `backend`, with its lock
+/// file in a directory of its own.
+fn hermit_run_flock_utility(backend: &str, log: &str, extra: &[&str]) -> Run {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the flock(1) directory");
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after", "10s", "120s"])
+        .arg(hermit_test::hermit_binary())
+        .arg(format!("--log={log}"))
+        .args([&format!("--backend={backend}"), "run", "--base-env=minimal"])
+        .args(extra)
+        .args(["--", "/bin/sh", "-c", FLOCK_UTILITY_SCRIPT, "sh"])
+        .arg(directory.path());
+    hermit_test::configure_guest_execution(&mut command);
+    finish(hermit_test::hermit_output(
+        &format!("{command:?}"),
+        &mut command,
+    ))
+}
+
+/// Natively, and on a backend whose descriptions are the host's, the shell's
+/// pattern behaves as Linux's: the description the shell opened before the
+/// fork is not one Detcore saw every reference to, so the kernel decides the
+/// file, as before Detcore's flock model.
+#[test]
+fn the_flock_utility_shell_pattern_keeps_the_kernel_path_on_ptrace() {
+    let run = hermit_run_flock_utility(
+        "ptrace",
+        "info",
+        &["--strict", "--verify", "--verify-strict"],
+    );
+    assert!(
+        run.status.success(),
+        "ptrace flock(1) run failed\n{}",
+        run.combined()
+    );
+    assert_eq!(
+        run.stdout,
+        FLOCK_UTILITY_OUTPUT,
+        "ptrace flock(1) output\n{}",
+        run.combined()
+    );
+    assert!(
+        run.combined().contains("bitwise parity established"),
+        "the flock(1) run did not verify at L2\n{}",
+        run.combined()
+    );
+}
+
+/// On KVM no host lock can decide the file, so the same pattern is refused by
+/// name at its first flock, with the reason.
+#[test]
+fn kvm_refuses_the_flock_utility_shell_pattern_by_name() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping: /dev/kvm is absent");
+        return;
+    }
+    let run = hermit_run_flock_utility("kvm", "error", &["--strict"]);
+    assert_eq!(
+        run.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "KVM did not refuse the shell pattern by name\n{}",
+        run.combined()
+    );
+    assert!(
+        run.stderr.contains("flock(fd=9")
+            && run
+                .stderr
+                .contains("was shared with another process before its first flock"),
+        "KVM's refusal did not give its reason\n{}",
+        run.combined()
+    );
+    assert!(
+        !run.stdout.contains("locked"),
+        "the KVM guest went on past the refused lock\n{}",
+        run.combined()
+    );
 }

@@ -51,12 +51,12 @@ non-host platform targets that the default Hermit binary does not use.
 
 The feature-complete release target is shadow-only: Cargo remains the
 authoritative binary and install/resource producer. First build the Cargo
-release with the optional backends and the revision stamped; the wrapper
+release with first-party LiteInst and the revision stamped; the wrapper
 requires the Cargo binary to name the 12-character `HEAD` revision, and only a
 stamped build embeds one:
 
 ```sh
-HERMIT_STAMP_GIT_SHA=1 cargo build --release --workspace --features hermit-run/third-party-backends
+HERMIT_STAMP_GIT_SHA=1 cargo build --release --workspace --features hermit-run/liteinst
 target/release/stage-detcore-liteinst --git target
 ```
 
@@ -67,7 +67,7 @@ Then invoke the guarded wrapper with explicit absolute paths:
   --dotslash /absolute/path/to/public/dotslash \
   --cargo-binary "$PWD/target/release/hermit" \
   --install-bundle "$PWD/target/install_pkg" \
-  --safehermit /absolute/path/to/dev-hermit/bin/safehermit
+  --safehermit /absolute/path/to/safehermit
 ```
 
 The wrapper always regenerates dependencies, refuses missing release metadata
@@ -528,8 +528,8 @@ CARGO_HTTP_PROXY=http://fwdproxy:8080 \
 ```
 
 **A proxy that refuses `github.com` to the build needs local git mirrors.**
-`Cargo.lock` locks some crates to git commits (`rust-shed`, `liteinst2` and
-`reverie` today), and Reindeer's Cargo fetches them from GitHub even when the
+`Cargo.lock` locks some crates to git commits (`rust-shed`, `reverie` and
+`agent-utils` today), and Reindeer's Cargo fetches them from GitHub even when the
 host's `~/.cargo/git` already holds them. If the proxy refuses that fetch
 (`CONNECT tunnel failed, response 403`), mirror each source with whatever
 route does reach GitHub, then point `HERMIT_GIT_DEP_MIRRORS` at the directory:
@@ -554,6 +554,28 @@ Each mirror is named after its URL's last component without `.git`, plus
 fetch` that fixes it. Because each source is pinned to a commit, a mirror
 changes only where the objects come from, never what is built. After a
 `Cargo.lock` change, `git -C <mirror> fetch` brings a mirror up to date.
+
+The recursive submodule fetch has the same problem one level down, and
+`HERMIT_GIT_DEP_MIRRORS` does not cover it: `git clone --recursive` (or
+`git submodule update --init --recursive`) also fetches the `agent-utils`
+submodule's nested submodules — `ext/minibeads`
+(`https://github.com/rrnewton/minibeads`) and, inside it, `beads` and
+`.claude_template` (relative `../beads` and `../claude_template`,
+resolving to `https://github.com/rrnewton/beads` and
+`https://github.com/rrnewton/claude_template`). Where `github.com` is
+refused, mirror those three into the same directory and rewrite their
+URLs *before* the recursive fetch:
+
+```sh
+for name in minibeads beads claude_template; do
+  with-proxy git clone --mirror "https://github.com/rrnewton/$name" "$mirrors/$name.git"
+  git config --global "url.$mirrors/$name.git.insteadOf" "https://github.com/rrnewton/$name"
+done
+git -c protocol.file.allow=always submodule update --init --recursive
+```
+
+Without the rewrites the recursive fetch fails on the nested submodules
+even when every Cargo git dependency is mirrored.
 
 ## Pinned versions
 
@@ -662,6 +684,101 @@ Reverie's BUCK files resolve their third-party crates through the same generated
 targets as Hermit. `shared-cell-aliases.txt` provides the unversioned names used
 by Reverie's hand-written BUCK targets.
 
-No shared action-cache performance measurement has yet been made. A local
-successful build proves target compatibility only, not the vision's claimed
-cross-worktree benefit.
+## Shared action cache on team hosts
+
+By default each checkout keeps its own `buck-out/` and daemon, so N
+checkouts of the same commit re-execute the same actions N times (the table
+under "Public nightly evidence" above: a fresh second checkout re-executes
+all ~2,220). On team hosts, one shared REAPI ActionCache/CAS per host
+removes that duplication. This is a host property, not a project default:
+nothing changes for a checkout whose host has not installed the file below,
+and `buck-out/` itself is never shared between checkouts.
+
+The host installs one config file (path and endpoint are host values; the
+cache byte cap lives in the service, not here):
+
+```ini
+# ~/.config/hermit/buckconfig.local  (team hosts; ports are host-chosen)
+[build]
+execution_platforms = gh_facebook_buck2_shims_meta//platforms:local-cache
+[buck2_re_client]
+address = 127.0.0.1:39291
+tls = false
+capabilities = true
+[buck2]
+default_allow_cache_upload = true
+```
+
+and each checkout links it as `.buckconfig.local` (gitignored):
+
+```sh
+ln -s ~/.config/hermit/buckconfig.local /path/to/hermit/.buckconfig.local
+```
+
+How it fits together:
+
+- `shim//platforms:local-cache` executes locally only, with
+  `remote_cache_enabled` and `allow_cache_uploads`: check the shared cache
+  first, run locally on a miss, upload the result. The plain local executor
+  never consults the cache (measured: 0 B uploaded with only
+  `[buck2_re_client]` set), and `hybrid`/`remote` would attempt remote
+  *execution*, which a cache-only service cannot serve. A user-level
+  `~/.buckconfig.d/` file cannot select the platform (the project's
+  `[build] execution_platforms` wins over the user layer; measured with
+  `buck2 audit config`), which is why the per-checkout link exists.
+- The service is any REAPI ActionCache+CAS on localhost. Team hosts run
+  `bazel-remote` (single static binary, built-in LRU with a hard GiB cap)
+  as a user systemd unit with its own CPU/memory bounds; the cap (20 GiB on
+  current hosts) and data directory are host config values. With the link
+  present and the service down, builds fail fast (the RE client's
+  capabilities query is refused; measured) — remove the link to opt a
+  checkout out; there is no silent local fallback.
+- Checkouts that share a cache must agree on the action-digest inputs:
+  the same isolation-dir name (the default `v2` — a custom name changes
+  output paths embedded in commands and defeats reuse), the same pinned
+  Buck2 binary (`bootstrap/buck2`), project config, and toolchain.
+- The OSS release-provenance path is unaffected: it passes
+  `--no-remote-cache` and refuses remote results, and the binary is
+  byte-identical in linked and truly unlinked checkouts (measured
+  below). Linked and unlinked checkouts select different execution
+  platforms, so exec-platform actions (proc macros, build scripts)
+  get different action keys and `.rmeta` bytes: the two modes do not
+  share cache entries for those actions, even though the final
+  binary matches.
+  Public CI installs no such file and builds exactly as before. The
+  internal Buck2's Meta RE routing is also unaffected: measured with the
+  link present, an `@shim/modes/hybrid` build still executes on Meta RE
+  (its thrift RE client ignores the gRPC `address`) and the localhost
+  cache sees no traffic.
+
+Measured 2026-11-08 on one team host at `f08e4082d`, pinned public Buck2,
+empty 20 GiB-capped localhost cache, two clean worktrees at the same
+commit building `//hermit-cli:hermit //:hermit-inguest-engine`:
+
+| Build | Actions | Wall | `buck-out` |
+| --- | --- | --- | --- |
+| Worktree A (populate) | 1,204 local, 0 cached | 2 m 13 s | 4.8 GiB |
+| Worktree B (fresh) | 2 local, 1,202 cached | 2.6 s | 294 MiB |
+
+The `hermit` binaries from A (locally executed), B (cache hits), and an
+independent `--no-remote-cache` build are byte-identical (SHA-256
+`9bdce2a49c1f…`). A later check at `fabd9416` compared the case the
+table does not cover — clean `--no-remote-cache` builds of
+`//hermit-cli:hermit` in linked and truly unlinked checkouts:
+byte-identical again (`cmp` clean, SHA-256
+`9bdce2a49c1f5bed2309abfa643f60314ca41a9f9cf1d193b31a658d4cdb80a4`;
+118 s unlinked, 113 s linked). Intermediate exec-platform outputs do
+differ between the modes (leaf `//detcore-model` `.rmeta` SHA-256:
+`b846034a…` unlinked, `469c4317…` linked, even with
+`--no-remote-cache` on both), which is why the modes do not share
+cache entries above; the linked binary's bytes do not depend on the
+choice. The 2 non-cached actions are
+`reverie//:reverie-linuxemu-terminal-read` (compile + archive): their
+command environment embeds the checkout's absolute path, so their digests
+differ per checkout — a hermeticity fix in Reverie, tracked as a
+follow-up. The full binary's cache footprint is 650 MiB compressed
+(2.7 GiB uncompressed). Two simultaneous builds of an uncached target
+family (`//ci/manifest-plan/...`) both succeed with byte-identical
+outputs; racing uploads of one digest are idempotent. So the marginal
+cost of another slot at the same commit is its sources plus ~0.3 GiB of
+materialized outputs, behind one capped cache — not another `target/`.

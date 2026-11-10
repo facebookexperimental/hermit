@@ -136,15 +136,51 @@ const INCARNATION_BITS: u32 = 8;
 /// tasks below `PID_MAX_LIMIT`, 2^22.
 const PID_BITS: u32 = 22;
 
-/// Bits of a per-process inode number for the file's index among the
-/// per-process files Detcore renders, from 1.
-const INDEX_BITS: u32 = 3;
+/// Bits of a per-process inode number for the file's tag among the
+/// per-process files Detcore renders ([`per_process_tag`]), from 1: the top
+/// four bits of the number.
+const TAG_BITS: u32 = 4;
+
+/// How many per-process files kept the inode numbers they had when the field
+/// above the pid was a set bit 63 and a 3-bit index from 1 (`cgroup` to
+/// `comm`, the first seven of `PER_PROCESS_NAMES`): each takes tag 8 + its
+/// old index, whose bits are those two fields'.
+const FIRST_LAYOUT_FILES: usize = 7;
 
 const _: () = assert!(
-    crate::procfs::ProcfsFile::PER_PROCESS_NAMES.len() < 1 << INDEX_BITS,
-    "every per-process file needs an index in its inode number"
+    crate::procfs::ProcfsFile::PER_PROCESS_NAMES.len() < 1 << TAG_BITS,
+    "every per-process file needs a tag in its inode number"
 );
-const _: () = assert!(1 + INDEX_BITS + 2 * PID_BITS + 2 * INCARNATION_BITS == 64);
+const _: () = assert!(TAG_BITS + 2 * PID_BITS + 2 * INCARNATION_BITS == 64);
+
+/// The tag of the per-process file at `index` in `PER_PROCESS_NAMES`, which
+/// the top [`TAG_BITS`] bits of its inode number hold. The first
+/// [`FIRST_LAYOUT_FILES`] files take 9 to 15, the bits of the set bit 63 and
+/// the 3-bit index from 1 that their numbers had before the field grew, so
+/// their numbers are unchanged; the next seven take 1 to 7. Tag 8 (bit 63
+/// with index 0) is every fdinfo's ([`fdinfo_inode`]). A tag of 1 or more
+/// puts a per-process number at 2^60 or above, out of the range of a
+/// system-wide rendered file's number (below 2^32) and of every number
+/// Detcore's inode pool mints (counting up from a few thousand). The
+/// fifteenth file, `environ` (package K item 2b slice 2b-3), takes the one
+/// tag left, 0: its number is its task's fields alone, at 2^38 or above (a
+/// task's pid is at least 1), out of both ranges too, and below every other
+/// per-process number.
+fn per_process_tag(index: usize) -> u64 {
+    const SECOND_LAYOUT_FILES: usize = 7;
+    if index < FIRST_LAYOUT_FILES {
+        8 + index as u64 + 1
+    } else if index < FIRST_LAYOUT_FILES + SECOND_LAYOUT_FILES {
+        (index - FIRST_LAYOUT_FILES) as u64 + 1
+    } else {
+        assert_eq!(
+            index,
+            FIRST_LAYOUT_FILES + SECOND_LAYOUT_FILES,
+            "no tag is left for another per-process file"
+        );
+        0
+    }
+}
 
 /// Whether a per-process file of the task with identity `incarnation` has an
 /// inode number of its own ([`MAX_INCARNATION`]).
@@ -157,13 +193,11 @@ pub(crate) fn incarnation_fits(incarnation: crate::procfs::TaskIncarnation) -> b
 
 /// The inode number of the per-process file `name`, on every backend: the
 /// fields of its identity laid out in 64 bits, so that two files share a
-/// number only if they are the same file of the same task. Bit 63 is set,
-/// which neither a system-wide rendered file's number (below 2^32, above) nor
-/// any number Detcore's inode pool mints (counting up from a few thousand)
-/// has. Then, from the high bits: the file's index among the per-process
-/// files Detcore renders (3 bits, from 1), the process (22 bits) and the
-/// thread below its `task` (22 bits, 0 for none), and the incarnation of each
-/// (8 bits each, from 1; 0 for no thread). Linux numbers tasks below
+/// number only if they are the same file of the same task. From the high
+/// bits: the file's tag among the per-process files Detcore renders (4 bits,
+/// from 1, [`per_process_tag`]), the process (22 bits) and the thread below
+/// its `task` (22 bits, 0 for none), and the incarnation of each (8 bits
+/// each, from 1; 0 for no thread). Linux numbers tasks below
 /// `PID_MAX_LIMIT`, 2^22, so 22 bits hold every pid and tid, and a task Linux
 /// could not number has no file (its lookup is ENOENT first). An incarnation
 /// holds up to [`MAX_INCARNATION`], 255: 254 reuses of one number in a run.
@@ -171,11 +205,13 @@ pub(crate) fn incarnation_fits(incarnation: crate::procfs::TaskIncarnation) -> b
 /// (`Detcore::bind_task_identity`); a value outside a field here is a
 /// Detcore defect, and panics rather than wraps into another file's number.
 pub(crate) fn per_process_inode(name: crate::procfs::PerProcessName) -> u64 {
+    if let Some(fd) = name.filename.strip_prefix("fdinfo/") {
+        return fdinfo_inode(name, fd);
+    }
     let index = crate::procfs::ProcfsFile::PER_PROCESS_NAMES
         .iter()
         .position(|candidate| *candidate == name.filename)
-        .expect("a per-process file Detcore renders has an index")
-        + 1;
+        .expect("a per-process file Detcore renders has an index");
     let field = |value: i64, bits: u32, what: &str| -> u64 {
         assert!(
             (0..1_i64 << bits).contains(&value),
@@ -184,7 +220,7 @@ pub(crate) fn per_process_inode(name: crate::procfs::PerProcessName) -> u64 {
         );
         value as u64
     };
-    let index = field(index as i64, INDEX_BITS, "file index");
+    let tag = field(per_process_tag(index) as i64, TAG_BITS, "file tag");
     let process = field(name.task.process.into(), PID_BITS, "pid");
     let thread = field(name.task.thread.unwrap_or(0).into(), PID_BITS, "tid");
     let incarnation = name.incarnation.unwrap_or(crate::procfs::TaskIncarnation {
@@ -201,12 +237,42 @@ pub(crate) fn per_process_inode(name: crate::procfs::PerProcessName) -> u64 {
         INCARNATION_BITS,
         "tid incarnation",
     );
-    1 << 63
-        | index << (PID_BITS * 2 + INCARNATION_BITS * 2)
+    tag << (PID_BITS * 2 + INCARNATION_BITS * 2)
         | process << (PID_BITS + INCARNATION_BITS * 2)
         | thread << (INCARNATION_BITS * 2)
         | process_incarnation << INCARNATION_BITS
         | thread_incarnation
+}
+
+/// The inode number of the fdinfo of descriptor `fd` (its name's digits) of
+/// the task `name` describes (package K slice K8-h), on every backend that
+/// renders one: bit 63 set and the file-index field 0, which no other
+/// per-process file takes ([`per_process_inode`] numbers those from 1), then
+/// the 64-bit FNV-1a hash of the task's numbers, their incarnations and the
+/// descriptor's digits, cut to its low 60 bits. A descriptor number has no
+/// room beside the task's fields in [`per_process_inode`]'s layout, which
+/// `comm` filled. Two fdinfo files share a number only where their hashes
+/// collide in 60 bits; Linux numbers each from a host-wide counter at its
+/// lookup (`get_next_ino`).
+fn fdinfo_inode(name: crate::procfs::PerProcessName, fd: &str) -> u64 {
+    let incarnation = name.incarnation.unwrap_or(crate::procfs::TaskIncarnation {
+        process: 0,
+        thread: None,
+    });
+    let fields = [
+        u64::from(name.task.process as u32),
+        u64::from(name.task.thread.unwrap_or(0) as u32),
+        u64::from(incarnation.process),
+        u64::from(incarnation.thread.unwrap_or(0)),
+    ];
+    let hash = fields.iter().fold(FNV_OFFSET_BASIS, |hash, field| {
+        fnv1a(hash, &field.to_le_bytes())
+    });
+    let hash = fnv1a(hash, fd.as_bytes());
+    // The low 60 bits: the width below bit 63 and the 3-bit file-index
+    // field this number's layout had when `fdinfo_inode` was added (the
+    // field is `TAG_BITS` wide now, and this hash takes none of it).
+    1 << 63 | (hash & ((1 << 60) - 1))
 }
 
 /// The bit every path key sets, which no 32-bit procfs inode number has.
@@ -229,29 +295,15 @@ pub(crate) fn may_be_procfs(device: u64, block_size: i64) -> bool {
     libc::major(device) == 0 && block_size == PROC_BLOCK_SIZE
 }
 
-/// The device of the procfs files the KVM backend synthesizes (`/proc` and
-/// its allowlisted files): reverie-kvm's `synthetic_dev(SYNTHETIC_PROC_DEV_MINOR)`
-/// in `reverie-kvm/src/executor.rs`, which reports them with 4096-byte blocks.
-/// `run_kvm_a_procfs_directory_keeps_its_size` fails if the two drift apart.
+/// The device of the regular procfs files the KVM backend's executor still
+/// synthesizes (`/proc/locks`, `/proc/self/status` and `/proc/self/maps`):
+/// reverie-linuxemu's `synthetic_dev(SYNTHETIC_PROC_DEV_MINOR)`, which it
+/// reports with 4096-byte blocks. It keys the inode numbers of the `/proc`
+/// directories Detcore serves on KVM
+/// (`Detcore::procfs_key_device`), so that they are the numbers they were
+/// when the executor's own `/proc` directory reported this device; the
+/// executor serves no procfs directory since package K slice P2.
 pub(crate) const KVM_SYNTHETIC_PROC_DEVICE: u64 = libc::makedev(0, 0xff01);
-
-/// Whether a stat result is the procfs of a backend whose `/proc` is its
-/// own: where the tool cannot name guest descriptors through host procfs
-/// ([`tool_can_name_guest_descriptors`], KVM), the backend serves `/proc`
-/// itself, on [`KVM_SYNTHETIC_PROC_DEVICE`] with 4096-byte blocks, and that
-/// device is the proof. Elsewhere the kernel's procfs is proved by naming the
-/// entry (`ProcfsEntry`), not by its stat fields: an anonymous device with
-/// 1024-byte blocks is also devpts, autofs or a FUSE mount that reports those
-/// blocks (Codex re-check of https://github.com/rrnewton/hermit/pull/4369).
-pub(crate) fn is_backend_procfs_device(
-    backend: &BackendCapabilities,
-    device: u64,
-    block_size: i64,
-) -> bool {
-    !tool_can_name_guest_descriptors(backend)
-        && device == KVM_SYNTHETIC_PROC_DEVICE
-        && block_size == 4096
-}
 
 /// Whether a stat result must be taken as procfs although Detcore cannot
 /// prove it: where guest thread IDs do not name host tasks
@@ -302,6 +354,21 @@ pub(crate) fn guest_tids_name_host_tasks(
 /// started without its configuration leaves at ptrace's values.
 pub(crate) fn tool_can_name_guest_descriptors(backend: &BackendCapabilities) -> bool {
     !backend.provides_process_signal_control
+}
+
+/// Whether the tool can read a guest process's working directory and root
+/// from host procfs, as `/proc/<pid>/cwd` and `/proc/<pid>/root` by the
+/// guest's process ID: the fact [`tool_can_name_guest_descriptors`] keys on,
+/// wherever guest threads are host tasks. Where the backend owns signal
+/// delivery because they are not (`provides_process_signal_control`, KVM),
+/// the guest's process ID names whatever host task holds it in the run's PID
+/// namespace, one of the supervisor's own threads
+/// (<https://github.com/rrnewton/hermit/issues/4541>), so Detcore reads the
+/// working directory from the guest instead, with an injected `getcwd`
+/// (`Detcore::read_guest_cwd_for_syscall`). A helper of its own over the
+/// same fact, so that each decision names what it reads from procfs.
+pub(crate) fn tool_can_read_guest_cwd(backend: &BackendCapabilities) -> bool {
+    tool_can_name_guest_descriptors(backend)
 }
 
 /// The key for the procfs entry at `path` within procfs on `device`: the
@@ -1085,6 +1152,49 @@ mod tests {
 
     use super::*;
 
+    /// A rendered fdinfo's inode number (package K slice K8-h) is a
+    /// per-process file's (bit 63) whose file index is 0, which no other
+    /// per-process file takes, so it is no other file's number; two fdinfo
+    /// files differ by descriptor, task, thread or incarnation.
+    #[test]
+    fn an_fdinfo_inode_is_its_own_per_process_number() {
+        use crate::procfs::BoundTask;
+        use crate::procfs::PerProcessName;
+        use crate::procfs::TaskIncarnation;
+        let name = |process, thread, incarnation, filename| PerProcessName {
+            task: BoundTask { process, thread },
+            incarnation: Some(TaskIncarnation {
+                process: incarnation,
+                thread: thread.map(|_| 1),
+            }),
+            filename,
+        };
+        let index = |inode: u64| (inode >> (PID_BITS * 2 + INCARNATION_BITS * 2)) & 0b111;
+        let fdinfo = per_process_inode(name(3, None, 1, "fdinfo/3"));
+        assert_eq!(fdinfo >> 63, 1);
+        assert_eq!(index(fdinfo), 0);
+        let others = [
+            per_process_inode(name(3, None, 1, "fdinfo/4")),
+            per_process_inode(name(4, None, 1, "fdinfo/3")),
+            per_process_inode(name(3, Some(3), 1, "fdinfo/3")),
+            per_process_inode(name(3, None, 2, "fdinfo/3")),
+        ];
+        assert!(
+            others
+                .iter()
+                .all(|other| *other != fdinfo && index(*other) == 0)
+        );
+        // Every other per-process file's tag is not fdinfo's 8 (bit 63 with
+        // index 0): `environ`'s is 0, without bit 63.
+        for filename in crate::procfs::ProcfsFile::PER_PROCESS_NAMES {
+            let inode = per_process_inode(name(3, None, 1, filename));
+            assert!(inode >> 63 == 0 || index(inode) != 0, "{filename}");
+            assert_ne!(inode, fdinfo, "{filename}");
+        }
+        // The same file is the same number.
+        assert_eq!(per_process_inode(name(3, None, 1, "fdinfo/3")), fdinfo);
+    }
+
     /// An inode number of a per-process file tells apart 255 incarnations of
     /// a number, for the process and for the thread each: the 255th task to
     /// hold one fits, the 256th does not (and is refused by name, not
@@ -1102,6 +1212,60 @@ mod tests {
         assert!(!incarnation_fits(identity(u32::MAX, Some(1))));
     }
 
+    /// The first seven per-process files keep the numbers they had when the
+    /// field above the pid was bit 63 and a 3-bit index from 1 (tags 9 to
+    /// 15); the next seven take tags 1 to 7 below them, and `environ` the
+    /// last tag, 0, below fdinfo's 8; and every file of one task has a number
+    /// of its own, at 2^38 or above, and at 2^60 or above for all but
+    /// `environ`.
+    #[test]
+    fn per_process_files_take_tags_that_keep_the_first_seven_numbers() {
+        assert_eq!(
+            (0..crate::procfs::ProcfsFile::PER_PROCESS_NAMES.len())
+                .map(per_process_tag)
+                .collect::<Vec<_>>(),
+            [9, 10, 11, 12, 13, 14, 15, 1, 2, 3, 4, 5, 6, 7, 0]
+        );
+        let task = 3 << (PID_BITS + 2 * INCARNATION_BITS) | 1 << INCARNATION_BITS;
+        let inode = |name: &str| {
+            let mut file =
+                crate::procfs::ProcfsFile::from_path(Path::new(&format!("/proc/self/{name}")))
+                    .unwrap();
+            file.bind_task(3, 3);
+            file.set_task_incarnation(crate::procfs::TaskIncarnation {
+                process: 1,
+                thread: None,
+            });
+            rendered_inode(file.into_rendered().opened_path().unwrap())
+        };
+        // As before the field grew: bit 63, then index 1 for `cgroup` and 7
+        // for `comm`.
+        assert_eq!(inode("cgroup"), 1 << 63 | 1 << 60 | task);
+        assert_eq!(inode("comm"), 1 << 63 | 7 << 60 | task);
+        assert_eq!(inode("statm"), 1 << 60 | task);
+        assert_eq!(inode("io"), 2 << 60 | task);
+        assert_eq!(inode("arch_status"), 3 << 60 | task);
+        assert_eq!(inode("smaps"), 4 << 60 | task);
+        assert_eq!(inode("smaps_rollup"), 5 << 60 | task);
+        assert_eq!(inode("numa_maps"), 6 << 60 | task);
+        assert_eq!(inode("status"), 7 << 60 | task);
+        assert_eq!(inode("environ"), task);
+        let numbers = crate::procfs::ProcfsFile::PER_PROCESS_NAMES
+            .iter()
+            .map(|name| inode(name))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            numbers.len(),
+            crate::procfs::ProcfsFile::PER_PROCESS_NAMES.len()
+        );
+        assert!(
+            numbers
+                .iter()
+                .all(|number| *number >= 1 << 60 || *number == inode("environ"))
+        );
+        assert!(inode("environ") >= 1 << 38);
+    }
+
     /// A host call that fails inside `preserving_errno` leaves the caller's
     /// `errno`, which under SaBRe is the guest's, as it was.
     #[test]
@@ -1109,7 +1273,13 @@ mod tests {
         const SENTINEL: i32 = 4242;
         nix::errno::Errno::set_raw(SENTINEL);
         let inside = futures::executor::block_on(preserving_errno(async {
-            assert!(std::fs::symlink_metadata("/proc/self/fd/-1").is_err());
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            // SAFETY: the path is NUL-terminated and stat is writable output
+            // storage. The failed call's output is never read.
+            assert_eq!(
+                unsafe { libc::lstat(c"/proc/self/fd/-1".as_ptr(), stat.as_mut_ptr()) },
+                -1
+            );
             nix::errno::Errno::last_raw()
         }));
         assert_eq!(inside, libc::ENOENT, "the failed call set errno");
@@ -1379,41 +1549,6 @@ mod tests {
     }
 
     #[test]
-    fn only_kvms_synthetic_procfs_device_is_proved_by_its_stat_fields() {
-        let synthetic = libc::makedev(0, 0xff01);
-        assert!(is_backend_procfs_device(
-            &BackendCapabilities::KVM,
-            synthetic,
-            4096
-        ));
-        assert!(!is_backend_procfs_device(
-            &BackendCapabilities::KVM,
-            synthetic,
-            1024
-        ));
-        assert!(!is_backend_procfs_device(
-            &BackendCapabilities::KVM,
-            PROC_DEVICE,
-            1024
-        ));
-        assert!(!is_backend_procfs_device(
-            &BackendCapabilities::PTRACE,
-            synthetic,
-            4096
-        ));
-        assert!(!is_backend_procfs_device(
-            &BackendCapabilities::PTRACE,
-            PROC_DEVICE,
-            1024
-        ));
-        assert!(!is_backend_procfs_device(
-            &BackendCapabilities::DBT,
-            PROC_DEVICE,
-            1024
-        ));
-    }
-
-    #[test]
     fn only_a_backend_that_names_no_entries_but_shares_procfs_keeps_its_signature() {
         // DBT: guest thread IDs are its scheduler's virtual IDs.
         assert!(unprovable_procfs_signature(
@@ -1507,6 +1642,34 @@ mod tests {
             assert!(tool_can_name_guest_descriptors(&backend));
         }
         assert!(!tool_can_name_guest_descriptors(&BackendCapabilities::KVM));
+    }
+
+    /// The working directory is read from host procfs wherever descriptors
+    /// are, and from the guest (an injected `getcwd`) under KVM, whose guest
+    /// process IDs name the supervisor's own threads
+    /// (<https://github.com/rrnewton/hermit/issues/4541>): one fact keys both,
+    /// never the backend's name.
+    #[test]
+    fn the_working_directory_is_read_from_procfs_where_descriptors_are() {
+        for backend in [
+            BackendCapabilities::PTRACE,
+            BackendCapabilities::LITEINST_IN_GUEST,
+            BackendCapabilities::SABRE,
+            BackendCapabilities::DBT,
+            BackendCapabilities::KVM,
+        ] {
+            assert_eq!(
+                tool_can_read_guest_cwd(&backend),
+                tool_can_name_guest_descriptors(&backend)
+            );
+            assert_eq!(
+                tool_can_read_guest_cwd(&backend),
+                !backend.provides_process_signal_control
+            );
+        }
+        assert!(tool_can_read_guest_cwd(&BackendCapabilities::PTRACE));
+        assert!(tool_can_read_guest_cwd(&BackendCapabilities::DBT));
+        assert!(!tool_can_read_guest_cwd(&BackendCapabilities::KVM));
     }
 
     /// Once its task has exited, an entry is not named: following the link

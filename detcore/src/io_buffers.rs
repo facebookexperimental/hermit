@@ -43,6 +43,10 @@
 //! MiB heap. This is `O(bytes the syscalls actually returned)`: 139.1 MB per
 //! boot, measured by summing real return values.
 
+use detcore_model::access_trace::ByteRange;
+use detcore_model::access_trace::MemoryOp;
+use detcore_model::access_trace::OUT_BYTES_CAP;
+use detcore_model::access_trace::ReturnedBytes;
 use reverie::Error;
 use reverie::Guest;
 use reverie::Tool;
@@ -129,6 +133,93 @@ fn observed_extents(
         return Ok(observed);
     }
     extents(memory, call, ret)
+}
+
+/// What the access trace keeps of the bytes a completed syscall moved
+/// through guest buffers (`crate::access_trace`).
+pub(crate) struct MovedBytes {
+    /// Each buffer, and whether the kernel read it or wrote it.
+    pub(crate) buffers: Vec<(MemoryOp, ByteRange)>,
+    /// The bytes the kernel wrote into the guest, summarized.
+    pub(crate) returned: Option<ReturnedBytes>,
+    /// The first bytes a write to fd 1 or 2 carried.
+    pub(crate) out_bytes: Option<Vec<u8>>,
+}
+
+/// The buffers of a completed call that returned `ret`, found and read as
+/// [`detlog_io_buffers`] finds and reads them. A buffer the guest cannot read
+/// leaves the summary out; the trace never changes the call's result.
+pub(crate) fn access_trace_buffers<M: MemoryAccess>(
+    memory: &M,
+    call: &Syscall,
+    ret: i64,
+    rng_output: Option<&[BufferExtent]>,
+) -> MovedBytes {
+    let Ok(extents) = observed_extents(memory, call, ret, rng_output) else {
+        return MovedBytes {
+            buffers: Vec::new(),
+            returned: None,
+            out_bytes: None,
+        };
+    };
+    let mut ranges: Vec<ByteRange> = extents
+        .iter()
+        .filter(|extent| extent.len > 0)
+        .map(|extent| ByteRange {
+            start: extent.addr,
+            end: extent.addr.saturating_add(extent.len),
+        })
+        .collect();
+    // Clock and timer reads, which the --detlog-io-buffers extents leave
+    // out, return the time through their result or small structures.
+    let (sysno, args) = call.into_parts();
+    let (value, time_buffers) = crate::access_trace::time_outputs(
+        sysno,
+        [
+            args.arg0 as u64,
+            args.arg1 as u64,
+            args.arg2 as u64,
+            args.arg3 as u64,
+            args.arg4 as u64,
+            args.arg5 as u64,
+        ],
+        ret,
+    );
+    ranges.extend(time_buffers);
+    let read = |addr: u64, want: usize| -> Result<Vec<u8>, Errno> {
+        let mut buf = vec![0u8; want];
+        let start = AddrMut::<u8>::from_raw(addr as usize).ok_or(Errno::EFAULT)?;
+        read_written(memory, start, &mut buf).map(|()| buf)
+    };
+    let direction = direction(call);
+    let returned = match direction {
+        Direction::In => crate::access_trace::summarize_output(value, &ranges, read),
+        Direction::Out => None,
+    };
+    let to_terminal = matches!(crate::syscalls::helpers::get_fd(*call), Some(1 | 2));
+    let out_bytes = (direction == Direction::Out && to_terminal && ret > 0)
+        .then(|| {
+            let mut bytes = Vec::new();
+            for range in &ranges {
+                let left = OUT_BYTES_CAP - bytes.len();
+                if left == 0 {
+                    break;
+                }
+                let want = ((range.end - range.start) as usize).min(left);
+                bytes.extend(read(range.start, want).ok()?);
+            }
+            Some(bytes)
+        })
+        .flatten();
+    let op = match direction {
+        Direction::In => MemoryOp::SyscallWrite,
+        Direction::Out => MemoryOp::SyscallRead,
+    };
+    MovedBytes {
+        buffers: ranges.into_iter().map(|range| (op, range)).collect(),
+        returned,
+        out_bytes,
+    }
 }
 
 /// Direction of travel, recorded so a reader can tell a value the kernel
@@ -371,6 +462,8 @@ pub(crate) const HASHED_SYSCALLS: &[reverie::syscalls::Sysno] = &[
     reverie::syscalls::Sysno::getrandom,
     reverie::syscalls::Sysno::getcwd,
     reverie::syscalls::Sysno::getdents64,
+    // x86_64 only: aarch64 has readlinkat alone.
+    #[cfg(target_arch = "x86_64")]
     reverie::syscalls::Sysno::readlink,
     reverie::syscalls::Sysno::readlinkat,
     reverie::syscalls::Sysno::recvmsg,
@@ -388,18 +481,28 @@ pub(crate) const HASHED_SYSCALLS: &[reverie::syscalls::Sysno] = &[
     reverie::syscalls::Sysno::pwritev,
     reverie::syscalls::Sysno::pwritev2,
     // Rewritten in place across the whole array.
+    // x86_64 only: aarch64 has ppoll alone.
+    #[cfg(target_arch = "x86_64")]
     reverie::syscalls::Sysno::poll,
     reverie::syscalls::Sysno::ppoll,
     // A structure the kernel (and Detcore) fills whole (`stat_buffer`).
+    // x86_64 only: aarch64 has fstat, fstatat and statx alone.
+    #[cfg(target_arch = "x86_64")]
     reverie::syscalls::Sysno::stat,
+    #[cfg(target_arch = "x86_64")]
     reverie::syscalls::Sysno::lstat,
     reverie::syscalls::Sysno::fstat,
-    reverie::syscalls::Sysno::newfstatat,
+    crate::arch::FSTATAT,
     reverie::syscalls::Sysno::statx,
 ];
 
 fn ret_gates_output(call: &Syscall) -> bool {
-    !matches!(call, Syscall::Poll(_) | Syscall::Ppoll(_))
+    match call {
+        Syscall::Ppoll(_) => false,
+        #[cfg(target_arch = "x86_64")]
+        Syscall::Poll(_) => false,
+        _ => true,
+    }
 }
 
 /// The structure a stat-family call fills: its guest address and size.
@@ -419,10 +522,15 @@ fn stat_buffer(call: &Syscall) -> Option<(Option<u64>, u64)> {
     let stat = |p: Option<reverie::syscalls::StatPtr<'_>>| p.map(|p| p.0.as_raw() as u64);
     let stat_len = std::mem::size_of::<libc::stat>() as u64;
     Some(match call {
+        #[cfg(target_arch = "x86_64")]
         Syscall::Stat(c) => (stat(c.stat()), stat_len),
+        #[cfg(target_arch = "x86_64")]
         Syscall::Lstat(c) => (stat(c.stat()), stat_len),
         Syscall::Fstat(c) => (stat(c.stat()), stat_len),
+        #[cfg(target_arch = "x86_64")]
         Syscall::Newfstatat(c) => (stat(c.stat()), stat_len),
+        #[cfg(target_arch = "aarch64")]
+        Syscall::Fstatat(c) => (stat(c.stat()), stat_len),
         Syscall::Statx(c) => (
             c.statx().map(|p| p.0.as_raw() as u64),
             std::mem::size_of::<reverie::syscalls::linux_abi::Statx>() as u64,
@@ -517,6 +625,7 @@ fn extents<M: MemoryAccess>(
             c.count() as usize,
             ret,
         ),
+        #[cfg(target_arch = "x86_64")]
         Syscall::Readlink(c) => clamp(c.buf().map(|p| p.as_raw() as u64), c.bufsize(), ret),
         Syscall::Readlinkat(c) => clamp(c.buf().map(|p| p.as_raw() as u64), c.buf_len(), ret),
         Syscall::Recvmsg(c) => msghdr_extents(memory, c.msg().map_or(0, |p| p.as_raw()), ret)?,
@@ -548,6 +657,7 @@ fn extents<M: MemoryAccess>(
         // `unsigned int`, so only its low 32 bits count: a guest that sets the
         // high word gets the low word's array, and the observer must not read
         // more.
+        #[cfg(target_arch = "x86_64")]
         Syscall::Poll(c) => whole(
             c.fds().map(|p| p.as_raw() as u64),
             pollfd_array_len(c.nfds()),
@@ -694,7 +804,7 @@ fn read_extent<M: MemoryAccess>(
 /// depends only on the guest's page protections, so it is the same in every
 /// run. The words are a fallback, not the first choice, because they cost one
 /// trap per eight bytes.
-fn read_written<M: MemoryAccess>(
+pub(crate) fn read_written<M: MemoryAccess>(
     memory: &M,
     start: AddrMut<'_, u8>,
     buf: &mut [u8],
@@ -758,6 +868,13 @@ fn chunk_digests(buf: &[u8]) -> (usize, Vec<String>) {
     (chunk, chunks)
 }
 
+/// Match the module target of the I/O-buffer records, including the in-guest
+/// forwarder's target policy. Callers in helpers or the top-level syscall
+/// dispatcher must not expand the macro under their own module targets.
+pub(crate) fn observed() -> bool {
+    crate::detlog_observed!()
+}
+
 /// ⚠️ THE GUARD IS FIRST AND THAT IS THE POINT. Everything below it touches
 /// guest memory: for `recvmsg` the extents cannot even be computed without
 /// reading a `msghdr` and an `iovec` array out of the guest. That is
@@ -777,7 +894,24 @@ where
     G: Guest<T>,
     T: Tool,
 {
-    if !crate::detlog_observed!() {
+    detlog_io_buffers_with_entry_geometry(guest, call, ret, dettid, rng_output, None)
+}
+
+/// Locations come from complete captured metadata; payload always comes from
+/// actual post-call guest memory. RNG's committed geometry takes precedence.
+pub(crate) fn detlog_io_buffers_with_entry_geometry<G, T>(
+    guest: &mut G,
+    call: &Syscall,
+    ret: i64,
+    dettid: DetTid,
+    rng_output: Option<&[BufferExtent]>,
+    entry_geometry: Option<&[(usize, usize)]>,
+) -> Result<(), Error>
+where
+    G: Guest<T>,
+    T: Tool,
+{
+    if !observed() {
         return Ok(());
     }
     let dir = direction(call).as_str();
@@ -801,14 +935,12 @@ where
         Some(fd) => fd.to_string(),
         None => "-".to_string(),
     };
-    // A recvmsg's buffers are found by re-reading its msghdr after the call,
-    // and Linux lets the receive's own output overwrite that header. When the
-    // re-read, a buffer read, or the re-read iovec's coverage of the returned
-    // length fails, the call's bytes cannot be (fully) observed. That is
-    // recorded as an explicit, compared `unobserved` entry after whatever was
-    // hashed, as before, from the re-read; and the guest still gets the
-    // kernel's result: the instrumentation must never change the guest's
-    // execution. Other calls keep failing on an observation error.
+    // Prefer complete actual-attempt geometry to re-reading a recvmsg header
+    // that the output may overwrite. With no certificate, keep the existing
+    // post-call observation. Failed geometry/payload reads and incomplete
+    // coverage remain explicit compared `unobserved` entries. A readable
+    // aliased payload can be hashed without writing metadata over it. The
+    // guest keeps the kernel's result; other calls retain their error policy.
     let unobserved = |reason: String| {
         crate::detlog!(
             "[iobuf][dtid {}] {} {} fd={} unobserved ret={} reason={}",
@@ -826,7 +958,21 @@ where
     };
     let moved_extents = {
         let memory = guest.memory();
-        match observed_extents(&memory, call, ret, rng_output) {
+        let extents = if rng_output.is_none() {
+            entry_geometry.map(|geometry| {
+                let iovecs: Vec<libc::iovec> = geometry
+                    .iter()
+                    .map(|&(base, len)| libc::iovec {
+                        iov_base: base as *mut libc::c_void,
+                        iov_len: len,
+                    })
+                    .collect();
+                Ok(iovec_extents_from_slice(&iovecs, ret))
+            })
+        } else {
+            None
+        };
+        match extents.unwrap_or_else(|| observed_extents(&memory, call, ret, rng_output)) {
             Ok(extents) => extents,
             Err(_) if receive.is_some() => {
                 unobserved("header-or-iovec-unreadable".to_string());
@@ -1148,6 +1294,14 @@ mod event_tests {
 
     type RetryGate = (oneshot::Sender<()>, oneshot::Receiver<()>);
 
+    /// Opt-in syscall scripting for the pairing-to-recorded-probe control.
+    /// Other EventGuest scenarios keep refusing these additional injections.
+    struct PairingProbe {
+        accepted_fd: i32,
+        carried_fd: i32,
+        calls: Vec<(Sysno, i32)>,
+    }
+
     struct EventGuest {
         config: Config,
         thread: ThreadState<()>,
@@ -1175,6 +1329,19 @@ mod event_tests {
         hb_requests: Mutex<Vec<ResourceID>>,
         /// Report the fixture's memory regions without the user-copy audit.
         report_memory_regions: bool,
+        /// The `sendmsg` and `sendmmsg` attempts injected: the first would
+        /// block, the second sends.
+        send_attempts: usize,
+        /// The ancillary input visible at each injected send attempt.
+        send_controls: Vec<Vec<u8>>,
+        /// Memory visible to a sibling when an export report yields.
+        export_wait_controls: Mutex<Vec<Vec<u8>>>,
+        /// `Resources::passes_descriptors_out` of each resource request, in
+        /// the order the requests arrive, the empty ones included.
+        passes_out: Mutex<Vec<bool>>,
+        /// What a `connect`'s second attempt returns.
+        connect_completes: Result<i64, Errno>,
+        pairing_probe: Option<PairingProbe>,
     }
 
     impl EventGuest {
@@ -1190,35 +1357,61 @@ mod event_tests {
         }
     }
 
-    struct UnusedStack;
     struct UnusedStackGuard;
 
-    impl Drop for UnusedStackGuard {
-        fn drop(&mut self) {}
+    /// Where the fixture's guest stack starts, and where it ends.
+    const STACK_BASE: usize = 0x3c00;
+    const STACK_END: usize = 0x4000;
+    /// The process id the fixture's injected `getpid` and `SO_PEERCRED`
+    /// report.
+    const EVENT_PID: i32 = 4242;
+
+    /// A guest stack in the fixture's memory, for the injections that need
+    /// one (`socket_option`): values are written as they are pushed.
+    struct EventStack {
+        memory: EventMemory,
+        top: usize,
     }
 
-    impl reverie::Stack for UnusedStack {
+    impl reverie::Stack for EventStack {
         type StackGuard = UnusedStackGuard;
 
         fn size(&self) -> usize {
-            panic!("readv event must not use a guest stack")
+            self.top - STACK_BASE
         }
 
         fn capacity(&self) -> usize {
-            panic!("readv event must not use a guest stack")
+            STACK_END - STACK_BASE
         }
 
-        fn push<'stack, T>(&mut self, _value: T) -> Addr<'stack, T> {
-            panic!("readv event must not use a guest stack")
+        fn push<'stack, T>(&mut self, value: T) -> Addr<'stack, T> {
+            let at = self.reserve::<T>();
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    (&value as *const T).cast::<u8>(),
+                    std::mem::size_of::<T>(),
+                )
+            };
+            let start = at.as_raw();
+            self.memory.0.lock().unwrap()[start..start + bytes.len()].copy_from_slice(bytes);
+            Addr::from_raw(start).unwrap()
         }
 
         fn reserve<'stack, T>(&mut self) -> AddrMut<'stack, T> {
-            panic!("readv event must not use a guest stack")
+            let align = std::mem::align_of::<T>();
+            let at = self.top.div_ceil(align) * align;
+            self.top = at + std::mem::size_of::<T>();
+            assert!(self.top <= STACK_END, "the fixture's stack overflowed");
+            AddrMut::from_raw(at).unwrap()
         }
 
         fn commit(self) -> Result<Self::StackGuard, Errno> {
-            panic!("readv event must not use a guest stack")
+            Ok(UnusedStackGuard)
         }
+    }
+
+    impl Drop for UnusedStackGuard {
+        fn drop(&mut self) {}
     }
 
     #[reverie::tool]
@@ -1227,7 +1420,7 @@ mod event_tests {
             &self,
             message: <GlobalState as GlobalTool>::Request,
         ) -> <GlobalState as GlobalTool>::Response {
-            let response = match message.2 {
+            let response = match crate::tool_global::without_cpu_publication(message.2) {
                 GlobalRequest::RequestResources(request, _)
                     if request.resources.keys().any(|resource| {
                         matches!(
@@ -1243,7 +1436,37 @@ mod event_tests {
                         .extend(request.resources.keys().cloned());
                     GlobalResponse::RequestResources(ResumeStatus::Normal)
                 }
+                GlobalRequest::RequestResources(request, _) if request.resources.is_empty() => {
+                    // A send's report of a pass-out before an attempt
+                    // (`Detcore::passes_descriptors_out_now`).
+                    self.export_wait_controls
+                        .lock()
+                        .unwrap()
+                        .push(message_control(&self.memory));
+                    self.passes_out
+                        .lock()
+                        .unwrap()
+                        .push(request.passes_descriptors_out);
+                    GlobalResponse::RequestResources(ResumeStatus::Normal)
+                }
+                GlobalRequest::RequestResources(request, _)
+                    if !request
+                        .resources
+                        .contains_key(&ResourceID::InternalIOPolling) =>
+                {
+                    // A blocking call's requests: the one that leaves the
+                    // turn and the one that rejoins it.
+                    self.passes_out
+                        .lock()
+                        .unwrap()
+                        .push(request.passes_descriptors_out);
+                    GlobalResponse::RequestResources(ResumeStatus::Normal)
+                }
                 GlobalRequest::RequestResources(request, _) => {
+                    self.passes_out
+                        .lock()
+                        .unwrap()
+                        .push(request.passes_descriptors_out);
                     assert_eq!(request.resources.len(), 1);
                     assert_eq!(
                         request.resources.get(&ResourceID::InternalIOPolling),
@@ -1257,7 +1480,9 @@ mod event_tests {
                     match request.poll_attempt {
                         0 => {}
                         1 => {
-                            assert_eq!(self.injected_iovecs, [(FIRST_DEST, 8)]);
+                            if self.send_attempts == 0 {
+                                assert_eq!(self.injected_iovecs, [(FIRST_DEST, 8)]);
+                            }
                             let (parked, resume) = self.retry_gate.lock().unwrap().take().unwrap();
                             parked.send(()).unwrap();
                             resume.await.unwrap();
@@ -1284,7 +1509,7 @@ mod event_tests {
     #[reverie::tool]
     impl Guest<Detcore> for EventGuest {
         type Memory = EventMemory;
-        type Stack = UnusedStack;
+        type Stack = EventStack;
 
         fn tid(&self) -> Pid {
             Pid::from_raw(self.thread.dettid.as_raw())
@@ -1316,11 +1541,15 @@ mod event_tests {
 
         async fn regs(&mut self) -> libc::user_regs_struct {
             if self.audit_call("regs") {
-                return libc::user_regs_struct {
-                    rip: 0x4000,
-                    eflags: 2,
-                    ..unsafe { std::mem::zeroed() }
-                };
+                // SAFETY: user_regs_struct is plain integers; all zeroes is valid.
+                let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+                crate::arch::set_instruction_pointer(&mut regs, 0x4000);
+                // x86_64's reserved flags bit 1, which always reads as one.
+                #[cfg(target_arch = "x86_64")]
+                {
+                    regs.eflags = 2;
+                }
+                return regs;
             }
             panic!("buffer observation must not request register evidence")
         }
@@ -1349,7 +1578,10 @@ mod event_tests {
         }
 
         async fn stack(&mut self) -> Self::Stack {
-            panic!("readv event must not use a guest stack")
+            EventStack {
+                memory: self.memory.clone(),
+                top: STACK_BASE,
+            }
         }
 
         async fn daemonize(&mut self) {
@@ -1358,6 +1590,37 @@ mod event_tests {
 
         async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
             let (number, args) = syscall.into_parts();
+            if let Some(probe) = &mut self.pairing_probe {
+                probe.calls.push((number, args.arg0 as i32));
+                match Syscall::from_raw(number, args) {
+                    Syscall::Accept4(_) => return Ok(i64::from(probe.accepted_fd)),
+                    Syscall::Fstat(call) => {
+                        assert_eq!(call.fd(), probe.carried_fd);
+                        // A valid fixed file identity, written into the same
+                        // guest stack buffer the production probe reserved.
+                        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                        stat.st_dev = 1;
+                        stat.st_ino = 123;
+                        stat.st_mode = libc::S_IFREG | 0o600;
+                        stat.st_nlink = 1;
+                        stat.st_size = 8;
+                        self.memory.write_value(call.stat().unwrap().0, &stat)?;
+                        return Ok(0);
+                    }
+                    Syscall::Fcntl(call) => {
+                        assert_eq!(call.fd(), FD);
+                        // R/R makes A's socket nonblocking after classifying
+                        // its peer. A began with the fixture's O_RDONLY flags.
+                        // The accepted socket already has SOCK_NONBLOCK.
+                        let reverie::syscalls::FcntlCmd::F_SETFL(flags) = call.cmd() else {
+                            panic!("unexpected peer classification probe");
+                        };
+                        assert_eq!(flags, OFlag::O_NONBLOCK.bits());
+                        return Ok(0);
+                    }
+                    _ => {}
+                }
+            }
             if matches!(
                 number,
                 Sysno::io_uring_setup | Sysno::io_uring_enter | Sysno::io_uring_register
@@ -1370,6 +1633,42 @@ mod event_tests {
                 // No host syscall: this fake backend records the invocation
                 // boundary even when the reported errno remains unchanged.
                 return Err(Errno::ENOSYS);
+            }
+            match Syscall::from_raw(number, args) {
+                Syscall::Sendmsg(_) | Syscall::Sendmmsg(_) | Syscall::Connect(_) => {
+                    if !matches!(Syscall::from_raw(number, args), Syscall::Connect(_)) {
+                        self.send_controls.push(message_control(&self.memory));
+                    }
+                    self.send_attempts += 1;
+                    let connect = matches!(Syscall::from_raw(number, args), Syscall::Connect(_));
+                    return match self.send_attempts {
+                        1 => Err(Errno::EAGAIN),
+                        2 if connect => self.connect_completes,
+                        2 => Ok(1),
+                        attempt => panic!("unexpected extra send or connect attempt {attempt}"),
+                    };
+                }
+                // A connected stream socket whose peer is this process
+                // (`classify_guest_held_peer`).
+                Syscall::Getsockopt(call) => {
+                    let value: Vec<u8> = match call.optname() {
+                        libc::SO_TYPE => libc::SOCK_STREAM.to_ne_bytes().to_vec(),
+                        libc::SO_ACCEPTCONN => 0i32.to_ne_bytes().to_vec(),
+                        libc::SO_PEERCRED => [EVENT_PID, 0, 0]
+                            .iter()
+                            .flat_map(|field| field.to_ne_bytes())
+                            .collect(),
+                        other => panic!("unexpected socket option {other}"),
+                    };
+                    let mut arena = self.memory.0.lock().unwrap();
+                    let at = call.optval().unwrap().as_raw();
+                    arena[at..at + value.len()].copy_from_slice(&value);
+                    let length = call.optlen().unwrap().as_raw();
+                    arena[length..length + 4].copy_from_slice(&(value.len() as u32).to_ne_bytes());
+                    return Ok(0);
+                }
+                Syscall::Getpid(_) => return Ok(EVENT_PID as i64),
+                _ => {}
             }
             if let Syscall::Read(call) = Syscall::from_raw(number, args) {
                 assert_eq!(call.len(), 0);
@@ -1464,6 +1763,7 @@ mod event_tests {
             detlog_io_buffers: true,
             detlog_heap: false,
             detlog_stack: false,
+            detlog_anon: None,
             detlog_regs: false,
             ..Config::default().with_backend(|backend| {
                 // The two behaviours the old `backend_is_kvm` identity flag
@@ -1471,7 +1771,6 @@ mod event_tests {
                 // address limit, is the guest's `user_address_limit` answer.
                 backend.provides_process_signal_control = true;
                 backend.emulates_child_waits = true;
-                backend.virtualizes_syscall_clobbers = true;
             })
         };
         let pid = DetPid::from_raw(1);
@@ -1504,6 +1803,12 @@ mod event_tests {
             user_address_limit_queries: Mutex::new(0),
             hb_requests: Mutex::new(Vec::new()),
             report_memory_regions: false,
+            send_attempts: 0,
+            send_controls: Vec::new(),
+            export_wait_controls: Mutex::new(Vec::new()),
+            passes_out: Mutex::new(Vec::new()),
+            connect_completes: Ok(0),
+            pairing_probe: None,
         };
         (tool, guest)
     }
@@ -1602,6 +1907,633 @@ mod event_tests {
         fn enter(&self, _span: &Id) {}
 
         fn exit(&self, _span: &Id) {}
+    }
+
+    /// A target-scoped INFO subscriber. "*" enables every INFO target;
+    /// any other value enables only that exact module.
+    struct TargetBufferLog {
+        messages: BufferLog,
+        target: &'static str,
+    }
+
+    impl Subscriber for TargetBufferLog {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() == Level::INFO
+                && (self.target == "*" || metadata.target() == self.target)
+        }
+
+        fn new_span(&self, span: &Attributes<'_>) -> Id {
+            self.messages.new_span(span)
+        }
+
+        fn record(&self, span: &Id, values: &Record<'_>) {
+            self.messages.record(span, values);
+        }
+
+        fn record_follows_from(&self, span: &Id, follows: &Id) {
+            self.messages.record_follows_from(span, follows);
+        }
+
+        fn event(&self, event: &Event<'_>) {
+            self.messages.event(event);
+        }
+
+        fn enter(&self, span: &Id) {
+            self.messages.enter(span);
+        }
+
+        fn exit(&self, span: &Id) {
+            self.messages.exit(span);
+        }
+    }
+
+    /// Where a send's message header (an `mmsghdr` for `sendmmsg`) and its
+    /// control data sit in the fixture's memory.
+    const MESSAGE: usize = 0x1800;
+    const CONTROL: usize = 0x1900;
+    /// A guest-held pipe end the rewritten message passes.
+    const MARKED: i32 = 9;
+
+    /// Writes a message header at `MESSAGE` with one iovec at `IOV` and, when
+    /// `control` holds bytes, that control data at `CONTROL`.
+    fn put_message(memory: &EventMemory, control: &[u8]) {
+        let mut header: libc::msghdr = unsafe { std::mem::zeroed() };
+        header.msg_iov = IOV as *mut libc::iovec;
+        header.msg_iovlen = 1;
+        if !control.is_empty() {
+            header.msg_control = CONTROL as *mut libc::c_void;
+            header.msg_controllen = control.len();
+        }
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&header as *const libc::msghdr).cast::<u8>(),
+                std::mem::size_of::<libc::msghdr>(),
+            )
+        };
+        let mut arena = memory.0.lock().unwrap();
+        arena[MESSAGE..MESSAGE + bytes.len()].copy_from_slice(bytes);
+        arena[CONTROL..CONTROL + control.len()].copy_from_slice(control);
+    }
+
+    /// Read the ancillary view the scripted kernel would import, independently
+    /// of the export classifier and its descriptor model.
+    fn message_control(memory: &EventMemory) -> Vec<u8> {
+        let arena = memory.0.lock().unwrap();
+        let header: libc::msghdr =
+            unsafe { std::ptr::read_unaligned(arena[MESSAGE..].as_ptr().cast()) };
+        let start = header.msg_control as usize;
+        arena[start..start + header.msg_controllen].to_vec()
+    }
+
+    /// `SCM_RIGHTS` control data that passes descriptor `fd`.
+    fn rights_passing(fd: i32) -> Vec<u8> {
+        let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) } as usize;
+        let mut control = vec![0u8; space];
+        let header = libc::cmsghdr {
+            cmsg_len: unsafe { libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) } as usize,
+            cmsg_level: libc::SOL_SOCKET,
+            cmsg_type: libc::SCM_RIGHTS,
+        };
+        let header_bytes = unsafe {
+            std::slice::from_raw_parts(
+                (&header as *const libc::cmsghdr).cast::<u8>(),
+                std::mem::size_of::<libc::cmsghdr>(),
+            )
+        };
+        control[..header_bytes.len()].copy_from_slice(header_bytes);
+        control[header_bytes.len()..header_bytes.len() + 4].copy_from_slice(&fd.to_ne_bytes());
+        control
+    }
+
+    /// What a send's message carries, and when (`send_rewritten_while_it_waits`).
+    #[derive(Clone, Copy)]
+    enum Rights {
+        /// No descriptor, throughout.
+        Never,
+        /// A guest-held pipe end, written by a sibling while the send waits.
+        Rewritten,
+        /// A guest-held pipe end, from the start.
+        FromTheStart,
+        /// Initially guest-held channel; a sibling replaces its model with an
+        /// external channel and changes the control while the send waits.
+        ReplacedChannel,
+    }
+
+    /// Runs one `sendmsg` (or, `batched`, one `sendmmsg` of one message)
+    /// through the real retry loop, on a datagram socketpair end that is not
+    /// guest-held, its message carrying descriptors as `rights` says. Returns
+    /// each request's `Resources::passes_descriptors_out`.
+    async fn send_rewritten_while_it_waits(batched: bool, rights: Rights) -> Vec<bool> {
+        let (parked_tx, parked_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        let (tool, mut guest) = event_guest(FdType::Socket, Some((parked_tx, resume_rx)));
+        guest
+            .thread
+            .with_detfd(FD, |detfd| {
+                detfd.set_socketpair_endpoint();
+                detfd.set_physically_nonblocking();
+            })
+            .unwrap();
+        let pid = DetPid::from_raw(1);
+        let marked = DetFd::new(
+            MARKED,
+            OFlag::O_RDONLY,
+            FdType::Pipe,
+            OpenFileId::new(pid, 98),
+        );
+        marked.set_guest_held();
+        guest
+            .thread
+            .file_metadata
+            .lock()
+            .unwrap()
+            .file_handles
+            .insert(MARKED, marked);
+        guest.memory.put_iovec(0, FIRST_DEST, 8);
+        if matches!(rights, Rights::ReplacedChannel) {
+            assert!(!batched, "this control tests sendmsg's captured entry view");
+            guest
+                .thread
+                .with_detfd(FD, |fd| fd.set_guest_held())
+                .unwrap();
+        }
+        let original = match rights {
+            Rights::FromTheStart | Rights::ReplacedChannel => rights_passing(MARKED),
+            Rights::Never | Rights::Rewritten => Vec::new(),
+        };
+        put_message(&guest.memory, &original);
+        let memory = guest.memory.clone();
+        let fd_table = guest.thread.file_metadata.clone();
+        let call: Syscall = if batched {
+            reverie::syscalls::Sendmmsg::new()
+                .with_sockfd(FD)
+                .with_msgvec(Addr::from_raw(MESSAGE))
+                .with_vlen(1)
+                .into()
+        } else {
+            reverie::syscalls::Sendmsg::new()
+                .with_fd(FD)
+                .with_msg(Addr::from_raw(MESSAGE))
+                .into()
+        };
+        let event = tool.handle_syscall_event(&mut guest, call);
+        let sibling = async {
+            parked_rx.await.unwrap();
+            if matches!(rights, Rights::Rewritten) {
+                put_message(&memory, &rights_passing(MARKED));
+            } else if matches!(rights, Rights::ReplacedChannel) {
+                let replacement =
+                    DetFd::new(FD, OFlag::O_RDWR, FdType::Socket, OpenFileId::new(pid, 99));
+                replacement.set_socketpair_endpoint();
+                replacement.set_physically_nonblocking();
+                fd_table
+                    .lock()
+                    .unwrap()
+                    .file_handles
+                    .insert(FD, replacement);
+                put_message(&memory, &rights_passing(MARKED + 1));
+            }
+            resume_tx.send(()).unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(event, sibling)
+        })
+        .await
+        .expect("the send did not cross its retry resource wait");
+        assert_eq!(result.unwrap(), 1);
+        assert_eq!(guest.send_attempts, 2);
+        let after_sibling = match rights {
+            Rights::Rewritten => rights_passing(MARKED),
+            Rights::ReplacedChannel => rights_passing(MARKED + 1),
+            _ => original.clone(),
+        };
+        // sendmsg imports its original header/control, as Linux did when the
+        // call began. sendmmsg's next attempted message is read afresh.
+        assert_eq!(
+            guest.send_controls,
+            [
+                original.clone(),
+                if batched {
+                    after_sibling.clone()
+                } else {
+                    original
+                }
+            ],
+            "ancillary input actually injected",
+        );
+        assert_eq!(
+            message_control(&guest.memory),
+            after_sibling,
+            "sibling writes survive the call"
+        );
+        if matches!(rights, Rights::ReplacedChannel) {
+            assert_eq!(
+                *guest.export_wait_controls.lock().unwrap(),
+                [after_sibling],
+                "the export request must not expose reinstated entry bytes to a sibling",
+            );
+        }
+        guest.passes_out.lock().unwrap().clone()
+    }
+
+    /// Captured sendmsg control bytes decide export, while a replacement
+    /// channel is classified again. A report must yield with the sibling's
+    /// rewritten bytes restored, and every attempt must still inject the
+    /// original input. The adjacent sendmmsg control keeps its refreshed view.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_sendmsg_keeps_its_captured_rights_and_restores_sibling_rewrites() {
+        assert_eq!(
+            send_rewritten_while_it_waits(false, Rights::Rewritten).await,
+            [false, false]
+        );
+        assert_eq!(
+            send_rewritten_while_it_waits(false, Rights::Never).await,
+            [false, false]
+        );
+        assert_eq!(
+            send_rewritten_while_it_waits(false, Rights::FromTheStart).await,
+            [true, false]
+        );
+        assert_eq!(
+            send_rewritten_while_it_waits(false, Rights::ReplacedChannel).await,
+            [false, false, true]
+        );
+    }
+
+    /// The same for a `sendmmsg` of one message.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_sendmmsg_rewritten_to_pass_a_descriptor_while_it_waits_revokes_every_mark() {
+        assert_eq!(
+            send_rewritten_while_it_waits(true, Rights::Rewritten).await,
+            [false, false, true]
+        );
+        assert_eq!(
+            send_rewritten_while_it_waits(true, Rights::Never).await,
+            [false, false]
+        );
+        assert_eq!(
+            send_rewritten_while_it_waits(true, Rights::FromTheStart).await,
+            [true, false]
+        );
+    }
+
+    /// A send that leaves the caller's turn counts as passing descriptors out
+    /// of the guest whatever its descriptor and messages name, decided where
+    /// it leaves (`Detcore::passes_descriptors_out_outside_the_turn`): other
+    /// threads run before the kernel imports them, and one may replace the
+    /// descriptor with an `AF_UNIX` socket that is not guest-held and rewrite
+    /// a message to pass a guest-held pipe. Here the real handler runs on a
+    /// guest-held socket that blocks in the kernel too, so the call takes the
+    /// external blocking path, and its message carries no descriptor, which
+    /// the handler's own reading does not report: the request that takes the
+    /// call out of the turn carries the report, whatever came before it
+    /// (Codex review of https://github.com/rrnewton/hermit/pull/4862).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_send_leaving_the_turn_reports_a_pass_out_with_the_request_that_leaves_it() {
+        for batched in [false, true] {
+            let (tool, mut guest) = event_guest(FdType::Socket, None);
+            guest
+                .thread
+                .with_detfd(FD, |detfd| detfd.set_guest_held())
+                .unwrap();
+            // The one attempt sends.
+            guest.send_attempts = 1;
+            guest.memory.put_iovec(0, FIRST_DEST, 8);
+            put_message(&guest.memory, &[]);
+            let call: Syscall = if batched {
+                reverie::syscalls::Sendmmsg::new()
+                    .with_sockfd(FD)
+                    .with_msgvec(Addr::from_raw(MESSAGE))
+                    .with_vlen(1)
+                    .into()
+            } else {
+                reverie::syscalls::Sendmsg::new()
+                    .with_fd(FD)
+                    .with_msg(Addr::from_raw(MESSAGE))
+                    .into()
+            };
+            let result = tool.handle_syscall_event(&mut guest, call).await;
+            assert_eq!(result.unwrap(), 1, "batched: {batched}");
+            // The request that leaves the turn, then the one that rejoins.
+            assert_eq!(
+                *guest.passes_out.lock().unwrap(),
+                [true, false],
+                "batched: {batched}"
+            );
+        }
+    }
+
+    /// Where a connect's address sits in the fixture's memory.
+    const ADDRESS: usize = 0x1a00;
+    /// Two abstract `AF_UNIX` names of one length, as `unix_address` names
+    /// them (the leading NUL included).
+    const NAME_A: &[u8] = b"\0hermit-name-a";
+    const NAME_B: &[u8] = b"\0hermit-name-b";
+
+    /// Writes an abstract `AF_UNIX` address naming `name` at `ADDRESS`;
+    /// returns its length.
+    fn put_unix_name(memory: &EventMemory, name: &[u8]) -> usize {
+        let family = (libc::AF_UNIX as libc::sa_family_t).to_ne_bytes();
+        let mut arena = memory.0.lock().unwrap();
+        arena[ADDRESS..ADDRESS + family.len()].copy_from_slice(&family);
+        let path = ADDRESS + family.len();
+        arena[path..path + name.len()].copy_from_slice(name);
+        family.len() + name.len()
+    }
+
+    /// How a `connect` in [`connect_rewritten_while_it_waits`] runs.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ConnectRun {
+        /// Polled in the caller's turns; the second attempt connects.
+        Polled,
+        /// Polled; the second attempt finds the socket already connected
+        /// (`EISCONN`), which reads as success.
+        PolledFoundConnected,
+        /// Outside the turn: the socket blocks in the kernel, and the one
+        /// attempt connects.
+        OutsideTheTurn,
+    }
+
+    /// Runs one `connect` of `FD`, a stream socket a guest made, to
+    /// `NAME_A`, both names bound by a guest beforehand, `NAME_B` to a socket
+    /// a guest made. Polled, a sibling rewrites the address to `NAME_B`
+    /// between the two attempts. Returns how many connections wait on each
+    /// name, `None` where their order is unknown, and whether the socket was
+    /// marked guest-held.
+    async fn connect_rewritten_while_it_waits(
+        run: ConnectRun,
+    ) -> (Option<usize>, Option<usize>, bool) {
+        let (parked_tx, parked_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel();
+        let (tool, mut guest) = event_guest(FdType::Socket, Some((parked_tx, resume_rx)));
+        let polled = run != ConnectRun::OutsideTheTurn;
+        guest
+            .thread
+            .with_detfd(FD, |detfd| {
+                detfd.set_unix_type(libc::SOCK_STREAM);
+                detfd.set_guest_created();
+                if polled {
+                    detfd.set_physically_nonblocking();
+                }
+            })
+            .unwrap();
+        match run {
+            ConnectRun::OutsideTheTurn => guest.send_attempts = 1,
+            ConnectRun::PolledFoundConnected => guest.connect_completes = Err(Errno::EISCONN),
+            ConnectRun::Polled => {}
+        }
+        // The second name's listener: a socket a guest made, kept open.
+        let listener = DetFd::new(
+            9,
+            OFlag::O_RDWR,
+            FdType::Socket,
+            OpenFileId::new(DetPid::from_raw(1), 97),
+        );
+        listener.set_guest_created();
+        {
+            let mut connections = guest.thread.unix_connections.lock().unwrap();
+            connections.bound(NAME_A, crate::fd::OpenFileHandle::dangling());
+            connections.bound(NAME_B, listener.open_file_handle());
+        }
+        let length = put_unix_name(&guest.memory, NAME_A);
+        let memory = guest.memory.clone();
+        let call: Syscall = reverie::syscalls::Connect::new()
+            .with_fd(FD)
+            .with_uservaddr(AddrMut::from_raw(ADDRESS))
+            .with_addrlen(length as i32)
+            .into();
+        let event = tool.handle_syscall_event(&mut guest, call);
+        let sibling = async {
+            if polled {
+                parked_rx.await.unwrap();
+                put_unix_name(&memory, NAME_B);
+                resume_tx.send(()).unwrap();
+            }
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(event, sibling)
+        })
+        .await
+        .expect("the connect did not finish");
+        assert_eq!(result.unwrap(), 0);
+        let marked = guest
+            .thread
+            .with_detfd(FD, |detfd| detfd.is_guest_held())
+            .unwrap();
+        let connections = guest.thread.unix_connections.lock().unwrap();
+        (
+            connections.waiting(NAME_A),
+            connections.waiting(NAME_B),
+            marked,
+        )
+    }
+
+    /// A connect polled in the caller's turns queues its socket for the
+    /// `accept` of the name its connecting attempt read, not the name the
+    /// address held when the call began: a sibling that rewrote the address
+    /// between attempts sent it to the other listener, whose `accept` takes
+    /// it, and the first listener's `accept` cannot take this socket's place
+    /// for another connector's connection (Codex review of
+    /// https://github.com/rrnewton/hermit/pull/4862).
+    /// It is marked guest-held from the listener it reached, both ends being
+    /// sockets guests made (`Detcore::classify_guest_held_peer`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_connect_rewritten_between_attempts_queues_for_the_name_it_reached() {
+        assert_eq!(
+            connect_rewritten_while_it_waits(ConnectRun::Polled).await,
+            (Some(0), Some(1), true)
+        );
+    }
+
+    /// A retried attempt that finds the socket already connected
+    /// (`EISCONN`, which the guest sees as success) saw neither where the
+    /// socket was connected nor the address now in memory: the connect is
+    /// paired with nothing, every name's order becomes unknown, and the socket
+    /// is not marked, though the address now names a guest-made listener
+    /// (Codex review of https://github.com/rrnewton/hermit/pull/4862).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_retried_connect_that_finds_its_socket_connected_pairs_nothing() {
+        assert_eq!(
+            connect_rewritten_while_it_waits(ConnectRun::PolledFoundConnected).await,
+            (None, None, false)
+        );
+    }
+
+    /// A connect that runs outside the caller's turn read its address at a
+    /// host-chosen moment, so it may have reached any name: no name's
+    /// queue is trusted afterwards (`Detcore::note_unix_connect`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_connect_outside_the_turn_leaves_every_name_unpaired() {
+        assert_eq!(
+            connect_rewritten_while_it_waits(ConnectRun::OutsideTheTurn).await,
+            (None, None, false)
+        );
+    }
+
+    /// Actual connect/accept/send handlers decide whether a carried FD's
+    /// fstat reaches record_or_replay. NoopTool makes the scripted injection
+    /// observable here; this is dispatch coverage, not serialized log bytes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn binary_modes_lose_unattributed_pairs_before_sent_rights_probes() {
+        const LISTENER_A: i32 = 10;
+        const LISTENER_B: i32 = 11;
+        const CONNECTOR_B: i32 = 12;
+        const ACCEPTED: i32 = 14;
+        const CARRIED: i32 = 15;
+        for (recordreplay_modes, replaying) in [(false, false), (true, false), (true, true)] {
+            for invalidate_other_name in [false, true] {
+                let (_original_tool, mut guest) = event_guest(FdType::Socket, None);
+                guest.config.recordreplay_modes = recordreplay_modes;
+                guest.config.replaying = replaying;
+                guest.config.virtualize_metadata = false;
+                guest.config.virtualize_time = false;
+                assert!(guest.config.sequentialize_threads);
+                assert!(!guest.config.backend.tool_shares_guest_descriptor_table);
+                let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+                guest.pairing_probe = Some(PairingProbe {
+                    accepted_fd: ACCEPTED,
+                    carried_fd: CARRIED,
+                    calls: Vec::new(),
+                });
+                guest
+                    .thread
+                    .with_detfd(FD, |fd| fd.set_unix_type(libc::SOCK_STREAM))
+                    .unwrap();
+                for fd in [LISTENER_A, LISTENER_B, CONNECTOR_B, CARRIED] {
+                    let ty = if fd == CARRIED {
+                        FdType::Regular
+                    } else {
+                        FdType::Socket
+                    };
+                    let descriptor = DetFd::new(
+                        fd,
+                        OFlag::O_RDWR | OFlag::O_NONBLOCK,
+                        ty,
+                        OpenFileId::new(DetPid::from_raw(1), 200 + fd as u64),
+                    );
+                    if ty == FdType::Socket {
+                        descriptor.set_unix_type(libc::SOCK_STREAM);
+                        descriptor.set_physically_nonblocking();
+                    }
+                    guest
+                        .thread
+                        .file_metadata
+                        .lock()
+                        .unwrap()
+                        .file_handles
+                        .insert(fd, descriptor);
+                }
+                tool.note_unix_bind(&mut guest, LISTENER_A, NAME_A);
+                tool.note_unix_bind(&mut guest, LISTENER_B, NAME_B);
+                let length = put_unix_name(&guest.memory, NAME_B);
+                guest.send_attempts = 1; // the one scripted connect succeeds
+                assert_eq!(
+                    tool.handle_connect(
+                        &mut guest,
+                        reverie::syscalls::Connect::new()
+                            .with_fd(CONNECTOR_B)
+                            .with_uservaddr(AddrMut::from_raw(ADDRESS))
+                            .with_addrlen(length as i32),
+                    )
+                    .await
+                    .unwrap(),
+                    0
+                );
+                if invalidate_other_name {
+                    put_unix_name(&guest.memory, NAME_A);
+                    guest.send_attempts = 1;
+                    assert_eq!(
+                        tool.handle_connect(
+                            &mut guest,
+                            reverie::syscalls::Connect::new()
+                                .with_fd(FD)
+                                .with_uservaddr(AddrMut::from_raw(ADDRESS))
+                                .with_addrlen(length as i32),
+                        )
+                        .await
+                        .unwrap(),
+                        0
+                    );
+                }
+                assert_eq!(
+                    tool.handle_accept4(
+                        &mut guest,
+                        reverie::syscalls::Accept4::new()
+                            .with_sockfd(LISTENER_B)
+                            .with_flags(reverie::syscalls::SockFlag::SOCK_NONBLOCK),
+                    )
+                    .await
+                    .unwrap(),
+                    i64::from(ACCEPTED)
+                );
+                guest.memory.put_iovec(0, FIRST_DEST, 8);
+                put_message(&guest.memory, &rights_passing(CARRIED));
+                guest.send_attempts = 1;
+                assert_eq!(
+                    tool.handle_sendmsg(
+                        &mut guest,
+                        reverie::syscalls::Sendmsg::new()
+                            .with_fd(CONNECTOR_B)
+                            .with_msg(Addr::from_raw(MESSAGE)),
+                    )
+                    .await
+                    .unwrap(),
+                    1
+                );
+                let calls = &guest.pairing_probe.as_ref().unwrap().calls;
+                let fstats: Vec<_> = calls
+                    .iter()
+                    .filter(|(call, _)| *call == Sysno::fstat)
+                    .map(|(_, fd)| *fd)
+                    .collect();
+                assert_eq!(
+                    fstats,
+                    if invalidate_other_name {
+                        Vec::new()
+                    } else {
+                        vec![CARRIED]
+                    },
+                    "carried-FD Stat membership: record={recordreplay_modes}, replay={replaying}, invalidated={invalidate_other_name}"
+                );
+                let fcntls: Vec<_> = calls
+                    .iter()
+                    .filter(|(call, _)| *call == Sysno::fcntl)
+                    .map(|(_, fd)| *fd)
+                    .collect();
+                let expected_fcntls = if recordreplay_modes && invalidate_other_name {
+                    vec![FD]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(
+                    fcntls, expected_fcntls,
+                    "peer classification probes: record={recordreplay_modes}, replay={replaying}, invalidated={invalidate_other_name}"
+                );
+                let observed: Vec<_> = calls
+                    .iter()
+                    .copied()
+                    .filter(|(call, _)| {
+                        matches!(
+                            call,
+                            Sysno::connect | Sysno::accept4 | Sysno::sendmsg | Sysno::fstat
+                        )
+                    })
+                    .collect();
+                let mut expected = vec![(Sysno::connect, CONNECTOR_B)];
+                if invalidate_other_name {
+                    expected.push((Sysno::connect, FD));
+                }
+                expected.extend([(Sysno::accept4, LISTENER_B), (Sysno::sendmsg, CONNECTOR_B)]);
+                if !invalidate_other_name {
+                    expected.push((Sysno::fstat, CARRIED));
+                }
+                assert_eq!(observed, expected, "probe identity and ordering");
+                assert_eq!(
+                    tool.rights_peer_is_stream(&mut guest, CONNECTOR_B),
+                    (!invalidate_other_name).then_some(true)
+                );
+            }
+        }
     }
 
     fn readv(count: usize) -> Syscall {
@@ -1793,8 +2725,10 @@ mod event_tests {
         }
 
         // Every syscall whose main result is a clock or timer value.
-        const TIME_READS: [Sysno; 11] = [
+        const TIME_READS: &[Sysno] = &[
             Sysno::gettimeofday,
+            // x86_64 only: aarch64 has no time syscall.
+            #[cfg(target_arch = "x86_64")]
             Sysno::time,
             Sysno::clock_gettime,
             Sysno::sysinfo,
@@ -1806,7 +2740,7 @@ mod event_tests {
             Sysno::adjtimex,
             Sysno::clock_adjtime,
         ];
-        for sysno in TIME_READS {
+        for &sysno in TIME_READS {
             assert!(observes_virtual_time(sysno), "{sysno} reads virtual time");
         }
         assert!(!observes_virtual_time(Sysno::readv));
@@ -1839,7 +2773,7 @@ mod event_tests {
         assert_eq!(second_read - first_read, time_read_cost);
         // The other time reads are charged inside the window as well, and
         // none of them counts toward the cap.
-        for sysno in TIME_READS {
+        for &sysno in TIME_READS {
             assert!(
                 booting.thread.charge_syscall_time(true, sysno),
                 "{sysno} inside the window must be charged"
@@ -2015,8 +2949,13 @@ mod event_tests {
         );
     }
 
+    /// A pipe `readv` whose iovec array another thread rewrites while it
+    /// waits moves its bytes through the array it began with, as Linux
+    /// imports it once (`EntryImport`): each nonblocking attempt is made with
+    /// that array put back, the other thread's array is restored after it,
+    /// and the observer hashes the destination the bytes went to.
     #[tokio::test(flavor = "current_thread")]
-    async fn pipe_readv_event_observes_destination_imported_after_retry_wait() {
+    async fn pipe_readv_event_observes_the_destination_the_call_began_with_across_a_retry_wait() {
         let logs = BufferLog::default();
         let _subscriber = tracing::subscriber::set_default(logs.clone());
         let (parked_tx, parked_rx) = oneshot::channel();
@@ -2041,19 +2980,101 @@ mod event_tests {
         .await
         .expect("readv did not cross its retry resource wait");
         assert_eq!(result.unwrap(), 4);
-        assert_eq!(guest.injected_iovecs, [(FIRST_DEST, 8), (RETRY_DEST, 8)]);
+        assert_eq!(guest.injected_iovecs, [(FIRST_DEST, 8), (FIRST_DEST, 8)]);
         assert_eq!(*guest.polls.lock().unwrap(), [0, 1]);
         assert_eq!(*guest.releases.lock().unwrap(), 1);
         assert_eq!(guest.thread.stats.syscall_count, 1);
-        assert_eq!(memory.bytes(FIRST_DEST, 8), [CANARY; 8]);
+        assert_eq!(memory.iovec(0), (RETRY_DEST, 8));
         assert_eq!(
-            memory.bytes(RETRY_DEST, 4).as_slice(),
+            memory.bytes(FIRST_DEST, 4).as_slice(),
             PIPE_BYTES.as_slice()
         );
-        assert_eq!(memory.bytes(RETRY_DEST + 4, 4), [CANARY; 4]);
+        assert_eq!(memory.bytes(FIRST_DEST + 4, 4), [CANARY; 4]);
+        assert_eq!(memory.bytes(RETRY_DEST, 8), [CANARY; 8]);
         let messages = logs.0.lock().unwrap();
         assert_eq!(messages.len(), 1, "{messages:?}");
-        assert_extent(&messages[0], RETRY_DEST, PIPE_BYTES);
+        assert_extent(&messages[0], FIRST_DEST, PIPE_BYTES);
+    }
+
+    /// The real retry and posthook must use the emitter's target, not the
+    /// helper/dispatcher targets. Disabled observers must add no guest reads,
+    /// including when another module's INFO records are enabled.
+    #[tokio::test(flavor = "current_thread")]
+    async fn readv_observer_uses_its_emitter_target_and_disabled_config_adds_no_reads() {
+        let mut disabled_reads = None;
+        for (enabled, target, emits) in [
+            (false, "nothing", false),
+            (false, "detcore::io_buffers", false),
+            (false, "detcore::syscalls::helpers", false),
+            (false, "*", false),
+            (true, "nothing", false),
+            (true, "detcore::syscalls::helpers", false),
+            (true, "detcore::io_buffers", true),
+        ] {
+            let case = format!("detlog_io_buffers={enabled}, target={target}");
+            let logs = BufferLog::default();
+            let _subscriber = tracing::subscriber::set_default(TargetBufferLog {
+                messages: logs.clone(),
+                target,
+            });
+            let (parked_tx, parked_rx) = oneshot::channel();
+            let (resume_tx, resume_rx) = oneshot::channel();
+            let (mut tool, mut guest) = event_guest(FdType::Pipe, Some((parked_tx, resume_rx)));
+            guest.config.detlog_io_buffers = enabled;
+            tool.cfg = guest.config.clone();
+            let memory = guest.memory.clone();
+            memory.put_iovec(0, FIRST_DEST, 8);
+
+            let event = tool.handle_syscall_event(&mut guest, readv(1));
+            let mutate_during_retry = async {
+                parked_rx.await.unwrap();
+                memory.put_iovec(0, RETRY_DEST, 8);
+                resume_tx.send(()).unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                tokio::join!(event, mutate_during_retry)
+            })
+            .await
+            .expect("readv did not cross its retry resource wait");
+            assert_eq!(result.unwrap(), 4, "{case}");
+            assert_eq!(
+                guest.injected_iovecs,
+                [(FIRST_DEST, 8), (FIRST_DEST, 8)],
+                "{case}"
+            );
+            assert_eq!(*guest.polls.lock().unwrap(), [0, 1], "{case}");
+            assert_eq!(*guest.releases.lock().unwrap(), 1, "{case}");
+            assert_eq!(guest.thread.stats.syscall_count, 1, "{case}");
+            assert_eq!(memory.iovec(0), (RETRY_DEST, 8), "{case}");
+            assert_eq!(
+                memory.bytes(FIRST_DEST, 4).as_slice(),
+                PIPE_BYTES.as_slice(),
+                "{case}"
+            );
+            assert_eq!(memory.bytes(FIRST_DEST + 4, 4), [CANARY; 4], "{case}");
+            assert_eq!(memory.bytes(RETRY_DEST, 8), [CANARY; 8], "{case}");
+            let messages = logs.0.lock().unwrap();
+            if emits {
+                assert_eq!(messages.len(), 1, "{case}: {messages:?}");
+                assert_extent(&messages[0], FIRST_DEST, PIPE_BYTES);
+            } else {
+                assert!(messages.is_empty(), "{case}: {messages:?}");
+                let reads = memory.1.lock().unwrap();
+                let footprint = (
+                    reads.imported_entries,
+                    reads.observer_reads.clone(),
+                    reads.exact_reads.clone(),
+                );
+                if let Some(expected) = &disabled_reads {
+                    assert_eq!(
+                        &footprint, expected,
+                        "{case}: disabled observation added reads"
+                    );
+                } else {
+                    disabled_reads = Some(footprint);
+                }
+            }
+        }
     }
 
     /// An ordinary readv whose observation fails after the call returns that
@@ -2146,14 +3167,14 @@ mod event_tests {
             assert_eq!(result.unwrap(), 20);
             let expected = if advances {
                 [
-                    41, 114, 187, 4, 77, 150, 223, 40, 113, 186, 3, 76, 149, 222, 39, 112, 185, 2,
-                    75, 148,
+                    175, 102, 200, 166, 218, 176, 40, 143, 247, 174, 112, 238, 2, 248, 208, 215,
+                    63, 22, 56, 54,
                 ]
             } else {
-                // Literal seed0 stream at explicit offset19, distinct from cursor0.
+                // The fixture's stream at explicit offset 19, distinct from its cursor at 0.
                 [
-                    148, 221, 38, 111, 184, 1, 74, 147, 220, 37, 110, 183, 0, 73, 146, 219, 36,
-                    109, 182, 255,
+                    54, 74, 0, 152, 31, 135, 94, 224, 126, 178, 72, 64, 167, 207, 134, 168, 134,
+                    250, 144, 8,
                 ]
             };
             assert_eq!(memory.bytes(second_iovec, 16), expected[..16]);
@@ -2211,9 +3232,9 @@ mod event_tests {
                 matches!(cause.downcast_ref::<Error>(), Some(Error::Errno(error)) if *error == fault)
             }));
                 let expected = if advances {
-                    [41, 114, 187, 4, 77, 150, 223, 40]
+                    [175, 102, 200, 166, 218, 176, 40, 143]
                 } else {
-                    [148, 221, 38, 111, 184, 1, 74, 147]
+                    [54, 74, 0, 152, 31, 135, 94, 224]
                 };
                 assert_eq!(memory.bytes(RETRY_DEST, 3), expected[..3]);
                 assert_eq!(memory.bytes(RETRY_DEST + 3, 1), [CANARY]);
@@ -2279,9 +3300,9 @@ mod event_tests {
                 "{name}"
             );
             let expected = if advances {
-                [41, 114, 187, 4, 77, 150, 223, 40]
+                [175, 102, 200, 166, 218, 176, 40, 143]
             } else {
-                [148, 221, 38, 111, 184, 1, 74, 147]
+                [54, 74, 0, 152, 31, 135, 94, 224]
             };
             assert_eq!(memory.bytes(RETRY_DEST, 3), expected[..3]);
             assert_eq!(memory.bytes(FIRST_DEST, 5), expected[3..]);
@@ -2320,9 +3341,9 @@ mod event_tests {
             let result = tool.handle_syscall_event(&mut guest, call).await;
             assert_eq!(result.unwrap(), 8, "{name}");
             let expected = if advances {
-                [41, 114, 187, 4, 77, 150, 223, 40]
+                [175, 102, 200, 166, 218, 176, 40, 143]
             } else {
-                [148, 221, 38, 111, 184, 1, 74, 147]
+                [54, 74, 0, 152, 31, 135, 94, 224]
             };
             assert_eq!(memory.bytes(RETRY_DEST, 3), expected[..3]);
             assert_eq!(memory.bytes(FIRST_DEST, 5), expected[3..]);
@@ -2364,9 +3385,9 @@ mod event_tests {
                 let result = tool.handle_syscall_event(&mut guest, call).await;
                 assert_eq!(result.unwrap(), 8);
                 let expected = if advances {
-                    [41, 114, 187, 4, 77, 150, 223, 40]
+                    [175, 102, 200, 166, 218, 176, 40, 143]
                 } else {
-                    [148, 221, 38, 111, 184, 1, 74, 147]
+                    [54, 74, 0, 152, 31, 135, 94, 224]
                 };
                 assert_eq!(memory.bytes(FIRST_DEST, 3), expected[..3]);
                 assert_eq!(memory.bytes(FIRST_DEST + 3, 1), [CANARY]);
@@ -2700,12 +3721,18 @@ mod event_tests {
     /// different `[iobuf]` records, and the record must name the device.
     #[test]
     fn a_stat_result_is_hashed_and_its_fields_are_named() {
-        let call: Syscall = reverie::syscalls::Newfstatat::new()
-            .with_dirfd(libc::AT_FDCWD)
-            .with_stat(Some(reverie::syscalls::StatPtr(
-                AddrMut::from_raw(FIRST_DEST).unwrap(),
-            )))
-            .into();
+        let call = crate::arch::fstatat_syscall(
+            reverie::syscalls::Fstatat::new()
+                .with_dirfd(libc::AT_FDCWD)
+                .with_stat(Some(reverie::syscalls::StatPtr(
+                    AddrMut::from_raw(FIRST_DEST).unwrap(),
+                ))),
+        );
+        // x86_64 numbers fstatat as newfstatat.
+        #[cfg(target_arch = "x86_64")]
+        let name = "newfstatat";
+        #[cfg(target_arch = "aarch64")]
+        let name = "fstatat";
         let mut records = Vec::new();
         for dev in [0x6, 0x7] {
             let logs = BufferLog::default();
@@ -2721,7 +3748,7 @@ mod event_tests {
             let messages = logs.0.lock().unwrap();
             assert_eq!(messages.len(), 1, "{messages:?}");
             let expected = format!(
-                "[iobuf][dtid 1] newfstatat in fd=-100 {FIRST_DEST:#x}+{}->{}",
+                "[iobuf][dtid 1] {name} in fd=-100 {FIRST_DEST:#x}+{}->{}",
                 bytes.len(),
                 Digest::new(&bytes)
             );
@@ -2754,11 +3781,14 @@ mod event_tests {
             ))
         };
         let stat_len = std::mem::size_of::<libc::stat>() as u64;
-        let calls: [(Syscall, u64); 5] = [
+        let calls: [(Syscall, u64); _] = [
+            // x86_64 only: aarch64 has fstat, fstatat and statx alone.
+            #[cfg(target_arch = "x86_64")]
             (
                 reverie::syscalls::Stat::new().with_stat(stat_ptr()).into(),
                 stat_len,
             ),
+            #[cfg(target_arch = "x86_64")]
             (
                 reverie::syscalls::Lstat::new().with_stat(stat_ptr()).into(),
                 stat_len,
@@ -2771,9 +3801,9 @@ mod event_tests {
                 stat_len,
             ),
             (
-                reverie::syscalls::Newfstatat::new()
-                    .with_stat(stat_ptr())
-                    .into(),
+                crate::arch::fstatat_syscall(
+                    reverie::syscalls::Fstatat::new().with_stat(stat_ptr()),
+                ),
                 stat_len,
             ),
             (
@@ -2817,6 +3847,92 @@ mod event_tests {
             messages[0].contains(&format!("fstat in fd={FD} ")),
             "{}",
             messages[0]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn certified_recvmsg_geometry_hashes_payload_overwriting_its_own_iovec() {
+        let logs = BufferLog::default();
+        let _subscriber = tracing::subscriber::set_default(logs.clone());
+        let (tool, mut guest) = event_guest(FdType::Socket, None);
+        let memory = guest.memory.clone();
+        memory.put_iovec(0, IOV, std::mem::size_of::<libc::iovec>());
+        let call = recvmsg_with_iov(&memory, IOV, 1, 0);
+        let captured =
+            crate::syscalls::entry_import::EntryImport::capture_observation(&memory, &call)
+                .expect("recvmsg is supported")
+                .expect("all metadata is readable");
+        assert_eq!(captured, vec![(IOV, std::mem::size_of::<libc::iovec>())]);
+        guest.thread.entry_import = crate::syscalls::entry_import::EntryImport::with_observation(
+            crate::syscalls::entry_import::EntryImport::capture(&memory, &call).map(Box::new),
+            call,
+            Some(Ok(captured)),
+        );
+        // The received bytes encode an unmapped pointer, while their actual
+        // destination is the readable iovec object itself.
+        memory.put_iovec(0, UNMAPPED, 1);
+        let payload = memory.bytes(IOV, std::mem::size_of::<libc::iovec>());
+        let before = memory.0.lock().unwrap().clone();
+        let failure = tool
+            .detlog_io_buffers_in_entry_view(
+                &mut guest,
+                &call,
+                payload.len() as i64,
+                DetTid::from_raw(1),
+                None,
+                0,
+                None,
+            )
+            .await;
+        assert!(
+            failure.is_none(),
+            "successful observation must keep the syscall result"
+        );
+        assert_eq!(
+            *memory.0.lock().unwrap(),
+            before,
+            "observer must not write guest memory"
+        );
+        let messages = logs.0.lock().unwrap();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert_named_extent(&messages[0], "recvmsg", IOV, &payload);
+        let mut original = Vec::new();
+        original.extend_from_slice(&IOV.to_ne_bytes());
+        original.extend_from_slice(&std::mem::size_of::<libc::iovec>().to_ne_bytes());
+        assert!(
+            !messages[0].contains(&Digest::new(&original).to_string()),
+            "metadata is not payload"
+        );
+    }
+
+    #[test]
+    fn actual_attempt_capture_is_complete_and_does_not_reuse_an_older_iovec() {
+        let memory = EventMemory::new();
+        let call = recvmsg_with_iov(&memory, IOV, 1, 0);
+        memory.put_iovec(0, FIRST_DEST, 4);
+        let first = crate::syscalls::entry_import::EntryImport::capture_observation(&memory, &call)
+            .unwrap()
+            .unwrap();
+        memory.put_iovec(0, FIRST_DEST + 64, 2);
+        let last = crate::syscalls::entry_import::EntryImport::capture_observation(&memory, &call)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, vec![(FIRST_DEST, 4)]);
+        assert_eq!(last, vec![(FIRST_DEST + 64, 2)]);
+        let unreadable = recvmsg_with_iov(&memory, UNMAPPED, 1, 0);
+        assert_eq!(
+            crate::syscalls::entry_import::EntryImport::capture_observation(&memory, &unreadable),
+            Some(Err(Errno::EFAULT)),
+        );
+        let entry = crate::syscalls::entry_import::EntryImport::with_observation(
+            crate::syscalls::entry_import::EntryImport::capture(&memory, &call).map(Box::new),
+            call,
+            Some(Err(Errno::EFAULT)),
+        )
+        .unwrap();
+        assert!(
+            entry.observation_geometry().is_none(),
+            "failed final capture must not reuse old metadata"
         );
     }
 
@@ -3154,7 +4270,9 @@ mod tests {
     fn poll_family_extents_use_the_low_32_bits_of_nfds() {
         let memory = LocalMemory::new();
         let nfds = (1_u64 << 32) | 1;
-        for call in [
+        let calls = [
+            // x86_64 only: aarch64 has ppoll alone.
+            #[cfg(target_arch = "x86_64")]
             Syscall::Poll(
                 syscalls::Poll::new()
                     .with_fds(AddrMut::from_raw(0x2000))
@@ -3165,7 +4283,8 @@ mod tests {
                     .with_fds(AddrMut::from_raw(0x2000))
                     .with_nfds(nfds as _),
             ),
-        ] {
+        ];
+        for call in calls {
             assert_eq!(
                 extents(&memory, &call, 1).unwrap(),
                 vec![BufferExtent {
@@ -3189,7 +4308,9 @@ mod tests {
     #[test]
     fn the_poll_family_is_exempt_from_the_return_value_guard() {
         let nfds = 3;
-        for call in [
+        let calls = [
+            // x86_64 only: aarch64 has ppoll alone.
+            #[cfg(target_arch = "x86_64")]
             Syscall::Poll(
                 syscalls::Poll::new()
                     .with_fds(AddrMut::from_raw(0x2000))
@@ -3200,7 +4321,8 @@ mod tests {
                     .with_fds(AddrMut::from_raw(0x2000))
                     .with_nfds(nfds),
             ),
-        ] {
+        ];
+        for call in calls {
             assert!(
                 !ret_gates_output(&call),
                 "{} returns a count of READY DESCRIPTORS, not a byte count, so a \
@@ -3306,7 +4428,7 @@ mod tests {
     /// 64-bit count would read past it and fail.
     #[test]
     fn vectored_calls_decode_only_the_low_32_bits_of_their_iovec_count() {
-        let page = 4096;
+        let page = crate::test_pages::page_size();
         // SAFETY: a fresh private anonymous mapping, unmapped below.
         let base = unsafe {
             libc::mmap(
@@ -3629,14 +4751,14 @@ mod tests {
     fn read_extent_in(prot: &[i32], offset: usize, bytes: &[u8], records: bool) -> ReadAndContents {
         use reverie::syscalls::MemoryAccess;
 
-        use crate::test_pages::PAGE;
         use crate::test_pages::Pages;
+        use crate::test_pages::page_size;
 
         let pages = Pages::new(prot);
         let mut memory = LocalMemory::new();
         let mut at = 0;
         while at < bytes.len() {
-            let len = (PAGE - (offset + at) % PAGE).min(bytes.len() - at);
+            let len = (page_size() - (offset + at) % page_size()).min(bytes.len() - at);
             // A page the guest cannot write keeps its fill.
             let _ = memory.write_exact(pages.address(offset + at), &bytes[at..at + len]);
             at += len;
@@ -3672,19 +4794,19 @@ mod tests {
     /// is an error, whatever the guest's buffer holds.
     #[test]
     fn only_unwritten_directory_padding_may_be_unread() {
-        use crate::test_pages::PAGE;
+        use crate::test_pages::page_size;
 
         const RW: i32 = libc::PROT_READ | libc::PROT_WRITE;
         let records = two_records();
         assert_eq!(records.len(), 48);
 
         for flag in [false, true] {
-            let (read, held) = read_extent_in(&[RW, RW], PAGE - 45, &records, flag);
+            let (read, held) = read_extent_in(&[RW, RW], page_size() - 45, &records, flag);
             assert_eq!(read.unwrap(), (held, 0), "records {flag}");
         }
 
         // The last three bytes, padding, in a page the guest cannot access.
-        let (read, held) = read_extent_in(&[RW, libc::PROT_NONE], PAGE - 45, &records, true);
+        let (read, held) = read_extent_in(&[RW, libc::PROT_NONE], page_size() - 45, &records, true);
         let (bytes, unread) = read.unwrap();
         assert_eq!(unread, 3);
         assert_eq!(bytes[..45], held[..45]);
@@ -3697,10 +4819,10 @@ mod tests {
         // write-only page here; on ptrace the word read can (see
         // `read_written_reads_every_extent_of_a_write_only_mapping`).
         for (prot, offset, flag) in [
-            ([RW, libc::PROT_NONE], PAGE - 45, false),
-            ([RW, libc::PROT_NONE], PAGE - 44, true),
+            ([RW, libc::PROT_NONE], page_size() - 45, false),
+            ([RW, libc::PROT_NONE], page_size() - 44, true),
             ([libc::PROT_WRITE, libc::PROT_WRITE], 0, true),
-            ([libc::PROT_WRITE, RW], PAGE - 24, true),
+            ([libc::PROT_WRITE, RW], page_size() - 24, true),
         ] {
             let (read, _) = read_extent_in(&prot, offset, &records, flag);
             assert!(read.is_err(), "{prot:?} at {offset}, records {flag}");

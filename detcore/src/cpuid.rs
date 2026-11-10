@@ -117,10 +117,17 @@ impl InterceptedCpuid {
                 profile: CpuProfile::HostNoRdrand,
                 xsave: [[0; 4]; XSAVE_SUBLEAVES],
             },
+            CpuProfile::Auto => panic!(
+                "--cpu-profile auto reached Detcore unresolved; the CLI resolves it to a named \
+                 profile before launch"
+            ),
         }
     }
 
     pub fn cpuid(&self, leaf: u32, subleaf: u32) -> Option<CpuIdResult> {
+        // The host profile reads the native CPUID instruction, which only x86
+        // has; launch admission refuses the profile elsewhere.
+        #[cfg(target_arch = "x86_64")]
         if self.profile == CpuProfile::HostNoRdrand {
             // Launch admission binds the tracer to the lowest originally
             // allowed CPU, including after container placement or worker reuse.
@@ -216,16 +223,44 @@ impl InterceptedCpuid {
     }
 }
 
+/// A task's `arch_status` on a CPU with AVX-512F (`avx512f`) or without it
+/// ([`InterceptedCpuid::arch_status`]).
+fn arch_status_for(avx512f: bool) -> Vec<u8> {
+    if avx512f {
+        b"AVX512_elapsed_ms:\t0\n".to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
 impl InterceptedCpuid {
+    /// A task's `/proc/<pid>/arch_status` for the CPU this table describes:
+    /// Linux prints its one line, `AVX512_elapsed_ms`, exactly when the CPU
+    /// has AVX-512F (`proc_pid_arch_status`, arch/x86/kernel/fpu/xstate.c,
+    /// `cpu_feature_enabled(X86_FEATURE_AVX512F)`), leaf 7's EBX bit 16, and
+    /// nothing otherwise. The value is how long ago the task last used
+    /// AVX-512, or -1 for never: a host timing, which Detcore reports as 0,
+    /// the value its sanitizer gives the kernel's file. So the file and the
+    /// CPUID instruction show a guest the same CPU, as `/proc/cpuinfo` does.
+    pub fn arch_status(&self) -> Vec<u8> {
+        const AVX512F: u32 = 1 << 16;
+        arch_status_for(
+            self.cpuid(0x7, 0)
+                .is_some_and(|leaf| leaf.ebx & AVX512F != 0),
+        )
+    }
+
     /// `/proc/cpuinfo` for the virtual CPU this table describes, so that the
     /// file and the CPUID instruction show a guest the same CPU
     /// (<https://github.com/rrnewton/hermit/issues/4161>). Without this, the
     /// file shows the host's model, flags and caches, which differ from host
     /// to host and contradict CPUID.
     ///
-    /// It is the block Linux's `show_cpuinfo` (arch/x86/kernel/cpu/proc.c)
-    /// prints for CPU 0 of a one-CPU machine whose CPUID answers as this table
-    /// does, with each value derived as Linux 7.1.3 derives it:
+    /// It is the blocks Linux's `show_cpuinfo` (arch/x86/kernel/cpu/proc.c)
+    /// prints for a machine of `cpus` single-core sockets whose CPUID answers
+    /// as this table does, one per CPU (CPU N's `processor`, `physical id`,
+    /// `apicid` and `initial apicid` are N, as [`on_virtual_cpu`] answers its
+    /// APIC IDs), with each value derived as Linux 7.1.3 derives it:
     /// - the vendor, family, model, stepping and `cpuid level` from leaves 0
     ///   and 1, and the model name from leaves 0x80000002-4, trimmed, or
     ///   `family/model` in hex when they hold no name (`identify_cpu`);
@@ -242,7 +277,7 @@ impl InterceptedCpuid {
     ///   `early_init_intel` clears it for, and `power management` from leaf
     ///   0x80000007's EDX.
     ///
-    /// The rest have no CPUID source and are fixed: one CPU at 1000 MHz with
+    /// The rest have no CPUID source and are fixed: each CPU at 1000 MHz with
     /// the matching TSC-calibrated `bogomips` (2000.00), and no microcode
     /// revision. `bugs` is [`CPUINFO_BUGS`], the set Linux derives for this
     /// table; it is not recomputed from the table, and
@@ -250,22 +285,53 @@ impl InterceptedCpuid {
     /// table so that a table change must revisit it. Linux's synthetic flags
     /// (such as `constant_tsc`), which describe the kernel rather than CPUID,
     /// are not shown.
-    pub fn cpuinfo(&self) -> Vec<u8> {
+    pub fn cpuinfo(&self, cpus: u32) -> Vec<u8> {
         let bugs = match self.profile {
             CpuProfile::X86_64V2 => CPUINFO_BUGS,
             CpuProfile::X86_64V3 => CPUINFO_BUGS_V3,
             // The virtual profiles' fixed vulnerability lists describe their
             // invented CPUs, not this host. Do not invent a host bug list.
             CpuProfile::HostNoRdrand => "",
+            CpuProfile::Auto => unreachable!("`Self::for_config` never builds an auto table"),
         };
-        render_cpuinfo(
-            |leaf, subleaf| {
-                self.cpuid(leaf, subleaf)
-                    .unwrap_or(cpuid_result(0, 0, 0, 0))
-            },
-            bugs,
-        )
+        (0..cpus)
+            .flat_map(|cpu| {
+                render_cpuinfo(
+                    |leaf, subleaf| {
+                        self.cpuid(leaf, subleaf)
+                            .unwrap_or(cpuid_result(0, 0, 0, 0))
+                    },
+                    bugs,
+                    cpu,
+                )
+            })
+            .collect()
     }
+}
+
+/// Whether CPUID's answer to `leaf` names the CPU that executes it: leaf 1's
+/// initial APIC ID (EBX bits 31-24), the x2APIC ID leaves 0xB and 0x1F give
+/// in EDX for every subleaf, and AMD's extended APIC IDs (leaf 0x8000001E's
+/// EAX, leaf 0x80000026's EDX). CPUID, and so this, is x86_64 only.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn names_executing_cpu(leaf: u32) -> bool {
+    matches!(leaf, 0x1 | 0xb | 0x1f | 0x8000_001e | 0x8000_0026)
+}
+
+/// `result`, the answer to `leaf`, as virtual CPU `cpu` gives it under
+/// `--virtual-cpus`: the machine is one single-core socket per CPU, so each
+/// APIC ID [`names_executing_cpu`] lists is the CPU's number, and nothing
+/// else differs from CPU to CPU. Leaf 1's count of logical processors, leaf
+/// 4 and leaf 0xB's counts already describe a one-thread, one-core package.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn on_virtual_cpu(leaf: u32, mut result: CpuIdResult, cpu: u32) -> CpuIdResult {
+    match leaf {
+        0x1 => result.ebx = (result.ebx & 0x00ff_ffff) | (cpu << 24),
+        0xb | 0x1f | 0x8000_0026 => result.edx = cpu,
+        0x8000_001e => result.eax = cpu,
+        _ => {}
+    }
+    result
 }
 
 /// Preserve the native ISA and XSAVE layout while steering feature-detecting
@@ -277,6 +343,7 @@ impl InterceptedCpuid {
 /// real TSC_AUX without trapping, so it must not be advertised. Leaf 0xD is
 /// deliberately unchanged, including subleaf 1 and components beyond PKRU:
 /// native XGETBV/XSAVE instructions need the host kernel's complete layout.
+#[cfg(target_arch = "x86_64")]
 fn mask_host_cpuid(leaf: u32, subleaf: u32, mut r: CpuIdResult) -> CpuIdResult {
     match (leaf, subleaf) {
         (1, _) => {
@@ -311,9 +378,9 @@ fn mask_host_cpuid(leaf: u32, subleaf: u32, mut r: CpuIdResult) -> CpuIdResult {
     r
 }
 
-/// [`InterceptedCpuid::cpuinfo`] for the CPU whose CPUID answers as `leaf`
-/// does.
-fn render_cpuinfo(leaf: impl Fn(u32, u32) -> CpuIdResult, bugs: &str) -> Vec<u8> {
+/// [`InterceptedCpuid::cpuinfo`]'s block for CPU `cpu`, whose CPUID answers
+/// as `leaf` does.
+fn render_cpuinfo(leaf: impl Fn(u32, u32) -> CpuIdResult, bugs: &str, cpu: u32) -> Vec<u8> {
     let basic = leaf(0, 0);
     let vendor: Vec<u8> = [basic.ebx, basic.edx, basic.ecx]
         .iter()
@@ -405,7 +472,7 @@ fn render_cpuinfo(leaf: impl Fn(u32, u32) -> CpuIdResult, bugs: &str) -> Vec<u8>
         .collect();
 
     let mut out = String::new();
-    out += "processor\t: 0\n";
+    out += &format!("processor\t: {cpu}\n");
     out += &format!("vendor_id\t: {}\n", String::from_utf8_lossy(&vendor));
     out += &format!("cpu family\t: {family}\n");
     out += &format!("model\t\t: {model}\n");
@@ -417,8 +484,8 @@ fn render_cpuinfo(leaf: impl Fn(u32, u32) -> CpuIdResult, bugs: &str) -> Vec<u8>
     if cache_kb != 0 {
         out += &format!("cache size\t: {cache_kb} KB\n");
     }
-    out += "physical id\t: 0\nsiblings\t: 1\ncore id\t\t: 0\ncpu cores\t: 1\n";
-    out += "apicid\t\t: 0\ninitial apicid\t: 0\n";
+    out += &format!("physical id\t: {cpu}\nsiblings\t: 1\ncore id\t\t: 0\ncpu cores\t: 1\n");
+    out += &format!("apicid\t\t: {cpu}\ninitial apicid\t: {cpu}\n");
     out += "fpu\t\t: yes\nfpu_exception\t: yes\n";
     out += &format!("cpuid level\t: {}\n", basic.eax);
     out += "wp\t\t: yes\n";
@@ -827,6 +894,8 @@ mod tests {
         [result.eax, result.ebx, result.ecx, result.edx]
     }
 
+    // x86_64 only: the host CPUID profile, which the build compiles only there.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn host_profile_masks_nondeterministic_instructions_and_cpu_identity() {
         // Feed every bit set, including features absent on the test host.
@@ -879,6 +948,8 @@ mod tests {
         );
     }
 
+    // x86_64 only: it executes the host's CPUID instruction.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn host_profile_preserves_xsave_subleaves_and_ordinary_host_features() {
         let profile = InterceptedCpuid::for_config(&crate::Config {
@@ -974,7 +1045,7 @@ mod tests {
             address sizes\t: 40 bits physical, 48 bits virtual\n\
             power management:\n\n";
         assert_eq!(
-            String::from_utf8(InterceptedCpuid::new().cpuinfo()).unwrap(),
+            String::from_utf8(InterceptedCpuid::new().cpuinfo(1)).unwrap(),
             expected
         );
     }
@@ -993,6 +1064,7 @@ mod tests {
                     })
             },
             CPUINFO_BUGS,
+            0,
         );
         String::from_utf8(block)
             .unwrap()
@@ -1005,6 +1077,76 @@ mod tests {
     // "GenuineIntel" and "AuthenticAMD" as leaf 0's EBX, ECX and EDX.
     const INTEL: [u32; 3] = [0x756e_6547, 0x6c65_746e, 0x4965_6e69];
     const AMD: [u32; 3] = [0x6874_7541, 0x444d_4163, 0x6974_6e65];
+
+    /// Each virtual CPU's block differs from CPU 0's only in the CPU's
+    /// number and APIC IDs, as each is a single-core socket of its own.
+    #[test]
+    fn cpuinfo_has_a_block_per_virtual_cpu() {
+        let table = InterceptedCpuid::new();
+        let one = String::from_utf8(table.cpuinfo(1)).unwrap();
+        let four = String::from_utf8(table.cpuinfo(4)).unwrap();
+        let blocks: Vec<&str> = four.split_inclusive("\n\n").collect();
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[0], one);
+        for (cpu, block) in blocks.iter().enumerate() {
+            let expected = one
+                .replace("processor\t: 0\n", &format!("processor\t: {cpu}\n"))
+                .replace("physical id\t: 0\n", &format!("physical id\t: {cpu}\n"))
+                .replace("apicid\t\t: 0\n", &format!("apicid\t\t: {cpu}\n"))
+                .replace(
+                    "initial apicid\t: 0\n",
+                    &format!("initial apicid\t: {cpu}\n"),
+                );
+            assert_eq!(*block, expected, "CPU {cpu}");
+        }
+    }
+
+    /// The APIC IDs a CPUID answer names are the executing virtual CPU's;
+    /// every other register and leaf is the table's.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn apic_ids_name_the_executing_virtual_cpu() {
+        let table = InterceptedCpuid::new();
+        let leaf1 = table.cpuid(1, 0).unwrap();
+        let on_5 = on_virtual_cpu(1, leaf1, 5);
+        assert_eq!(on_5.ebx >> 24, 5);
+        assert_eq!(on_5.ebx & 0x00ff_ffff, leaf1.ebx & 0x00ff_ffff);
+        assert_eq!(
+            (on_5.eax, on_5.ecx, on_5.edx),
+            (leaf1.eax, leaf1.ecx, leaf1.edx)
+        );
+        for subleaf in [0, 1, 7] {
+            let leaf_b = table.cpuid(0xb, subleaf).unwrap();
+            let on_3 = on_virtual_cpu(0xb, leaf_b, 3);
+            assert_eq!(on_3.edx, 3, "subleaf {subleaf}");
+            assert_eq!(
+                (on_3.eax, on_3.ebx, on_3.ecx),
+                (leaf_b.eax, leaf_b.ebx, leaf_b.ecx)
+            );
+        }
+        assert_eq!(
+            on_virtual_cpu(0x8000_001e, cpuid_result(0, 0, 0, 0), 2).eax,
+            2
+        );
+        assert_eq!(
+            on_virtual_cpu(0x8000_0026, cpuid_result(0, 0, 0, 0), 2).edx,
+            2
+        );
+        for leaf in [0, 4, 7, 0x8000_0001] {
+            assert!(!names_executing_cpu(leaf));
+            let answer = table.cpuid(leaf, 0).unwrap();
+            assert_eq!(
+                registers(on_virtual_cpu(leaf, answer, 9)),
+                registers(answer)
+            );
+        }
+        // Leaf 1 says one logical processor per package (no HTT), and leaf
+        // 0xB's only level is one thread: one single-core socket per CPU.
+        assert_eq!(leaf1.edx & (1 << 28), 0);
+        let smt = table.cpuid(0xb, 0).unwrap();
+        assert_eq!((smt.ebx & 0xffff, (smt.ecx >> 8) & 0xff), (1, 1));
+        assert_eq!((table.cpuid(0xb, 1).unwrap().ecx >> 8) & 0xff, 0);
+    }
 
     #[test]
     fn cpuinfo_follows_linux_on_other_cpus() {
@@ -1131,7 +1273,17 @@ mod tests {
     #[test]
     fn a_v3_configuration_without_host_facts_is_refused() {
         use crate::cpu_profile_admission_refusal as refusal;
-        assert_eq!(refusal(&crate::Config::default()), None);
+        let v2 = crate::Config {
+            cpu_profile: CpuProfile::X86_64V2,
+            ..Default::default()
+        };
+        assert_eq!(refusal(&v2), None);
+        // Nor does Detcore run an unresolved auto, the unset default.
+        let auto = crate::Config {
+            cpu_profile: CpuProfile::Auto,
+            ..Default::default()
+        };
+        assert!(refusal(&auto).unwrap().contains("auto was not resolved"));
         let mut v3 = crate::Config {
             cpu_profile: CpuProfile::X86_64V3,
             ..Default::default()
@@ -1240,9 +1392,47 @@ mod tests {
         assert_ne!(changed(|h| h.xfeature_max = 19), digest);
     }
 
+    /// A task's `arch_status` names AVX-512 only on a CPU that has
+    /// AVX-512F, as Linux's does: neither virtual CPU has it, so both give
+    /// the empty file a native kernel gives on such a CPU.
+    #[test]
+    fn arch_status_names_avx512_only_for_a_cpu_with_it() {
+        assert_eq!(InterceptedCpuid::new().arch_status(), b"");
+        assert_eq!(InterceptedCpuid::v3(&epyc_9d85()).arch_status(), b"");
+        assert_eq!(arch_status_for(true), b"AVX512_elapsed_ms:\t0\n");
+        assert_eq!(arch_status_for(false), b"");
+    }
+
+    /// `arch_status` reads AVX-512F from the table, leaf 7's EBX bit 16: the
+    /// host-no-rdrand table answers that leaf from this host's CPU, so the
+    /// file names AVX-512 exactly when this host's CPU has AVX-512F, the
+    /// branch neither virtual CPU reaches (on the development host, an AMD
+    /// EPYC 9D85, it does).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn arch_status_follows_the_tables_avx512f_bit() {
+        let config = crate::Config {
+            cpu_profile: CpuProfile::HostNoRdrand,
+            ..Default::default()
+        };
+        let table = InterceptedCpuid::for_config(&config);
+        let native = std::arch::x86_64::__cpuid_count(7, 0).ebx & (1 << 16) != 0;
+        let answered = table
+            .cpuid(0x7, 0)
+            .is_some_and(|leaf| leaf.ebx & (1 << 16) != 0);
+        assert_eq!(answered, native, "the host table passes AVX-512F through");
+        let expected: &[u8] = if native {
+            b"AVX512_elapsed_ms:\t0\n"
+        } else {
+            b""
+        };
+        eprintln!("this host's CPU has AVX-512F: {native}");
+        assert_eq!(table.arch_status(), expected);
+    }
+
     #[test]
     fn v3_cpuinfo_shows_the_v3_flags_and_bugs() {
-        let text = String::from_utf8(InterceptedCpuid::v3(&epyc_9d85()).cpuinfo()).unwrap();
+        let text = String::from_utf8(InterceptedCpuid::v3(&epyc_9d85()).cpuinfo(1)).unwrap();
         let line = |key: &str| {
             text.lines()
                 .find_map(|l| {
@@ -1264,7 +1454,7 @@ mod tests {
         assert_eq!(line("bugs"), CPUINFO_BUGS_V3);
         // The v2 file is unchanged.
         assert!(
-            String::from_utf8(InterceptedCpuid::new().cpuinfo())
+            String::from_utf8(InterceptedCpuid::new().cpuinfo(1))
                 .unwrap()
                 .contains(" hypervisor ")
         );

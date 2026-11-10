@@ -51,14 +51,39 @@ use crate::procfs::ids;
 use crate::record_or_replay::RecordOrReplay;
 use crate::tool_local::Detcore;
 
-/// A call whose paths are respelled with the kernel's numbers, and the
-/// transient page holding them, which the caller unmaps once the call
-/// returns.
+/// A call whose paths are respelled (with the kernel's numbers, or below a
+/// descriptor directory), and where they are staged, which the caller
+/// releases once the call returns ([`Detcore::finish_translated_call`]).
 pub(crate) struct TranslatedCall {
     pub(crate) call: Syscall,
-    pub(crate) page: AddrMut<'static, u8>,
-    pub(crate) length: usize,
+    staging: Staging,
 }
+
+/// Where a [`TranslatedCall`]'s respelled paths are staged.
+enum Staging {
+    /// In the guest stack scratch below the stack pointer, which needs no
+    /// release.
+    Scratch,
+    /// In a transient private page, unmapped once the call returns.
+    Page {
+        page: AddrMut<'static, u8>,
+        length: usize,
+    },
+}
+
+/// How far below the stack pointer the guest stack scratch for respelled
+/// paths starts: past the red zone and the whole of the scratch Reverie
+/// hands out (`Guest::stack`: the red zone's 128 bytes and 896 more, on
+/// ptrace), so a stack guard alive around the call is never overlapped and
+/// none is checked out (a second checkout while one is alive panics,
+/// `reverie-ptrace/src/stack.rs`).
+const SCRATCH_GAP: usize = 1024 + 64;
+
+/// The most bytes of respelled paths, NULs included, staged in the guest
+/// stack scratch; more go to a transient page. A path respelled below a
+/// descriptor directory starts with a short spelling of it
+/// (`/proc/self/fd/N`).
+const SCRATCH_LIMIT: usize = 512;
 
 impl<T: RecordOrReplay> Detcore<T> {
     /// Whether this guest thread's `/proc` paths may need translating: where
@@ -204,11 +229,15 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Whether [`Self::procfs_translated_call`] can translate anything in
-    /// `call`: numbers are translated on this thread, and `call` looks up a
-    /// path. Where this is false, that function answers `Ok(None)` at once,
-    /// so a caller that asks first may skip it.
+    /// `call`: numbers are translated on this thread and `call` looks up a
+    /// path, or a path of `call` may lead below a descriptor directory
+    /// (`Detcore::may_respell_below_descriptor_directory`). Where this is
+    /// false, that function answers `Ok(None)` at once, so a caller that asks
+    /// first may skip it.
     pub(crate) fn may_translate_procfs_call<G: Guest<Self>>(guest: &G, call: &Syscall) -> bool {
-        Self::translates_procfs_numbers(guest) && path_operands(call.number()).is_some()
+        ((Self::translates_procfs_numbers(guest) || Self::serves_task_directories(guest))
+            && path_operands(call.number()).is_some())
+            || Self::may_respell_below_descriptor_directory(guest, call)
     }
 
     /// `call` with each path it looks up that names a process or thread by
@@ -218,20 +247,142 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// respelled paths cannot be staged. A path is respelled where it is
     /// absolute, or relative to a directory the tool can resolve
     /// ([`Self::relative_base`]).
+    ///
+    /// A path that leads below a descriptor directory Detcore serves is
+    /// respelled as Linux resolves it instead
+    /// (`Detcore::respelled_below_descriptor_directory`), and looked up from
+    /// the working directory (`AT_FDCWD`) at its absolute spelling. The
+    /// respelled paths are staged for this one call alone
+    /// ([`Self::stage_translated`]): in the guest stack scratch, or, where
+    /// that cannot hold them, a transient private page mapped for the call
+    /// and unmapped as it returns ([`Self::finish_translated_call`]); the
+    /// guest never learns either address. Every call so translated is one
+    /// that holds the turn while it runs (no path call is committed as a
+    /// background turn), so no other guest thread runs while they are
+    /// staged, outside `--no-sequentialize-threads`.
     pub(crate) async fn procfs_translated_call<G: Guest<Self>>(
         guest: &mut G,
         call: &Syscall,
+    ) -> Result<Option<TranslatedCall>, Errno> {
+        Self::translated_call_with_scratch(guest, call, true).await
+    }
+
+    /// [`Self::own_task_backend_spelling`] of a path operand `bytes` of the
+    /// call `sysno`, with argument `values`, where the walk it decides fails
+    /// (`ENOENT` at a task that does not exist, `ELOOP` past the link limit)
+    /// only after the checks Linux makes of the call's own arguments before
+    /// any walk (`other_process_procfs::arguments_refused_before_the_walk`):
+    /// their refusal comes first, as natively (v6.17: `build_open_flags`,
+    /// `do_faccessat`, `vfs_statx`, `do_statx`); and where those checks
+    /// answer the call without a walk (two `UTIME_OMIT` times), the operand
+    /// is left as it is spelled, for the backend to answer the call as
+    /// before (package K slice K10).
+    async fn own_task_operand_spelling<G: Guest<Self>>(
+        guest: &mut G,
+        sysno: reverie::syscalls::Sysno,
+        values: &[usize; 6],
+        bytes: &[u8],
+    ) -> Result<Option<Vec<u8>>, Errno> {
+        match Self::own_task_backend_spelling(guest, bytes).await {
+            Err(walk) => match super::other_process_procfs::arguments_refused_before_the_walk(
+                &guest.memory(),
+                sysno,
+                values,
+            ) {
+                Some(Err(refused)) => Err(refused),
+                Some(Ok(_)) => Ok(None),
+                None => Err(walk),
+            },
+            spelled => spelled,
+        }
+    }
+
+    async fn translated_call_with_scratch<G: Guest<Self>>(
+        guest: &mut G,
+        call: &Syscall,
+        allow_scratch: bool,
     ) -> Result<Option<TranslatedCall>, Errno> {
         if !Self::may_translate_procfs_call(guest, call) {
             return Ok(None);
         }
         let (sysno, args) = call.into_parts();
-        let Some(operands) = path_operands(sysno) else {
-            return Ok(None);
-        };
         let mut values = [
             args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5,
         ];
+        // Where Detcore serves the caller's own task directories (KVM), each
+        // absolute path the backend is given is spelled as its executor's
+        // `/proc` answers it (`Detcore::own_task_backend_spelling`).
+        let own_tasks = Self::serves_task_directories(guest);
+        if Self::may_respell_below_descriptor_directory(guest, call) {
+            // Boxed: the respelling's future is large, and every handler that
+            // injects a path call through this one would carry it inline,
+            // while a path below a placeholder descriptor is rare.
+            let respelled =
+                Box::pin(Self::respelled_below_descriptor_directory(guest, call)).await?;
+            if !respelled.is_empty() {
+                let mut staged = Vec::with_capacity(respelled.len());
+                for operand in respelled {
+                    if let Some(dirfd) = operand.dirfd {
+                        values[dirfd] = libc::AT_FDCWD as isize as usize;
+                    }
+                    let mut bytes = operand.bytes;
+                    if own_tasks
+                        && bytes.starts_with(b"/")
+                        && let Some(spelled) = Box::pin(Self::own_task_operand_spelling(
+                            guest, sysno, &values, &bytes,
+                        ))
+                        .await?
+                    {
+                        bytes = spelled;
+                    }
+                    bytes.push(0);
+                    staged.push((operand.path, bytes));
+                }
+                return Self::stage_translated(guest, sysno, values, staged, allow_scratch)
+                    .await
+                    .map(Some);
+            }
+        }
+        if own_tasks && let Some(operands) = path_operands(sysno) {
+            let mut respelled = Vec::new();
+            for &(_, argument) in operands {
+                let Some(spelling) = PathPtr::from_ptr(values[argument] as *const libc::c_char)
+                    .and_then(|address| address.read(&guest.memory()).ok())
+                else {
+                    continue;
+                };
+                let spelling = spelling.into_os_string().into_vec();
+                // An absolute path whose first component is `proc`, however
+                // many empty or `.` components come before it.
+                if !spelling.starts_with(b"/")
+                    || spelling
+                        .split(|byte| *byte == b'/')
+                        .find(|component| !component.is_empty() && *component != b".")
+                        != Some(b"proc".as_slice())
+                {
+                    continue;
+                }
+                if let Some(mut spelled) = Box::pin(Self::own_task_operand_spelling(
+                    guest, sysno, &values, &spelling,
+                ))
+                .await?
+                {
+                    spelled.push(0);
+                    respelled.push((argument, spelled));
+                }
+            }
+            if !respelled.is_empty() {
+                return Self::stage_translated(guest, sysno, values, respelled, allow_scratch)
+                    .await
+                    .map(Some);
+            }
+        }
+        if !Self::translates_procfs_numbers(guest) {
+            return Ok(None);
+        }
+        let Some(operands) = path_operands(sysno) else {
+            return Ok(None);
+        };
         let mut respelled = Vec::new();
         for &(dirfd, argument) in operands {
             let Some(spelling) = PathPtr::from_ptr(values[argument] as *const libc::c_char)
@@ -268,9 +419,93 @@ impl<T: RecordOrReplay> Detcore<T> {
         if respelled.is_empty() {
             return Ok(None);
         }
+        Self::stage_translated(guest, sysno, values, respelled, allow_scratch)
+            .await
+            .map(Some)
+    }
+
+    /// The call `sysno` with arguments `values`, each path argument in
+    /// `respelled` (by index, with its NUL) pointing at its bytes, staged as
+    /// `Detcore::inject_fstat` stages its buffer
+    /// (<https://github.com/rrnewton/hermit/issues/3328>): in the guest stack
+    /// scratch where the paths fit in [`SCRATCH_LIMIT`] bytes, the scratch
+    /// overlaps no other argument the call may read, and it is writable;
+    /// otherwise in a transient private page mapped for the call. The
+    /// scratch maps nothing, so the guest's address space and the placement
+    /// of its later mappings stay as they were, and nothing is left behind
+    /// if the thread is killed inside the call. Only where neither can hold
+    /// them does the call fail (ENOMEM) rather than reach a directory other
+    /// than the one the guest named.
+    async fn stage_translated<G: Guest<Self>>(
+        guest: &mut G,
+        sysno: reverie::syscalls::Sysno,
+        values: [usize; 6],
+        respelled: Vec<(usize, Vec<u8>)>,
+        allow_scratch: bool,
+    ) -> Result<TranslatedCall, Errno> {
+        if allow_scratch
+            && let Some(staged) = Self::stage_in_scratch(guest, sysno, values, &respelled).await
+        {
+            return Ok(staged);
+        }
+        Self::stage_in_page(guest, sysno, values, respelled).await
+    }
+
+    /// [`Self::stage_translated`] in the guest stack scratch, or `None`
+    /// where it cannot be: [`SCRATCH_GAP`] below the stack pointer and
+    /// down, memory the x86-64 ABI leaves dead (anything below the red zone
+    /// may be overwritten at any moment, by a signal frame), written with
+    /// the call's paths and read by the call alone, in the caller's turn. A
+    /// stack pointer too low, or memory that cannot be written there (a
+    /// guard page), falls back to the page.
+    async fn stage_in_scratch<G: Guest<Self>>(
+        guest: &mut G,
+        sysno: reverie::syscalls::Sysno,
+        mut values: [usize; 6],
+        respelled: &[(usize, Vec<u8>)],
+    ) -> Option<TranslatedCall> {
         let length: usize = respelled.iter().map(|(_, bytes)| bytes.len()).sum();
-        // With no room for the respelled paths, the call fails rather than
-        // reaching the kernel's process of the guest's number.
+        if length > SCRATCH_LIMIT {
+            return None;
+        }
+        let rsp = usize::try_from(guest.regs().await.rsp).ok()?;
+        let top = rsp.checked_sub(SCRATCH_GAP)?;
+        let lowest = top.checked_sub(length)? & !15;
+        // Another argument the call reads (a second path, a buffer) must not
+        // lie in the scratch, nor in the page below it, where a buffer may
+        // start.
+        let respelled_arguments = respelled
+            .iter()
+            .map(|(argument, _)| *argument)
+            .collect::<Vec<_>>();
+        let overlaps = values.iter().enumerate().any(|(index, value)| {
+            !respelled_arguments.contains(&index)
+                && (lowest.saturating_sub(4096)..top).contains(value)
+        });
+        if overlaps {
+            return None;
+        }
+        let mut contents = Vec::with_capacity(length);
+        for (argument, bytes) in respelled {
+            values[*argument] = lowest + contents.len();
+            contents.extend_from_slice(bytes);
+        }
+        let target = AddrMut::<u8>::from_raw(lowest)?;
+        guest.memory().write_exact(target, &contents).ok()?;
+        Some(TranslatedCall {
+            call: Syscall::from_raw(sysno, raw_args(values)),
+            staging: Staging::Scratch,
+        })
+    }
+
+    /// [`Self::stage_translated`] in a transient private page.
+    async fn stage_in_page<G: Guest<Self>>(
+        guest: &mut G,
+        sysno: reverie::syscalls::Sysno,
+        mut values: [usize; 6],
+        respelled: Vec<(usize, Vec<u8>)>,
+    ) -> Result<TranslatedCall, Errno> {
+        let length: usize = respelled.iter().map(|(_, bytes)| bytes.len()).sum();
         let page = map_transient(guest, length).await.ok_or(Errno::ENOMEM)?;
         let mut contents = Vec::with_capacity(length);
         for (argument, bytes) in &respelled {
@@ -281,11 +516,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             unmap_transient(guest, page, length).await;
             return Err(Errno::ENOMEM);
         }
-        Ok(Some(TranslatedCall {
+        Ok(TranslatedCall {
             call: Syscall::from_raw(sysno, raw_args(values)),
-            page,
-            length,
-        }))
+            staging: Staging::Page { page, length },
+        })
     }
 
     /// Inject `call` directly, with its `/proc` paths translated as
@@ -296,26 +530,60 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: Syscall,
     ) -> Result<i64, Errno> {
-        let translated = Self::procfs_translated_call(guest, &call).await?;
-        let result = guest
-            .inject(
-                translated
-                    .as_ref()
-                    .map_or(call, |translated| translated.call),
-            )
-            .await;
+        Self::inject_translated_retrying(guest, call, false).await
+    }
+
+    /// An auxiliary lookup whose translated paths must not borrow guest
+    /// stack scratch: the original syscall may still need bytes that are
+    /// absent from this lookup's arguments. Keep the same translation, but
+    /// stage changed paths in the existing transient page instead.
+    pub(crate) async fn inject_translated_in_page<G: Guest<Self>>(
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Errno> {
+        let translated = Self::translated_call_with_scratch(guest, &call, false).await?;
+        let injected = translated
+            .as_ref()
+            .map_or(call, |translated| translated.call);
+        let result = guest.inject(injected).await;
         if let Some(translated) = translated {
             Self::finish_translated_call(guest, translated).await;
         }
         result
     }
 
-    /// Unmap the page of a [`TranslatedCall`] once its call returned.
+    /// [`Self::inject_translated`], made again while a signal interrupts it
+    /// where `retry` is set (`Guest::inject_with_retry`).
+    pub(crate) async fn inject_translated_retrying<G: Guest<Self>>(
+        guest: &mut G,
+        call: Syscall,
+        retry: bool,
+    ) -> Result<i64, Errno> {
+        let translated = Self::procfs_translated_call(guest, &call).await?;
+        let injected = translated
+            .as_ref()
+            .map_or(call, |translated| translated.call);
+        let result = if retry {
+            guest.inject_with_retry(injected).await
+        } else {
+            guest.inject(injected).await
+        };
+        if let Some(translated) = translated {
+            Self::finish_translated_call(guest, translated).await;
+        }
+        result
+    }
+
+    /// Release where a [`TranslatedCall`]'s paths were staged once its call
+    /// returned: drop the scratch guard, or unmap the page.
     pub(crate) async fn finish_translated_call<G: Guest<Self>>(
         guest: &mut G,
         translated: TranslatedCall,
     ) {
-        unmap_transient(guest, translated.page, translated.length).await;
+        match translated.staging {
+            Staging::Scratch => {}
+            Staging::Page { page, length } => unmap_transient(guest, page, length).await,
+        }
     }
 
     /// The kernel's number for the guest's process or thread number `id`

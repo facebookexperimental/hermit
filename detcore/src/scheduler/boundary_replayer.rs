@@ -20,6 +20,7 @@ use detcore_model::schedule::boundary::Record;
 use detcore_model::schedule::boundary::Schedule;
 
 use super::replayer::ReplayAction;
+use super::replayer::is_terminal_posthook;
 use crate::slice_boundary::grant::Budget;
 
 #[derive(Debug)]
@@ -107,7 +108,10 @@ impl BoundaryReplayer {
                     op: Op::Syscall(_, SyscallPhase::Prehook),
                     ..
                 })
-            );
+            )
+            // A committed exit has no returning continuation to background;
+            // its original exit grant supplies the terminal handoff.
+            || matches!(observed, Record::Event(event) if is_terminal_posthook(event));
         Ok(ReplayAction::ContextSwitch(!deferred, next_tid, None))
     }
 }
@@ -174,6 +178,8 @@ mod tests {
             start_rip: None,
             end_rip: None,
             end_time: None,
+            stopless: false,
+            instruction_offset: None,
         })
     }
     fn replay(records: Vec<Record>) -> BoundaryReplayer {
@@ -346,5 +352,34 @@ mod tests {
                 ReplayAction::ContextSwitch(immediate, owner(4).tid, None)
             );
         }
+    }
+
+    #[test]
+    fn terminal_posthook_handoff_preserves_target_and_stored_order() {
+        for syscall in [Sysno::exit, Sysno::exit_group] {
+            let exited = event(5, Op::Syscall(syscall, SyscallPhase::Posthook), 1);
+            let next = event(3, Op::OtherInstructions, 1);
+            let mut r = replay(vec![exited.clone(), next.clone()]);
+            assert_eq!(
+                r.observe(&exited).unwrap(),
+                ReplayAction::ContextSwitch(false, owner(3).tid, None)
+            );
+            assert_eq!(r.stored_index(), 1);
+            assert_eq!(r.record(1), Some(&next));
+            assert_eq!(r.next_thread(), Some(owner(3).tid));
+            assert_eq!(r.observe(&next).unwrap(), ReplayAction::Continue(None));
+            r.finish().unwrap();
+        }
+    }
+
+    #[test]
+    fn terminal_posthook_mismatch_refuses_without_consumption() {
+        let recorded = event(5, Op::Syscall(Sysno::exit, SyscallPhase::Posthook), 1);
+        let observed = event(5, Op::Syscall(Sysno::exit_group, SyscallPhase::Posthook), 1);
+        let mut r = replay(vec![recorded.clone(), event(3, Op::OtherInstructions, 1)]);
+        assert!(r.observe(&observed).is_err());
+        assert_eq!(r.stored_index(), 0);
+        assert_eq!(r.record(0), Some(&recorded));
+        assert!(r.finish().is_err());
     }
 }

@@ -427,7 +427,9 @@ impl NativeRunOwner {
             return Err(invalid("native server has another GlobalState"));
         }
         server.retain_connection_issues();
-        server.set_connection_admission(self.clone());
+        server
+            .set_connection_admission(self.clone())
+            .map_err(error)?;
         server
             .set_native_image_admission(self.clone(), self.clone())
             .map_err(error)

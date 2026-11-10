@@ -90,8 +90,12 @@ fn ipc_patterns_are_deterministic_across_five_runs() {
             "unexpected {pattern} output: {expected:?}"
         );
         if pattern == "pipe-capacity" {
+            // Two of the host's pages: 8192 on x86-64.
+            // SAFETY: sysconf has no preconditions.
+            let capacity = 2 * unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
             assert_eq!(
-                expected, "pipe-capacity:8192:a5\n",
+                expected,
+                format!("pipe-capacity:{capacity}:a5\n"),
                 "Hermit must not expose the host-wide pipe-page pressure state"
             );
         }

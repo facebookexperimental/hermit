@@ -13,6 +13,9 @@
 //! beside the other backends' instantiations. The entry point,
 //! [`run_detcore`], is not generic and returns a boxed future, so its callers
 //! instantiate nothing of it (see `hermit-record` for why it is boxed).
+//!
+//! `reverie_kvm` is an x86-64 VMM and empty elsewhere, and so is this crate.
+#![cfg(target_arch = "x86_64")]
 
 use std::future::Future;
 use std::pin::Pin;

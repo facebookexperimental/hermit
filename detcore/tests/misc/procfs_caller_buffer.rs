@@ -46,7 +46,7 @@ const SENTINEL: u8 = 0xa5;
 /// level, where `/proc/diskstats` exists.
 fn det_test_fn_at_standard<F>(f: F)
 where
-    F: Fn() + Send + Sync,
+    F: Fn() + Send + Sync + 'static,
 {
     let config = detcore::Config {
         max_timeslice: None,
@@ -95,7 +95,7 @@ fn assert_untouched(buf: &[u8], returned: usize, call: &str) {
 #[test]
 fn procfs_read_leaves_no_host_bytes_in_the_caller_buffer() {
     let host = require_host_disks();
-    det_test_fn_at_standard(|| {
+    det_test_fn_at_standard(move || {
         let file = File::open("/proc/diskstats").unwrap();
         let mut buf = vec![SENTINEL; LEN];
         let n = unsafe { libc::read(file.as_raw_fd(), buf.as_mut_ptr().cast(), LEN) };
@@ -107,7 +107,7 @@ fn procfs_read_leaves_no_host_bytes_in_the_caller_buffer() {
 #[test]
 fn procfs_pread_leaves_no_host_bytes_in_the_caller_buffer() {
     let host = require_host_disks();
-    det_test_fn_at_standard(|| {
+    det_test_fn_at_standard(move || {
         let file = File::open("/proc/diskstats").unwrap();
         let mut buf = vec![SENTINEL; LEN];
         let n = unsafe { libc::pread(file.as_raw_fd(), buf.as_mut_ptr().cast(), LEN, 0) };
@@ -158,7 +158,7 @@ fn assert_write_only_destination_untouched(
 #[test]
 fn procfs_read_leaves_no_host_bytes_in_a_write_only_buffer() {
     let host = require_host_disks();
-    det_test_fn_at_standard(|| {
+    det_test_fn_at_standard(move || {
         assert_write_only_destination_untouched(host, "write-only read", |fd, buf| unsafe {
             libc::read(fd, buf, WRITE_ONLY_COUNT)
         });
@@ -168,7 +168,7 @@ fn procfs_read_leaves_no_host_bytes_in_a_write_only_buffer() {
 #[test]
 fn procfs_pread_leaves_no_host_bytes_in_a_write_only_buffer() {
     let host = require_host_disks();
-    det_test_fn_at_standard(|| {
+    det_test_fn_at_standard(move || {
         assert_write_only_destination_untouched(host, "write-only pread", |fd, buf| unsafe {
             libc::pread(fd, buf, WRITE_ONLY_COUNT, 0)
         });

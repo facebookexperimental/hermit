@@ -18,6 +18,7 @@ use sha2::Sha256;
 use super::native_exec_guest_provider as provider;
 use super::native_exec_inputs::InputRole;
 use super::native_exec_inputs::seal_bytes;
+use crate::app::container_clone::CheckedClone;
 
 fn isolated(body: fn()) {
     // No host pathname is unlinked or bound. The production literal resolves
@@ -29,7 +30,7 @@ fn isolated(body: fn()) {
             Mount::tmpfs("/run")
                 .flags(MountFlags::MS_NOSUID | MountFlags::MS_NODEV | MountFlags::MS_NOEXEC),
         )
-        .run(body)
+        .checked_run(body)
         .expect("isolated provider socket control failed");
 }
 
@@ -235,6 +236,9 @@ fn aliases(source: &File) -> usize {
 
 #[test]
 fn actual_provider_socket_remains_unconnected_past_request_deadline_and_close() {
+    if crate::app::test_isolation::rerun_alone() {
+        return;
+    }
     isolated(|| {
         let listener = listener(libc::SOCK_SEQPACKET);
         let client = client();
@@ -249,6 +253,9 @@ fn actual_provider_socket_remains_unconnected_past_request_deadline_and_close() 
 
 #[test]
 fn actual_provider_first_exchange_preserves_socket_and_receives_five_sealed_roles() {
+    if crate::app::test_isolation::rerun_alone() {
+        return;
+    }
     isolated(|| {
         let listener = listener(libc::SOCK_SEQPACKET);
         let sources = sources();
@@ -296,6 +303,9 @@ fn actual_provider_first_exchange_preserves_socket_and_receives_five_sealed_role
 
 #[test]
 fn actual_provider_connect_failure_preserves_original_socket() {
+    if crate::app::test_isolation::rerun_alone() {
+        return;
+    }
     isolated(|| {
         // No listener exists at the production literal. Creation must not
         // depend on a host accepted connection or its five-second deadline.
@@ -318,6 +328,9 @@ fn actual_provider_connect_failure_preserves_original_socket() {
 
 #[test]
 fn actual_provider_second_exchange_refuses_without_second_request() {
+    if crate::app::test_isolation::rerun_alone() {
+        return;
+    }
     isolated(|| {
         let listener = listener(libc::SOCK_SEQPACKET);
         let sources = sources();
@@ -348,6 +361,9 @@ fn actual_provider_second_exchange_refuses_without_second_request() {
 
 #[test]
 fn actual_provider_malformed_reply_closes_received_descriptors() {
+    if crate::app::test_isolation::rerun_alone() {
+        return;
+    }
     isolated(|| {
         let listener = listener(libc::SOCK_SEQPACKET);
         let sources = sources();

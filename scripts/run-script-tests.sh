@@ -58,6 +58,33 @@ declare -A shards=(
     [ci/compat-envelope/scorecard.rs]=4
 )
 
+# Exactly one deferred test identity per listed script, and why; each is listed
+# before partitioning and must appear exactly once, with tests left to run.
+# - scripts/validate.rs: owner scope. Core qualification retains every
+#   validate.rs test except this complete DBT-positive case. Its source
+#   assertions remain intact; third-party nightly registration and execution
+#   are pending, not supplied by this filter.
+# - ci/build-liteinst-allocator-fixtures.rs compiles Reverie's
+#   reverie-liteinst-artifact/src/lib.rs by #[path], so its unit tests run here
+#   too. This one (Reverie 55f3dfce9) runs a factory transaction over the Reverie
+#   workspace it finds at CARGO_MANIFEST_DIR/.., a clean Git checkout with an
+#   offline Cargo cache for its locked metadata. Compiled into the package
+#   ci/prepare-rust-scripts.sh generates, CARGO_MANIFEST_DIR is that package's
+#   deleted temporary directory, not the crate's, so the test cannot name its
+#   workspace here; Reverie's own `cargo test -p reverie-liteinst-artifact`
+#   runs it. Follow-up minibeads dh-ui60v (Reverie, P1): move the test into
+#   reverie-liteinst-artifact/tests/, then drop this entry. The entry requires
+#   the identity to exist, so it holds only with a Reverie pin that has
+#   55f3dfce9 (523d3672 and later).
+declare -A deferred_cases=(
+    [scripts/validate.rs]=validate_evidence::tests::requalification_captures_and_publishes_the_committed_owner_without_full_authority
+    [ci/build-liteinst-allocator-fixtures.rs]=m1_artifact::preparation_identity::tests::qualify_transfers_refuses_nonidentity_missing_sources_and_wrong_owned_entry
+)
+declare -A deferred_reasons=(
+    [scripts/validate.rs]='core scope, one DBT case deferred'
+    [ci/build-liteinst-allocator-fixtures.rs]='one Reverie-workspace case deferred'
+)
+
 files=()
 for f in $(git ls-files '*.rs' ':!:third-party/**' ':!:scripts/lib/**'); do
     # Only standalone entrypoints: a rust-script shebang makes the file runnable
@@ -113,7 +140,7 @@ unit_listed=()
 failed_listing=()
 for f in "${files[@]}"; do
     n=${shards[$f]:-1}
-    if [ "$n" -eq 1 ]; then
+    if [ "$n" -eq 1 ] && [[ -z ${deferred_cases[$f]+present} ]]; then
         unit_file+=("$f")
         unit_label+=("$f")
         unit_names+=('')
@@ -144,6 +171,38 @@ for f in "${files[@]}"; do
         printf 'run-script-tests: %s listed no tests\n' "$f" >"$list.why"
         status=list
     fi
+    deferred_case=${deferred_cases[$f]:-}
+    if [ "$status" = 0 ] && [ -n "$deferred_case" ]; then
+        # List before partitioning: never silently defer a missing, duplicate or
+        # substring-colliding identity. Keep every other emitted name, in order.
+        unset seen_names
+        declare -A seen_names=()
+        deferred_count=0
+        for name in "${names[@]}"; do
+            if [[ -n ${seen_names["$name"]+present} ]]; then
+                printf 'run-script-tests: duplicate test identity in %s: %s\n' "$f" "$name" >"$list.why"
+                status=list
+                break
+            fi
+            seen_names["$name"]=1
+            if [ "$name" = "$deferred_case" ]; then
+                deferred_count=$((deferred_count + 1))
+            elif [[ $name == *"$deferred_case"* ]]; then
+                printf 'run-script-tests: ambiguous deferred identity: %s\n' "$name" >"$list.why"
+                status=list
+                break
+            fi
+        done
+        if [ "$status" = 0 ] && [ "$deferred_count" -ne 1 ]; then
+            printf 'run-script-tests: expected exactly one deferred identity %s, found %s\n' \
+                "$deferred_case" "$deferred_count" >"$list.why"
+            status=list
+        fi
+        if [ "$status" = 0 ] && [ "${#names[@]}" -le 1 ]; then
+            printf 'run-script-tests: %s has no tests left after its deferred one\n' "$f" >"$list.why"
+            status=list
+        fi
+    fi
     if [ "$status" != 0 ]; then
         printf 'run-script-tests: %s (listing tests)\n' "$f"
         cat -- "$list.stdout"
@@ -159,10 +218,17 @@ for f in "${files[@]}"; do
         names_file=$out/names.${#unit_file[@]}
         : >"$names_file"
         for ((i = k; i < count; i += n)); do
+            if [ -n "$deferred_case" ] && [ "${names[$i]}" = "$deferred_case" ]; then
+                continue
+            fi
             printf '%s\n' "${names[$i]}" >>"$names_file"
         done
         unit_file+=("$f")
-        unit_label+=("$f (shard $((k + 1)) of ${n}: $(wc -l <"$names_file") of ${count} tests)")
+        if [ -n "$deferred_case" ]; then
+            unit_label+=("$f (shard $((k + 1)) of ${n}: $(wc -l <"$names_file") of ${count} tests; ${deferred_reasons[$f]})")
+        else
+            unit_label+=("$f (shard $((k + 1)) of ${n}: $(wc -l <"$names_file") of ${count} tests)")
+        fi
         unit_names+=("$names_file")
         unit_listed+=("$count")
     done

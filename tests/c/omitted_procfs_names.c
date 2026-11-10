@@ -24,8 +24,10 @@
  *   fails them for a name procfs does not have; so do the checks in a thread
  *   with its own descriptor table, and after chroot("/").
  *   --kvm-local-procfs: KVM's own /proc lists no directory entries, and
- *   refuses /proc as a working directory, its directories, and renames and
- *   links that reach it (EACCES where Linux gives ENOENT, ENOTDIR or EXDEV),
+ *   refuses /proc as a working directory, its directories but the caller's
+ *   own task directories (which Detcore serves, package K slice K10), and
+ *   renames and links that reach it (EACCES where Linux gives ENOENT,
+ *   ENOTDIR or EXDEV),
  *   until it is removed (slice B4). Its executor refuses stat's sync flags
  *   (https://github.com/rrnewton/reverie/issues/1047), and the KVM backend
  *   does not implement inotify or chroot (ENOSYS), or a clone without
@@ -216,12 +218,10 @@ static void check_absent(const char* path, int kvm_local_procfs) {
   unlink(link);
 }
 
-/* The level's names that KVM's own /proc refuses: its directories, and the
- * per-process files it does not serve. */
+/* The level's names that KVM's own /proc refuses: its directories. A
+ * process's `io` is Detcore's on every backend now. */
 static int kvm_refuses(const char* path) {
-  return strcmp(path, "/proc/sys/fs") == 0 ||
-      strcmp(path, "/proc/self/task") == 0 ||
-      strcmp(path, "/proc/self/io") == 0;
+  return strcmp(path, "/proc/sys/fs") == 0;
 }
 
 /* `path` opens; returns whether it was checked. */
@@ -433,7 +433,7 @@ static int chroot_into_proc(void) {
 
 /* The names in a process's directory by its other spellings: its pid, a
  * thread's directory below `task`, and a descriptor on the directory. */
-static void check_process_spellings(int kvm_local_procfs) {
+static void check_process_spellings(void) {
   char path[64];
   snprintf(path, sizeof path, "/proc/%d/limits", (int)getpid());
   ABSENT(open(path, O_RDONLY), "open %s", path);
@@ -446,9 +446,6 @@ static void check_process_spellings(int kvm_local_procfs) {
   CHECK(fd >= 0, "open %s: %s", path, strerror(errno));
   if (fd >= 0) {
     close(fd);
-  }
-  if (kvm_local_procfs) {
-    return;
   }
   int dir = open("/proc/self", O_RDONLY | O_DIRECTORY);
   CHECK(dir >= 0, "open /proc/self: %s", strerror(errno));
@@ -571,7 +568,7 @@ int main(int argc, char** argv) {
         checked ? "present" : "unchecked (KVM's own /proc refuses it)",
         minimal[i]);
   }
-  check_process_spellings(kvm_local_procfs);
+  check_process_spellings();
   printf("a process's names by its pid, its threads and a descriptor: as the level\n");
   check_changes(kvm_local_procfs);
   printf("creating, renaming and linking: as Linux\n");
@@ -591,8 +588,8 @@ int main(int argc, char** argv) {
   }
   if (kvm_local_procfs) {
     printf(
-        "unchecked: listings, /proc as the working directory, process "
-        "directory descriptors, renames and links (KVM's own /proc); stat sync flags (KVM's executor, "
+        "unchecked: listings, /proc as the working directory, renames and "
+        "links (KVM's own /proc); stat sync flags (KVM's executor, "
         "https://github.com/rrnewton/reverie/issues/1047); inotify, a thread "
         "with its own descriptor table, chroot (no KVM support)\n");
     return failures ? 1 : 0;

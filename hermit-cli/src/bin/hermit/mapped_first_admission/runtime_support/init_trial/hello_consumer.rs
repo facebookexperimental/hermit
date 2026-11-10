@@ -31,7 +31,7 @@ pub(crate) struct HelloConsumer {
 }
 pub(crate) struct HelloReports {
     pub(crate) source: reverie_liteinst::LiteinstBackendStatsSource,
-    pub(crate) detlog: Vec<u8>,
+    pub(crate) observation: RecordObservation,
     pub(crate) drained: Arc<super::super::MappedFirstAdmission>,
 }
 impl HelloConsumer {
@@ -79,6 +79,7 @@ impl HelloConsumer {
         &mut self,
         trial: &Trial,
         mapping: &mut PreparedMapping<'_>,
+        finite_live_wait: bool,
     ) -> io::Result<ExitStatus> {
         need(!self.handover_attempted, "hello handover already attempted")?;
         self.handover_attempted = true;
@@ -109,10 +110,14 @@ impl HelloConsumer {
                     .is_some_and(|task| !task.is_finished()),
             "hello service failed before release",
         )?;
+        // Direct mapped experiments keep the original deadline start point.
+        // Only complete strict capture delegates detached execution time to its
+        // original outer owner; restoration and detach stay finitely bounded.
         let deadline = Instant::now() + WAIT;
+        let live_deadline = finite_live_wait.then_some(deadline);
         let status = tokio::select! {
             // No physical owner is moved; dropping this future retains mapping.
-            status = unsafe { mapping.handover_and_wait(deadline) } => status.map_err(rpc),
+            status = unsafe { mapping.handover_and_wait_with_live_deadline(deadline, live_deadline) } => status.map_err(rpc),
             _ = serving.issues.failed() => Err(rpc(format!("hello RPC issue: {:?}", serving.issues.snapshot()))),
             _ = self.stats_issues.failed() => Err(rpc(format!("hello stats issue: {:?}", self.stats_issues.snapshot()))),
         }?;
@@ -273,7 +278,10 @@ impl HelloConsumer {
         if records.overflow {
             errors.push("hello DETLOG exceeded existing bound".to_owned());
         }
-        let detlog = records.bytes.clone();
+        if records.counter_overflow {
+            errors.push("hello DETLOG observation count overflow".to_owned());
+        }
+        let observation = records.snapshot();
         if require_success_report {
             if source
                 .as_ref()
@@ -291,14 +299,14 @@ impl HelloConsumer {
                 errors
                     .push("hello final report has no actual physical dispatcher event".to_owned());
             }
-            if detlog.is_empty() {
+            if observation.required_records_absent() {
                 errors.push("hello produced no genuine forwarded DETLOG".to_owned());
             }
         }
         need(errors.is_empty(), &errors.join("; "))?;
         Ok(HelloReports {
             source: source.ok_or_else(|| rpc("hello actual stats source absent"))?,
-            detlog,
+            observation,
             drained: drained.ok_or_else(|| rpc("hello actual watch drain absent"))?,
         })
     }

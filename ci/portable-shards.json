@@ -26,7 +26,6 @@
     "check.shard_coverage",
     "check.backend_abstraction",
     "check.backend_parity_mutation",
-    "check.e9patch_corpus",
     "check.portability_paths",
     "check.dagrun_naming",
     "check.run_node_args",
@@ -40,7 +39,8 @@
     "selftest.pressure_test",
     "selftest.validate_rs",
     "selftest.manifest_cli",
-    "selftest.dbt_budget"
+    "selftest.core_build",
+    "check.gvisor_vendoring"
   ],
   "build_debug_nodes": [
     "e2e.audit_compile_c_programs",
@@ -98,7 +98,9 @@
         "test.hermit_integration",
         "test.cli_on_host",
         "test.arbitrary_binaries",
-        "test.applications_e2e"
+        "test.applications_e2e",
+        "e2e.manifest_gvisor_on_host",
+        "e2e.manifest_rr_on_host"
       ]
     },
     {
@@ -131,20 +133,5 @@
       ]
     }
   ],
-  "release_shards": [
-    {
-      "slug": "dbt-runtime-abi",
-      "needs": "dbt",
-      "nodes": [
-        "check.dbt_runtime_abi"
-      ]
-    },
-    {
-      "slug": "sabre",
-      "needs": "dbt",
-      "nodes": [
-        "test.sabre_examples"
-      ]
-    }
-  ]
+  "release_shards": []
 }

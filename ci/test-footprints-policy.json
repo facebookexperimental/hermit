@@ -104,8 +104,7 @@
         "test.hermit_modes_on_host",
         "test.hermit_unit",
         "test.ignored_syscall_regressions",
-        "test.rr_suite_contract",
-        "test.sabre_examples"
+        "test.rr_suite_contract"
       ],
       "e2e_all": true
     },
@@ -139,18 +138,6 @@
       "e2e_all": true
     },
     {
-      "_why": "The DBT plugin has a runtime-callback ABI check and DBT cells. The retired test.dbt_parity matrix's 28 cases are DBT cells of the c-programs and system-utils manifests since slice S13 of https://github.com/rrnewton/hermit/issues/3301, and check.dbt_runtime_abi lost the test.dbt_parity dependent that used to pull it in.",
-      "packages": ["detcore-dbt", "detcore-dbt-cdylib"],
-      "nodes": ["check.dbt_runtime_abi", "e2e.manifest_c_programs_on_host", "e2e.manifest_system_utils_on_host"],
-      "e2e_backends": ["dbt"]
-    },
-    {
-      "_why": "The SaBRe plugin has a backend-private release/examples harness and SaBRe cells.",
-      "packages": ["detcore-sabre"],
-      "nodes": ["test.sabre_examples"],
-      "e2e_backends": ["sabre"]
-    },
-    {
       "_why": "The in-guest LiteInst runtime (the detcore-liteinst cdylib) is preloaded at run time by the cli binary's in-guest LiteInst tests and by every liteinst and in-guest-trap guest, a dependency Cargo's graph does not show.",
       "packages": ["detcore-liteinst"],
       "nodes": ["test.cli_on_host"],
@@ -169,11 +156,6 @@
     }
   ],
   "path_footprints": [
-    {
-      "_why": "The e9patch preprocessing corpus and its manual driver moved out of tests/backend-parity in slice S13 of https://github.com/rrnewton/hermit/issues/3301. No validation lane has e9tool, so only the driver's contract test is selected.",
-      "paths": ["tests/e9patch/**"],
-      "nodes": ["check.e9patch_corpus"]
-    },
     {
       "_why": "The identity-fixture mutation guard and the fixtures it plants into moved to tests/c when backend-parity-c was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301).",
       "paths": ["tests/c/**"],
@@ -232,7 +214,6 @@
         ".agents/**",
         ".claude/**",
         ".llms/**",
-        "CLAUDE.md",
         "scripts/check-skill-discovery.rs"
       ],
       "nodes": ["check.skill_discovery"]
@@ -251,6 +232,190 @@
       "_why": "Standalone checks map to their own portable DAG node.",
       "paths": ["scripts/check-dagrun-naming.sh"],
       "nodes": ["check.dagrun_naming"]
+    },
+    {
+      "_why": "Super-tier own inputs (affected-super selection): node/test-list definitions and the budget files every super node runs under. A cap or selector change here can break any super node (the 4741 class) while full stays green, so every super-labelled node is named via the generated @super group.",
+      "paths": [
+        "scripts/lib/validate_super.rs",
+        "ci/manifest-plan/src/validation_dag_static.rs",
+        "ci/manifest-plan/src/validation_dag.rs",
+        "ci/manifest-plan/src/step_limits.rs",
+        "ci/manifest-plan/src/timeouts.rs",
+        "ci/nextest-timeout-config.rs",
+        "ci/nextest-binaries.rs",
+        "ci/run-nextest-counted.sh",
+        ".config/nextest.toml",
+        "tests/e2e/manifests/defaults.yaml"
+      ],
+      "nodes": ["@super"]
+    },
+    {
+      "_why": "Super nextest diagnostics select these hermit-cli test files by name; a test added there runs only in its super node.",
+      "paths": ["hermit-cli/tests/relaxed_flag_matrix.rs"],
+      "nodes": ["super.relaxed_hermit_flag_matrix"]
+    },
+    {
+      "_why": "Super nextest diagnostics select these hermit-cli test files by name; a test added there runs only in its super node.",
+      "paths": ["hermit-cli/tests/pselect6_simulation.rs"],
+      "nodes": ["super.pselect_signal_interruption_diagnostic"]
+    },
+    {
+      "_why": "Super nextest diagnostics select these hermit-cli test files by name; a test added there runs only in its super node.",
+      "paths": ["hermit-cli/tests/record_replay.rs", "hermit-cli/tests/record_replay/**"],
+      "nodes": ["super.record_replay_matrix_diagnostic"]
+    },
+    {
+      "_why": "Super nextest diagnostics select these hermit-cli test files by name; a test added there runs only in its super node.",
+      "paths": ["hermit-cli/tests/app_strict_verify.rs"],
+      "nodes": ["super.managed_jvm_strict_verify_diagnostics"]
+    },
+    {
+      "_why": "Super nextest diagnostics select these hermit-cli test files by name; a test added there runs only in its super node.",
+      "paths": ["hermit-cli/tests/ipc_determinism.rs"],
+      "nodes": ["super.ipc_determinism_diagnostic"]
+    },
+    {
+      "_why": "Super nextest diagnostics select these hermit-cli test files by name; a test added there runs only in its super node.",
+      "paths": ["hermit-cli/tests/random_determinism.rs"],
+      "nodes": ["super.random_source_determinism_diagnostic"]
+    },
+    {
+      "_why": "Super nextest diagnostics select these hermit-cli test files by name; a test added there runs only in its super node.",
+      "paths": ["hermit-cli/tests/integration_matrix.rs"],
+      "nodes": ["super.threaded_integration_matrix_diagnostic"]
+    },
+    {
+      "_why": "Super nextest diagnostics select these hermit-cli test files by name; a test added there runs only in its super node.",
+      "paths": ["hermit-cli/tests/hermit_modes.rs"],
+      "nodes": [
+        "super.chaos_hello_race_verification_diagnostic",
+        "super.pmu_buck_chaos_cases",
+        "super.weekly_relaxed_default_mode_cases"
+      ]
+    },
+    {
+      "_why": "Super nextest diagnostics select these hermit-cli test files by name; a test added there runs only in its super node.",
+      "paths": ["hermit-cli/tests/stress_suite.rs"],
+      "nodes": [
+        "super.weekly_ignored_portable_chaos_cases",
+        "super.weekly_portable_chaos_cases"
+      ]
+    },
+    {
+      "_why": "Super nextest diagnostics select these hermit-cli test files by name; a test added there runs only in its super node.",
+      "paths": ["hermit-cli/tests/leveldb.rs", "hermit-cli/tests/prepare_leveldb.sh"],
+      "nodes": [
+        "super.build_pinned_leveldb_super_fixture",
+        "super.full_leveldb_strict_determinism"
+      ]
+    },
+    {
+      "_why": "Super nextest diagnostics select these hermit-cli test files by name; a test added there runs only in its super node.",
+      "paths": ["hermit-cli/tests/sqlite_veryquick.rs"],
+      "nodes": ["super.sqlite_veryquick_strict_determinism"]
+    },
+    {
+      "_why": "The mem_race weekly diagnostics select tests_parallelism cases by exact name; the whole target directory is their own input.",
+      "paths": ["detcore/tests/parallelism/**"],
+      "nodes": [
+        "super.weekly_pmu_parallel_memory_diagnostic_mem_race_bottom_detcore",
+        "super.weekly_pmu_parallel_memory_diagnostic_mem_race_default_detcore",
+        "super.weekly_pmu_parallel_memory_diagnostic_mem_race_middle_detcore",
+        "super.weekly_pmu_parallel_memory_diagnostic_mem_race_top_detcore"
+      ]
+    },
+    {
+      "_why": "The post-fork and network super diagnostics select tests_misc cases by name; the whole target directory is their own input.",
+      "paths": ["detcore/tests/misc/**"],
+      "nodes": [
+        "super.network_syscall_determinism_diagnostic",
+        "super.post_fork_scheduling_diagnostics"
+      ]
+    },
+    {
+      "_why": "The super compat bucket selects the compat corpus heavy rows by the super label; its fixtures come from the compat prepare/workload scripts.",
+      "paths": [
+        "tests/e2e/manifests/compat.yaml",
+        "tests/compat/prepare_real_compat_fixtures.sh",
+        "tests/compat/real_compat_workload.sh",
+        "tests/compat/complex_shell_workload.sh"
+      ],
+      "nodes": ["super-compatprep.fixtures", "supercompat.manifest_compat"]
+    },
+    {
+      "_why": "Test-body precision for the PMU analyze super node: its ignored nextest cases, the hermit analyze product code they drive, and the skid calibration guest the node compiles. A slower test body here breaks only this node (the 4741 residual).",
+      "paths": [
+        "hermit-cli/tests/analyze.rs",
+        "hermit-cli/tests/common/hermit_binary.rs",
+        "hermit-cli/tests/common/skid_overshoot.rs",
+        "hermit-cli/src/bin/hermit/analyze.rs",
+        "detcore/src/skid_overshoots.rs",
+        "tests/util/pmu_skid.c"
+      ],
+      "nodes": ["super.pmu_analyze_hello_race_stress_calibrated_skid"]
+    },
+    {
+      "_why": "Quick-super selftest own inputs: each tool self-test node's program and harness sources map to exactly its node.",
+      "paths": [
+        "ci/compat-envelope/scorecard.rs",
+        "ci/prepare-scorecard-self-test-corpus.sh"
+      ],
+      "nodes": [
+        "quick-super-selftest.scorecard",
+        "quick-super-selftest.scorecard_commands"
+      ]
+    },
+    {
+      "_why": "Quick-super selftest own inputs: each tool self-test node's program and harness sources map to exactly its node.",
+      "paths": [
+        "ci/compat-envelope/pressure-test.rs",
+        "ci/compat-envelope/pressure_log_tail.rs"
+      ],
+      "nodes": ["quick-super-selftest.pressure_test"]
+    },
+    {
+      "_why": "Quick-super selftest own inputs: each tool self-test node's program and harness sources map to exactly its node.",
+      "paths": ["scripts/validate.rs", "scripts/lib/validate_*.rs"],
+      "nodes": ["quick-super-selftest.validate_rs"]
+    },
+    {
+      "_why": "Quick-super selftest own inputs: each tool self-test node's program and harness sources map to exactly its node.",
+      "paths": ["tests/manifest-cli.rs"],
+      "nodes": ["quick-super-selftest.manifest_cli"]
+    },
+    {
+      "_why": "Quick-super selftest own inputs: each tool self-test node's program and harness sources map to exactly its node.",
+      "paths": ["ci/run-with-core-build-test.sh", "ci/run-with-core-build.sh"],
+      "nodes": ["quick-super-selftest.core_build"]
+    }
+  ],
+  "backend_rules": [
+    {
+      "_why": "Shared Reverie crates every backend builds on, plus crates whose reverse-dependency closure spans multiple backends (safeptrace, reverie-inguest; enforced by the generator closure check): a pin bump touching any of these (or the reverie workspace manifests) can affect every backend, so selection falls back to the full suite.",
+      "id": "reverie-core",
+      "paths": [],
+      "reverie_paths": [
+        "reverie/**",
+        "reverie-syscalls/**",
+        "reverie-process/**",
+        "reverie-util/**",
+        "reverie-rpc-transport/**",
+        "reverie-memory/**",
+        "reverie-loader/**",
+        "safeptrace/**",
+        "reverie-inguest/**",
+        "Cargo.toml",
+        "Cargo.lock"
+      ],
+      "backends": [
+        "*"
+      ],
+      "lanes": [
+        "portable",
+        "privileged"
+      ],
+      "extra_nodes": [],
+      "tier": "core"
     }
   ]
 }

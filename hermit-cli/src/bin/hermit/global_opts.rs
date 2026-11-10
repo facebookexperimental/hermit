@@ -51,11 +51,12 @@ pub(crate) const CONTROLLER_TARGET: &str = "hermit::controller";
 /// In run and record mode, by default (`--network=local`), the guest gets its
 /// own network namespace with only a loopback interface. `--network=host`
 /// exposes the host network, which gives up isolation and reproducibility. A
-/// recording stores its choice, and `hermit replay --autopilot` replays in the
-/// same network; `hermit record start --verify-with-gdbex` defaults to, and
-/// requires, `--network=host`. The DBT backend does not apply `--network` yet:
+/// recording stores its choice, and `hermit replay` replays in the same network.
+/// `--gdbserver`, and a replay served to gdb, keep the guest's network: the
+/// gdbserver's port is bound in the host's network namespace, where a host gdb
+/// client reaches it. The DBT backend does not apply `--network` yet:
 /// its guest sees the host network
-/// (https://github.com/rrnewton/hermit/issues/3543).
+/// (<https://github.com/rrnewton/hermit/issues/3543>).
 ///
 /// In record mode, the guest's system call results are saved so that
 /// `hermit replay` can reproduce the execution. Recordings are stored in
@@ -104,12 +105,36 @@ pub struct GlobalOpts {
     /// Refused with exit 122, before any guest starts, where the guest could
     /// outlive hermit: --backend=dbt; --no-namespace with every backend,
     /// --gdbserver runs included, and so the trials of `analyze` and `bisect`
-    /// when their run arguments include --no-namespace.
+    /// when their run arguments include --no-namespace; and `hermit
+    /// --backend=sabre strace`.
     ///
     /// SIZE is a byte count with an optional K/M/G/T suffix in powers of 1024,
     /// e.g. 8G. Omit the flag for no cap.
     #[clap(long, value_name = "SIZE", value_parser = parse_max_log_bytes)]
     pub max_log_bytes: Option<u64>,
+
+    /// Keep the newest SIZE bytes of hermit's log, at the --log level or INFO
+    /// if that is quieter, in --log-ring-file, as a flight recorder.
+    ///
+    /// The file is a fixed-size ring mapped into hermit, so it holds the newest
+    /// records however hermit ends, a crash or SIGKILL included, at a cost of one
+    /// memory copy per record and no disk writes of its own beyond the page
+    /// cache's. Other logging (--log-file, or stderr) is unchanged. Read the file
+    /// with `hermit log-diff FILE`, or compare two with `hermit log-diff A B`.
+    /// SIZE is a byte count with an optional K/M/G/T suffix in powers of 1024,
+    /// at least 4K. The file is SIZE plus 64 bytes.
+    #[clap(long, value_name = "SIZE", value_parser = parse_max_log_bytes, requires = "log_ring_file")]
+    pub log_ring: Option<u64>,
+
+    /// The --log-ring file. Like --log-file it is opened on the HOST, before the
+    /// guest's container exists, and replaced if it exists.
+    #[clap(long, value_name = "FILE", requires = "log_ring")]
+    pub log_ring_file: Option<PathBuf>,
+
+    /// The --log-ring file, opened in the host's filename namespace (see
+    /// `log_file_handle`).
+    #[clap(skip)]
+    pub log_ring_handle: Option<Arc<File>>,
 
     /// Process-shared byte total for `--max-log-bytes`, created by
     /// [`GlobalOpts::prepare_log_budget`] before any container fork so the cap
@@ -138,6 +163,12 @@ pub struct GlobalOpts {
     #[clap(skip)]
     pub log_file_handle: Option<Arc<File>>,
 
+    /// A tighter bound than HERMIT_LOG_MAX_BYTES on this run's log file, in
+    /// bytes. `hermit analyze` sets it for its trials
+    /// (`AnalyzeOpts::trial_log_limit`).
+    #[clap(skip)]
+    pub log_file_limit: Option<u64>,
+
     /// Select the process instrumentation backend. This is a global option and
     /// must come before the subcommand, e.g. `hermit --backend ptrace run ...`.
     #[clap(long, value_enum, value_name = "BACKEND")]
@@ -154,7 +185,22 @@ pub struct GlobalOpts {
     pub unsafe_ignore_host_seccomp: bool,
 }
 
+/// The bound on one log file: HERMIT_LOG_MAX_BYTES (`env`), or `tighter`
+/// where that is smaller. `env` 0 lifts both, as the variable documents.
+fn tighter_log_limit(env: u64, tighter: Option<u64>) -> u64 {
+    match (env, tighter) {
+        (0, _) | (_, None) => env,
+        (env, Some(tighter)) => env.min(tighter),
+    }
+}
+
 impl GlobalOpts {
+    /// The bound on this run's log file (0 for none): HERMIT_LOG_MAX_BYTES,
+    /// within [`Self::log_file_limit`].
+    fn file_log_limit(&self) -> Result<u64, String> {
+        Ok(tighter_log_limit(log_max_bytes()?, self.log_file_limit))
+    }
+
     /// Open `--log-file` in the HOST's filename namespace.
     ///
     /// Call this from `main`, before any container exists. That placement is the
@@ -175,6 +221,19 @@ impl GlobalOpts {
                     format!("cannot open --log-file {} for writing", path.display())
                 })?;
             self.log_file_handle = Some(Arc::new(file));
+        }
+        if let Some(path) = &self.log_ring_file {
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                .open(path)
+                .with_context(|| {
+                    format!("cannot open --log-ring-file {} for writing", path.display())
+                })?;
+            self.log_ring_handle = Some(Arc::new(file));
         }
         Ok(())
     }
@@ -275,7 +334,7 @@ impl GlobalOpts {
                 let file = handle
                     .try_clone()
                     .context("cannot duplicate the host log file descriptor")?;
-                let limit = log_max_bytes().map_err(Error::msg)?;
+                let limit = self.file_log_limit().map_err(Error::msg)?;
                 EarlyLog::File(CappedWriter::file(file, limit, self.log_budget()))
             }
             None => EarlyLog::Stderr(self.log_budget()),
@@ -312,7 +371,7 @@ impl GlobalOpts {
         let guard = self.install_tracing_for_backend(backend);
         // A run admitted under --unsafe-ignore-host-seccomp says so in every
         // log it writes, the run-evidence log included, from its first record.
-        if let Some(host) = crate::host_seccomp::unverified() {
+        if let Some(host) = crate::app::host_seccomp::unverified() {
             ::tracing::info!(
                 target: "hermit::host_seccomp",
                 "unverified host seccomp filter: {} (admitted by --unsafe-ignore-host-seccomp)",
@@ -323,13 +382,34 @@ impl GlobalOpts {
     }
 
     fn install_tracing_for_backend(&self, backend: Backend) -> Option<TracingGuard> {
+        if let (Some(ring_file), Some(capacity)) = (&self.log_ring_handle, self.log_ring) {
+            let ring = super::log_ring::LogRing::create(ring_file, capacity)
+                .unwrap_or_else(|e| panic!("cannot map the --log-ring file: {e}"));
+            let file = self.log_file_handle.as_ref().map(|handle| {
+                let limit = log_max_bytes().unwrap_or_else(|e| panic!("{e}"));
+                CappedWriter::file(
+                    handle
+                        .try_clone()
+                        .expect("cannot duplicate the host log file descriptor"),
+                    limit,
+                    self.log_budget(),
+                )
+            });
+            return Some(super::tracing::init_ring_tracing(
+                self.log,
+                super::log_ring::RingWriter::new(ring),
+                file,
+                self.log_budget(),
+                backend,
+            ));
+        }
         if let Some(handle) = &self.log_file_handle {
             // Each subscriber needs an owned File; `try_clone` dups the descriptor,
             // so every run writes through the same host-side open file.
             let file_writer = handle
                 .try_clone()
                 .expect("cannot duplicate the host log file descriptor");
-            let limit = log_max_bytes().unwrap_or_else(|e| panic!("{e}"));
+            let limit = self.file_log_limit().unwrap_or_else(|e| panic!("{e}"));
             let file_writer = CappedWriter::file(file_writer, limit, self.log_budget());
             Some(init_sync_file_tracing(self.log, file_writer, backend))
         } else if let Some(path) = &self.log_file {
@@ -345,7 +425,7 @@ impl GlobalOpts {
             // A malformed bound is fatal rather than silently defaulted, so a
             // typo in the value meant to DISABLE the bound cannot quietly
             // re-enable it.
-            let limit = log_max_bytes().unwrap_or_else(|e| panic!("{e}"));
+            let limit = self.file_log_limit().unwrap_or_else(|e| panic!("{e}"));
             let file_writer = CappedWriter::file(file_writer, limit, self.log_budget());
             Some(init_sync_file_tracing(self.log, file_writer, backend))
         } else {
@@ -368,9 +448,24 @@ mod tests {
             max_log_bytes: None,
             log_budget: None,
             log_file_handle: None,
+            log_file_limit: None,
+            log_ring: None,
+            log_ring_file: None,
+            log_ring_handle: None,
             unsafe_ignore_host_seccomp: false,
             backend: None,
         }
+    }
+
+    /// A run's own log bound narrows HERMIT_LOG_MAX_BYTES and never widens
+    /// it; HERMIT_LOG_MAX_BYTES=0 lifts it too, as it lifts every bound.
+    #[test]
+    fn a_runs_log_bound_only_tightens_the_environment_bound() {
+        assert_eq!(tighter_log_limit(1 << 30, None), 1 << 30);
+        assert_eq!(tighter_log_limit(1 << 30, Some(64 << 20)), 64 << 20);
+        assert_eq!(tighter_log_limit(1 << 20, Some(64 << 20)), 1 << 20);
+        assert_eq!(tighter_log_limit(0, Some(64 << 20)), 0);
+        assert_eq!(tighter_log_limit(0, None), 0);
     }
 
     /// A reported event is a real tracing record in the run's log file, at
@@ -431,13 +526,13 @@ mod tests {
             .arg(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "global_opts::tests::a_log_file_is_written_synchronously_in_its_own_process",
+                "app::global_opts::tests::a_log_file_is_written_synchronously_in_its_own_process",
                 "--ignored",
                 "--nocapture",
                 "--test-threads=1",
             ])
             .env(SYNCHRONOUS_LOG_CHILD_ENV, &path)
-            .env_remove(crate::tracing::LOG_MAX_BYTES_ENV)
+            .env_remove(crate::app::tracing::LOG_MAX_BYTES_ENV)
             .env_remove("RUST_LOG")
             .output()
             .unwrap();

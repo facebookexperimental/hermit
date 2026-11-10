@@ -85,7 +85,6 @@ so there is a single source of truth:
   Claude/LLMS hook.
 - `.agents/skills/<name>` is a whole-package symlink to the matching canonical
   directory. Stock Codex discovers the shared `SKILL.md` through that link.
-- `CLAUDE.md` is a symlink to `AGENTS.md` for the same reason.
 
 Keep instruction bodies canonical under `.claude/skills/`; never copy the body
 into an adapter or link only the `SKILL.md` file. Run

@@ -72,10 +72,7 @@ fn the_parity_population_is_every_selected_ptrace_verify_test_on_every_candidate
 
     // The committed snapshot's population is the same set.
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let snapshot: parity::ParityCells = serde_json::from_str(
-        &std::fs::read_to_string(root.join(parity::PARITY_CELLS_PATH)).unwrap(),
-    )
-    .unwrap();
+    let snapshot: parity::ParityCells = parity::load_snapshot(&root).unwrap();
     let committed = snapshot
         .cells
         .iter()

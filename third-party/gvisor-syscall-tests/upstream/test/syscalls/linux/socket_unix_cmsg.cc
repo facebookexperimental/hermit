@@ -1,0 +1,1852 @@
+// Copyright 2018 The gVisor Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "test/syscalls/linux/socket_unix_cmsg.h"
+
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/capability.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <cstring>
+#include <vector>
+
+#include "gmock/gmock.h"
+#include "gtest/gtest.h"
+#include "test/syscalls/linux/unix_domain_socket_test_util.h"
+#include "test/util/cleanup.h"
+#include "test/util/linux_capability_util.h"
+#include "test/util/memory_util.h"
+#include "test/util/posix_error.h"
+#include "test/util/socket_util.h"
+#include "test/util/test_util.h"
+#include "test/util/thread_util.h"
+
+// This file contains tests for control message in Unix domain sockets.
+//
+// This file is a generic socket test file. It must be built with another file
+// that provides the test types.
+
+namespace gvisor {
+namespace testing {
+
+namespace {
+
+TEST_P(UnixSocketPairCmsgTest, BasicFDPass) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  auto pair =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+
+  ASSERT_NO_FATAL_FAILURE(SendSingleFD(sockets->first_fd(), pair->second_fd(),
+                                       sent_data, sizeof(sent_data)));
+
+  char received_data[20];
+  int fd = -1;
+  ASSERT_NO_FATAL_FAILURE(RecvSingleFD(sockets->second_fd(), &fd, received_data,
+                                       sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+
+  ASSERT_NO_FATAL_FAILURE(TransferTest(fd, pair->first_fd()));
+}
+
+TEST_P(UnixSocketPairCmsgTest, BasicTwoFDPass) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  auto pair1 =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+  auto pair2 =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+  int sent_fds[] = {pair1->second_fd(), pair2->second_fd()};
+
+  ASSERT_NO_FATAL_FAILURE(
+      SendFDs(sockets->first_fd(), sent_fds, 2, sent_data, sizeof(sent_data)));
+
+  char received_data[20];
+  int received_fds[] = {-1, -1};
+
+  ASSERT_NO_FATAL_FAILURE(RecvFDs(sockets->second_fd(), received_fds, 2,
+                                  received_data, sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+
+  ASSERT_NO_FATAL_FAILURE(TransferTest(received_fds[0], pair1->first_fd()));
+  ASSERT_NO_FATAL_FAILURE(TransferTest(received_fds[1], pair2->first_fd()));
+}
+
+TEST_P(UnixSocketPairCmsgTest, BasicThreeFDPass) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  auto pair1 =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+  auto pair2 =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+  auto pair3 =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+  int sent_fds[] = {pair1->second_fd(), pair2->second_fd(), pair3->second_fd()};
+
+  ASSERT_NO_FATAL_FAILURE(
+      SendFDs(sockets->first_fd(), sent_fds, 3, sent_data, sizeof(sent_data)));
+
+  char received_data[20];
+  int received_fds[] = {-1, -1, -1};
+
+  ASSERT_NO_FATAL_FAILURE(RecvFDs(sockets->second_fd(), received_fds, 3,
+                                  received_data, sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+
+  ASSERT_NO_FATAL_FAILURE(TransferTest(received_fds[0], pair1->first_fd()));
+  ASSERT_NO_FATAL_FAILURE(TransferTest(received_fds[1], pair2->first_fd()));
+  ASSERT_NO_FATAL_FAILURE(TransferTest(received_fds[2], pair3->first_fd()));
+}
+
+TEST_P(UnixSocketPairCmsgTest, BadFDPass) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  int sent_fd = -1;
+
+  struct msghdr msg = {};
+  char control[CMSG_SPACE(sizeof(sent_fd))];
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+
+  struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+  cmsg->cmsg_len = CMSG_LEN(sizeof(sent_fd));
+  cmsg->cmsg_level = SOL_SOCKET;
+  cmsg->cmsg_type = SCM_RIGHTS;
+  memcpy(CMSG_DATA(cmsg), &sent_fd, sizeof(sent_fd));
+
+  struct iovec iov;
+  iov.iov_base = sent_data;
+  iov.iov_len = sizeof(sent_data);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+
+  ASSERT_THAT(RetryEINTR(sendmsg)(sockets->first_fd(), &msg, 0),
+              SyscallFailsWithErrno(EBADF));
+}
+
+// A receive that fails with EFAULT doesn't leak the passed FDs.
+TEST_P(UnixSocketPairCmsgTest, FDPassRecvEFAULT) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+  int pipe_fds[2];
+  ASSERT_THAT(pipe2(pipe_fds, O_NONBLOCK), SyscallSucceeds());
+  Cleanup close_read_end([&] { close(pipe_fds[0]); });
+
+  char sent_data[] = {'a', 'b'};
+  ASSERT_NO_FATAL_FAILURE(SendSingleFD(sockets->first_fd(), pipe_fds[1],
+                                       sent_data, sizeof(sent_data)));
+  ASSERT_THAT(close(pipe_fds[1]), SyscallSucceeds());
+
+  // Only the first byte of the destination is accessible.
+  Mapping inaccessible =
+      ASSERT_NO_ERRNO_AND_VALUE(MmapAnon(kPageSize, PROT_NONE, MAP_PRIVATE));
+  char received_data = 0;
+  struct iovec iov[] = {
+      {.iov_base = &received_data, .iov_len = sizeof(received_data)},
+      {.iov_base = inaccessible.ptr(), .iov_len = 1},
+  };
+  char control[CMSG_SPACE(sizeof(int))] = {};
+  struct msghdr msg = {};
+  msg.msg_iov = iov;
+  msg.msg_iovlen = 2;
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+  EXPECT_THAT(RetryEINTR(recvmsg)(sockets->second_fd(), &msg, 0),
+              SyscallFailsWithErrno(EFAULT));
+
+  // Once the sockets are closed, nothing holds the pipe's write end.
+  sockets.reset();
+  char c;
+  EXPECT_THAT(ReadFd(pipe_fds[0], &c, 1), SyscallSucceedsWithValue(0));
+}
+
+// Like FDPassRecvEFAULT, but peeking without room for control messages.
+TEST_P(UnixSocketPairCmsgTest, FDPassPeekEFAULTNoControl) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+  int pipe_fds[2];
+  ASSERT_THAT(pipe2(pipe_fds, O_NONBLOCK), SyscallSucceeds());
+  Cleanup close_read_end([&] { close(pipe_fds[0]); });
+
+  char sent_data[] = {'a', 'b'};
+  ASSERT_NO_FATAL_FAILURE(SendSingleFD(sockets->first_fd(), pipe_fds[1],
+                                       sent_data, sizeof(sent_data)));
+  ASSERT_THAT(close(pipe_fds[1]), SyscallSucceeds());
+
+  // Only the first byte of the destination is accessible.
+  Mapping inaccessible =
+      ASSERT_NO_ERRNO_AND_VALUE(MmapAnon(kPageSize, PROT_NONE, MAP_PRIVATE));
+  char received_data = 0;
+  struct iovec iov[] = {
+      {.iov_base = &received_data, .iov_len = sizeof(received_data)},
+      {.iov_base = inaccessible.ptr(), .iov_len = 1},
+  };
+  struct msghdr msg = {};
+  msg.msg_iov = iov;
+  msg.msg_iovlen = 2;
+  EXPECT_THAT(RetryEINTR(recvmsg)(sockets->second_fd(), &msg, MSG_PEEK),
+              SyscallFailsWithErrno(EFAULT));
+
+  // Once the sockets are closed, nothing holds the pipe's write end.
+  sockets.reset();
+  char c;
+  EXPECT_THAT(ReadFd(pipe_fds[0], &c, 1), SyscallSucceedsWithValue(0));
+}
+
+TEST_P(UnixSocketPairCmsgTest, ShortCmsg) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  int sent_fd = -1;
+
+  struct msghdr msg = {};
+  char control[CMSG_SPACE(sizeof(sent_fd))];
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+
+  struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+  cmsg->cmsg_len = 1;
+  cmsg->cmsg_level = SOL_SOCKET;
+  cmsg->cmsg_type = SCM_RIGHTS;
+  memcpy(CMSG_DATA(cmsg), &sent_fd, sizeof(sent_fd));
+
+  struct iovec iov;
+  iov.iov_base = sent_data;
+  iov.iov_len = sizeof(sent_data);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+
+  ASSERT_THAT(RetryEINTR(sendmsg)(sockets->first_fd(), &msg, 0),
+              SyscallFailsWithErrno(EINVAL));
+}
+
+// BasicFDPassNoSpace starts off by sending a single FD just like BasicFDPass.
+// The difference is that when calling recvmsg, no space for FDs is provided,
+// only space for the cmsg header.
+TEST_P(UnixSocketPairCmsgTest, BasicFDPassNoSpace) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  auto pair =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+
+  ASSERT_NO_FATAL_FAILURE(SendSingleFD(sockets->first_fd(), pair->second_fd(),
+                                       sent_data, sizeof(sent_data)));
+
+  char received_data[20];
+
+  struct msghdr msg = {};
+  std::vector<char> control(CMSG_SPACE(0));
+  msg.msg_control = &control[0];
+  msg.msg_controllen = control.size();
+
+  struct iovec iov;
+  iov.iov_base = received_data;
+  iov.iov_len = sizeof(received_data);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+
+  ASSERT_THAT(RetryEINTR(recvmsg)(sockets->second_fd(), &msg, 0),
+              SyscallSucceedsWithValue(sizeof(received_data)));
+
+  EXPECT_EQ(msg.msg_controllen, 0);
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+}
+
+// BasicFDPassNoSpaceMsgCtrunc sends an FD, but does not provide any space to
+// receive it. It then verifies that the MSG_CTRUNC flag is set in the msghdr.
+TEST_P(UnixSocketPairCmsgTest, BasicFDPassNoSpaceMsgCtrunc) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  auto pair =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+
+  ASSERT_NO_FATAL_FAILURE(SendSingleFD(sockets->first_fd(), pair->second_fd(),
+                                       sent_data, sizeof(sent_data)));
+
+  struct msghdr msg = {};
+  std::vector<char> control(CMSG_SPACE(0));
+  msg.msg_control = &control[0];
+  msg.msg_controllen = control.size();
+
+  char received_data[sizeof(sent_data)];
+  struct iovec iov;
+  iov.iov_base = received_data;
+  iov.iov_len = sizeof(received_data);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+
+  ASSERT_THAT(RetryEINTR(recvmsg)(sockets->second_fd(), &msg, 0),
+              SyscallSucceedsWithValue(sizeof(received_data)));
+
+  EXPECT_EQ(msg.msg_controllen, 0);
+  EXPECT_EQ(msg.msg_flags, MSG_CTRUNC);
+}
+
+// BasicFDPassNullControlMsgCtrunc sends an FD and sets contradictory values for
+// msg_controllen and msg_control. msg_controllen is set to the correct size to
+// accommodate the FD, but msg_control is set to NULL. In this case, msg_control
+// should override msg_controllen.
+TEST_P(UnixSocketPairCmsgTest, BasicFDPassNullControlMsgCtrunc) {
+  // FIXME(gvisor.dev/issue/207): Fix handling of NULL msg_control.
+  SKIP_IF(IsRunningOnGvisor());
+
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  auto pair =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+
+  ASSERT_NO_FATAL_FAILURE(SendSingleFD(sockets->first_fd(), pair->second_fd(),
+                                       sent_data, sizeof(sent_data)));
+
+  struct msghdr msg = {};
+  msg.msg_controllen = CMSG_SPACE(1);
+
+  char received_data[sizeof(sent_data)];
+  struct iovec iov;
+  iov.iov_base = received_data;
+  iov.iov_len = sizeof(received_data);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+
+  ASSERT_THAT(RetryEINTR(recvmsg)(sockets->second_fd(), &msg, 0),
+              SyscallSucceedsWithValue(sizeof(received_data)));
+
+  EXPECT_EQ(msg.msg_controllen, 0);
+  EXPECT_EQ(msg.msg_flags, MSG_CTRUNC);
+}
+
+// BasicFDPassNotEnoughSpaceMsgCtrunc sends an FD, but does not provide enough
+// space to receive it. It then verifies that the MSG_CTRUNC flag is set in the
+// msghdr.
+TEST_P(UnixSocketPairCmsgTest, BasicFDPassNotEnoughSpaceMsgCtrunc) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  auto pair =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+
+  ASSERT_NO_FATAL_FAILURE(SendSingleFD(sockets->first_fd(), pair->second_fd(),
+                                       sent_data, sizeof(sent_data)));
+
+  struct msghdr msg = {};
+  std::vector<char> control(CMSG_SPACE(0) + 1);
+  msg.msg_control = &control[0];
+  msg.msg_controllen = control.size();
+
+  char received_data[sizeof(sent_data)];
+  struct iovec iov;
+  iov.iov_base = received_data;
+  iov.iov_len = sizeof(received_data);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+
+  ASSERT_THAT(RetryEINTR(recvmsg)(sockets->second_fd(), &msg, 0),
+              SyscallSucceedsWithValue(sizeof(received_data)));
+
+  EXPECT_EQ(msg.msg_controllen, 0);
+  EXPECT_EQ(msg.msg_flags, MSG_CTRUNC);
+}
+
+// BasicThreeFDPassTruncationMsgCtrunc sends three FDs, but only provides enough
+// space to receive two of them. It then verifies that the MSG_CTRUNC flag is
+// set in the msghdr.
+TEST_P(UnixSocketPairCmsgTest, BasicThreeFDPassTruncationMsgCtrunc) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  auto pair1 =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+  auto pair2 =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+  auto pair3 =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+  int sent_fds[] = {pair1->second_fd(), pair2->second_fd(), pair3->second_fd()};
+
+  ASSERT_NO_FATAL_FAILURE(
+      SendFDs(sockets->first_fd(), sent_fds, 3, sent_data, sizeof(sent_data)));
+
+  struct msghdr msg = {};
+  std::vector<char> control(CMSG_SPACE(2 * sizeof(int)));
+  msg.msg_control = &control[0];
+  msg.msg_controllen = control.size();
+
+  char received_data[sizeof(sent_data)];
+  struct iovec iov;
+  iov.iov_base = received_data;
+  iov.iov_len = sizeof(received_data);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+
+  ASSERT_THAT(RetryEINTR(recvmsg)(sockets->second_fd(), &msg, 0),
+              SyscallSucceedsWithValue(sizeof(received_data)));
+
+  EXPECT_EQ(msg.msg_flags, MSG_CTRUNC);
+
+  struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+  ASSERT_NE(cmsg, nullptr);
+  EXPECT_EQ(cmsg->cmsg_len, CMSG_LEN(2 * sizeof(int)));
+  EXPECT_EQ(cmsg->cmsg_level, SOL_SOCKET);
+  EXPECT_EQ(cmsg->cmsg_type, SCM_RIGHTS);
+}
+
+// BasicFDPassUnalignedRecv starts off by sending a single FD just like
+// BasicFDPass. The difference is that when calling recvmsg, the length of the
+// receive data is only aligned on a 4 byte boundary instead of the normal 8.
+TEST_P(UnixSocketPairCmsgTest, BasicFDPassUnalignedRecv) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  auto pair =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+
+  ASSERT_NO_FATAL_FAILURE(SendSingleFD(sockets->first_fd(), pair->second_fd(),
+                                       sent_data, sizeof(sent_data)));
+
+  char received_data[20];
+  int fd = -1;
+  ASSERT_NO_FATAL_FAILURE(RecvSingleFDUnaligned(
+      sockets->second_fd(), &fd, received_data, sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+
+  ASSERT_NO_FATAL_FAILURE(TransferTest(fd, pair->first_fd()));
+}
+
+// BasicFDPassUnalignedRecvNoMsgTrunc sends one FD and only provides enough
+// space to receive just it. (Normally the minimum amount of space one would
+// provide would be enough space for two FDs.) It then verifies that the
+// MSG_CTRUNC flag is not set in the msghdr.
+TEST_P(UnixSocketPairCmsgTest, BasicFDPassUnalignedRecvNoMsgTrunc) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  auto pair =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+
+  ASSERT_NO_FATAL_FAILURE(SendSingleFD(sockets->first_fd(), pair->second_fd(),
+                                       sent_data, sizeof(sent_data)));
+
+  struct msghdr msg = {};
+  char control[CMSG_SPACE(sizeof(int)) - sizeof(int)];
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+
+  char received_data[sizeof(sent_data)] = {};
+  struct iovec iov;
+  iov.iov_base = received_data;
+  iov.iov_len = sizeof(received_data);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+
+  ASSERT_THAT(RetryEINTR(recvmsg)(sockets->second_fd(), &msg, 0),
+              SyscallSucceedsWithValue(sizeof(received_data)));
+
+  EXPECT_EQ(msg.msg_flags, 0);
+
+  struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+  ASSERT_NE(cmsg, nullptr);
+  EXPECT_EQ(cmsg->cmsg_len, CMSG_LEN(sizeof(int)));
+  EXPECT_EQ(cmsg->cmsg_level, SOL_SOCKET);
+  EXPECT_EQ(cmsg->cmsg_type, SCM_RIGHTS);
+}
+
+// BasicTwoFDPassUnalignedRecvTruncationMsgTrunc sends two FDs, but only
+// provides enough space to receive one of them. It then verifies that the
+// MSG_CTRUNC flag is set in the msghdr.
+TEST_P(UnixSocketPairCmsgTest, BasicTwoFDPassUnalignedRecvTruncationMsgTrunc) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  auto pair =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+  int sent_fds[] = {pair->first_fd(), pair->second_fd()};
+
+  ASSERT_NO_FATAL_FAILURE(
+      SendFDs(sockets->first_fd(), sent_fds, 2, sent_data, sizeof(sent_data)));
+
+  struct msghdr msg = {};
+  // CMSG_SPACE rounds up to two FDs, we only want one.
+  char control[CMSG_SPACE(sizeof(int)) - sizeof(int)];
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+
+  char received_data[sizeof(sent_data)] = {};
+  struct iovec iov;
+  iov.iov_base = received_data;
+  iov.iov_len = sizeof(received_data);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+
+  ASSERT_THAT(RetryEINTR(recvmsg)(sockets->second_fd(), &msg, 0),
+              SyscallSucceedsWithValue(sizeof(received_data)));
+
+  EXPECT_EQ(msg.msg_flags, MSG_CTRUNC);
+
+  struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+  ASSERT_NE(cmsg, nullptr);
+  EXPECT_EQ(cmsg->cmsg_len, CMSG_LEN(sizeof(int)));
+  EXPECT_EQ(cmsg->cmsg_level, SOL_SOCKET);
+  EXPECT_EQ(cmsg->cmsg_type, SCM_RIGHTS);
+}
+
+TEST_P(UnixSocketPairCmsgTest, ConcurrentBasicFDPass) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  int sockfd1 = sockets->first_fd();
+  auto recv_func = [sockfd1, sent_data]() {
+    char received_data[20];
+    int fd = -1;
+    RecvSingleFD(sockfd1, &fd, received_data, sizeof(received_data));
+    ASSERT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+    char buf[20];
+    ASSERT_THAT(ReadFd(fd, buf, sizeof(buf)),
+                SyscallSucceedsWithValue(sizeof(buf)));
+    ASSERT_THAT(WriteFd(fd, buf, sizeof(buf)),
+                SyscallSucceedsWithValue(sizeof(buf)));
+  };
+
+  auto pair =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+
+  ASSERT_NO_FATAL_FAILURE(SendSingleFD(sockets->second_fd(), pair->second_fd(),
+                                       sent_data, sizeof(sent_data)));
+
+  ScopedThread t(recv_func);
+
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+  ASSERT_THAT(WriteFd(pair->first_fd(), sent_data, sizeof(sent_data)),
+              SyscallSucceedsWithValue(sizeof(sent_data)));
+
+  char received_data[20];
+  ASSERT_THAT(ReadFd(pair->first_fd(), received_data, sizeof(received_data)),
+              SyscallSucceedsWithValue(sizeof(received_data)));
+
+  t.Join();
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+}
+
+// FDPassNoRecv checks that the control message can be safely ignored by using
+// read(2) instead of recvmsg(2).
+TEST_P(UnixSocketPairCmsgTest, FDPassNoRecv) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  auto pair =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+
+  ASSERT_NO_FATAL_FAILURE(SendSingleFD(sockets->first_fd(), pair->second_fd(),
+                                       sent_data, sizeof(sent_data)));
+
+  // Read while ignoring the passed FD.
+  char received_data[20];
+  ASSERT_THAT(
+      ReadFd(sockets->second_fd(), received_data, sizeof(received_data)),
+      SyscallSucceedsWithValue(sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+
+  // Check that the socket still works for reads and writes.
+  ASSERT_NO_FATAL_FAILURE(
+      TransferTest(sockets->first_fd(), sockets->second_fd()));
+}
+
+// FDPassInterspersed1 checks that sent control messages cannot be read before
+// their associated data has been read.
+TEST_P(UnixSocketPairCmsgTest, FDPassInterspersed1) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char written_data[20];
+  RandomizeBuffer(written_data, sizeof(written_data));
+
+  ASSERT_THAT(WriteFd(sockets->first_fd(), written_data, sizeof(written_data)),
+              SyscallSucceedsWithValue(sizeof(written_data)));
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  auto pair =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+  ASSERT_NO_FATAL_FAILURE(SendSingleFD(sockets->first_fd(), pair->second_fd(),
+                                       sent_data, sizeof(sent_data)));
+
+  // Check that we don't get a control message, but do get the data.
+  char received_data[20];
+  RecvNoCmsg(sockets->second_fd(), received_data, sizeof(received_data));
+  EXPECT_EQ(0, memcmp(written_data, received_data, sizeof(written_data)));
+}
+
+// FDPassInterspersed2 checks that sent control messages cannot be read after
+// their associated data has been read while ignoring the control message by
+// using read(2) instead of recvmsg(2).
+TEST_P(UnixSocketPairCmsgTest, FDPassInterspersed2) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  auto pair =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+
+  ASSERT_NO_FATAL_FAILURE(SendSingleFD(sockets->first_fd(), pair->second_fd(),
+                                       sent_data, sizeof(sent_data)));
+
+  char written_data[20];
+  RandomizeBuffer(written_data, sizeof(written_data));
+  ASSERT_THAT(WriteFd(sockets->first_fd(), written_data, sizeof(written_data)),
+              SyscallSucceedsWithValue(sizeof(written_data)));
+
+  char received_data[20];
+  ASSERT_THAT(
+      ReadFd(sockets->second_fd(), received_data, sizeof(received_data)),
+      SyscallSucceedsWithValue(sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+
+  ASSERT_NO_FATAL_FAILURE(
+      RecvNoCmsg(sockets->second_fd(), received_data, sizeof(received_data)));
+  EXPECT_EQ(0, memcmp(written_data, received_data, sizeof(written_data)));
+}
+
+TEST_P(UnixSocketPairCmsgTest, FDPassNotCoalesced) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data1[20];
+  RandomizeBuffer(sent_data1, sizeof(sent_data1));
+
+  auto pair1 =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+
+  ASSERT_NO_FATAL_FAILURE(SendSingleFD(sockets->first_fd(), pair1->second_fd(),
+                                       sent_data1, sizeof(sent_data1)));
+
+  char sent_data2[20];
+  RandomizeBuffer(sent_data2, sizeof(sent_data2));
+
+  auto pair2 =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+
+  ASSERT_NO_FATAL_FAILURE(SendSingleFD(sockets->first_fd(), pair2->second_fd(),
+                                       sent_data2, sizeof(sent_data2)));
+
+  char received_data1[sizeof(sent_data1) + sizeof(sent_data2)];
+  int received_fd1 = -1;
+
+  RecvSingleFD(sockets->second_fd(), &received_fd1, received_data1,
+               sizeof(received_data1), sizeof(sent_data1));
+
+  EXPECT_EQ(0, memcmp(sent_data1, received_data1, sizeof(sent_data1)));
+  TransferTest(pair1->first_fd(), pair1->second_fd());
+
+  char received_data2[sizeof(sent_data1) + sizeof(sent_data2)];
+  int received_fd2 = -1;
+
+  RecvSingleFD(sockets->second_fd(), &received_fd2, received_data2,
+               sizeof(received_data2), sizeof(sent_data2));
+
+  EXPECT_EQ(0, memcmp(sent_data2, received_data2, sizeof(sent_data2)));
+  TransferTest(pair2->first_fd(), pair2->second_fd());
+}
+
+TEST_P(UnixSocketPairCmsgTest, FDPassPeek) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  auto pair =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+
+  ASSERT_NO_FATAL_FAILURE(SendSingleFD(sockets->first_fd(), pair->second_fd(),
+                                       sent_data, sizeof(sent_data)));
+
+  char peek_data[20];
+  int peek_fd = -1;
+  PeekSingleFD(sockets->second_fd(), &peek_fd, peek_data, sizeof(peek_data));
+  EXPECT_EQ(0, memcmp(sent_data, peek_data, sizeof(sent_data)));
+  TransferTest(peek_fd, pair->first_fd());
+  EXPECT_THAT(close(peek_fd), SyscallSucceeds());
+
+  char received_data[20];
+  int received_fd = -1;
+  RecvSingleFD(sockets->second_fd(), &received_fd, received_data,
+               sizeof(received_data));
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+  TransferTest(received_fd, pair->first_fd());
+  EXPECT_THAT(close(received_fd), SyscallSucceeds());
+}
+
+// A zero-length SCM_RIGHTS array should be equivalent to sending no FDs at all.
+TEST_P(UnixSocketPairCmsgTest, ZeroFDPass) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+  ASSERT_NO_FATAL_FAILURE(
+      SendFDs(sockets->first_fd(), nullptr, 0, sent_data, sizeof(sent_data)));
+
+  char received_data[sizeof(sent_data)];
+  ASSERT_NO_FATAL_FAILURE(
+      RecvNoCmsg(sockets->second_fd(), received_data, sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(received_data, sent_data, sizeof(sent_data)));
+}
+
+TEST_P(UnixSocketPairCmsgTest, ZeroFDPassCoalesceData) {
+  SKIP_IF(GetParam().type != SOCK_STREAM);
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+  ASSERT_NO_FATAL_FAILURE(
+      SendFDs(sockets->first_fd(), nullptr, 0, sent_data, sizeof(sent_data)));
+  ASSERT_NO_FATAL_FAILURE(
+      WriteFd(sockets->first_fd(), sent_data, sizeof(sent_data)));
+
+  char received_data[sizeof(sent_data) * 2];
+  ASSERT_NO_FATAL_FAILURE(
+      RecvNoCmsg(sockets->second_fd(), received_data, sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(received_data, sent_data, sizeof(sent_data)));
+  EXPECT_EQ(0, memcmp(received_data + sizeof(sent_data), sent_data,
+                      sizeof(sent_data)));
+}
+
+TEST_P(UnixSocketPairCmsgTest, BasicCredPass) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  struct ucred sent_creds;
+
+  ASSERT_THAT(sent_creds.pid = getpid(), SyscallSucceeds());
+  ASSERT_THAT(sent_creds.uid = getuid(), SyscallSucceeds());
+  ASSERT_THAT(sent_creds.gid = getgid(), SyscallSucceeds());
+
+  ASSERT_NO_FATAL_FAILURE(
+      SendCreds(sockets->first_fd(), sent_creds, sent_data, sizeof(sent_data)));
+
+  SetSoPassCred(sockets->second_fd());
+
+  char received_data[20];
+  struct ucred received_creds;
+  ASSERT_NO_FATAL_FAILURE(RecvCreds(sockets->second_fd(), &received_creds,
+                                    received_data, sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+  EXPECT_EQ(sent_creds.pid, received_creds.pid);
+  EXPECT_EQ(sent_creds.uid, received_creds.uid);
+  EXPECT_EQ(sent_creds.gid, received_creds.gid);
+}
+
+// A privileged sender (CAP_SYS_ADMIN) may attach SCM_CREDENTIALS naming the PID
+// of a different, live process. The receiver must observe that process's PID.
+TEST_P(UnixSocketPairCmsgTest, BasicCredPassDifferentPID) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  // Pipe to signal to child when to exit.
+  int pipefd[2];
+  ASSERT_THAT(pipe(pipefd), SyscallSucceeds());
+
+  pid_t child = fork();
+  if (child == 0) {
+    close(pipefd[1]);
+    char c;
+    RetryEINTR(read)(pipefd[0], &c, 1);
+    _exit(0);
+  }
+  ASSERT_THAT(child, SyscallSucceeds());
+  ASSERT_THAT(close(pipefd[0]), SyscallSucceeds());
+
+  auto cleanup = Cleanup([&child, &pipefd] {
+    ASSERT_THAT(close(pipefd[1]), SyscallSucceeds());
+    ASSERT_THAT(RetryEINTR(waitpid)(child, nullptr, 0),
+                SyscallSucceedsWithValue(child));
+  });
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  struct ucred sent_creds;
+  sent_creds.pid = child;
+  ASSERT_THAT(sent_creds.uid = getuid(), SyscallSucceeds());
+  ASSERT_THAT(sent_creds.gid = getgid(), SyscallSucceeds());
+
+  ASSERT_NO_FATAL_FAILURE(
+      SendCreds(sockets->first_fd(), sent_creds, sent_data, sizeof(sent_data)));
+
+  SetSoPassCred(sockets->second_fd());
+
+  char received_data[20];
+  struct ucred received_creds;
+  ASSERT_NO_FATAL_FAILURE(RecvCreds(sockets->second_fd(), &received_creds,
+                                    received_data, sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+  // The received PID must be the child's, not the sender's.
+  EXPECT_EQ(received_creds.pid, child);
+  EXPECT_NE(received_creds.pid, getpid());
+  EXPECT_EQ(received_creds.uid, sent_creds.uid);
+  EXPECT_EQ(received_creds.gid, sent_creds.gid);
+}
+
+// A sender without CAP_SYS_ADMIN should not be able to send SCM_CREDENTIALS
+// messages with a different PID.
+TEST_P(UnixSocketPairCmsgTest, CredPassDifferentPIDUnprivileged) {
+  // Drop CAP_SYS_ADMIN
+  AutoCapability cap(CAP_SYS_ADMIN, false);
+
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  // Pipe to signal to child when to exit.
+  int pipefd[2];
+  ASSERT_THAT(pipe(pipefd), SyscallSucceeds());
+
+  pid_t child = fork();
+  if (child == 0) {
+    close(pipefd[1]);
+    char c;
+    RetryEINTR(read)(pipefd[0], &c, 1);
+    _exit(0);
+  }
+  ASSERT_THAT(child, SyscallSucceeds());
+  ASSERT_THAT(close(pipefd[0]), SyscallSucceeds());
+
+  auto cleanup = Cleanup([&child, &pipefd] {
+    ASSERT_THAT(close(pipefd[1]), SyscallSucceeds());
+    ASSERT_THAT(RetryEINTR(waitpid)(child, nullptr, 0),
+                SyscallSucceedsWithValue(child));
+  });
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  struct ucred sent_creds;
+  sent_creds.pid = child;
+  ASSERT_THAT(sent_creds.uid = getuid(), SyscallSucceeds());
+  ASSERT_THAT(sent_creds.gid = getgid(), SyscallSucceeds());
+  struct msghdr msg = {};
+  char control[CMSG_SPACE(sizeof(struct ucred))];
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+
+  struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+  cmsg->cmsg_level = SOL_SOCKET;
+  cmsg->cmsg_type = SCM_CREDENTIALS;
+  cmsg->cmsg_len = CMSG_LEN(sizeof(struct ucred));
+  memcpy(CMSG_DATA(cmsg), &sent_creds, sizeof(struct ucred));
+
+  struct iovec iov;
+  iov.iov_base = sent_data;
+  iov.iov_len = sizeof(sent_data);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+
+  ASSERT_THAT(RetryEINTR(sendmsg)(sockets->first_fd(), &msg, 0),
+              SyscallFailsWithErrno(EPERM));
+}
+
+// Sending SCM_CREDENTIALS naming a PID that does not exist fails with ESRCH.
+TEST_P(UnixSocketPairCmsgTest, CredPassNonexistentPID) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  struct ucred sent_creds;
+  sent_creds.pid = -1;
+  ASSERT_THAT(sent_creds.uid = getuid(), SyscallSucceeds());
+  ASSERT_THAT(sent_creds.gid = getgid(), SyscallSucceeds());
+
+  struct msghdr msg = {};
+  char control[CMSG_SPACE(sizeof(struct ucred))];
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+
+  struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+  cmsg->cmsg_level = SOL_SOCKET;
+  cmsg->cmsg_type = SCM_CREDENTIALS;
+  cmsg->cmsg_len = CMSG_LEN(sizeof(struct ucred));
+  memcpy(CMSG_DATA(cmsg), &sent_creds, sizeof(struct ucred));
+
+  struct iovec iov;
+  iov.iov_base = sent_data;
+  iov.iov_len = sizeof(sent_data);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+
+  ASSERT_THAT(RetryEINTR(sendmsg)(sockets->first_fd(), &msg, 0),
+              SyscallFailsWithErrno(ESRCH));
+}
+
+TEST_P(UnixSocketPairCmsgTest, SendNullCredsBeforeSoPassCredRecvEnd) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  ASSERT_NO_FATAL_FAILURE(
+      SendNullCmsg(sockets->first_fd(), sent_data, sizeof(sent_data)));
+
+  SetSoPassCred(sockets->second_fd());
+
+  char received_data[20];
+  struct ucred received_creds;
+  ASSERT_NO_FATAL_FAILURE(RecvCreds(sockets->second_fd(), &received_creds,
+                                    received_data, sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+
+  struct ucred want_creds{0, 65534, 65534};
+
+  EXPECT_EQ(want_creds.pid, received_creds.pid);
+  EXPECT_EQ(want_creds.uid, received_creds.uid);
+  EXPECT_EQ(want_creds.gid, received_creds.gid);
+}
+
+TEST_P(UnixSocketPairCmsgTest, SendNullCredsAfterSoPassCredRecvEnd) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  SetSoPassCred(sockets->second_fd());
+
+  ASSERT_NO_FATAL_FAILURE(
+      SendNullCmsg(sockets->first_fd(), sent_data, sizeof(sent_data)));
+
+  char received_data[20];
+  struct ucred received_creds;
+  ASSERT_NO_FATAL_FAILURE(RecvCreds(sockets->second_fd(), &received_creds,
+                                    received_data, sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+
+  struct ucred want_creds;
+  ASSERT_THAT(want_creds.pid = getpid(), SyscallSucceeds());
+  ASSERT_THAT(want_creds.uid = getuid(), SyscallSucceeds());
+  ASSERT_THAT(want_creds.gid = getgid(), SyscallSucceeds());
+
+  EXPECT_EQ(want_creds.pid, received_creds.pid);
+  EXPECT_EQ(want_creds.uid, received_creds.uid);
+  EXPECT_EQ(want_creds.gid, received_creds.gid);
+}
+
+TEST_P(UnixSocketPairCmsgTest, SendNullCredsBeforeSoPassCredSendEnd) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  ASSERT_NO_FATAL_FAILURE(
+      SendNullCmsg(sockets->first_fd(), sent_data, sizeof(sent_data)));
+
+  SetSoPassCred(sockets->first_fd());
+
+  char received_data[20];
+  ASSERT_NO_FATAL_FAILURE(
+      RecvNoCmsg(sockets->second_fd(), received_data, sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+}
+
+TEST_P(UnixSocketPairCmsgTest, SendNullCredsAfterSoPassCredSendEnd) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  SetSoPassCred(sockets->first_fd());
+
+  ASSERT_NO_FATAL_FAILURE(
+      SendNullCmsg(sockets->first_fd(), sent_data, sizeof(sent_data)));
+
+  char received_data[20];
+  ASSERT_NO_FATAL_FAILURE(
+      RecvNoCmsg(sockets->second_fd(), received_data, sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+}
+
+TEST_P(UnixSocketPairCmsgTest,
+       SendNullCredsBeforeSoPassCredRecvEndAfterSendEnd) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  SetSoPassCred(sockets->first_fd());
+
+  ASSERT_NO_FATAL_FAILURE(
+      SendNullCmsg(sockets->first_fd(), sent_data, sizeof(sent_data)));
+
+  SetSoPassCred(sockets->second_fd());
+
+  char received_data[20];
+  struct ucred received_creds;
+  ASSERT_NO_FATAL_FAILURE(RecvCreds(sockets->second_fd(), &received_creds,
+                                    received_data, sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+
+  struct ucred want_creds;
+  ASSERT_THAT(want_creds.pid = getpid(), SyscallSucceeds());
+  ASSERT_THAT(want_creds.uid = getuid(), SyscallSucceeds());
+  ASSERT_THAT(want_creds.gid = getgid(), SyscallSucceeds());
+
+  EXPECT_EQ(want_creds.pid, received_creds.pid);
+  EXPECT_EQ(want_creds.uid, received_creds.uid);
+  EXPECT_EQ(want_creds.gid, received_creds.gid);
+}
+
+TEST_P(UnixSocketPairCmsgTest, WriteBeforeSoPassCredRecvEnd) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  ASSERT_THAT(WriteFd(sockets->first_fd(), sent_data, sizeof(sent_data)),
+              SyscallSucceedsWithValue(sizeof(sent_data)));
+
+  SetSoPassCred(sockets->second_fd());
+
+  char received_data[20];
+
+  struct ucred received_creds;
+  ASSERT_NO_FATAL_FAILURE(RecvCreds(sockets->second_fd(), &received_creds,
+                                    received_data, sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+
+  struct ucred want_creds{0, 65534, 65534};
+
+  EXPECT_EQ(want_creds.pid, received_creds.pid);
+  EXPECT_EQ(want_creds.uid, received_creds.uid);
+  EXPECT_EQ(want_creds.gid, received_creds.gid);
+}
+
+TEST_P(UnixSocketPairCmsgTest, WriteAfterSoPassCredRecvEnd) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  SetSoPassCred(sockets->second_fd());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+  ASSERT_THAT(WriteFd(sockets->first_fd(), sent_data, sizeof(sent_data)),
+              SyscallSucceedsWithValue(sizeof(sent_data)));
+
+  char received_data[20];
+
+  struct ucred received_creds;
+  ASSERT_NO_FATAL_FAILURE(RecvCreds(sockets->second_fd(), &received_creds,
+                                    received_data, sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+
+  struct ucred want_creds;
+  ASSERT_THAT(want_creds.pid = getpid(), SyscallSucceeds());
+  ASSERT_THAT(want_creds.uid = getuid(), SyscallSucceeds());
+  ASSERT_THAT(want_creds.gid = getgid(), SyscallSucceeds());
+
+  EXPECT_EQ(want_creds.pid, received_creds.pid);
+  EXPECT_EQ(want_creds.uid, received_creds.uid);
+  EXPECT_EQ(want_creds.gid, received_creds.gid);
+}
+
+TEST_P(UnixSocketPairCmsgTest, WriteBeforeSoPassCredSendEnd) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  ASSERT_THAT(WriteFd(sockets->first_fd(), sent_data, sizeof(sent_data)),
+              SyscallSucceedsWithValue(sizeof(sent_data)));
+
+  SetSoPassCred(sockets->first_fd());
+
+  char received_data[20];
+  ASSERT_NO_FATAL_FAILURE(
+      RecvNoCmsg(sockets->second_fd(), received_data, sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+}
+
+TEST_P(UnixSocketPairCmsgTest, WriteAfterSoPassCredSendEnd) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  SetSoPassCred(sockets->first_fd());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  ASSERT_THAT(WriteFd(sockets->first_fd(), sent_data, sizeof(sent_data)),
+              SyscallSucceedsWithValue(sizeof(sent_data)));
+
+  char received_data[20];
+  ASSERT_NO_FATAL_FAILURE(
+      RecvNoCmsg(sockets->second_fd(), received_data, sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+}
+
+TEST_P(UnixSocketPairCmsgTest, WriteBeforeSoPassCredRecvEndAfterSendEnd) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  SetSoPassCred(sockets->first_fd());
+
+  ASSERT_THAT(WriteFd(sockets->first_fd(), sent_data, sizeof(sent_data)),
+              SyscallSucceedsWithValue(sizeof(sent_data)));
+
+  SetSoPassCred(sockets->second_fd());
+
+  char received_data[20];
+
+  struct ucred received_creds;
+  ASSERT_NO_FATAL_FAILURE(RecvCreds(sockets->second_fd(), &received_creds,
+                                    received_data, sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+
+  struct ucred want_creds;
+  ASSERT_THAT(want_creds.pid = getpid(), SyscallSucceeds());
+  ASSERT_THAT(want_creds.uid = getuid(), SyscallSucceeds());
+  ASSERT_THAT(want_creds.gid = getgid(), SyscallSucceeds());
+
+  EXPECT_EQ(want_creds.pid, received_creds.pid);
+  EXPECT_EQ(want_creds.uid, received_creds.uid);
+  EXPECT_EQ(want_creds.gid, received_creds.gid);
+}
+
+TEST_P(UnixSocketPairCmsgTest, CredPassTruncated) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  struct ucred sent_creds;
+
+  ASSERT_THAT(sent_creds.pid = getpid(), SyscallSucceeds());
+  ASSERT_THAT(sent_creds.uid = getuid(), SyscallSucceeds());
+  ASSERT_THAT(sent_creds.gid = getgid(), SyscallSucceeds());
+
+  ASSERT_NO_FATAL_FAILURE(
+      SendCreds(sockets->first_fd(), sent_creds, sent_data, sizeof(sent_data)));
+
+  SetSoPassCred(sockets->second_fd());
+
+  struct msghdr msg = {};
+  char control[CMSG_SPACE(0) + sizeof(pid_t)];
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+
+  char received_data[sizeof(sent_data)] = {};
+  struct iovec iov;
+  iov.iov_base = received_data;
+  iov.iov_len = sizeof(received_data);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+
+  ASSERT_THAT(RetryEINTR(recvmsg)(sockets->second_fd(), &msg, 0),
+              SyscallSucceedsWithValue(sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+
+  EXPECT_EQ(msg.msg_controllen, sizeof(control));
+
+  struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+  ASSERT_NE(cmsg, nullptr);
+  EXPECT_EQ(cmsg->cmsg_len, sizeof(control));
+  EXPECT_EQ(cmsg->cmsg_level, SOL_SOCKET);
+  EXPECT_EQ(cmsg->cmsg_type, SCM_CREDENTIALS);
+
+  pid_t pid = 0;
+  memcpy(&pid, CMSG_DATA(cmsg), sizeof(pid));
+  EXPECT_EQ(pid, sent_creds.pid);
+}
+
+// CredPassNoMsgCtrunc passes a full set of credentials. It then verifies that
+// receiving the full set does not result in MSG_CTRUNC being set in the msghdr.
+TEST_P(UnixSocketPairCmsgTest, CredPassNoMsgCtrunc) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  struct ucred sent_creds;
+
+  ASSERT_THAT(sent_creds.pid = getpid(), SyscallSucceeds());
+  ASSERT_THAT(sent_creds.uid = getuid(), SyscallSucceeds());
+  ASSERT_THAT(sent_creds.gid = getgid(), SyscallSucceeds());
+
+  ASSERT_NO_FATAL_FAILURE(
+      SendCreds(sockets->first_fd(), sent_creds, sent_data, sizeof(sent_data)));
+
+  SetSoPassCred(sockets->second_fd());
+
+  struct msghdr msg = {};
+  char control[CMSG_SPACE(sizeof(struct ucred))];
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+
+  char received_data[sizeof(sent_data)] = {};
+  struct iovec iov;
+  iov.iov_base = received_data;
+  iov.iov_len = sizeof(received_data);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+
+  ASSERT_THAT(RetryEINTR(recvmsg)(sockets->second_fd(), &msg, 0),
+              SyscallSucceedsWithValue(sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+
+  // The control message should not be truncated.
+  EXPECT_EQ(msg.msg_flags, 0);
+  EXPECT_EQ(msg.msg_controllen, sizeof(control));
+
+  struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+  ASSERT_NE(cmsg, nullptr);
+  EXPECT_EQ(cmsg->cmsg_len, CMSG_LEN(sizeof(struct ucred)));
+  EXPECT_EQ(cmsg->cmsg_level, SOL_SOCKET);
+  EXPECT_EQ(cmsg->cmsg_type, SCM_CREDENTIALS);
+}
+
+// CredPassNoSpaceMsgCtrunc passes a full set of credentials. It then receives
+// the data without providing space for any credentials and verifies that
+// MSG_CTRUNC is set in the msghdr.
+TEST_P(UnixSocketPairCmsgTest, CredPassNoSpaceMsgCtrunc) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  struct ucred sent_creds;
+
+  ASSERT_THAT(sent_creds.pid = getpid(), SyscallSucceeds());
+  ASSERT_THAT(sent_creds.uid = getuid(), SyscallSucceeds());
+  ASSERT_THAT(sent_creds.gid = getgid(), SyscallSucceeds());
+
+  ASSERT_NO_FATAL_FAILURE(
+      SendCreds(sockets->first_fd(), sent_creds, sent_data, sizeof(sent_data)));
+
+  SetSoPassCred(sockets->second_fd());
+
+  struct msghdr msg = {};
+  char control[CMSG_SPACE(0)];
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+
+  char received_data[sizeof(sent_data)] = {};
+  struct iovec iov;
+  iov.iov_base = received_data;
+  iov.iov_len = sizeof(received_data);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+
+  ASSERT_THAT(RetryEINTR(recvmsg)(sockets->second_fd(), &msg, 0),
+              SyscallSucceedsWithValue(sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+
+  // The control message should be truncated.
+  EXPECT_EQ(msg.msg_flags, MSG_CTRUNC);
+  EXPECT_EQ(msg.msg_controllen, sizeof(control));
+
+  struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+  ASSERT_NE(cmsg, nullptr);
+  EXPECT_EQ(cmsg->cmsg_len, sizeof(control));
+  EXPECT_EQ(cmsg->cmsg_level, SOL_SOCKET);
+  EXPECT_EQ(cmsg->cmsg_type, SCM_CREDENTIALS);
+}
+
+// CredPassTruncatedMsgCtrunc passes a full set of credentials. It then receives
+// the data while providing enough space for only the first field of the
+// credentials and verifies that MSG_CTRUNC is set in the msghdr.
+TEST_P(UnixSocketPairCmsgTest, CredPassTruncatedMsgCtrunc) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  struct ucred sent_creds;
+
+  ASSERT_THAT(sent_creds.pid = getpid(), SyscallSucceeds());
+  ASSERT_THAT(sent_creds.uid = getuid(), SyscallSucceeds());
+  ASSERT_THAT(sent_creds.gid = getgid(), SyscallSucceeds());
+
+  ASSERT_NO_FATAL_FAILURE(
+      SendCreds(sockets->first_fd(), sent_creds, sent_data, sizeof(sent_data)));
+
+  SetSoPassCred(sockets->second_fd());
+
+  struct msghdr msg = {};
+  char control[CMSG_SPACE(0) + sizeof(pid_t)];
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+
+  char received_data[sizeof(sent_data)] = {};
+  struct iovec iov;
+  iov.iov_base = received_data;
+  iov.iov_len = sizeof(received_data);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+
+  ASSERT_THAT(RetryEINTR(recvmsg)(sockets->second_fd(), &msg, 0),
+              SyscallSucceedsWithValue(sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+
+  // The control message should be truncated.
+  EXPECT_EQ(msg.msg_flags, MSG_CTRUNC);
+  EXPECT_EQ(msg.msg_controllen, sizeof(control));
+
+  struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+  ASSERT_NE(cmsg, nullptr);
+  EXPECT_EQ(cmsg->cmsg_len, sizeof(control));
+  EXPECT_EQ(cmsg->cmsg_level, SOL_SOCKET);
+  EXPECT_EQ(cmsg->cmsg_type, SCM_CREDENTIALS);
+}
+
+TEST_P(UnixSocketPairCmsgTest, SoPassCred) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  int opt;
+  socklen_t optLen = sizeof(opt);
+  EXPECT_THAT(
+      getsockopt(sockets->first_fd(), SOL_SOCKET, SO_PASSCRED, &opt, &optLen),
+      SyscallSucceeds());
+  EXPECT_FALSE(opt);
+
+  optLen = sizeof(opt);
+  EXPECT_THAT(
+      getsockopt(sockets->second_fd(), SOL_SOCKET, SO_PASSCRED, &opt, &optLen),
+      SyscallSucceeds());
+  EXPECT_FALSE(opt);
+
+  SetSoPassCred(sockets->first_fd());
+
+  optLen = sizeof(opt);
+  EXPECT_THAT(
+      getsockopt(sockets->first_fd(), SOL_SOCKET, SO_PASSCRED, &opt, &optLen),
+      SyscallSucceeds());
+  EXPECT_TRUE(opt);
+
+  optLen = sizeof(opt);
+  EXPECT_THAT(
+      getsockopt(sockets->second_fd(), SOL_SOCKET, SO_PASSCRED, &opt, &optLen),
+      SyscallSucceeds());
+  EXPECT_FALSE(opt);
+
+  int zero = 0;
+  EXPECT_THAT(setsockopt(sockets->first_fd(), SOL_SOCKET, SO_PASSCRED, &zero,
+                         sizeof(zero)),
+              SyscallSucceeds());
+
+  optLen = sizeof(opt);
+  EXPECT_THAT(
+      getsockopt(sockets->first_fd(), SOL_SOCKET, SO_PASSCRED, &opt, &optLen),
+      SyscallSucceeds());
+  EXPECT_FALSE(opt);
+
+  optLen = sizeof(opt);
+  EXPECT_THAT(
+      getsockopt(sockets->second_fd(), SOL_SOCKET, SO_PASSCRED, &opt, &optLen),
+      SyscallSucceeds());
+  EXPECT_FALSE(opt);
+}
+
+TEST_P(UnixSocketPairCmsgTest, NoDataCredPass) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  struct msghdr msg = {};
+
+  struct iovec iov;
+  iov.iov_base = sent_data;
+  iov.iov_len = sizeof(sent_data);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+
+  char control[CMSG_SPACE(0)];
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+
+  struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+  cmsg->cmsg_level = SOL_SOCKET;
+  cmsg->cmsg_type = SCM_CREDENTIALS;
+  cmsg->cmsg_len = CMSG_LEN(0);
+
+  ASSERT_THAT(RetryEINTR(sendmsg)(sockets->first_fd(), &msg, 0),
+              SyscallFailsWithErrno(EINVAL));
+}
+
+TEST_P(UnixSocketPairCmsgTest, NoPassCred) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  struct ucred sent_creds;
+
+  ASSERT_THAT(sent_creds.pid = getpid(), SyscallSucceeds());
+  ASSERT_THAT(sent_creds.uid = getuid(), SyscallSucceeds());
+  ASSERT_THAT(sent_creds.gid = getgid(), SyscallSucceeds());
+
+  ASSERT_NO_FATAL_FAILURE(
+      SendCreds(sockets->first_fd(), sent_creds, sent_data, sizeof(sent_data)));
+
+  char received_data[20];
+
+  ASSERT_NO_FATAL_FAILURE(
+      RecvNoCmsg(sockets->second_fd(), received_data, sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+}
+
+TEST_P(UnixSocketPairCmsgTest, CredAndFDPass) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  struct ucred sent_creds;
+
+  ASSERT_THAT(sent_creds.pid = getpid(), SyscallSucceeds());
+  ASSERT_THAT(sent_creds.uid = getuid(), SyscallSucceeds());
+  ASSERT_THAT(sent_creds.gid = getgid(), SyscallSucceeds());
+
+  auto pair =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+
+  ASSERT_NO_FATAL_FAILURE(SendCredsAndFD(sockets->first_fd(), sent_creds,
+                                         pair->second_fd(), sent_data,
+                                         sizeof(sent_data)));
+
+  SetSoPassCred(sockets->second_fd());
+
+  char received_data[20];
+  struct ucred received_creds;
+  int fd = -1;
+  ASSERT_NO_FATAL_FAILURE(RecvCredsAndFD(sockets->second_fd(), &received_creds,
+                                         &fd, received_data,
+                                         sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+
+  EXPECT_EQ(sent_creds.pid, received_creds.pid);
+  EXPECT_EQ(sent_creds.uid, received_creds.uid);
+  EXPECT_EQ(sent_creds.gid, received_creds.gid);
+
+  ASSERT_NO_FATAL_FAILURE(TransferTest(fd, pair->first_fd()));
+}
+
+TEST_P(UnixSocketPairCmsgTest, FDPassBeforeSoPassCred) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  auto pair =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+
+  ASSERT_NO_FATAL_FAILURE(SendSingleFD(sockets->first_fd(), pair->second_fd(),
+                                       sent_data, sizeof(sent_data)));
+
+  SetSoPassCred(sockets->second_fd());
+
+  char received_data[20];
+  struct ucred received_creds;
+  int fd = -1;
+  ASSERT_NO_FATAL_FAILURE(RecvCredsAndFD(sockets->second_fd(), &received_creds,
+                                         &fd, received_data,
+                                         sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+
+  struct ucred want_creds{0, 65534, 65534};
+
+  EXPECT_EQ(want_creds.pid, received_creds.pid);
+  EXPECT_EQ(want_creds.uid, received_creds.uid);
+  EXPECT_EQ(want_creds.gid, received_creds.gid);
+
+  ASSERT_NO_FATAL_FAILURE(TransferTest(fd, pair->first_fd()));
+}
+
+TEST_P(UnixSocketPairCmsgTest, FDPassAfterSoPassCred) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  auto pair =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+
+  SetSoPassCred(sockets->second_fd());
+
+  ASSERT_NO_FATAL_FAILURE(SendSingleFD(sockets->first_fd(), pair->second_fd(),
+                                       sent_data, sizeof(sent_data)));
+
+  char received_data[20];
+  struct ucred received_creds;
+  int fd = -1;
+  ASSERT_NO_FATAL_FAILURE(RecvCredsAndFD(sockets->second_fd(), &received_creds,
+                                         &fd, received_data,
+                                         sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+
+  struct ucred want_creds;
+  ASSERT_THAT(want_creds.pid = getpid(), SyscallSucceeds());
+  ASSERT_THAT(want_creds.uid = getuid(), SyscallSucceeds());
+  ASSERT_THAT(want_creds.gid = getgid(), SyscallSucceeds());
+
+  EXPECT_EQ(want_creds.pid, received_creds.pid);
+  EXPECT_EQ(want_creds.uid, received_creds.uid);
+  EXPECT_EQ(want_creds.gid, received_creds.gid);
+
+  ASSERT_NO_FATAL_FAILURE(TransferTest(fd, pair->first_fd()));
+}
+
+TEST_P(UnixSocketPairCmsgTest, CloexecDroppedWhenFDPassed) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  auto pair = ASSERT_NO_ERRNO_AND_VALUE(
+      UnixDomainSocketPair(SOCK_SEQPACKET | SOCK_CLOEXEC).Create());
+
+  ASSERT_NO_FATAL_FAILURE(SendSingleFD(sockets->first_fd(), pair->second_fd(),
+                                       sent_data, sizeof(sent_data)));
+
+  char received_data[20];
+  int fd = -1;
+  ASSERT_NO_FATAL_FAILURE(RecvSingleFD(sockets->second_fd(), &fd, received_data,
+                                       sizeof(received_data)));
+
+  EXPECT_THAT(fcntl(fd, F_GETFD), SyscallSucceedsWithValue(0));
+}
+
+TEST_P(UnixSocketPairCmsgTest, CloexecRecvFDPass) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  auto pair =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+
+  ASSERT_NO_FATAL_FAILURE(SendSingleFD(sockets->first_fd(), pair->second_fd(),
+                                       sent_data, sizeof(sent_data)));
+
+  struct msghdr msg = {};
+  char control[CMSG_SPACE(sizeof(int))];
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+
+  struct iovec iov;
+  char received_data[20];
+  iov.iov_base = received_data;
+  iov.iov_len = sizeof(received_data);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+
+  ASSERT_THAT(RetryEINTR(recvmsg)(sockets->second_fd(), &msg, MSG_CMSG_CLOEXEC),
+              SyscallSucceedsWithValue(sizeof(received_data)));
+  struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+  ASSERT_NE(cmsg, nullptr);
+  ASSERT_EQ(cmsg->cmsg_len, CMSG_LEN(sizeof(int)));
+  ASSERT_EQ(cmsg->cmsg_level, SOL_SOCKET);
+  ASSERT_EQ(cmsg->cmsg_type, SCM_RIGHTS);
+
+  int fd = -1;
+  memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
+
+  EXPECT_THAT(fcntl(fd, F_GETFD), SyscallSucceedsWithValue(FD_CLOEXEC));
+}
+
+TEST_P(UnixSocketPairCmsgTest, FDPassAfterSoPassCredWithoutCredSpace) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  auto pair =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+
+  SetSoPassCred(sockets->second_fd());
+
+  ASSERT_NO_FATAL_FAILURE(SendSingleFD(sockets->first_fd(), pair->second_fd(),
+                                       sent_data, sizeof(sent_data)));
+
+  struct msghdr msg = {};
+  char control[CMSG_LEN(0)];
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+
+  char received_data[20];
+  struct iovec iov;
+  iov.iov_base = received_data;
+  iov.iov_len = sizeof(received_data);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+
+  ASSERT_THAT(RetryEINTR(recvmsg)(sockets->second_fd(), &msg, 0),
+              SyscallSucceedsWithValue(sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+
+  EXPECT_EQ(msg.msg_controllen, sizeof(control));
+
+  struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+  ASSERT_NE(cmsg, nullptr);
+  EXPECT_EQ(cmsg->cmsg_len, sizeof(control));
+  EXPECT_EQ(cmsg->cmsg_level, SOL_SOCKET);
+  EXPECT_EQ(cmsg->cmsg_type, SCM_CREDENTIALS);
+}
+
+TEST_P(UnixSocketPairCmsgTest, InheritPasscred) {
+  // Create an abstract server, but set SO_PASSCRED on it
+  struct sockaddr_un bind_addr =
+      ASSERT_NO_ERRNO_AND_VALUE(UniqueUnixAddr(true, AF_UNIX));
+  auto bound = ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_UNIX, SOCK_STREAM, 0));
+  SetSoPassCred(bound.get());
+  ASSERT_THAT(bind(bound.get(), AsSockAddr(&bind_addr), sizeof(bind_addr)),
+              SyscallSucceeds());
+  ASSERT_THAT(listen(bound.get(),
+                     /* backlog = */ 5),  // NOLINT(bugprone-argument-comment)
+              SyscallSucceeds());
+
+  // Create a connected socket pair using the server
+  auto connected = ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_UNIX, SOCK_STREAM, 0));
+  ASSERT_THAT(
+      connect(connected.get(), AsSockAddr(&bind_addr), sizeof(bind_addr)),
+      SyscallSucceeds());
+  auto accepted =
+      ASSERT_NO_ERRNO_AND_VALUE(Accept4(bound.get(), nullptr, nullptr, 0));
+  ASSERT_THAT(close(bound.release()), SyscallSucceeds());
+
+  // The accepted socket should have SO_PASSCRED set
+  int opt;
+  socklen_t optLen = sizeof(opt);
+  EXPECT_THAT(
+      getsockopt(accepted.get(), SOL_SOCKET, SO_PASSCRED, &opt, &optLen),
+      SyscallSucceeds());
+  EXPECT_TRUE(opt);
+}
+
+// This test will validate that MSG_CTRUNC as an input flag to recvmsg will
+// not appear as an output flag on the control message when truncation doesn't
+// happen.
+TEST_P(UnixSocketPairCmsgTest, MsgCtruncInputIsNoop) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  auto pair =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+
+  ASSERT_NO_FATAL_FAILURE(SendSingleFD(sockets->first_fd(), pair->second_fd(),
+                                       sent_data, sizeof(sent_data)));
+
+  struct msghdr msg = {};
+  char control[CMSG_SPACE(sizeof(int)) /* we're passing a single fd */];
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+
+  struct iovec iov;
+  char received_data[20];
+  iov.iov_base = received_data;
+  iov.iov_len = sizeof(received_data);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+
+  ASSERT_THAT(RetryEINTR(recvmsg)(sockets->second_fd(), &msg, MSG_CTRUNC),
+              SyscallSucceedsWithValue(sizeof(received_data)));
+  struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+  ASSERT_NE(cmsg, nullptr);
+  ASSERT_EQ(cmsg->cmsg_len, CMSG_LEN(sizeof(int)));
+  ASSERT_EQ(cmsg->cmsg_level, SOL_SOCKET);
+  ASSERT_EQ(cmsg->cmsg_type, SCM_RIGHTS);
+
+  // Now we should verify that MSG_CTRUNC wasn't set as an output flag.
+  EXPECT_EQ(msg.msg_flags & MSG_CTRUNC, 0);
+}
+
+TEST_P(UnixSocketPairCmsgTest, FDPassAfterSoPassCredWithoutCredHeaderSpace) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+
+  auto pair =
+      ASSERT_NO_ERRNO_AND_VALUE(UnixDomainSocketPair(SOCK_SEQPACKET).Create());
+
+  SetSoPassCred(sockets->second_fd());
+
+  ASSERT_NO_FATAL_FAILURE(SendSingleFD(sockets->first_fd(), pair->second_fd(),
+                                       sent_data, sizeof(sent_data)));
+
+  struct msghdr msg = {};
+  char control[CMSG_LEN(0) / 2];
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+
+  char received_data[20];
+  struct iovec iov;
+  iov.iov_base = received_data;
+  iov.iov_len = sizeof(received_data);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+
+  ASSERT_THAT(RetryEINTR(recvmsg)(sockets->second_fd(), &msg, 0),
+              SyscallSucceedsWithValue(sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(sent_data, received_data, sizeof(sent_data)));
+  EXPECT_EQ(msg.msg_controllen, 0);
+}
+
+// A zero-length receive still delivers a pending SCM_RIGHTS fd without
+// consuming data on stream sockets, and consuming data (with MSG_TRUNC)
+// on packet sockets.
+TEST_P(UnixSocketPairCmsgTest, ZeroLengthRecvReceivesFD) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data = 'a';
+  char sent_control[CMSG_SPACE(sizeof(int))] = {};
+  struct iovec sent_iov = {};
+  sent_iov.iov_base = &sent_data;
+  sent_iov.iov_len = sizeof(sent_data);
+  struct msghdr sent_msg = {};
+  sent_msg.msg_iov = &sent_iov;
+  sent_msg.msg_iovlen = 1;
+  sent_msg.msg_control = sent_control;
+  sent_msg.msg_controllen = sizeof(sent_control);
+  struct cmsghdr* cmsg = CMSG_FIRSTHDR(&sent_msg);
+  cmsg->cmsg_level = SOL_SOCKET;
+  cmsg->cmsg_type = SCM_RIGHTS;
+  cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+  const int fd_to_send = sockets->second_fd();
+  memcpy(CMSG_DATA(cmsg), &fd_to_send, sizeof(int));
+  ASSERT_THAT(RetryEINTR(sendmsg)(sockets->second_fd(), &sent_msg, 0),
+              SyscallSucceedsWithValue(sizeof(sent_data)));
+
+  char recv_control[CMSG_SPACE(sizeof(int))] = {};
+  struct msghdr recv_msg = {};
+  recv_msg.msg_control = recv_control;
+  recv_msg.msg_controllen = sizeof(recv_control);
+  ASSERT_THAT(RetryEINTR(recvmsg)(sockets->first_fd(), &recv_msg, 0),
+              SyscallSucceedsWithValue(0));
+
+  const bool is_stream =
+      (GetParam().type & ~(SOCK_NONBLOCK | SOCK_CLOEXEC)) == SOCK_STREAM;
+  if (is_stream) {
+    // Stream sockets never report MSG_TRUNC.
+    EXPECT_EQ(recv_msg.msg_flags & MSG_TRUNC, 0);
+  } else {
+    EXPECT_EQ(recv_msg.msg_flags & MSG_TRUNC, MSG_TRUNC);
+  }
+
+  cmsg = CMSG_FIRSTHDR(&recv_msg);
+  ASSERT_NE(cmsg, nullptr);
+  EXPECT_EQ(cmsg->cmsg_level, SOL_SOCKET);
+  EXPECT_EQ(cmsg->cmsg_type, SCM_RIGHTS);
+  ASSERT_EQ(cmsg->cmsg_len, CMSG_LEN(sizeof(int)));
+  int received_fd = -1;
+  memcpy(&received_fd, CMSG_DATA(cmsg), sizeof(int));
+  EXPECT_GE(received_fd, 0);
+  EXPECT_THAT(close(received_fd), SyscallSucceeds());
+
+  if (is_stream) {
+    // On stream sockets, the data byte is still there and the fd does
+    // not come again.
+    char received_data = 0;
+    char recv_control2[CMSG_SPACE(sizeof(int))] = {};
+    struct iovec recv_iov = {};
+    recv_iov.iov_base = &received_data;
+    recv_iov.iov_len = sizeof(received_data);
+    struct msghdr recv_msg2 = {};
+    recv_msg2.msg_iov = &recv_iov;
+    recv_msg2.msg_iovlen = 1;
+    recv_msg2.msg_control = recv_control2;
+    recv_msg2.msg_controllen = sizeof(recv_control2);
+    ASSERT_THAT(RetryEINTR(recvmsg)(sockets->first_fd(), &recv_msg2, 0),
+                SyscallSucceedsWithValue(sizeof(received_data)));
+    EXPECT_EQ(received_data, sent_data);
+    EXPECT_EQ(CMSG_FIRSTHDR(&recv_msg2), nullptr);
+  }
+}
+
+}  // namespace
+
+}  // namespace testing
+}  // namespace gvisor

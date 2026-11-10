@@ -4,7 +4,9 @@
 //! Initial workload/result draining is blocking. The two explicit settlement
 //! attempts below bound only finalization; configured CLI alarms/outer runners
 //! bound a stalled initial drain. The caller must satisfy Container's pre-thread
-//! and no-competing-reaper requirements.
+//! requirement (no other thread, or only one that takes no lock, allocates
+//! nothing and leaves signal dispositions alone; see
+//! `ContainerInitStopSignalBridge::install`) and its no-competing-reaper one.
 
 use std::any::Any;
 use std::cell::RefCell;
@@ -32,6 +34,8 @@ use serde::Deserializer;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde::de::Error as _;
+
+use crate::app::container_clone::CheckedClone;
 
 /// How long the parent waits for the container child to EXIT after it has
 /// published its result, and then waits again after cancelling it.
@@ -301,10 +305,14 @@ where
             )
         }
     };
+    // A virtual-timeout note an earlier child left is not this child's
+    // (`classify_container_result`), nor is a replay refusal note.
+    super::terminal_outcome_note::clear();
+    super::replay_refusal_note::clear();
     // The container init inherits this at clone, and it covers the setup Reverie
     // runs before the factory above can arm the init's own handlers.
     let stop_signal_bridge = super::container::ContainerInitStopSignalBridge::install()?;
-    let started = container.run_with_deferred_drop_owned(&mut factory);
+    let started = container.checked_run_with_deferred_drop_owned(&mut factory);
     drop(stop_signal_bridge);
     let (first, child_pid) = match started {
         Ok(run) => {
@@ -566,13 +574,13 @@ mod tests {
             assert_eq!(error.kind(), kind);
             let error = super::super::container::classify_container_result::<()>(Ok(Err(error)))
                 .unwrap_err();
-            assert_eq!(crate::failure_exit_code(&error), code);
-            assert_eq!(crate::classify_failure(&error), marker);
+            assert_eq!(crate::app::failure_exit_code(&error), code);
+            assert_eq!(crate::app::classify_failure(&error), marker);
             assert!(format!("{error:#}").contains("original diagnostic"));
             let primary_display = error.to_string();
             let error = diagnostic(Some(kind)).context(error);
-            assert_eq!(crate::failure_exit_code(&error), code);
-            assert_eq!(crate::classify_failure(&error), marker);
+            assert_eq!(crate::app::failure_exit_code(&error), code);
+            assert_eq!(crate::app::classify_failure(&error), marker);
             assert!(
                 error
                     .to_string()
@@ -604,9 +612,9 @@ mod tests {
             RunError::ExitStatus(ExitStatus::Exited(125)),
         ))
         .unwrap_err();
-        assert_eq!(crate::failure_exit_code(&error), 125);
+        assert_eq!(crate::app::failure_exit_code(&error), 125);
         assert_eq!(
-            crate::classify_failure(&error),
+            crate::app::classify_failure(&error),
             "HERMIT_INTERNAL_FAILURE class=container-child-exit status=Exited(125)"
         );
     }

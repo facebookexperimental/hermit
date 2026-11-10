@@ -39,6 +39,30 @@ ci/run-dag.sh privileged -j 2                    # PMU lane, one gate at a time
 agent-utils/py/bin/dagrun ascii --dag ci/dag/validate.json  # inspect the superset
 ```
 
+## Step limits: CPU bounds, with the wall a hang backstop
+
+Every node declares a CPU bound (`cpu_timeout`) and a wall bound (`timeout`).
+A wall bound fires on host load; a CPU bound does not. The owner rule of
+2026-11-01, enforced by `ci/manifest-plan/src/step_limits.rs` whenever the
+generator runs (so `generate-validation-dag --check` and the freshness unit
+test refuse a violation):
+
+- the wall bound is at most 8 times the CPU bound;
+- the CPU bound must be reachable before the wall bound at the node's
+  declared width (`preferred_inner_jobs`, default 1), so a node cannot be
+  bounded by its wall alone;
+- the wall bound is at most 600 seconds unless the node has an entry, with the
+  measurement or contract that needs it, in `WALL_CEILING_EXCEPTIONS`.
+
+On 2026-11-02, under four to six concurrent full validations, 74 of the 103
+`full` nodes carried a 7200-second CPU bound they could never reach, and they
+failed on WALL bounds alone. They were recalibrated from 30 days of retained
+dagrun journals (about 1.5 times the largest measured CPU; the module comment
+has the derivation). Families with no retained measurement (the hosted twins,
+`privileged-only-*`, quick, super, envelope, the compat-only lanes) are listed
+in `UNMEASURED_FAMILIES`. Each entry must still hold a node the rule refuses,
+so the list can only shrink.
+
 ## Status: active local lanes and manual hosted diagnostics
 
 `scripts/validate.rs` reads `validate.json` and selects local labels.
@@ -60,16 +84,18 @@ runnable DAG.
 The local privileged selection contains 19 nodes (20 until the one-build change
 of 2026-09-30 retired the unconsumed host copy of
 `privileged-only-build.privileged_tests`, which compiled Hermit on the host)
-with a 4740-second critical
+with a 5160-second critical
 path (4500 until setup.manifest_plan's wall cap went from 180 to 300 seconds in
 https://github.com/rrnewton/hermit/issues/3381, then 4620 until the Rust-script
 producer's wall cap went from 900 to 1200 seconds, then 4920 until
-setup.manifest_plan stopped waiting for the Rust-script producer on 2026-10-16;
+setup.manifest_plan stopped waiting for the Rust-script producer on 2026-10-16,
+then 4740 until the step-limit recalibration of 2026-11-02 below;
 the longest path is now the pinned-root one through
 build.rust_scripts_in_pinned_root and setup.manifest_plan_in_pinned_root). The separately labelled hosted privileged smoke preserves its historical
-12-node population and has a 2400-second critical path (2100 before the
-Rust-script producer's wall cap went from 900 to 1200 seconds), so the manual
-workflow uses an audited 2460-second launcher bound. The stale hosted file omitted CPU
+12-node population and has a 3650-second critical path (2400 before the
+cell wall derivation raised the hosted applications node's wall bound
+for its retry window), so the manual
+workflow uses an audited 3720-second launcher bound. The stale hosted file omitted CPU
 budgets and therefore inherited dagrun's 10-second fallback; every hosted node
 now carries the corresponding current-plan CPU budget explicitly. This is a
 correctness repair, not a claim that the obsolete fallback was equivalent.
@@ -80,7 +106,10 @@ job.
 
 The `mem_race` family and three nonblocking post-DAG diagnostics run in the
 manually dispatched `super` tier so a known host-sensitive hang cannot consume
-the serialized capability lane unexpectedly.
+the serialized capability lane unexpectedly. The `super` *level* selects the
+`full` and `super` labels together (the nightly tier runs everything `full`
+runs plus the super-only population; `--inventory --labels full,super` shows
+that union, while `--labels super` alone shows only the super-only part).
 
 The `Validation Levels` workflow does not launch for pull requests, `main`, or a
 schedule. Its quick, privileged, and super levels remain available by manual
@@ -115,6 +144,17 @@ and supplies their verified Cargo-reported paths to the test process. Missing,
 stale, ambiguous, or wrong-target artifacts cause refusal; a consumer never
 falls back to compiling them. The actual Cargo target directory is retained,
 including a configured `CARGO_TARGET_DIR`; no guessed target remap is applied.
+
+The record also names the graph profile that prepared it and the Cargo profile
+that built its executables (`validate` for `full` and `hosted-portable`, `dev`
+for every other profile). There is one record per target directory, and the last
+producer to run replaces it, so a focused lane's `prepare privileged` leaves
+dev-profile executables behind for any later consumer. `ci/nextest-binaries.rs
+assert PROFILE [--prepared-by PRODUCER]` therefore refuses a record built in a
+Cargo profile other than the one `prepare PRODUCER` uses, naming both profiles
+and the producer node to rerun. The full lane's privileged barrier runs `assert
+privileged --prepared-by full`. A record from before record schema 6 names no
+Cargo profile and is refused rather than inferred from executable paths.
 
 For an explicit local prepared run, first prepare a graph profile, then invoke
 `ci/nextest-binaries.rs run` or `list` with the same Cargo selectors and desired

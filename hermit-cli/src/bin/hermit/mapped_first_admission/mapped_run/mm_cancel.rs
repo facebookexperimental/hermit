@@ -335,19 +335,19 @@ pub(crate) fn cancel_at(
 
 #[test]
 fn physical_mm_cancel_before_registration() -> anyhow::Result<()> {
-    crate::run::physical_mm_cancellation_control(Point::BeforeRegistration)
+    crate::app::run::physical_mm_cancellation_control(Point::BeforeRegistration)
 }
 #[test]
 fn physical_mm_cancel_registered_before_first_grant() -> anyhow::Result<()> {
-    crate::run::physical_mm_cancellation_control(Point::RegisteredBeforeGrant)
+    crate::app::run::physical_mm_cancellation_control(Point::RegisteredBeforeGrant)
 }
 #[test]
 fn physical_mm_cancel_during_thread_startup() -> anyhow::Result<()> {
-    crate::run::physical_mm_cancellation_control(Point::ThreadStartup)
+    crate::app::run::physical_mm_cancellation_control(Point::ThreadStartup)
 }
 #[test]
 fn physical_mm_cancel_during_post_exec() -> anyhow::Result<()> {
-    crate::run::physical_mm_cancellation_control(Point::PostExec)
+    crate::app::run::physical_mm_cancellation_control(Point::PostExec)
 }
 
 // Exercise the actual acceptance predicate and final-outcome capture, without

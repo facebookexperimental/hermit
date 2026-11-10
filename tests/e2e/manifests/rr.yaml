@@ -1,0 +1,2607 @@
+schema: 3
+bucket: rr
+test:
+  - id: rr/simple
+    description: Upstream rr simple guest prints EXIT-SUCCESS (Batch 0 spike for the rr pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/simple.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/llseek
+    description: Upstream rr _llseek guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/_llseek.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/abort-nonmain
+    description: Upstream rr abort_nonmain guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/abort_nonmain.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        expected_guest_exit:
+          signal: 6
+          reason: The guest aborts from a non-main thread on purpose; both verify runs must die with SIGABRT after printing its killing token.
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/accept
+    description: Upstream rr accept guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/accept.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/alarm
+    description: Upstream rr alarm guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/alarm.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/barrier
+    description: Upstream rr barrier guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/barrier.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/blocked-sigill
+    description: Upstream rr blocked_sigill guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/blocked_sigill.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        expected_guest_exit:
+          signal: 4
+          reason: The guest executes an illegal instruction with SIGILL blocked on purpose; both verify runs must die with SIGILL.
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/capget
+    description: Upstream rr capget guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/capget.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/chmod
+    description: Upstream rr chmod guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/chmod.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/clone
+    description: Upstream rr clone guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/clone.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/copy-file-range
+    description: Upstream rr copy_file_range guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/copy_file_range.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/crash
+    description: Upstream rr crash guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/crash.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        expected_guest_exit:
+          signal: 11
+          reason: The guest dereferences a null pointer on purpose; both verify runs must die with SIGSEGV.
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/epoll-many
+    description: Upstream rr epoll_many guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/epoll_many.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/eventfd
+    description: Upstream rr eventfd guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/eventfd.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/fcntl-notify
+    description: Upstream rr fcntl_notify guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/fcntl_notify.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/futex-requeue
+    description: Upstream rr futex_requeue guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/futex_requeue.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/futex-restart-race
+    description: Upstream rr futex_restart_race guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/futex_restart_race.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/inotify
+    description: Upstream rr inotify guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/inotify.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/intr-poll
+    description: Upstream rr intr_poll guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/intr_poll.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        expected_guest_exit:
+          code: 1
+          reason: The guest exits 1 after its interrupted poll returns as designed upstream; fbsource records the same expected exit code.
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/io-uring
+    description: Upstream rr io_uring guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/io_uring.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/landlock
+    description: Upstream rr landlock guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/landlock.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/mmap-shared
+    description: Upstream rr mmap_shared guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/mmap_shared.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/nanosleep
+    description: Upstream rr nanosleep guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/nanosleep.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/openat2
+    description: Upstream rr openat2 guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/openat2.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/prctl-caps
+    description: Upstream rr prctl_caps guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/prctl_caps.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/robust-futex
+    description: Upstream rr robust_futex guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/robust_futex.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/sched-yield
+    description: Upstream rr sched_yield guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/sched_yield.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/scm-rights
+    description: Upstream rr scm_rights guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/scm_rights.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/segfault
+    description: Upstream rr segfault guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/segfault.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/sigrt
+    description: Upstream rr sigrt guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/sigrt.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/statfs
+    description: Upstream rr statfs guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/statfs.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: rr/timerfd
+    description: Upstream rr timerfd guest completes with its success token under Hermit (pressure corpus)
+    labels: [pressure]
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+      - python3
+    occasional: false
+    program: third-party/rr/src/test/timerfd.c
+    preprocessors: [rr-generated-headers]
+    build:
+      cflags:
+        - -std=gnu11
+        - -O0
+        - -g3
+        - -Wno-error
+        - -D_FILE_OFFSET_BITS=64
+        - -pthread
+        - -Ithird-party/rr/src/test
+        - -Ithird-party/rr/src/preload
+        - -Ithird-party/rr/include
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: rr guests assert deterministic Hermit behavior; there is no naked nondeterminism oracle.'
+        backends_enabled: []
+        backends_disabled:
+          native: The guest prints a fixed EXIT-SUCCESS line by construction
+      verify:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: rr corpus qualifies ptrace first; DBT ratchets separately
+          kvm: rr corpus qualifies ptrace first; KVM ratchets separately
+          sabre: rr corpus qualifies ptrace first; SaBRe ratchets separately
+          liteinst: rr corpus qualifies ptrace first; LiteInst ratchets separately
+          in-guest-trap: rr corpus qualifies ptrace first; in-guest-trap ratchets separately
+      replay:
+        ci: false
+        ci_disabled_reason: 'Pressure tier: measured run-only green in the Phase 1 sample on debug Hermit; hermetic replay/verify pass plus 2 clean pressure nights required for super.'
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: single-threaded guest has no schedule-diversity oracle.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded guest has no schedule diversity to explore
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case Hermit arguments have been calibrated for this cell.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No edge-case Hermit arguments are required
+          dbt: No edge-case Hermit arguments are required
+          kvm: No edge-case Hermit arguments are required
+          sabre: No edge-case Hermit arguments are required
+          liteinst: No edge-case Hermit arguments are required
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap

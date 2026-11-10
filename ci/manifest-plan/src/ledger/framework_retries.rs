@@ -7,6 +7,8 @@
 //! census binds, and it revises no verdict.
 
 use super::*;
+use crate::runner::MAX_ATTEMPTS_PER_CELL;
+use crate::runner::history_past_generic_bound_is_skid_qualified;
 use crate::runner::outcome_after_retries;
 
 /// The cells of one run that have more than one attempt row, whatever caused
@@ -35,11 +37,43 @@ pub struct RetriedCellV1 {
     pub first_outcome: String,
     pub first_failure_class: Option<String>,
     pub first_error_kind: Option<String>,
+    /// Named signature of the first attempt's cause, derived from its own
+    /// recorded reason: `skid_overshoot` or `host_input_changed` for the
+    /// typed infrastructure causes, otherwise the error kind. Keeps
+    /// skid-overshoot its own bucket, separate from other infrastructure.
+    pub first_signature: Option<String>,
     pub first_result: Option<String>,
     pub first_divergent_scheduler_turn: Option<u64>,
     pub first_divergent_record: Option<u64>,
     pub first_divergent_syscall: Option<u64>,
     pub final_outcome: String,
+    /// Every attempt's own outcome, in attempt order, retained from the
+    /// raw rows (absent in records written before these fields). The
+    /// retry rollup must use these, never a reconstruction from the
+    /// first and final attempts: past the generic bound only the
+    /// retained rows say what each intermediate attempt was.
+    #[serde(default)]
+    pub attempt_outcomes: Vec<String>,
+    #[serde(default)]
+    pub attempt_failure_classes: Vec<Option<String>>,
+    #[serde(default)]
+    pub attempt_error_kinds: Vec<Option<String>>,
+    #[serde(default)]
+    pub attempt_signatures: Vec<Option<String>>,
+}
+
+/// The named cause of one attempt, from its recorded reason. Only the
+/// typed infrastructure causes get their own names; everything else
+/// falls back to the attempt's error kind.
+pub fn signature_of(reason: Option<&str>, error_kind: Option<&str>) -> String {
+    let reason = reason.unwrap_or_default();
+    if reason.contains("HERMIT_SKID_OVERSHOOT") {
+        "skid_overshoot".to_string()
+    } else if reason.contains("host_input_changed") || reason.contains("outside the guest") {
+        "host_input_changed".to_string()
+    } else {
+        error_kind.unwrap_or("unclassified").to_string()
+    }
 }
 
 impl FrameworkRetriesV1 {
@@ -82,6 +116,32 @@ impl FrameworkRetriesV1 {
                     continue;
                 }
                 history.sort_by_key(|(attempt, _)| *attempt);
+                // A history past the generic bound is admitted only on
+                // retained skid-only evidence, re-decided from the full
+                // rows: the outcome strings alone cannot distinguish a
+                // proven skid history from an over-budget product one.
+                if history.len() as u64 > MAX_ATTEMPTS_PER_CELL {
+                    let full_rows = history
+                        .iter()
+                        .map(|(_, row)| {
+                            serde_json::from_value::<crate::runner::CellResult>(row.clone())
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| {
+                            format!(
+                                "{path}: {} ({}): history past the generic bound is not skid-qualified: row does not decode as a cell result: {error}",
+                                cell.test, cell.mode
+                            )
+                        })?;
+                    if !history_past_generic_bound_is_skid_qualified(&full_rows) {
+                        return Err(format!(
+                            "{path}: {} ({}): history of {} attempt(s) exceeds the generic maximum of {MAX_ATTEMPTS_PER_CELL} without skid-only evidence for every attempt before the final one",
+                            cell.test,
+                            cell.mode,
+                            history.len()
+                        ));
+                    }
+                }
                 let outcome = |row: &Value| row["outcome"].as_str().unwrap_or_default().to_string();
                 let final_outcome = outcome_after_retries(
                     history
@@ -92,6 +152,12 @@ impl FrameworkRetriesV1 {
                 let first = &history[0].1;
                 let text = |name: &str| first.get(name).and_then(Value::as_str).map(str::to_string);
                 let number = |name: &str| first.get(name).and_then(Value::as_u64);
+                let per_attempt = |name: &str| {
+                    history
+                        .iter()
+                        .map(|(_, row)| row.get(name).and_then(Value::as_str).map(str::to_string))
+                        .collect::<Vec<_>>()
+                };
                 cells.push(RetriedCellV1 {
                     path: path.clone(),
                     cell,
@@ -99,11 +165,27 @@ impl FrameworkRetriesV1 {
                     first_outcome: outcome(first),
                     first_failure_class: text("failure_class"),
                     first_error_kind: text("error_kind"),
+                    first_signature: Some(signature_of(
+                        text("reason").as_deref(),
+                        text("error_kind").as_deref(),
+                    )),
                     first_result: text("result"),
                     first_divergent_scheduler_turn: number("first_divergent_scheduler_turn"),
                     first_divergent_record: number("first_divergent_record"),
                     first_divergent_syscall: number("first_divergent_syscall"),
                     final_outcome: final_outcome.to_string(),
+                    attempt_outcomes: history.iter().map(|(_, row)| outcome(row)).collect(),
+                    attempt_failure_classes: per_attempt("failure_class"),
+                    attempt_error_kinds: per_attempt("error_kind"),
+                    attempt_signatures: history
+                        .iter()
+                        .map(|(_, row)| {
+                            Some(signature_of(
+                                row.get("reason").and_then(Value::as_str),
+                                row.get("error_kind").and_then(Value::as_str),
+                            ))
+                        })
+                        .collect(),
                 });
             }
         }
@@ -190,6 +272,13 @@ mod tests {
         );
         assert_eq!(retries.cells[1].cell.test, "fixture/twice");
         assert_eq!(retries.cells[1].final_outcome, "FAIL");
+        // Per-attempt values are retained from the raw rows, in order.
+        assert_eq!(rescued.attempt_outcomes, ["FAIL", "PASS"]);
+        assert_eq!(
+            rescued.attempt_failure_classes,
+            [Some("product_failure".to_string()), None]
+        );
+        assert_eq!(retries.cells[1].attempt_outcomes, ["FAIL", "FAIL"]);
         // The record round-trips through its strict reader.
         let value = serde_json::to_value(&retries).unwrap();
         assert_eq!(
@@ -204,6 +293,15 @@ mod tests {
             ("no attempt", "{\"lane\":\"portable\",\"category\":\"fixture\",\"test\":\"fixture/x\",\"mode\":\"verify\",\"backend\":\"ptrace\",\"outcome\":\"FAIL\"}\n".to_string()),
             ("attempt after a pass", [row("fixture/x", 1, "PASS", false), row("fixture/x", 2, "FAIL", false)].concat()),
             ("a gap", [row("fixture/x", 1, "FAIL", false), row("fixture/x", 3, "PASS", false)].concat()),
+            (
+                "a product history past the generic bound",
+                [
+                    row("fixture/x", 1, "FAIL", false),
+                    row("fixture/x", 2, "FAIL", false),
+                    row("fixture/x", 3, "PASS", false),
+                ]
+                .concat(),
+            ),
             ("malformed", "{".to_string()),
         ] {
             let inputs = BTreeMap::from([("one/results.jsonl".to_string(), rows.into_bytes())]);

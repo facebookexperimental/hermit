@@ -35,7 +35,10 @@
  * I/O, an interface ioctl on an AF_UNIX socket, or opening /proc/net/dev.
  *
  * The backpressure controller reads nothing from a data connection until a
- * second, control connection says "go". The backpressure clients fill the
+ * second, control connection says "go". Before that, a client may ask it on
+ * the control connection to wait until nothing the client sent is in
+ * flight, which only the controller can do in real time. The backpressure
+ * clients fill the
  * data connection from one thread, past what the small socket buffers hold,
  * while a second thread sends "go" only after the first is stuck: after a
  * nonblocking send reported EAGAIN, or while a blocking send waits. Linux
@@ -70,6 +73,11 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/inet_diag.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <linux/sock_diag.h>
+#include <linux/tcp.h>
 #include <net/if.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -138,6 +146,9 @@ static const char FIRST_INPUT[] = "abc";
 static const char SECOND_INPUT[] = "def";
 static const char OUTBOUND_HEX[] = "726571756573740a6e6578740a646f6e650a";
 static const char GO[] = "go\n";
+/* Asks the backpressure controller to wait until the data connection is
+ * settled, and is its reply; see wait_until_settled. */
+static const char SETTLE[] = "st\n";
 static const char DRAINED[] = "ok\n";
 
 static void fail(const char *operation) {
@@ -1009,11 +1020,99 @@ static int accept_backpressure_connections(const char *port_path,
   return data;
 }
 
-static void receive_go(int control) {
-  char go[sizeof(GO) - 1];
-  receive_exact(control, go, sizeof(go));
-  if (memcmp(go, GO, sizeof(go)) != 0)
-    fail_message("control connection mismatch");
+/* The tcp_info of the established TCP connection from `source` to
+ * `destination`, read through sock_diag, which reports another process's
+ * socket. */
+static void connection_info(const struct sockaddr_in *source,
+                            const struct sockaddr_in *destination, struct tcp_info *info) {
+  int fd = socket(AF_NETLINK, SOCK_DGRAM | SOCK_CLOEXEC, NETLINK_SOCK_DIAG);
+  if (fd < 0)
+    fail("socket sock_diag");
+  struct {
+    struct nlmsghdr header;
+    struct inet_diag_req_v2 request;
+  } message = {
+      .header = {.nlmsg_len = sizeof(message),
+                 .nlmsg_type = SOCK_DIAG_BY_FAMILY,
+                 .nlmsg_flags = NLM_F_REQUEST},
+      .request = {.sdiag_family = AF_INET,
+                  .sdiag_protocol = IPPROTO_TCP,
+                  .idiag_ext = 1 << (INET_DIAG_INFO - 1),
+                  .idiag_states = 1 << 1, // TCP_ESTABLISHED
+                  .id = {.idiag_sport = source->sin_port,
+                         .idiag_dport = destination->sin_port,
+                         .idiag_cookie = {INET_DIAG_NOCOOKIE, INET_DIAG_NOCOOKIE}}}};
+  message.request.id.idiag_src[0] = source->sin_addr.s_addr;
+  message.request.id.idiag_dst[0] = destination->sin_addr.s_addr;
+  if (send(fd, &message, sizeof(message), 0) != (ssize_t)sizeof(message))
+    fail("send sock_diag request");
+  static char reply[8192];
+  ssize_t length;
+  do
+    length = recv(fd, reply, sizeof(reply), 0);
+  while (length < 0 && errno == EINTR);
+  if (length < 0)
+    fail("recv sock_diag reply");
+  close(fd);
+  for (struct nlmsghdr *header = (struct nlmsghdr *)reply; NLMSG_OK(header, length);
+       header = NLMSG_NEXT(header, length)) {
+    if (header->nlmsg_type != SOCK_DIAG_BY_FAMILY)
+      continue;
+    struct inet_diag_msg *diag = NLMSG_DATA(header);
+    int attributes = (int)(header->nlmsg_len - NLMSG_LENGTH(sizeof(*diag)));
+    for (struct rtattr *attribute = (struct rtattr *)(diag + 1); RTA_OK(attribute, attributes);
+         attribute = RTA_NEXT(attribute, attributes)) {
+      if (attribute->rta_type != INET_DIAG_INFO)
+        continue;
+      size_t size = RTA_PAYLOAD(attribute);
+      if (size < offsetof(struct tcp_info, tcpi_snd_wnd) + sizeof(info->tcpi_snd_wnd))
+        fail_message("sock_diag reported a tcp_info without tcpi_snd_wnd");
+      memset(info, 0, sizeof(*info));
+      memcpy(info, RTA_DATA(attribute), size < sizeof(*info) ? size : sizeof(*info));
+      return;
+    }
+  }
+  fail_message("sock_diag did not report the client's data connection");
+}
+
+/* Waits until the client's end of `data` has nothing in flight and the
+ * window this end advertised is closed: then no acknowledgement still to
+ * come frees space in its send buffer, and only reading here would. The
+ * client's last segment before the window closed is acknowledged only when
+ * this end's delayed-acknowledgement timer fires, up to 200 ms later. The
+ * client cannot wait for that itself: under Hermit its sleeps are virtual
+ * and take next to no real time. Bounded by alarm(FIXTURE_DEADLINE_SECONDS). */
+static void wait_until_settled(int data) {
+  struct sockaddr_in here;
+  struct sockaddr_in client;
+  socklen_t here_length = sizeof(here);
+  socklen_t client_length = sizeof(client);
+  if (getsockname(data, (struct sockaddr *)&here, &here_length) != 0 ||
+      getpeername(data, (struct sockaddr *)&client, &client_length) != 0)
+    fail("name data connection");
+  for (;;) {
+    struct tcp_info info;
+    connection_info(&client, &here, &info);
+    if (info.tcpi_unacked == 0 && info.tcpi_snd_wnd == 0)
+      return;
+    const struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000 * 1000};
+    nanosleep(&pause, NULL);
+  }
+}
+
+/* Answers each settle request on `control` once `data` is settled, until
+ * "go". */
+static void receive_go(int control, int data) {
+  for (;;) {
+    char message[sizeof(GO) - 1];
+    receive_exact(control, message, sizeof(message));
+    if (memcmp(message, GO, sizeof(message)) == 0)
+      return;
+    if (memcmp(message, SETTLE, sizeof(message)) != 0)
+      fail_message("control connection mismatch");
+    wait_until_settled(data);
+    send_all(control, SETTLE, sizeof(SETTLE) - 1);
+  }
 }
 
 /* Drains the data connection only after "go". With `report_digest` it
@@ -1027,7 +1126,7 @@ static int run_backpressure_controller(const char *port_path,
   int data = accept_backpressure_connections(port_path, contact_path, &listener, &control);
   close(listener);
 
-  receive_go(control);
+  receive_go(control, data);
   uint64_t digest = UINT64_C(14695981039346656037);
   for (size_t received = 0; received < BACKPRESSURE_BYTES;) {
     unsigned char bytes[BACKPRESSURE_SOCKET_BUFFER];
@@ -1071,7 +1170,7 @@ static int run_replace_controller(const char *port_path, const char *report_path
   set_socket_timeouts(replacement);
   close(listener);
 
-  receive_go(control);
+  receive_go(control, data);
   int fds[2] = {data, replacement};
   size_t counts[2] = {0, 0};
   int open_count = 2;
@@ -1328,19 +1427,25 @@ static size_t fill_until_refused(int fd, const unsigned char *bytes, size_t sent
   }
 }
 
-/* Fills the connection until it stays full: acknowledgements still in
- * flight after the first refusal free buffer space, which a later
- * one-byte send would take. */
-static size_t fill_until_full(int fd, const unsigned char *bytes) {
+/* Fills the connection until it stays full: an acknowledgement still to
+ * come after a refusal frees buffer space, which a later one-byte send
+ * would take. After each fill the controller waits until none is to come,
+ * and the next fill takes what the last one freed, until one takes nothing.
+ * A timed pause here would not do: under Hermit it takes next to no real
+ * time, so the acknowledgement could still come after it. */
+static size_t fill_until_full(int fd, int control, const unsigned char *bytes) {
   size_t sent = fill_until_refused(fd, bytes, 0);
-  for (int quiet = 0; quiet < 3;) {
-    const struct timespec settle = {.tv_sec = 0, .tv_nsec = 20 * 1000 * 1000};
-    nanosleep(&settle, NULL);
+  for (;;) {
+    send_all(control, SETTLE, sizeof(SETTLE) - 1);
+    char settled[sizeof(SETTLE) - 1];
+    receive_exact(control, settled, sizeof(settled));
+    if (memcmp(settled, SETTLE, sizeof(settled)) != 0)
+      fail_message("settle reply mismatch");
     size_t more = fill_until_refused(fd, bytes, sent);
-    quiet = more == sent ? quiet + 1 : 0;
+    if (more == sent)
+      return sent;
     sent = more;
   }
-  return sent;
 }
 
 static int run_backpressure_client(const char *port_text, enum backpressure_kind kind) {
@@ -1390,7 +1495,7 @@ static int run_backpressure_client(const char *port_text, enum backpressure_kind
   struct timespec after = {0, 0};
   if (kind == INTERLEAVED || kind == SHARED) {
     // The blocking send waits before it sends its first byte.
-    size_t sent = fill_until_full(data, bytes);
+    size_t sent = fill_until_full(data, control, bytes);
     announce_stuck(&state);
     send_all(data, bytes + sent, BACKPRESSURE_BYTES - sent);
   } else if (kind == NONBLOCKING) {

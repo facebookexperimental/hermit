@@ -94,6 +94,39 @@ pub fn understood_infrastructure_class(output: &str) -> Option<&'static str> {
     {
         return Some(class);
     }
+    // systemd-run's full user-bus refusal shape only: a bare "connection
+    // refused" elsewhere is product evidence, not an infrastructure cause.
+    // The refusal is terminal only when nothing in the detail shows the run
+    // progressed past it: `safe_ci_scope::self_test` plants the full shape as
+    // a fixture, so a green self-test detail carries the line alongside a
+    // `verdict bracketed` success marker, and a later real failure in the
+    // same detail (`SELF-TEST FAILED:`) must not be masked as a non-run.
+    let has_self_test_failure = output
+        .lines()
+        .any(|line| line.contains("SELF-TEST FAILED:"));
+    let has_bracket_success = lower.contains("verdict bracketed");
+    // Only the harness's own terminal emission counts, never test output: a
+    // test that prints the refusal and then reports its own failure must stay
+    // a product failure, and the refusal must be the detail's last word (the
+    // harness probe/wrapper line), with nothing measured after it.
+    let has_product_failure = lower.contains("test result:")
+        || lower.contains("panicked at")
+        || lower.contains("assertion failed");
+    let last_line = output.lines().rev().find(|line| !line.trim().is_empty());
+    let refusal_is_terminal = last_line.is_some_and(|line| {
+        let line = line.to_ascii_lowercase();
+        line.contains("failed to connect to user scope bus via local transport:")
+            || line.contains("systemd user scope bus unavailable")
+            || line.contains("cgroup boxing could not be established")
+    });
+    if lower.contains("failed to connect to user scope bus via local transport:")
+        && !has_self_test_failure
+        && !has_bracket_success
+        && !has_product_failure
+        && refusal_is_terminal
+    {
+        return Some("user-bus-unavailable");
+    }
     if lower.contains("prehook: pmu rcb overshoot!")
         && lower.contains("clock_value:")
         && lower.contains("stepped forward")
@@ -1778,6 +1811,11 @@ pub fn self_test() -> Result<String, String> {
             "2026-08-27 ERROR detcore: prehook: PMU RCB overshoot! Clock_value: 16249. \
              Stepped forward 139 RCBs, but should have trapped at 100",
         ),
+        (
+            "user-bus-unavailable",
+            "[dagrun] re-exec inside transient systemd scope dagrun-3414313.scope\n\
+             Failed to connect to user scope bus via local transport: Connection refused",
+        ),
     ] {
         if understood_infrastructure_class(text) != Some(want) {
             return Err(format!(
@@ -1792,11 +1830,55 @@ pub fn self_test() -> Result<String, String> {
         "error: failed to run custom build command for `reverie-dbi v0.1.0`",
         "guest wrote: prehook: PMU RCB overshoot!",
         "guest wrote: mount failed: -1",
+        "connect: Connection refused",
+        "Failed to connect to user scope bus",
         "Error: Sandbox container failed to spawn\nCaused by: No such file or directory",
     ] {
         if understood_infrastructure_class(text).is_some() {
             return Err(format!(
                 "understood infrastructure: an incomplete or guest-only phrase was excused: {text:?}"
+            ));
+        }
+    }
+    // User-bus fixture leak (dh-u9f0w): the planted refusal line must only
+    // classify when it is the terminal detail. (a) fixture + bracket success
+    // + a later real SELF-TEST FAILED is a product failure, not a non-run.
+    let leaked_fixture = "Failed to connect to user scope bus via local transport: \
+                          Connection refused\n\
+                          safe-ci scope: containment, promised-scope ancestor, outer \
+                          memory/swap/OOM-group, optional RuntimeMax, per-step cgroups, \
+                          and CPU placement verdict bracketed\n\
+                          SELF-TEST FAILED: selective bracket: external cells or nodes \
+                          reappeared in the core graph";
+    if understood_infrastructure_class(leaked_fixture).is_some() {
+        return Err(
+            "understood infrastructure: a leaked user-bus fixture with bracket success \
+             and SELF-TEST FAILED was masked as user-bus-unavailable"
+                .into(),
+        );
+    }
+    // (b) the same line alone as the terminal detail is still a non-run.
+    let terminal_bus = "Failed to connect to user scope bus via local transport: \
+                        Connection refused";
+    if understood_infrastructure_class(terminal_bus) != Some("user-bus-unavailable") {
+        return Err("understood infrastructure: a terminal user-bus refusal lost its class".into());
+    }
+    // Each progress guard alone suffices, and a test that merely prints the
+    // refusal banner before its own failure stays a product failure.
+    for text in [
+        "Failed to connect to user scope bus via local transport: Connection refused\n\
+         safe-ci scope: containment, promised-scope ancestor, outer memory/swap/OOM-group, \
+         optional RuntimeMax, per-step cgroups, and CPU placement verdict bracketed",
+        "Failed to connect to user scope bus via local transport: Connection refused\n\
+         SELF-TEST FAILED: selective bracket: external cells or nodes reappeared",
+        "Failed to connect to user scope bus via local transport: Connection refused\n\
+         test result: FAILED. 0 passed; 1 failed; 0 ignored",
+        "Failed to connect to user scope bus via local transport: Connection refused\n\
+         thread 'tests::x' panicked at src/lib.rs:1:1:\nassertion failed: left == right",
+    ] {
+        if understood_infrastructure_class(text).is_some() {
+            return Err(format!(
+                "understood infrastructure: test output printing the user-bus banner was excused: {text:?}"
             ));
         }
     }

@@ -166,12 +166,11 @@ impl Guest<Detcore<InnerTool>> for GetterGuest {
 }
 
 fn setup(pid: i32, tid: i32, nested: bool) -> (Detcore<InnerTool>, GetterGuest) {
-    let mut config = Config {
+    let config = Config {
         sequentialize_threads: false,
         max_timeslice: None,
         ..Config::default()
     };
-    config.backend.virtualizes_syscall_clobbers = true;
     let mut thread = ThreadState::new(DetPid::from_raw(tid), &config, InnerState::default());
     thread.detpid = Some(DetPid::from_raw(pid));
     thread.physical_tid = Some(509);

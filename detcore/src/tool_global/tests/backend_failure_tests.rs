@@ -518,9 +518,14 @@ async fn unknown_deregistration(
                     detpid: DetPid::from_raw(owner_mm),
                     mm: MmId::initial(DetPid::from_raw(owner_mm)),
                     thread_start_entered: started,
+                    vfork_origin: None,
                     timeslice_stats: TimesliceStats::default(),
                     syscall_count: 0,
+                    syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
+                    killed_by_group_signal: false,
+                    passed_descriptors_out: false,
+                    wait_status: 0,
                 }),
             ),
         )
@@ -600,9 +605,14 @@ async fn dbt_missing_physical_id_start_preserves_tombstone_deregistration_accoun
                         detpid: process,
                         mm,
                         thread_start_entered: true,
+                        vfork_origin: None,
                         timeslice_stats: stats,
                         syscall_count: count,
+                        syscall_histogram: Default::default(),
                         chaos_epochs: Vec::new(),
+                        killed_by_group_signal: false,
+                        passed_descriptors_out: false,
+                        wait_status: 0,
                     }),
                 ),
             )
@@ -646,7 +656,7 @@ async fn backend_failure_cleanup_does_not_build_an_invalid_run_summary() {
         let mut sched = state.sched.lock().unwrap();
         let writer = sched.preemption_writer.as_mut().unwrap();
         writer.register_thread(tid, DEFAULT_PRIORITY);
-        writer.insert_reprioritization(tid, time, 23, DEFAULT_PRIORITY, DEFAULT_PRIORITY + 1);
+        writer.insert_reprioritization(tid, time, 23, DEFAULT_PRIORITY, DEFAULT_PRIORITY + 1, None);
     }
     assert!(!recording.exists());
     state.report_backend_failure(failure(tid));
@@ -659,7 +669,12 @@ async fn backend_failure_cleanup_does_not_build_an_invalid_run_summary() {
     assert!(cleanup.scheduler.is_ok());
     assert!(cleanup.preemption_recording.is_ok());
     let actual: crate::preemptions::PreemptionRecord =
-        serde_json::from_slice(&std::fs::read(recording).unwrap()).unwrap();
+        crate::preemptions::boundary_recording::Recording::decode(
+            &std::fs::read(recording).unwrap(),
+        )
+        .unwrap()
+        .into_legacy("test")
+        .unwrap();
     actual.validate().unwrap();
     let mut expected = crate::preemptions::ThreadHistory::new()
         .with_prio_changes(vec![(time, DEFAULT_PRIORITY)])
@@ -672,6 +687,10 @@ async fn backend_failure_cleanup_does_not_build_an_invalid_run_summary() {
     assert!(actual.schedevents().is_empty());
 }
 
+/// A scheduler that panics during a backend failure's cleanup: the production
+/// task (`exit_on_scheduler_panic`) ends the process on a panic at any other
+/// time, but lets this one unwind into its JoinError, so the backend's failure
+/// stays the primary one. This test installs a raw task to model that panic.
 #[tokio::test]
 async fn backend_failure_cleanup_retains_panicked_scheduler_and_recording_error() {
     let directory = tempfile::tempdir().unwrap();
@@ -788,17 +807,18 @@ fn terminal_replay_state(
     let recorded = Recording::Boundaries(
         BoundaryRecording::new(PreemptionRecord::default(), Schedule::new(events).unwrap())
             .unwrap(),
-    );
+    )
+    .with_identity(Some(crate::clock_identity::test_sources::known()));
     std::fs::write(&replay, recorded.encode().unwrap()).unwrap();
     GlobalState::initialize(
-        &Config {
+        &crate::clock_identity::test_sources::qualified(Config {
             sequentialize_threads: true,
             replay_schedule_from: Some(replay),
             strict_schedule_boundaries: true,
             record_preemptions: recording.is_some(),
             record_preemptions_to: recording,
             ..Config::default()
-        },
+        }),
         false,
     )
 }

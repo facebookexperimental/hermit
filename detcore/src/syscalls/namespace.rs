@@ -11,7 +11,8 @@
 #[cfg(test)]
 #[path = "namespace/own_getters_tests.rs"]
 mod own_getters_tests;
-
+#[path = "namespace/own_links.rs"]
+mod own_links;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Component;
@@ -19,6 +20,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub(crate) use own_links::procfs_file_link_name;
 use reverie::Errno;
 use reverie::Error;
 use reverie::Guest;
@@ -125,7 +127,7 @@ fn decimal_u32(component: &OsStr) -> Option<u32> {
         .then(|| value.parse().ok())?
 }
 
-fn decimal_fd(component: &OsStr) -> Option<i32> {
+pub(crate) fn decimal_fd(component: &OsStr) -> Option<i32> {
     let value = component.to_str()?;
     // procfs names descriptors without leading zeros (`name_to_int`).
     (!value.is_empty()
@@ -455,6 +457,28 @@ fn decided_procfs_link(path: &[u8], pid: i32, tid: i32) -> Option<DecidedLink> {
     decided_procfs_link_parts(&parts, pid, tid)
 }
 
+/// The absolute spelling `path` spelled from `/proc/` where empty or `.`
+/// components come before its first component, `proc` (`//proc/self`,
+/// `/./proc/thread-self`): those name nothing, as they name nothing after it.
+/// The rest is kept byte for byte, a final `/` or `.` included. `None` for
+/// any other spelling, and for one that begins `/proc/` already.
+fn procfs_leading_components_dropped(path: &[u8]) -> Option<Vec<u8>> {
+    let mut rest = path.strip_prefix(b"/")?;
+    let mut dropped = false;
+    loop {
+        if let Some(after) = rest.strip_prefix(b"/") {
+            rest = after;
+        } else if let Some(after) = rest.strip_prefix(b"./") {
+            rest = after;
+        } else {
+            break;
+        }
+        dropped = true;
+    }
+    let rest = rest.strip_prefix(b"proc/")?;
+    dropped.then(|| [b"/proc/".as_slice(), rest].concat())
+}
+
 /// [`decided_procfs_link`] of the components below `/proc` of a spelling
 /// that does not follow its last one.
 fn decided_procfs_link_parts(parts: &[&[u8]], pid: i32, tid: i32) -> Option<DecidedLink> {
@@ -524,6 +548,27 @@ pub(crate) fn guest_task_procfs(
     // (`crate::util::raw_syscall`).
     let namespace = |path: &Path| crate::util::raw_stat(path).ok().map(|stat| stat.st_ino);
     (namespace(&task.join("ns/mnt"))? == namespace(Path::new("/proc/self/ns/mnt"))?).then_some(task)
+}
+
+/// The procfs directory of guest thread `tid` for reading what names no
+/// path in it: the `exe` link's file and `auxv`. [`guest_task_procfs`]
+/// without its conditions on the guest's root and mount namespace, which
+/// matter only to a pathname looked up through the directory. `None` where
+/// guest threads are not host tasks (KVM).
+pub(crate) fn guest_task_objects_procfs(
+    backend: &reverie::BackendCapabilities,
+    tid: i32,
+) -> Option<PathBuf> {
+    if !crate::procfs_inode::tool_can_name_guest_descriptors(backend) {
+        return None;
+    }
+    Some(PathBuf::from(
+        if backend.tool_shares_guest_descriptor_table {
+            "/proc/thread-self".to_owned()
+        } else {
+            format!("/proc/{tid}")
+        },
+    ))
 }
 
 /// Whether the guest's pathname `path` may name an `exe` link Detcore
@@ -611,6 +656,7 @@ pub(crate) fn exe_link_subject(path: &[u8], pid: i32) -> Option<ExeLinkSubject> 
 }
 
 // TODO-HUMAN-REVIEW(PR-1079): Review numeric virtual-self proc-fd path rewriting.
+#[cfg(target_arch = "x86_64")]
 fn host_self_proc_fd_alias(path: &Path, current_pid: i64) -> Option<PathBuf> {
     let (Some(subject), fd) = proc_fd_target(path)? else {
         return None;
@@ -803,8 +849,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     where
         G: Guest<Self>,
     {
-        if let Some(path) =
-            crate::procfs::placeholder_link_path(raw_target, self.rendered_files(guest))
+        if let Some(path) = self.placeholder_link_within_level(guest, raw_target)
             && self.placeholder_link_confirmed(guest, link).await
         {
             // Another process's link to a procfs file Detcore renders names
@@ -979,6 +1024,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(written as i64)
     }
 
+    #[cfg(target_arch = "x86_64")]
     async fn finish_other_proc_fd_readlink<G>(
         &self,
         guest: &mut G,
@@ -1110,7 +1156,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Ok(length) => {
                 let mut target = vec![0; (length as usize).min(ANONYMOUS_PROC_FD_TARGET_CAPACITY)];
                 guest.memory().read_exact(scratch.cast(), &mut target)?;
-                crate::procfs::placeholder_link_path(&target, self.rendered_files(guest))
+                self.placeholder_link_within_level(guest, &target)
             }
             Err(_) => None,
         };
@@ -1521,6 +1567,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         (dirfd, path): (i32, Option<PathPtr<'_>>),
     ) -> Option<Vec<u8>> {
         const CAPACITY: usize = libc::PATH_MAX as usize;
+        // The working directory a relative spelling needs is read before
+        // the stack scratch is taken: the translation of the call below can
+        // reach `Detcore::prepare_guest_cwd`, whose reads take that scratch
+        // too, which KVM refuses with a panic while it is held.
+        if let Some(Ok(spelling)) = path.map(|path| path.read(&guest.memory())) {
+            let spelling: PathBuf = spelling;
+            Self::prepare_guest_cwd(guest, dirfd, &spelling).await;
+        }
         let mut stack = guest.stack().await;
         if stack.capacity() < CAPACITY {
             return None;
@@ -1532,7 +1586,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_path(path)
             .with_buf(Some(scratch))
             .with_buf_len(CAPACITY);
-        let length = usize::try_from(guest.inject(call).await.ok()?).ok()?;
+        // The guest's path, respelled for this injection where it leads below
+        // a descriptor directory, as the guest's own call is.
+        let length = usize::try_from(
+            Self::inject_translated(guest, Syscall::from(call))
+                .await
+                .ok()?,
+        )
+        .ok()?;
         let mut target = vec![0; length.min(CAPACITY)];
         let read = guest.memory().read_exact(scratch.cast(), &mut target);
         drop(guard);
@@ -1638,6 +1699,133 @@ impl<T: RecordOrReplay> Detcore<T> {
         let at_phdr = crate::exec_record::auxv_entry(&auxv, libc::AT_PHDR)
             .ok_or("the auxiliary vector has no AT_PHDR")?;
         layout.start_brk(at_phdr)
+    }
+
+    /// Why the image the calling thread's exec just ran may not run under
+    /// the selected CPU profile: it, or the program interpreter the kernel
+    /// loaded for it, declares that it needs a higher x86-64 level than the
+    /// profile presents (`GNU_PROPERTY_X86_ISA_1_NEEDED`), which glibc's
+    /// loader checks against the CPUID Detcore answers. `None` where nothing
+    /// declares more, and where nothing can be compared:
+    ///
+    /// - host-no-rdrand, which masks the host's CPUID (hiding RDRAND, RDSEED
+    ///   and other nondeterministic features) but presents its ISA, so no
+    ///   fixed level describes it: excluding it proves nothing about a v3
+    ///   image on a v2 host, which then gets no typed refusal;
+    /// - `--no-virtualize-cpuid`, and an image whose CPUID is not intercepted
+    ///   (`Guest::has_cpuid_interception`): the guest sees the host's CPUID;
+    /// - a run that declares a launcher (DBT, SaBRe): the kernel exec'd the
+    ///   launcher, and the guest's loader runs under it before this callback;
+    /// - an object unread or declaring nothing, logged as unknown: that is
+    ///   no proof the image runs.
+    ///
+    /// The objects are the ones the exec ran, not ones found again by
+    /// pathname: the executable through `/proc/<pid>/exe`, which is the
+    /// file the kernel exec'd even where it was unlinked, renamed, a memfd
+    /// or outside the guest's root; the interpreter in the process's memory
+    /// at `AT_BASE`, its bytes as the kernel mapped them. A ptrace guest is
+    /// checked at its exec stop, before the interpreter's first instruction;
+    /// LiteInst's and in-guest-trap's callbacks come later, after the loader
+    /// has run.
+    ///
+    /// KVM is narrower than that, and no claim is made otherwise: the KVM
+    /// backend performs no per-exec ISA check after the first image. Its
+    /// `AdmitExec` admission is a file-identity hash of the image a later
+    /// exec would run, not an ISA declaration check, and `KvmGuest` has
+    /// no exec callback that reaches this function for a later image. A
+    /// KVM guest whose later exec runs an image declaring more than the
+    /// profile gets no typed refusal from this check; closing that gap
+    /// needs a KVM exec-time check that does not exist yet.
+    pub(crate) fn isa_refusal<G: Guest<Self>>(&self, guest: &G) -> Option<String> {
+        use crate::exec_record::IsaNeeds;
+        let profile = self.cfg.cpu_profile;
+        let level = profile.x86_64_level()?;
+        // The profile is what the guest sees only where Detcore answers its
+        // CPUID: virtualized, and intercepted for this image (ptrace arms
+        // CPUID faulting before this callback, or refuses the run).
+        if !self.cfg.virtualize_cpuid || !guest.has_cpuid_interception() || self.declares_launcher()
+        {
+            return None;
+        }
+        let dettid = guest.thread_state().dettid;
+        // Not `Self::guest_task_directory`, which has none after a chroot:
+        // nothing is looked up by a guest pathname here.
+        let Some(directory) = guest_task_objects_procfs(&self.cfg.backend, guest.tid().as_raw())
+        else {
+            tracing::debug!(
+                "[detcore, dtid {}] image ISA needs unknown: no procfs directory for the process",
+                dettid
+            );
+            return None;
+        };
+        let image = crate::util::RawFd::open(&directory.join("exe"), libc::O_RDONLY)
+            .ok()
+            .as_ref()
+            .and_then(IsaNeeds::read_file);
+        // The interpreter the kernel loaded, wherever AT_BASE says it did,
+        // read on its own evidence: its first file mapping at or above
+        // AT_BASE (its segment holding file offset 0, which need not be at
+        // AT_BASE itself), in the process's memory.
+        let base = crate::util::raw_read_file(&directory.join("auxv"))
+            .ok()
+            .and_then(|auxv| crate::exec_record::auxv_entry(&auxv, libc::AT_BASE))
+            .filter(|&base| base != 0);
+        let maps = base.and_then(|_| crate::util::raw_read_file(&directory.join("maps")).ok());
+        let mapping = base
+            .zip(maps.as_deref())
+            .and_then(|(base, maps)| crate::exec_record::first_image_mapping(maps, base));
+        let loader = base.map(|base| {
+            let (header, _) = mapping.as_ref()?;
+            IsaNeeds::read_mapped(base, *header, |address, buffer| {
+                let address = reverie::syscalls::Addr::from_raw(usize::try_from(address).ok()?)?;
+                guest.memory().read_exact(address, buffer).ok()
+            })
+        });
+        let objects = crate::exec_record::exec_objects(image, loader);
+        for &(what, needs) in &objects {
+            match needs {
+                Some(IsaNeeds::Level(_)) => {}
+                Some(IsaNeeds::Unmarked) => tracing::debug!(
+                    "[detcore, dtid {}] {} declares no x86 ISA level",
+                    dettid,
+                    what
+                ),
+                Some(IsaNeeds::Malformed(why)) => tracing::warn!(
+                    "[detcore, dtid {}] {} declares its x86 ISA level unreadably ({}): not compared",
+                    dettid,
+                    what,
+                    why
+                ),
+                None => tracing::warn!(
+                    "[detcore, dtid {}] {} is unreadable or not x86-64 ELF64: its x86 ISA level is unknown",
+                    dettid,
+                    what
+                ),
+            }
+        }
+        let (what, needed) = crate::exec_record::first_needing_above(level, &objects)?;
+        let path = crate::util::raw_read_link(&directory.join("exe"))
+            .map_or_else(|_| "?".into(), |path| path.display().to_string());
+        let what = match (what, &mapping) {
+            ("its program interpreter", Some((_, loader))) if !loader.is_empty() => {
+                format!(
+                    "its program interpreter {}",
+                    String::from_utf8_lossy(loader)
+                )
+            }
+            _ => what.to_owned(),
+        };
+        let remedy = if needed == 3 {
+            "rerun with --cpu-profile x86-64-v3, on a host that qualifies for it"
+        } else {
+            "no CPU profile presents it"
+        };
+        Some(format!(
+            "--cpu-profile {profile} refused: {what} of {path} declares that it needs {} \
+             (GNU_PROPERTY_X86_ISA_1_NEEDED), above the {} CPU this profile presents; {remedy}",
+            crate::exec_record::x86_64_level_name(needed),
+            crate::exec_record::x86_64_level_name(level),
+        ))
     }
 
     /// Check Detcore's model of the program break for the image an exec just
@@ -1857,12 +2045,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// `thread-self` and the namespace links). The caller's own descriptor
     /// link spelled through its thread is answered as `/proc/self/fd/N` is,
     /// with the kernel reading `/proc/thread-self/fd/N`, the calling thread's
-    /// own table. Not in a nested PID namespace, where the caller's pid is
-    /// not Detcore's, nor after a guest `chroot`, where `/proc` need not be
-    /// procfs, nor for a pathname too long for Linux to look up.
+    /// own table. Where Detcore reads the caller's own links from the
+    /// backend's `link_path` fact (KVM), every spelling of the caller's own
+    /// descriptor link is answered from it instead
+    /// (`Detcore::readlink_own_descriptor_fact`, package K slice F2-h). Not
+    /// in a nested PID namespace, where the caller's pid is not Detcore's,
+    /// nor after a guest `chroot`, where `/proc` need not be procfs, nor for
+    /// a pathname too long for Linux to look up.
     async fn readlink_decided_link<G: Guest<Self>>(
         &self,
         guest: &mut G,
+        sysno: reverie::syscalls::Sysno,
         path: &Path,
         (spelled, link): (&Path, (i32, Option<PathPtr<'_>>)),
         buffer: Option<AddrMut<'_, libc::c_char>>,
@@ -1875,13 +2068,83 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Ok(None);
         }
-        let decided = decided_procfs_link(
-            path.as_os_str().as_bytes(),
-            self.own_detpid(guest).as_raw(),
-            state.dettid.as_raw(),
-        );
-        let Some(decided) = decided else {
-            return Ok(None);
+        let tid = state.dettid.as_raw();
+        // Where Detcore serves the caller's own task directories (KVM, where
+        // record and replay do not run), empty and `.` components before
+        // `proc` name nothing, as they name nothing after it (`//proc/self`),
+        // and each `..` within the caller's own task tree resolves as Linux's
+        // walk resolves it (`/proc/self/../self` is the link `/proc/self`),
+        // once the walk to the last component succeeds, which readlink does
+        // not follow (unless a final `/` or `/.` makes it); the backend's
+        // executor, which would answer the spelling otherwise, takes neither
+        // (package K slice K10).
+        let bytes = path.as_os_str().as_bytes();
+        let serves = Self::serves_task_directories(guest);
+        let unprefixed = serves
+            .then(|| procfs_leading_components_dropped(bytes))
+            .flatten();
+        // Any other walk through one of the caller's descriptor links to a
+        // directory Detcore serves there (`/proc/self/fd/D/N`, `/dev/fd/D/N`,
+        // and `/proc/self/fd/P/self/fd/N` through a descriptor on `/proc`)
+        // goes on from the directory's own spelling, as Linux follows the
+        // link, so the link it ends at is decided as that spelling is: the
+        // backend's executor, which answered such a walk before Reverie
+        // F2-d, has no `/proc` of the guest's to walk.
+        // A walk that starts at `/dev/fd` is respelled only where `/dev/fd`
+        // is the link to `/proc/self/fd` it is on Linux, as
+        // `Detcore::readlink_own_descriptor_fact` checks for `/dev/fd/N`.
+        let resolved = if serves {
+            let follows_last = bytes.ends_with(b"/") || bytes.ends_with(b"/.");
+            let mut resolved = Self::own_tree_resolved(guest, bytes, follows_last).await;
+            if matches!(resolved, Ok(None))
+                && (!bytes.starts_with(b"/dev/")
+                    || self
+                        .injected_link_target(guest, b"/dev/fd")
+                        .await
+                        .as_deref()
+                        == Some(Path::new("/proc/self/fd")))
+            {
+                resolved = Self::through_own_descriptor_links(guest, bytes);
+            }
+            match resolved {
+                Ok(resolved) => resolved,
+                Err(errno) => {
+                    // Linux refuses a size that is not positive before it
+                    // looks up the path.
+                    readlink_size(buffer_len)?;
+                    return Err(errno.into());
+                }
+            }
+        } else {
+            None
+        };
+        let spelling = resolved
+            .as_deref()
+            .or(unprefixed.as_deref())
+            .unwrap_or(bytes);
+        // The caller's own descriptor link, by any of its spellings, where
+        // Detcore reads it from the backend's fact (KVM, package K slice
+        // F2-h).
+        if let Some(result) = self
+            .readlink_own_descriptor_fact(guest, sysno, (spelling, bytes), buffer, buffer_len)
+            .await?
+        {
+            return Ok(Some(result));
+        }
+        let decided = decided_procfs_link(spelling, self.own_detpid(guest).as_raw(), tid);
+        let decided = match decided {
+            Some(decided) => decided,
+            // A directory Detcore serves there (`/proc`, the caller's own
+            // descriptor and task directories), by any spelling that reaches
+            // it, is no link: EINVAL, once the walk to it succeeds.
+            None => match self.served_directory_walk(guest, bytes).await {
+                Some(Ok(())) => DecidedLink::Followed(Errno::EINVAL),
+                Some(Err(errno)) => {
+                    readlink_size(buffer_len)?;
+                    return Err(errno.into());
+                }
+                None => return Ok(None),
+            },
         };
         // Linux takes the size as an int, and refuses one that is not
         // positive before it looks up the path.
@@ -1944,12 +2207,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut stack = guest.stack().await;
         let path_address = stack.push(path_buffer).cast::<libc::c_char>();
         let stack_guard = stack.commit()?;
+        let path = PathPtr::from_ptr(path_address.as_raw() as *const libc::c_char);
+        #[cfg(target_arch = "x86_64")]
         let call = syscalls::Readlink::new()
-            .with_path(PathPtr::from_ptr(
-                path_address.as_raw() as *const libc::c_char
-            ))
+            .with_path(path)
             .with_buf(buffer)
             .with_bufsize(size);
+        // aarch64 has only `readlinkat`.
+        #[cfg(not(target_arch = "x86_64"))]
+        let call = syscalls::Readlinkat::new()
+            .with_dirfd(libc::AT_FDCWD)
+            .with_path(path)
+            .with_buf(buffer)
+            .with_buf_len(size);
         let result = self.record_or_replay(guest, call).await?;
         // The stack is released before anything else uses it; a placeholder
         // is confirmed through the guest's own pathname, as before.
@@ -1965,9 +2235,65 @@ impl<T: RecordOrReplay> Detcore<T> {
         .await
     }
 
+    /// The absolute spelling of a `readlink` of `path` from `dirfd` that may
+    /// be a descriptor link of the caller's to a placeholder directory
+    /// (`syscalls::files::descriptor_directory`), whose link Detcore answers
+    /// so that the placeholder's own path never reaches the guest: an
+    /// absolute path as it is; a name relative to a placeholder descriptor
+    /// below its directory's spelling; a name relative to the working
+    /// directory, from the guest's working directory (`Detcore::observed_path`,
+    /// which the caller prepares, `Detcore::prepare_guest_cwd`: where the tool
+    /// cannot read it from host procfs, KVM, the guest's own `getcwd` names
+    /// it, <https://github.com/rrnewton/hermit/issues/4541>). `None` for any
+    /// other.
+    fn placeholder_link_spelling<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        dirfd: i32,
+        path: &Path,
+    ) -> Option<PathBuf> {
+        if path.is_absolute() {
+            return Some(path.to_path_buf());
+        }
+        if let Some(spelled) = Self::spelling_below_placeholder(guest, dirfd, path) {
+            return Some(spelled);
+        }
+        (dirfd == libc::AT_FDCWD && !path.as_os_str().is_empty())
+            .then(|| Self::observed_path(guest, dirfd, path).ok())
+            .flatten()
+            .filter(|observed| observed.is_absolute())
+    }
+
+    /// Answer a `readlink` of `path` from `dirfd` if it is a descriptor link
+    /// of the caller's to a placeholder directory
+    /// ([`Self::placeholder_link_spelling`],
+    /// `Detcore::answer_descriptor_directory_link`), or a system-wide procfs
+    /// directory where the guest's procfs is not the kernel's
+    /// (`Detcore::answer_system_directory_link`). Boxed by its callers, so
+    /// that the spelling it holds does not grow every system call's future.
+    async fn answer_placeholder_link_at<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        dirfd: i32,
+        path: &Path,
+        buf: Option<reverie::syscalls::AddrMut<'_, libc::c_char>>,
+        buf_len: usize,
+    ) -> Option<Result<i64, Error>> {
+        Self::prepare_guest_cwd(guest, dirfd, path).await;
+        let spelled = self.placeholder_link_spelling(guest, dirfd, path)?;
+        match self
+            .answer_descriptor_directory_link(guest, &spelled, buf, buf_len)
+            .await
+        {
+            Some(answer) => Some(answer),
+            None => self.answer_system_directory_link(guest, path, &spelled),
+        }
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#877)
     /// Preserve Linux readlink errors and canonicalize procfs namespace identities.
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_readlink<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1976,6 +2302,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Linux refuses a size that is not positive before it reads the path.
         readlink_size(call.bufsize())?;
         let path: PathBuf = call.path().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
+        if let Some(answer) = Box::pin(self.answer_placeholder_link_at(
+            guest,
+            libc::AT_FDCWD,
+            &path,
+            call.buf(),
+            call.bufsize(),
+        ))
+        .await
+        {
+            return answer;
+        }
+        if let Some(result) = self
+            .readlink_own_task_link(
+                guest,
+                reverie::syscalls::Sysno::readlink,
+                &path,
+                (call.buf(), call.bufsize()),
+            )
+            .await?
+        {
+            return Ok(result);
+        }
         if let Some(exe) = self
             .launched_exe(guest, (libc::AT_FDCWD, &path), false)
             .await
@@ -2021,12 +2369,19 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// [`Self::handle_readlink`] of a link Detcore does not answer from an
     /// exec record.
+    #[cfg(target_arch = "x86_64")]
     async fn readlink_unlaunched<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Readlink,
         path: PathBuf,
     ) -> Result<i64, Error> {
+        if self
+            .readlink_names_runtime_fd(guest, libc::AT_FDCWD, &path)
+            .await
+        {
+            return Err(Errno::ENOENT.into());
+        }
         if let Some(result) = self
             .readlink_rendered_procfs(guest, &path, call.buf(), call.bufsize())
             .await?
@@ -2036,6 +2391,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Some(result) = self
             .readlink_decided_link(
                 guest,
+                reverie::syscalls::Sysno::readlink,
                 &path,
                 (&path, (libc::AT_FDCWD, call.path())),
                 call.buf(),
@@ -2101,6 +2457,29 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Linux refuses a size that is not positive before it reads the path.
         readlink_size(call.buf_len())?;
         let path: PathBuf = call.path().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
+        if let Some(answer) = Box::pin(self.answer_placeholder_link_at(
+            guest,
+            call.dirfd(),
+            &path,
+            call.buf(),
+            call.buf_len(),
+        ))
+        .await
+        {
+            return answer;
+        }
+        if path.is_absolute()
+            && let Some(result) = self
+                .readlink_own_task_link(
+                    guest,
+                    reverie::syscalls::Sysno::readlinkat,
+                    &path,
+                    (call.buf(), call.buf_len()),
+                )
+                .await?
+        {
+            return Ok(result);
+        }
         if let Some(exe) = self.launched_exe(guest, (call.dirfd(), &path), false).await {
             let saved = saved_exe_link_bytes(guest, call.buf(), call.buf_len());
             let result = self.record_or_replay(guest, call).await?;
@@ -2147,7 +2526,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // looks it up (`Detcore::procfs_spelling_at`): below a `/proc/self`
         // or `/proc/<pid>` directory, the task the directory was opened on
         // (ESRCH once that task is gone), and below a descriptor Detcore has
-        // no record of (one received over `SCM_RIGHTS`), the procfs directory
+        // no recorded path for (one received over `SCM_RIGHTS`), the procfs directory
         // the kernel names for it; so a namespace or descriptor link there is
         // modeled and canonicalized as the same link spelled absolutely. Any
         // other such name stays relative, and the kernel decides.
@@ -2173,6 +2552,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             lexical.clone()
         };
+        if self
+            .readlink_names_runtime_fd(guest, call.dirfd(), &path)
+            .await
+        {
+            return Err(Errno::ENOENT.into());
+        }
         // The directory names a task or a kernel path Detcore knows.
         let named_by_directory = below_directory && observed_path != lexical;
         if let Some(result) = self
@@ -2185,19 +2570,41 @@ impl<T: RecordOrReplay> Detcore<T> {
         // itself, a directory, or one whose task or kernel path Detcore knows
         // (a selector's directory records its task only where the open
         // followed the selector, not for the link itself, an
-        // `O_PATH | O_NOFOLLOW` open of `/proc/self`). An empty pathname reads
-        // the descriptor's own link, which the kernel answers (an inherited
-        // one keeps its opener's binding).
+        // `O_PATH | O_NOFOLLOW` open of `/proc/self`), and, where Detcore
+        // serves the caller's own task directories (KVM, package K slice
+        // K10), below any directory it serves on a placeholder, which it
+        // resolves as Linux's walk does (`../self` below `/proc/self`). An
+        // empty pathname reads the descriptor's own link, which the kernel
+        // answers (an inherited one keeps its opener's binding).
         let decidable = path.is_absolute()
             || named_by_directory
             || (below_directory
                 && recorded
                     .as_deref()
-                    .is_some_and(|directory| directory == Path::new("/proc")));
+                    .is_some_and(|directory| directory == Path::new("/proc")))
+            || (below_directory
+                && Self::serves_task_directories(guest)
+                && Self::placeholder_of(guest, call.dirfd()).is_some());
+        // The caller's own `exe`, `cwd` and `root` links, by a name below a
+        // descriptor on `/proc` or one of its process directories.
+        if decidable
+            && !path.is_absolute()
+            && let Some(result) = self
+                .readlink_own_task_link(
+                    guest,
+                    reverie::syscalls::Sysno::readlinkat,
+                    &observed_path,
+                    (call.buf(), call.buf_len()),
+                )
+                .await?
+        {
+            return Ok(result);
+        }
         if decidable
             && let Some(result) = self
                 .readlink_decided_link(
                     guest,
+                    reverie::syscalls::Sysno::readlinkat,
                     &observed_path,
                     (&path, (call.dirfd(), call.path())),
                     call.buf(),
@@ -2297,6 +2704,53 @@ mod tests {
         ] {
             assert_eq!(subject(path), None, "{path}");
         }
+    }
+
+    /// Empty and `.` components before `proc` name nothing: the spelling is
+    /// given from `/proc/`, the rest byte for byte (package K slice K10).
+    #[test]
+    fn a_procfs_spelling_loses_the_components_before_proc() {
+        let dropped = |path: &str| {
+            procfs_leading_components_dropped(path.as_bytes())
+                .map(|path| String::from_utf8(path).unwrap())
+        };
+        assert_eq!(dropped("//proc/self"), Some("/proc/self".into()));
+        assert_eq!(
+            dropped("/./proc/thread-self"),
+            Some("/proc/thread-self".into())
+        );
+        assert_eq!(dropped("/.//./proc//self/"), Some("/proc//self/".into()));
+        assert_eq!(
+            dropped("///proc/3/task/5/fd/7"),
+            Some("/proc/3/task/5/fd/7".into())
+        );
+        for path in [
+            "/proc/self",
+            "/proc/./self",
+            "//proc",
+            "//procx/self",
+            "//tmp/proc/self",
+            "/../proc/self",
+            "proc/self",
+            "",
+        ] {
+            assert_eq!(dropped(path), None, "{path}");
+        }
+        let decided = |path: &str| {
+            decided_procfs_link(
+                &procfs_leading_components_dropped(path.as_bytes()).unwrap(),
+                3,
+                5,
+            )
+        };
+        assert_eq!(
+            decided("//proc/self"),
+            Some(DecidedLink::Target(b"3".to_vec()))
+        );
+        assert_eq!(
+            decided("/./proc/thread-self/"),
+            Some(DecidedLink::Followed(Errno::EINVAL))
+        );
     }
 
     #[test]
@@ -2435,6 +2889,9 @@ mod tests {
         }
     }
 
+    // x86_64 only: the rewrite serves readlink, which aarch64 does not have
+    // and the build compiles only for x86_64.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn rewrites_only_numeric_virtual_self_proc_fd_aliases() {
         assert_eq!(

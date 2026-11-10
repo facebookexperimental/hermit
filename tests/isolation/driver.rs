@@ -742,6 +742,67 @@ pub fn load_descriptor_registry(
     })
 }
 
+/// Explicit measured command owners. Core selectors retain their original
+/// argv. A non-core selector requires a held actual static frontend and never
+/// falls back to a core --backend option.
+#[derive(Default)]
+pub struct CommandBindings {
+    entries: BTreeMap<String, hermit_manifest_plan::executable_binding::HeldExecutable>,
+}
+impl CommandBindings {
+    pub fn open(path: Option<&Path>, core: &Path, cells: &[Cell]) -> Result<Self, String> {
+        let bindings = Self {
+            entries: hermit_manifest_plan::executable_binding::read_bindings(path)?,
+        };
+        let core = core
+            .canonicalize()
+            .map_err(|error| format!("core command: {error}"))?;
+        for cell in cells {
+            bindings.select(&core, &cell.backend)?;
+        }
+        Ok(bindings)
+    }
+    fn select<'a>(&'a self, core: &'a Path, backend: &str) -> Result<(&'a Path, bool), String> {
+        self.recheck()?;
+        if hermit_manifest_plan::execution_owners::core_backends().contains(backend) {
+            if let Some(binding) = self.entries.get(backend)
+                && binding.identity.executable != core
+            {
+                return Err(format!(
+                    "core selector {backend} changed its retained executable"
+                ));
+            }
+            return Ok((core, false));
+        }
+        let binding = self
+            .entries
+            .get(backend)
+            .ok_or_else(|| format!("required measured command owner for {backend} is absent"))?;
+        let first_party =
+            fs::metadata(core).map_err(|error| format!("core command identity: {error}"))?;
+        if binding.identity.dev == first_party.dev() && binding.identity.ino == first_party.ino() {
+            return Err(format!(
+                "{backend} command owner is the core comparator itself"
+            ));
+        }
+        Ok((&binding.identity.executable, true))
+    }
+    fn recheck(&self) -> Result<(), String> {
+        for binding in self.entries.values() {
+            binding.recheck()?;
+        }
+        Ok(())
+    }
+    fn inventory(&self) -> Result<String, String> {
+        self.recheck()?;
+        Ok(self
+            .entries
+            .iter()
+            .map(|(name, binding)| format!("COMMAND {name} {:?}\n", binding.identity))
+            .collect())
+    }
+}
+
 pub struct Prepared {
     pub repository: PathBuf,
     pub hermit: PathBuf,
@@ -749,10 +810,16 @@ pub struct Prepared {
     pub guest: PathBuf,
     pub native: PathBuf,
     pub installation: PathBuf,
+    /// Node-private copies of the VERIFICATION_INPUTS files, taken at
+    /// prepare time (dh-j8eb7 snapshot): the inventory hashes these, so
+    /// a writer in the shared tree cannot move a hashed input while
+    /// collection runs.
+    verification_snapshots: Vec<(String, PathBuf)>,
     executor: Executor,
     input_inventory: String,
     cohort_inputs: BTreeMap<String, CohortInput>,
     descriptor_registry: Option<DescriptorRegistry>,
+    command_bindings: CommandBindings,
 }
 
 // Only ordinary host routes adopt this fixture. Named, covered-root and replay
@@ -1267,8 +1334,111 @@ fn installation_for(
     Ok(absolute.canonicalize().unwrap_or(absolute))
 }
 
+/// Name the first rows on which two input inventories disagree, so a
+/// `receipt.input_stability` no_result says WHAT changed during
+/// collection instead of only that something did (dh-j8eb7). Rows are
+/// keyed by everything before their digest; up to three differences are
+/// named, with twelve digest characters on each side when both exist.
+fn inventory_difference(before: &str, after: &str) -> String {
+    fn rows(inventory: &str) -> std::collections::BTreeMap<String, String> {
+        inventory
+            .lines()
+            .map(|line| {
+                let key = line
+                    .split(" sha256=")
+                    .next()
+                    .unwrap_or(line)
+                    .split(" bytes=")
+                    .next()
+                    .unwrap_or(line)
+                    .to_owned();
+                (key, line.to_owned())
+            })
+            .collect()
+    }
+    fn digest_of(line: &str) -> &str {
+        line.split("sha256=").nth(1).unwrap_or(line)
+    }
+    let before_rows = rows(before);
+    let after_rows = rows(after);
+    let mut differences = Vec::new();
+    for (key, before_line) in &before_rows {
+        match after_rows.get(key) {
+            None => differences.push(format!("{key} removed")),
+            Some(after_line) if after_line != before_line => differences.push(format!(
+                "{key} changed {} -> {}",
+                &digest_of(before_line)[..digest_of(before_line).len().min(12)],
+                &digest_of(after_line)[..digest_of(after_line).len().min(12)],
+            )),
+            _ => {}
+        }
+    }
+    for key in after_rows.keys() {
+        if !before_rows.contains_key(key) {
+            differences.push(format!("{key} added"));
+        }
+    }
+    if differences.is_empty() {
+        return "inventories differ only in row order".to_owned();
+    }
+    let shown = differences
+        .iter()
+        .take(3)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("; ");
+    if differences.len() > 3 {
+        format!("{shown}; and {} more", differences.len() - 3)
+    } else {
+        shown
+    }
+}
+
+/// Copy a declared installation tree into a node-private snapshot,
+/// preserving directories, files and symlinks (dh-j8eb7).
+fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|error| format!("input snapshot metadata {}: {error}", source.display()))?;
+    if metadata.is_dir() {
+        fs::create_dir_all(target)
+            .map_err(|error| format!("input snapshot directory {}: {error}", target.display()))?;
+        let mut children = fs::read_dir(source)
+            .map_err(|error| format!("input snapshot read {}: {error}", source.display()))?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("input snapshot entries {}: {error}", source.display()))?;
+        children.sort();
+        for child in children {
+            let name = child.file_name().ok_or("input snapshot child has no name")?;
+            copy_tree(&child, &target.join(name))?;
+        }
+    } else if metadata.file_type().is_symlink() {
+        let dest = fs::read_link(source)
+            .map_err(|error| format!("input snapshot link {}: {error}", source.display()))?;
+        std::os::unix::fs::symlink(&dest, target)
+            .map_err(|error| format!("input snapshot symlink {}: {error}", target.display()))?;
+    } else if metadata.is_file() {
+        fs::copy(source, target)
+            .map_err(|error| format!("input snapshot copy {}: {error}", source.display()))?;
+    } else {
+        return Err(format!(
+            "input snapshot: {} is not a file, directory or symlink",
+            source.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Copy one executable into the snapshot, keeping its mode.
+fn copy_executable(source: &Path, target: &Path) -> Result<(), String> {
+    fs::copy(source, target).map_err(|error| {
+        format!("input snapshot executable {}: {error}", source.display())
+    })?;
+    Ok(())
+}
+
 fn input_inventory(prepared: &Prepared) -> Result<String, String> {
-    let mut rows = Vec::new();
+    let mut rows = vec![prepared.command_bindings.inventory()?];
     for (role, path) in [
         ("hermit", &prepared.hermit),
         ("guest", &prepared.guest),
@@ -1295,10 +1465,10 @@ fn input_inventory(prepared: &Prepared) -> Result<String, String> {
             }
         }
     }
-    for (snapshot, source) in VERIFICATION_INPUTS {
+    for (snapshot, path) in &prepared.verification_snapshots {
         rows.push(format!(
             "SOURCE {snapshot} sha256={}\n",
-            digest(&prepared.repository.join(source))?
+            digest(path)?
         ));
     }
     if let Some(registry) = &prepared.descriptor_registry {
@@ -1829,6 +1999,22 @@ pub fn integration_artifacts(
 }
 
 impl Prepared {
+    pub fn with_command_bindings(mut self, bindings: CommandBindings) -> Result<Self, String> {
+        self.command_bindings = bindings;
+        fs::write(
+            self.artifacts.join("command-bindings.inputs"),
+            self.command_bindings.inventory()?,
+        )
+        .map_err(|error| format!("actual command owner receipt: {error}"))?;
+        self.input_inventory = input_inventory(&self)?;
+        fs::write(
+            self.artifacts.join("installation.inputs"),
+            &self.input_inventory,
+        )
+        .map_err(|error| format!("complete command/resource inventory: {error}"))?;
+        Ok(self)
+    }
+
     pub fn build(
         repository: &Path,
         hermit: &Path,
@@ -2053,6 +2239,74 @@ impl Prepared {
         fs::write(artifacts.join("inputs.sha256"), hashes)
             .map_err(|error| format!("producer hashes: {error}"))?;
         let installation = installation_for(&repository, &hermit, installation)?;
+        // Snapshot the hashed executables and the declared installation
+        // into this node's own artifacts, then run AND hash the copies
+        // (dh-j8eb7, option B): what is tested is exactly what is hashed,
+        // and no sibling process - in this run or any other checkout -
+        // can move a hashed input while collection runs. The copies are
+        // taken after every prepare-time authentication above, so a copy
+        // is the authenticated bytes. Verification inputs were already
+        // copied beside the artifacts for inputs.sha256; the inventory
+        // hashes those copies through verification_snapshots below.
+        let snapshot = artifacts.join("input-snapshot");
+        fs::create_dir(&snapshot)
+            .map_err(|error| format!("input snapshot root: {error}"))?;
+        let hermit = {
+            let copy = snapshot.join("hermit");
+            copy_executable(&hermit, &copy)?;
+            copy
+        };
+        let executor = match executor {
+            Executor::SafeHermit(path) => {
+                let copy = snapshot.join("safehermit");
+                copy_executable(&path, &copy)?;
+                Executor::SafeHermit(copy)
+            }
+            Executor::Integration {
+                capture,
+                sources,
+                binary,
+            } => {
+                let copy = snapshot.join("executor");
+                copy_executable(&binary, &copy)?;
+                Executor::Integration {
+                    capture,
+                    sources: sources
+                        .iter()
+                        .enumerate()
+                        .map(|(index, _)| {
+                            artifacts.join(format!("executor-source-{index}.rs"))
+                        })
+                        .collect(),
+                    binary: copy,
+                }
+            }
+        };
+        let installation = {
+            let copy = snapshot.join("installation");
+            copy_tree(&installation, &copy)?;
+            copy
+        };
+        let verification_snapshots = VERIFICATION_INPUTS
+            .iter()
+            .map(|(name, _)| (name.to_string(), artifacts.join(name)))
+            .collect::<Vec<_>>();
+        // Descriptor references were authenticated against their expected
+        // digests above; hash node-private copies from here on, so a
+        // later writer of the retained evidence cannot move them either.
+        let descriptor_registry = match descriptor_registry {
+            Some(mut registry) => {
+                let mut remapped = BTreeMap::new();
+                for (index, (path, expected)) in registry.references.iter().enumerate() {
+                    let copy = snapshot.join(format!("descriptor-{index}"));
+                    copy_executable(path, &copy)?;
+                    remapped.insert(copy, expected.clone());
+                }
+                registry.references = remapped;
+                Some(registry)
+            }
+            None => None,
+        };
         let mut prepared = Self {
             repository,
             hermit,
@@ -2060,10 +2314,12 @@ impl Prepared {
             guest,
             native,
             installation,
+            verification_snapshots,
             executor,
             input_inventory: String::new(),
             cohort_inputs,
             descriptor_registry,
+            command_bindings: CommandBindings::default(),
         };
         fs::write(
             prepared.artifacts.join("installation-root.hex"),
@@ -2270,12 +2526,36 @@ impl Prepared {
             },
         });
         assertions.push(match input_inventory(self) {
-            Ok(inventory) => Assertion {
+            Ok(inventory) if inventory == self.input_inventory => Assertion {
                 name: "receipt.input_stability".to_owned(),
-                verdict: if inventory == self.input_inventory { Verdict::Match } else { Verdict::NoResult },
+                verdict: Verdict::Match,
                 detail: "content hashes of the CLI, selected executor and sources, guest, native helper, verification parser/policy/standalone/manifest/lock inputs, and complete declared installation before and after collection".to_owned(),
             },
-            Err(error) => Assertion { name: "receipt.input_stability".to_owned(), verdict: Verdict::NoResult, detail: error },
+            Ok(inventory) => {
+                // Keep the after inventory beside the cell's report on
+                // failure (dh-j8eb7): the before inventory is already
+                // retained as installation.inputs at prepare, so the
+                // differing row stays diffable after the run - tonight's
+                // hits lost both when their volumes were reaped.
+                let difference = inventory_difference(&self.input_inventory, &inventory);
+                let _ = fs::write(directory.join("input-inventory.after"), &inventory);
+                let _ = fs::write(
+                    directory.join("input-inventory.difference"),
+                    format!("{difference}\n"),
+                );
+                Assertion {
+                    name: "receipt.input_stability".to_owned(),
+                    verdict: Verdict::NoResult,
+                    detail: format!(
+                        "input inventory changed during collection (dh-j8eb7): {difference}"
+                    ),
+                }
+            },
+            Err(error) => Assertion {
+                name: "receipt.input_stability".to_owned(),
+                verdict: Verdict::NoResult,
+                detail: format!("input inventory could not be measured (dh-j8eb7): {error}"),
+            },
         });
         assertions.push(match boundary {
             Ok(detail) => Assertion {
@@ -2362,6 +2642,8 @@ impl Prepared {
         let physical = directory.join("physical");
         let stdout = directory.join("stdout");
         let stderr = directory.join("stderr");
+        let (executable, static_entry) =
+            self.command_bindings.select(&self.hermit, &cell.backend)?;
         let mut arguments: Vec<OsString> = vec![
             "--observe".into(),
             physical.as_os_str().to_owned(),
@@ -2371,10 +2653,12 @@ impl Prepared {
             "--sentinel-directory".into(),
             sentinel.as_os_str().to_owned(),
             "--".into(),
-            self.hermit.as_os_str().to_owned(),
+            executable.as_os_str().to_owned(),
             "--log=info".into(),
-            format!("--backend={}", cell.backend).into(),
         ];
+        if !static_entry {
+            arguments.push(format!("--backend={}", cell.backend).into());
+        }
         let record = cell.path.starts_with("record") || cell.path.starts_with("replay");
         if record {
             arguments.extend([
@@ -2447,6 +2731,7 @@ impl Prepared {
             NATIVE_LIMITS,
             Some(&physical),
         );
+        let command_after = self.command_bindings.recheck();
         let cohort_after =
             cohort.map(|input| input.retain_snapshot(&directory.join("cohort.inputs.after")));
         let code = execution
@@ -2467,6 +2752,12 @@ impl Prepared {
             verification.push(input.assertion(directory, before, after));
         }
         let mut boundary = execution.boundary;
+        if let Err(error) = command_after {
+            boundary = Err(match boundary {
+                Ok(_) => error,
+                Err(previous) => format!("{previous}; {error}"),
+            });
+        }
         let mut hashes = String::new();
         let mut observations = vec![
             stdout,
@@ -2519,6 +2810,86 @@ fn hex_bytes(bytes: &[u8]) -> String {
         write!(encoded, "{byte:02x}").expect("String writes succeed");
     }
     encoded
+}
+
+#[cfg(test)]
+mod inventory_difference_tests {
+    use super::inventory_difference;
+
+    /// dh-j8eb7 fixture: an inventory whose one hashed input changed
+    /// during collection must name that input, so a no_result receipt
+    /// identifies the differing path instead of reporting nothing.
+    #[test]
+    fn a_changed_input_is_named_with_both_digests() {
+        let before = "EXECUTABLE hermit sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nSOURCE workspace-Cargo.lock sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n";
+        let after = "EXECUTABLE hermit sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nSOURCE workspace-Cargo.lock sha256=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\n";
+        let difference = inventory_difference(before, after);
+        assert!(difference.contains("SOURCE workspace-Cargo.lock"), "{difference}");
+        assert!(difference.contains("bbbbbbbbbbbb -> cccccccccccc"), "{difference}");
+        assert!(!difference.contains("EXECUTABLE hermit"), "{difference}");
+    }
+
+    #[test]
+    fn added_and_removed_inputs_are_named() {
+        let before = "FILE 00 sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+        let after = "FILE 11 sha256=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n";
+        let difference = inventory_difference(before, after);
+        assert!(difference.contains("removed"), "{difference}");
+        assert!(difference.contains("added"), "{difference}");
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::{copy_executable, copy_tree, digest, inventory_tree};
+    use std::fs;
+
+    /// dh-j8eb7 option-B fixture: snapshot the hashed executables and
+    /// installation at prepare, then mutate the ORIGINALS mid-collection
+    /// (what a sibling build in the shared tree does). Digests taken
+    /// over the copies - which are also what the cells execute - must
+    /// not move, and the copies must hold the prepared bytes.
+    #[test]
+    fn mutating_the_originals_mid_collection_moves_no_snapshot_digest() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-isolation-snapshot-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let originals = root.join("originals");
+        let snapshot = root.join("input-snapshot");
+        fs::create_dir_all(originals.join("installation/rsrcs")).unwrap();
+        fs::create_dir_all(&snapshot).unwrap();
+        let hermit = originals.join("hermit");
+        fs::write(&hermit, b"hermit-v1").unwrap();
+        fs::write(originals.join("installation/rsrcs/data"), b"data-v1").unwrap();
+
+        let hermit_copy = snapshot.join("hermit");
+        copy_executable(&hermit, &hermit_copy).unwrap();
+        let installation_copy = snapshot.join("installation");
+        copy_tree(&originals.join("installation"), &installation_copy).unwrap();
+
+        let digests = |hermit_path: &std::path::Path, installation: &std::path::Path| {
+            let mut rows = vec![format!("EXECUTABLE hermit sha256={}\n", digest(hermit_path).unwrap())];
+            inventory_tree(installation, installation, &mut rows).unwrap();
+            rows.concat()
+        };
+        let before = digests(&hermit_copy, &installation_copy);
+
+        // A sibling restages the installation and relinks the binary.
+        fs::write(&hermit, b"hermit-v2-relinked").unwrap();
+        fs::write(originals.join("installation/rsrcs/data"), b"data-v2").unwrap();
+        fs::write(originals.join("installation/rsrcs/new"), b"new").unwrap();
+
+        assert_eq!(digests(&hermit_copy, &installation_copy), before);
+        assert_eq!(fs::read(&hermit_copy).unwrap(), b"hermit-v1");
+        assert_ne!(
+            digests(&hermit, &originals.join("installation")),
+            before,
+            "the fixture must actually mutate the originals"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
 }
 
 #[cfg(test)]
@@ -2609,6 +2980,88 @@ mod executor_controls {
             expected,
             NATIVE_LIMITS,
         )
+    }
+
+    #[test]
+    fn measured_command_owners_keep_core_argv_and_refuse_missing_changed_or_self_aliases() {
+        use std::os::unix::fs::PermissionsExt;
+        let core = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let empty = CommandBindings::default();
+        assert_eq!(
+            empty.select(&core, "ptrace").unwrap(),
+            (core.as_path(), false)
+        );
+        assert!(
+            empty
+                .select(&core, "external-fixture")
+                .unwrap_err()
+                .contains("absent")
+        );
+        let mut bound = CommandBindings::default();
+        bound.entries.insert(
+            "external-fixture".into(),
+            hermit_manifest_plan::executable_binding::measure(
+                "external-fixture".into(),
+                "actual-fixture".into(),
+                core.clone(),
+                "a".repeat(40),
+            )
+            .unwrap(),
+        );
+        assert!(
+            bound
+                .select(&core, "external-fixture")
+                .unwrap_err()
+                .contains("comparator itself")
+        );
+        struct Remove(PathBuf);
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
+        let path = std::env::temp_dir().join(format!(
+            "isolation-command-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cleanup = Remove(path.clone());
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        std::io::copy(&mut File::open(&core).unwrap(), &mut output).unwrap();
+        output.sync_all().unwrap();
+        drop(output);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = path.canonicalize().unwrap();
+        bound.entries.insert(
+            "external-fixture".into(),
+            hermit_manifest_plan::executable_binding::measure(
+                "external-fixture".into(),
+                "actual-fixture".into(),
+                path.clone(),
+                "a".repeat(40),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            bound.select(&core, "external-fixture").unwrap(),
+            (path.as_path(), true)
+        );
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"changed")
+            .unwrap();
+        assert!(bound.select(&core, "external-fixture").is_err());
+        drop(bound);
+        drop(cleanup);
     }
 
     #[test]

@@ -40,10 +40,9 @@ test:
         backends_disabled:
           native: This migration inventories strict verification; it does not assert native nondeterminism
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from the initial strict-verification migration
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe

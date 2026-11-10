@@ -69,7 +69,7 @@ static int print_proc_identity(void) {
   long pid = (long)getpid();
   long ppid = (long)getppid();
   return stat_pid == pid && stat_ppid == ppid && status_pid == pid &&
-          status_ppid == ppid && tracer_pid == 1
+          status_ppid == ppid && tracer_pid == 0
       ? 0
       : 3;
 }

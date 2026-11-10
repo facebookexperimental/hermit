@@ -403,15 +403,17 @@ rr_test!(rr_msg_trunc, "msg_trunc", 0, &[]);
 rr_test!(rr_msync, "msync", 0, &[]);
 rr_test!(rr_mtio, "mtio", 0, &[]);
 rr_test!(
-    #[ignore = "refused (exit 122): process-directed kill while the sender blocks the signal; https://github.com/rrnewton/hermit/issues/4034"]
     rr_multiple_pending_signals,
     "multiple_pending_signals",
     0,
     &[]
 );
-// rr_multiple_pending_signals_sequential is refused under Hermit: it sends a
-// process-directed signal that the sending thread blocks
-// (https://github.com/rrnewton/hermit/issues/4034); see docs/rr-test-suite.md.
+rr_test!(
+    rr_multiple_pending_signals_sequential,
+    "multiple_pending_signals_sequential",
+    0,
+    &[]
+);
 rr_test!(rr_munmap_discontinuous, "munmap_discontinuous", 0, &[]);
 rr_test!(rr_munmap_segv, "munmap_segv", 0, &[]);
 rr_test!(rr_netlink_mmap_disable, "netlink_mmap_disable", 0, &[]);

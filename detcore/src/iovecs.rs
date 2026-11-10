@@ -11,7 +11,8 @@ use reverie::syscalls::Addr;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
 
-pub(crate) const MAX_RW_COUNT: usize = 0x7fff_f000;
+use crate::page::max_rw_count;
+
 #[cfg(test)]
 const FOUR_LEVEL_USER_LIMIT: usize = reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT as usize;
 /// A four-level x86-64 guest whose kernel (Linux 6.4 or later) shortens a lone
@@ -70,7 +71,7 @@ fn validate_ranges(iovecs: &[ImportedIovec], limit: UserAddressLimit) -> Result<
         // every kernel for multiple descriptors, validate original ranges,
         // even beyond the eventual cap.
         let len = if iovecs.len() == 1 && limit.caps_single_vector {
-            iov.len.min(MAX_RW_COUNT)
+            iov.len.min(max_rw_count())
         } else {
             iov.len
         };
@@ -82,7 +83,7 @@ fn validate_ranges(iovecs: &[ImportedIovec], limit: UserAddressLimit) -> Result<
 }
 
 fn cap_lengths(iovecs: &mut [ImportedIovec]) {
-    let mut remaining = MAX_RW_COUNT;
+    let mut remaining = max_rw_count();
     for iov in iovecs {
         iov.len = iov.len.min(remaining);
         remaining -= iov.len;
@@ -336,7 +337,7 @@ mod tests {
         let memory = ArrayMemory::new(vec![large]);
         assert_eq!(
             import_read_iovecs(&memory, 0x1000, 1, four_level).unwrap()[0].len,
-            MAX_RW_COUNT
+            max_rw_count()
         );
         let memory = ArrayMemory::new(vec![large, ImportedIovec { base: 0, len: 0 }]);
         assert_eq!(
@@ -346,7 +347,7 @@ mod tests {
         let memory = ArrayMemory::new(vec![
             ImportedIovec {
                 base: 0,
-                len: MAX_RW_COUNT,
+                len: max_rw_count(),
             },
             ImportedIovec {
                 base: usize::MAX,
@@ -372,26 +373,26 @@ mod tests {
         );
         let accepted = ImportedIovec {
             base: 0,
-            len: MAX_RW_COUNT + 4096,
+            len: max_rw_count() + 4096,
         };
         let memory = ArrayMemory::new(vec![accepted]);
         assert_eq!(
             import_read_iovecs(&memory, 0x1000, 1, || Ok(before_6_4)).unwrap(),
             [ImportedIovec {
                 base: 0,
-                len: MAX_RW_COUNT
+                len: max_rw_count()
             }]
         );
         // The range that tells the two kernels apart: one byte past the limit
         // whole, exactly at the limit once shortened to MAX_RW_COUNT.
         let straddle = [ImportedIovec {
-            base: FOUR_LEVEL_USER_LIMIT - MAX_RW_COUNT,
-            len: MAX_RW_COUNT + 1,
+            base: FOUR_LEVEL_USER_LIMIT - max_rw_count(),
+            len: max_rw_count() + 1,
         }];
         assert_eq!(validate_ranges(&straddle, FOUR_LEVEL), Ok(()));
         assert_eq!(validate_ranges(&straddle, before_6_4), Err(Errno::EFAULT));
         let at_limit = [ImportedIovec {
-            len: MAX_RW_COUNT,
+            len: max_rw_count(),
             ..straddle[0]
         }];
         assert_eq!(validate_ranges(&at_limit, FOUR_LEVEL), Ok(()));
@@ -428,7 +429,7 @@ mod tests {
         };
         assert!(validate_ranges(&vectors, five_level).is_ok());
         cap_lengths(&mut vectors);
-        assert_eq!(vectors[0].len, MAX_RW_COUNT);
+        assert_eq!(vectors[0].len, max_rw_count());
         assert!(vectors[1..].iter().all(|iov| iov.len == 0));
     }
 

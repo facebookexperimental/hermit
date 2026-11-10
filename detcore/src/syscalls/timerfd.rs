@@ -69,8 +69,11 @@ use reverie::syscalls::Sysno;
 
 use crate::detlog;
 use crate::fd::FdType;
+use crate::fd::FdinfoFacts;
+use crate::fd::LinuxTimerfd;
 use crate::fd::VirtualTimerfd;
 use crate::record_or_replay::RecordOrReplay;
+use crate::syscalls::helpers::PollProbe;
 use crate::syscalls::helpers::poll_deadline_for;
 use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
@@ -290,8 +293,10 @@ where
         })
     };
     match call {
+        #[cfg(target_arch = "x86_64")]
         Syscall::Poll(poll) => pollfds(poll.fds().map(|fds| fds.as_raw()), poll.nfds()),
         Syscall::Ppoll(ppoll) => pollfds(ppoll.fds().map(|fds| fds.as_raw()), ppoll.nfds()),
+        #[cfg(target_arch = "x86_64")]
         Syscall::Select(select) => fd_sets(
             select.nfds(),
             [select.readfds(), select.writefds(), select.exceptfds()]
@@ -340,12 +345,9 @@ where
     G: Guest<Detcore<T>>,
 {
     match call {
-        Syscall::Poll(_)
-        | Syscall::Ppoll(_)
-        | Syscall::Select(_)
-        | Syscall::Pselect6(_)
-        | Syscall::EpollWait(_)
-        | Syscall::EpollPwait(_) => true,
+        Syscall::Ppoll(_) | Syscall::Pselect6(_) | Syscall::EpollPwait(_) => true,
+        #[cfg(target_arch = "x86_64")]
+        Syscall::Poll(_) | Syscall::Select(_) | Syscall::EpollWait(_) => true,
         Syscall::Other(Sysno::epoll_pwait2, _) => true,
         Syscall::Read(read) => is_timerfd(guest, read.fd()),
         Syscall::Readv(readv) => is_timerfd(guest, readv.fd()),
@@ -376,7 +378,7 @@ fn itimerspec(remaining_ns: u64, interval_ns: u64) -> libc::itimerspec {
 
 /// The guest clock at this probe, without raising its floor: what
 /// `clock_gettime` would return now. Timerfd deadlines live on it.
-async fn timerfd_now<T, G>(guest: &mut G) -> LogicalTime
+pub(crate) async fn timerfd_now<T, G>(guest: &mut G) -> LogicalTime
 where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
@@ -406,6 +408,7 @@ where
 pub(crate) struct Scratch {
     setting: AddrMut<'static, libc::itimerspec>,
     pollfd: AddrMut<'static, libc::pollfd>,
+    probe: PollProbe,
 }
 
 /// Reserve a [`Scratch`] on `stack`, before the caller commits it.
@@ -433,6 +436,7 @@ pub(crate) fn reserve_scratch<S: Stack>(stack: &mut S) -> Scratch {
     Scratch {
         setting: stack.reserve(),
         pollfd: stack.reserve(),
+        probe: PollProbe::reserve(stack),
     }
 }
 
@@ -580,8 +584,8 @@ where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
-    let (setting, pollfd, _guard) = match scratch {
-        Some(scratch) => (scratch.setting, scratch.pollfd, None),
+    let (setting, pollfd, poll_probe, _guard) = match scratch {
+        Some(scratch) => (scratch.setting, scratch.pollfd, scratch.probe, None),
         None => {
             let mut stack = guest.stack().await;
             let scratch = reserve_scratch(&mut stack);
@@ -590,7 +594,7 @@ where
                     "no scratch memory to make expired timerfd {fd} readable"
                 ));
             };
-            (scratch.setting, scratch.pollfd, Some(guard))
+            (scratch.setting, scratch.pollfd, scratch.probe, Some(guard))
         }
     };
     let fault = take_fault();
@@ -660,10 +664,12 @@ where
         }
         // A 1 ms host wait where the backend honors it (ptrace); KVM probes
         // without waiting, so this loop then spins until the timer fires.
-        let probe = syscalls::Poll::new()
-            .with_fds(Some(pollfd.cast()))
-            .with_nfds(1)
-            .with_timeout(1);
+        let probe = match poll_probe.call(guest.memory(), pollfd, 1, 1) {
+            Ok(probe) => probe,
+            Err(error) => refuse(format_args!(
+                "could not stage the readiness probe of timerfd {fd}: {error}"
+            )),
+        };
         let ready = inject_bounded(
             guest,
             probe,
@@ -746,6 +752,17 @@ where
     };
     // Linux keeps the interval of a disarmed timer for timerfd_gettime.
     detfd.set_virtual_timerfd(Some(VirtualTimerfd::set(deadline, interval_ns)));
+    // Its fdinfo's `settime flags:` and Linux's own timer, which only the
+    // fdinfo shows (`timerfd_setup`, fs/timerfd.c).
+    if let Some(FdinfoFacts::Timerfd { clockid, .. }) = detfd.fdinfo_facts() {
+        detfd.set_fdinfo_facts(FdinfoFacts::Timerfd {
+            clockid,
+            settime_flags: (call.flags()
+                & (libc::TFD_TIMER_ABSTIME | libc::TFD_TIMER_CANCEL_ON_SET))
+                as u32,
+            linux: LinuxTimerfd::set(deadline),
+        });
+    }
     detlog!(
         "[dtid {}] timerfd_settime(fd={}, flags={:#x}, interval_ns={}, value_ns={}) armed against virtual clock",
         guest.thread_state().dettid,
@@ -784,6 +801,9 @@ where
     publish_expired(guest).await;
     let now = timerfd_now(guest).await;
     let timer = detfd.virtual_timerfd().unwrap_or_default();
+    // Linux forwards its own timer here, which its fdinfo shows
+    // (`LinuxTimerfd::forward`); the answer is Detcore's model's.
+    forward_linux_timer(&detfd, |linux| linux.forward(now, timer.interval_ns));
     let (remaining_ns, interval_ns) = timer.remaining(now);
     guest
         .memory()
@@ -811,7 +831,27 @@ where
     let unread = timer.unread;
     timer.unread = 0;
     detfd.set_virtual_timerfd(Some(timer));
+    // And Linux's own timer, which its fdinfo shows, as its read leaves it.
+    forward_linux_timer(&detfd, |linux| linux.after_read(timer.deadline));
     Some(unread)
+}
+
+/// Apply `step` to the Linux timer that the fdinfo of the timerfd `detfd`
+/// shows ([`LinuxTimerfd`]), where Detcore recorded one.
+fn forward_linux_timer(detfd: &crate::fd::DetFd, step: impl FnOnce(&mut LinuxTimerfd)) {
+    if let Some(FdinfoFacts::Timerfd {
+        clockid,
+        settime_flags,
+        mut linux,
+    }) = detfd.fdinfo_facts()
+    {
+        step(&mut linux);
+        detfd.set_fdinfo_facts(FdinfoFacts::Timerfd {
+            clockid,
+            settime_flags,
+            linux,
+        });
+    }
 }
 
 /// After a `read` of the timerfd `fd` into `buf` returned `result`.

@@ -21,7 +21,7 @@ static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 // (exit 122, cause=skid-overshoot). That measures the host, not the guest, so
 // such an attempt runs again; nothing else does
 // (https://github.com/rrnewton/hermit/issues/1845).
-const SKID_ATTEMPTS: u32 = 5;
+const SKID_ATTEMPTS: u32 = detcore_model::SKID_RETRY_MAX_ATTEMPTS;
 
 #[test]
 fn compression_tools_are_deterministic_under_strict_hermit() {
@@ -35,14 +35,18 @@ fn compression_tools_are_deterministic_under_strict_hermit() {
     let artifact_root =
         Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("compression-{}", std::process::id()));
 
-    let (_, output, ()) =
-        skid_overshoot::retry_typed_skid_refusal("compression", SKID_ATTEMPTS, || {
+    let (_, output, ()) = skid_overshoot::retry_typed_skid_refusal(
+        "compression",
+        SKID_ATTEMPTS,
+        || {
             if artifact_root.exists() {
                 fs::remove_dir_all(&artifact_root)
                     .expect("failed to remove stale compression artifacts");
             }
             let output = Command::new(&runner)
                 .env("HERMIT_BIN", env!("CARGO_BIN_EXE_hermit"))
+                // Staged test sources may not contain Git metadata.
+                .env("COMPRESSION_SOURCE_IDENTITY", "content")
                 // The script's strict runs take their epoch from this.
                 .env("HERMIT_EPOCH", detcore_model::config::CANONICAL_TEST_EPOCH)
                 .env("COMPRESSION_ARTIFACT_ROOT", &artifact_root)
@@ -50,7 +54,9 @@ fn compression_tools_are_deterministic_under_strict_hermit() {
                 .output()
                 .unwrap_or_else(|error| panic!("failed to start {}: {error}", runner.display()));
             (output, ())
-        });
+        },
+        &|_| {},
+    );
 
     assert!(
         output.status.success(),

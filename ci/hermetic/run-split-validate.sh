@@ -130,6 +130,12 @@ MAP="$ROOT/ci/portable-shards.json"
 EXPECTED_E2E_PLAN="$ROOT/ci/expected-e2e-plan.json"
 FETCH_MANIFESTS=(
     Cargo.toml
+    # Reverie is a separate workspace with its own lockfile. Fetching only
+    # Hermit's root lock misses Reverie's dev-dependency graph (io-uring,
+    # for reverie-kvm), which test.liteinst_allocator needs; with a fresh
+    # Cargo home that surfaced as a missing-crate build failure in the
+    # offline phase. Fetch Reverie's lock too.
+    reverie/Cargo.toml
     liteinst-runtime-build/Cargo.toml
     agent-utils/rs/Cargo.toml
 )
@@ -318,8 +324,9 @@ if [[ $do_fetch -eq 1 ]]; then
     fi
 
     # --locked is the point of the phase: resolve to EXACTLY each workspace's
-    # Cargo.lock or fail. LiteInst and Agent Utils have separate workspaces;
-    # the root lock does not include every member of either workspace.
+    # Cargo.lock or fail. LiteInst, Reverie and Agent Utils have separate
+    # workspaces; the root lock does not include every member of those
+    # workspaces (Reverie's dev-dependencies included).
     (
         cd "$ROOT"
         # Keep Cargo's executable name (possibly a rustup proxy) while making

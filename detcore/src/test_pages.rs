@@ -13,8 +13,13 @@
 
 use reverie::syscalls::AddrMut;
 
-/// The page size the tests assume.
-pub(crate) const PAGE: usize = 4096;
+/// The host's page size, the granularity of the pages' protections: 4 KiB on
+/// x86_64, and 4, 16 or 64 KiB on aarch64.
+pub(crate) fn page_size() -> usize {
+    // SAFETY: sysconf has no preconditions.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    usize::try_from(page).expect("the page size is positive")
+}
 
 /// Consecutive pages, each filled with [`Pages::FILL`] and then given its
 /// protection.
@@ -29,12 +34,11 @@ impl Pages {
 
     /// Map one page for each of `protections` (`libc::PROT_*`).
     pub(crate) fn new(protections: &[libc::c_int]) -> Self {
-        assert_eq!(unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize, PAGE);
         let count = protections.len();
         let address = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                count * PAGE,
+                count * page_size(),
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                 -1,
@@ -43,10 +47,16 @@ impl Pages {
         };
         assert_ne!(address, libc::MAP_FAILED);
         let address = address.cast::<u8>();
-        unsafe { std::ptr::write_bytes(address, Self::FILL, count * PAGE) };
+        unsafe { std::ptr::write_bytes(address, Self::FILL, count * page_size()) };
         for (page, &protection) in protections.iter().enumerate() {
             assert_eq!(
-                unsafe { libc::mprotect(address.add(page * PAGE).cast(), PAGE, protection) },
+                unsafe {
+                    libc::mprotect(
+                        address.add(page * page_size()).cast(),
+                        page_size(),
+                        protection,
+                    )
+                },
                 0
             );
         }
@@ -55,7 +65,7 @@ impl Pages {
 
     /// The address `offset` bytes into the pages.
     pub(crate) fn address(&self, offset: usize) -> AddrMut<'static, u8> {
-        assert!(offset < self.count * PAGE);
+        assert!(offset < self.count * page_size());
         AddrMut::from_raw(self.address as usize + offset).unwrap()
     }
 
@@ -66,20 +76,20 @@ impl Pages {
             unsafe {
                 libc::mprotect(
                     self.address.cast(),
-                    self.count * PAGE,
+                    self.count * page_size(),
                     libc::PROT_READ | libc::PROT_WRITE,
                 )
             },
             0
         );
-        unsafe { std::slice::from_raw_parts(self.address, self.count * PAGE) }.to_vec()
+        unsafe { std::slice::from_raw_parts(self.address, self.count * page_size()) }.to_vec()
     }
 }
 
 impl Drop for Pages {
     fn drop(&mut self) {
         assert_eq!(
-            unsafe { libc::munmap(self.address.cast(), self.count * PAGE) },
+            unsafe { libc::munmap(self.address.cast(), self.count * page_size()) },
             0
         );
     }

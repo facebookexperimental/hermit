@@ -43,9 +43,10 @@ pub enum FailureKind {
     /// `class=container-child-exit`. Two configurations of one policy reported
     /// opposite things about the same decision.
     PolicyRefusal,
-    /// A ptrace PMU timer interrupt arrived after its target. The count is
-    /// carried across the container boundary so the parent can publish the
-    /// named infrastructure error instead of leaving the pending no-result.
+    /// A precise PMU timer event (ptrace or KVM) arrived after its target. The
+    /// count is carried across the container boundary so the parent can
+    /// publish the named infrastructure error instead of leaving the pending
+    /// no-result.
     SkidOvershoot { count: u64 },
     /// The child stopped because HERMIT'S OWN `--timeout` BOUND was reached.
     ///
@@ -63,6 +64,14 @@ pub enum FailureKind {
     /// Carried so the parent can record the verification run as failed by its
     /// backend instead of leaving the pending no-result stamp.
     BackendRunFailure,
+    /// The run ended with a scheduler terminal outcome
+    /// ([`crate::SchedulerEndedRun`]): a deadlock under Hermit's model, or its
+    /// virtual clock passed `--virtual-timeout`. Its own outcome, neither a
+    /// guest result nor an internal failure. Carried for the reason
+    /// `RunTimeout` is: the child reports it through this channel, after the
+    /// run was unwound and finished, rather than through the outcome's status,
+    /// which it exits with when its backend cannot unwind the guest.
+    TerminalOutcome(detcore::TerminalOutcome),
 }
 
 /// ⚠️ THE `kind` FIELD IS THE THIRD AND LAST OF ONE CHAIN OF FLATTENINGS.
@@ -143,14 +152,100 @@ impl SerializableError {
 /// be the thing `kind` exists to avoid, and it would break the moment the message
 /// is reworded. This reaches through the one wrapper that hides the type.
 fn is_policy_refusal(err: &Error) -> bool {
-    // Detcore's refusal of an unsupported syscall, and reverie-ptrace's end of
-    // a run in which the guest made a syscall through Reverie's untraced
+    // Anyhow typed context is downcastable through Anyhow, but is not
+    // necessarily exposed as that type by std::error::Error::source().
+    if detcore::ReplayDepartureError::in_error(err).is_some() {
+        return true;
+    }
+    // Detcore's refusal of an unsupported syscall, Detcore's refusal of a
+    // self-sentinel pidfd_send_signal its backend could not qualify, and
+    // reverie-ptrace's end of a run in which the guest made a syscall through Reverie's untraced
     // private-page stub, which no tool saw
     // (https://github.com/rrnewton/reverie/issues/1064).
     fn refuses(cause: &(dyn std::error::Error + 'static)) -> bool {
         cause.is::<detcore::UnsupportedSyscallError>()
+            || cause.is::<detcore::preemptions::RecordAdmissionRefusal>()
+            || cause.is::<detcore::preemptions::RecordFormatRefusal>()
+            || cause.is::<detcore::ChosenBinaryInputRefusal>()
+            || cause.is::<detcore::PidfdSelfQualificationRefusal>()
             || cause.is::<detcore::TerminalReplayRefusal>()
+            || cause.is::<detcore::PriorityHistoryRefusal>()
+            || cause.is::<detcore::UntrapPassthroughRefusal>()
+            || cause.is::<detcore::ReplayDepartureError>()
             || cause.is::<reverie_ptrace::UntracedStubSyscall>()
+            || is_chosen_root_id_taken(cause)
+            || is_kvm_host_resources_refusal(cause)
+            || is_kvm_named_refusal(cause)
+            || is_kvm_vfork_child_refusal(cause)
+    }
+    // The KVM backend's end of a run whose exec it could not finish past the
+    // exec's point of no return, because a host resource of Hermit's own
+    // process ran out (reverie-kvm's `Error::HostResources`, found beneath
+    // the wrappers a run's failure is aggregated in). The guest saw no errno;
+    // before that point the same shortage is Detcore's refusal of the exec.
+    #[cfg(target_arch = "x86_64")]
+    fn is_kvm_host_resources_refusal(cause: &(dyn std::error::Error + 'static)) -> bool {
+        cause
+            .downcast_ref::<reverie_kvm::Error>()
+            .is_some_and(reverie_kvm::Error::is_host_resources_refusal)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    fn is_kvm_host_resources_refusal(_cause: &(dyn std::error::Error + 'static)) -> bool {
+        false
+    }
+    // The KVM executor's refusals by name (`reverie_kvm::Error::is_named_refusal`,
+    // decided by the failure's original cause beneath Reverie's wrappers): an
+    // operation it declines because it cannot perform it faithfully, such as a
+    // read that would wait in the host, or a shared-file operation it does not
+    // implement (`Error::UnsupportedSharedFile`), such as a shared view of a
+    // hugetlbfs file. Every other KVM error stays a backend failure, among them
+    // `SharedFileCapability`, which also reports internal guards
+    // (https://github.com/rrnewton/hermit/issues/5025).
+    #[cfg(target_arch = "x86_64")]
+    fn is_kvm_named_refusal(cause: &(dyn std::error::Error + 'static)) -> bool {
+        cause
+            .downcast_ref::<reverie_kvm::Error>()
+            .is_some_and(reverie_kvm::Error::is_named_refusal)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    fn is_kvm_named_refusal(_cause: &(dyn std::error::Error + 'static)) -> bool {
+        false
+    }
+    // The KVM backend's refusal by name of an operation of a vfork child that
+    // its copy of the parent's memory cannot carry back (reverie-kvm's
+    // `Error::VforkChildCapability`, found beneath the wrappers a run's
+    // failure is aggregated in): a mapping change the child leaves in place
+    // when its window ends, a byte the child and another thread of its parent
+    // both changed, a changed page whose mapping that thread replaced or
+    // removed, a brk that moves the break, and thread creation in the child
+    // (https://github.com/rrnewton/hermit/issues/5025).
+    #[cfg(target_arch = "x86_64")]
+    fn is_kvm_vfork_child_refusal(cause: &(dyn std::error::Error + 'static)) -> bool {
+        cause
+            .downcast_ref::<reverie_kvm::Error>()
+            .is_some_and(|error| {
+                matches!(
+                    error.primary(),
+                    reverie_kvm::Error::VforkChildCapability { .. }
+                )
+            })
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    fn is_kvm_vfork_child_refusal(_cause: &(dyn std::error::Error + 'static)) -> bool {
+        false
+    }
+    // The guest's first process could not have its chosen ID
+    // (`--no-namespace`, `Command::pid`): another task took it after Hermit
+    // checked, such as a run in another network namespace, which the window
+    // reservation does not cover. Linux's clone never fails with EEXIST but
+    // for a requested ID, so this is that refusal.
+    fn is_chosen_root_id_taken(cause: &(dyn std::error::Error + 'static)) -> bool {
+        cause
+            .downcast_ref::<reverie::process::Error>()
+            .is_some_and(|error| {
+                error.errno() == reverie::syscalls::Errno::EEXIST
+                    && error.context() == reverie::process::Context::Clone
+            })
     }
     if err.chain().any(refuses) {
         return true;
@@ -171,6 +266,16 @@ fn is_policy_refusal(err: &Error) -> bool {
 /// cleanup observations are deliberately unreachable from this function.
 pub(crate) fn classify_ptrace_primary(error: &reverie::Error) -> FailureKind {
     match error {
+        // A terminal outcome completes as its own outcome only when its
+        // teardown was clean (`ptrace_completion::clean_terminal_outcome`).
+        // Left as the primary of a failed run, the teardown failed or never
+        // confirmed, which is Hermit's failure.
+        reverie::Error::Tool(inner)
+            if inner.is::<crate::SchedulerEndedRun>()
+                && detcore::ReplayDepartureError::in_error(inner).is_none() =>
+        {
+            FailureKind::Error
+        }
         reverie::Error::Tool(inner) => classify_unwrapped(inner),
         _ => FailureKind::Error,
     }
@@ -210,7 +315,10 @@ fn classify_unwrapped(error: &Error) -> FailureKind {
         FailureKind::SkidOvershoot {
             count: error.count(),
         }
-    } else if is_policy_refusal(error)
+    } else if error
+        .chain()
+        .any(|cause| cause.is::<detcore_model::virtual_timeout::VirtualTimeoutWithDebugger>())
+        || is_policy_refusal(error)
         || error
             .downcast_ref::<crate::LiteinstInGuestRefusal>()
             .is_some()
@@ -220,10 +328,21 @@ fn classify_unwrapped(error: &Error) -> FailureKind {
         || error
             .chain()
             .any(|cause| cause.is::<crate::preemption_admission::UnsupportedPreemption>())
+        || error
+            .chain()
+            .any(|cause| cause.is::<crate::preemption_admission::UnqualifiedAnnotatedReplay>())
+        || error
+            .chain()
+            .any(|cause| cause.is::<crate::kvm_address_space::KvmAddressSpaceRefusal>())
+        || error.chain().any(|cause| {
+            cause.is::<crate::sleep_registration_admission::UnreadableSleeperSignalState>()
+        })
     {
         FailureKind::PolicyRefusal
     } else if error.downcast_ref::<crate::GuestTimedOut>().is_some() {
         FailureKind::RunTimeout
+    } else if let Some(ended) = error.downcast_ref::<crate::SchedulerEndedRun>() {
+        FailureKind::TerminalOutcome(ended.outcome)
     } else if error.downcast_ref::<crate::BackendRunFailure>().is_some() {
         FailureKind::BackendRunFailure
     } else {
@@ -267,8 +386,11 @@ impl From<SerializableError> for Error {
     }
 }
 
+/// A boundary schedule with one record no run consumes, stating `identity`.
 #[cfg(test)]
-pub(crate) async fn terminal_replay_refusal_for_test() -> Error {
+fn unconsumed_schedule_for_test(
+    identity: Option<detcore::preemptions::HistoryIdentity>,
+) -> detcore::preemptions::boundary_recording::Recording {
     use detcore::preemptions::PreemptionRecord;
     use detcore::preemptions::boundary_recording::BoundaryRecording;
     use detcore::preemptions::boundary_recording::Recording;
@@ -276,9 +398,7 @@ pub(crate) async fn terminal_replay_refusal_for_test() -> Error {
     use detcore_model::schedule::SchedEvent;
     use detcore_model::schedule::boundary::Record;
     use detcore_model::schedule::boundary::Schedule;
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("unconsumed.json");
-    let recording = Recording::Boundaries(
+    Recording::Boundaries(
         BoundaryRecording::new(
             PreemptionRecord::default(),
             Schedule::new(vec![Record::Event(SchedEvent::branches(
@@ -288,23 +408,159 @@ pub(crate) async fn terminal_replay_refusal_for_test() -> Error {
             .unwrap(),
         )
         .unwrap(),
-    );
+    )
+    .with_identity(identity)
+}
+
+#[cfg(test)]
+pub(crate) async fn terminal_replay_refusal_for_test() -> Error {
+    use detcore::preemptions::HistoryIdentity;
+    // The replay reaches its terminal refusal only past identity admission:
+    // the schedule and the run state the same backend-local clock, so the
+    // fixture needs no qualified host counter. Its other capabilities stay
+    // the defaults apart from the stated clock contract.
+    const LOCAL: &str = "test:terminal-replay:v1";
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("unconsumed.json");
+    let recording =
+        unconsumed_schedule_for_test(Some(HistoryIdentity::BackendLocal(LOCAL.to_owned())));
     std::fs::write(&path, recording.encode().unwrap()).unwrap();
-    detcore::GlobalState::init_for_external_scheduler(&detcore::Config {
+    let mut config = detcore::Config {
         sequentialize_threads: true,
         strict_schedule_boundaries: true,
         replay_schedule_from: Some(path),
         record_preemptions: false,
         ..detcore::Config::default()
-    })
-    .clean_up(false, &None)
-    .await
-    .unwrap_err()
+    };
+    config.backend.rcb_clock_contract = None;
+    config.rcb_clock_claim = detcore_model::config::RcbClockClaim::BackendLocal(LOCAL);
+    detcore::GlobalState::init_for_external_scheduler(&config)
+        .clean_up(false, &None)
+        .await
+        .unwrap_err()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_format_refusal_keeps_its_kind_through_context_and_reverie() {
+        use detcore::preemptions::RecordFormatRefusal;
+        use detcore::preemptions::boundary_recording::Recording;
+
+        // The first format past the newest this Hermit reads.
+        let future = format!(
+            r#"{{"per_thread":{{}},"global":[],"format_version":{}}}"#,
+            detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX + 1
+        );
+        let records: [&[u8]; 2] = [
+            future.as_bytes(),
+            br#"{"per_thread":{},"global":[],"format_version":3,"time_skips":[]}"#,
+        ];
+        for contextual in [false, true] {
+            for wrapped in [false, true] {
+                let adapt = |mut error: Error| {
+                    if contextual {
+                        error = error.context("reading schedule before guest startup");
+                    }
+                    if wrapped {
+                        error = Error::new(reverie::Error::Tool(error));
+                    }
+                    if contextual {
+                        error = error.context("outer launch boundary");
+                    }
+                    error
+                };
+                for bytes in records {
+                    let refusal = Recording::decode(bytes).unwrap_err();
+                    assert!(refusal.is::<RecordFormatRefusal>());
+                    let prose = adapt(Error::msg(refusal.to_string()));
+                    let serialized = SerializableError::from(adapt(refusal));
+                    assert_eq!(serialized.kind(), FailureKind::PolicyRefusal);
+                    let bytes =
+                        bincode::serde::encode_to_vec(&serialized, bincode::config::legacy())
+                            .unwrap();
+                    let (decoded, used): (SerializableError, usize) =
+                        bincode::serde::decode_from_slice(&bytes, bincode::config::legacy())
+                            .unwrap();
+                    assert_eq!(used, bytes.len());
+                    assert_eq!(decoded, serialized);
+                    assert_eq!(SerializableError::from(prose).kind(), FailureKind::Error);
+                }
+                for error in [
+                    Recording::decode(b"{").unwrap_err(),
+                    Error::new(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                ] {
+                    assert!(!error.is::<RecordFormatRefusal>());
+                    assert_eq!(
+                        SerializableError::from(adapt(error)).kind(),
+                        FailureKind::Error
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_unconsumed_schedule_without_identity_is_refused_before_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unconsumed.json");
+        std::fs::write(&path, unconsumed_schedule_for_test(None).encode().unwrap()).unwrap();
+        let refusal = crate::rcb_history_refusal(
+            &detcore::Config::default(),
+            &[("--replay-schedule-from", path.as_path())],
+        )
+        .unwrap()
+        .expect("an identity-less schedule is refused");
+        assert!(
+            refusal.contains("it states no RCB coordinate identity"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_rcb_history_is_a_named_refusal_not_a_parse_error() {
+        use detcore::preemptions::HistoryIdentity;
+
+        let directory = tempfile::tempdir().unwrap();
+        let known = HistoryIdentity::Known(
+            reverie::pmu_config::RcbMetric::ConditionalBranchesRetiredUserV1,
+        );
+        type Edit = dyn Fn(&mut serde_json::Value);
+        let cases: [(&str, &Edit, &str); 2] = [
+            (
+                "format3.json",
+                &|v: &mut serde_json::Value| v["rcb_history"]["format"] = 3.into(),
+                "unsupported rcb_history format 3",
+            ),
+            (
+                "unknown.json",
+                &|v: &mut serde_json::Value| {
+                    v["rcb_history"]["identity"] = "rcb:cond-retired:user:v2".into()
+                },
+                "unknown RCB coordinate identity",
+            ),
+        ];
+        for (name, change, cause) in cases {
+            let mut value: serde_json::Value = serde_json::from_slice(
+                &unconsumed_schedule_for_test(Some(known.clone()))
+                    .encode()
+                    .unwrap(),
+            )
+            .unwrap();
+            change(&mut value);
+            let path = directory.path().join(name);
+            std::fs::write(&path, value.to_string()).unwrap();
+            let refusal = crate::rcb_history_refusal(
+                &detcore::Config::default(),
+                &[("--replay-schedule-from", path.as_path())],
+            )
+            .unwrap()
+            .expect("an unknown rcb_history envelope is refused, not a parse error");
+            assert!(refusal.contains(cause), "{refusal}");
+        }
+    }
 
     #[tokio::test]
     async fn terminal_refusal_is_typed_direct_and_through_reverie() {
@@ -344,12 +600,29 @@ mod tests {
             (
                 Error::new(crate::GuestTimedOut {
                     limit: std::time::Duration::from_secs(3),
+                    survivors: None,
                 }),
                 FailureKind::RunTimeout,
             ),
             (
                 Error::new(crate::BackendRunFailure),
                 FailureKind::BackendRunFailure,
+            ),
+            (
+                Error::new(crate::SchedulerEndedRun::new(
+                    detcore::TerminalOutcome::GuestDeadlock,
+                    None,
+                )),
+                FailureKind::TerminalOutcome(detcore::TerminalOutcome::GuestDeadlock),
+            ),
+            (
+                Error::new(crate::SchedulerEndedRun::new(
+                    detcore::TerminalOutcome::VirtualTimeout { bound_ns: 9 },
+                    None,
+                )),
+                FailureKind::TerminalOutcome(detcore::TerminalOutcome::VirtualTimeout {
+                    bound_ns: 9,
+                }),
             ),
             (
                 Error::new(crate::SkidOvershootError::new(2)),
@@ -379,10 +652,30 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_first_pass_refusal_keeps_its_policy_class_across_the_container_boundary() {
+        let config = detcore::Config {
+            sequentialize_threads: true,
+            backend: crate::backend_capabilities(crate::Backend::Kvm),
+            sleep_registration: Some(detcore_model::config::SleepRegistration::FirstPass),
+            ..detcore::Config::default()
+        };
+        let refusal =
+            crate::sleep_registration_admission::refuse_unreadable_first_pass_launch(&config)
+                .unwrap_err();
+        let serialized = SerializableError::from(Error::new(refusal).context("launch refused"));
+        assert_eq!(serialized.kind(), FailureKind::PolicyRefusal);
+        assert!(serialized.context.iter().any(|message| {
+            message.contains("unreadable_sleeper_signal_state")
+                && message.contains("--sleep-registration=first-pass")
+        }));
+    }
+
+    #[test]
     fn unsupported_preemption_keeps_its_policy_class_across_the_container_boundary() {
-        let refusal = crate::preemption_admission::refuse_unsupported_preemption(
+        let refusal = crate::preemption_admission::refuse_unsupported_preemption_with_capabilities(
             &detcore::Config::default(),
-            crate::Backend::Dbt,
+            "dbt",
+            reverie::BackendCapabilities::DBT,
             true,
             false,
         )
@@ -391,6 +684,23 @@ mod tests {
         assert_eq!(serialized.kind(), FailureKind::PolicyRefusal);
         assert!(serialized.context.iter().any(|message| {
             message.contains("unsupported_preemption") && message.contains("--backend=dbt")
+        }));
+    }
+
+    #[test]
+    fn a_kvm_address_space_refusal_keeps_its_policy_class_across_the_container_boundary() {
+        let refusal = crate::kvm_address_space::KvmAddressSpaceRefusal::for_limit(
+            libc::rlimit {
+                rlim_cur: 16 << 30,
+                rlim_max: 16 << 30,
+            },
+            3 << 30,
+        )
+        .expect("a finite limit is refused");
+        let serialized = SerializableError::from(Error::new(refusal).context("launch refused"));
+        assert_eq!(serialized.kind(), FailureKind::PolicyRefusal);
+        assert!(serialized.context.iter().any(|message| {
+            message.contains("kvm_address_space_limit") && message.contains("--backend=kvm")
         }));
     }
 
@@ -490,6 +800,49 @@ mod tests {
         assert_eq!(serialized.kind(), FailureKind::PolicyRefusal);
         assert!(
             serialized.error.contains("0x71000002"),
+            "{}",
+            serialized.error
+        );
+    }
+
+    /// A finished run's terminal outcome (a deadlock under Hermit's model, a
+    /// virtual timeout) keeps its own outcome and crosses the container
+    /// boundary with its kind; one left as the primary of a failed ptrace run
+    /// (its teardown failed or never confirmed) is Hermit's failure, so the
+    /// unclean teardown is not reported as the outcome.
+    #[test]
+    fn a_terminal_outcome_keeps_its_kind_only_once_the_run_finished() {
+        for outcome in [
+            detcore::TerminalOutcome::GuestDeadlock,
+            detcore::TerminalOutcome::VirtualTimeout { bound_ns: 5 },
+        ] {
+            let finished =
+                SerializableError::from(Error::new(crate::SchedulerEndedRun::new(outcome, None)));
+            assert_eq!(finished.kind(), FailureKind::TerminalOutcome(outcome));
+            let primary =
+                reverie::Error::Tool(Error::new(crate::SchedulerEndedRun::new(outcome, None)));
+            assert_eq!(classify_ptrace_primary(&primary), FailureKind::Error);
+        }
+    }
+
+    /// Detcore's refusal of a self-sentinel pidfd_send_signal whose backend
+    /// could not qualify its spelling is a policy refusal, through ptrace's
+    /// Tool wrapper and across the container boundary, and keeps its reason.
+    #[test]
+    fn an_unqualified_pidfd_self_sentinel_is_a_policy_refusal() {
+        let refusal = || detcore::PidfdSelfQualificationRefusal { sentinel: -10001 };
+        let primary = reverie::Error::Tool(Error::new(refusal()));
+        assert_eq!(
+            classify_ptrace_primary(&primary),
+            FailureKind::PolicyRefusal
+        );
+        let wrapped = Error::new(reverie::Error::Tool(Error::new(refusal())))
+            .context("the ptrace backend failed");
+        assert_eq!(classify_unwrapped(&wrapped), FailureKind::PolicyRefusal);
+        let serialized = SerializableError::from(Error::new(refusal()));
+        assert_eq!(serialized.kind(), FailureKind::PolicyRefusal);
+        assert!(
+            serialized.error.contains("self sentinel -10001"),
             "{}",
             serialized.error
         );

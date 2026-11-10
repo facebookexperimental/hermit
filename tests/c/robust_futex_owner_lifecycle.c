@@ -8,6 +8,7 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/futex.h>
 #include <pthread.h>
 #include <sched.h>
@@ -33,6 +34,9 @@ struct shared_state {
   _Atomic int sibling_blocking;
   _Atomic int exiting;
   _Atomic int registered;
+  /* A second robust mutex, for the SIGKILL modes with two owners. */
+  pthread_mutex_t mutex2;
+  _Atomic int owner2_ready;
 };
 
 /* How many private robust mutexes the exit_group caller holds in the
@@ -134,6 +138,57 @@ static void raw_waiter_process(void) {
       atomic_load(&state->registered));
   fflush(stdout);
   _exit(0);
+}
+
+/* The waiter on the second mutex: as waiter_process, on mutex2. */
+static void second_waiter_process(void) {
+  int rc = pthread_mutex_lock(&state->mutex2);
+  if (rc != EOWNERDEAD) {
+    fprintf(
+        stderr,
+        "second waiter got %d (%s), expected EOWNERDEAD\n",
+        rc,
+        strerror(rc));
+    _exit(5);
+  }
+  pthread_mutex_consistent(&state->mutex2);
+  pthread_mutex_unlock(&state->mutex2);
+  puts("PASS: second waiter received EOWNERDEAD");
+  fflush(stdout);
+  _exit(0);
+}
+
+static pid_t spawn_second_waiter(void) {
+  pid_t pid = fork();
+  if (pid < 0) {
+    die("fork second waiter");
+  }
+  if (pid == 0) {
+    second_waiter_process();
+  }
+  _Atomic uint32_t* lock = (_Atomic uint32_t*)&state->mutex2;
+  while (!(atomic_load(lock) & FUTEX_WAITERS)) {
+    sched_yield();
+  }
+  return pid;
+}
+
+static void lock_second_as_owner(void) {
+  int rc = pthread_mutex_lock(&state->mutex2);
+  if (rc != 0) {
+    errno = rc;
+    die("owner pthread_mutex_lock mutex2");
+  }
+  atomic_store_explicit(&state->owner2_ready, 1, memory_order_release);
+}
+
+static void* second_owner_thread(void* unused) {
+  (void)unused;
+  lock_second_as_owner();
+  for (;;) {
+    pause();
+  }
+  return NULL;
 }
 
 static pid_t spawn_waiter(int raw) {
@@ -268,6 +323,29 @@ static void* exec_thread(void* unused) {
   return NULL;
 }
 
+/*
+ * Takes the mutex's lock word by hand and leaves the mutex only in this
+ * thread's list_op_pending slot, as glibc's lock does between taking the word
+ * and linking the mutex into the list. Linux's walk of a dying owner handles
+ * that slot last, as the owner's.
+ */
+static void lock_through_pending_only(void) {
+  struct robust_list_head* head;
+  size_t len;
+  if (syscall(SYS_get_robust_list, 0, &head, &len) != 0 || head == NULL) {
+    die("get_robust_list");
+  }
+  _Atomic uint32_t* word = (_Atomic uint32_t*)&state->mutex;
+  head->list_op_pending =
+      (struct robust_list*)((char*)word - head->futex_offset);
+  uint32_t expected = 0;
+  if (!atomic_compare_exchange_strong(
+          word, &expected, (uint32_t)syscall(SYS_gettid))) {
+    die("take the lock word");
+  }
+  atomic_store_explicit(&state->owner_ready, 1, memory_order_release);
+}
+
 static pid_t spawn_group_owner(const char* mode) {
   pid_t pid = fork();
   if (pid < 0) {
@@ -287,6 +365,85 @@ static pid_t spawn_group_owner(const char* mode) {
     /* The signal recipient is deliberately not the robust-mutex owner. */
     raise(SIGTERM);
     _exit(9);
+  }
+
+  /*
+   * The SIGKILL modes: another process kills the owner's process
+   * (kill, or tgkill naming a thread that is not the owner), or the owner's
+   * process kills itself (from a thread that is not the owner, or from the
+   * owner), while the waiter waits.
+   */
+  if (strcmp(mode, "sigkill") == 0 || strcmp(mode, "sigkill-killer-waits") == 0 ||
+      strcmp(mode, "sigkill-pidfd") == 0) {
+    lock_as_owner();
+    for (;;) {
+      pause();
+    }
+  }
+
+  /* Two threads of the owner's process each own one mutex. */
+  if (strcmp(mode, "sigkill-two-owners") == 0) {
+    pthread_t first, second;
+    if (pthread_create(&first, NULL, owner_thread, NULL) != 0 ||
+        pthread_create(&second, NULL, second_owner_thread, NULL) != 0) {
+      die("pthread_create owners");
+    }
+    for (;;) {
+      pause();
+    }
+  }
+
+  /* The killing thread owns mutex2, a sibling owns the first mutex. */
+  if (strcmp(mode, "sigkill-self-both") == 0) {
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, owner_thread, NULL) != 0) {
+      die("pthread_create owner");
+    }
+    lock_second_as_owner();
+    wait_until(&state->trigger, 1);
+    kill(getpid(), SIGKILL);
+    _exit(7);
+  }
+
+  /* The owner leads its own process group, which the parent kills. */
+  if (strcmp(mode, "sigkill-group") == 0) {
+    if (setpgid(0, 0) != 0) {
+      die("setpgid");
+    }
+    lock_as_owner();
+    for (;;) {
+      pause();
+    }
+  }
+
+  if (strcmp(mode, "sigkill-self-owner") == 0) {
+    lock_as_owner();
+    wait_until(&state->trigger, 1);
+    kill(getpid(), SIGKILL);
+    _exit(7);
+  }
+
+  if (strcmp(mode, "sigkill-pending") == 0) {
+    lock_through_pending_only();
+    for (;;) {
+      pause();
+    }
+  }
+
+  if (strcmp(mode, "sigkill-thread") == 0 || strcmp(mode, "sigkill-self") == 0) {
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, owner_thread, NULL) != 0) {
+      die("pthread_create owner");
+    }
+    wait_until(&state->owner_ready, 1);
+    if (strcmp(mode, "sigkill-self") == 0) {
+      wait_until(&state->trigger, 1);
+      kill(getpid(), SIGKILL);
+      _exit(7);
+    }
+    for (;;) {
+      pause();
+    }
   }
 
   if (strcmp(mode, "exit-group") == 0) {
@@ -979,6 +1136,103 @@ struct two_waiters_state {
 };
 static struct two_waiters_state* tw;
 
+/* Reads one small /proc file of a waiter child into `buf` with raw
+ * open/read/close (three syscalls; stdio would multiply them).
+ * Returns 1 when the file was read, 0 when this environment does not
+ * expose it. */
+static int read_waiter_proc(pid_t pid, const char* name, char* buf, size_t cap) {
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/%ld/%s", (long)pid, name);
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return 0;
+  }
+  ssize_t read_count = read(fd, buf, cap - 1);
+  close(fd);
+  if (read_count <= 0) {
+    return 0;
+  }
+  buf[read_count] = '\0';
+  return 1;
+}
+
+/* Whether one waiter is provably blocked in its FUTEX_WAIT: /proc
+ * state S plus a futex wait channel or the futex syscall number.
+ * Sets `*observable` when either witness file yielded contents at
+ * all, so the caller can tell "not blocked yet" from "this procfs
+ * cannot say" (a synthesized procfs may have stat but neither
+ * wchan nor syscall). */
+static int waiter_provably_blocked(pid_t pid, int* observable) {
+  char stat_buf[512];
+  if (!read_waiter_proc(pid, "stat", stat_buf, sizeof(stat_buf))) {
+    return 0;
+  }
+  const char* close_paren = strrchr(stat_buf, ')');
+  if (close_paren == NULL || close_paren[1] != ' ' || close_paren[2] != 'S') {
+    return 0;
+  }
+  char wchan[128];
+  if (read_waiter_proc(pid, "wchan", wchan, sizeof(wchan)) &&
+      strcmp(wchan, "0") != 0) {
+    *observable = 1;
+    return strstr(wchan, "futex") != NULL;
+  }
+  char syscall_buf[256];
+  if (read_waiter_proc(pid, "syscall", syscall_buf, sizeof(syscall_buf))) {
+    *observable = 1;
+    return strtol(syscall_buf, NULL, 10) == SYS_futex;
+  }
+  return 0;
+}
+
+/* Proves both raw waiters are blocked in their FUTEX_WAIT before the
+ * exec is triggered. `parked` alone only proves a waiter is between
+ * incrementing the counter and issuing the syscall; under load the
+ * exec's robust walk could then mark the word before the late waiter
+ * queues, and its FUTEX_WAIT would return EAGAIN and be counted as
+ * neither woken nor timed out (the native-oracle race in dh-wmzqx,
+ * observed as "woken=1 timed_out=0"). A waiter past `parked` does
+ * nothing but the FUTEX_WAIT, so state S in a futex wait proves it
+ * queued: the kernel enqueues under the hash-bucket lock the waker
+ * must also take.
+ *
+ * Observability is decided by one probe up front, never by burning
+ * the waiters' timeout waiting for witnesses this procfs does not
+ * have (a synthesized procfs, as under Hermit, has stat but neither
+ * wchan nor syscall; polling for them there once let both waiters
+ * time out). Unobservable falls back to the same settle the sibling
+ * modes use after `parked`; observable-but-never-blocked fails
+ * rather than let the string comparison misattribute the oracle's
+ * own race. */
+static void wait_until_two_waiters_blocked(const pid_t* waiters, int count) {
+  int observable = 0;
+  (void)waiter_provably_blocked(waiters[0], &observable);
+  if (!observable) {
+    struct timespec settle = {0, 30000000};
+    while (nanosleep(&settle, &settle) < 0 && errno == EINTR) {
+    }
+    return;
+  }
+  for (int poll = 0; poll < 200000; ++poll) {
+    int blocked = 0;
+    for (int i = 0; i < count; ++i) {
+      int ignored = 0;
+      blocked += waiter_provably_blocked(waiters[i], &ignored);
+    }
+    if (blocked == count) {
+      return;
+    }
+    sched_yield();
+    if (poll % 1024 == 1023) {
+      struct timespec pause = {0, 100000};
+      while (nanosleep(&pause, &pause) < 0 && errno == EINTR) {
+      }
+    }
+  }
+  fputs("waiters did not provably block in FUTEX_WAIT\n", stderr);
+  _exit(5);
+}
+
 static void two_waiters_raw_waiter(void) {
   _Atomic uint32_t* word = (_Atomic uint32_t*)&tw->mutex;
   uint32_t value = atomic_load(word);
@@ -1033,11 +1287,11 @@ static int exec_two_waiters_main(void) {
     if (waiters[i] == 0) {
       two_waiters_raw_waiter();
     }
-    boundary_spin_until(&tw->parked, i + 1);
-    for (int y = 0; y < 50; ++y) {
-      sched_yield();
-    }
   }
+  boundary_spin_until(&tw->parked, 2);
+  /* `parked` said each waiter is about to issue FUTEX_WAIT; prove both
+   * are actually queued in it before the exec may run (dh-wmzqx). */
+  wait_until_two_waiters_blocked(waiters, 2);
   atomic_store(&tw->trigger, 1);
   for (int i = 0; i < 2; ++i) {
     if (waitpid(waiters[i], NULL, 0) != waiters[i]) {
@@ -1055,6 +1309,38 @@ static int exec_two_waiters_main(void) {
   return 0;
 }
 
+/* The waiter of sigkill-killer-waits: a thread of the killing process. */
+static void* killer_waiter_thread(void* result) {
+  int rc = pthread_mutex_lock(&state->mutex);
+  *(int*)result = rc;
+  if (rc == EOWNERDEAD) {
+    pthread_mutex_consistent(&state->mutex);
+    pthread_mutex_unlock(&state->mutex);
+  }
+  return NULL;
+}
+
+/* How the parent ends a SIGKILL mode's owner, once the waiter waits. */
+static void kill_owner(const char* mode, pid_t owner) {
+  int rc = 0;
+  if (strcmp(mode, "sigkill") == 0 || strcmp(mode, "sigkill-pending") == 0 ||
+      strcmp(mode, "sigkill-killer-waits") == 0) {
+    rc = kill(owner, SIGKILL);
+  } else if (strcmp(mode, "sigkill-thread") == 0 ||
+             strcmp(mode, "sigkill-two-owners") == 0) {
+    rc = (int)syscall(SYS_tgkill, owner, owner, SIGKILL);
+  } else if (strcmp(mode, "sigkill-group") == 0) {
+    rc = kill(-owner, SIGKILL);
+  } else if (strcmp(mode, "sigkill-pidfd") == 0) {
+    int pidfd = (int)syscall(SYS_pidfd_open, owner, 0);
+    rc = pidfd < 0 ? -1
+                   : (int)syscall(SYS_pidfd_send_signal, pidfd, SIGKILL, NULL, 0);
+  }
+  if (rc != 0) {
+    die("kill owner");
+  }
+}
+
 int main(int argc, char** argv) {
   if (argc == 2 && strcmp(argv[1], "after-exec") == 0) {
     return 0;
@@ -1066,7 +1352,10 @@ int main(int argc, char** argv) {
         "shared-alias|self-alias|two-pending|pending-marked|pending-marked-quiet|"
         "pending-owner|concurrent-exit-group|reversed-owner|de-thread|owner-exec|"
         "leader-exec|"
-        "thread-owner-exec|thread-tgid-exec|failed-exec|exec-two-waiters\n",
+        "thread-owner-exec|thread-tgid-exec|failed-exec|exec-two-waiters|"
+        "sigkill|sigkill-pending|sigkill-thread|sigkill-self|sigkill-self-owner|"
+        "sigkill-two-owners|sigkill-self-both|sigkill-group|sigkill-pidfd|"
+        "sigkill-killer-waits\n",
         argv[0]);
     return 64;
   }
@@ -1111,20 +1400,56 @@ int main(int argc, char** argv) {
   if (pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST) != 0) {
     die("pthread_mutexattr_setrobust");
   }
-  if (pthread_mutex_init(&state->mutex, &attr) != 0) {
+  if (pthread_mutex_init(&state->mutex, &attr) != 0 ||
+      pthread_mutex_init(&state->mutex2, &attr) != 0) {
     die("pthread_mutex_init");
   }
 
   pid_t owner = spawn_group_owner(argv[1]);
   wait_until(&state->owner_ready, 1);
+  if (strcmp(argv[1], "sigkill-killer-waits") == 0) {
+    int result = -1;
+    pthread_t waiter_thread;
+    if (pthread_create(&waiter_thread, NULL, killer_waiter_thread, &result) !=
+        0) {
+      die("pthread_create waiter");
+    }
+    wait_for_waiter();
+    kill_owner(argv[1], owner);
+    pthread_join(waiter_thread, NULL);
+    if (result != EOWNERDEAD) {
+      fprintf(
+          stderr,
+          "waiter thread got %d (%s), expected EOWNERDEAD\n",
+          result,
+          strerror(result));
+      return 5;
+    }
+    puts("PASS: waiter received EOWNERDEAD");
+    if (waitpid(owner, NULL, 0) != owner) {
+      die("waitpid owner");
+    }
+    puts("PASS: lifecycle completed");
+    return 0;
+  }
   int raw = strcmp(argv[1], "thread-owner-exec") == 0 ||
       strcmp(argv[1], "failed-exec") == 0 ||
       strcmp(argv[1], "late-registration") == 0;
   pid_t waiter = spawn_waiter(raw);
+  pid_t second_waiter = -1;
+  if (strcmp(argv[1], "sigkill-two-owners") == 0 ||
+      strcmp(argv[1], "sigkill-self-both") == 0) {
+    wait_until(&state->owner2_ready, 1);
+    second_waiter = spawn_second_waiter();
+  }
 
   atomic_store_explicit(&state->trigger, 1, memory_order_release);
+  kill_owner(argv[1], owner);
 
   await_success(waiter, "waiter");
+  if (second_waiter > 0) {
+    await_success(second_waiter, "second waiter");
+  }
   int owner_status;
   if (waitpid(owner, &owner_status, 0) != owner) {
     die("waitpid owner");

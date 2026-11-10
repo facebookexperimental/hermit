@@ -12,10 +12,6 @@ mod hermit_test;
 #[path = "common/readonly_proc.rs"]
 mod readonly_proc;
 
-#[cfg(feature = "dbt")]
-#[path = "common/mapping_capture_live.rs"]
-mod mapping_capture_live;
-
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
@@ -289,8 +285,15 @@ fn proc_self_stat_is_deterministic() {
         let comm_end = text.rfind(") ").expect("stat has no comm terminator");
         let fields = text[comm_end + 2..].split_whitespace().collect::<Vec<_>>();
         assert!(fields.len() >= 50, "stat has too few fields");
-        for field in [10, 11, 12, 13, 14, 15, 16, 17, 21, 22, 24, 39, 42, 43, 44] {
+        for field in [10, 11, 12, 13, 21, 22, 24, 39, 42, 43, 44] {
             assert_eq!(fields[field - 3], "0", "stat field {field} is volatile");
+        }
+        // The CPU times (14-17) are Detcore's CPU accounting, the same in
+        // every run, which the comparison of the runs checks.
+        for field in 14..=17 {
+            fields[field - 3]
+                .parse::<u64>()
+                .unwrap_or_else(|_| panic!("stat field {field} is not a tick count"));
         }
     });
 }
@@ -2808,147 +2811,4 @@ fn sysfs_hwmon_input_is_deterministic_when_available() {
     };
     let path = path.to_str().expect("hwmon path should be UTF-8");
     assert_deterministic(path, |contents| assert_eq!(contents, b"0\n"));
-}
-
-#[cfg(feature = "dbt")]
-#[test]
-fn runtime_private_maps_keep_the_opened_targets_guest_mapping() {
-    runtime_private_mapping_target_check(false);
-}
-
-#[cfg(feature = "dbt")]
-#[test]
-fn runtime_private_smaps_keep_the_opened_targets_guest_mapping() {
-    runtime_private_mapping_target_check(true);
-}
-
-#[cfg(feature = "dbt")]
-fn runtime_private_mapping_target_check(smaps: bool) {
-    let _run_lock = hermit_run_lock();
-    let leaf = if smaps { "smaps" } else { "maps" };
-    let build = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("runtime-private-maps")
-        .join(std::process::id().to_string())
-        .join(leaf);
-    fs::create_dir_all(&build).unwrap();
-    let source =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/runtime_private_maps.c");
-    let program = build.join("runtime_private_maps");
-    compile_c(&source, &program);
-    let expected = format!("{leaf} aliases retain the target's guest mapping\n");
-    let expected = expected.as_bytes();
-    let mut native = Command::new(&program);
-    if smaps {
-        native.arg("smaps");
-    }
-    let native = native.output().unwrap();
-    assert!(native.status.success(), "native target control: {native:?}");
-    assert_eq!(native.stdout, expected);
-    let mut observations = Vec::new();
-    for backend in ["ptrace", "dbt"] {
-        let report = build.join(format!("{backend}.json"));
-        let mut command = Command::new(hermit_test::hermit_binary());
-        command
-            .args([
-                "--log=debug",
-                "--backend",
-                backend,
-                "run",
-                "--base-env=minimal",
-                "--strict",
-                "--epoch=2026-01-01T00:00:00Z",
-                "--verify",
-                "--verify-strict",
-                "--verify-json",
-            ])
-            .arg(&report)
-            .arg("--keep-logs")
-            .arg("--verify-log-dir")
-            .arg(build.join(format!("{backend}-logs")))
-            .arg("--")
-            .arg(&program);
-        if smaps {
-            command.arg("smaps");
-        }
-        hermit_test::configure_guest_execution(&mut command);
-        let output = hermit_test::hermit_output_attempts(
-            &format!("runtime-private {leaf} target binding ({backend})"),
-            1,
-            &mut command,
-        );
-        eprintln!(
-            "{backend} target binding: {output:?}; report={}",
-            report.display()
-        );
-        observations.push((backend, output, report));
-    }
-    for (backend, output, report) in observations {
-        assert!(output.status.success(), "{backend}: {output:?}");
-        assert_eq!(output.stdout, expected, "{backend}");
-        let value: serde_json::Value = serde_json::from_slice(&fs::read(report).unwrap()).unwrap();
-        assert_eq!(value["verdict"], "matched", "{backend}: {value}");
-        assert_eq!(value["bitwise_parity"], true, "{backend}: {value}");
-        assert_eq!(value["comparison"]["strictness"], "canonical");
-        assert_eq!(value["comparison"]["compare_io_buffers"], true);
-        for side in ["left", "right"] {
-            assert!(value["compared_log_messages"][side].as_u64().unwrap() > 0);
-            assert_eq!(value["compared_outputs"][side]["exit_code"], 0);
-            assert_eq!(
-                value["compared_outputs"][side]["stdout_bytes"],
-                expected.len()
-            );
-        }
-    }
-    let old_expected = b"old maps descriptor has no replacement image\n";
-    let old_exec = if smaps { "old-exec-smaps" } else { "old-exec" };
-    let native_old = Command::new(&program).arg(old_exec).output().unwrap();
-    assert!(
-        native_old.status.success(),
-        "native old-mm control: {native_old:?}"
-    );
-    assert_eq!(native_old.stdout, old_expected);
-    let mut old_observations = Vec::new();
-    for backend in ["ptrace", "dbt"] {
-        let mut command = Command::new(hermit_test::hermit_binary());
-        command
-            .args([
-                "--log=info",
-                "--backend",
-                backend,
-                "run",
-                "--base-env=minimal",
-                "--strict",
-                "--epoch=2026-01-01T00:00:00Z",
-                "--",
-            ])
-            .arg(&program)
-            .arg(old_exec);
-        hermit_test::configure_guest_execution(&mut command);
-        let output = hermit_test::hermit_output_attempts(
-            &format!("runtime-private {leaf} old image ({backend})"),
-            1,
-            &mut command,
-        );
-        eprintln!("{backend} old maps binding: {output:?}");
-        old_observations.push((backend, output));
-    }
-    for (backend, output) in old_observations {
-        if backend == "ptrace" {
-            assert!(output.status.success(), "ptrace old-mm control: {output:?}");
-            assert_eq!(output.stdout, old_expected);
-        } else {
-            assert!(
-                !output.status.success(),
-                "retired DBT view must refuse: {output:?}"
-            );
-            assert!(output.status.code().is_some(), "{output:?}");
-            assert!(output.stdout.is_empty(), "{output:?}");
-            assert!(
-                String::from_utf8_lossy(&output.stderr).contains(&format!(
-                    "runtime-private {leaf} view unavailable: target ownership retired"
-                )),
-                "{output:?}"
-            );
-        }
-    }
 }

@@ -43,7 +43,17 @@
 //! initially queued, there is exponential backoff in priority with the number
 //! of attempts. After enough queueing operations are performed, however,
 //! polling tasks are upgraded to their original priority to prevent complete
-//! starvation. The frequency of upgrades is controlled by `POLLING_UPGRADE_INTERVAL`.
+//! starvation. The frequency of upgrades is controlled by `POLLING_UPGRADE_INTERVAL`,
+//! and the scheduler also runs one when none has run for a poll-upgrade period
+//! of virtual time, at least 200 ms (`Scheduler::upgrade_pollers_on_time`).
+//!
+//! An upgraded poller competes as ordinary runnable work, which under chaos
+//! includes the bound on how often a change point may pass it over
+//! (`Scheduler::bound_chaos_starvation`). A poller whose normal priority is
+//! the last band already sits there, so its upgrade cannot move it; it
+//! records the upgrade instead (`QueueValue::upgraded_in_place`), which
+//! gives it the same protection from starvation while the
+//! deterministic-work-first gates keep counting it as a poller.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -155,10 +165,14 @@ pub enum PollerRestore {
     NotQueued,
 }
 
+/// The first queue turn of an entry ordered by run time
+/// ([`RunQueue::order_by_run_time`]), far above any turn `push_back` hands out.
+const RUN_TIME_TURNS: RoundRobinTurn = 1 << 61;
+
 /// After queueing this many new tasks, perform a "poll upgrade," in which
 /// we upgrade all outstanding polling tasks their original priority levels,
 /// temporarily negating backoff behavior.
-const POLLING_UPGRADE_INTERVAL: u64 = 200;
+pub(crate) const POLLING_UPGRADE_INTERVAL: u64 = 200;
 
 #[derive(Debug, Copy, Clone)]
 struct QueueValue {
@@ -177,9 +191,31 @@ struct QueueValue {
     /// the gates, and stays so
     /// (<https://github.com/rrnewton/hermit/issues/3952>).
     deadline_restored: bool,
+    /// Set by a poll upgrade that reached this entry but could not move it:
+    /// a backed-off poller, or a deadline-restored one, whose normal priority
+    /// is the last band, where it already sits. Every other poller a poll
+    /// upgrade reaches becomes ordinary work, which a chaos change point can
+    /// pass over only a bounded number of times
+    /// (`Scheduler::bound_chaos_starvation`). Without this mark such a poller
+    /// was never upgraded and never counted, so two threads that sleep in
+    /// turns at better priorities kept it from its next retry forever, even
+    /// after another thread wrote what it polled for. It stays a poller for
+    /// the deterministic-work-first gates (`counts_as_poller`) and the yield
+    /// epoch, as the upgrade leaves it in the last band; it only joins the
+    /// change-point bound (`RunQueue::can_be_passed_over`). A requeue makes a
+    /// fresh entry without it, so it lasts until the poller's next retry;
+    /// `suspend`/`restore` keep the entry, and the mark with it.
+    upgraded_in_place: bool,
 }
 
 impl QueueValue {
+    /// Whether this entry is a thread that will run its turn, not a polling
+    /// thread retrying a call that is not ready: neither a backed-off poller
+    /// (`push_poller`) nor one a deadline restored and that has not run since.
+    fn is_non_polling(&self) -> bool {
+        self.poll_upgrade.is_none() && !self.deadline_restored
+    }
+
     /// Whether this entry counts as a poller for the deterministic-work-first
     /// gates, given its queue priority: a polling thread whose backoff has
     /// reached the last band, or one `restore_poller_priority` restored from
@@ -227,6 +263,11 @@ pub struct RunQueue {
     // a turn value when altering the priority level of a thread.
     last_back_turn: RoundRobinTurn,
     last_front_turn: RoundRobinTurn,
+
+    /// How many poll upgrades have run, from the queueing-operation interval
+    /// or [`Self::upgrade_pollers`], so the scheduler can tell how long ago
+    /// the last one was.
+    poll_upgrades: u64,
 
     /// Used to lock the queue from other changes while we are tentatively popping from it, and also
     /// cache the result.
@@ -299,6 +340,7 @@ impl RunQueue {
             // For clarity, 0 is unused so that positive/negative == back/front:
             last_back_turn: 0,
             last_front_turn: 0,
+            poll_upgrades: 0,
             sched_strategy: ss,
             tentative_selection: None,
             tentative_selection_is_exact: false,
@@ -326,6 +368,18 @@ impl RunQueue {
         }
     }
 
+    /// [`Self::has_runnable_besides`], with the queued threads for which
+    /// `passed_over` holds not counted as work either. Read-only.
+    pub fn has_runnable_besides_unless(
+        &self,
+        exclude: DetTid,
+        passed_over: impl Fn(DetTid) -> bool,
+    ) -> bool {
+        self.queue.iter().any(|(k, v)| {
+            v.tid != exclude && !v.counts_as_poller(k.priority) && !passed_over(v.tid)
+        })
+    }
+
     /// True if any thread other than `exclude` is runnable at ordinary
     /// (non-poller) priority, where a thread `restore_poller_priority` restored
     /// still counts as a poller until it runs. This is the "deterministic work still runnable"
@@ -336,6 +390,24 @@ impl RunQueue {
         self.queue
             .iter()
             .any(|(k, v)| v.tid != exclude && !v.counts_as_poller(k.priority))
+    }
+
+    /// The queued threads besides `exclude` that [`Self::has_runnable_besides`]
+    /// counts as work, in thread order. Read-only.
+    pub fn runnable_besides(&self, exclude: DetTid) -> BTreeSet<DetTid> {
+        self.queue
+            .iter()
+            .filter(|(k, v)| v.tid != exclude && !v.counts_as_poller(k.priority))
+            .map(|(_, v)| v.tid)
+            .collect()
+    }
+
+    /// Whether `tid` is queued as work in the sense of
+    /// [`Self::has_runnable_besides`]: queued, and not a poller. Read-only.
+    pub fn holds_work(&self, tid: DetTid) -> bool {
+        self.queue
+            .iter()
+            .any(|(k, v)| v.tid == tid && !v.counts_as_poller(k.priority))
     }
 
     /// True when every queued thread is a poller (or the queue is empty): the
@@ -512,6 +584,7 @@ impl RunQueue {
             tid,
             poll_upgrade,
             deadline_restored: false,
+            upgraded_in_place: false,
         };
         let old = self.queue.insert(prio, qval);
         assert!(old.is_none()); // last_*_turn should be monotonic
@@ -548,7 +621,20 @@ impl RunQueue {
     pub fn contains_non_polling_tid(&self, tid: DetTid) -> bool {
         self.queue
             .iter()
-            .any(|(_, v)| v.tid == tid && v.poll_upgrade.is_none() && !v.deadline_restored)
+            .any(|(_, v)| v.tid == tid && v.is_non_polling())
+    }
+
+    /// Whether `tid` is queued as work that a chaos change point can pass
+    /// over (`Scheduler::bound_chaos_starvation`): a thread that will run its
+    /// turn ([`Self::contains_non_polling_tid`]), which includes every poller
+    /// a poll upgrade has moved back to its normal priority, or a poller the
+    /// upgrade reached in the last band, where it could not move
+    /// (`QueueValue::upgraded_in_place`). A poller still backed off is not:
+    /// its backoff, not the bound, decides when it retries. Read-only.
+    pub fn can_be_passed_over(&self, tid: DetTid) -> bool {
+        self.queue
+            .values()
+            .any(|v| v.tid == tid && (v.is_non_polling() || v.upgraded_in_place))
     }
 
     pub(super) fn suspend(
@@ -579,7 +665,85 @@ impl RunQueue {
                 entry.value.poll_upgrade = Some(current_priority);
             }
         }
+        // An entry ordered by run time may find its old turn taken: the order
+        // hands those turns out again at every selection. It takes the next
+        // free one, and the next selection orders it again.
+        if entry.key.turn >= RUN_TIME_TURNS {
+            while self.queue.contains_key(&entry.key) {
+                entry.key.turn += 1;
+            }
+        }
         assert!(self.queue.insert(entry.key, entry.value).is_none());
+    }
+
+    /// Whether an entry is in round-robin order at an ordinary band: neither
+    /// pushed to the front of its band (a time event, an eager readmission)
+    /// nor a poller, backed off or restored from its backoff. These are the
+    /// entries [`Self::order_by_run_time`] orders.
+    fn in_round_robin_order(key: &PrioritizedOrder, value: &QueueValue) -> bool {
+        key.turn >= 0
+            && key.priority != EAGER_IO_REPOLL_PRIORITY
+            && value.poll_upgrade.is_none()
+            && !value.deadline_restored
+    }
+
+    /// The threads queued in round-robin order at an ordinary band, in
+    /// thread order ([`Self::order_by_run_time`]). Read-only.
+    pub(super) fn round_robin_tids(&self) -> Vec<DetTid> {
+        let mut tids: Vec<DetTid> = self
+            .queue
+            .iter()
+            .filter(|(key, value)| Self::in_round_robin_order(key, value))
+            .map(|(_, value)| value.tid)
+            .collect();
+        tids.sort();
+        tids
+    }
+
+    /// Order the round-robin entries of `order`'s threads within their bands
+    /// by their sort keys, least first, and equal keys by thread order. Their
+    /// queue turns move to a range far above any turn `push_back` hands out,
+    /// so they never meet one; the entries this leaves alone (pushed to the
+    /// front, pollers, pollers restored from their backoff) keep their turns,
+    /// which are ahead of every ordered entry of their band.
+    pub(super) fn order_by_run_time(&mut self, order: &[(DetTid, (u64, u64))]) {
+        assert!(self.tentative_selection.is_none());
+        let wanted: BTreeMap<DetTid, (u64, u64)> = order.iter().copied().collect();
+        let keys: Vec<PrioritizedOrder> = self
+            .queue
+            .iter()
+            .filter(|(key, value)| {
+                wanted.contains_key(&value.tid) && Self::in_round_robin_order(key, value)
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        let mut moved: Vec<(Priority, (u64, u64), QueueValue)> = keys
+            .into_iter()
+            .map(|key| {
+                let value = self.queue.remove(&key).expect("located queue entry");
+                (key.priority, wanted[&value.tid], value)
+            })
+            .collect();
+        moved.sort_by_key(|(priority, sort_key, value)| (*priority, *sort_key, value.tid));
+        // Every ordered entry of these bands was taken out, and they go back
+        // in order, so each takes its run time's turn or the turn after the
+        // previous one in its band, whichever is later.
+        let mut last: Option<PrioritizedOrder> = None;
+        for (priority, (run_time, _), value) in moved {
+            let offset = RoundRobinTurn::try_from(run_time).unwrap_or(RoundRobinTurn::MAX);
+            let mut turn = RUN_TIME_TURNS.saturating_add(offset.min(RUN_TIME_TURNS));
+            if let Some(previous) = last
+                && previous.priority == priority
+            {
+                turn = turn.max(previous.turn + 1);
+            }
+            let mut key = PrioritizedOrder { priority, turn };
+            while self.queue.contains_key(&key) {
+                key.turn += 1;
+            }
+            assert!(self.queue.insert(key, value).is_none());
+            last = Some(key);
+        }
     }
 
     /// Remove `tid` from the queue, returning true if removal ocurred.
@@ -847,7 +1011,7 @@ impl RunQueue {
 
     fn check_poll_upgrade(&mut self) {
         if self.turn_counter().is_multiple_of(POLLING_UPGRADE_INTERVAL) {
-            self.do_poll_upgrade()
+            self.do_poll_upgrade();
         }
     }
 
@@ -855,6 +1019,12 @@ impl RunQueue {
     /// ([`SchedHeuristic::is_priority_ordered`]).
     pub fn is_priority_ordered(&self) -> bool {
         self.sched_strategy.is_priority_ordered()
+    }
+
+    /// Run a poll upgrade now, as the `POLLING_UPGRADE_INTERVAL`th push would.
+    #[cfg(test)]
+    pub fn poll_upgrade_now(&mut self) {
+        self.do_poll_upgrade();
     }
 
     /// The priority `tid` is queued at, if it is queued.
@@ -875,6 +1045,10 @@ impl RunQueue {
     /// older round-robin turn instead let it overtake a thread that became
     /// runnable before its deadline. The move is a queueing operation: it
     /// takes a new back turn and counts toward the poll-upgrade interval.
+    /// Under `--replay-continue-fairly`, past the end of a replayed schedule,
+    /// the threads ordered by run time sit behind every turn this hands out,
+    /// so a restored poller goes ahead of them
+    /// ([`Self::order_by_run_time`]).
     ///
     /// Mutating operation: this will error if a tentative_pop/commit transaction is underway.
     pub fn restore_poller_priority(&mut self, tid: DetTid) -> PollerRestore {
@@ -900,9 +1074,27 @@ impl RunQueue {
         PollerRestore::Restored
     }
 
-    /// Upgrade polled tasks to their specified normal priority.
+    /// How many poll upgrades have run so far.
+    pub fn poll_upgrade_count(&self) -> u64 {
+        self.poll_upgrades
+    }
+
+    /// Run a poll upgrade now, outside the queueing-operation interval, and
+    /// answer which backed-off pollers it restored to their normal priority.
+    /// The scheduler calls this when virtual time, not queueing operations,
+    /// says an upgrade is due.
+    ///
+    /// Mutating operation: this will error if a tentative_pop/commit transaction is underway.
+    pub fn upgrade_pollers(&mut self) -> Vec<DetTid> {
+        assert!(self.tentative_selection.is_none());
+        self.do_poll_upgrade()
+    }
+
+    /// Upgrade polled tasks to their specified normal priority, and answer
+    /// which it restored.
     #[cold]
-    fn do_poll_upgrade(&mut self) {
+    fn do_poll_upgrade(&mut self) -> Vec<DetTid> {
+        self.poll_upgrades += 1;
         let upgrades = self
             .queue
             .iter()
@@ -911,20 +1103,29 @@ impl RunQueue {
         // TODO(T100400409): if all polling threads are below a certain priority, this
         // can use a range query rather than iterating over all threads in the
         // run queue:
+        let mut restored = Vec::new();
         for (key, upgrade_prio) in upgrades {
             // A poller whose normal priority is the last band has nowhere to
             // be upgraded to. Clearing its marker would only make it ordinary
             // work for the gates, and with `POLLING_UPGRADE_INTERVAL` pollers
             // like it queued, every one could lose the marker again before
             // the next push restored it, so that no gate ever opened (Codex
-            // review of https://github.com/rrnewton/hermit/pull/4314).
+            // review of https://github.com/rrnewton/hermit/pull/4314). It
+            // keeps the marker and records the upgrade instead, which lets
+            // the chaos change-point bound count it as it counts every other
+            // upgraded poller (`QueueValue::upgraded_in_place`).
             if upgrade_prio >= LAST_PRIORITY {
+                self.queue
+                    .get_mut(&key)
+                    .expect("located queue entry")
+                    .upgraded_in_place = true;
                 continue;
             }
             let mut new_key = key;
             new_key.priority = upgrade_prio;
             let mut qval = self.queue.remove(&key).unwrap();
             qval.poll_upgrade = None; // there's no need to upgrade to the same priority twice
+            restored.push(qval.tid);
             let old = self.queue.insert(new_key, qval);
             assert!(old.is_none()); // round robin turns should ensure uniqueness
         }
@@ -932,12 +1133,16 @@ impl RunQueue {
         // deterministic-work-first gates. A poller its deadline restored
         // earlier would have been upgraded here too, so it stops counting as
         // a poller now as well (https://github.com/rrnewton/hermit/issues/3952),
-        // unless it is already in the last band, where an upgrade is a no-op.
+        // unless it is already in the last band, where an upgrade cannot move
+        // it: there it keeps counting as a poller, and records the upgrade.
         for (key, value) in self.queue.iter_mut() {
             if key.priority < LAST_PRIORITY {
                 value.deadline_restored = false;
+            } else if value.deadline_restored {
+                value.upgraded_in_place = true;
             }
         }
+        restored
     }
 }
 
@@ -950,6 +1155,24 @@ impl Default for RunQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An entry ordered by run time and suspended finds its turn taken by
+    /// another entry ordered to the same run time meanwhile; restoring it
+    /// takes the next free turn, behind that entry.
+    #[test]
+    fn a_restored_entry_ordered_by_run_time_takes_the_next_free_turn() {
+        let mut queue = RunQueue::new(SchedHeuristic::None, 0, 0.0);
+        let (first, second) = (DetTid::from_raw(3), DetTid::from_raw(5));
+        queue.push_back(first, DEFAULT_PRIORITY);
+        queue.push_back(second, DEFAULT_PRIORITY);
+        queue.order_by_run_time(&[(first, (5, 0)), (second, (9, 0))]);
+        let suspended = queue.suspend(first, DEFAULT_PRIORITY).expect("queued");
+        queue.order_by_run_time(&[(second, (5, 0))]);
+        queue.restore(suspended, DEFAULT_PRIORITY);
+        assert_eq!(queue.tentative_pop_next(), Some(second));
+        queue.commit_tentative_pop();
+        assert_eq!(queue.tentative_pop_next(), Some(first));
+    }
 
     /// `restore_poller_priority` restores one backed-off poller to its recorded
     /// priority at the back of that level: behind a thread queued before the
@@ -1141,6 +1364,51 @@ mod tests {
             queue.push_poller(tid, LAST_PRIORITY, 1);
         }
         assert!(queue.only_pollers());
+    }
+
+    /// A poll upgrade reaches a poller in the last band without moving it,
+    /// and records that it did: from then on the chaos change-point bound can
+    /// count it (`can_be_passed_over`), as it counts every poller an upgrade
+    /// moved back to its normal priority, while the gates and the queue key
+    /// still see a backed-off poller. The same holds for one its deadline
+    /// restored there. A poller still backed off is not counted, and the mark
+    /// goes with the entry when the thread is requeued after its retry.
+    #[test]
+    fn a_poll_upgrade_lets_the_change_point_bound_count_a_last_band_poller() {
+        let poller = DetTid::from_raw(1);
+        let other = DetTid::from_raw(2);
+        let mut queue = RunQueue::default();
+        queue.push_poller(poller, LAST_PRIORITY, 5);
+        queue.push_poller(other, DEFAULT_PRIORITY, 30);
+        assert!(!queue.can_be_passed_over(poller), "backed off: not yet");
+        assert!(!queue.can_be_passed_over(other));
+        queue.do_poll_upgrade();
+        assert!(queue.can_be_passed_over(poller), "the upgrade reached it");
+        assert!(queue.can_be_passed_over(other), "moved, as on main");
+        assert!(!queue.contains_non_polling_tid(poller));
+        assert_eq!(queue.queued_priority(poller), Some(LAST_PRIORITY));
+        assert!(queue.remove_tid(other));
+        assert!(queue.only_pollers(), "still a poller for the gates");
+        assert!(!queue.has_runnable_besides(other));
+
+        assert_eq!(queue.tentative_pop_next(), Some(poller));
+        assert_eq!(queue.commit_tentative_pop(), poller);
+        queue.push_poller(poller, LAST_PRIORITY, 6);
+        assert!(!queue.can_be_passed_over(poller), "requeued: backed off");
+
+        let restored = DetTid::from_raw(3);
+        let mut queue = RunQueue::default();
+        queue.push_poller(restored, LAST_PRIORITY, 3);
+        assert_eq!(
+            queue.restore_poller_priority(restored),
+            PollerRestore::Restored
+        );
+        assert!(!queue.can_be_passed_over(restored));
+        queue.do_poll_upgrade();
+        assert!(queue.can_be_passed_over(restored));
+        assert!(queue.only_pollers());
+        assert!(!queue.contains_tid(DetTid::from_raw(9)));
+        assert!(!queue.can_be_passed_over(DetTid::from_raw(9)));
     }
 
     /// A chaos `sched_yield` requeue marks its thread as a yielder, as the

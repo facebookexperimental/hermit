@@ -366,12 +366,15 @@ specific configuration:
 
 - `hermit_args` are Hermit `run` flags added after the runner's own, per
   enabled backend: a backend not named gets none. Only
-  `--no-virtualize-cpuid` and `--max-timeslice=VALUE` are accepted. Each
-  relaxes determinism, so a non-empty `hermit_args_reason` is required and
-  every flag is recorded, with that reason, in the result row's
-  `relaxations`. `hermit_args_reason` is one string for every backend's
-  flags, or a mapping that names exactly the backends of `hermit_args`, each
-  with its own reason, so each cell records only its own.
+  `--no-virtualize-cpuid` and `--max-timeslice=VALUE` are accepted, VALUE as
+  hermit reads it: `disabled` or 0 turns the preemption timer off, and a value
+  hermit refuses (1 to 9, below one RCB, or anything else that is not a
+  number) is refused here. Each relaxes determinism, so a non-empty
+  `hermit_args_reason` is required and every flag is recorded, with that
+  reason, in the result row's `relaxations`. `hermit_args_reason` is one
+  string for every backend's flags, or a mapping that names exactly the
+  backends of `hermit_args`, each with its own reason, so each cell records
+  only its own.
 - `env` adds guest variables as `--env NAME=VALUE` after the runner's fixed
   guest environment; a name the runner sets (`HOME`, `TZ`, `LC_ALL`, ...) is
   refused. Only a verify or a replay mode accepts it. A replay cell that does
@@ -431,11 +434,18 @@ and the cell allow:
   (without the preemption timer it does not refuse an inexact counter). Nothing
   can make a host without the capabilities run the strict level.
 
-Only a verify cell on ptrace or e9patch, the backends whose virtual clock reads
-the host's branch counter, has a relaxed form. Every other cell runs as
-declared, and a chaos or replay cell that needs the counter is still
-`HOST-INAPPLICABLE` on a host without it. `test-harness run` prints the level it
-chose and why.
+Only a verify cell on ptrace or e9patch has a relaxed form. KVM's preemption
+timer reads the same branch counter, but a KVM cell has no relaxed form: it runs
+as declared, and on a host without an exact counter a strict KVM cell with a
+timeslice is `HOST-INAPPLICABLE`, as is a chaos or replay cell that needs the
+counter. A cell whose run has no timeslice arms no timer and still runs: a KVM
+cell whose recipe passes `--max-timeslice=disabled` or `--max-timeslice=0`, and
+a strict custom cell whose arguments turn the timer off in any spelling hermit
+accepts (`--max-timeslice` or its alias `--preemption-timeout`, with `disabled`
+or 0 after `=` or as the next argument). Custom arguments that hermit would
+refuse for their timeslice (a second one under either name, a name with no
+value, a value hermit refuses) are refused when the manifest loads. Every other
+cell runs as declared. `test-harness run` prints the level it chose and why.
 
 A verify mode that does not depend on preemption or CPUID virtualization may cap
 itself at the relaxed level, so it never has a strict form on any host:
@@ -543,6 +553,17 @@ selects a run type declares it in its static source (`ManifestSpec::label` in
 ci/manifest-plan/src/validation_dag_static.rs), carries only that DAG label, and
 owns that run type's required cells. A label that no cell carries is refused,
 so a typo cannot select nothing and pass.
+
+Two label values are reserved as the single tier marker for the `gvisor`
+and `rr` buckets: `super` (expected-pass nightly) and `pressure`
+(negative-space nightly). Every row in those buckets carries exactly one
+at test-row level, and no resolved cell may carry both (a mode may add
+`super` for one backend, as the compat corpus's heavy rows do). A row in the
+full validation sample carries `[full, super]`. There is no separately
+authored `tier` field: selectors consume the label directly
+(`--label super|pressure`). Promotion replaces `pressure` with
+`super` after the required hermetic-image evidence; a red super cell is a
+regression, never a silent demotion.
 
 `naked` must set `ci = false`; it runs only when explicitly selected. A mode
 with no enabled backend remains visible with `ci = false` and a reason for
@@ -690,7 +711,12 @@ from its selector, or the aggregate selected cells differ from the ratchet.
 4. Add or update its exact entry in `inventory/test-files.json`.
 5. Run `target/debug/test-harness validate` and the affected cells.
 6. Add a structured DAG node when adding a bucket; validation fails until each
-   lane has exactly one node per bucket.
+   lane has exactly one node per bucket. Post-split nodes are admitted ONLY
+   through `POST_SPLIT_CORE_NODES` in
+   `ci/manifest-plan/src/dag_source_ownership.rs` (see its module docs for
+   the exact API): one entry per generated tag, dependencies on core or
+   extension nodes only. Never edit the frozen
+   `ci/dag-source-ownership.json` to admit a node.
 
 Do not replace a semantic workload with `--help`, `--version`, or a no-op
 launcher probe.

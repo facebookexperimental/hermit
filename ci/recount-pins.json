@@ -1,0 +1,9 @@
+{
+  "sites": [
+    {
+      "kind": "inventory",
+      "name": "test.cli",
+      "file": "ci/inventories/test.cli.txt"
+    }
+  ]
+}

@@ -207,6 +207,31 @@ The one remaining case is a coincidence: a host file replaced during an attempt
 before the divergence, and an unrelated flaky product divergence in that same
 attempt. That attempt earns the one retry.
 
+### Between separate runs
+
+Two separate invocations of the same command and seed have no shared side
+file, so `--verify`'s check cannot name a host file that changed between them.
+Measured case: a configuration loop on a build host reinstalled `llvm-libs`
+every few minutes, each time rewriting `/etc/ld.so.cache` with one entry more
+or less (36887 or 36839 bytes). The guest's dynamic loader searched a
+different cache and mapped one page more or less, so under `--chaos` its
+preemption points, its schedule and finally its outcome followed the cache.
+One seed hung 100 of 100 times under one cache and exited 0 100 of 100 times
+under the other, and `--verify --verify-strict` gave `bitwise_parity: true`
+20 of 20 times under each. An earlier sweep had reported the seed as hanging
+in 1 of 16 runs: that was the fraction of runs that started under the first
+cache.
+
+Hermit now records the set of host files a run read in its `--summary-json`
+summary and in a `--record-preemptions-to` schedule (`host_inputs`, with a
+digest of the set), and a schedule replay prints
+`HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING` for each file whose bytes (or,
+where they were not hashed, whose host identity) differ from the
+recording's (docs/USER_GUIDE.md, "Chaos Mode"). Before comparing the
+results of separate runs, compare their summaries' `host_inputs` digests; for
+runs that read different host files, pin the files and rerun before calling
+a difference a Hermit divergence.
+
 ## Why this class is only now visible
 
 `compare_io_buffers` became the default in

@@ -312,9 +312,11 @@ impl Scheduler {
         true
     }
 
-    /// The sweep that opens step 2: acts on every pending entry, in process
-    /// order. It records the loss of a thread that blocked, in the last pass,
-    /// in a wait admitted with its entry already due. It runs before the timed
+    /// The sweep at the start of step 2, after queued plain sleeps are
+    /// registered (`Scheduler::step2_register_queued_sleeps`): acts on every
+    /// pending entry, in process order. It records the loss of a thread that
+    /// blocked in a wait admitted with its entry already due, which, under
+    /// first-pass registration, includes a plain sleep filed in the last pass. It runs before the timed
     /// events, so a sleep that blocked and is now expiring is seen blocked.
     pub(crate) fn step2_sigalrm_ledger(&mut self) {
         let pending: Vec<DetPid> = self.sigalrm.pending.iter().copied().collect();

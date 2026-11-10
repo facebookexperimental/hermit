@@ -80,8 +80,17 @@ pub const HERMIT_RUN_ARGS: &[&str] = &[
 /// `L4_REPS` (validate.sh:1256).
 pub const L4_REPS_DEFAULT: i64 = 20;
 
-/// `HERMIT_SMOKE_TIMEOUT` (validate.sh:1086), as seconds.
-const SMOKE_TIMEOUT_S: i64 = 30;
+/// Per-probe CPU budget in seconds: the primary limit (owner rule,
+/// 2026-11-01). A whole L2/L3 probe measured 0.22 s CPU locally on
+/// 2026-11-05; envelope also runs on slower hosted runners, so the budget
+/// keeps order-of-magnitude headroom over the measurement while staying far
+/// below the former 60 s CPU cap. Donor job eb64ff5f (2026-11-05) failed
+/// this step at the old 30 s *wall* limit under load ~980.
+const SMOKE_CPU_S: i64 = 5;
+/// Wall hang backstop per probe run: 8x the former 30 s `HERMIT_SMOKE_TIMEOUT`
+/// wall limit (validate.sh:1086). Only a run that makes no CPU progress
+/// should ever reach it.
+const SMOKE_WALL_BACKSTOP_S: i64 = 240;
 
 const PROBE_MEM_BYTES: i64 = 4 * 1024 * 1024 * 1024;
 
@@ -128,8 +137,8 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
             &format!("envelope {}: L1 hermit run --strict", p.label),
             level_command(hermit_bin, &["--strict"], p.argv),
             vec![build_dep.to_string()],
-            SMOKE_TIMEOUT_S,
-            SMOKE_TIMEOUT_S * 2,
+            SMOKE_WALL_BACKSTOP_S,
+            SMOKE_CPU_S,
             PROBE_MEM_BYTES,
         ));
         out.push(node(
@@ -138,8 +147,8 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
             &format!("envelope {}: L2 --strict --verify", p.label),
             level_command(hermit_bin, &["--strict", "--verify"], p.argv),
             vec![build_dep.to_string()],
-            SMOKE_TIMEOUT_S,
-            SMOKE_TIMEOUT_S * 2,
+            SMOKE_WALL_BACKSTOP_S,
+            SMOKE_CPU_S,
             PROBE_MEM_BYTES,
         ));
         out.push(node(
@@ -155,14 +164,16 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
                 p.argv,
             ),
             vec![build_dep.to_string()],
-            SMOKE_TIMEOUT_S,
-            SMOKE_TIMEOUT_S * 2,
+            SMOKE_WALL_BACKSTOP_S,
+            SMOKE_CPU_S,
             PROBE_MEM_BYTES,
         ));
         // L4 depends on L2: the bash only counted L4 when L2 passed, and a
         // dependency edge reproduces that without a second conditional. Each
-        // repetition keeps its own 30s bound, and the loop stops at the first
-        // divergence exactly as `|| { ok=0; break; }` did.
+        // repetition keeps its own bound, now CPU-primary (`ulimit -t` in a
+        // subshell, inherited by the probe) with the wall backstop in
+        // `timeout`, and the loop stops at the first divergence exactly as
+        // `|| { ok=0; break; }` did.
         let l2_cmd = level_command(hermit_bin, &["--strict", "--verify"], p.argv);
         out.push(node(
             "envelope",
@@ -172,22 +183,26 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
                 p.label
             ),
             format!(
-                "i=0; while [ $i -lt {reps} ]; do timeout {SMOKE_TIMEOUT_S}s {l2_cmd} || exit 1; \
+                "i=0; while [ $i -lt {reps} ]; do \
+                 (ulimit -t {SMOKE_CPU_S}; timeout {SMOKE_WALL_BACKSTOP_S}s {l2_cmd}) || exit 1; \
                  i=$((i+1)); done"
             ),
             vec![format!("envelope.{}", job("l2"))],
-            SMOKE_TIMEOUT_S * reps + 60,
-            SMOKE_TIMEOUT_S * reps * 2,
+            SMOKE_WALL_BACKSTOP_S * reps + 60,
+            SMOKE_CPU_S * reps,
             PROBE_MEM_BYTES,
         ));
         // `record start --verify` records, replays non-interactively, diffs the
         // two logs, and deletes the recording on success -- a self-contained rr
         // probe with a clean exit status (validate.sh:4205-4211).
+        // HERMIT_RR_TIMEOUT names the rr probe's wall backstop; its CPU
+        // budget below is the primary limit (record + replay + diff run
+        // several probe-equivalents of work, so 4x one probe's budget).
         let rr_timeout = std::env::var("HERMIT_RR_TIMEOUT")
             .ok()
             .and_then(|v| v.trim_end_matches('s').parse::<i64>().ok())
             .filter(|n| *n > 0)
-            .unwrap_or(SMOKE_TIMEOUT_S);
+            .unwrap_or(SMOKE_WALL_BACKSTOP_S);
         let mut rr: Vec<String> = vec![
             hermit_bin.to_string(),
             "record".into(),
@@ -203,7 +218,7 @@ pub fn nodes(hermit_bin: &str, reps: i64, build_dep: &str) -> Vec<Step> {
             format!("{} </dev/null", shell_join(&rr)),
             vec![build_dep.to_string()],
             rr_timeout,
-            rr_timeout * 2,
+            SMOKE_CPU_S * 4,
             PROBE_MEM_BYTES,
         ));
     }

@@ -1602,6 +1602,11 @@ mod tests {
     /// directory below it, the shape of an ordinary host.
     #[test]
     fn cache_directory_is_private_and_not_a_symlink() {
+        if crate::run_in_fresh_process(
+            "e9patch::tests::cache_directory_is_private_and_not_a_symlink",
+        ) {
+            return;
+        }
         use reverie::process::Container;
         use reverie::process::Mount;
 

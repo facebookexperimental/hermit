@@ -12,8 +12,9 @@
 //! process of the namespace, so a parent waiting for the refusing child, and
 //! a grandchild that would write a file later, never run on.
 //!
-//! Nothing in Hermit files the request yet (its producers come with A5 steps
-//! 3c.1c and 3c.1e), so the run is played by plain processes: a forked
+//! Its producers (A5 step 3c.1c's restart checkpoint and kernel-run refusals,
+//! and step 3c.1e's) file it only under the in-guest delivery gate, which no
+//! run sets yet, so the run is played by plain processes: a forked
 //! process enters a new user and PID namespace, and its first child, PID 1
 //! there, stands for Hermit's container init, where the scheduler runs. It
 //! forks a guest parent, which forks the refusing child and waits for it; the
@@ -27,6 +28,13 @@
 //! killed first. The mutation it catches: `PolicyRefusal` semantics (the
 //! reason recorded and the request answered), under which the init goes on,
 //! the sentinel writes its file and the run ends normally.
+//!
+//! The forking test runs in a process of its own (`in_own_process`). A
+//! forked child of a multithreaded process may only do what is safe after a
+//! fork, and the init here runs the coordinator's handling of a request,
+//! which takes locks. In the library suite, another test's thread can hold
+//! such a lock when the init is forked, and the init then waits for it for
+//! ever: the whole suite hung on that futex.
 
 use std::os::unix::ffi::OsStrExt;
 
@@ -36,6 +44,44 @@ use super::*;
 
 /// The refusing child's thread, as the scheduler numbers it.
 const CHILD: DetTid = DetTid::from_raw(7);
+
+/// Whether this process runs the test `name` of this module by itself.
+///
+/// In the library suite this re-executes the test binary for exactly that
+/// test and requires that it passed, within two minutes, and returns false.
+/// In the process it starts, where the only other thread is libtest's main
+/// thread waiting for the test, it returns true and the caller runs the test.
+fn in_own_process(name: &str) -> bool {
+    const CHILD_TEST: &str = "HERMIT_STOPPING_REFUSAL_TEST";
+    let test = format!("tool_global::tests::stopping_refusal_tests::{name}");
+    if std::env::var(CHILD_TEST).as_deref() == Ok(test.as_str()) {
+        return true;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+        .env(CHILD_TEST, &test)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("launch the test in a process of its own");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while child.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+        "test {test} in its own process did not pass exactly once within two minutes: {}\n{stdout}\n{stderr}",
+        output.status
+    );
+    false
+}
 
 /// `/proc/PID/ns/pid` as a NUL-terminated path in `buffer`, without
 /// allocating (for a forked process).
@@ -108,6 +154,9 @@ fn members(namespace: &std::ffi::OsStr) -> Vec<String> {
 
 #[test]
 fn a_stopping_refusal_filed_by_a_child_ends_every_process_of_the_run() {
+    if !in_own_process("a_stopping_refusal_filed_by_a_child_ends_every_process_of_the_run") {
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let sentinel = dir.path().join("sentinel");
     let sentinel_path = std::ffi::CString::new(sentinel.as_os_str().as_bytes()).unwrap();
@@ -139,6 +188,15 @@ fn a_stopping_refusal_filed_by_a_child_ends_every_process_of_the_run() {
     let mut report = [0; 2];
     let mut trigger = [0; 2];
     let mut proceed = [0; 2];
+    // The forks below are safe only with no other thread that could hold a
+    // lock: here libtest's main thread, waiting for this one, is the only one.
+    let mut threads = 0;
+    crate::util::find_in_directory(std::path::Path::new("/proc/self/task"), |_| {
+        threads += 1;
+        None::<()>
+    })
+    .unwrap();
+    assert!(threads <= 2, "{threads} threads at the first fork");
     // SAFETY: plain descriptor and process calls. Each forked process uses
     // only what the parent made before the fork and async-signal-safe calls;
     // the init also runs the coordinator's handling of one request, polled
@@ -271,4 +329,89 @@ fn a_stopping_refusal_filed_by_a_child_ends_every_process_of_the_run() {
         !sentinel.exists(),
         "the sentinel grandchild ran on after the refusal"
     );
+}
+
+/// IR-16: with the gate off a filed `StoppingRefusal` is refused the run-wide
+/// exit. Through the real `GlobalState::receive_rpc`, from a registered
+/// thread (so the handler's bookkeeping after its `match` runs on the
+/// answer): the reply is `PolicyRefusal`, the reason is recorded as the
+/// run's policy refusal (which ends the run with `HERMIT_POLICY_REFUSAL_EXIT`
+/// once it completes), and the process goes on: this test returns. Mutation
+/// "the gate check removed": the coordinator exits inside the call, so the
+/// test process ends with `HERMIT_POLICY_REFUSAL_EXIT` and the test fails.
+#[tokio::test]
+async fn with_the_gate_off_a_stopping_refusal_is_recorded_and_answered_without_the_exit() {
+    let mut config = Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        in_guest_signal_delivery: false,
+        ..Config::default()
+    };
+    config.backend = reverie::BackendCapabilities::LITEINST_IN_GUEST;
+    let state = GlobalState::initialize(&config, false);
+    let detpid = DetPid::from_raw(CHILD.as_raw());
+    state
+        .sched
+        .lock()
+        .unwrap()
+        .thread_tree
+        .add_child(CHILD, CHILD, true);
+    install_test_registration(&state, CHILD, Ivar::new());
+    let reason = "hermit refused to continue the run (stopping-refusal-test): filed with the \
+                  gate off"
+        .to_owned();
+    let (_, reply) = state
+        .receive_rpc(
+            Tid::from_raw(CHILD.as_raw()),
+            (
+                DetTime::new(&config),
+                MmId::initial(detpid),
+                GlobalRequest::StoppingRefusal(reason.clone()),
+            ),
+        )
+        .await;
+    assert_eq!(reply, GlobalResponse::PolicyRefusal(()));
+    assert_eq!(state.policy_refusal(), Some(reason));
+}
+
+/// A self-sentinel `pidfd_send_signal` refusal filed with the coordinator is
+/// answered as a policy refusal, recorded as the run's policy refusal (what
+/// the in-guest launcher reads), and kept as its type for the DBT launcher,
+/// which takes it once. The first filed refusal is the one kept.
+#[tokio::test]
+async fn a_filed_pidfd_self_refusal_is_recorded_as_its_type_and_as_a_policy_refusal() {
+    let config = Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        in_guest_signal_delivery: false,
+        ..Config::default()
+    };
+    let state = GlobalState::initialize(&config, false);
+    let detpid = DetPid::from_raw(CHILD.as_raw());
+    state
+        .sched
+        .lock()
+        .unwrap()
+        .thread_tree
+        .add_child(CHILD, CHILD, true);
+    install_test_registration(&state, CHILD, Ivar::new());
+    let first = crate::PidfdSelfQualificationRefusal { sentinel: -10001 };
+    for sentinel in [-10001, -10000] {
+        let (_, reply) = state
+            .receive_rpc(
+                Tid::from_raw(CHILD.as_raw()),
+                (
+                    DetTime::new(&config),
+                    MmId::initial(detpid),
+                    GlobalRequest::PidfdSelfQualificationRefusal(
+                        crate::PidfdSelfQualificationRefusal { sentinel },
+                    ),
+                ),
+            )
+            .await;
+        assert_eq!(reply, GlobalResponse::PolicyRefusal(()));
+    }
+    assert_eq!(state.policy_refusal(), Some(first.to_string()));
+    assert_eq!(state.take_pidfd_self_qualification_refusal(), Some(first));
+    assert_eq!(state.take_pidfd_self_qualification_refusal(), None);
 }

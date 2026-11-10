@@ -1,0 +1,36 @@
+RUN: %hermit --log info run -- %me same |& awk '/^same:/ {print} /polls_guest_state_only: true/ {n++} /guest-held marks no longer count/ {r=1} END {print "classified polls: " (n > 0 ? "some" : "none"); print "marks revoked: " (r ? "yes" : "no")}' | FileCheck --check-prefix=SAME %s
+SAME: same: revents 0x1
+SAME-NEXT: classified polls: some
+SAME-NEXT: marks revoked: no
+RUN: %hermit --log info run -- %me peer-exits |& awk '/^peer-exits:/ {print} /polls_guest_state_only: true/ {n++} /guest-held marks no longer count/ {r=1} END {print "classified polls: " (n > 0 ? "some" : "none"); print "marks revoked: " (r ? "yes" : "no")}' | FileCheck --check-prefix=EXITS %s
+EXITS: peer-exits: hangup 1
+EXITS-NEXT: classified polls: some
+EXITS-NEXT: marks revoked: no
+RUN: %hermit --log info run -- %me child |& awk '/^child:/ {print} /polls_guest_state_only: true/ {n++} /guest-held marks no longer count/ {r=1} END {print "classified polls: " (n > 0 ? "some" : "none"); print "marks revoked: " (r ? "yes" : "no")}' | FileCheck --check-prefix=CHILD %s
+CHILD: child: hangup 1
+CHILD-NEXT: classified polls: none
+CHILD-NEXT: marks revoked: no
+RUN: %hermit --log info run -- %me exported |& awk '/^exported:/ {print} /polls_guest_state_only: true/ {n++} /guest-held marks no longer count/ {r=1} END {print "classified polls: " (n > 0 ? "some" : "none"); print "marks revoked: " (r ? "yes" : "no")}' | FileCheck --check-prefix=EXPORTED %s
+EXPORTED: exported: revents 0x1
+EXPORTED-NEXT: classified polls: some
+EXPORTED-NEXT: marks revoked: yes
+RUN: %hermit --log info run -- %me connect |& awk '/^connect:/ {print} /polls_guest_state_only: true/ {n++} /guest-held marks no longer count/ {r=1} END {print "classified polls: " (n > 0 ? "some" : "none"); print "marks revoked: " (r ? "yes" : "no")}' | FileCheck --check-prefix=CONNECT %s
+CONNECT: connect: readable 1
+CONNECT-NEXT: classified polls: some
+CONNECT-NEXT: marks revoked: no
+RUN: %hermit --log info run -- %me listener-export |& awk '/^listener-export:/ {print} /polls_guest_state_only: true/ {n++} /guest-held marks no longer count/ {r=1} END {print "classified polls: " (n > 0 ? "some" : "none"); print "marks revoked: " (r ? "yes" : "no")}' | FileCheck --check-prefix=LEXPORT %s
+LEXPORT: listener-export: readable 1
+LEXPORT-NEXT: classified polls: none
+LEXPORT-NEXT: marks revoked: yes
+RUN: %hermit --log info run -- %me dgram-named |& awk '/^dgram-named:/ {print} /polls_guest_state_only: true/ {n++} /guest-held marks no longer count/ {r=1} END {print "classified polls: " (n > 0 ? "some" : "none"); print "marks revoked: " (r ? "yes" : "no")}' | FileCheck --check-prefix=DGRAM %s
+DGRAM: dgram-named: revents 0x1
+DGRAM-NEXT: classified polls: some
+DGRAM-NEXT: marks revoked: yes
+RUN: %hermit --log info run -- %me bound-pair |& awk '/^bound-pair:/ {print} /polls_guest_state_only: true/ {n++} /guest-held marks no longer count/ {r=1} END {print "classified polls: " (n > 0 ? "some" : "none"); print "marks revoked: " (r ? "yes" : "no")}' | FileCheck --check-prefix=BOUND %s
+BOUND: bound-pair: revents 0x1
+BOUND-NEXT: classified polls: none
+BOUND-NEXT: marks revoked: no
+RUN: %hermit --log info run -- %me crossexport |& awk '/^crossexport:/ {print} /polls_guest_state_only: true/ {n++} /guest-held marks no longer count/ {r=1} END {print "classified polls: " (n > 0 ? "some" : "none"); print "marks revoked: " (r ? "yes" : "no")}' | FileCheck --check-prefix=CROSS %s
+CROSS: crossexport: readable 1
+CROSS-NEXT: classified polls: some
+CROSS-NEXT: marks revoked: yes

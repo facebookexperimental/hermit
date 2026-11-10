@@ -94,6 +94,8 @@ const ARGS_ID: &str = "args";
 pub(crate) const EPOCH_KEY: &str = "epoch";
 pub(crate) const SEED_KEY: &str = "seed";
 pub(crate) const SEED_FROM_KEY: &str = "seed-from";
+pub(crate) const PID_BASE_KEY: &str = "pid-base";
+pub(crate) const CPU_PROFILE_KEY: &str = "cpu-profile";
 const REPLAY_NETWORKING_KEY: &str = "replay-networking";
 
 /// One run config document. See the module documentation for the format.
@@ -131,7 +133,7 @@ impl RunConfig {
     fn new() -> Self {
         RunConfig {
             schema: SCHEMA.to_owned(),
-            hermit_version: Some(crate::version::Version::get().to_owned()),
+            hermit_version: Some(crate::app::version::Version::get().to_owned()),
             global: BTreeMap::new(),
             run: BTreeMap::new(),
             program: None,
@@ -143,6 +145,15 @@ impl RunConfig {
     /// The document `--save-config` writes.
     pub(crate) fn to_yaml(&self) -> Result<String, Error> {
         let body = serde_yaml::to_string(self).context("cannot encode the run config as YAML")?;
+        if let Some(backend) = self.global.get("backend").and_then(Value::as_str)
+            && super::backend_hook::validate_name(backend).is_ok()
+        {
+            return Ok(format!(
+                "# Written by executable-selected backend `{backend}`. Reproduce with the same\n\
+                 # backend executable and `run --config FILE`; options given on that command\n\
+                 # line replace the ones here.\n{body}"
+            ));
+        }
         Ok(format!(
             "# Written by `hermit run --save-config`. Reproduce the run with\n\
              # `hermit run --config FILE`; options given on that command line\n\
@@ -217,7 +228,7 @@ pub(crate) fn read(path: &Path) -> Result<RunConfig, Error> {
 
 /// Says so when a manifest's run started in another directory: a rerun
 /// resolves relative paths against its own.
-fn note_another_directory(manifest: &crate::manifest::Manifest) {
+fn note_another_directory(manifest: &crate::app::manifest::Manifest) {
     let here = std::env::current_dir().ok();
     if let Some(there) = &manifest.command.cwd
         && here.as_deref() != Some(Path::new(there))
@@ -234,15 +245,15 @@ fn note_another_directory(manifest: &crate::manifest::Manifest) {
 /// checked against the digest it recorded, becomes `--replay-networking`. A
 /// syscall recording is replayed with `hermit replay`, not rerun.
 pub(crate) fn from_manifest_at(
-    manifest: &crate::manifest::Manifest,
+    manifest: &crate::app::manifest::Manifest,
     path: &Path,
 ) -> Result<RunConfig, Error> {
-    use crate::manifest::Kind;
+    use crate::app::manifest::Kind;
     let mut config = from_manifest(manifest)?;
     match manifest.kind {
         Kind::InputsOnly | Kind::History => {}
         Kind::Network => {
-            let trace = crate::manifest::checked_network_trace(manifest, path)?;
+            let trace = crate::app::manifest::checked_network_trace(manifest, path)?;
             let trace = trace.to_str().ok_or_else(|| {
                 anyhow::anyhow!("network trace path {} is not UTF-8", trace.display())
             })?;
@@ -254,7 +265,7 @@ pub(crate) fn from_manifest_at(
             "{} describes a syscall recording, which `hermit run --from` does not rerun; replay \
              it with: hermit replay {}",
             path.display(),
-            crate::manifest::directory_of(path).display()
+            crate::app::manifest::directory_of(path).display()
         ),
     }
     Ok(config)
@@ -262,7 +273,7 @@ pub(crate) fn from_manifest_at(
 
 /// The run config a manifest's `inputs` and `command` stand for, which
 /// `hermit run --from` loads as `--config` loads a file.
-pub(crate) fn from_manifest(manifest: &crate::manifest::Manifest) -> Result<RunConfig, Error> {
+pub(crate) fn from_manifest(manifest: &crate::app::manifest::Manifest) -> Result<RunConfig, Error> {
     let section = |entries: &BTreeMap<String, serde_json::Value>| {
         entries
             .iter()
@@ -494,9 +505,71 @@ fn scalar(text: &str) -> Value {
 /// invocation to the ordinary parser, when it is not a `hermit run` that
 /// names `--config`, or when it does not parse even leniently (an unknown
 /// option, `--help`), which that parser then reports.
+#[cfg(test)]
 pub(crate) fn expand_argv(
     command: &Command,
     argv: &[OsString],
+) -> Result<Option<Vec<OsString>>, Error> {
+    expand_argv_for_application(command, argv, None)
+}
+
+/// A separately linked executable owns its selected backend identity. Saved
+/// configs/manifests use the existing `global.backend` string to bind that
+/// identity: only the matching executable may consume it without a built-in
+/// `--backend` enum. Ordinary Hermit still parses the value normally and
+/// refuses an unknown backend instead of silently choosing ptrace.
+/// An external executable also refuses files with no saved backend identity;
+/// the ordinary executable retains its implicit builtin default.
+pub(super) fn expand_argv_for_application(
+    command: &Command,
+    argv: &[OsString],
+    application_backend: Option<&str>,
+) -> Result<Option<Vec<OsString>>, Error> {
+    expand_argv_with_selection(command, argv, application_backend)
+}
+
+/// The selected executable parses the complete option schema. Only its shared
+/// global selector is consumed here, using the same option names/arity as run
+/// config expansion. The original Unix argv used for exec is never modified.
+/// A matching explicit selector is consumed for this executable's parser; it
+/// cannot override a missing/different saved executable backend identity.
+pub(super) fn application_arguments(
+    command: &Command,
+    argv: &[OsString],
+    application: &str,
+) -> Result<(Vec<OsString>, bool), Error> {
+    super::backend_hook::validate_name(application)?;
+    let mut normalized = None;
+    if let Ok(mut prefix) = command_prefix(command, argv)
+        && let Some(backend) = prefix.backend()?
+    {
+        anyhow::ensure!(
+            backend == OsStr::new(application),
+            "this executable selects backend `{application}`, but the command line selects {}; \
+             use the executable for that backend instead",
+            backend.to_string_lossy(),
+        );
+        let (_, command_index) = prefix.command.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("an executable-selected --backend requires a subcommand")
+        })?;
+        // Re-spell only the parsed global prefix. Raw guest operands, including
+        // non-UTF8 values and every byte after `--`, remain the original tail.
+        prefix.matches.remove_many::<OsString>("backend");
+        let mut parsed = vec![argv.first().cloned().unwrap_or_else(|| "hermit".into())];
+        parsed.extend(given_tokens(command, &prefix.matches));
+        parsed.extend_from_slice(&argv[*command_index..]);
+        normalized = Some(parsed);
+    }
+    let input = normalized.as_deref().unwrap_or(argv);
+    let expanded = expand_argv_with_selection(command, input, Some(application))?;
+    let config_applied = expanded.is_some();
+    Ok((expanded.unwrap_or_else(|| input.to_vec()), config_applied))
+}
+
+fn expand_argv_with_selection(
+    command: &Command,
+    argv: &[OsString],
+    application_backend: Option<&str>,
 ) -> Result<Option<Vec<OsString>>, Error> {
     let names = |long: &str| {
         let with_value = format!("{long}=");
@@ -512,42 +585,25 @@ pub(crate) fn expand_argv(
     let Some(run_matches) = matches.subcommand_matches(RUN) else {
         return Ok(None);
     };
-    let given_paths = |id: &str| -> Vec<&OsString> {
-        run_matches
-            .get_many::<OsString>(id)
-            .into_iter()
-            .flatten()
-            .collect()
+    let Some((path, mut config)) = input_config(run_matches, true)? else {
+        return Ok(None);
     };
-    let (configs, manifests) = (given_paths(CONFIG_ID), given_paths(FROM_ID));
-    let (path, config) = match (configs.as_slice(), manifests.as_slice()) {
-        ([], []) => return Ok(None),
-        ([path], []) => (PathBuf::from(path), read(Path::new(path))?),
-        ([], [spec]) => {
-            use crate::manifest::Target;
-            let path = match crate::manifest::resolve(&crate::manifest::data_dir(), spec)? {
-                Target::Manifest(path) => path,
-                Target::Recording { data_dir, id } => anyhow::bail!(
-                    "{} is a syscall recording, which `hermit run --from` does not rerun; \
-                     replay it with: hermit replay {}",
-                    spec.to_string_lossy(),
-                    data_dir.join(id.to_string()).display()
-                ),
-            };
-            let manifest = crate::manifest::read(&path)?;
-            note_another_directory(&manifest);
-            let config = from_manifest_at(&manifest, &path)?;
-            (path, config)
-        }
-        ([_, ..], [_, ..]) => {
-            anyhow::bail!("--config and --from both name a run's options; give one of them")
-        }
-        (paths, []) | ([], paths) => anyhow::bail!(
-            "--{} was given {} times; give one",
-            if configs.is_empty() { "from" } else { "config" },
-            paths.len()
-        ),
-    };
+    if let Some(application) = application_backend {
+        let backend = config.global.remove("backend").with_context(|| {
+            format!(
+                "{} has no saved backend identity, but this executable selects `{application}`; \
+                 use the executable for the saved backend instead",
+                path.display(),
+            )
+        })?;
+        anyhow::ensure!(
+            backend.as_str() == Some(application),
+            "{} selects backend {}, but this executable selects `{application}`; \
+             use the executable for the saved backend instead",
+            path.display(),
+            display_value(&backend),
+        );
+    }
     let run = run_command(command);
     let given =
         |matches: &ArgMatches, id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
@@ -583,69 +639,395 @@ pub(crate) fn expand_argv(
     Ok(Some(expanded))
 }
 
+/// Read just the explicitly located config/manifest. Dispatch selection uses
+/// the same resolver without emitting the ordinary rerun-directory note;
+/// complete expansion in the selected executable still owns that note.
+fn input_config(
+    run_matches: &ArgMatches,
+    note_directory: bool,
+) -> Result<Option<(PathBuf, RunConfig)>, Error> {
+    let given_paths = |id: &str| -> Vec<&OsString> {
+        run_matches
+            .get_many::<OsString>(id)
+            .into_iter()
+            .flatten()
+            .collect()
+    };
+    let (configs, manifests) = (given_paths(CONFIG_ID), given_paths(FROM_ID));
+    let input = match (configs.as_slice(), manifests.as_slice()) {
+        ([], []) => return Ok(None),
+        ([path], []) => (PathBuf::from(path), read(Path::new(path))?),
+        ([], [spec]) => {
+            use crate::app::manifest::Target;
+            let path = match crate::app::manifest::resolve(&crate::app::manifest::data_dir(), spec)?
+            {
+                Target::Manifest(path) => path,
+                Target::Recording { data_dir, id } => anyhow::bail!(
+                    "{} is a syscall recording, which `hermit run --from` does not rerun; \
+                     replay it with: hermit replay {}",
+                    spec.to_string_lossy(),
+                    data_dir.join(id.to_string()).display()
+                ),
+            };
+            let manifest = crate::app::manifest::read(&path)?;
+            if note_directory {
+                note_another_directory(&manifest);
+            }
+            (path.clone(), from_manifest_at(&manifest, &path)?)
+        }
+        ([_, ..], [_, ..]) => {
+            anyhow::bail!("--config and --from both name a run's options; give one of them")
+        }
+        (paths, []) | ([], paths) => anyhow::bail!(
+            "--{} was given {} times; give one",
+            if configs.is_empty() { "from" } else { "config" },
+            paths.len()
+        ),
+    };
+    Ok(Some(input))
+}
+
+struct CommandPrefix {
+    matches: ArgMatches,
+    command: Option<(String, usize)>,
+}
+
+impl CommandPrefix {
+    fn backend(&self) -> Result<Option<&OsStr>, Error> {
+        let values: Vec<_> = self
+            .matches
+            .get_many::<OsString>("backend")
+            .into_iter()
+            .flatten()
+            .collect();
+        match values.as_slice() {
+            [] => Ok(None),
+            [value] => Ok(Some(value.as_os_str())),
+            _ => anyhow::bail!("--backend was given {} times; give one", values.len()),
+        }
+    }
+}
+
+/// Parse only the actual global prefix. Treat the subcommand and all of its
+/// raw operands as an external tail; no backend-specific option arity can
+/// affect which global --backend this parser owns.
+fn command_prefix(command: &Command, argv: &[OsString]) -> Result<CommandPrefix, Error> {
+    let matches = lenient_scope(command, false)
+        .allow_external_subcommands(true)
+        .external_subcommand_value_parser(ValueParser::os_string())
+        .try_get_matches_from(argv)?;
+    let selected = if let Some((name, tail)) = matches.subcommand() {
+        let count = tail.get_many::<OsString>("").into_iter().flatten().count();
+        let index = argv
+            .len()
+            .checked_sub(count + 1)
+            .ok_or_else(|| anyhow::anyhow!("shared subcommand has an invalid raw-argv boundary"))?;
+        anyhow::ensure!(
+            argv.get(index).is_some_and(|arg| arg == name),
+            "shared subcommand does not match its original raw-argv boundary"
+        );
+        Some((name.to_owned(), index))
+    } else {
+        None
+    };
+    Ok(CommandPrefix {
+        matches,
+        command: selected,
+    })
+}
+
+/// Proven shared inputs for wrapper dispatch. This is not a full app parse or
+/// a verdict: the selected executable still parses its complete option schema.
+#[derive(Debug)]
+pub(super) struct ExternalSelection {
+    pub(super) backend: String,
+    pub(super) pending_verification: Option<PathBuf>,
+}
+
+/// Select only from known shared option grammar and structured config fields.
+/// Unknown extension-option arity and an undelimited guest are deliberately
+/// unsupported wrapper forms: use the selected executable directly for them.
+/// Neither an unknown option value nor a guest operand is scanned for control
+/// flags, config paths or report destinations.
+pub(super) fn external_selection(
+    command: &Command,
+    argv: &[OsString],
+) -> Result<Option<ExternalSelection>, Error> {
+    use clap::ValueEnum;
+
+    let Ok(prefix) = command_prefix(command, argv) else {
+        return Ok(None);
+    };
+    let explicit = prefix
+        .backend()?
+        .map(|value| {
+            value.to_str().ok_or_else(|| {
+                anyhow::anyhow!("backend identity must be UTF8; raw guest operands need not be")
+            })
+        })
+        .transpose()?;
+    let builtin = |name| <hermit::Backend as ValueEnum>::from_str(name, false).is_ok();
+    if explicit.is_some_and(builtin) {
+        return Ok(None);
+    }
+    let Some((name, index)) = &prefix.command else {
+        return Ok(None);
+    };
+    if name != RUN {
+        anyhow::ensure!(
+            explicit.is_none(),
+            "external backend selection currently supports `run`; use the backend executable directly for other commands"
+        );
+        return Ok(None);
+    }
+    let options = match shared_options_before_guest(command, argv, *index) {
+        Ok(matches) => matches,
+        Err(_) if explicit.is_none() => return Ok(None),
+        Err(error) => return Err(error).context("external dispatch cannot prove shared option ownership; use the backend executable directly, or keep only known shared options before an explicit `--` guest boundary"),
+    };
+    let run = options
+        .subcommand_matches(RUN)
+        .ok_or_else(|| anyhow::anyhow!("shared selection lost its run subcommand"))?;
+    let saved = match input_config(run, false) {
+        Ok(saved) => saved,
+        // Until a config actually identifies an external backend, keep its
+        // ordinary parser/descriptor/error ordering. An explicit external
+        // selector owns the early refusal instead; it must never fall back.
+        Err(_) if explicit.is_none() => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let configured = saved
+        .as_ref()
+        .and_then(|(_, config)| config.global.get("backend"));
+    let selected = match (explicit, configured) {
+        (Some(name), _) => Some(name),
+        (None, Some(Value::String(name))) => Some(name.as_str()),
+        (None, Some(value)) => anyhow::bail!(
+            "`global.backend` must be a backend name, not {}",
+            display_value(value)
+        ),
+        (None, None) => None,
+    };
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    if builtin(selected) {
+        return Ok(None);
+    }
+    super::backend_hook::validate_name(selected)?;
+    hermit::compatibility::ExecutableIdentity::backend(selected)?;
+    if saved.is_some() {
+        anyhow::ensure!(
+            configured.and_then(Value::as_str) == Some(selected),
+            "saved backend identity must exist and match executable-selected backend `{selected}`; use the executable for the saved backend instead"
+        );
+    }
+    let pending_verification =
+        pending_verification_path(run, saved.as_ref().map(|(_, config)| config))?;
+    Ok(Some(ExternalSelection {
+        backend: selected.to_owned(),
+        pending_verification,
+    }))
+}
+
+fn shared_options_before_guest(
+    command: &Command,
+    argv: &[OsString],
+    command_index: usize,
+) -> Result<ArgMatches, Error> {
+    let parser = || shared_selection_parser(command);
+    if let Ok(matches) = parser().try_get_matches_from(argv) {
+        return Ok(matches);
+    }
+    // A candidate boundary is accepted only when the entire known-option
+    // prefix parses WITHOUT positionals. `--` used as a known option's value
+    // therefore cannot be mistaken for the guest delimiter.
+    for index in command_index + 1..argv.len() {
+        if argv[index] == "--"
+            && let Ok(matches) = parser().try_get_matches_from(&argv[..index])
+        {
+            return Ok(matches);
+        }
+    }
+    anyhow::bail!("ambiguous extension option or undelimited guest arguments")
+}
+
+fn shared_selection_parser(command: &Command) -> Command {
+    lenient_scope(command, false).subcommand(lenient_scope(run_command(command), false))
+}
+
+/// A failed dispatch still stamps a report whose ownership is provable before
+/// an unknown option/operand. Select the longest COMPLETE shared-option prefix,
+/// without positionals or an unknown-option catch-all. Nothing after that
+/// prefix is interpreted, even if it resembles --config/--verify-json.
+pub(super) fn external_refusal_pending(
+    command: &Command,
+    argv: &[OsString],
+) -> Result<Option<PathBuf>, Error> {
+    use clap::ValueEnum;
+    let Ok(prefix) = command_prefix(command, argv) else {
+        return Ok(None);
+    };
+    let explicit = prefix.backend()?.and_then(OsStr::to_str);
+    let builtin = |name| <hermit::Backend as ValueEnum>::from_str(name, false).is_ok();
+    if explicit.is_some_and(builtin) {
+        return Ok(None);
+    }
+    let Some((name, index)) = &prefix.command else {
+        return Ok(None);
+    };
+    if name != RUN {
+        return Ok(None);
+    }
+    let mut parsed = None;
+    for end in (*index + 1..=argv.len()).rev() {
+        if let Ok(matches) = shared_selection_parser(command).try_get_matches_from(&argv[..end]) {
+            parsed = Some(matches);
+            break;
+        }
+    }
+    let Some(parsed) = parsed else {
+        return Ok(None);
+    };
+    let run = parsed
+        .subcommand_matches(RUN)
+        .context("shared prefix lost its run command")?;
+    let saved = match input_config(run, false) {
+        Ok(saved) => saved,
+        // A missing/invalid file cannot grant a report path. If the explicit
+        // external selector is proven, the known CLI fields still can.
+        Err(_) if explicit.is_some() => None,
+        Err(_) => return Ok(None),
+    };
+    let configured = saved
+        .as_ref()
+        .and_then(|(_, config)| config.global.get("backend"))
+        .and_then(Value::as_str);
+    let Some(selected) = explicit.or(configured) else {
+        return Ok(None);
+    };
+    if builtin(selected) {
+        return Ok(None);
+    }
+    pending_verification_path(run, saved.as_ref().map(|(_, config)| config))
+}
+
+/// Select only the two common failure-report fields, with the existing CLI >
+/// file precedence and scalar rules. Unknown backend config keys are left for
+/// the selected executable's COMPLETE parser; they cannot grant report-path or
+/// verification authority. No report is written by selection itself.
+fn pending_verification_path(
+    run: &ArgMatches,
+    config: Option<&RunConfig>,
+) -> Result<Option<PathBuf>, Error> {
+    let given = |id| run.value_source(id) == Some(ValueSource::CommandLine);
+    let verify = if given("verify") {
+        run.get_count("verify") != 0
+    } else {
+        match config.and_then(|config| config.run.get("verify")) {
+            None | Some(Value::Bool(false)) => false,
+            Some(Value::Bool(true)) => true,
+            Some(value) => anyhow::bail!(
+                "`run.verify` must be true or false, not {}",
+                display_value(value)
+            ),
+        }
+    };
+    if !verify {
+        return Ok(None);
+    }
+    if given("verify_json") {
+        let paths: Vec<_> = run
+            .get_many::<OsString>("verify_json")
+            .into_iter()
+            .flatten()
+            .collect();
+        anyhow::ensure!(
+            paths.len() == 1,
+            "--verify-json must name exactly one report destination"
+        );
+        return Ok(Some(PathBuf::from(paths[0])));
+    }
+    config
+        .and_then(|config| config.run.get("verify-json"))
+        .map(|value| {
+            scalar_text(value).map(PathBuf::from).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "`run.verify-json` must be a single path value, not {}",
+                    display_value(value)
+                )
+            })
+        })
+        .transpose()
+}
+
 /// A copy of the `hermit` command that accepts every option of the global
 /// level and of `run` with any value and in any combination, keeping only
 /// the names and value arity. It finds what the command line gave without
 /// applying the rules that the file's options may be what satisfies, such as
 /// `--verify-strict` requiring `--verify`.
 fn lenient_command(command: &Command) -> Command {
-    let lenient = |source: &Command| {
-        let positionals = source
-            .get_arguments()
-            .filter(|arg| arg.is_positional())
-            .count();
-        let mut index = 0;
-        let mut copy = Command::new(source.get_name().to_owned())
-            .disable_help_flag(true)
-            .disable_version_flag(true)
-            .trailing_var_arg(source.is_trailing_var_arg_set());
-        for arg in source.get_arguments() {
-            let mut lenient = Arg::new(arg.get_id().as_str().to_owned());
-            if arg.is_positional() {
-                index += 1;
-                lenient = lenient.index(index).value_parser(ValueParser::os_string());
-                lenient = if index == positionals {
-                    lenient
-                        .action(ArgAction::Append)
-                        .num_args(0..)
-                        .allow_hyphen_values(true)
-                        .trailing_var_arg(source.is_trailing_var_arg_set())
-                } else {
-                    lenient.action(ArgAction::Set)
-                };
-                copy = copy.arg(lenient);
+    lenient_scope(command, true)
+        .allow_external_subcommands(true)
+        .subcommand(lenient_scope(run_command(command), true))
+}
+
+fn lenient_scope(source: &Command, include_positionals: bool) -> Command {
+    let positionals = source
+        .get_arguments()
+        .filter(|arg| arg.is_positional())
+        .count();
+    let mut index = 0;
+    let mut copy = Command::new(source.get_name().to_owned())
+        .disable_help_flag(true)
+        .disable_version_flag(true)
+        .trailing_var_arg(include_positionals && source.is_trailing_var_arg_set());
+    for arg in source.get_arguments() {
+        let mut lenient = Arg::new(arg.get_id().as_str().to_owned());
+        if arg.is_positional() {
+            if !include_positionals {
                 continue;
             }
-            if let Some(long) = arg.get_long() {
-                lenient = lenient.long(long.to_owned());
-            }
-            if let Some(short) = arg.get_short() {
-                lenient = lenient.short(short);
-            }
-            if let Some(aliases) = arg.get_all_aliases() {
-                lenient = lenient.aliases(aliases.into_iter().map(str::to_owned));
-            }
-            if let Some(shorts) = arg.get_all_short_aliases() {
-                lenient = lenient.short_aliases(shorts);
-            }
-            // A global option may follow the subcommand, as on a typed command line.
-            lenient = lenient.global(arg.is_global_set());
-            lenient = match shape(arg) {
-                Some(Shape::Flag | Shape::Count) => lenient.action(ArgAction::Count),
-                _ => lenient
+            index += 1;
+            lenient = lenient.index(index).value_parser(ValueParser::os_string());
+            lenient = if index == positionals {
+                lenient
                     .action(ArgAction::Append)
-                    .value_parser(ValueParser::os_string())
-                    .num_args(1)
-                    .allow_hyphen_values(arg.is_allow_hyphen_values_set())
-                    .require_equals(arg.is_require_equals_set()),
+                    .num_args(0..)
+                    .allow_hyphen_values(true)
+                    .trailing_var_arg(source.is_trailing_var_arg_set())
+            } else {
+                lenient.action(ArgAction::Set)
             };
             copy = copy.arg(lenient);
+            continue;
         }
-        copy
-    };
-    lenient(command)
-        .allow_external_subcommands(true)
-        .subcommand(lenient(run_command(command)))
+        if let Some(long) = arg.get_long() {
+            lenient = lenient.long(long.to_owned());
+        }
+        if let Some(short) = arg.get_short() {
+            lenient = lenient.short(short);
+        }
+        if let Some(aliases) = arg.get_all_aliases() {
+            lenient = lenient.aliases(aliases.into_iter().map(str::to_owned));
+        }
+        if let Some(shorts) = arg.get_all_short_aliases() {
+            lenient = lenient.short_aliases(shorts);
+        }
+        // A global option may follow the subcommand, as on a typed command line.
+        lenient = lenient.global(arg.is_global_set());
+        lenient = match shape(arg) {
+            Some(Shape::Flag | Shape::Count) => lenient.action(ArgAction::Count),
+            _ => lenient
+                .action(ArgAction::Append)
+                .value_parser(ValueParser::os_string())
+                .num_args(1)
+                .allow_hyphen_values(arg.is_allow_hyphen_values_set())
+                .require_equals(arg.is_require_equals_set()),
+        };
+        copy = copy.arg(lenient);
+    }
+    copy
 }
 
 /// The command-line options of a lenient parse, respelled as `--long[=VALUE]`
@@ -887,6 +1269,14 @@ mod tests {
             &["-l", "debug", "--log-file=/nonexistent/hermit.log"],
         ),
         ("max-log-bytes", &["--max-log-bytes=8G"]),
+        (
+            "log-ring",
+            &["--log-ring=1M", "--log-ring-file=/nonexistent/ring.log"],
+        ),
+        (
+            "log-ring-file",
+            &["--log-ring-file=/nonexistent/ring.log", "--log-ring=1M"],
+        ),
         ("backend", &["--backend", "ptrace"]),
         (
             "unsafe-ignore-host-seccomp",
@@ -926,9 +1316,26 @@ mod tests {
         ("sequentialize-threads", &["--sequentialize-threads"]),
         ("runs-post-fork", &["--runs-post-fork=parent"]),
         ("passthru-opt", &["--passthru-opt"]),
+        (
+            "untrap-passthrough-syscalls",
+            &["--untrap-passthrough-syscalls"],
+        ),
         ("imprecise-timers", &["--imprecise-timers"]),
+        ("eager-lone-preemptions", &["--eager-lone-preemptions"]),
         ("no-signal-state-copy", &["--no-signal-state-copy"]),
         ("chaos", &["--chaos"]),
+        (
+            "chaos-timeslice-range",
+            &["--chaos", "--chaos-timeslice-range=1000..2000000"],
+        ),
+        (
+            "chaos-timeslice-draw",
+            &[
+                "--chaos",
+                "--chaos-timeslice-range=1000..2000000",
+                "--chaos-timeslice-draw=run",
+            ],
+        ),
         ("fuzz-futexes", &["--fuzz-futexes"]),
         ("chaos-target-races", &["--chaos-target-races"]),
         (
@@ -940,6 +1347,10 @@ mod tests {
             &["--chaos-slowdown-max-factor=4.0"],
         ),
         ("chaos-epoch-length-ns", &["--chaos-epoch-length-ns=100"]),
+        (
+            "chaos-instruction-offset",
+            &["--chaos-instruction-offset=8"],
+        ),
         ("record-preemptions", &["--record-preemptions"]),
         (
             "strict-schedule-boundaries",
@@ -960,11 +1371,33 @@ mod tests {
             "replay-schedule-from",
             &["--replay-schedule-from=/tmp/s.json"],
         ),
+        (
+            "replay-edited-preemptions",
+            &[
+                "--replay-preemptions-from=/tmp/r.json",
+                "--replay-edited-preemptions",
+            ],
+        ),
         ("replay-exhausted-panic", &["--replay-exhausted-panic"]),
         ("die-on-desync", &["--die-on-desync"]),
         (
+            "replay-continue-fairly",
+            &[
+                "--replay-schedule-from=/tmp/s.json",
+                "--replay-continue-fairly",
+            ],
+        ),
+        (
             "stacktrace-event",
             &["--stacktrace-event=3", "-s", "5,/tmp/st.txt"],
+        ),
+        (
+            "stacktrace-at-schedule-positions",
+            &[
+                "--replay-schedule-from=/tmp/s.json",
+                "--stacktrace-event=3",
+                "--stacktrace-at-schedule-positions",
+            ],
         ),
         ("stacktrace-signal", &["--stacktrace-signal=SIGINT"]),
         ("preemption-stacktrace", &["--preemption-stacktrace"]),
@@ -987,6 +1420,10 @@ mod tests {
             &["--dap-listen=127.0.0.1:4711", "--dap-gdb=/usr/bin/gdb"],
         ),
         ("max-timeslice", &["--preemption-timeout=disabled"]),
+        (
+            "post-crash-timeslice",
+            &["--post-crash-timeslice=400000000"],
+        ),
         ("target-timeslice", &["--target-timeslice=5000"]),
         (
             "target-timeslice-syscalls-only",
@@ -997,11 +1434,76 @@ mod tests {
         ),
         ("futex-wake-yields", &["--futex-wake-yields"]),
         ("pipe-wake-latency", &["--pipe-wake-latency=1000000"]),
+        ("expired-wait-charge", &["--expired-wait-charge=once"]),
+        ("sleep-registration", &["--sleep-registration=when-chosen"]),
         (
             "work-span-report",
             &["--work-span-report=/tmp/work-span.json"],
         ),
+        (
+            "record-access-trace-to",
+            &[
+                "--record-preemptions-to=/tmp/p.json",
+                "--record-access-trace-to=/tmp/a.access",
+            ],
+        ),
+        (
+            "access-trace-from",
+            &[
+                "--record-preemptions-to=/tmp/p.json",
+                "--record-access-trace-to=/tmp/a.access",
+                "--access-trace-from=5",
+            ],
+        ),
+        (
+            "access-trace-max-records",
+            &[
+                "--record-preemptions-to=/tmp/p.json",
+                "--record-access-trace-to=/tmp/a.access",
+                "--access-trace-max-records=9",
+            ],
+        ),
+        (
+            "access-trace-max-bytes",
+            &[
+                "--record-preemptions-to=/tmp/p.json",
+                "--record-access-trace-to=/tmp/a.access",
+                "--access-trace-max-bytes=4096",
+            ],
+        ),
+        ("rewrite-exclusives", &["--rewrite-exclusives"]),
+        (
+            "rewrite-exclusives-also",
+            &[
+                "--rewrite-exclusives",
+                "--rewrite-exclusives-also=/tmp/liblse.so",
+            ],
+        ),
+        (
+            "rewrite-exclusives-mode",
+            &["--rewrite-exclusives", "--rewrite-exclusives-mode=memory"],
+        ),
+        (
+            "watch",
+            &[
+                "--record-preemptions-to=/tmp/p.json",
+                "--record-access-trace-to=/tmp/a.access",
+                "--watch=0x404010:8:w",
+                "--watch=0x404020:1:rw",
+            ],
+        ),
+        (
+            "watch-from",
+            &[
+                "--record-preemptions-to=/tmp/p.json",
+                "--record-access-trace-to=/tmp/a.access",
+                "--watch=0x404010",
+                "--watch-from=3",
+            ],
+        ),
         ("scheduler-turn-cost", &["--scheduler-turn-cost=10000"]),
+        ("cap-preemption-charge", &["--cap-preemption-charge"]),
+        ("virtual-timeout", &["--virtual-timeout=1000"]),
         ("sigint-instakill", &["--sigint-instakill"]),
         ("warn-non-zero-binds", &["--warn-non-zero-binds"]),
         ("sched-heuristic", &["--sched-heuristic=random"]),
@@ -1019,6 +1521,7 @@ mod tests {
         ),
         ("debug-futex-mode", &["--debug-futex-mode=polling"]),
         ("no-rcb-time", &["--no-rcb-time"]),
+        ("detlog-anon", &["--detlog-anon"]),
         ("detlog-heap", &["--detlog-heap"]),
         ("detlog-stack", &["--detlog-stack"]),
         ("detlog-regs", &["--detlog-regs"]),
@@ -1026,6 +1529,7 @@ mod tests {
         ("detlog-regs-cadence", &["--detlog-regs-cadence=2"]),
         ("sysinfo-uptime-offset", &["--sysinfo-uptime-offset=60"]),
         ("memory", &["--memory=2GB"]),
+        ("virtual-cpus", &["--virtual-cpus=4"]),
         ("proc", &["--proc=standard"]),
         (
             "interrupt-at",
@@ -1055,10 +1559,15 @@ mod tests {
         ("replay-networking", &["--replay-networking=/tmp/old.trace"]),
         ("namespace-only", &["--lite"]),
         ("no-namespace", &["--core-only"]),
+        ("pid-base", &["--no-namespace", "--pid-base=4000"]),
         ("strace-only", &["--strace-only"]),
         ("tmp", &["--tmp=/tmp/guest tmp"]),
         ("image", &["--image=docker.io/library/busybox@sha256:00"]),
         ("seed-from", &["--seed-from=Args"]),
+        (
+            "chaos-seeded-timeslice",
+            &["--chaos", "--chaos-seeded-timeslice"],
+        ),
         ("verify", &["--verify"]),
         ("verify-verbose", &["--verify", "--verify-verbose"]),
         ("verify-strict", &["--verify", "--verify-strict"]),
@@ -1131,19 +1640,19 @@ mod tests {
         run: String,
     }
 
-    fn parse_at(argv: &[OsString], seconds: u64) -> (crate::Args, ArgMatches) {
-        let matches = crate::Args::command()
+    fn parse_at(argv: &[OsString], seconds: u64) -> (crate::app::Args, ArgMatches) {
+        let matches = crate::app::Args::command()
             .try_get_matches_from(argv)
             .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
-        let args = crate::args_from_matches_with_clock(&matches, || {
+        let args = crate::app::args_from_matches_with_clock(&matches, || {
             UNIX_EPOCH + Duration::from_secs(seconds)
         })
         .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
         (args, matches)
     }
 
-    fn parsed(args: &crate::Args) -> Parsed {
-        let crate::Subcommand::Run(run) = &args.command else {
+    fn parsed(args: &crate::app::Args) -> Parsed {
+        let crate::app::Subcommand::Run(run) = &args.command else {
             panic!("not a `run` command: {args:?}");
         };
         Parsed {
@@ -1156,7 +1665,7 @@ mod tests {
         let mut command_line = argv(&[], &["--config"], &[]);
         command_line.push(path.into());
         command_line.extend(run.iter().map(OsString::from));
-        expand_argv(&crate::Args::command(), &command_line)
+        expand_argv(&crate::app::Args::command(), &command_line)
             .unwrap_or_else(|error| panic!("{command_line:?} should load: {error:#}"))
             .unwrap_or_else(|| panic!("{command_line:?} names --config"))
     }
@@ -1167,12 +1676,12 @@ mod tests {
     fn save_and_load(argv: &[OsString]) -> (Parsed, Parsed, RunConfig) {
         let (mut args, matches) = parse_at(argv, SAVING_CLOCK);
         let config = capture(
-            &crate::Args::command(),
+            &crate::app::Args::command(),
             &matches,
             matches.subcommand_matches(RUN).unwrap(),
         )
         .unwrap();
-        let crate::Subcommand::Run(run) = &mut args.command else {
+        let crate::app::Subcommand::Run(run) = &mut args.command else {
             panic!("{argv:?} is not a `run` command");
         };
         run.set_config_capture(config);
@@ -1195,26 +1704,26 @@ mod tests {
             let argv = sample_argv(section, tokens);
             let (mut args, matches) = parse_at(&argv, SAVING_CLOCK);
             let config = capture(
-                &crate::Args::command(),
+                &crate::app::Args::command(),
                 &matches,
                 matches.subcommand_matches(RUN).unwrap(),
             )
             .unwrap();
-            let crate::Subcommand::Run(run) = &mut args.command else {
+            let crate::app::Subcommand::Run(run) = &mut args.command else {
                 panic!("{argv:?} is not a `run` command");
             };
             run.set_config_capture(config);
             let saved = run.saved_run_config().unwrap();
             let (global, run_inputs) = to_manifest_parts(&saved).unwrap();
-            let manifest = crate::manifest::Manifest::new(
+            let manifest = crate::app::manifest::Manifest::new(
                 hermit::Id::unique(),
-                crate::manifest::Kind::InputsOnly,
-                crate::manifest::Command {
+                crate::app::manifest::Kind::InputsOnly,
+                crate::app::manifest::Command {
                     program: saved.program.clone(),
                     args: saved.args.clone(),
                     cwd: None,
                 },
-                crate::manifest::Inputs {
+                crate::app::manifest::Inputs {
                     global,
                     run: run_inputs,
                     host_drawn: BTreeMap::new(),
@@ -1225,15 +1734,144 @@ mod tests {
             let path = directory
                 .path()
                 .join("id")
-                .join(crate::manifest::MANIFEST_NAME);
-            crate::manifest::write(&path, &manifest).unwrap();
+                .join(crate::app::manifest::MANIFEST_NAME);
+            crate::app::manifest::write(&path, &manifest).unwrap();
             let command_line = argv_for_from(path.parent().unwrap());
-            let expanded = expand_argv(&crate::Args::command(), &command_line)
+            let expanded = expand_argv(&crate::app::Args::command(), &command_line)
                 .unwrap()
                 .expect("--from expands");
             let (reloaded, _) = parse_at(&expanded, LOADING_CLOCK);
             assert_eq!(parsed(&args), parsed(&reloaded), "--{long}: {manifest:#?}");
         }
+    }
+
+    /// Set in the child of [`a_resolved_auto_profile_is_saved_and_reloads_as_named`]
+    /// that checks the unset case.
+    const UNSET_PROFILE_CHILD: &str = "HERMIT_TEST_RUN_CONFIG_UNSET_PROFILE_CHILD";
+
+    /// A run whose auto profile resolved saves the resolved profile, so that
+    /// `--config` and `--from` a manifest run that named profile rather than
+    /// resolving again; a named profile is saved as given, and a run that
+    /// resolved nothing saves no profile. That last case runs in a child
+    /// given no HERMIT_CPU_PROFILE, since the capture keeps a profile the
+    /// environment supplies.
+    #[test]
+    fn a_resolved_auto_profile_is_saved_and_reloads_as_named() {
+        use detcore_model::cpu_profile::CpuProfile;
+        let unset_child = std::env::var_os(UNSET_PROFILE_CHILD).is_some();
+        // The parsed run's profile, from its field-by-field rendering.
+        let profile_of = |parsed: &Parsed| {
+            parsed
+                .run
+                .lines()
+                .find(|line| line.trim_start().starts_with("cpu_profile:"))
+                .unwrap_or_else(|| panic!("no cpu_profile in {parsed:?}"))
+                .trim()
+                .to_owned()
+        };
+        let save = |run_args: &[&str], resolved: Option<CpuProfile>| {
+            let argv = argv(&[], run_args, GUEST);
+            let (mut args, matches) = parse_at(&argv, SAVING_CLOCK);
+            let config = capture(
+                &crate::app::Args::command(),
+                &matches,
+                matches.subcommand_matches(RUN).unwrap(),
+            )
+            .unwrap();
+            let crate::app::Subcommand::Run(run) = &mut args.command else {
+                panic!("{argv:?} is not a `run` command");
+            };
+            run.set_config_capture(config);
+            if let Some(profile) = resolved {
+                run.set_auto_resolution(profile);
+            }
+            run.saved_run_config().unwrap()
+        };
+        let reload = |saved: &RunConfig| {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("run.yaml");
+            write(&path, saved).unwrap();
+            let by_config = parsed(&parse_at(&load(&path, &[]), LOADING_CLOCK).0);
+            let (global, run_inputs) = to_manifest_parts(saved).unwrap();
+            let manifest = crate::app::manifest::Manifest::new(
+                hermit::Id::unique(),
+                crate::app::manifest::Kind::InputsOnly,
+                crate::app::manifest::Command {
+                    program: saved.program.clone(),
+                    args: saved.args.clone(),
+                    cwd: None,
+                },
+                crate::app::manifest::Inputs {
+                    global,
+                    run: run_inputs,
+                    host_drawn: BTreeMap::new(),
+                },
+            );
+            let path = directory
+                .path()
+                .join("id")
+                .join(crate::app::manifest::MANIFEST_NAME);
+            crate::app::manifest::write(&path, &manifest).unwrap();
+            let expanded = expand_argv(
+                &crate::app::Args::command(),
+                &argv_for_from(path.parent().unwrap()),
+            )
+            .unwrap()
+            .expect("--from expands");
+            let by_from = parsed(&parse_at(&expanded, LOADING_CLOCK).0);
+            assert_eq!(by_config, by_from);
+            profile_of(&by_config)
+        };
+        let named = |profile: &str| {
+            let argv = argv(&[], &["--cpu-profile", profile], GUEST);
+            profile_of(&parsed(&parse_at(&argv, LOADING_CLOCK).0))
+        };
+        if unset_child {
+            // Nothing resolved, nothing given: no profile is saved, and the
+            // reload is the unset (auto) default again, not a named v2.
+            assert_eq!(std::env::var_os("HERMIT_CPU_PROFILE"), None);
+            let saved = save(&[], None);
+            assert_eq!(saved.run.get(CPU_PROFILE_KEY), None);
+            assert_ne!(reload(&saved), named("x86-64-v2"));
+            return;
+        }
+        for (given, resolved) in [
+            (&[][..], CpuProfile::X86_64V2),
+            (&[][..], CpuProfile::X86_64V3),
+            (&["--cpu-profile", "auto"][..], CpuProfile::X86_64V3),
+        ] {
+            let saved = save(given, Some(resolved));
+            assert_eq!(
+                saved.run.get(CPU_PROFILE_KEY),
+                Some(&Value::from(resolved.name())),
+                "{given:?}"
+            );
+            assert_eq!(reload(&saved), named(resolved.name()), "{given:?}");
+        }
+        // A named profile is saved as given, and reloads as named.
+        let saved = save(&["--cpu-profile", "x86-64-v2"], None);
+        assert_eq!(
+            saved.run.get(CPU_PROFILE_KEY),
+            Some(&Value::from("x86-64-v2"))
+        );
+        assert_eq!(reload(&saved), named("x86-64-v2"));
+        let test = format!(
+            "{}::a_resolved_auto_profile_is_saved_and_reloads_as_named",
+            module_path!().split_once("::").unwrap().1
+        );
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+            .env(UNSET_PROFILE_CHILD, "1")
+            .env_remove("HERMIT_CPU_PROFILE")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        assert!(
+            child.status.success() && stdout.contains("test result: ok. 1 passed;"),
+            "the unset-profile child did not pass exactly once: {}\nstdout:\n{stdout}\nstderr:\n{}",
+            child.status,
+            String::from_utf8_lossy(&child.stderr)
+        );
     }
 
     fn argv_for_from(path: &Path) -> Vec<OsString> {
@@ -1255,7 +1893,7 @@ mod tests {
             let mut command_line = argv(&[], &["--config"], &[]);
             command_line.push(path.into());
             assert!(
-                expand_argv(&crate::Args::command(), &command_line).is_err(),
+                expand_argv(&crate::app::Args::command(), &command_line).is_err(),
                 "{entry}"
             );
         }
@@ -1266,7 +1904,7 @@ mod tests {
     /// refused with the `hermit replay` command to use instead.
     #[test]
     fn from_a_network_manifest_replays_its_trace() {
-        use crate::manifest;
+        use crate::app::manifest;
         let directory = tempfile::tempdir().unwrap();
         let trace = directory.path().join("net.trace");
         std::fs::write(&trace, b"HERMIT-NET-TRACE\x04\0\0\0").unwrap();
@@ -1314,7 +1952,7 @@ mod tests {
     fn from_and_config_together_are_refused() {
         let mut command_line = argv(&[], &["--config=/nonexistent.yaml", "--from"], &[]);
         command_line.push("/nonexistent".into());
-        let error = expand_argv(&crate::Args::command(), &command_line).unwrap_err();
+        let error = expand_argv(&crate::app::Args::command(), &command_line).unwrap_err();
         assert!(
             format!("{error:#}").contains("give one of them"),
             "{error:#}"
@@ -1323,7 +1961,7 @@ mod tests {
 
     #[test]
     fn every_option_has_a_round_trip_sample() {
-        let hermit = crate::Args::command();
+        let hermit = crate::app::Args::command();
         let options: BTreeSet<(&str, String)> = [Section::Global, Section::Run]
             .into_iter()
             .flat_map(|section| {
@@ -1351,6 +1989,39 @@ mod tests {
             Vec::<&(&str, String)>::new(),
             "these sample rows name no option"
         );
+    }
+
+    /// The optional value's implicit mappings mode and both explicit modes
+    /// must retain their actual typed values through the production save/load
+    /// path, not merely parse successfully.
+    #[test]
+    fn anonymous_mapping_log_modes_survive_save_and_load() {
+        use detcore_model::config::DetlogAnon;
+
+        for (spelling, expected, saved_value) in [
+            ("--detlog-anon", DetlogAnon::Mappings, "mappings"),
+            ("--detlog-anon=mappings", DetlogAnon::Mappings, "mappings"),
+            ("--detlog-anon=pages", DetlogAnon::Pages, "pages"),
+        ] {
+            let argv = sample_argv(Section::Run, &[spelling]);
+            let (args, _) = parse_at(&argv, SAVING_CLOCK);
+            let crate::app::Subcommand::Run(run) = args.command else {
+                panic!("not a run command");
+            };
+            assert_eq!(run.det_opts.det_config.detlog_anon, Some(expected));
+            let (before, after, saved) = save_and_load(&argv);
+            assert_eq!(before, after, "{spelling}");
+            assert_eq!(saved.run["detlog-anon"], Value::from(saved_value));
+
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("run.yaml");
+            write(&path, &saved).unwrap();
+            let (reloaded, _) = parse_at(&load(&path, &[]), LOADING_CLOCK);
+            let crate::app::Subcommand::Run(run) = reloaded.command else {
+                panic!("not a run command");
+            };
+            assert_eq!(run.det_opts.det_config.detlog_anon, Some(expected));
+        }
     }
 
     /// The guarantee itself: for every option, saving an invocation that
@@ -1391,13 +2062,13 @@ mod tests {
         let path = directory.path().join("exec-stop.yaml");
         write(&path, &saved).unwrap();
         let args = run_options(&load(&path, &[]));
-        let crate::Subcommand::Run(run) = args.command else {
+        let crate::app::Subcommand::Run(run) = args.command else {
             unreachable!()
         };
         let error = run.refuse_unready_exec_stop().unwrap_err();
         assert!(
             error
-                .downcast_ref::<crate::container::PolicyRefusal>()
+                .downcast_ref::<crate::app::container::PolicyRefusal>()
                 .is_some(),
             "{error:#}"
         );
@@ -1440,7 +2111,7 @@ mod tests {
         path
     }
 
-    fn run_options(argv: &[OsString]) -> crate::Args {
+    fn run_options(argv: &[OsString]) -> crate::app::Args {
         parse_at(argv, LOADING_CLOCK).0
     }
 
@@ -1461,7 +2132,7 @@ mod tests {
         let mut command_line = argv(&["--log-file=/from/cli.log"], &["--config"], &[]);
         command_line.push(path.clone().into());
         command_line.extend(["--seed=2", "-e", "C=3"].map(OsString::from));
-        let expanded = expand_argv(&crate::Args::command(), &command_line)
+        let expanded = expand_argv(&crate::app::Args::command(), &command_line)
             .unwrap()
             .unwrap();
         let args = run_options(&expanded);
@@ -1470,7 +2141,7 @@ mod tests {
             Some(tracing::level_filters::LevelFilter::INFO)
         );
         assert_eq!(args.global.log_file, Some("/from/cli.log".into()));
-        let crate::Subcommand::Run(run) = &args.command else {
+        let crate::app::Subcommand::Run(run) = &args.command else {
             panic!("{expanded:?}");
         };
         let expected = run_options(&argv(
@@ -1478,7 +2149,7 @@ mod tests {
             &["--seed=2", "--env=C=3", "--verify", "--summary"],
             &["--", "/bin/from-file", "x"],
         ));
-        let crate::Subcommand::Run(expected) = &expected.command else {
+        let crate::app::Subcommand::Run(expected) = &expected.command else {
             unreachable!()
         };
         assert_eq!(
@@ -1488,7 +2159,7 @@ mod tests {
 
         // A guest on the command line replaces the file's program and args.
         let args = run_options(&load(&path, &["--", "/bin/from-cli", "-y"]));
-        let crate::Subcommand::Run(run) = &args.command else {
+        let crate::app::Subcommand::Run(run) = &args.command else {
             unreachable!()
         };
         let expected = run_options(&argv(
@@ -1502,7 +2173,7 @@ mod tests {
             ],
             &["--", "/bin/from-cli", "-y"],
         ));
-        let crate::Subcommand::Run(expected) = &expected.command else {
+        let crate::app::Subcommand::Run(expected) = &expected.command else {
             unreachable!()
         };
         assert_eq!(
@@ -1527,7 +2198,7 @@ mod tests {
             "schema: hermit-run-config/v1\nrun: {verify-strict: true}\n",
         );
         let expanded = load(&path, &["--", "/bin/true"]);
-        let error = crate::Args::command()
+        let error = crate::app::Args::command()
             .try_get_matches_from(&expanded)
             .unwrap_err()
             .to_string();
@@ -1555,7 +2226,7 @@ mod tests {
         command_line.push(path.into());
         format!(
             "{:#}",
-            expand_argv(&crate::Args::command(), &command_line).unwrap_err()
+            expand_argv(&crate::app::Args::command(), &command_line).unwrap_err()
         )
     }
 
@@ -1670,7 +2341,7 @@ mod tests {
     /// Only a top-level `hermit run` that names `--config` is rewritten.
     #[test]
     fn other_invocations_are_left_to_the_parser() {
-        let hermit = crate::Args::command();
+        let hermit = crate::app::Args::command();
         for command_line in [
             argv(&[], &[], &["--", "/bin/echo", "--config", "x"]),
             argv(&[], &["--config=x", "--help"], &[]),
@@ -1721,7 +2392,7 @@ mod tests {
     /// options of `hermit run`.
     #[test]
     fn resolved_input_keys_name_run_options() {
-        let hermit = crate::Args::command();
+        let hermit = crate::app::Args::command();
         let longs: Vec<String> = option_specs(run_command(&hermit))
             .into_iter()
             .map(|spec| spec.long)
@@ -1729,5 +2400,262 @@ mod tests {
         for key in [EPOCH_KEY, SEED_KEY, SEED_FROM_KEY] {
             assert!(longs.iter().any(|long| long == key), "{key}");
         }
+    }
+
+    #[test]
+    fn dispatch_selection_preserves_raw_guest_controls_and_shared_report_ownership() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let schema = crate::app::Args::command();
+        let mut raw = [
+            "hermit",
+            "--backend",
+            "dynamorio",
+            "run",
+            "--verify",
+            "--verify-json",
+            "report.json",
+            "--",
+            "/bin/echo",
+            "--backend",
+            "ptrace",
+            "--config",
+            "/must-not-be-read",
+            "--verify-json",
+            "/not-the-report",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        raw.push(OsString::from_vec(vec![b'x', 0xff]));
+        let before = raw.clone();
+        let selected = external_selection(&schema, &raw).unwrap().unwrap();
+        assert_eq!(selected.backend, "dynamorio");
+        assert_eq!(
+            selected.pending_verification,
+            Some(PathBuf::from("report.json"))
+        );
+        assert_eq!(raw, before, "selection must not rewrite raw exec argv");
+        let (parsed, config_applied) = application_arguments(&schema, &raw, "dynamorio").unwrap();
+        assert!(!config_applied);
+        let delimiter = parsed.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(&parsed[delimiter..], &raw[7..]);
+        assert_eq!(parsed.first(), raw.first());
+        assert_eq!(parsed[1], "run");
+
+        let raw = [
+            "hermit",
+            "--log-file=--backend",
+            "run",
+            "--",
+            "/bin/echo",
+            "dynamorio",
+        ]
+        .map(OsString::from);
+        assert!(external_selection(&schema, &raw).unwrap().is_none());
+    }
+
+    #[test]
+    fn dispatch_selection_refuses_unknown_arity_and_undelimited_guest_forms() {
+        let schema = crate::app::Args::command();
+        for raw in [
+            vec![
+                "hermit",
+                "--backend",
+                "dynamorio",
+                "run",
+                "--extension",
+                "--config",
+                "/not-a-config",
+                "--",
+                "/bin/true",
+            ],
+            vec![
+                "hermit",
+                "--backend",
+                "dynamorio",
+                "run",
+                "/bin/echo",
+                "--config",
+                "/guest-operand",
+            ],
+            vec![
+                "hermit",
+                "--backend",
+                "dynamorio",
+                "run",
+                "--extension=value",
+                "--",
+                "/bin/true",
+            ],
+        ] {
+            let raw: Vec<_> = raw.into_iter().map(OsString::from).collect();
+            let error = external_selection(&schema, &raw).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("cannot prove shared option ownership"),
+                "{error:#}"
+            );
+        }
+        // The wrapper does not infer a config location from an unknown
+        // option's possible value. Ordinary parsing still refuses that form.
+        let raw = [
+            "hermit",
+            "run",
+            "--extension",
+            "--config",
+            "/must-not-be-read",
+        ]
+        .map(OsString::from);
+        assert!(external_selection(&schema, &raw).unwrap().is_none());
+        assert!(external_refusal_pending(&schema, &raw).unwrap().is_none());
+
+        let raw = [
+            "hermit",
+            "--backend=dynamorio",
+            "run",
+            "--verify",
+            "--verify-json=owned.json",
+            "--extension",
+            "--config",
+            "/must-not-be-read",
+            "--verify-json=not-owned.json",
+        ]
+        .map(OsString::from);
+        assert!(external_selection(&schema, &raw).is_err());
+        assert_eq!(
+            external_refusal_pending(&schema, &raw).unwrap(),
+            Some(PathBuf::from("owned.json"))
+        );
+        let raw = [
+            "hermit",
+            "--backend=dynamorio",
+            "run",
+            "--extension",
+            "--verify",
+            "--verify-json=not-owned.json",
+        ]
+        .map(OsString::from);
+        assert!(external_selection(&schema, &raw).is_err());
+        assert!(
+            external_refusal_pending(&schema, &raw).unwrap().is_none(),
+            "an unknown option's possible operands must not acquire report authority"
+        );
+    }
+
+    #[test]
+    fn dispatch_config_selection_leaves_extension_fields_to_the_selected_parser() {
+        let directory = tempfile::tempdir().unwrap();
+        let report = directory.path().join("saved.json");
+        let path = config_file(
+            &directory,
+            &format!(
+                "schema: {SCHEMA}\nglobal: {{backend: dynamorio}}\nrun:\n  verify: true\n  verify-json: {}\n  extension-setting: value\nprogram: /bin/true\n",
+                report.display()
+            ),
+        );
+        let mut raw = ["hermit", "run", "--config"].map(OsString::from).to_vec();
+        raw.push(path.into());
+        let schema = crate::app::Args::command();
+        let selected = external_selection(&schema, &raw).unwrap().unwrap();
+        assert_eq!(selected.backend, "dynamorio");
+        assert_eq!(selected.pending_verification, Some(report.clone()));
+        assert!(!report.exists(), "selection is read-only");
+        assert!(
+            application_arguments(&schema, &raw, "dynamorio").is_err(),
+            "an unregistered config field must still fail the complete parser"
+        );
+        let schema = schema.mut_subcommand(RUN, |run| {
+            run.arg(
+                Arg::new("extension_setting")
+                    .long("extension-setting")
+                    .action(ArgAction::Set),
+            )
+        });
+        let (parsed, applied) = application_arguments(&schema, &raw, "dynamorio").unwrap();
+        assert!(applied);
+        let matches = schema.try_get_matches_from(&parsed).unwrap();
+        assert_eq!(
+            matches
+                .subcommand_matches(RUN)
+                .unwrap()
+                .get_one::<String>("extension_setting")
+                .map(String::as_str),
+            Some("value")
+        );
+        assert!(matches.get_one::<hermit::Backend>("backend").is_none());
+    }
+
+    #[test]
+    fn executable_selector_requires_identity_match_and_retains_cli_over_file_precedence() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = config_file(
+            &directory,
+            &format!(
+                "schema: {SCHEMA}\nglobal: {{backend: ptrace}}\nrun: {{verify: true, verify-json: saved.json}}\nprogram: /bin/true\n"
+            ),
+        );
+        let schema = crate::app::Args::command();
+        let mut raw = [
+            "hermit",
+            "--backend=dynamorio",
+            "run",
+            "--verify-json=cli.json",
+            "--config",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        raw.push(path.clone().into());
+        assert!(
+            external_selection(&schema, &raw).is_err(),
+            "an explicit external selector cannot override a different saved backend identity"
+        );
+        assert!(
+            application_arguments(&schema, &raw, "dynamorio").is_err(),
+            "complete selected parsing must retain the same saved-identity refusal"
+        );
+        std::fs::write(&path, format!(
+            "schema: {SCHEMA}\nglobal: {{backend: dynamorio}}\nrun: {{verify: true, verify-json: saved.json}}\nprogram: /bin/true\n")).unwrap();
+        let selected = external_selection(&schema, &raw).unwrap().unwrap();
+        assert_eq!(selected.backend, "dynamorio");
+        assert_eq!(
+            selected.pending_verification,
+            Some(PathBuf::from("cli.json"))
+        );
+        let (parsed, applied) = application_arguments(&schema, &raw, "dynamorio").unwrap();
+        assert!(applied);
+        let matches = schema.clone().try_get_matches_from(&parsed).unwrap();
+        assert!(matches.get_one::<hermit::Backend>("backend").is_none());
+        assert_eq!(
+            matches
+                .subcommand_matches(RUN)
+                .unwrap()
+                .get_one::<PathBuf>("verify_json"),
+            Some(&PathBuf::from("cli.json"))
+        );
+        assert!(application_arguments(&schema, &raw, "other").is_err());
+
+        std::fs::write(&path, format!("schema: {SCHEMA}\nprogram: /bin/true\n")).unwrap();
+        assert!(
+            external_selection(&schema, &raw).is_err(),
+            "an explicit external selector cannot supply a missing saved backend identity"
+        );
+        assert!(application_arguments(&schema, &raw, "dynamorio").is_err());
+        std::fs::write(
+            &path,
+            format!("schema: {SCHEMA}\nglobal: {{backend: ptrace}}\nprogram: /bin/true\n"),
+        )
+        .unwrap();
+        let mut saved_only = ["hermit-dynamorio", "run", "--config"]
+            .map(OsString::from)
+            .to_vec();
+        saved_only.push(path.into());
+        assert!(
+            application_arguments(&schema, &saved_only, "dynamorio").is_err(),
+            "a mismatching saved identity must not fall back to a builtin"
+        );
+        raw[1] = "--backend=ptrace".into();
+        assert!(
+            external_selection(&schema, &raw).unwrap().is_none(),
+            "ordinary builtin selection remains the original parser's responsibility"
+        );
     }
 }

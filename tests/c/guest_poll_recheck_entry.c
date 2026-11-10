@@ -44,14 +44,24 @@
  *   writev-partial-quiet-swap, atomic-full-quiet-swap
  *                  a 70000-byte writev with room for 4096, or a 100-byte one
  *                  into a full pipe, and no signal. Just before its call the
- *                  worker starts a thread that sleeps 1 ms and points the
- *                  iovec array at a buffer of other bytes, as
- *                  writev_determinism's reader does; main drains: the write
- *                  completes, and every byte main reads
- *                  after the filler comes from the first array, which Linux
- *                  imported when the call began (writev_determinism's atomic
- *                  full-pipe case, which reverted the first landing of R2b-1;
- *                  the Claude re-check, N5).
+ *                  worker starts a thread that points the iovec array at a
+ *                  buffer of other bytes once the call has begun, and main
+ *                  drains only after that: the write completes, and every
+ *                  byte main reads after the filler comes from the first
+ *                  array, which Linux imported when the call began
+ *                  (writev_determinism's atomic full-pipe case, which
+ *                  reverted the first landing of R2b-1; the Claude re-check,
+ *                  N5). The partial write has begun once the pipe is full,
+ *                  as only its first 4096 bytes can fill it. The atomic one
+ *                  writes nothing while it waits, so its rewriter waits 50 ms
+ *                  of virtual time after the worker's last step before the
+ *                  call. The worker needs a few scheduler turns to reach its
+ *                  call, while main only wakes every millisecond to check, so
+ *                  it gets them long before (failing would take over 100
+ *                  turns at the default 0.5 ms each), whatever the schedule
+ *                  or timeslice. A 1 ms wait was shorter than the worker's
+ *                  last steps at a 1 us timeslice
+ *                  (https://github.com/rrnewton/hermit/issues/4804).
  * In the -two modes the worker stays alive after its call until main is
  * done, so a handler that does not run was lost, not left undelivered.
  *   writev-full-ign, writev-partial-ign
@@ -75,6 +85,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <time.h>
@@ -89,6 +100,7 @@ static struct iovec atomic33_iov[33];
 static struct iovec large_iov[2];
 static char large_other[70000];
 static long drained_x, drained_y;
+static atomic_int calling, swapped;
 static pid_t worker_tid;
 static long result;
 static int error;
@@ -133,12 +145,24 @@ static void swap_arrays(void) {
 }
 
 /* The -quiet-swap modes' rewriter, started by the worker just before its
- * call, as writev_determinism's reader is: its 1 ms sleep has begun before
- * the call does. */
+ * call: it points the array elsewhere only once the call has begun (see the
+ * modes above), then lets main drain. */
 static void *rewrite_later(void *unused) {
   (void)unused;
-  sleep_ms(1);
+  while (!atomic_load(&calling)) {
+    sched_yield();
+  }
+  if (starts("writev")) {
+    int capacity = fcntl(fds[1], F_GETPIPE_SZ);
+    int queued = 0;
+    while (ioctl(fds[0], FIONREAD, &queued) == 0 && queued < capacity) {
+      sleep_ms(1);
+    }
+  } else {
+    sleep_ms(50);
+  }
   swap_arrays();
+  atomic_store(&swapped, 1);
   return NULL;
 }
 
@@ -169,11 +193,13 @@ static void *worker(void *unused) {
     atomic_iov[0] = (struct iovec){bytes, 50};
     atomic_iov[1] = (struct iovec){bytes + 50, 50};
     start_rewriter();
+    atomic_store(&calling, 1);
     result = writev(fds[1], atomic_iov, 2);
   } else if (starts("writev")) {
     large_iov[0] = (struct iovec){bytes, 35000};
     large_iov[1] = (struct iovec){bytes + 35000, 35000};
     start_rewriter();
+    atomic_store(&calling, 1);
     result = writev(fds[1], large_iov, 2);
   } else {
     result = write(fds[1], bytes, sizeof(bytes));
@@ -267,6 +293,9 @@ int main(int argc, char **argv) {
     set_action(SIGUSR1, on_h2);
   }
   sleep_ms(50);
+  while (strstr(mode, "-quiet") && !atomic_load(&swapped)) {
+    sleep_ms(1);
+  }
   if (starts("read")) {
     if (write(fds[1], "x", 1) != 1) {
       return 2;

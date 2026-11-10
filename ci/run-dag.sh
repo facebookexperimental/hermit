@@ -70,6 +70,14 @@ fi
 case $lane in
     portable) selection_label=hosted-portable ;;
     privileged) selection_label=hosted-privileged ;;
+    # The super level is the full+super union minus the pressure tier;
+    # dagrun --labels cannot express that exclusion, and a raw
+    # full,super selection would silently include negative-space
+    # nodes. Refuse and point at the canonical driver instead.
+    super)
+        echo "run-dag.sh: lane 'super' is not a raw dagrun selection; run ./scripts/validate.rs super (pressure-tier nodes: dagrun run --labels pressure)" >&2
+        exit 2
+        ;;
     *) selection_label=$lane ;;
 esac
 

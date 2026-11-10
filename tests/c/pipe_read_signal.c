@@ -16,6 +16,9 @@
  *   restart  the same with SA_RESTART: the handler runs, the read restarts and
  *            returns the byte written afterwards.
  *   ignored  SIGUSR1 is ignored: the read returns the byte, no handler runs.
+ *   default-ignored  the sibling sends SIGWINCH, whose disposition is SIG_DFL,
+ *            which ignores it: the read returns the byte, no handler runs, as
+ *            Linux discards a default-ignored signal.
  *   blocked  the reader blocks SIGUSR1: the read returns the byte, and the
  *            signal stays pending until the reader exits. This mode sends
  *            without the ready handshake, after the 1 ms settle: at that
@@ -58,6 +61,10 @@
  *   waitpid        a sibling signals a thread blocked in
  *                  waitpid(child, WUNTRACED) for a child that has not exited:
  *                  the wait fails with EINTR.
+ *   sigchld-default  the main thread waits in waitpid for a forked child
+ *                  that exits 7 once the main thread waits; no handler is
+ *                  installed, so the child's SIGCHLD takes its default action,
+ *                  which ignores it, and the wait returns the child.
  *   repeat         a sibling reads in a loop, retrying on EINTR, until told
  *                  to stop; the main thread tells it, then sends SIGUSR1
  *                  every 100 us until the handler has run, as the jobserver
@@ -445,7 +452,7 @@ static int thread_mode(void) {
       fail("close");
     }
   }
-  if (pthread_kill(thread, SIGUSR1) != 0) {
+  if (pthread_kill(thread, strcmp(mode, "default-ignored") == 0 ? SIGWINCH : SIGUSR1) != 0) {
     fail("pthread_kill");
   }
   if (strcmp(mode, "ready2") == 0 && pthread_kill(thread, SIGUSR2) != 0) {
@@ -637,6 +644,29 @@ static int waitpid_mode(void) {
   return 0;
 }
 
+static int sigchld_default_mode(void) {
+  pid_t child = fork();
+  if (child < 0) {
+    fail("fork");
+  }
+  if (child == 0) {
+    char byte;
+    /* Exits once the parent closes the pipe's write end, after it waits. */
+    close(pipe_fds[1]);
+    if (read(pipe_fds[0], &byte, 1) < 0) {
+      _exit(1);
+    }
+    _exit(7);
+  }
+  close(pipe_fds[1]);
+  int status;
+  if (waitpid(child, &status, 0) != child) {
+    fail("waitpid");
+  }
+  printf("child exited %d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+  return 0;
+}
+
 static int process_mode(void) {
   pid_t child = fork();
   if (child < 0) {
@@ -687,6 +717,9 @@ int main(int argc, char** argv) {
   if (strcmp(mode, "waitpid") == 0) {
     return waitpid_mode();
   }
+  if (strcmp(mode, "sigchld-default") == 0) {
+    return sigchld_default_mode();
+  }
   if (strcmp(mode, "repeat") == 0) {
     return repeat_mode();
   }
@@ -718,8 +751,8 @@ int main(int argc, char** argv) {
   }
   if (strcmp(mode, "eintr") == 0 || strcmp(mode, "restart") == 0 ||
       strcmp(mode, "ignored") == 0 || strcmp(mode, "blocked") == 0 ||
-      strcmp(mode, "ready") == 0 || strcmp(mode, "eof") == 0 ||
-      strcmp(mode, "ready2") == 0) {
+      strcmp(mode, "default-ignored") == 0 || strcmp(mode, "ready") == 0 ||
+      strcmp(mode, "eof") == 0 || strcmp(mode, "ready2") == 0) {
     return thread_mode();
   }
   fprintf(stderr, "unknown mode %s\n", mode);

@@ -9,16 +9,20 @@
 /*
  * Linux names a random device by its device number, 1:8 (/dev/random) or 1:9
  * (/dev/urandom), whatever path reached it. Under Hermit every open of one is
- * a new open file description reading Hermit's deterministic stream from
- * offset zero, so the first bytes read through any spelling equal the first
- * bytes read through /dev/urandom itself. Before Hermit classified random
- * devices by device number, every spelling but the two literal names read the
- * host's entropy on ptrace (https://github.com/rrnewton/hermit/issues/4544).
+ * a new open file description that reads a deterministic stream of its own:
+ * Hermit's canonical stream, whose byte i is (i * 73 + 41) mod 256 XOR byte
+ * (i mod 8) of the stream's seed, under a seed no earlier open used. So the
+ * first bytes read through any spelling reveal their seed, follow the
+ * canonical pattern, and repeat no earlier open's stream, as Linux's opens
+ * never repeat. Before Hermit classified random devices by device number,
+ * every spelling but the two literal names read the host's entropy on ptrace
+ * (https://github.com/rrnewton/hermit/issues/4544).
  *
  * Each check prints one line, and standard output is the oracle: each
- * backend's cell declares the exact output. A spelling whose bytes differ from
- * the literal stream prints them; natively every spelling differs, since the
- * host's entropy never repeats. Spellings a backend cannot open print the
+ * backend's cell declares the exact output. The first open's bytes are
+ * printed as the reference, which pins its stream under the run seed. A
+ * spelling whose bytes are not the canonical pattern prints them; natively no
+ * spelling's are, since the host's entropy has no pattern. Spellings a backend cannot open print the
  * refusal, so a backend's own expected output records what it supports. The
  * program exits 0 whatever it found, so a backend's known difference is
  * recorded in its expected output rather than failing the run before the
@@ -36,6 +40,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,7 +64,10 @@ static void strict_check(int ok) {
     failures++;
   }
 }
-static unsigned char reference[4 * CHUNK];
+/* Seeds of the streams that earlier opens read, and the last bytes read. */
+static uint64_t seeds[16];
+static size_t opens;
+static unsigned char last_chunk[CHUNK];
 
 static void print_hex(const unsigned char* bytes, size_t len) {
   for (size_t i = 0; i < len; i++) {
@@ -79,24 +87,69 @@ static int read_exact(int fd, unsigned char* buf, size_t len) {
   return 0;
 }
 
-/* Compare `len` bytes read from `fd` with the reference stream at `offset`. */
+static unsigned char canonical_byte(uint64_t seed, size_t index) {
+  return (unsigned char)((unsigned char)index * 73 + 41) ^
+      (unsigned char)(seed >> (8 * (index % 8)));
+}
+
+/* Read CHUNK bytes from `fd` at stream offset `offset` and check that they are
+ * the canonical stream seeded `*seed`, or, for a new open (`offset` 0), learn
+ * the seed from the first eight bytes, check the rest against it, and check
+ * that no earlier open read this stream. */
 static void expect_stream(
     const char* label,
     int fd,
     size_t offset,
-    size_t len) {
-  unsigned char buf[CHUNK];
+    uint64_t* seed) {
+  unsigned char* buf = last_chunk;
   errno = 0;
-  if (read_exact(fd, buf, len) != 0) {
+  if (read_exact(fd, buf, CHUNK) != 0) {
     printf("%s read-failed errno=%d\n", label, errno);
     failures++;
-  } else if (memcmp(buf, reference + offset, len) != 0) {
+    return;
+  }
+  if (offset == 0) {
+    *seed = 0;
+    for (size_t i = 0; i < 8; i++) {
+      *seed |= (uint64_t)(buf[i] ^ canonical_byte(0, i)) << (8 * i);
+    }
+  }
+  int canonical = 1;
+  for (size_t i = 0; i < CHUNK; i++) {
+    canonical &= buf[i] == canonical_byte(*seed, offset + i);
+  }
+  int repeated = 0;
+  for (size_t i = 0; offset == 0 && i < opens; i++) {
+    repeated |= seeds[i] == *seed;
+  }
+  /* An alias whose cursor fell behind rereads an earlier chunk. */
+  size_t reread = offset;
+  for (size_t earlier = 0; !canonical && earlier < offset; earlier += CHUNK) {
+    int same = 1;
+    for (size_t i = 0; i < CHUNK; i++) {
+      same &= buf[i] == canonical_byte(*seed, earlier + i);
+    }
+    reread = same ? earlier : reread;
+  }
+  if (reread != offset) {
+    printf("%s REREADS stream offset %zu\n", label, reread);
+    failures++;
+  } else if (!canonical) {
     printf("%s DIFFERENT bytes=", label);
-    print_hex(buf, len);
+    print_hex(buf, CHUNK);
     printf("\n");
     failures++;
+  } else if (repeated) {
+    printf("%s REPEATS an earlier open's stream\n", label);
+    failures++;
   } else {
-    printf("%s same-stream\n", label);
+    printf("%s %s\n", label, offset == 0 ? "new-stream" : "same-stream");
+  }
+  if (offset == 0 && opens == sizeof seeds / sizeof seeds[0]) {
+    printf("%s too many opens to track\n", label);
+    failures++;
+  } else if (offset == 0) {
+    seeds[opens++] = *seed;
   }
 }
 
@@ -110,7 +163,8 @@ static void spelling(const char* name, int dirfd, const char* path) {
     strict_check(0);
     return;
   }
-  expect_stream(label, fd, 0, CHUNK);
+  uint64_t seed;
+  expect_stream(label, fd, 0, &seed);
   close(fd);
 }
 
@@ -264,20 +318,21 @@ static void shared_cursor(void) {
     failures++;
     return;
   }
-  expect_stream("cursor first", fd, 0, CHUNK);
+  uint64_t seed = 0;
+  expect_stream("cursor first", fd, 0, &seed);
   int alias = dup(fd);
   if (alias < 0) {
     printf("cursor dup failed errno=%d\n", errno);
     failures++;
   } else {
-    expect_stream("cursor dup", alias, CHUNK, CHUNK);
+    expect_stream("cursor dup", alias, CHUNK, &seed);
     close(alias);
   }
   fflush(stdout);
   int before = failures;
   pid_t child = fork();
   if (child == 0) {
-    expect_stream("cursor fork-child", fd, 2 * CHUNK, CHUNK);
+    expect_stream("cursor fork-child", fd, 2 * CHUNK, &seed);
     fflush(stdout);
     _exit(failures == before ? 0 : 1);
   }
@@ -287,7 +342,7 @@ static void shared_cursor(void) {
     printf("cursor fork-child failed\n");
     failures++;
   }
-  expect_stream("cursor fork-parent", fd, 3 * CHUNK, CHUNK);
+  expect_stream("cursor fork-parent", fd, 3 * CHUNK, &seed);
   close(fd);
 }
 
@@ -325,16 +380,11 @@ static void path_only(void) {
 int main(int argc, char** argv) {
   strict = argc > 1 && strcmp(argv[1], "--strict-checks") == 0;
   setvbuf(stdout, NULL, _IONBF, 0);
-  int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-  if (fd < 0 || read_exact(fd, reference, sizeof reference) != 0) {
-    printf("reference unavailable errno=%d\n", errno);
-    return 1;
-  }
-  close(fd);
+  spelling("literal-urandom", AT_FDCWD, "/dev/urandom");
+  /* The first open's bytes pin its stream under the run seed. */
   printf("reference=");
-  print_hex(reference, CHUNK);
+  print_hex(last_chunk, CHUNK);
   printf("\n");
-
   spelling("literal-random", AT_FDCWD, "/dev/random");
   spelling("double-slash", AT_FDCWD, "/dev//urandom");
   spelling("dot", AT_FDCWD, "/dev/./urandom");
@@ -351,7 +401,7 @@ int main(int argc, char** argv) {
     }
   }
   symlink_spelling();
-  fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+  int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
   if (fd >= 0) {
     char path[64];
     snprintf(path, sizeof path, "/proc/self/fd/%d", fd);

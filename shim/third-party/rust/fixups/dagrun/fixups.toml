@@ -1,5 +1,6 @@
-# `ci/manifest-plan` is coordinator tooling and has no Buck target. Cargo still
-# resolves its `dagrun` git dependency (agent-utils, pinned to the submodule's
-# gitlink) while resolving the workspace. Nothing Buck builds uses it, so keep
-# Reindeer from emitting a third-party rule for it.
-omit_targets = ["dagrun"]
+# `ci/manifest-plan` gained Buck targets in the Buck-only pilot (dh-cqlkz),
+# so Reindeer now emits a third-party rule for its `dagrun` git dependency
+# (agent-utils, pinned to the submodule's gitlink). Previously this fixup
+# omitted the target because nothing Buck built used it.
+# dagrun's lib.rs reads env!("CARGO_PKG_VERSION") for its VERSION const.
+cargo_env = ["CARGO_PKG_VERSION"]

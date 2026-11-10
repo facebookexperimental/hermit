@@ -259,6 +259,7 @@ pub fn config_violation(config: &Config) -> Option<&'static str> {
         || config.chaos
         || config.chaos_target_races
         || config.chaos_per_thread_slowdown
+        || config.chaos_instruction_offset > 0
     {
         return Some("InitialImage does not support chaos or imprecise timers");
     }

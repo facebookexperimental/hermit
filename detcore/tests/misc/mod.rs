@@ -14,14 +14,21 @@
 )]
 
 mod cpuinfo_sessions;
+mod ignored_signal_waits;
 mod inode_reuse;
 mod notification_fds;
+mod post_crash;
+mod proc_stat_lifecycle;
 mod procfs_caller_buffer;
 mod procfs_inode;
+mod property_snapshot;
 mod raw_clone;
 mod readdir_order;
+mod scm_rights;
 mod subreaper;
 mod tight_stack_openat;
+mod tight_stack_received_inotify;
+mod untraced_clone;
 mod vfork;
 
 use std::io::Read;
@@ -115,7 +122,7 @@ fn cpuid_faulting_supported() -> bool {
 
 fn det_test_fn_without_pmu<F>(f: F)
 where
-    F: Fn() + Send + Sync,
+    F: Fn() + Send + Sync + 'static,
 {
     let config = detcore::Config {
         max_timeslice: None,
@@ -126,7 +133,7 @@ where
 
 fn det_test_fn_sequential_without_pmu<F>(f: F)
 where
-    F: Fn() + Send + Sync,
+    F: Fn() + Send + Sync + 'static,
 {
     det_test_fn_sequential_without_pmu_with_post_fork(detcore::RunsPostFork::Child, f);
 }
@@ -135,7 +142,7 @@ where
 /// for a guest that reads a name only that level has.
 fn det_test_fn_sequential_without_pmu_at_standard<F>(f: F)
 where
-    F: Fn() + Send + Sync,
+    F: Fn() + Send + Sync + 'static,
 {
     let config = detcore::Config {
         max_timeslice: None,
@@ -148,7 +155,7 @@ where
 
 fn det_test_fn_sequential_without_pmu_with_post_fork<F>(runs_post_fork: detcore::RunsPostFork, f: F)
 where
-    F: Fn() + Send + Sync,
+    F: Fn() + Send + Sync + 'static,
 {
     let config = detcore::Config {
         max_timeslice: None,
@@ -302,6 +309,40 @@ fn run_madvise_policy_test(passthru_opt: bool) {
     );
 }
 
+/// A guest's first thread gets the calling test thread's stack, and the guest
+/// closure must not be on it. The guest is forked from detcore-testutils'
+/// session thread, so in the guest glibc counts the test thread as gone and
+/// marks its stack free in its stack cache (glibc 2.34 `reclaim_stacks`). A
+/// thread the guest starts with the same stack size, Rust's default, as this
+/// one is, takes that stack, and writing over it here overwrites what the
+/// test thread had near its top. On exit the thread hands it back, and glibc
+/// unmaps it when the cache passes its 40 MiB limit, as one 64 MiB
+/// `RUST_MIN_STACK` stack does. A closure kept on the test thread's stack, or
+/// data it borrowed from there, was then overwritten or unmapped: the marker
+/// below read as the fill byte, or faulted. That needs the test thread's stack
+/// to be the one glibc hands out, as when the test runs alone in its process
+/// (nextest); with this fix the marker is on the heap either way.
+#[test]
+fn a_guest_thread_on_the_callers_stack_leaves_the_guest_closure_intact() {
+    const MARKER: u64 = 0x5a5a_1234_5678_5a5a;
+    let marker = [MARKER; 64];
+    det_test_fn_without_pmu(move || {
+        std::thread::spawn(|| {
+            // A quarter of a default 2 MiB stack, from near its top: far
+            // deeper than the test thread's frames down to the closure.
+            let mut fill = [0xa5_u8; 512 << 10];
+            std::hint::black_box(&mut fill);
+        })
+        .join()
+        .unwrap();
+        assert!(
+            marker.iter().all(|word| *word == MARKER),
+            "the guest closure's capture changed under its thread: {:#x}",
+            marker[0]
+        );
+    });
+}
+
 #[test]
 fn madvise_policy_is_deterministic_and_preserves_semantic_advice() {
     run_madvise_policy_test(false);
@@ -328,6 +369,10 @@ fn prctl_keepcaps_round_trips_deterministically() {
     });
 }
 
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: /proc/<pid>/timerslack_ns is not writable"
+)]
 #[test]
 fn timer_slack_prctl_and_procfs_share_virtual_state() {
     const DEFAULT_TIMER_SLACK_NS: libc::c_int = 50_000;
@@ -457,6 +502,10 @@ fn timer_slack_prctl_and_procfs_share_virtual_state() {
     });
 }
 
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: /proc/<pid>/timerslack_ns is not writable"
+)]
 #[test]
 fn timer_slack_procfs_vector_io_matches_linux() {
     det_test_fn_sequential_without_pmu_at_standard(|| unsafe {
@@ -643,6 +692,10 @@ fn timer_slack_procfs_vector_io_matches_linux() {
     });
 }
 
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: /proc/<pid>/timerslack_ns is not writable"
+)]
 #[test]
 fn timer_slack_procfs_binds_target_at_open() {
     det_test_fn_sequential_without_pmu_at_standard(|| unsafe {
@@ -738,6 +791,10 @@ fn timer_slack_procfs_binds_target_at_open() {
     });
 }
 
+#[cfg_attr(
+    fbcode_build,
+    ignore = "fbsource-disabled: sandcastle-env: /proc/<pid>/timerslack_ns is not writable"
+)]
 #[test]
 fn timer_slack_is_mediated_under_passthru_opt() {
     let config = detcore::Config {
@@ -770,6 +827,20 @@ fn timer_slack_is_mediated_under_passthru_opt() {
 
 #[test]
 fn timer_slack_virtual_state_is_isolated_from_physical_tracee() {
+    // This test drives `spawn_fn_with_config` directly instead of through
+    // detcore-testutils, so it runs on a thread with an explicit stack
+    // here: a debug Detcore session overflows the test thread's default
+    // 2 MiB stack under plain `cargo test`.
+    std::thread::Builder::new()
+        .name("timer_slack_virtual_state_is_isolated_from_physical_tracee".to_owned())
+        .stack_size(16 << 20)
+        .spawn(timer_slack_virtual_state_is_isolated_from_physical_tracee_body)
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn timer_slack_virtual_state_is_isolated_from_physical_tracee_body() {
     const PHYSICAL_SENTINEL_NS: libc::c_int = 7_654_321;
     const VIRTUAL_REQUEST_NS: libc::c_int = 1_000_000_000;
     const VIRTUAL_PROC_REQUEST_NS: libc::c_int = 888_888_888;
@@ -809,12 +880,12 @@ fn timer_slack_virtual_state_is_isolated_from_physical_tracee() {
         })
     };
 
-    let config = detcore::Config {
+    let config = detcore_testutils::prepare_ptrace_timer_config(detcore::Config {
         max_timeslice: None,
         sequentialize_threads: true,
         proc_level: detcore_model::config::ProcLevel::Standard,
         ..Default::default()
-    };
+    });
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

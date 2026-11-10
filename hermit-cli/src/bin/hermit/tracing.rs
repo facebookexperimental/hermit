@@ -1035,6 +1035,54 @@ pub fn init_sync_file_tracing<W: Write + Send + 'static>(
     TracingGuard::synchronous()
 }
 
+/// Installs tracing for `--log-ring`. Every record at the ring's level, the
+/// `--log` level or INFO if that is quieter, goes to `ring`; `file` (the
+/// `--log-file`) or, without one, stderr gets the records at `level` exactly as
+/// it would without the ring. Both are synchronous.
+pub fn init_ring_tracing<W: Write + Send + 'static>(
+    level: Option<LevelFilter>,
+    ring: super::log_ring::RingWriter,
+    file: Option<W>,
+    budget: Option<LogBudget>,
+    backend: Backend,
+) -> TracingGuard {
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+    align_tracing_pid_baseline(backend);
+    let public = level.unwrap_or(DEFAULT_TRACE_LEVEL);
+    let ring_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::sync::Mutex::new(ring))
+        .with_ansi(false)
+        .with_filter(env_filter(public.max(LevelFilter::INFO)));
+    let (file_layer, stderr_layer) = match file {
+        Some(file) => (
+            Some(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::sync::Mutex::new(file))
+                    .with_ansi(false)
+                    .with_filter(env_filter(public)),
+            ),
+            None,
+        ),
+        None => (
+            None,
+            Some(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(move || CappedWriter::stderr(budget.clone()))
+                    .with_ansi(stderr().is_terminal())
+                    .with_filter(env_filter(public)),
+            ),
+        ),
+    };
+    tracing_subscriber::registry()
+        .with(ring_layer)
+        .with(file_layer)
+        .with(stderr_layer)
+        .try_init()
+        .expect("global tracing subscriber to install");
+    TracingGuard::synchronous()
+}
+
 /// Make the next guest task use the same identity as the asynchronous logger.
 ///
 /// The non-blocking file subscriber that `--log-file` used until
@@ -1060,6 +1108,12 @@ pub(super) fn align_tracing_pid_baseline(backend: Backend) {
         return;
     }
 
+    align_namespace_pid_baseline();
+}
+
+/// Reserve the normal Linux tracing task slot before an external physical
+/// runtime starts coordinator tasks in the fresh PID namespace.
+pub(super) fn align_namespace_pid_baseline() {
     // SAFETY: getpid has no preconditions and cannot fail.
     if unsafe { libc::getpid() } != 1 {
         return;
@@ -1196,6 +1250,7 @@ mod tests {
     use reverie::process::Namespace;
 
     use super::*;
+    use crate::app::container_clone::CheckedClone;
 
     /// `log_max_bytes` reads the process environment, which libtest's threads
     /// share.
@@ -1304,8 +1359,11 @@ mod tests {
 
     #[test]
     fn synchronous_pid_alignment_matches_the_file_appender_baseline() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         let synchronous_pid = pid_namespace()
-            .run(|| {
+            .checked_run(|| {
                 assert_eq!(unsafe { libc::getpid() }, 1);
                 align_tracing_pid_baseline(Backend::Ptrace);
                 fork_and_observe_child_pid()
@@ -1313,7 +1371,7 @@ mod tests {
             .expect("synchronous baseline namespace failed");
 
         let appender_pid = pid_namespace()
-            .run(|| {
+            .checked_run(|| {
                 assert_eq!(unsafe { libc::getpid() }, 1);
                 let (_subscriber, guard) = file_subscriber(DEFAULT_TRACE_LEVEL, io::sink());
                 let child = fork_and_observe_child_pid();
@@ -1328,8 +1386,11 @@ mod tests {
 
     #[test]
     fn pid_alignment_succeeds_when_host_thread_creation_is_denied() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         let guest_pid = pid_namespace()
-            .run(|| {
+            .checked_run(|| {
                 assert_eq!(unsafe { libc::getpid() }, 1);
                 deny_host_thread_creation().expect("cannot install host-thread deny filter");
                 align_tracing_pid_baseline(Backend::Ptrace);
@@ -1342,8 +1403,11 @@ mod tests {
 
     #[test]
     fn kvm_pid_alignment_allocates_no_host_task() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
         let next_pid = pid_namespace()
-            .run(|| {
+            .checked_run(|| {
                 assert_eq!(unsafe { libc::getpid() }, 1);
                 align_tracing_pid_baseline(Backend::Kvm);
                 // No task was allocated by alignment, so this first actual
@@ -1826,7 +1890,7 @@ mod tests {
             for run in 0..LOG_CAP_STRESS_RUNS {
                 let output = std::process::Command::new(std::env::current_exe().unwrap())
                     .args([
-                        "tracing::tests::the_final_message_is_the_last_line_when_writers_race_the_crossing",
+                        "app::tracing::tests::the_final_message_is_the_last_line_when_writers_race_the_crossing",
                         "--exact",
                         "--nocapture",
                         "--test-threads=1",

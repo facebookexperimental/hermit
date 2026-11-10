@@ -11,14 +11,14 @@
  * then with a second thread waiting in sigsuspend()
  * (https://github.com/rrnewton/hermit/issues/4047). A pidfd names a whole
  * process, so this is a process-directed signal: Linux's complete_signal picks
- * the receiving thread, which Detcore does not model, so with two threads it
- * refuses the call by name as it refuses kill. A fail-closed run stops with
- * the policy-refusal status at the two-thread send, and
- * --allow-unsupported-syscalls returns ENOSYS. Everything else is the
- * kernel's answer: signal 0, a zombie target (still 0), and SIGKILL to a
- * two-threaded child, which kills it whichever thread it reaches. A one-thread
- * child blocked in pause() must be woken to run its handler, as kill wakes it
- * (https://github.com/rrnewton/hermit/issues/4099).
+ * the receiving thread, and Hermit sends it to the thread Detcore picks by the
+ * same rule, as for kill (https://github.com/rrnewton/hermit/issues/4034).
+ * The two-thread step here is still refused by name, because the second
+ * thread sleeps in sigsuspend, outside the schedule.
+ * Everything else is the kernel's answer: signal 0, a zombie target (still
+ * 0), and SIGKILL to a two-threaded child, which kills it whichever thread it
+ * reaches. A one-thread child blocked in pause() must be woken to run its
+ * handler, as kill wakes it (https://github.com/rrnewton/hermit/issues/4099).
  */
 
 #define _GNU_SOURCE

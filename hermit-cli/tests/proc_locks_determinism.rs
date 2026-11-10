@@ -992,6 +992,10 @@ fn host_locks_stay_out_of_the_guests_proc_locks_on_dbt() {
 /// - `transfer DIR`: the parent OFD-locks a file it opened after forking,
 ///   sends the descriptor over `SCM_RIGHTS` and closes it; the child holds it,
 ///   then closes it;
+/// - `in-flight-sender-closes DIR` and `in-flight-sender-exits DIR`: the
+///   child OFD-locks a file, sends the descriptor and closes it or exits
+///   before the parent receives it; the parent looks while the message is in
+///   flight, after it receives it, and after it closes it;
 /// - `write-only DIR`: an OFD lock whose `struct flock` is on a page mapped
 ///   `PROT_WRITE` only, which the kernel reads and a tracer's
 ///   `process_vm_readv` cannot;
@@ -1332,6 +1336,55 @@ static int receive_descriptor(int socket) {
   return received;
 }
 
+// The sender (the child) locks `path`, opened after forking so that only it
+// holds it, sends the descriptor, and lets go of its own before the
+// receiver takes the message: it closes it, or with `sender_exits` exits
+// holding it. The open file and its OFD lock ride the message meanwhile, as
+// Linux's in-flight reference holds them; the receiver then takes the
+// descriptor and closes it.
+static int in_flight_scenario(const char* path, int sender_exits) {
+  int pair[2];
+  int closed[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0 || pipe(closed) != 0) {
+    die("socketpair");
+  }
+  pid_t child = fork();
+  if (child < 0) {
+    die("fork");
+  }
+  if (child == 0) {
+    close(pair[0]);
+    close(closed[0]);
+    int file = open_path(path, O_RDWR);
+    ofd(file, F_WRLCK, 0, 1);
+    send_descriptor(pair[1], file);
+    if (sender_exits) {
+      _exit(0);
+    }
+    close(file);
+    byte_out(closed[1]);
+    byte_in(pair[1]);
+    _exit(0);
+  }
+  close(pair[1]);
+  close(closed[1]);
+  if (sender_exits) {
+    wait_for(child);
+  } else {
+    byte_in(closed[0]);
+  }
+  snapshot("in-flight");
+  int received = receive_descriptor(pair[0]);
+  snapshot("received");
+  close(received);
+  snapshot("closed");
+  if (!sender_exits) {
+    byte_out(pair[0]);
+    wait_for(child);
+  }
+  return 0;
+}
+
 // The parent locks and sends its descriptor to the child, which unlocks
 // through the one it received while the parent keeps its own open: the
 // shared description, and so the kernel, holds no lock.
@@ -1636,7 +1689,10 @@ static int lock_after_fork_vfork_unlock_scenario(const char* path, int use_flock
   }
   if (unlocker == 0) {
     if (use_flock) {
-      _exit(flock(fd, LOCK_UN) == 0 ? 0 : 3);
+      if (flock(fd, LOCK_UN) == 0) {
+        _exit(0);
+      }
+      _exit(errno == ENOLCK ? 10 : 3);
     }
     struct flock lock = {.l_type = F_UNLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 1};
     if (fcntl(fd, F_OFD_SETLK, &lock) == 0) {
@@ -1649,9 +1705,10 @@ static int lock_after_fork_vfork_unlock_scenario(const char* path, int use_flock
       (WEXITSTATUS(status) != 0 && WEXITSTATUS(status) != 10)) {
     die("unlocker");
   }
-  // 10: the unlock was refused with ENOLCK and the lock is still held (DBT
-  // under --allow-unsupported-syscalls). Reported on stderr, outside the
-  // snapshots.
+  // 10: the unlock was refused with ENOLCK and the lock is still held (DBT's
+  // copied child under --allow-unsupported-syscalls: an OFD unlock, and every
+  // flock operation, which Detcore's flock model decides; the default policy
+  // ends the run there instead). Reported on stderr, outside the snapshots.
   fprintf(stderr, "unlocker-status=%d\n", WEXITSTATUS(status));
   snapshot("after-vfork-unlock");
   byte_out(go[1]);
@@ -1765,6 +1822,14 @@ int main(int argc, char** argv) {
       die("path");
     }
     return transfer_scenario(path, F_WRLCK, 1);
+  }
+  if (strcmp(mode, "in-flight-sender-closes") == 0 ||
+      strcmp(mode, "in-flight-sender-exits") == 0) {
+    char path[4096];
+    if (snprintf(path, sizeof(path), "%s/in-flight-ofd", where) >= (int)sizeof(path)) {
+      die("path");
+    }
+    return in_flight_scenario(path, strcmp(mode, "in-flight-sender-exits") == 0);
   }
   if (strcmp(mode, "write-only") == 0) {
     return write_only_scenario(where);
@@ -1907,8 +1972,14 @@ fn expected(sections: Vec<(&str, Vec<&str>)>) -> Sections {
 ///   the child exits;
 /// - an OFD lock sent over `SCM_RIGHTS` is shown while both hold it, and
 ///   goes once both have closed it; after the sender's close alone it stays
-///   shown where Detcore models the receiver's descriptor (DBT) and is hidden
-///   on ptrace, a named residual;
+///   shown, as Linux shows it, because Detcore models the receiver's
+///   descriptor on every backend (recorded as it arrives on ptrace,
+///   `Detcore::record_received_descriptors`; discovered on DBT);
+/// - it stays shown while the message is in flight after the sender closed
+///   its descriptor or exited, as Linux's in-flight reference keeps the open
+///   file and its lock (https://github.com/rrnewton/hermit/issues/4930), then
+///   while the receiver holds it, and goes with the receiver's close; on DBT,
+///   which queues nothing, it is not shown in flight (a named residual);
 /// - an OFD lock whose argument is on a write-only page is shown.
 fn lock_rows_follow_the_guests_descriptions(backend: &str) {
     let root = tempfile::Builder::new()
@@ -1932,18 +2003,29 @@ fn lock_rows_follow_the_guests_descriptions(backend: &str) {
     );
     let own = root.path().join("own");
     fs::create_dir(&own).expect("create the guest's own lock directory");
-    // The sender closes before the receiver looks. A receiver whose
-    // descriptor Detcore models (the in-guest backends) registers it, so the
-    // row survives the sender's close; on ptrace Detcore keeps no model of a
-    // received descriptor, so once the sender closes, the lock is hidden: a
-    // named residual, pinned here so the hidden row is tested, not unasserted.
-    let receiver_registers = backend != "ptrace";
-    let after_sender_close = if receiver_registers {
-        vec!["OFDLCK"]
-    } else {
-        vec![]
+    // The sender closes before the receiver looks. The receiver's descriptor
+    // is modelled and registered on reception on every backend, so the row
+    // survives the sender's close, as on Linux.
+    let after_sender_close = vec!["OFDLCK"];
+    // In flight, the message holds the open file and its lock where Detcore
+    // queues the descriptions a send carries (ptrace,
+    // `Detcore::queue_sent_rights`). DBT discovers received descriptors
+    // lazily and queues nothing, so there the lock leaves the rows with the
+    // sender's close or exit and comes back with the receipt: a named
+    // residual of the in-guest backends.
+    let in_flight = || {
+        let in_flight = if backend == "dbt" {
+            vec![]
+        } else {
+            vec!["OFDLCK"]
+        };
+        expected(vec![
+            ("in-flight", in_flight),
+            ("received", vec!["OFDLCK"]),
+            ("closed", vec![]),
+        ])
     };
-    let scenarios: [(&str, &OsStr, Sections); 5] = [
+    let scenarios: [(&str, &OsStr, Sections); 7] = [
         (
             "unlock",
             shared.as_os_str(),
@@ -1975,6 +2057,8 @@ fn lock_rows_follow_the_guests_descriptions(backend: &str) {
                 ("closed", vec![]),
             ]),
         ),
+        ("in-flight-sender-closes", own.as_os_str(), in_flight()),
+        ("in-flight-sender-exits", own.as_os_str(), in_flight()),
     ];
     for (scenario, argument, want) in scenarios {
         let label = format!("{backend} {scenario}");
@@ -2202,7 +2286,7 @@ fn recordings_from_before_the_lock_ledger_are_refused_by_the_version_gate() {
     let mut metadata: serde_json::Value =
         serde_json::from_str(&text).expect("recording metadata is not JSON");
     assert_eq!(
-        metadata["version"], 0x186,
+        metadata["version"], 0x19e,
         "RECORD_VERSION moved; point this test at the current version and the ledger's predecessor"
     );
     // 0x180, 0x17f, 0x17e, 0x17d and 0x17c keep, or drop by length alone, the
@@ -2664,12 +2748,16 @@ fn a_copied_childs_ofd_unlock_is_refused_on_dbt_and_seen_on_ptrace() {
 /// `/proc/locks` ledger records the description's flock; the parent vforks
 /// and the vfork child runs `LOCK_UN` on its inherited descriptor; a host
 /// process holds the identical shared flock throughout. Under
-/// `--no-namespace` the guest's procfs shows the host's flock row. On DBT the
-/// copied child's unlock is native, so the ledger's record of the sibling's
-/// flock goes stale; a flock row is kept only by its taker's pid, so the
-/// host's row stays out anyway. On ptrace the unlock is mediated; the same
-/// shape checks the owner rule there. Both backends show the sibling's flock
-/// (its taker is a guest process) and then nothing.
+/// `--no-namespace` the guest's procfs shows the host's flock row; a flock
+/// row is kept only by its taker's pid, so the host's row stays out. On
+/// ptrace the unlock is mediated, and both snapshots show the sibling's flock
+/// (its taker is a guest process) and then nothing. On DBT the copied vfork
+/// child cannot reach Detcore's flock model, so its copied policy refuses the
+/// unlock by name, which under `--panic-on-unsupported-syscalls` ends the run
+/// (exit 101) after the first snapshot, where the sibling's flock shows and
+/// the host's does not. Before the model the unlock ran natively and left the
+/// ledger's record of the sibling's flock stale; no lock is left held behind
+/// an unlock the guest made.
 ///
 /// Relaxation: `--strict` refuses `--no-namespace`, so these runs are not
 /// strict, and their task ids are the host's; the sections are compared,
@@ -2715,10 +2803,24 @@ fn a_stale_flock_record_admits_no_host_row_without_a_namespace() {
             None,
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if backend == "dbt" {
+            assert!(
+                output.status.code() == Some(DBT_REFUSAL_EXIT)
+                    && stderr.contains("detcore-dbt: refusing flock in copied child"),
+                "dbt: the copied vfork child's unlock was not refused by name\nstdout:\n{stdout}\n\
+                 stderr:\n{stderr}"
+            );
+            assert_eq!(
+                sections(&stdout),
+                expected(vec![("child-holds", vec!["FLOCK"])]),
+                "dbt: the host's identical flock reached the guest\n{stdout}"
+            );
+            continue;
+        }
         assert!(
             output.status.success(),
-            "{backend}: run failed\nstdout:\n{stdout}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stderr)
+            "{backend}: run failed\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
         assert_eq!(
             sections(&stdout),

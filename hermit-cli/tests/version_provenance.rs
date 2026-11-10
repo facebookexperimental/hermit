@@ -7,8 +7,11 @@
  */
 
 #[allow(dead_code)]
-#[path = "../build_support.rs"]
-mod build_support;
+#[path = "../build.rs"]
+mod build_script;
+
+#[path = "version_provenance/explicit_build_identity.rs"]
+mod explicit_build_identity;
 
 use std::fs;
 use std::path::Path;
@@ -16,6 +19,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use tempfile::TempDir;
+
+use self::build_script::build_support;
 
 fn git(repo: &Path, args: &[&str]) -> String {
     let output = Command::new("git")

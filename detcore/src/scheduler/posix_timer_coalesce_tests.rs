@@ -52,6 +52,11 @@ struct Family {
 /// Process 100 with threads 100 and 101, catching USR1, on the gated
 /// scheduler, its sends captured.
 fn family() -> Family {
+    family_at(100)
+}
+
+/// [`family`], as process `raw` with threads `raw` and `raw + 1`.
+fn family_at(raw: i32) -> Family {
     let mut config = Config {
         sequentialize_threads: true,
         ..Config::default()
@@ -60,8 +65,8 @@ fn family() -> Family {
     config.backend.delivers_preemption_timer_events = false;
     let mut sched = Scheduler::new(&config);
     assert!(sched.coalesces_alarms());
-    let leader = DetTid::from_raw(100);
-    let sibling = DetTid::from_raw(101);
+    let leader = DetTid::from_raw(raw);
+    let sibling = DetTid::from_raw(raw + 1);
     sched.thread_tree.add_child(leader, leader, true);
     sched.thread_tree.add_child(leader, sibling, false);
     register_known_thread_for(&mut sched, leader);
@@ -69,7 +74,7 @@ fn family() -> Family {
     sched.test_sent_signals = Some(Vec::new());
     let mut family = Family {
         sched,
-        process: DetPid::from_raw(100),
+        process: DetPid::from_raw(raw),
         leader,
         sibling,
     };
@@ -750,6 +755,63 @@ fn a_copy_standing_for_an_unignored_entry_wakes_the_target() {
         f.woken(f.sibling),
         "the copy-stands unignore wakes the sibling"
     );
+}
+
+/// The coord7 review of https://github.com/rrnewton/hermit/pull/5221, finding
+/// 6 (mutation M6): where guest thread IDs name no host task (the KVM latch,
+/// `refuse_host_signal_state_reads`), the unignore's re-queue of a parked
+/// expiry, which Linux makes (`posixtimer_sig_unignore`) and the guest sees,
+/// ends the run by name (`host_signal_send_refusal`, taken by
+/// `sched_loop_inner`) and makes no host send. Without the latch the same
+/// re-queue makes one. The process's IDs are above any host's `pid_max`
+/// (2^22), so a send that the guard failed to stop names no host task.
+#[test]
+fn an_unignore_requeue_on_a_latched_backend_ends_the_run() {
+    for latched in [false, true] {
+        let mut f = family_at(5_000_000);
+        for thread in [f.leader, f.sibling] {
+            let state = f.sched.test_kernel_signal_states.get_mut(&thread).unwrap();
+            state.caught = 0;
+            state.ignored = kernel_signal_bit(USR1);
+        }
+        f.arm(0, SignalTarget::Process(f.leader), 10, 10);
+        f.pop(10);
+        assert_eq!(
+            f.sched
+                .discarded_at_send
+                .parked_timers(f.process, USR1)
+                .len(),
+            1,
+            "parked"
+        );
+        // A delivery stop took the discarded copy while USR1 was ignored, so
+        // the unignore must send the expiry again.
+        assert!(f.sched.discarded_at_send.take(shared(&f), USR1));
+        f.sent();
+        if latched {
+            crate::syscalls::refuse_host_signal_state_reads(&reverie::BackendCapabilities::KVM);
+        }
+        let attempts = f.sched.host_signal_attempts;
+        f.sched
+            .discarded_signal_control(f.leader, DiscardedSignalControl::Unignored { signal: USR1 });
+        assert_eq!(
+            f.sched.host_signal_attempts - attempts,
+            u64::from(!latched),
+            "latched {latched}: host sends"
+        );
+        assert_eq!(
+            f.sched
+                .host_signal_send_refusal
+                .as_deref()
+                .is_some_and(
+                    |refusal| refusal.contains("HERMIT_REFUSAL host-signal-send")
+                        && refusal.contains("the re-queue of a timer expiry at unignore")
+                ),
+            latched,
+            "latched {latched}: {:?}",
+            f.sched.host_signal_send_refusal
+        );
+    }
 }
 
 /// An unignore whose copy stands for the entry, with the caller the only
@@ -1565,4 +1627,24 @@ fn a_mismatched_blocked_finish_after_an_early_pop_retires() {
         f.sched.blocked.timed_waiters.next_deadline().is_some(),
         "the timer re-armed"
     );
+}
+
+/// A timer's send is made at the time the timer was due, whenever the pass
+/// that pops it runs: `dispatch_timed_signal` sets `signal_sent_at` for the
+/// length of the dispatch, so a sleep the signal reaches is judged by when
+/// the signal was due, and restores it after. A send outside a dispatch is
+/// made at the commit point (https://github.com/rrnewton/hermit/pull/4682).
+#[test]
+fn a_timer_send_is_made_at_its_due_time() {
+    let mut f = family();
+    let leader = f.leader;
+    f.arm(0, SignalTarget::Thread(leader), 1_000, 0);
+    f.pop(5_000);
+    assert_eq!(f.sent().len(), 1);
+    assert_eq!(
+        f.sched.test_send_times,
+        vec![LogicalTime::from_nanos(1_000)]
+    );
+    assert_eq!(f.sched.signal_sent_at, None);
+    assert_eq!(f.sched.signal_sent_at(), LogicalTime::from_nanos(5_000));
 }

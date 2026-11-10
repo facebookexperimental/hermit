@@ -10,14 +10,17 @@ pub const MIN_TIMEOUT_SECONDS: u64 = 1;
 pub const MAX_TIMEOUT_SECONDS: u64 = 1800;
 /// Owner-approved ordinary-cell CPU bound: ceil(1.5 * 14.298 s) = 22 s.
 pub const DEFAULT_TEST_CPU_TIMEOUT_SECONDS: u64 = 22;
-/// Owner-approved ordinary-test wall bound: ceil(4 * 14.019 s) = 57 s.
-pub const DEFAULT_TEST_WALL_TIMEOUT_SECONDS: u64 = 57;
+/// Owner-approved ordinary-test wall backstop (policy 2026-11-01): 8x the
+/// 22 s default CPU base, matching tests/e2e/manifests/defaults.yaml (180 s).
+/// It was ceil(4 * 14.019 s) = 57 s until the timeout audit found cells whose
+/// p99 wall sat at 57 s under contention while their CPU stayed within cap.
+pub const DEFAULT_TEST_WALL_TIMEOUT_SECONDS: u64 = 180;
 pub const TEST_CPU_TIMEOUT_MULTIPLIER_ENV: &str = "HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER";
 pub const TEST_WALL_TIMEOUT_MULTIPLIER_ENV: &str = "HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER";
 
 /// Frozen retained-data census used to calibrate the per-test policy.
 pub const TIMEOUT_CALIBRATION_CUTOFF_UTC: &str = "2026-09-03T02:18:30Z";
-pub const CALIBRATED_CI_CELL_COUNT: usize = 492;
+pub const CALIBRATED_CI_CELL_COUNT: usize = 494;
 pub const DEFAULT_COVERED_CI_CELL_COUNT: usize = 487;
 pub const NON_CI_CELL_COUNT: usize = 173;
 /// Additional selected cells covered by the KVM qualification evidence.
@@ -159,10 +162,13 @@ pub const STRICT_COMPAT_FOLD_2026_10_01_EVIDENCE_SHA: &str =
 pub const STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT: usize = 214;
 /// Since 2026-10-20 the full run also has the compat corpus's ptrace replay
 /// cells (`replay.full` in `tests/e2e/manifests/compat.yaml`), with the rr run
-/// type's 59/60 s bounds, except java, javac and rustc at 59/177 (the replay
-/// section's `slow` group, 2026-10-21): 212 selected after two clean nightly
-/// pressure sweeps, and 3 enabled with `ci: false` (lsof, cscope and zip-unzip).
-pub const COMPAT_REPLAY_FULL_2026_10_20_ENABLED_CELL_COUNT: usize = 215;
+/// type's 59/60 s bounds, except the java/javac compile+run rows and rustc at
+/// 59/177 (the replay section's `slow` group, 2026-10-21): 212 selected after
+/// two clean nightly pressure sweeps, and 3 enabled with `ci: false` (lsof,
+/// cscope and zip-unzip). The 338-cell flip of 2026-10-30 selected df, lua
+/// and perl as well: 215 selected, 218 enabled. The java/javac compile+run
+/// split of 2026-11-05 adds two net rows: 217 selected, 220 enabled.
+pub const COMPAT_REPLAY_FULL_2026_10_20_ENABLED_CELL_COUNT: usize = 220;
 /// Ptrace replay cells selected when
 /// <https://github.com/rrnewton/hermit/pull/3580> taught the recorder and
 /// replayer `select` and `pselect6`. Before it, replay of both programs
@@ -250,7 +256,24 @@ pub struct TimeoutCalibration {
 
 /// The only selected cells whose retained p90-derived bounds exceed at least
 /// one ordinary default at [`TIMEOUT_CALIBRATION_CUTOFF_UTC`].
-pub const EXPLICIT_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 5] = [
+pub const EXPLICIT_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 7] = [
+    // The gVisor batch-2 qualification allowance (2026-11-07): the only
+    // selected cell whose measured bound exceeds a default. Samples are
+    // the low-concurrency retries in the pinned hermetic image; the
+    // configured CPU bound is ceil(1.5 x 21.23) and wall 8x it, the same
+    // measured-allowance pattern as the entries below.
+    TimeoutCalibration {
+        test: "gvisor/eventfd-eventfdtest-notifynonzero",
+        mode: "verify",
+        backend: "ptrace",
+        samples: 1,
+        p90_cpu_usec: 21_230_000,
+        p90_wall_millis: 24_370,
+        required_cpu_seconds: 32,
+        required_wall_seconds: 98,
+        configured_cpu_seconds: 32,
+        configured_wall_seconds: 256,
+    },
     TimeoutCalibration {
         test: "applications/kvm-python-examples",
         mode: "verify",
@@ -274,6 +297,26 @@ pub const EXPLICIT_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 5] = [
         required_wall_seconds: 91,
         configured_cpu_seconds: 32,
         configured_wall_seconds: 91,
+    },
+    // The identical user-facing example workload (dh-1j6br, 2026-11-08):
+    // 291 completed retained verify/ptrace rows from the seven days
+    // before the fix give the p90 below, while loaded attempts were
+    // censored at the ordinary 22 CPU-s cap (maximum recorded value
+    // 22.073927 CPU-s). The configured CPU bound follows the censored
+    // allowance pattern, ceil(1.5 x 22.07) = 34, and configured wall is
+    // the owner policy's 8x that CPU bound. Required bounds remain the
+    // ordinary p90 formulas.
+    TimeoutCalibration {
+        test: "applications/example-timed-progress-bar",
+        mode: "verify",
+        backend: "ptrace",
+        samples: 291,
+        p90_cpu_usec: 15_707_994,
+        p90_wall_millis: 18_619,
+        required_cpu_seconds: 24,
+        required_wall_seconds: 75,
+        configured_cpu_seconds: 34,
+        configured_wall_seconds: 272,
     },
     TimeoutCalibration {
         test: "c-programs/fp-reduction-nondeterminism",
@@ -316,6 +359,47 @@ pub const EXPLICIT_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 5] = [
 /// KVM cells whose qualification evidence needs a bound above the ordinary
 /// default. This is separate from the earlier full retained-data census so its
 /// source revision and sample count stay explicit.
+/// Three cells the 338-cell flip of 2026-10-30 made required with measured
+/// bounds above the ordinary default, from local samples on the host named in
+/// docs/TESTING_ENVIRONMENTS.md under "Named measurement hosts", at the flip
+/// head (test-harness run, 2026-10-30); each cell was also CLEAN on the
+/// nightly pressure sweeps of 2026-10-29 and 2026-10-30. Configured bounds
+/// follow the manifest-declared rules recorded in each cell's reason:
+/// ceil(1.5x measured CPU) and ceil(3x measured wall). The third cell,
+/// python-io-subprocess-time, left the blocking validate on 2026-10-31
+/// (deselected with python-dict-hash-iteration under the owner's
+/// deselect-and-fix-forward rule after its CPU cost inside full validates
+/// reached 2.6x solo; root cause:
+/// <https://github.com/rrnewton/hermit/issues/4996>), so its calibration is
+/// removed with the cell; its measurements stay in that issue and in the
+/// manifest git history.
+pub const FLIP_2026_10_30_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 2] = [
+    TimeoutCalibration {
+        test: "applications/kvm-python-examples",
+        mode: "verify",
+        backend: "ptrace",
+        samples: 1,
+        p90_cpu_usec: 40_920_000,
+        p90_wall_millis: 42_271,
+        required_cpu_seconds: 62,
+        required_wall_seconds: 127,
+        configured_cpu_seconds: 62,
+        configured_wall_seconds: 127,
+    },
+    TimeoutCalibration {
+        test: "data-handling/zstd-multithread",
+        mode: "verify",
+        backend: "dbt",
+        samples: 2,
+        p90_cpu_usec: 27_269_000,
+        p90_wall_millis: 29_307,
+        required_cpu_seconds: 41,
+        required_wall_seconds: 88,
+        configured_cpu_seconds: 41,
+        configured_wall_seconds: 88,
+    },
+];
+
 pub const KVM_RATCHET_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 1] = [TimeoutCalibration {
     test: "applications/timed-progress-bar",
     mode: "verify",
@@ -328,6 +412,100 @@ pub const KVM_RATCHET_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 1] = [TimeoutCa
     configured_cpu_seconds: 24,
     configured_wall_seconds: 80,
 }];
+
+/// The DBT verify cell of the Python random example, from its 249 passing
+/// result rows in coordinator-launched full validations of 2026-10-11 to
+/// 2026-10-25 (row-level `cpu_usage_usec` and `duration_ms`), after the
+/// default CPU bound stopped the validation of f8adb23a at 22.0 CPU seconds.
+/// The configured CPU bound covers that stop (ceil(1.5 x 22.0) = 33).
+pub const DBT_2026_10_25_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 1] = [TimeoutCalibration {
+    test: "language-runtimes/example-python-random",
+    mode: "verify",
+    backend: "dbt",
+    samples: 249,
+    p90_cpu_usec: 17_274_987,
+    p90_wall_millis: 23_556,
+    required_cpu_seconds: 26,
+    required_wall_seconds: 95,
+    configured_cpu_seconds: 33,
+    configured_wall_seconds: 95,
+}];
+
+/// Five DBT verify cells the 288-cell flip made required and full validation
+/// stopped at the default 22 CPU s. The validation of 77635530182d stopped
+/// compat/git, compat/ld, compat/pkg-config and language-runtimes/node-v8-jit;
+/// the landed flip's validation of 330a8b849db3 then stopped compat/node on its
+/// local Buck route (22.093 CPU s recorded at the kill). Local single samples
+/// on the host named in docs/TESTING_ENVIRONMENTS.md under "Named measurement
+/// hosts", at the flip head (test-harness run, 4x timeout multiplier,
+/// 2026-10-27) measured the first four cells' CPU/wall below; five Buck-cell
+/// runs of compat/node at 25d8071f6aa measured 13.487-14.242 CPU s (max wall
+/// 24.838 s). The configured CPU bound is ceil(1.5 x 22.0) = 33, the same rule
+/// as DBT_2026_10_25 above, because the validate-context measurement is the
+/// 22.0 stop itself. Wall stays at the 57 s default: every measured wall sample
+/// is at most 31.5 s and the cells are CPU-bound.
+pub const DBT_FLIP_2026_10_27_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 5] = [
+    TimeoutCalibration {
+        test: "compat/git",
+        mode: "verify",
+        backend: "dbt",
+        samples: 1,
+        p90_cpu_usec: 12_464_774,
+        p90_wall_millis: 13_744,
+        required_cpu_seconds: 19,
+        required_wall_seconds: 21,
+        configured_cpu_seconds: 33,
+        configured_wall_seconds: 57,
+    },
+    TimeoutCalibration {
+        test: "compat/ld",
+        mode: "verify",
+        backend: "dbt",
+        samples: 1,
+        p90_cpu_usec: 14_867_876,
+        p90_wall_millis: 16_055,
+        required_cpu_seconds: 23,
+        required_wall_seconds: 25,
+        configured_cpu_seconds: 33,
+        configured_wall_seconds: 57,
+    },
+    TimeoutCalibration {
+        test: "compat/pkg-config",
+        mode: "verify",
+        backend: "dbt",
+        samples: 1,
+        p90_cpu_usec: 13_171_550,
+        p90_wall_millis: 14_464,
+        required_cpu_seconds: 20,
+        required_wall_seconds: 22,
+        configured_cpu_seconds: 33,
+        configured_wall_seconds: 57,
+    },
+    TimeoutCalibration {
+        test: "compat/node",
+        mode: "verify",
+        backend: "dbt",
+        samples: 5,
+        p90_cpu_usec: 14_242_037,
+        p90_wall_millis: 24_838,
+        required_cpu_seconds: 22,
+        required_wall_seconds: 38,
+        configured_cpu_seconds: 33,
+        configured_wall_seconds: 57,
+    },
+    TimeoutCalibration {
+        test: "language-runtimes/node-v8-jit",
+        mode: "verify",
+        backend: "dbt",
+        samples: 1,
+        p90_cpu_usec: 20_172_896,
+        p90_wall_millis: 31_470,
+        required_cpu_seconds: 31,
+        required_wall_seconds: 48,
+        configured_cpu_seconds: 33,
+        configured_wall_seconds: 57,
+    },
+];
 
 /// Per-cell nearest-rank p90 from ten schema-4 result rows, using row-level
 /// CPU microseconds and wall milliseconds, including reported preparation.
@@ -1850,13 +2028,32 @@ pub fn scale_timeout_seconds(base: u64, multiplier: f64, name: &str) -> Result<u
     Ok((scaled as u64).max(1))
 }
 
+/// The wall backstop for a cell, from its CPU budget (owner rule
+/// 2026-11-01): eight times the CPU cap, at most 600 s. The wall is
+/// only a backstop for a near-zero-CPU wedge; the CPU cap is the
+/// primary bound. Deriving it from the CPU budget instead of an
+/// independently authored wall keeps the two from drifting apart:
+/// fp-reduction-nondeterminism carried a 46 CPU-s budget and a 105 s
+/// wall (about 2.3x), so at load 381 the starved cell hit the wall
+/// with most of its CPU budget unspent and failed a healthy run.
+pub fn wall_backstop_seconds(cpu_seconds: u64) -> u64 {
+    cpu_seconds.saturating_mul(8).min(600)
+}
+
 pub fn resolve_test_timeouts(
     cpu_base_seconds: u64,
     wall_base_seconds: u64,
     multipliers: TimeoutMultipliers,
 ) -> Result<ResolvedTestTimeouts, String> {
     let cpu_seconds = scale_timeout_seconds(cpu_base_seconds, multipliers.cpu, "CPU timeout")?;
-    let wall_seconds = scale_timeout_seconds(wall_base_seconds, multipliers.wall, "wall timeout")?;
+    // Floor the derived wall at the declared wall (walls are generous:
+    // never shorter than the cell declared). The 600 s cap lives in
+    // wall_backstop_seconds, on the derivation from the scaled CPU;
+    // the wall multiplier then scales the result, so a heavy cell
+    // (CPU 599, declared wall 600) keeps wall > CPU under a CPU
+    // multiplier instead of being capped back below its own CPU.
+    let derived = wall_base_seconds.max(wall_backstop_seconds(cpu_seconds));
+    let wall_seconds = scale_timeout_seconds(derived, multipliers.wall, "wall timeout")?;
     if wall_seconds <= cpu_seconds {
         return Err(format!(
             "scaled wall timeout must remain greater than scaled CPU timeout, got wall={wall_seconds}s cpu={cpu_seconds}s"
@@ -1909,7 +2106,9 @@ mod tests {
     #[test]
     fn owner_defaults_are_the_conservative_ceilings() {
         assert_eq!(DEFAULT_TEST_CPU_TIMEOUT_SECONDS, 22);
-        assert_eq!(DEFAULT_TEST_WALL_TIMEOUT_SECONDS, 57);
+        // Wall is now the 8x-CPU backstop (policy 2026-11-01), not the old
+        // measured ceiling; the derivation helpers below are unchanged.
+        assert_eq!(DEFAULT_TEST_WALL_TIMEOUT_SECONDS, 180);
         assert_eq!(cpu_bound_from_p90_usec(14_298_000), 22);
         assert_eq!(wall_bound_from_p90_millis(14_019), 57);
     }
@@ -2068,6 +2267,7 @@ mod tests {
         for calibration in EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()
             .chain(&KVM_RATCHET_TIMEOUT_CALIBRATIONS)
+            .chain(&DBT_2026_10_25_TIMEOUT_CALIBRATIONS)
             .chain(&LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS)
             .chain(&LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS)
             .copied()
@@ -2100,7 +2300,7 @@ mod tests {
         assert_eq!(scale_timeout_seconds(57, 1.01, "wall").unwrap(), 58);
         let policy = resolve_test_timeouts(
             22,
-            57,
+            180,
             TimeoutMultipliers {
                 cpu: 1.5,
                 wall: 2.0,
@@ -2108,20 +2308,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(policy.cpu_seconds, 33);
-        assert_eq!(policy.wall_seconds, 114);
+        // Derived wall max(180 declared, 8 x 33) = 264, scaled by the
+        // wall multiplier and capped at 600.
+        assert_eq!(policy.wall_seconds, 528);
     }
 
     #[test]
-    fn invalid_or_inverted_scaled_policy_is_refused() {
+    fn wall_backstop_is_eight_times_cpu_capped_at_600() {
+        // The ratio is pinned (owner rule 2026-11-01): a cell can never
+        // again carry a wall that is a small multiple of its CPU cap,
+        // and the derived wall is never shorter than the declared one.
+        for (cpu, declared, wall) in [
+            (22, 180, 180),
+            (46, 105, 368),
+            (22, 57, 176),
+            (75, 180, 600),
+            (100, 180, 600),
+        ] {
+            let policy =
+                resolve_test_timeouts(cpu, declared, TimeoutMultipliers::default()).unwrap();
+            assert_eq!(policy.cpu_seconds, cpu);
+            assert_eq!(policy.wall_seconds, wall, "cpu={cpu} declared={declared}");
+        }
+        assert_eq!(wall_backstop_seconds(46), 368);
+    }
+
+    #[test]
+    fn invalid_scaled_policy_is_refused() {
         for multiplier in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             assert!(scale_timeout_seconds(57, multiplier, "wall").is_err());
         }
         assert!(
             resolve_test_timeouts(
                 22,
-                57,
+                180,
                 TimeoutMultipliers {
                     cpu: 3.0,
+                    wall: 0.0,
+                },
+            )
+            .is_err()
+        );
+        // A CPU multiplier that pushes the scaled CPU past the 600 s
+        // wall cap leaves wall <= CPU and is refused.
+        assert!(
+            resolve_test_timeouts(
+                22,
+                180,
+                TimeoutMultipliers {
+                    cpu: 30.0,
                     wall: 1.0,
                 },
             )

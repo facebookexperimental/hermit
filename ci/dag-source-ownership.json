@@ -1,0 +1,5194 @@
+{
+  "schema": 1,
+  "origin_sha256": "1eeecab763f13b8b653e0f46ee66e6313f7df1b2fa261b1bb182839a51abf5ef",
+  "nodes": {
+    "pre.submodules": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable",
+        "quick",
+        "super"
+      ],
+      "deps": []
+    },
+    "pre.reverie_pin": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable",
+        "quick",
+        "super"
+      ],
+      "deps": [
+        "pre.submodules"
+      ]
+    },
+    "setup.manifest_plan": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "deps": [
+        "pre.reverie_pin"
+      ]
+    },
+    "gate.manifest": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "setup.manifest_plan"
+      ]
+    },
+    "build.rust_scripts": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "deps": [
+        "pre.reverie_pin"
+      ]
+    },
+    "check.skill_discovery": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "check.exit_status_class": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "check.dbt_runtime_abi": {
+      "owner": "dynamorio",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "check.backend_abstraction": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "check.backend_parity_mutation": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "check.e9patch_corpus": {
+      "owner": "patching",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "check.portability_paths": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "check.shard_coverage": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "check.dagrun_naming": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "check.run_node_args": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "check.check_outcome_consumers": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "check.lint_checks": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "check.script_unit_tests": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "check.canonical_adapter_accept": {
+      "owner": "core",
+      "labels": [
+        "full"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "check.script_sigpipe": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "lint.rustfmt": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "setup.nextest": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "build.buck_release_artifact": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "deps": [
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "build.host_hermit_link": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "build.manifest_guests": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "deps": [
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "e2e.manifest_applications": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.manifest_guests_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan",
+        "setup.manifest_plan_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "e2e.audit_compile_c_programs": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "deps": [
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "e2e.manifest_bin_c": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.manifest_guests_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan",
+        "setup.manifest_plan_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "e2e.manifest_c_programs": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.manifest_guests_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan",
+        "setup.manifest_plan_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "e2e.manifest_chaos_c": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.manifest_guests_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan",
+        "setup.manifest_plan_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "e2e.manifest_compat": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
+        "compatprep.fixtures_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan",
+        "setup.manifest_plan_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "portablecompat.manifest_compat": {
+      "owner": "core",
+      "labels": [
+        "portable-strict-compat-only"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "gate.manifest",
+        "portablecompatprep.fixtures"
+      ]
+    },
+    "rrcompat.manifest_compat": {
+      "owner": "core",
+      "labels": [
+        "rr-compat-only"
+      ],
+      "deps": [
+        "build.host_hermit_link",
+        "build.rust_scripts",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "rrcompatprep.fixtures",
+        "setup.manifest_plan"
+      ]
+    },
+    "supercompat.manifest_compat": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-build.rust_scripts",
+        "quick-super-gate.manifest",
+        "quick-super-setup.manifest_plan",
+        "super-compatprep.fixtures",
+        "super.build_release_hermit"
+      ]
+    },
+    "sabrecompat.manifest_compat": {
+      "owner": "patching",
+      "labels": [
+        "sabre-compat-only"
+      ],
+      "deps": [
+        "build.host_hermit_link",
+        "build.rust_scripts",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "sabrecompatprep.fixtures",
+        "setup.manifest_plan"
+      ]
+    },
+    "e2e.manifest_data_handling": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.manifest_guests_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan",
+        "setup.manifest_plan_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "e2e.manifest_debugger_c": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.manifest_guests_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan",
+        "setup.manifest_plan_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "e2e.manifest_determinism_stress_c": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.manifest_guests_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan",
+        "setup.manifest_plan_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "e2e.manifest_determinism_stress": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.manifest_guests_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan",
+        "setup.manifest_plan_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "e2e.manifest_language_runtimes": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.manifest_guests_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan",
+        "setup.manifest_plan_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "e2e.manifest_shared_futex_c": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.manifest_guests_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan",
+        "setup.manifest_plan_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "e2e.manifest_system_utils": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.manifest_guests_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan",
+        "setup.manifest_plan_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "e2e.manifest_util_c": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.manifest_guests_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan",
+        "setup.manifest_plan_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.applications_e2e": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "lint.clippy": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "doc.doctests": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "doc.rustdoc": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.regular_crates": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.hermit_unit": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.detcore_unit": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.detcore_misc": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.detcore_parallel": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.detcore_time": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.hermit_integration": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.hermit_integration_2": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.hermit_integration_3": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.inherited_terminal_read": {
+      "owner": "core",
+      "labels": [
+        "full"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.isolation_matrix_ptrace_runtime": {
+      "owner": "core",
+      "labels": [
+        "full"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.isolation_matrix_dbt_in_guest": {
+      "owner": "core",
+      "labels": [
+        "full"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.arbitrary_binaries": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.record_replay": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.liteinst_allocator": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.liteinst_allocator_fixtures_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.liteinst_stacks": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.liteinst_allocator_fixtures_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.cli": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.cli_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.nextest"
+      ]
+    },
+    "test.sabre_examples": {
+      "owner": "patching",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "sabrecompat.sabre_examples": {
+      "owner": "patching",
+      "labels": [
+        "sabre-compat-only"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.hermit_modes": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.hermit_modes_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.nextest"
+      ]
+    },
+    "test.app_strict_verify": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.command_strict_verify": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.ignored_syscall_regressions": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.rr_suite_contract": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.envelope_levels": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "privileged-build.privileged_tests": {
+      "owner": "core",
+      "labels": [
+        "full"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "privileged-cpuid.faulting": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "cpuid-faulting"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-build.privileged_tests",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "privileged-cpuid.cpu_profile_v3": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "cpuid-faulting"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-build.privileged_tests",
+        "privileged-cpuid.faulting",
+        "privileged-pmu.preemption",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "privileged-pmu.preemption": {
+      "owner": "core",
+      "labels": [
+        "full"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-build.privileged_tests",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "privileged-test.pmu_buck_chaos_cases": {
+      "owner": "core",
+      "labels": [
+        "full"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-build.privileged_tests",
+        "privileged-pmu.preemption",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "privileged-test.pmu_ptrace_completion_cases": {
+      "owner": "core",
+      "labels": [
+        "full"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-build.privileged_tests",
+        "privileged-pmu.preemption",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "privileged-test.pmu_cli_cases": {
+      "owner": "core",
+      "labels": [
+        "full"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-build.privileged_tests",
+        "privileged-pmu.preemption",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "privileged-test.pmu_detcore_time_cases": {
+      "owner": "core",
+      "labels": [
+        "full"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-build.privileged_tests",
+        "privileged-pmu.preemption",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.pmu_integration_cases": {
+      "owner": "core",
+      "labels": [
+        "full"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-build.privileged_tests",
+        "privileged-pmu.preemption",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.pmu_integration_cases_2": {
+      "owner": "core",
+      "labels": [
+        "full"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-build.privileged_tests",
+        "privileged-pmu.preemption",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "privileged-build.manifest_guests": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "privileged"
+      ],
+      "deps": [
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "privileged-e2e.manifest_applications": {
+      "owner": "core",
+      "labels": [
+        "full"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-build.manifest_guests_in_pinned_root",
+        "privileged-build.privileged_tests",
+        "setup.manifest_plan",
+        "setup.manifest_plan_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "privileged-e2e.manifest_c_programs": {
+      "owner": "core",
+      "labels": [
+        "full"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-build.manifest_guests_in_pinned_root",
+        "privileged-build.privileged_tests",
+        "setup.manifest_plan",
+        "setup.manifest_plan_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "privileged-e2e.manifest_system_utils": {
+      "owner": "core",
+      "labels": [
+        "full"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-build.manifest_guests_in_pinned_root",
+        "privileged-build.privileged_tests",
+        "setup.manifest_plan",
+        "setup.manifest_plan_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "privileged-test.binder_cli_cases": {
+      "owner": "core",
+      "labels": [
+        "privileged"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-only-build.privileged_tests_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "privileged-test.cli_kvm": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "kvm"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-build.privileged_tests",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "privileged-test.deadline_slice_cap_kvm": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "kvm"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-build.privileged_tests",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "privileged-test.isolation_matrix_kvm": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "kvm"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "full-scorecard.compatibility": {
+      "owner": "core",
+      "labels": [
+        "full"
+      ],
+      "deps": [
+        "e2e.manifest_applications",
+        "e2e.manifest_bin_c",
+        "e2e.manifest_c_programs",
+        "e2e.manifest_chaos_c",
+        "e2e.manifest_compat",
+        "e2e.manifest_data_handling",
+        "e2e.manifest_debugger_c",
+        "e2e.manifest_determinism_stress",
+        "e2e.manifest_determinism_stress_c",
+        "e2e.manifest_language_runtimes",
+        "e2e.manifest_shared_futex_c",
+        "e2e.manifest_system_utils",
+        "e2e.manifest_util_c",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-e2e.manifest_applications",
+        "privileged-e2e.manifest_c_programs",
+        "privileged-e2e.manifest_system_utils"
+      ]
+    },
+    "scorecard.compatibility": {
+      "owner": "core",
+      "labels": [
+        "portable"
+      ],
+      "deps": [
+        "e2e.manifest_applications",
+        "e2e.manifest_bin_c",
+        "e2e.manifest_c_programs",
+        "e2e.manifest_chaos_c",
+        "e2e.manifest_compat",
+        "e2e.manifest_data_handling",
+        "e2e.manifest_debugger_c",
+        "e2e.manifest_determinism_stress",
+        "e2e.manifest_determinism_stress_c",
+        "e2e.manifest_language_runtimes",
+        "e2e.manifest_shared_futex_c",
+        "e2e.manifest_system_utils",
+        "e2e.manifest_util_c",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "quick.build": {
+      "owner": "core",
+      "labels": [
+        "quick"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-build.rust_scripts_in_pinned_root",
+        "quick-super-gate.manifest",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "quick.e2e_metadata": {
+      "owner": "core",
+      "labels": [
+        "quick"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "quick.build"
+      ]
+    },
+    "quick.e2e_verify": {
+      "owner": "core",
+      "labels": [
+        "quick"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-build.rust_scripts_in_pinned_root",
+        "quick-super-gate.manifest",
+        "quick-super-setup.manifest_plan",
+        "quick-super-setup.manifest_plan_in_pinned_root",
+        "quick.build",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "quick.detcore_unit": {
+      "owner": "core",
+      "labels": [
+        "quick"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-build.rust_scripts_in_pinned_root",
+        "quick-super-gate.manifest",
+        "quick.build",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "quick.run_smoke": {
+      "owner": "core",
+      "labels": [
+        "quick"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-build.rust_scripts_in_pinned_root",
+        "quick-super-gate.manifest",
+        "quick.build",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "quick.verify_smoke": {
+      "owner": "core",
+      "labels": [
+        "quick"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-build.rust_scripts_in_pinned_root",
+        "quick-super-gate.manifest",
+        "quick.build",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "quick.record_replay_smoke": {
+      "owner": "core",
+      "labels": [
+        "quick"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-build.rust_scripts_in_pinned_root",
+        "quick-super-gate.manifest",
+        "quick.build",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "super.build_workspace": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "quick-super-setup.nextest"
+      ]
+    },
+    "super.build_release_hermit": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest"
+      ]
+    },
+    "super.relaxed_hermit_flag_matrix": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_workspace"
+      ]
+    },
+    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_bottom_detcore": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_workspace"
+      ]
+    },
+    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_default_detcore": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.weekly_pmu_parallel_memory_diagnostic_mem_race_bottom_detcore"
+      ]
+    },
+    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_middle_detcore": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.weekly_pmu_parallel_memory_diagnostic_mem_race_default_detcore"
+      ]
+    },
+    "super.weekly_pmu_parallel_memory_diagnostic_mem_race_top_detcore": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.weekly_pmu_parallel_memory_diagnostic_mem_race_middle_detcore"
+      ]
+    },
+    "super.pselect_signal_interruption_diagnostic": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_workspace"
+      ]
+    },
+    "super.record_replay_matrix_diagnostic": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_workspace"
+      ]
+    },
+    "super.managed_jvm_strict_verify_diagnostics": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_workspace"
+      ]
+    },
+    "super.post_fork_scheduling_diagnostics": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_workspace"
+      ]
+    },
+    "super.network_syscall_determinism_diagnostic": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_workspace"
+      ]
+    },
+    "super.ipc_determinism_diagnostic": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_workspace"
+      ]
+    },
+    "super.random_source_determinism_diagnostic": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_workspace"
+      ]
+    },
+    "super.threaded_integration_matrix_diagnostic": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_workspace"
+      ]
+    },
+    "super.chaos_hello_race_verification_diagnostic": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_workspace"
+      ]
+    },
+    "super.dbt_pipe_backpressure_diagnostic": {
+      "owner": "dynamorio",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_workspace"
+      ]
+    },
+    "super.dbt_failed_exec_recovery_diagnostic": {
+      "owner": "dynamorio",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_workspace"
+      ]
+    },
+    "super.dbt_unsupported_syscall_aggregation_diagnostic": {
+      "owner": "dynamorio",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_workspace"
+      ]
+    },
+    "super.dbt_strict_blocked_stdin_teardown_diagnostic": {
+      "owner": "dynamorio",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_workspace"
+      ]
+    },
+    "super.dbt_guest_stderr_isolation_diagnostic": {
+      "owner": "dynamorio",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_workspace"
+      ]
+    },
+    "super.weekly_relaxed_default_mode_cases": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_workspace"
+      ]
+    },
+    "super.weekly_portable_chaos_cases": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_workspace"
+      ]
+    },
+    "super.weekly_ignored_portable_chaos_cases": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_workspace"
+      ]
+    },
+    "super.pmu_buck_chaos_cases": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_workspace"
+      ]
+    },
+    "super.pmu_analyze_hello_race_stress_calibrated_skid": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "quick-super-setup.nextest",
+        "super.build_workspace"
+      ]
+    },
+    "super.build_pinned_leveldb_super_fixture": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_workspace"
+      ]
+    },
+    "super.full_leveldb_strict_determinism": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_pinned_leveldb_super_fixture"
+      ]
+    },
+    "super.sqlite_veryquick_strict_determinism": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_workspace"
+      ]
+    },
+    "privileged-only-cpuid.faulting": {
+      "owner": "core",
+      "labels": [
+        "privileged",
+        "cpuid-faulting"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-only-build.privileged_tests_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "privileged-only-pmu.preemption": {
+      "owner": "core",
+      "labels": [
+        "privileged"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-only-build.privileged_tests_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "privileged-only-test.pmu_buck_chaos_cases": {
+      "owner": "core",
+      "labels": [
+        "privileged"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-only-pmu.preemption",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "privileged-only-e2e.manifest_applications": {
+      "owner": "core",
+      "labels": [
+        "privileged"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-build.manifest_guests_in_pinned_root",
+        "privileged-only-build.privileged_tests_in_pinned_root",
+        "setup.manifest_plan",
+        "setup.manifest_plan_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "privileged-only-e2e.manifest_c_programs": {
+      "owner": "core",
+      "labels": [
+        "privileged"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-build.manifest_guests_in_pinned_root",
+        "privileged-only-build.privileged_tests_in_pinned_root",
+        "setup.manifest_plan",
+        "setup.manifest_plan_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "privileged-only-e2e.manifest_system_utils": {
+      "owner": "core",
+      "labels": [
+        "privileged"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-build.manifest_guests_in_pinned_root",
+        "privileged-only-build.privileged_tests_in_pinned_root",
+        "setup.manifest_plan",
+        "setup.manifest_plan_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "privileged-only-test.cli_kvm": {
+      "owner": "core",
+      "labels": [
+        "privileged",
+        "kvm"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-only-build.privileged_tests_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "privileged-scorecard.compatibility": {
+      "owner": "core",
+      "labels": [
+        "privileged"
+      ],
+      "deps": [
+        "gate.manifest",
+        "pre.reverie_pin",
+        "privileged-only-e2e.manifest_applications",
+        "privileged-only-e2e.manifest_c_programs",
+        "privileged-only-e2e.manifest_system_utils"
+      ]
+    },
+    "compatprep.hermit_release": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "gate.manifest"
+      ]
+    },
+    "qemu.hermit_release": {
+      "owner": "core",
+      "labels": [
+        "qemu-l2-only"
+      ],
+      "deps": [
+        "gate.manifest"
+      ]
+    },
+    "qemu.strict_l2_boot": {
+      "owner": "core",
+      "labels": [
+        "qemu-l2-only"
+      ],
+      "deps": [
+        "qemu.hermit_release"
+      ]
+    },
+    "envelope.build": {
+      "owner": "core",
+      "labels": [
+        "envelope-only"
+      ],
+      "deps": [
+        "gate.manifest"
+      ]
+    },
+    "envelope.true_l1": {
+      "owner": "core",
+      "labels": [
+        "envelope-only"
+      ],
+      "deps": [
+        "envelope.build"
+      ]
+    },
+    "envelope.true_l2": {
+      "owner": "core",
+      "labels": [
+        "envelope-only"
+      ],
+      "deps": [
+        "envelope.build"
+      ]
+    },
+    "envelope.true_l3": {
+      "owner": "core",
+      "labels": [
+        "envelope-only"
+      ],
+      "deps": [
+        "envelope.build"
+      ]
+    },
+    "envelope.true_l4": {
+      "owner": "core",
+      "labels": [
+        "envelope-only"
+      ],
+      "deps": [
+        "envelope.true_l2"
+      ]
+    },
+    "envelope.true_rr": {
+      "owner": "core",
+      "labels": [
+        "envelope-only"
+      ],
+      "deps": [
+        "envelope.build"
+      ]
+    },
+    "envelope.echo_l1": {
+      "owner": "core",
+      "labels": [
+        "envelope-only"
+      ],
+      "deps": [
+        "envelope.build"
+      ]
+    },
+    "envelope.echo_l2": {
+      "owner": "core",
+      "labels": [
+        "envelope-only"
+      ],
+      "deps": [
+        "envelope.build"
+      ]
+    },
+    "envelope.echo_l3": {
+      "owner": "core",
+      "labels": [
+        "envelope-only"
+      ],
+      "deps": [
+        "envelope.build"
+      ]
+    },
+    "envelope.echo_l4": {
+      "owner": "core",
+      "labels": [
+        "envelope-only"
+      ],
+      "deps": [
+        "envelope.echo_l2"
+      ]
+    },
+    "envelope.echo_rr": {
+      "owner": "core",
+      "labels": [
+        "envelope-only"
+      ],
+      "deps": [
+        "envelope.build"
+      ]
+    },
+    "envelope.date_l1": {
+      "owner": "core",
+      "labels": [
+        "envelope-only"
+      ],
+      "deps": [
+        "envelope.build"
+      ]
+    },
+    "envelope.date_l2": {
+      "owner": "core",
+      "labels": [
+        "envelope-only"
+      ],
+      "deps": [
+        "envelope.build"
+      ]
+    },
+    "envelope.date_l3": {
+      "owner": "core",
+      "labels": [
+        "envelope-only"
+      ],
+      "deps": [
+        "envelope.build"
+      ]
+    },
+    "envelope.date_l4": {
+      "owner": "core",
+      "labels": [
+        "envelope-only"
+      ],
+      "deps": [
+        "envelope.date_l2"
+      ]
+    },
+    "envelope.date_rr": {
+      "owner": "core",
+      "labels": [
+        "envelope-only"
+      ],
+      "deps": [
+        "envelope.build"
+      ]
+    },
+    "e2e.manifest_applications_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "build.manifest_guests",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "e2e.manifest_bin_c_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "build.manifest_guests",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "e2e.manifest_c_programs_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "build.manifest_guests",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "e2e.manifest_chaos_c_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "build.manifest_guests",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "e2e.manifest_compat_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "compatprep.fixtures_on_host",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "e2e.manifest_data_handling_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "build.manifest_guests",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "e2e.manifest_debugger_c_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "build.manifest_guests",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "e2e.manifest_determinism_stress_c_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "build.manifest_guests",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "e2e.manifest_determinism_stress_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "build.manifest_guests",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "e2e.manifest_language_runtimes_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "build.manifest_guests",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "e2e.manifest_shared_futex_c_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "build.manifest_guests",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "e2e.manifest_system_utils_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "build.manifest_guests",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "e2e.manifest_util_c_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "build.manifest_guests",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "scorecard.compatibility_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "e2e.manifest_applications_on_host",
+        "e2e.manifest_bin_c_on_host",
+        "e2e.manifest_c_programs_on_host",
+        "e2e.manifest_chaos_c_on_host",
+        "e2e.manifest_compat_on_host",
+        "e2e.manifest_data_handling_on_host",
+        "e2e.manifest_debugger_c_on_host",
+        "e2e.manifest_determinism_stress_c_on_host",
+        "e2e.manifest_determinism_stress_on_host",
+        "e2e.manifest_language_runtimes_on_host",
+        "e2e.manifest_shared_futex_c_on_host",
+        "e2e.manifest_system_utils_on_host",
+        "e2e.manifest_util_c_on_host",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "pre.reverie_pin_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-privileged"
+      ],
+      "deps": []
+    },
+    "build.rust_scripts_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-privileged"
+      ],
+      "deps": [
+        "pre.reverie_pin_on_host"
+      ]
+    },
+    "setup.manifest_plan_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-privileged"
+      ],
+      "deps": [
+        "build.rust_scripts_on_host"
+      ]
+    },
+    "gate.manifest_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-privileged"
+      ],
+      "deps": [
+        "setup.manifest_plan_on_host"
+      ]
+    },
+    "privileged-only-build.privileged_tests_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-privileged"
+      ],
+      "deps": [
+        "gate.manifest_on_host",
+        "pre.reverie_pin_on_host"
+      ]
+    },
+    "privileged-only-cpuid.faulting_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-privileged"
+      ],
+      "deps": [
+        "gate.manifest_on_host",
+        "pre.reverie_pin_on_host",
+        "privileged-only-build.privileged_tests_on_host"
+      ]
+    },
+    "privileged-only-pmu.preemption_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-privileged"
+      ],
+      "deps": [
+        "gate.manifest_on_host",
+        "pre.reverie_pin_on_host",
+        "privileged-only-build.privileged_tests_on_host"
+      ]
+    },
+    "privileged-only-test.pmu_buck_chaos_cases_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-privileged"
+      ],
+      "deps": [
+        "gate.manifest_on_host",
+        "pre.reverie_pin_on_host",
+        "privileged-only-pmu.preemption_on_host"
+      ]
+    },
+    "privileged-build.manifest_guests_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-privileged"
+      ],
+      "deps": [
+        "gate.manifest_on_host",
+        "pre.reverie_pin_on_host",
+        "setup.manifest_plan_on_host"
+      ]
+    },
+    "privileged-only-e2e.manifest_applications_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-privileged"
+      ],
+      "deps": [
+        "gate.manifest_on_host",
+        "pre.reverie_pin_on_host",
+        "privileged-build.manifest_guests_on_host",
+        "privileged-only-build.privileged_tests_on_host",
+        "setup.manifest_plan_on_host"
+      ]
+    },
+    "privileged-only-e2e.manifest_c_programs_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-privileged"
+      ],
+      "deps": [
+        "gate.manifest_on_host",
+        "pre.reverie_pin_on_host",
+        "privileged-build.manifest_guests_on_host",
+        "privileged-only-build.privileged_tests_on_host",
+        "setup.manifest_plan_on_host"
+      ]
+    },
+    "privileged-only-e2e.manifest_system_utils_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-privileged"
+      ],
+      "deps": [
+        "gate.manifest_on_host",
+        "pre.reverie_pin_on_host",
+        "privileged-build.manifest_guests_on_host",
+        "privileged-only-build.privileged_tests_on_host",
+        "setup.manifest_plan_on_host"
+      ]
+    },
+    "privileged-only-test.cli_kvm_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-privileged"
+      ],
+      "deps": [
+        "gate.manifest_on_host",
+        "pre.reverie_pin_on_host",
+        "privileged-only-build.privileged_tests_on_host"
+      ]
+    },
+    "test.isolated_dbt_workdir": {
+      "owner": "dynamorio",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "test.isolated_detcore_workdir": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "selftest.scorecard": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "deps": [
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "selftest.scorecard_commands": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "deps": [
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "selftest.pressure_test": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "deps": [
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "selftest.validate_rs": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "deps": [
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "selftest.manifest_cli": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "deps": [
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "selftest.core_build": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "hosted-portable",
+        "portable"
+      ],
+      "deps": [
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "compatprep.fixtures": {
+      "owner": "core",
+      "labels": [],
+      "deps": [
+        "build.host_hermit_link",
+        "doc.doctests",
+        "doc.rustdoc",
+        "lint.clippy",
+        "test.detcore_unit",
+        "test.hermit_unit",
+        "test.regular_crates",
+        "test.rr_suite_contract"
+      ]
+    },
+    "portablecompatprep.fixtures": {
+      "owner": "core",
+      "labels": [
+        "portable-strict-compat-only"
+      ],
+      "deps": [
+        "compatprep.hermit_release_in_pinned_root"
+      ]
+    },
+    "sabrecompatprep.fixtures": {
+      "owner": "patching",
+      "labels": [
+        "sabre-compat-only"
+      ],
+      "deps": [
+        "build.host_hermit_link"
+      ]
+    },
+    "e9patchcompatprep.release_resources": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "compatprep.hermit_release"
+      ]
+    },
+    "e9patchcompatprep.nsswitch": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.release_resources"
+      ]
+    },
+    "e9patchcompatprep.fixtures": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "compatprep.hermit_release",
+        "e9patchcompatprep.nsswitch"
+      ]
+    },
+    "e9patchcompat.echo": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.true": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.pwd": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.seq": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.cat": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.wc": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.head": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.base64": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.base32": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.id": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.lua": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.perl": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.bc": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.awk": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.sqlite3": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.jq": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.bash": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.cargo": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.rustc": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.java": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.ruby": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.node": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.python3": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.curl": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.git": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.cmake": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.pkg-config": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.m4": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.gcc": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.g++": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.make": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.ar": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.as": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.ld": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.nm": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.objcopy": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.objdump": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.ranlib": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.readelf": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.size": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.strip": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.addr2line": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.c++filt": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.elfedit": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.gprof": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.cpp": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.gcov": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.bzip2": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.gzip": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.xz": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.zstd": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.zip-unzip": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.openssl": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.sort": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.uniq": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.tr": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.cut": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.tee": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.paste": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.comm": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.join": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.find": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.stat": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.file": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.basename": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.dirname": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.env": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.printenv": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.uname": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.factor": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.expr": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.dd": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.df": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.du": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.hostname": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.whoami": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.groups": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.tty": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.nproc": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.arch": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.realpath": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.readlink": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.mktemp": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.sha256sum": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.sha1sum": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.md5sum": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.sha224sum": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.sha384sum": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.sha512sum": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.wc-lines": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.nl": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.expand": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.unexpand": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.test": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.bracket": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.printf": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.pr": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.ls": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.xargs": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.iconv": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.sleep": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.stdbuf": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.nohup": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.nice": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.ionice": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.taskset": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.chrt": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.flock": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.logger": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.getopt": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.column": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.hexdump": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.xxd": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.strings": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.od": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.sum": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.cksum": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.b2sum": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.tsort": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.ptx": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.pinky": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.logname": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.users": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.uptime": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.iostat": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.vmstat-disk": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.pidstat-disk": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.findmnt": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.sysctl-random-uuid": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.sar-resource-tables": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.lsirq": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.mpstat-softirqs": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.lsmod": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.numastat": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.numactl-hardware": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.ps": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.vmstat": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.top": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.kill": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.pgrep": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.pkill": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.diff": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.patch": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.grep": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.egrep": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.fgrep": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.sed": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.tar": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.cp": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.mv": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.rm": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.mkdir": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.rmdir": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.touch": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.chmod": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.chown": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.ln": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.date": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.cal": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.yes": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.tac": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.rev": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.fold": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.fmt": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.shuf": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.numfmt": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.csplit": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.split": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.install": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.mkfifo": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.cmp": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "e9patchcompat.free": {
+      "owner": "patching",
+      "labels": [
+        "e9patch-compat-only"
+      ],
+      "deps": [
+        "e9patchcompatprep.fixtures"
+      ]
+    },
+    "rrcompatprep.fixtures": {
+      "owner": "core",
+      "labels": [
+        "rr-compat-only"
+      ],
+      "deps": [
+        "build.host_hermit_link"
+      ]
+    },
+    "super-compatprep.fixtures": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_release_hermit"
+      ]
+    },
+    "superstress.kvm_available": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_workspace"
+      ]
+    },
+    "superstress.dbt_available": {
+      "owner": "dynamorio",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_workspace"
+      ]
+    },
+    "superstress.ptrace_strict_verify": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_release_hermit"
+      ]
+    },
+    "superstress.ptrace_pipeline": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_release_hermit"
+      ]
+    },
+    "superstress.ptrace_record_replay": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_release_hermit"
+      ]
+    },
+    "superstress.kvm_verify": {
+      "owner": "core",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_workspace",
+        "superstress.kvm_available"
+      ]
+    },
+    "superstress.dbt_verify": {
+      "owner": "dynamorio",
+      "labels": [
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest",
+        "super.build_workspace",
+        "superstress.dbt_available"
+      ]
+    },
+    "check.dbt_runtime_abi_on_host": {
+      "owner": "dynamorio",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "build.workspace_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.nextest"
+      ]
+    },
+    "build.e2e_artifact_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.buck_release_artifact",
+        "build.workspace_on_host",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "test.applications_e2e_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "lint.clippy_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "doc.doctests_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "doc.rustdoc_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "test.regular_crates_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.nextest"
+      ]
+    },
+    "test.hermit_unit_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.nextest"
+      ]
+    },
+    "test.detcore_unit_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.nextest"
+      ]
+    },
+    "test.detcore_misc_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.nextest"
+      ]
+    },
+    "test.detcore_parallel_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.nextest"
+      ]
+    },
+    "test.detcore_time_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.nextest"
+      ]
+    },
+    "test.hermit_integration_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.nextest"
+      ]
+    },
+    "test.arbitrary_binaries_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.nextest"
+      ]
+    },
+    "test.sabre_examples_on_host": {
+      "owner": "patching",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.nextest"
+      ]
+    },
+    "test.app_strict_verify_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.nextest"
+      ]
+    },
+    "test.command_strict_verify_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.nextest"
+      ]
+    },
+    "test.ignored_syscall_regressions_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.nextest"
+      ]
+    },
+    "test.rr_suite_contract_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.nextest"
+      ]
+    },
+    "test.envelope_levels_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "compatprep.fixtures_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_on_host",
+        "doc.doctests_on_host",
+        "doc.rustdoc_on_host",
+        "gate.manifest",
+        "lint.clippy_on_host",
+        "pre.reverie_pin",
+        "test.detcore_unit_on_host",
+        "test.hermit_unit_on_host",
+        "test.regular_crates_on_host",
+        "test.rr_suite_contract_on_host"
+      ]
+    },
+    "check.script_unit_tests_on_host": {
+      "owner": "core",
+      "labels": [
+        "hosted-portable"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "gate.manifest",
+        "pre.reverie_pin"
+      ]
+    },
+    "e2e.manifest_applications_buck": {
+      "owner": "core",
+      "labels": [
+        "full-buck-e2e"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "e2e.buck_cells",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "e2e.manifest_bin_c_buck": {
+      "owner": "core",
+      "labels": [
+        "full-buck-e2e"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "e2e.buck_cells",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "e2e.manifest_c_programs_buck": {
+      "owner": "core",
+      "labels": [
+        "full-buck-e2e"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "e2e.buck_cells",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "e2e.manifest_chaos_c_buck": {
+      "owner": "core",
+      "labels": [
+        "full-buck-e2e"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "e2e.buck_cells",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "e2e.manifest_compat_buck": {
+      "owner": "core",
+      "labels": [
+        "full-buck-e2e"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "e2e.buck_cells",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "e2e.manifest_data_handling_buck": {
+      "owner": "core",
+      "labels": [
+        "full-buck-e2e"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "e2e.buck_cells",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "e2e.manifest_debugger_c_buck": {
+      "owner": "core",
+      "labels": [
+        "full-buck-e2e"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "e2e.buck_cells",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "e2e.manifest_determinism_stress_c_buck": {
+      "owner": "core",
+      "labels": [
+        "full-buck-e2e"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "e2e.buck_cells",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "e2e.manifest_determinism_stress_buck": {
+      "owner": "core",
+      "labels": [
+        "full-buck-e2e"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "e2e.buck_cells",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "e2e.manifest_language_runtimes_buck": {
+      "owner": "core",
+      "labels": [
+        "full-buck-e2e"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "e2e.buck_cells",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "e2e.manifest_shared_futex_c_buck": {
+      "owner": "core",
+      "labels": [
+        "full-buck-e2e"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "e2e.buck_cells",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "e2e.manifest_system_utils_buck": {
+      "owner": "core",
+      "labels": [
+        "full-buck-e2e"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "e2e.buck_cells",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "e2e.manifest_util_c_buck": {
+      "owner": "core",
+      "labels": [
+        "full-buck-e2e"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "e2e.buck_cells",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "privileged-e2e.manifest_applications_buck": {
+      "owner": "core",
+      "labels": [
+        "full-buck-e2e"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "e2e.buck_cells",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "privileged-e2e.manifest_c_programs_buck": {
+      "owner": "core",
+      "labels": [
+        "full-buck-e2e"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "e2e.buck_cells",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "privileged-e2e.manifest_system_utils_buck": {
+      "owner": "core",
+      "labels": [
+        "full-buck-e2e"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "e2e.buck_cells",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "full-scorecard.compatibility_buck": {
+      "owner": "core",
+      "labels": [
+        "full-buck-e2e"
+      ],
+      "deps": [
+        "e2e.manifest_applications_buck",
+        "e2e.manifest_bin_c_buck",
+        "e2e.manifest_c_programs_buck",
+        "e2e.manifest_chaos_c_buck",
+        "e2e.manifest_compat_buck",
+        "e2e.manifest_data_handling_buck",
+        "e2e.manifest_debugger_c_buck",
+        "e2e.manifest_determinism_stress_buck",
+        "e2e.manifest_determinism_stress_c_buck",
+        "e2e.manifest_language_runtimes_buck",
+        "e2e.manifest_shared_futex_c_buck",
+        "e2e.manifest_system_utils_buck",
+        "e2e.manifest_util_c_buck",
+        "privileged-e2e.manifest_applications_buck",
+        "privileged-e2e.manifest_c_programs_buck",
+        "privileged-e2e.manifest_system_utils_buck"
+      ]
+    },
+    "e2e.buck_stage": {
+      "owner": "core",
+      "labels": [
+        "full-buck-e2e"
+      ],
+      "deps": [
+        "pre.reverie_pin"
+      ]
+    },
+    "e2e.buck_cells": {
+      "owner": "core",
+      "labels": [
+        "full-buck-e2e"
+      ],
+      "deps": [
+        "build.rust_scripts",
+        "e2e.buck_stage",
+        "gate.manifest",
+        "pre.reverie_pin",
+        "setup.manifest_plan"
+      ]
+    },
+    "setup.pinned_root_fetch": {
+      "owner": "core",
+      "labels": [],
+      "deps": [
+        "pre.reverie_pin"
+      ]
+    },
+    "setup.manifest_plan_in_pinned_root": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "build.rust_scripts_in_pinned_root": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "build.workspace_compile_in_pinned_root": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "build.workspace_in_pinned_root": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.liteinst_runtime_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "build.workspace_compile_in_pinned_root",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "build.liteinst_runtime_in_pinned_root": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "build.e2e_artifact_in_pinned_root": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.buck_release_artifact",
+        "build.rust_scripts_in_pinned_root",
+        "build.workspace_in_pinned_root",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "build.manifest_guests_in_pinned_root": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "pre.reverie_pin",
+        "setup.manifest_plan_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "build.liteinst_allocator_fixtures_in_pinned_root": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "privileged-build.manifest_guests_in_pinned_root": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "privileged"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "pre.reverie_pin",
+        "setup.manifest_plan_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "privileged-only-build.privileged_tests_in_pinned_root": {
+      "owner": "core",
+      "labels": [
+        "privileged"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "compatprep.hermit_release_in_pinned_root": {
+      "owner": "core",
+      "labels": [
+        "portable-strict-compat-only"
+      ],
+      "deps": [
+        "build.rust_scripts_in_pinned_root",
+        "gate.manifest",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "compatprep.fixtures_in_pinned_root": {
+      "owner": "core",
+      "labels": [
+        "full",
+        "portable"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "quick-super-setup.manifest_plan": {
+      "owner": "core",
+      "labels": [
+        "quick",
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin"
+      ]
+    },
+    "quick-super-gate.manifest": {
+      "owner": "core",
+      "labels": [
+        "quick",
+        "super"
+      ],
+      "deps": [
+        "quick-super-build.rust_scripts",
+        "quick-super-setup.manifest_plan"
+      ]
+    },
+    "quick-super-build.rust_scripts": {
+      "owner": "core",
+      "labels": [
+        "quick",
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin"
+      ]
+    },
+    "quick-super-setup.nextest": {
+      "owner": "core",
+      "labels": [
+        "quick",
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-build.rust_scripts",
+        "quick-super-gate.manifest"
+      ]
+    },
+    "quick-super-selftest.scorecard": {
+      "owner": "core",
+      "labels": [
+        "quick",
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest"
+      ]
+    },
+    "quick-super-selftest.scorecard_commands": {
+      "owner": "core",
+      "labels": [
+        "quick",
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest"
+      ]
+    },
+    "quick-super-selftest.pressure_test": {
+      "owner": "core",
+      "labels": [
+        "quick",
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest"
+      ]
+    },
+    "quick-super-selftest.validate_rs": {
+      "owner": "core",
+      "labels": [
+        "quick",
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest"
+      ]
+    },
+    "quick-super-selftest.manifest_cli": {
+      "owner": "core",
+      "labels": [
+        "quick",
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest"
+      ]
+    },
+    "quick-super-selftest.core_build": {
+      "owner": "core",
+      "labels": [
+        "quick",
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-gate.manifest"
+      ]
+    },
+    "quick-super-setup.manifest_plan_in_pinned_root": {
+      "owner": "core",
+      "labels": [
+        "quick",
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "quick-super-build.rust_scripts_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ]
+    },
+    "quick-super-build.rust_scripts_in_pinned_root": {
+      "owner": "core",
+      "labels": [
+        "quick",
+        "super"
+      ],
+      "deps": [
+        "pre.reverie_pin",
+        "setup.pinned_root_fetch"
+      ]
+    }
+  },
+  "transferred_diagnostic_edges": {
+    "e2e.manifest_applications": {
+      "check.dbt_runtime_abi": "dynamorio-e2e.manifest_applications"
+    },
+    "e2e.manifest_bin_c": {
+      "check.dbt_runtime_abi": "dynamorio-e2e.manifest_bin_c"
+    },
+    "e2e.manifest_c_programs": {
+      "check.dbt_runtime_abi": "dynamorio-e2e.manifest_c_programs"
+    },
+    "e2e.manifest_chaos_c": {
+      "check.dbt_runtime_abi": "dynamorio-e2e.manifest_chaos_c"
+    },
+    "e2e.manifest_compat": {
+      "check.dbt_runtime_abi": "dynamorio-e2e.manifest_compat"
+    },
+    "e2e.manifest_data_handling": {
+      "check.dbt_runtime_abi": "dynamorio-e2e.manifest_data_handling"
+    },
+    "e2e.manifest_debugger_c": {
+      "check.dbt_runtime_abi": "dynamorio-e2e.manifest_debugger_c"
+    },
+    "e2e.manifest_determinism_stress_c": {
+      "check.dbt_runtime_abi": "dynamorio-e2e.manifest_determinism_stress_c"
+    },
+    "e2e.manifest_determinism_stress": {
+      "check.dbt_runtime_abi": "dynamorio-e2e.manifest_determinism_stress"
+    },
+    "e2e.manifest_language_runtimes": {
+      "check.dbt_runtime_abi": "dynamorio-e2e.manifest_language_runtimes"
+    },
+    "e2e.manifest_shared_futex_c": {
+      "check.dbt_runtime_abi": "dynamorio-e2e.manifest_shared_futex_c"
+    },
+    "e2e.manifest_system_utils": {
+      "check.dbt_runtime_abi": "dynamorio-e2e.manifest_system_utils"
+    },
+    "e2e.manifest_util_c": {
+      "check.dbt_runtime_abi": "dynamorio-e2e.manifest_util_c"
+    },
+    "test.inherited_terminal_read": {
+      "check.dbt_runtime_abi": "dynamorio-test.inherited_terminal_read"
+    },
+    "test.isolation_matrix_dbt_in_guest": {
+      "check.dbt_runtime_abi": "dynamorio-test.isolation_matrix_dbt_in_guest"
+    },
+    "privileged-e2e.manifest_applications": {
+      "check.dbt_runtime_abi": "dynamorio-privileged-e2e.manifest_applications"
+    },
+    "privileged-e2e.manifest_c_programs": {
+      "check.dbt_runtime_abi": "dynamorio-privileged-e2e.manifest_c_programs"
+    },
+    "privileged-e2e.manifest_system_utils": {
+      "check.dbt_runtime_abi": "dynamorio-privileged-e2e.manifest_system_utils"
+    }
+  },
+  "producer_policies": {
+    "compatprep.hermit_release": {
+      "timeout": 420,
+      "cpu_timeout": 2400,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "resources": {},
+      "est_duration_s": 0.0,
+      "rss_baseline_bytes": null,
+      "rss_baseline_inner_jobs": null,
+      "hard_mem_max_bytes": 17179869184,
+      "classification": "cpu-bound",
+      "preferred_inner_jobs": 8,
+      "measured_effective_cores": null,
+      "measured_cpu_utilization": null
+    },
+    "compatprep.hermit_release_in_pinned_root": {
+      "timeout": 420,
+      "cpu_timeout": 2400,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "resources": {},
+      "est_duration_s": 0.0,
+      "rss_baseline_bytes": null,
+      "rss_baseline_inner_jobs": null,
+      "hard_mem_max_bytes": 17179869184,
+      "classification": "cpu-bound",
+      "preferred_inner_jobs": 8,
+      "measured_effective_cores": null,
+      "measured_cpu_utilization": null
+    }
+  },
+  "hosted_original_roots": [
+    "check.dbt_runtime_abi",
+    "doc.doctests",
+    "doc.rustdoc",
+    "lint.clippy",
+    "test.app_strict_verify",
+    "test.applications_e2e",
+    "test.arbitrary_binaries",
+    "test.command_strict_verify",
+    "test.detcore_misc",
+    "test.detcore_parallel",
+    "test.detcore_time",
+    "test.detcore_unit",
+    "test.envelope_levels",
+    "test.hermit_integration",
+    "test.hermit_unit",
+    "test.ignored_syscall_regressions",
+    "test.regular_crates",
+    "test.rr_suite_contract",
+    "test.sabre_examples"
+  ],
+  "hosted_original_closure": [
+    "build.e2e_artifact",
+    "build.workspace",
+    "check.dbt_runtime_abi",
+    "compatprep.fixtures",
+    "doc.doctests",
+    "doc.rustdoc",
+    "lint.clippy",
+    "test.app_strict_verify",
+    "test.applications_e2e",
+    "test.arbitrary_binaries",
+    "test.command_strict_verify",
+    "test.detcore_misc",
+    "test.detcore_parallel",
+    "test.detcore_time",
+    "test.detcore_unit",
+    "test.envelope_levels",
+    "test.hermit_integration",
+    "test.hermit_unit",
+    "test.ignored_syscall_regressions",
+    "test.regular_crates",
+    "test.rr_suite_contract",
+    "test.sabre_examples"
+  ],
+  "named_populations": {
+    "manifest_publishers": [
+      "e2e.manifest_applications",
+      "e2e.manifest_applications_buck",
+      "e2e.manifest_applications_on_host",
+      "e2e.manifest_bin_c",
+      "e2e.manifest_bin_c_buck",
+      "e2e.manifest_bin_c_on_host",
+      "e2e.manifest_c_programs",
+      "e2e.manifest_c_programs_buck",
+      "e2e.manifest_c_programs_on_host",
+      "e2e.manifest_chaos_c",
+      "e2e.manifest_chaos_c_buck",
+      "e2e.manifest_chaos_c_on_host",
+      "e2e.manifest_compat",
+      "e2e.manifest_compat_buck",
+      "e2e.manifest_compat_on_host",
+      "e2e.manifest_data_handling",
+      "e2e.manifest_data_handling_buck",
+      "e2e.manifest_data_handling_on_host",
+      "e2e.manifest_debugger_c",
+      "e2e.manifest_debugger_c_buck",
+      "e2e.manifest_debugger_c_on_host",
+      "e2e.manifest_determinism_stress",
+      "e2e.manifest_determinism_stress_buck",
+      "e2e.manifest_determinism_stress_c",
+      "e2e.manifest_determinism_stress_c_buck",
+      "e2e.manifest_determinism_stress_c_on_host",
+      "e2e.manifest_determinism_stress_on_host",
+      "e2e.manifest_language_runtimes",
+      "e2e.manifest_language_runtimes_buck",
+      "e2e.manifest_language_runtimes_on_host",
+      "e2e.manifest_shared_futex_c",
+      "e2e.manifest_shared_futex_c_buck",
+      "e2e.manifest_shared_futex_c_on_host",
+      "e2e.manifest_system_utils",
+      "e2e.manifest_system_utils_buck",
+      "e2e.manifest_system_utils_on_host",
+      "e2e.manifest_util_c",
+      "e2e.manifest_util_c_buck",
+      "e2e.manifest_util_c_on_host",
+      "portablecompat.manifest_compat",
+      "privileged-e2e.manifest_applications",
+      "privileged-e2e.manifest_applications_buck",
+      "privileged-e2e.manifest_c_programs",
+      "privileged-e2e.manifest_c_programs_buck",
+      "privileged-e2e.manifest_system_utils",
+      "privileged-e2e.manifest_system_utils_buck",
+      "privileged-only-e2e.manifest_applications",
+      "privileged-only-e2e.manifest_applications_on_host",
+      "privileged-only-e2e.manifest_c_programs",
+      "privileged-only-e2e.manifest_c_programs_on_host",
+      "privileged-only-e2e.manifest_system_utils",
+      "privileged-only-e2e.manifest_system_utils_on_host",
+      "quick.e2e_verify",
+      "rrcompat.manifest_compat",
+      "sabrecompat.manifest_compat",
+      "supercompat.manifest_compat"
+    ]
+  }
+}

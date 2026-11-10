@@ -55,14 +55,21 @@ pub enum Publication {
 /// Builder whose E2E payload is the debug binary a receipt certifies.
 pub const RELEASE_BUILDER_CARGO: &str = "cargo";
 
+/// Build mode whose prepared Nextest selections a receipt certifies. A buck
+/// run's substituted detcore selections execute Buck-built binaries, which
+/// is supplemental evidence about those selections, not the Cargo-built
+/// full-suite receipt.
+pub const BUILD_MODE_CARGO: &str = "cargo";
+
 /// The five conditions `validate.sh:1735` requires before publishing, plus the
-/// builder.
+/// builder and the build mode.
 ///
 /// Expressed as a pure predicate so it can be bracketed on both sides. Note
 /// `profile == "full"`: a focused or selective green is real evidence about what
 /// it ran, but it is not the full-suite receipt the label claims, so it must not
 /// mint one. The same holds for a Buck run: its E2E cells executed the release
-/// payload, without debug assertions or overflow checks.
+/// payload, without debug assertions or overflow checks, and a buck build-mode
+/// run's prepared selections contain Buck-built executables.
 pub fn eligible(
     exit_code: u8,
     failures: usize,
@@ -71,6 +78,7 @@ pub fn eligible(
     tree_dirty: bool,
     profile: &str,
     release_builder: &str,
+    build_mode: &str,
 ) -> Result<(), String> {
     if exit_code != 0 || failures != 0 {
         return Err("the run was not green".into());
@@ -92,6 +100,13 @@ pub fn eligible(
             "release builder is {release_builder}: its E2E cells ran the release payload \
              without debug assertions or overflow checks, which is supplemental evidence, \
              not the full-suite receipt"
+        ));
+    }
+    if build_mode != BUILD_MODE_CARGO {
+        return Err(format!(
+            "build mode is {build_mode}: its prepared Nextest selections contain \
+             Buck-built executables, which is supplemental evidence, not the \
+             Cargo-built full-suite receipt"
         ));
     }
     Ok(())
@@ -297,62 +312,66 @@ pub fn self_test() -> Result<String, String> {
     }
     // Positive: exactly one qualifying combination must be ACCEPTED, so the
     // predicate is not vacuously restrictive.
-    eligible(0, 0, true, true, false, "full", "cargo")
+    eligible(0, 0, true, true, false, "full", "cargo", "cargo")
         .map_err(|e| format!("receipt: the one qualifying case must be eligible, got: {e}"))?;
     let mut accepted = 1usize;
     // Negative: each condition, spoiled alone, must be REFUSED.
     let negatives: Vec<(&str, Result<(), String>)> = vec![
         (
             "nonzero exit",
-            eligible(1, 0, true, true, false, "full", "cargo"),
+            eligible(1, 0, true, true, false, "full", "cargo", "cargo"),
         ),
         (
             "nonzero failures",
-            eligible(0, 1, true, true, false, "full", "cargo"),
+            eligible(0, 1, true, true, false, "full", "cargo", "cargo"),
         ),
         (
             "--no-label-pr",
-            eligible(0, 0, false, true, false, "full", "cargo"),
+            eligible(0, 0, false, true, false, "full", "cargo", "cargo"),
         ),
         (
             "not commit-anchored",
-            eligible(0, 0, true, false, false, "full", "cargo"),
+            eligible(0, 0, true, false, false, "full", "cargo", "cargo"),
         ),
         (
             "dirty tree",
-            eligible(0, 0, true, true, true, "full", "cargo"),
+            eligible(0, 0, true, true, true, "full", "cargo", "cargo"),
         ),
         (
             "quick profile",
-            eligible(0, 0, true, true, false, "quick", "cargo"),
+            eligible(0, 0, true, true, false, "quick", "cargo", "cargo"),
         ),
         (
             "portable-only profile",
-            eligible(0, 0, true, true, false, "portable-only", "cargo"),
+            eligible(0, 0, true, true, false, "portable-only", "cargo", "cargo"),
         ),
         (
             "super profile",
-            eligible(0, 0, true, true, false, "super", "cargo"),
+            eligible(0, 0, true, true, false, "super", "cargo", "cargo"),
         ),
         (
             "envelope-only profile",
-            eligible(0, 0, true, true, false, "envelope-only", "cargo"),
+            eligible(0, 0, true, true, false, "envelope-only", "cargo", "cargo"),
         ),
         (
             "selective profile",
-            eligible(0, 0, true, true, false, "selective", "cargo"),
+            eligible(0, 0, true, true, false, "selective", "cargo", "cargo"),
         ),
         (
             "focused compat profile",
-            eligible(0, 0, true, true, false, "sabre-compat-only", "cargo"),
+            eligible(0, 0, true, true, false, "sabre-compat-only", "cargo", "cargo"),
         ),
         (
             "cell requalification profile",
-            eligible(0, 0, true, true, false, "cell-requalification", "cargo"),
+            eligible(0, 0, true, true, false, "cell-requalification", "cargo", "cargo"),
         ),
         (
             "Buck release payload",
-            eligible(0, 0, true, true, false, "full", "buck"),
+            eligible(0, 0, true, true, false, "full", "buck", "cargo"),
+        ),
+        (
+            "Buck build mode",
+            eligible(0, 0, true, true, false, "full", "cargo", "buck"),
         ),
     ];
     let mut refused = 0usize;
@@ -365,14 +384,14 @@ pub fn self_test() -> Result<String, String> {
     // A green super or envelope run is real, but it is NOT the full-suite
     // receipt; confirm the profile gate is what refuses it (not some other
     // condition), so the refusal cannot silently move.
-    if let Err(e) = eligible(0, 0, true, true, false, "super", "cargo") {
+    if let Err(e) = eligible(0, 0, true, true, false, "super", "cargo", "cargo") {
         if !e.contains("not the full suite") {
             return Err(format!(
                 "receipt: super must be refused BY THE PROFILE gate, got: {e}"
             ));
         }
     }
-    let focused_error = eligible(0, 0, true, true, false, "cell-requalification", "cargo")
+    let focused_error = eligible(0, 0, true, true, false, "cell-requalification", "cargo", "cargo")
         .err()
         .ok_or("focused evidence must not authorize a full-suite receipt")?;
     if focused_error != "profile is cell-requalification, not the full suite" {
@@ -380,12 +399,20 @@ pub fn self_test() -> Result<String, String> {
             "receipt: requalification must be refused BY THE PROFILE gate, got: {focused_error}"
         ));
     }
-    let buck_error = eligible(0, 0, true, true, false, "full", "buck")
+    let buck_error = eligible(0, 0, true, true, false, "full", "buck", "cargo")
         .err()
         .ok_or("a Buck release-payload green must not authorize a full-suite receipt")?;
     if !buck_error.starts_with("release builder is buck:") {
         return Err(format!(
             "receipt: a Buck green must be refused BY THE BUILDER gate, got: {buck_error}"
+        ));
+    }
+    let buck_mode_error = eligible(0, 0, true, true, false, "full", "cargo", "buck")
+        .err()
+        .ok_or("a buck build-mode green must not authorize a full-suite receipt")?;
+    if !buck_mode_error.starts_with("build mode is buck:") {
+        return Err(format!(
+            "receipt: a buck build-mode green must be refused BY THE BUILD-MODE gate, got: {buck_mode_error}"
         ));
     }
     // The PR lookup makes no network call where no PR can exist.

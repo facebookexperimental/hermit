@@ -339,8 +339,9 @@ static int run_masked_readonly_zero_timeout(void) {
  * timeout. The blocking call times out with 0, as on Linux, when `times_out`
  * is set: record and replay let the kernel own the wait, and a sequentialized
  * ptrace run polls it under its mask (https://github.com/rrnewton/hermit/issues/4042).
- * A backend whose kernel does not report the guest's signal state fails it
- * closed with ENOSYS. */
+ * A backend whose kernel does not report the guest's signal state refuses it
+ * by name, which ends a strict run; with --allow-unsupported-syscalls the
+ * guest gets ENOSYS, which this mode checks. */
 static int run_masked_fail_closed(int times_out) {
   int pipefd[2];
   if (pipe(pipefd) != 0 || write(pipefd[1], "r", 1) != 1) {

@@ -101,7 +101,15 @@ pub const PARITY_REFERENCE_BACKEND: &str = "ptrace";
 /// The only mode a parity cell compares.
 pub const PARITY_MODE: &str = "verify";
 /// Generated snapshot of every parity cell's status and population membership.
+/// The committed layout is one shard file per manifest bucket under
+/// [`PARITY_CELLS_DIR`]; [`PARITY_CELLS_PATH`] names the pre-shard single file,
+/// which readers of historical commits still resolve by that path.
 pub const PARITY_CELLS_PATH: &str = "ci/compat-envelope/parity-cells.json";
+/// Directory holding the sharded snapshot: one `<category>.json` per manifest
+/// bucket, each a [`ParityCells`] whose cells are exactly that bucket's, so no
+/// single file approaches the freshness test's per-file size bound as buckets
+/// grow. The union of the shards is the snapshot; [`load_snapshot`] reads it.
+pub const PARITY_CELLS_DIR: &str = "ci/compat-envelope/parity-cells";
 /// Schema 2 replaced schema 1's selection file (`selection_path`,
 /// `selection_rule`) with the derived population (`population_rule`), and its
 /// `selected` field now means "in the parity population".
@@ -1410,6 +1418,158 @@ pub fn canonical_text(snapshot: &ParityCells) -> Result<String, String> {
     }
     cells.push_str("  ]");
     Ok(format!("{}\n", header.replace(SLOT, &cells)))
+}
+
+/// The shard file for one manifest bucket, under [`PARITY_CELLS_DIR`].
+pub fn shard_file_name(category: &str) -> String {
+    format!("{category}.json")
+}
+
+/// Split a snapshot into one shard per manifest bucket, in category order.
+/// Each shard keeps the snapshot header, with counts recomputed over its own
+/// cells only, so a shard is a standalone [`ParityCells`] of one bucket.
+pub fn shard_snapshots(snapshot: &ParityCells) -> std::collections::BTreeMap<String, ParityCells> {
+    let mut by_category: std::collections::BTreeMap<String, Vec<ParityCellStatus>> =
+        std::collections::BTreeMap::new();
+    for cell in &snapshot.cells {
+        by_category
+            .entry(cell.category.clone())
+            .or_default()
+            .push(cell.clone());
+    }
+    by_category
+        .into_iter()
+        .map(|(category, cells)| {
+            let mut all = ParityCount::default();
+            let mut by_backend: BTreeMap<ParityBackend, ParityCount> = ParityBackend::ALL
+                .into_iter()
+                .map(|backend| (backend, ParityCount::default()))
+                .collect();
+            for cell in &cells {
+                all.add(cell);
+                by_backend
+                    .get_mut(&cell.backend)
+                    .expect("every backend is counted")
+                    .add(cell);
+            }
+            let shard = ParityCells {
+                counts: ParityCounts { all, by_backend },
+                cells,
+                ..snapshot.clone()
+            };
+            (shard_file_name(&category), shard)
+        })
+        .collect()
+}
+
+/// The canonical text of every shard of `snapshot`, by shard file name.
+pub fn shard_texts(
+    snapshot: &ParityCells,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    shard_snapshots(snapshot)
+        .into_iter()
+        .map(|(name, shard)| Ok((name, canonical_text(&shard)?)))
+        .collect()
+}
+
+/// Load the committed snapshot under `root`: the sharded layout when
+/// [`PARITY_CELLS_DIR`] is a directory, else the legacy single file. Shards
+/// must agree on the header, hold only their own bucket's cells, have counts
+/// matching their cells, and be in generated cell order within each shard;
+/// the union's counts are recomputed from the cells, never trusted.
+pub fn load_snapshot(root: &Path) -> Result<ParityCells, String> {
+    let dir = root.join(PARITY_CELLS_DIR);
+    if !dir.is_dir() {
+        let path = root.join(PARITY_CELLS_PATH);
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        return serde_json::from_str(&text)
+            .map_err(|error| format!("{PARITY_CELLS_PATH} is not a readable snapshot: {error}"));
+    }
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .map_err(|error| format!("cannot list {}: {error}", dir.display()))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".json"))
+        .collect();
+    names.sort();
+    if names.is_empty() {
+        return Err(format!("{PARITY_CELLS_DIR} holds no shard files"));
+    }
+    let mut union: Option<ParityCells> = None;
+    let mut seen: std::collections::BTreeSet<(String, ParityBackend)> =
+        std::collections::BTreeSet::new();
+    for name in &names {
+        let path = dir.join(name);
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        let shard: ParityCells = serde_json::from_str(&text).map_err(|error| {
+            format!("{PARITY_CELLS_DIR}/{name} is not a readable snapshot: {error}")
+        })?;
+        let category = name.strip_suffix(".json").unwrap_or(name);
+        let mut all = ParityCount::default();
+        let mut by_backend: BTreeMap<ParityBackend, ParityCount> = ParityBackend::ALL
+            .into_iter()
+            .map(|backend| (backend, ParityCount::default()))
+            .collect();
+        for cell in &shard.cells {
+            if cell.category != category {
+                return Err(format!(
+                    "{PARITY_CELLS_DIR}/{name} holds {} cell {} of another bucket",
+                    cell.category, cell.test_id
+                ));
+            }
+            if !seen.insert((cell.test_id.clone(), cell.backend)) {
+                return Err(format!(
+                    "parity cell {}@{} appears twice across the shards",
+                    cell.test_id, cell.backend
+                ));
+            }
+            all.add(cell);
+            by_backend
+                .get_mut(&cell.backend)
+                .expect("every backend is counted")
+                .add(cell);
+        }
+        if shard.counts != (ParityCounts { all, by_backend }) {
+            return Err(format!(
+                "{PARITY_CELLS_DIR}/{name} counts do not match its cells"
+            ));
+        }
+        match &mut union {
+            None => union = Some(shard),
+            Some(union) => {
+                if union.schema != shard.schema
+                    || union.regenerate != shard.regenerate
+                    || union.reference != shard.reference
+                    || union.population_rule != shard.population_rule
+                {
+                    return Err(format!(
+                        "{PARITY_CELLS_DIR}/{name} header disagrees with the other shards"
+                    ));
+                }
+                union.cells.extend(shard.cells);
+            }
+        }
+    }
+    let mut union = union.expect("names is non-empty");
+    union
+        .cells
+        .sort_by(|a, b| (a.test_id.as_str(), a.backend).cmp(&(b.test_id.as_str(), b.backend)));
+    let mut all = ParityCount::default();
+    let mut by_backend: BTreeMap<ParityBackend, ParityCount> = ParityBackend::ALL
+        .into_iter()
+        .map(|backend| (backend, ParityCount::default()))
+        .collect();
+    for cell in &union.cells {
+        all.add(cell);
+        by_backend
+            .get_mut(&cell.backend)
+            .expect("every backend is counted")
+            .add(cell);
+    }
+    union.counts = ParityCounts { all, by_backend };
+    Ok(union)
 }
 
 /// Refuse a stale snapshot, naming the first differing line and the fix.
@@ -3390,10 +3550,13 @@ fn evaluate_history(
         ObservedResult::Oom => Some(UnavailableClass::Oom),
         ObservedResult::InfrastructureError => Some(UnavailableClass::InfrastructureError),
         ObservedResult::SandboxDenied => Some(UnavailableClass::SandboxDenied),
+        // A chaos-floor failure is a chaos cell's result; a verify row never
+        // carries one.
         ObservedResult::Pass
         | ObservedResult::DeterminismFailure
         | ObservedResult::ParityFailure
-        | ObservedResult::ReplayFailure => None,
+        | ObservedResult::ReplayFailure
+        | ObservedResult::ChaosFloorFailure => None,
     });
     let result = row.result.map_or_else(
         || "no typed result".to_string(),
@@ -5832,6 +5995,34 @@ pub fn ledger_row_counts(rows: &[ParityLedgerSource]) -> String {
         .join(", ")
 }
 
+/// [`append_ledger_rows`]'s outcome with whether the writer accepted every
+/// row: `accepted` is true only for the writer's exit status 0 on the rows
+/// themselves, false for every line [`append_ledger_rows`] calls a refusal,
+/// an `ERROR:` or a writer without `append-parity`. A caller that must not
+/// count unaccepted rows as published (the pressure test's series-emitted
+/// marker) reads it rather than the line's words.
+pub struct LedgerAppendOutcome {
+    pub line: String,
+    pub accepted: bool,
+}
+
+pub fn append_ledger_rows_outcome(
+    append: &LedgerAppend<'_>,
+    rows: &[ParityLedgerSource],
+    bounds: AppendBounds,
+) -> LedgerAppendOutcome {
+    match append_ledger_rows_checked(append, rows, bounds) {
+        Ok(line) => LedgerAppendOutcome {
+            line,
+            accepted: true,
+        },
+        Err(line) => LedgerAppendOutcome {
+            line,
+            accepted: false,
+        },
+    }
+}
+
 /// Send `rows` to `series.py append-parity` and return the one `parity:`
 /// line that reports the outcome. Parity is measured after determinism and
 /// decides nothing, so no outcome here is an error for the caller.
@@ -5859,13 +6050,23 @@ pub fn append_ledger_rows(
     rows: &[ParityLedgerSource],
     bounds: AppendBounds,
 ) -> String {
+    append_ledger_rows_outcome(append, rows, bounds).line
+}
+
+/// [`append_ledger_rows`] with its outcome typed: `Ok` only for the writer's
+/// acceptance of the rows, `Err` for every other line.
+fn append_ledger_rows_checked(
+    append: &LedgerAppend<'_>,
+    rows: &[ParityLedgerSource],
+    bounds: AppendBounds,
+) -> Result<String, String> {
     let counts = ledger_row_counts(rows);
-    let left = |why: &str| {
-        format!(
+    let left = |why: &str| -> Result<String, String> {
+        Err(format!(
             "parity: {why}; {} rows left in {} ({counts})",
             rows.len(),
             append.source.display()
-        )
+        ))
     };
     for row in rows {
         if let Err(error) = check_producer_class(
@@ -5973,7 +6174,7 @@ pub fn append_ledger_rows(
     }
     let said = String::from_utf8_lossy(&stdout);
     let said = said.trim();
-    format!(
+    Ok(format!(
         "parity: append-parity accepted {} row(s) from {} ({counts}): {}",
         rows.len(),
         append.source.display(),
@@ -5982,7 +6183,7 @@ pub fn append_ledger_rows(
         } else {
             said
         }
-    )
+    ))
 }
 
 /// A file holding `bytes`, positioned at its start and already unlinked, to
@@ -6152,7 +6353,7 @@ mod tests {
     use crate::logdiff_report::RecordEnvelopePolicy;
 
     fn repo_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+        crate::compiled_manifest_dir!().join("../..")
     }
 
     fn shipped_matrix() -> ParityMatrix {
@@ -6164,12 +6365,39 @@ mod tests {
     /// validation DAG's freshness test, and it runs wherever that test runs.
     #[test]
     fn committed_parity_cells_snapshot_is_fresh() {
-        let generated = canonical_text(&generate(&repo_root()).unwrap()).unwrap();
-        let committed = include_str!("../../compat-envelope/parity-cells.json");
-        if let Err(error) = require_fresh(committed, &generated) {
-            panic!("{error}");
+        let snapshot = generate(&repo_root()).unwrap();
+        let shards = shard_texts(&snapshot).unwrap();
+        let dir = repo_root().join(PARITY_CELLS_DIR);
+        let mut committed_names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".json"))
+            .collect();
+        committed_names.sort();
+        assert_eq!(
+            committed_names,
+            shards.keys().cloned().collect::<Vec<_>>(),
+            "committed shard set differs from the generated one"
+        );
+        assert!(
+            !repo_root().join(PARITY_CELLS_PATH).exists(),
+            "the pre-shard {PARITY_CELLS_PATH} must not exist beside {PARITY_CELLS_DIR}/"
+        );
+        for (name, generated) in &shards {
+            let committed = std::fs::read_to_string(dir.join(name)).unwrap();
+            if let Err(error) = require_fresh(&committed, generated) {
+                panic!("{PARITY_CELLS_DIR}/{name}: {error}");
+            }
+            assert!(
+                committed.len() < 1536 * 1024,
+                "{PARITY_CELLS_DIR}/{name} is {} bytes; each shard must stay well under 2 MiB",
+                committed.len()
+            );
         }
-        let parsed: ParityCells = serde_json::from_str(committed).unwrap();
+        let parsed: ParityCells = load_snapshot(&repo_root()).unwrap();
+        assert_eq!(parsed.cells.len(), snapshot.cells.len());
+        assert_eq!(parsed.counts, snapshot.counts);
         // c-programs/userfaultfd-self-service adds one line per backend but ptrace: 3148.
         // in-guest-trap, a fifth candidate backend, adds one line per test (787):
         // 3148 + 787 = 3935.
@@ -6209,20 +6437,97 @@ mod tests {
         // candidate backend: 2965.
         // c-programs/proc-cmdline-other-processes (the same guest, another
         // process's file) adds one row per candidate backend: 2970.
-        assert_eq!(parsed.cells.len(), 2970);
+        // c-programs/proc-stat-comm (LinuxEmu D4c-1's guest) adds one row per
+        // candidate backend: 2975.
+        // system-utils/stat-script-root (D4c-1's #! script root) adds one row
+        // per candidate backend: 2980.
+        // system-utils/stat-alias-root (D4c-1's root through a symbolic link)
+        // adds one row per candidate backend: 2985.
+        // c-programs/scm-rights-received-descriptors (package K slice F0a's
+        // guest) adds one row per candidate backend: 2990.
+        // c-programs/scm-rights-received-anon-inodes (F0a's anonymous-inode
+        // guest) adds one row per candidate backend: 2995.
+        // c-programs/syscall-clobbers (the capability-flag lane's slice 3
+        // guest) adds one row per candidate backend: 3000.
+        // c-programs/inotify-rename-cookies (the inotify cookie guest,
+        // https://github.com/rrnewton/hermit/issues/4765) adds one row per
+        // candidate backend: 3005.
+        // c-programs/inotify-write-only-buffer (an inotify read into a
+        // write-only page) adds one row per candidate backend: 3010.
+        // c-programs/proc-fd-directory (package K slice F1's guest) adds one
+        // row per candidate backend: 3015.
+        // c-programs/proc-own-links (package K slice E1's guest) adds one row
+        // per candidate backend: 3020.
+        // c-programs/inotify-received-descriptor (inotify descriptors received
+        // over SCM_RIGHTS) adds one row per candidate backend: 3025.
+        // c-programs/inotify-faults (the events a read copies before it
+        // faults) adds one row per candidate backend: 3030.
+        // c-programs/inotify-blocking-faults (reads of a blocking inotify
+        // descriptor that Linux refuses before it copies) adds one row per
+        // candidate backend: 3035.
+        // c-programs/inotify-protection-key-fault (a read into a page a
+        // protection key keeps the guest from writing) adds one row per
+        // candidate backend: 3040.
+        // c-programs/signalfd-threads (a signalfd in a multi-threaded process,
+        // https://github.com/rrnewton/hermit/issues/4797) adds one row per
+        // candidate backend: 3045.
+        // c-programs/inotify-failed-protection-key and
+        // c-programs/inotify-guard-page-faults (the events a read copies before
+        // it faults after a failed protection-key allocation, and at a guard
+        // page, https://github.com/rrnewton/hermit/issues/4793) add one row
+        // per candidate backend each: 3055.
+        // c-programs/shared-file-vfork and applications/cc-compile-and-run
+        // (vfork and posix_spawn children of a process that holds a shared
+        // file view, https://github.com/rrnewton/reverie/issues/1108) add one
+        // row each per candidate backend: 3065. c-programs/vfork-shares-memory
+        // (a vfork child's stores are its parent's when the parent's call
+        // returns, https://github.com/rrnewton/reverie/issues/1087) adds one
+        // row per candidate backend: 3070. c-programs/concurrent-piped-spawns,
+        // language-runtimes/python-subprocess-capture and
+        // language-runtimes/go-os-exec-output (spawns from several threads,
+        // each pipe's write end shared with the other threads until its
+        // close) add one row each per candidate backend: 3085.
+        // c-programs/inotify-blocking-read and c-programs/inotify-blocking-signal
+        // (blocking inotify reads, and signals sent to a blocked reader,
+        // https://github.com/rrnewton/hermit/issues/4768) add one row per
+        // candidate backend each: 3095. c-programs/seqpacket-two-writers and
+        // language-runtimes/rustc-hello (SOCK_SEQPACKET socketpairs, which
+        // rustc's linker start uses) add one row each per candidate backend:
+        // 3105.
+        // c-programs/robust-list-owner-death-routes (robust-futex owner death
+        // by each Linux exit route, https://github.com/rrnewton/hermit/issues/4529)
+        // adds one row per candidate backend: 3110.
+        // system-utils/flock-shared-exclusive (Detcore's flock model, the kvm
+        // lane's slice SP2) adds one row per candidate backend: 3115.
+        // c-programs/shared-file-threads (shared file views beside live
+        // threads, https://github.com/rrnewton/reverie/issues/1108) adds one row
+        // per candidate backend: 3120. The java/javac compile+run split of
+        // 2026-11-05 adds two net rows per candidate backend: 3130.
+        // c-programs/madvise-guard-fault and c-programs/madvise-guard-regions
+        // (madvise guard regions, https://github.com/rrnewton/hermit/issues/5154)
+        // add one row each per candidate backend: 3140.
+        // rr/simple (first upstream rr guest, pressure tier) adds one row
+        // per candidate backend: 3145. The gvisor bucket's 148 vendored
+        // cases add one row per candidate backend each (148 x 5): 3885.
+        // Batch 1's 31 further rr guests add one row per candidate backend
+        // each: 4040. The gVisor batch-2 optional rows (530 more vendored
+        // cases measured in the pinned image 2026-11-07) add one row per
+        // candidate backend each (129 x 5 for PR A's first suites; the
+        // remaining batch-2 cases follow the parity-cells shard): 4685.
+        assert_eq!(parsed.cells.len(), 4685);
         assert_eq!(parsed.schema, PARITY_CELLS_SCHEMA);
-        // The repository's limit for a text file is 2 MiB. This bound was
-        // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448
-        // took the snapshot to 1,099,771 bytes: every test lists one line per
-        // backend, and the 139 rr-compat-only replay tests added 556
-        // not-applicable lines. Folding those replay cells into the rows' own
-        // tests removed the 556 lines again (902,846 bytes, 3144 cells, on
-        // 2026-10-04).
-        assert!(
-            committed.len() < 1536 * 1024,
-            "{PARITY_CELLS_PATH} is {} bytes; it must stay well under 2 MiB",
-            committed.len()
-        );
+        // Per-shard size bound: the original single file asserted it must
+        // stay well under 2 MiB (1,536 KiB in the assert; the 2 MiB figure
+        // is uncited snapshot-era prose from 71b5bca69, with no repo-wide
+        // source - ci/compat-envelope/cells.json already exceeds it). The
+        // shard layout keeps the 1,536 KiB assert PER SHARD (checked above),
+        // so a bucket can grow without any one file approaching it. This
+        // bound was 1 MiB until fold 5 of
+        // https://github.com/rrnewton/hermit/issues/3448 took the snapshot to
+        // 1,099,771 bytes: every test lists one line per backend, and the
+        // 139 rr-compat-only replay tests added 556 not-applicable lines.
+        // Folding those replay cells into the rows' own tests removed the
+        // 556 lines again (902,846 bytes, 3144 cells, on 2026-10-04).
     }
 
     /// The census is consistent with itself. Its values are not pinned here:

@@ -9,7 +9,8 @@
  * independent of the host's per-UID pipe-page pressure state.
  */
 int main(void) {
-  enum { EXPECTED_PIPE_CAPACITY = 8192 };
+  /* Two of the host's pages: 8192 on x86-64. */
+  const int EXPECTED_PIPE_CAPACITY = 2 * (int)sysconf(_SC_PAGESIZE);
   int fds[2] = {-1, -1};
 
   if (pipe(fds) != 0) {

@@ -92,6 +92,14 @@ jobs:
     runs-on: [Linux, X64, hermit, pmu]
     timeout-minutes: 360
     steps:
+      - name: Guard — refuse untrusted actor on self-hosted runner
+        env:
+          GUARD_ACTOR: ${{ github.actor }}
+        run: |
+          case "$GUARD_ACTOR" in
+            hermit-bot3|rrnewton) echo "runner-trust: actor $GUARD_ACTOR is allow-listed" ;;
+            *) echo "::error::runner-trust: actor '$GUARD_ACTOR' is not allow-listed for self-hosted runners (allowlist: hermit-bot3, rrnewton)"; exit 1 ;;
+          esac
       - name: Remove stale checkout locks
         run: |
           set -euo pipefail
@@ -113,7 +121,13 @@ jobs:
         with:
           ref: ${{ env.TARGET_SHA }}
           path: dev-hermit-demo-suite/hermit
+          fetch-depth: 0
           submodules: false
+      - name: Guard — verify commit authors before running code
+        working-directory: dev-hermit-demo-suite/hermit
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+        run: bash scripts/check-runner-trust.sh
 
       - name: Verify exact culprit attribution
         run: |

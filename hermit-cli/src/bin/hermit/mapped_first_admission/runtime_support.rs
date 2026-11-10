@@ -618,7 +618,7 @@ impl PacketMappingWire {
 
 pub(crate) fn memfd_bytes(bytes: &[u8], seal: bool) -> io::Result<File> {
     let file = File::from(
-        crate::verify_inputs::new_unsealed_memfd(c"mapped-packet-control").map_err(rpc)?,
+        crate::app::verify_inputs::new_unsealed_memfd(c"mapped-packet-control").map_err(rpc)?,
     );
     file.write_all_at(bytes, 0)?;
     file.set_len(bytes.len() as u64)?;

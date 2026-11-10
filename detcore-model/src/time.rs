@@ -910,20 +910,30 @@ impl GlobalTime {
     /// error into a fatal exit. Without the option the default charge
     /// saturates, as it always did, and this never fails.
     pub fn add_scheduler_time(&mut self) -> Result<LogicalTime, ClockExhausted> {
-        let charge = match self.scheduler_turn_charge {
-            Some(charge) => {
-                if self.total.0.checked_add(charge).is_none() {
-                    return Err(ClockExhausted {
-                        charge,
-                        total: self.total,
-                    });
-                }
-                charge
-            }
-            None => (NANOS_PER_SCHED * self.multiplier) as u64,
-        };
-        let delta = Duration::from_nanos(charge);
-        Ok(self.add_extra_time(delta))
+        self.add_capped_scheduler_time(u64::MAX)
+    }
+
+    /// [`Self::add_scheduler_time`] for a turn charged at most `cap`
+    /// nanoseconds: the scheduler's charge for a turn that ends a timeslice
+    /// under `--cap-preemption-charge`, whose `cap` is the virtual time the
+    /// thread ran since its previous turn. The capped charge is at least one
+    /// nanosecond, so the turn still advances the clock, as a configured
+    /// `--scheduler-turn-cost` must (`Config::scheduler_turn_charge`); a
+    /// default charge that the clock multiplier truncates to zero stays zero,
+    /// as it always was. A `cap` at or above the turn's charge changes
+    /// nothing.
+    pub fn add_capped_scheduler_time(&mut self, cap: u64) -> Result<LogicalTime, ClockExhausted> {
+        let full = self
+            .scheduler_turn_charge
+            .unwrap_or((NANOS_PER_SCHED * self.multiplier) as u64);
+        let charge = full.min(cap.max(1));
+        if self.scheduler_turn_charge.is_some() && self.total.0.checked_add(charge).is_none() {
+            return Err(ClockExhausted {
+                charge,
+                total: self.total,
+            });
+        }
+        Ok(self.add_extra_time(Duration::from_nanos(charge)))
     }
 
     /// Update the global clock to account for time not driven by internal
@@ -964,22 +974,39 @@ impl GlobalTime {
             return;
         }
 
+        // Work the old leader did stays in aggregate time.
+        self.retire_thread(to);
         let survivor_time = self
             .time_vector
             .remove(&from)
             .unwrap_or_else(|| panic!("cannot reassign missing thread clock {from}"));
         let survivor_inherited = self.inherited_time.remove(&from).unwrap_or_default();
-        let retired_inherited = self.inherited_time.remove(&to).unwrap_or_default();
-        if let Some(retired_leader_time) = self.time_vector.remove(&to) {
-            self.extra_time = self.extra_time + (retired_leader_time - retired_inherited);
-        }
         self.time_vector.insert(to, survivor_time);
         self.inherited_time.insert(to, survivor_inherited);
         self.sanity();
     }
 
+    /// Drop the clock component of a thread that is gone, keeping its own
+    /// work in aggregate time. A later thread that Linux gives the same ID
+    /// then starts a component of its own, with its own inherited baseline,
+    /// instead of continuing the old thread's clock.
+    pub fn retire_thread(&mut self, dtid: DetTid) {
+        let inherited = self.inherited_time.remove(&dtid).unwrap_or_default();
+        if let Some(time) = self.time_vector.remove(&dtid) {
+            self.extra_time = self.extra_time + (time - inherited);
+        }
+        self.sanity();
+    }
+
     fn inherited_duration(&self, dtid: DetTid) -> LogicalDuration {
         self.inherited_time.get(&dtid).copied().unwrap_or_default()
+    }
+
+    /// The absolute clock inherited when this thread started. Its first
+    /// report can arrive after scheduler registration; work since startup is
+    /// the current thread clock minus this baseline, not minus the epoch.
+    pub fn threads_inherited_time(&self, dtid: DetTid) -> LogicalTime {
+        self.starting_nanos + self.inherited_duration(dtid)
     }
 
     /// Project a thread's local duration, including inherited history but
@@ -1181,6 +1208,60 @@ mod global_time_tests {
         assert_eq!(time.as_nanos(), previous, "a refused turn adds nothing");
     }
 
+    /// A capped turn charges the smaller of its cap and the full charge, and
+    /// at least one nanosecond, with the default and a configured cost alike.
+    #[test]
+    fn a_capped_turn_charges_its_cap_bounded_by_the_full_charge_and_one_nanosecond() {
+        let advance = |config: &Config, cap: u64| {
+            let mut time = GlobalTime::new(config);
+            let start = time.as_nanos();
+            time.add_capped_scheduler_time(cap).unwrap() - start
+        };
+        let default = Config::default();
+        let configured = Config {
+            scheduler_turn_cost: std::num::NonZeroU64::new(10_000),
+            ..Config::default()
+        };
+        for (config, full) in [(&default, NANOS_PER_SCHED as u64), (&configured, 10_000)] {
+            assert_eq!(advance(config, 1_000), LogicalTime::from_nanos(1_000));
+            assert_eq!(advance(config, full - 1), LogicalTime::from_nanos(full - 1));
+            assert_eq!(advance(config, full), LogicalTime::from_nanos(full));
+            assert_eq!(advance(config, full + 1), LogicalTime::from_nanos(full));
+            assert_eq!(advance(config, u64::MAX), LogicalTime::from_nanos(full));
+            assert_eq!(advance(config, 0), LogicalTime::from_nanos(1));
+        }
+        let mut uncapped = GlobalTime::new(&default);
+        let start = uncapped.as_nanos();
+        assert_eq!(
+            uncapped.add_scheduler_time().unwrap() - start,
+            LogicalTime::from_nanos(NANOS_PER_SCHED as u64)
+        );
+    }
+
+    /// A capped turn that would pass the end of representable time under a
+    /// configured cost is refused with its capped charge, and adds nothing.
+    #[test]
+    fn a_capped_turn_refuses_to_saturate_the_clock_with_its_capped_charge() {
+        let config = Config {
+            scheduler_turn_cost: std::num::NonZeroU64::new(crate::config::MAX_SCHEDULER_TURN_COST),
+            epoch: "2554-07-21T23:34:33Z".parse().unwrap(),
+            ..Config::default()
+        };
+        let mut time = GlobalTime::new(&config);
+        let headroom = u64::MAX - time.as_nanos().as_nanos();
+        time.add_capped_scheduler_time(headroom).unwrap();
+        let end = time.as_nanos();
+        assert_eq!(end, LogicalTime::MAX);
+        assert_eq!(
+            time.add_capped_scheduler_time(5),
+            Err(ClockExhausted {
+                charge: 5,
+                total: end,
+            })
+        );
+        assert_eq!(time.as_nanos(), end, "a refused turn adds nothing");
+    }
+
     /// Without `--scheduler-turn-cost` the default charge saturates at the
     /// end of representable time, as it always did, rather than fail.
     #[test]
@@ -1303,5 +1384,39 @@ mod global_time_tests {
         assert_eq!(time.threads_time(leader), worker_time);
         assert!(time.contains_thread(leader));
         assert!(!time.contains_thread(worker));
+    }
+
+    /// Linux gives an exited thread's ID to a later thread once IDs wrap at
+    /// `pid_max`. The later thread starts at its creator's time with a
+    /// component of its own: none of its inherited history is charged, and
+    /// the first holder's own work stays in aggregate time.
+    #[test]
+    fn a_reused_thread_id_starts_its_own_clock_and_keeps_the_old_work() {
+        let config = Config::default();
+        let mut time = GlobalTime::new(&config);
+        let start = time.as_nanos();
+        let parent = DetTid::from_raw(17);
+        let reused = DetTid::from_raw(18);
+        let mut parent_clock = DetTime::new(&config);
+        parent_clock.add_syscall_with_cost(100);
+        publish(&mut time, parent, &parent_clock);
+        let mut first_holder = parent_clock.clone_for_child();
+        first_holder.add_syscall_with_cost(50);
+        publish(&mut time, reused, &first_holder);
+        assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(150));
+
+        time.retire_thread(reused);
+        assert!(!time.contains_thread(reused));
+        assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(150));
+
+        parent_clock.add_syscall_with_cost(1_000);
+        publish(&mut time, parent, &parent_clock);
+        let mut second_holder = parent_clock.clone_for_child();
+        publish(&mut time, reused, &second_holder);
+        assert_eq!(time.threads_time(reused), second_holder.as_nanos());
+        assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(1_150));
+        second_holder.add_syscall_with_cost(7);
+        publish(&mut time, reused, &second_holder);
+        assert_eq!(time.as_nanos(), start + LogicalTime::from_nanos(1_157));
     }
 }

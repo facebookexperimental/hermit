@@ -20,6 +20,7 @@ use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Ftruncate;
 use reverie::syscalls::Getcwd;
+#[cfg(target_arch = "x86_64")]
 use reverie::syscalls::Getdents;
 use reverie::syscalls::Getdents64;
 use reverie::syscalls::Ioctl;
@@ -27,6 +28,7 @@ use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Pread64;
 use reverie::syscalls::Read;
 use reverie::syscalls::ReadAddr;
+#[cfg(target_arch = "x86_64")]
 use reverie::syscalls::Readlink;
 use reverie::syscalls::Sendfile;
 use reverie::syscalls::Statx;
@@ -1325,6 +1327,7 @@ impl Recorder {
         Ok(ret)
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub(super) async fn handle_readlink<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1429,6 +1432,7 @@ impl Recorder {
         result
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub(super) async fn handle_getdents<G: Guest<Self>>(
         &self,
         guest: &mut G,

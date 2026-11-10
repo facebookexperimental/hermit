@@ -40,7 +40,9 @@
  * so it is the same on every run.
  *
  * Only backends whose Detcore wait model re-parents orphans support the
- * flag; the others refuse it, which c-programs/child-subreaper-refusal
+ * flag: ptrace, where the kernel has moved them by the time Detcore decides,
+ * and KVM, whose process signal control moves its own records where Detcore
+ * names. The others refuse it, which c-programs/child-subreaper-refusal
  * asserts.
  */
 

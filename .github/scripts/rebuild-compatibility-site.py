@@ -227,8 +227,8 @@ def require_sources(parent, config):
 # https://github.com/rrnewton/hermit/actions/runs/38256949845. The fetch moves
 # about 711 MiB at a GitHub serving rate near 1 MB/s; its bytes shrink by the
 # scorecard history parts (265.9 MiB of the pack at ledger f8361f72) once
-# those leave the ledger's main branch (dev-hermit option (a),
-# https://github.com/rrnewton/dev-hermit/issues/558). The rebuild step's own
+# those leave the ledger's main branch (the planned move of the scorecard
+# history to a branch of its own, replaced on each regeneration). The rebuild step's own
 # 180-minute bound holds the fetch, the 36-42 minute build and the upload.
 LEDGER_FETCH_TIMEOUT = 2700
 LEDGER_DEEPEN_STEP = 50
@@ -260,11 +260,69 @@ def _is_ancestor(ledger, ancestor, descendant):
     return result.returncode == 0
 
 
+def _folded_tips(ledger, descendant):
+    """Old tips that squash snapshots in DESCENDANT's history fold in.
+
+    A ledger squash replaces main with a parentless snapshot commit whose
+    tree is exactly the old tip's tree and whose message ends with the
+    trailer ``Ledger-Snapshot-Of: <old tip>``. Commits published before the
+    squash are then no longer ancestors of main, but a checkout that still
+    holds the old history can prove they are folded in. This mirrors the
+    ledger's own snapshot rule; it only ever widens what the fetch below
+    treats as reachable, never what the website builder admits.
+    """
+    def read(*args):
+        try:
+            return run(["git", "--no-replace-objects", "-C", ledger, *args]).decode().strip()
+        except (subprocess.CalledProcessError, ValueError):
+            return None
+
+    tips = []
+    current = descendant
+    for _ in range(64):
+        roots = (read("rev-list", "--max-parents=0", current) or "").split()
+        if len(roots) != 1:
+            break
+        raw = read("cat-file", "commit", roots[0])
+        if raw is None:
+            break
+        headers, separator, body = raw.partition("\n\n")
+        if not separator or any(line.startswith("parent ") for line in headers.split("\n")):
+            break
+        lines = body.rstrip("\n").split("\n")
+        match = re.fullmatch(r"Ledger-Snapshot-Of: ([0-9a-f]{40})", lines[-1]) if lines else None
+        if match is None:
+            break
+        tip = match.group(1)
+        trees = (read("rev-parse", roots[0] + "^{tree}", tip + "^{tree}") or "").split()
+        if len(trees) != 2 or trees[0] != trees[1]:
+            break
+        tips.append(tip)
+        current = tip
+    return tips
+
+
+def _is_ancestor_or_folded(ledger, ancestor, descendant):
+    """Whether ANCESTOR is an ancestor of DESCENDANT or folded into it.
+
+    After a squash the parity summary's commit is folded in, not an
+    ancestor, so the fetch must stop deepening once the snapshot proving
+    that is present instead of deepening to the limit. The builder still
+    refuses a summary it cannot place; this only bounds the fetch.
+    """
+    if _is_ancestor(ledger, ancestor, descendant):
+        return True
+    return any(
+        _is_ancestor(ledger, ancestor, tip)
+        for tip in _folded_tips(ledger, descendant)
+    )
+
+
 def _history_complete(ledger, ledger_commit, depth):
     """Whether the fetch at DEPTH already reached ledger_commit's root commit.
 
     After the ledger's main is squashed to one snapshot commit
-    (https://github.com/rrnewton/dev-hermit/issues/562), a parity summary
+    (done from time to time, to drop history no reader needs), a parity summary
     written before the squash names a commit that is in no history this fetch
     can reach, and deepening further only repeats the fetch.
     """
@@ -276,6 +334,21 @@ def _history_complete(ledger, ledger_commit, depth):
     return count < depth
 
 
+def _snapshot_trailer_tip(ledger, ledger_commit):
+    """The old tip a snapshot root's trailer names, without any proof check."""
+    try:
+        roots = run(["git", "--no-replace-objects", "-C", ledger, "rev-list",
+                     "--max-parents=0", ledger_commit]).decode().split()
+        if len(roots) != 1:
+            return None
+        body = run(["git", "--no-replace-objects", "-C", ledger, "log", "-1",
+                    "--format=%B", roots[0]]).decode().rstrip("\n").split("\n")
+    except (subprocess.CalledProcessError, ValueError):
+        return None
+    match = re.fullmatch(r"Ledger-Snapshot-Of: ([0-9a-f]{40})", body[-1]) if body else None
+    return match.group(1) if match else None
+
+
 def fetch_ledger(ledger, ledger_commit):
     """Fetch ledger_commit and only the history the builder reads."""
     fetch = ["git", "-C", ledger, "fetch", "--no-tags", "--no-recurse-submodules"]
@@ -284,7 +357,7 @@ def fetch_ledger(ledger, ledger_commit):
     summarized = _parity_summary_commit(ledger, ledger_commit)
     while (
         summarized not in (None, ledger_commit)
-        and not _is_ancestor(ledger, summarized, ledger_commit)
+        and not _is_ancestor_or_folded(ledger, summarized, ledger_commit)
         and depth < LEDGER_DEEPEN_LIMIT
         and not _history_complete(ledger, ledger_commit, depth)
     ):
@@ -292,6 +365,38 @@ def fetch_ledger(ledger, ledger_commit):
         # naming the summarized commit it could not place.
         depth += LEDGER_DEEPEN_STEP
         run([*fetch, "--depth", str(depth), "origin", ledger_commit], timeout=LEDGER_FETCH_TIMEOUT)
+    if summarized not in (None, ledger_commit) and not _is_ancestor_or_folded(
+        ledger, summarized, ledger_commit
+    ):
+        # A cold checkout holds only post-squash history; the folding proof
+        # needs the detached old tip the snapshot trailer names. Fetch it,
+        # bounded like the deepening above, so the proof can be checked
+        # locally instead of the summary being refused for a missing object.
+        # Follow successive snapshot trailers: each fetched tip's own root
+        # may be an earlier snapshot naming the next tip. The chain walk is
+        # bounded (64 links, the ledger snapshot chain limit), and each
+        # tip's fetch deepens only within the same overall limit.
+        proof_commit = ledger_commit
+        for _ in range(64):
+            tip = _snapshot_trailer_tip(ledger, proof_commit)
+            if tip is None:
+                break
+            try:
+                run([*fetch, "--depth", "1", "origin", tip], timeout=LEDGER_FETCH_TIMEOUT)
+                proof_depth = 1
+                while (
+                    not _is_ancestor(ledger, summarized, tip)
+                    and proof_depth < LEDGER_DEEPEN_LIMIT
+                    and not _history_complete(ledger, tip, proof_depth)
+                ):
+                    proof_depth += LEDGER_DEEPEN_STEP
+                    run([*fetch, "--depth", str(proof_depth), "origin", tip],
+                        timeout=LEDGER_FETCH_TIMEOUT)
+            except subprocess.CalledProcessError:
+                break  # the builder refuses a summary it cannot place
+            if _is_ancestor(ledger, summarized, tip):
+                break
+            proof_commit = tip
     # The workflow caches this repository; the next run's fetch offers this
     # commit as already present and downloads only what changed since.
     run(["git", "-C", ledger, "update-ref", LEDGER_CACHE_REF, ledger_commit])
@@ -502,8 +607,14 @@ def publish_release(pin, archive, registry, ledger_commit, hermit_commit):
     return asset_id(release, pin, registry.name, registry_sha, len(registry_bytes))
 
 
-def rebuild(parent, scratch, receipt, *, ledger_commit, validation_history_commit):
-    config = configuration()
+def rebuild(
+    parent, scratch, receipt, *, ledger_commit, validation_history_commit, config_path=None
+):
+    # The workflow passes the pin saved from the DISPATCHED commit: this
+    # checkout stands at hermit_commit, whose own pin file names an older
+    # builder generation.  Reading the pin here instead would silently
+    # build with that older pair (runs 41537071693 and 41666103898).
+    config = configuration(config_path) if config_path is not None else configuration()
     ledger_commit = exact_commit(ledger_commit, "cell ledger")
     validation_history_commit = exact_commit(
         validation_history_commit, "parent validation history"
@@ -651,10 +762,16 @@ def main(argv=None):
         allow_abbrev=False,
     )
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser(
+    source_config = commands.add_parser(
         "source-config",
         allow_abbrev=False,
         help="print the exact reviewed builder checkout configuration",
+    )
+    source_config.add_argument(
+        "--builder-config",
+        type=Path,
+        default=None,
+        help="pin file saved from the dispatched commit (default: this checkout's pin)",
     )
     commands.add_parser(
         "capture-ledger",
@@ -679,6 +796,12 @@ def main(argv=None):
         required=True,
         help="full origin/main SHA from the later full-history private checkout",
     )
+    build.add_argument(
+        "--builder-config",
+        type=Path,
+        default=None,
+        help="pin file saved from the dispatched commit (default: this checkout's pin)",
+    )
     verify = commands.add_parser(
         "verify-public",
         allow_abbrev=False,
@@ -688,7 +811,11 @@ def main(argv=None):
     arguments = parser.parse_args(argv)
     try:
         if arguments.command == "source-config":
-            result = configuration()
+            result = (
+                configuration(arguments.builder_config)
+                if arguments.builder_config is not None
+                else configuration()
+            )
         elif arguments.command == "capture-ledger":
             result = capture_ledger()
         elif arguments.command == "rebuild":
@@ -706,6 +833,7 @@ def main(argv=None):
                     arguments.receipt,
                     ledger_commit=arguments.ledger_commit,
                     validation_history_commit=arguments.validation_history_commit,
+                    config_path=arguments.builder_config,
                 )
             finally:
                 resources.update(

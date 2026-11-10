@@ -11,7 +11,9 @@ use std::io::BufRead;
 use std::io::BufReader;
 use std::path::Path;
 
+use anyhow::Context;
 use colored::Colorize;
+use detcore::preemptions::boundary_recording::Recording;
 
 use super::RunEnvironment;
 use crate::cli_wrapper::display_cmd;
@@ -120,15 +122,156 @@ impl<P: AsRef<OsStr>> Verify<P> {
         }
     }
 
+    /// The recording fields of a schedule file, and the RCB coordinate
+    /// identity it states. A file in the `rcb_history` envelope is decoded by
+    /// the common reader, which refuses an unknown format, a malformed or
+    /// unknown identity and an invalid record, and its fields are the
+    /// envelope's inner recording, exactly as written. An unwrapped file
+    /// states no identity and is compared as it is.
+    fn schedule_fields(path: &Path) -> anyhow::Result<(serde_json::Value, Option<String>)> {
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        if value.get("rcb_history").is_none() {
+            return Ok((value, None));
+        }
+        let identity = Recording::decode_from(path, &bytes)?
+            .identity()
+            .map(ToString::to_string);
+        Ok((value["rcb_history"]["recording"].take(), identity))
+    }
+
     fn verify_files(left: &Path, right: &Path) -> anyhow::Result<bool> {
         let left = std::fs::read_to_string(left)?;
         let right = std::fs::read_to_string(right)?;
         Self::verify_lines(left, right)
     }
 
+    /// Every difference between two schedule files in what priority-history
+    /// replay must reproduce beside the global events: each per-thread
+    /// history, whole, and each callback checkpoint. A key present on one
+    /// side only is a difference; absent on both is equal. Nothing is
+    /// projected, reordered or normalized.
+    fn priority_history_differences(
+        left: &serde_json::Value,
+        right: &serde_json::Value,
+    ) -> Vec<String> {
+        let mut differences = Vec::new();
+        for key in ["per_thread", "callback_checkpoints"] {
+            match (left.get(key), right.get(key)) {
+                (None, None) => {}
+                (Some(_), None) => differences.push(format!("{key}: in the first run only")),
+                (None, Some(_)) => differences.push(format!("{key}: in the second run only")),
+                (Some(left), Some(right)) => {
+                    Self::value_differences(key.to_owned(), left, right, &mut differences)
+                }
+            }
+        }
+        differences
+    }
+
+    /// The number of per-thread histories, their preemption rows, and the
+    /// callback checkpoints in one schedule file.
+    fn priority_history_extent(schedule: &serde_json::Value) -> (usize, usize, usize) {
+        let threads = schedule.get("per_thread").and_then(|t| t.as_object());
+        let rows = threads.map_or(0, |threads| {
+            threads
+                .values()
+                .filter_map(|t| t.get("preemption_rcbs")?.as_array().map(Vec::len))
+                .sum()
+        });
+        let checkpoints = schedule
+            .get("callback_checkpoints")
+            .and_then(|c| c.as_object())
+            .map_or(0, |c| {
+                c.values().filter_map(|t| t.as_array().map(Vec::len)).sum()
+            });
+        (threads.map_or(0, |t| t.len()), rows, checkpoints)
+    }
+
+    fn value_differences(
+        path: String,
+        left: &serde_json::Value,
+        right: &serde_json::Value,
+        differences: &mut Vec<String>,
+    ) {
+        use serde_json::Value;
+        if left == right {
+            return;
+        }
+        match (left, right) {
+            (Value::Object(left), Value::Object(right)) => {
+                let keys: std::collections::BTreeSet<&String> =
+                    left.keys().chain(right.keys()).collect();
+                for key in keys {
+                    match (left.get(key), right.get(key)) {
+                        (Some(l), Some(r)) => {
+                            Self::value_differences(format!("{path}.{key}"), l, r, differences)
+                        }
+                        (Some(_), None) => {
+                            differences.push(format!("{path}.{key}: in the first run only"))
+                        }
+                        (None, Some(_)) => {
+                            differences.push(format!("{path}.{key}: in the second run only"))
+                        }
+                        (None, None) => unreachable!(),
+                    }
+                }
+            }
+            (Value::Array(l), Value::Array(r)) => {
+                if l.len() != r.len() {
+                    differences.push(format!("{path}: {} entries vs {}", l.len(), r.len()));
+                }
+                for (index, (l, r)) in l.iter().zip(r).enumerate() {
+                    Self::value_differences(format!("{path}[{index}]"), l, r, differences);
+                }
+            }
+            _ => differences.push(format!("{path}: {left} vs {right}")),
+        }
+    }
+
+    /// The fixed point of priority-history replay, which re-records what it
+    /// replays: the two schedule files must agree exactly on every
+    /// per-thread priority history and every callback checkpoint.
+    /// `verify_schedules`, which compares only the global events, is
+    /// unchanged and checked separately.
+    pub fn verify_priority_histories(
+        &self,
+        left: &RunEnvironment,
+        right: &RunEnvironment,
+    ) -> anyhow::Result<bool> {
+        println!(
+            "{}",
+            "::  Checking that per-thread priority histories and callback checkpoints match".bold()
+        );
+        let (left, left_identity) = Self::schedule_fields(&left.schedule_file)?;
+        let (right, right_identity) = Self::schedule_fields(&right.schedule_file)?;
+        // Name what was compared, so an exact agreement of two empty
+        // histories is never mistaken for coverage.
+        let (threads, rows, checkpoints) = Self::priority_history_extent(&left);
+        println!(
+            "   first run: {threads} per-thread histories, {rows} preemption rows, \
+             {checkpoints} callback checkpoints"
+        );
+        let mut differences = Vec::new();
+        if left_identity != right_identity {
+            differences.push(format!(
+                "rcb_history identity: {left_identity:?} vs {right_identity:?}"
+            ));
+        }
+        differences.extend(Self::priority_history_differences(&left, &right));
+        const SHOWN: usize = 20;
+        for difference in differences.iter().take(SHOWN) {
+            println!("{}", difference.red().bold());
+        }
+        if differences.len() > SHOWN {
+            println!("... and {} more differences", differences.len() - SHOWN);
+        }
+        Ok(differences.is_empty())
+    }
+
     fn format_json<TPath: AsRef<Path>>(path: TPath) -> anyhow::Result<String> {
-        let value: serde_json::Value =
-            serde_json::from_reader(std::fs::File::open(path.as_ref())?)?;
+        let (value, _) = Self::schedule_fields(path.as_ref())?;
         let schedules = match &value {
             serde_json::Value::Object(sched_file) => sched_file.get("global").ok_or_else(|| {
                 anyhow::Error::msg("expecting \"global\" key in the target json file")
@@ -150,6 +293,14 @@ impl<P: AsRef<OsStr>> Verify<P> {
             "{}",
             "::  Checking that event schedules match (fixed point)".bold()
         );
+        // Schedules stating different RCB identities count different things,
+        // so they differ even where their events agree.
+        let (_, left_identity) = Self::schedule_fields(&left.schedule_file)?;
+        let (_, right_identity) = Self::schedule_fields(&right.schedule_file)?;
+        if left_identity != right_identity {
+            println!("rcb_history identity differs: {left_identity:?} vs {right_identity:?}");
+            return Ok(false);
+        }
         Self::verify_lines(
             Self::format_json(&left.schedule_file)?,
             Self::format_json(&right.schedule_file)?,
@@ -178,6 +329,37 @@ impl<P: AsRef<OsStr>> Verify<P> {
             left.std_err_file_path.as_path(),
             right.std_err_file_path.as_path(),
         )
+    }
+
+    /// The later run's written preemption record must not be marked as
+    /// departed from the record it replayed. This reads the record's own
+    /// `replay_departed_at` marker through Detcore's reader, so it does
+    /// not depend on any warning's wording or on log filtering.
+    pub fn verify_replay_not_departed(&self, right: &RunEnvironment) -> anyhow::Result<bool> {
+        println!(
+            "{}",
+            "::  Checking the replay record is not departed:".bold()
+        );
+        match detcore::preemptions::read_recorded_replay_departure(&right.schedule_file) {
+            Ok(None) => {
+                println!("Replay record is not marked departed");
+                Ok(true)
+            }
+            Ok(Some(event)) => {
+                println!(
+                    "{}",
+                    format!("WARNING: replay record is marked departed at event {event}").red()
+                );
+                Ok(false)
+            }
+            Err(err) => {
+                println!(
+                    "{}",
+                    format!("WARNING: replay record departure unreadable: {err}").red()
+                );
+                Ok(false)
+            }
+        }
     }
 
     pub fn verify_desync(&self, right: &RunEnvironment) -> anyhow::Result<bool> {
@@ -266,6 +448,329 @@ mod test {
 
     use super::*;
     use crate::common::TemporaryEnvironmentBuilder;
+
+    /// A schedule file as priority-history replay writes it: global events,
+    /// one thread's history and one callback checkpoint.
+    fn priority_schedule() -> serde_json::Value {
+        serde_json::json!({
+            "global": [{"dettid": 3, "op": "Branch", "count": 4}],
+            "per_thread": {
+                "3": {
+                    "final_prio": 2195,
+                    "prio_changes": [[1792847361183390955u64, 2195]],
+                    "preemption_rcbs": [1253548],
+                    "chaos_epochs": []
+                }
+            },
+            "callback_checkpoints": {
+                "3": [{
+                    "history_index": 0,
+                    "origin": {
+                        "callback": {"Syscall": 1},
+                        "site": "Posthook",
+                        "progress": 1256742,
+                        "last_op": {"Syscall": [1, "Posthook"]},
+                        "time": 1792847361183390955u64,
+                        "rcbs": 1253548
+                    }
+                }]
+            }
+        })
+    }
+
+    /// The priority-history fixed point passes only on exact agreement of
+    /// every per-thread history and every checkpoint: one changed field, a
+    /// missing checkpoint map, a removed checkpoint and an added row each
+    /// fail, named by path, while the global events are left to
+    /// `verify_schedules`.
+    #[test]
+    fn priority_histories_must_agree_exactly() {
+        let left = priority_schedule();
+        assert!(Verify::<PathBuf>::priority_history_differences(&left, &left).is_empty());
+        assert_eq!(Verify::<PathBuf>::priority_history_extent(&left), (1, 1, 1));
+        assert_eq!(
+            Verify::<PathBuf>::priority_history_extent(&serde_json::json!({"global": []})),
+            (0, 0, 0)
+        );
+        let mut global_only = left.clone();
+        global_only["global"] = serde_json::json!([]);
+        assert!(
+            Verify::<PathBuf>::priority_history_differences(&left, &global_only).is_empty(),
+            "global events are verify_schedules' to compare"
+        );
+
+        let mut site = left.clone();
+        site["callback_checkpoints"]["3"][0]["origin"]["site"] = serde_json::json!("Prehook");
+        assert_eq!(
+            Verify::<PathBuf>::priority_history_differences(&left, &site),
+            vec!["callback_checkpoints.3[0].origin.site: \"Posthook\" vs \"Prehook\"".to_owned()]
+        );
+
+        let mut absent = left.clone();
+        absent
+            .as_object_mut()
+            .unwrap()
+            .remove("callback_checkpoints");
+        assert_eq!(
+            Verify::<PathBuf>::priority_history_differences(&left, &absent),
+            vec!["callback_checkpoints: in the first run only".to_owned()]
+        );
+
+        let mut removed = left.clone();
+        removed["callback_checkpoints"]["3"] = serde_json::json!([]);
+        assert_eq!(
+            Verify::<PathBuf>::priority_history_differences(&left, &removed),
+            vec!["callback_checkpoints.3: 1 entries vs 0".to_owned()]
+        );
+
+        let mut added = left.clone();
+        added["per_thread"]["3"]["preemption_rcbs"] = serde_json::json!([1253548, 2000000]);
+        assert_eq!(
+            Verify::<PathBuf>::priority_history_differences(&left, &added),
+            vec!["per_thread.3.preemption_rcbs: 1 entries vs 2".to_owned()]
+        );
+
+        let mut thread = left.clone();
+        thread["per_thread"]["5"] = left["per_thread"]["3"].clone();
+        assert_eq!(
+            Verify::<PathBuf>::priority_history_differences(&left, &thread),
+            vec!["per_thread.5: in the second run only".to_owned()]
+        );
+    }
+
+    /// Negative control for the trace-replay admission check: a replay
+    /// whose outputs, logs and exit statuses all match but whose written
+    /// record is marked departed must fail verification, while a complete
+    /// record passes and an unreadable one fails closed.
+    #[test]
+    fn a_departed_replay_record_fails_verification() -> anyhow::Result<()> {
+        let env = TemporaryEnvironmentBuilder::new().run_count(1).build()?;
+        let run = &env.runs()[0];
+        let verify = Verify::new(PathBuf::from("hermit"));
+
+        write_to_file(
+            &run.schedule_file,
+            r#"{"incomplete_preemption_record":{"version":1,"replay_departed_at":290,"record":{"per_thread":{},"global":[],"rejoins":[]}}}"#,
+        )?;
+        assert_eq!(verify.verify_replay_not_departed(run)?, false);
+
+        write_to_file(
+            &run.schedule_file,
+            r#"{"per_thread":{},"global":[],"rejoins":[]}"#,
+        )?;
+        assert_eq!(verify.verify_replay_not_departed(run)?, true);
+
+        write_to_file(&run.schedule_file, "not a record")?;
+        assert_eq!(verify.verify_replay_not_departed(run)?, false);
+        Ok(())
+    }
+
+    /// `priority_schedule` with global events that end its checkpoint's
+    /// recorded progress at its recorded operation, so the record validates.
+    fn valid_priority_schedule() -> serde_json::Value {
+        let mut schedule = priority_schedule();
+        schedule["global"] = serde_json::json!([
+            {"dettid": 3, "op": "Branch", "count": 1256741},
+            {"dettid": 3, "op": {"Syscall": [1, "Posthook"]}, "count": 1}
+        ]);
+        schedule
+    }
+
+    fn known_identity() -> detcore::preemptions::HistoryIdentity {
+        Recording::decode(
+            br#"{"rcb_history":{"format":2,"identity":"rcb:cond-retired:user:v1","recording":{"per_thread":{},"global":[]}}}"#,
+        )
+        .unwrap()
+        .identity()
+        .cloned()
+        .unwrap()
+    }
+
+    /// `schedule` as the common encoder emits it, stating `identity`.
+    fn emitted(
+        schedule: &serde_json::Value,
+        identity: Option<detcore::preemptions::HistoryIdentity>,
+    ) -> serde_json::Value {
+        let recording = Recording::decode(&serde_json::to_vec(schedule).unwrap())
+            .unwrap()
+            .with_identity(identity);
+        serde_json::from_slice(&recording.encode().unwrap()).unwrap()
+    }
+
+    /// Schedule files in the identity envelope, as F1's writers emit them,
+    /// are compared on their inner histories and checkpoints and on their
+    /// identity: an exact copy agrees with nonzero extent, and every
+    /// corrupted field, a different identity, a dropped envelope or an
+    /// unknown format is never reported equal.
+    #[test]
+    fn priority_histories_are_compared_inside_the_identity_envelope() -> anyhow::Result<()> {
+        let env = TemporaryEnvironmentBuilder::new().run_count(2).build()?;
+        let verify = Verify::new("hermit");
+        let (left, right) = (&env.runs()[0], &env.runs()[1]);
+        let schedule = valid_priority_schedule();
+        let envelope = emitted(&schedule, Some(known_identity()));
+        assert_eq!(
+            envelope["rcb_history"]["identity"],
+            serde_json::json!("rcb:cond-retired:user:v1")
+        );
+        write_to_file(&left.schedule_file, &envelope.to_string())?;
+        let (fields, identity) = Verify::<PathBuf>::schedule_fields(&left.schedule_file)?;
+        assert_eq!(identity.as_deref(), Some("rcb:cond-retired:user:v1"));
+        assert_eq!(
+            Verify::<PathBuf>::priority_history_extent(&fields),
+            (1, 1, 1)
+        );
+
+        write_to_file(&right.schedule_file, &envelope.to_string())?;
+        assert!(verify.verify_priority_histories(left, right)?);
+        assert!(verify.verify_schedules(left, right)?);
+
+        let inner = |path: &[&str], value: serde_json::Value| {
+            let mut corrupted = envelope.clone();
+            let mut slot = &mut corrupted["rcb_history"]["recording"];
+            for key in path {
+                slot = if slot.is_array() {
+                    &mut slot[key.parse::<usize>().unwrap()]
+                } else {
+                    &mut slot[*key]
+                };
+            }
+            *slot = value;
+            corrupted
+        };
+        let origin = ["callback_checkpoints", "3", "0", "origin"];
+        let at = |field: &'static str| [&origin[..], &[field]].concat();
+        // Fields a valid record may still differ in: reported, never equal.
+        let differing = [
+            inner(&["per_thread", "3", "final_prio"], serde_json::json!(2196)),
+            inner(
+                &["per_thread", "3", "prio_changes", "0", "1"],
+                serde_json::json!(2194),
+            ),
+            inner(&at("site"), serde_json::json!("Prehook")),
+            inner(&at("callback"), serde_json::json!({"Syscall": 0})),
+            emitted(
+                &schedule,
+                Some(detcore::preemptions::HistoryIdentity::Unqualified(
+                    "claim-unset".to_owned(),
+                )),
+            ),
+            schedule.clone(),
+        ];
+        for corrupted in &differing {
+            write_to_file(&right.schedule_file, &corrupted.to_string())?;
+            assert!(
+                !verify.verify_priority_histories(left, right)?,
+                "reported equal: {corrupted}"
+            );
+        }
+        // Fields whose corruption makes the record invalid, and an unknown
+        // envelope format: refused by the common reader, never equal.
+        let refused = [
+            inner(
+                &["per_thread", "3", "prio_changes", "0", "0"],
+                serde_json::json!(1),
+            ),
+            inner(
+                &["per_thread", "3", "preemption_rcbs", "0"],
+                serde_json::json!(7),
+            ),
+            inner(&at("progress"), serde_json::json!(1256743)),
+            inner(&at("rcbs"), serde_json::json!(7)),
+            inner(&at("time"), serde_json::json!(1)),
+            inner(&at("last_op"), serde_json::json!("Branch")),
+            inner(
+                &["callback_checkpoints", "3", "0", "history_index"],
+                serde_json::json!(1),
+            ),
+            {
+                let mut unknown = envelope.clone();
+                unknown["rcb_history"]["format"] = serde_json::json!(3);
+                unknown
+            },
+        ];
+        for corrupted in &refused {
+            write_to_file(&right.schedule_file, &corrupted.to_string())?;
+            assert!(
+                !matches!(verify.verify_priority_histories(left, right), Ok(true)),
+                "reported equal: {corrupted}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The global schedule comparison reads identity-enveloped files
+    /// through the common decoder too: an emitted envelope agrees with itself;
+    /// a changed or added global event that still validates is reported
+    /// different; a global change that breaks the record is refused; and a
+    /// change only to priority histories or checkpoints is left to
+    /// `verify_priority_histories`, which reports it.
+    #[test]
+    fn schedules_are_compared_inside_the_identity_envelope() -> anyhow::Result<()> {
+        let env = TemporaryEnvironmentBuilder::new().run_count(2).build()?;
+        let verify = Verify::new("hermit");
+        let (left, right) = (&env.runs()[0], &env.runs()[1]);
+        let envelope = emitted(&valid_priority_schedule(), Some(known_identity()));
+        write_to_file(&left.schedule_file, &envelope.to_string())?;
+        write_to_file(&right.schedule_file, &envelope.to_string())?;
+        assert!(verify.verify_schedules(left, right)?);
+
+        let global = |change: &dyn Fn(&mut serde_json::Value)| {
+            let mut corrupted = envelope.clone();
+            change(&mut corrupted["rcb_history"]["recording"]["global"]);
+            corrupted
+        };
+        let differing = [
+            global(&|g| g[0]["end_time"] = serde_json::json!(5)),
+            global(&|g| {
+                g.as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({"dettid": 3, "op": "Branch", "count": 1}))
+            }),
+        ];
+        for corrupted in &differing {
+            write_to_file(&right.schedule_file, &corrupted.to_string())?;
+            assert!(
+                !verify.verify_schedules(left, right)?,
+                "reported equal: {corrupted}"
+            );
+        }
+        let refused = global(&|g| g[0]["count"] = serde_json::json!(1256740));
+        write_to_file(&right.schedule_file, &refused.to_string())?;
+        assert!(
+            verify.verify_schedules(left, right).is_err(),
+            "an invalid record must be refused"
+        );
+
+        // Envelopes the common reader rejects stay rejected by both
+        // comparisons: a nested envelope and a duplicated identity field.
+        let nested = serde_json::json!({
+            "rcb_history": {"format": 2, "identity": "rcb:cond-retired:user:v1", "recording": envelope}
+        })
+        .to_string();
+        let duplicated = envelope.to_string().replacen(
+            r#""identity":"rcb:cond-retired:user:v1""#,
+            r#""identity":"rcb:cond-retired:user:v1","identity":"rcb:cond-retired:user:v1""#,
+            1,
+        );
+        assert_ne!(duplicated, envelope.to_string());
+        for rejected in [nested, duplicated] {
+            write_to_file(&right.schedule_file, &rejected)?;
+            assert!(verify.verify_schedules(left, right).is_err(), "{rejected}");
+            assert!(
+                verify.verify_priority_histories(left, right).is_err(),
+                "{rejected}"
+            );
+        }
+
+        let mut priority_only = envelope.clone();
+        priority_only["rcb_history"]["recording"]["callback_checkpoints"]["3"][0]["origin"]["site"] =
+            serde_json::json!("Prehook");
+        write_to_file(&right.schedule_file, &priority_only.to_string())?;
+        assert!(verify.verify_schedules(left, right)?);
+        assert!(!verify.verify_priority_histories(left, right)?);
+        Ok(())
+    }
 
     #[test]
     fn test_build_command_args_ignore_lines_provided() -> anyhow::Result<()> {

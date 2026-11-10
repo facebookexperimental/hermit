@@ -22,7 +22,13 @@ fn proc_fdinfo_consumers_are_deterministic_under_strict_verify() {
         Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("proc-fdinfo-{}", std::process::id()));
     fs::create_dir_all(&build_root).expect("failed to create proc-fdinfo build directory");
 
-    for (name, source) in [("open", "1"), ("openat", "2"), ("memfd", "3")] {
+    for (name, source) in [
+        ("open", "1"),
+        ("openat", "2"),
+        ("memfd", "3"),
+        ("eventfd", "4"),
+        ("pipe", "5"),
+    ] {
         let guest = build_root.join(name);
         let compile = Command::new("cc")
             .args(["-O2", "-std=gnu11", "-Wall", "-Wextra", "-Werror"])

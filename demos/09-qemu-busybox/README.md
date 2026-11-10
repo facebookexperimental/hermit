@@ -303,8 +303,8 @@ stages and printed its PASS line without `stages=5`; it took 154 seconds.
     program starts. Hermit uses that branch count to place its preemption
     points. In a test with `/bin/true` under `--base-env=host`, the program's
     third clock read came at 36,095 retired branches, and at 36,265 with one
-    more variable set; under `--base-env=minimal` it came at 3,187 in both
-    cases.
+    more variable set; under `--base-env=minimal`, which then set only `PATH`,
+    `HOSTNAME` and `HOME`, it came at 3,187 in both cases.
 
   A fourth input showed up only in a `VERIFY=1` comparison. An earlier
   `boot_qemu.sh` always looked up its own directory with bash's `cd`, which

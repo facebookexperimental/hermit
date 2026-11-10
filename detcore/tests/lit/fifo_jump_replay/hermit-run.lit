@@ -1,0 +1,6 @@
+RUN: %hermit run --record-preemptions-to=record.json -- %me > recorded.txt
+RUN: grep -c FifoOpenAlone record.json | FileCheck --check-prefix=JUMP %s
+JUMP: 1
+RUN: %hermit run --replay-schedule-from=record.json --die-on-desync -- %me > replayed.txt
+RUN: cmp recorded.txt replayed.txt && echo "same output" | FileCheck %s
+CHECK: same output

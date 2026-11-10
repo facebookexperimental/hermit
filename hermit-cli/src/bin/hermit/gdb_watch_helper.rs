@@ -413,7 +413,7 @@ pub(super) fn helper_command(control: RawFd, parent: RawFd) -> Command {
     #[cfg(test)]
     command
         .arg("--exact")
-        .arg("gdb_watch_helper::tests::exec_helper_entry")
+        .arg("app::gdb_watch_helper::tests::exec_helper_entry")
         .arg("--nocapture")
         .arg("--test-threads=1")
         .env(TEST_CONTROL_FD, control.to_string())
@@ -432,6 +432,19 @@ mod tests {
         };
         let control = control.into_string().unwrap().parse().unwrap();
         let parent = std::env::var(TEST_PARENT_FD).unwrap().parse().unwrap();
+        // The shipped executable reserves its startup stdin in a preinit hook
+        // (`main.rs`) before the helper role retires unsolicited descriptors.
+        // This role now re-executes the library's unit-test image, which has
+        // no preinit hook, so establish the same reservation once here, as
+        // `entry_descriptor_failure_can_stamp_no_result_without_running_a_guest`
+        // does, before the identical exec-owned supervisor runs.
+        assert_eq!(
+            super::super::STARTUP_STDIN.load(std::sync::atomic::Ordering::Acquire),
+            super::super::STDIN_UNCAPTURED
+        );
+        // SAFETY: this fresh exec image has run nothing that changes its
+        // descriptor table; libtest's main thread only waits for this test.
+        unsafe { super::super::capture_startup_stdin() };
         // Do not unwind into the harness while a helper role is still live.
         match run(control, parent) {
             Ok(()) => std::process::exit(0),

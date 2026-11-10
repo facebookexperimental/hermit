@@ -52,7 +52,7 @@ pub(crate) fn git_command_at(program: &std::path::Path) -> Command {
 pub(crate) fn checkout_root() -> std::path::PathBuf {
     let output = git_command()
         .arg("-C")
-        .arg(env!("CARGO_MANIFEST_DIR"))
+        .arg(crate::compiled_manifest_dir!())
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .expect("asking git for the checkout holding this crate");

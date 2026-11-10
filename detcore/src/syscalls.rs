@@ -9,6 +9,8 @@
 //! This module just aggregates submodules.
 
 mod accept_in_turn;
+pub(crate) mod chosen_ids;
+pub(crate) mod entry_import;
 mod files;
 /// The `SigBlk` a `/proc` status snapshot reports in place of the kernel's,
 /// for the guest-mask publication tests (`initialize_procfs_snapshot` calls it
@@ -18,12 +20,17 @@ pub(crate) use files::status_published_sigblk;
 pub(crate) mod guest_siginfo;
 pub mod helpers;
 
+pub(crate) use files::SyscallCwd;
+pub(crate) use files::descriptor_directory::SendInspection;
 /// Re-exported so `procfs` can report the SAME ceiling that `F_SETPIPE_SZ`
-/// enforces. Two constants that must agree are one constant.
-pub(crate) use files::DETERMINISTIC_PIPE_CAPACITY_BYTES;
+/// enforces. Two values that must agree are one value.
+pub(crate) use files::deterministic_pipe_capacity_bytes;
+pub(crate) use files::may_name_file_or_descriptor;
+pub(crate) use files::procfs_levels::take_proc_device;
 pub(crate) use files::read_guest_exact;
 pub(crate) use files::read_guest_prefix;
 pub(crate) use files::rendered_procfs;
+pub(crate) use files::vectored_offset;
 pub(crate) use threads::VIRTUAL_CPUSET_BYTES;
 mod io;
 pub(crate) mod memory;
@@ -31,34 +38,78 @@ mod misc;
 mod namespace;
 pub(crate) use namespace::anonymous_object_devices;
 pub(crate) use namespace::guest_task_procfs;
-pub(crate) use network_trace::received_descriptors;
+pub(crate) mod binder;
 mod network_trace;
+pub(crate) mod pi_futex;
 pub(crate) mod robust_list;
+pub(crate) mod scm_rights;
+/// A buffer for an injected syscall, in the stack scratch or a transient page.
+pub(crate) mod scratch;
 mod signal;
 pub(crate) mod signal_shadow;
 /// The guest's virtual SIGALRM blocked bit (signal phase 1).
 pub(crate) use signal::ClaimFault;
+/// A send's `siginfo`, for the in-guest delivery gate's tests (A5 step
+/// 3c.1c).
+#[cfg(test)]
+pub(crate) use signal::ReservedSendSiginfo;
+/// A send's target, for the in-guest delivery gate's tests (A5 step 3c.1c).
+#[cfg(test)]
+pub(crate) use signal::ReservedSendTarget;
+/// An emulated sleep's own check, for the in-guest delivery gate's tests (A5
+/// step 3c.1c).
+#[cfg(test)]
+pub(crate) use signal::SleepCheck;
+/// An emulated sleep's own verdict, for the in-guest delivery gate's tests (A5
+/// step 3c.1c).
+#[cfg(test)]
+pub(crate) use signal::SleepSignal;
 pub(crate) use signal::claim_still_pending;
+/// An emulated sleep's own check, for the in-guest delivery gate's tests (A5
+/// step 3c.1c).
+#[cfg(test)]
+pub(crate) use signal::sleep_signal;
 pub(crate) use signal::take_claim_fault;
 pub(crate) use signal::take_pending_signal;
 pub(crate) use signal::virtual_sigalrm_blocked;
+/// Rename cookies in inotify events, renumbered by first observation.
+pub(crate) mod inotify;
 pub(crate) mod socket_timestamp_ioctl;
 pub(crate) mod sysinfo;
 mod threads;
+pub(crate) use threads::FatalDeliveryObservation;
 /// Where a futex wait takes its deadline from; a `restart_syscall` resumes an
 /// interrupted wait with the deadline it kept.
 pub(crate) use threads::FutexDeadline;
 /// The kernel's view of a guest thread's signals, which the scheduler reads when
 /// it commits a wake for a parked precise-mode futex waiter or an emulated sleep.
 pub(crate) use threads::KernelSignalState;
+/// One of a thread's two queues of pending signals.
+pub(crate) use threads::SignalQueue;
 pub(crate) use threads::default_action_ends_process;
+pub(crate) use threads::fatal_default_delivery;
+pub(crate) use threads::fatal_delivery_observation;
+pub(crate) use threads::forget_thread_status;
+pub(crate) use threads::host_signal_send_refusal;
+pub(crate) use threads::host_signal_send_refused;
 pub(crate) use threads::host_signal_state_reads_refused;
 pub(crate) use threads::ignored_at_generation;
+pub(crate) use threads::keep_status_files_open;
 pub(crate) use threads::kernel_sigset_bit;
+pub(crate) use threads::read_guest_group_wait_signal_state;
+pub(crate) use threads::read_guest_signal_state;
+pub(crate) use threads::read_guest_task_signal_state;
+pub(crate) use threads::read_guest_thread_signal_state;
+pub(crate) use threads::read_guest_wait_signal_state;
 pub(crate) use threads::read_kernel_signal_state;
 pub(crate) use threads::read_thread_signal_state;
+pub(crate) use threads::reads_signal_state_from_backend;
 pub(crate) use threads::real_uid;
 pub(crate) use threads::refuse_host_signal_state_reads;
+pub(crate) use threads::refuses_host_signal_state_reads;
+pub(crate) use threads::restarts_woken_calls_only_through_erestartsys;
+pub(crate) use threads::retires_others_at_fatal_delivery;
+pub(crate) use threads::signal_sets_errno;
 #[cfg(test)]
 pub(crate) use threads::signal_state_read_seam;
 pub(crate) use threads::thread_is_gone;

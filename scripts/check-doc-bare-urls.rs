@@ -316,6 +316,16 @@ fn attribute_value<'a>(line: &'a str, name: &str) -> Option<&'a str> {
     value.trim().strip_prefix('"')?.strip_suffix('"')
 }
 
+/// The path in a one-line `#[cfg_attr(<cfg>, path = "...")]` attribute.
+/// Dual Cargo/Buck sources select a module file per builder this way
+/// (ci/manifest-plan); the checker follows whichever candidate exists,
+/// since both name the same tracked source content.
+fn cfg_attr_path_value(line: &str) -> Option<&str> {
+    let inner = line.trim().strip_prefix("#[cfg_attr(")?.strip_suffix(")]")?;
+    let (_, value) = inner.split_once("path = \"")?;
+    value.split_once('"')?.0.into()
+}
+
 /// Every file reachable from `root_file` through `mod` declarations. Modules
 /// declared under `#[cfg(test)]` and `mod $name {` lines in a `macro_rules!`
 /// body are skipped. A line that starts like a `mod` declaration and ends with
@@ -339,7 +349,7 @@ fn module_tree(root_file: &Path) -> Result<Vec<PathBuf>, String> {
         } else {
             directory.join(stem)
         };
-        let mut path_attribute = None;
+        let mut path_candidates: Vec<String> = Vec::new();
         let mut test_only = false;
         // Enclosing inline `mod NAME {` blocks: the line that closes each
         // (rustfmt puts it at the opening line's indentation), its name, and
@@ -378,22 +388,33 @@ fn module_tree(root_file: &Path) -> Result<Vec<PathBuf>, String> {
                     ));
                 }
                 index += span - 1;
-                path_attribute = None;
+                path_candidates.clear();
                 test_only = false;
                 continue;
             }
             if let Some(name) = inline_module(trimmed) {
                 inline.push((format!("{}}}", &line[..indentation(line)]), name, test_only));
-                path_attribute = None;
+                path_candidates.clear();
                 test_only = false;
                 continue;
             }
             if trimmed.starts_with("#[") {
-                if trimmed == "#[cfg(test)]" {
+                // rustfmt reflows a long attribute over several lines;
+                // join it back before looking for a path.
+                let mut attribute = trimmed.to_string();
+                while !attribute.ends_with(']') && index < lines.len() {
+                    attribute.push(' ');
+                    attribute.push_str(without_line_comment(lines[index].trim()));
+                    index += 1;
+                }
+                if attribute == "#[cfg(test)]" {
                     test_only = true;
                 }
-                if let Some(value) = attribute_value(trimmed, "path") {
-                    path_attribute = Some(value.to_string());
+                if let Some(value) = attribute_value(&attribute, "path") {
+                    path_candidates.push(value.to_string());
+                }
+                if let Some(value) = cfg_attr_path_value(&attribute) {
+                    path_candidates.push(value.to_string());
                 }
                 continue;
             }
@@ -422,9 +443,16 @@ fn module_tree(root_file: &Path) -> Result<Vec<PathBuf>, String> {
                     for (_, inline_name, ..) in &inline {
                         parent.push(inline_name);
                     }
-                    let child = match &path_attribute {
-                        Some(path) => directory.join(path),
-                        None => {
+                    let child = match path_candidates
+                        .iter()
+                        .map(|path| directory.join(path))
+                        .find(|candidate| candidate.is_file())
+                    {
+                        Some(existing) => existing,
+                        None if !path_candidates.is_empty() => {
+                            directory.join(&path_candidates[0])
+                        }
+                        _ => {
                             let flat = parent.join(format!("{name}.rs"));
                             if flat.is_file() {
                                 flat
@@ -443,7 +471,7 @@ fn module_tree(root_file: &Path) -> Result<Vec<PathBuf>, String> {
                     pending.push((child, false));
                 }
             }
-            path_attribute = None;
+            path_candidates.clear();
             test_only = false;
         }
         if let Some((close, name, _)) = inline.last() {
@@ -1600,6 +1628,24 @@ pub fn g() {}
             .unwrap();
             let error = module_tree(&directory.join("lib.rs")).unwrap_err();
             assert!(error.contains("declares a file"), "{body}: {error}");
+        }
+        // Dual Cargo/Buck sources pick a module file per builder with
+        // cfg_attr path attributes (ci/manifest-plan); the walk follows
+        // whichever candidate exists, in either order, and still errors
+        // when none does.
+        for decl in [
+            "#[cfg_attr(not(buck_build), path = \"real.rs\")]\n#[cfg_attr(buck_build, path = \"mapped/real.rs\")]\npub mod c;\n",
+            "#[cfg_attr(buck_build, path = \"mapped/real.rs\")]\n#[cfg_attr(not(buck_build), path = \"real.rs\")]\npub mod c;\n",
+            // As rustfmt reflows a long cfg_attr (ci/manifest-plan).
+            "#[cfg_attr(\n    not(buck_build),\n    path = \"real.rs\"\n)]\n#[cfg_attr(buck_build, path = \"mapped/real.rs\")]\npub mod c;\n",
+        ] {
+            fs::write(directory.join("lib.rs"), decl).unwrap();
+            fs::write(directory.join("real.rs"), "").unwrap();
+            let tree: Vec<PathBuf> = module_tree(&directory.join("lib.rs")).unwrap();
+            assert_eq!(tree, [directory.join("lib.rs"), directory.join("real.rs")]);
+            fs::remove_file(directory.join("real.rs")).unwrap();
+            let error = module_tree(&directory.join("lib.rs")).unwrap_err();
+            assert!(error.contains("mod c;"), "{error}");
         }
         fs::remove_dir_all(&directory).unwrap();
     }

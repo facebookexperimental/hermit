@@ -7,7 +7,7 @@
  */
 
 //! Run manifests: the "tiny recording" a `hermit run` leaves when it draws an
-//! input from the host (https://github.com/rrnewton/hermit/issues/4271).
+//! input from the host (<https://github.com/rrnewton/hermit/issues/4271>).
 //!
 //! A run whose every input is given by its options is reproducible from its
 //! command line. A run that takes its virtual-time epoch from the host clock,
@@ -99,7 +99,15 @@ pub(crate) const MAX_TIMESLICE_KEY: &str = "max-timeslice";
 /// them would overwrite the original run's log, cores and reports.
 const GLOBAL_OUTPUTS: &[&str] = &["log-file"];
 const RUN_OUTPUTS: &[&str] = &[
+    // Not outputs themselves, but they only shape the access trace or write
+    // into it, and a rerun without the trace refuses them.
+    "access-trace-from",
+    "access-trace-max-bytes",
+    "access-trace-max-records",
+    "watch",
+    "watch-from",
     "backend-engagement-json",
+    "record-access-trace-to",
     "record-networking",
     "fatal-core-dir",
     "preemption-stacktrace-log-file",
@@ -406,7 +414,7 @@ impl Manifest {
         Manifest {
             schema: SCHEMA.to_owned(),
             hermit: Writer {
-                version: crate::version::Version::get().to_owned(),
+                version: crate::app::version::Version::get().to_owned(),
             },
             id: id.to_string(),
             kind,
@@ -884,18 +892,22 @@ mod tests {
             PreemptionSummary {
                 max_timeslice_ns: None,
                 timer_enabled: Some(false),
+                stopless_slice_ends: None,
             },
             PreemptionSummary {
                 max_timeslice_ns: Some(200_000_000),
                 timer_enabled: Some(false),
+                stopless_slice_ends: None,
             },
             PreemptionSummary {
                 max_timeslice_ns: Some(12_340),
                 timer_enabled: Some(true),
+                stopless_slice_ends: None,
             },
             PreemptionSummary {
                 max_timeslice_ns: Some(200_000_000),
                 timer_enabled: None,
+                stopless_slice_ends: None,
             },
         ] {
             manifest.preemption = Some(preemption);
@@ -935,7 +947,7 @@ mod tests {
     #[test]
     fn output_destinations_are_left_out() {
         use clap::CommandFactory;
-        let hermit = crate::Args::command();
+        let hermit = crate::app::Args::command();
         let run = hermit.find_subcommand("run").unwrap();
         let longs = |command: &clap::Command| -> Vec<String> {
             command

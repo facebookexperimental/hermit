@@ -14,11 +14,11 @@ use reverie::syscalls;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
+use tracing::warn;
 
 use crate::Detcore;
 use crate::RecordOrReplay;
 
-const PAGE_SIZE: usize = 4096;
 // Added in Linux 6.13 and not yet exposed by the pinned libc crate.
 const MADV_GUARD_INSTALL: i32 = 102;
 const MADV_GUARD_REMOVE: i32 = 103;
@@ -84,9 +84,61 @@ const fn madvise_action(advice: i32) -> MadviseAction {
     }
 }
 
+/// Whether `advice`, once the backend runs it, may set or clear a flag Linux
+/// keeps on the mappings it covers (`madvise_vma_behavior`, mm/madvise.c in
+/// v6.17), which `smaps` prints (`VmFlags`) and the backend's memory map does
+/// not list (`MemoryMetadata::mapping_flags_changed`): the access-pattern
+/// advice (VM_SEQ_READ, VM_RAND_READ) and the fork and dump advice
+/// (VM_DONTCOPY, VM_DONTDUMP, VM_WIPEONFORK). The huge-page and KSM advice
+/// change flags too, but Detcore answers it itself and never passes it on
+/// ([`MadviseAction::Ignore`]); the rest acts on pages, not on flags.
+const fn advice_changes_mapping_flags(advice: i32) -> bool {
+    matches!(
+        advice,
+        libc::MADV_NORMAL
+            | libc::MADV_RANDOM
+            | libc::MADV_SEQUENTIAL
+            | libc::MADV_DONTFORK
+            | libc::MADV_DOFORK
+            | libc::MADV_DONTDUMP
+            | libc::MADV_DODUMP
+            | libc::MADV_WIPEONFORK
+            | libc::MADV_KEEPONFORK
+    )
+}
+
+/// Whether `advice`, once the backend runs it, may leave a mapping it covers
+/// without the pages it held (`madvise_dontneed_free` and
+/// `madvise_guard_install`, mm/madvise.c in v6.17): `MADV_DONTNEED` and
+/// `MADV_DONTNEED_LOCKED` zap them, `MADV_GUARD_INSTALL` zaps them and
+/// installs guard markers, and `MADV_WIPEONFORK` leaves a later fork's copy
+/// empty. `numa_maps` prints `kernelpagesize_kB` only for a mapping with a
+/// resident page (`MemoryMetadata::pages_discarded`). `MADV_FREE`,
+/// `MADV_COLD` and `MADV_PAGEOUT` would too, but Detcore answers them itself
+/// and never passes them on ([`MadviseAction::Ignore`]).
+const fn advice_discards_pages(advice: i32) -> bool {
+    matches!(
+        advice,
+        libc::MADV_DONTNEED
+            | libc::MADV_DONTNEED_LOCKED
+            | MADV_GUARD_INSTALL
+            | libc::MADV_WIPEONFORK
+    )
+}
+
+/// Whether a forwarded madvise call that returned `result` may have changed
+/// mapping flags or pages: every outcome but ENOSYS, which says the backend
+/// ran nothing (a backend that does not implement the advice). Linux applies
+/// advice to the mapped part of a range it then reports ENOMEM for, and may
+/// fail with EINVAL at a later mapping after changing earlier ones.
+fn madvise_may_have_run(result: &Result<i64, Errno>) -> bool {
+    !matches!(result, Err(Errno::ENOSYS))
+}
+
 fn validate_common_args(call: syscalls::Madvise) -> Result<(), Error> {
+    let page = crate::page::page_size() as usize;
     let start = call.addr().map(AddrMut::as_raw).unwrap_or(0);
-    if !start.is_multiple_of(PAGE_SIZE) {
+    if !start.is_multiple_of(page) {
         return Err(Errno::EINVAL.into());
     }
     if call.len() == 0 {
@@ -94,22 +146,22 @@ fn validate_common_args(call: syscalls::Madvise) -> Result<(), Error> {
     }
 
     let end = start.checked_add(call.len()).ok_or(Errno::EINVAL)?;
-    end.checked_add(PAGE_SIZE - 1).ok_or(Errno::EINVAL)?;
+    end.checked_add(page - 1).ok_or(Errno::EINVAL)?;
     Ok(())
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
     /// Apply a deterministic policy to madvise(2).
     ///
-    /// Ptrace/DBT forward hints and supported advice with guest-visible semantics.
+    /// Hints and advice with guest-visible semantics are forwarded to the
+    /// backend, on every backend. A backend that does not implement an advice
+    /// answers ENOSYS with the typed refusal `MemoryAdvice`, which is logged as a
+    /// warning naming the advice; the guest sees the ENOSYS.
     /// Record/replay accepts pure hints as no-ops and passes guest-semantic advice
     /// to the recorder and replayer, which record and restore the effects that
     /// differ because replay replaces file mappings with anonymous mappings.
     /// Reclaim and asynchronous VM-policy advice receives fixed success without exposing host memory pressure. Resource-
     /// dependent, backing-store, and hardware-failure operations receive fixed errors.
-    /// KVM accepts pure hints as no-ops, implements MADV_DONTNEED in its executor
-    /// (`supports_madv_dontneed`), and reports ENOSYS for the other guest-visible
-    /// semantics it cannot provide.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#548): Recheck advice policy and record/replay boundaries.
     pub async fn handle_madvise<G: Guest<Self>>(
@@ -137,31 +189,44 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         match action {
-            MadviseAction::ForwardHint if self.cfg.backend.supports_madvise => {
-                Ok(self.record_or_replay(guest, call).await?)
-            }
-            MadviseAction::ForwardHint => {
-                crate::detlog!(
-                    "[dtid {}] madvise hint {} accepted as backend no-op",
-                    guest.thread_state().dettid,
-                    advice,
+            MadviseAction::ForwardHint | MadviseAction::ForwardSemantic => {
+                let advised = (
+                    call.addr().map_or(0, |addr| addr.as_raw() as u64),
+                    call.len() as u64,
                 );
-                Ok(0)
-            }
-            MadviseAction::ForwardSemantic
-                if self.cfg.backend.supports_madvise
-                    || (advice == libc::MADV_DONTNEED
-                        && self.cfg.backend.supports_madv_dontneed) =>
-            {
-                Ok(self.record_or_replay(guest, call).await?)
-            }
-            MadviseAction::ForwardSemantic => {
-                crate::detlog!(
-                    "[dtid {}] madvise advice {} is unsupported by this backend",
-                    guest.thread_state().dettid,
-                    advice,
-                );
-                Err(Errno::ENOSYS.into())
+                let result = self.record_or_replay(guest, call).await;
+                // The backend's memory map lists neither the flags this advice
+                // sets nor the pages it discards, so a `smaps` or `numa_maps`
+                // Detcore renders from that map can no longer derive them for
+                // a listed mapping the advice reached
+                // (`MemoryMetadata::mapping_flags_changed`, `pages_discarded`).
+                let changes_flags = advice_changes_mapping_flags(advice);
+                let discards_pages = advice_discards_pages(advice);
+                if (changes_flags || discards_pages)
+                    && madvise_may_have_run(&result)
+                    && self.renders_address_space_files()
+                    && Self::range_reaches_listed_mapping(guest, advised.0, advised.1)
+                {
+                    if changes_flags {
+                        guest.thread_state().note_mapping_flags_changed();
+                    }
+                    if discards_pages {
+                        guest.thread_state().note_pages_discarded();
+                    }
+                }
+                if result.is_err()
+                    && let Some(refusal) = guest.take_unsupported_refusal().filter(|refusal| {
+                        refusal.operation == reverie::UnsupportedOperation::MemoryAdvice
+                    })
+                {
+                    warn!(
+                        "[dtid {}] madvise advice {} refused by the backend: {}",
+                        guest.thread_state().dettid,
+                        advice,
+                        refusal.diagnostic,
+                    );
+                }
+                Ok(result?)
             }
             MadviseAction::Ignore => {
                 crate::detlog!(
@@ -211,8 +276,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Mincore,
     ) -> Result<i64, Error> {
         // Linux rejects a start address that is not page-aligned with EINVAL.
+        let page = crate::page::page_size() as usize;
         let start = call.addr().map(AddrMut::as_raw).unwrap_or(0);
-        if !start.is_multiple_of(PAGE_SIZE) {
+        if !start.is_multiple_of(page) {
             return Err(Errno::EINVAL.into());
         }
         let len = call.len();
@@ -221,7 +287,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         // Match madvise's overflow guard on the requested range.
         start.checked_add(len).ok_or(Errno::EINVAL)?;
-        let page_count = len.div_ceil(PAGE_SIZE);
+        let page_count = len.div_ceil(page);
         let vec = call.vec().ok_or(Errno::EFAULT)?;
         guest.inject(syscalls::Syscall::from(call)).await?;
         let residency = vec![1u8; page_count];
@@ -230,16 +296,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 }
 
-/// The page size `brk(2)` rounds the break to.
-const BRK_PAGE: u64 = 4096;
-
-fn brk_page_align(address: u64) -> Option<u64> {
-    Some(address.checked_add(BRK_PAGE - 1)? & !(BRK_PAGE - 1))
+/// `address` rounded up to a `page`-byte boundary, as `brk(2)` rounds the
+/// break (`PAGE_ALIGN`).
+fn brk_page_align(address: u64, page: u64) -> Option<u64> {
+    Some(address.checked_add(page - 1)? & !(page - 1))
 }
 
-/// Linux's default `stack_guard_gap`: 256 pages kept free below a mapping
-/// that grows down.
-const STACK_GUARD_GAP: u64 = 256 * BRK_PAGE;
+/// Linux's default `stack_guard_gap` with `page`-byte pages: 256 pages kept
+/// free below a mapping that grows down.
+fn stack_guard_gap(page: u64) -> u64 {
+    256 * page
+}
 
 /// One mapping of a `/proc/<pid>/smaps` text: its range, and the gap Linux
 /// keeps free below it (`stack_guard_start_gap`): `stack_guard_gap` below a
@@ -256,13 +323,15 @@ struct Vma {
 /// they are asked for: nothing is allocated, so where the tool shares the
 /// guest's process its allocator maps nothing between the read and the
 /// injected call that relies on it.
-fn smaps_vmas(smaps: &[u8]) -> SmapsVmas<'_> {
-    SmapsVmas { rest: smaps }
+fn smaps_vmas(smaps: &[u8], page: u64) -> SmapsVmas<'_> {
+    SmapsVmas { rest: smaps, page }
 }
 
 #[derive(Clone)]
 struct SmapsVmas<'a> {
     rest: &'a [u8],
+    /// The host's page size, which sizes the guard gaps.
+    page: u64,
 }
 
 impl<'a> SmapsVmas<'a> {
@@ -321,9 +390,9 @@ impl Iterator for SmapsVmas<'_> {
             if let Some(flags) = line.strip_prefix(b"VmFlags:") {
                 let mut flags = flags.split(|byte| byte.is_ascii_whitespace());
                 vma.start_gap = if flags.clone().any(|flag| flag == b"gd") {
-                    STACK_GUARD_GAP
+                    stack_guard_gap(self.page)
                 } else if flags.any(|flag| flag == b"ss") {
-                    BRK_PAGE
+                    self.page
                 } else {
                     0
                 };
@@ -338,11 +407,16 @@ impl Iterator for SmapsVmas<'_> {
 /// mapping that grows down have its guard gap there
 /// (`vma_find(&vmi, newbrk + PAGE_SIZE + stack_guard_gap)` and
 /// `vm_start_gap`).
-fn brk_may_grow(mut vmas: impl Iterator<Item = Vma>, old_end: u64, new_end: u64) -> bool {
-    let Some(limit) = new_end.checked_add(BRK_PAGE) else {
+fn brk_may_grow(
+    mut vmas: impl Iterator<Item = Vma>,
+    old_end: u64,
+    new_end: u64,
+    page: u64,
+) -> bool {
+    let Some(limit) = new_end.checked_add(page) else {
         return false;
     };
-    let search_end = limit.saturating_add(STACK_GUARD_GAP);
+    let search_end = limit.saturating_add(stack_guard_gap(page));
     let Some(next) = vmas.find(|vma| vma.end > old_end && vma.start < search_end) else {
         return true;
     };
@@ -455,10 +529,17 @@ pub enum BrkMappingCheck {
 
 impl BrkMappingCheck {
     pub(crate) fn allows(self, smaps: &[u8]) -> bool {
+        self.allows_with_page(smaps, crate::page::page_size())
+    }
+
+    /// [`Self::allows`] on a host whose pages are `page` bytes.
+    fn allows_with_page(self, smaps: &[u8], page: u64) -> bool {
         match self {
-            Self::Grow { old_end, new_end } => brk_may_grow(smaps_vmas(smaps), old_end, new_end),
+            Self::Grow { old_end, new_end } => {
+                brk_may_grow(smaps_vmas(smaps, page), old_end, new_end, page)
+            }
             Self::Shrink { new_end, old_end } => {
-                brk_may_shrink(smaps_vmas(smaps), new_end, old_end)
+                brk_may_shrink(smaps_vmas(smaps, page), new_end, old_end)
             }
         }
     }
@@ -565,8 +646,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             diagnostic.rejected("rlimit_data", Some(limit), None, &"not_injected");
             return Ok(current);
         }
-        let (Some(new_end), Some(old_end)) = (brk_page_align(requested), brk_page_align(current))
-        else {
+        let page = crate::page::page_size();
+        let (Some(new_end), Some(old_end)) = (
+            brk_page_align(requested, page),
+            brk_page_align(current, page),
+        ) else {
             diagnostic.rejected("page_overflow", Some(limit), None, &"not_injected");
             return Ok(current);
         };
@@ -682,6 +766,9 @@ impl<T: RecordOrReplay> Detcore<T> {
 mod tests {
     use super::*;
 
+    /// The page size the fixtures below are written for.
+    const PAGE: u64 = 4096;
+
     #[test]
     fn a_shared_brk_check_uses_the_existing_mapping_policy() {
         let smaps = b"00500000-00501000 rw-p 00000000 00:00 0\nVmFlags: rd wr\n";
@@ -689,30 +776,30 @@ mod tests {
             old_end: 0x400000,
             new_end,
         };
-        assert!(grow(0x4ff000).allows(smaps));
-        assert!(!grow(0x500000).allows(smaps));
-        assert!(!grow(u64::MAX - BRK_PAGE + 1).allows(smaps));
+        assert!(grow(0x4ff000).allows_with_page(smaps, PAGE));
+        assert!(!grow(0x500000).allows_with_page(smaps, PAGE));
+        assert!(!grow(u64::MAX - PAGE + 1).allows_with_page(smaps, PAGE));
         assert!(
             BrkMappingCheck::Shrink {
                 new_end: 0x500000,
                 old_end: 0x501000,
             }
-            .allows(smaps)
+            .allows_with_page(smaps, PAGE)
         );
         assert!(
             !BrkMappingCheck::Shrink {
                 new_end: 0x400000,
                 old_end: 0x500000,
             }
-            .allows(smaps)
+            .allows_with_page(smaps, PAGE)
         );
-        assert!(grow(0x500000).allows(b""));
+        assert!(grow(0x500000).allows_with_page(b"", PAGE));
         assert!(
             !BrkMappingCheck::Shrink {
                 new_end: 0x500000,
                 old_end: 0x501000,
             }
-            .allows(b"")
+            .allows_with_page(b"", PAGE)
         );
     }
 
@@ -727,13 +814,13 @@ VmFlags: rd mr mw me
 7ffffff00000-7ffffffff000 rw-p 00000000 00:00 0 [stack]
 VmFlags: rd wr mr mw me gd ac
 ";
-        let vmas: Vec<Vma> = smaps_vmas(smaps.as_bytes()).collect();
+        let vmas: Vec<Vma> = smaps_vmas(smaps.as_bytes(), PAGE).collect();
         assert_eq!(vmas.len(), 3);
         // A pathname that is not UTF-8 does not hide the mappings.
         let mut named =
             b"00500000-00501000 r--p 00000000 00:20 42 /n\xffme\nVmFlags: rd\n".to_vec();
         named.extend_from_slice(smaps.as_bytes());
-        let named: Vec<Vma> = smaps_vmas(&named).collect();
+        let named: Vec<Vma> = smaps_vmas(&named, PAGE).collect();
         assert_eq!(named.len(), 4);
         assert_eq!(named[1..], vmas[..]);
         assert_eq!(
@@ -741,31 +828,111 @@ VmFlags: rd wr mr mw me gd ac
             Vma {
                 start: 0x7ffffff00000,
                 end: 0x7ffffffff000,
-                start_gap: STACK_GUARD_GAP
+                start_gap: stack_guard_gap(PAGE)
             }
         );
         // A mapping at 0x406000: growth to 0x405000 needs 0x405000-0x406000
         // free above it, which it is; growth to 0x406000 meets the mapping.
-        assert!(brk_may_grow(vmas.iter().copied(), 0x401000, 0x405000));
-        assert!(!brk_may_grow(vmas.iter().copied(), 0x401000, 0x406000));
+        assert!(brk_may_grow(vmas.iter().copied(), 0x401000, 0x405000, PAGE));
+        assert!(!brk_may_grow(
+            vmas.iter().copied(),
+            0x401000,
+            0x406000,
+            PAGE
+        ));
         // Below a stack, the guard gap is kept as well.
-        let below_stack = 0x7ffffff00000 - STACK_GUARD_GAP;
+        let below_stack = 0x7ffffff00000 - stack_guard_gap(PAGE);
         assert!(brk_may_grow(
             vmas.iter().copied(),
             0x500000,
-            below_stack - BRK_PAGE
+            below_stack - PAGE,
+            PAGE
         ));
-        assert!(!brk_may_grow(vmas.iter().copied(), 0x500000, below_stack));
+        assert!(!brk_may_grow(
+            vmas.iter().copied(),
+            0x500000,
+            below_stack,
+            PAGE
+        ));
         // Below a shadow stack, one page.
-        let shadow: Vec<Vma> =
-            smaps_vmas(b"00410000-00411000 rw-p 00000000 00:00 0\nVmFlags: rd wr mr mw me ss\n")
-                .collect();
-        assert_eq!(shadow[0].start_gap, BRK_PAGE);
-        assert!(brk_may_grow(shadow.iter().copied(), 0x401000, 0x40e000));
-        assert!(!brk_may_grow(shadow.iter().copied(), 0x401000, 0x40f000));
+        let shadow: Vec<Vma> = smaps_vmas(
+            b"00410000-00411000 rw-p 00000000 00:00 0\nVmFlags: rd wr mr mw me ss\n",
+            PAGE,
+        )
+        .collect();
+        assert_eq!(shadow[0].start_gap, PAGE);
+        assert!(brk_may_grow(
+            shadow.iter().copied(),
+            0x401000,
+            0x40e000,
+            PAGE
+        ));
+        assert!(!brk_may_grow(
+            shadow.iter().copied(),
+            0x401000,
+            0x40f000,
+            PAGE
+        ));
         // Shrinking needs a mapping to unmap in the range.
         assert!(brk_may_shrink(vmas.iter().copied(), 0x405000, 0x407000));
         assert!(!brk_may_shrink(vmas.iter().copied(), 0x402000, 0x406000));
+    }
+
+    /// With 64 KiB pages the break, the page above it and the stack guard
+    /// gap are each counted in 64 KiB pages.
+    #[test]
+    fn a_break_on_a_host_with_large_pages_keeps_large_page_gaps() {
+        const LARGE: u64 = 0x10000;
+        let smaps = "\
+00400000-00410000 r-xp 00000000 00:20 1234 /image
+VmFlags: rd ex mr mw me
+00460000-00470000 r--p 00000000 00:00 0
+VmFlags: rd mr mw me
+7ffffff00000-7fffffff0000 rw-p 00000000 00:00 0 [stack]
+VmFlags: rd wr mr mw me gd ac
+";
+        let vmas: Vec<Vma> = smaps_vmas(smaps.as_bytes(), LARGE).collect();
+        assert_eq!(vmas[2].start_gap, 256 * LARGE);
+        // The page above the new break must be free as well: growth to
+        // 0x450000 leaves 0x450000-0x460000 free, growth to 0x460000 does not.
+        assert!(brk_may_grow(
+            vmas.iter().copied(),
+            0x410000,
+            0x450000,
+            LARGE
+        ));
+        assert!(!brk_may_grow(
+            vmas.iter().copied(),
+            0x410000,
+            0x460000,
+            LARGE
+        ));
+        // A break requested at 0x45f000: with 4 KiB pages it ends there and
+        // fits; with 64 KiB pages it rounds up to 0x460000 and meets the
+        // mapping's page.
+        let requested = 0x45f000;
+        let small = brk_page_align(requested, PAGE).unwrap();
+        let large = brk_page_align(requested, LARGE).unwrap();
+        assert_eq!((small, large), (0x45f000, 0x460000));
+        assert!(brk_may_grow(vmas.iter().copied(), 0x410000, small, PAGE));
+        assert!(!brk_may_grow(vmas.iter().copied(), 0x410000, large, LARGE));
+        // Below the stack, the guard gap is 256 large pages.
+        let below_stack = 0x7ffffff00000 - 256 * LARGE;
+        assert!(brk_may_grow(
+            vmas.iter().copied(),
+            0x500000,
+            below_stack - LARGE,
+            LARGE
+        ));
+        assert!(!brk_may_grow(
+            vmas.iter().copied(),
+            0x500000,
+            below_stack,
+            LARGE
+        ));
+        assert_eq!(brk_page_align(0x421001, LARGE), Some(0x430000));
+        assert_eq!(brk_page_align(0x430000, LARGE), Some(0x430000));
+        assert_eq!(brk_page_align(0x421001, PAGE), Some(0x422000));
     }
 
     #[test]
@@ -820,6 +987,227 @@ VmFlags: rd wr mr mw me gd ac
         assert_eq!(madvise_action(i32::MAX), MadviseAction::Unknown);
     }
 
+    /// The advice that sets or clears a flag `smaps` prints is all advice
+    /// Detcore passes on, but for advice that acts on pages alone; the advice
+    /// that discards pages is `MADV_DONTNEED`, `MADV_DONTNEED_LOCKED`,
+    /// `MADV_GUARD_INSTALL` and `MADV_WIPEONFORK`, all passed on.
+    #[test]
+    fn flag_advice_is_forwarded_advice_that_does_not_act_on_pages_alone() {
+        let forwarded = (-1..=200).filter(|advice| {
+            matches!(
+                madvise_action(*advice),
+                MadviseAction::ForwardHint | MadviseAction::ForwardSemantic
+            )
+        });
+        let pages_alone = [
+            libc::MADV_WILLNEED,
+            libc::MADV_DONTNEED,
+            libc::MADV_DONTNEED_LOCKED,
+            MADV_GUARD_INSTALL,
+            MADV_GUARD_REMOVE,
+        ];
+        let discarding = [
+            libc::MADV_DONTNEED,
+            libc::MADV_DONTNEED_LOCKED,
+            MADV_GUARD_INSTALL,
+            libc::MADV_WIPEONFORK,
+        ];
+        for advice in forwarded {
+            assert_eq!(
+                advice_changes_mapping_flags(advice),
+                !pages_alone.contains(&advice),
+                "{advice}"
+            );
+            assert_eq!(
+                advice_discards_pages(advice),
+                discarding.contains(&advice),
+                "{advice}"
+            );
+        }
+        for advice in (-1..=200).filter(|advice| advice_discards_pages(*advice)) {
+            assert_eq!(
+                madvise_action(advice),
+                MadviseAction::ForwardSemantic,
+                "{advice}"
+            );
+        }
+        for advice in [
+            libc::MADV_HUGEPAGE,
+            libc::MADV_NOHUGEPAGE,
+            libc::MADV_MERGEABLE,
+        ] {
+            assert_eq!(madvise_action(advice), MadviseAction::Ignore);
+        }
+    }
+
+    /// A memory map that lists one stack window, `[0x7000_0000, 0x7002_0000)`,
+    /// for the tests below.
+    fn stack_window() -> reverie::MemoryMap {
+        let stack = reverie::MappingFact::new(
+            0x7000_0000,
+            0x7002_0000,
+            (libc::PROT_READ | libc::PROT_WRITE) as u32,
+            false,
+            0,
+            reverie::MappingBacking::Stack,
+        )
+        .unwrap();
+        reverie::MemoryMap::new(vec![stack], false).unwrap()
+    }
+
+    /// Flag advice marks the address space once the backend may have run it:
+    /// a success, and a failure Linux can return after changing a mapping;
+    /// not ENOSYS (the backend ran nothing), advice that acts on pages alone,
+    /// or advice Detcore answers itself. So does advice that discards pages,
+    /// in its own record. Each only where Detcore renders the files from the
+    /// memory map (KVM's capabilities), and only for a range that reaches a
+    /// mapping the map lists, or where the backend gives no map.
+    #[test]
+    fn advice_that_reaches_a_listed_mapping_marks_the_address_space() {
+        use crate::record_or_replay::NoopTool;
+        use crate::syscall_hot_path_tests::InjectGuest;
+
+        futures::executor::block_on(async {
+            let page = crate::page::page_size() as usize;
+            for (advice, reply, flags, discarded) in [
+                (libc::MADV_RANDOM, Ok(0), true, false),
+                (libc::MADV_SEQUENTIAL, Err(Errno::ENOMEM), true, false),
+                (libc::MADV_DONTFORK, Err(Errno::EINVAL), true, false),
+                (libc::MADV_NORMAL, Ok(0), true, false),
+                (libc::MADV_WIPEONFORK, Ok(0), true, true),
+                (libc::MADV_DONTDUMP, Err(Errno::ENOSYS), false, false),
+                (libc::MADV_WILLNEED, Ok(0), false, false),
+                (libc::MADV_DONTNEED, Ok(0), false, true),
+                (libc::MADV_DONTNEED_LOCKED, Err(Errno::EINVAL), false, true),
+                (MADV_GUARD_INSTALL, Ok(0), false, true),
+                (libc::MADV_DONTNEED, Err(Errno::ENOSYS), false, false),
+                (libc::MADV_HUGEPAGE, Ok(0), false, false),
+            ] {
+                for (backend, map, at, reached) in [
+                    // The stack window's first page, its last, a page past it,
+                    // and the first page with no map to tell.
+                    (reverie::BackendCapabilities::KVM, true, 0x7000_0000, true),
+                    (reverie::BackendCapabilities::KVM, true, 0x7001_f000, true),
+                    (reverie::BackendCapabilities::KVM, true, 0x7002_0000, false),
+                    (reverie::BackendCapabilities::KVM, false, 0x7002_0000, true),
+                    // Where the kernel's files are served, nothing reads it.
+                    (
+                        reverie::BackendCapabilities::PTRACE,
+                        true,
+                        0x7000_0000,
+                        false,
+                    ),
+                ] {
+                    let mut tool = crate::syscall_hot_path_tests::detcore::<NoopTool>();
+                    tool.cfg.recordreplay_modes = false;
+                    tool.cfg.backend = backend;
+                    let mut guest = InjectGuest::<NoopTool>::new(reply);
+                    if map {
+                        guest = guest.with_memory_map(stack_window());
+                    }
+                    let addr = unsafe { AddrMut::<libc::c_void>::from_raw_unchecked(at) };
+                    let call = syscalls::Madvise::new()
+                        .with_addr(Some(addr))
+                        .with_len(page)
+                        .with_advice(advice);
+                    let _ = tool.handle_madvise(&mut guest, call).await;
+                    let state = guest.thread_state();
+                    let what = format!("{advice} {reply:?} at {at:#x} map {map}");
+                    assert_eq!(
+                        state.mapping_flags_may_have_changed(),
+                        flags && reached,
+                        "flags: {what}"
+                    );
+                    assert_eq!(
+                        state.pages_may_have_been_discarded(),
+                        discarded && reached,
+                        "pages: {what}"
+                    );
+                }
+            }
+        })
+    }
+
+    /// A memory lock marks the address space once the backend may have run
+    /// it, a part-way failure too; not ENOSYS, the answer of a backend that
+    /// runs none (KVM's LinuxEmu). Only where Detcore renders the files from
+    /// the memory map, and only for a lock whose range reaches a listed
+    /// mapping; `mlockall` reaches every mapping.
+    #[test]
+    fn a_memory_lock_that_reaches_a_listed_mapping_marks_the_address_space() {
+        use reverie::syscalls::Syscall;
+        use reverie::syscalls::SyscallArgs;
+        use reverie::syscalls::Sysno;
+
+        use crate::record_or_replay::NoopTool;
+        use crate::syscall_hot_path_tests::InjectGuest;
+
+        futures::executor::block_on(async {
+            for (backend, sysno, reply, at, marked) in [
+                (
+                    reverie::BackendCapabilities::KVM,
+                    Sysno::mlock,
+                    Ok(0),
+                    0x7000_0000,
+                    true,
+                ),
+                (
+                    reverie::BackendCapabilities::KVM,
+                    Sysno::mlock2,
+                    Err(Errno::ENOMEM),
+                    0x7001_ff00,
+                    true,
+                ),
+                (
+                    reverie::BackendCapabilities::KVM,
+                    Sysno::mlock,
+                    Ok(0),
+                    0x7002_0000,
+                    false,
+                ),
+                (
+                    reverie::BackendCapabilities::KVM,
+                    Sysno::mlockall,
+                    Ok(0),
+                    0,
+                    true,
+                ),
+                (
+                    reverie::BackendCapabilities::KVM,
+                    Sysno::mlock,
+                    Err(Errno::ENOSYS),
+                    0x7000_0000,
+                    false,
+                ),
+                (
+                    reverie::BackendCapabilities::KVM,
+                    Sysno::mlockall,
+                    Err(Errno::ENOSYS),
+                    0,
+                    false,
+                ),
+                (
+                    reverie::BackendCapabilities::PTRACE,
+                    Sysno::mlockall,
+                    Ok(0),
+                    0,
+                    false,
+                ),
+            ] {
+                let mut tool = crate::syscall_hot_path_tests::detcore::<NoopTool>();
+                tool.cfg.backend = backend;
+                let mut guest = InjectGuest::<NoopTool>::new(reply).with_memory_map(stack_window());
+                let call = Syscall::from_raw(sysno, SyscallArgs::new(at, 4096, 0, 0, 0, 0));
+                let _ = tool.handle_memory_lock_call(&mut guest, call).await;
+                assert_eq!(
+                    guest.thread_state().mapping_flags_may_have_changed(),
+                    marked,
+                    "{sysno} {reply:?} at {at:#x}"
+                );
+            }
+        })
+    }
+
     #[test]
     fn common_argument_validation_is_host_independent() {
         let aligned = unsafe { AddrMut::<libc::c_void>::from_raw_unchecked(0x1000) };
@@ -844,13 +1232,14 @@ VmFlags: rd wr mr mw me gd ac
             .is_err()
         );
 
+        let page = crate::page::page_size() as usize;
         let near_end =
-            unsafe { AddrMut::<libc::c_void>::from_raw_unchecked(usize::MAX & !(PAGE_SIZE - 1)) };
+            unsafe { AddrMut::<libc::c_void>::from_raw_unchecked(usize::MAX & !(page - 1)) };
         assert!(
             validate_common_args(
                 syscalls::Madvise::new()
                     .with_addr(Some(near_end))
-                    .with_len(PAGE_SIZE)
+                    .with_len(page)
                     .with_advice(libc::MADV_FREE),
             )
             .is_err()

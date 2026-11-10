@@ -48,6 +48,24 @@ KVM accepts pure access-pattern/prefetch hints as deterministic no-ops. Advice
 whose memory, fork, dump, backing-store, or guard semantics the pinned KVM
 executor cannot reproduce returns deterministic `ENOSYS`.
 
+### Post-Snapshot `CLONE_UNTRACED` Policy
+
+`CLONE_UNTRACED` keeps a tracer from attaching to the new child. No guest task
+has a tracer of its own (Detcore answers every guest `ptrace` with `EPERM`), so
+the flag changes nothing for the guest, but under ptrace Hermit must trace
+every guest task to schedule it. Detcore therefore clears the flag in the
+`clone` or `clone3` call it makes, and the child is traced like every other.
+The guest's `struct clone_args` is left as it made it: `clone3`'s copy is
+staged in the guest stack scratch (below the red zone on ptrace) and the bytes
+under it are put back. On ptrace, Reverie gives parent and child the guest's
+own argument registers back; e9patch's frame mode gives the child the
+injected ones. Before, the child ran untraced and the clone never returned.
+
+LeakSanitizer's exit-time check makes such a clone. With the check on (Hermit
+turns it off by default), its helper now runs, cannot attach to threads that
+are already traced, and LeakSanitizer reports that it does not work under
+ptrace, as under any tracer.
+
 ## Terminology And Scope
 
 - **Emulated** means Detcore returns a result without executing the guest's

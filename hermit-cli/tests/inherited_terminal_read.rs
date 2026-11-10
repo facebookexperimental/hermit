@@ -4,10 +4,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! Native Linux controls and real Detcore DBT progress regressions for a root
+//! Native Linux controls for a root
 //! inherited terminal. These one-run tests do not establish canonical parity.
-
-#![cfg(feature = "dbt")]
 
 use std::fs;
 use std::io::Read;
@@ -27,7 +25,6 @@ mod hermit_binary;
 #[derive(Clone, Copy, Debug)]
 enum Backend {
     Native,
-    Dbt,
 }
 
 struct OwnedChild(std::process::Child);
@@ -172,21 +169,7 @@ fn run_guest(backend: Backend, mode: &str, prefix: &str, guest_source: &str) {
     // after this one test returns, including descendants which changed groups.
     let mut command = Command::new("timeout");
     command.args(["--signal=TERM", "--kill-after=2s", "30s"]);
-    if matches!(backend, Backend::Dbt) {
-        command.arg(hermit_binary::hermit_binary()).args([
-            "--backend=dbt",
-            "--log=debug",
-            "run",
-            "--strict",
-            "--base-env=minimal",
-            "--epoch=2026-10-12T07:49:05+00:00",
-            "--",
-        ]);
-    }
     command.arg(&guest).arg(mode);
-    if matches!(backend, Backend::Dbt) {
-        hermit_binary::configure_guest_execution(&mut command);
-    }
     command
         .env_remove("RUST_LOG")
         .env_remove("HERMIT_LOG")
@@ -301,21 +284,11 @@ fn run_guest(backend: Backend, mode: &str, prefix: &str, guest_source: &str) {
         )
         .as_bytes()
     );
-    if matches!(backend, Backend::Dbt) {
-        assert!(
-            err.bytes
-                .windows(b"DETLOG".len())
-                .any(|window| window == b"DETLOG"),
-            "real Detcore log absent; evidence={}",
-            root.display()
-        );
-    } else {
-        assert!(
-            err.bytes.is_empty(),
-            "native stderr: {}",
-            String::from_utf8_lossy(&err.bytes)
-        );
-    }
+    assert!(
+        err.bytes.is_empty(),
+        "native stderr: {}",
+        String::from_utf8_lossy(&err.bytes)
+    );
 }
 
 #[test]
@@ -329,29 +302,9 @@ fn native_terminal_alias_survives_failed_and_successful_exec() {
 }
 
 #[test]
-fn dbt_inherited_terminal_short_read_allows_parent_progress() {
-    run(Backend::Dbt, false);
-}
-
-#[test]
-fn dbt_terminal_alias_survives_failed_and_successful_exec() {
-    run(Backend::Dbt, true);
-}
-
-#[test]
 fn native_terminal_read_observes_peer_cleared_nonblocking_after_exec() {
     run_guest(
         Backend::Native,
-        "peer-flags",
-        "pty-peer-reader-restored\npty-peer-cleared\n",
-        "inherited_terminal_peer_flags.c",
-    );
-}
-
-#[test]
-fn dbt_terminal_read_observes_peer_cleared_nonblocking_after_exec() {
-    run_guest(
-        Backend::Dbt,
         "peer-flags",
         "pty-peer-reader-restored\npty-peer-cleared\n",
         "inherited_terminal_peer_flags.c",

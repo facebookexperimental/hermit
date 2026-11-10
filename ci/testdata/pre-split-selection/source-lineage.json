@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "purpose": "Frozen pre-split selector contract fixture; not the current core graph and not external build/runtime evidence.",
+  "original_commit": "1a52541080c50457cbd3b691709885827908d5a6",
+  "original_tree": "912951e8ee499783010c90ad1b0a713e106c6bae",
+  "files": [
+    {
+      "original_path": "ci/test-footprints.json",
+      "original_bytes": 29322,
+      "original_sha256": "16dcd89d57675ebf2d35d4d36f1e6e1a609ec952578cb08aa9e47fe4d510c0b1",
+      "fixture_path": "ci/testdata/pre-split-selection/test-footprints.json",
+      "fixture_bytes": 29322,
+      "fixture_sha256": "16dcd89d57675ebf2d35d4d36f1e6e1a609ec952578cb08aa9e47fe4d510c0b1",
+      "projection": "exact JSON object"
+    },
+    {
+      "original_path": "ci/dag/validate.json",
+      "original_bytes": 2860510,
+      "original_sha256": "6490ce73707e7f39790917b6f5fa06a17b8d424a95bcb4c6690a4ad2e96580a9",
+      "fixture_path": "ci/testdata/pre-split-selection/validate.json",
+      "fixture_bytes": 111859,
+      "fixture_sha256": "386b78f06480d26b8158e5e1f58758aa2f34f3b2c998668e999e1736a79a654f",
+      "projection": "only all ordered fields read by the unchanged selector loader, no omitted rows"
+    },
+    {
+      "original_path": "ci/portable-shards.json",
+      "original_bytes": 4048,
+      "original_sha256": "f0ded9a71d2df11f861aeb734a679b40e1da212f7e991956b978fbd4e825ecb3",
+      "fixture_path": "ci/testdata/pre-split-selection/portable-shards.json",
+      "fixture_bytes": 4048,
+      "fixture_sha256": "f0ded9a71d2df11f861aeb734a679b40e1da212f7e991956b978fbd4e825ecb3",
+      "projection": "exact JSON object"
+    },
+    {
+      "original_path": "ci/expected-e2e-plan.json",
+      "original_bytes": 950222,
+      "original_sha256": "8e4ca0e925fea8948f05af2d025da4f4500eb82a0e17f151e6e1a31a01010938",
+      "fixture_path": "ci/testdata/pre-split-selection/expected-e2e-plan.json",
+      "fixture_bytes": 217930,
+      "fixture_sha256": "ee00b1eb712948e6f09a19645fa131380d8d8fd8c15754b5ffaf5ad98b4094e1",
+      "projection": "only all ordered fields read by the unchanged selector loader, no omitted rows"
+    }
+  ]
+}

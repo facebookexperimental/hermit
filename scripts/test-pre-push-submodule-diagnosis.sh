@@ -9,7 +9,7 @@
 # dependency whose directory is absent, and the hook announced "the working tree
 # does not compile in the default feature configuration" pointing at
 # `cargo clippy`. It fired on a diff touching no Rust at all and never named the
-# submodule. A clean detached worktree is the landing procedure CLAUDE.md
+# submodule. A clean detached worktree is the landing procedure AGENTS.md
 # prescribes, so the documented safe path reliably produced a misleading failure.
 #
 # ⚠️ BOTH DIRECTIONS. A hook that always blamed the submodule would pass the

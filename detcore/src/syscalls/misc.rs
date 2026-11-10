@@ -17,6 +17,7 @@ use reverie::Error;
 use reverie::Guest;
 use reverie::syscalls;
 use reverie::syscalls::AddrMut;
+#[cfg(target_arch = "x86_64")]
 use reverie::syscalls::ArchPrctlCmd;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
@@ -24,17 +25,18 @@ use reverie::syscalls::Sysno;
 
 use crate::consts::DEFAULT_HOSTNAME;
 use crate::detlog;
-#[cfg(test)]
-use crate::random::GETRANDOM_MAX_BYTES;
+use crate::fd::RandomDeviceStream;
 use crate::random::RANDOM_FILL_CHUNK_BYTES;
 #[cfg(test)]
 use crate::random::getrandom_request_len;
+use crate::random::splitmix64;
 #[cfg(test)]
 use crate::random::validate_getrandom_flags;
 use crate::random::write_random_chunk;
 use crate::record_or_replay::RecordOrReplay;
 use crate::scheduler::HostTimedSignalScope;
 use crate::tool_global::SigalrmControl;
+use crate::tool_global::child_subreaper;
 use crate::tool_global::create_session;
 use crate::tool_global::record_host_timed_signals;
 use crate::tool_global::refuse_sigalrm;
@@ -44,17 +46,28 @@ use crate::tool_global::set_process_group;
 use crate::tool_local::Detcore;
 use crate::types::DetPid;
 
+#[cfg(target_arch = "x86_64")]
 const ARCH_GET_XCOMP_SUPP: libc::c_int = 0x1021;
+#[cfg(target_arch = "x86_64")]
 const ARCH_GET_XCOMP_PERM: libc::c_int = 0x1022;
+#[cfg(target_arch = "x86_64")]
 const ARCH_REQ_XCOMP_PERM: libc::c_int = 0x1023;
+#[cfg(target_arch = "x86_64")]
 const ARCH_GET_XCOMP_GUEST_PERM: libc::c_int = 0x1024;
+#[cfg(target_arch = "x86_64")]
 const ARCH_REQ_XCOMP_GUEST_PERM: libc::c_int = 0x1025;
 
+#[cfg(target_arch = "x86_64")]
 const ARCH_SHSTK_ENABLE: libc::c_int = 0x5001;
+#[cfg(target_arch = "x86_64")]
 const ARCH_SHSTK_DISABLE: libc::c_int = 0x5002;
+#[cfg(target_arch = "x86_64")]
 const ARCH_SHSTK_LOCK: libc::c_int = 0x5003;
+#[cfg(target_arch = "x86_64")]
 const ARCH_SHSTK_UNLOCK: libc::c_int = 0x5004;
+#[cfg(target_arch = "x86_64")]
 const ARCH_SHSTK_STATUS: libc::c_int = 0x5005;
+#[cfg(target_arch = "x86_64")]
 const ARCH_SHSTK_VALID_MASK: usize = 0b11;
 
 const SECCOMP_SET_MODE_STRICT: u32 = 0;
@@ -88,10 +101,14 @@ fn seccomp_result(op: u32, flags: u32, has_args: bool) -> Result<i64, Errno> {
 
 /// Whether Detcore sends parent-death signals itself
 /// (https://github.com/rrnewton/hermit/issues/4440): only where a thread's
-/// exit reaches the scheduler in order (sequentialized threads) and the
-/// guest's tasks are host tasks it can signal (ptrace).
+/// exit reaches the scheduler in order (sequentialized threads), and the
+/// guest's tasks are host tasks it can signal (ptrace) or the backend
+/// publishes signals Detcore decides (a nonempty
+/// `publishable_parent_death_signals`, KVM's process signal control).
 fn delivers_parent_death_signal(config: &crate::config::Config) -> bool {
-    config.sequentialize_threads && config.backend.host_task_reads_reach_guest_threads
+    config.sequentialize_threads
+        && (config.backend.host_task_reads_reach_guest_threads
+            || config.backend.publishable_parent_death_signals != 0)
 }
 
 /// Whether Detcore holds parent-death signals itself, arming the kernel with
@@ -119,19 +136,25 @@ enum ParentDeathSignalRoute {
 
 /// Where `prctl(PR_SET_PDEATHSIG, signal)` goes, where Detcore holds
 /// parent-death signals (`holds`) and refuses the ones it cannot hold
-/// (`refuses_unheld`, an in-guest run's default route). Detcore holds 0 and
-/// every signal it sends itself ([`detcore_sends_parent_death_signal`]).
-/// SIGKILL keeps the kernel's path everywhere: it cannot be blocked or left
-/// pending, so the in-guest runtime's mask does not make it host-timed in the
-/// way the refusal is about (design section 16.32). Any other signal (SIGSTOP,
+/// (`refuses_unheld`, an in-guest run's default route), on a backend that
+/// publishes the signals in `published` for it (its declared set, empty
+/// where it publishes none). Detcore holds 0 and every
+/// signal it sends itself ([`detcore_sends_parent_death_signal`]). Elsewhere
+/// SIGKILL keeps the kernel's path: it cannot be blocked or left pending, so
+/// the in-guest runtime's mask does not make it host-timed in the way the
+/// refusal is about (design section 16.32). Any other signal (SIGSTOP,
 /// SIGALRM, a realtime signal) is refused where unheld signals are; a value
-/// above 64 always goes to the kernel, which refuses it with EINVAL.
+/// above 64 always goes to the kernel, which refuses it with EINVAL. On a
+/// publishing backend the signals outside its declared set take the
+/// backend's path, where the backend declines them (KVM with a typed refusal
+/// that ends a fail-closed run by name, `ParentDeathSignal`).
 fn parent_death_signal_route(
     signal: libc::c_ulong,
     holds: bool,
     refuses_unheld: bool,
+    published: u64,
 ) -> ParentDeathSignalRoute {
-    if holds && (signal == 0 || detcore_sends_parent_death_signal(signal)) {
+    if holds && (signal == 0 || detcore_sends_parent_death_signal(signal, published)) {
         ParentDeathSignalRoute::Hold
     } else if refuses_unheld
         && (1..=64).contains(&signal)
@@ -143,12 +166,36 @@ fn parent_death_signal_route(
     }
 }
 
-/// Whether parent-death signal `signal` is one Detcore sends itself: a
-/// standard signal (1 to 31) other than SIGKILL and SIGSTOP, which the
-/// kernel keeps acting on as before (a SIGKILL'd child is never counted as
-/// stuck, `Scheduler::child_is_stuck`), and SIGALRM, whose scheduler sends go
-/// to the process's alarm ledger.
-fn detcore_sends_parent_death_signal(signal: libc::c_ulong) -> bool {
+/// Whether parent-death signal `signal` is one Detcore sends itself.
+///
+/// Where the backend publishes none (`published` empty, so the guest's tasks
+/// are host tasks Detcore signals itself): a standard
+/// signal (1 to 31) other than SIGKILL and SIGSTOP, which the kernel keeps
+/// acting on as before (a SIGKILL'd child is never counted as stuck,
+/// `Scheduler::child_is_stuck`), and SIGALRM, whose scheduler sends go to the
+/// process's alarm ledger.
+///
+/// Where the backend publishes them (`published`, the set it declares in
+/// `BackendCapabilities::publishable_parent_death_signals`, bit `n - 1` for
+/// signal `n`): the standard signals in that set. Each other signal takes the
+/// backend's path, which refuses it by name. The backend decides what it can
+/// publish. Detcore's own delivery carries standard signals only: each
+/// pending send is one `Signal` (`PendingParentDeathSignal`), and the
+/// parked-wait selection asks the backend about signals 1 to 31
+/// (`Scheduler::select_parked_alarm`). So a real-time signal a backend
+/// declares is not held, which would leave it registered but never sent: it
+/// takes the backend's path and its refusal. KVM declares every standard signal except the stop
+/// signals and SIGCHLD: SIGKILL is in it (KVM queues it like any other, and
+/// it ends the process at its next delivery boundary), and so is SIGALRM
+/// (the publication puts it in the process's shared queue beside a
+/// controlled `ITIMER_REAL`'s copy, as Linux does); the stop signals are not
+/// (KVM has no stopped state), nor SIGCHLD (KVM's queues carry it only for a
+/// child's exit), nor the realtime signals (its process queue holds one
+/// event per standard signal and none of a realtime one).
+fn detcore_sends_parent_death_signal(signal: libc::c_ulong, published: u64) -> bool {
+    if published != 0 {
+        return (1..=31).contains(&signal) && published & (1_u64 << (signal - 1)) != 0;
+    }
     (1..=31).contains(&signal)
         && ![libc::SIGKILL, libc::SIGSTOP, libc::SIGALRM].contains(&(signal as libc::c_int))
 }
@@ -217,6 +264,22 @@ fn is_supported_prctl_option(option: libc::c_int) -> bool {
             // ENOSYS everywhere else.
             | libc::PR_CAPBSET_DROP
             | libc::PR_CAP_AMBIENT
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-4763)
+            //
+            // PR_SET_PTRACER names which process may ptrace the caller's
+            // process under the Yama LSM's ptrace scope 1, or any process
+            // (PR_SET_PTRACER_ANY), or none (0). It changes only that
+            // per-process exception, and the answer is a function of the
+            // argument and the host kernel: 0 with Yama, EINVAL for a pid
+            // that names no process, and EINVAL without Yama, where the option
+            // reaches prctl's default case. Android's crash handler (bionic's
+            // debuggerd) calls it with PR_SET_PTRACER_ANY on every fatal
+            // signal and treats EINVAL as "no Yama", but any other error as
+            // fatal: with ENOSYS from here, every crashing guest on Android
+            // exited 1 from inside its own signal handler instead of dying of
+            // the signal.
+            | libc::PR_SET_PTRACER
     )
 }
 
@@ -225,18 +288,42 @@ fn is_supported_prctl_option(option: libc::c_int) -> bool {
 /// `deregister_thread` and re-parents there (`Scheduler::reparent_orphans`);
 /// without that, Detcore's record never learns the orphan moved while it still
 /// decides ECHILD. And on `backend`, its own record of children decides waits
-/// (`tracks_process_children`), the kernel rather than the backend performs
-/// them (`!emulates_child_waits`), and a process's exit reaches Detcore only
-/// after the kernel's `exit_notify` has re-parented its children (neither
-/// asynchronous nor separately reported physical exits), so the record agrees
-/// with the kernel. Today that is ptrace, and e9patch preprocessing run under
-/// ptrace, in a sequentialized run.
+/// (`tracks_process_children`), and a process's exit reaches Detcore only
+/// after its children have their new parent (neither asynchronous nor
+/// separately reported physical exits), so the record agrees with whoever
+/// performs the waits: the kernel, whose `exit_notify` re-parented them
+/// (`!emulates_child_waits`), or a backend that emulates the waits and
+/// places each orphan where Detcore names (`places_orphans`), in the same
+/// critical section of the exit. Today that is ptrace, e9patch preprocessing
+/// run under ptrace, and KVM, in a sequentialized run.
 fn models_child_subreapers(sequentialize_threads: bool, backend: &BackendCapabilities) -> bool {
     sequentialize_threads
         && backend.tracks_process_children
-        && !backend.emulates_child_waits
+        && (!backend.emulates_child_waits || backend.places_orphans)
         && !backend.process_exits_complete_asynchronously
         && !backend.reports_physical_process_exits
+}
+
+/// The name `PR_SET_NAME` stores from the caller's string at `address`
+/// (`strncpy_from_user(comm, arg2, sizeof(me->comm) - 1)`): its bytes through
+/// the first NUL, at most 15. The bytes are read with the vectored,
+/// protection-respecting copy (`files::read_guest_prefix`, never
+/// `PTRACE_PEEKDATA`, which reads whole words and could fault on the page
+/// after a string that ends before it), so a string that ends just before an
+/// unreadable page is read whole, as the kernel reads it. `None` where a byte
+/// before the string's end or its 15th byte cannot be read.
+fn prctl_task_name<M: reverie::syscalls::MemoryAccess>(
+    memory: &M,
+    address: libc::c_ulong,
+) -> Option<crate::procfs::task_stat::TaskComm> {
+    let mut bytes = [0_u8; crate::procfs::task_stat::TASK_COMM_LEN - 1];
+    let address = AddrMut::<u8>::from_raw(usize::try_from(address).ok()?)?;
+    let read = crate::syscalls::files::read_guest_prefix(memory, address, &mut bytes).ok()?;
+    let readable = &bytes[..read];
+    if read < bytes.len() && !readable.contains(&0) {
+        return None;
+    }
+    Some(crate::procfs::task_stat::TaskComm::new(readable))
 }
 
 /// Is `which` one of the Linux `PRIO_*` target selectors for get/setpriority?
@@ -305,10 +392,10 @@ fn write_get_mempolicy_output<M: MemoryAccess>(
     }
 }
 
-fn from_str(s: &str) -> [i8; 65] {
-    let mut ret: [i8; 65] = [0; 65];
+fn from_str(s: &str) -> [libc::c_char; 65] {
+    let mut ret: [libc::c_char; 65] = [0; 65];
     for (i, ch) in s.bytes().take(64).enumerate() {
-        ret[i] = ch as i8;
+        ret[i] = ch as libc::c_char;
     }
     ret
 }
@@ -324,6 +411,16 @@ fn canonical_random_device_byte(seed: u64, index: u64) -> u8 {
         .wrapping_mul(RANDOM_DEVICE_BYTE_STRIDE)
         .wrapping_add(RANDOM_DEVICE_FIRST_BYTE)
         ^ seed_byte
+}
+
+/// The seed of `stream`'s bytes in a run seeded `run_seed`. Distinct streams
+/// of a run, like distinct run seeds, almost surely get distinct seeds, so two
+/// open files of a random device read different bytes
+/// (`crate::fd::RandomDeviceStream`).
+fn random_device_stream_seed(run_seed: u64, stream: RandomDeviceStream) -> u64 {
+    [stream.creator.as_raw() as u32 as u64, stream.sequence]
+        .into_iter()
+        .fold(run_seed, |seed, word| splitmix64(seed ^ splitmix64(word)))
 }
 
 /// Scatter one stream through an already-imported array. Scratch space is
@@ -394,12 +491,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// The host xstate facts of an x86-64-v3 run, or `None` under v2.
+    #[cfg(target_arch = "x86_64")]
     fn v3_host_xstate(&self) -> Option<&detcore_model::cpu_profile::HostXstate> {
         (self.cfg.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V3)
             .then_some(self.cfg.cpu_profile_host.as_ref())
             .flatten()
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn write_arch_prctl_u64<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -414,6 +513,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#539): Confirm the virtual arch_prctl control policy.
     /// Preserve thread-local bases while hiding host CPU feature controls.
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_arch_prctl<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -607,6 +707,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     signal,
                     held,
                     guest.config().in_guest_refuses_host_timed_producers,
+                    guest.config().backend.publishable_parent_death_signals,
                 );
                 if route == ParentDeathSignalRoute::Refuse {
                     tracing::warn!(
@@ -649,7 +750,24 @@ impl<T: RecordOrReplay> Detcore<T> {
                     )
                     .await;
                 }
-                let result = self.passthrough(guest, call.into()).await?;
+                if signal == libc::SIGKILL as libc::c_ulong {
+                    crate::reserved_input::expose_global(guest, "kernel-parent-death-sigkill")?;
+                }
+                // A backend that cannot arm a valid signal declines it with
+                // the typed refusal `ParentDeathSignal` (KVM, for a stop
+                // signal, SIGCHLD or a real-time signal, which it cannot
+                // send). That ends a
+                // fail-closed run by name, instead of handing the guest an
+                // ENOSYS that Linux never gives for a signal from 1 to 64.
+                let result = self.passthrough(guest, call.into()).await;
+                let result = self
+                    .report_backend_refusal(
+                        guest,
+                        Sysno::prctl,
+                        reverie::UnsupportedOperation::ParentDeathSignal,
+                        result,
+                    )
+                    .await?;
                 if held {
                     crate::tool_global::parent_death_signal(guest, Some(0)).await;
                 }
@@ -683,7 +801,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let Some(process) = registered_process_of(guest, dettid).await else {
                     return Err(Errno::ENOSYS.into());
                 };
-                let result = guest.inject(call).await?;
+                // A backend that places orphans where Detcore names
+                // (`places_orphans`, KVM) holds no flag of its own: Detcore's
+                // record is the flag, and Linux's prctl answers 0 for any
+                // argument (`kernel/sys.c`).
+                let result = if guest.config().backend.places_orphans {
+                    0
+                } else {
+                    guest.inject(call).await?
+                };
                 set_child_subreaper(guest, process, call.arg2() != 0).await;
                 Ok(result)
             }
@@ -693,7 +819,44 @@ impl<T: RecordOrReplay> Detcore<T> {
                     &guest.config().backend,
                 ) =>
             {
-                Ok(guest.inject(call).await?)
+                if !guest.config().backend.places_orphans {
+                    return Ok(guest.inject(call).await?);
+                }
+                // Linux writes the caller's process flag as an int
+                // (`put_user`), EFAULT where it cannot.
+                let dettid = guest.thread_state().dettid;
+                let Some(process) = registered_process_of(guest, dettid).await else {
+                    return Err(Errno::ENOSYS.into());
+                };
+                let flag = i32::from(child_subreaper(guest, process).await);
+                let target =
+                    AddrMut::<libc::c_int>::from_raw(call.arg2() as usize).ok_or(Errno::EFAULT)?;
+                guest
+                    .memory()
+                    .write_value(target, &flag)
+                    .map_err(|_| Errno::EFAULT)?;
+                Ok(0)
+            }
+            // PR_SET_NAME reaches the kernel, as before, and Detcore then
+            // records the name the kernel took, which a rendered
+            // `/proc/<pid>/stat` shows where the tool cannot read the kernel's
+            // own (`procfs::task_stat`): the caller's string through its first
+            // NUL, at most 15 bytes (`strncpy_from_user(comm, arg2,
+            // sizeof(me->comm) - 1)`, kernel/sys.c:2514-2521 in 6.17), read
+            // byte-exactly through the guest's own protections
+            // (`prctl_task_name`). A string Detcore cannot read where the
+            // kernel could keeps the previous record.
+            libc::PR_SET_NAME => {
+                let result = self.passthrough(guest, call.into()).await?;
+                let dettid = guest.thread_state().dettid;
+                match prctl_task_name(&guest.memory(), call.arg2()) {
+                    Some(comm) => crate::tool_global::set_task_comm(guest, dettid, comm).await,
+                    None => tracing::warn!(
+                        "[detcore, dtid {dettid}] PR_SET_NAME succeeded but its name could not \
+                         be read again; the previous recorded name stands"
+                    ),
+                }
+                Ok(result)
             }
             option if is_supported_prctl_option(option) => {
                 self.passthrough(guest, call.into()).await
@@ -771,17 +934,19 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1096): Review the backend-independent random-device stream.
-    /// Fill guest memory from the canonical stream used by every backend's
-    /// `/dev/random` and `/dev/urandom` virtualization.
+    /// Fill guest memory from `stream`, one of the canonical streams that every
+    /// backend's `/dev/random` and `/dev/urandom` virtualization reads.
     pub(super) fn fill_random_device_bytes<G: Guest<Self>>(
         &self,
         guest: &mut G,
+        stream: RandomDeviceStream,
         remote_buf: AddrMut<u8>,
         len: usize,
         stream_offset: u64,
     ) -> Result<usize, Error> {
         self.fill_random_device_iovecs(
             guest,
+            stream,
             &[crate::iovecs::ImportedIovec {
                 base: remote_buf.as_raw(),
                 len,
@@ -793,10 +958,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     pub(super) fn fill_random_device_iovecs<G: Guest<Self>>(
         &self,
         guest: &mut G,
+        stream: RandomDeviceStream,
         iovecs: &[crate::iovecs::ImportedIovec],
         stream_offset: u64,
     ) -> Result<usize, Error> {
-        let seed = guest.config().rng_seed();
+        let seed = random_device_stream_seed(guest.config().rng_seed(), stream);
         let mut hasher = DefaultHasher::new();
         let written = fill_canonical_random_iovecs(
             &mut guest.memory(),
@@ -807,9 +973,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         )?;
         if cfg!(debug_assertions) {
             detlog!(
-                "[dtid {}] USER RAND [/dev/[u]random] Filled guest memory with {} canonical random bytes at offset {}, hash of bytes: {}",
+                "[dtid {}] USER RAND [/dev/[u]random] Filled guest memory with {} canonical random bytes of {:?} at offset {}, hash of bytes: {}",
                 guest.thread_state().dettid,
                 written,
+                stream,
                 stream_offset,
                 hasher.finish()
             );
@@ -917,9 +1084,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(guest.inject(call).await?);
         }
         let (sysno, args) = reverie::syscalls::SyscallInfo::into_parts(call);
+        #[cfg(target_arch = "x86_64")]
         let pid = if sysno == Sysno::getpgrp {
             0
         } else {
+            args.arg0 as libc::pid_t
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let pid = {
+            let _ = sysno;
             args.arg0 as libc::pid_t
         };
         let task = match pid {
@@ -1100,15 +1273,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    /// getcpu system call
+    /// getcpu system call: CPU 0 of Hermit's historical single CPU, or under
+    /// `--virtual-cpus` the thread's virtual CPU (`Detcore::virtual_cpu`).
+    /// The vDSO's `getcpu` reaches here too: Reverie turns it into this
+    /// system call.
     pub async fn handle_getcpu<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Getcpu,
     ) -> Result<i64, Error> {
-        // Always set the CPU to 0.
+        let current = match self.cfg.virtual_cpus {
+            Some(cpus) => self.virtual_cpu(guest, cpus.get()).await,
+            None => 0,
+        };
         if let Some(cpu) = call.cpu() {
-            guest.memory().write_value(cpu, &0)?;
+            guest.memory().write_value(cpu, &current)?;
         }
 
         // Always set the NUMA node to 0.
@@ -1209,13 +1388,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         const MPOL_F_NODE: u64 = 1;
         const MPOL_F_ADDR: u64 = 2;
         const MPOL_F_MEMS_ALLOWED: u64 = 4;
-        const PAGE: u64 = 4096;
+        // `copy_nodes_to_user` refuses a mask longer than a page.
+        let page = crate::page::page_size();
         let mask = call.nodemask();
         if mask.is_some() && call.maxnode() < 1 {
             return Err(Errno::EINVAL.into());
         }
         // The flags argument is an unsigned long; Reverie decodes it as u32.
-        let flags = guest.regs().await.r8;
+        let flags = crate::arch::syscall_arguments(&guest.regs().await)[4];
         if flags & !(MPOL_F_NODE | MPOL_F_ADDR | MPOL_F_MEMS_ALLOWED) != 0 {
             return Err(Errno::EINVAL.into());
         }
@@ -1233,7 +1413,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         if let Some(mask) = mask {
             let bytes = (call.maxnode() - 1).div_ceil(64) * 8;
-            if bytes > PAGE.max(8) {
+            if bytes > page.max(8) {
                 return Err(Errno::EINVAL.into());
             }
             let mut words = vec![0u8; bytes as usize];
@@ -1272,6 +1452,59 @@ impl<T: RecordOrReplay> Detcore<T> {
 
 #[cfg(test)]
 mod tests {
+    /// PR_SET_NAME's name: the caller's string through its first NUL, at
+    /// most 15 bytes, read exactly: a string that ends just before an
+    /// unmapped page is read whole, and one whose bytes run into it is not.
+    #[test]
+    fn prctl_set_name_reads_exactly_up_to_15_bytes_and_the_first_nul() {
+        let memory = reverie::syscalls::LocalMemory::new();
+        let name = |address: usize| {
+            super::prctl_task_name(&memory, address as libc::c_ulong)
+                .map(|comm| comm.as_bytes().to_vec())
+        };
+        let text = |bytes: &[u8]| name(bytes.as_ptr() as usize);
+        assert_eq!(text(b"worker\0junk"), Some(b"worker".to_vec()));
+        assert_eq!(
+            text(b"0123456789abcdefghij\0"),
+            Some(b"0123456789abcde".to_vec())
+        );
+        assert_eq!(text(b"\0"), Some(Vec::new()));
+        assert_eq!(text(b"\xff\n\\L\0"), Some(b"\xff\n\\L".to_vec()));
+        // Two pages, the second made unreadable: "x\0" in the last two bytes
+        // of the first page is a whole name; "xy" there runs into the
+        // unreadable page.
+        let page = crate::test_pages::page_size();
+        // SAFETY: a private anonymous mapping this test owns and unmaps.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                2 * page,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED);
+        let base = base as usize;
+        // SAFETY: inside the first, writable page; then the second page is
+        // made unreadable.
+        unsafe {
+            *((base + page - 2) as *mut u8) = b'x';
+            *((base + page - 1) as *mut u8) = 0;
+            assert_eq!(
+                libc::mprotect((base + page) as *mut _, page, libc::PROT_NONE),
+                0
+            );
+        }
+        assert_eq!(name(base + page - 2), Some(b"x".to_vec()));
+        // SAFETY: the first page is still writable.
+        unsafe { *((base + page - 1) as *mut u8) = b'y' };
+        assert_eq!(name(base + page - 2), None);
+        // SAFETY: the mapping this test made.
+        assert_eq!(unsafe { libc::munmap(base as *mut _, 2 * page) }, 0);
+    }
+
     use super::*;
 
     /// D28a: on an in-guest run's default route Detcore holds 0 and every
@@ -1284,10 +1517,10 @@ mod tests {
     fn parent_death_signals_are_held_refused_or_the_kernels() {
         use ParentDeathSignalRoute::*;
         for signal in 0..=66_u64 {
-            let held = signal == 0 || detcore_sends_parent_death_signal(signal);
-            let in_guest = parent_death_signal_route(signal, true, true);
-            let ptrace = parent_death_signal_route(signal, true, false);
-            let other = parent_death_signal_route(signal, false, false);
+            let held = signal == 0 || detcore_sends_parent_death_signal(signal, 0);
+            let in_guest = parent_death_signal_route(signal, true, true, 0);
+            let ptrace = parent_death_signal_route(signal, true, false, 0);
+            let other = parent_death_signal_route(signal, false, false, 0);
             assert_eq!(other, Kernel, "{signal}");
             assert_eq!(ptrace, if held { Hold } else { Kernel }, "{signal}");
             let expected = if held {
@@ -1312,9 +1545,69 @@ mod tests {
             (65, Kernel),
         ] {
             assert_eq!(
-                parent_death_signal_route(signal as u64, true, true),
+                parent_death_signal_route(signal as u64, true, true, 0),
                 route,
                 "{signal}"
+            );
+        }
+    }
+
+    /// Where the backend publishes the signals Detcore decides, Detcore holds
+    /// 0 and the standard signals the backend declares. KVM declares every
+    /// standard signal but the stop signals and SIGCHLD, SIGKILL and SIGALRM
+    /// among them; the stop signals, SIGCHLD, the realtime signals and a
+    /// value above 64 take the backend's path, which refuses or rejects them.
+    /// A backend declaring another set gets its standard signals held, and
+    /// none of the real-time ones it declares, which Detcore's delivery
+    /// cannot carry.
+    #[test]
+    fn a_publishing_backend_holds_every_standard_signal_but_the_stop_signals_and_sigchld() {
+        use ParentDeathSignalRoute::*;
+        let kvm = BackendCapabilities::KVM.publishable_parent_death_signals;
+        let unsent = [
+            libc::SIGSTOP,
+            libc::SIGTSTP,
+            libc::SIGTTIN,
+            libc::SIGTTOU,
+            libc::SIGCHLD,
+        ];
+        for signal in 0..=66_u64 {
+            let expected = if signal == 0
+                || ((1..=31).contains(&signal) && !unsent.contains(&(signal as i32)))
+            {
+                Hold
+            } else {
+                Kernel
+            };
+            assert_eq!(
+                parent_death_signal_route(signal, true, false, kvm),
+                expected,
+                "{signal}"
+            );
+            assert_eq!(
+                parent_death_signal_route(signal, false, false, kvm),
+                Kernel,
+                "{signal}: nothing is held where Detcore does not deliver"
+            );
+        }
+        for signal in [libc::SIGKILL, libc::SIGALRM, libc::SIGCONT, libc::SIGTERM] {
+            assert_eq!(
+                parent_death_signal_route(signal as u64, true, false, kvm),
+                Hold,
+                "{signal}"
+            );
+        }
+        let other = (1_u64 << (libc::SIGUSR1 - 1)) | (1_u64 << (40 - 1)) | (1_u64 << (64 - 1));
+        for signal in 0..=66_u64 {
+            let expected = if [0, libc::SIGUSR1 as u64].contains(&signal) {
+                Hold
+            } else {
+                Kernel
+            };
+            assert_eq!(
+                parent_death_signal_route(signal, true, false, other),
+                expected,
+                "{signal} of another backend's set"
             );
         }
     }
@@ -1350,6 +1643,20 @@ mod tests {
             ..in_guest
         };
         assert!(!holds_parent_death_signal(&off));
+        // KVM publishes the signals Detcore decides, in a sequentialized run.
+        let kvm = crate::config::Config {
+            sequentialize_threads: true,
+            backend: BackendCapabilities::KVM,
+            ..Default::default()
+        };
+        assert!(delivers_parent_death_signal(&kvm));
+        assert!(holds_parent_death_signal(&kvm));
+        let kvm_unsequentialized = crate::config::Config {
+            sequentialize_threads: false,
+            ..kvm
+        };
+        assert!(!delivers_parent_death_signal(&kvm_unsequentialized));
+        assert!(!holds_parent_death_signal(&kvm_unsequentialized));
     }
 
     mod group_mirror {
@@ -1551,6 +1858,18 @@ mod tests {
         #[tokio::test]
         #[should_panic(expected = "HERMIT_INTERNAL_FAILURE class=tool-decided-injection")]
         async fn an_injected_tool_decided_call_ends_the_run() {
+            // Any group or session getter will do; aarch64 has getpgid, not
+            // getpgrp.
+            #[cfg(target_arch = "x86_64")]
+            let (sysno, call) = (
+                Sysno::getpgrp,
+                reverie::syscalls::Syscall::Getpgrp(reverie::syscalls::Getpgrp::new()),
+            );
+            #[cfg(not(target_arch = "x86_64"))]
+            let (sysno, call) = (
+                Sysno::getpgid,
+                reverie::syscalls::Syscall::Getpgid(reverie::syscalls::Getpgid::new()),
+            );
             let process = DetPid::from_raw(23);
             let config = Config::default();
             let global = GlobalState::init_global_state(&config).await;
@@ -1567,14 +1886,9 @@ mod tests {
                 refusal: Some(reverie::UnsupportedOperation::ToolDecided),
                 recorded: None,
                 injections: Mutex::new(0),
-                expected: Sysno::getpgrp,
+                expected: sysno,
             };
-            let result = tool
-                .handle_group_or_session_getter(
-                    &mut guest,
-                    reverie::syscalls::Syscall::Getpgrp(reverie::syscalls::Getpgrp::new()),
-                )
-                .await;
+            let result = tool.handle_group_or_session_getter(&mut guest, call).await;
             assert_eq!(*guest.injections.lock().unwrap(), 1);
             assert!(
                 matches!(result, Err(Error::Errno(Errno::ENOSYS))),
@@ -1583,7 +1897,7 @@ mod tests {
             crate::syscalls::helpers::fail_on_tool_decided_injection::<
                 crate::record_or_replay::NoopTool,
                 _,
-            >(&mut guest, Sysno::getpgrp);
+            >(&mut guest, sysno);
         }
     }
 
@@ -1818,14 +2132,20 @@ mod tests {
     }
 
     /// The subreaper prctls are admitted only where Detcore's record of
-    /// children decides waits and the kernel has re-parented by the time an
-    /// exit reaches Detcore: ptrace, and e9patch preprocessing under ptrace,
-    /// with threads sequentialized. Without sequentialization no exit reaches
-    /// the scheduler, nothing re-parents, and a subreaper's wait would see
-    /// ECHILD while its orphan lives, so the call keeps failing with ENOSYS.
+    /// children decides waits and the orphans have their new parent by the
+    /// time an exit reaches Detcore: ptrace, and e9patch preprocessing under
+    /// ptrace, where the kernel re-parented them, and KVM, which places each
+    /// one where Detcore names, with threads sequentialized. Without
+    /// sequentialization no exit reaches the scheduler, nothing re-parents,
+    /// and a subreaper's wait would see ECHILD while its orphan lives, so the
+    /// call keeps failing with ENOSYS.
     #[test]
     fn child_subreaper_prctls_are_admitted_only_where_detcore_models_them() {
-        for backend in [BackendCapabilities::PTRACE, BackendCapabilities::E9PATCH] {
+        for backend in [
+            BackendCapabilities::PTRACE,
+            BackendCapabilities::E9PATCH,
+            BackendCapabilities::KVM,
+        ] {
             assert!(models_child_subreapers(true, &backend), "{backend:?}");
             assert!(!models_child_subreapers(false, &backend), "{backend:?}");
         }
@@ -1833,7 +2153,6 @@ mod tests {
             BackendCapabilities::LITEINST_IN_GUEST,
             BackendCapabilities::SABRE,
             BackendCapabilities::DBT,
-            BackendCapabilities::KVM,
         ] {
             assert!(!models_child_subreapers(true, &backend), "{backend:?}");
             assert!(!models_child_subreapers(false, &backend), "{backend:?}");
@@ -1848,6 +2167,15 @@ mod tests {
             assert!(is_supported_prctl_option(option));
         }
         assert!(!is_supported_prctl_option(libc::PR_SET_SECUREBITS));
+    }
+
+    /// PR_SET_PTRACER reaches the kernel, which answers as Linux does: 0 with
+    /// Yama, EINVAL without it. Before, Detcore answered ENOSYS, which
+    /// bionic's crash handler takes as fatal.
+    #[test]
+    fn set_ptracer_reaches_the_kernel() {
+        assert_eq!(libc::PR_SET_PTRACER, 0x5961_6d61);
+        assert!(is_supported_prctl_option(libc::PR_SET_PTRACER));
     }
 
     #[test]
@@ -1882,7 +2210,10 @@ mod tests {
     #[test]
     fn getrandom_caps_requests_at_linux_max_rw_count() {
         assert_eq!(getrandom_request_len(16), 16);
-        assert_eq!(getrandom_request_len(usize::MAX), GETRANDOM_MAX_BYTES);
+        assert_eq!(
+            getrandom_request_len(usize::MAX),
+            crate::page::max_rw_count()
+        );
     }
 
     #[test]
@@ -1907,6 +2238,51 @@ mod tests {
             ]
         );
         assert_ne!(seeded, [first, continued].concat());
+    }
+
+    /// Distinct random-device open files read distinct bytes, and each one's
+    /// bytes depend only on the run seed and its name. The pinned seeds catch
+    /// an accidental change to the derivation, which would change every
+    /// guest's random-device bytes and stop older recordings replaying.
+    #[test]
+    fn random_device_streams_are_distinct_per_open_file_and_pinned() {
+        let named = |creator, sequence| RandomDeviceStream {
+            creator: DetPid::from_raw(creator),
+            sequence,
+        };
+        assert_eq!(
+            random_device_stream_seed(0, named(3, 0)),
+            0x0581_cd8e_1945_b98c
+        );
+        assert_eq!(
+            random_device_stream_seed(0, named(3, 1)),
+            0xbd1c_08a3_03e1_67c7
+        );
+        assert_eq!(
+            random_device_stream_seed(17, named(3, 0)),
+            0x149b_5f6d_a3c3_0dbc
+        );
+        let first_bytes = |run_seed, stream| -> Vec<u8> {
+            let seed = random_device_stream_seed(run_seed, stream);
+            (0..8)
+                .map(|index| canonical_random_device_byte(seed, index))
+                .collect()
+        };
+        assert_eq!(
+            first_bytes(0, named(3, 0)),
+            [165, 203, 254, 29, 195, 91, 94, 45]
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        for run_seed in [0, 1, 17] {
+            for creator in [3, 5, 7] {
+                for sequence in 0..4 {
+                    assert!(
+                        seen.insert(first_bytes(run_seed, named(creator, sequence))),
+                        "seed {run_seed}, creator {creator}, sequence {sequence}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

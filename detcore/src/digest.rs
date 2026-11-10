@@ -58,6 +58,23 @@ impl Digest {
     }
 }
 
+/// A SHA-256 digest computed piece by piece, for content too large to hold at
+/// once.
+#[derive(Default)]
+pub struct DigestBuilder(Sha256);
+
+impl DigestBuilder {
+    /// Adds `data` to the digest.
+    pub fn update(&mut self, data: &[u8]) {
+        self.0.update(data);
+    }
+
+    /// The digest of everything added.
+    pub fn finish(self) -> Digest {
+        Digest(self.0.finalize().into())
+    }
+}
+
 impl fmt::LowerHex for Digest {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         for byte in &self.0 {

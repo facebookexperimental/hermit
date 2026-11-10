@@ -10,7 +10,11 @@
 //!
 //! Local exact-head validation is the landing authority. The portable workflow
 //! is supplemental evidence and may run automatically only after a commit is
-//! pushed to `integration`. Two owner-approved maintenance workflows also run
+//! pushed to `integration`, and for pull requests not opened by the project bot
+//! (owner decision, 2026-10-27): its `pull_request` trigger must use exactly
+//! PORTABLE_PR_TYPES, and every job that can start without a predecessor or
+//! runs under `always()` must carry PORTABLE_PR_GATE, so a bot or draft pull
+//! request runs nothing. Two owner-approved maintenance workflows also run
 //! at their exact reviewed schedules; every workflow may remain manually
 //! dispatchable. This checker deliberately accepts only the small YAML shape
 //! used here. An unfamiliar or ambiguous trigger block is an error, never a
@@ -29,12 +33,20 @@ const PORTABLE: &str = "ci-portable.yml";
 const VALIDATION_LEVELS: &str = "validation-levels.yml";
 const BUCK2_OSS_NIGHTLY: &str = "buck2-oss-nightly.yml";
 const RUST_SCRIPT_VERSION: &str = "0.36.0";
+/// The only `pull_request` activity types ci-portable.yml may list.
+const PORTABLE_PR_TYPES: [&str; 4] = ["opened", "synchronize", "reopened", "ready_for_review"];
+/// The gate every ci-portable.yml entry job carries: a pull_request run whose
+/// author is hermit-bot3, or whose pull request is a draft, does nothing.
+const PORTABLE_PR_GATE: &str = "github.event_name != 'pull_request' || (github.event.pull_request.user.login != 'hermit-bot3' && !github.event.pull_request.draft)";
+/// The cleanup job deletes artifacts (actions: write), which a fork's token lacks.
+const PORTABLE_FORK_GUARD: &str = "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository";
 
 #[derive(Debug, PartialEq, Eq)]
 struct Triggers {
     events: BTreeSet<String>,
     push_branches: Option<Vec<String>>,
     schedule_crons: Option<Vec<String>>,
+    pull_request_types: Option<Vec<String>>,
 }
 
 fn indentation(line: &str) -> Result<usize, String> {
@@ -135,6 +147,9 @@ fn parse_triggers(source: &str) -> Result<Triggers, String> {
     let mut schedule_indent = None;
     let mut schedule_child_indent = None;
     let mut schedule_crons = None;
+    let mut pull_request_indent = None;
+    let mut pull_request_child_indent = None;
+    let mut pull_request_types = None;
     for raw in &lines[on_index + 1..] {
         let line = code(raw);
         if line.trim().is_empty() {
@@ -162,6 +177,8 @@ fn parse_triggers(source: &str) -> Result<Triggers, String> {
             push_child_indent = None;
             schedule_indent = (event == "schedule").then_some(indent);
             schedule_child_indent = None;
+            pull_request_indent = (event == "pull_request").then_some(indent);
+            pull_request_child_indent = None;
             if event == "schedule" {
                 schedule_crons = Some(Vec::new());
             }
@@ -188,6 +205,29 @@ fn parse_triggers(source: &str) -> Result<Triggers, String> {
                 } else {
                     return Err(format!(
                         "unsupported direct `push` key; only `branches` is permitted: `{trimmed}`"
+                    ));
+                }
+            }
+        } else if let Some(indent_of_pull_request) = pull_request_indent {
+            if indent > indent_of_pull_request {
+                let direct = *pull_request_child_indent.get_or_insert(indent);
+                if indent != direct {
+                    return Err(format!(
+                        "ambiguous nested structure in `pull_request`: `{}`",
+                        line.trim()
+                    ));
+                }
+                let trimmed = line.trim();
+                if let Some(value) = trimmed.strip_prefix("types:") {
+                    if pull_request_types.is_some() {
+                        return Err("duplicate `pull_request.types` entry".to_string());
+                    }
+                    pull_request_types = Some(inline_list(value).ok_or_else(|| {
+                        "`pull_request.types` must be an explicit inline list".to_string()
+                    })?);
+                } else {
+                    return Err(format!(
+                        "unsupported direct `pull_request` key; only `types` is permitted: `{trimmed}`"
                     ));
                 }
             }
@@ -224,6 +264,7 @@ fn parse_triggers(source: &str) -> Result<Triggers, String> {
         events,
         push_branches,
         schedule_crons,
+        pull_request_types,
     })
 }
 
@@ -239,11 +280,14 @@ fn approved_schedule(name: &str) -> Option<&'static [&'static str]> {
 }
 
 fn validate(name: &str, triggers: &Triggers) -> Vec<String> {
-    let recognized = BTreeSet::from([
+    let mut recognized = BTreeSet::from([
         "push".to_string(),
         "schedule".to_string(),
         "workflow_dispatch".to_string(),
     ]);
+    if name == PORTABLE {
+        recognized.insert("pull_request".to_string());
+    }
     let mut errors = Vec::new();
     for event in triggers.events.difference(&recognized) {
         errors.push(format!("automatic `{event}` trigger is not permitted"));
@@ -283,15 +327,451 @@ fn validate(name: &str, triggers: &Triggers) -> Vec<String> {
     }
 
     if name == PORTABLE {
-        let allowed = BTreeSet::from(["push".to_string(), "workflow_dispatch".to_string()]);
+        let allowed = BTreeSet::from([
+            "pull_request".to_string(),
+            "push".to_string(),
+            "workflow_dispatch".to_string(),
+        ]);
         if triggers.events != allowed {
             errors.push(
-                "ci-portable.yml must have exactly `workflow_dispatch` and `push` triggers"
+                "ci-portable.yml must have exactly `workflow_dispatch`, `push` and `pull_request` triggers"
                     .to_string(),
             );
         }
+        if triggers.events.contains("pull_request")
+            && !triggers
+                .pull_request_types
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(String::as_str)
+                .eq(PORTABLE_PR_TYPES.iter().copied())
+        {
+            errors.push(format!(
+                "ci-portable.yml `pull_request.types` must be exactly [{}]",
+                PORTABLE_PR_TYPES.join(", ")
+            ));
+        }
         if triggers.push_branches.as_deref() != Some(&["integration".to_string()]) {
             errors.push("ci-portable.yml must push-trigger exactly on `integration`".to_string());
+        }
+    }
+    errors
+}
+
+/// GitHub-hosted runner labels ci-portable.yml may use. It is the one workflow
+/// that runs a pull request's code automatically, so no job may run on a
+/// self-hosted runner.
+const PORTABLE_HOSTED_RUNNERS: [&str; 3] = ["ubuntu-latest", "ubuntu-24.04", "ubuntu-22.04"];
+
+#[derive(Debug, Default)]
+struct PortableJob {
+    name: String,
+    needs: Vec<String>,
+    condition: Option<String>,
+    runs_on: Vec<String>,
+}
+
+/// An `if:` expression without its optional `${{ }}` wrapper, whitespace collapsed.
+fn normalized_condition(expr: &str) -> String {
+    let trimmed = expr.trim();
+    // A YAML double-quoted scalar: the expression is its content.
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|t| t.strip_suffix('"'))
+        .unwrap_or(trimmed);
+    let mut text = unquoted.split_whitespace().collect::<Vec<_>>().join(" ");
+    if let Some(inner) = text.strip_prefix("${{").and_then(|t| t.strip_suffix("}}")) {
+        text = inner.split_whitespace().collect::<Vec<_>>().join(" ");
+    }
+    text
+}
+
+/// The `&&` conjuncts of an expression at parenthesis depth 0, outside quotes.
+fn top_level_conjuncts(expr: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let (mut depth, mut quoted, mut current) = (0usize, false, String::new());
+    let chars = expr.chars().collect::<Vec<_>>();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\'' {
+            quoted = !quoted;
+        } else if !quoted && c == '(' {
+            depth += 1;
+        } else if !quoted && c == ')' {
+            depth = depth.saturating_sub(1);
+        } else if !quoted && depth == 0 && c == '&' && chars.get(i + 1) == Some(&'&') {
+            parts.push(current.trim().to_string());
+            current.clear();
+            i += 2;
+            continue;
+        }
+        current.push(c);
+        i += 1;
+    }
+    parts.push(current.trim().to_string());
+    parts
+}
+
+/// Whether an expression uses a status function, which replaces the implicit
+/// `success() &&` GitHub adds otherwise. `success()` counts too: written
+/// explicitly it can be negated or or-ed away (`!success()`).
+fn has_status_function(expr: &str) -> bool {
+    // Expression function names match regardless of case (`Always()`) and of
+    // whitespace before the parenthesis (`always ( )`). Over-matching only refuses.
+    let squeezed = expr
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    ["always(", "cancelled(", "failure(", "success("]
+        .iter()
+        .any(|function| squeezed.contains(function))
+}
+
+/// Whether an expression has a `||` at parenthesis depth 0, outside quotes.
+/// `&&` binds tighter, so `x || y && anchor` does not require the anchor.
+fn has_top_level_or(expr: &str) -> bool {
+    let (mut depth, mut quoted) = (0usize, false);
+    let chars = expr.chars().collect::<Vec<_>>();
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '\'' {
+            quoted = !quoted;
+        } else if !quoted && c == '(' {
+            depth += 1;
+        } else if !quoted && c == ')' {
+            depth = depth.saturating_sub(1);
+        } else if !quoted && depth == 0 && c == '|' && chars.get(i + 1) == Some(&'|') {
+            return true;
+        }
+    }
+    false
+}
+
+/// A line without its YAML comment: `#` starts a comment only at the start of
+/// the line or after whitespace, and outside quotes.
+fn yaml_code(line: &str) -> &str {
+    let (mut single, mut double, mut escaped) = (false, false, false);
+    let mut previous = ' ';
+    for (i, c) in line.char_indices() {
+        if escaped {
+            // A double-quoted `\"` or `\\` does not end the string.
+            escaped = false;
+            previous = c;
+            continue;
+        }
+        match c {
+            '\\' if double => escaped = true,
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '#' if !single && !double && previous.is_whitespace() => {
+                return line[..i].trim_end();
+            }
+            _ => {}
+        }
+        previous = c;
+    }
+    line.trim_end()
+}
+
+fn list_value(value: &str) -> Option<Vec<String>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.starts_with('[') {
+        inline_list(value)
+    } else {
+        Some(vec![
+            value.trim_matches(|c| c == '"' || c == '\'').to_string(),
+        ])
+    }
+}
+
+/// The jobs of ci-portable.yml with their needs, job-level condition and runners.
+/// Any line at job-key indentation that is not a plain `name:` key is an error.
+fn portable_jobs(source: &str) -> Result<Vec<PortableJob>, String> {
+    let Some(jobs_start) = source.find("\njobs:\n") else {
+        return Err("ci-portable.yml has no top-level `jobs:` mapping".to_string());
+    };
+    let mut jobs: Vec<PortableJob> = Vec::new();
+    // The key whose block-scalar or block-list continuation is being read.
+    let mut open: Option<(&'static str, usize)> = None;
+    // A guarded key whose value was given on its own line: nothing may continue it.
+    let mut closed: Option<&'static str> = None;
+    for raw in source[jobs_start + "\njobs:\n".len()..].lines() {
+        let line = yaml_code(raw);
+        if line.trim().is_empty() {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        if indent == 0 {
+            break;
+        }
+        if let Some((what, at)) = open {
+            if indent > at {
+                let job = jobs.last_mut().expect("a key belongs to a job");
+                let text = line.trim();
+                match what {
+                    "if" => {
+                        let current = job.condition.get_or_insert_with(String::new);
+                        current.push(' ');
+                        current.push_str(text);
+                    }
+                    "needs" | "runs-on" => {
+                        let item = text.strip_prefix("- ").ok_or_else(|| {
+                            format!(
+                                "unsupported `{what}` continuation in job `{}`: `{text}`",
+                                job.name
+                            )
+                        })?;
+                        let target = if what == "needs" {
+                            &mut job.needs
+                        } else {
+                            &mut job.runs_on
+                        };
+                        target.push(
+                            item.trim()
+                                .trim_matches(|c| c == '"' || c == '\'')
+                                .to_string(),
+                        );
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            open = None;
+        }
+        if let Some(key) = closed {
+            if indent > 4 {
+                let job = jobs.last().map_or("", |job| job.name.as_str());
+                return Err(format!(
+                    "job `{job}` continues its single-line `{key}:` value on a further line; write the whole value on one line or as a block: `{}`",
+                    line.trim()
+                ));
+            }
+            closed = None;
+        }
+        if indent == 2 {
+            let name = line
+                .trim()
+                .strip_suffix(':')
+                .filter(|name| {
+                    !name.is_empty()
+                        && name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                })
+                .ok_or_else(|| {
+                    format!("unrecognised line at job indentation: `{}`", line.trim())
+                })?;
+            jobs.push(PortableJob {
+                name: name.to_string(),
+                ..PortableJob::default()
+            });
+            continue;
+        }
+        let Some(job) = jobs.last_mut() else {
+            return Err(format!("line before any job: `{}`", line.trim()));
+        };
+        if indent != 4 {
+            continue;
+        }
+        let text = line.trim();
+        // Only a plain `key:` is read below. A quoted key (`"if":`), a space
+        // before the colon (`if :`), an explicit `? key` or a `<<` merge key is
+        // still a job key to YAML, so it is refused rather than skipped.
+        let plain_key = text.split_once(':').is_some_and(|(key, _)| {
+            !key.is_empty()
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        });
+        if !plain_key {
+            return Err(format!(
+                "job `{}` has a job-level line that is not a plain `key:`: `{text}`",
+                job.name
+            ));
+        }
+        let guarded = ["if", "needs", "runs-on"].into_iter().find_map(|key| {
+            text.strip_prefix(key)
+                .and_then(|rest| rest.strip_prefix(':'))
+                .map(|value| (key, value.trim()))
+        });
+        let Some((key, value)) = guarded else {
+            continue;
+        };
+        let seen = match key {
+            "if" => job.condition.is_some(),
+            "needs" => !job.needs.is_empty(),
+            _ => !job.runs_on.is_empty(),
+        };
+        if seen {
+            return Err(format!("job `{}` repeats `{key}:`", job.name));
+        }
+        if value.starts_with('*') || value.starts_with('&') {
+            return Err(format!(
+                "job `{}` uses a YAML alias or anchor in `{key}:`; write the value out",
+                job.name
+            ));
+        }
+        if (value.starts_with('>') || value.starts_with('|'))
+            && !matches!(value, ">" | ">-" | "|" | "|-")
+        {
+            return Err(format!(
+                "job `{}` uses an unsupported block-scalar header `{value}` in `{key}:`",
+                job.name
+            ));
+        }
+        let block = value.is_empty() || matches!(value, ">" | ">-" | "|" | "|-");
+        match key {
+            "if" if block => {
+                job.condition = Some(String::new());
+                open = Some(("if", 4));
+            }
+            "if" => {
+                job.condition = Some(value.to_string());
+                closed = Some("if");
+            }
+            "needs" | "runs-on" if value.is_empty() => {
+                open = Some((if key == "needs" { "needs" } else { "runs-on" }, 4));
+            }
+            _ => {
+                let items = list_value(value).ok_or_else(|| {
+                    format!(
+                        "job `{}` has an unreadable `{key}:` value `{value}`",
+                        job.name
+                    )
+                })?;
+                if key == "needs" {
+                    job.needs = items;
+                    closed = Some("needs");
+                } else {
+                    job.runs_on = items;
+                    closed = Some("runs-on");
+                }
+            }
+        }
+    }
+    if jobs.is_empty() {
+        return Err("ci-portable.yml declares no jobs".to_string());
+    }
+    Ok(jobs)
+}
+
+/// ci-portable.yml must run nothing for a bot or draft pull request, and only
+/// on GitHub-hosted runners:
+/// - a job with no `needs:` must have exactly PORTABLE_PR_GATE as its `if:`;
+/// - `regular` must be exactly `always() && (gate)` and `cleanup` exactly
+///   `always() && (gate) && (fork guard)`;
+/// - any other job whose `if:` uses a status function (always(), cancelled(),
+///   failure()), which drops the default success() over its needs, must carry a
+///   top-level `&& needs.<J>.result == 'success'` for a job J it needs that is
+///   itself gated; a job without one is gated when any job it needs is gated;
+/// - every `runs-on` must be a PORTABLE_HOSTED_RUNNERS label.
+fn validate_portable_pr_gate(source: &str) -> Vec<String> {
+    let jobs = match portable_jobs(source) {
+        Ok(jobs) => jobs,
+        Err(error) => return vec![error],
+    };
+    let mut errors = Vec::new();
+    let gate = normalized_condition(PORTABLE_PR_GATE);
+    let regular = format!("always() && ({gate})");
+    let cleanup = format!("always() && ({gate}) && ({PORTABLE_FORK_GUARD})");
+    for job in &jobs {
+        if job.runs_on.is_empty() {
+            errors.push(format!(
+                "ci-portable.yml job `{}` has no `runs-on`",
+                job.name
+            ));
+        }
+        for label in &job.runs_on {
+            if !PORTABLE_HOSTED_RUNNERS.contains(&label.as_str()) {
+                errors.push(format!(
+                    "ci-portable.yml job `{}` must run on a GitHub-hosted runner ({}), not `{label}`",
+                    job.name,
+                    PORTABLE_HOSTED_RUNNERS.join(", ")
+                ));
+            }
+        }
+    }
+    let mut gated = BTreeSet::new();
+    let mut verdict: std::collections::BTreeMap<String, Result<(), String>> = Default::default();
+    // Fixed point over the needs graph: a job's verdict can depend on its needs.
+    for _ in 0..=jobs.len() {
+        for job in &jobs {
+            if verdict.get(&job.name).is_some_and(Result::is_ok) {
+                continue;
+            }
+            let condition = job
+                .condition
+                .as_deref()
+                .map(normalized_condition)
+                .unwrap_or_default();
+            let result = if job.needs.is_empty() {
+                if condition == gate {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "ci-portable.yml job `{}` has no `needs:` and its `if:` must be exactly: {PORTABLE_PR_GATE}",
+                        job.name
+                    ))
+                }
+            } else if job.name == "regular" {
+                if condition == regular {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "ci-portable.yml job `regular` must have `if:` exactly: {regular}"
+                    ))
+                }
+            } else if job.name == "cleanup" {
+                if condition == cleanup {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "ci-portable.yml job `cleanup` deletes artifacts and must have `if:` exactly: {cleanup}"
+                    ))
+                }
+            } else if has_status_function(&condition) && has_top_level_or(&condition) {
+                Err(format!(
+                    "ci-portable.yml job `{}` combines a status function with a top-level `||`, which makes its success requirement optional",
+                    job.name
+                ))
+            } else if has_status_function(&condition) {
+                let anchored = top_level_conjuncts(&condition).iter().any(|part| {
+                    part.strip_prefix("needs.")
+                        .and_then(|rest| rest.strip_suffix(".result == 'success'"))
+                        .is_some_and(|need| {
+                            job.needs.iter().any(|n| n == need) && gated.contains(need)
+                        })
+                });
+                if anchored {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "ci-portable.yml job `{}` uses a status function in `if:` and must also require a gated job it needs to succeed (`&& needs.<job>.result == 'success'`)",
+                        job.name
+                    ))
+                }
+            } else if job.needs.iter().any(|need| gated.contains(need)) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "ci-portable.yml job `{}` needs no gated job",
+                    job.name
+                ))
+            };
+            if result.is_ok() {
+                gated.insert(job.name.clone());
+            }
+            verdict.insert(job.name.clone(), result);
+        }
+    }
+    for job in &jobs {
+        if let Some(Err(error)) = verdict.get(&job.name) {
+            errors.push(error.clone());
         }
     }
     errors
@@ -934,6 +1414,13 @@ fn run(dir: &Path) -> Result<usize, Vec<String>> {
             }
             Err(error) => errors.push(format!("{}: {error}", path.display())),
         }
+        if name == PORTABLE {
+            errors.extend(
+                validate_portable_pr_gate(&source)
+                    .into_iter()
+                    .map(|error| format!("{}: {error}", path.display())),
+            );
+        }
         if name == VALIDATION_LEVELS {
             errors.extend(
                 validate_validation_levels_bootstrap(&source)
@@ -963,7 +1450,7 @@ fn main() {
     rust_script_prelude::init();
     match run(Path::new(WORKFLOW_DIR)) {
         Ok(count) => println!(
-            "GitHub Actions triggers OK: {count} workflows; automatic runs are limited to integration and exact approved schedules"
+            "GitHub Actions triggers OK: {count} workflows; automatic runs are limited to integration, non-bot pull requests and exact approved schedules"
         ),
         Err(errors) => {
             for error in errors {
@@ -982,12 +1469,352 @@ mod tests {
         parse_triggers(source).expect("fixture should parse")
     }
 
+    const PORTABLE_ON: &str = "name: portable\non:\n  workflow_dispatch:\n  push:\n    branches: [integration]\n  pull_request:\n    types: [opened, synchronize, reopened, ready_for_review]\njobs:\n";
+
     #[test]
-    fn portable_policy_accepts_integration_and_manual_only() {
+    fn portable_policy_accepts_integration_manual_and_gated_pull_requests() {
+        assert!(validate(PORTABLE, &parsed(PORTABLE_ON)).is_empty());
+    }
+
+    #[test]
+    fn portable_now_requires_its_pull_request_trigger() {
         let triggers = parsed(
             "name: portable\non:\n  workflow_dispatch:\n  push:\n    branches: [integration]\njobs:\n",
         );
-        assert!(validate(PORTABLE, &triggers).is_empty());
+        assert!(!validate(PORTABLE, &triggers).is_empty());
+    }
+
+    #[test]
+    fn portable_pull_request_types_must_be_exact() {
+        for types in [
+            "[opened]",
+            "[opened, synchronize, reopened, ready_for_review, labeled]",
+            "[opened, synchronize, reopened]",
+        ] {
+            let source =
+                PORTABLE_ON.replace("[opened, synchronize, reopened, ready_for_review]", types);
+            assert!(!validate(PORTABLE, &parsed(&source)).is_empty(), "{types}");
+        }
+        let missing = PORTABLE_ON.replace(
+            "    types: [opened, synchronize, reopened, ready_for_review]\n",
+            "",
+        );
+        assert!(!validate(PORTABLE, &parsed(&missing)).is_empty());
+    }
+
+    #[test]
+    fn pull_request_accepts_only_a_types_list() {
+        for extra in [
+            "    branches: [main]\n",
+            "    paths: [src]\n",
+            "    types:\n      - opened\n",
+        ] {
+            let source = PORTABLE_ON.replace(
+                "    types: [opened, synchronize, reopened, ready_for_review]\n",
+                extra,
+            );
+            assert!(
+                parse_triggers(&source).is_err()
+                    || !validate(PORTABLE, &parsed(&source)).is_empty(),
+                "{extra:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn checked_in_portable_workflow_gates_every_entry_job() {
+        let source = include_str!("../.github/workflows/ci-portable.yml");
+        assert!(validate(PORTABLE, &parsed(source)).is_empty());
+        let errors = validate_portable_pr_gate(source);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    /// A miniature of ci-portable.yml's job graph: two gated roots, plain jobs that
+    /// need them, a status-function job anchored on a gated job, and the two
+    /// always() jobs.
+    fn portable_fixture() -> String {
+        format!(
+            "{PORTABLE_ON}  select:\n    name: Select\n    if: {PORTABLE_PR_GATE}\n    runs-on: ubuntu-latest\n  plan:\n    if: >-\n      {PORTABLE_PR_GATE}\n    runs-on: ubuntu-latest\n  preflight:\n    needs: select\n    if: needs.select.outputs.decision != 'skip'\n    runs-on: ubuntu-latest\n  build-debug:\n    needs: [select, preflight]\n    runs-on: ubuntu-latest\n  test-debug:\n    needs: [select, build-debug]\n    if: \"!cancelled() && needs.select.outputs.run_debug_shards != 'false' && needs.build-debug.result == 'success'\"\n    runs-on: ubuntu-latest\n  regular:\n    needs: [select, plan, test-debug]\n    if: always() && ({PORTABLE_PR_GATE})\n    runs-on: ubuntu-latest\n  cleanup:\n    needs:\n      - test-debug\n      - regular\n    if: always() && ({PORTABLE_PR_GATE}) && ({PORTABLE_FORK_GUARD})\n    runs-on: ubuntu-latest\n"
+        )
+    }
+
+    #[test]
+    fn the_portable_fixture_is_accepted() {
+        let ok = portable_fixture();
+        assert!(
+            validate_portable_pr_gate(&ok).is_empty(),
+            "{:?}",
+            validate_portable_pr_gate(&ok)
+        );
+    }
+
+    fn rejected_with(source: &str, needle: &str) {
+        let errors = validate_portable_pr_gate(source);
+        assert!(
+            errors.iter().any(|error| error.contains(needle)),
+            "expected an error containing {needle:?}, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_line_condition_cannot_continue_on_the_next_line() {
+        // Review round 2, P1: `if: x` then `      || always()` was ignored.
+        let source = format!(
+            "{}  wrapped:\n    needs: select\n    if: needs.select.outputs.decision != 'skip'\n      || always()\n    runs-on: ubuntu-latest\n",
+            portable_fixture()
+        );
+        rejected_with(&source, "continues its single-line `if:` value");
+    }
+
+    #[test]
+    fn a_top_level_or_cannot_make_the_success_anchor_optional() {
+        let ok = portable_fixture();
+        // Review round 2, P4 and P14.
+        for prefix in ["always() || true && ", "!cancelled() || (true) && "] {
+            let source = ok.replace("\"!cancelled() && ", &format!("\"{prefix}"));
+            assert_ne!(source, ok);
+            rejected_with(&source, "top-level `||`");
+        }
+    }
+
+    #[test]
+    fn a_hash_inside_quotes_is_not_a_comment() {
+        // Review round 2, P5: `contains(github.ref, '#') || always()` was cut at `#`.
+        let source = format!(
+            "{}  hashed:\n    needs: select\n    if: contains(github.ref, '#') || always()\n    runs-on: ubuntu-latest\n",
+            portable_fixture()
+        );
+        rejected_with(&source, "`hashed`");
+    }
+
+    #[test]
+    fn unsupported_block_scalar_headers_are_refused() {
+        // Review round 2, P6 and P6b.
+        for header in [">+", "|2", ">2-"] {
+            let source = format!(
+                "{}  blocky:\n    needs: select\n    if: {header}\n      always()\n    runs-on: ubuntu-latest\n",
+                portable_fixture()
+            );
+            rejected_with(&source, "unsupported block-scalar header");
+        }
+    }
+
+    #[test]
+    fn yaml_aliases_are_refused() {
+        // Review round 2, P7: `if: *st`.
+        let source = format!(
+            "{}  aliased:\n    needs: select\n    if: *st\n    runs-on: ubuntu-latest\n",
+            portable_fixture()
+        );
+        rejected_with(&source, "YAML alias or anchor");
+    }
+
+    #[test]
+    fn status_functions_are_found_in_any_case() {
+        // Review round 2, P2: `${{ Always() }}`.
+        let source = format!(
+            "{}  shouty:\n    needs: select\n    if: ${{{{ Always() }}}}\n    runs-on: ubuntu-latest\n",
+            portable_fixture()
+        );
+        rejected_with(&source, "uses a status function");
+    }
+
+    #[test]
+    fn an_explicit_success_is_a_status_function() {
+        // Review round 3, R1 and R2: written out, success() can be or-ed away
+        // or negated, and then the job runs when the gated job was skipped.
+        for condition in [
+            "success() || github.event_name == 'pull_request'",
+            "${{ !success() }}",
+        ] {
+            let source = format!(
+                "{}  probe:\n    needs: select\n    if: {condition}\n    runs-on: ubuntu-latest\n",
+                portable_fixture()
+            );
+            assert!(
+                !validate_portable_pr_gate(&source).is_empty(),
+                "{condition}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_functions_are_found_with_spaces_before_the_parenthesis() {
+        // Review round 3, R3: `always ( )`.
+        let source = format!(
+            "{}  spaced:\n    needs: select\n    if: ${{{{ always ( ) }}}}\n    runs-on: ubuntu-latest\n",
+            portable_fixture()
+        );
+        rejected_with(&source, "uses a status function");
+    }
+
+    #[test]
+    fn a_job_key_must_be_written_plainly() {
+        // Review round 3, R5-R7: YAML reads each of these as the key `if`.
+        for line in [
+            "\"if\": always()",
+            "'if': always()",
+            "if : always()",
+            "? if",
+            "<<: *base",
+        ] {
+            let source = format!(
+                "{}  probe:\n    needs: select\n    {line}\n    runs-on: ubuntu-latest\n",
+                portable_fixture()
+            );
+            rejected_with(&source, "not a plain `key:`");
+        }
+    }
+
+    #[test]
+    fn an_escaped_quote_does_not_end_a_double_quoted_string() {
+        // Review round 3, R4: the `\"` must not reopen a comment before always().
+        let source = format!(
+            "{}  probe:\n    needs: select\n    if: \"contains(github.ref, '\\\" #') || always()\"\n    runs-on: ubuntu-latest\n",
+            portable_fixture()
+        );
+        rejected_with(&source, "top-level `||`");
+    }
+
+    #[test]
+    fn a_guarded_key_may_appear_once() {
+        // Review round 3, R13: two `if:` keys, whichever GitHub keeps.
+        let source = format!(
+            "{}  twice:\n    needs: select\n    if: always()\n    if: needs.select.result == 'success'\n    runs-on: ubuntu-latest\n",
+            portable_fixture()
+        );
+        rejected_with(&source, "repeats `if:`");
+    }
+
+    #[test]
+    fn earlier_rejections_name_their_cause() {
+        let ok = portable_fixture();
+        rejected_with(
+            &format!("{ok}  newroot:\n    runs-on: ubuntu-latest\n"),
+            "has no `needs:`",
+        );
+        rejected_with(
+            &ok.replace(&format!(" && ({PORTABLE_FORK_GUARD})"), ""),
+            "job `cleanup`",
+        );
+        rejected_with(
+            &ok.replace(" && needs.build-debug.result == 'success'", ""),
+            "uses a status function",
+        );
+        rejected_with(
+            &format!("{ok}  orphan:\n    needs: select\n"),
+            "has no `runs-on`",
+        );
+    }
+
+    fn rejected(source: &str, why: &str) {
+        let errors = validate_portable_pr_gate(source);
+        assert!(!errors.is_empty(), "accepted although {why}");
+    }
+
+    #[test]
+    fn a_new_root_job_without_the_gate_is_rejected() {
+        rejected(
+            &format!(
+                "{}  newroot:\n    runs-on: ubuntu-latest\n",
+                portable_fixture()
+            ),
+            "a root job has no gate",
+        );
+    }
+
+    #[test]
+    fn a_job_header_with_a_trailing_comment_is_still_a_job() {
+        // Review probe A: `evil: # note` used to be merged into the job above.
+        rejected(
+            &format!(
+                "{}  evil: # note\n    runs-on: ubuntu-latest\n",
+                portable_fixture()
+            ),
+            "a commented header hid an ungated job",
+        );
+    }
+
+    #[test]
+    fn an_optional_gate_is_rejected() {
+        let ok = portable_fixture();
+        // Review probe B: regular with `always() || (gate)`.
+        rejected(
+            &ok.replace(
+                &format!("always() && ({PORTABLE_PR_GATE})\n    runs-on: ubuntu-latest\n  cleanup"),
+                &format!("always() || ({PORTABLE_PR_GATE})\n    runs-on: ubuntu-latest\n  cleanup"),
+            ),
+            "regular's gate was made optional",
+        );
+        // Review probe E: a root with `gate || true`.
+        rejected(
+            &ok.replacen(
+                &format!("    if: {PORTABLE_PR_GATE}\n"),
+                &format!("    if: {PORTABLE_PR_GATE} || true\n"),
+                1,
+            ),
+            "a root's gate was made optional",
+        );
+    }
+
+    #[test]
+    fn a_status_function_job_must_require_a_gated_job_to_succeed() {
+        let ok = portable_fixture();
+        // Review probe C: a new job with `needs: select` and `if: ${{ !cancelled() }}`.
+        rejected(
+            &format!(
+                "{ok}  sneaky:\n    needs: select\n    if: ${{{{ !cancelled() }}}}\n    runs-on: ubuntu-latest\n"
+            ),
+            "a !cancelled() job runs without its gated need succeeding",
+        );
+        // Review probe D: test-debug without its needs.build-debug.result conjunct.
+        rejected(
+            &ok.replace(" && needs.build-debug.result == 'success'", ""),
+            "test-debug lost its success anchor",
+        );
+        // The anchor must be a top-level conjunct, not hidden behind ||.
+        rejected(
+            &ok.replace(
+                " && needs.build-debug.result == 'success'",
+                " || needs.build-debug.result == 'success'",
+            ),
+            "the anchor is optional",
+        );
+        // And it must name a job the job actually needs.
+        rejected(
+            &ok.replace(
+                "needs.build-debug.result == 'success'",
+                "needs.other.result == 'success'",
+            ),
+            "the anchor names a job it does not need",
+        );
+    }
+
+    #[test]
+    fn cleanup_must_keep_the_fork_guard() {
+        rejected(
+            &portable_fixture().replace(&format!(" && ({PORTABLE_FORK_GUARD})"), ""),
+            "cleanup lost the fork guard",
+        );
+    }
+
+    #[test]
+    fn every_portable_job_must_run_on_a_github_hosted_runner() {
+        let ok = portable_fixture();
+        // Review probe G: preflight moved to the self-hosted PMU pool.
+        rejected(&ok.replacen("    needs: select\n    if: needs.select.outputs.decision != 'skip'\n    runs-on: ubuntu-latest\n", "    needs: select\n    if: needs.select.outputs.decision != 'skip'\n    runs-on: [self-hosted, hermit, pmu]\n", 1), "a job runs on a self-hosted runner");
+        rejected(
+            &ok.replacen(
+                "    runs-on: ubuntu-latest\n  plan:",
+                "    runs-on: self-hosted\n  plan:",
+                1,
+            ),
+            "a root runs on a self-hosted runner",
+        );
+        rejected(
+            &format!("{ok}  orphan:\n    needs: select\n"),
+            "a job has no runs-on",
+        );
     }
 
     #[test]

@@ -832,7 +832,168 @@ impl RecordVersion {
 // guest procfs bytes and refuses unsupported observation domains. ABI15 and
 // private capture storage can also shift runtime layout. Older recordings must
 // not replay with different values.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x186);
+// 0x186 -> 0x187: a recording stores the schedule it ran under (`record start
+// --chaos --seed=N`), and replay follows it. An older reader would replay a
+// chaos recording under the default schedule and fall out of step, so it is
+// refused here.
+// 0x187 -> 0x188 (allocated at land time as HIGHEST_SHIPPED + 1, from the
+// branch's provisional 0x18b): a send or receive with MSG_DONTWAIT on a socketpair end the guest
+// left blocking runs once, as on Linux, where Detcore polled it until it
+// stopped failing with EAGAIN. A recording of such a call that polled until
+// another thread wrote holds those retries and the data, while this build
+// returns the first EAGAIN to the guest and falls out of step. One that
+// succeeded at once also took a polling turn that this build no longer
+// takes, so its schedule differs. Both are refused here.
+// 0x188 -> 0x189 (renumbered at land time from the branch's 0x18e, the next
+// HIGHEST_SHIPPED + 1 in this train): the recorder stores a
+// poll's raw ERESTARTSYS, and this change maps a recorded ERESTARTSYS
+// to ERESTARTNOHAND instead of rerunning the poll, so an old recording
+// can replay a different result.
+// 0x189 -> 0x18a (ledger-assigned for this change): each open file description
+// of a random device reads a stream of its own, named by its opener and its
+// table's count of random-device opens, where every one read the run seed's
+// single stream from its start. An older recording's guest read the old
+// bytes, while this replayer serves the new ones and falls out of step, so it
+// is refused here.
+// 0x18a -> 0x18b (ledger-assigned for this change): an epoll_wait, or an
+// epoll_pwait or epoll_pwait2 without a mask, that Detcore runs in the kernel
+// now waits with the signals the guest ignores blocked, in record and in replay
+// (`IgnoredSignalShield`), so such a signal no longer ends it with EINTR. The
+// scheduler reads that mask when it commits the wait, so an older recording,
+// made under the guest's own mask, could choose another SIGCHLD taker or
+// readmission point in replay; it is refused here.
+// 0x18b -> 0x18c (0x18c reserved for the 4681 change by coord3): a `poll`,
+// `select`, or `ppoll` or `pselect6` naming no mask, that Detcore runs in
+// the kernel, now waits with the signals the guest ignores blocked, in
+// record and in replay, so such a signal no longer ends it with a restart
+// code. An older recording holds the restarts and was made under the
+// guest's own mask; it is refused here.
+// 0x18c -> 0x18f (ledger-assigned for this change; 0x18d is 4676's and 0x18e
+// is reassigned by the ledger): a descriptor received over SCM_RIGHTS joins
+// the open file its send modeled, named without asking the kernel, instead of
+// getting a description of its own. An older recording's table holds other
+// descriptions for those descriptors, so it is refused here.
+// 0x18f -> 0x190 (ledger-assigned for this change in landing order; its
+// reserved 0x18d could not be taken after 0x18f shipped): at a fatal
+// signal's delivery Detcore now retires the process's other threads in that
+// turn, where it left them to the host. An older recording's schedule has
+// those threads running on, so it is refused here.
+// 0x191 -> 0x193 (ledger-assigned 0x193 for this change; 0x192 is reserved
+// for PMU-H): every /proc status file Detcore renders now shows TracerPid 0,
+// by any path to the task, where it showed 1 on a task's own paths
+// (/proc/self, /proc/thread-self). Detcore renders the status file over the
+// recorded procfs bytes during recording and replay, so an older stream
+// replayed under the new rendering would show the guest 0 where it read 1,
+// and a guest that branches on the value, as a death test that looks for a
+// debugger does, would diverge. It is refused here.
+// 0x193 -> 0x195 (ledger-assigned 0x195 for this change; 0x194 is reserved
+// for PMU-H): the kernel's restart of a poll a signal ended in the kernel is
+// the guest's own restart_syscall, run in place and recorded with the poll's
+// outputs, where it was a poll Detcore injected in its stead. A recording
+// holds restart_syscall at that point instead of poll, so an older replayer
+// would refuse it as a desync, and this one would refuse an older recording
+// the same way; the exact-match gate names the cause instead.
+// 0x195 -> 0x196 (ledger-assigned 0x196 for this change): a run without a
+// PID namespace of its own (--no-namespace) can number its guest's process
+// and thread IDs from a chosen base, and the preemption record carries that
+// numbering so a replay under another one is refused. A recording made
+// before the numbering existed names no guest IDs, so an older replayer
+// would key its threads differently and diverge; it is refused here.
+// 0x196 -> 0x197 (coordinator-assigned for the combined guest-poll change):
+// Unix connections completed outside their turn, or normalized from EISCONN,
+// no longer establish a trustworthy pairing from the address read afterward.
+// Losing those pairings also changes binary record/replay: sends through a
+// known peer record fstat probes for carried SCM_RIGHTS descriptors, while an
+// unpaired send does not, and received aliases can follow different routing.
+// An older stream can therefore contain a different probe/turn sequence even
+// though the new idle-poller time jumps are excluded from binary record/replay.
+// Refuse that stream before starting the guest rather than desynchronizing it.
+// https://github.com/rrnewton/hermit/pull/4864
+// 0x197 -> 0x198 (HIGHEST_SHIPPED+1 at the change's rebase onto main
+// fd59b85c, under land-time numbering; reserved in dev-hermit
+// ai_docs/hermit-record-version-reservations.md and minibeads dh-gxmvo):
+// Detcore renders a task's statm, io and
+// arch_status, and /proc/diskstats, with no kernel file (the kvm lane's slice
+// N3). Six changes reach recordings:
+// - every spelling of a thread's io (/proc/thread-self/io,
+//   /proc/<pid>/task/<tid>/io, a name relative to a task directory) is now
+//   classified, so Detcore takes a capture read of the kernel's file where
+//   the guest's own read went to the kernel before; an older recording has
+//   no such read, and its replay desyncs;
+// - a kernel-opened arch_status under record and replay now reads the
+//   virtual CPU's bytes (empty for Hermit's CPU profiles) where it read the
+//   recorded kernel line, so the guest's read returns a different count;
+// - a kernel-opened /proc/diskstats now takes Detcore's rendered-file path
+//   for readv, preadv, preadv2 and lseek, where readv and preadv were
+//   ENOSYS and lseek was injected;
+// - every per-process seq file the kernel opened takes a new capture read
+//   at each read or seek that runs show, where later reads were served from
+//   the first read's snapshot;
+// - a seek of such a file through a descriptor that cannot read goes to the
+//   kernel's file as an absolute seek to Detcore's position, recorded;
+// - a received empty regular file with a link has its descriptor's link
+//   read, recorded, to tell whether it is such a file.
+// An older recording that reads any of these is refused here instead of
+// failing mid-replay.
+// 0x198 -> 0x199 (reserved for the kvm lane's slice SP2): Detcore
+// decides flock(2) in its lock ledger. A flock is no longer one recorded probe:
+// the recording holds a recorded fstat and fstatfs at a description's first
+// flock and the mirrors of the model's decisions (LOCK_NB after a grant,
+// LOCK_UN after a release), a contended blocking flock waits instead of being
+// refused, and a malformed operation is answered without a kernel call. An
+// older recording replayed with this binary desyncs at its first flock.
+// 0x199 -> 0x19a (drain of PR 4885; 0x199 was taken by SP2 above, so this
+// change takes HIGHEST_SHIPPED+1 at its rebase onto main 77be1fd0): CPU clocks
+// answer as Linux does, and replay recomputes every one of these answers:
+// clock_getres of a CPU clock gives the kernel's per-kind resolution instead
+// of a flat value; timer_create and timer_settime on a CPU clock of no live
+// task fail with Linux's errno; an absolute CPU-clock timer whose expiry has
+// passed fires at once; and a CPU-clock sleep that would have to wait is
+// refused by the unsupported-operation policy instead of completing. A
+// recording made before, with any of these calls, would replay with other
+// values, or a refusal where it recorded a completion, and another schedule.
+// It is refused here.
+// https://github.com/rrnewton/hermit/pull/4885
+// 0x19a -> 0x19c (reserved for this change in minibeads dh-gxmvo;
+// this change keeps 0x19c at its rebase onto main f76f9b8c, after
+// 0x19a shipped above; 0x19b stays reserved for the replayed-MAP_SHARED
+// fix-forward, and land-time numbering still applies): a parent's
+// SIGCHLD that the scheduler defers until no other ordinary work is
+// runnable is re-admitted earlier where the kernel's copy was raised at
+// a point the schedule fixes (a child killed by SIGKILL, or one whose
+// SIGCHLD Linux discards, on a backend that reports child-exit
+// publication): once every thread that was runnable work at the
+// deferral has had a turn. Record and replay both run that rule and
+// replay recomputes it rather than reading it from the stream, so a
+// recording made before it, in which such a delivery waited for
+// quiescence beside busy threads, would replay with an earlier
+// re-admission and fall out of step. It is refused here.
+// https://github.com/rrnewton/hermit/pull/4627
+// 0x19c -> 0x19d (HIGHEST_SHIPPED+1 at the rebase onto main 0220dd85,
+// after PR 4627 took 0x19c): an Mmap event of a MAP_SHARED file mapping
+// names the mapped file
+// (device, inode, offset; for /dev/zero, the new shmem object the mapping
+// made) and the mapped descriptor's access mode. Replay
+// maps every shared mapping of one file as a view of one backing, opened
+// with that access mode, instead of making separate anonymous copies. An
+// older reader cannot decode the new field, and an older recording has no
+// identity with which to restore sharing, so it is refused here.
+// 0x19d -> 0x19e (HIGHEST_SHIPPED+1 at this change's rebase onto main
+// shipping 0x19d; provisionally 0x19b at its earlier rebase onto main
+// shipping 0x19a, since spent on the replayed-MAP_SHARED fix-forward): on
+// seven Intel models (Ice Lake 0x6A, 0x6C, 0x7D and 0x7E, Tiger Lake 0x8D,
+// Sapphire Rapids 0x8F and Emerald Rapids 0xCF) the retired-conditional-
+// branch counter changes from umask 0x01, which counts only taken
+// conditional branches there, to umask 0x11, every conditional branch, the
+// metric every other profile counts. Every RCB coordinate a recording made
+// on those hosts stores (preemption points, branch counts, timer targets)
+// counted the other quantity. A history now states its RCB coordinate
+// identity in the `rcb_history` envelope; replay requires the recording
+// backend and a qualified RCB metric, and a history with no recorded
+// identity is refused before the guest starts. An older recording would
+// place its events elsewhere; it is refused here.
+// https://github.com/rrnewton/hermit/pull/4668
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x19e);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -857,7 +1018,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x186);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x186;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x19e;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -865,6 +1026,46 @@ const _: () = assert!(
      build would carry a label an older reader already claims. If this fired during a \
      rebase, the version constant was resolved BACKWARD -- merge it forward."
 );
+
+/// How a recording schedules guest threads. Replay schedules them the same
+/// way, so a schedule-dependent failure that one chaos seed provokes replays.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecordedSchedule {
+    /// Detcore's default scheduler.
+    #[default]
+    Default,
+    /// Chaos scheduling, as `hermit run --chaos` does, driven by `seed`.
+    Chaos {
+        /// Seed of the scheduler's random number generator.
+        seed: u64,
+    },
+}
+
+impl RecordedSchedule {
+    /// Makes a record/replay configuration schedule threads this way. Only the
+    /// scheduler is seeded: the guest's own randomness is recorded, not seeded.
+    pub(crate) fn apply(self, config: &mut detcore::Config) {
+        if let Self::Chaos { seed } = self {
+            config.chaos = true;
+            config.sched_seed = Some(seed);
+        }
+    }
+}
+
+/// Choices `hermit record start` makes that the recording stores in its
+/// `metadata.json` and that its replays honor.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RecordOptions {
+    /// Run the guest with an isolated loopback interface instead of the host
+    /// network (`record start --network local`).
+    pub local_networking: bool,
+    /// How much of `/proc` the guest sees.
+    pub proc_level: detcore_model::config::ProcLevel,
+    /// The CPU the guest sees.
+    pub cpu_profile: detcore_model::cpu_profile::CpuProfile,
+    /// How the guest's threads are scheduled.
+    pub schedule: RecordedSchedule,
+}
 
 /// Metadata associated with the recording. This is serialized as a JSON file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -887,6 +1088,13 @@ pub struct Metadata {
     pub envs: BTreeMap<String, String>,
     /// Hermit record/replay version.
     pub version: RecordVersion,
+    /// The RCB coordinate identity the recording's event stream counts, in
+    /// the `rcb_history` envelope's JSON form. A replay admits it only
+    /// under the same identity and refuses pre-guest otherwise. Absent in
+    /// a recording made before identities were recorded, whose replay is
+    /// refused for stating none.
+    #[serde(default)]
+    pub rcb_identity: Option<serde_json::Value>,
     /// Why this recording cannot be replayed faithfully, when the recording
     /// run said so (`detcore::detlog::replay_refusal`): replay refuses before
     /// starting the guest (<https://github.com/rrnewton/hermit/issues/3994>).
@@ -925,9 +1133,9 @@ pub struct Metadata {
     /// Whether the recording ran in an isolated network namespace with only
     /// loopback (`record start --network local`). `None` means the recorder
     /// did not say, which is every recording made before this field existed;
-    /// those recordings ran on the host network. An autopilot replay uses the
-    /// same network, so syscalls the replayer re-executes see the same
-    /// interfaces and ports they were recorded against.
+    /// those recordings ran on the host network. A replay, served to gdb or
+    /// not, uses the same network, so syscalls the replayer re-executes see the
+    /// same interfaces and ports they were recorded against.
     #[serde(default)]
     pub local_networking: Option<bool>,
     /// The `/proc` level the recording ran at (`record start --proc`, or the
@@ -954,6 +1162,10 @@ pub struct Metadata {
     /// recording sees it.
     #[serde(default)]
     pub cpu_profile_residual: Option<String>,
+    /// How the recording scheduled guest threads (`record start --chaos`).
+    /// Absent means the default scheduler.
+    #[serde(default)]
+    pub schedule: RecordedSchedule,
 }
 
 impl Metadata {
@@ -1003,6 +1215,9 @@ impl Metadata {
             envs,
             replay_refused: None,
             version: RECORD_VERSION,
+            // Stamped by the recorder from its validated clock claim
+            // before the metadata is written.
+            rcb_identity: None,
             proc_readonly: None,
             mountinfo_root_rewrites: Vec::new(),
             mountinfo_mount_ids: Vec::new(),
@@ -1015,6 +1230,7 @@ impl Metadata {
             cpu_profile_host: None,
             cpu_table_digest: None,
             cpu_profile_residual: None,
+            schedule: RecordedSchedule::Default,
         })
     }
 
@@ -1123,6 +1339,7 @@ fn record_or_replay_config_with_timer_support(
         // of the Determinized classification begins in v0x10a; madvise policy
         // semantics begin in v0x102.
         passthru_opt: true,
+        untrap_passthrough_syscalls: false,
         deterministic_io: false,
         virtualize_time: crate::RECORD_REPLAY_VIRTUALIZES_TIME,
         virtualize_metadata: false,
@@ -1134,14 +1351,34 @@ fn record_or_replay_config_with_timer_support(
         mount_id_assignment_order: Vec::new(),
         // The recorder and the replayer set the table from the recording.
         container_mount_table: None,
+        // Detcore serves no placeholder directory under record and replay,
+        // whose containers mount none, and serves no `/proc` directory there.
+        directory_placeholder: None,
+        container_procfs: false,
         virtualize_cpuid: true,
         // The recorder and the replayer set the profile from the command line
         // and the recording; see `record_or_replay_config`'s callers.
         cpu_profile: default_config.cpu_profile,
         cpu_profile_host: None,
+        // `hermit record` keeps the files it replays; nothing is rewritten.
+        rewrite_exclusives_in_memory: false,
+        count_store_exclusives: false,
+        rewrite_exclusives_overlay: Vec::new(),
+        rewrite_exclusives_overlay_requested: false,
         cpu_profile_source: None,
         // Record and replay run under the ptrace backend.
         backend: <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),
+        // A recording replays no standalone history (`replay_schedule_from`
+        // and `replay_preemptions_from` stay unset below) and writes none,
+        // but its event stream still counts RCB coordinates: prepare the
+        // ptrace clock claim as `hermit run` does, so the recorder can
+        // state the identity in its metadata and the replayer admits only
+        // the same identity.
+        rcb_clock_claim: crate::prepare_backend_config(
+            detcore::Config::default(),
+            crate::Backend::Ptrace,
+        )
+        .rcb_clock_claim,
         // As `hermit run` sets it for ptrace (`prepare_backend_config` in
         // lib.rs). With it off, the scheduler did not model signal targets, so
         // a thread asleep in a backgrounded rt_sigsuspend that a child-exit
@@ -1161,11 +1398,22 @@ fn record_or_replay_config_with_timer_support(
         in_guest_reserved_signals: 0,
         in_guest_refuses_host_timed_producers: false,
         in_guest_signal_delivery: false,
+        // Record and replay never replay a priority history.
+        annotated_priority_replay: false,
         // The first image's link stays the kernel's in record and replay.
         launch_image: None,
+        // `hermit record` has no `--rewrite-exclusives`.
+        rewrite_exclusives_unmarked: Vec::new(),
         // Not measured for record and replay.
         inherited_seccomp: detcore::InheritedSeccomp::Unknown,
         has_uts_namespace: true,
+        // Record and replay print no notice for an abstract AF_UNIX bind,
+        // `hermit record start --network=host` included; only `hermit run`
+        // sets it.
+        notice_host_network_abstract_binds: false,
+        // A recording runs in a PID namespace of its own.
+        guest_ids: detcore::GuestIds::Namespace,
+        standard_stream_aliases: None,
         // The path to the directory where syscalls will be recorded.
         replay_data: Some(data.to_path_buf()),
         clock_multiplier: None,
@@ -1181,12 +1429,25 @@ fn record_or_replay_config_with_timer_support(
         // the option existed, and record mode's own scheduling, have no
         // hand-off (https://github.com/rrnewton/hermit/issues/4380).
         pipe_wake_latency: None,
+        // Record and replay charge every expired timed wait, whatever the value.
+        expired_wait_charge: None,
+        // Record and replay register queued sleeps when chosen, whatever the value.
+        sleep_registration: None,
         // A `hermit run` option; record and replay do not gather it.
         work_span_report: None,
         scheduler_turn_cost: default_config.scheduler_turn_cost,
+        // A `hermit run` option, like `pipe_wake_latency`: record mode's own
+        // scheduling, and recordings made before the option existed, charge
+        // every turn in full.
+        cap_preemption_charge: false,
+        // A `hermit run` option; record and replay take none.
+        virtual_timeout: None,
         seed: default_config.seed,
         rng_seed: default_config.rng_seed,
         imprecise_timers: false,
+        // Record and replay make the same timeslice decisions either way: a
+        // lone thread's skipped stops are processed at the same branch counts.
+        eager_lone_preemptions: false,
         // Off in record and replay, a constant like the rest: replay rebuilds
         // this configuration and must decide every signal question as the
         // recording did, and recordings made before the copy was on by
@@ -1194,7 +1455,12 @@ fn record_or_replay_config_with_timer_support(
         signal_state_copy: false,
         // The copy is off, so no delivery is checked.
         signal_delivery_check_fatal: false,
+        strict_binder: false,
         chaos: false,
+        // `hermit record` draws no chaos slices.
+        chaos_timeslice_range: None,
+        chaos_timeslice_draw: Default::default(),
+        chaos_timeslice: None,
         sigint_instakill: false,
         warn_non_zero_binds: false,
         sched_heuristic: Default::default(),
@@ -1208,30 +1474,46 @@ fn record_or_replay_config_with_timer_support(
         replay_preemptions_from: None,
         replay_schedule_from: None,
         replay_exhausted_panic: false,
-        die_on_desync: true,
+        replay_continue_fairly: false,
+        lenient_replay: false,
+        die_on_desync: false,
+        replay_edited_preemptions: false,
         stacktrace_event: Vec::new(),
+        stacktrace_at_schedule_positions: false,
         stacktrace_signal: None,
+        access_trace: None,
+        access_trace_from: 0,
+        access_trace_max_records: None,
+        access_trace_max_bytes: None,
+        watch: Vec::new(),
+        watch_from: 0,
         preemption_stacktrace: false,
         preemption_stacktrace_log_file: None,
         stop_after_turn: None,
         stop_after_iter: None,
         signal_at: None,
+        post_crash_timeslice: None,
         debug_externalize_sockets: false,
         debug_futex_mode: BlockingMode::Precise,
         sched_sticky_random_param: 0.0,
         no_rcb_time: false,
         detlog_heap: false,
         detlog_stack: false,
+        detlog_anon: None,
         detlog_regs: false,
         detlog_io_buffers: crate::RECORD_REPLAY_HASHES_IO_BUFFERS,
         detlog_regs_cadence: 1,
         sysinfo_uptime_offset: 120,
         memory: default_config.memory,
+        virtual_cpus: default_config.virtual_cpus,
         proc_level: default_config.proc_level,
         interrupt_at: vec![],
         happens_before: None,
+        launch_namespace_mounts: Default::default(),
         record_host_inputs: false,
         host_input_log: None,
+        host_input_snapshots: Vec::new(),
+        property_snapshot: None,
         untraced_code_range: None,
         fatal_core_capture: None,
         fuzz_futexes: false,
@@ -1239,6 +1521,7 @@ fn record_or_replay_config_with_timer_support(
         chaos_per_thread_slowdown: false,
         chaos_slowdown_max_factor: 10.0,
         chaos_epoch_length_ns: 0,
+        chaos_instruction_offset: 0,
         fuzz_seed: None,
     }
     .with_backend(|backend| {
@@ -1249,6 +1532,57 @@ fn record_or_replay_config_with_timer_support(
         disable_timeslice_without_a_timer(&mut config, &reason);
     }
     config
+}
+
+/// A full recording in a format this build cannot execute, typed so the
+/// CLI classifies it as the policy refusal (exit 122), not an internal
+/// failure.
+pub(crate) fn record_format_refusal(message: String) -> Error {
+    anyhow::Error::new(detcore::preemptions::RecordFormatRefusal(message))
+}
+
+/// The RCB coordinate identity a recording made under `config` counts,
+/// validated (not pinned) against this host. A contradicted prepared
+/// claim is the named refusal, as at a run's preparation.
+pub(crate) fn record_rcb_identity(
+    config: &detcore::Config,
+) -> Result<detcore::preemptions::HistoryIdentity, Error> {
+    let validated = detcore::clock_identity::validate_run_clock(
+        config,
+        &detcore::clock_identity::ClockSources::process(),
+    )
+    .map_err(record_format_refusal)?;
+    Ok(validated.producer().history_identity())
+}
+
+/// Admit `metadata`'s stated RCB identity under the replay configuration
+/// `config`, before any guest starts: no stated identity, an identity
+/// this build does not know, and any other identity than this run's own
+/// are each the named policy refusal.
+pub(crate) fn admit_recorded_rcb_identity(
+    config: &detcore::Config,
+    metadata: &Metadata,
+    source: &str,
+) -> Result<(), Error> {
+    let Some(raw) = &metadata.rcb_identity else {
+        return Err(record_format_refusal(format!(
+            "hermit refused to replay {source}: it states no RCB coordinate identity, so \
+             the unit of its recorded coordinates is unknown (it was written before \
+             identities were recorded, or by hand). Record it again with this build, or \
+             replay it with the build that made it."
+        )));
+    };
+    let recorded = detcore::preemptions::boundary_recording::history_identity_from_json(raw)
+        .map_err(|error| {
+            record_format_refusal(format!("hermit refused to replay {source}: {error}"))
+        })?;
+    let validated = detcore::clock_identity::validate_run_clock(
+        config,
+        &detcore::clock_identity::ClockSources::process(),
+    )
+    .map_err(record_format_refusal)?;
+    detcore::clock_identity::admit_identity(source, Some(&recorded), validated.producer())
+        .map_err(record_format_refusal)
 }
 
 /// Whether this host can arm Reverie's ptrace timer for a record or replay:
@@ -1452,6 +1786,17 @@ mod tests {
         for (name, config) in [("record", record), ("replay", replay), ("gdb", gdb_replay)] {
             assert!(!detcore::observes_sigreturns(&config), "{name}");
         }
+    }
+
+    /// Record and replay register a queued sleep only when its thread is
+    /// chosen, as before `--sleep-registration`, whatever its value, so a
+    /// recording's turn selection is the one its version promises.
+    #[test]
+    fn record_and_replay_register_sleeps_when_chosen() {
+        let mut config = record_or_replay_config(Path::new("replay-data"));
+        assert!(!config.queued_sleeps_registered_at_first_pass());
+        config.sleep_registration = Some(detcore_model::config::SleepRegistration::FirstPass);
+        assert!(!config.queued_sleeps_registered_at_first_pass());
     }
 
     /// Record mode never hands the turn to a readied pipe poller, whatever
@@ -2248,6 +2593,30 @@ mod tests {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x184)));
     }
 
+    /// A 0x187 recording polled a MSG_DONTWAIT send or receive on a
+    /// socketpair end until it stopped failing with EAGAIN; this replayer runs
+    /// it once, so the version gate must refuse it.
+    #[test]
+    fn record_version_rejects_polled_dontwait_socketpair_recordings() {
+        // The version current before this change, on the main this branch
+        // was rebased onto, not only the version before the original bump.
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x187)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x186)));
+    }
+
+    /// A recording from before the corrected RCB event (0x19a and earlier)
+    /// made on one of the seven corrected Intel models counted only taken
+    /// conditional branches, so every RCB coordinate it stores names another
+    /// point in the guest; the version gate must refuse it on every host, as
+    /// a full recording does not state which counter it used. A recording of
+    /// this version is accepted.
+    #[test]
+    fn record_version_rejects_streams_from_before_the_corrected_rcb_event() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x19a)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x186)));
+        assert!(RECORD_VERSION.compatible_with(&RecordVersion(0x19e)));
+    }
+
     #[test]
     fn record_version_rejects_pre_complete_determinized_subscription_streams() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x109)));
@@ -2272,5 +2641,31 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(metadata.local_networking, None);
+        assert_eq!(metadata.schedule, RecordedSchedule::Default);
+    }
+
+    /// A chaos schedule sets chaos mode and seeds only the scheduler: the
+    /// guest's random numbers are recorded, not seeded.
+    #[test]
+    fn a_chaos_schedule_reaches_the_record_replay_configuration() {
+        let mut config = record_or_replay_config(Path::new("replay-data"));
+        RecordedSchedule::Default.apply(&mut config);
+        assert!(!config.chaos);
+        assert_eq!(config.sched_seed, None);
+
+        let seed = config.seed;
+        RecordedSchedule::Chaos { seed: 16 }.apply(&mut config);
+        assert!(config.chaos);
+        assert_eq!(config.sched_seed(), 16);
+        assert_eq!(config.seed, seed, "only the scheduler is seeded");
+    }
+
+    #[test]
+    fn a_recorded_schedule_round_trips_through_metadata_json() {
+        let mut metadata = Metadata::new(&Command::new("/bin/true")).unwrap();
+        metadata.schedule = RecordedSchedule::Chaos { seed: 7 };
+        let loaded: Metadata =
+            serde_json::from_str(&serde_json::to_string(&metadata).unwrap()).unwrap();
+        assert_eq!(loaded.schedule, RecordedSchedule::Chaos { seed: 7 });
     }
 }

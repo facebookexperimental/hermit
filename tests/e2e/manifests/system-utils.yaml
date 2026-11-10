@@ -1,5 +1,10 @@
 schema: 3
 bucket: system-utils
+# This bucket runs inside the pinned hermetic root like compat: the
+# run-in-pinned-root wrapper enters the image and hermit runs in plain
+# open mode there. The bucket deliberately does not declare an image:
+# the harness itself starts inside the pinned root, where no podman
+# store exists for hermit --image (see issue 5030).
 test:
   - id: system-utils/clock-determinism
     description: clock_gettime/gettimeofday output is identical across repeated Hermit runs
@@ -53,10 +58,9 @@ test:
             - --max-timeslice=disabled
         hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Clock replay divergence is tracked separately from this determinism entry
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -118,19 +122,19 @@ test:
         ci:
           ptrace: true
           kvm: true
+          dbt: true
         backends_enabled:
           - ptrace
           - kvm
+          - dbt
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
           sabre: The exec socket is fixed, but required date/clock virtual-time support remains owner-gated for SaBRe
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: The date utility currently diverges while replaying timezone-file reads
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -179,20 +183,22 @@ test:
         backends_disabled:
           native: The existing date-nanoseconds test owns the native-variation assertion
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          kvm: true
+          dbt: true
         backends_enabled:
           - ptrace
           - kvm
+          - dbt
         backends_disabled:
-          dbt: DBT wedges when the guest execs a new program image, and this script ends in `exec /usr/bin/date`. Measured 2026-08-24 - the run never exits and emits zero DETLOG records after "[dbt backend] Detcore Tool active"; a cell timeout then misreports it as "failed to launch drrun". Note DBT refuses execveat legibly with ENOSYS (tests/c/dbt_execveat_unsupported.c passes), so it is execve specifically that hangs
           sabre: Required date/clock virtual-time support remains owner-gated for SaBRe
           liteinst: The preload runtime cannot survive the date script's post-start exec
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Strict verification owns the examples-directory parity contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -243,23 +249,23 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
           kvm: true
           sabre: false
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
           - sabre
         backends_disabled:
-          dbt: DBT wedges when the guest execs a new program image, and this script ends in `exec hexdump`. Measured 2026-08-24 - the run never exits and emits zero DETLOG records after "[dbt backend] Detcore Tool active"; a cell timeout then misreports it as "failed to launch drrun". Note DBT refuses execveat legibly with ENOSYS (tests/c/dbt_execveat_unsupported.c passes), so it is execve specifically that hangs
           liteinst: The preload runtime cannot survive the hexdump script's post-start exec
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Strict verification owns the examples-directory parity contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -311,20 +317,22 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          kvm: true
+          dbt: true
         backends_enabled:
           - ptrace
           - kvm
+          - dbt
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: The record-getpid sentinel owns the blocking replay contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -376,22 +384,24 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: true
+          kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           sabre: Ptrace and SaBRe each reach L2, but coreutils mktemp consumes different deterministic entropy positions and emits different name suffixes
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: The focused C sentinel owns the blocking replay contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -447,19 +457,19 @@ test:
         ci:
           ptrace: true
           kvm: true
+          dbt: true
         backends_enabled:
           - ptrace
           - kvm
+          - dbt
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: The focused C sentinel owns the blocking replay contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -512,20 +522,22 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: true
+          kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: The focused C sentinel owns the blocking replay contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -577,20 +589,22 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: true
+          kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: The record-getpid sentinel owns the blocking replay contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -643,22 +657,24 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: true
+          kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe and ptrace each reach L2, but libcrypto consumes different deterministic entropy positions and emits different hex stdout
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: The focused C sentinel owns the blocking replay contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -710,20 +726,22 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: true
+          kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           sabre: Certificate issuance combines wall-clock validity with multiple entropy draws; clock, random-stream, and full-trace support remain unqualified
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: The record-getpid sentinel owns the blocking replay contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -766,12 +784,22 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: true
+          kvm: true
+        # KVM qualified 2026-10-29: 21 of 21 canonical strict verify pairs at Hermit
+        # a69361ae, the tree that enabled this cell (bitwise parity, 1185 INFO records
+        # each side); stdout and every syscall return value identical to ptrace's.
+        # The reason this cell was disabled, "KVM requires the privileged runner",
+        # no longer held: this manifest's portable KVM verify cells run in the
+        # portable lane's own nodes (34 of them, all PASS, in the full validation
+        # of 6090709d), and the hosted portable node passes --exclude-backend kvm.
         backends_enabled:
           - ptrace
+          - dbt
+          - kvm
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
-          kvm: KVM requires the privileged runner
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
           sabre: SaBRe coverage is owned by its backend compatibility partition
@@ -782,11 +810,9 @@ test:
         backends_disabled:
           native: Native runs outside the container see the host /etc/group, which is the state this control exists to replace; a native arm would assert the absence of the control rather than its presence
       replay:
-        ci: false
-        ci_disabled_reason: A single stat of a static file has no record/replay divergence surface to exercise.
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: A single stat of a static file has no record/replay divergence surface
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -840,7 +866,10 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: true
+          kvm: true
         backends_enabled:
           - ptrace
           - dbt
@@ -850,10 +879,9 @@ test:
           liteinst: Under in-guest LiteInst, /usr/bin/env cannot exec bash (EOPNOTSUPP), so the guest never starts (https://github.com/rrnewton/hermit/issues/4476)
           in-guest-trap: Under in-guest-trap, /usr/bin/env cannot exec bash (EOPNOTSUPP), so the guest never starts (https://github.com/rrnewton/hermit/issues/4476)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: The record-getpid sentinel owns the blocking replay contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -905,20 +933,22 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: true
+          kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
           sabre: Path evidence found 33 raw syscall sites per execution in ld-linux and libc; trusted shared-object native execution is not SaBRe support
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: The hexdump process tree currently diverges during replay
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -1046,20 +1076,22 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: true
+          kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: The focused C sentinel owns the blocking replay contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -1111,20 +1143,22 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: true
+          kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: The focused C sentinel owns the blocking replay contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -1178,20 +1212,20 @@ test:
       verify:
         ci:
           ptrace: true
+          dbt: true
           kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: The record-getpid sentinel owns the blocking replay contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -1243,22 +1277,24 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: true
+          kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: The record-getpid sentinel owns the blocking replay contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -1310,20 +1346,29 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: true
+          kvm: true
+        # KVM qualified 2026-10-29: 21 of 21 canonical strict verify pairs at Hermit
+        # a69361ae, the tree that enabled this cell (bitwise parity, 668 INFO records
+        # each side); stdout and every syscall return value identical to ptrace's.
+        # The reason this cell was disabled, "KVM requires the privileged runner",
+        # no longer held: this manifest's portable KVM verify cells run in the
+        # portable lane's own nodes (34 of them, all PASS, in the full validation
+        # of 6090709d), and the hosted portable node passes --exclude-backend kvm.
         backends_enabled:
           - ptrace
+          - dbt
+          - kvm
         backends_disabled:
-          dbt: DBT coverage is owned by its backend parity partition
-          kvm: KVM requires the privileged runner
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: The record-getpid sentinel owns the blocking replay contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -1378,6 +1423,10 @@ test:
         ci:
           ptrace: true
           dbt: true
+        # KVM qualified 2026-11-01, once Detcore renders smaps and numa_maps from the backend's
+        # memory map: 21 of 21 canonical strict verify pairs (bitwise parity, 1256 INFO records
+        # each side); stdout identical to ptrace's. KVM is disabled under dh-9j8ue below since
+        # Reverie #1319 made the KVM memory map complete.
         compare_io_buffers: true
         rcb_time: false
         rcb_time_disabled_reason: The guest intentionally parses sanitizer outputs whose non-sanitized fields may vary; RCB-derived virtual time would turn legitimate data-dependent assertion work into unrelated INFO timestamp divergence.
@@ -1385,21 +1434,19 @@ test:
           - ptrace
           - dbt
         backends_disabled:
-          kvm: KVM's own /proc refuses /proc/self/smaps with EACCES, so the guest fails (https://github.com/rrnewton/hermit/issues/4479, https://github.com/rrnewton/hermit/issues/4282)
+          kvm: 'known failure: Detcore refuses smaps flags it cannot source for non-stack mappings (capability gap, minibeads dh-9j8ue, kvm lane re-enables); Reverie #1319 made the KVM memory map complete, so the old pass was not Linux-faithful'
           sabre: Under SaBRe this guest's verify matches, but the harness refuses the run because SaBRe used fallback or native sites for bash and the utilities it runs (https://github.com/rrnewton/hermit/issues/4477)
           liteinst: Under in-guest LiteInst, /usr/bin/env cannot exec bash (EOPNOTSUPP), so the guest never starts (https://github.com/rrnewton/hermit/issues/4476)
           in-guest-trap: Under in-guest-trap, /usr/bin/env cannot exec bash (EOPNOTSUPP), so the guest never starts (https://github.com/rrnewton/hermit/issues/4476)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: The verify guest owns these assertions, and its ptrace tuple is required in CI
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
           in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-        ci_disabled_reason: 'NOT-EXERCISED: the verify guest owns these assertions, and its ptrace tuple is required in CI.'
       chaos:
         ci: false
         backends_enabled: []
@@ -1449,7 +1496,12 @@ test:
         backends_disabled:
           native: The checkout byte count is deterministic by construction; this row establishes the ptrace execution reference
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          kvm: true
+          dbt: true
+          liteinst: true
+          in-guest-trap: true
         backends_enabled:
           - ptrace
           - kvm
@@ -1465,10 +1517,9 @@ test:
             - --max-timeslice=disabled
         hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: The record-getpid sentinel owns the blocking replay contract
           dbt: Record/replay is unsupported by DBI
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -1527,7 +1578,13 @@ test:
         backends_disabled:
           native: The checkout path/size inventory is deterministic by construction; this row establishes the ptrace execution reference
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          sabre: true
+          kvm: true
+          dbt: true
+          liteinst: true
+          in-guest-trap: true
         backends_enabled:
           - ptrace
           - sabre
@@ -1543,10 +1600,9 @@ test:
             - --max-timeslice=disabled
         hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed 10 of 10 verify runs that way in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: The record-getpid sentinel owns the blocking replay contract
           dbt: Record/replay is unsupported by DBI
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -1594,7 +1650,13 @@ test:
         - -D_GNU_SOURCE
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          sabre: true
+          kvm: true
+          dbt: true
+          liteinst: true
+          in-guest-trap: true
         backends_enabled:
           - ptrace
           - sabre
@@ -1635,14 +1697,13 @@ test:
           ptrace: No custom multi-run assertion needed; verify's double-run comparison is the contract
           sabre: No custom multi-run assertion needed; verify's double-run comparison is the contract
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
           dbt: Record/replay identity of file timestamps is a separate contract
           kvm: Record/replay identity of file timestamps is a separate contract
           liteinst: Record/replay identity of file timestamps is a separate contract
           in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-          ptrace: Record/replay identity of file timestamps is a separate contract
           sabre: Record/replay identity of file timestamps is a separate contract
   - id: system-utils/startup-surface-identity
     description: argv, environ order, the full auxv vector (incl. AT_RANDOM bytes and the raw vDSO base) and initial stack layout are identical across repeated Hermit runs
@@ -1666,15 +1727,21 @@ test:
         - -D_GNU_SOURCE
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: true
+          sabre: true
+          kvm: true
+          liteinst: true
+          in-guest-trap: true
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
           - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled:
-          dbt: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in the RAW vDSO base or AT_RANDOM is a FINDING to report, never something to normalise away
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -1707,14 +1774,13 @@ test:
           ptrace: No custom multi-run assertion is needed; verify's double-run comparison is the whole contract
           sabre: No custom multi-run assertion is needed; verify's double-run comparison is the whole contract
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
           dbt: Record/replay identity of the startup surface is a separate contract and is not what this fixture pins
           kvm: Record/replay identity of the startup surface is a separate contract and is not what this fixture pins
           liteinst: Record/replay identity of the startup surface is a separate contract and is not what this fixture pins
           in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-          ptrace: Record/replay identity of the startup surface is a separate contract and is not what this fixture pins
           sabre: Record/replay identity of the startup surface is a separate contract and is not what this fixture pins
   - id: system-utils/startup-tls-guards
     description: the x86-64 glibc TLS stack canary and pointer guard initialized before main are identical across repeated runs
@@ -1779,15 +1845,13 @@ test:
           ptrace: No custom Hermit arguments are needed; verify's repeated-run comparison is the contract
           sabre: No custom Hermit arguments are needed; verify's repeated-run comparison is the contract
       replay:
-        ci: false
-        ci_disabled_reason: Record/replay ownership of startup TLS guards is a separate contract from repeated-run verification
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
           dbt: Record/replay ownership of startup TLS guards is a separate contract
           kvm: Record/replay ownership of startup TLS guards is a separate contract
           liteinst: Record/replay ownership of startup TLS guards is a separate contract
           in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-          ptrace: Record/replay ownership of startup TLS guards is a separate contract
           sabre: Record/replay ownership of startup TLS guards is a separate contract
   - id: system-utils/shm-coherency-identity
     description: what each process observes through MAP_SHARED / memfd / COW mappings is identical across repeated Hermit runs, including partial updates
@@ -1858,14 +1922,13 @@ test:
           ptrace: No custom multi-run assertion needed; verify's double-run comparison is the contract
           sabre: No custom multi-run assertion needed; verify's double-run comparison is the contract
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
           dbt: Record/replay identity of shared-memory observation is a separate contract
           kvm: Record/replay identity of shared-memory observation is a separate contract
           liteinst: Record/replay identity of shared-memory observation is a separate contract
           in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-          ptrace: Record/replay identity of shared-memory observation is a separate contract
           sabre: Record/replay identity of shared-memory observation is a separate contract
   - id: system-utils/clock-exec-continuity
     description: Guest clock keeps advancing across execs and is never rebased onto a round origin
@@ -1895,20 +1958,32 @@ test:
         backends_disabled:
           native: The guard asserts Hermit's virtual clock; the host clock is not the contract
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: true
+          kvm: true
+        # KVM qualified 2026-10-29: the KVM launch now keeps the program's file as
+        # its executable (Reverie d97e8895), so the guest's execv of /proc/self/exe
+        # works, as under ptrace; before, it failed with ENOENT. 21 of 21 canonical
+        # strict verify pairs on the host (bitwise parity, 649 INFO records each
+        # side), with stdout, every clock sample included, identical to ptrace's.
+        # In the pinned root it passes on both backends, but its clock samples run
+        # 10 to 30 us later on KVM: with glibc 2.42 a KVM guest makes one more call
+        # in each image that starts threads, because KVM answers
+        # madvise(MADV_GUARD_INSTALL) with ENOSYS
+        # (https://github.com/rrnewton/reverie/issues/1216).
         backends_enabled:
           - ptrace
+          - dbt
+          - kvm
         backends_disabled:
-          dbt: Enable once the DBI post-exec clock path is qualified against the ptrace baseline
-          kvm: Enable once the KVM post-exec clock path is qualified against the ptrace baseline
           sabre: SaBRe does not intercept RDTSCP; clock probes can leak raw host TSC
           liteinst: The preload runtime does not survive the guest's own re-exec
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Clock replay divergence is tracked by the clock-determinism entry
           dbt: Record/replay is unsupported by DBI
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -1956,7 +2031,13 @@ test:
         - -D_GNU_SOURCE
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          sabre: true
+          kvm: true
+          dbt: true
+          liteinst: true
+          in-guest-trap: true
         backends_enabled:
           - ptrace
           - sabre
@@ -1997,14 +2078,13 @@ test:
           ptrace: No custom multi-run assertion needed; verify's double-run comparison is the contract
           sabre: No custom multi-run assertion needed; verify's double-run comparison is the contract
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
           dbt: Record/replay identity of error paths is a separate contract
           kvm: Record/replay identity of error paths is a separate contract
           liteinst: Record/replay identity of error paths is a separate contract
           in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-          ptrace: Record/replay identity of error paths is a separate contract
           sabre: Record/replay identity of error paths is a separate contract
   - id: system-utils/auxv-loader-dump
     description: 'LD_SHOW_AUXV loader dump: AT_RANDOM, vdso base and the rest of the auxiliary vector'
@@ -2029,26 +2109,27 @@ test:
           native: AT_RANDOM and the vdso base vary on every native execution by design; native repetition is not a contract
         ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          kvm: true
+          dbt: true
         backends_enabled:
           - ptrace
           - kvm
+          - dbt
         backends_disabled:
-          dbt: Established on ptrace first; other backends ratchet against this shared entry
           sabre: Established on ptrace first; other backends ratchet against this shared entry
           liteinst: Established on ptrace first; other backends ratchet against this shared entry
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is tracked separately from this strict-verify entry
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
           in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
       chaos:
         ci: false
         backends_enabled: []
@@ -2094,26 +2175,32 @@ test:
           native: The host process table changes continuously, so native repetition is not a contract
         ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: true
+          kvm: true
+        # KVM: Detcore renders /proc/1/stat and /proc/1/comm of Hermit's own
+        # init from its fixed model (procfs::task_stat::with_hermit_init), so
+        # ps lists pid 1 as on ptrace; 3/3 strict verify runs in the pinned
+        # root at bitwise parity. KVM's ps row says R where ptrace's says S:
+        # the reader's own status is the kernel's, sanitized, on ptrace.
         backends_enabled:
           - ptrace
           - dbt
+          - kvm
         backends_disabled:
-          kvm: ps exits 1 with no output on KVM, whose own /proc cannot open a process's directory (https://github.com/rrnewton/hermit/issues/4479, https://github.com/rrnewton/hermit/issues/4282)
           sabre: Under SaBRe this guest's verify matches, but the harness refuses the run because SaBRe used fallback or native sites for bash and the utilities it runs (https://github.com/rrnewton/hermit/issues/4477)
           liteinst: Under in-guest LiteInst, /usr/bin/env cannot exec bash (EOPNOTSUPP), so the guest never starts (https://github.com/rrnewton/hermit/issues/4476)
           in-guest-trap: Under in-guest-trap, /usr/bin/env cannot exec bash (EOPNOTSUPP), so the guest never starts (https://github.com/rrnewton/hermit/issues/4476)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is tracked separately from this strict-verify entry
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
           in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-        ci_disabled_reason: 'NOT-EXERCISED: this mode is outside the measured strict-verification contract for this guest.'
       chaos:
         ci: false
         backends_enabled: []
@@ -2160,26 +2247,27 @@ test:
           native: Natively the control is absent by definition, so this is the cell's RED arm and must not run as a green cell
         ci_disabled_reason: 'NOT-EXERCISED: running natively removes the control under test; that arm is the demonstrated red, not a passing cell.'
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          kvm: true
+          dbt: true
         backends_enabled:
           - ptrace
           - kvm
+          - dbt
         backends_disabled:
-          dbt: The mount is container setup and backend-independent; ptrace is the canonical required witness
           sabre: The mount is container setup and backend-independent; ptrace is the canonical required witness
           liteinst: The mount is container setup and backend-independent; ptrace is the canonical required witness
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: The control is established at container setup; the verify cell owns it
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
           in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-        ci_disabled_reason: 'NOT-EXERCISED: the required verify cell owns the nscd neutralisation contract.'
       chaos:
         ci: false
         backends_enabled: []
@@ -2229,23 +2317,21 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: The sysfs read sanitizers are backend-independent; ptrace is the canonical required witness
           sabre: The sysfs read sanitizers are backend-independent; ptrace is the canonical required witness
           liteinst: The sysfs read sanitizers are backend-independent; ptrace is the canonical required witness
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: The guest assertions and required verify cell own this sysfs readability contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
           in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-        ci_disabled_reason: 'NOT-EXERCISED: the required verify cell owns the sysfs readability and stability contract.'
       chaos:
         ci: false
         backends_enabled: []
@@ -2292,26 +2378,27 @@ test:
           native: The contract describes test-harness scheduling, not native guest behavior
         ci_disabled_reason: 'NOT-EXERCISED: the required verify cell owns the harness-width contract.'
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: true
+          kvm: true
         backends_enabled:
           - ptrace
+          - dbt
           - kvm
         backends_disabled:
-          dbt: The harness control is backend-independent; ptrace is the canonical required witness
           sabre: The harness control is backend-independent; ptrace is the canonical required witness
           liteinst: The harness control is backend-independent; ptrace is the canonical required witness
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       replay:
-        ci: false
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Replay does not strengthen the harness-width assertion
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
           in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
-        ci_disabled_reason: 'NOT-EXERCISED: the required verify cell owns the harness-width contract.'
       chaos:
         ci: false
         backends_enabled: []
@@ -2355,7 +2442,13 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: true
+          sabre: true
+          kvm: true
+          liteinst: true
+          in-guest-trap: true
         backends_enabled:
           - ptrace
           - dbt
@@ -2380,11 +2473,9 @@ test:
         backends_disabled:
           native: The output is fixed by construction; this row asserts the same bytes under every enabled backend
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification contract and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from this strict-verification contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -2430,7 +2521,13 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: true
+          sabre: true
+          kvm: true
+          liteinst: true
+          in-guest-trap: true
         backends_enabled:
           - ptrace
           - dbt
@@ -2455,11 +2552,9 @@ test:
         backends_disabled:
           native: The output is fixed by construction; this row asserts the same bytes under every enabled backend
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification contract and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from this strict-verification contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -2507,7 +2602,12 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: true
+          kvm: true
+          liteinst: true
+          in-guest-trap: true
         backends_enabled:
           - ptrace
           - dbt
@@ -2586,7 +2686,13 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        ci:
+          ptrace: true
+          dbt: true
+          sabre: true
+          kvm: true
+          liteinst: true
+          in-guest-trap: true
         backends_enabled:
           - ptrace
           - dbt
@@ -2611,11 +2717,9 @@ test:
         backends_disabled:
           native: The output is fixed by construction; this row asserts the same bytes under every enabled backend
       replay:
-        ci: false
-        ci_disabled_reason: 'NOT-EXERCISED: record/replay qualification is a separate exercise from this strict-verification contract and has never been run for this guest.'
-        backends_enabled: []
+        ci: true
+        backends_enabled: [ptrace]
         backends_disabled:
-          ptrace: Record/replay qualification is separate from this strict-verification contract
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
@@ -2627,6 +2731,237 @@ test:
         backends_enabled: []
         backends_disabled:
           ptrace: The workload is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case arguments have been calibrated for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this guest
+          dbt: No custom edge-case arguments have been calibrated for this guest
+          kvm: No custom edge-case arguments have been calibrated for this guest
+          sabre: No custom edge-case arguments have been calibrated for this guest
+          liteinst: No custom edge-case arguments have been calibrated for this guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: system-utils/stat-script-root
+    description: "tests/e2e/system-utils/stat-root.sh is the run's root image, executed by its #!/usr/bin/bash line, and prints the name its own /proc/<pid>/stat, the Name: line of its /proc/<pid>/status and its /proc/<pid>/comm show, read by the shell itself. Linux names the task by the script's file name (kbasename(bprm->filename), fs/exec.c begin_new_exec), so all three say stat-root.sh; the ptrace row is the native output. Detcore renders the stat (package K slice D4c-1): on ptrace and DBT its name is the kernel's, on KVM Detcore's record from the image's AT_EXECFN, the script's path, so stat says stat-root.sh on ptrace and KVM. On KVM Detcore also renders the read of the comm file (package K slice A+) and of the process's own status (package K slice 2b-2) from the same record, so comm and status say stat-root.sh there too, and the KVM row equals the native one. The KVM and DBT rows are measured under Hermit (strict verification at bitwise parity). The DBT row records a named DBT difference that is not Detcore's: DynamoRIO runs a #! script root through its interpreter and names the task by the basename of the image it runs (its loader's PR_SET_NAME), so the kernel's name, which stat, status and comm all show there, is bash (https://github.com/rrnewton/hermit/issues/4595). Before slice 2b-2 the KVM row said status=bash: the KVM executor served status there and names the root image by the resolved argv[0], which Hermit's launcher rewrites to the interpreter for a #! script (reverie-kvm elf.rs initial_thread_name). The executor still answers PR_GET_NAME on KVM, which this guest does not read, so that name still differs from the record's for such a root (https://github.com/rrnewton/reverie/issues/1106)"
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - bash
+    occasional: false
+    program: tests/e2e/system-utils/stat-root.sh
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci:
+          ptrace: true
+          dbt: true
+          kvm: true
+          in-guest-trap: true
+          liteinst: true
+        backends_enabled:
+          - ptrace
+          - dbt
+          - kvm
+          - in-guest-trap
+          - liteinst
+        backends_disabled:
+          sabre: "NOT-QUALIFIED: this cell checks the name Detcore's rendered stat gives a #! script root against the kernel's status and comm; SaBRe has not been run on it, and SaBRe is a drop candidate under the owner's ruling."
+        expected_stdout:
+          ptrace: "stat=stat-root.sh status=stat-root.sh comm=stat-root.sh\n"
+          dbt: "stat=bash status=bash comm=bash\n"
+          kvm: "stat=stat-root.sh status=stat-root.sh comm=stat-root.sh\n"
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each was CLEAN on the nightly pressure sweeps of 2026-10-29 and 2026-10-30 (https://github.com/rrnewton/hermit/issues/3745)
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (by design): the contract is the same output under Hermit on every backend; the native output equals the ptrace row, checked when the cell was written.'
+        backends_enabled: []
+        backends_disabled:
+          native: This contract asserts Hermit's output on each backend, not a native run
+      replay:
+        ci: true
+        backends_enabled: [ptrace]
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: the workload is single-threaded, so chaos scheduling has no schedule to diversify.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The workload is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case arguments have been calibrated for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this guest
+          dbt: No custom edge-case arguments have been calibrated for this guest
+          kvm: No custom edge-case arguments have been calibrated for this guest
+          sabre: No custom edge-case arguments have been calibrated for this guest
+          liteinst: No custom edge-case arguments have been calibrated for this guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: system-utils/stat-alias-root
+    description: "The run's root image is /usr/bin/bash (an ELF) launched through tests/e2e/system-utils/stat-alias, a symbolic link to it, with tests/e2e/system-utils/stat-root.sh as its script, which prints the name the shell's own /proc/<pid>/stat, the Name: line of its /proc/<pid>/status and its /proc/<pid>/comm show, read by the shell itself. Linux names the task by the path it was executed by (kbasename(bprm->filename), fs/exec.c begin_new_exec), the link's, so all three say stat-alias; the ptrace row is the native output. Detcore renders the stat (package K slice D4c-1): on ptrace and DBT its name is the kernel's, on KVM Detcore's record from the image's AT_EXECFN, the path as launched, so stat says stat-alias on ptrace, DBT and KVM. On KVM Detcore also renders the read of the comm file (package K slice A+) and of the process's own status (package K slice 2b-2) from the same record, so comm and status say stat-alias there too, and the KVM row equals the native one. The KVM row is measured under Hermit (strict verification at bitwise parity). The DBT row matches the native alias control: Reverie now passes the selected executable spelling separately from argv[0] to DynamoRIO, whose loader's PR_SET_NAME uses the alias basename. Thus stat, status and comm all say stat-alias; direct /usr/bin/bash controls still say bash. This removes the earlier DBT link-target naming difference (https://github.com/rrnewton/hermit/issues/4595). Before slice 2b-2 the KVM row said status=bash: the KVM executor served status there and names the root image by its resolved, canonical argv[0] (reverie-kvm elf.rs initial_thread_name), the link's target. The executor still answers PR_GET_NAME on KVM, which this guest does not read, so that name still differs from the record's for such a root (https://github.com/rrnewton/reverie/issues/1106)"
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - bash
+    occasional: false
+    direct:
+      - "{{ROOT_DIR}}/tests/e2e/system-utils/stat-alias"
+      - "{{ROOT_DIR}}/tests/e2e/system-utils/stat-root.sh"
+      - "--run"
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci:
+          ptrace: true
+          dbt: true
+          kvm: true
+          in-guest-trap: true
+          liteinst: true
+        backends_enabled:
+          - ptrace
+          - dbt
+          - kvm
+          - in-guest-trap
+          - liteinst
+        backends_disabled:
+          sabre: "NOT-QUALIFIED: this cell checks the name Detcore's rendered stat gives a root launched through a symbolic link against the kernel's status and comm; SaBRe has not been run on it, and SaBRe is a drop candidate under the owner's ruling."
+        expected_stdout:
+          ptrace: "stat=stat-alias status=stat-alias comm=stat-alias\n"
+          dbt: "stat=stat-alias status=stat-alias comm=stat-alias\n"
+          kvm: "stat=stat-alias status=stat-alias comm=stat-alias\n"
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each was CLEAN on the nightly pressure sweeps of 2026-10-29 and 2026-10-30 (https://github.com/rrnewton/hermit/issues/3745)
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (by design): the contract is the same output under Hermit on every backend; the native output equals the ptrace row, checked when the cell was written.'
+        backends_enabled: []
+        backends_disabled:
+          native: This contract asserts Hermit's output on each backend, not a native run
+      replay:
+        ci: true
+        backends_enabled: [ptrace]
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: the workload is single-threaded, so chaos scheduling has no schedule to diversify.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The workload is single-threaded
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: no custom edge-case arguments have been calibrated for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this guest
+          dbt: No custom edge-case arguments have been calibrated for this guest
+          kvm: No custom edge-case arguments have been calibrated for this guest
+          sabre: No custom edge-case arguments have been calibrated for this guest
+          liteinst: No custom edge-case arguments have been calibrated for this guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: system-utils/flock-shared-exclusive
+    description: "tests/c/flock_shared_exclusive.c takes flock(2) locks between processes, each through an open file description Detcore can follow, which Detcore's flock model decides on every backend (the kvm lane's slice SP2): shared and exclusive locks, LOCK_NB conflicts (EWOULDBLOCK), a conversion that deletes the held lock before it finds a conflict, blocking waiters woken at a release, at a last close (a dup still holding it first) and at the holder's exit, a fork's copy of a locked description, a downgrade that wakes a shared waiter, the wake order of two exclusive waiters (granted in the order they blocked) and of shared and exclusive ones (both shared granted together, the exclusive one after both release), the rows /proc/locks shows for the file (two shared, one, a converted exclusive, none, and a blocked request's waiter row under the shared lock it waits for), a lock taken before children are forked and exec'd, the way rustup holds its lock while cargo runs, a signal directed at a waiting thread that ends its call with EINTR or, under SA_RESTART, restarts it until the release, a waiting thread woken by a release in another thread of its process, a waiting call whose descriptor another thread closes or replaces with another file's, which keeps the open file description it took (it takes the lock after the release, its lock gone with its own reference, the other file never locked), and the wake order of Linux's tree of blocked requests, where a release wakes the requests blocked under the lock and each retries in its own run: a blocking upgrade that blocks ahead of the waiter its conversion woke (the upgrader holds the lock first), a waiter a signal interrupts, which wakes the request blocked under it (a later shared waiter is granted before it), a retry that converts its description's lock, which wakes that lock's waiters (either of the two states Linux reaches, as the schedule has it), and a release through a waiting call's own description before its retry. Every line is printed by the parent at points its pipes order, or once /proc/locks shows a request blocked, so the output is the same natively and under Hermit on every backend, and where the schedule picks one of two Linux outcomes the guest prints whether it saw one of them; hermit-cli/tests/flock_exclusion.rs compares it with native Linux's. The guest exits 0 when every answer is Linux's."
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    proc: standard
+    program: tests/c/flock_shared_exclusive.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -O0
+    modes:
+      verify:
+        ci:
+          ptrace: true
+          kvm: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled:
+          dbt: "Config::backend_supports_blocked_wait_signal_interruption is false on DBT, so a signal to a thread waiting for a flock does not end the wait there, and a timer's ends a blocked pipe read or flock wait with errno 512 instead of EINTR (https://github.com/rrnewton/hermit/issues/5051; related: https://github.com/rrnewton/hermit/issues/5019, DBT's pipe and inotify reads): the signal-interrupts and interrupted-waiter scenarios never return. The other 19 scenarios pass on DBT when run alone."
+          sabre: "SaBRe is archived; there a thread blocked in a Detcore wait is killed by SIGSEGV at address 0, as one blocked in a pipe read is, and a signal does not end a flock wait. The 13 scenarios without a waiting thread pass on SaBRe when run alone."
+          liteinst: "The in-guest backend cannot create a thread (clone3 is not forwarded) or replace the process image (execve is not forwarded, https://github.com/rrnewton/hermit/issues/3745), and it refuses this guest's SIGUSR1 handler (sigaction EPERM), so 9 of the 21 scenarios cannot run there. The other 12 pass on LiteInst when run alone."
+          in-guest-trap: "As on LiteInst, which in-guest-trap runs with syscall site patching off: no thread (clone3 is not forwarded), no exec (execve is not forwarded, https://github.com/rrnewton/hermit/issues/3745), and no SIGUSR1 handler (sigaction EPERM), so 9 of the 21 scenarios cannot run there. The other 12 pass on in-guest-trap when run alone."
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (by design): the contract is native Linux output on every backend, which hermit-cli/tests/flock_exclusion.rs checks against a native run of this guest.'
+        backends_enabled: []
+        backends_disabled:
+          native: hermit-cli/tests/flock_exclusion.rs runs this guest natively and compares each backend's output with it
+      replay:
+        ci: true
+        backends_enabled: [ptrace]
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED: every outcome the guest prints is ordered by its pipes and its locks, so chaos scheduling has no outcome to diversify.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Every outcome the guest prints is ordered by its pipes and its locks
           dbt: Chaos scheduling is unsupported by DBT
           kvm: Chaos scheduling is unsupported by KVM
           sabre: Chaos scheduling is unsupported by SaBRe

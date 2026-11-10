@@ -196,10 +196,7 @@ fn pselect6_wrapper_validation_preserves_pending_signals() {
         .arg("-o")
         .arg(&guest);
     command_output(compile, "pselect validation guest compilation");
-    #[cfg(not(feature = "dbt"))]
     let backends = ["native", "ptrace"];
-    #[cfg(feature = "dbt")]
-    let backends = ["native", "ptrace", "dbt"];
     for backend in backends {
         for mode in ["validation-empty", "validation-pending"] {
             let mut command = if backend == "native" {
@@ -265,6 +262,38 @@ fn pselect6_wrapper_validation_preserves_pending_signals() {
                 output.stdout, b"pselect6-simulation-ok\n",
                 "wrapper-validation {backend} {mode}"
             );
+            if backend != "ptrace" {
+                continue;
+            }
+            // Without sequentialized threads and under record the call runs
+            // in the kernel. A wrapper naming a NULL mask is handed to the
+            // kernel as no wrapper only once all of it has been read with the
+            // guest's own access; a wrapper whose tail it cannot read keeps
+            // its EFAULT.
+            let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+                .expect("failed to create the recording data dir");
+            let data_dir_arg = format!("--data-dir={}", data_dir.path().display());
+            for leg in [
+                &["run", "--no-sequentialize-threads", "--base-env=minimal"][..],
+                &[
+                    "record",
+                    "start",
+                    "--verify",
+                    "--verify-strict",
+                    "--record-timeout",
+                    "120",
+                    &data_dir_arg,
+                ],
+            ] {
+                let mut command = Command::new(hermit_test::hermit_binary());
+                command.args(leg).arg("--").arg(&guest).arg(mode);
+                hermit_test::configure_guest_execution(&mut command);
+                let output = command_output(command, &format!("wrapper-validation {leg:?} {mode}"));
+                assert_eq!(
+                    output.stdout, b"pselect6-simulation-ok\n",
+                    "wrapper-validation {leg:?} {mode}"
+                );
+            }
         }
     }
 }

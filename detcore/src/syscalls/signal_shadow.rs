@@ -42,7 +42,6 @@ use tracing::warn;
 use super::threads::KernelSigaction;
 use super::threads::KernelSigset;
 use super::threads::host_signal_state_reads_refused;
-use super::threads::read_thread_signal_state;
 use crate::Detcore;
 use crate::record_or_replay::RecordOrReplay;
 use crate::signal_state::Action;
@@ -527,7 +526,7 @@ where
     if guest.thread_state().signal_shadow_lost || !kernel_state_is_the_guests(guest) {
         return;
     }
-    match read_thread_signal_state(guest.pid(), guest.tid()) {
+    match crate::syscalls::read_guest_thread_signal_state(guest) {
         Ok(state) => {
             guest.thread_state_mut().signal_shadow =
                 Some(SignalShadow::seeded(state.ignored, state.blocked));
@@ -957,8 +956,18 @@ fn unavailable_reason(reason: reverie::SignalDeliveryUnavailable) -> &'static st
 /// Whether Detcore sees syscall number `nr` through a Tool callback: a number
 /// in Reverie's syscall table. Another number (beyond the table, or negative)
 /// reaches the kernel with no callback.
+#[cfg(target_arch = "x86_64")]
 fn sees_syscall(nr: i64) -> bool {
     usize::try_from(nr).is_ok_and(|nr| reverie::syscalls::Sysno::new(nr).is_some())
+}
+
+/// Whether syscall number `nr` runs with no Tool callback because
+/// `--untrap-passthrough-syscalls` (`untrap`) leaves it untrapped.
+fn untrapped(untrap: bool, nr: i64) -> bool {
+    untrap
+        && crate::syscall_classification::UNTRAPPED_PASSTHROUGH
+            .iter()
+            .any(|&sysno| sysno as i64 == nr)
 }
 
 /// `sizeof(struct ucontext)` on x86-64 Linux (`include/uapi/asm-generic/ucontext.h`):
@@ -1123,11 +1132,17 @@ where
             //   which needs the thread back in user code
             //   (`synchronous_with_a_kernel_code`);
             // - the thread is in a syscall Detcore cannot see: a number
-            //   outside Reverie's table, or a negative one the kernel refuses,
+            //   outside Reverie's table, a negative one the kernel refuses,
+            //   or one `--untrap-passthrough-syscalls` leaves untrapped,
             //   reaches no Tool callback, so the record still names an earlier
             //   event.
             None | Some(Interruption::AfterFrame) => (from_registers, true),
-            _ if orig == -1 || !sees_syscall(orig) => (from_registers, true),
+            _ if orig == -1
+                || !sees_syscall(orig)
+                || untrapped(guest.config().untrap_passthrough_syscalls, orig) =>
+            {
+                (from_registers, true)
+            }
             // A known syscall that the record does not name: Detcore missed an
             // event it subscribes to. Sent as it stands, so the backend reports
             // the contradiction.
@@ -1887,7 +1902,7 @@ where
     if guest.thread_state().signal_shadow.is_none() {
         return;
     }
-    let sp = guest.regs().await.rsp as usize;
+    let sp = crate::arch::stack_pointer(&guest.regs().await) as usize;
     let restored = Addr::<u64>::from_raw(sp.wrapping_add(super::signal::UC_SIGMASK_OFFSET))
         .and_then(|address| guest.memory().read_value(address).ok());
     if let Some(mask) = restored {
@@ -1992,7 +2007,7 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    match read_thread_signal_state(guest.pid(), guest.tid()) {
+    match crate::syscalls::read_guest_thread_signal_state(guest) {
         Ok(state) => Some(state),
         Err(errno) => {
             debug!(
@@ -2172,9 +2187,11 @@ mod tests {
             self.delivery.registers_read += 1;
             // SAFETY: an all-zero `user_regs_struct` is a valid value.
             let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-            regs.orig_rax = orig_rax as u64;
-            regs.rip = self.delivery.rip;
-            [regs.rdi, regs.rsi, regs.rdx, regs.rsp] = self.delivery.frame_regs;
+            crate::arch::set_syscall_number(&mut regs, orig_rax as u64);
+            crate::arch::set_instruction_pointer(&mut regs, self.delivery.rip);
+            let [arg0, arg1, arg2, sp] = self.delivery.frame_regs;
+            crate::arch::set_syscall_arguments(&mut regs, &[arg0, arg1, arg2]);
+            crate::arch::set_stack_pointer(&mut regs, sp);
             regs
         }
         fn signal_report_path(&self) -> Option<reverie::SignalReportPath> {
@@ -2581,6 +2598,9 @@ mod tests {
     /// mask from a forced clear of the own one, so the copy follows the
     /// kernel only when the record agrees, and otherwise gives itself up
     /// quietly, as for a forced delivery, never reporting a divergence.
+    // x86_64 only: Detcore reads a delivery's interruption from the
+    // registers only there (elsewhere it takes AfterFrame).
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_wait_mask_differing_only_in_forced_signals_is_taken_only_with_evidence() {
         let kernel = Kernel::default();
@@ -3676,6 +3696,9 @@ mod tests {
         assert_eq!(due(&parent), Some(None));
     }
 
+    // x86_64 only: the ptrace backend reports sigreturns only there (the
+    // report reads an x86-64 signal frame).
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn sigreturns_are_observed_only_where_the_backend_reports_them() {
         let config = |backend| Config {
@@ -3814,6 +3837,9 @@ mod tests {
         }
     }
 
+    // x86_64 only: the ptrace backend reports sigreturns only there (the
+    // report reads an x86-64 signal frame).
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_report_the_kernel_did_not_follow_fails_closed_at_the_next_entry() {
         let kernel = Kernel::default();
@@ -3865,7 +3891,12 @@ mod tests {
         let kernel = Kernel::default();
         let _seam = kernel.install();
         for (backend, inferred) in [
+            // The ptrace backend reports sigreturns only on x86_64 (the report
+            // reads an x86-64 signal frame); elsewhere its returns are inferred.
+            #[cfg(target_arch = "x86_64")]
             (reverie::BackendCapabilities::PTRACE, false),
+            #[cfg(not(target_arch = "x86_64"))]
+            (reverie::BackendCapabilities::PTRACE, true),
             (reverie::BackendCapabilities::E9PATCH, true),
         ] {
             let mut guest = in_handler(&kernel, backend);
@@ -4042,6 +4073,9 @@ mod tests {
     /// delivery: the caught action, the frame and current masks, Linux's
     /// handler mask, every reserved and forced signal unchecked except the
     /// delivered one, and the interruption Detcore recorded.
+    // x86_64 only: Detcore reads a delivery's interruption from the
+    // registers only there (elsewhere it takes AfterFrame).
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_checked_delivery_is_built_from_the_copy_and_recorded_as_unchecked() {
         let kernel = Kernel::default();
@@ -4241,7 +4275,8 @@ mod tests {
     /// The registers Linux leaves for a SIGUSR1 frame at 0x7fff_0008, stated
     /// on their own rather than from `KERNEL_UCONTEXT_SIZE`: `rdi` the signal,
     /// `rsi` the siginfo 8 + 304 bytes above the frame, `rdx` the ucontext 8
-    /// bytes above it, and `rsp` the frame.
+    /// bytes above it, and `rsp` the frame. x86_64 only, as are its tests.
+    #[cfg(target_arch = "x86_64")]
     const FRAME_REGS: [u64; 4] = [libc::SIGUSR1 as u64, 0x7fff_0140, 0x7fff_0010, 0x7fff_0008];
 
     /// A frame's chained delivery at the same exit stops at the handler's
@@ -4250,6 +4285,9 @@ mod tests {
     /// guest ran on, and with `orig_ax` -1 that is no syscall. Anywhere else
     /// it is no syscall too; and still at the syscall's exit away from the
     /// handler, where a frame fault's SIGSEGV stops, the registers decide.
+    // x86_64 only: Detcore reads a delivery's interruption from the
+    // registers only there (elsewhere it takes AfterFrame).
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn after_frame_holds_only_at_the_handlers_first_instruction() {
         let kernel = Kernel::default();
@@ -4332,6 +4370,9 @@ mod tests {
     /// until the thread enters the kernel again. At the handler's first
     /// instruction with every frame register intact but `orig_ax` -1, the
     /// thread went back to user code and came in again: not `AfterFrame`.
+    // x86_64 only: Detcore reads a delivery's interruption from the
+    // registers only there (elsewhere it takes AfterFrame).
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn after_frame_needs_the_frames_own_orig_ax() {
         let kernel = Kernel::default();
@@ -4372,6 +4413,9 @@ mod tests {
     /// at the same exit is. One the thread queued to itself with a positive
     /// code is chained too, but cannot be told from a fault, and takes the
     /// registers' answer as well.
+    // x86_64 only: Detcore reads a delivery's interruption from the
+    // registers only there (elsewhere it takes AfterFrame).
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn after_frame_is_never_a_synchronous_signal_with_a_kernel_code() {
         let kernel = Kernel::default();
@@ -4690,6 +4734,9 @@ mod tests {
     /// Detcore cannot see; and the record as it stands where it disagrees with
     /// a known syscall, so the backend reports it. Only `orig_ax` -1 is no
     /// syscall.
+    // x86_64 only: Detcore reads a delivery's interruption from the
+    // registers only there (elsewhere it takes AfterFrame).
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn the_interruption_is_the_record_where_the_registers_agree_on_the_syscall() {
         let kernel = Kernel::default();
@@ -4786,6 +4833,72 @@ mod tests {
                 u64::from(from_registers),
                 "record {record:?}, orig_rax {orig}, passthru {passthru}"
             );
+        }
+        // A syscall `--untrap-passthrough-syscalls` leaves untrapped reaches no
+        // Tool callback, so with the flag the registers decide; without it the
+        // call is trapped, and a record that does not name it is reported.
+        let getppid = libc::SYS_getppid;
+        for (untrap, expected, from_registers) in [
+            (
+                true,
+                reverie::Interruption::KernelRun { syscall: getppid },
+                true,
+            ),
+            (false, read, false),
+        ] {
+            let mut guest = catching(&kernel, reverie::SignalDeliveryOutcome::Accepted);
+            guest.config.untrap_passthrough_syscalls = untrap;
+            guest.thread.delivery_interruption = Some(read);
+            guest.delivery.orig_rax = Some(getppid);
+            check(&mut guest, libc::SIGUSR1);
+            assert_eq!(
+                guest.delivery.asked[0].interruption, expected,
+                "untrap {untrap}"
+            );
+            assert_eq!(
+                guest.thread.delivery_counters.interruption_from_registers,
+                u64::from(from_registers),
+                "untrap {untrap}"
+            );
+        }
+    }
+
+    /// The aarch64 side of `delivery_interruption`: it reads no registers
+    /// there, so every delivery is sent as `AfterFrame`, which checks nothing,
+    /// whatever the record, the syscall the thread is in and `--passthru-opt`,
+    /// and counts as taken from the registers.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn without_register_reads_every_interruption_is_after_frame() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let read = reverie::Interruption::Return {
+            syscall: libc::SYS_read,
+            result: -512,
+        };
+        let cases = [
+            (Some(read), libc::SYS_read, false),
+            (Some(read), -1, false),
+            (None, libc::SYS_read, false),
+            (Some(reverie::Interruption::NotInSyscall), -1, false),
+            (Some(read), libc::SYS_write, true),
+        ];
+        for (record, orig, passthru) in cases {
+            let mut guest = catching(&kernel, reverie::SignalDeliveryOutcome::Accepted);
+            guest.config.passthru_opt = passthru;
+            guest.thread.delivery_interruption = record;
+            guest.delivery.orig_rax = Some(orig);
+            check(&mut guest, libc::SIGUSR1);
+            assert_eq!(
+                guest.delivery.asked[0].interruption,
+                reverie::Interruption::AfterFrame,
+                "record {record:?}, orig {orig}, passthru {passthru}"
+            );
+            assert_eq!(
+                guest.thread.delivery_counters.interruption_from_registers, 1,
+                "record {record:?}, orig {orig}, passthru {passthru}"
+            );
+            assert_eq!(guest.delivery.registers_read, 0, "no register is read");
         }
     }
 }

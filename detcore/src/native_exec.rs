@@ -637,6 +637,26 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn native_exec_rejects_a_replay_change_point_before_snapshot() {
+        let (tool, mut thread, binding) = fixture();
+        assert_eq!(thread.last_replay_change_point, None);
+        let receipt = validate_old_native_exec_cut(&tool, &thread, &binding).unwrap();
+        thread.last_replay_change_point = Some(LogicalTime::from_nanos(1));
+        assert_eq!(
+            validate_old_native_exec_cut(&tool, &thread, &binding).unwrap_err(),
+            NativeExecCutError::LiveCapability("RCB/replay/chaos state")
+        );
+        thread.last_replay_change_point = None;
+        prepare(&mut thread, &binding);
+        capture_prepared_native_exec(&tool, &thread, &binding, &receipt).unwrap();
+        thread.last_replay_change_point = Some(LogicalTime::from_nanos(1));
+        assert_eq!(
+            capture_prepared_native_exec(&tool, &thread, &binding, &receipt).unwrap_err(),
+            NativeExecCutError::LiveCapability("RCB/replay/chaos state")
+        );
+    }
+
+    #[test]
     fn native_exec_final_exact_comparison_keeps_state_and_refuses_every_byte_change() {
         let (tool, mut thread, binding) = fixture();
         let receipt = validate_old_native_exec_cut(&tool, &thread, &binding).unwrap();
@@ -672,7 +692,7 @@ pub(crate) mod tests {
         );
         let changed = encoded(&tool, &thread, &binding, &receipt);
         check_prepared_native_exec_bytes(&tool, &thread, &binding, &receipt, &changed).unwrap();
-        thread.stats.count_syscall();
+        thread.stats.count_syscall(reverie::syscalls::Sysno::getpid);
         assert!(
             check_prepared_native_exec_bytes(&tool, &thread, &binding, &receipt, &changed).is_err()
         );
@@ -705,8 +725,8 @@ pub(crate) mod tests {
             let _ = thread.chaos_prng.random::<u64>();
         }
         thread.pedigree = thread.pedigree.fork().1.fork().0;
-        thread.stats.count_syscall();
-        thread.stats.count_syscall();
+        thread.stats.count_syscall(reverie::syscalls::Sysno::getpid);
+        thread.stats.count_syscall(reverie::syscalls::Sysno::getpid);
         thread.stats.count_signal();
         thread.stats.timeslice_stats.record(173);
         thread.timer_slack_ns = 137;

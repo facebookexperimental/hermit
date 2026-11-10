@@ -4,10 +4,10 @@
  * Exercises the pipe-buffer sizing fcntl command family (distinct from the
  * F_GETFD/F_SETFD descriptor-flag and F_GETFL/F_SETFL status-flag namespaces
  * already covered elsewhere). Detcore pins pipes used by its deterministic
- * scheduler to 8192 bytes so the guest cannot observe host-wide per-UID pipe
+ * scheduler to two pages (8192 bytes on x86-64) so the guest cannot observe host-wide per-UID pipe
  * pressure. This fixture locks that guest-visible contract:
  *   1. pipe2 opens a pipe.
- *   2. the initial capacity reported by F_GETPIPE_SZ is exactly 8192 bytes.
+ *   2. the initial capacity reported by F_GETPIPE_SZ is exactly two pages.
  *   3. shrinking the capacity to one page returns a positive rounded size
  *      (shrinking is always permitted for an unprivileged process; growing a
  *      pipe can require CAP_SYS_RESOURCE under per-user page accounting and is
@@ -28,11 +28,10 @@
 #include <unistd.h>
 
 int main(void) {
-  enum {
-    EXPECTED_CHECKS = 5,
-    EXPECTED_DEFAULT_PIPE_SZ = 8192,
-    WANT_PIPE_SZ = 4096
-  };
+  enum { EXPECTED_CHECKS = 5 };
+  /* Two of the host's pages, and one: 8192 and 4096 on x86-64. */
+  const int WANT_PIPE_SZ = (int)sysconf(_SC_PAGESIZE);
+  const int EXPECTED_DEFAULT_PIPE_SZ = 2 * WANT_PIPE_SZ;
   int ok = 0;
   int fds[2] = {-1, -1};
   if (pipe2(fds, 0) != 0) {

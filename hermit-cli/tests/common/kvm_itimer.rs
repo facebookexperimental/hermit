@@ -9,17 +9,65 @@
 
 use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use detcore::Digest;
 use hermit::canonical_verdict::ComparedLogScope;
 use hermit::canonical_verdict::VerificationReport;
 
+use super::kvm_cancellation::bounded_command_with_budgets;
 use super::kvm_cancellation::bounded_command_with_timeout;
 use super::kvm_cancellation::bounded_read;
 
 const MIB: u64 = 1024 * 1024;
+
+/// The compiled timer guest, built once per test binary and cached under
+/// CARGO_TARGET_TMPDIR (the dh-322bp pattern): the per-run compile under a
+/// 20 s wall limit failed under queue load even though the compile burns
+/// only a few CPU-seconds, because a descheduled compiler makes no CPU
+/// progress. The one build uses a CPU-primary budget; later runs copy the
+/// cached binary into their retained root.
+fn fixture_guest() -> &'static Path {
+    static GUEST: OnceLock<PathBuf> = OnceLock::new();
+    GUEST.get_or_init(|| {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/kvm_itimer_sleep_continuation.c");
+        let build = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kvm-itimer-fixture");
+        fs::create_dir_all(&build).expect("fixture cache directory");
+        let guest = build.join("program");
+        let compile = build.join("compile");
+        let status = bounded_command_with_budgets(
+            Command::new("cc")
+                .args([
+                    "-std=gnu11",
+                    "-O2",
+                    "-g",
+                    "-Wall",
+                    "-Wextra",
+                    "-Wpedantic",
+                    "-Wformat=2",
+                    "-Werror",
+                    "-fno-pie",
+                    "-no-pie",
+                    "-pthread",
+                ])
+                .arg(&fixture)
+                .arg("-o")
+                .arg(&guest),
+            &compile,
+            Duration::from_secs(30),
+            Duration::from_secs(240),
+            "timer fixture compile CPU budget guard",
+        );
+        assert!(status.success(), "timer fixture compilation failed");
+        assert!(bounded_read(&compile.join("stdout"), 64 * MIB).is_empty());
+        assert!(bounded_read(&compile.join("stderr"), 16 * MIB).is_empty());
+        guest
+    })
+}
 
 pub(super) fn run() {
     let _lock = super::hermit_run_guard();
@@ -38,31 +86,7 @@ pub(super) fn run() {
         .join("tests/fixtures/kvm_itimer_sleep_continuation.c");
     fs::copy(&fixture, root.join("guest.c")).expect("retain exact fixture");
     let guest = root.join("program");
-    let compile = root.join("compile");
-    let status = bounded_command_with_timeout(
-        Command::new("cc")
-            .args([
-                "-std=gnu11",
-                "-O2",
-                "-g",
-                "-Wall",
-                "-Wextra",
-                "-Wpedantic",
-                "-Wformat=2",
-                "-Werror",
-                "-fno-pie",
-                "-no-pie",
-                "-pthread",
-            ])
-            .arg(&fixture)
-            .arg("-o")
-            .arg(&guest),
-        &compile,
-        Duration::from_secs(20),
-    );
-    assert!(status.success(), "timer fixture compilation failed");
-    assert!(bounded_read(&compile.join("stdout"), 64 * MIB).is_empty());
-    assert!(bounded_read(&compile.join("stderr"), 16 * MIB).is_empty());
+    fs::copy(fixture_guest(), &guest).expect("retain the cached compiled guest");
     let elf_bytes = bounded_read(&guest, 16 * MIB);
     let elf = goblin::elf::Elf::parse(&elf_bytes).expect("actual timer fixture ELF");
     assert_eq!(elf.header.e_type, goblin::elf::header::ET_EXEC);
