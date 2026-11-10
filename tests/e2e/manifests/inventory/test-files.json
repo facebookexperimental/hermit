@@ -3583,6 +3583,12 @@
       "why": "tests/c/two_child_after_handler.c is owned by hermit-cli/tests/cli.rs: two_children_after_a_handler_return_choose_the_creator compiles this guest, in which two children are created before the creator's ppoll, the first exits while it waits, its SIGCHLD handler returns and the ppoll returns EINTR, and only then is the second child released with no new wait or mask change; it prints which thread each handler ran on and requires the creator twice natively, on KVM and on ptrace at bitwise parity, so a delivery frame that survives the first handler (remembering SIGCHLD's automatic handler block) is caught giving the second exit to the worker."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/two_child_slice_burning_handler.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/two_child_slice_burning_handler.c is owned by hermit-cli/tests/cli.rs: two_children_after_a_slice_burning_handler_return_choose_the_creator compiles this guest, in which the first child's SIGCHLD handler burns CPU past a timeslice before returning and the creator makes no syscall between its return and the second child's exit; it requires the creator twice natively, on KVM and on ptrace at bitwise parity, so only a slice boundary can retire what the return left behind and a delivery frame surviving it is caught."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/umask_mode.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

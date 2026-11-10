@@ -3088,7 +3088,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         // and a wake that syscall made no longer ends the slice.
         guest.thread_state_mut().in_uncharged_bootstrap_syscall = false;
         guest.thread_state_mut().yield_after_futex_wake = false;
-        guest.thread_state_mut().returned_from_sigreturn = false;
+        // A reported sigreturn since the last event ends its delivery
+        // interval here too: a timeslice can expire after the return and
+        // before any syscall or inbound stop, and clearing the report
+        // without popping would leave the frame deciding indefinitely.
+        if std::mem::take(&mut guest.thread_state_mut().returned_from_sigreturn)
+            && crate::syscalls::signal_shadow::observes_sigreturns(&self.cfg)
+        {
+            crate::tool_global::pop_delivery_mask(guest).await;
+        }
         let dettid = guest.thread_state().dettid;
         let timer_event = matches!(entry, Some(slice_boundary::callbacks::Callback::PmuTimer));
         let evs = self
