@@ -10697,7 +10697,9 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), String> {
         if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
             copy_tree(&entry.path(), &target)?;
         } else {
-            fs::copy(entry.path(), target).map_err(|e| e.to_string())?;
+            // A prebuilt `fixtures/program` runs as soon as preparation
+            // returns, so it must not be copied in-process (ETXTBSY).
+            crate::exec_safe_fs::copy(entry.path(), target).map_err(|e| e.to_string())?;
         }
     }
     Ok(())
