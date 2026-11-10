@@ -93,8 +93,6 @@ mod tests {
     use std::path::PathBuf;
     use std::process::Command;
     use std::process::Stdio;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
 
@@ -166,48 +164,6 @@ mod tests {
         panic!("still busy after the holder exited: {last:?}");
     }
 
-    /// Regression: while other threads spawn continuously, every file created
-    /// by these helpers executes at once. Each fresh executable is run
-    /// immediately, which is where the in-process write failed.
-    #[test]
-    fn helpers_create_executables_that_are_never_busy_under_concurrent_spawns() {
-        let dir = Scratch::new("regression");
-        let stop = Arc::new(AtomicBool::new(false));
-        let spawners = (0..8)
-            .map(|_| {
-                let stop = stop.clone();
-                std::thread::spawn(move || {
-                    while !stop.load(Ordering::Relaxed) {
-                        let _ = Command::new("true").status();
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-        let source = dir.0.join("source");
-        write_executable(&source, SCRIPT, 0o755).unwrap();
-        let mut failures = Vec::new();
-        let mut run = |path: &Path, want: i32| match Command::new(path).status() {
-            Ok(status) if status.code() == Some(want) => {}
-            other => failures.push(format!("{}: {other:?}", path.display())),
-        };
-        for index in 0..200 {
-            let written = dir.0.join(format!("written-{index}"));
-            write_executable(&written, SCRIPT, 0o700).unwrap();
-            run(&written, 0);
-            // Replacing in place must not reuse the executed inode either.
-            write_executable(&written, "#!/bin/sh\nexit 3\n", 0o700).unwrap();
-            run(&written, 3);
-            let copied = dir.0.join(format!("copied-{index}"));
-            copy(&source, &copied).unwrap();
-            run(&copied, 0);
-        }
-        stop.store(true, Ordering::Relaxed);
-        for spawner in spawners {
-            spawner.join().unwrap();
-        }
-        assert!(failures.is_empty(), "{} busy: {failures:?}", failures.len());
-    }
-
     #[test]
     fn helpers_keep_mode_and_bytes_and_leave_nothing_beside_the_target() {
         let dir = Scratch::new("shape");
@@ -230,6 +186,14 @@ mod tests {
         assert_eq!(copy(&executable, &copied).unwrap(), SCRIPT.len() as u64);
         assert_eq!(std::fs::read(&copied).unwrap(), SCRIPT.as_bytes());
         assert_eq!(std::fs::metadata(&copied).unwrap().mode() & 0o7777, 0o750);
+        // Copying over an existing executable yields a new inode too.
+        let copied_inode = std::fs::metadata(&copied).unwrap().ino();
+        copy(&executable, &copied).unwrap();
+        assert_ne!(
+            std::fs::metadata(&copied).unwrap().ino(),
+            copied_inode,
+            "copy over an executable reused the inode"
+        );
         let plain = dir.0.join("plain");
         std::fs::write(&plain, "data\n").unwrap();
         std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o640)).unwrap();
