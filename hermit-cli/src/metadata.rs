@@ -1453,6 +1453,10 @@ fn record_or_replay_config_with_timer_support(
         cap_preemption_charge: false,
         // A `hermit run` option; record and replay take none.
         virtual_timeout: None,
+        // A chaos option of `hermit run`, like `pipe_wake_latency`: record
+        // mode's own scheduling, and recordings made before the option
+        // existed, wake every timed wait at its deadline.
+        chaos_timed_wait_spread: None,
         seed: default_config.seed,
         rng_seed: default_config.rng_seed,
         imprecise_timers: false,

@@ -987,6 +987,33 @@ pub struct Config {
     #[serde(default)]
     #[clap(long, default_value = "0", value_name = "instructions")]
     pub chaos_instruction_offset: u64,
+    /// Spread the timed waits of a `--chaos` run: end each sleep, and each futex wait with a
+    /// timeout in the default precise futex mode, when the global clock reaches the time the
+    /// scheduler queues the wait plus its remaining duration times a factor drawn
+    /// log-uniformly from `[1/R, R]`, where `R` is this value. Chaos alone only
+    /// reorders threads, so the ratio between a sleep and other threads' work is fixed by the
+    /// program, and a race ordered by that ratio (a test that sleeps while a worker computes,
+    /// a periodic timer against a teardown) never changes order. A factor of at least one
+    /// oversleeps, as Linux may. A factor below one ends the wait after that fraction of
+    /// other threads' progress, and first advances the global clock to the wait's deadline,
+    /// as if every other thread had been descheduled for the rest of the wait, so the waiter
+    /// still observes at least its full duration. The factor is a pure function of the
+    /// scheduler seed, the thread, and the number of the thread's earlier spread waits.
+    /// Recorded schedules store the value and the seed, and a replay under others is refused.
+    /// Not spread: poll, epoll and select timeouts, signal timers, and waits with no finite
+    /// future deadline. Needs `--chaos`, or a replay of preemptions recorded with it, threads
+    /// sequentialized by Detcore's scheduler, and the ptrace backend (or e9patch preprocessing,
+    /// which runs on it); must be finite and above 1. Unset (the default), nothing changes.
+    /// Its sleeps are registered at the first scheduler pass by default
+    /// (`--sleep-registration=first-pass`), so a schedule replay draws each wake time from the
+    /// committed time the recording drew it from; `--replay-schedule-from` refuses a record of
+    /// sleeps registered when chosen, which it cannot reproduce, and spreads no wait filed after
+    /// its schedule has run out, where the run continues without chaos. `hermit analyze` refuses to
+    /// bisect or minimize it: those trials replay schedules found under different scheduler
+    /// seeds, and the factors are keyed on the seed.
+    #[serde(default)]
+    #[clap(long, value_name = "factor")]
+    pub chaos_timed_wait_spread: Option<f64>,
 
     /// Record the timing of preemption events for future replay or experimentation.
     /// This is only useful in chaos modes.
@@ -1413,10 +1440,11 @@ pub struct Config {
     /// does not select by priority, where those late wakes are what real sleep-ordered races
     /// depend on, and on a backend whose sleepers' signal mask and dispositions the scheduler
     /// does not read (DBT, SaBRe and LiteInst without the in-guest delivery gate, KVM), and
-    /// `first-pass` otherwise. On such a backend a sleep parked at the first pass would be ended
-    /// by any signal the scheduler sends it, including one Linux ignores or the sleeper blocks,
-    /// so `first-pass` there, asked for or taken from a record, is refused by name before the
-    /// guest starts. A replay of a schedule or of preemptions that
+    /// `first-pass` otherwise, and always under `--chaos-timed-wait-spread`, whose wake times a
+    /// schedule replay can then reproduce. On such a backend a sleep parked at the first pass
+    /// would be ended by any signal the scheduler sends it, including one Linux ignores or the
+    /// sleeper blocks, so `first-pass` there, asked for or taken from a record, is refused by
+    /// name before the guest starts. A replay of a schedule or of preemptions that
     /// leaves this unset takes the value its record stores (a record that stores none, written
     /// before the option existed or by a `when-chosen` run, registered sleeps when chosen), and an
     /// explicit value that disagrees with the record is refused. `hermit analyze` and `hermit
@@ -2132,6 +2160,13 @@ impl Config {
                 "clock_multiplier must be finite and positive"
             );
         }
+        if let Some(spread) = self.chaos_timed_wait_spread {
+            assert!(
+                spread.is_finite() && spread > 1.0,
+                "chaos_timed_wait_spread must be finite and above 1, as \
+                 `hermit run --chaos-timed-wait-spread` requires, got {spread}"
+            );
+        }
         let minimum_max_timeslice = self.minimum_max_timeslice_nanos();
         assert!(
             self.max_timeslice
@@ -2489,9 +2524,10 @@ impl Config {
             && match self.sleep_registration {
                 Some(registration) => registration == SleepRegistration::FirstPass,
                 None => {
-                    !self.chaos
+                    (!self.chaos
                         && self.sched_heuristic.is_priority_ordered()
-                        && self.reads_sleeper_signal_state()
+                        && self.reads_sleeper_signal_state())
+                        || self.chaos_timed_wait_spread.is_some()
                 }
             }
     }
@@ -2640,6 +2676,9 @@ impl fmt::Display for Config {
                 " --chaos-instruction-offset={}",
                 self.chaos_instruction_offset
             )?;
+        }
+        if let Some(spread) = self.chaos_timed_wait_spread {
+            write!(f, " --chaos-timed-wait-spread={}", spread)?;
         }
         if let Some(m) = self.clock_multiplier {
             write!(f, " --clock-multiplier={}", m)?;
@@ -3644,8 +3683,9 @@ impl Default for Config {
 /// [`Config::launch_image`], which came after it. So is [`Config::target_timeslice_syscalls_only`],
 /// added after this form froze; DBT runs without a PMU maximum, where the
 /// option has no effect. So are [`Config::futex_wake_yields`],
-/// [`Config::scheduler_turn_cost`], [`Config::cap_preemption_charge`] and
-/// [`Config::virtual_timeout`], also added after this form froze, which
+/// [`Config::scheduler_turn_cost`], [`Config::cap_preemption_charge`],
+/// [`Config::virtual_timeout`] and [`Config::chaos_timed_wait_spread`], also added after
+/// this form froze, which
 /// `hermit run` refuses with the DBT backend, and [`Config::replaying`], set
 /// only by `hermit replay`, which runs only on the ptrace backend. So is
 /// [`Config::inherited_seccomp`], added after this form froze, which reads
@@ -4220,9 +4260,10 @@ mod legacy_backend_json {
     /// the behaviour every legacy reader already has.
     /// `in_guest_detlog_forward_policy` is unset for DBT (its runtime forwards
     /// no records on a socket), so it is never written and reads as unset.
-    /// `futex_wake_yields`, `pipe_wake_latency`, `scheduler_turn_cost` and
-    /// `cap_preemption_charge` and `virtual_timeout` came after the legacy form
-    /// froze too, and `hermit run` refuses them with the DBT backend.
+    /// `futex_wake_yields`, `pipe_wake_latency`, `scheduler_turn_cost`,
+    /// `cap_preemption_charge`, `virtual_timeout` and `chaos_timed_wait_spread`
+    /// came after the legacy form froze too, and `hermit run` refuses them with
+    /// the DBT backend.
     /// `replaying` is never written either: only `hermit replay` sets it, and
     /// replay runs only on the ptrace backend.
     /// `in_guest_site_patching_off` is false for DBT (it is set only for
@@ -4329,7 +4370,7 @@ mod legacy_backend_json {
     /// states its provenance, so it is never written and reads as false.
     /// `untrap_passthrough_syscalls` came after it too. `hermit run` refuses it
     /// on every backend but ptrace, so it is never written and reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 61] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 62] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -4348,6 +4389,7 @@ mod legacy_backend_json {
         "scheduler_turn_cost",
         "cap_preemption_charge",
         "virtual_timeout",
+        "chaos_timed_wait_spread",
         "inherited_seccomp",
         "cpu_profile",
         "cpu_profile_host",
@@ -4489,7 +4531,8 @@ mod legacy_backend_json {
     /// [`Config::target_timeslice_syscalls_only`],
     /// [`Config::futex_wake_yields`], [`Config::replaying`],
     /// [`Config::scheduler_turn_cost`], [`Config::cap_preemption_charge`],
-    /// [`Config::virtual_timeout`], [`Config::inherited_seccomp`] or [`Config::replay_edited_preemptions`] takes
+    /// [`Config::virtual_timeout`], [`Config::chaos_timed_wait_spread`],
+    /// [`Config::inherited_seccomp`] or [`Config::replay_edited_preemptions`] takes
     /// an element. Each gets a
     /// placeholder; [`super::from_legacy_backend_json`] replaces the first.
     struct LegacyPositions<'f, 'l, A> {
@@ -4574,6 +4617,7 @@ mod legacy_backend_json {
                     | "detlog_anon"
                     | "scheduler_turn_cost"
                     | "virtual_timeout"
+                    | "chaos_timed_wait_spread"
                     | "pipe_wake_latency"
                     | "expired_wait_charge"
                     | "sleep_registration"
@@ -4887,6 +4931,7 @@ mod legacy_backend_json {
                 | "scheduler_turn_cost"
                 | "cap_preemption_charge"
                 | "virtual_timeout"
+                | "chaos_timed_wait_spread"
                 | "inherited_seccomp"
                 | "cpu_profile"
                 | "cpu_profile_host"
@@ -5920,7 +5965,7 @@ mod tests {
     /// `in_guest_signal_delivery`,
     /// `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
     /// `replaying`,
-    /// `scheduler_turn_cost`, `cap_preemption_charge`,
+    /// `scheduler_turn_cost`, `cap_preemption_charge`, `chaos_timed_wait_spread`,
     /// `inherited_seccomp`, `replay_edited_preemptions`, `lenient_replay` or `detlog_anon`,
     /// which is the key order the encoder writes.
     #[test]
@@ -5954,6 +5999,7 @@ mod tests {
                 | "scheduler_turn_cost"
                 | "cap_preemption_charge"
                 | "virtual_timeout"
+                | "chaos_timed_wait_spread"
                 | "inherited_seccomp"
                 | "cpu_profile"
                 | "cpu_profile_host"
@@ -6013,7 +6059,7 @@ mod tests {
         // `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
         // `pipe_wake_latency`, `expired_wait_charge`, `sleep_registration`, `replaying`,
         // `scheduler_turn_cost`, `cap_preemption_charge`, `virtual_timeout`,
-        // `inherited_seccomp`, `cpu_profile`,
+        // `chaos_timed_wait_spread`, `inherited_seccomp`, `cpu_profile`,
         // `cpu_profile_host`, `cpu_profile_source`,
         // `signal_state_copy`, `container_mount_table`,
         // `guest_may_inherit_a_terminal`, `in_guest_detlog_forward_policy`,
@@ -6039,9 +6085,10 @@ mod tests {
         // `chaos_instruction_offset`, `rewrite_exclusives_overlay_requested`,
         // `rewrite_exclusives_unmarked`, `untrap_passthrough_syscalls`
         // and `strict_schedule_boundaries` none: fourteen more keys and
-        // sixty fewer (lenient_replay joined them in dh-mvz7y), so forty-six keys fewer than fields.
+        // sixty-one fewer (lenient_replay joined them in dh-mvz7y,
+        // chaos_timed_wait_spread later), so forty-seven keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 46);
+        assert_eq!(fields.len(), keys.len() + 47);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -7020,6 +7067,105 @@ mod tests {
             !old.cap_preemption_charge,
             "a configuration from before the option reads as off"
         );
+    }
+
+    /// `chaos_timed_wait_spread` never enters the legacy form, whatever its
+    /// value: the legacy string keeps its bytes, and it reads
+    /// back as unset from both the object and the array form.
+    #[test]
+    fn chaos_timed_wait_spread_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            chaos_timed_wait_spread: Some(10.0),
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("chaos_timed_wait_spread"), "{json}");
+        assert_eq!(
+            from_legacy_backend_json(&json)
+                .unwrap()
+                .chaos_timed_wait_spread,
+            None
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert_eq!(
+            from_legacy_backend_json(&array)
+                .unwrap()
+                .chaos_timed_wait_spread,
+            None
+        );
+    }
+
+    /// `--chaos-timed-wait-spread` is unset by default, parses, and survives
+    /// the rendered command line and serde; a configuration from before the
+    /// option reads as unset.
+    /// `--chaos-timed-wait-spread` registers queued sleeps at the first pass
+    /// unless `--sleep-registration` says otherwise, under `--chaos` as well,
+    /// so a schedule replay can reproduce its wake times; `hermit record` and
+    /// `hermit replay` still register them when chosen.
+    #[test]
+    fn a_timed_wait_spread_registers_sleeps_at_the_first_pass_by_default() {
+        let spread = Config {
+            chaos: true,
+            chaos_timed_wait_spread: Some(8.0),
+            ..Default::default()
+        };
+        assert!(spread.queued_sleeps_registered_at_first_pass());
+        assert!(
+            !Config {
+                chaos_timed_wait_spread: None,
+                ..spread.clone()
+            }
+            .queued_sleeps_registered_at_first_pass()
+        );
+        assert!(
+            !Config {
+                sleep_registration: Some(SleepRegistration::WhenChosen),
+                ..spread.clone()
+            }
+            .queued_sleeps_registered_at_first_pass()
+        );
+        assert!(
+            !Config {
+                recordreplay_modes: true,
+                ..spread
+            }
+            .queued_sleeps_registered_at_first_pass()
+        );
+    }
+
+    #[test]
+    fn chaos_timed_wait_spread_is_opt_in_and_round_trips() {
+        let default = Config::default();
+        assert_eq!(default.chaos_timed_wait_spread, None);
+        assert!(!default.to_string().contains("timed-wait-spread"));
+        let config = Config::parse_from(["detcore", "--chaos", "--chaos-timed-wait-spread=12.5"]);
+        assert_eq!(config.chaos_timed_wait_spread, Some(12.5));
+        let rendered = config.to_string();
+        assert!(
+            rendered.contains(" --chaos-timed-wait-spread=12.5"),
+            "{rendered}"
+        );
+        let reparsed =
+            Config::parse_from(std::iter::once("detcore").chain(rendered.split_whitespace()));
+        assert_eq!(reparsed.chaos_timed_wait_spread, Some(12.5));
+        let back: Config = serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(back.chaos_timed_wait_spread, Some(12.5));
+        let mut legacy = serde_json::to_value(&default).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("chaos_timed_wait_spread");
+        let old: Config = serde_json::from_value(legacy).unwrap();
+        assert_eq!(old.chaos_timed_wait_spread, None);
     }
 
     /// `replaying` never enters the legacy form, whatever its value: the

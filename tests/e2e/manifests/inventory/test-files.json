@@ -3506,6 +3506,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/timed_wait_spread.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/timed_wait_spread.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test runs this guest's sleep and condwait modes under --chaos across seeds, with and without --chaos-timed-wait-spread, and asserts that the spread reorders the timed wait against the worker while the waiter's own clock never shows less than its 50 ms; it remains a guest fixture because a generic manifest cannot assert a set of outcomes across seeds."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/timer_coalesce.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/timer_coalesce.c is owned by hermit-cli/tests/cli.rs: posix_timer_entries_are_delivered_as_on_linux_at_bitwise_parity runs each mode (a POSIX timer's entry beside an ordinary copy of its signal, overruns, stale entries, parked and unignored expiries, the order of a signalfd read, the forged SI_TIMER rows) and requires Linux's output at bitwise parity, and posix_timer_entries_hermit_refuses_or_diverges_on_are_named requires the named refusal and the known divergence (https://github.com/rrnewton/hermit/issues/4262). It stays a fixture because a generic manifest cannot assert these per-mode outputs."

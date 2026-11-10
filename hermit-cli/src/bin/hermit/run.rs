@@ -8410,6 +8410,244 @@ fn a_replay_under_another_cap_preemption_charge_is_refused() {
     );
 }
 
+/// `--chaos-timed-wait-spread` parses, is rendered into the reproduce command
+/// and round-trips. It is refused below 1 or non-finite, on a fresh run
+/// without `--chaos`, with `--namespace-only`, with `--replay-schedule-from`
+/// (which cannot reproduce its sleep draws), and on a backend other than
+/// ptrace; a preemption or schedule replay may carry it without `--chaos`. (`--chaos`
+/// already keeps threads sequentialized and conflicts with `--strace-only`.)
+#[test]
+fn chaos_timed_wait_spread_parses_round_trips_and_is_refused_where_inert() {
+    let mut opts = RunOpts::parse_from([
+        "fakehermit",
+        "--chaos",
+        "--chaos-timed-wait-spread=10",
+        "fakeprog",
+    ]);
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(opts.det_opts.det_config.chaos_timed_wait_spread, Some(10.0));
+    let rendered = format!("{opts}");
+    assert!(
+        rendered.contains(" --chaos-timed-wait-spread=10"),
+        "{rendered}"
+    );
+    let mut reparsed_args = vec!["fakehermit".to_owned()];
+    reparsed_args.extend(shell_words::split(&rendered).unwrap());
+    let mut reparsed = RunOpts::parse_from(reparsed_args);
+    reparsed.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(
+        reparsed.det_opts.det_config.chaos_timed_wait_spread,
+        Some(10.0)
+    );
+
+    let mut default = RunOpts::parse_from(["fakehermit", "--chaos", "fakeprog"]);
+    default.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(default.det_opts.det_config.chaos_timed_wait_spread, None);
+    assert!(!format!("{default}").contains("timed-wait-spread"));
+
+    // Validation reads a replayed record for the timeslice its run drew, so
+    // each replay needs a readable record; these state none.
+    let dir = tempfile::tempdir().unwrap();
+    let preemptions = dir.path().join("preemptions.json");
+    let schedule = dir.path().join("schedule.json");
+    for record in [&preemptions, &schedule] {
+        detcore::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+            .write_to_disk(record)
+            .unwrap();
+    }
+    let preemptions = format!("--replay-preemptions-from={}", preemptions.display());
+    let schedule = format!("--replay-schedule-from={}", schedule.display());
+    let mut replay = RunOpts::parse_from([
+        "fakehermit",
+        preemptions.as_str(),
+        "--chaos-timed-wait-spread=10",
+        "fakeprog",
+    ]);
+    replay.validate_args_with_perf_support(true).unwrap();
+    let mut schedule_replay = RunOpts::parse_from([
+        "fakehermit",
+        schedule.as_str(),
+        "--chaos-timed-wait-spread=10",
+        "fakeprog",
+    ]);
+    schedule_replay
+        .validate_args_with_perf_support(true)
+        .unwrap();
+
+    for (argv, expected) in [
+        (
+            vec!["hermit", "run", "--chaos-timed-wait-spread=10", "fakeprog"],
+            "add --chaos",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--chaos",
+                "--chaos-timed-wait-spread=0.5",
+                "fakeprog",
+            ],
+            "must be a finite factor above 1 (received 0.5)",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--chaos",
+                "--chaos-timed-wait-spread=1",
+                "fakeprog",
+            ],
+            "1 would spread nothing",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--chaos",
+                "--chaos-timed-wait-spread=inf",
+                "fakeprog",
+            ],
+            "must be a finite factor above 1",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--namespace-only",
+                "--chaos-timed-wait-spread=10",
+                "fakeprog",
+            ],
+            "Drop --namespace-only or --chaos-timed-wait-spread",
+        ),
+        (
+            vec![
+                "hermit",
+                "--backend=liteinst",
+                "run",
+                "--chaos",
+                "--chaos-timed-wait-spread=10",
+                "fakeprog",
+            ],
+            "--chaos-timed-wait-spread has been tested only on the ptrace backend",
+        ),
+    ] {
+        let error = run_opts_for(&argv)
+            .validate_args_with_perf_support(true)
+            .err()
+            .unwrap_or_else(|| panic!("{argv:?} was accepted"));
+        assert!(error.to_string().contains(expected), "{argv:?}: {error}");
+    }
+
+    // An executable-selected backend (DBT here) is refused by name before
+    // validation, as every option it is not qualified for is.
+    let opts = run_opts_for(&[
+        "hermit",
+        "--backend=dbt",
+        "run",
+        "--chaos",
+        "--chaos-timed-wait-spread=10",
+        "--",
+        "fakeprog",
+    ]);
+    assert_eq!(opts.application_backend, Some("dbt"));
+    let error = opts
+        .refuse_unqualified_application_options(
+            <super::core_adapter::CoreApplicationAdapter as
+                super::backend_hook::BackendAdapter>::NONDEFAULT_CPU_PROFILE_REFUSAL,
+        )
+        .expect_err("--chaos-timed-wait-spread under --backend=dbt was accepted");
+    assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+    assert!(
+        error.to_string().contains(
+            "--chaos-timed-wait-spread is not qualified for executable-selected backend `dbt`"
+        ),
+        "{error:#}"
+    );
+}
+
+/// A preemption replay of a record made under another
+/// `--chaos-timed-wait-spread`, or another scheduler seed than the one it
+/// names, is refused before launch with the values to replay with; the
+/// recorded values are accepted. A schedule replay of a record made with the
+/// option is refused whatever it gives, with the preemption replay to use.
+#[test]
+fn a_replay_under_another_timed_wait_spread_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("schedule.json");
+    let record = detcore::preemptions::PreemptionWriter::new(None)
+        .with_timed_wait_spread(Some(detcore::preemptions::RecordedTimedWaitSpread {
+            spread: 10.0,
+            seed: Some(7),
+        }))
+        .into_string();
+    std::fs::write(&path, record).unwrap();
+    let replay = |extra: &[&str]| {
+        let preemptions = format!("--replay-preemptions-from={}", path.display());
+        let mut argv = vec!["fakehermit", preemptions.as_str()];
+        argv.extend_from_slice(extra);
+        argv.push("fakeprog");
+        RunOpts::parse_from(argv).refuse_replay_under_another_timed_wait_spread()
+    };
+    replay(&["--chaos-timed-wait-spread=10", "--sched-seed=7"]).unwrap();
+    let error = replay(&["--sched-seed=7"]).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("Replay with --chaos-timed-wait-spread=10"),
+        "{error:#}"
+    );
+    let error = replay(&["--chaos-timed-wait-spread=10", "--sched-seed=8"]).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("Replay with --sched-seed=7"),
+        "{error:#}"
+    );
+    // A schedule replay of a record whose sleeps were registered when chosen
+    // is refused whatever it gives, naming the registration to record with.
+    let schedule = format!("--replay-schedule-from={}", path.display());
+    for extra in [
+        &[][..],
+        &["--chaos-timed-wait-spread=10", "--sched-seed=7"][..],
+    ] {
+        let mut argv = vec!["fakehermit", schedule.as_str()];
+        argv.extend_from_slice(extra);
+        argv.push("fakeprog");
+        let error = RunOpts::parse_from(argv)
+            .refuse_replay_under_another_timed_wait_spread()
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Record with --sleep-registration=first-pass"),
+            "{error:#}"
+        );
+    }
+    // One registered at the first pass is accepted under the recorded spread
+    // and seed, and refused under others as a preemption replay is.
+    let first_pass = dir.path().join("first-pass.json");
+    let record = detcore::preemptions::PreemptionWriter::new(None)
+        .with_timed_wait_spread(Some(detcore::preemptions::RecordedTimedWaitSpread {
+            spread: 10.0,
+            seed: Some(7),
+        }))
+        .with_queued_sleeps_registered_at_first_pass(true)
+        .into_string();
+    std::fs::write(&first_pass, record).unwrap();
+    let schedule = format!("--replay-schedule-from={}", first_pass.display());
+    let replay = |extra: &[&str]| {
+        let mut argv = vec!["fakehermit", schedule.as_str()];
+        argv.extend_from_slice(extra);
+        argv.push("fakeprog");
+        RunOpts::parse_from(argv).refuse_replay_under_another_timed_wait_spread()
+    };
+    replay(&["--chaos-timed-wait-spread=10", "--sched-seed=7"]).unwrap();
+    let error = replay(&["--sched-seed=7"]).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("Replay with --chaos-timed-wait-spread=10"),
+        "{error:#}"
+    );
+    let error = replay(&["--chaos-timed-wait-spread=10", "--sched-seed=8"]).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("Replay with --sched-seed=7"),
+        "{error:#}"
+    );
+}
+
 /// `--scheduler-turn-cost` parses, is rendered into the reproduce command and
 /// round-trips; zero, and a cost the clock multiplier scales below one
 /// nanosecond or past the bound, are refused.
@@ -11667,6 +11905,61 @@ impl RunOpts {
         Ok(())
     }
 
+    /// Refuses a replay of a recorded schedule that would not redraw its
+    /// `--chaos-timed-wait-spread` factors: another spread, or another
+    /// scheduler seed than the one the record names, as
+    /// `refuse_replay_under_another_pipe_wake_latency` refuses another
+    /// latency. A record without the field was made with the option off.
+    fn refuse_replay_under_another_timed_wait_spread(&self) -> Result<(), Error> {
+        if self.namespace_only {
+            return Ok(());
+        }
+        let config = &self.det_opts.det_config;
+        for (option, path) in [
+            ("--replay-preemptions-from", &config.replay_preemptions_from),
+            ("--replay-schedule-from", &config.replay_schedule_from),
+        ] {
+            let Some(path) = path else {
+                continue;
+            };
+            let recorded =
+                detcore::preemptions::read_recorded_timed_wait_spread(path).map_err(Error::msg)?;
+            // A schedule replay reproduces a spread sleep's wake time only
+            // when the recording registered the sleep at the first pass, as
+            // the replay does: a sleep registered when its thread was chosen
+            // drew its wake time from a committed time that the schedule does
+            // not record, since it records the thread's next turn only after
+            // the wake.
+            if option == "--replay-schedule-from"
+                && let Some(recorded) = recorded
+                && !detcore::preemptions::read_recorded_queued_sleeps_registered_at_first_pass(path)
+                    .map_err(Error::msg)?
+            {
+                return Err(Error::new(PolicyRefusal).context(format!(
+                    "{option} {} was recorded with --chaos-timed-wait-spread={} and registered \
+                     its sleeps when chosen (--sleep-registration=when-chosen), which a schedule \
+                     replay cannot reproduce: it evaluates such a sleep when its schedule next \
+                     runs the thread, later than the recording did, and would draw the sleep's \
+                     wake time from another clock. Record with --sleep-registration=first-pass \
+                     (the default with --chaos-timed-wait-spread), or replay this recording with \
+                     --replay-preemptions-from, --chaos and its --chaos-timed-wait-spread and \
+                     --seed",
+                    path.display(),
+                    recorded.spread
+                )));
+            }
+            if let Some(refusal) = detcore::preemptions::timed_wait_spread_mismatch(
+                &format!("{option} {}", path.display()),
+                recorded,
+                config.chaos_timed_wait_spread,
+                Some(config.sched_seed()),
+            ) {
+                return Err(Error::new(PolicyRefusal).context(refusal));
+            }
+        }
+        Ok(())
+    }
+
     /// Point this run at an OCI image rootfs, as `--image` does.
     ///
     /// Used by `hermit oci run`, which resolves the user's reference to the
@@ -11888,6 +12181,10 @@ impl RunOpts {
             (self.happens_before.is_some(), "--happens-before"),
             (config.futex_wake_yields, "--futex-wake-yields"),
             (config.cap_preemption_charge, "--cap-preemption-charge"),
+            (
+                config.chaos_timed_wait_spread.is_some(),
+                "--chaos-timed-wait-spread",
+            ),
             (
                 config.untrap_passthrough_syscalls,
                 "--untrap-passthrough-syscalls",
@@ -13039,6 +13336,7 @@ impl RunOpts {
         self.refuse_replay_under_other_guest_ids()?;
         self.refuse_replay_under_another_sleep_registration()?;
         self.refuse_replay_under_another_exclusive_rewrite()?;
+        self.refuse_replay_under_another_timed_wait_spread()?;
         if !self.namespace_only
             && (self.verify_verbose
                 || global
@@ -13968,6 +14266,14 @@ impl RunOpts {
         // check the maximum the run will use.
         self.resolve_seeded_chaos_timeslice()?;
         let config = &mut self.det_opts.det_config;
+        if let Some(spread) = config.chaos_timed_wait_spread
+            && (!spread.is_finite() || spread <= 1.0)
+        {
+            anyhow::bail!(
+                "--chaos-timed-wait-spread must be a finite factor above 1 (received {spread}); \
+                 10 draws factors from 0.1 to 10, and 1 would spread nothing"
+            );
+        }
         let minimum_max_timeslice = config.minimum_max_timeslice_nanos();
         if let Some(max_timeslice) = config.max_timeslice
             && u64::from(max_timeslice) < minimum_max_timeslice
@@ -14097,6 +14403,50 @@ impl RunOpts {
                     "--cap-preemption-charge has no effect: no timeslice ends by expiry because \
                      {cause}. Give a --max-timeslice (or --target-timeslice), or drop \
                      --cap-preemption-charge"
+                );
+            }
+        }
+
+        // `--chaos-timed-wait-spread` moves the wake time of timed waits that
+        // Detcore's scheduler orders. A launch without that scheduler, or a
+        // fresh run without chaos, would accept it and change nothing, or
+        // change a run the user did not ask to perturb, so it is refused.
+        if config.chaos_timed_wait_spread.is_some() {
+            let unscheduled = if self.namespace_only {
+                Some("--namespace-only")
+            } else if self.strace_only {
+                Some("--strace-only")
+            } else if !config.sequentialize_threads {
+                Some("--no-sequentialize-threads")
+            } else {
+                None
+            };
+            if let Some(option) = unscheduled {
+                anyhow::bail!(
+                    "--chaos-timed-wait-spread moves timed waits that Detcore's scheduler \
+                     orders; {option} runs the guest without it. Drop {option} or \
+                     --chaos-timed-wait-spread"
+                );
+            }
+            // A replay of a schedule recorded with the spread may carry it
+            // without --chaos, as a preemption replay may; whether the record
+            // is one a schedule replay can reproduce is
+            // `refuse_replay_under_another_timed_wait_spread`'s to decide.
+            if !config.chaos
+                && config.replay_preemptions_from.is_none()
+                && config.replay_schedule_from.is_none()
+            {
+                anyhow::bail!(
+                    "--chaos-timed-wait-spread perturbs a chaos run's timed waits; add --chaos \
+                     (or replay preemptions recorded with it)"
+                );
+            }
+            if !matches!(backend, Backend::Ptrace) {
+                anyhow::bail!(
+                    "--chaos-timed-wait-spread has been tested only on the ptrace backend (and \
+                     e9patch preprocessing, which runs on it); backend `{}` is refused, use \
+                     --backend=ptrace",
+                    backend.as_str()
                 );
             }
         }

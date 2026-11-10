@@ -597,6 +597,28 @@ range sets the run's `--max-timeslice` to MAX; give one or the other, and do
 not combine it with `--target-timeslice`. It needs PMU-backed preemption. A
 small MIN makes runs slower, because fine slices mean many preemptions.
 
+Chaos reorders threads but never changes how long a timed wait lasts against
+other threads' work: a sleeping thread wakes when the virtual clock, which
+advances with that work, reaches its deadline. A race ordered by that ratio
+(a test that sleeps while a worker computes, a periodic timer against a
+teardown) therefore keeps one order under every seed.
+`--chaos-timed-wait-spread=R` ends each sleep, and each futex wait with a
+timeout (in the default precise futex mode), after its remaining duration
+times a seeded factor drawn log-uniformly from `[1/R, R]` of the clock's
+progress. When the factor is below one, the clock
+first jumps to the wait's deadline, as if the other threads had been
+descheduled, so the waiter still observes its full duration; above one, the
+wait oversleeps. Poll, epoll and select timeouts and signal timers are not
+spread. A recording stores the spread and seed, and a replay under others is
+refused. With the option, sleeps are registered at the first scheduler pass
+unless `--sleep-registration` says otherwise, so a recording replays with
+`--replay-schedule-from` and the recorded spread and seed, or with
+`--replay-preemptions-from` and `--chaos` as well. A schedule replay refuses a
+recording of sleeps registered when chosen, and spreads no wait it files after
+its schedule has run out, since the run then continues without chaos. `hermit analyze` cannot bisect or
+minimize such a run: its trials replay schedules found under different
+scheduler seeds, and the spread's factors are keyed on the seed.
+
 Advanced investigations can save preemption decisions with
 `--record-preemptions-to=FILE` and replay them with
 `--replay-preemptions-from=FILE`. A record edited after it was recorded (for
@@ -1347,6 +1369,7 @@ that their order decides the failure.
 | `--chaos-timeslice-range=MIN..MAX` | With `--chaos`, draws each slice's mean log-uniformly from MIN..MAX virtual nanoseconds and caps slices at MAX (the run's `--max-timeslice`). Not with `--chaos-seeded-timeslice`, which draws the maximum instead. |
 | `--chaos-timeslice-draw=run` | Discovery mode: draws the run's `--max-timeslice` once from the range (without one, the recommended 1000..200000000), from the scheduler seed. Fine draws make runs much slower. |
 | `--chaos-timeslice-draw=slice` | The default draw: each slice's mean from `--chaos-timeslice-range`, which it needs; what a range alone does. |
+| `--chaos-timed-wait-spread=R` | Ends each sleep and futex timeout after its duration times a seeded factor in `[1/R, R]`, never before its deadline on the guest's clock. |
 
 A thread that polls with timed waits shorter than a scheduler turn's charge
 (`--scheduler-turn-cost`) would otherwise burn a full charge of virtual time

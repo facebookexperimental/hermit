@@ -670,6 +670,12 @@ impl Replayer {
             .find(|thread| *thread != except && threads.contains(thread))
     }
 
+    /// Whether every recorded event has been replayed, so the run continues
+    /// past its schedule.
+    pub(super) fn ran_out(&self) -> bool {
+        self.cursor.peek().is_none()
+    }
+
     fn peek_next(&self) -> Option<SchedEvent> {
         self.cursor.peek().cloned()
     }

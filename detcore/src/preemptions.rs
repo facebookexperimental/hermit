@@ -44,6 +44,36 @@ use crate::types::DetTid;
 use crate::types::LogicalTime;
 use crate::types::SchedEvent;
 
+/// The `--chaos-timed-wait-spread` a record was produced under
+/// ([`PreemptionRecord`]): the spread, and the scheduler seed of the run when
+/// the scheduler wrote the record (`None` in a record `hermit analyze`
+/// assembles from its trials, whose seeds it keeps itself).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct RecordedTimedWaitSpread {
+    /// The spread `R`: factors are drawn from `[1/R, R]`.
+    pub spread: f64,
+    /// The scheduler seed the factors were drawn from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+}
+
+/// Compared bit for bit: a spread is a configuration value read back exactly,
+/// not a measurement.
+impl PartialEq for RecordedTimedWaitSpread {
+    fn eq(&self, other: &Self) -> bool {
+        self.spread.to_bits() == other.spread.to_bits() && self.seed == other.seed
+    }
+}
+
+impl Eq for RecordedTimedWaitSpread {}
+
+impl std::hash::Hash for RecordedTimedWaitSpread {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.spread.to_bits().hash(state);
+        self.seed.hash(state);
+    }
+}
+
 /// The RCB-coordinate identity a stored history declares. Only a history
 /// written in the `rcb_history` envelope (`boundary_recording`) has one; a
 /// legacy file states none, so where it was produced is unknown.
@@ -257,6 +287,13 @@ pub struct PreemptionRecord {
     /// standalone JSON member is deliberately absent from ThreadHistory/RPC.
     /// Unknown values are retained for editing and non-Chosen replay.
     reserved_input: ReservedInputMetadata,
+    /// The `--chaos-timed-wait-spread` of the run that produced this record,
+    /// and the scheduler seed its draws came from when the scheduler wrote
+    /// it. Every spread wait's factor is a pure function of the two, so a
+    /// replay under the same values redraws exactly the recorded factors, and
+    /// one under others is refused. `None` when the option was off, which
+    /// writes the record exactly as before the field existed.
+    timed_wait_spread: Option<RecordedTimedWaitSpread>,
     /// The post-crash bound in effect in the run that produced this record
     /// (`Config::post_crash_timeslice_in_effect`), in virtual nanoseconds. The
     /// switch changes every slice after it, so a replay takes this value
@@ -881,6 +918,7 @@ impl PreemptionRecord {
             guest_ids: None,
             replay_departed_at: None,
             reserved_input: ReservedInputMetadata::default(),
+            timed_wait_spread: None,
             post_crash_timeslice: None,
             post_crash: None,
             uncapped_slices: None,
@@ -964,6 +1002,7 @@ impl PreemptionRecord {
             chaos_timeslice,
             guest_ids,
             reserved_input,
+            timed_wait_spread,
             post_crash_timeslice,
             post_crash,
             uncapped_slices,
@@ -1029,6 +1068,7 @@ impl PreemptionRecord {
             chaos_timeslice: *chaos_timeslice,
             guest_ids: *guest_ids,
             reserved_input: reserved_input.clone(),
+            timed_wait_spread: *timed_wait_spread,
             post_crash_timeslice: *post_crash_timeslice,
             // The switches the run took name points of the recorded run, as
             // the checkpoints do. A prefix of the whole schedule keeps them;
@@ -1571,6 +1611,19 @@ impl PreemptionRecord {
         self
     }
 
+    /// The same record, stating the `--chaos-timed-wait-spread` of the
+    /// trials it came from, as it states the pipe-wake latency.
+    pub fn with_timed_wait_spread(mut self, spread: Option<RecordedTimedWaitSpread>) -> Self {
+        self.timed_wait_spread = spread;
+        self
+    }
+
+    /// The `--chaos-timed-wait-spread` this record was produced under
+    /// (`None` for off).
+    pub fn timed_wait_spread(&self) -> Option<RecordedTimedWaitSpread> {
+        self.timed_wait_spread
+    }
+
     /// The post-crash bound in effect in the run this record came from
     /// (`None` for off).
     pub fn post_crash_timeslice(&self) -> Option<u64> {
@@ -1754,6 +1807,7 @@ impl PreemptionRecord {
             // A record derived from an inexact one is inexact too.
             replay_departed_at: self.replay_departed_at,
             reserved_input: self.reserved_input.clone(),
+            timed_wait_spread: self.timed_wait_spread,
             post_crash_timeslice: self.post_crash_timeslice,
             // A derived record (minimize, analyze trials) runs a different
             // schedule, whose switches the run computes afresh.
@@ -1976,6 +2030,7 @@ impl PreemptionRecord {
             guest_ids: None,
             replay_departed_at: None,
             reserved_input: ReservedInputMetadata::default(),
+            timed_wait_spread: None,
             post_crash_timeslice: None,
             post_crash: None,
             uncapped_slices: None,
@@ -5386,6 +5441,72 @@ mod tests {
         assert_eq!(hash(&back), hash(&without));
     }
 
+    /// The timed-wait spread and its seed round-trip through the writer, the
+    /// record and the settings reader; a record without them is written as
+    /// before; a replay under another spread, or another seed where both
+    /// name one, is refused.
+    #[test]
+    fn the_timed_wait_spread_round_trips_and_is_compared() {
+        let unsaid = PreemptionRecord::from_sched_events(Vec::new());
+        assert_eq!(unsaid.timed_wait_spread(), None);
+        assert!(
+            !serde_json::to_string(&unsaid)
+                .unwrap()
+                .contains("timed_wait_spread")
+        );
+        let setting = RecordedTimedWaitSpread {
+            spread: 12.5,
+            seed: Some(7),
+        };
+        let written = PreemptionWriter::new(None)
+            .with_timed_wait_spread(Some(setting))
+            .into_string();
+        assert!(
+            written.contains(r#""timed_wait_spread":{"spread":12.5,"seed":7}"#),
+            "{written}"
+        );
+        let back: PreemptionRecord = serde_json::from_str(&written).unwrap();
+        assert_eq!(back.timed_wait_spread(), Some(setting));
+        assert_eq!(
+            back.clone_preemptions_only().timed_wait_spread(),
+            Some(setting)
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.json");
+        std::fs::write(&path, &written).unwrap();
+        assert_eq!(read_recorded_timed_wait_spread(&path), Ok(Some(setting)));
+        let unseeded = RecordedTimedWaitSpread {
+            spread: 12.5,
+            seed: None,
+        };
+        for (recorded, spread, seed, refused) in [
+            (None, None, Some(1), false),
+            (Some(setting), Some(12.5), Some(7), false),
+            (Some(setting), Some(12.5), None, false),
+            (Some(unseeded), Some(12.5), Some(1), false),
+            (Some(setting), None, Some(7), true),
+            (None, Some(12.5), Some(7), true),
+            (Some(setting), Some(12.0), Some(7), true),
+            (Some(setting), Some(12.5), Some(8), true),
+        ] {
+            let refusal =
+                timed_wait_spread_mismatch("--replay-schedule-from=x", recorded, spread, seed);
+            assert_eq!(
+                refusal.is_some(),
+                refused,
+                "{recorded:?} replayed with {spread:?} and seed {seed:?}: {refusal:?}"
+            );
+        }
+        let refusal = timed_wait_spread_mismatch(
+            "--replay-schedule-from=x",
+            Some(setting),
+            Some(12.5),
+            Some(8),
+        )
+        .unwrap();
+        assert!(refusal.contains("Replay with --sched-seed=7"), "{refusal}");
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
     #[test]
@@ -6637,6 +6758,30 @@ mod tests {
         }
     }
 
+    /// The timed-wait spread and the seed its draws came from are settings of
+    /// the whole run, as the other run settings are: a prefix of the schedule
+    /// keeps them, whether it is shorter or whole.
+    #[test]
+    fn a_schedule_prefix_keeps_the_timed_wait_spread() {
+        let setting = RecordedTimedWaitSpread {
+            spread: 12.5,
+            seed: Some(7),
+        };
+        let tid = DetTid::from_raw(3);
+        let record = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(tid, 10),
+            SchedEvent::branches(tid, 20),
+        ])
+        .with_timed_wait_spread(Some(setting));
+        for len in [0, 1, 2, 9] {
+            assert_eq!(
+                record.schedule_prefix(len).timed_wait_spread,
+                Some(setting),
+                "prefix of {len} events"
+            );
+        }
+    }
+
     /// Every loader of a preemption record reads the same readmissions from
     /// the same bytes, whatever the record's format: the scheduler's
     /// (`read_recorded_rejoins`), the replay and editing reader
@@ -7482,6 +7627,14 @@ impl PreemptionWriter {
         self
     }
 
+    /// Store the run's `--chaos-timed-wait-spread` and scheduler seed
+    /// (`None` for off, which leaves the record as it was before the field
+    /// existed).
+    pub fn with_timed_wait_spread(mut self, spread: Option<RecordedTimedWaitSpread>) -> Self {
+        self.inner.timed_wait_spread = spread;
+        self
+    }
+
     /// Store where a backgrounded call rejoined the run queue, so a replay
     /// can readmit it at the same turn (`crate::scheduler::rejoin_log`).
     pub(crate) fn push_rejoin(&mut self, rejoin: crate::scheduler::rejoin_log::Rejoin) {
@@ -8252,6 +8405,59 @@ pub fn post_crash_timeslice_for_replay(
             show(replay),
             show(recorded),
         )),
+    }
+}
+
+/// Read only the `--chaos-timed-wait-spread` stored in a preemption record
+/// file, as [`read_recorded_epoch`] reads the epoch. `Ok(None)` means the
+/// record was made with the option off, or before the field existed.
+pub fn read_recorded_timed_wait_spread(
+    path: &Path,
+) -> Result<Option<RecordedTimedWaitSpread>, String> {
+    #[derive(Deserialize)]
+    struct SpreadOnly {
+        #[serde(default)]
+        timed_wait_spread: Option<RecordedTimedWaitSpread>,
+    }
+    Ok(boundary_recording::read_settings::<SpreadOnly>(path)?.timed_wait_spread)
+}
+
+/// The refusal of a replay that would not redraw a record's spread-wait
+/// factors, naming the record by `source` (an option and a path), or `None`
+/// when it would: the replay's `--chaos-timed-wait-spread` (`spread`) must be
+/// the recorded one, and where both the record and the replay name a
+/// scheduler seed (`seed`), so must the seed. Absent and off are the same.
+pub fn timed_wait_spread_mismatch(
+    source: &str,
+    recorded: Option<RecordedTimedWaitSpread>,
+    spread: Option<f64>,
+    seed: Option<u64>,
+) -> Option<String> {
+    let show = |spread: Option<f64>| match spread {
+        Some(spread) => format!("--chaos-timed-wait-spread={spread}"),
+        None => "no --chaos-timed-wait-spread".to_owned(),
+    };
+    let redirect = |spread: Option<f64>| match spread {
+        Some(spread) => format!("Replay with --chaos-timed-wait-spread={spread}"),
+        None => "Drop --chaos-timed-wait-spread".to_owned(),
+    };
+    let recorded_spread = recorded.map(|recorded| recorded.spread);
+    if recorded_spread.map(f64::to_bits) != spread.map(f64::to_bits) {
+        return Some(format!(
+            "{source} was recorded with {} and would be replayed with {}. The spread draws \
+             every timed wait's wake time, so the replay cannot reproduce the run. {}.",
+            show(recorded_spread),
+            show(spread),
+            redirect(recorded_spread),
+        ));
+    }
+    match (recorded.and_then(|recorded| recorded.seed), seed) {
+        (Some(recorded), Some(seed)) if recorded != seed => Some(format!(
+            "{source} was recorded with --chaos-timed-wait-spread drawn from scheduler seed \
+             {recorded} and would be replayed with seed {seed}, which draws other timed-wait \
+             wake times. Replay with --sched-seed={recorded}."
+        )),
+        _ => None,
     }
 }
 

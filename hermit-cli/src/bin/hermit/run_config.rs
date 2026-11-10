@@ -1359,6 +1359,10 @@ mod tests {
             "chaos-instruction-offset",
             &["--chaos-instruction-offset=8"],
         ),
+        (
+            "chaos-timed-wait-spread",
+            &["--chaos-timed-wait-spread=2.5"],
+        ),
         ("record-preemptions", &["--record-preemptions"]),
         (
             "strict-schedule-boundaries",

@@ -30,6 +30,15 @@ pub struct TimedEvents {
     // Real timers of a backend that provides process signal control recur only after an
     // actual shared SIGALRM dequeue.
     controlled_real_timer_deadlines: BTreeMap<DetPid, LogicalTime>,
+
+    /// Under `--chaos-timed-wait-spread`, a thread whose timed wait is queued
+    /// at a wake threshold before its deadline (`insert_spread`): the
+    /// threshold and the deadline. When the threshold's event pops, the
+    /// scheduler first advances the global clock to the deadline
+    /// (`take_promise`), so the waiter never observes less than its duration.
+    /// An entry lives exactly while its thread's event is queued at the
+    /// threshold, or set aside by `suspend_thread`.
+    promised: BTreeMap<DetTid, (LogicalTime, LogicalTime)>,
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -198,7 +207,51 @@ impl fmt::Display for TimedEvent {
 }
 
 impl TimedEvents {
+    /// Queue a thread's timed wait to end at `ns`, its deadline.
     pub fn insert(&mut self, ns: LogicalTime, dt: DetTid) {
+        self.promised.remove(&dt);
+        self.insert_thread_event(ns, dt);
+    }
+
+    /// Queue a thread's timed wait whose deadline is `deadline` to end at the
+    /// wake threshold `wake` that `--chaos-timed-wait-spread` drew for it. A
+    /// threshold before the deadline is remembered, so that popping it
+    /// advances the clock to the deadline first (`take_promise`).
+    pub fn insert_spread(&mut self, wake: LogicalTime, deadline: LogicalTime, dt: DetTid) {
+        if wake < deadline {
+            self.promised.insert(dt, (wake, deadline));
+        } else {
+            self.promised.remove(&dt);
+        }
+        self.insert_thread_event(wake, dt);
+    }
+
+    /// The deadline promised to `dt` whose wake threshold `at` just popped,
+    /// taken out of the record; `None` when its wait ended at its deadline.
+    pub fn take_promise(&mut self, dt: DetTid, at: LogicalTime) -> Option<LogicalTime> {
+        match self.promised.get(&dt) {
+            Some(&(wake, deadline)) if wake == at => {
+                self.promised.remove(&dt);
+                Some(deadline)
+            }
+            _ => None,
+        }
+    }
+
+    /// Set a thread's queued wait aside, keeping a promised deadline, for
+    /// `resume_thread` to queue it again at the same time.
+    pub fn suspend_thread(&mut self, dt: DetTid) -> Option<LogicalTime> {
+        let at = self.thread_deadline(dt)?;
+        self.remove_thread_event(dt);
+        Some(at)
+    }
+
+    /// Queue again a wait that `suspend_thread` set aside at `ns`.
+    pub fn resume_thread(&mut self, ns: LogicalTime, dt: DetTid) {
+        self.insert_thread_event(ns, dt);
+    }
+
+    fn insert_thread_event(&mut self, ns: LogicalTime, dt: DetTid) {
         let set = self.map.entry(ns).or_default();
         if !set.insert(TimedEvent::ThreadEvt(dt)) {
             panic!(
@@ -673,6 +726,11 @@ impl TimedEvents {
 
     /// Remove a specific thread from the set of those waiting on time to elapse.
     pub fn remove(&mut self, dettid: DetTid) {
+        self.promised.remove(&dettid);
+        self.remove_thread_event(dettid);
+    }
+
+    fn remove_thread_event(&mut self, dettid: DetTid) {
         let mut to_remove: Option<LogicalTime> = None;
         let mut already_removed = false;
         for (time_key, set) in self.map.iter_mut() {
@@ -778,6 +836,47 @@ mod test {
             None
         );
         assert_eq!(ev.len(), 1);
+    }
+
+    /// A spread wait queued before its deadline pops at its threshold with
+    /// its deadline promised once; one queued at or past its deadline, a
+    /// plain insert, a removal and a stale threshold promise nothing. A
+    /// suspended wait keeps its promise for its resumption.
+    #[test]
+    fn a_spread_wait_promises_its_deadline_only_from_its_own_threshold() {
+        let mut ev = TimedEvents::default();
+        ev.insert_spread(at(100), at(1_000), tid(1));
+        assert_eq!(ev.next_deadline(), Some(at(100)));
+        assert_eq!(ev.pop(), Some((at(100), TimedEvent::ThreadEvt(tid(1)))));
+        assert_eq!(ev.take_promise(tid(1), at(99)), None, "another time");
+        assert_eq!(ev.take_promise(tid(1), at(100)), Some(at(1_000)));
+        assert_eq!(ev.take_promise(tid(1), at(100)), None, "taken once");
+
+        ev.insert_spread(at(5_000), at(1_000), tid(2));
+        assert_eq!(ev.pop(), Some((at(5_000), TimedEvent::ThreadEvt(tid(2)))));
+        assert_eq!(
+            ev.take_promise(tid(2), at(5_000)),
+            None,
+            "an overslept wait"
+        );
+
+        ev.insert_spread(at(100), at(1_000), tid(3));
+        ev.remove(tid(3));
+        assert!(ev.is_empty());
+        ev.insert(at(100), tid(3));
+        assert_eq!(ev.pop(), Some((at(100), TimedEvent::ThreadEvt(tid(3)))));
+        assert_eq!(
+            ev.take_promise(tid(3), at(100)),
+            None,
+            "removed with its wait"
+        );
+
+        ev.insert_spread(at(100), at(1_000), tid(4));
+        assert_eq!(ev.suspend_thread(tid(4)), Some(at(100)));
+        assert!(ev.is_empty());
+        ev.resume_thread(at(100), tid(4));
+        assert_eq!(ev.pop(), Some((at(100), TimedEvent::ThreadEvt(tid(4)))));
+        assert_eq!(ev.take_promise(tid(4), at(100)), Some(at(1_000)));
     }
 
     #[test]
