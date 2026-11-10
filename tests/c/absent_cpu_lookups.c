@@ -303,13 +303,14 @@ static void seeks(const char *label, const char *path) {
  * device's `numa_node`; `control`, its `vendor`; `nodes`, the node
  * directory; `cpu`, cpu0's directory; `device`, the PCI device's directory;
  * `nvme`, the first NVMe controller's `numa_node`, which need not exist)
- * and files of the caller's own (`own`, an ordinary file; `lookalike` and
- * `nvme-lookalike`, directories each with a `numa_node` and a `subsystem`
- * link to the PCI bus or the NVMe class). Through a link, an object is
- * found, or not, as by its own path, whether the call follows the link or
- * fails once its lookup found the object, by every call that looks a path
- * up (readlink, statfs, the xattr calls, inotify, chdir), and after a `..`
- * that leaves it; the link itself is found by lstat, readlink, llistxattr,
+ * and files of the caller's own (`own-file`, an ordinary file, and `own`, a
+ * link to it; `lookalike` and `nvme-lookalike`, directories each with a
+ * `numa_node` and a `subsystem` link to the PCI bus or the NVMe class).
+ * Through a link, an object is found, or not, as by its own path, whether
+ * the call follows the link or fails once its lookup found the object, by
+ * every call that looks a path up (readlink, statfs, the xattr calls,
+ * inotify, chdir, mkdir), and after a `..` that leaves it, wherever the
+ * walk then ends; the link itself is found by lstat, readlink, llistxattr,
  * IN_DONT_FOLLOW and an O_PATH|O_NOFOLLOW open. */
 static void aliases(const char *directory) {
     static const char *const names[] = {
@@ -457,6 +458,65 @@ static void aliases(const char *directory) {
                 printf("chdir back: %s\n", strerrorname_np(errno));
             }
         }
+    }
+
+    /* A walk through the absent node directory fails there, also where
+     * `..` then leaves sysfs and where the call would make the last name. */
+    snprintf(path, sizeof(path), "%s/nodes/../../../..", directory);
+    report("stat alias nodes/../../../..", stat(path, &st));
+    report("statfs alias nodes/../../../..", statfs(path, &fs));
+    snprintf(path, sizeof(path), "%s/nodes/fresh-child", directory);
+    report("mkdir alias nodes/fresh-child", mkdir(path, 0755));
+    snprintf(path, sizeof(path), "%s/nodes/fresh-file", directory);
+    fd = open(path, O_WRONLY | O_CREAT | O_CLOEXEC, 0644);
+    report("creat alias nodes/fresh-file", fd);
+    if (fd >= 0) {
+        close(fd);
+    }
+    /* A `..` below a file is ENOTDIR before the walk reaches the link to
+     * the absent directory. */
+    snprintf(path, sizeof(path), "%s/own-file/../nodes", directory);
+    report("stat alias own-file/../nodes", stat(path, &st));
+    report("statfs alias own-file/../nodes", statfs(path, &fs));
+    report("chdir alias own-file/../nodes", chdir(path));
+    snprintf(path, sizeof(path), "%s/own-file/../nodes/node0", directory);
+    report("readlink alias own-file/../nodes/node0",
+           (int)readlink(path, target, sizeof(target)));
+
+    /* A `..` straight after `/proc`, or after `self`, leaves it, for the
+     * walk to reach the absent directory; a directory the walk may not
+     * search on the way (`/root`, where the caller has no search permission
+     * there) ends it first, with EACCES. */
+    snprintf(path, sizeof(path), "/proc/..%s/nodes", directory);
+    report("stat /proc/../alias nodes", stat(path, &st));
+    snprintf(path, sizeof(path), "/proc/self/../..%s/nodes", directory);
+    report("stat /proc/self/../../alias nodes", stat(path, &st));
+    report("stat /proc/../root/../node directory",
+           stat("/proc/../root/../sys/devices/system/node", &st));
+    /* Links of the caller's own through its `/proc/self/fd` link to the
+     * device's directory lead where its descriptor does. */
+    snprintf(path, sizeof(path), "%s/device", directory);
+    int opened = open(path, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    static const char *const through_fd[][2] = {
+        {"attribute", "numa_node"},
+        {"control", "vendor"},
+    };
+    for (size_t i = 0; i < sizeof(through_fd) / sizeof(through_fd[0]); i++) {
+        snprintf(target, sizeof(target), "/proc/self/fd/%d/%s", opened, through_fd[i][1]);
+        snprintf(path, sizeof(path), "%s/fd-%s", directory, through_fd[i][0]);
+        unlink(path);
+        if (symlink(target, path) != 0) {
+            printf("symlink fd-%s: %s\n", through_fd[i][0], strerrorname_np(errno));
+            continue;
+        }
+        snprintf(label, sizeof(label), "stat fd link %s", through_fd[i][0]);
+        report(label, stat(path, &st));
+        snprintf(label, sizeof(label), "access fd link %s", through_fd[i][0]);
+        report(label, access(path, F_OK));
+        unlink(path);
+    }
+    if (opened >= 0) {
+        close(opened);
     }
 }
 

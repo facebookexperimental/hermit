@@ -383,33 +383,6 @@ fn follows_last_name(spelling: &Path) -> bool {
         || bytes.rsplit(|byte| *byte == b'/').next() == Some(b"..")
 }
 
-/// Whether Linux reports the failure `errno` of a call that looks up a path
-/// only once its lookup has found an object, or has gone through one: a
-/// refusal for permission or of a write, a name that is no directory or a
-/// link too many, and the like. Not a failure Linux reports before its lookup
-/// (`EINVAL`, `EFAULT`, `EBADF`, `EMFILE`, `ENAMETOOLONG`), nor `ENOENT`,
-/// which is the answer for an absent object already.
-fn fails_after_lookup(errno: Errno) -> bool {
-    matches!(
-        errno,
-        Errno::EACCES
-            | Errno::EPERM
-            | Errno::EROFS
-            | Errno::ENOTDIR
-            | Errno::ELOOP
-            | Errno::EISDIR
-            | Errno::ETXTBSY
-            | Errno::ENXIO
-            | Errno::ENODEV
-            | Errno::EOPNOTSUPP
-            | Errno::EEXIST
-            | Errno::EBUSY
-            | Errno::EOVERFLOW
-            | Errno::EFBIG
-            | Errno::EAGAIN
-    )
-}
-
 /// Whether the call `sysno`, its arguments `values`, follows a symbolic link
 /// that the last name of its path operand number `operand` names (in
 /// [`path_operands`]' order), as Linux's lookup of it does
@@ -474,13 +447,25 @@ fn follows_last_link(sysno: Sysno, operand: usize, values: &[usize; 6]) -> bool 
 /// names the walk had still to look up after it. The walk looks up each
 /// name in turn in the directory it has reached, follows the symbolic link
 /// that name is (the last name's only where `follow`), and takes a `..` in
-/// the directory it has reached, as `link_path_walk` does (fs/namei.c). It
-/// ends, finding nothing, at a name that is missing or below one that is no
-/// directory, where Linux's walk fails as it would without the absent
-/// object, and past `MAXSYMLINKS` links (ELOOP).
+/// the directory it has reached, as `link_path_walk` does (fs/namei.c at
+/// v7.1). It ends, finding nothing, where Linux's walk fails without the
+/// absent object: in a directory it may not search, before any name, `..`
+/// included ([`searchable`]; `may_lookup`, 2600), at a name that is missing,
+/// below a name that is no directory, `..` included (`d_can_lookup`,
+/// ENOTDIR, 2662-2668), and past `MAXSYMLINKS` links (ELOOP). `self` and
+/// `thread-self` in `/proc` are the caller's: where `own_entries` holds the
+/// caller's process and thread directories, those, which the tool's lookup
+/// would take for its own; otherwise as the tool's lookup takes them.
+///
+/// Without `read_links` it looks nothing up and takes every name but the
+/// last for a directory: right for a path that Linux's walk resolves
+/// without following a symbolic link ([`restricted_walk`] with
+/// `RESOLVE_NO_SYMLINKS`).
 fn absent_on_walk(
     named: &Path,
     follow: bool,
+    read_links: bool,
+    own_entries: Option<&(PathBuf, PathBuf)>,
     is_absent: impl Fn(&Path, &[u8]) -> bool,
 ) -> Option<(PathBuf, PathBuf)> {
     let mut pending = named.components().map(owned).collect::<VecDeque<_>>();
@@ -493,12 +478,33 @@ fn absent_on_walk(
                 continue;
             }
             Owned::Current => continue,
+            _ if read_links && !searchable(&resolved) => return None,
             Owned::Parent => {
                 resolved.pop();
                 continue;
             }
             Owned::Name(name) => name,
         };
+        if let Some((process, thread)) = own_entries.filter(|_| resolved == Path::new("/proc")) {
+            let caller = match name.as_bytes() {
+                b"self" => Some(process),
+                b"thread-self" => Some(thread),
+                _ => None,
+            };
+            if let Some(caller) = caller {
+                if pending.is_empty() && !follow {
+                    return None;
+                }
+                links += 1;
+                if links > MAXSYMLINKS {
+                    return None;
+                }
+                for component in caller.components().rev() {
+                    pending.push_front(owned(component));
+                }
+                continue;
+            }
+        }
         let next = resolved.join(&name);
         if is_absent(&resolved, name.as_bytes()) {
             let mut rest = PathBuf::new();
@@ -511,25 +517,104 @@ fn absent_on_walk(
             }
             return Some((next, rest));
         }
-        if pending.is_empty() && !follow {
-            return None;
+        let last = pending.is_empty();
+        if !read_links {
+            resolved = next;
+            continue;
         }
-        match std::fs::read_link(&next) {
-            Ok(target) => {
-                links += 1;
-                if links > MAXSYMLINKS {
-                    return None;
-                }
-                for component in target.components().rev() {
-                    pending.push_front(owned(component));
-                }
+        let metadata = std::fs::symlink_metadata(&next).ok()?;
+        if metadata.file_type().is_symlink() {
+            if last && !follow {
+                return None;
             }
-            // An object that is no symbolic link.
-            Err(error) if error.raw_os_error() == Some(libc::EINVAL) => resolved = next,
-            Err(_) => return None,
+            links += 1;
+            if links > MAXSYMLINKS {
+                return None;
+            }
+            let target = std::fs::read_link(&next).ok()?;
+            for component in target.components().rev() {
+                pending.push_front(owned(component));
+            }
+        } else if metadata.is_dir() || last {
+            resolved = next;
+        } else {
+            return None;
         }
     }
     None
+}
+
+/// How Linux's walk of `named`, an absolute path in the tool's view, ends
+/// under the `openat2` restriction `resolve` (`RESOLVE_NO_SYMLINKS`, say),
+/// following a symbolic link the last name names where `follow`: `Ok` where
+/// it reaches an object, which an `O_PATH` descriptor opened and this closed
+/// again, and the error it fails with otherwise. Issued without the C
+/// library, which under in-guest LiteInst is the guest's
+/// ([`crate::util::raw_syscall`]).
+fn restricted_walk(named: &Path, follow: bool, resolve: u64) -> Result<(), Errno> {
+    /// `struct open_how` (`OPEN_HOW_SIZE_VER0`).
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+    let path = std::ffi::CString::new(named.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)?;
+    let nofollow = if follow { 0 } else { libc::O_NOFOLLOW };
+    let how = OpenHow {
+        flags: (libc::O_PATH | libc::O_CLOEXEC | nofollow) as u64,
+        mode: 0,
+        resolve,
+    };
+    // SAFETY: a NUL-terminated path and an `open_how` of the size passed,
+    // both alive for the call.
+    let fd = unsafe {
+        crate::util::raw_syscall(
+            libc::SYS_openat2,
+            [
+                libc::AT_FDCWD as u64,
+                path.as_ptr() as u64,
+                &how as *const OpenHow as u64,
+                std::mem::size_of::<OpenHow>() as u64,
+                0,
+                0,
+            ],
+        )
+    };
+    if fd < 0 {
+        return Err(Errno::new(-fd as i32));
+    }
+    // SAFETY: the descriptor openat2 just returned, which nothing else owns.
+    unsafe {
+        crate::util::raw_syscall(libc::SYS_close, [fd as u64, 0, 0, 0, 0, 0]);
+    }
+    Ok(())
+}
+
+/// Whether the walk may look a name up in `directory`, a directory in the
+/// tool's view (`may_lookup`, fs/namei.c:2600 at v7.1), by the kernel's own
+/// check of the tool's credentials (`faccessat2` with `X_OK` and
+/// `AT_EACCESS`), which are the ones the guest starts with: in Hermit's
+/// container both are the namespace's root, with the same capabilities.
+fn searchable(directory: &Path) -> bool {
+    let Ok(path) = std::ffi::CString::new(directory.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: a NUL-terminated path, alive for the call.
+    let result = unsafe {
+        crate::util::raw_syscall(
+            libc::SYS_faccessat2,
+            [
+                libc::AT_FDCWD as u64,
+                path.as_ptr() as u64,
+                libc::X_OK as u64,
+                libc::AT_EACCESS as u64,
+                0,
+                0,
+            ],
+        )
+    };
+    result == 0
 }
 
 /// A path component, owned.
@@ -1498,12 +1583,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// below the guest's working directory or the descriptor's directory as
     /// Detcore knows them ([`Self::observed_path`]), or, for a descriptor
     /// whose recorded path is a descriptor link's spelling or that has none,
-    /// by the kernel's path for it ([`Self::descriptor_path_in_tool_view`]).
-    /// Through the guest's own `/proc/self` or `/proc/thread-self`: its
-    /// descriptor's path for `fd/<n>`, and `/` for its `root`; anything else
-    /// there by the caller's numbers where the tool's `/proc` entry for the
-    /// caller is the caller's, and not placed where it is not (KVM). `None`
-    /// where it cannot be placed.
+    /// by the kernel's path for it ([`Self::descriptor_path_in_tool_view`]),
+    /// placed as [`Self::placed_in_tool_view`] places it. `None` where it
+    /// cannot be placed.
     fn named_in_tool_view<G: Guest<Self>>(
         &self,
         guest: &G,
@@ -1522,6 +1604,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .join(spelling),
             _ => return None,
         };
+        self.placed_in_tool_view(guest, named)
+    }
+
+    /// `named`, an absolute path in the guest's view, as a path in the
+    /// tool's view that leads where the guest's lookup does. Through the
+    /// guest's own `/proc/self` or `/proc/thread-self`: its descriptor's path
+    /// for `fd/<n>`, and `/` for its `root`; anything else there by the
+    /// caller's numbers where the tool's `/proc` entry for the caller is the
+    /// caller's ([`Self::own_procfs_entries`]), and not placed where it is
+    /// not (KVM). A `..` straight after `/proc` or `self` leaves the caller's
+    /// entries (`self` is an entry of `/proc` for every caller), and one after
+    /// `thread-self` is the caller's `task` directory. Any other path as it
+    /// is; `None` where it cannot be placed.
+    fn placed_in_tool_view<G: Guest<Self>>(&self, guest: &G, named: PathBuf) -> Option<PathBuf> {
         let Ok(below) = named.strip_prefix("/proc") else {
             return Some(named);
         };
@@ -1529,33 +1625,59 @@ impl<T: RecordOrReplay> Detcore<T> {
             .components()
             .map(|component| component.as_os_str().as_bytes())
             .collect::<Vec<_>>();
+        let rest = |skip: usize| below.components().skip(skip).collect::<PathBuf>();
+        match names.as_slice() {
+            [] | [b"..", ..] => return Some(named),
+            [b"self", b"..", ..] => {
+                return self.placed_in_tool_view(guest, Path::new("/proc").join(rest(2)));
+            }
+            [b"thread-self", b"..", ..] => {
+                return self.placed_in_tool_view(guest, Path::new("/proc/self/task").join(rest(2)));
+            }
+            _ => {}
+        }
         let own = matches!(names.first(), Some(&(b"self" | b"thread-self")));
         let visible = crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend);
         match names.as_slice() {
             [_, b"fd", number, ..] if own => {
                 let fd = std::str::from_utf8(number).ok()?.parse::<RawFd>().ok()?;
-                let rest = below.components().skip(3).collect::<PathBuf>();
-                return Some(self.descriptor_path_in_tool_view(guest, fd)?.join(rest));
+                return Some(self.descriptor_path_in_tool_view(guest, fd)?.join(rest(3)));
             }
-            [_, b"root", ..] if own => {
-                return Some(Path::new("/").join(below.components().skip(2).collect::<PathBuf>()));
-            }
+            [_, b"root", ..] if own => return Some(Path::new("/").join(rest(2))),
             _ if !visible => return None,
-            // The tool on the guest's own thread (DBT) has the guest's `self`.
-            _ if !own || self.cfg.backend.tool_shares_guest_descriptor_table => {
-                return Some(named);
-            }
+            _ if !own => return Some(named),
             _ => {}
         }
-        let caller = match names.first() {
-            Some(&b"self") => format!("/proc/{}", guest.pid().as_raw()),
-            _ => format!(
-                "/proc/{}/task/{}",
-                guest.pid().as_raw(),
-                guest.tid().as_raw()
-            ),
+        // The tool on the guest's own thread (DBT) has the guest's `self`.
+        let Some((process, thread)) = self.own_procfs_entries(guest) else {
+            return Some(named);
         };
-        Some(Path::new(&caller).join(below.components().skip(1).collect::<PathBuf>()))
+        let caller = if names.first() == Some(&b"self".as_slice()) {
+            process
+        } else {
+            thread
+        };
+        Some(caller.join(rest(1)))
+    }
+
+    /// The caller's process and thread directories in `/proc`, by its
+    /// numbers, where the tool's `self` and `thread-self` are another task's:
+    /// where the tool names guest descriptors through host procfs
+    /// ([`crate::procfs_inode::tool_can_name_guest_descriptors`]) from
+    /// another task than the guest's (ptrace). `None` where the tool's are
+    /// the guest's (DBT, on the guest's own thread) or where the guest's
+    /// numbers name no host task of its own (KVM).
+    fn own_procfs_entries<G: Guest<Self>>(&self, guest: &G) -> Option<(PathBuf, PathBuf)> {
+        if !crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend)
+            || self.cfg.backend.tool_shares_guest_descriptor_table
+        {
+            return None;
+        }
+        let pid = guest.pid().as_raw();
+        Some((
+            PathBuf::from(format!("/proc/{pid}")),
+            PathBuf::from(format!("/proc/{pid}/task/{}", guest.tid().as_raw())),
+        ))
     }
 
     /// The first sysfs object the machine Detcore presents does not have
@@ -1571,14 +1693,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// guest's sysfs mount ([`rendered_procfs::sys_device`]). So a symbolic
     /// link to such an object or to a directory above it, a `..`, and the
     /// guest's own `/proc/self/fd/<n>` reach it as its own path does
-    /// ([`Self::named_in_tool_view`]).
+    /// ([`Self::named_in_tool_view`]), the last also from a link's target
+    /// ([`Self::own_procfs_entries`]).
     ///
-    /// The walk reads each link on the way, so it runs only where a stat in
-    /// the tool's view, by the same `follow`, finds what the path names on
-    /// the guest's sysfs mount, or fails as only a lookup that found an
-    /// object fails ([`fails_after_lookup`]): a lookup that reaches no sysfs
-    /// object costs that one stat. One that fails with ENOENT is not walked,
-    /// as it fails with ENOENT on the machine Detcore presents too.
+    /// Which walk a lookup needs, Linux's own walk of the path says, under
+    /// `openat2`'s restrictions ([`restricted_walk`]), wherever the walk
+    /// ends and whatever the call does there (a call that makes a name
+    /// included): where it reaches its object without following a symbolic
+    /// link, the names it went through are the path's own, `..` taken where
+    /// it is, so none is read; otherwise, where it crosses into no other
+    /// mount than the root's, it never reached sysfs, and nothing is walked;
+    /// otherwise each name is looked at and each link read. A lookup that
+    /// reaches no sysfs object costs one or two such opens.
     fn absent_sysfs_object_on_walk<G: Guest<Self>>(
         &self,
         guest: &G,
@@ -1589,26 +1715,31 @@ impl<T: RecordOrReplay> Detcore<T> {
         let sysfs = rendered_procfs::sys_device()?;
         let named = self.named_in_tool_view(guest, dirfd, spelling)?;
         let follow = follow || follows_last_name(spelling);
-        let reached = if follow {
-            std::fs::metadata(&named)
-        } else {
-            std::fs::symlink_metadata(&named)
+        let read_links = match restricted_walk(&named, follow, libc::RESOLVE_NO_SYMLINKS) {
+            Ok(()) => false,
+            // A failure before any mount crossing (`RESOLVE_NO_XDEV` fails
+            // the crossing itself with EXDEV) went through no sysfs object.
+            Err(_) => match restricted_walk(&named, follow, libc::RESOLVE_NO_XDEV) {
+                Ok(())
+                | Err(Errno::ENOENT | Errno::ENOTDIR | Errno::EACCES | Errno::ENAMETOOLONG) => {
+                    return None;
+                }
+                Err(_) => true,
+            },
         };
-        let walks = match reached {
-            Ok(metadata) => metadata.dev() == sysfs,
-            Err(error) => error
-                .raw_os_error()
-                .is_some_and(|errno| fails_after_lookup(Errno::new(errno))),
-        };
-        if !walks {
-            return None;
-        }
         let cpus = self.cfg.virtual_cpu_count();
-        absent_on_walk(&named, follow, |directory, name| {
-            (crate::procfs::is_absent_cpu_entry(directory, name, cpus)
-                || crate::procfs::is_absent_device_attribute(directory, name))
-                && std::fs::metadata(directory).is_ok_and(|metadata| metadata.dev() == sysfs)
-        })
+        let own_entries = self.own_procfs_entries(guest);
+        absent_on_walk(
+            &named,
+            follow,
+            read_links,
+            own_entries.as_ref(),
+            |directory, name| {
+                (crate::procfs::is_absent_cpu_entry(directory, name, cpus)
+                    || crate::procfs::is_absent_device_attribute(directory, name))
+                    && std::fs::metadata(directory).is_ok_and(|metadata| metadata.dev() == sysfs)
+            },
+        )
     }
 
     /// The answer to the open `call` where the kernel opened `object`, a
@@ -2243,34 +2374,6 @@ mod tests {
         }
     }
 
-    /// The failures Linux reports once its lookup found an object are the
-    /// ones for which a lookup is walked; those it reports before its lookup,
-    /// and `ENOENT`, are not.
-    #[test]
-    fn only_a_failure_after_the_lookup_is_walked() {
-        for errno in [
-            Errno::EACCES,
-            Errno::EPERM,
-            Errno::EROFS,
-            Errno::ENOTDIR,
-            Errno::ELOOP,
-            Errno::EISDIR,
-        ] {
-            assert!(fails_after_lookup(errno), "{errno}");
-        }
-        for errno in [
-            Errno::ENOENT,
-            Errno::EINVAL,
-            Errno::EFAULT,
-            Errno::EBADF,
-            Errno::EMFILE,
-            Errno::ENAMETOOLONG,
-            Errno::EINTR,
-        ] {
-            assert!(!fails_after_lookup(errno), "{errno}");
-        }
-    }
-
     /// Each call follows the symbolic link its last name names as Linux's
     /// lookup does: not where the call acts on the name itself, nor where its
     /// flags say not to; `linkat` follows its old name only with
@@ -2384,7 +2487,7 @@ mod tests {
             (directory == tree && name == b"node")
                 || (directory == cpu0 && name.starts_with(b"node"))
         };
-        let walk = |path: &Path, follow: bool| absent_on_walk(path, follow, absent);
+        let walk = |path: &Path, follow: bool| absent_on_walk(path, follow, true, None, absent);
         // By its own path, below it, and through a link to it.
         assert_eq!(
             walk(&tree.join("node"), true),
@@ -2420,5 +2523,100 @@ mod tests {
         assert_eq!(walk(&links.join("cpu/core_id/node0"), true), None);
         // A link loop ends the walk, as ELOOP ends Linux's.
         assert_eq!(walk(&links.join("loop/x"), true), None);
+        // A `..` below a file ends the walk too, as ENOTDIR ends Linux's,
+        // before it reaches the absent directory.
+        std::fs::write(links.join("file"), "").unwrap();
+        assert_eq!(walk(&links.join("file/../nodes"), true), None);
+        assert_eq!(walk(&links.join("file/../nodes/node0"), false), None);
+        // So does one below a file reached through a link, or in a link's
+        // target.
+        assert_eq!(walk(&links.join("cpu/core_id/../node0"), true), None);
+        std::os::unix::fs::symlink("file/../nodes", links.join("via-file")).unwrap();
+        assert_eq!(walk(&links.join("via-file/node0"), true), None);
+        // A directory the walk may not search ends it before any name, `..`
+        // included, as EACCES ends Linux's (one with CAP_DAC_READ_SEARCH
+        // searches it).
+        use std::os::unix::fs::PermissionsExt;
+        let blocked = links.join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let expected = match std::fs::metadata(blocked.join("..")) {
+            Ok(_) => Some((tree.join("node"), PathBuf::new())),
+            Err(error) => {
+                assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+                None
+            }
+        };
+        assert_eq!(walk(&blocked.join("../nodes"), true), expected);
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // `self` in `/proc` is the caller's own process directory, given,
+        // here a test directory; the tool's own is not the caller's.
+        std::os::unix::fs::symlink("/proc/self/node0", links.join("own")).unwrap();
+        let own = (cpu0.clone(), tree.join("thread"));
+        assert_eq!(
+            absent_on_walk(&links.join("own"), true, true, Some(&own), absent),
+            Some((cpu0.join("node0"), PathBuf::new()))
+        );
+        assert_eq!(walk(&links.join("own"), true), None);
+        assert_eq!(
+            absent_on_walk(Path::new("/proc/self"), false, true, Some(&own), absent),
+            None
+        );
+        // A `..` that leaves sysfs after the absent object still went
+        // through it.
+        assert_eq!(
+            walk(&links.join("nodes/../../.."), true),
+            Some((tree.join("node"), PathBuf::from("../../..")))
+        );
+        // Without reading links, every name is taken as it is spelled.
+        assert_eq!(
+            absent_on_walk(&tree.join("cpu0/../node/node0"), true, false, None, absent),
+            Some((tree.join("node"), PathBuf::from("node0")))
+        );
+        assert_eq!(
+            absent_on_walk(&links.join("cpu/node0"), true, false, None, absent),
+            None
+        );
+    }
+
+    /// Linux's walk under `openat2`'s restrictions: a path without a
+    /// symbolic link resolves under `RESOLVE_NO_SYMLINKS`, the last link only
+    /// where it is not followed, and one through a link does not (ELOOP);
+    /// under `RESOLVE_NO_XDEV`, a walk from `/` into another mount fails
+    /// with EXDEV, and one that fails first reports its own failure.
+    #[test]
+    fn a_restricted_walk_reports_what_the_kernel_met() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::util::canonicalize(directory.path()).unwrap();
+        std::fs::create_dir(root.join("directory")).unwrap();
+        std::os::unix::fs::symlink("directory", root.join("link")).unwrap();
+        let symlinks = libc::RESOLVE_NO_SYMLINKS;
+        assert_eq!(
+            restricted_walk(&root.join("directory"), true, symlinks),
+            Ok(())
+        );
+        assert_eq!(
+            restricted_walk(&root.join("directory/../directory"), true, symlinks),
+            Ok(())
+        );
+        assert_eq!(restricted_walk(&root.join("link"), false, symlinks), Ok(()));
+        assert_eq!(
+            restricted_walk(&root.join("link"), true, symlinks),
+            Err(Errno::ELOOP)
+        );
+        assert_eq!(
+            restricted_walk(&root.join("link/x"), false, symlinks),
+            Err(Errno::ELOOP)
+        );
+        assert_eq!(
+            restricted_walk(&root.join("missing/x"), true, symlinks),
+            Err(Errno::ENOENT)
+        );
+        let mounts = libc::RESOLVE_NO_XDEV;
+        assert_eq!(restricted_walk(Path::new("/"), true, mounts), Ok(()));
+        assert_eq!(
+            restricted_walk(Path::new("/proc/self"), true, mounts),
+            Err(Errno::EXDEV)
+        );
     }
 }

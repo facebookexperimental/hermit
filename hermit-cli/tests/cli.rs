@@ -52811,13 +52811,20 @@ fn cpu_directory_reads_list_only_cpu0_on_every_path() {
 /// open for writing, `access(W_OK)`, `O_CREAT`, through the guest's own
 /// `/proc/self/fd/<n>` link to the device's directory, by a stat whose
 /// result overwrites its path, by readlink, statfs, listxattr, inotify and
-/// chdir, and after a `..` that leaves the absent node directory; the link
-/// itself stays found by lstat, readlink, `AT_SYMLINK_NOFOLLOW`, llistxattr,
-/// `IN_DONT_FOLLOW` and an `O_PATH|O_NOFOLLOW` open, and `O_NOFOLLOW`
-/// refuses it with ELOOP, as Linux does. Files of the test's own,
-/// beside a `subsystem` link to the PCI bus or the NVMe class, keep their
-/// names and bytes, as do the files of an ordinary directory bound over all
-/// of `/sys`: the rules hold only on the guest's sysfs mount.
+/// chdir, and after a `..` that leaves the absent node directory, also where
+/// further `..` leave sysfs and where the call would make the last name
+/// (mkdir, `O_CREAT`): the walk fails at the absent directory; also after a
+/// `..` straight after `/proc` or `/proc/self`, and through a link of the
+/// guest's own to its `/proc/self/fd/<n>` for the device's directory. A `..`
+/// after a file is ENOTDIR first (fs/namei.c:2662-2668), as natively, and a
+/// directory the guest may not search on the way (`/root`) EACCES
+/// (fs/namei.c:2600). The link itself stays found by lstat, readlink,
+/// `AT_SYMLINK_NOFOLLOW`, llistxattr, `IN_DONT_FOLLOW` and an
+/// `O_PATH|O_NOFOLLOW` open, and `O_NOFOLLOW` refuses it with ELOOP, as Linux
+/// does. Files of the test's own, beside a `subsystem` link to the PCI bus or
+/// the NVMe class, keep their names and bytes, as do the files of an
+/// ordinary directory bound over all of `/sys`: the rules hold only on the
+/// guest's sysfs mount.
 fn absent_cpu_node_backlinks(backend: &str) {
     let guest = futex_c_guest(&ABSENT_CPU_LOOKUPS_GUEST, "absent_cpu_lookups")
         .to_str()
@@ -52992,8 +52999,43 @@ fn absent_cpu_node_backlinks(backend: &str) {
          stat alias nodes/..: ENOENT\n\
          stat alias cpu/..: ok\n\
          chdir alias nodes: ENOENT\n\
-         chdir alias device: ok\n",
+         chdir alias device: ok\n\
+         stat alias nodes/../../../..: ENOENT\n\
+         statfs alias nodes/../../../..: ENOENT\n\
+         mkdir alias nodes/fresh-child: ENOENT\n\
+         creat alias nodes/fresh-file: ENOENT\n\
+         stat alias own-file/../nodes: ENOTDIR\n\
+         statfs alias own-file/../nodes: ENOTDIR\n\
+         chdir alias own-file/../nodes: ENOTDIR\n\
+         readlink alias own-file/../nodes/node0: ENOTDIR\n\
+         stat /proc/../alias nodes: ENOENT\n\
+         stat /proc/self/../../alias nodes: ENOENT\n",
     );
+    // The guest, the namespace's root, may search `/root` only where its
+    // mode lets every user do so, since its owner is outside the namespace:
+    // as this test's user may (and not at all where there is none).
+    expected.push_str(match fs::metadata("/root/..") {
+        Err(error) if error.raw_os_error() == Some(libc::EACCES) => {
+            "stat /proc/../root/../node directory: EACCES\n"
+        }
+        _ => "stat /proc/../root/../node directory: ENOENT\n",
+    });
+    // KVM refuses a name below a guest's `/proc/self/fd/<n>` with ELOOP
+    // through a link too, the control's as well.
+    expected.push_str(match backend {
+        "kvm" => {
+            "stat fd link attribute: ELOOP\n\
+             access fd link attribute: ELOOP\n\
+             stat fd link control: ELOOP\n\
+             access fd link control: ELOOP\n"
+        }
+        _ => {
+            "stat fd link attribute: ENOENT\n\
+             access fd link attribute: ENOENT\n\
+             stat fd link control: ok\n\
+             access fd link control: ok\n"
+        }
+    });
     // On a host whose kernel has NUMA, the PCI device's attribute and the
     // CPU's node link exist, also through the links: their absence above
     // is Hermit's.
@@ -53015,6 +53057,14 @@ fn absent_cpu_node_backlinks(backend: &str) {
             "statfs alias attribute: ok\n",
             "stat alias nodes/..: ok\n",
             "chdir alias nodes: ok\n",
+            "stat alias nodes/../../../..: ok\n",
+            "statfs alias nodes/../../../..: ok\n",
+            "stat alias own-file/../nodes: ENOTDIR\n",
+            "readlink alias own-file/../nodes/node0: ENOTDIR\n",
+            "stat /proc/../alias nodes: ok\n",
+            "stat /proc/self/../../alias nodes: ok\n",
+            "stat fd link attribute: ok\n",
+            "stat fd link control: ok\n",
             ", end page, data at 3 3, hole at 0 page, read there 0\n",
         ] {
             assert!(native.contains(line), "{line:?} natively:\n{native}");
@@ -53124,10 +53174,10 @@ fn absent_cpu_node_backlinks(backend: &str) {
 /// `attribute` to the first PCI device's `numa_node`, `control` to its
 /// `vendor`, `nodes` to the node directory, `cpu` to cpu0's directory,
 /// `device` to the PCI device's directory, and `nvme` to the first NVMe
-/// controller's `numa_node` (dangling without one); `own` to an ordinary
-/// file; and the directories `lookalike` and `nvme-lookalike`, each with a
-/// `numa_node` reading 7 and a `subsystem` link to the PCI bus or the NVMe
-/// class.
+/// controller's `numa_node` (dangling without one); the ordinary file
+/// `own-file` and `own` to it; and the directories `lookalike` and
+/// `nvme-lookalike`, each with a `numa_node` reading 7 and a `subsystem`
+/// link to the PCI bus or the NVMe class.
 fn sysfs_links(root: &Path) -> PathBuf {
     let links = root.join("links");
     fs::create_dir(&links).unwrap();
