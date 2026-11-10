@@ -375,7 +375,7 @@ def entry_source_guard(mapped, terminal, rpin):
     refusal = where + ' requires exactly one literal each for ' + ', '.join(ENTRY_SOURCE_NAMES)
     token = re.compile(rb'//[^\n]*|(?P<comment>/\*)|(?:br|cr|r)(?P<hashes>#{0,255})"|'
                        rb'"(?:\\.|[^"\\])*"|(?:b)?\'(?:\\.|[^\'\\])\'|'
-                       rb'(?P<identifier>(?:r\#)?[A-Za-z_][A-Za-z0-9_]*)')
+                       rb'(?P<identifier>(?:r\#)?[A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*)')
     at, pins, after_const = 0, [], False
     while match := token.search(terminal, at):
         at = match.end()
@@ -392,7 +392,8 @@ def entry_source_guard(mapped, terminal, rpin):
             need(end >= 0, refusal + ': unterminated raw string')
             at = end + len(close)
         elif match['identifier']:
-            name = match['identifier'].decode()
+            # Keep non-ASCII bytes in the name, never a misleading ASCII suffix.
+            name = match['identifier'].decode(errors='replace')
             declaration, after_const = after_const, name == 'const'
             plain = name.removeprefix('r#')
             if not declaration or not (plain == 'ENTRY_SOURCE' or plain.endswith('_ENTRY_SOURCE')):

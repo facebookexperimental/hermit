@@ -653,7 +653,8 @@ class EntrySourcePins(unittest.TestCase):
 
     def test_literal_names_count_and_shape_are_strict(self):
         for change in ['missing', 'commented', 'duplicate', 'additional', 'comment_separator',
-                       'raw_identifier', 'empty_prefix', 'short', 'uppercase', 'expression']:
+                       'raw_identifier', 'empty_prefix', 'unicode_substitute', 'unicode_additional',
+                       'short', 'uppercase', 'expression']:
             with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
                 tree = PinnedTree(Path(directory))
                 raw = tree.terminal_source()
@@ -673,6 +674,10 @@ class EntrySourcePins(unittest.TestCase):
                     raw += b'const r#NEW_ENTRY_SOURCE: &str = "' + first + b'";\n'
                 elif change == 'empty_prefix':
                     raw += b'const _ENTRY_SOURCE: &str = "' + first + b'";\n'
+                elif change == 'unicode_substitute':
+                    raw = raw.replace(b'const ENTRY_SOURCE:', 'const λENTRY_SOURCE:'.encode())
+                elif change == 'unicode_additional':
+                    raw += 'const Xλ_ENTRY_SOURCE: &str = "'.encode() + first + b'";\n'
                 elif change == 'short':
                     raw = raw.replace(first, first[:-1])
                 elif change == 'uppercase':
@@ -693,6 +698,7 @@ class EntrySourcePins(unittest.TestCase):
             tree = PinnedTree(Path(directory))
             raw = tree.terminal_source().replace(b'const ', b'const /* nested /* comment */ */ ')
             raw += b'const /* unrelated */ PRIVATE_SOURCE: &str = "unchanged";\n'
+            raw += 'const λPRIVATE_SOURCE: &str = "unchanged";\n'.encode()
             tree.write(tree.reverie / TERMINAL, raw)
             tree.commit(tree.reverie)
             tree.repin()
