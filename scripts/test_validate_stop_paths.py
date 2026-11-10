@@ -271,6 +271,9 @@ def run_accept_arm_ownership_contract() -> str:
 VALIDATE = ROOT / "scripts" / "validate.rs"
 TEST_ROOTS: list[Path] = []
 OUTER_VALIDATE_ENV = (
+    "HERMIT_VALIDATE_BUILD_MODE",
+    "HERMIT_VALIDATE_RUN_MODE",
+    "HERMIT_VALIDATE_RELEASE_BUILD_MODE",
     "DEV_HERMIT_PARENT",
     "DEV_HERMIT_TOOL_ROOT",
     "CI_HUB_APPLY_LOCAL_LABEL",
