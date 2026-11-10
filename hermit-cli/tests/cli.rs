@@ -199,6 +199,7 @@ static SIGCHLD_BUSY_SIBLING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGKILL_ROBUST_PSHARED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GUEST_SIGCHLD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCESS_SIGNAL_TARGET_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static TWO_CHILD_AFTER_HANDLER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GUEST_DISCARD_AT_SEND_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_RECHECK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_RECHECK_PARTIAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -27002,6 +27003,61 @@ fn a_kernel_sent_process_signal_reaches_the_thread_linux_chooses_natively_and_on
         }
         let ptrace = process_signal_target_at_l2(&[], case.mode);
         judge_process_signal_target("ptrace", case.mode, case.linux, case.ptrace, &ptrace);
+    }
+}
+
+/// Two child exits straddling one handler return
+/// (tests/c/two_child_after_handler.c): the creator's `ppoll` is
+/// interrupted by the first child's SIGCHLD, its handler returns, and
+/// only then is the second child released, with no new wait or mask
+/// change. Linux gives both to the creator; a delivery frame that
+/// survives the first handler instead remembers SIGCHLD's automatic
+/// handler block and gives the second to the worker. Native, KVM and
+/// ptrace must all print the creator twice, at strict parity.
+#[test]
+fn two_children_after_a_handler_return_choose_the_creator() {
+    let guest_path =
+        TWO_CHILD_AFTER_HANDLER_GUEST.get_or_init(|| compile_c_guest("two_child_after_handler"));
+    let native = {
+        let output = Command::new(guest_path)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run the two-child guest natively");
+        assert!(output.status.success(), "natively: {output:?}");
+        String::from_utf8(output.stdout).expect("guest stdout should be UTF-8")
+    };
+    assert_eq!(native, "first=M second=M\n", "natively");
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM two-child case: /dev/kvm is unavailable");
+        return;
+    }
+    for backend in [&["--backend=kvm"][..], &[][..]] {
+        let _guard = hermit_run_guard();
+        let guest = guest_path.to_str().expect("guest path should be UTF-8");
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let report = directory.path().join("verify.json");
+        let report_arg = report.to_str().expect("report path should be UTF-8");
+        let mut args: Vec<&str> = backend.to_vec();
+        args.extend([
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report_arg,
+            "--",
+            guest,
+        ]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let verdict: serde_json::Value = serde_json::from_slice(
+            &fs::read(&report).expect("strict verification wrote no verdict"),
+        )
+        .expect("strict verification verdict is valid JSON");
+        assert_eq!(verdict["bitwise_parity"], true, "{backend:?}: {verdict}");
+        assert_eq!(stdout(&output), native, "{backend:?}");
     }
 }
 

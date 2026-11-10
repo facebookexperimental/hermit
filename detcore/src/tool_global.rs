@@ -5439,6 +5439,12 @@ impl GlobalState {
                     R::ThreadExited
                 }
             }
+            GlobalRequest::DeliveryEntry => {
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .record_delivery_entry(dtid);
+                R::DeliveryEntry(())
+            }
             GlobalRequest::SetSigtimedwaitSet(set) => {
                 let updated = self
                     .lock_rpc_scheduler(false)
@@ -8787,6 +8793,11 @@ pub enum GlobalRequest {
     /// `rt_sigreturn` restored the mask the frame saved.
     PopDeliveryMask,
 
+    /// Record the calling thread's handler entry for a wake the
+    /// scheduler queued: its wait interval hands off to the delivery
+    /// frame now (`Scheduler::record_delivery_entry`).
+    DeliveryEntry,
+
     /// The guest's own signal mask that a thread published while Detcore
     /// holds it under a private blocking mask, if any
     /// (`Scheduler::published_guest_sigmask`), for its `/proc` status.
@@ -9641,6 +9652,7 @@ pub enum GlobalResponse {
     EndWaitMask(()),
     WithdrawWaitMask(()),
     PopDeliveryMask(()),
+    DeliveryEntry(()),
     PublishedGuestSigmask(Option<u64>),
     SetSigtimedwaitSet(()),
     OwnProcessSignalInputs(OwnProcessSignalInputs),
@@ -10695,6 +10707,23 @@ where
             GlobalResponse::EndWaitMask(()) | GlobalResponse::ThreadExited
         ),
         "unexpected response to EndWaitMask: {response:?}"
+    );
+}
+
+/// Record the calling thread's handler entry for a wake the scheduler
+/// queued: its wait interval hands off to the delivery frame now.
+pub(crate) async fn record_delivery_entry<G, T>(guest: &mut G)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) = send_and_update_time(guest, GlobalRequest::DeliveryEntry).await;
+    assert!(
+        matches!(
+            response,
+            GlobalResponse::DeliveryEntry(()) | GlobalResponse::ThreadExited
+        ),
+        "unexpected response to DeliveryEntry: {response:?}"
     );
 }
 

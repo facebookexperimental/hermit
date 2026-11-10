@@ -2370,13 +2370,21 @@ pub struct Scheduler {
     /// there instead.
     wait_masks_in_force: BTreeMap<DetTid, (MmId, Option<u64>)>,
 
-    /// Each thread's delivery-mask frames: at an interrupted wait's
+    /// Each thread's delivery-mask frame: at an interrupted wait's
     /// delivery the wait mask hands off to the mask Linux installs for
     /// the handler (the wait value, the handler's `sa_mask`, and the
     /// delivered signal unless `SA_NODEFER`), which decides until
-    /// `rt_sigreturn` pops it. Nested deliveries push again; a fresh
-    /// wait or a newer published mask supersedes the top.
+    /// `rt_sigreturn` pops it. Depth one by design: only a wait hands
+    /// off, a fresh wait supersedes the frame, and any later delivery
+    /// is already in the thread's physical mask, which decides then.
     delivery_masks: BTreeMap<DetTid, Vec<Option<u64>>>,
+
+    /// Threads the scheduler woke for a caught signal whose handler has
+    /// not entered yet: at the waiter's next filing the wake's wait
+    /// interval hands off to its delivery frame (`record_delivery_entry`).
+    /// Until then the wait mask still decides: a wake alone installs no
+    /// handler mask.
+    pending_delivery: BTreeMap<DetTid, SigWrapper>,
 
     /// Under the in-guest delivery gate, the threads that have published
     /// their own guest mask at a request (`record_request_guest_mask`), which
@@ -6458,6 +6466,7 @@ impl Scheduler {
             saved_guest_sigmasks: Default::default(),
             wait_masks_in_force: Default::default(),
             delivery_masks: Default::default(),
+            pending_delivery: Default::default(),
             unknown_guest_sigmasks: Default::default(),
             own_mask_publishers: Default::default(),
             temporary_mask_publications: Default::default(),
@@ -8052,6 +8061,7 @@ impl Scheduler {
         self.saved_guest_sigmasks.remove(dtid);
         self.wait_masks_in_force.remove(dtid);
         self.delivery_masks.remove(dtid);
+        self.pending_delivery.remove(dtid);
         if self.in_guest_signal_delivery {
             self.unknown_guest_sigmasks.remove(dtid);
             self.temporary_mask_publications.remove(dtid);
@@ -10054,6 +10064,14 @@ impl Scheduler {
     /// mask is an unknown mask in force. Returns false for a thread the
     /// scheduler no longer knows, as `set_saved_guest_sigmask` does, so a
     /// stale publication from a retired incarnation is refused.
+    ///
+    /// Incarnation safety without an `mm` argument: the publication is
+    /// awaited in the publishing thread's own turn under the scheduler
+    /// mutex, so no second incarnation of the tid can be live while it
+    /// lands; a retired incarnation's late publication finds no
+    /// registration and is refused, and the consult
+    /// (`wait_mask_in_force`) ignores a value whose incarnation has been
+    /// replaced, as after an exec.
     pub(crate) fn begin_wait_mask(&mut self, dettid: DetTid, mask: Option<u64>) -> bool {
         if !self.next_turns.contains_key(&dettid) {
             return false;
@@ -10064,8 +10082,10 @@ impl Scheduler {
             .copied()
             .unwrap_or_else(|| MmId::initial(DetPid::from_raw(dettid.as_raw())));
         self.wait_masks_in_force.insert(dettid, (mm, mask));
-        // A fresh wait supersedes any delivery frame it nests in.
+        // A fresh wait supersedes any delivery frame it nests in, and
+        // any wake still awaiting its handler entry.
         self.delivery_masks.remove(&dettid);
+        self.pending_delivery.remove(&dettid);
         match mask {
             Some(mask) => self.saved_guest_sigmasks.insert(dettid, mask),
             None => self.saved_guest_sigmasks.remove(&dettid),
@@ -10078,16 +10098,23 @@ impl Scheduler {
         true
     }
 
-    /// End `dettid`'s wait-mask interval without touching the legacy
-    /// saved mask: the delivery handoff at an interrupted wait's return,
-    /// where the thread's current handler mask (its physical `blocked`,
-    /// as the delivery installed it) decides from here, and the legacy
-    /// publication stays until the thread's next request.
+    /// End `dettid`'s wait-mask interval at an interrupted wait's
+    /// delivery handoff: the thread's current handler mask (its physical
+    /// `blocked`, as the delivery installed it, or a mask it published
+    /// since) decides from here. The stale legacy saved mask goes with
+    /// the interval, so a newer publication is not refused for it
+    /// (`published_mask_for` declines while a saved mask exists).
     pub(crate) fn end_wait_mask(&mut self, dettid: DetTid) -> bool {
         if !self.next_turns.contains_key(&dettid) {
             return false;
         }
         self.wait_masks_in_force.remove(&dettid);
+        self.saved_guest_sigmasks.remove(&dettid);
+        if self.in_guest_signal_delivery {
+            self.unknown_guest_sigmasks.remove(&dettid);
+            self.temporary_guest_sigmasks.remove(&dettid);
+            self.forget_temporary_mask_publication(dettid);
+        }
         true
     }
 
@@ -10136,6 +10163,18 @@ impl Scheduler {
         self.delivery_masks.entry(dettid).or_default().push(frame);
     }
 
+    /// Record `dettid`'s handler entry (`pending_delivery`): hand its
+    /// wait interval off to the delivery frame now, when the handler is
+    /// actually entered (the signal-state copy recorded the delivery),
+    /// not at the wake that only queued it. A thread with no wake
+    /// awaiting entry is unaffected.
+    pub(crate) fn record_delivery_entry(&mut self, dettid: DetTid) {
+        let Some(signal) = self.pending_delivery.remove(&dettid) else {
+            return;
+        };
+        self.handoff_delivery(dettid, signal);
+    }
+
     /// Pop `dettid`'s top delivery frame, as `rt_sigreturn` restores the
     /// mask its frame saved. Returns false for a thread the scheduler no
     /// longer knows, as the other mask mutations do.
@@ -10148,6 +10187,15 @@ impl Scheduler {
             if stack.is_empty() {
                 self.delivery_masks.remove(&dettid);
             }
+        }
+        // The frame's leftover legacy saved mask goes in the same
+        // mutation: after the return, the thread's published and
+        // physical masks decide again, not the wait's stale publication.
+        self.saved_guest_sigmasks.remove(&dettid);
+        if self.in_guest_signal_delivery {
+            self.unknown_guest_sigmasks.remove(&dettid);
+            self.temporary_guest_sigmasks.remove(&dettid);
+            self.forget_temporary_mask_publication(dettid);
         }
         true
     }
@@ -15746,10 +15794,6 @@ impl Scheduler {
             );
             return;
         }
-        // A wake that ends a masked wait for a caught handler hands its
-        // interval off to the delivery frame, in this same mutation
-        // (`handoff_delivery`), before any request is rewritten.
-        self.handoff_delivery(dettid, signal);
         debug!(
             "[dtid {}] make pending signal {} visible to the scheduler.",
             dettid, signal
@@ -17614,6 +17658,21 @@ impl Scheduler {
 
         self.note_backend_suspend_replaced(dettid);
         if let Some(nxt) = self.next_turns.get_mut(&dettid) {
+            // A wake's InboundSignal awaits its handler entry: the wait
+            // mask stays in force until the waiter's next filing hands it
+            // off (`record_delivery_entry`). Other substitutions clear
+            // any wake still awaiting entry.
+            match rsrcs.resources.keys().find_map(|resource| match resource {
+                ResourceID::InboundSignal(signal) => Some(*signal),
+                _ => None,
+            }) {
+                Some(signal) => {
+                    self.pending_delivery.insert(dettid, signal);
+                }
+                None => {
+                    self.pending_delivery.remove(&dettid);
+                }
+            }
             // Counterfeit the entry as though the thread had requested this resource from the start:
             nxt.req = Ivar::full(Ok(rsrcs));
         }

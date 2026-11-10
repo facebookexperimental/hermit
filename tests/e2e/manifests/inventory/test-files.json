@@ -3577,6 +3577,12 @@
       "why": "tests/c/tool_output_protection.c is owned by hermit-cli/tests/cli.rs: tool_output_respects_page_protection_and_the_private_page runs it under ptrace, --strict and not, and requires that Detcore's syscall outputs respect page protection (https://github.com/rrnewton/reverie/issues/1064): an rt_sigprocmask whose pushed mask the guest aims at an executable read-only page or at the ud2 on Reverie's private page gets EFAULT with the bytes unchanged, and time(tloc) across a writable/read-only page boundary gets EFAULT with none of its eight bytes written. It stays a fixture because a generic manifest cannot compare guest memory before and after against a Hermit-specific expectation (the stack cases differ from native by design)."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/two_child_after_handler.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/two_child_after_handler.c is owned by hermit-cli/tests/cli.rs: two_children_after_a_handler_return_choose_the_creator compiles this guest, in which two children are created before the creator's ppoll, the first exits while it waits, its SIGCHLD handler returns and the ppoll returns EINTR, and only then is the second child released with no new wait or mask change; it prints which thread each handler ran on and requires the creator twice natively, on KVM and on ptrace at bitwise parity, so a delivery frame that survives the first handler (remembering SIGCHLD's automatic handler block) is caught giving the second exit to the worker."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/umask_mode.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

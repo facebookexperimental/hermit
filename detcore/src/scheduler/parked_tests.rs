@@ -12688,6 +12688,151 @@ fn a_delivery_frame_decides_until_sigreturn_and_nests() {
     );
 }
 
+/// A wake has not entered the handler (the Astra delivery probes at
+/// `4de0cdc9`): its `sa_mask` cannot affect a second send yet, so the
+/// next SIGCHLD still reads the wait mask until the waiter's grant.
+#[test]
+fn a_caught_wake_does_not_install_the_handler_mask_before_its_grant() {
+    let usr1 = kernel_signal_bit(libc::SIGUSR1);
+    let chld = kernel_signal_bit(libc::SIGCHLD);
+    let mut s = Scheduler::new(&Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE)
+    });
+    let (creator, _, _) = add(&mut s, 100, 100);
+    let (sibling, _, _) = add(&mut s, 100, 101);
+    s.test_kernel_signal_states.insert(
+        creator,
+        KernelSignalState {
+            blocked: 0,
+            shared_pending: usr1,
+            caught: usr1 | chld,
+            ..KernelSignalState::default()
+        },
+    );
+    s.test_kernel_signal_states
+        .insert(sibling, KernelSignalState::default());
+    s.handler_masks
+        .insert((DetPid::from_raw(100), libc::SIGUSR1), (chld, false));
+    assert!(s.begin_wait_mask(creator, Some(0)));
+    file_temporary_mask_wait(&mut s, creator, TemporaryMaskWait::Ppoll, Some(0));
+    file_restartable_read(&mut s, sibling);
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+        (Some(creator), None)
+    );
+    s.wake_signaled_guest(creator, SigWrapper(libc::SIGUSR1));
+    let request = s.next_turns[&creator].req.try_read().unwrap().unwrap();
+    assert!(
+        request
+            .resources
+            .contains_key(&ResourceID::InboundSignal(SigWrapper(libc::SIGUSR1)))
+    );
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+        (Some(creator), None),
+        "SIGUSR1 only woke the ppoll; no grant or handler entry has installed sa_mask yet"
+    );
+}
+
+/// The scheduler can queue a blocked timer signal without any handler
+/// delivery: its `sa_mask` fabricates no handler mask.
+#[test]
+fn a_blocked_alarm_keeps_the_wait_mask_in_force() {
+    let alrm = kernel_signal_bit(libc::SIGALRM);
+    let chld = kernel_signal_bit(libc::SIGCHLD);
+    let mut s = Scheduler::new(&Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE)
+    });
+    let (creator, _, _) = add(&mut s, 100, 100);
+    let (sibling, _, _) = add(&mut s, 100, 101);
+    s.test_kernel_signal_states.insert(
+        creator,
+        KernelSignalState {
+            blocked: alrm,
+            shared_pending: alrm,
+            caught: alrm | chld,
+            ..KernelSignalState::default()
+        },
+    );
+    s.test_kernel_signal_states.insert(
+        sibling,
+        KernelSignalState {
+            blocked: alrm,
+            ..KernelSignalState::default()
+        },
+    );
+    s.handler_masks
+        .insert((DetPid::from_raw(100), libc::SIGALRM), (chld, false));
+    assert!(s.begin_wait_mask(creator, Some(alrm)));
+    file_temporary_mask_wait(&mut s, creator, TemporaryMaskWait::Ppoll, Some(alrm));
+    file_restartable_read(&mut s, sibling);
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+        (Some(creator), None)
+    );
+    s.wake_signaled_guest(creator, SigWrapper(libc::SIGALRM));
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+        (Some(creator), None),
+        "blocked SIGALRM stays pending; its handler sa_mask cannot block SIGCHLD"
+    );
+}
+
+/// After an actual handler changes its mask, its current publication
+/// must decide: the stale legacy saved mask goes at the delivery
+/// handoff (`end_wait_mask`), so the handler's published mask wins.
+#[test]
+fn a_handler_sigprocmask_supersedes_its_delivery_frame() {
+    let usr1 = kernel_signal_bit(libc::SIGUSR1);
+    let chld = kernel_signal_bit(libc::SIGCHLD);
+    let mut s = Scheduler::new(&Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE)
+    });
+    let (creator, mm, _) = add(&mut s, 100, 100);
+    let (sibling, _, _) = add(&mut s, 100, 101);
+    s.test_kernel_signal_states.insert(
+        creator,
+        KernelSignalState {
+            blocked: usr1,
+            caught: usr1 | chld,
+            ..KernelSignalState::default()
+        },
+    );
+    s.test_kernel_signal_states
+        .insert(sibling, KernelSignalState::default());
+    s.handler_masks
+        .insert((DetPid::from_raw(100), libc::SIGUSR1), (0, false));
+    assert!(s.begin_wait_mask(creator, Some(0)));
+    file_temporary_mask_wait(&mut s, creator, TemporaryMaskWait::Ppoll, Some(0));
+    file_restartable_read(&mut s, sibling);
+    s.handoff_delivery(creator, SigWrapper(libc::SIGUSR1));
+    assert!(s.end_wait_mask(creator));
+    // The handler has entered and executes sigprocmask(SIG_BLOCK, {SIGCHLD}).
+    s.test_kernel_signal_states
+        .get_mut(&creator)
+        .unwrap()
+        .blocked = usr1 | chld;
+    assert!(s.publish_signal_mask(creator, mm, Some(usr1 | chld)));
+    let mut checkpoint = Resources::new(creator);
+    checkpoint.insert(ResourceID::TraceReplay, Permission::RW);
+    s.next_turns.get_mut(&creator).unwrap().req = Ivar::full(Ok(checkpoint));
+    assert!(
+        !s.saved_guest_sigmasks.contains_key(&creator),
+        "the handoff cleared the stale legacy publication"
+    );
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+        (Some(sibling), Some(sibling)),
+        "a handler's current blocked mask must supersede the delivery frame"
+    );
+}
+
 /// A `sigtimedwait` wait publishes its own mask through the shared wait
 /// machinery: a signal it does not wait for stays eligible from that
 /// mask (not the private all-blocked physical mask), and the waited set

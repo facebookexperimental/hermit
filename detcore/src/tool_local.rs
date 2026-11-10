@@ -6893,6 +6893,11 @@ pub struct ThreadState<T> {
     /// replay of it decide continuations by `delivered_since_request` alone.
     #[serde(default)]
     pub(crate) returned_from_sigreturn: bool,
+    /// A delivery the signal-state copy recorded (`record_checked_delivery`)
+    /// whose handler entry Detcore has not yet recorded with the scheduler
+    /// (`record_delivery_entry` at the waiter's next syscall entry).
+    #[serde(default)]
+    pub(crate) delivery_entered: bool,
     /// Deliveries announced to `Tool::announce_signal_event` and neither
     /// committed nor withdrawn yet, with what each one's turn left for its
     /// commit. A backend settles every announcement before it returns to
@@ -7985,6 +7990,7 @@ impl<T> ThreadState<T> {
             own_signal_turn_hold: None,
             delivered_since_request: false,
             returned_from_sigreturn: false,
+            delivery_entered: false,
             signal_announcements: Vec::new(),
             next_signal_announcement: 0,
             consecutive_continuations: 0,

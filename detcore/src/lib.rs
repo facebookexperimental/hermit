@@ -2539,6 +2539,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             grants_at_stop,
         } = stop;
         let delivery = scope == TurnScope::Delivery;
+        // A reported sigreturn since the last event ends its delivery
+        // interval before this stop's turn can be chosen for.
+        if reported {
+            crate::tool_global::pop_delivery_mask(guest).await;
+        }
         // The kernel dequeued `signal` before this stop: a hold for it ends
         // here, and this stop's hooks may end the slice
         // (`own_signal_turn_hold`).
@@ -6005,6 +6010,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     own_signal_turn_hold: None,
                     delivered_since_request: false,
                     returned_from_sigreturn: false,
+                    delivery_entered: false,
                     // A child starts with no announcement: its parent
                     // settles its own before it returns from the clone.
                     signal_announcements: Vec::new(),
@@ -6666,6 +6672,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // while no page is left.
         if crate::fifo_peer::any_orphaned_page() {
             Self::unmap_orphaned_staging_pages(guest).await;
+        }
+        // A reported `rt_sigreturn` since the last event ends its
+        // delivery interval here, at the thread's next syscall entry, on
+        // every backend (the ordinary syscall route to it is one no
+        // backend exposes; `Tool::handle_sigreturn` reports it instead).
+        if std::mem::take(&mut guest.thread_state_mut().returned_from_sigreturn)
+            && crate::syscalls::signal_shadow::observes_sigreturns(&self.cfg)
+        {
+            crate::tool_global::pop_delivery_mask(guest).await;
+        }
+        // A delivery the copy recorded since the last event is entered
+        // now: a queued wake's wait interval hands off to its delivery
+        // frame before this syscall's first scheduler request.
+        if std::mem::take(&mut guest.thread_state_mut().delivery_entered) {
+            crate::tool_global::record_delivery_entry(guest).await;
         }
         crate::syscalls::signal_shadow::at_syscall_entry(guest);
         // An armed crash handler that has returned disarms before this call

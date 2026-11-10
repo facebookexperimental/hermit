@@ -4952,8 +4952,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// (https://github.com/rrnewton/hermit/issues/4089). The call itself
     /// passes through.
     pub(crate) async fn observe_sigreturn_mask<G: Guest<Self>>(&self, guest: &mut G) {
-        // The frame this sigreturn restores ends its delivery interval.
-        crate::tool_global::pop_delivery_mask(guest).await;
+        // The frame this sigreturn restores ends its delivery interval,
+        // exactly once: only a reported return (`Tool::handle_sigreturn`
+        // set the flag) pops, and taking the flag here keeps the syscall
+        // entry from popping a second time for the same return.
+        if std::mem::take(&mut guest.thread_state_mut().returned_from_sigreturn) {
+            crate::tool_global::pop_delivery_mask(guest).await;
+        }
         let pending = pending_real_time_among(guest, REAL_TIME_SIGNALS).await;
         if pending == 0 {
             return;

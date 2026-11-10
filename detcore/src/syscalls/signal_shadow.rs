@@ -750,6 +750,10 @@ where
 {
     if check_delivery_to_record(guest, signal).await {
         record_checked_delivery(guest, signal);
+        // The copy has entered the handler: Detcore records the entry at
+        // the waiter's next syscall (`handle_syscall_event`), where a
+        // queued wake's wait interval hands off to its delivery frame.
+        guest.thread_state_mut().delivery_entered = true;
     }
 }
 
