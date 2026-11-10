@@ -1125,11 +1125,9 @@ const SIGALRM_PIPE_READ_EINTR: &str = concat!(
 /// of a child that exits first interrupts nothing (`childexit`). A SIGALRM
 /// blocked across the read does not interrupt it: the read returns the byte,
 /// and the handler runs when SIGALRM is unblocked, before `sigprocmask`
-/// returns (`blocked`, coord7 review of ec9b2177, S4(a)). A send that passes
-/// another pipe's read end over a guest-held channel, named only after the
-/// send waited, leaves the read end's status tracked: its read is admitted
-/// and returns EINTR after the handler (`scmswitch_other`, the unrelated-pipe
-/// control of finding 1 of rev5338-cx's review of 4d17d5ab).
+/// returns (`blocked`, coord7 review of ec9b2177, S4(a)). (`scmswitch_other`,
+/// the unrelated-pipe control of finding 1 of rev5338-cx's review of
+/// 4d17d5ab, moved to the refusal test in round 10.2: see there.)
 #[test]
 fn in_guest_trap_sigalrm_interrupts_a_guest_held_pipe_read_as_ptrace_does() {
     let _guard = hermit_run_guard();
@@ -1168,7 +1166,6 @@ fn in_guest_trap_sigalrm_interrupts_a_guest_held_pipe_read_as_ptrace_does() {
                 "child_exit=0\n",
             ),
         ),
-        ("scmswitch_other", SIGALRM_PIPE_READ_EINTR),
     ] {
         for backend in ["ptrace", "in-guest-trap"] {
             let stdout = strict_sigalrm_fixture_run(&guest, backend, Some("1"), "0", mode);
@@ -1231,6 +1228,15 @@ fn in_guest_trap_sigalrm_interrupts_a_guest_held_pipe_read_as_ptrace_does() {
 ///   it once the first message is sent, so the child receives the read end,
 ///   and Linux returns EAGAIN at once (finding 1 of rev5338-cx's review of
 ///   4d17d5ab).
+/// - `scmswitch_other`: as `scmswitch`, where the control data is rewritten
+///   to a third pipe's read end, so the read end itself is never passed and
+///   Linux returns EINTR after the handler (rev5338-cx's unrelated-pipe
+///   control). In-guest, the runtime maps shared memory Detcore does not
+///   see, so no `msg_len` of the batch is proven private, and the send
+///   untracks every pipe the parent holds (round 10.2, coord7, 2:32 PM ET;
+///   `tool_runs_in_guest_process`). The read is then refused by name: a
+///   deliberate over-refusal until minibeads dh-cge466 has the runtime
+///   register those mappings. ptrace stays compared with Linux.
 /// - `stdin`: of the container's standard input, which phase 1's earlier
 ///   rule refuses as stdio that may wait. Under ptrace the guest's standard
 ///   input is the container's own, empty, so the read returns 0: the
@@ -1316,6 +1322,9 @@ fn in_guest_trap_refuses_by_name_the_sigalrm_pipe_reads_slice_2_does_not_place()
         // marked every pipe the parent holds untracked.
         ("scmalias_shared", eagain, diverged),
         ("scmalias_shared_wait", eagain, diverged),
+        // An unrelated pipe passed by a batch whose later entry reads control
+        // data: in-guest, no msg_len is proven private (see the doc above).
+        ("scmswitch_other", SIGALRM_PIPE_READ_EINTR, diverged),
         (
             "stdin",
             concat!(
