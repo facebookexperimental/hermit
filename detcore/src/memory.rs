@@ -250,9 +250,11 @@ impl MemoryMetadata {
     /// configuration (`Detcore::subscriptions`, `--passthru-opt` included;
     /// none is in `UNTRAPPED_PASSTHROUGH`), and `shmat` and
     /// `remap_file_pages` are refused with a fixed `ENOSYS`
-    /// (`syscall_classification`). Not covered: memory an in-guest runtime
-    /// maps for itself with raw syscalls, which is the runtime's and not the
-    /// guest's. A record that outlives its mapping (an exec, or a fork with
+    /// (`syscall_classification`). Not covered: memory a backend's runtime
+    /// maps in the guest's address space with calls that never reach
+    /// Detcore; a caller treats every address as unproven where the backend
+    /// runs such a runtime (`crate::syscalls::tool_runs_in_guest_process`).
+    /// A record that outlives its mapping (an exec, or a fork with
     /// `MADV_DONTFORK`) only answers true more often.
     pub(crate) fn may_share_backing(&self, start: usize, len: usize) -> bool {
         if self.unresolved_shared_mapping {

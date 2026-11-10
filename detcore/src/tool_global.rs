@@ -20620,6 +20620,95 @@ mod tests {
         }
     }
 
+    /// Round 10.2 (coord7, 2:32 PM ET): where the backend runs its tool
+    /// inside each guest process, its runtime maps shared memory Detcore
+    /// does not see, so no earlier `msg_len` is proven private, and a batch
+    /// whose later entry reads control data untracks every pipe read
+    /// description, even one in private memory whose control lies elsewhere
+    /// (`tool_runs_in_guest_process`, minibeads dh-cge466). A batch whose
+    /// later entries read no control data still untracks only the pipe it
+    /// names. Mutation "runtime predicate false": the unnamed pipe stays
+    /// admitted.
+    #[tokio::test]
+    async fn a_tool_in_the_guest_proves_no_batch_private() {
+        use std::os::unix::net::UnixStream;
+
+        use nix::fcntl::OFlag;
+
+        assert!(crate::syscalls::tool_runs_in_guest_process(
+            &reverie::BackendCapabilities::LITEINST_IN_GUEST
+        ));
+        assert!(!crate::syscalls::tool_runs_in_guest_process(
+            &reverie::BackendCapabilities::PTRACE
+        ));
+        let read =
+            |fd: i32| reverie::syscalls::Syscall::Read(reverie::syscalls::Read::new().with_fd(fd));
+        // SAFETY: arithmetic on lengths, with no memory access.
+        let (item_len, item_space) = unsafe {
+            (
+                libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as usize,
+                libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) as usize,
+            )
+        };
+        // Whether the second entry carries the control data (else the first).
+        for later_control in [true, false] {
+            let (config, state, tid, pid) = cancellation_test_state_with_config(
+                sigalrm_pipe_status_config().with_backend(|backend| {
+                    backend.promotes_open_files_before_native_lifecycle = true;
+                }),
+            );
+            install_test_registration(&state, tid, Ivar::new());
+            let (named_reader, _named_writer) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
+            let (other_reader, _other_writer) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
+            let (channel, _peer) = UnixStream::pair().unwrap();
+            let (named, other) = (named_reader.as_raw_fd(), other_reader.as_raw_fd());
+            let (tool, mut guest) = sigalrm_pipe_status_guest(
+                &state,
+                &config,
+                tid,
+                pid,
+                &[named, other],
+                channel.as_raw_fd(),
+            );
+            // SAFETY: plain C structs, all zero; the batch and its control
+            // buffer are private, on this stack, and apart.
+            let mut batch: [libc::mmsghdr; 2] = unsafe { std::mem::zeroed() };
+            let mut control = [0_u64; 3];
+            unsafe {
+                let cmsg = control.as_mut_ptr().cast::<libc::cmsghdr>();
+                (*cmsg).cmsg_len = item_len;
+                (*cmsg).cmsg_level = libc::SOL_SOCKET;
+                (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+                std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<i32>(), named);
+            }
+            let carrier = &mut batch[usize::from(later_control)].msg_hdr;
+            carrier.msg_control = control.as_mut_ptr().cast();
+            carrier.msg_controllen = item_space;
+            let headers = [
+                (&raw const batch[0]) as usize,
+                (&raw const batch[1]) as usize,
+            ];
+            assert_eq!(
+                crate::syscalls::batch_results_may_feed_control(&guest, &headers),
+                later_control,
+                "later control {later_control}"
+            );
+            tool.untrack_sent_pipe_status(&mut guest, &headers, false)
+                .await;
+            guest.thread.sigalrm_handled = true;
+            assert_eq!(
+                tool.sigalrm_phase1_gate(&mut guest, read(named)).await,
+                Some(nix::errno::Errno::EOPNOTSUPP),
+                "later control {later_control}: the named pipe"
+            );
+            assert_eq!(
+                tool.sigalrm_phase1_gate(&mut guest, read(other)).await,
+                later_control.then_some(nix::errno::Errno::EOPNOTSUPP),
+                "later control {later_control}: the unnamed pipe"
+            );
+        }
+    }
+
     /// B1 of coord7's review of 4d17d5ab, through the real receive path: a
     /// pipe read end received over SCM_RIGHTS on a guest-held channel, by a
     /// process that already holds the same pipe (as after a fork), is

@@ -37,6 +37,8 @@ mod io;
 pub(crate) use io::batch_results_may_feed_control;
 #[cfg(test)]
 pub(crate) use io::sent_descriptors;
+#[cfg(test)]
+pub(crate) use io::tool_runs_in_guest_process;
 pub(crate) mod memory;
 mod misc;
 mod namespace;

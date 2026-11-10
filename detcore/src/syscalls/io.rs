@@ -5608,15 +5608,18 @@ fn send_headers(call: Syscall) -> Option<(RawFd, Vec<usize>)> {
 /// rev5338-cx's review of 858541a9). The same holds for a control buffer
 /// that reaches those bytes through another address: two shared mappings
 /// of one page (finding 1 of rev5338-cx's review of 8fec6777). Before the
-/// call, conservatively:
+/// call, conservatively, either of:
 /// - any earlier entry's `msg_len` over any later entry's control buffer by
 ///   address, as `msg_len_may_overwrite_control` decides after it, or a
 ///   header that cannot be read;
-/// - any earlier entry's `msg_len` whose store may be seen through another
-///   address (`MemoryMetadata::may_share_backing`): in a shared mapping, or
-///   anywhere once a shared mapping's backing is unknown. Elsewhere its page
-///   is private, so the store reaches a later control buffer only at its
-///   own address, which the first test covers.
+/// - a later entry that reads control data (`reads_control_data`) after an
+///   earlier entry whose `msg_len` store may be seen through another
+///   address: in a shared mapping, or anywhere once a shared mapping's
+///   backing is unknown (`MemoryMetadata::may_share_backing`), or anywhere
+///   at all where the backend runs its tool inside the guest's process
+///   (`tool_runs_in_guest_process`). Elsewhere the `msg_len`'s page is
+///   private, so its store reaches a later control buffer only at its own
+///   address, which the first test covers.
 ///
 /// Never true for one message (`sendmsg`, or a one-entry batch).
 pub(crate) fn batch_results_may_feed_control<T, G>(guest: &G, headers: &[usize]) -> bool
@@ -5629,17 +5632,56 @@ where
     let Some((_, results)) = headers.split_last() else {
         return false;
     };
-    !results.is_empty()
-        && (msg_len_may_overwrite_control(guest, results, &headers[1..])
-            || results.iter().any(|header| {
-                header
-                    .checked_add(std::mem::offset_of!(Mmsghdr, msg_len))
-                    .is_none_or(|length| {
-                        guest
-                            .thread_state()
-                            .memory_may_share_backing(length, std::mem::size_of::<u32>())
-                    })
-            }))
+    if results.is_empty() {
+        return false;
+    }
+    if msg_len_may_overwrite_control(guest, results, &headers[1..]) {
+        return true;
+    }
+    let runtime_unseen = tool_runs_in_guest_process(&guest.config().backend);
+    let may_be_seen_elsewhere = |header: &usize| {
+        runtime_unseen
+            || header
+                .checked_add(std::mem::offset_of!(Mmsghdr, msg_len))
+                .is_none_or(|length| {
+                    guest
+                        .thread_state()
+                        .memory_may_share_backing(length, std::mem::size_of::<u32>())
+                })
+    };
+    (1..headers.len()).any(|later| {
+        reads_control_data(guest, headers[later])
+            && headers[..later].iter().any(may_be_seen_elsewhere)
+    })
+}
+
+/// Whether the message whose header is at `header` may have Linux read
+/// control data: its header cannot be read, or names a nonempty control
+/// buffer (`____sys_sendmsg` copies `msg_controllen` bytes).
+fn reads_control_data<T, G>(guest: &G, header: usize) -> bool
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    Addr::<Msghdr>::from_raw(header)
+        .and_then(|header| guest.memory().read_value::<_, Msghdr>(header).ok())
+        .is_none_or(|message| message.msg_controllen != 0)
+}
+
+/// Whether the backend runs its tool inside each guest process: it promotes
+/// open files before the native lifecycle calls it performs there, or runs
+/// guest code inside the tool's handler (`BackendCapabilities`;
+/// LITEINST_IN_GUEST does both, ptrace neither). Such a backend's runtime
+/// maps memory of its own in the guest's address space with calls that
+/// never reach Detcore: LiteInst's in-guest runtime maps its RPC queue and
+/// its guest log buffer shared and writable
+/// (`reverie-rpc-transport/src/mapped.rs`, `guest_log/buffer.rs`). Detcore's
+/// shared-mapping model then proves no page of that address space private
+/// (`batch_results_may_feed_control`; minibeads dh-cge466 would have the
+/// runtime register those mappings).
+pub(crate) fn tool_runs_in_guest_process(backend: &reverie::BackendCapabilities) -> bool {
+    backend.promotes_open_files_before_native_lifecycle
+        || backend.runs_guest_code_between_injections
 }
 
 /// The descriptors the messages at `headers` name in `SCM_RIGHTS`, and
