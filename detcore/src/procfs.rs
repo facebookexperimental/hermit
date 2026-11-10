@@ -4413,9 +4413,13 @@ fn sanitize_status_held(
     const CPUS_ALLOWED: &[u8] = b"Cpus_allowed:";
     const CPUS_ALLOWED_LIST: &[u8] = b"Cpus_allowed_list:";
     // The nodes the task may allocate from: node 0 alone, the one node a
-    // kernel built without NUMA has (`MAX_NUMNODES` 1), which prints these
-    // lines exactly so. The mask has 64 bits, a fixed width, as
-    // Cpus_allowed's 128 bits are.
+    // kernel built without NUMA has. Its `MAX_NUMNODES` is 1, without
+    // `CONFIG_NODES_SHIFT` (include/linux/nodemask_types.h:7-13 and
+    // arch/x86/Kconfig:1555-1561 at v7.1), the width
+    // `cpuset_task_status_allowed` prints the mask with
+    // (kernel/cgroup/cpuset.c:4385-4391, include/linux/nodemask.h:104-109),
+    // so the mask is the one hexadecimal digit `1` (`bitmap_string`,
+    // lib/vsprintf.c:1232-1273) and the list `0`.
     const MEMS_ALLOWED: &[u8] = b"Mems_allowed:";
     const MEMS_ALLOWED_LIST: &[u8] = b"Mems_allowed_list:";
     const VOLUNTARY: &[u8] = b"voluntary_ctxt_switches:";
@@ -4555,7 +4559,7 @@ fn sanitize_status_held(
             }
         } else if body.starts_with(MEMS_ALLOWED) {
             normalized.extend_from_slice(MEMS_ALLOWED);
-            normalized.extend_from_slice(b"\t00000000,00000001");
+            normalized.extend_from_slice(b"\t1");
         } else if body.starts_with(MEMS_ALLOWED_LIST) {
             normalized.extend_from_slice(MEMS_ALLOWED_LIST);
             normalized.extend_from_slice(b"\t0");
@@ -8446,7 +8450,7 @@ Rss:                   4 kB\n" as &[u8];
         let input = b"Name:\tcat\nTgid:\t1234\nPid:\t1234\nPPid:\t1200\nTracerPid:\t0\nNStgid:\t1234\nNSpid:\t1234\nNSpgid:\t1200\nNSsid:\t1190\nSigQ:\t426/2042342\nVmHWM:\t1572 kB\nVmRSS:\t1568 kB\nRssFile:\t1452 kB\nCpus_allowed:\tffffffff,ffffffff\nCpus_allowed_list:\t0-63\nMems_allowed:\t00000000,00000003\nMems_allowed_list:\t0-1\nvoluntary_ctxt_switches:\t120\nnonvoluntary_ctxt_switches:\t3\n";
         assert_eq!(
             sanitize_status(input, Some((3, 3, 1)), None, false),
-            b"Name:\tcat\nTgid:\t3\nPid:\t3\nPPid:\t1\nTracerPid:\t0\nNStgid:\t3\nNSpid:\t3\nNSpgid:\t0\nNSsid:\t0\nSigQ:\t0/0\nVmHWM:\t0 kB\nVmRSS:\t0 kB\nRssFile:\t0 kB\nCpus_allowed:\t00000000,00000000,00000000,00000001\nCpus_allowed_list:\t0\nMems_allowed:\t00000000,00000001\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
+            b"Name:\tcat\nTgid:\t3\nPid:\t3\nPPid:\t1\nTracerPid:\t0\nNStgid:\t3\nNSpid:\t3\nNSpgid:\t0\nNSsid:\t0\nSigQ:\t0/0\nVmHWM:\t0 kB\nVmRSS:\t0 kB\nRssFile:\t0 kB\nCpus_allowed:\t00000000,00000000,00000000,00000001\nCpus_allowed_list:\t0\nMems_allowed:\t1\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
         );
     }
 
