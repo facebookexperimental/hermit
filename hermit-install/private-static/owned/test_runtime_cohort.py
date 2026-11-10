@@ -862,6 +862,82 @@ class ActivePinsFromObjects(unittest.TestCase):
                 self.guard.tracked_source(tree.root, tree.h_head)
 
 
+class PipelinePrepareEntry(unittest.TestCase):
+    """pipeline.py prepare, run through its real command-line entry, nothing mocked."""
+
+    ROLE_PATHS = ['cargo', 'rustc', 'host_cargo', 'host_rustc', 'target', 'cargo_home', 'runner',
+                  'native_inputs_json', 'inspection_tools_json', 'musl_source_archive', 'memcpy_source',
+                  'musl_source_authority', 'stack_chk_source', 'optional_std_weak_source',
+                  'optional_std_destructors_source', 'optional_musl_dl_iterate_source']
+    MODULES = ['initializer_module', 'tls_source_module', 'native_leaf_module', 'ordinary_gate_module',
+               'terminal_module', 'view_site_module', 'view_table_module']
+
+    def config(self, root, tree, h_head, runtime_pin):
+        inputs = root / 'inputs'
+        inputs.mkdir(exist_ok=True)
+        paths = {}
+        for name in self.ROLE_PATHS:
+            path = inputs / name
+            path.write_bytes(name.encode())
+            paths[name] = str(path)
+        paths.update(H=str(tree.root), runtime_R=str(tree.reverie), tool_R=str(tree.reverie))
+        digest = lambda name: hashlib.sha256(Path(paths[name]).read_bytes()).hexdigest()
+        digests = dict({name: 'e' * 64 for name in self.MODULES}, native_inputs=digest('native_inputs_json'),
+                       inspection_tools=digest('inspection_tools_json'), runner=digest('runner'))
+        owner = dict(symbol='actual_owner', offset=1, owner_sha256='a' * 64)
+        roles = dict(fallback_entry=owner, completion_syscall=owner,
+                     sites=[dict(owner=owner, number=number, operation=operation)
+                            for operation, number in [(1, 158), (2, 218), (3, 7), (4, 2)]])
+        config = dict(schema='hermit.private-static-producer-inputs.v1', paths=paths,
+                      heads=dict(H=h_head, runtime_R=runtime_pin, tool_R=tree.rpin),
+                      digests=digests, data_roles=roles)
+        path = root / ('config-%s-%s.json' % (h_head[:8], runtime_pin[:8]))
+        path.write_text(json.dumps(config))
+        return path
+
+    def prepare(self, root, config, name):
+        evidence = root / 'evidence'
+        evidence.mkdir(exist_ok=True)
+        digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+        return subprocess.run([sys.executable, '-B', str(D / 'pipeline.py'), 'prepare',
+                               '--config', str(config), '--config-sha256', digest(config),
+                               '--source-manifest-sha256', digest(D / 'source-files.json'),
+                               '--evidence-root', str(evidence), '--name', name,
+                               '--publish-directory', str(root / ('publish-' + name))],
+                              capture_output=True, text=True, timeout=120, env=GIT_FIXTURE_ENV)
+
+    def test_prepare_passes_at_the_pinned_rows_and_refuses_a_disagreeing_pin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / 'H').mkdir()
+            tree = PinnedTree(root / 'H')
+            child = self.prepare(root, self.config(root, tree, tree.h_head, tree.rpin), 'pinned')
+            self.assertEqual(child.returncode, 0, child.stderr)
+            binding = json.loads(Path(json.loads(child.stdout)['binding']).read_text())
+            self.assertEqual(binding['config']['heads'], dict(H=tree.h_head, runtime_R=tree.rpin, tool_R=tree.rpin))
+            other = 'f' * 40
+            child = self.prepare(root, self.config(root, tree, tree.h_head, other), 'other-pin')
+            self.assertNotEqual(child.returncode, 0)
+            self.assertIn('runtime cohort derivation: declared runtime_R_pin ' + other +
+                          ' differs from the H_head gitlink ' + tree.rpin, child.stderr)
+            self.assertFalse((root / 'evidence' / 'other-pin.pipeline.binding.json').exists())
+
+    def test_prepare_refuses_a_head_or_tree_that_is_not_the_pinned_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / 'H').mkdir()
+            tree = PinnedTree(root / 'H')
+            self.assertEqual(self.prepare(root, self.config(root, tree, tree.h_head, tree.rpin), 'baseline').returncode, 0)
+            stale = 'a' * 40
+            child = self.prepare(root, self.config(root, tree, stale, tree.rpin), 'stale-head')
+            self.assertIn('runtime cohort derivation: H checkout HEAD ' + tree.h_head + ' is not H_head ' + stale, child.stderr)
+            (tree.root / 'detcore-liteinst/build.rs').write_bytes(b'uncommitted edit\n')
+            child = self.prepare(root, self.config(root, tree, tree.h_head, tree.rpin), 'edited-tree')
+            self.assertNotEqual(child.returncode, 0)
+            self.assertIn('one complete reviewed content cohort', child.stderr)
+            self.assertIn('H detcore-liteinst/build.rs observed 17:', child.stderr)
+
+
 class FixedPageData(unittest.TestCase):
     def fixture(self):
         gate=0x6000e1001000;reference=gate+8192
