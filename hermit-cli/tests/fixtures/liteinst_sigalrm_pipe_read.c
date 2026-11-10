@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -70,6 +71,23 @@
  *            a second pipe; it writes at 3s. Linux's received descriptor is
  *            the same description, so the read returns -1/EAGAIN at once,
  *            with no handler run.
+ *   scmswitch: as scmsetfl, where the end the child receives is named only
+ *            after the parent's send waited. Before the install the parent
+ *            fills the socketpair, tells the child, and sends a batch of two
+ *            messages with sendmmsg: a plain byte, which waits for room, then
+ *            one whose SCM_RIGHTS control data, in memory both processes
+ *            share (MAP_SHARED), names another pipe's read end. At 0.5s the
+ *            child rewrites that control data to name the read end and
+ *            drains the socket. Linux copies the second message's control
+ *            data only once the first is sent, so it passes the read end; the
+ *            child checks that it received it, sets O_NONBLOCK on it and
+ *            tells the parent. The read returns -1/EAGAIN at once, with no
+ *            handler run.
+ *   scmswitch_other: as scmswitch, where the child rewrites the control
+ *            data to name a third pipe's read end, not the one the parent
+ *            reads, and sets O_NONBLOCK on that. The read end's status is
+ *            untouched: the read returns -1/EINTR after the handler, as in
+ *            eintr.
  *   revoke:  as eintr, but at 0.5s, while the parent's read waits, the child
  *            passes a descriptor over SCM_RIGHTS on an AF_UNIX socket that is
  *            not connected, which fails. The read returns -1/EINTR after the
@@ -157,6 +175,58 @@ static int receive_fd(int socket) {
     return fd;
 }
 
+/* Fills `socket` with data until a nonblocking send would wait: 0, or -1. */
+static int fill(int socket) {
+    static char chunk[4096];
+    for (;;) {
+        if (send(socket, chunk, sizeof(chunk), MSG_DONTWAIT) < 0) {
+            return errno == EAGAIN ? 0 : -1;
+        }
+    }
+}
+
+/* Sends, in one sendmmsg on `socket`, a plain byte and then a byte whose
+ * control data is the SCM_RIGHTS message at `control`: the number of messages
+ * sent, or -1. */
+static int send_batch(int socket, void *control) {
+    char plain = 'm', byte = 'f';
+    struct iovec iov[2] = {{&plain, 1}, {&byte, 1}};
+    struct mmsghdr batch[2];
+    memset(batch, 0, sizeof(batch));
+    batch[0].msg_hdr.msg_iov = &iov[0];
+    batch[0].msg_hdr.msg_iovlen = 1;
+    batch[1].msg_hdr.msg_iov = &iov[1];
+    batch[1].msg_hdr.msg_iovlen = 1;
+    batch[1].msg_hdr.msg_control = control;
+    batch[1].msg_hdr.msg_controllen = CMSG_SPACE(sizeof(int));
+    return sendmmsg(socket, batch, 2, 0);
+}
+
+/* Reads `socket` until a message carries a descriptor over SCM_RIGHTS, and
+ * returns it, or -1. */
+static int drain_to_fd(int socket) {
+    static char data[65536];
+    for (;;) {
+        struct iovec iov = {data, sizeof(data)};
+        union {
+            char buf[CMSG_SPACE(sizeof(int))];
+            struct cmsghdr align;
+        } control;
+        struct msghdr msg = {0};
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.buf;
+        msg.msg_controllen = sizeof(control.buf);
+        if (recvmsg(socket, &msg, 0) <= 0) return -1;
+        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+        if (cmsg && cmsg->cmsg_type == SCM_RIGHTS) {
+            int fd;
+            memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
+            return fd;
+        }
+    }
+}
+
 static void sleep_ms(long ms) {
     struct timespec t = {ms / 1000, (ms % 1000) * 1000000};
     while (nanosleep(&t, &t) && errno == EINTR) {
@@ -206,9 +276,15 @@ int main(int argc, char **argv) {
     int setfl_exit = !strcmp(mode, "setfl_exit");
     int scmsetfl = !strcmp(mode, "scmsetfl");
     int revoke = !strcmp(mode, "revoke");
-    /* The child changes the read end's status before the read (setfl,
-     * fionbio, setfl_exit, scmsetfl) or while it waits (setfl_mid). */
-    int status_change = setfl || fionbio || setfl_mid || setfl_exit || scmsetfl;
+    int scmswitch = !strcmp(mode, "scmswitch");
+    int scmswitch_other = !strcmp(mode, "scmswitch_other");
+    /* The parent's send names the end the child receives only after it
+     * waited (scmswitch, scmswitch_other). */
+    int switched = scmswitch || scmswitch_other;
+    /* The child changes the read end's status, or, in scmswitch_other,
+     * another pipe's, before the read (setfl, fionbio, setfl_exit, scmsetfl,
+     * scmswitch, scmswitch_other) or while it waits (setfl_mid). */
+    int status_change = setfl || fionbio || setfl_mid || setfl_exit || scmsetfl || switched;
     if (!restart && !fifo && !eof && !data && !childexit && !blocked && !status_change &&
         !stdin_read && !revoke && strcmp(mode, "eintr"))
         return 2;
@@ -223,15 +299,40 @@ int main(int argc, char **argv) {
     int ends[2];
     /* The child's word that it changed the read end's status. */
     int sync[2] = {-1, -1};
-    if ((setfl || fionbio || scmsetfl) && pipe(sync)) {
+    if ((setfl || fionbio || scmsetfl || switched) && pipe(sync)) {
         printf("pipe errno=%d\n", errno);
         return 1;
     }
-    /* The channel the parent passes the read end over (scmsetfl). */
+    /* The channel the parent passes a read end over (scmsetfl, scmswitch,
+     * scmswitch_other). */
     int channel[2] = {-1, -1};
-    if (scmsetfl && socketpair(AF_UNIX, SOCK_STREAM, 0, channel)) {
+    if ((scmsetfl || switched) && socketpair(AF_UNIX, SOCK_STREAM, 0, channel)) {
         printf("socketpair errno=%d\n", errno);
         return 1;
+    }
+    /* The pipes whose read ends the shared control data names first and,
+     * in scmswitch_other, after the rewrite; the parent's word that the
+     * socket is full; and the control data itself (scmswitch,
+     * scmswitch_other). */
+    int first[2] = {-1, -1}, third[2] = {-1, -1}, filled[2] = {-1, -1};
+    void *shared = NULL;
+    if (switched) {
+        if (pipe(first) || pipe(third) || pipe(filled)) {
+            printf("pipe errno=%d\n", errno);
+            return 1;
+        }
+        shared = mmap(NULL, CMSG_SPACE(sizeof(int)), PROT_READ | PROT_WRITE,
+                      MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (shared == MAP_FAILED) {
+            printf("mmap errno=%d\n", errno);
+            return 1;
+        }
+        memset(shared, 0, CMSG_SPACE(sizeof(int)));
+        struct cmsghdr *cmsg = shared;
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type = SCM_RIGHTS;
+        cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(cmsg), &first[0], sizeof(int));
     }
     const char *path = "sigalrm_pipe_read.fifo";
     int in = -1;
@@ -271,6 +372,19 @@ int main(int argc, char **argv) {
             if (setfl_mid) sleep_ms(500);
             int target = ends[0];
             if (scmsetfl && (target = receive_fd(channel[1])) < 0) _exit(6);
+            if (switched) {
+                /* After the parent's send waited for room: name the end
+                 * to pass, drain, and check what arrived. */
+                char f;
+                if (read(filled[0], &f, 1) != 1) _exit(9);
+                sleep_ms(500);
+                int named = scmswitch ? ends[0] : third[0];
+                memcpy(CMSG_DATA((struct cmsghdr *)shared), &named, sizeof(int));
+                if ((target = drain_to_fd(channel[1])) < 0) _exit(6);
+                struct stat got, want;
+                if (fstat(target, &got) || fstat(named, &want) || got.st_ino != want.st_ino)
+                    _exit(10);
+            }
             int changed = fionbio ? ioctl(target, FIONBIO, &(int){1})
                                   : fcntl(target, F_SETFL, fcntl(target, F_GETFL) | O_NONBLOCK);
             if (changed) _exit(4);
@@ -322,6 +436,21 @@ int main(int argc, char **argv) {
         printf("sendmsg errno=%d\n", errno);
         return 1;
     }
+    if (switched) {
+        if (fill(channel[0])) {
+            printf("fill errno=%d\n", errno);
+            return 1;
+        }
+        if (write(filled[1], "f", 1) != 1) {
+            printf("filled errno=%d\n", errno);
+            return 1;
+        }
+        int sent = send_batch(channel[0], shared);
+        if (sent != 2) {
+            printf("sendmmsg=%d errno=%d\n", sent, errno);
+            return 1;
+        }
+    }
     if (sync[0] >= 0) {
         /* Before the install: the parent may not close a pipe afterwards. */
         char s = '?';
@@ -331,6 +460,9 @@ int main(int argc, char **argv) {
         }
         close(sync[0]);
         close(sync[1]);
+        /* The child's write counts from its word, which in scmswitch and
+         * scmswitch_other comes after the send's wait: so do the windows. */
+        if (switched) clock_gettime(CLOCK_MONOTONIC, &start);
     }
     sigset_t alarm_set;
     sigemptyset(&alarm_set);

@@ -1125,7 +1125,11 @@ const SIGALRM_PIPE_READ_EINTR: &str = concat!(
 /// of a child that exits first interrupts nothing (`childexit`). A SIGALRM
 /// blocked across the read does not interrupt it: the read returns the byte,
 /// and the handler runs when SIGALRM is unblocked, before `sigprocmask`
-/// returns (`blocked`, coord7 review of ec9b2177, S4(a)).
+/// returns (`blocked`, coord7 review of ec9b2177, S4(a)). A send that passes
+/// another pipe's read end over a guest-held channel, named only after the
+/// send waited, leaves the read end's status tracked: its read is admitted
+/// and returns EINTR after the handler (`scmswitch_other`, the unrelated-pipe
+/// control of finding 1 of rev5338-cx's review of 4d17d5ab).
 #[test]
 fn in_guest_trap_sigalrm_interrupts_a_guest_held_pipe_read_as_ptrace_does() {
     let _guard = hermit_run_guard();
@@ -1164,6 +1168,7 @@ fn in_guest_trap_sigalrm_interrupts_a_guest_held_pipe_read_as_ptrace_does() {
                 "child_exit=0\n",
             ),
         ),
+        ("scmswitch_other", SIGALRM_PIPE_READ_EINTR),
     ] {
         for backend in ["ptrace", "in-guest-trap"] {
             let stdout = strict_sigalrm_fixture_run(&guest, backend, Some("1"), "0", mode);
@@ -1193,6 +1198,13 @@ fn in_guest_trap_sigalrm_interrupts_a_guest_held_pipe_read_as_ptrace_does() {
 ///   end the parent passed it over SCM_RIGHTS on a socketpair, a guest-held
 ///   channel; Linux's receiver holds the same description, so Linux returns
 ///   EAGAIN at once (finding 1 of coord7's review of 29b3e6a8).
+/// - `scmswitch`: as `scmsetfl`, where the end passed is named only after
+///   the send waited: the second message of a `sendmmsg` batch, whose first
+///   waited for room, has shared control data that the child rewrote from
+///   another pipe's read end to the read end during the wait. Linux copies
+///   it once the first message is sent, so the child receives the read end,
+///   and Linux returns EAGAIN at once (finding 1 of rev5338-cx's review of
+///   4d17d5ab).
 /// - `stdin`: of the container's standard input, which phase 1's earlier
 ///   rule refuses as stdio that may wait. Under ptrace the guest's standard
 ///   input is the container's own, empty, so the read returns 0: the
@@ -1242,6 +1254,9 @@ fn in_guest_trap_refuses_by_name_the_sigalrm_pipe_reads_slice_2_does_not_place()
         // Detcore models as a description of its own: the send marked the
         // parent's description untracked.
         ("scmsetfl", eagain, diverged),
+        // The read end was named only by the send's attempt after its wait,
+        // which marked the parent's description untracked then.
+        ("scmswitch", eagain, diverged),
         (
             "stdin",
             concat!(
