@@ -2082,7 +2082,7 @@ impl Config {
     /// Whether the scheduler reads a sleeper's signal mask and dispositions
     /// (`Scheduler::signal_sleep`): where it models the kernel's signal targets
     /// (`models_signal_targets`), or under the in-guest delivery gate. Elsewhere
-    /// (DBT, SaBRe and LiteInst without the gate, KVM) a sleep parked as a
+    /// (DBT, SaBRe and LiteInst without the gate) a sleep parked as a
     /// timed waiter is woken by any signal the scheduler sends it, including a
     /// default-ignored `SIGCHLD` or a signal the sleeper blocks, which Linux
     /// never lets end a sleep.
@@ -2523,7 +2523,7 @@ impl Config {
     /// A registered sleep is parked, and a signal the scheduler sends a parked sleep wakes it
     /// whatever the signal is unless the scheduler can read the sleeper's mask and dispositions
     /// (`Scheduler::signal_sleep`). Without them (DBT, SaBRe and LiteInst without the in-guest
-    /// gate, KVM), a default-ignored `SIGCHLD` or a blocked timer signal would end every plain
+    /// gate), a default-ignored `SIGCHLD` or a blocked timer signal would end every plain
     /// sleep with `EINTR`, where Linux never wakes it. So the default registers when chosen on
     /// those backends, as before (<https://github.com/rrnewton/hermit/pull/4682>); an explicit
     /// `first-pass` there, or one taken from a record, is refused before the guest starts, and
