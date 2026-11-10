@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -53,21 +54,41 @@
  *            description's flags, so the read returns -1/EAGAIN at once,
  *            with no handler run.
  *   fionbio: as setfl, with ioctl(FIONBIO).
+ *   setfl_exit: the parent keeps its own write end; the child sets
+ *            O_NONBLOCK on the shared read end with F_SETFL and exits at
+ *            once, and the parent reaps it before the install. The status
+ *            is the description's, which the parent still holds, so the read
+ *            returns -1/EAGAIN at once, with no handler run.
  *   setfl_mid: as eintr, but the child sets O_NONBLOCK on the shared read
  *            end at 0.5s, while the parent's read waits. Linux's interrupted
  *            wait returns -ERESTARTSYS whatever the flags, so the read
  *            returns -1/EINTR after the handler; a second read then returns
  *            -1/EAGAIN at once.
- *   hostpipe: as eintr, on standard input, a pipe the host passed in whose
- *            writer the host keeps open and never writes; the child exits at
- *            once. The read returns -1/EINTR after the handler. In-guest
- *            refuses it: the host could fill the pipe at any time.
+ *   scmsetfl: the parent passes the read end to the child over a
+ *            socketpair (SCM_RIGHTS) before the install; the child sets
+ *            O_NONBLOCK on the end it received and tells the parent, through
+ *            a second pipe; it writes at 3s. Linux's received descriptor is
+ *            the same description, so the read returns -1/EAGAIN at once,
+ *            with no handler run.
+ *   revoke:  as eintr, but at 0.5s, while the parent's read waits, the child
+ *            passes a descriptor over SCM_RIGHTS on an AF_UNIX socket that is
+ *            not connected, which fails. The read returns -1/EINTR after the
+ *            handler, as in eintr. In-guest, the attempt counts as a
+ *            descriptor that may have left the guest.
+ *   stdin:   as eintr, on standard input, the container's stdin, with no
+ *            writer in the guest; the child exits at once. Under ptrace,
+ *            Hermit's container gives the guest an empty standard input, so
+ *            the read returns 0. In-guest refuses it: a read of the
+ *            container's stdio that may wait.
  */
 
 static volatile sig_atomic_t hits;
 static volatile sig_atomic_t frame_result_is_eintr;
 static volatile sig_atomic_t frame_ip_after_syscall;
 static struct timespec start;
+/* The child's exit status where the parent reaped it before the install
+ * (setfl_exit), or -2. */
+static int reaped = -2;
 
 static long elapsed_ms(void) {
     struct timespec now;
@@ -93,6 +114,49 @@ static void on_alarm(int sig, siginfo_t *info, void *context) {
     frame_ip_after_syscall = ip[-2] == 0x0f && ip[-1] == 0x05;
 }
 
+/* Sends `fd` over SCM_RIGHTS on `socket`, with one data byte. */
+static ssize_t send_fd(int socket, int fd) {
+    char byte = 'f';
+    struct iovec iov = {&byte, 1};
+    union {
+        char buf[CMSG_SPACE(sizeof(int))];
+        struct cmsghdr align;
+    } control;
+    memset(&control, 0, sizeof(control));
+    struct msghdr msg = {0};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.buf;
+    msg.msg_controllen = sizeof(control.buf);
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
+    return sendmsg(socket, &msg, 0);
+}
+
+/* Receives one descriptor over SCM_RIGHTS on `socket`, or -1. */
+static int receive_fd(int socket) {
+    char byte;
+    struct iovec iov = {&byte, 1};
+    union {
+        char buf[CMSG_SPACE(sizeof(int))];
+        struct cmsghdr align;
+    } control;
+    struct msghdr msg = {0};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.buf;
+    msg.msg_controllen = sizeof(control.buf);
+    if (recvmsg(socket, &msg, 0) != 1) return -1;
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (!cmsg || cmsg->cmsg_type != SCM_RIGHTS) return -1;
+    int fd;
+    memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
+    return fd;
+}
+
 static void sleep_ms(long ms) {
     struct timespec t = {ms / 1000, (ms % 1000) * 1000000};
     while (nanosleep(&t, &t) && errno == EINTR) {
@@ -113,6 +177,10 @@ static int install(int restart) {
 static int finish(pid_t child) {
     alarm(0);
     signal(SIGALRM, SIG_DFL);
+    if (reaped != -2) {
+        printf("child_exit=%d\n", reaped);
+        return 0;
+    }
     int status = 0;
     if (waitpid(child, &status, 0) != child) {
         printf("waitpid errno=%d\n", errno);
@@ -134,12 +202,15 @@ int main(int argc, char **argv) {
     int setfl = !strcmp(mode, "setfl");
     int fionbio = !strcmp(mode, "fionbio");
     int setfl_mid = !strcmp(mode, "setfl_mid");
-    int hostpipe = !strcmp(mode, "hostpipe");
+    int stdin_read = !strcmp(mode, "stdin");
+    int setfl_exit = !strcmp(mode, "setfl_exit");
+    int scmsetfl = !strcmp(mode, "scmsetfl");
+    int revoke = !strcmp(mode, "revoke");
     /* The child changes the read end's status before the read (setfl,
-     * fionbio) or while it waits (setfl_mid). */
-    int status_change = setfl || fionbio || setfl_mid;
+     * fionbio, setfl_exit, scmsetfl) or while it waits (setfl_mid). */
+    int status_change = setfl || fionbio || setfl_mid || setfl_exit || scmsetfl;
     if (!restart && !fifo && !eof && !data && !childexit && !blocked && !status_change &&
-        !hostpipe && strcmp(mode, "eintr"))
+        !stdin_read && !revoke && strcmp(mode, "eintr"))
         return 2;
     long write_ms = data ? 1000 : eof ? 1000 : childexit ? 500 : 3000;
     /* The windows' upper bound: the write, or 3s where the child writes
@@ -152,8 +223,14 @@ int main(int argc, char **argv) {
     int ends[2];
     /* The child's word that it changed the read end's status. */
     int sync[2] = {-1, -1};
-    if ((setfl || fionbio) && pipe(sync)) {
+    if ((setfl || fionbio || scmsetfl) && pipe(sync)) {
         printf("pipe errno=%d\n", errno);
+        return 1;
+    }
+    /* The channel the parent passes the read end over (scmsetfl). */
+    int channel[2] = {-1, -1};
+    if (scmsetfl && socketpair(AF_UNIX, SOCK_STREAM, 0, channel)) {
+        printf("socketpair errno=%d\n", errno);
         return 1;
     }
     const char *path = "sigalrm_pipe_read.fifo";
@@ -174,7 +251,7 @@ int main(int argc, char **argv) {
         /* Unlinked while still unhandled: phase 1 refuses unlink once the
          * process handles SIGALRM. The open ends stay usable. */
         unlink(path);
-    } else if (hostpipe) {
+    } else if (stdin_read) {
         in = 0;
     } else if (pipe(ends)) {
         printf("pipe errno=%d\n", errno);
@@ -186,27 +263,41 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (child == 0) {
-        if (hostpipe) _exit(0);
+        if (stdin_read) _exit(0);
         int out = ends[1];
         if (status_change) {
             /* The read end stays open here: its status is the shared
              * description's, which the child changes. */
             if (setfl_mid) sleep_ms(500);
-            int changed = fionbio ? ioctl(ends[0], FIONBIO, &(int){1})
-                                  : fcntl(ends[0], F_SETFL, fcntl(ends[0], F_GETFL) | O_NONBLOCK);
+            int target = ends[0];
+            if (scmsetfl && (target = receive_fd(channel[1])) < 0) _exit(6);
+            int changed = fionbio ? ioctl(target, FIONBIO, &(int){1})
+                                  : fcntl(target, F_SETFL, fcntl(target, F_GETFL) | O_NONBLOCK);
             if (changed) _exit(4);
+            if (setfl_exit) _exit(0);
             if (!setfl_mid && write(sync[1], "s", 1) != 1) _exit(5);
             sleep_ms(write_ms - (setfl_mid ? 500 : 0));
             if (write(out, "x", 1) != 1) _exit(3);
             _exit(0);
         }
         close(fifo ? in : ends[0]);
+        if (revoke) {
+            /* A socket that is not connected: the send fails, having
+             * offered a descriptor. */
+            sleep_ms(500);
+            int unconnected = socket(AF_UNIX, SOCK_DGRAM, 0);
+            if (unconnected < 0) _exit(7);
+            if (send_fd(unconnected, out) >= 0) _exit(8);
+            sleep_ms(write_ms - 500);
+            if (write(out, "x", 1) != 1) _exit(3);
+            _exit(0);
+        }
         sleep_ms(write_ms);
         if (!eof && !childexit && write(out, "x", 1) != 1) _exit(3);
         _exit(0);
     }
-    if (hostpipe) {
-        /* The host's descriptor, kept as it came. */
+    if (stdin_read) {
+        /* The container's descriptor, kept as it came. */
     } else if (fifo) {
         if (fcntl(in, F_SETFL, fcntl(in, F_GETFL) & ~O_NONBLOCK)) {
             printf("fcntl errno=%d\n", errno);
@@ -214,8 +305,22 @@ int main(int argc, char **argv) {
         }
     } else {
         in = ends[0];
-        /* childexit keeps a writer, so the read waits for the alarm. */
-        if (!childexit) close(ends[1]);
+        /* childexit and setfl_exit keep a writer, so the read could wait. */
+        if (!childexit && !setfl_exit) close(ends[1]);
+    }
+    if (setfl_exit) {
+        /* Before the install: the parent may wait for its child only while
+         * SIGALRM's action is the default. */
+        int status = 0;
+        if (waitpid(child, &status, 0) != child) {
+            printf("waitpid errno=%d\n", errno);
+            return 1;
+        }
+        reaped = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    }
+    if (scmsetfl && send_fd(channel[0], in) != 1) {
+        printf("sendmsg errno=%d\n", errno);
+        return 1;
     }
     if (sync[0] >= 0) {
         /* Before the install: the parent may not close a pipe afterwards. */
@@ -254,7 +359,7 @@ int main(int argc, char **argv) {
     if (blocked) {
         int unblocked = sigprocmask(SIG_UNBLOCK, &alarm_set, NULL);
         printf("unblock=%d hits_at_return=%d\n", unblocked, (int)hits);
-    } else if (n < 0 && e == EINTR && !childexit && !hostpipe) {
+    } else if (n < 0 && e == EINTR && !childexit && !stdin_read) {
         c = '?';
         errno = 0;
         n = read(in, &c, 1);

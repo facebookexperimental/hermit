@@ -832,18 +832,6 @@ fn strict_sigalrm_fixture_run(
     patching: &str,
     mode: &str,
 ) -> Vec<u8> {
-    strict_sigalrm_fixture_run_with_stdin(guest, backend, admission, patching, mode, Stdio::null())
-}
-
-/// [`strict_sigalrm_fixture_run`] with the guest's standard input `stdin`.
-fn strict_sigalrm_fixture_run_with_stdin(
-    guest: &Path,
-    backend: &str,
-    admission: Option<&str>,
-    patching: &str,
-    mode: &str,
-    stdin: Stdio,
-) -> Vec<u8> {
     use hermit::canonical_verdict::VerificationReport;
 
     use super::kvm_cancellation::bounded_command_with_timeout;
@@ -869,7 +857,7 @@ fn strict_sigalrm_fixture_run_with_stdin(
         .env_remove("RUST_LOG")
         .env_remove("HERMIT_LOG")
         .env_remove("HERMIT_LOG_FILE")
-        .stdin(stdin);
+        .stdin(Stdio::null());
     if let Some(value) = admission {
         command.arg(format!("--env=REVERIE_LITEINST_SIGALRM_HANDLERS={value}"));
     }
@@ -1082,7 +1070,6 @@ fn single_sigalrm_pipe_read_run(
     guest: &Path,
     backend: &str,
     mode: &str,
-    stdin: Stdio,
 ) -> (std::process::ExitStatus, String, String) {
     use super::kvm_cancellation::bounded_command_with_timeout;
     use super::kvm_cancellation::bounded_read;
@@ -1104,7 +1091,7 @@ fn single_sigalrm_pipe_read_run(
         .env_remove("RUST_LOG")
         .env_remove("HERMIT_LOG")
         .env_remove("HERMIT_LOG_FILE")
-        .stdin(stdin)
+        .stdin(Stdio::null())
         .arg("--")
         .arg(guest)
         .arg(mode);
@@ -1185,12 +1172,12 @@ fn in_guest_trap_sigalrm_interrupts_a_guest_held_pipe_read_as_ptrace_does() {
     }
 }
 
-/// dev-hermit dh-ru056 slice 2 (T2.4, T1.4) and the reviews of ec9b2177 and
-/// 8871d444: the pipe reads slice 2 does not place keep phase 1's refusal
-/// under in-guest-trap, EOPNOTSUPP at the read's entry with no handler run,
-/// each verified at L2, and the refusal names its reason on the run's
-/// stderr. Under ptrace, where the kernel runs the handler, each runs as
-/// Linux does, verified at L2. The reads:
+/// dev-hermit dh-ru056 slice 2 (T2.4) and the reviews of ec9b2177, 8871d444
+/// and 29b3e6a8: the pipe reads slice 2 does not place keep phase 1's
+/// refusal under in-guest-trap, EOPNOTSUPP at the read's entry with no
+/// handler run, each verified at L2, and the refusal names its reason on the
+/// run's stderr. Under ptrace, where the kernel runs the handler, each runs
+/// as Linux does, verified at L2. The reads:
 /// - `restart`: under an SA_RESTART handler, which Linux runs and then
 ///   restarts the read.
 /// - `fifo`: of a named FIFO, which a process outside the container could
@@ -1199,10 +1186,20 @@ fn in_guest_trap_sigalrm_interrupts_a_guest_held_pipe_read_as_ptrace_does() {
 ///   the fork (review P1-b); Linux returns EAGAIN at once, since the
 ///   processes share the description's flags, while the reader's copy of the
 ///   model still says blocking.
-/// - `hostpipe`: of standard input, a pipe whose writer the test, a process
-///   outside the container, holds open and never writes; its result under
-///   ptrace is the one this test measures (Hermit's container gives the guest
-///   its own standard input).
+/// - `setfl_exit`: as `setfl`, where the child that changed the status has
+///   exited before the read; the description, and its status, live on in
+///   the parent (finding 3 of rev5338-cx's review of 29b3e6a8).
+/// - `scmsetfl`: as `setfl`, where the child changed the status through the
+///   end the parent passed it over SCM_RIGHTS on a socketpair, a guest-held
+///   channel; Linux's receiver holds the same description, so Linux returns
+///   EAGAIN at once (finding 1 of coord7's review of 29b3e6a8).
+/// - `stdin`: of the container's standard input, which phase 1's earlier
+///   rule refuses as stdio that may wait. Under ptrace the guest's standard
+///   input is the container's own, empty, so the read returns 0: the
+///   ptrace result this row measures, not Linux's with a host pipe. This is
+///   not T1.4 coverage: `hermit run` hands the guest no host pipe, and by
+///   coord7's ruling in bead dh-ru056 T1.4 rests on the unit-test
+///   unmarked-pipe rows.
 #[test]
 fn in_guest_trap_refuses_by_name_the_sigalrm_pipe_reads_slice_2_does_not_place() {
     let _guard = hermit_run_guard();
@@ -1215,9 +1212,10 @@ fn in_guest_trap_refuses_by_name_the_sigalrm_pipe_reads_slice_2_does_not_place()
         "read=-1 errno=11 byte=- window=before_alarm hits_at_return=0\n",
         "child_exit=0\n",
     );
-    let diverged = "a pipe read whose status flags another process changed after a fork, which \
-                    this process's copy does not show";
-    for (mode, linux, reason) in [
+    let diverged = "a pipe read whose status flags another process may have changed through a \
+                    copy of the description that a fork or SCM_RIGHTS made, which this process's \
+                    copy does not show";
+    for (mode, under_ptrace, reason) in [
         (
             "restart",
             concat!(
@@ -1231,12 +1229,21 @@ fn in_guest_trap_refuses_by_name_the_sigalrm_pipe_reads_slice_2_does_not_place()
         (
             "fifo",
             SIGALRM_PIPE_READ_EINTR,
-            "a read of a named FIFO, which a process outside the container may open and fill",
+            "a read or seek of a named FIFO, which a process outside the container may open and fill",
         ),
         ("setfl", eagain, diverged),
         ("fionbio", eagain, diverged),
+        // The child that set the status has exited before the read: the
+        // status stays the description's while the parent holds it (the
+        // ledger keeps it until its last holder goes, and its creator holds
+        // it from the `pipe2`).
+        ("setfl_exit", eagain, diverged),
+        // The child changed the status through a received end, which its
+        // Detcore models as a description of its own: the send marked the
+        // parent's description untracked.
+        ("scmsetfl", eagain, diverged),
         (
-            "hostpipe",
+            "stdin",
             concat!(
                 "read=0 errno=0 byte=- window=before_alarm hits_at_return=0\n",
                 "child_exit=0\n",
@@ -1244,34 +1251,19 @@ fn in_guest_trap_refuses_by_name_the_sigalrm_pipe_reads_slice_2_does_not_place()
             "I/O on the container's stdio that may wait",
         ),
     ] {
-        // The host's pipe for `hostpipe`: the test holds its writer open,
-        // writing nothing, until every run of the mode has ended.
-        let (reader, _writer) = nix::unistd::pipe().expect("host pipe");
-        let stdin = || {
-            if mode == "hostpipe" {
-                Stdio::from(reader.try_clone().expect("host pipe reader"))
-            } else {
-                Stdio::null()
-            }
-        };
-        let ptrace =
-            strict_sigalrm_fixture_run_with_stdin(&guest, "ptrace", Some("1"), "0", mode, stdin());
-        assert_eq!(String::from_utf8_lossy(&ptrace), linux, "ptrace/{mode}");
-        let trap = strict_sigalrm_fixture_run_with_stdin(
-            &guest,
-            "in-guest-trap",
-            Some("1"),
-            "0",
-            mode,
-            stdin(),
+        let ptrace = strict_sigalrm_fixture_run(&guest, "ptrace", Some("1"), "0", mode);
+        assert_eq!(
+            String::from_utf8_lossy(&ptrace),
+            under_ptrace,
+            "ptrace/{mode}"
         );
+        let trap = strict_sigalrm_fixture_run(&guest, "in-guest-trap", Some("1"), "0", mode);
         assert_eq!(
             String::from_utf8_lossy(&trap),
             refused,
             "in-guest-trap/{mode}"
         );
-        let (status, stdout, stderr) =
-            single_sigalrm_pipe_read_run(&guest, "in-guest-trap", mode, stdin());
+        let (status, stdout, stderr) = single_sigalrm_pipe_read_run(&guest, "in-guest-trap", mode);
         assert_eq!(status.code(), Some(0), "in-guest-trap/{mode}: {stderr}");
         assert_eq!(stdout, refused, "in-guest-trap/{mode}");
         let named = format!(
@@ -1288,13 +1280,15 @@ fn in_guest_trap_refuses_by_name_the_sigalrm_pipe_reads_slice_2_does_not_place()
 /// dev-hermit dh-ru056 slice 2, review P1-b with museli-lt's added
 /// requirement: the child sets O_NONBLOCK on the shared read end while the
 /// parent's admitted read waits, and the SIGALRM then falls due. Linux's
-/// interrupted wait returns ERESTARTSYS whatever the flags, so under ptrace
-/// the read returns EINTR after the handler and a second read EAGAIN at once,
-/// verified at L2. In-guest, the reader's copy of the description no longer
-/// shows its status, and Linux's `pipe_read` tests the shared O_NONBLOCK
-/// again when a wait ends with the pipe empty and a writer present, so the
-/// read's end stops the run by name, with the policy refusal's status,
-/// before the guest sees any result: never a silent EINTR.
+/// interrupted wait returns ERESTARTSYS before any O_NONBLOCK test, so under
+/// ptrace the read returns EINTR after the handler and a second read EAGAIN
+/// at once, verified at L2. In-guest, the reader's copy of the description
+/// no longer shows its status, and the read's end stops the run by name,
+/// with the policy refusal's status, before the guest sees any result. The
+/// stop is a deliberate over-refusal, stricter than Linux, whose EINTR here
+/// is the same as the in-guest result would have been (finding 6 of coord7's
+/// review of 29b3e6a8): what it rules out is a silent result decided by a
+/// stale copy.
 #[test]
 fn in_guest_trap_stops_by_name_when_a_waiting_pipe_reads_status_changes() {
     let _guard = hermit_run_guard();
@@ -1311,7 +1305,7 @@ fn in_guest_trap_stops_by_name_when_a_waiting_pipe_reads_status_changes() {
         "ptrace/setfl_mid"
     );
     let (status, stdout, stderr) =
-        single_sigalrm_pipe_read_run(&guest, "in-guest-trap", "setfl_mid", Stdio::null());
+        single_sigalrm_pipe_read_run(&guest, "in-guest-trap", "setfl_mid");
     assert_eq!(
         status.code(),
         Some(122),
@@ -1322,7 +1316,45 @@ fn in_guest_trap_stops_by_name_when_a_waiting_pipe_reads_status_changes() {
         stderr.contains(
             "hermit refused to continue the run (HERMIT_SIGALRM_PIPE_STATUS_DIVERGED): read in \
              thread 3 was admitted by signal phase 1 on a pipe whose status flags another \
-             process changed after a fork while it waited"
+             process may have changed while it waited"
+        ),
+        "{stderr}"
+    );
+}
+
+/// dev-hermit dh-ru056 slice 2, review P1-a of 8871d444, finding 4 of
+/// coord7's review of 29b3e6a8: while the parent's admitted read waits, the
+/// child offers a descriptor over SCM_RIGHTS on an AF_UNIX socket that is not
+/// connected. The send fails, but an export counts from the attempt: the
+/// scheduler then trusts no guest-held mark, the parent's due SIGALRM finds
+/// its read with no deterministic probe, and the turn loop ends the run by
+/// name before the next selection (`Scheduler::take_sigalrm_stop`), status
+/// 122, before the guest sees any result. Under ptrace nothing is
+/// virtualized: the read returns EINTR after the handler, as in `eintr`,
+/// verified at L2. The message is the scheduler's, which names the waiting
+/// thread; the read's own end would name the call instead
+/// (`sigalrm_pipe_authority_revoked_at_end_refusal`).
+#[test]
+fn in_guest_trap_stops_by_name_when_a_waiting_pipe_reads_authority_is_revoked() {
+    let _guard = hermit_run_guard();
+    let guest = sigalrm_fixture("liteinst_sigalrm_pipe_read");
+    let ptrace = strict_sigalrm_fixture_run(&guest, "ptrace", Some("1"), "0", "revoke");
+    assert_eq!(
+        String::from_utf8_lossy(&ptrace),
+        SIGALRM_PIPE_READ_EINTR,
+        "ptrace/revoke"
+    );
+    let (status, stdout, stderr) = single_sigalrm_pipe_read_run(&guest, "in-guest-trap", "revoke");
+    assert_eq!(
+        status.code(),
+        Some(122),
+        "the policy refusal's status: {stderr}"
+    );
+    assert_eq!(stdout, "", "the guest saw no result of the read");
+    assert!(
+        stderr.contains(
+            "hermit refused to continue the run (HERMIT_SIGALRM_PIPE_AUTHORITY_REVOKED): thread 3 \
+             waits in a pipe read that signal phase 1 admitted because only guests held the pipe"
         ),
         "{stderr}"
     );
