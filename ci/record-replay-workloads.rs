@@ -759,7 +759,10 @@ fn prepare_population(
         fs::remove_dir_all(&population).map_err(|e| e.to_string())?;
     }
     fs::rename(&staging.0, &population).map_err(|e| e.to_string())?;
-    std::mem::forget(staging);
+    // The staging directory is renamed into place, so the Staging guard's
+    // cleanup at scope end can only find a path that no longer exists:
+    // let it drop normally (and free its path allocation) instead of
+    // forgetting it, which leaked the allocation on every build.
     let paths = names()
         .map(|name| (name.to_owned(), population.join(name)))
         .collect::<BTreeMap<_, _>>();
