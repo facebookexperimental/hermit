@@ -52804,7 +52804,10 @@ fn cpu_directory_reads_list_only_cpu0_on_every_path() {
 /// include/linux/numa.h:57-64), beside no `numa_node`. That `numa_node` and
 /// the CPUs' `online` list seek as sysfs attributes do, to an end, data and
 /// hole a page in, before and after a read, whatever they show
-/// (fs/kernfs/file.c:885-910 and fs/sysfs/file.c:313-314).
+/// (fs/kernfs/file.c:885-910 and fs/sysfs/file.c:313-314); a duplicate
+/// descriptor shares the position, at the bytes read through either, and a
+/// seek past the largest position, from it or from the end, is EINVAL and
+/// leaves the position (fs/read_write.c:57-63).
 ///
 /// The same objects, looked up through symbolic links the test makes
 /// ([`sysfs_links`]), are found or not as by their own paths, also by an
@@ -52927,13 +52930,17 @@ fn absent_cpu_node_backlinks(backend: &str) {
     expected.push_str(match nvme {
         Some(_) => {
             "nvme seek: end page, read 3, at 3, end page, data at 3 3, hole at 0 page, \
-             read there 0\n"
+             read there 0\n\
+             nvme seek: read 1, dup at 1, dup read 1, at 2, set max 9223372036854775807, \
+             cur +1 EINVAL, dup at 9223372036854775807, end max EINVAL\n"
         }
         None => "nvme seek: no device\n",
     });
     expected.push_str(
         "online seek: end page, read 2, at 2, end page, data at 3 3, hole at 0 page, \
-         read there 0\n",
+         read there 0\n\
+         online seek: read 1, dup at 1, dup read 1, at 2, set max 9223372036854775807, \
+         cur +1 EINVAL, dup at 9223372036854775807, end max EINVAL\n",
     );
     // Through the links.
     for (name, found, link_found) in [
@@ -53066,6 +53073,8 @@ fn absent_cpu_node_backlinks(backend: &str) {
             "stat fd link attribute: ok\n",
             "stat fd link control: ok\n",
             ", end page, data at 3 3, hole at 0 page, read there 0\n",
+            "online seek: read 1, dup at 1, dup read 1, at 2, set max 9223372036854775807, \
+             cur +1 EINVAL, dup at 9223372036854775807, end max EINVAL\n",
         ] {
             assert!(native.contains(line), "{line:?} natively:\n{native}");
         }

@@ -11455,8 +11455,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             _ => return Err(Errno::EINVAL.into()),
         };
-        let new_offset = usize::try_from(new_offset).map_err(|_| Errno::EINVAL)?;
-        let result = i64::try_from(new_offset).map_err(|_| Errno::EOVERFLOW)?;
+        // A position below 0 or past what a `loff_t` holds is EINVAL, and
+        // the position stays (`vfs_setpos_cookie`, fs/read_write.c:57-63 at
+        // v7.1), as before the snapshot, where the kernel's own seek
+        // answers.
+        let result = i64::try_from(new_offset)
+            .ok()
+            .filter(|offset| *offset >= 0)
+            .ok_or(Errno::EINVAL)?;
+        let new_offset = result as usize;
         guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.set_procfs_offset(new_offset))?;

@@ -276,9 +276,14 @@ static const char *offset_name(off_t offset, char *buffer, size_t size) {
 /* Seeks the sysfs attribute at `path` to its end, reads it from the start,
  * then seeks to its end, to the data at 3 and to the hole at 0, and reads
  * there: an attribute's end is its inode's size, a page, whatever it shows,
- * and the position after a read is at the bytes read. */
+ * and the position after a read is at the bytes read. Then reads one byte
+ * from the start, which moves a duplicate's position too, and one through
+ * the duplicate, which moves the first's, and seeks to the largest
+ * position, accepted, and one past it, from there or from the end, EINVAL,
+ * which leaves the position where it was. */
 static void seeks(const char *label, const char *path) {
     char text[64], end[32], at[32], end_after[32], data[32], hole[32];
+    char shared[32], moved[32], largest[32], past[32], kept[32], end_past[32];
     int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         printf("%s seek: %s\n", label, strerrorname_np(errno));
@@ -292,10 +297,28 @@ static void seeks(const char *label, const char *path) {
     const char *data_name = offset_name(lseek(fd, 3, SEEK_DATA), data, sizeof(data));
     const char *hole_name = offset_name(lseek(fd, 0, SEEK_HOLE), hole, sizeof(hole));
     ssize_t there = read(fd, text, sizeof(text));
-    close(fd);
     printf("%s seek: end %s, read %zd, at %s, end %s, data at 3 %s, hole at 0 %s, read there "
            "%zd\n",
            label, end_name, got, at_name, end_after_name, data_name, hole_name, there);
+    lseek(fd, 0, SEEK_SET);
+    int other = dup(fd);
+    ssize_t one = read(fd, text, 1);
+    const char *shared_name = offset_name(lseek(other, 0, SEEK_CUR), shared, sizeof(shared));
+    ssize_t two = read(other, text, 1);
+    const char *moved_name = offset_name(lseek(fd, 0, SEEK_CUR), moved, sizeof(moved));
+    const char *largest_name = offset_name(lseek(fd, LLONG_MAX, SEEK_SET), largest, sizeof(largest));
+    const char *past_name = offset_name(lseek(fd, 1, SEEK_CUR), past, sizeof(past));
+    const char *kept_name = offset_name(lseek(other, 0, SEEK_CUR), kept, sizeof(kept));
+    const char *end_past_name =
+        offset_name(lseek(fd, LLONG_MAX, SEEK_END), end_past, sizeof(end_past));
+    printf("%s seek: read %zd, dup at %s, dup read %zd, at %s, set max %s, cur +1 %s, dup at %s, "
+           "end max %s\n",
+           label, one, shared_name, two, moved_name, largest_name, past_name, kept_name,
+           end_past_name);
+    if (other >= 0) {
+        close(other);
+    }
+    close(fd);
 }
 
 /* Looks up, through the symbolic links the caller made in `directory`, the
