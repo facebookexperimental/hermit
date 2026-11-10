@@ -259,10 +259,13 @@ hermit_e2e_bundle = rule(
     },
 )
 
-def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh", labels = []):
+def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh", labels = [], require_host_caps = False):
     """One hermit_e2e_cell_test per plan cell, plus test suites all / re / local.
 
     `labels` are added to every cell's test, e.g. a consumer's CI scheduling labels.
+    `require_host_caps = True` sets HERMIT_E2E_REQUIRE_HOST_CAPS=1 on every local cell:
+    a cell the harness withholds as HOST-INAPPLICABLE then fails instead of being
+    skipped (cell.sh), for a consumer whose CI hosts must have the capability.
     """
     routing = read_root_config("hermit_e2e", "routing", "hybrid")
     if routing not in ["hybrid", "local"]:
@@ -317,6 +320,8 @@ def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh"
             "HERMIT_E2E_ROUTE": where,
             "HERMIT_E2E_ROUTE_REASON": reason,
         }
+        if require_host_caps and where == "local":
+            env["HERMIT_E2E_REQUIRE_HOST_CAPS"] = "1"
         if nonce:
             env["HERMIT_E2E_NONCE"] = nonce
         if epoch:

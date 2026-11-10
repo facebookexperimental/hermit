@@ -915,6 +915,43 @@ class CellTest(unittest.TestCase):
         self.assertEqual(done["status"], "failed", done)
         self.assertIn("produced 2 test_done records", json.loads(done["details"])["reason"])
 
+    # HERMIT_E2E_REQUIRE_HOST_CAPS=1: a CI host that must have the capability. A withheld
+    # cell there is a failure naming the harness's reason, never a skip that reads as
+    # coverage; every other verdict, and the RE route, are unchanged.
+    def test_required_host_capability_turns_the_local_skip_into_a_failure(self) -> None:
+        done, result = self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="local",
+                                     HERMIT_E2E_REQUIRE_HOST_CAPS="1")
+        self.assertEqual(done["test"], CELL)
+        self.assertEqual(done["status"], "failed", done)
+        details = json.loads(done["details"])
+        self.assertEqual(details["outcome"], "ERROR")
+        self.assertEqual(details["reason"],
+                         "HOST-INAPPLICABLE on a local route with HERMIT_E2E_REQUIRE_HOST_CAPS=1, which "
+                         "requires the capability here: NOT RUN, NOT a pass, no coverage: this machine "
+                         "lacks exact-branch-counter")
+        self.assertEqual(result["harness_rc"], 1)
+
+    def test_require_host_caps_0_keeps_the_local_skip(self) -> None:
+        done, _ = self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="local",
+                                HERMIT_E2E_REQUIRE_HOST_CAPS="0")
+        self.assertEqual(done["status"], "skipped", done)
+
+    def test_require_host_caps_leaves_a_passing_cell_passing(self) -> None:
+        done, _ = self.run_cell(HERMIT_E2E_ROUTE="local", HERMIT_E2E_REQUIRE_HOST_CAPS="1")
+        self.assertEqual(done["status"], "passed", done)
+
+    def test_require_host_caps_on_re_keeps_the_plain_failure_tpx_retries(self) -> None:
+        done, _ = self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="re",
+                                HERMIT_E2E_REQUIRE_HOST_CAPS="1")
+        self.assertEqual(done["status"], "failed", done)
+        self.assertIn("produced 2 test_done records", json.loads(done["details"])["reason"])
+
+    def test_an_invalid_require_host_caps_value_fails_the_cell(self) -> None:
+        done, _ = self.run_cell(HERMIT_E2E_ROUTE="local", HERMIT_E2E_REQUIRE_HOST_CAPS="yes")
+        self.assertEqual(done["status"], "failed", done)
+        self.assertIn("HERMIT_E2E_REQUIRE_HOST_CAPS must be 0 or 1, not 'yes'",
+                      json.loads(done["details"])["reason"])
+
     def test_host_inapplicable_cell_with_another_run_failure_still_fails(self) -> None:
         done, _ = self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="local",
                                 FAKE_RUN_FAILURES=json.dumps(["cannot write the test-count file"]))
@@ -1412,7 +1449,8 @@ class _Anything:
         return self
 
 
-def evaluate_cells(routing: str, pmu_on_re: str = "true", cpuid_on_re: str | None = None) -> dict[str, dict]:
+def evaluate_cells(routing: str, pmu_on_re: str = "true", cpuid_on_re: str | None = None,
+                   **cells_kwargs) -> dict[str, dict]:
     """Runs defs.bzl's hermit_e2e_cells over the real plan; returns each target's attrs by name.
 
     cpuid_on_re=None leaves the key unset, so defs.bzl's own default applies; any
@@ -1440,7 +1478,8 @@ def evaluate_cells(routing: str, pmu_on_re: str = "true", cpuid_on_re: str | Non
     }
     exec(compile(DEFS.read_text(), str(DEFS), "exec"), namespace)
     assert "_cell_test_impl" in rule_calls, rule_calls
-    namespace["hermit_e2e_cells"](json.loads(PLAN.read_text()), json.loads(RE_EXCLUSIONS.read_text()))
+    namespace["hermit_e2e_cells"](json.loads(PLAN.read_text()), json.loads(RE_EXCLUSIONS.read_text()),
+                                  **cells_kwargs)
     return targets
 
 
@@ -1461,6 +1500,26 @@ def load_defs() -> tuple[dict, list[str]]:
     }
     exec(compile(DEFS.read_text(), str(DEFS), "exec"), namespace)
     return namespace, attr_names
+
+
+class RequireHostCapsTest(unittest.TestCase):
+    """hermit_e2e_cells(require_host_caps=True) sets cell.sh's HERMIT_E2E_REQUIRE_HOST_CAPS=1
+    on exactly the local cells; by default no cell carries it."""
+
+    def test_only_local_cells_carry_the_flag_when_required(self) -> None:
+        # cpuid_on_re=true is the configuration that routes some cells to RE (by default
+        # every cell is local), so both routes are checked.
+        targets = evaluate_cells("hybrid", "true", "true", require_host_caps=True)
+        routes = {t["route"] for t in targets.values()}
+        self.assertEqual(routes, {"local", "re"})
+        for target in targets.values():
+            expected = "1" if target["route"] == "local" else None
+            self.assertEqual(target["env"].get("HERMIT_E2E_REQUIRE_HOST_CAPS"), expected, target["name"])
+
+    def test_no_cell_carries_the_flag_by_default(self) -> None:
+        for routing in ("hybrid", "local"):
+            for target in evaluate_cells(routing).values():
+                self.assertNotIn("HERMIT_E2E_REQUIRE_HOST_CAPS", target["env"], target["name"])
 
 
 class ContainerChoiceTest(unittest.TestCase):

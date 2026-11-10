@@ -30,13 +30,20 @@
 #        HERMIT_E2E_DIGEST_CACHE_DIR
 #                                  where cells on this host share verified file digests
 #                                  (default /tmp/hermit-e2e-digests-UID; host cells only)
+#        HERMIT_E2E_REQUIRE_HOST_CAPS
+#                                  "1": a cell the harness withholds as HOST-INAPPLICABLE on
+#                                  a local route FAILS instead of being skipped (for a CI
+#                                  host that must have the capability: a skip there would
+#                                  read as coverage nobody got); "0" or unset: skipped, as
+#                                  before. Any other value fails the cell.
 #        HERMIT_E2E_SESSION_CENSUS the file cells on this host share the harness's process
 #                                  session census through (default
 #                                  /tmp/hermit-e2e-session-census-UID; host cells only)
 # stdout: Tpx HPHP-JSON (`type = "json"`): the harness's test_done for the cell, turned
 #         into a failure if its evidence is incomplete, then all_done. Always exits 0.
 #         A cell the harness withholds as HOST-INAPPLICABLE on a local route is reported
-#         skipped, with the harness's reason; on RE it stays failed, so Tpx retries it on
+#         skipped, with the harness's reason (failed, naming that reason, under
+#         HERMIT_E2E_REQUIRE_HOST_CAPS=1); on RE it stays failed, so Tpx retries it on
 #         another worker (see ci/buck-e2e/run).
 set -u
 TEST=$1 MODE=$2 BACKEND=$3
@@ -104,6 +111,10 @@ workdir=
 # harness still tries a cgroup first and only then uses the agent-utils process-group
 # scan, whose rows name that source. A local cell runs in a cgroup it can use, so it
 # never inherits a caller's marker; neither does the pinned-root container.
+case ${HERMIT_E2E_REQUIRE_HOST_CAPS:-} in
+"" | 0 | 1) ;;
+*) emit_fatal "HERMIT_E2E_REQUIRE_HOST_CAPS must be 0 or 1, not '${HERMIT_E2E_REQUIRE_HOST_CAPS}'" ;;
+esac
 if [[ ${HERMIT_E2E_ROUTE:-} == re ]]; then
     cpu_scan_env=(HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN=1)
 else
@@ -514,9 +525,9 @@ rm -rf "${W:?}"
 # three lines does cell.sh publish the completion, by renaming a finished copy of
 # result.json over the original, so a normalizer or publication that fails at any point
 # leaves result.json without producer_completion, which ingest.py refuses.
-verdict_out=$(python3 - "$A/tpx.jsonl" "$CELL" "$evidence_complete" "$harness_rc" "${missing[*]}" "${HERMIT_E2E_ROUTE:-}" "$rows_seen" <<'PY'
+verdict_out=$(python3 - "$A/tpx.jsonl" "$CELL" "$evidence_complete" "$harness_rc" "${missing[*]}" "${HERMIT_E2E_ROUTE:-}" "$rows_seen" "${HERMIT_E2E_REQUIRE_HOST_CAPS:-}" <<'PY'
 import json, os, re, sys
-path, cell, complete, rc, missing, route, rows_seen = sys.argv[1:8]
+path, cell, complete, rc, missing, route, rows_seen, require_host_caps = sys.argv[1:9]
 
 class Invalid(Exception):
     """The harness output breaks its contract with this cell; the reason says how."""
@@ -586,13 +597,24 @@ def withheld_here(pair):
 
     A local host that lacks a capability lacks it on a retry too, so the cell is
     reported skipped with the harness's reason, never as a pass. Only a local route
-    qualifies: an RE worker that lacks the capability is retried on another worker."""
-    if route != "local" or pair is None:
+    qualifies: an RE worker that lacks the capability is retried on another worker.
+    Under HERMIT_E2E_REQUIRE_HOST_CAPS=1 nothing qualifies: required_here fails it."""
+    if route != "local" or pair is None or require_host_caps == "1":
         return None
     record, details = pair
     reason = details.get("reason")
     details["reason"] = "SKIP: " + (reason if isinstance(reason, str) and reason else "host-inapplicable")
     return dict(record, details=json.dumps(details))
+
+def required_here(pair):
+    """A failure for the withheld cell on a local route whose host must have the
+    capability (HERMIT_E2E_REQUIRE_HOST_CAPS=1); else None."""
+    if route != "local" or pair is None or require_host_caps != "1":
+        return None
+    reason = pair[1].get("reason")
+    return failed("HOST-INAPPLICABLE on a local route with HERMIT_E2E_REQUIRE_HOST_CAPS=1, "
+                  "which requires the capability here: "
+                  + (reason if isinstance(reason, str) and reason else "host-inapplicable"))
 
 def no_result_pair(done, rows):
     """The cell's own record when the harness ran this one cell and got no result back:
@@ -620,6 +642,9 @@ def verdict():
     skip = withheld_here(pair)
     if skip:
         return skip
+    required = required_here(pair)
+    if required:
+        return required
     if pair:
         # A withheld cell fails there; ci/buck-e2e/run reruns it locally (Tpx retries are off).
         return failed(f"harness rc={rc} produced {len(done)} test_done records")
