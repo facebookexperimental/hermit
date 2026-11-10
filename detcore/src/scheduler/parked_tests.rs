@@ -12133,6 +12133,66 @@ fn the_no_progress_wake_record_ends_at_its_grant() {
     assert_eq!(s.take_sigalrm_stop(), None, "no wake of the read is filed");
 }
 
+/// Finding S1 of coord7's review of 4d17d5ab: two processes' reads each
+/// settle as a no-progress probe, so each files a signal wake still resting
+/// on guest-held marks. The second process's reservation is made in the
+/// sweep that settles the first, and its probe runs before the first wake;
+/// its own wake, filed later at the front of the band, is granted first.
+/// An export the scheduler then learns of must still stop the run for the
+/// first wake, ungranted, before its final attempt: the record holds every
+/// such wake, and one wake's grant ends only its own. Mutation "the record
+/// holds one wake": the second settlement overwrites the first, the second
+/// grant clears it, and nothing stops.
+#[test]
+fn a_second_readers_wake_leaves_the_first_wakes_stop_in_place() {
+    let mut s = liteinst_scheduler();
+    let (first, _, _) = add(&mut s, 100, 100);
+    let (second, _, _) = add(&mut s, 200, 200);
+    let (first_pid, second_pid) = (DetPid::from_raw(100), DetPid::from_raw(200));
+    for (pid, reader) in [(first_pid, first), (second_pid, second)] {
+        s.set_sigalrm_handled(pid, true);
+        file_pipe_read_attempt(&mut s, reader, 1);
+        s.runqueue_push_back(reader);
+    }
+    s.fire_alarm(first_pid, first, Signal::SIGALRM);
+    s.fire_alarm(second_pid, second, Signal::SIGALRM);
+    assert!(sigalrm_reserved_for(&s, first), "the first entry reserves");
+    assert!(!sigalrm_reserved_for(&s, second), "the second waits");
+
+    assert_eq!(grant_selected(&mut s), first, "the first probe");
+    file_probe_successor(&mut s, first, 1, false);
+    s.step2_sigalrm_ledger();
+    assert!(woken_by_sigalrm(&s, first), "the first settles: its wake");
+    assert!(
+        sigalrm_reserved_for(&s, second),
+        "the same sweep reserves the second"
+    );
+
+    assert_eq!(grant_selected(&mut s), second, "the second probe, placed");
+    file_probe_successor(&mut s, second, 1, false);
+    s.step2_sigalrm_ledger();
+    assert!(woken_by_sigalrm(&s, second), "the second settles: its wake");
+    assert!(woken_by_sigalrm(&s, first), "the first wake still filed");
+    assert_eq!(s.take_sigalrm_stop(), None, "no export yet");
+
+    assert_eq!(
+        grant_selected(&mut s),
+        second,
+        "the later wake, at the front of the band, is granted first"
+    );
+    s.revoke_guest_held_marks(DetTid::from_raw(300));
+    assert!(s.sigalrm_pending(first_pid), "the first entry is still due");
+    s.step2_sigalrm_ledger();
+    let stop = s.take_sigalrm_stop();
+    assert!(
+        stop.as_deref().is_some_and(|reason| {
+            reason.contains("HERMIT_SIGALRM_PIPE_AUTHORITY_REVOKED")
+                && reason.contains(&format!("thread {first}"))
+        }),
+        "the first wake's stop survives the second's grant; got {stop:?}"
+    );
+}
+
 /// R1 with the successor production files: the probe completed the read,
 /// so `complete_syscall` delivers the due entry and files its
 /// `InboundSignal(SIGALRM)` turn. Step 2 classifies that as completed (no

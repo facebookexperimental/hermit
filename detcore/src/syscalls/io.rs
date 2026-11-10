@@ -4819,7 +4819,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// only ever claim that no process outside the guest holds the object;
     /// once a descriptor may have left the guest, the scheduler stops trusting
     /// every mark (`Scheduler::polls_only_guest_state`).
-    async fn classify_received_descriptors<G: Guest<Self>>(
+    pub(crate) async fn classify_received_descriptors<G: Guest<Self>>(
         &self,
         guest: &mut G,
         channel: RawFd,
@@ -5110,7 +5110,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// that identity, which no reader of the sender's description would ask
     /// about. A guest-held channel revokes no mark, so without this a read of
     /// the sent description could be admitted on a status the receiver has
-    /// changed (finding 1 of coord7's review of 29b3e6a8). Control data
+    /// changed (finding 1 of coord7's review of 29b3e6a8). The receiver's
+    /// own description is untracked at the receipt
+    /// (`untrack_received_pipe_status`), and each attempt after the first
+    /// untracks what it passes then (`pipe_reads_an_attempt_passes`). Control data
     /// that cannot be read, or a send outside the caller's turn, may pass
     /// any descriptor: every pipe read description the table holds loses
     /// its status then. Sent before the send itself, regardless of its
@@ -5177,6 +5180,50 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut ids = Self::pipe_reads_sent(guest, &headers, false);
         ids.retain(|id| !untracked.contains(id));
         ids
+    }
+
+    /// After a receive that delivered `received` over `SCM_RIGHTS`, where the
+    /// runtime virtualizes SIGALRM: each pipe read description the receiver
+    /// now holds through them loses its tracked status in the SIGALRM ledger
+    /// (`SigalrmControl::UntrackPipeStatus`), in the receiver's turn. Linux's
+    /// receiver installs the sender's `struct file` (`receive_fd`, Linux
+    /// v6.12
+    /// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/file.c?h=v6.12#n1301>),
+    /// whose status flags the sender's processes share, but a receiver
+    /// whose Detcore runs in its own process records it as a description of
+    /// its own (`record_received_descriptors`, `Receipt::New`), with no
+    /// status in the ledger under that identity, whose flags are the model's
+    /// own guess. Marked guest-held when the receiver already holds the same
+    /// pipe (`classify_received_descriptors`), as after a fork, its read would
+    /// otherwise be admitted on a copy no other holder's change reaches
+    /// (finding B1 of coord7's review of 4d17d5ab). Untracked, the gate
+    /// refuses it by name, as phase 1 refused every pipe read before slice 2,
+    /// and so for each fork alias that shares its identity. The lookup
+    /// discovers a descriptor the tool has not recorded yet (`with_detfd`).
+    pub(crate) async fn untrack_received_pipe_status<G: Guest<Self>>(
+        guest: &mut G,
+        received: &[RawFd],
+    ) {
+        let config = guest.config();
+        if !(config.backend.virtualizes_guest_sigalrm && config.sequentialize_threads) {
+            return;
+        }
+        let ids: BTreeSet<crate::types::OpenFileId> = received
+            .iter()
+            .filter_map(|&fd| {
+                guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| {
+                        (detfd.ty() == FdType::Pipe
+                            && detfd.status_flags() & libc::O_ACCMODE != libc::O_WRONLY)
+                            .then(|| detfd.open_file_id())
+                    })
+                    .ok()
+                    .flatten()
+            })
+            .collect();
+        let ids: Vec<_> = ids.into_iter().collect();
+        Self::untrack_pipe_statuses(guest, &ids).await;
     }
 
     /// The pipe read descriptions `ids` each lose their tracked status in the
@@ -5793,6 +5840,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await?;
         self.classify_received_descriptors(guest, call.sockfd(), &recorded)
             .await;
+        Self::untrack_received_pipe_status(guest, &delivered.fds).await;
         // Where the tool discovers received descriptors, recvmsg's refresh
         // covers every descriptor delivered, as before; elsewhere only those
         // this receipt recorded.
@@ -6264,6 +6312,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await?;
         self.classify_received_descriptors(guest, call.fd(), &recorded)
             .await;
+        Self::untrack_received_pipe_status(guest, &delivered.fds).await;
         self.note_short_batch(guest, from, call.vlen() as usize);
         // Only the descriptors this receipt recorded.
         self.refresh_received_locks(guest, &recorded, super::files::LockCall::Recvmmsg)

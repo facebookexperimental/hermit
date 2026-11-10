@@ -182,14 +182,16 @@ pub(crate) struct SigalrmLedger {
     /// review P1-b), with the processes that may hold it. An entry lasts
     /// while any of them does (`PipeStatus::holders`).
     pipe_status: BTreeMap<OpenFileId, PipeStatus>,
-    /// The thread whose filed request is the signal wake a no-progress probe
+    /// The threads whose filed request is the signal wake a no-progress probe
     /// substituted (`act_on_sigalrm_reserved_poll`) for a polled pipe read
-    /// that relied on guest-held marks, until that wake is granted or
-    /// replaced (`end_sigalrm_polling_wait`). The wake request names neither
-    /// the read nor its descriptor, so this is what tells the sweep that the
-    /// wake's final attempt still rests on those marks (review of 29b3e6a8,
-    /// finding 2).
-    marked_wake: Option<DetTid>,
+    /// that relied on guest-held marks, each until its wake is granted or
+    /// replaced (`end_sigalrm_polling_wait`) or it retires. The wake request
+    /// names neither the read nor its descriptor, so this is what tells the
+    /// sweep that the wake's final attempt still rests on those marks (review
+    /// of 29b3e6a8, finding 2). A set: another process's probe can settle,
+    /// and file its own wake, before an earlier wake is granted (finding S1
+    /// of coord7's review of 4d17d5ab).
+    marked_wake: BTreeSet<DetTid>,
     /// The named refusal that ends the run before the next selection, set
     /// when a due entry finds an admitted pipe read whose guest-held
     /// authority was revoked while it waited (`act_on_pending_sigalrm`,
@@ -217,9 +219,14 @@ struct PipeStatus {
     /// one, so the ledger keeps only descriptions some process may still read
     /// while a copy another process changed stays visible to every alias
     /// (review of 29b3e6a8, finding 3). A process that receives the
-    /// description over `SCM_RIGHTS` is not counted until it publishes, which
-    /// is sound because that send revoked guest-held marks first, and phase 1
-    /// admits no read once they are revoked.
+    /// description over `SCM_RIGHTS` is not counted: a send over a guest-held
+    /// channel revokes no mark, but it marks the description untracked
+    /// before every attempt (`Detcore::untrack_sent_pipe_status`,
+    /// `Detcore::pipe_reads_an_attempt_passes`), and the receiver, whose
+    /// Detcore records the descriptor as a description of its own, marks
+    /// that one untracked at the receipt
+    /// (`Detcore::untrack_received_pipe_status`). Phase 1 admits no read of
+    /// either (finding B1 of coord7's review of 4d17d5ab).
     holders: BTreeSet<DetPid>,
 }
 
@@ -793,7 +800,7 @@ impl Scheduler {
                 // still rests on those marks: an export committed before that
                 // grant stops the run (`act_on_pending_sigalrm`).
                 if requeued && relies_on_marks {
-                    self.sigalrm.marked_wake = Some(reserved.target);
+                    self.sigalrm.marked_wake.insert(reserved.target);
                 }
             }
             ReservedProbeOutcome::Completed => {
@@ -870,9 +877,7 @@ impl Scheduler {
     /// substituted.
     pub(crate) fn end_sigalrm_polling_wait(&mut self, thread: DetTid) {
         self.sigalrm.polling.remove(&thread);
-        if self.sigalrm.marked_wake == Some(thread) {
-            self.sigalrm.marked_wake = None;
-        }
+        self.sigalrm.marked_wake.remove(&thread);
     }
 
     /// A retry of an `InternalIOPolling` operation after EAGAIN.
@@ -985,9 +990,7 @@ impl Scheduler {
         if self.sigalrm.reserved_poll.map(|r| r.target) == Some(thread) {
             let _ = self.take_sigalrm_reserved_poll();
         }
-        if self.sigalrm.marked_wake == Some(thread) {
-            self.sigalrm.marked_wake = None;
-        }
+        self.sigalrm.marked_wake.remove(&thread);
         if thread.as_raw() == process.as_raw() {
             self.sigalrm.handled.remove(&process);
             self.sigalrm.pending.remove(&process);
@@ -1064,7 +1067,7 @@ impl Scheduler {
                 return;
             }
         }
-        if self.guest_held_marks_revoked && self.sigalrm.marked_wake == Some(thread) {
+        if self.guest_held_marks_revoked && self.sigalrm.marked_wake.contains(&thread) {
             // A no-progress probe of a read admitted on guest-held marks was
             // replaced by the signal wake, whose grant makes the read's final
             // attempt; the wake is not placed, so a better band could run

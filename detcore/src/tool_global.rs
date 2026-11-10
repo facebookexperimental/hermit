@@ -8594,11 +8594,12 @@ pub enum SignalScope {
 /// https://github.com/rrnewton/hermit/pull/5259.
 /// 57 brings
 /// `SigalrmControl` into the digest, after dh-ru056 slice 2 appended
-/// `GuestHeldMarksRevoked`, `PublishPipeStatus` and `PipeStatusDiffers` to
-/// it: the in-guest runtimes send those controls, so the append rule above
-/// does not cover them (finding 1 of rev5338-cx's review of 29b3e6a8,
-/// finding 2 of coord7's; 56 on its first rebase, 57 at its rebase onto
-/// main's 56); it is current.
+/// `GuestHeldMarksRevoked`, `PublishPipeStatus`, `PipeStatusDiffers` and
+/// `UntrackPipeStatus` to it: the in-guest runtimes send those controls, so
+/// the append rule above does not cover them (finding 1 of rev5338-cx's
+/// review of 29b3e6a8, finding 2 of coord7's; 56 on its first rebase, 57 at
+/// its rebase onto main's 56, where https://github.com/rrnewton/hermit/pull/5259
+/// had taken 56); it is current.
 pub(crate) const GLOBAL_RPC_REVISION: u32 = 57;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
@@ -19015,6 +19016,52 @@ mod tests {
         }
     }
 
+    /// The guest stack of a `RetirementGuest` whose memory is this process's
+    /// own (`local_memory`): each allocation is a zeroed heap block of 8-byte
+    /// words, live until the guard its commit returns is dropped.
+    #[derive(Default)]
+    struct LocalScratchStack(Vec<Box<[u64]>>);
+
+    impl Drop for LocalScratchStack {
+        fn drop(&mut self) {}
+    }
+
+    impl reverie::Stack for LocalScratchStack {
+        type StackGuard = Self;
+
+        fn size(&self) -> usize {
+            self.0.iter().map(|block| block.len() * 8).sum()
+        }
+
+        fn capacity(&self) -> usize {
+            64 * 1024
+        }
+
+        fn push<'stack, T>(&mut self, value: T) -> reverie::syscalls::Addr<'stack, T> {
+            let address = self.reserve::<T>();
+            // SAFETY: the block holds `size_of::<T>()` bytes, aligned to 8,
+            // which `reserve` checked is enough for `T`.
+            unsafe { std::ptr::write(address.as_raw() as *mut T, value) };
+            reverie::syscalls::Addr::from_raw(address.as_raw()).unwrap()
+        }
+
+        fn reserve<'stack, T>(&mut self) -> reverie::syscalls::AddrMut<'stack, T> {
+            assert!(
+                std::mem::align_of::<T>() <= 8,
+                "an over-aligned guest value"
+            );
+            let words = std::mem::size_of::<T>().div_ceil(8).max(1);
+            let mut block = vec![0_u64; words].into_boxed_slice();
+            let address = block.as_mut_ptr() as usize;
+            self.0.push(block);
+            reverie::syscalls::AddrMut::from_raw(address).unwrap()
+        }
+
+        fn commit(self) -> Result<Self::StackGuard, reverie::syscalls::Errno> {
+            Ok(self)
+        }
+    }
+
     #[reverie::tool]
     impl GlobalRPC<GlobalState> for ExternalRegistrationGuest<'_> {
         async fn send_rpc(
@@ -19162,7 +19209,7 @@ mod tests {
     #[reverie::tool]
     impl Guest<Detcore> for RetirementGuest<'_> {
         type Memory = reverie::syscalls::LocalMemory;
-        type Stack = ExternalRegistrationStack;
+        type Stack = LocalScratchStack;
 
         fn tid(&self) -> reverie::Pid {
             reverie::Pid::from_raw(self.thread.dettid.as_raw())
@@ -19202,7 +19249,11 @@ mod tests {
         }
 
         async fn stack(&mut self) -> Self::Stack {
-            panic!("external registration must not use a guest stack")
+            assert!(
+                self.local_memory,
+                "external registration must not use a guest stack"
+            );
+            LocalScratchStack::default()
         }
 
         async fn daemonize(&mut self) {
@@ -19211,9 +19262,36 @@ mod tests {
 
         async fn inject<S: reverie::syscalls::SyscallInfo>(
             &mut self,
-            _syscall: S,
+            syscall: S,
         ) -> Result<i64, reverie::syscalls::Errno> {
-            panic!("external registration must not inject a syscall")
+            // A guest whose memory is this process's own has its descriptors
+            // too: its syscall runs here, as the kernel would run it for the
+            // guest (`local_memory`).
+            assert!(
+                self.local_memory,
+                "external registration must not inject a syscall"
+            );
+            let (sysno, args) = syscall.into_parts();
+            // SAFETY: a test's own descriptors and memory, which the test
+            // built for the call.
+            let result = unsafe {
+                libc::syscall(
+                    sysno.id() as libc::c_long,
+                    args.arg0,
+                    args.arg1,
+                    args.arg2,
+                    args.arg3,
+                    args.arg4,
+                    args.arg5,
+                )
+            };
+            if result < 0 {
+                Err(reverie::syscalls::Errno::new(
+                    std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
+                ))
+            } else {
+                Ok(result)
+            }
         }
 
         async fn retire_current_thread(&mut self) -> reverie::Never {
@@ -20239,6 +20317,233 @@ mod tests {
             "an attempt after the rewrite passes the pipe now named"
         );
         drop((first_reader, second_reader, third_reader));
+    }
+
+    /// A guest whose runtime virtualizes SIGALRM, in a run that
+    /// sequentializes threads, with pipe read ends `pipes` and a socketpair
+    /// end `channel`, each guest-held, for the SIGALRM pipe-status tests.
+    fn sigalrm_pipe_status_guest<'a>(
+        state: &'a GlobalState,
+        config: &'a Config,
+        tid: DetTid,
+        pid: DetPid,
+        pipes: &[i32],
+        channel: i32,
+    ) -> (Detcore, RetirementGuest<'a>) {
+        use nix::fcntl::OFlag;
+        use reverie::Tool;
+
+        use crate::fd::FdType;
+
+        let tool: Detcore = Detcore::new(Tid::from_raw(tid.as_raw()), config);
+        let mut thread = tool.init_thread_state(Tid::from_raw(tid.as_raw()), None);
+        thread.detpid = Some(pid);
+        let guest = RetirementGuest {
+            global: state,
+            config,
+            thread,
+            requests: Mutex::new(Vec::new()),
+            retired: std::sync::atomic::AtomicBool::new(false),
+            hold_private_memory_publication: false,
+            local_memory: true,
+        };
+        let entries = pipes
+            .iter()
+            .map(|&fd| (fd, OFlag::O_RDONLY, FdType::Pipe))
+            .chain([(channel, OFlag::O_RDWR, FdType::Socket)]);
+        for (fd, flags, ty) in entries {
+            // With its stat, as Detcore records a descriptor it creates, so a
+            // received copy of the same object can be matched to it.
+            // SAFETY: a plain C struct, which fstat fills for an open
+            // descriptor the test owns.
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
+            guest
+                .thread
+                .add_fd(fd, flags, ty, Some(stat.into()))
+                .unwrap();
+            guest
+                .thread
+                .with_detfd(fd, |detfd| {
+                    detfd.set_guest_held();
+                    if ty == FdType::Pipe {
+                        detfd.set_physically_nonblocking();
+                    }
+                })
+                .unwrap();
+        }
+        (tool, guest)
+    }
+
+    /// The config of the SIGALRM pipe-status tests: the runtime virtualizes
+    /// SIGALRM in a run that sequentializes threads.
+    fn sigalrm_pipe_status_config() -> Config {
+        Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        }
+        .with_backend(|backend| {
+            backend.needs_killed_thread_rpc_cancellation = true;
+            backend.virtualizes_guest_sigalrm = true;
+        })
+    }
+
+    /// The fallback of a send's untracking (`Detcore::untrack_sent_pipe_status`,
+    /// B2 of coord7's review of 4d17d5ab): control data that cannot be read,
+    /// or a send outside the caller's turn, may pass any descriptor, so
+    /// every pipe read description the table holds loses its status, named
+    /// or not. A readable in-turn send leaves an unnamed pipe admitted (the
+    /// control). Mutation "no fallback": the unnamed pipe stays admitted.
+    #[tokio::test]
+    async fn an_unread_or_off_turn_send_untracks_every_pipe_status() {
+        use std::os::unix::net::UnixStream;
+
+        use nix::fcntl::OFlag;
+
+        let read =
+            |fd: i32| reverie::syscalls::Syscall::Read(reverie::syscalls::Read::new().with_fd(fd));
+        for case in ["control", "unread", "outside the turn"] {
+            let (config, state, tid, pid) =
+                cancellation_test_state_with_config(sigalrm_pipe_status_config());
+            install_test_registration(&state, tid, Ivar::new());
+            let (named_reader, _named_writer) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
+            let (other_reader, _other_writer) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
+            let (channel, _peer) = UnixStream::pair().unwrap();
+            let (named, other) = (named_reader.as_raw_fd(), other_reader.as_raw_fd());
+            let (tool, mut guest) = sigalrm_pipe_status_guest(
+                &state,
+                &config,
+                tid,
+                pid,
+                &[named, other],
+                channel.as_raw_fd(),
+            );
+            let mut control = [0_u64; 3];
+            let cmsg = control.as_mut_ptr().cast::<libc::cmsghdr>();
+            // SAFETY: the control buffer holds one SCM_RIGHTS header and its fd.
+            unsafe {
+                (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as usize;
+                (*cmsg).cmsg_level = libc::SOL_SOCKET;
+                (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+                std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<i32>(), named);
+            }
+            // SAFETY: a plain C struct, all zero.
+            let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+            message.msg_control = if case == "unread" {
+                // An address no mapping covers: the read fails.
+                std::ptr::without_provenance_mut(8)
+            } else {
+                control.as_mut_ptr().cast()
+            };
+            message.msg_controllen = std::mem::size_of_val(&control);
+            let headers = [(&raw const message) as usize];
+            tool.untrack_sent_pipe_status(&mut guest, &headers, case == "outside the turn")
+                .await;
+            guest.thread.sigalrm_handled = true;
+            assert_eq!(
+                tool.sigalrm_phase1_gate(&mut guest, read(named)).await,
+                Some(nix::errno::Errno::EOPNOTSUPP),
+                "{case}: the named pipe's status is no longer followed"
+            );
+            assert_eq!(
+                tool.sigalrm_phase1_gate(&mut guest, read(other)).await,
+                (case != "control").then_some(nix::errno::Errno::EOPNOTSUPP),
+                "{case}: the unnamed pipe"
+            );
+        }
+    }
+
+    /// B1 of coord7's review of 4d17d5ab, through the real receive path: a
+    /// pipe read end received over SCM_RIGHTS on a guest-held channel, by a
+    /// process that already holds the same pipe (as after a fork), is
+    /// recorded as a description of the receiver's own
+    /// (`record_received_descriptors`) and marked guest-held
+    /// (`classify_received_descriptors`); the receipt then untracks it
+    /// (`untrack_received_pipe_status`), and the gate refuses its read by
+    /// name. Linux's receiver holds the sender's description, whose status
+    /// another holder may change. The receiver's own copy of the pipe, not
+    /// received, stays admitted (the control). Mutation "no receipt
+    /// untracking": the received end is admitted.
+    #[tokio::test]
+    async fn a_pipe_end_received_over_a_guest_held_channel_is_refused() {
+        use std::os::unix::net::UnixStream;
+
+        use nix::fcntl::OFlag;
+
+        use crate::syscalls::scm_rights::Channel;
+        use crate::syscalls::scm_rights::Delivered;
+        use crate::syscalls::scm_rights::DeliveredMessage;
+        use crate::syscalls::scm_rights::ReceivedFrom;
+
+        let (config, state, tid, pid) =
+            cancellation_test_state_with_config(sigalrm_pipe_status_config());
+        install_test_registration(&state, tid, Ivar::new());
+        let (own_reader, _writer) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
+        let (channel, _peer) = UnixStream::pair().unwrap();
+        let own = own_reader.as_raw_fd();
+        let channel_fd = channel.as_raw_fd();
+        let (tool, mut guest) =
+            sigalrm_pipe_status_guest(&state, &config, tid, pid, &[own], channel_fd);
+        // The kernel's installation of the received end: the same pipe.
+        // SAFETY: `own` is an open descriptor this test owns.
+        let received = unsafe { libc::dup(own) };
+        assert!(received >= 0);
+        let delivered = Delivered {
+            fds: vec![received],
+            messages: vec![DeliveredMessage {
+                count: 1,
+                truncated: false,
+                bytes: Some(1),
+            }],
+            refused: None,
+            may_have_installed: true,
+        };
+        let recorded = tool
+            .record_received_descriptors(
+                &mut guest,
+                &delivered,
+                Channel::ScmRights,
+                true,
+                false,
+                ReceivedFrom {
+                    socket: channel_fd,
+                    peek: false,
+                    messages: 1,
+                    call: reverie::syscalls::Sysno::recvmsg,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(recorded, vec![received], "recorded in the receiver's turn");
+        tool.classify_received_descriptors(&mut guest, channel_fd, &recorded)
+            .await;
+        let facts = |guest: &RetirementGuest<'_>, fd: i32| {
+            guest
+                .thread
+                .with_detfd(fd, |detfd| (detfd.open_file_id(), detfd.is_guest_held()))
+                .unwrap()
+        };
+        let (own_id, _) = facts(&guest, own);
+        let (received_id, received_guest_held) = facts(&guest, received);
+        assert_ne!(received_id, own_id, "a description of the receiver's own");
+        assert!(received_guest_held, "marked: the receiver holds the pipe");
+        Detcore::untrack_received_pipe_status(&mut guest, &delivered.fds).await;
+
+        guest.thread.sigalrm_handled = true;
+        let read =
+            |fd: i32| reverie::syscalls::Syscall::Read(reverie::syscalls::Read::new().with_fd(fd));
+        assert_eq!(
+            tool.sigalrm_phase1_gate(&mut guest, read(received)).await,
+            Some(nix::errno::Errno::EOPNOTSUPP),
+            "the received end's status is not followed"
+        );
+        assert_eq!(
+            tool.sigalrm_phase1_gate(&mut guest, read(own)).await,
+            None,
+            "the receiver's own end, not received, is admitted"
+        );
+        // SAFETY: `received` is the descriptor dup made above.
+        unsafe { libc::close(received) };
     }
 
     /// While any process handles SIGALRM, a file lease is refused before the

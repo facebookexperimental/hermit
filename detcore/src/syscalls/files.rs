@@ -16258,6 +16258,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 },
             )
             .await?;
+        // A pipe end a binder transaction delivers is the sender's
+        // description, which this process's Detcore records as its own
+        // (`Detcore::untrack_received_pipe_status`).
+        Self::untrack_received_pipe_status(guest, &delivered.fds).await;
         self.refresh_received_locks(guest, &recorded, LockCall::BinderWriteRead)
             .await
     }

@@ -1087,11 +1087,11 @@ mod tests {
         );
     }
 
-    /// A runtime built at revision 54 (the slice-2 branch at 29b3e6a8, whose
-    /// `SigalrmControl` already had the `GuestHeldMarksRevoked`,
-    /// `PublishPipeStatus` and `PipeStatusDiffers` controls) or at 55 (main
-    /// without slice 2, which lacks them) is refused by name before it
-    /// decodes anything: its configuration fingerprint is this build's, so
+    /// A runtime built at any earlier revision, among them 54 (the slice-2
+    /// branch at 29b3e6a8, whose `SigalrmControl` already had the
+    /// `GuestHeldMarksRevoked`, `PublishPipeStatus` and `PipeStatusDiffers`
+    /// controls) and 55 (main without slice 2, which lacks them), is refused
+    /// by name before it decodes anything: its configuration fingerprint is this build's, so
     /// only the revision tells the pair apart (finding 1 of rev5338-cx's
     /// review of 29b3e6a8, finding 2 of coord7's). The in-guest runtime makes
     /// this comparison before it decodes its coordinator's configuration
@@ -1099,7 +1099,7 @@ mod tests {
     #[test]
     fn a_runtime_from_before_the_slice_2_sigalrm_controls_is_refused() {
         let model = detcore_model::config::config_wire_fingerprint();
-        for revision in [54, 55] {
+        for revision in 1..crate::tool_global::GLOBAL_RPC_REVISION {
             let before = fingerprint_with_revision(&model, revision);
             let mismatch = config_fingerprint_mismatch(std::ffi::OsStr::new(&before))
                 .unwrap_or_else(|| panic!("a revision-{revision} runtime is refused"));
