@@ -9,12 +9,12 @@
   "counts": {
     "all": {
       "cells": 1525,
-      "applicable": 1254,
-      "selectable": 1014,
+      "applicable": 1255,
+      "selectable": 1015,
       "population": 1515,
-      "population_candidate_selected": 1014,
+      "population_candidate_selected": 1015,
       "population_candidate_not_selected": 240,
-      "population_candidate_disabled": 261
+      "population_candidate_disabled": 260
     },
     "by_backend": {
       "dbt": {
@@ -37,12 +37,12 @@
       },
       "kvm": {
         "cells": 305,
-        "applicable": 295,
-        "selectable": 295,
+        "applicable": 296,
+        "selectable": 296,
         "population": 303,
-        "population_candidate_selected": 295,
+        "population_candidate_selected": 296,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 8
+        "population_candidate_disabled": 7
       },
       "liteinst": {
         "cells": 305,
@@ -967,7 +967,7 @@
     {"test_id":"c-programs/process-vm-writev-refusal-probe","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"c-programs/procfs-identity-agreement","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/procfs-identity-agreement","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"c-programs/procfs-identity-agreement","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: KVM gap (https://github.com/rrnewton/hermit/issues/5038): KVM's /proc/self/maps holds only the [stack] line, so no line covers the guest's memfd mapping and the guest exits 1 (`FAIL: no maps line covers the mapping`) in 3 of 3 KVM verify runs at Hermit 26eb116d; ptrace lists every mapping and passes"},
+    {"test_id":"c-programs/procfs-identity-agreement","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/procfs-identity-agreement","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/procfs-identity-agreement","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"c-programs/procfs-positioned-probe","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
