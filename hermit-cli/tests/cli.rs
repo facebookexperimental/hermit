@@ -64279,16 +64279,19 @@ fn procfs_system_directory_links_guest() -> String {
 }
 
 /// `output` of the guest's native `--native-settle` run without its
-/// ` settle=N` fields, after checking that no row below the link budget is
-/// ELOOP on all 8 attempts ("native unsettled"): Linux can overcount the
-/// links of a lookup whose RCU walk a host mount restarts (fs/namei.c v6.12,
-/// `set_nameidata` once, then `path_lookupat` again), and the native
-/// reference takes its settled answer, never a constant.
+/// ` settle=N` fields, after checking that no row stayed ELOOP through all
+/// of the guest's settle attempts (` settle=exhausted`, "native unsettled"):
+/// Linux can overcount the links of a lookup whose RCU walk a host mount
+/// restarts (fs/namei.c v6.12, `set_nameidata` once, then `path_lookupat`
+/// again), and the native reference takes its settled answer, never a
+/// constant. The guest settles only the rows below the link budget: a "41
+/// links" row is asked once, and Linux answers it ELOOP however its walk
+/// goes.
 fn settled_native_reference(output: &str) -> String {
     let mut settled = String::new();
     for line in output.lines() {
         assert!(
-            line.contains("41 links") || !line.contains("ELOOP settle=8"),
+            !line.contains(" settle=exhausted"),
             "native unsettled: {line}"
         );
         let mut rest = line;

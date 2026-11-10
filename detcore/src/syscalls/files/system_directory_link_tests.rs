@@ -163,15 +163,21 @@ fn an_overlong_system_directory_spelling_is_left_to_the_kernel() {
     }
 }
 
+/// How many times [`native_readlink`] asks an ELOOP. The attempts run back
+/// to back, so their number is the window a burst of host mounts must
+/// outlast: 8 did not on a busy host, where up to 34 lookups in a row were
+/// ELOOP (56 under induced mount churn); 10000 take under 0.1 s.
+const SETTLE_ATTEMPTS: usize = 10000;
+
 /// Linux's `readlink` of `path`, as the host answers it, settled: the
-/// link's length or the errno, and how many attempts it took. An ELOOP is
-/// asked again, up to 8 times, for this native reference only (Detcore is
-/// asked once): Linux keeps a lookup's link count across the restart of its
-/// RCU walk (`set_nameidata` once, then `path_lookupat` again; fs/namei.c
-/// v6.12), which a mount anywhere on the host forces, so a native lookup
-/// near `MAXSYMLINKS` can fail with ELOOP below the budget, though it never
-/// succeeds past it.
-fn native_readlink(path: &[u8]) -> (Result<i64, Errno>, usize) {
+/// link's length or the errno, and how many attempts it took. With `settle`,
+/// an ELOOP is asked again, up to [`SETTLE_ATTEMPTS`] times, for this
+/// native reference only (Detcore is asked once): Linux keeps a lookup's
+/// link count across the restart of its RCU walk (`set_nameidata` once,
+/// then `path_lookupat` again; fs/namei.c v6.12), which a mount anywhere on
+/// the host forces, so a native lookup near `MAXSYMLINKS` can fail with
+/// ELOOP below the budget, though it never succeeds past it.
+fn native_readlink(path: &[u8], settle: bool) -> (Result<i64, Errno>, usize) {
     let path = CString::new(path).unwrap();
     let mut buffer = [0u8; 256];
     let mut attempts = 0;
@@ -185,17 +191,19 @@ fn native_readlink(path: &[u8]) -> (Result<i64, Errno>, usize) {
         } else {
             Ok(length as i64)
         };
-        if answer != Err(Errno::ELOOP) || attempts == 8 {
+        if answer != Err(Errno::ELOOP) || !settle || attempts == SETTLE_ATTEMPTS {
             return (answer, attempts);
         }
     }
 }
 
 /// [`native_readlink`] of `path`, which must be `expected`: a lookup
-/// below the budget that is still ELOOP after 8 attempts fails the test as
-/// "native unsettled", never taken for the answer.
+/// below the budget that is still ELOOP after [`SETTLE_ATTEMPTS`] attempts
+/// fails the test as "native unsettled", never taken for the answer. A
+/// lookup whose `expected` answer is ELOOP is asked once: a restarted walk
+/// can add an ELOOP, never take one away.
 fn assert_native(path: &[u8], expected: Result<i64, Errno>, label: &str) {
-    let (answer, attempts) = native_readlink(path);
+    let (answer, attempts) = native_readlink(path, expected != Err(Errno::ELOOP));
     assert!(
         !(answer == Err(Errno::ELOOP) && expected != answer),
         "native unsettled: {label}, ELOOP on all {attempts} attempts"

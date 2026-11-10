@@ -36,29 +36,39 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-/* --native-settle, for the native reference run only: an ELOOP is asked
- * again, up to 8 times, and each answer is followed by " settle=N", the
- * attempts it took. Linux keeps a lookup's link count across the restart
- * of its RCU walk (set_nameidata once, then path_lookupat again; fs/namei.c
- * v6.12), which a mount anywhere on the host forces, so a native lookup near
- * MAXSYMLINKS that crosses procfs's self can fail with ELOOP below the
- * budget; it never succeeds past it. A run under Hermit asks each call
- * once. */
+/* --native-settle, for the native reference run only: an ELOOP below the
+ * link budget is asked again, up to SETTLE_ATTEMPTS times, and each answer
+ * is followed by " settle=N", the attempts it took, or " settle=exhausted"
+ * when every attempt was ELOOP. Linux keeps a lookup's link count across the
+ * restart of its RCU walk (set_nameidata once, then path_lookupat again;
+ * fs/namei.c v6.12), which a mount anywhere on the host forces on a walk
+ * that crosses a mount, as every chain here does at /proc. So a native
+ * lookup near MAXSYMLINKS can fail with ELOOP below the budget; it never
+ * succeeds past it. The attempts run back to back, so their number is the
+ * window a burst of mounts must outlast: 8 did not on a busy host, where up
+ * to 34 lookups in a row were ELOOP (56 under induced mount churn); 10000
+ * take under 0.1 s. A row past the budget ("41 links") is asked once: ELOOP
+ * is its answer. A run under Hermit asks each call once. */
+#define SETTLE_ATTEMPTS 10000
 static bool native_settle;
 
+/* `attempts` 0: every settle attempt was ELOOP. */
 static void show(const char *what, ssize_t length, const char *buffer, int attempts) {
     if (length < 0) {
         printf(" %s=%s", what, strerrorname_np(errno));
     } else {
         printf(" %s=%zd:%.*s", what, length, (int)length, buffer);
     }
-    if (native_settle) {
+    if (native_settle && attempts == 0) {
+        printf(" settle=exhausted");
+    } else if (native_settle) {
         printf(" settle=%d", attempts);
     }
 }
 
 static void both(const char *label, const char *path) {
     char buffer[256];
+    bool settle = native_settle && strstr(label, "41 links") == NULL;
     printf("%s:", label);
     for (int at = 0; at <= 1; at++) {
         ssize_t length = -1;
@@ -67,8 +77,9 @@ static void both(const char *label, const char *path) {
             attempts++;
             length = at ? readlinkat(AT_FDCWD, path, buffer, sizeof(buffer))
                         : readlink(path, buffer, sizeof(buffer));
-        } while (native_settle && length < 0 && errno == ELOOP && attempts < 8);
-        show(at ? "readlinkat" : "readlink", length, buffer, attempts);
+        } while (settle && length < 0 && errno == ELOOP && attempts < SETTLE_ATTEMPTS);
+        show(at ? "readlinkat" : "readlink", length, buffer,
+             settle && length < 0 && errno == ELOOP ? 0 : attempts);
     }
     printf("\n");
 }
