@@ -1,13 +1,13 @@
 [package]
 name = "hermit-run-ptrace"
 description = "Hermit's plain ptrace run: the root of Detcore's ptrace instantiation, compiled apart from the hermit library so it builds in parallel."
-version = "0.5.5"
+version = "0.5.6"
 edition = "2024"
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
 publish = false
 
 [dependencies]
-detcore = { package = "hermit-detcore", version = "0.5.5", path = "../detcore" }
-reverie = { package = "reverie-core", version = "0.5.5", git = "https://github.com/rrnewton/reverie.git", rev = "131093f62a50f50c3428fc58c1897e770d864049" }
-reverie-ptrace = { version = "0.5.5", git = "https://github.com/rrnewton/reverie.git", rev = "131093f62a50f50c3428fc58c1897e770d864049" }
+detcore = { package = "hermit-detcore", version = "0.5.6", path = "../detcore" }
+reverie = { package = "reverie-core", version = "0.5.6", git = "https://github.com/rrnewton/reverie.git", rev = "f2129d99a44d809a5bb56df130cade723d7e6ebd" }
+reverie-ptrace = { version = "0.5.6", git = "https://github.com/rrnewton/reverie.git", rev = "f2129d99a44d809a5bb56df130cade723d7e6ebd" }

@@ -37,7 +37,7 @@ rust_library(
         "cargo_toml_config": {
             "package": {
                 "name": "hermit-manifest-plan",
-                "version": "0.5.5",
+                "version": "0.5.6",
                 "publish": False,
             },
             "lib": {

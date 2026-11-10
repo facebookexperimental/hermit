@@ -487,7 +487,7 @@ dependencies = [
 
 [[package]]
 name = "detcore-liteinst"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "bincode",
  "detcore-model",
@@ -504,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "detcore-model"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "anyhow",
  "bincode",
@@ -526,7 +526,7 @@ dependencies = [
 
 [[package]]
 name = "detcore-testutils"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "hermit-detcore",
  "hermit-test-workdir",
@@ -875,11 +875,11 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hermetic_infra_hermit_flaky-tests"
-version = "0.5.5"
+version = "0.5.6"
 
 [[package]]
 name = "hermetic_infra_hermit_tests"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "close-err",
  "hermit-detcore",
@@ -891,14 +891,14 @@ dependencies = [
 
 [[package]]
 name = "hermit-cdylib"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "hermit-run",
 ]
 
 [[package]]
 name = "hermit-detcore"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -934,7 +934,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-detcore-tests"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "chrono",
  "detcore-model",
@@ -954,7 +954,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-inguest-engine"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "hermit-detcore",
  "libc",
@@ -969,7 +969,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-install"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "reverie-liteinst-artifact",
  "serde_json",
@@ -978,7 +978,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-lit-guests"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "close-err",
  "libc",
@@ -989,7 +989,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-manifest-plan"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "blake3",
  "chrono",
@@ -1006,7 +1006,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-record"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "bincode",
  "hermit-detcore",
@@ -1021,7 +1021,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-record-format"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "bincode",
  "goblin",
@@ -1036,7 +1036,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-replay"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "anyhow",
  "hermit-detcore",
@@ -1053,11 +1053,11 @@ dependencies = [
 
 [[package]]
 name = "hermit-resources"
-version = "0.5.5"
+version = "0.5.6"
 
 [[package]]
 name = "hermit-run"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "addr2line",
  "anyhow",
@@ -1117,7 +1117,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-run-kvm"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "hermit-detcore",
  "reverie-kvm",
@@ -1125,7 +1125,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-run-ptrace"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "hermit-detcore",
  "reverie-core",
@@ -1134,14 +1134,14 @@ dependencies = [
 
 [[package]]
 name = "hermit-test-workdir"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "hermit-verify"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "anyhow",
  "clap",
@@ -1760,8 +1760,8 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "reverie-core"
-version = "0.5.5"
-source = "git+https://github.com/rrnewton/reverie.git?rev=131093f62a50f50c3428fc58c1897e770d864049#131093f62a50f50c3428fc58c1897e770d864049"
+version = "0.5.6"
+source = "git+https://github.com/rrnewton/reverie.git?rev=f2129d99a44d809a5bb56df130cade723d7e6ebd#f2129d99a44d809a5bb56df130cade723d7e6ebd"
 dependencies = [
  "addr2line",
  "anyhow",
@@ -1789,8 +1789,8 @@ dependencies = [
 
 [[package]]
 name = "reverie-inguest"
-version = "0.5.5"
-source = "git+https://github.com/rrnewton/reverie.git?rev=131093f62a50f50c3428fc58c1897e770d864049#131093f62a50f50c3428fc58c1897e770d864049"
+version = "0.5.6"
+source = "git+https://github.com/rrnewton/reverie.git?rev=f2129d99a44d809a5bb56df130cade723d7e6ebd#f2129d99a44d809a5bb56df130cade723d7e6ebd"
 dependencies = [
  "bincode",
  "libc",
@@ -1811,8 +1811,8 @@ dependencies = [
 
 [[package]]
 name = "reverie-kvm"
-version = "0.5.5"
-source = "git+https://github.com/rrnewton/reverie.git?rev=131093f62a50f50c3428fc58c1897e770d864049#131093f62a50f50c3428fc58c1897e770d864049"
+version = "0.5.6"
+source = "git+https://github.com/rrnewton/reverie.git?rev=f2129d99a44d809a5bb56df130cade723d7e6ebd#f2129d99a44d809a5bb56df130cade723d7e6ebd"
 dependencies = [
  "futures 0.3.33",
  "goblin",
@@ -1829,8 +1829,8 @@ dependencies = [
 
 [[package]]
 name = "reverie-kvm-core"
-version = "0.5.5"
-source = "git+https://github.com/rrnewton/reverie.git?rev=131093f62a50f50c3428fc58c1897e770d864049#131093f62a50f50c3428fc58c1897e770d864049"
+version = "0.5.6"
+source = "git+https://github.com/rrnewton/reverie.git?rev=f2129d99a44d809a5bb56df130cade723d7e6ebd#f2129d99a44d809a5bb56df130cade723d7e6ebd"
 dependencies = [
  "futures 0.3.33",
  "goblin",
@@ -1843,8 +1843,8 @@ dependencies = [
 
 [[package]]
 name = "reverie-linuxemu"
-version = "0.5.5"
-source = "git+https://github.com/rrnewton/reverie.git?rev=131093f62a50f50c3428fc58c1897e770d864049#131093f62a50f50c3428fc58c1897e770d864049"
+version = "0.5.6"
+source = "git+https://github.com/rrnewton/reverie.git?rev=f2129d99a44d809a5bb56df130cade723d7e6ebd#f2129d99a44d809a5bb56df130cade723d7e6ebd"
 dependencies = [
  "cc",
  "futures 0.3.33",
@@ -1859,8 +1859,8 @@ dependencies = [
 
 [[package]]
 name = "reverie-liteinst"
-version = "0.5.5"
-source = "git+https://github.com/rrnewton/reverie.git?rev=131093f62a50f50c3428fc58c1897e770d864049#131093f62a50f50c3428fc58c1897e770d864049"
+version = "0.5.6"
+source = "git+https://github.com/rrnewton/reverie.git?rev=f2129d99a44d809a5bb56df130cade723d7e6ebd#f2129d99a44d809a5bb56df130cade723d7e6ebd"
 dependencies = [
  "bincode",
  "iced-x86",
@@ -1879,8 +1879,8 @@ dependencies = [
 
 [[package]]
 name = "reverie-liteinst-artifact"
-version = "0.5.5"
-source = "git+https://github.com/rrnewton/reverie.git?rev=131093f62a50f50c3428fc58c1897e770d864049#131093f62a50f50c3428fc58c1897e770d864049"
+version = "0.5.6"
+source = "git+https://github.com/rrnewton/reverie.git?rev=f2129d99a44d809a5bb56df130cade723d7e6ebd#f2129d99a44d809a5bb56df130cade723d7e6ebd"
 dependencies = [
  "goblin",
  "libc",
@@ -1891,21 +1891,21 @@ dependencies = [
 
 [[package]]
 name = "reverie-loader"
-version = "0.5.5"
-source = "git+https://github.com/rrnewton/reverie.git?rev=131093f62a50f50c3428fc58c1897e770d864049#131093f62a50f50c3428fc58c1897e770d864049"
+version = "0.5.6"
+source = "git+https://github.com/rrnewton/reverie.git?rev=f2129d99a44d809a5bb56df130cade723d7e6ebd#f2129d99a44d809a5bb56df130cade723d7e6ebd"
 
 [[package]]
 name = "reverie-memory"
-version = "0.5.5"
-source = "git+https://github.com/rrnewton/reverie.git?rev=131093f62a50f50c3428fc58c1897e770d864049#131093f62a50f50c3428fc58c1897e770d864049"
+version = "0.5.6"
+source = "git+https://github.com/rrnewton/reverie.git?rev=f2129d99a44d809a5bb56df130cade723d7e6ebd#f2129d99a44d809a5bb56df130cade723d7e6ebd"
 dependencies = [
  "syscalls",
 ]
 
 [[package]]
 name = "reverie-process"
-version = "0.5.5"
-source = "git+https://github.com/rrnewton/reverie.git?rev=131093f62a50f50c3428fc58c1897e770d864049#131093f62a50f50c3428fc58c1897e770d864049"
+version = "0.5.6"
+source = "git+https://github.com/rrnewton/reverie.git?rev=f2129d99a44d809a5bb56df130cade723d7e6ebd#f2129d99a44d809a5bb56df130cade723d7e6ebd"
 dependencies = [
  "bincode",
  "bitflags 2.13.1",
@@ -1921,8 +1921,8 @@ dependencies = [
 
 [[package]]
 name = "reverie-ptrace"
-version = "0.5.5"
-source = "git+https://github.com/rrnewton/reverie.git?rev=131093f62a50f50c3428fc58c1897e770d864049#131093f62a50f50c3428fc58c1897e770d864049"
+version = "0.5.6"
+source = "git+https://github.com/rrnewton/reverie.git?rev=f2129d99a44d809a5bb56df130cade723d7e6ebd#f2129d99a44d809a5bb56df130cade723d7e6ebd"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1953,8 +1953,8 @@ dependencies = [
 
 [[package]]
 name = "reverie-rpc-transport"
-version = "0.5.5"
-source = "git+https://github.com/rrnewton/reverie.git?rev=131093f62a50f50c3428fc58c1897e770d864049#131093f62a50f50c3428fc58c1897e770d864049"
+version = "0.5.6"
+source = "git+https://github.com/rrnewton/reverie.git?rev=f2129d99a44d809a5bb56df130cade723d7e6ebd#f2129d99a44d809a5bb56df130cade723d7e6ebd"
 dependencies = [
  "async-trait",
  "bincode",
@@ -1968,8 +1968,8 @@ dependencies = [
 
 [[package]]
 name = "reverie-syscalls"
-version = "0.5.5"
-source = "git+https://github.com/rrnewton/reverie.git?rev=131093f62a50f50c3428fc58c1897e770d864049#131093f62a50f50c3428fc58c1897e770d864049"
+version = "0.5.6"
+source = "git+https://github.com/rrnewton/reverie.git?rev=f2129d99a44d809a5bb56df130cade723d7e6ebd#f2129d99a44d809a5bb56df130cade723d7e6ebd"
 dependencies = [
  "bitflags 2.13.1",
  "derive_more",
@@ -2033,8 +2033,8 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
 name = "safeptrace"
-version = "0.5.5"
-source = "git+https://github.com/rrnewton/reverie.git?rev=131093f62a50f50c3428fc58c1897e770d864049#131093f62a50f50c3428fc58c1897e770d864049"
+version = "0.5.6"
+source = "git+https://github.com/rrnewton/reverie.git?rev=f2129d99a44d809a5bb56df130cade723d7e6ebd#f2129d99a44d809a5bb56df130cade723d7e6ebd"
 dependencies = [
  "bitflags 2.13.1",
  "futures 0.3.33",
@@ -2348,7 +2348,7 @@ dependencies = [
 
 [[package]]
 name = "test-allocator"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "libc",
 ]

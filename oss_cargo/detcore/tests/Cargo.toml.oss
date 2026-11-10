@@ -1,7 +1,7 @@
 [package]
 name = "hermit-detcore-tests"
 description = "Detcore's integration tests, which drive Detcore under a real tracer; a separate package so hermit-detcore's own unit-test binary does not wait for, and link a second copy of, the hermit-detcore library."
-version = "0.5.5"
+version = "0.5.6"
 edition = "2024"
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
@@ -28,16 +28,16 @@ path = "time/mod.rs"
 # scripts/check-detcore-backend-abstraction.sh expects of detcore's tests.
 [dev-dependencies]
 chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-features = false }
-detcore = { package = "hermit-detcore", version = "0.5.5", path = ".." }
-detcore-model = { version = "0.5.5", path = "../../detcore-model" }
-detcore-testutils = { version = "0.5.5", path = "testutils" }
+detcore = { package = "hermit-detcore", version = "0.5.6", path = ".." }
+detcore-model = { version = "0.5.6", path = "../../detcore-model" }
+detcore-testutils = { version = "0.5.6", path = "testutils" }
 libc = "0.2.186"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
 pretty_assertions = { version = "1.4.1", features = ["alloc"], default-features = false }
 raw-cpuid = "10.7.0"
-reverie = { package = "reverie-core", version = "0.5.5", git = "https://github.com/rrnewton/reverie.git", rev = "131093f62a50f50c3428fc58c1897e770d864049" }
-reverie-ptrace = { version = "0.5.5", git = "https://github.com/rrnewton/reverie.git", rev = "131093f62a50f50c3428fc58c1897e770d864049" }
+reverie = { package = "reverie-core", version = "0.5.6", git = "https://github.com/rrnewton/reverie.git", rev = "f2129d99a44d809a5bb56df130cade723d7e6ebd" }
+reverie-ptrace = { version = "0.5.6", git = "https://github.com/rrnewton/reverie.git", rev = "f2129d99a44d809a5bb56df130cade723d7e6ebd" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 tempfile = "3.27.0"
-test-allocator = { version = "0.5.5", path = "../../common/test-allocator" }
+test-allocator = { version = "0.5.6", path = "../../common/test-allocator" }
 tokio = { version = "1.54.1", features = ["full", "test-util", "tracing"] }
