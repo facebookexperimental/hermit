@@ -32,7 +32,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         // The hermit_unit selection plus native-exec, prepared in its own
         // cohort (nextest_binaries::NATIVE_EXEC_COHORT) so the feature never
         // enters the default workspace union or the production binary. The
-        // node's filters own exactly the cases this feature adds.
+        // node's filters own exactly the cases this feature adds, plus the
+        // run-config sample-table cases that check its feature-gated options.
         "test.hermit_native_exec" => Some(&[
             "-p",
             "hermit-run",
