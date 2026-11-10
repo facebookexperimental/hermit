@@ -917,6 +917,19 @@ class ActivePinsFromObjects(unittest.TestCase):
             rows += [[name, n, line] for n, line in enumerate(text.splitlines(), 1) if 'github.com/rrnewton/reverie' in line]
         return rows
 
+    def test_replace_refs_are_ignored(self):
+        # coord7 finding 3: a replace ref must not substitute the content of a
+        # tracked manifest or lock. Read the original objects only.
+        with tempfile.TemporaryDirectory() as directory:
+            tree = self.tree(directory)
+            committed = self.guard.full_pins(tree.root, tree.rpin, tree.h_head)
+            original = fixture_git(tree.root, 'rev-parse', tree.h_head + ':Cargo.lock')
+            (Path(directory) / 'replacement.lock').write_text(lock_text('f' * 40))
+            replacement = fixture_git(tree.root, 'hash-object', '-w', str(Path(directory) / 'replacement.lock'))
+            fixture_git(tree.root, 'replace', original, replacement)
+            self.assertEqual(fixture_git_bytes(tree.root, 'cat-file', 'blob', original).decode(), lock_text('f' * 40))
+            self.assertEqual(self.guard.full_pins(tree.root, tree.rpin, tree.h_head), committed)
+
     def test_dirty_working_tree_lock_is_irrelevant_to_pins_and_refused_by_custody(self):
         with tempfile.TemporaryDirectory() as directory:
             tree = self.tree(directory)

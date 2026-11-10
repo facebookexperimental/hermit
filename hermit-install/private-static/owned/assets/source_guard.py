@@ -61,13 +61,18 @@ def full_pins(h,rpin,head):
         return (name.endswith(('Cargo.toml','Cargo.lock')) or Path(name).name=='BUCK' or
                 'budget' in name.lower() and name.endswith(('.toml','.json','.sh')))
     names=[]
-    for raw in git(h,'ls-tree','-rz','--full-tree',head).split(b'\0'):
+    # Original objects only: a replace ref must not substitute what a tracked
+    # manifest or lock says (tracked_source hashed the tree; this reads objects).
+    exact=dict(os.environ,GIT_OPTIONAL_LOCKS='0',GIT_NO_LAZY_FETCH='1',GIT_NO_REPLACE_OBJECTS='1')
+    listing=subprocess.check_output(['git','--no-replace-objects','-c','diff.autoRefreshIndex=false','-C',str(h),
+                                     'ls-tree','-rz','--full-tree',head],env=exact)
+    for raw in listing.split(b'\0'):
         if not raw: continue
         header,name=raw.split(b'\t',1);mode,kind,oid=header.split();name=os.fsdecode(name)
         if kind!=b'blob' or mode==b'120000' or not active(name): continue
         names.append((name,oid.decode()))
-    stream=subprocess.run(['git','-C',str(h),'cat-file','--batch'],input=''.join(oid+'\n' for _,oid in names).encode(),
-                          stdout=subprocess.PIPE,check=True,env=dict(os.environ,GIT_OPTIONAL_LOCKS='0',GIT_NO_LAZY_FETCH='1')).stdout
+    stream=subprocess.run(['git','--no-replace-objects','-C',str(h),'cat-file','--batch'],input=''.join(oid+'\n' for _,oid in names).encode(),
+                          stdout=subprocess.PIPE,check=True,env=exact).stdout
     at=0
     for name,oid in names:
         end=stream.index(b'\n',at);fields=stream[at:end].split();at=end+1

@@ -619,7 +619,7 @@ def bind_prepared(c, x):
     for name, digest in {
         'elf_metadata.py': 'c6fe4a6db783ca4af300e5cfbf595e545b17e746cd8594eccbf2ecb7c81215d5',
         'archive_metadata.py': 'd313a47a769e91e6d297c5452edf66b9129370f381c25e228385efdb01d60972',
-        'source_guard.py': '331bda5cef71a7d0885e308ea1a3b1b9e1ac6aaec556e3b48f483d518622a3a7',
+        'source_guard.py': 'f7a8ec7845a0225b003f74ef47b4bcb7d05cb7efa75f934fafdad6524894fdf4',
         'native_guard.py': 'd05e3d63b7c914d2e2794d97dbda4a7e94f5c904aa7cdf8515c37c1c0d4bdda5',
     }.items():
         need(sha(ASSETS / name) == digest, 'existing diagnostic helper changed')
