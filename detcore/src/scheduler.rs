@@ -19663,7 +19663,8 @@ impl Scheduler {
             // (`reserved_probe_to_resume`). Its grant spends the alarm
             // priority of https://github.com/rrnewton/hermit/issues/4929;
             // the probe itself, like a SIGCHLD taker, is exempt from that
-            // bound (one probe grant per due entry).
+            // bound (one probe grant per due entry, under the runtime's
+            // contract to deliver the entry at the read's completion).
             let reserved_probe = if decider.is_none() {
                 self.reserved_probe_to_resume()
             } else {
