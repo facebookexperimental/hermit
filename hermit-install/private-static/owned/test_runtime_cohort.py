@@ -971,6 +971,30 @@ class ActivePinsFromObjects(unittest.TestCase):
             self.assertEqual(fixture_git_bytes(tree.root, 'cat-file', 'blob', original).decode(), lock_text('f' * 40))
             self.assertEqual(self.guard.full_pins(tree.root, tree.rpin, tree.h_head), committed)
 
+    def test_budget_expected_pin_must_be_the_pin(self):
+        # An active expected_pin= line in a tracked *budget* .sh/.toml/.json
+        # file restates the pin. Comments and non-budget files carry no authority.
+        budget = 'ci/run-with-reverie-dbt-budget.sh'
+        with tempfile.TemporaryDirectory() as directory:
+            tree = self.tree(directory)
+            other = 'f' * 40
+
+            def commit(name, text):
+                tree.write(tree.root / name, text.encode())
+                tree.h_head = tree.commit(tree.root)
+
+            commit(budget, '# reverie DBT budget\n# expected_pin=%s (carried)\nexpected_pin=%s\n' % (other, tree.rpin))
+            rows = self.guard.full_pins(tree.root, tree.rpin, tree.h_head)
+            self.assertIn([budget, 3, 'expected_pin=' + tree.rpin], rows)
+            commit('ci/run-other-reverie-job.sh', '# reverie\nexpected_pin=%s\n' % other)
+            self.guard.full_pins(tree.root, tree.rpin, tree.h_head)
+            commit(budget, '# reverie DBT budget\nexpected_pin=%s\n' % other)
+            with self.assertRaisesRegex(RuntimeError, 'budget pin differs: ci/run-with-reverie-dbt-budget.sh:2'):
+                self.guard.full_pins(tree.root, tree.rpin, tree.h_head)
+            commit(budget, '# reverie DBT budget\nexpected_pin=%s %s\n' % (tree.rpin, other))
+            with self.assertRaisesRegex(RuntimeError, 'budget pin differs: ci/run-with-reverie-dbt-budget.sh:2'):
+                self.guard.full_pins(tree.root, tree.rpin, tree.h_head)
+
     def test_dirty_working_tree_lock_is_irrelevant_to_pins_and_refused_by_custody(self):
         with tempfile.TemporaryDirectory() as directory:
             tree = self.tree(directory)
