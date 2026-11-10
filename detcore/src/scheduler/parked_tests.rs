@@ -7020,7 +7020,8 @@ fn pipe_read_request(tid: DetTid, attempt: u32) -> Resources {
     r.poll_attempt = attempt;
     r.set_signal_interrupt_errno(reverie::syscalls::Errno::ERESTARTSYS);
     r.read_fd = Some((detcore_model::fd::FilesId::initial(tid), 4));
-    // A plain run's guest pipe end (`single_fd_poll_readiness`).
+    // As a plain run's guest-held pipe end files its retries
+    // (`refresh_guest_poll_state` sets both from the held mark).
     r.polls_guest_state_only = true;
     r.relies_on_guest_held_marks = true;
     r.private_sigchld_decides = true;
@@ -7090,9 +7091,13 @@ fn a_due_sigalrm_reserves_a_filed_pipe_read_and_wakes_after_a_no_progress_probe(
         (0, 1),
         "normalized by the upgrade"
     );
-    // Placed precedence: step 3 resumes the probe first, by alarm
-    // priority (false before any alarm fires).
-    assert_eq!(s.first_alarm_taker(), Some(tid), "the probe is placed");
+    // Placed precedence: step 3 resumes the unrun probe first (None
+    // before any alarm fires).
+    assert_eq!(
+        s.reserved_probe_to_resume(),
+        Some((pid, tid)),
+        "the probe is placed"
+    );
 
     // The probe is selected (popped), grants, and files the next
     // retry: no bytes moved.
@@ -7130,8 +7135,8 @@ fn a_due_sigalrm_reserves_a_deferred_pipe_poller_and_wakes_after_a_no_progress_p
     assert!(sigalrm_reserved_for(&s, tid));
     assert!(!s.sigalrm_loss_recorded(pid));
     assert_eq!(
-        s.first_alarm_taker(),
-        Some(tid),
+        s.reserved_probe_to_resume(),
+        Some((pid, tid)),
         "poller restored and placed for its probe"
     );
 
@@ -7250,11 +7255,12 @@ fn the_completion_check_settles_a_probe_before_the_sweep_reaches_another_process
     s.fire_alarm(first_pid, first, Signal::SIGALRM);
     assert!(sigalrm_reserved_for(&s, first));
 
-    // The first probe runs and files its no-progress successor; the
-    // second process's read polls by the next pass's sweep.
-    assert_eq!(s.run_queue.tentative_pop_tid(first), Some(first));
-    assert_eq!(s.run_queue.commit_tentative_pop(), first);
-    s.clear_nextturn(first).unwrap();
+    // Production order: step 3 resumes the first probe (its grant counts
+    // as an alarm grant, which no longer keeps another process's entry
+    // from being reserved), and the probe files its no-progress
+    // successor; the second process's read polls by the next pass's sweep.
+    assert_eq!(grant_selected(&mut s), first);
+    assert_eq!(s.parked.alarm_priority_served, Some(first_pid));
     file_probe_successor(&mut s, first, 1, false);
     file_pipe_read_attempt(&mut s, second, 1);
     s.runqueue_push_back(second);
@@ -7361,10 +7367,10 @@ fn a_second_process_due_in_the_same_sweep_keeps_the_phase1_loss() {
     file_probe_successor(&mut s, second, 1, false);
     s.step2_sigalrm_ledger();
     assert!(woken_by_sigalrm(&s, second));
-    // The completion check settled before the sweep, so the same sweep
-    // reserves the still-polling other entry (its loss stays recorded:
-    // a loss is reported once and never withdrawn).
-    assert_eq!(s.sigalrm_reserved_poll_target(), Some(first));
+    // The completion check settled before the sweep, but the other
+    // entry's loss is already recorded, so it is not reserved again: the
+    // loss stands and the entry waits for a completion's delivery.
+    assert_eq!(s.sigalrm_reserved_poll_target(), None);
     assert!(s.sigalrm_loss_recorded(first_pid));
 
     // Entries pending before either read polled: the sweep's
@@ -11428,19 +11434,30 @@ fn a_no_progress_probe_settles_at_step2_with_its_thread_requeued() {
     assert_eq!(grant_selected(&mut s), writer);
 }
 
-/// Gate item 1: the probe's alarm-taker placement ends with its settle. The
-/// ordinary loop never derives `alarm_takers` anew, so a stale entry kept the
-/// reader first at every other selection for the rest of the run. After the
-/// settle and the wake, selection is the run queue's own round robin.
+/// Review item 1 (7cdd90dc): the probe's precedence ends with its settle.
+/// A placement that outlived the reservation kept the reader first at every
+/// other selection for the rest of the run. Placement is now the unrun
+/// probe's selection at step 3 (`reserved_probe_to_resume`) and registers no
+/// alarm taker; after the settle and the wake, selection is the run queue's
+/// own round robin.
 #[test]
 fn the_reserved_probes_alarm_priority_ends_with_its_settle() {
     let (mut s, reader, pid, queued) = reserved_reader_behind(&[300, 500]);
-    assert_eq!(s.parked.alarm_takers.get(&pid), Some(&reader));
-    assert_eq!(grant_selected(&mut s), reader, "alarm priority");
+    assert_eq!(s.reserved_probe_to_resume(), Some((pid, reader)));
+    assert!(
+        s.parked.alarm_takers.is_empty(),
+        "no alarm taker registered"
+    );
+    assert_eq!(grant_selected(&mut s), reader, "placed precedence");
+    assert_eq!(
+        s.reserved_probe_to_resume(),
+        None,
+        "granted: no longer unrun"
+    );
     file_probe_successor(&mut s, reader, 2, false);
     s.step2_sigalrm_ledger();
     assert!(woken_by_sigalrm(&s, reader));
-    assert!(s.parked.alarm_takers.is_empty(), "placement ended");
+    assert_eq!(s.reserved_probe_to_resume(), None, "placement ended");
 
     let mut selections = Vec::new();
     for _ in 0..9 {
@@ -11473,7 +11490,7 @@ fn every_reservation_consumer_ends_the_alarm_placement() {
             _ => s.retire_sigalrm_thread(reader, pid),
         }
         assert_eq!(s.sigalrm_reserved_poll_target(), None, "{consumer}");
-        assert!(s.parked.alarm_takers.is_empty(), "{consumer}");
+        assert_eq!(s.reserved_probe_to_resume(), None, "{consumer}");
     }
 }
 
@@ -11510,7 +11527,11 @@ fn a_backed_off_poller_reserved_for_its_probe_runs_before_a_writer() {
         s.fire_alarm(pid, reader, Signal::SIGALRM);
 
         assert!(sigalrm_reserved_for(&s, reader), "attempt {attempt}");
-        assert_eq!(s.first_alarm_taker(), Some(reader), "attempt {attempt}");
+        assert_eq!(
+            s.reserved_probe_to_resume(),
+            Some((pid, reader)),
+            "attempt {attempt}"
+        );
         assert!(
             !s.poll_deadline_of.contains_key(&reader),
             "attempt {attempt}: deadline dropped"
@@ -11528,18 +11549,18 @@ fn a_backed_off_poller_reserved_for_its_probe_runs_before_a_writer() {
     }
 }
 
-/// Gate item 2's admission: the reservation is made only where step 3 would
-/// resume the probe next by alarm priority; otherwise phase 1's loss stands
-/// and nothing is placed.
+/// The reservation's remaining refusals, where phase 1's loss stands and
+/// nothing is placed: a selection already open (the poller restore is a
+/// queue operation), the thread not queued to run (step 3 could not select
+/// it), record and replay (excluded until the design's D6 test exists), and
+/// an entry whose loss is already recorded (never reserved again).
 #[test]
-fn a_reservation_needs_step3_to_resume_the_probe_next() {
+fn a_reservation_needs_its_thread_queued_outside_a_selection() {
     for case in [
-        "served",
-        "other-taker",
         "open-selection",
         "not-queued",
-        "group-exit-decider",
-        "sigreturn-continuation",
+        "record-replay",
+        "already-lost",
     ] {
         let mut s = liteinst_scheduler();
         let (reader, _, _) = add(&mut s, 100, 100);
@@ -11548,20 +11569,67 @@ fn a_reservation_needs_step3_to_resume_the_probe_next() {
         s.set_sigalrm_handled(pid, true);
         file_ordinary(&mut s, other);
         s.runqueue_push_back(other);
-        file_pipe_read_attempt(&mut s, reader, 1);
-        if case != "not-queued" {
-            s.runqueue_push_back(reader);
-        }
         match case {
-            "served" => s.parked.alarm_priority_served = Some(DetPid::from_raw(300)),
-            "other-taker" => {
-                s.parked.alarm_takers.insert(DetPid::from_raw(300), other);
-            }
             "open-selection" => {
+                file_pipe_read_attempt(&mut s, reader, 1);
+                s.runqueue_push_back(reader);
                 assert_eq!(s.run_queue.tentative_pop_tid(other), Some(other));
             }
-            "group-exit-decider" => s.group_exit_decider = Some(other),
-            "sigreturn-continuation" => {
+            "not-queued" => file_pipe_read_attempt(&mut s, reader, 1),
+            "record-replay" => {
+                s.recordreplay_modes = true;
+                file_pipe_read_attempt(&mut s, reader, 1);
+                s.runqueue_push_back(reader);
+            }
+            _ => {
+                // First due in a poll slice 1 does not reserve: the loss.
+                let mut r = pipe_read_request(reader, 1);
+                r.polls_guest_state_only = false;
+                file_request(&mut s, r, false);
+                s.runqueue_push_back(reader);
+                s.fire_alarm(pid, reader, Signal::SIGALRM);
+                assert!(s.sigalrm_loss_recorded(pid));
+                // Then the same entry, still pending, in a reservable one.
+                s.clear_nextturn(reader).unwrap();
+                file_pipe_read_attempt(&mut s, reader, 2);
+                s.step2_sigalrm_ledger();
+            }
+        }
+        if case != "already-lost" {
+            s.fire_alarm(pid, reader, Signal::SIGALRM);
+        }
+
+        assert!(!sigalrm_reserved_for(&s, reader), "{case}");
+        assert!(s.sigalrm_loss_recorded(pid), "{case}: phase 1's loss");
+        assert_eq!(s.reserved_probe_to_resume(), None, "{case}");
+    }
+}
+
+/// Placed precedence enforced where step 3 selects (design rev.2 section 5,
+/// review of e1ff4299 item (i)): an unrun reserved probe resumes right after
+/// a group-exit decider and ahead of every other choice, whatever arrives
+/// after the reservation: a spent alarm priority, an alarm taker, a
+/// `rt_sigreturn` continuation of another thread with a vfork child queued
+/// (which would otherwise make the alarm taker yield to the vfork child),
+/// and a queued group-exit decider, which alone goes first. The probe's
+/// grant counts as an alarm grant (`alarm_priority_served`).
+#[test]
+fn the_unrun_probe_resumes_ahead_of_everything_but_a_group_exit_decider() {
+    for case in [
+        "served",
+        "alarm-taker",
+        "sigreturn-continuation-and-vfork-child",
+        "group-exit-decider",
+    ] {
+        let (mut s, reader, pid, queued) = reserved_reader_behind(&[300, 500]);
+        let (other, child) = (queued[0], queued[1]);
+        // All of these arrive after the reservation.
+        match case {
+            "served" => s.parked.alarm_priority_served = Some(DetPid::from_raw(300)),
+            "alarm-taker" => {
+                s.parked.alarm_takers.insert(DetPid::from_raw(300), other);
+            }
+            "sigreturn-continuation-and-vfork-child" => {
                 let mut delivery = Resources::new(other);
                 delivery.insert(
                     ResourceID::InboundSignal(SigWrapper::from(Signal::SIGUSR1)),
@@ -11571,16 +11639,75 @@ fn a_reservation_needs_step3_to_resume_the_probe_next() {
                 s.clear_nextturn(other).unwrap();
                 s.next_turns[&other].req.put(Ok(delivery));
                 s.sigreturn_continuations.insert(other);
+                s.vfork_barriers.insert(DetTid::from_raw(900), Some(child));
             }
-            _ => {}
+            _ => s.group_exit_decider = Some(other),
         }
+        assert!(sigalrm_reserved_for(&s, reader), "{case}");
 
-        s.fire_alarm(pid, reader, Signal::SIGALRM);
-
-        assert!(!sigalrm_reserved_for(&s, reader), "{case}");
-        assert!(s.sigalrm_loss_recorded(pid), "{case}: phase 1's loss");
-        assert_ne!(s.parked.alarm_takers.get(&pid), Some(&reader), "{case}");
+        if case == "group-exit-decider" {
+            assert_eq!(grant_selected(&mut s), other, "{case}: the decider first");
+            // Its turn was its group exit: no longer the decider.
+            s.group_exit_decider = None;
+        }
+        assert_eq!(grant_selected(&mut s), reader, "{case}: the probe");
+        assert_eq!(s.parked.alarm_priority_served, Some(pid), "{case}");
+        assert!(!s.sigalrm_loss_recorded(pid), "{case}");
     }
+}
+
+/// A scheduler signal wake that replaces the reader's own unrun probe (its
+/// child's exit SIGCHLD, sent after the reservation): the probe is no
+/// longer unrun, so step 3 resumes the thread as the signal taker; the
+/// replaced request is classified completed before that turn is granted (no
+/// loss, no G1 stop), and the entry stays pending for delivery at the
+/// interrupted call's completion, where the take succeeds.
+#[test]
+fn a_signal_wake_replacing_the_unrun_probe_classifies_it_completed() {
+    let (mut s, reader, pid, _) = reserved_reader_behind(&[300]);
+    s.test_kernel_signal_states
+        .insert(reader, KernelSignalState::default());
+    s.wake_signaled_guest(reader, Signal::SIGCHLD);
+    assert_eq!(s.reserved_probe_to_resume(), None, "replaced: not unrun");
+    assert!(sigalrm_reserved_for(&s, reader), "until classified");
+
+    let (tid, req, resp) = s.step3_peek().expect("a selection");
+    assert_eq!(tid, reader, "the signal taker");
+    let request = req.try_read().unwrap().unwrap();
+    assert!(s.step4_resource_block(tid, &request, &resp).is_ok());
+
+    assert_eq!(
+        s.sigalrm_reserved_poll_target(),
+        None,
+        "classified completed"
+    );
+    assert!(!s.sigalrm_loss_recorded(pid));
+    assert!(s.sigalrm_pending(pid), "delivered at the completion");
+    assert!(s.take_sigalrm(pid, reader), "taken after classification");
+}
+
+/// A SIGCHLD taker created after the reservation, later in the same pass
+/// (step 2b's child-exit pop), does not overtake the unrun probe: it
+/// resumes after it.
+#[test]
+fn a_sigchld_taker_created_after_the_reservation_runs_after_the_probe() {
+    let (mut s, reader, _pid, queued) = reserved_reader_behind(&[300]);
+    let other = queued[0];
+    // `other` polls a pipe read of its own, which the SIGCHLD wakes.
+    s.clear_nextturn(other).unwrap();
+    let mut r = pipe_read_request(other, 1);
+    r.read_fd = Some((detcore_model::fd::FilesId::initial(other), 7));
+    s.next_turns[&other].req.put(Ok(r));
+    s.test_kernel_signal_states
+        .insert(other, KernelSignalState::default());
+    s.wake_signaled_guest(other, Signal::SIGCHLD);
+    assert!(s.blocked.sigchld_takers.contains(&other));
+
+    assert_eq!(grant_selected(&mut s), reader, "the probe first");
+    file_probe_successor(&mut s, reader, 2, false);
+    s.step2_sigalrm_ledger();
+    assert!(woken_by_sigalrm(&s, reader));
+    assert_eq!(grant_selected(&mut s), other, "then the taker");
 }
 
 /// Gate item 4: a poll whose readiness the host can change is not reserved,
@@ -11638,8 +11765,10 @@ fn a_completed_probe_is_classified_before_its_delivery_takes_the_entry() {
 }
 
 /// A first attempt of another lineage on the same descriptor means a new
-/// read began, so the bound read ended: classified completed (R1), not
-/// woken, never mistaken for the still-unrun probe.
+/// read began after the bound read ended without its due entry's delivery,
+/// which the completion path never does with an entry due (design 5.1):
+/// classified `NewRead`, charged as a loss, not woken, never mistaken for
+/// the still-unrun probe.
 #[test]
 fn a_new_read_of_the_same_descriptor_classifies_the_probe_completed() {
     let (mut s, reader, pid, _) = reserved_reader_behind(&[300]);
@@ -11649,6 +11778,27 @@ fn a_new_read_of_the_same_descriptor_classifies_the_probe_completed() {
     s.step2_sigalrm_ledger();
 
     assert_eq!(s.sigalrm_reserved_poll_target(), None, "classified");
+    assert!(
+        s.sigalrm_loss_recorded(pid),
+        "a protocol violation: the loss"
+    );
     assert!(!woken_by_sigalrm(&s, reader), "no wake for a new read");
     assert!(s.sigalrm_pending(pid));
+}
+
+/// Precedence belongs to the unrun probe only. Once the probe ran and its
+/// successor retry is filed but not yet classified (the defensive step-4
+/// path: no step 2 in between), step 3 makes the run queue's own choice:
+/// the thread queued ahead runs first, and the reader's successor is settled
+/// at its own step-4 head when it is reached.
+#[test]
+fn a_ran_probe_has_no_precedence_before_its_classification() {
+    let (mut s, reader, _pid, queued) = reserved_reader_behind(&[300]);
+    let other = queued[0];
+    assert_eq!(grant_selected(&mut s), reader, "the unrun probe first");
+    file_probe_successor(&mut s, reader, 2, false);
+    assert!(sigalrm_reserved_for(&s, reader), "not yet classified");
+    assert_eq!(s.reserved_probe_to_resume(), None, "the probe ran");
+
+    assert_eq!(grant_selected(&mut s), other, "the run queue's own choice");
 }

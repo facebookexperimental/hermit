@@ -19144,7 +19144,27 @@ impl Scheduler {
                 self.first_alarm_taker_entry()
             };
             let decider = self.queued_group_exit_decider();
-            let by_alarm = decider.is_none() && taker.is_none() && process_taker.is_none();
+            // An unrun reserved SIGALRM poll probe (dh-ru056 slice 1,
+            // design rev.2 section 5: placed precedence, the
+            // `sigchld_takers` class) resumes right after a group-exit
+            // decider and ahead of every other choice here, so no other
+            // thread's turn commits between its reservation and the probe
+            // (`reserved_probe_to_resume`). Its grant counts as an alarm
+            // grant for the bound of
+            // https://github.com/rrnewton/hermit/issues/4929.
+            let reserved_probe = if decider.is_none() {
+                self.reserved_probe_to_resume()
+            } else {
+                None
+            };
+            if let Some((pid, _)) = reserved_probe {
+                self.parked.alarm_priority_served = Some(pid);
+            }
+            let reserved_probe = reserved_probe.map(|(_, thread)| thread);
+            let by_alarm = decider.is_none()
+                && reserved_probe.is_none()
+                && taker.is_none()
+                && process_taker.is_none();
             let alarm_taker = alarm_taker.map(|(pid, thread)| {
                 if by_alarm {
                     self.parked.alarm_priority_served = Some(pid);
@@ -19152,6 +19172,7 @@ impl Scheduler {
                 thread
             });
             let next_dtid = match decider
+                .or(reserved_probe)
                 .or(taker)
                 .or(process_taker)
                 .or(alarm_taker)
@@ -43767,13 +43788,15 @@ mod test {
         assert!(!scheduler.blocked.continuation_masks.contains_key(&thread));
     }
 
-    /// dh-ru056 slice 1, placed precedence: a SIGALRM entry due while its
-    /// owner polls a pipe read is reserved for one probe only where step 3
-    /// would resume that thread next. A queued `SIGCHLD` taker, or a queued
-    /// process-signal taker, resumes ahead of any alarm taker, so either
-    /// keeps phase 1's loss; with neither, the probe is reserved.
+    /// dh-ru056 slice 1, placed precedence enforced at selection: a SIGALRM
+    /// entry due while its owner polls a pipe read is reserved for one probe,
+    /// and step 3 resumes that probe ahead of a queued `SIGCHLD` taker or
+    /// process-signal taker (both of which resume ahead of an alarm taker).
+    /// The process-signal case is defensive: on in-guest LiteInst, the only
+    /// backend that virtualizes guest SIGALRM handlers, the scheduler does
+    /// not model signal targets, so no process-signal taker exists there.
     #[test]
-    fn a_sigalrm_poll_reservation_yields_to_queued_signal_takers() {
+    fn a_sigalrm_poll_probe_resumes_ahead_of_queued_signal_takers() {
         let chld = kernel_signal_bit(libc::SIGCHLD);
         let usr1 = kernel_signal_bit(libc::SIGUSR1);
         for case in ["none", "sigchld-taker", "process-signal-taker"] {
@@ -43842,13 +43865,15 @@ mod test {
 
             scheduler.fire_alarm(process, reader, Signal::SIGALRM);
 
-            let reserved = scheduler.sigalrm_reserved_poll_target() == Some(reader);
-            assert_eq!(reserved, case == "none", "{case}");
             assert_eq!(
-                scheduler.sigalrm_loss_recorded(process),
-                case != "none",
+                scheduler.sigalrm_reserved_poll_target(),
+                Some(reader),
                 "{case}"
             );
+            assert!(!scheduler.sigalrm_loss_recorded(process), "{case}");
+            let (selected, _, _) = scheduler.step3_peek().expect("a thread is runnable");
+            scheduler.run_queue.undo_tentative_pop();
+            assert_eq!(selected, reader, "{case}: the unrun probe first");
         }
     }
 
