@@ -12207,6 +12207,60 @@ fn a_kvm_child_exit_receiver_is_chosen_by_the_temporary_mask_its_call_installs()
     }
 }
 
+/// The dual review of https://github.com/rrnewton/hermit/pull/5259, P1: the
+/// private-pending half of `wants_signal` (`task_sigpending`,
+/// kernel/signal.c:960 at v6.17) reads the same installed mask as the
+/// blocks-target half. A copy pending for M alone counts only if the mask
+/// in force — the wait's temporary mask, not M's own — leaves it unblocked:
+/// - own admits SIGUSR2, the temporary mask blocks it: the copy is not
+///   pending work, M wants the child's SIGCHLD and is chosen;
+/// - own blocks SIGUSR2, the temporary mask admits it: the copy is pending
+///   work, M is busy and the walk reaches the sibling.
+///
+/// The pending state is scripted through the real reader seam
+/// (`test_kernel_signal_states`), so the pending filter itself, with its
+/// exclusions, is the code under test.
+#[test]
+fn a_kvm_child_exit_receiver_counts_private_pending_under_the_temporary_mask() {
+    let usr2 = kernel_signal_bit(libc::SIGUSR2);
+    let chld = kernel_signal_bit(libc::SIGCHLD);
+    for (own_blocked, temporary, expected_m, case) in [
+        (0, usr2, true, "the temporary mask blocks the private copy"),
+        (usr2, 0, false, "the temporary mask admits the private copy"),
+    ] {
+        let (mut s, backend) = kvm_fixture();
+        let (creator, _, _) = add(&mut s, 100, 100);
+        let (sibling, _, _) = add(&mut s, 100, 101);
+        backend
+            .signal_sets
+            .lock()
+            .unwrap()
+            .insert(100, reverie::SignalSets::new(0, 0, own_blocked, 0, chld));
+        backend
+            .signal_sets
+            .lock()
+            .unwrap()
+            .insert(101, sigchld_sets(false, false, true));
+        s.test_kernel_signal_states.insert(
+            creator,
+            KernelSignalState {
+                thread_pending: usr2,
+                blocked: own_blocked,
+                ..KernelSignalState::default()
+            },
+        );
+        file_temporary_mask_wait(&mut s, creator, TemporaryMaskWait::Ppoll, Some(temporary));
+        file_restartable_read(&mut s, sibling);
+        let expected = if expected_m { creator } else { sibling };
+        assert_eq!(
+            s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD)
+                .0,
+            Some(expected),
+            "{case}"
+        );
+    }
+}
+
 /// The Codex review of https://github.com/rrnewton/hermit/pull/5259, P1: an
 /// unblocked SIGURG sent to a KVM thread while it is ignored by default is
 /// one Linux discards before it is queued (`prepare_signal`,
