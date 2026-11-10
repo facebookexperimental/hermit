@@ -12682,9 +12682,20 @@ fn a_delivery_frame_decides_until_sigreturn_and_nests() {
     );
     assert!(s.end_wait_mask(creator));
     // Re-deliver and pop at sigreturn: the physical mask decides again.
+    // Re-file the wait first, as a handler that waits again would: the
+    // previous wake left an InboundSignal request, against which no new
+    // entry could be recorded.
+    let mut refiled = Resources::new(creator);
+    refiled.insert(ResourceID::InternalIOPolling, Permission::W);
+    refiled.blocked_signal_mask = Some(usr2);
+    s.next_turns.get_mut(&creator).unwrap().req = Ivar::full(Ok(refiled));
     assert!(s.begin_wait_mask(creator, Some(usr2)));
     s.wake_signaled_guest(creator, SigWrapper(libc::SIGCHLD));
     s.record_delivery_entry(creator);
+    assert!(
+        s.delivery_masks.contains_key(&creator),
+        "the second delivery must leave a frame for the pop to retire"
+    );
     assert!(s.pop_delivery_mask(creator));
     assert_eq!(
         s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGUSR1),

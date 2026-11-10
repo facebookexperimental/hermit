@@ -2377,6 +2377,16 @@ pub struct Scheduler {
     /// `rt_sigreturn` pops it. Depth one by design: only a wait hands
     /// off, a fresh wait supersedes the frame, and any later delivery
     /// is already in the thread's physical mask, which decides then.
+    ///
+    /// Unreachable on every backend today, kept defensively: the Tool
+    /// callback completes before signal selection and frame delivery,
+    /// the backend-served wait loops never begin a wait interval, and
+    /// KVM reports no sigreturns through it — so in production the
+    /// interval has always already ended (or never began) when a
+    /// handler is entered, and the entry-before-finish ordering is
+    /// proven only at scheduler level. If a backend ever enters a
+    /// handler inside a live interval, this decides correctly instead
+    /// of reading a restored mask.
     delivery_masks: BTreeMap<DetTid, Vec<Option<u64>>>,
 
     /// Threads the scheduler woke for a caught signal whose handler has
