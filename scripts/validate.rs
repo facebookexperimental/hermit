@@ -36131,17 +36131,12 @@ mod prepared_command_tests {
                 .unwrap();
         assert!(prepared_nextest_commands_bracket(host, &changed).is_err());
 
-        for workspace in [pinned] {
-            let payload = guarded_command_source(&workspace.tag(), &workspace.cmd).unwrap();
-            let mut changed = workspace.clone();
-            changed.cmd = bracket_command_with_payload(
-                workspace,
-                &format!("{payload} --planted-after-preparation"),
-            )
-            .unwrap();
-            assert!(prepared_nextest_commands_bracket(&changed, barrier).is_err());
-        }
         let payload = guarded_command_source(&pinned.tag(), &pinned.cmd).unwrap();
+        let mut changed = pinned.clone();
+        changed.cmd =
+            bracket_command_with_payload(pinned, &format!("{payload} --planted-after-preparation"))
+                .unwrap();
+        assert!(prepared_nextest_commands_bracket(&changed, barrier).is_err());
         let changed = outer_decoy(
             pinned,
             &payload.replacen(NEXTEST_FULL_PREPARE_COMMAND, "missing-preparation", 1),
