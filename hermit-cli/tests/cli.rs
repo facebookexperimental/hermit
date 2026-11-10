@@ -27085,8 +27085,27 @@ fn two_children_after_a_slice_burning_handler_return_choose_the_creator() {
         String::from_utf8(output.stdout).expect("guest stdout should be UTF-8")
     };
     assert_eq!(native, "first=M second=M\n", "natively");
+    // PMU qualification: without a usable branch PMU no timeslice can
+    // expire inside the guest's syscall-free window, the case would pass
+    // vacuously, and it is skipped with this named reason instead. The
+    // ordinary two-child regression above stays unconditional.
+    let pmu_usable = Path::new("/sys/bus/event_source/devices/cpu/events/branch-instructions")
+        .exists()
+        && fs::read_to_string("/proc/sys/kernel/perf_event_paranoid")
+            .map(|level| level.trim().parse::<i32>().unwrap_or(4) <= 3)
+            .unwrap_or(false);
+    if !pmu_usable {
+        eprintln!(
+            "skipping the slice-burning case: no usable PMU (branch events unavailable), \
+             so no timeslice preemption can be observed here"
+        );
+        return;
+    }
     // ptrace first, as in the two-child case: it is the half that catches
-    // a surviving delivery frame, and /dev/kvm may be absent.
+    // a surviving delivery frame, and /dev/kvm may be absent. The ptrace
+    // run records its preemptions: without a usable PMU no timeslice can
+    // expire inside the guest's syscall-free window, the case would pass
+    // vacuously, and it is skipped with this named reason instead.
     let mut backends: Vec<&[&str]> = vec![&[][..]];
     if Path::new("/dev/kvm").exists() {
         backends.push(&["--backend=kvm"][..]);
@@ -27099,7 +27118,10 @@ fn two_children_after_a_slice_burning_handler_return_choose_the_creator() {
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let report = directory.path().join("verify.json");
         let report_arg = report.to_str().expect("report path should be UTF-8");
+        let log = directory.path().join("slice.detlog");
+        let log_arg = log.to_str().expect("log path should be UTF-8");
         let mut args: Vec<&str> = backend.to_vec();
+        args.extend(["--log", "info", "--log-file", log_arg]);
         args.extend([
             "run",
             "--strict",

@@ -180,10 +180,9 @@ int main(void) {
   if (result != -1 || errno != EINTR || first != 0)
     unconfirmed("M's first SIGCHLD handler and ppoll EINTR not confirmed");
   /* This store is after both the actual handler's return and ppoll's return.
-   * From here to the second observation, M begins no wait and changes no mask.
-   * The failure bound restarts here: the burn above is CPU, and under a
-   * branch-accounted clock it alone would eat a from-start bound. */
-  deadline = now_ms() + 20000;
+   * From here to the second observation, M begins no wait, changes no mask,
+   * and reads no clock: a syscall in this window could consume the return
+   * report before any slice boundary does. */
   atomic_store_explicit(&shared->second_gate, 1, memory_order_release);
   /* No syscall between the handler's return and this observation, so
    * only a slice boundary (or a later choice in the kernel) can retire
@@ -193,20 +192,23 @@ int main(void) {
    * the second child. */
   /* Iteration-budgeted, not wall-clocked: under a branch-accounted
    * clock the burn above already ate any from-start wall bound. The
-   * syscall-free window (2M iterations) is far past a PMU timeslice;
-   * past it the loop yields, so a no-preemption configuration degrades
-   * to the ordinary two-child case instead of starving the child. */
+   * syscall-free window is 40M iterations: at roughly five retired
+   * branches per iteration that is some 200M branches, ten times the
+   * default 200M-virtual-ns timeslice (about 20M branches at 10 ns
+   * per retired conditional branch), so a PMU timeslice expires inside
+   * it or the run is not testing slices at all. Past the window the
+   * loop yields, so a no-preemption configuration degrades to the
+   * ordinary two-child case instead of starving the child. */
   unsigned long budget = 0;
-  unsigned long spin_past_cap = 0;
+  unsigned long yields = 0;
   while (atomic_load_explicit(&receivers[1], memory_order_acquire) < 0) {
     for (volatile int i = 0; i < 1000; ++i) {
     }
-    if (++budget == 2000UL) {
+    if (++budget == 40000UL) {
       bounded_yield();
       budget = 0;
+      if (++yields > 100UL) unconfirmed("second handler observation expired");
     }
-    if (budget == 0 && ++spin_past_cap > 1000000UL)
-      unconfirmed("second handler observation expired");
   }
   int second = atomic_load(&receivers[1]);
   printf("first=%s second=%s\n", first == 0 ? "M" : "W1", second == 0 ? "M" : "W1");
