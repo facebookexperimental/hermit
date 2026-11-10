@@ -875,6 +875,7 @@ async fn publication_sender_preserves_terminal_nonresumption_and_retirement() {
             retired: AtomicBool::new(false),
             hold_private_memory_publication: false,
             local_memory: false,
+            runs_syscalls: false,
         };
         let clock = bytes(&guest.thread.thread_logical_time);
         {

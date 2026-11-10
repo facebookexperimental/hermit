@@ -34,6 +34,8 @@ pub(crate) use files::vectored_offset;
 pub(crate) use threads::VIRTUAL_CPUSET_BYTES;
 mod io;
 #[cfg(test)]
+pub(crate) use io::batch_results_may_feed_control;
+#[cfg(test)]
 pub(crate) use io::sent_descriptors;
 pub(crate) mod memory;
 mod misc;

@@ -52,6 +52,7 @@ async fn a_retired_siblings_late_request_stays_unanswered() {
                 retired: std::sync::atomic::AtomicBool::new(false),
                 hold_private_memory_publication: false,
                 local_memory: false,
+                runs_syscalls: false,
             }
         };
         let mut receiving = guest_of(receiver);

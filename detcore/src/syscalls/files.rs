@@ -16258,10 +16258,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 },
             )
             .await?;
-        // A pipe end a binder transaction delivers is the sender's
-        // description, which this process's Detcore records as its own
-        // (`Detcore::untrack_received_pipe_status`).
-        Self::untrack_received_pipe_status(guest, &delivered.fds).await;
+        // A pipe end a binder transaction delivered and this receipt
+        // recorded is the sender's description, which this process's Detcore
+        // records as its own (`Detcore::untrack_received_pipe_status`).
+        Self::untrack_received_pipe_status(guest, &recorded).await;
         self.refresh_received_locks(guest, &recorded, LockCall::BinderWriteRead)
             .await
     }
@@ -23107,6 +23107,11 @@ mod inject_fstat_scratch {
         /// descriptor received outside the model do where it is gone; any
         /// other answer is not scripted.
         fcntl_ebadf: bool,
+        /// Whether an injected syscall that nothing here scripts runs in this
+        /// process, on the test's own descriptors, as the probes of a
+        /// received descriptor (`fcntl`, `fstatfs`, ...) do; otherwise it is
+        /// a test failure.
+        unscripted_real: bool,
         /// For a `BINDER_WRITE_READ`: the commands Linux writes into its read
         /// buffer before the call fails with this errno, leaving the header
         /// as it was, as when the copy back of a read-only header faults.
@@ -23120,6 +23125,9 @@ mod inject_fstat_scratch {
         unreported_at_ioctl: Option<bool>,
         /// The determinism losses the guest reported to the global state.
         determinism_losses: std::sync::Mutex<Vec<String>>,
+        /// The SIGALRM ledger controls sent (`GlobalRequest::Sigalrm`), each
+        /// answered as not refused.
+        sigalrm_controls: std::sync::Mutex<Vec<crate::tool_global::SigalrmControl>>,
         /// The resource sets this guest requested from the scheduler, in
         /// order, for a test that witnesses a turn release.
         resource_requests: std::sync::Mutex<Vec<Vec<crate::resources::ResourceID>>>,
@@ -23182,10 +23190,12 @@ mod inject_fstat_scratch {
                 binder_read_consumed: None,
                 ppoll_ready: None,
                 fcntl_ebadf: false,
+                unscripted_real: false,
                 counts_memory_reads: false,
                 binder_read_fault: None,
                 unreported_at_ioctl: None,
                 determinism_losses: Default::default(),
+                sigalrm_controls: Default::default(),
                 resource_requests: Default::default(),
                 capture_resource_requests: false,
                 blocking_grant_gate: None,
@@ -23282,6 +23292,15 @@ mod inject_fstat_scratch {
             if let GlobalRequest::RecordDeterminismLoss(reason) = &message.2 {
                 self.determinism_losses.lock().unwrap().push(reason.clone());
                 return (None, GlobalResponse::RecordDeterminismLoss(()));
+            }
+            // A received descriptor's lock state, which its recording
+            // publishes; acknowledged, as the global state does.
+            if self.unscripted_real && matches!(&message.2, GlobalRequest::DescriptionLocks(..)) {
+                return (None, GlobalResponse::DescriptionLocks(()));
+            }
+            if let GlobalRequest::Sigalrm(control) = &message.2 {
+                self.sigalrm_controls.lock().unwrap().push(*control);
+                return (None, GlobalResponse::Sigalrm(false));
             }
             if let GlobalRequest::CreateChildThread(..) = &message.2 {
                 return (None, GlobalResponse::CreateChildThread(None));
@@ -23558,6 +23577,19 @@ mod inject_fstat_scratch {
                         .write_exact(AddrMut::<u8>::from_raw(data).unwrap(), &bytes)?;
                     0
                 }
+                // SAFETY: a probe Detcore asked for, on descriptors and memory
+                // of this process that the test owns.
+                _ if self.unscripted_real => unsafe {
+                    libc::syscall(
+                        number.id() as libc::c_long,
+                        args.arg0,
+                        args.arg1,
+                        args.arg2,
+                        args.arg3,
+                        args.arg4,
+                        args.arg5,
+                    )
+                },
                 other => panic!("unexpected injected syscall {other:?}"),
             };
             Errno::result(raw)
@@ -24031,6 +24063,75 @@ mod inject_fstat_scratch {
             crate::syscalls::binder::delivered(&LocalMemory::new(), argument, 0).fds,
             vec![123]
         );
+    }
+
+    /// N1 of coord7's review of 858541a9, at the binder receipt: a pipe read
+    /// end a binder transaction delivers, recorded in the caller's turn, loses
+    /// its tracked SIGALRM status where the runtime virtualizes SIGALRM
+    /// (`Detcore::untrack_received_pipe_status`), as one received over
+    /// SCM_RIGHTS does. The object names a real pipe's read end, so the
+    /// receipt's probes record it as a pipe. Where SIGALRM is not virtualized
+    /// nothing is sent (the control). Mutation "the binder receipt untracks
+    /// nothing": no control is sent.
+    #[tokio::test]
+    async fn a_pipe_end_a_binder_read_delivers_loses_its_sigalrm_status() {
+        use std::os::fd::AsRawFd;
+
+        use crate::syscalls::binder::BinderRun;
+        use crate::tool_global::SigalrmControl;
+
+        let (reader, _writer) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
+        let received = reader.as_raw_fd();
+        let mut object = [0u8; 24];
+        object[..4].copy_from_slice(&0x6664_2a85u32.to_ne_bytes()); // BINDER_TYPE_FD
+        object[8..12].copy_from_slice(&(received as u32).to_ne_bytes());
+        let offsets = [0u64];
+        let mut transaction = [0u8; 64];
+        transaction[40..48].copy_from_slice(&8u64.to_ne_bytes());
+        transaction[48..56].copy_from_slice(&(object.as_ptr() as u64).to_ne_bytes());
+        transaction[56..64].copy_from_slice(&(offsets.as_ptr() as u64).to_ne_bytes());
+        let mut commands = 0x8040_7202u32.to_ne_bytes().to_vec(); // BR_TRANSACTION
+        commands.extend_from_slice(&transaction);
+        let words = [
+            0,
+            0,
+            0,
+            commands.len() as u64,
+            commands.len() as u64,
+            commands.as_ptr() as u64,
+        ];
+        for virtualized in [true, false] {
+            let (_, mut guest) = ScriptedGuest::new(true, false);
+            guest.unscripted_real = true;
+            guest.config.sequentialize_threads = true;
+            guest.config = guest
+                .config
+                .clone()
+                .with_backend(|backend| backend.virtualizes_guest_sigalrm = virtualized);
+            let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+            assert!(tool.records_received_descriptors(&guest));
+            tool.take_binder_receipts(
+                &mut guest,
+                99,
+                words.as_ptr() as usize,
+                0,
+                BinderRun::InTurn,
+            )
+            .await
+            .unwrap();
+            let (ty, id) = guest
+                .thread
+                .with_detfd(received, |detfd| (detfd.ty(), detfd.open_file_id()))
+                .unwrap();
+            assert_eq!(ty, FdType::Pipe, "recorded as a pipe");
+            let controls = guest.sigalrm_controls.lock().unwrap().clone();
+            let expected = if virtualized {
+                vec![SigalrmControl::UntrackPipeStatus { id }]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(controls, expected, "virtualized {virtualized}");
+        }
     }
 
     /// A binder read in the caller's turn whose descriptors cannot be named

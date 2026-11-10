@@ -5132,8 +5132,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// The pipe read descriptions a send whose messages' headers are at
     /// `headers` may pass over `SCM_RIGHTS`, read from the messages and the
     /// descriptor table as they are now, for `untrack_sent_pipe_status`:
-    /// every one the table holds when the control data cannot be read or
-    /// the send runs outside the caller's turn. None unless the runtime
+    /// every one the table holds when the control data cannot be read, a
+    /// later message's control data may be an earlier one's result
+    /// (`batch_results_may_feed_control`), or the send runs outside the
+    /// caller's turn. None unless the runtime
     /// virtualizes SIGALRM in a run that sequentializes threads, the only
     /// runs whose ledger records a pipe's status.
     fn pipe_reads_sent<G: Guest<Self>>(
@@ -5146,7 +5148,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Vec::new();
         }
         let (sent, unread) = sent_descriptors(guest, headers);
-        if unread || outside_turn {
+        if unread || outside_turn || batch_results_may_feed_control(guest, headers) {
             guest.thread_state().pipe_read_descriptions(None)
         } else {
             guest.thread_state().pipe_read_descriptions(Some(&sent))
@@ -5182,9 +5184,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         ids
     }
 
-    /// After a receive that delivered `received` over `SCM_RIGHTS`, where the
-    /// runtime virtualizes SIGALRM: each pipe read description the receiver
-    /// now holds through them loses its tracked status in the SIGALRM ledger
+    /// After a receive that recorded `received` (`record_received_descriptors`)
+    /// over `SCM_RIGHTS` or binder, where the runtime virtualizes SIGALRM: each
+    /// pipe read description the receiver now holds through them loses its
+    /// tracked status in the SIGALRM ledger
     /// (`SigalrmControl::UntrackPipeStatus`), in the receiver's turn. Linux's
     /// receiver installs the sender's `struct file` (`receive_fd`, Linux
     /// v6.12
@@ -5198,8 +5201,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// otherwise be admitted on a copy no other holder's change reaches
     /// (finding B1 of coord7's review of 4d17d5ab). Untracked, the gate
     /// refuses it by name, as phase 1 refused every pipe read before slice 2,
-    /// and so for each fork alias that shares its identity. The lookup
-    /// discovers a descriptor the tool has not recorded yet (`with_detfd`).
+    /// and so for each fork alias that shares its identity. Only recorded
+    /// receipts are named: only they can be marked guest-held
+    /// (`classify_received_descriptors`), and a number a receive outside the
+    /// turn delivered may name another description by now, which the receipt
+    /// path neither records nor marks (N2 of coord7's review of 858541a9).
     pub(crate) async fn untrack_received_pipe_status<G: Guest<Self>>(
         guest: &mut G,
         received: &[RawFd],
@@ -5587,6 +5593,34 @@ fn send_headers(call: Syscall) -> Option<(RawFd, Vec<usize>)> {
     }
 }
 
+/// Whether a later message of the `sendmmsg` batch whose entries are at
+/// `headers` may take its control data from memory the same call writes
+/// first: Linux sends each entry and stores its byte count in the entry's
+/// `msg_len` before it copies the next entry's header and control data
+/// (`__sys_sendmmsg`, Linux v6.12
+/// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/socket.c?h=v6.12#n2747>;
+/// the control copy in `____sys_sendmsg`,
+/// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/socket.c?h=v6.12#n2584>).
+/// A control buffer over an earlier entry's `msg_len` may then name a
+/// descriptor no scan before the call sees: an `SCM_RIGHTS`
+/// item whose descriptor is an earlier entry's `msg_len` passes the
+/// descriptor numbered by that entry's payload length (finding 1 of
+/// rev5338-cx's review of 858541a9). Before the call, as
+/// `msg_len_may_overwrite_control` decides after it, conservatively: any
+/// earlier entry's `msg_len` over any later entry's control buffer, or a
+/// header that cannot be read. Never true for one message (`sendmsg`, or a
+/// one-entry batch).
+pub(crate) fn batch_results_may_feed_control<T, G>(guest: &G, headers: &[usize]) -> bool
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    // Every entry but the last writes a result a later entry may read; every
+    // entry but the first may read one. A header that cannot be read counts.
+    headers.len() > 1
+        && msg_len_may_overwrite_control(guest, &headers[..headers.len() - 1], &headers[1..])
+}
+
 /// The descriptors the messages at `headers` name in `SCM_RIGHTS`, and
 /// whether a header or control buffer could not be read in full, in which case
 /// the list may be incomplete (`mark_exported_listeners`).
@@ -5840,7 +5874,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await?;
         self.classify_received_descriptors(guest, call.sockfd(), &recorded)
             .await;
-        Self::untrack_received_pipe_status(guest, &delivered.fds).await;
+        Self::untrack_received_pipe_status(guest, &recorded).await;
         // Where the tool discovers received descriptors, recvmsg's refresh
         // covers every descriptor delivered, as before; elsewhere only those
         // this receipt recorded.
@@ -6312,7 +6346,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await?;
         self.classify_received_descriptors(guest, call.fd(), &recorded)
             .await;
-        Self::untrack_received_pipe_status(guest, &delivered.fds).await;
+        Self::untrack_received_pipe_status(guest, &recorded).await;
         self.note_short_batch(guest, from, call.vlen() as usize);
         // Only the descriptors this receipt recorded.
         self.refresh_received_locks(guest, &recorded, super::files::LockCall::Recvmmsg)

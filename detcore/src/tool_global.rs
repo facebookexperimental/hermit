@@ -19022,6 +19022,8 @@ mod tests {
     #[derive(Default)]
     struct LocalScratchStack(Vec<Box<[u64]>>);
 
+    // `Stack::StackGuard` is bounded by `Drop`, which only an explicit impl
+    // satisfies; the blocks themselves are freed with the vector.
     impl Drop for LocalScratchStack {
         fn drop(&mut self) {}
     }
@@ -19178,6 +19180,11 @@ mod tests {
         /// Whether the guest's memory is this process's own, for a test that
         /// hands Detcore a message header it built (`LocalMemory`).
         local_memory: bool,
+        /// Whether an injected syscall runs in this process and a guest stack
+        /// is handed out, for a test that drives a path which injects, with
+        /// `local_memory` (the guest's descriptors are this process's too).
+        /// Otherwise either is a test failure.
+        runs_syscalls: bool,
     }
 
     #[reverie::tool]
@@ -19250,7 +19257,7 @@ mod tests {
 
         async fn stack(&mut self) -> Self::Stack {
             assert!(
-                self.local_memory,
+                self.local_memory && self.runs_syscalls,
                 "external registration must not use a guest stack"
             );
             LocalScratchStack::default()
@@ -19268,7 +19275,7 @@ mod tests {
             // too: its syscall runs here, as the kernel would run it for the
             // guest (`local_memory`).
             assert!(
-                self.local_memory,
+                self.local_memory && self.runs_syscalls,
                 "external registration must not inject a syscall"
             );
             let (sysno, args) = syscall.into_parts();
@@ -19362,6 +19369,7 @@ mod tests {
             retired: std::sync::atomic::AtomicBool::new(false),
             hold_private_memory_publication: true,
             local_memory: false,
+            runs_syscalls: false,
         };
         {
             let request = super::resource_request(&mut guest, Resources::new(sender));
@@ -19439,6 +19447,7 @@ mod tests {
                 retired: std::sync::atomic::AtomicBool::new(false),
                 hold_private_memory_publication: false,
                 local_memory: false,
+                runs_syscalls: false,
             };
             let futex = FutexID::private(MmId::initial(sender), 0x1000);
             {
@@ -19505,6 +19514,7 @@ mod tests {
             retired: std::sync::atomic::AtomicBool::new(false),
             hold_private_memory_publication: false,
             local_memory: false,
+            runs_syscalls: false,
         };
         let (raw_pid, raw_tid) = (pid.as_raw(), tid.as_raw());
         let eperm = |result: Result<i64, reverie::Error>, what: &str| {
@@ -19589,6 +19599,7 @@ mod tests {
             retired: std::sync::atomic::AtomicBool::new(false),
             hold_private_memory_publication: false,
             local_memory: false,
+            runs_syscalls: false,
         };
         let raw = |sysno, a0, a1| Syscall::from_raw(sysno, SyscallArgs::new(a0, a1, 0, 0, 0, 0));
 
@@ -19713,6 +19724,7 @@ mod tests {
             retired: std::sync::atomic::AtomicBool::new(false),
             hold_private_memory_publication: false,
             local_memory: false,
+            runs_syscalls: false,
         };
         let raw = |sysno, fd: i32| {
             Syscall::from_raw(sysno, SyscallArgs::new(fd as usize, 0x1000, 1, 0, 0, 0))
@@ -19920,6 +19932,7 @@ mod tests {
             retired: std::sync::atomic::AtomicBool::new(false),
             hold_private_memory_publication: false,
             local_memory: true,
+            runs_syscalls: false,
         };
         let (reader, writer) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
         let read_fd = reader.as_raw_fd();
@@ -20070,6 +20083,7 @@ mod tests {
             retired: std::sync::atomic::AtomicBool::new(false),
             hold_private_memory_publication: false,
             local_memory: true,
+            runs_syscalls: false,
         };
         let (sent_reader, _sent_writer) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
         let (kept_reader, _kept_writer) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
@@ -20198,6 +20212,7 @@ mod tests {
             retired: std::sync::atomic::AtomicBool::new(false),
             hold_private_memory_publication: false,
             local_memory: true,
+            runs_syscalls: false,
         };
         let (first_reader, _first_writer) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
         let (second_reader, _second_writer) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
@@ -20346,6 +20361,7 @@ mod tests {
             retired: std::sync::atomic::AtomicBool::new(false),
             hold_private_memory_publication: false,
             local_memory: true,
+            runs_syscalls: false,
         };
         let entries = pipes
             .iter()
@@ -20453,6 +20469,95 @@ mod tests {
         }
     }
 
+    /// Finding 1 of rev5338-cx's review of 858541a9: a `sendmmsg` batch whose
+    /// second `SCM_RIGHTS` item lies over the first entry's own `msg_len`
+    /// passes whatever descriptor Linux's count for the first message names,
+    /// which no scan before the call can know, so every pipe read description
+    /// the table holds loses its status (`batch_results_may_feed_control`). A
+    /// batch whose control data lies elsewhere untracks only the pipe it
+    /// names (the control). Mutation "no aliasing guard": the unnamed pipe
+    /// stays admitted.
+    #[tokio::test]
+    async fn an_aliased_batch_untracks_every_pipe_status() {
+        use std::os::unix::net::UnixStream;
+
+        use nix::fcntl::OFlag;
+
+        let read =
+            |fd: i32| reverie::syscalls::Syscall::Read(reverie::syscalls::Read::new().with_fd(fd));
+        for aliased in [false, true] {
+            let (config, state, tid, pid) =
+                cancellation_test_state_with_config(sigalrm_pipe_status_config());
+            install_test_registration(&state, tid, Ivar::new());
+            let (named_reader, _named_writer) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
+            let (other_reader, _other_writer) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
+            let (channel, _peer) = UnixStream::pair().unwrap();
+            let (named, other) = (named_reader.as_raw_fd(), other_reader.as_raw_fd());
+            let (tool, mut guest) = sigalrm_pipe_status_guest(
+                &state,
+                &config,
+                tid,
+                pid,
+                &[named, other],
+                channel.as_raw_fd(),
+            );
+            // SAFETY: plain C structs, all zero.
+            let mut batch: [libc::mmsghdr; 2] = unsafe { std::mem::zeroed() };
+            let mut separate = [0_u64; 3];
+            let item = if aliased {
+                // rev5338-cx's layout: the first entry's msg_controllen,
+                // msg_flags, padding and msg_len are the second item's
+                // cmsg_len, level, type and descriptor.
+                // SAFETY: arithmetic on a length, with no memory access.
+                batch[0].msg_hdr.msg_controllen =
+                    unsafe { libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) } as usize;
+                batch[0].msg_hdr.msg_flags = libc::SOL_SOCKET;
+                // SAFETY: the padding word and msg_len lie inside `batch[0]`.
+                unsafe {
+                    let base = (&raw mut batch[0]).cast::<u8>();
+                    std::ptr::write_unaligned(base.add(52).cast::<i32>(), libc::SCM_RIGHTS);
+                }
+                batch[0].msg_len = named as u32;
+                (&raw mut batch[0].msg_hdr.msg_controllen).cast::<libc::c_void>()
+            } else {
+                let cmsg = separate.as_mut_ptr().cast::<libc::cmsghdr>();
+                // SAFETY: the buffer holds one SCM_RIGHTS header and its fd.
+                unsafe {
+                    (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as usize;
+                    (*cmsg).cmsg_level = libc::SOL_SOCKET;
+                    (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+                    std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<i32>(), named);
+                }
+                separate.as_mut_ptr().cast::<libc::c_void>()
+            };
+            batch[1].msg_hdr.msg_control = item;
+            // SAFETY: arithmetic on a length, with no memory access.
+            batch[1].msg_hdr.msg_controllen =
+                unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) } as usize;
+            let headers = [
+                (&raw const batch[0]) as usize,
+                (&raw const batch[1]) as usize,
+            ];
+            assert_eq!(
+                crate::syscalls::batch_results_may_feed_control(&guest, &headers),
+                aliased
+            );
+            tool.untrack_sent_pipe_status(&mut guest, &headers, false)
+                .await;
+            guest.thread.sigalrm_handled = true;
+            assert_eq!(
+                tool.sigalrm_phase1_gate(&mut guest, read(named)).await,
+                Some(nix::errno::Errno::EOPNOTSUPP),
+                "aliased {aliased}: the named pipe's status is no longer followed"
+            );
+            assert_eq!(
+                tool.sigalrm_phase1_gate(&mut guest, read(other)).await,
+                aliased.then_some(nix::errno::Errno::EOPNOTSUPP),
+                "aliased {aliased}: the unnamed pipe"
+            );
+        }
+    }
+
     /// B1 of coord7's review of 4d17d5ab, through the real receive path: a
     /// pipe read end received over SCM_RIGHTS on a guest-held channel, by a
     /// process that already holds the same pipe (as after a fork), is
@@ -20484,6 +20589,8 @@ mod tests {
         let channel_fd = channel.as_raw_fd();
         let (tool, mut guest) =
             sigalrm_pipe_status_guest(&state, &config, tid, pid, &[own], channel_fd);
+        // The receipt path injects to inspect the received descriptor.
+        guest.runs_syscalls = true;
         // The kernel's installation of the received end: the same pipe.
         // SAFETY: `own` is an open descriptor this test owns.
         let received = unsafe { libc::dup(own) };
@@ -20573,6 +20680,7 @@ mod tests {
             retired: std::sync::atomic::AtomicBool::new(false),
             hold_private_memory_publication: false,
             local_memory: false,
+            runs_syscalls: false,
         };
         for lease in [libc::F_RDLCK, libc::F_WRLCK] {
             let fcntl = syscalls::Fcntl::new()
@@ -20650,6 +20758,7 @@ mod tests {
                 retired: std::sync::atomic::AtomicBool::new(false),
                 hold_private_memory_publication: false,
                 local_memory: false,
+                runs_syscalls: false,
             };
             {
                 let mut rejoin = Resources::new(victim);
@@ -20756,6 +20865,7 @@ mod tests {
             retired: std::sync::atomic::AtomicBool::new(false),
             hold_private_memory_publication: false,
             local_memory: false,
+            runs_syscalls: false,
         };
         let mut rejoin = Resources::new(victim);
         rejoin.insert(
@@ -21178,6 +21288,7 @@ mod tests {
                 retired: std::sync::atomic::AtomicBool::new(false),
                 hold_private_memory_publication: false,
                 local_memory: false,
+                runs_syscalls: false,
             };
             let token = state
                 .sched
@@ -21298,6 +21409,7 @@ mod tests {
                 retired: std::sync::atomic::AtomicBool::new(false),
                 hold_private_memory_publication: false,
                 local_memory: false,
+                runs_syscalls: false,
             };
             let before = guest.thread.thread_logical_time.as_nanos();
             {
