@@ -26,7 +26,12 @@ TEST_CTX = struct(
     implicit_rewrite_rules = {
         "internal": struct(
             exact = {
+                # Inside the prefix-mapped, project and stripped-root
+                # directories: an exact rule wins over each of them.
+                "dep/fbonly:lib": "third_party/rust:deplib",
                 "exact:exact": "foo/shimmed:exact",
+                "project/fbonly:lib": "third_party/rust:projlib",
+                "root_dir/fbonly/crate:crate": "third_party/rust:crate",
             },
             dirs = [
                 ("third-party", "third_party"),
@@ -80,6 +85,17 @@ def test_translate_target():
     _test_target("internal//exact:exact", "shim//foo/shimmed:exact")
     _test_target("other//exact:exact", "other//exact:exact")
 
+    # An exact rule wins over the project, stripped-root and prefix-mapping
+    # rules; the rest of each directory is unchanged.
+    _test_target("//project/fbonly:lib", "shim//third_party/rust:projlib")
+    _test_target("//project/fbonly:other", "root//project/fbonly:other")
+    _test_target("//root_dir/fbonly/crate:crate", "shim//third_party/rust:crate")
+    _test_target("internal//root_dir/fbonly/crate:crate", "shim//third_party/rust:crate")
+    _test_target("//root_dir/fbonly/other:other", "root//fbonly/other:other")
+    _test_target("//dep/fbonly:lib", "shim//third_party/rust:deplib")
+    _test_target("//dep/fbonly:other", "dep//dep_rename/fbonly:other")
+    _test_target("other//root_dir/fbonly/crate:crate", "other//root_dir/fbonly/crate:crate")
+
     _test_target("//third-party/lib/foo:bar", "shim//third_party/lib/foo:bar")
     _test_target("internal//third-party/lib/foo:bar", "shim//third_party/lib/foo:bar")
 
@@ -93,6 +109,7 @@ def test_translate_target():
     _test_target("//dep:foo", "dep//dep_rename:foo", DEP_CTX)
     _test_target("//dep/with/subdir:foo", "dep//dep_rename/with/subdir:foo", DEP_CTX)
     _test_target("//root_dir/foo:bar", "root//foo:bar", DEP_CTX)
+    _test_target("//root_dir/fbonly/crate:crate", "shim//third_party/rust:crate", DEP_CTX)
     _test_target("//third-party/lib/foo:bar", "shim//third_party/lib/foo:bar", DEP_CTX)
     _test_target("//elsewhere:foo", "//elsewhere:foo", DEP_CTX)
     _test_target("dep//dep_rename:foo", "dep//dep_rename:foo", DEP_CTX)
@@ -102,6 +119,11 @@ def test_real_rules():
     # This repository's own rules (IMPLICIT_REWRITE_RULES and .buckconfig [oss]).
     shim = DEFAULT_REWRITE_CTX.cells.shim
     root = DEFAULT_REWRITE_CTX.cells.root
+    # Spelled in two parts so that scripts/check-buck-graph-drift.rs, which
+    # requires a real BUCK reference for each first-party rename, does not
+    # count this test as one.
+    _test_target("fbcode//hermetic_infra/hermit/fb-only/" + "dagrun:dagrun", shim + "//third-party/rust:dagrun", DEFAULT_REWRITE_CTX)
+    _test_target("fbcode//hermetic_infra/hermit/fb-only/other:other", root + "//fb-only/other:other", DEFAULT_REWRITE_CTX)
     _test_target("fbcode//hermetic_infra/reverie:reverie", "reverie//:reverie", DEFAULT_REWRITE_CTX)
     _test_target("fbcode//hermetic_infra/hermit/hermit-cli:hermit", root + "//hermit-cli:hermit", DEFAULT_REWRITE_CTX)
     # Spelled in two parts so that scripts/check-buck-graph-drift.rs, which

@@ -1,4 +1,0 @@
-oncall("hermit")
-
-# Package marker for the open-source wrap_test_suite.bzl next to this file.
-# See that file for why this package exists only in the OSS tree.

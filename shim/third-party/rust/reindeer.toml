@@ -25,7 +25,9 @@ include_workspace_members = false
 # just `default` when a platform names none. hermit-cli's Buck targets enable
 # the LiteInst backend, an optional cargo feature, so the members are resolved
 # with `liteinst`; detcore-testutils' Buck target likewise enables its
-# `nightly` feature (no dependencies, so the generated graph is unchanged).
+# `nightly` feature, and hermit-cli's :integration-libhermit-kvm its
+# `kvm-execution-tests` feature (neither has dependencies, so the generated
+# graph is unchanged).
 # With `default` alone, liteinst2 and reverie-liteinst get no
 # target and the shared-cell alias step fails. (The third-party backends and
 # their `third-party-backends` feature left core with the split.) A platform table here replaces
@@ -34,27 +36,27 @@ include_workspace_members = false
 # target enables and these lists do not resolve.
 [platform.linux-x86_64]
 target = "x86_64-unknown-linux-gnu"
-features = ["default", "liteinst", "nightly"]
+features = ["default", "kvm-execution-tests", "liteinst", "nightly"]
 
 [platform.linux-arm64]
 target = "aarch64-unknown-linux-gnu"
-features = ["default", "liteinst", "nightly"]
+features = ["default", "kvm-execution-tests", "liteinst", "nightly"]
 
 [platform.macos-x86_64]
 target = "x86_64-apple-darwin"
-features = ["default", "liteinst", "nightly"]
+features = ["default", "kvm-execution-tests", "liteinst", "nightly"]
 
 [platform.macos-arm64]
 target = "aarch64-apple-darwin"
-features = ["default", "liteinst", "nightly"]
+features = ["default", "kvm-execution-tests", "liteinst", "nightly"]
 
 [platform.windows-msvc]
 target = "x86_64-pc-windows-msvc"
-features = ["default", "liteinst", "nightly"]
+features = ["default", "kvm-execution-tests", "liteinst", "nightly"]
 
 [platform.windows-gnu]
 target = "x86_64-pc-windows-gnu"
-features = ["default", "liteinst", "nightly"]
+features = ["default", "kvm-execution-tests", "liteinst", "nightly"]
 
 [cargo]
 # Support Cargo's unstable "artifact dependencies" functionality, RFC 3028.

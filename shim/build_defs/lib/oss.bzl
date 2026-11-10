@@ -108,13 +108,21 @@ PREFIX_MAPPINGS = _parse_prefix_mappings(
 )
 
 # Hardcoded rewrite rules that apply to many projects and only produce targets
-# within the shim cell. They are applied after the rules from .buckconfig, and
-# will not be applied if any other rules match.
+# within the shim cell. An `exact` rule renames one target and is applied
+# first, before the project directories and the rules from .buckconfig. The
+# `dirs` and `dynamic` rules are applied after those, and only if no other
+# rule matches.
 IMPLICIT_REWRITE_RULES = {
     "fbcode": struct(
         exact = {
             "common/rust/shed/fbinit:fbinit": "third-party/rust:fbinit",
             "common/rust/shed/sorted_vector_map:sorted_vector_map": "third-party/rust:sorted_vector_map",
+            # fbsource builds agent-utils' dagrun as first-party code under
+            # fb-only/, which is never exported; this tree takes the dagrun
+            # crate (ci/manifest-plan/Cargo.toml). The rule is exact, so it
+            # wins over the project directory rule for hermetic_infra/hermit.
+            # scripts/check-buck-graph-drift.rs reads this entry.
+            "hermetic_infra/hermit/fb-only/dagrun:dagrun": "third-party/rust:dagrun",
             "watchman/rust/watchman_client:watchman_client": "third-party/rust:watchman_client",
         },
         dirs = [
@@ -126,6 +134,7 @@ IMPLICIT_REWRITE_RULES = {
         # Internal names that carry a major version because fbsource vendors
         # several majors of the crate. This tree's Cargo.lock has one, and
         # Reindeer names its alias without the suffix.
+        # scripts/check-buck-graph-drift.rs reads these entries.
         exact = {
             "third-party/rust:sha2-010": "third-party/rust:sha2",
         },
@@ -187,6 +196,14 @@ def translate_target(target: str, ctx = DEFAULT_REWRITE_CTX) -> str:
     else:
         internal_cell = resolved_cell
 
+    rules = ctx.implicit_rewrite_rules.get(internal_cell)
+
+    # An exact rule names one internal target, so it wins over every directory
+    # rule below, including the project's own directories.
+    exact = getattr(rules, "exact", {}).get(path) if rules != None else None
+    if exact != None:
+        return ctx.cells.shim + "//" + exact
+
     if internal_cell == ctx.cells.internal:
         for d in ctx.project_dirs:
             if _path_rooted_in_dir(path, d):
@@ -200,15 +217,9 @@ def translate_target(target: str, ctx = DEFAULT_REWRITE_CTX) -> str:
         if internal_cell == rule.match.cell and _path_rooted_in_dir(path, rule.match.root_dir):
             return rule.replace.cell + "//" + _swap_root_dir_for_path(path, rule.match.root_dir, rule.replace.root_dir)
 
-    rules = ctx.implicit_rewrite_rules.get(internal_cell)
-
     if rules == None:
         # No implicit rewrite rules
         return target
-
-    exact = getattr(rules, "exact", {}).get(path)
-    if exact != None:
-        return ctx.cells.shim + "//" + exact
 
     for match_root_dir, replace_root_dir in getattr(rules, "dirs", []):
         if _path_rooted_in_dir(path, match_root_dir):

@@ -165,13 +165,13 @@ def cpp_library(
             linker_flags += exported_linker_flags
     prelude.cxx_library(
         name = name,
-        srcs = srcs,
+        srcs = _fix_cxx_sources(srcs),
         deps = _fix_deps(deps + external_deps_to_targets(external_deps)),
         exported_deps = _fix_deps(exported_deps + external_deps_to_targets(exported_external_deps)),
         visibility = visibility,
         preferred_linkage = "static",
-        exported_headers = headers,
-        headers = private_headers,
+        exported_headers = _fix_cxx_sources(headers),
+        headers = _fix_cxx_sources(private_headers) if private_headers else private_headers,
         exported_linker_flags = linker_flags,
         linker_flags = private_linker_flags,
         header_namespace = header_base_path,
@@ -206,7 +206,7 @@ def cpp_unittest(
         deps = deps + CPP_UNITTEST_DEPS
 
     prelude.cxx_test(
-        name = name, deps = _fix_deps(deps + external_deps_to_targets(external_deps)), visibility = visibility, resources = _fix_resources(resources), **kwargs
+        name = name, deps = _fix_deps(deps + external_deps_to_targets(external_deps)), visibility = visibility, resources = _fix_resources(resources), **_fix_cxx_kwargs(kwargs)
     )
 
 def cpp_binary(
@@ -221,7 +221,10 @@ def cpp_binary(
     **kwargs,
 ):
     _unused = (dlopen_enabled, compiler_specific_flags, allocator, modules)  # @unused
-    prelude.cxx_binary(name = name, deps = _fix_deps(deps + external_deps_to_targets(external_deps)), visibility = visibility, **kwargs)
+
+    # Internal macros accept None for an empty list.
+    deps = (deps or []) + external_deps_to_targets(external_deps or [])
+    prelude.cxx_binary(name = name, deps = _fix_deps(deps), visibility = visibility, **_fix_cxx_kwargs(kwargs))
 
 def java_binary(name, jar_style = None, runtime = None, *args, **kwargs):
     _unused = (jar_style, runtime)  # @unused
@@ -243,10 +246,11 @@ def rust_library(
     test_rustc_flags = None,
     test_srcs = None,
     test_labels = None,
+    test_run_env = None,
     visibility = ["PUBLIC"],
     **kwargs,
 ):
-    _unused = (test_deps, test_env, autocargo, unittests, visibility, cpp_deps, cxx_bridge, test_rustc_flags, test_srcs, test_labels)  # @unused
+    _unused = (test_deps, test_env, autocargo, unittests, visibility, cpp_deps, cxx_bridge, test_rustc_flags, test_srcs, test_labels, test_run_env)  # @unused
     deps = _fix_deps(deps)
     mapped_srcs = _maybe_select_map(mapped_srcs, _fix_mapped_srcs)
     if named_deps:
@@ -283,7 +287,7 @@ def rust_binary(
     **kwargs,
 ):
     _unused = (unittests, allocator, default_strip_mode, autocargo, test_deps, test_env, test_srcs)  # @unused
-    deps = _fix_deps(deps)
+    deps = _fix_deps(deps or [])
 
     # @lint-ignore BUCKLINT: avoid "Direct usage of native rules is not allowed."
     prelude.rust_binary(
@@ -295,7 +299,7 @@ def rust_unittest(name, edition = None, rustc_flags = [], deps = [], visibility 
     # allocator = "malloc" asks fbcode for the system allocator, which is the
     # only one here.
     _unused = (autocargo, allocator)  # @unused
-    deps = _fix_deps(deps)
+    deps = _fix_deps(deps or [])
 
     prelude.rust_test(
         name = name, edition = edition or _default_rust_edition(), rustc_flags = rustc_flags + [_CFG_BUCK_BUILD], deps = deps, visibility = visibility, **_fix_rust_labels(kwargs)
@@ -303,10 +307,12 @@ def rust_unittest(name, edition = None, rustc_flags = [], deps = [], visibility 
 
 def _fix_rust_labels(kwargs):
     """Translate the labels internal BUCK files pass to a Rust rule outside
-    `deps`: aliased dependencies, resources, and targets named inside the
-    macros of its environment variables."""
+    `deps`: aliased dependencies, mapped sources, resources, and targets named
+    inside the macros of its environment variables."""
     if kwargs.get("named_deps"):
         kwargs["named_deps"] = _maybe_select_map(kwargs["named_deps"], _fix_named_deps)
+    if kwargs.get("mapped_srcs"):
+        kwargs["mapped_srcs"] = _maybe_select_map(kwargs["mapped_srcs"], _fix_mapped_srcs)
     if kwargs.get("resources"):
         kwargs["resources"] = _fix_resources(kwargs["resources"])
     for attr in ("env", "run_env"):
@@ -461,6 +467,30 @@ def _fix_mapped_srcs(xs: dict[str, str]):
 
 def _fix_named_deps(xs: dict[str, str]):
     return {k: translate_target(v) for (k, v) in xs.items()}
+
+def _fix_cxx_source(src):
+    # A label (possibly by its internal path) or a file in this package; a
+    # (source, flags) pair keeps its flags.
+    if is_tuple(src):
+        return (_fix_cxx_source(src[0]),) + src[1:]
+    if "//" in src or src.startswith(":"):
+        return translate_target(src)
+    return src
+
+def _fix_cxx_sources(srcs):
+    """Translate the labels among C/C++ sources or headers given as a list,
+    a dict (path -> source) or a select of either."""
+    if is_select(srcs):
+        return select_map(srcs, _fix_cxx_sources)
+    if is_dict(srcs):
+        return {k: _fix_cxx_source(v) for (k, v) in srcs.items()}
+    return [_fix_cxx_source(src) for src in srcs]
+
+def _fix_cxx_kwargs(kwargs):
+    for attr in ("srcs", "headers"):
+        if kwargs.get(attr):
+            kwargs[attr] = _fix_cxx_sources(kwargs[attr])
+    return kwargs
 
 def _fix_deps(xs):
     if is_select(xs):

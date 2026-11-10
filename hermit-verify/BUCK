@@ -4,28 +4,9 @@ oncall("hermit")
 
 rust_binary(
     name = "hermit-verify",
-    autocargo = {
-        "cargo_toml_dir": ".",
-        "cargo_toml_config": {
-            "package": {
-                "version": "0.5.6",
-                "readme": "README.md",
-                "homepage": "https://hermetic-infra.org",
-                "documentation": "https://docs.rs/hermit-verify",
-                "keywords": [
-                    "linux",
-                    "hermit",
-                    "determinism",
-                    "debugging"
-                ],
-                "categories": [
-                    "development-tools::debugging",
-                    "development-tools::testing"
-                ]
-            },
-        },
-    },
     srcs = glob(["src/**/*.rs"]),
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
     test_deps = ["fbsource//third-party/rust:pretty_assertions"],
     test_srcs = glob([
         "src/**/*.rs",

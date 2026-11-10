@@ -11,6 +11,7 @@
 
 tpx_labels = struct(
     local_only = "",
+    long_running = "",
     disabled = "",
     run_as_bundle = "",
     test_is_invisible_to_testpilot = "",

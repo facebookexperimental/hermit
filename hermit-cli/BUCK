@@ -5,363 +5,424 @@
 # WILL BE DELETED. UNLESS THERE IS AN ONCALL ADDED THIS FILE WILL BE
 
 # DELETED WITHOUT NOTICE - DO NOT DEPEND ON IT.
-load("@fbcode_macros//build_defs:export_files.bzl", "export_file")
-load("@fbcode_macros//build_defs:native_rules.bzl", "buck_sh_test")
+load("@fbcode//hermetic_infra/hermit/fb-only/gated_tests:defs.bzl", "gated_test", "hermit_host_test", "run_gated_only")
+load("@fbcode//hermetic_infra/hermit/hermit-cli:integration_tests.bzl", "hermit_integration_tests")
+load("@fbcode_macros//build_defs:clippy_configuration.bzl", "clippy_configuration")
+load("@fbcode_macros//build_defs:export_files.bzl", "buck_export_file")
+load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup", "buck_genrule")
 load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
-load(":release_alias.bzl", "hermit_release_aliases")
+load("@fbsource//tools/build_defs:rust_unittest.bzl", "rust_unittest")
+load(":release_alias.bzl", "hermit_release_aliases", "hermit_release_targets")
 
 oncall("hermit")
 
-hermit_build_env = {
+# Upstream's hermit-cli/clippy.toml, for Buck's Clippy (see PACKAGE beside this file).
+clippy_configuration(
+    name = "clippy_config",
+    clippy_toml_src = "clippy.toml",
+)
+
+# libhermit's dependencies, shared with its test harness variants below.
+LIBHERMIT_DEPS = [
+    "fbsource//third-party/rust:addr2line",
+    "fbsource//third-party/rust:anyhow",
+    "fbsource//third-party/rust:bincode",
+    "fbsource//third-party/rust:clap",
+    "fbsource//third-party/rust:colored",
+    "fbsource//third-party/rust:diff",
+    "fbsource//third-party/rust:dirs",
+    "fbsource//third-party/rust:flate2",
+    "fbsource//third-party/rust:goblin",
+    "fbsource//third-party/rust:iced-x86",
+    "fbsource//third-party/rust:libc",
+    "fbsource//third-party/rust:nix",
+    "fbsource//third-party/rust:object",
+    "fbsource//third-party/rust:pretty_assertions",
+    "fbsource//third-party/rust:rand",
+    "fbsource//third-party/rust:rand_pcg",
+    "fbsource//third-party/rust:regex",
+    "fbsource//third-party/rust:serde",
+    "fbsource//third-party/rust:serde_json",
+    "fbsource//third-party/rust:serde_yaml",
+    "fbsource//third-party/rust:shell-words",
+    "fbsource//third-party/rust:tar",
+    "fbsource//third-party/rust:tempfile",
+    "fbsource//third-party/rust:tokio",
+    "fbsource//third-party/rust:tracing",
+    "fbsource//third-party/rust:tracing-appender",
+    "fbsource//third-party/rust:tracing-log",
+    "fbsource//third-party/rust:tracing-subscriber",
+    "fbsource//third-party/rust:uuid",
+    "//common/rust/build_info:build_info",
+    "//hermetic_infra/hermit/detcore:detcore",
+    "//hermetic_infra/hermit/detcore-model:detcore-model",
+    "//hermetic_infra/hermit/hermit-record:hermit-record",
+    "//hermetic_infra/hermit/hermit-record-format:hermit-record-format",
+    "//hermetic_infra/hermit/hermit-replay:hermit-replay",
+    "//hermetic_infra/hermit/hermit-resources:hermit-resources",
+    "//hermetic_infra/hermit/hermit-run-kvm:hermit-run-kvm",
+    "//hermetic_infra/hermit/hermit-run-ptrace:hermit-run-ptrace",
+    "//hermetic_infra/reverie:reverie-kvm",
+    "//hermetic_infra/reverie:reverie-liteinst",
+    "//hermetic_infra/reverie:reverie-ptrace",
+    "//hermetic_infra/reverie:reverie-rpc-transport",
+    "//hermetic_infra/reverie:safeptrace",
+]
+
+# libhermit's test harnesses take reverie-liteinst built against the one
+# reverie-inguest of Cargo's hermit-cli test build
+# (reverie:reverie-liteinst-exec-stop), beside their exec-stop dependency.
+LIBHERMIT_TEST_DEPS = [
+    "//hermetic_infra/reverie:reverie-liteinst-exec-stop" if dep == "//hermetic_infra/reverie:reverie-liteinst" else dep for dep in LIBHERMIT_DEPS
+]
+
+LIBHERMIT_ENV = {
+    # src/bin/hermit/version.rs reports it in `hermit --version`. Keep in sync
+    # with the version in oss_cargo/hermit-cli/Cargo.toml.oss.
     "CARGO_PKG_VERSION": "0.5.6",
+    # The open-source Buck build's version string names these (an fbcode
+    # build reports BuildInfo instead); a regular build embeds no date or
+    # revision.
     "HERMIT_BUILD_DATE": "unknown",
     "HERMIT_BUILD_GIT_SHA": "unknown",
     "HERMIT_REVERIE_PIN": "9c3703857154641d85d5de7ec2539bbbce6a984c",
 }
 
-# The shadow release entrypoint supplies these values from Git/Cargo metadata
-# using Buck config arguments (never shell-expanded source text). The supported
-# entrypoint is `scripts/build-buck-release.rs`, which derives and validates all
-# four values before selecting these shadow targets.
-#
-# Regular builds and CI (ci/buck-e2e, `validate --build buck-*`) instead pass
-# -c hermit_release.unstamped=true: the same release feature set and linkage
-# with the ordinary build identity (no commit hash, no build date), so a commit
-# that changes no compiled source rebuilds nothing and stays cached. Without
-# that flag the release targets still refuse to compile unstamped.
-release_unstamped = read_root_config("hermit_release", "unstamped", "false") == "true"
-
-# The release targets' cargo features, passed to both as their last argument,
-# `**release_features`.
-# A stamped build adds the buck-release-provenance cfg. Each case spells out its
-# whole list because scripts/check-buck-reindeer-features.rs reads only literal
-# `features` lists, never a variable or a concatenation.
-release_features = {"features": [
-    "liteinst",
-]} if release_unstamped else {"features": [
-    "buck-release-provenance",
-    "liteinst",
-]}
-release_build_env = hermit_build_env if release_unstamped else {
-    "CARGO_PKG_VERSION": read_root_config("hermit_release", "version", ""),
-    "HERMIT_BUILD_DATE": read_root_config("hermit_release", "build_date", ""),
-    "HERMIT_BUILD_GIT_SHA": read_root_config("hermit_release", "hermit_sha", ""),
-    "HERMIT_REVERIE_PIN": read_root_config("hermit_release", "reverie_sha", ""),
+# The unit tests' run-time environment.
+LIBHERMIT_TEST_RUN_ENV = {
+    "CARGO_MANIFEST_DIR": "$(location :hermit-test-fixtures)",
+    # iced-x86 decoder tables and signal-handler messages are process-lifetime
+    # globals.
+    "LSAN_OPTIONS": "detect_leaks=0",
+    "RUST_MIN_STACK": "16777216",
 }
-release_lzma_target = read_root_config(
-    "hermit_release",
-    "lzma_target",
-    "fbsource//third-party/xz:lzma",
-)
-release_unwind_target = read_root_config(
-    "hermit_release",
-    "unwind_target",
-    "fbsource//third-party/libunwind:unwind-ptrace",
+
+# libhermit's sources as its test harnesses see them, under a "hermit-cli/"
+# prefix: src/bin/hermit/mod.rs's unit tests include detcore-liteinst's
+# numeric mapped-entry bounds by #[path], which must resolve inside the
+# declared source tree.
+LIBHERMIT_TEST_SRCS = {
+    src: "hermit-cli/" + src
+    for src in [
+        "README.md",
+        "reverie_pin.rs",
+        "src/in_guest_delivery_harness/guest.c",
+        "tests/common/exclusive_rewrite_summary.rs",
+        "tests/common/readonly_proc.rs",
+        "tests/fixtures/chosen-before-reserved-input.json",
+        "tests/fixtures/ptrace_copy_permission.c",
+        "tests/fixtures/random_copy_fatal.c",
+    ]
+    + glob([
+        "test-resources/**/*.json",
+        "tests/fixtures/access_trace_*.jsonl",
+        "tests/fixtures/dbt/*.json",
+    ])
+    + glob(
+        ["src/**/*.rs"],
+        exclude = ["src/bin/*.rs"],
+    )
+} | {
+    "//hermetic_infra/hermit:mapped-entry-bounds": "detcore-liteinst/src/exec_initial/mapped_entry/bounds.rs",
+}
+
+# libhermit's sources, shared with :_libhermit-release.
+LIBHERMIT_SRCS = [
+    # src/lib.rs's crate documentation.
+    "README.md",
+] + glob(
+    [
+        "src/**/*.rs",
+    ],
+    # src/lib.rs includes the application, src/bin/hermit/mod.rs, as `app`;
+    # the other binaries stay out.
+    exclude = [
+        "src/bin/*.rs",
+    ],
 )
 
 rust_library(
     name = "libhermit",
+    srcs = LIBHERMIT_SRCS,
     autocargo = {
-        "cargo_toml_dir": ".",
         "cargo_toml_config": {
-            "package": {
-                "name": "hermit-run",
-                "version": "0.5.6",
-                "readme": "README.md",
-                "homepage": "https://hermetic-infra.org",
-                "documentation": "https://docs.rs/hermit-run",
-                "keywords": [
-                    "linux",
-                    "hermit",
-                    "determinism",
-                    "debugging"
-                ],
-                "categories": [
-                    "development-tools::debugging",
-                    "development-tools::testing"
-                ],
-                "metadata": {"hermit": {"build-identity": "source"}},
-            },
             "dependencies_override": {
-                "dependencies": {
-                    "reverie-inguest": {"default-features": False, "optional": True},
-                    "sha2": {"optional": True},
-                    "reverie-rpc-transport": {"optional": True},
-                },
-                "build-dependencies": {
-                    "libc": {"version": "0.2.186"},
-                    "sha1_smol": {"version": "1.0.1"},
-                    "serde": {"version": "1.0.219", "features": ["derive"]},
-                    "serde_json": {"version": "1.0.140"},
-                    "sha2": {"version": "0.10.9"},
-                    "toml": {"version": "0.8.23"},
-                },
                 "dev-dependencies": {
-                    # Export debt: Cargo makes this test dependency x86_64-only.
-                    # This override is not target-synchronized; see the Cargo/Buck
-                    # coverage note in docs/TESTING_ENVIRONMENTS.md.
-                    "reverie-inguest": {"default-features": False, "features": ["exec-stop"]},
-                    "toml": {"version": "0.8.23"},
+                    "reverie-inguest": {
+                        "default-features": False,
+                        "features": ["exec-stop"],
+                    },
                 },
             },
-            "features": {
-                "exec-stop-launcher": ["dep:reverie-inguest", "reverie-inguest/exec-stop", "reverie-inguest/loader-private-runtime"],
-                "default": [],
-                "loader-rcb-observation": ["exec-stop-launcher", "reverie-ptrace/rcb-observation"],
-                "liteinst": ["dep:reverie-liteinst", "dep:reverie-rpc-transport"],
-                "native-exec-input-admission": [],
-                "native-exec": ["native-exec-input-admission", "liteinst", "detcore-model/native-exec", "reverie-liteinst/exec-native-injection", "dep:reverie-inguest", "dep:sha2"],
-                "kvm-native-test-support": ["reverie-kvm/native-test-support"],
-                "mm-cancellation-test-support": ["exec-stop-launcher", "liteinst", "detcore/physical-mm-test-support"],
-                "kvm-execution-tests": [],
+            # Retain the package's Cargo dependency surface independently of
+            # the native default-feature binary's narrower dependency graph.
+            "extra_buck_dependencies": {
+                "dependencies": [
+                    ("hermit-test-workdir", "//hermetic_infra/hermit/common/test-workdir:hermit-test-workdir"),
+                    ("num_cpus", "fbsource//third-party/rust:num_cpus"),
+                ],
+                # Cargo-only: upstream's tests/*.rs integration tests, which Buck does not build.
+                "dev-dependencies": [
+                    ("proc-macro2", "fbsource//third-party/rust:proc-macro2"),
+                    ("quote", "fbsource//third-party/rust:quote"),
+                    ("reverie-inguest", "//hermetic_infra/reverie:reverie-inguest"),
+                    ("reverie-loader", "//hermetic_infra/reverie:reverie-loader"),
+                    ("ruzstd", "fbsource//third-party/rust:ruzstd"),
+                    ("sha2", "fbsource//third-party/rust:sha2-010"),
+                    ("syn", "fbsource//third-party/rust:syn2"),
+                ],
             },
+            # The OSS package's backend features (oss_cargo/hermit-cli/
+            # Cargo.toml.oss), declared but empty, which keeps
+            # `cfg(feature = ...)` known to clippy's `-D warnings` in
+            # fb-only/ci.sh. Of those backends fbsource builds only LiteInst,
+            # whose dependencies the Buck targets list unconditionally.
+            "features": {
+                "dbt": [],
+                "default": [],
+                "e9patch": [],
+                "exec-stop-launcher": [],
+                "kvm-execution-tests": [],
+                "kvm-native-test-support": [],
+                "liteinst": [],
+                "native-exec": [],
+                "sabre": [],
+                "third-party-backends": [
+                    "dbt",
+                    "e9patch",
+                    "liteinst",
+                    "sabre",
+                ],
+            },
+            "package": {"name": "hermit-run"},
+            # Preserve upstream's explicit feature requirements for these
+            # integration tests; Cargo must not select them without LiteInst.
+            "test": [
+                {
+                    "name": "liteinst_allocator",
+                    "required-features": ["liteinst"],
+                },
+                {
+                    "name": "liteinst_stacks",
+                    "required-features": ["liteinst"],
+                },
+            ],
         },
     },
-    srcs = glob(
-        [
-            "src/**/*.rs",
-            "README.md",
-        ],
-        exclude = [
-            "src/bin/**/*.rs",
-        ],
-    ) + glob(
-        ["src/bin/hermit/**/*.rs"],
-        exclude = ["src/bin/hermit/main.rs"],
-    ),
-    test_srcs = glob([
-        "src/bin/**/*.rs",
-        "test-resources/**/*.json",
-        "tests/common/exclusive_rewrite_summary.rs",
-        "tests/common/readonly_proc.rs",
-        "tests/fixtures/staged-summary.gitignore",
-    ]),
     crate = "hermit",
-    env = hermit_build_env,
-    # Like _libhermit-release below: the LiteInst backing descriptor and the
-    # in-guest entry symbols are per-image link contracts that only a final
-    # binary link can resolve, so this library must not become a shared object.
-    preferred_linkage = "static",
-    # The shared application deliberately uses LiteInst in this internal debug
-    # build, unlike Cargo's empty default feature set. Backend cfgs and their app
-    # tests now belong to this library, not the thin executable.
+    env = LIBHERMIT_ENV,
+    # The LiteInst backend, as upstream's Buck build of this library. Each
+    # target spells out its features: the open-source tree's
+    # scripts/check-buck-reindeer-features.rs reads only literal lists.
     features = ["liteinst"],
-    # iced-x86 decoder tables are process-lifetime globals.
-    test_env = {"LSAN_OPTIONS": "detect_leaks=0"},
-    deps = [
-        "fbsource//third-party/rust:addr2line",
-        "fbsource//third-party/rust:anyhow",
-        "fbsource//third-party/rust:bincode",
-        "fbsource//third-party/rust:clap",
-        "fbsource//third-party/rust:dirs",
-        "fbsource//third-party/rust:goblin",
-        "fbsource//third-party/rust:iced-x86",
-        "fbsource//third-party/rust:libc",
-        "fbsource//third-party/rust:nix",
-        "fbsource//third-party/rust:object",
-        "fbsource//third-party/rust:rand_pcg",
-        "fbsource//third-party/rust:serde",
-        "fbsource//third-party/rust:serde_json",
-        "fbsource//third-party/rust:tempfile",
-        "fbsource//third-party/rust:tokio",
-        "fbsource//third-party/rust:tracing",
-        "fbsource//third-party/rust:tracing-log",
-        "fbsource//third-party/rust:tracing-subscriber",
-        "fbsource//third-party/rust:uuid",
-        "//hermetic_infra/hermit/detcore:detcore",
-        "//hermetic_infra/hermit/detcore-model:detcore-model",
-        "//hermetic_infra/hermit/hermit-record:hermit-record",
-        "//hermetic_infra/hermit/hermit-record-format:hermit-record-format",
-        "//hermetic_infra/hermit/hermit-replay:hermit-replay",
-        "//hermetic_infra/hermit/hermit-run-kvm:hermit-run-kvm",
-        "//hermetic_infra/hermit/hermit-run-ptrace:hermit-run-ptrace",
-        "//hermetic_infra/hermit/hermit-resources:hermit-resources",
-        "//hermetic_infra/reverie:reverie",
-        "fbsource//third-party/rust:flate2",
-        "fbsource//third-party/rust:tar",
-        "//hermetic_infra/reverie:reverie-kvm",
-        "//hermetic_infra/reverie:reverie-liteinst",
-        "//hermetic_infra/reverie:reverie-ptrace",
-        "//hermetic_infra/reverie:reverie-rpc-transport",
-        "//hermetic_infra/reverie:safeptrace",
-        "fbsource//third-party/rust:colored",
-        "fbsource//third-party/rust:diff",
-        "fbsource//third-party/rust:pretty_assertions",
-        "fbsource//third-party/rust:rand",
-        "fbsource//third-party/rust:regex",
-        "fbsource//third-party/rust:serde_yaml",
-        "fbsource//third-party/rust:shell-words",
-        "fbsource//third-party/rust:tracing-appender",
-        "//common/rust/build_info:build_info",
+    named_deps = {"reverie": "//hermetic_infra/reverie:reverie"},
+    # The LiteInst backing descriptor and the in-guest entry symbols are
+    # per-image link contracts that only a final binary link can resolve, so
+    # this library must not become a shared object.
+    preferred_linkage = "static",
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
+    # :libhermit-unittest below, which needs the prefixed source layout.
+    unittests = False,
+    deps = LIBHERMIT_DEPS,
+)
+
+# libhermit's unit tests, the application's (src/bin/hermit) included.
+rust_unittest(
+    name = "libhermit-unittest",
+    # The system allocator, as in the Cargo build and as :hermit uses.
+    # fbcode's default jemalloc runs background threads (jemalloc_bg_thd), and
+    # a test that clones a container refuses to while any thread but libtest's
+    # main thread runs beside it (src/bin/hermit/test_isolation.rs).
+    allocator = "malloc",
+    autocargo = {"ignore_rule": True},
+    crate = "hermit",
+    crate_root = "hermit-cli/src/lib.rs",
+    env = LIBHERMIT_ENV,
+    features = ["liteinst"],
+    # Run by :libhermit-unittest-gated (fb-only/gated_tests).
+    labels = run_gated_only(),
+    mapped_srcs = LIBHERMIT_TEST_SRCS,
+    named_deps = {
+        "reverie": "//hermetic_infra/reverie:reverie",
+        # Cargo's dev-dependency on reverie-inguest with `exec-stop`, for
+        # src/bin/hermit/exec_stop_launch_tests.rs.
+        "reverie_inguest": "//hermetic_infra/reverie:reverie-inguest-exec-stop",
+    },
+    resources = [":hermit-test-fixtures"],
+    run_env = LIBHERMIT_TEST_RUN_ENV,
+    # The test fixtures are project-relative, as Cargo's CARGO_MANIFEST_DIR.
+    rustc_flags = [
+        "--env-set=CARGO_MANIFEST_DIR=$(location :hermit-test-fixtures)",
     ],
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
+    deps = LIBHERMIT_TEST_DEPS,
+)
+
+# libhermit's unit-test harness with upstream's test-only `kvm-execution-tests`
+# feature, which adds src/kvm_execution_tests.rs and nothing else. It is not a
+# test target itself: privileged-test.cli_kvm (integration_tests.bzl) selects
+# from it, so the ordinary unit tests never require KVM.
+rust_binary(
+    name = "integration-libhermit-kvm",
+    # The system allocator, for the reason given at :libhermit-unittest.
+    allocator = "malloc",
+    autocargo = {"ignore_rule": True},
+    crate = "hermit",
+    crate_root = "hermit-cli/src/lib.rs",
+    env = LIBHERMIT_ENV,
+    features = [
+        "liteinst",
+        "kvm-execution-tests",
+    ],
+    mapped_srcs = LIBHERMIT_TEST_SRCS,
+    named_deps = {
+        "reverie": "//hermetic_infra/reverie:reverie",
+        "reverie_inguest": "//hermetic_infra/reverie:reverie-inguest-exec-stop",
+    },
+    rustc_flags = ["--test"],
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
+    # The binary is already a libtest harness.
+    unittests = False,
+    deps = LIBHERMIT_TEST_DEPS,
 )
 
 rust_binary(
     name = "hermit",
+    srcs = ["src/bin/hermit/main.rs"],
+    # The system allocator, as in the Cargo build. fbcode's default jemalloc
+    # starts a background thread before main(), which breaks the CLI-owned
+    # lifecycle role's single-threaded precondition (cli_owned_lifecycle.rs).
+    allocator = "malloc",
     autocargo = {
-        "cargo_toml_dir": ".",
-        "cargo_toml_config": {
-            "package": {
-                "name": "hermit-run",
-                "version": "0.5.6",
-                "readme": "README.md",
-                "homepage": "https://hermetic-infra.org",
-                "documentation": "https://docs.rs/hermit-run",
-                "keywords": [
-                    "linux",
-                    "hermit",
-                    "determinism",
-                    "debugging"
-                ],
-                "categories": [
-                    "development-tools::debugging",
-                    "development-tools::testing"
-                ],
-                "metadata": {"hermit": {"build-identity": "source"}},
-            },
-            "dependencies_override": {
-                "dependencies": {
-                    "reverie-inguest": {"default-features": False, "optional": True},
-                    "sha2": {"optional": True},
-                    "reverie-rpc-transport": {"optional": True},
-                },
-                "build-dependencies": {
-                    "toml": {"version": "0.8.23"},
-                },
-                "dev-dependencies": {
-                    # Export debt: Cargo makes this test dependency x86_64-only.
-                    # This override is not target-synchronized; see the Cargo/Buck
-                    # coverage note in docs/TESTING_ENVIRONMENTS.md.
-                    "reverie-inguest": {"default-features": False, "features": ["exec-stop"]},
-                    "toml": {"version": "0.8.23"},
-                },
-            },
-            "features": {
-                "exec-stop-launcher": ["dep:reverie-inguest", "reverie-inguest/exec-stop", "reverie-inguest/loader-private-runtime"],
-                "default": [],
-                "loader-rcb-observation": ["exec-stop-launcher", "reverie-ptrace/rcb-observation"],
-                "liteinst": ["dep:reverie-liteinst", "dep:reverie-rpc-transport"],
-                "native-exec-input-admission": [],
-                "native-exec": ["native-exec-input-admission", "liteinst", "detcore-model/native-exec", "reverie-liteinst/exec-native-injection", "dep:reverie-inguest", "dep:sha2"],
-                "kvm-native-test-support": ["reverie-kvm/native-test-support"],
-                "mm-cancellation-test-support": ["exec-stop-launcher", "liteinst", "detcore/physical-mm-test-support"],
-                "kvm-execution-tests": [],
-            },
-        },
+        "cargo_target_config": {"path": "src/bin/hermit/main.rs"},
     },
-    srcs = glob(["src/bin/hermit/main.rs"]),
-    env = hermit_build_env,
-    # Backend cfgs are owned by :libhermit. This thin entry contains only
-    # executable preinitialization and fbinit, so it needs no backend feature list.
-    # Signal-handler messages intentionally live for the process lifetime.
-    test_env = {"LSAN_OPTIONS": "detect_leaks=0"},
-    test_srcs = glob(["src/bin/hermit/main.rs"]),
+    crate_root = "src/bin/hermit/main.rs",
+    link_group_map = [],
+    link_style = "static_pic",
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
+    # main.rs only starts libhermit's application (hermit::app), whose unit
+    # tests are :libhermit-unittest.
+    unittests = False,
     deps = [
         ":libhermit",
         "//common/rust/shed/fbinit:fbinit",
     ],
 )
 
-rust_library(
-    name = "_libhermit-release",
-    srcs = glob(
-        [
-            "src/**/*.rs",
-            "README.md",
-        ],
-        exclude = [
-            "src/bin/**/*.rs",
-        ],
-    ) + glob(
-        ["src/bin/hermit/**/*.rs"],
-        exclude = ["src/bin/hermit/main.rs"],
-    ),
-    test_srcs = glob([
-        "src/bin/**/*.rs",
-        "test-resources/**/*.json",
-        "tests/common/exclusive_rewrite_summary.rs",
-        "tests/common/readonly_proc.rs",
-        "tests/fixtures/staged-summary.gitignore",
-    ]),
-    crate = "hermit",
-    env = release_build_env,
-    preferred_linkage = "static",
-    deps = [
-        "fbsource//third-party/rust:flate2",
-        "fbsource//third-party/rust:tar",
-        "fbsource//third-party/rust:addr2line",
-        "fbsource//third-party/rust:anyhow",
-        "fbsource//third-party/rust:bincode",
-        "fbsource//third-party/rust:clap",
-        "fbsource//third-party/rust:dirs",
-        "fbsource//third-party/rust:goblin",
-        "fbsource//third-party/rust:iced-x86",
-        "fbsource//third-party/rust:libc",
-        "fbsource//third-party/rust:nix",
-        "fbsource//third-party/rust:object",
-        "fbsource//third-party/rust:rand_pcg",
-        "fbsource//third-party/rust:serde",
-        "fbsource//third-party/rust:serde_json",
-        "fbsource//third-party/rust:tempfile",
-        "fbsource//third-party/rust:tokio",
-        "fbsource//third-party/rust:tracing",
-        "fbsource//third-party/rust:tracing-log",
-        "fbsource//third-party/rust:tracing-subscriber",
-        "fbsource//third-party/rust:uuid",
-        "//hermetic_infra/hermit/detcore:detcore",
-        "//hermetic_infra/hermit/detcore-model:detcore-model",
-        "//hermetic_infra/hermit/hermit-record:hermit-record",
-        "//hermetic_infra/hermit/hermit-record-format:hermit-record-format",
-        "//hermetic_infra/hermit/hermit-replay:hermit-replay",
-        "//hermetic_infra/hermit/hermit-run-kvm:hermit-run-kvm",
-        "//hermetic_infra/hermit/hermit-run-ptrace:hermit-run-ptrace",
-        "//hermetic_infra/hermit/hermit-resources:hermit-resources",
-        "//hermetic_infra/reverie:reverie",
-        "//hermetic_infra/reverie:reverie-kvm",
-        "//hermetic_infra/reverie:reverie-liteinst",
-        "//hermetic_infra/reverie:reverie-ptrace",
-        "//hermetic_infra/reverie:reverie-rpc-transport",
-        "//hermetic_infra/reverie:safeptrace",
-        "fbsource//third-party/rust:colored",
-        "fbsource//third-party/rust:diff",
-        "fbsource//third-party/rust:pretty_assertions",
-        "fbsource//third-party/rust:rand",
-        "fbsource//third-party/rust:regex",
-        "fbsource//third-party/rust:serde_yaml",
-        "fbsource//third-party/rust:shell-words",
-        "fbsource//third-party/rust:tracing-appender",
-        "//common/rust/build_info:build_info",
-    ],
-    **release_features
+# libhermit and hermit as the release build compiles them, :_libhermit-release
+# and :_hermit-release (release_alias.bzl). The open-source build selects them
+# as :libhermit-release and :hermit-release.
+hermit_release_targets(
+    srcs = LIBHERMIT_SRCS,
+    unstamped_env = LIBHERMIT_ENV,
+    deps = LIBHERMIT_DEPS,
 )
 
-rust_binary(
-    name = "_hermit-release",
-    srcs = glob(["src/bin/hermit/main.rs"]),
-    crate = "hermit",
-    env = release_build_env,
-    link_style = "static_pic",
-    rustc_flags = [
-        "-C",
-        "link-arg=-Wl,--disable-new-dtags",
-        "-C",
-        "link-arg=-Wl,-rpath,$ORIGIN/../install_pkg/rsrcs/hermit-runtime:$ORIGIN/install/rsrcs/hermit-runtime",
-    ],
-    # The guarded local producer overrides this with its content-bound prebuilt
-    # target. CI resolves the default declared pkg-config dependency.
-    deps = [release_lzma_target, release_unwind_target] + [
-        ":_libhermit-release",
-        "//common/rust/shed/fbinit:fbinit",
-    ],
-    **release_features
-)
-
-# The hermit-release aliases exist only in the GitHub build; see
+# The hermit-release aliases exist only in the open-source build; see
 # release_alias.bzl for why (fbcode forbids the raw configured_alias rule).
 hermit_release_aliases()
 
-buck_sh_test(
+gated_test(
+    name = "libhermit-unittest-gated",
+    env = LIBHERMIT_TEST_RUN_ENV,
+    # Match the native Rust test provider: fixtures are project-relative.
+    labels = ["buck2_run_from_project_root"],
+    test = "//hermetic_infra/hermit/hermit-cli:libhermit-unittest",
+)
+
+# Cargo's src/bin/hermit-dap.rs; the CLI integration tests run it.
+rust_binary(
+    name = "hermit-dap",
+    srcs = [
+        "src/bin/hermit-dap.rs",
+        "src/bin/hermit-dap-reverse.py",
+    ],
+    autocargo = {"ignore_rule": True},
+    crate_root = "src/bin/hermit-dap.rs",
+    # Match :hermit above: a self-contained link, so the staged copy beside
+    # :hermit (hermit-and-hermit-dap) does not depend on shared libraries
+    # the copy does not carry. Without this the staged hermit-dap fails in
+    # the dynamic loader (libunwind.so.8) before it can run.
+    link_group_map = [],
+    link_style = "static_pic",
+    deps = [
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:nix",
+        "fbsource//third-party/rust:serde_json",
+    ],
+)
+
+# hermit and hermit-dap copied into one directory, as Cargo builds them. Each
+# starts the other from beside its own executable, which a link to either
+# output cannot provide. The CLI integration tests stage both from here.
+buck_genrule(
+    name = "hermit-and-hermit-dap",
+    out = "bin",
+    cmd = "mkdir -p $OUT && cp $(location :hermit) $OUT/hermit && cp $(location :hermit-dap) $OUT/hermit-dap",
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
+)
+
+# Cargo's src/bin/verification-report.rs; integration tests run it.
+rust_binary(
+    name = "verification-report",
+    srcs = ["src/bin/verification-report.rs"],
+    autocargo = {"ignore_rule": True},
+    crate_root = "src/bin/verification-report.rs",
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
+    deps = [
+        "fbsource//third-party/rust:serde_json",
+        ":libhermit",
+    ],
+)
+
+buck_filegroup(
+    name = "hermit-test-fixtures",
+    srcs = {src: src for src in glob(["test-resources/**/*.json"])},
+)
+
+# hermit-cli as its Cargo integration tests see CARGO_MANIFEST_DIR at run time
+# (part of //hermetic_infra/hermit:integration-repository).
+buck_filegroup(
+    name = "integration-cli-tree",
+    srcs = glob(["**"], exclude = ["BUCK", "*.bzl"]),
+    visibility = ["//hermetic_infra/hermit:"],
+)
+
+hermit_integration_tests()
+
+# check-exit-status-class.rs's unit tests include this file by include_str!.
+buck_export_file(
+    name = "tests/common/liteinst_in_guest_programs.rs",
+    visibility = ["//hermetic_infra/hermit/fb-only/contract_checks:"],
+)
+
+# Inputs of fb-only/integration_tests/generate.py, checked for drift by its test.
+buck_filegroup(
+    name = "integration-generator-inputs",
+    # integration_tests_data.bzl, the one *_data.bzl, is fbsource's own
+    # generated file: the open-source tree does not carry it, so the glob
+    # names it without requiring it, and the target is fbsource-only.
+    srcs = [
+        "build.rs",
+        "build_support.rs",
+        "reverie_pin.rs",
+    ]
+    + glob(["*_data.bzl", "src/**", "tests/**"]),
+    target_compatible_with = ["fbcode//opensource/macros:broken-in-oss"],
+    visibility = [
+        "//hermetic_infra/hermit/fb-only/integration_tests/tests:",
+        "//hermetic_infra/hermit/fb-only/rr_tests/tests:",
+    ],
+)
+
+hermit_host_test(
     name = "test_record_uptime",
     args = [
         "record",
@@ -374,7 +435,7 @@ buck_sh_test(
     test = ":hermit",
 )
 
-buck_sh_test(
+hermit_host_test(
     name = "test_record_dev_urandom",
     args = [
         "record",
@@ -390,8 +451,10 @@ buck_sh_test(
     test = ":hermit",
 )
 
-buck_sh_test(
+hermit_host_test(
     name = "test_record_with_gdb_smoke",
+    # RE workers have no gdb in PATH (measured 2026-10-28, re-cpuid RE pass).
+    allow_cpuid_re = False,
     args = [
         "record",
         "start",
@@ -406,25 +469,17 @@ buck_sh_test(
     test = ":hermit",
 )
 
-# Included verbatim by ci/manifest-plan via #[path] modules
-# (ci/manifest-plan/src/lib.rs). Exported so the manifest-plan Buck
-# library can name them in mapped_srcs.
-export_file(
-    name = "canonical_verdict.rs",
-    src = "src/canonical_verdict.rs",
-)
-
-export_file(
-    name = "logdiff_report.rs",
-    src = "src/logdiff_report.rs",
-)
-
-export_file(
-    name = "verify_run_record.rs",
-    src = "src/verify_run_record.rs",
-)
-
-export_file(
-    name = "proc_locks_lease.rs",
-    src = "tests/common/proc_locks_lease.rs",
-)
+# Sources the e2e test harness (ci/manifest-plan) includes verbatim by #[path].
+[
+    buck_export_file(
+        name = name,
+        src = src,
+        visibility = ["//hermetic_infra/hermit/ci/manifest-plan:"],
+    )
+    for name, src in [
+        ("canonical_verdict.rs", "src/canonical_verdict.rs"),
+        ("logdiff_report.rs", "src/logdiff_report.rs"),
+        ("proc_locks_lease.rs", "tests/common/proc_locks_lease.rs"),
+        ("verify_run_record.rs", "src/verify_run_record.rs"),
+    ]
+]

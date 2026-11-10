@@ -1,27 +1,50 @@
-load("@fbcode_macros//build_defs:export_files.bzl", "export_file")
+# @lint-ignore-every AUTODEPS2
+# These repository maintenance scripts are not part of the fbsource Buck graph,
+# except the unchanged sources that fb-only/contract_checks builds and runs and
+# the validation-plan sources that the ci/manifest-plan library maps.
+
+load("@fbcode_macros//build_defs:export_files.bzl", "buck_export_file")
 
 oncall("hermit")
 
-# Shared verbatim with ci/manifest-plan, which includes these files via
-# #[path] modules (ci/manifest-plan/src/lib.rs) exactly as
-# scripts/validate.rs includes them. Exported so the manifest-plan Buck
-# library can name them in mapped_srcs.
-export_file(
-    name = "validate_corpus.rs",
-    src = "lib/validate_corpus.rs",
-)
+# check.exit_status_class: the rust-script and the module it includes by #[path].
+[
+    buck_export_file(
+        name = src,
+        visibility = ["//hermetic_infra/hermit/fb-only/contract_checks:"],
+    )
+    for src in [
+        "check-exit-status-class.rs",
+        "lib/rust_script_prelude.rs",
+    ]
+]
 
-export_file(
-    name = "validate_generator.rs",
-    src = "lib/validate_generator.rs",
-)
+# check.backend_abstraction: the script and the source gate it executes.
+[
+    buck_export_file(
+        name = src,
+        visibility = [
+            "//hermetic_infra/hermit:",
+            "//hermetic_infra/hermit/fb-only/contract_checks:",
+        ],
+    )
+    for src in [
+        "check-detcore-backend-abstraction.sh",
+        "detcore-backend-source.rs",
+    ]
+]
 
-export_file(
-    name = "validate_plan.rs",
-    src = "lib/validate_plan.rs",
-)
-
-export_file(
-    name = "validate_super.rs",
-    src = "lib/validate_super.rs",
-)
+# scripts/lib sources the e2e test harness (ci/manifest-plan) includes by #[path].
+[
+    buck_export_file(
+        name = name,
+        src = "lib/" + name,
+        visibility = ["//hermetic_infra/hermit/ci/manifest-plan:"],
+    )
+    for name in [
+        "validate_corpus.rs",
+        "validate_generator.rs",
+        "validate_plan.rs",
+        "validate_super.rs",
+    ]
+]

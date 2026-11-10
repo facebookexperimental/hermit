@@ -2,8 +2,17 @@
 # This freestanding C fixture is not part of the fbsource Buck graph.
 
 load("@fbcode_macros//build_defs:export_files.bzl", "export_file")
+load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup")
 
 oncall("hermit")
+
+# Guest sources for hermit-cli's Cargo integration tests (see
+# //hermetic_infra/hermit/tests:integration-tree).
+buck_filegroup(
+    name = "guest-sources",
+    srcs = glob(["**"], exclude = ["BUCK"]),
+    visibility = ["//hermetic_infra/hermit/tests/..."],
+)
 
 # Named by label from tests/BUCK; a package may not list another package's
 # files as sources.

@@ -1,14 +1,17 @@
 load("@bazel_skylib//lib:paths.bzl", "paths")
-load("@fbcode_macros//build_defs:lit_unittest.bzl", "lit_unittest")
-load("build_defs.bzl", "cpp_lit_unittest", "go_lit_unittest", "rust_lit_unittest")
+load("@fbcode//hermetic_infra/hermit/fb-only/gated_tests:defs.bzl", "hermit_host_lit_test")
+load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup")
+load("build_defs.bzl", "LIT_TEST_ENV", "cpp_lit_unittest", "go_lit_unittest", "rust_lit_unittest")
 
 oncall("hermit")
 
 # Pure lit tests. These have no dependencies on anything else except `hermit
-# run`.
+# run`, whose ptrace backend needs CPUID faulting: each is admitted by the
+# cpuid-faulting probe.
 [
-    lit_unittest(
+    hermit_host_lit_test(
         name = p.replace(".", "_"),
+        env = LIT_TEST_ENV,
         lit_args = ["--show-all"],
         subs = [
             ("hermit", "//hermetic_infra/hermit/hermit-cli:hermit"),
@@ -74,3 +77,15 @@ oncall("hermit")
         "*/main.go",
     ])
 ]
+
+# Guest sources for hermit-cli's Cargo integration tests (see
+# //hermetic_infra/hermit:integration-repository), and part of the tree
+# check.exit_status_class scans (//hermetic_infra/hermit/detcore:tests-rust).
+buck_filegroup(
+    name = "guest-sources",
+    srcs = glob(["**"], exclude = ["BUCK", "*.bzl"]),
+    visibility = [
+        "//hermetic_infra/hermit:",
+        "//hermetic_infra/hermit/detcore:",
+    ],
+)

@@ -1277,9 +1277,12 @@ mod e2e_payload_identity_tests {
         }
         // The release target's own rustc_flags come after the toolchain's and
         // would override them, in either the one- or two-token spelling.
-        let target = read(&test_source_root(), "hermit-cli/BUCK");
-        for class in ["debug-assertions", "overflow-checks"] {
-            assert!(!target.contains(class), "hermit-cli/BUCK sets {class}");
+        // hermit-cli/BUCK defines the release targets through release_alias.bzl.
+        for path in ["hermit-cli/BUCK", "hermit-cli/release_alias.bzl"] {
+            let target = read(&test_source_root(), path);
+            for class in ["debug-assertions", "overflow-checks"] {
+                assert!(!target.contains(class), "{path} sets {class}");
+            }
         }
     }
 

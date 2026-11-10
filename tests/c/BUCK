@@ -1,5 +1,7 @@
+load("@fbcode//hermetic_infra/hermit/tests:record_workloads.bzl", "record_c_workloads")
 load("@fbcode_macros//build_defs:cpp_binary.bzl", "cpp_binary")
 load("@fbcode_macros//build_defs:export_files.bzl", "export_file")
+load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup")
 
 oncall("hermit")
 
@@ -47,8 +49,8 @@ cpp_binary(
 cpp_binary(
     name = "ipc_determinism",
     srcs = ["ipc_determinism.c"],
-    preprocessor_flags = ["-D_GNU_SOURCE"],
     labels = ["autodeps2_generated"],
+    preprocessor_flags = ["-D_GNU_SOURCE"],
 )
 
 cpp_binary(
@@ -120,8 +122,8 @@ cpp_binary(
 cpp_binary(
     name = "resource_determinism",
     srcs = ["resource_determinism.c"],
-    preprocessor_flags = ["-D_GNU_SOURCE"],
     labels = ["autodeps2_generated"],
+    preprocessor_flags = ["-D_GNU_SOURCE"],
 )
 
 cpp_binary(
@@ -201,3 +203,16 @@ cpp_binary(
     srcs = ["signal_determinism.c"],
     labels = ["autodeps2_generated"],
 )
+
+# Guest sources for hermit-cli's Cargo integration tests (see
+# //hermetic_infra/hermit/tests:integration-tree).
+buck_filegroup(
+    name = "guest-sources",
+    srcs = {
+        "simple": "//hermetic_infra/hermit/tests/c/simple:guest-sources",
+    }
+    | {src: src for src in glob(["**"], exclude = ["BUCK"])},
+    visibility = ["//hermetic_infra/hermit/tests/..."],
+)
+
+record_c_workloads("tests/c")

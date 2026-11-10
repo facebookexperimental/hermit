@@ -5,25 +5,5 @@ oncall("hermit")
 rust_library(
     name = "hermit-resources",
     srcs = glob(["src/**/*.rs"]),
-    autocargo = {
-        "cargo_toml_dir": ".",
-        "cargo_toml_config": {
-            "package": {
-                "version": "0.5.6",
-                "readme": "README.md",
-                "homepage": "https://hermetic-infra.org",
-                "documentation": "https://docs.rs/hermit-resources",
-                "keywords": [
-                    "linux",
-                    "hermit",
-                    "determinism",
-                    "debugging"
-                ],
-                "categories": [
-                    "development-tools::debugging",
-                    "development-tools::testing"
-                ]
-            },
-        },
-    },
+    autocargo = {"cargo_toml_dir": "."},
 )

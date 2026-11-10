@@ -25,6 +25,14 @@ oncall("open_source")
 # Remote Execution needs; otherwise the system (rustup) rustc on PATH is used, as before.
 _RUST_SYSROOT = read_config("hermit", "rust_sysroot", "")
 
+# clippy_configuration's required TOML merge tool. The prelude runs it only
+# when the Rust toolchain sets its own clippy.toml, which this one does not.
+sh_binary(
+    name = "clippy-toml-merge-unused",
+    main = "clippy-toml-merge-unused.sh",
+    visibility = ["PUBLIC"],
+)
+
 # These flags reproduce Cargo's default release profile (the workspace
 # declares no [profile.release]) for the target dependency closure, while host
 # build scripts/proc macros keep their execution configuration. Measured with this

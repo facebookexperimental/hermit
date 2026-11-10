@@ -42,6 +42,10 @@ prefix_mappings = fbcode//hermetic_infra/reverie->reverie// fbcode//common/rust/
 
 [rust]
 default_edition = 2024
+# ci/manifest-plan's Cargo manifest says edition 2021. Its BUCK file is shared
+# with fbsource, which refuses a non-default edition for first-party code, so
+# this build sets the package's edition here and compiles what Cargo compiles.
+default_edition:ci/manifest-plan = 2021
 
 [buck2]
 forkserver = false
@@ -54,3 +58,7 @@ file_watcher = notify
 # write made the daemon hold the second invocation until the first finished
 # ("Waiting on Synchronizing buck2 internal state").
 ignore = .git, target, ignored, shim/third-party/rust/vendor
+# The BUCK files are fbsource's, mirrored here, and fbsource lets a package
+# name sources inside a subpackage: the root BUCK exports files under ci/ and
+# scripts/, which are packages of their own in this tree.
+package_boundary_exceptions = .

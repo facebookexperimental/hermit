@@ -1,5 +1,7 @@
+load("@fbcode//hermetic_infra/hermit/fb-only/gated_tests:defs.bzl", "gated_test", "run_gated_only")
+load("@fbcode_macros//build_defs:clippy_configuration.bzl", "clippy_configuration")
 load("@fbcode_macros//build_defs:export_files.bzl", "export_file")
-load("@fbcode_macros//build_defs:native_rules.bzl", "buck_sh_test")
+load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup", "buck_sh_test")
 load("@fbcode_macros//build_defs:sanitizers.bzl", "sanitizers")
 load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
@@ -8,6 +10,12 @@ load("@fbsource//tools/build_defs:selects.bzl", "selects")
 load("@fbsource//tools/build_defs:testpilot_defs.bzl", "tpx_labels")
 
 oncall("hermit")
+
+# Upstream's detcore/clippy.toml, for Buck's Clippy (see PACKAGE beside this file).
+clippy_configuration(
+    name = "clippy_config",
+    clippy_toml_src = "clippy.toml",
+)
 
 # Some tests don't work when a sanitizer is in use (i.e., with @mode/dev). This
 # makes it easy to conditionally compile them with `#[cfg(not(sanitized))]`.
@@ -20,28 +28,12 @@ rust_library(
     name = "detcore",
     srcs = glob([
         "src/**/*.rs",
-        "src/**/*.txt",
-        "src/**/*.json",
+        # include_str! tables for the rendered procfs files.
+        "src/procfs/tables/*.tsv",
+        "src/procfs/tables/*.txt",
     ]),
     autocargo = {
         "cargo_toml_config": {
-            "package": {
-                "version": "0.5.6",
-                "readme": "README.md",
-                "homepage": "https://hermetic-infra.org",
-                "documentation": "https://docs.rs/hermit-detcore",
-                "keywords": [
-                    "linux",
-                    "hermit",
-                    "determinism",
-                    "debugging"
-                ],
-                "categories": [
-                    "development-tools::debugging",
-                    "development-tools::testing"
-                ]
-            },
-            "features": {"physical-mm-test-support": []},
             "dependencies_override": {
                 "dependencies": {
                     "bitflags": {
@@ -51,8 +43,22 @@ rust_library(
                     },
                 },
             },
+            # Upstream's features, declared but empty so `cfg(feature = ...)`
+            # stays known to the fbsource Cargo check.
+            "features": {
+                "dispatch-observer": [],
+                "physical-mm-test-support": [],
+            },
         },
     },
+    # Do NOT add a dependency on reverie-ptrace here! The implementation of
+    # detcore should be backend agnostic. However, it's okay to depend on
+    # reverie-ptrace in tests.
+    named_deps = {"reverie": "//hermetic_infra/reverie:reverie"},
+    # detcore virtualizes the x86 cpuid instruction (raw_cpuid crate and the
+    # cpuid interception module are x86-64-only), so the hermit stack is
+    # inherently x86; arm CI must skip it instead of failing rustc.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
     test_deps = [
         "fbsource//third-party/rust:serde_json",
         "fbsource//third-party/rust:tempfile",
@@ -62,13 +68,26 @@ rust_library(
     test_env = {
         "ASAN_OPTIONS": "detect_leaks=0",
     },
-    test_rustc_flags = sanitized_feature,
+    # Run by :detcore-unittest-gated (fb-only/gated_tests).
+    test_labels = run_gated_only(),
+    # As in :detcore-unittest-gated below.
+    test_run_env = {"MALLOC_CONF": "background_thread:false"},
+    # Unit tests keep invariant assertions on in every mode, opt included,
+    # as Cargo's `validate` profile does.
+    test_rustc_flags = sanitized_feature + ["-Cdebug-assertions=on"],
+    test_srcs = glob([
+        "src/**/*.rs",
+        # include_str! test data.
+        "src/aarch64_lse/testdata/*.txt",
+        "src/edit_distance/testdata/*.json",
+    ]),
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:async-trait",
         "fbsource//third-party/rust:bincode",
         "fbsource//third-party/rust:bitflags",
         "fbsource//third-party/rust:chrono",
+        "fbsource//third-party/rust:clap",
         "fbsource//third-party/rust:futures",
         "fbsource//third-party/rust:goblin",
         "fbsource//third-party/rust:hex",
@@ -76,6 +95,7 @@ rust_library(
         "fbsource//third-party/rust:nix",
         "fbsource//third-party/rust:pretty",
         "fbsource//third-party/rust:pretty_assertions",
+        "fbsource//third-party/rust:procfs",
         "fbsource//third-party/rust:rand",
         "fbsource//third-party/rust:rand_distr",
         "fbsource//third-party/rust:rand_pcg",
@@ -84,17 +104,38 @@ rust_library(
         "fbsource//third-party/rust:ruzstd",
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:serde_json",
-        "fbsource//third-party/rust:sha2",
-        "fbsource//third-party/rust:clap",
+        "fbsource//third-party/rust:sha2-010",
         "fbsource//third-party/rust:tempfile",
         "fbsource//third-party/rust:tokio",
         "fbsource//third-party/rust:tracing",
-        "fbsource//third-party/rust:procfs",
-        # Do NOT add a dependency on reverie-ptrace here! The implementation of
-        # detcore should be backend agnostic. However, it's okay to depend on
-        # reverie-ptrace in tests.
-        "//hermetic_infra/reverie:reverie",
         "//hermetic_infra/hermit/detcore-model:detcore-model",
+    ],
+)
+
+gated_test(
+    name = "detcore-unittest-gated",
+    env = {
+        "ASAN_OPTIONS": "detect_leaks=0",
+        # fbcode's default jemalloc starts background threads
+        # (jemalloc_bg_thd) before main(); tests that fork or clone from a
+        # single-threaded process check that no other thread runs (for one,
+        # tool_global's stopping-refusal tests). The Cargo build has none.
+        "MALLOC_CONF": "background_thread:false",
+    },
+    test = "//hermetic_infra/hermit/detcore:detcore-unittest",
+)
+
+# Storage needs the portable digest module without Detcore's Linux runtime.
+# Cargo already owns this source through detcore; do not create another package.
+rust_library(
+    name = "digest",
+    srcs = ["src/digest.rs"],
+    autocargo = {"ignore_rule": True},
+    crate_root = "src/digest.rs",
+    deps = [
+        "fbsource//third-party/rust:hex",
+        "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:sha2-010",
     ],
 )
 
@@ -103,12 +144,17 @@ rust_library(
     name = "detcore-testutils",
     srcs = ["tests/testutils/src/lib.rs"],
     autocargo = {
+        # Upstream's off-by-default `nightly` feature, declared so that
+        # `cfg(feature = "nightly")` is known to clippy's `-D warnings` in
+        # fb-only/ci.sh. This build leaves it off.
         "cargo_toml_config": {
             "features": {"nightly": []},
         },
         "cargo_toml_dir": "tests/testutils/",
     },
-    features = ["nightly"],
+    named_deps = {"reverie": "//hermetic_infra/reverie:reverie"},
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
     deps = [
         "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:pretty_assertions",
@@ -118,7 +164,6 @@ rust_library(
         ":detcore",
         "//hermetic_infra/hermit/common/test-allocator:test-allocator",
         "//hermetic_infra/hermit/common/test-workdir:hermit-test-workdir",
-        "//hermetic_infra/reverie:reverie",
         "//hermetic_infra/reverie:reverie-ptrace",
     ],
 )
@@ -135,13 +180,27 @@ test_env = {
     # "RUST_LOG_FILE": "/tmp/detcore_tests.log",
 }
 
+# The tests' tracers run on the test thread, whose default 2 MiB stack the
+# unoptimized fbcode build overflows ("has overflowed its stack" after a test
+# passes). 16 MiB, as upstream's ci/prepare-rust-scripts.sh sets for the same
+# overflow.
+test_run_env = {
+    "RUST_MIN_STACK": "16777216",
+}
+
 rust_unittest(
     name = "tests_misc",
     srcs = glob(["tests/misc/**/*.rs"]),
     crate_root = "tests/misc/mod.rs",
     env = test_env,
+    # Run by :tests_misc-gated (fb-only/gated_tests).
+    labels = run_gated_only(),
     link_style = "static_pic",  # T196869422: [global_allocator] requires static linkage to function
+    named_deps = {"reverie": "//hermetic_infra/reverie:reverie"},
+    run_env = test_run_env,
     rustc_flags = sanitized_feature,
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
     deps = [
         "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:nix",
@@ -153,9 +212,14 @@ rust_unittest(
         ":detcore-testutils",
         "//hermetic_infra/hermit/common/test-allocator:test-allocator",
         "//hermetic_infra/hermit/detcore-model:detcore-model",
-        "//hermetic_infra/reverie:reverie",
         "//hermetic_infra/reverie:reverie-ptrace",
     ],
+)
+
+gated_test(
+    name = "tests_misc-gated",
+    env = test_env | test_run_env,
+    test = "//hermetic_infra/hermit/detcore:tests_misc",
 )
 
 rust_unittest(
@@ -163,17 +227,30 @@ rust_unittest(
     srcs = ["tests/parallelism/mod.rs"],
     crate_root = "tests/parallelism/mod.rs",
     env = test_env,
+    # TODO(T290458853): three mem_race tests take over 700 s in mode/dev-nosan,
+    # past the default 600 s test timeout.
+    # Run by :tests_parallelism-gated (fb-only/gated_tests).
+    labels = [tpx_labels.long_running] + run_gated_only(),
     link_style = "static_pic",  # T196869422: [global_allocator] requires static linkage to function
+    named_deps = {"reverie": "//hermetic_infra/reverie:reverie"},
+    run_env = test_run_env,
     rustc_flags = sanitized_feature,
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
     deps = [
         "fbsource//third-party/rust:libc",
         "fbsource//third-party/rust:pretty_assertions",
         ":detcore",
         ":detcore-testutils",
         "//hermetic_infra/hermit/common/test-allocator:test-allocator",
-        "//hermetic_infra/reverie:reverie",
         "//hermetic_infra/reverie:reverie-ptrace",
     ],
+)
+
+gated_test(
+    name = "tests_parallelism-gated",
+    env = test_env | test_run_env,
+    test = "//hermetic_infra/hermit/detcore:tests_parallelism",
 )
 
 # FIXME: Disabled because these tests are too brittle to run and maintain.
@@ -202,8 +279,14 @@ rust_unittest(
     srcs = ["tests/time/mod.rs"],
     crate_root = "tests/time/mod.rs",
     env = test_env,
+    # Run by :tests_time-gated (fb-only/gated_tests).
+    labels = run_gated_only(),
     link_style = "static_pic",  # [global_allocator] requires static linkage to function
+    named_deps = {"reverie": "//hermetic_infra/reverie:reverie"},
+    run_env = test_run_env,
     rustc_flags = sanitized_feature,
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
     deps = [
         "fbsource//third-party/rust:chrono",
         "fbsource//third-party/rust:libc",
@@ -211,9 +294,16 @@ rust_unittest(
         ":detcore-testutils",
         "//hermetic_infra/hermit/common/test-allocator:test-allocator",
         "//hermetic_infra/hermit/detcore-model:detcore-model",
-        "//hermetic_infra/reverie:reverie",
         "//hermetic_infra/reverie:reverie-ptrace",
     ],
+)
+
+gated_test(
+    name = "tests_time-gated",
+    # tod_clock_getres_2 fails on RE workers (measured 2026-10-28, re-cpuid RE pass); keep local pending investigation.
+    allow_cpuid_re = False,
+    env = test_env | test_run_env,
+    test = "//hermetic_infra/hermit/detcore:tests_time",
 )
 
 export_file(
@@ -227,7 +317,14 @@ buck_sh_test(
         "$(location :musl_srcs)",
         "$(location //hermetic_infra/hermit/hermit-cli:hermit)",
         "run",
+        # The script unpacks and configures Musl in a host mktemp directory
+        # under /tmp, then builds it under Hermit from build/ next to the
+        # sources. Hermit replaces guest /tmp with an empty isolated directory,
+        # which hides the sources; mount the host /tmp as the guest /tmp.
+        "--tmp=/tmp",
     ],
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
     test = "tests/scripts/test_build_musl.sh",
     deps = [
         ":musl_srcs",
@@ -237,6 +334,8 @@ buck_sh_test(
 rust_binary(
     name = "syscaller",
     srcs = ["scripts/syscaller.rs"],
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
     deps = [
         "fbsource//third-party/rust:libc",
     ],
@@ -258,8 +357,26 @@ buck_sh_test(
     # This is for buck test to ignore this target
     # as this target is meant for `buck run` only.
     labels = [tpx_labels.test_is_invisible_to_testpilot],
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
     test = "scripts/get_syscall_support.py",
     deps = [
         ":syscaller",
     ],
+)
+
+# detcore/tests/**/*.rs, the detcore root of check.exit_status_class's scan;
+# tests/lit is its own package.
+buck_filegroup(
+    name = "tests-rust",
+    srcs = {"tests/lit": "//hermetic_infra/hermit/detcore/tests/lit:guest-sources"} | {src: src for src in glob(["tests/**/*.rs"])},
+    visibility = ["//hermetic_infra/hermit:"],
+)
+
+# detcore/src, which check.backend_abstraction's source gate scans, keyed
+# relative to src/ so that it materializes where it is mapped.
+buck_filegroup(
+    name = "backend-abstraction-src",
+    srcs = {path[len("src/") :]: path for path in glob(["src/**"])},
+    visibility = ["//hermetic_infra/hermit:"],
 )

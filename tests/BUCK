@@ -5,11 +5,21 @@
 # LICENSE file in the root directory of this source tree.
 
 load("@bazel_skylib//lib:paths.bzl", "paths")
+load("@fbcode//hermetic_infra/common:wrap_test_suite.bzl", "RR_TEST_TARGETS", "wrap_test_suite")
+load("@fbcode//hermetic_infra/hermit/fb-only/gated_tests:defs.bzl", "CPUID_FAULTING_REASON", "hermit_host_test")
+load("@fbcode//hermetic_infra/hermit/fb-only/rr_tests:upstream_ignored.bzl", "RR_UPSTREAM_IGNORED")
+load(
+    "@fbcode//hermetic_infra/hermit/fb-only/shell_tests:defs.bzl",
+    "LONG_RUNNING_CHAOS",
+    "REPOSITORY_ROOT_STANDALONE",
+    "long_running_chaos_shell_test",
+    "repository_root_standalone_test",
+)
+load("@fbcode//hermetic_infra/hermit/tests:record_workloads.bzl", "record_c_workloads")
 load("@fbcode_macros//build_defs:cpp_binary.bzl", "cpp_binary")
 load("@fbcode_macros//build_defs:export_files.bzl", "export_file")
-load("@fbcode_macros//build_defs:native_rules.bzl", "buck_genrule", "buck_sh_binary", "buck_sh_test")
+load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup", "buck_genrule", "buck_sh_binary", "cxx_genrule")
 load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
-load("//hermetic_infra/common:wrap_test_suite.bzl", "RR_TEST_TARGETS", "wrap_test_suite")
 load(
     ":helpers.bzl",
     "hermit_bin_test",
@@ -31,7 +41,8 @@ oncall("hermit")
 
 [
     hermit_shell_test(
-        chaos = True,
+        # fb-only/shell_tests emits the long_running chaos target for these.
+        chaos = p not in LONG_RUNNING_CHAOS,
         # TODO(T124815884): add disabled test(s) as they work:
         chaosreplay = (p != "shell/py_hello.sh") and (p != "shell/devrand.sh"),
         no_deterministic_io = False,
@@ -51,6 +62,8 @@ oncall("hermit")
     for p in glob(["shell/*.sh"])
 ]
 
+[long_running_chaos_shell_test(p) for p in LONG_RUNNING_CHAOS]
+
 [
     hermit_shell_test(
         chaos = False,
@@ -69,7 +82,7 @@ oncall("hermit")
 ]
 
 [
-    buck_sh_test(
+    hermit_host_test(
         name = "standalone__"
         + paths.replace_extension(
             paths.basename(p),
@@ -86,7 +99,8 @@ oncall("hermit")
     )
     for p in glob(
         ["standalone/*.sh"],
-        exclude = [
+        exclude = list(REPOSITORY_ROOT_STANDALONE)
+        + [
             "standalone/test_no_networking_network_bind.sh",
             # Disabled under fbcode: fail in the hosted CI sandbox (timer/itimer
             # signal delivery). Tracked for re-enablement upstream.
@@ -96,11 +110,15 @@ oncall("hermit")
     )
 ]
 
+[repository_root_standalone_test(p) for p in REPOSITORY_ROOT_STANDALONE]
+
 # Additional standalone test(s) in Rust:
 rust_binary(
     name = "standalone_stacktrace_events",
     srcs = ["standalone/stacktrace_events.rs"],
     crate_root = "standalone/stacktrace_events.rs",
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
     deps = [
         "fbsource//third-party/rust:regex",
         "fbsource//third-party/rust:tempfile",
@@ -112,6 +130,8 @@ rust_binary(
     name = "network_bind_rs",
     srcs = ["standalone/network_bind.rs"],
     crate_root = "standalone/network_bind.rs",
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
     deps = [],
 )
 
@@ -119,12 +139,14 @@ rust_binary(
     name = "network_bind_full_rs",
     srcs = ["standalone/network_bind_full.rs"],
     crate_root = "standalone/network_bind_full.rs",
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
     deps = [
         "fbsource//third-party/rust:libc",
     ],
 )
 
-buck_sh_test(
+hermit_host_test(
     name = "test_no_networking_network_bind",
     args = [
         "$(location //hermetic_infra/hermit/hermit-cli:hermit)",
@@ -133,7 +155,7 @@ buck_sh_test(
     test = "standalone/test_no_networking_network_bind.sh",
 )
 
-buck_sh_test(
+hermit_host_test(
     name = "test_no_networking_network_bind_full",
     args = [
         "$(location //hermetic_infra/hermit/hermit-cli:hermit)",
@@ -143,7 +165,7 @@ buck_sh_test(
 )
 
 [
-    buck_sh_test(
+    hermit_host_test(
         name = "test_standalone_stacktrace_events__" + binname,
         args = [
             "$(location //hermetic_infra/hermit/hermit-cli:hermit)",
@@ -160,8 +182,10 @@ buck_sh_test(
 ]
 
 [
-    buck_sh_test(
+    hermit_host_test(
         name = "verify_replay__" + test_target[1:],
+        # Fails on RE workers (measured 2026-10-28, re-cpuid RE pass); keep local pending investigation.
+        allow_cpuid_re = False,
         args = [
             "$(location {})".format(test_target),
         ],
@@ -179,8 +203,10 @@ buck_sh_test(
 
 # TODO: Analyze v2 of cas_sequence is currently broken
 [
-    buck_sh_test(
+    hermit_host_test(
         name = "analyze_" + name,
+        # Fails on RE workers (measured 2026-10-28, re-cpuid RE pass); keep local pending investigation.
+        allow_cpuid_re = False,
         args = [
             "$(location //hermetic_infra/hermit/hermit-cli:hermit)",
             target,
@@ -303,24 +329,36 @@ buck_sh_test(
     }.items()
 ]
 
-buck_genrule(
-    name = "minimal_hello",
+# cxx_genrule selects the configured compiler but does not provide RunInfo.
+# Keep the public targets executable and expose the ELF itself to Hermit.
+cxx_genrule(
+    name = "minimal_hello_compile",
     srcs = ["//hermetic_infra/hermit/tests/c/simple:hello_nostdlib.c"],
     out = "minimal_hello.bin",
-    cmd = "clang.par -g -nostdlib $(location //hermetic_infra/hermit/tests/c/simple:hello_nostdlib.c) -o $OUT",
-    # Is there an efficient/correct way to depend on clang as a buck target?
-    # cmd = "$(location fbsource//third-party/llvm-project/12.0.0-fbcode:bin/clang-12) -nostdlib c/simple/hello_nostdlib.c -o $OUT",
+    cmd = "$(cc) -g -nostdlib $SRCS -o $OUT",
+)
+
+buck_genrule(
+    name = "minimal_hello",
+    out = "minimal_hello.bin",
+    cmd = 'cp "$(location :minimal_hello_compile)" "$OUT"',
     executable = True,
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
+)
+
+cxx_genrule(
+    name = "racewrite_nostdlib_compile",
+    srcs = ["//hermetic_infra/hermit/tests/c/simple:racewrite_nostdlib.c"],
+    out = "racewrite_nostdlib.bin",
+    cmd = "$(cc) -g -nostdlib $SRCS -o $OUT",
 )
 
 buck_genrule(
     name = "racewrite_nostdlib",
-    srcs = ["//hermetic_infra/hermit/tests/c/simple:racewrite_nostdlib.c"],
     out = "racewrite_nostdlib.bin",
-    cmd = "clang.par -g -nostdlib $(location //hermetic_infra/hermit/tests/c/simple:racewrite_nostdlib.c) -o $OUT",
-    # Is there an efficient/correct way to depend on clang as a buck target?
-    # cmd = "$(location fbsource//third-party/llvm-project/12.0.0-fbcode:bin/clang-12) -nostdlib c/simple/hello_nostdlib.c -o $OUT",
+    cmd = 'cp "$(location :racewrite_nostdlib_compile)" "$OUT"',
     executable = True,
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
 )
 
 # Split this out into its own target so that we can specify the allocator.
@@ -330,6 +368,8 @@ cpp_binary(
         "//hermetic_infra/hermit/tests/c/simple:nanosleep-threads-simple.c",
     ],
     allocator = "malloc",
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
     external_deps = [
         ("glibc", None, "pthread"),
     ],
@@ -341,6 +381,8 @@ cpp_binary(
         "//hermetic_infra/hermit/tests/c/simple:nanosleep-threads-nocrash.c",
     ],
     allocator = "malloc",
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
     external_deps = [
         ("glibc", None, "pthread"),
     ],
@@ -352,6 +394,12 @@ cpp_binary(
 # https://github.com/rrnewton/hermit/issues/3419).
 single_threaded_rs = [
     "rust/tkill.rs",
+]
+
+# fbsource-disabled: replay of select/pselect6 on a ready fd returns 0
+# (https://github.com/rrnewton/hermit/issues/3569, T137258824).
+record_and_replay_exempt_rs = [
+    "rust/select.rs",
 ]
 
 # TODO(T124837711): get the rest of the tests working under trace replay:
@@ -376,7 +424,7 @@ tracereplay_exempt_rs = [
         no_sequentialize_threads = False,
         path = p,
         raw = True,
-        record_and_replay = True,
+        record_and_replay = not p in record_and_replay_exempt_rs,
         run = True,
         tracereplay = not p in tracereplay_exempt_rs,
         tracereplay_chaos = not p in tracereplay_exempt_rs
@@ -413,6 +461,8 @@ rust_binary(
     srcs = ["chaos/nanosleep-threads-nocrash-rust.rs"],
     allocator = "malloc",
     crate_root = "chaos/nanosleep-threads-nocrash-rust.rs",
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
     deps = [
         "fbsource//third-party/rust:libc",
     ],
@@ -422,6 +472,8 @@ rust_binary(
     name = "chaos_hello_chaos",
     srcs = ["chaos/hello_chaos.rs"],
     crate_root = "chaos/hello_chaos.rs",
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
 )
 
 hermit_chaos_stress_test(
@@ -436,6 +488,8 @@ rust_binary(
     srcs = ["chaos/cas_sequence.rs"],
     allocator = "malloc",
     crate_root = "chaos/cas_sequence.rs",
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
 )
 
 hermit_chaos_stress_test(
@@ -449,6 +503,8 @@ rust_binary(
     name = "chaos_keyvalue_bin",
     srcs = ["chaos/keyvalue.rs"],
     crate_root = "chaos/keyvalue.rs",
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
 )
 
 hermit_chaos_stress_test(
@@ -461,6 +517,8 @@ hermit_chaos_stress_test(
 cpp_binary(
     name = "chaos_lock_granularity_bin",
     srcs = ["chaos/lock_granularity.c"],
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
     external_deps = [
         ("glibc", None, "pthread"),
     ],
@@ -476,6 +534,8 @@ hermit_chaos_stress_test(
 cpp_binary(
     name = "chaos_order_violation_bin",
     srcs = ["chaos/order_violation.c"],
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
     external_deps = [
         ("glibc", None, "pthread"),
     ],
@@ -498,6 +558,8 @@ export_file(
 cpp_binary(
     name = "memoryPress",
     srcs = ["//hermetic_infra/hermit/tests/c:memoryPress.c"],
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
 )
 
 buck_sh_binary(
@@ -505,6 +567,95 @@ buck_sh_binary(
     main = "//hermetic_infra/hermit/tests/util:chaos_stress_wrapper.sh",
 )
 # TODO: In the future add Java tests, go tests, etc.
+
+# rr tests the Hermit suite below does not run, with why.
+RR_HERMIT_EXCLUDED = [
+    # fails
+    "rr_redzone_integrity",
+    "rr_nanosleep",
+    "rr_sem",
+    "rr_switch_read",
+    "rr_sigstop",
+    "rr_utimes",
+    "rr_sock_names_opts",
+    "rr_sigprocmask_exec",
+    "rr_vfork_shared",
+    "rr_wait_sigstop",
+    "rr_vsyscall",
+    "rr_scm_rights",
+    "rr_robust_futex",
+    "rr_intr_futex_wait_restart",
+    "rr_grandchild_threads_parent_alive",
+    "rr_seccomp_null",
+    "rr_perf_event",
+    "rr_packet_mmap_disable",
+    "rr_timerfd",
+    "rr_intr_read_no_restart",
+    "rr_intr_read_restart",
+    "rr_pthread_pi_mutex",
+    "rr_int3",
+    "rr_intr_sleep_no_restart",
+    "rr_intr_sleep",
+    "rr_fcntl_notify",
+    "rr_send_block",  # T121482036
+    "rr_intr_pselect",  # TODO(T137258824): fully support Select/PSelect6
+    "rr_vdso_parts",  # The guest aborts under v0.4.1's strict --verify.
+    # Refused (exit 122): process-directed kill while the sender blocks the
+    # signal; https://github.com/rrnewton/hermit/issues/4034. Upstream stopped
+    # ignoring its rr_multiple_pending_signals sibling in 0.5.5; recheck this.
+    "rr_multiple_pending_signals_sequential",
+    # verify failures, i.e. non-deterministic
+    "rr_sigprocmask_ensure_delivery",
+    "rr_times",
+    "rr_mount_ns_exec",
+    "rr_mount_ns_exec2",
+    "rr_pivot_root",
+    "rr_prctl_caps",
+    "rr_syscallbuf_signal_blocking",
+    "rr_exit_status",
+    "rr_two_signals_with_mask",
+    "rr_ioctl_pty",
+    "rr_mmap_shared",
+    "rr_mmap_shared_subpage",
+    "rr_mmap_shared_grow",
+    "rr_mq",
+    "rr_samask",
+    "rr_grandchild_threads",
+    "rr_save_data_fd",
+    "rr_sigstop2",
+    "rr_fatal_sigsegv_thread",
+    "rr_orphan_process",
+    "rr_statfs",
+    "rr_sigreturnmask",  # T121482215
+    # timeout
+    "rr_wait",
+    "rr_unexpected_exit_execve",
+    "rr_sigsuspend",
+    "rr_sigrt",
+    "rr_pid_ns_kill_threads",
+    "rr_msg",
+    "rr_intr_poll",
+    "rr_unexpected_exit",
+    "rr_pid_ns_kill_child_threads",
+    "rr_set_tid_address",
+    "rr_record_replay_subject",
+    "rr_pidfd",
+    "rr_unexpected_exit_execve_twice",
+    "rr_main_thread_exit",
+    "rr_prctl_deathsig",
+    "rr_grandchild_threads_thread_running",
+    "rr_pid_ns_kill_child",
+    "rr_grandchild_threads_main_running",
+    "rr_pid_ns_segv",
+    "rr_pid_ns_kill_child_zombie",
+    "rr_fd_tracking_across_threads",
+    "rr_pid_ns_reap",
+    "rr_proc_mem",
+    "rr_pid_ns_kill_threads_exit_wait",
+    "rr_pid_ns_shutdown",
+    "rr_fcntl_owner_ex",
+    "rr_hooks",
+]
 
 wrap_test_suite(
     args = [
@@ -514,90 +665,57 @@ wrap_test_suite(
         "--preemption-timeout=80000000",
         "--workdir=/tmp",
     ],
-    exclude = [
-        # fails
-        "rr_redzone_integrity",
-        "rr_nanosleep",
-        "rr_sem",
-        "rr_switch_read",
-        "rr_sigstop",
-        "rr_utimes",
-        "rr_sock_names_opts",
-        "rr_sigprocmask_exec",
-        "rr_vfork_shared",
-        "rr_wait_sigstop",
-        "rr_vsyscall",
-        "rr_scm_rights",
-        "rr_robust_futex",
-        "rr_intr_futex_wait_restart",
-        "rr_grandchild_threads_parent_alive",
-        "rr_seccomp_null",
-        "rr_perf_event",
-        "rr_packet_mmap_disable",
-        "rr_timerfd",
-        "rr_intr_read_no_restart",
-        "rr_intr_read_restart",
-        "rr_pthread_pi_mutex",
-        "rr_int3",
-        "rr_intr_sleep_no_restart",
-        "rr_intr_sleep",
-        "rr_fcntl_notify",
-        "rr_send_block",  # T121482036
-        "rr_intr_pselect",  # TODO(T137258824): fully support Select/PSelect6
-        # verify failures, i.e. non-deterministic
-        "rr_sigprocmask_ensure_delivery",
-        "rr_times",
-        "rr_mount_ns_exec",
-        "rr_mount_ns_exec2",
-        "rr_pivot_root",
-        "rr_prctl_caps",
-        "rr_syscallbuf_signal_blocking",
-        "rr_exit_status",
-        "rr_two_signals_with_mask",
-        "rr_ioctl_pty",
-        "rr_mmap_shared",
-        "rr_mmap_shared_subpage",
-        "rr_mmap_shared_grow",
-        "rr_mq",
-        "rr_samask",
-        "rr_grandchild_threads",
-        "rr_save_data_fd",
-        "rr_sigstop2",
-        "rr_fatal_sigsegv_thread",
-        "rr_orphan_process",
-        "rr_statfs",
-        "rr_sigreturnmask",  # T121482215
-        # timeout
-        "rr_wait",
-        "rr_unexpected_exit_execve",
-        "rr_sigsuspend",
-        "rr_sigrt",
-        "rr_pid_ns_kill_threads",
-        "rr_msg",
-        "rr_intr_poll",
-        "rr_unexpected_exit",
-        "rr_pid_ns_kill_child_threads",
-        "rr_set_tid_address",
-        "rr_record_replay_subject",
-        "rr_pidfd",
-        "rr_unexpected_exit_execve_twice",
-        "rr_main_thread_exit",
-        "rr_prctl_deathsig",
-        "rr_grandchild_threads_thread_running",
-        "rr_pid_ns_kill_child",
-        "rr_grandchild_threads_main_running",
-        "rr_pid_ns_segv",
-        "rr_pid_ns_kill_child_zombie",
-        "rr_fd_tracking_across_threads",
-        "rr_pid_ns_reap",
-        "rr_proc_mem",
-        "rr_pid_ns_kill_threads_exit_wait",
-        "rr_pid_ns_shutdown",
-        "rr_fcntl_owner_ex",
-        "rr_hooks",
-    ],
+    exclude = RR_HERMIT_EXCLUDED,
+    # Upstream's rr suite #[ignore]s these, with these reasons; see
+    # fb-only/rr_tests/upstream_ignored.bzl.
+    ignored = RR_UPSTREAM_IGNORED,
     name_prefix = "test_hermit_strict__",
+    # --verify accepts only a successful first run by default. A program
+    # expected to exit nonzero (rr_pause) is still run twice and compared.
+    nonzero_exit_args = ["--verify-allow=failure"],
+    # Every rr test this suite runs starts Hermit's ptrace backend with
+    # virtual CPUID, which needs CPUID faulting. rr_syscall_bp also needs a
+    # writable procfs in fresh namespaces: run_gated.py's `a+b` probes both.
+    requires = {
+        name: (
+            "cpuid-faulting+userns-mount",
+            CPUID_FAULTING_REASON
+            + "; and it opens /proc/self/mem O_RDWR, which needs a writable procfs mounted in fresh user, mount and PID namespaces (where refused, Hermit falls back to a read-only /proc and the open fails with EROFS)",
+        )
+        if name == "rr_syscall_bp"
+        else ("cpuid-faulting", CPUID_FAULTING_REASON)
+        for name in RR_TEST_TARGETS
+        if name not in RR_HERMIT_EXCLUDED and name not in RR_UPSTREAM_IGNORED
+    },
     suite_name = "rr_tests",
     target = "//hermetic_infra/hermit/hermit-cli:hermit",
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
     test_targets = RR_TEST_TARGETS,
 )
+
+# The repository's tests/ directory as hermit-cli's Cargo integration tests
+# see it: they compile guests from these sources at run time.
+buck_filegroup(
+    name = "integration-tree",
+    srcs = {sub: "//hermetic_infra/hermit/tests/{}:guest-sources".format(sub) for sub in ["bin", "c", "debugger", "runtime", "util"]}
+    | {
+        src: src
+        for src in glob(
+            ["**"],
+            exclude = [
+                "BUCK",
+                "bin/**",
+                "c/**",
+                "debugger/**",
+                "runtime/**",
+                "util/**",
+            ],
+        )
+    },
+    visibility = [
+        "//hermetic_infra/hermit:",
+        "//hermetic_infra/hermit/fb-only/integration_tests/tests:",
+    ],
+)
+
+record_c_workloads("tests")
