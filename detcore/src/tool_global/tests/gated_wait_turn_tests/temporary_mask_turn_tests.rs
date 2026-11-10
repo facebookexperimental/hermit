@@ -1147,6 +1147,13 @@ async fn poll_retries_refresh_guest_held_authority_after_a_parked_fd_replacement
                     .filter(|r| r.resources.contains_key(&ResourceID::InternalIOPolling))
                     .collect();
                 assert!(requests.len() >= 2, "{family}: two parked retry boundaries");
+                // A pipe read names its read on every retry, the
+                // classification taken at entry (dh-ru056 slice 1); a poll
+                // names none.
+                let read_fd = (family == "read").then(|| (guest.thread.files_id(), 8));
+                for request in &requests {
+                    assert_eq!(request.read_fd, read_fd, "{family}, replace={replace}");
+                }
                 assert!(requests[0].polls_guest_state_only);
                 assert_eq!(requests[0].relies_on_guest_held_marks, !recordreplay);
                 let last = requests.last().unwrap();

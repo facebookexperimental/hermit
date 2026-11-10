@@ -28,16 +28,30 @@
 //!   pause is already parked. Either way the pause returns EINTR.
 //! - A due entry whose owner is blocked in any other wait records a
 //!   determinism loss: Linux would interrupt that wait, and phase 1 cannot.
-//!   That includes a polling wait (`InternalIOPolling` retried after EAGAIN),
-//!   whose thread stays on the run queue between retries. A running thread, or
-//!   one whose filed request has not blocked, takes the entry at its syscall's
-//!   completion; that delivery is the runtime's (later steps).
-//! - Every change happens at a scheduler commit: an expiry, an admission, or
-//!   the sweep that opens step 2. So what is pending, and what is due, is a
-//!   function of the schedule.
+//!   A running thread, or one whose filed request has not blocked, takes the
+//!   entry at its syscall's completion; that delivery is the runtime's.
+//! - One polling wait is modelled instead (dev-hermit dh-ru056 slice 1,
+//!   signal phase-2 design revision 2, section 5.1): a restartable pipe read
+//!   retried after EAGAIN (`InternalIOPolling` with a `read_fd`) on a
+//!   descriptor only guest actions make ready. The entry is reserved to the
+//!   owner (`ReservedPoll`), the filed retry is made runnable, and step 3
+//!   resumes the thread next by alarm priority, so its one probe runs before
+//!   any writer turn. The probe's successor request is classified at the next
+//!   pass's step 2, before the sweep (step 1 waits for every queued thread to
+//!   file): a retry that moved nothing is replaced by the `InboundSignal` wake,
+//!   at the front of its band; any other successor means the read completed
+//!   and the entry is delivered after its result. Every other polling wait, a
+//!   read that does not pass these checks, and a second process's entry while
+//!   one probe is reserved, keep the loss.
+//! - Every change happens at a scheduler commit: an expiry, an admission, the
+//!   step-2 completion check and sweep, or the successor's step-4 head. So what
+//!   is pending, what is due, and what is reserved is a function of the
+//!   schedule.
 //!
 //! Nothing publishes a handled SIGALRM until the runtime admits guest
-//! handlers, so this module changes no run today.
+//! handlers; and phase 1 still refuses a pipe read in a handling process
+//! (`sigalrm_phase1::descriptor_class`), so no run reaches the reservation
+//! today.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -315,16 +329,21 @@ impl Scheduler {
     }
 
     /// Review gate G1: in slice 1 a reservation is never released back to
-    /// `Pending`. Its target is single-threaded and holds no turn between
-    /// reservation and probe (the probe is a retry inside the same read,
-    /// not a syscall entry, so no mask or disposition publication of its
-    /// own can arrive), and the reservation is classified at the next
-    /// step 2 or at the successor's step-4 head, before that request is
-    /// granted and so before any later publication or take. A
-    /// publication or take that would release it therefore cannot occur;
-    /// one that does is a defect of that argument, which stops the run
-    /// rather than invent restore semantics for the pre-reservation
-    /// request (design rev.2 section 5, approval gate G1).
+    /// `Pending`. The argument rests on this ordering. The target is
+    /// single-threaded and holds no turn from the reservation (step 2) until
+    /// its probe is granted (step 3 resumes it next by alarm priority); the
+    /// probe is a retry inside the same read, not a syscall entry, so no mask
+    /// or disposition publication of its own runs in it. Its successor
+    /// request is filed before the next pass's step 2 (step 1 waits for every
+    /// queued thread to file) and classified there, before the sweep, or at
+    /// that request's step-4 head; either way before the request is granted.
+    /// A completed read's successor is its delivery's `InboundSignal` turn
+    /// (`Detcore::complete_syscall`, `deliver_due_sigalrm`), so the take in
+    /// that turn comes after the classification. A publication or take that
+    /// would release the reservation therefore cannot occur; one that does
+    /// is a defect of this argument, which stops the run rather than invent
+    /// restore semantics for the pre-reservation request (design rev.2
+    /// section 5, approval gate G1).
     fn assert_no_reserved_poll_release(&self, raw: i32, what: &str) {
         if let Some(reserved) = self.sigalrm.reserved_poll {
             assert!(
@@ -359,7 +378,9 @@ impl Scheduler {
     /// reservation (not the ledger entry, which stays pending
     /// until its ordinary owner-turn take).
     pub(crate) fn take_sigalrm_reserved_poll(&mut self) -> Option<ReservedPoll> {
-        self.sigalrm.reserved_poll.take()
+        let reserved = self.sigalrm.reserved_poll.take()?;
+        self.drop_sigalrm_reserved_poll_taker(reserved);
+        Some(reserved)
     }
 
     /// Reserved-probe eligibility for the slice-1 pipe-read shape:
@@ -367,18 +388,26 @@ impl Scheduler {
     /// polling probes (`execute_nonblockable_fd_syscall`): an
     /// `InternalIOPolling` resource plus `read_fd`, restartable
     /// (`signal_interrupt_errno` is `ERESTARTSYS`, design rev.2
-    /// section 5.1), with no earlier progress. Any other errno
-    /// (a deadline wait's EINTR, or none) must never be replaced
-    /// by the restart table's outcome; the phase-1 due-entry loss
-    /// is preserved for it. Returns the request identity to bind,
-    /// or `None` to keep the loss.
-    fn reservable_pipe_read(request: &Resources) -> Option<(detcore_model::fd::FilesId, i32)> {
+    /// section 5.1), with no earlier progress, on a descriptor whose
+    /// readiness only guest actions change (`polls_only_guest_state`,
+    /// and not a named FIFO a process outside the container may hold):
+    /// otherwise whether the probe finds data or the wake substitutes
+    /// would depend on host timing. Any other errno (a deadline wait's
+    /// EINTR, or none) must never be replaced by the restart table's
+    /// outcome. Returns the request identity to bind, or `None` to keep
+    /// phase 1's loss.
+    fn reservable_pipe_read(
+        &self,
+        request: &Resources,
+    ) -> Option<(detcore_model::fd::FilesId, i32)> {
         if request.previous_attempt_made_progress
             || request.signal_interrupt_errno()
                 != Some(reverie::syscalls::Errno::ERESTARTSYS.into_raw())
             || !request
                 .resources
                 .contains_key(&ResourceID::InternalIOPolling)
+            || !self.polls_only_guest_state(request)
+            || request.polls_a_named_fifo
         {
             return None;
         }
@@ -412,16 +441,14 @@ impl Scheduler {
         let Some(mut request) = filed else {
             return false;
         };
-        let Some(read_fd) = Self::reservable_pipe_read(&request) else {
+        let Some(read_fd) = self.reservable_pipe_read(&request) else {
             return false;
         };
-        // The third slice-1 admission gate: alarm-taker placement
-        // must actually put the probe ahead of ordinary runnable
-        // work. If step 3 would consume this request as an inbound
-        // signal turn, or the alarm priority is unavailable, a
-        // writer could run between reservation and probe — keep
-        // phase 1's loss instead of claiming placed precedence.
-        if !self.alarm_priority_available() || !self.takes_alarm_priority(thread) {
+        // The third slice-1 admission gate: placed precedence (design
+        // rev.2 section 5.1). Step 3 must resume this thread next, by
+        // alarm priority, so no writer turn commits between the
+        // reservation and the probe; otherwise phase 1's loss stands.
+        if !self.step3_resumes_alarm_taker_next(thread) {
             return false;
         }
         let bound_upgraded_from_attempt = request.upgraded_from_attempt.max(request.poll_attempt);
@@ -431,15 +458,20 @@ impl Scheduler {
             read_fd,
             bound_upgraded_from_attempt,
         });
-        // Filed substate: normalize with the same upgrade step 4
-        // applies, in place, so the stored request becomes the
-        // runnable probe (attempt 0). In place, not
-        // `substitute_request`: substituting would mint a second
-        // Ivar in between that retired/Cancelled the live
-        // request's response token. Alarm-taker registration is
-        // the placement (primary): the probe is already queued in
-        // both substates, so no run-queue re-insertion is needed.
-        if !deferred {
+        if deferred {
+            // Deferred poller: step 4 already rewrote the stored request
+            // to its runnable copy and backed the thread off. Restore its
+            // normal priority and drop its poll deadline (section 5.1);
+            // the stored request is not rewritten.
+            self.run_queue.restore_poller_priority(thread);
+            self.forget_poll_deadline(thread);
+        } else {
+            // Filed substate: normalize with the same upgrade step 4
+            // applies, in place, so the stored request becomes the
+            // runnable probe (attempt 0). In place, not
+            // `substitute_request`: substituting would mint a second
+            // Ivar in between that retired/Cancelled the live
+            // request's response token.
             request = request.upgraded_to_runnable();
             let turn = self
                 .next_turns
@@ -447,8 +479,47 @@ impl Scheduler {
                 .expect("reservation target has a filed request");
             turn.req = crate::ivar::Ivar::full(Ok(request));
         }
+        // The placement: step 3 resumes the alarm taker first
+        // (`first_alarm_taker_entry`), until the probe's successor is
+        // classified (`drop_sigalrm_reserved_poll_taker`).
         self.parked.alarm_takers.insert(process, thread);
+        assert_eq!(
+            self.first_alarm_taker_entry(),
+            Some((process, thread)),
+            "dh-ru056 slice 1: the reserved probe is step 3's alarm taker"
+        );
         true
+    }
+
+    /// Whether step 3 would resume `thread` next by alarm priority once
+    /// it is the only alarm taker (the gate `reserve_sigalrm_poll` must
+    /// pass): no selection is open; no thread step 3 resumes ahead of an
+    /// alarm taker is queued (a group-exit decider, a `SIGCHLD` or
+    /// process-signal taker, a `rt_sigreturn` continuation); the alarm
+    /// priority is available and serves `thread`'s request; no other
+    /// alarm taker is registered; and `thread` is queued to run.
+    fn step3_resumes_alarm_taker_next(&mut self, thread: DetTid) -> bool {
+        !self.run_queue.tentative_pop_in_progress()
+            && self.parked.alarm_takers.is_empty()
+            && self.alarm_priority_available()
+            && self.takes_alarm_priority(thread)
+            && self.run_queue.contains_tid(thread)
+            && self.queued_group_exit_decider().is_none()
+            && self.first_sigchld_taker().is_none()
+            && self.first_process_signal_taker().is_none()
+            && self.first_sigreturn_continuation().is_none()
+    }
+
+    /// Forgets the reserved probe's alarm-taker placement once its
+    /// reservation is consumed (classified, charged its loss, or retired
+    /// with its thread). The ordinary loop never derives `alarm_takers`
+    /// anew (only `select_parked_alarm`, under a process signal control,
+    /// does), so an entry left behind would keep the thread first at
+    /// every other selection for the rest of the run.
+    fn drop_sigalrm_reserved_poll_taker(&mut self, reserved: ReservedPoll) {
+        if self.parked.alarm_takers.get(&reserved.owner) == Some(&reserved.target) {
+            self.parked.alarm_takers.remove(&reserved.owner);
+        }
     }
 
     /// Successor classification of an outstanding reserved probe,
@@ -474,13 +545,17 @@ impl Scheduler {
         if !is_retry {
             return Some((reserved, ReservedProbeOutcome::Completed));
         }
-        if successor.poll_attempt == 0
-            && successor.upgraded_from_attempt == reserved.bound_upgraded_from_attempt
-        {
-            // The stored request is still the bound probe itself:
-            // the probe has not granted, so no successor exists
-            // yet to classify.
-            return None;
+        if successor.poll_attempt == 0 {
+            if successor.upgraded_from_attempt == reserved.bound_upgraded_from_attempt {
+                // The stored request is still the bound probe itself:
+                // the probe has not granted, so no successor exists
+                // yet to classify.
+                return None;
+            }
+            // A first attempt of another lineage: a new read of the
+            // same descriptor began, so the bound read ended (R1).
+            // A retry of the bound read advances its lineage.
+            return Some((reserved, ReservedProbeOutcome::Completed));
         }
         Some((
             reserved,
@@ -524,9 +599,13 @@ impl Scheduler {
                 // dequeue it so force-unblock's requeue is its
                 // only queue entry.
                 self.run_queue.remove_tid(reserved.target);
-                self.force_unblock_thread(
+                // Front of its band (section 5.1): the probe already
+                // spent the alarm priority, and no writer turn may
+                // commit between the no-progress probe and its wake.
+                let _ = self.force_unblock_thread_at(
                     reserved.target,
                     Self::sigalrm_wake_probe(reserved.target),
+                    true,
                 );
             }
             ReservedProbeOutcome::Completed => {
@@ -557,16 +636,16 @@ impl Scheduler {
         self.record_sigalrm_loss(process, thread, why);
     }
 
-    /// Settles an outstanding reservation of `thread` when its
-    /// successor request reaches step 4 as the selected head before a
-    /// step-2 completion check classified it — the usual case, since
-    /// step 3 reselects the probe's thread and awaits that request
-    /// (G2: still before step 4 can defer it). Returns whether the
-    /// wake was substituted: step 4 must then end this turn rather
-    /// than act on `thread`'s stale retry, so the selection step 3
-    /// opened is committed first, and the substitution's requeue is
-    /// the thread's only queue entry. A completed or progressed probe
-    /// leaves the selection open and step 4 goes on with the head
+    /// Settles an outstanding reservation of `thread` when its successor
+    /// request reaches step 4 as the selected head unclassified. In
+    /// production the step-2 check classifies the successor first (step 1
+    /// waits for every queued thread to file), so this is the defensive path
+    /// for a successor filed after that check (G2: still before step 4 can
+    /// defer it). Returns whether the wake was substituted: step 4 must then
+    /// end this turn rather than act on `thread`'s stale retry, so the
+    /// selection step 3 opened is committed first, and the substitution's
+    /// requeue is the thread's only queue entry. A completed or progressed
+    /// probe leaves the selection open and step 4 goes on with the head
     /// request.
     pub(super) fn act_on_sigalrm_reserved_head(&mut self, thread: DetTid) -> bool {
         let Some(element) = self

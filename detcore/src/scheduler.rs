@@ -43767,6 +43767,91 @@ mod test {
         assert!(!scheduler.blocked.continuation_masks.contains_key(&thread));
     }
 
+    /// dh-ru056 slice 1, placed precedence: a SIGALRM entry due while its
+    /// owner polls a pipe read is reserved for one probe only where step 3
+    /// would resume that thread next. A queued `SIGCHLD` taker, or a queued
+    /// process-signal taker, resumes ahead of any alarm taker, so either
+    /// keeps phase 1's loss; with neither, the probe is reserved.
+    #[test]
+    fn a_sigalrm_poll_reservation_yields_to_queued_signal_takers() {
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        for case in ["none", "sigchld-taker", "process-signal-taker"] {
+            let reader = DetTid::from_raw(200);
+            let other = DetTid::from_raw(300);
+            let mm = MmId::initial(DetPid::from_raw(300));
+            let mut scheduler = gated_scheduler();
+            for thread in [reader, other] {
+                scheduler.thread_tree.add_child(thread, thread, true);
+                register_known_thread(&mut scheduler, thread);
+            }
+            match case {
+                "sigchld-taker" => {
+                    let futex = FutexID::private(mm, 0x404110);
+                    scheduler.sleep_futex_waiter(
+                        &other,
+                        futex,
+                        None,
+                        u32::MAX,
+                        Some(signal_watch(chld)),
+                    );
+                    scheduler
+                        .test_kernel_signal_states
+                        .insert(other, signal_state(chld, 0));
+                    assert!(scheduler.note_group_send(other, Signal::SIGCHLD, false));
+                    scheduler.wake_signaled_guest(other, Signal::SIGCHLD);
+                    assert_eq!(scheduler.first_sigchld_taker(), Some(other), "{case}");
+                }
+                "process-signal-taker" => {
+                    scheduler.next_turns[&other]
+                        .req
+                        .put(Ok(Resources::new(other)));
+                    scheduler.runqueue_push_back(other);
+                    scheduler.test_kernel_signal_states.insert(
+                        other,
+                        KernelSignalState {
+                            shared_pending: usr1,
+                            ..Default::default()
+                        },
+                    );
+                    scheduler.process_signal_takers.insert(other, usr1);
+                    assert_eq!(
+                        scheduler.first_process_signal_taker(),
+                        Some(other),
+                        "{case}"
+                    );
+                }
+                _ => {
+                    scheduler.next_turns[&other]
+                        .req
+                        .put(Ok(Resources::new(other)));
+                    scheduler.runqueue_push_back(other);
+                }
+            }
+            let process = DetPid::from_raw(200);
+            scheduler.set_sigalrm_handled(process, true);
+            scheduler.set_sigalrm_blocked(reader, false);
+            let mut read = Resources::new(reader);
+            read.insert(ResourceID::InternalIOPolling, Permission::W);
+            read.poll_attempt = 1;
+            read.set_signal_interrupt_errno(reverie::syscalls::Errno::ERESTARTSYS);
+            read.read_fd = Some((detcore_model::fd::FilesId::initial(reader), 4));
+            read.polls_guest_state_only = true;
+            scheduler.next_turns[&reader].req.put(Ok(read));
+            scheduler.runqueue_push_back(reader);
+
+            scheduler.fire_alarm(process, reader, Signal::SIGALRM);
+
+            let reserved = scheduler.sigalrm_reserved_poll_target() == Some(reader);
+            assert_eq!(reserved, case == "none", "{case}");
+            assert_eq!(
+                scheduler.sigalrm_loss_recorded(process),
+                case != "none",
+                "{case}"
+            );
+        }
+    }
+
     /// A5 step 2b: the first SIGCHLD taker is chosen by the mask its thread
     /// published in place of `SigBlk`, and by the kernel's under a private
     /// mask or once the mask is withdrawn.

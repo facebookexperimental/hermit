@@ -2227,7 +2227,9 @@ impl Scheduler {
     /// `select_parked_alarm`), with its process, if any: the first in process
     /// order still queued to run and served by the priority
     /// (`takes_alarm_priority`), while the priority is available
-    /// (`alarm_priority_available`).
+    /// (`alarm_priority_available`). A reserved SIGALRM poll probe
+    /// (`Scheduler::reserve_sigalrm_poll`) counts as queued to run however
+    /// its poller entry was restored: that probe is its next turn.
     pub(super) fn first_alarm_taker_entry(&self) -> Option<(DetPid, DetTid)> {
         if !self.alarm_priority_available() {
             return None;
@@ -2237,8 +2239,10 @@ impl Scheduler {
             .iter()
             .map(|(pid, thread)| (*pid, *thread))
             .find(|(_, thread)| {
-                self.run_queue.contains_non_polling_tid(*thread)
-                    && self.takes_alarm_priority(*thread)
+                let queued = self.run_queue.contains_non_polling_tid(*thread)
+                    || (self.sigalrm_reserved_poll_target() == Some(*thread)
+                        && self.run_queue.contains_tid(*thread));
+                queued && self.takes_alarm_priority(*thread)
             })
     }
 
