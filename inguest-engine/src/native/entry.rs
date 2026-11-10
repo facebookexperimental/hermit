@@ -81,6 +81,7 @@ pub(super) fn event(callback: &Callback, number: i64, args: [u64; 6], ip: u64) -
         context: callback.context,
         dispatch: SyscallDispatch::InstalledHook,
         guest_pkru: None,
+        unsupported_refusal: None,
     }
 }
 

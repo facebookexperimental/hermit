@@ -36,10 +36,6 @@ fn refusal(message: &'static str) -> io::Error {
     io::Error::other(message)
 }
 
-#[expect(
-    clippy::large_enum_variant,
-    reason = "Initial/successor preparation owns distinct fixed controllers on the native private initializer stack; preserve their by-value lifecycle."
-)]
 pub(crate) enum Prepared {
     Initial {
         image: reverie_liteinst::PreparedInitialImage<detcore::Detcore>,

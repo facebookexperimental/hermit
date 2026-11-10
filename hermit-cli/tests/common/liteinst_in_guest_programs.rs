@@ -1395,7 +1395,6 @@ fn liteinst_in_guest_tool_directory_reads_stay_out_of_the_guest_heap() {
 /// must hold exactly what it holds natively and the first allocation must
 /// land at the same address every time.
 #[test]
-#[ignore = "known failure, minibeads dh-ofa2w3 (P1): since Reverie f52d98380 the in-guest runtime's COMMITTED_STACKS thread_local registers a glibc TLS destructor, so glibc mallocs on the guest heap before main; re-enable in the Reverie pin bump that carries the fix"]
 fn liteinst_in_guest_runtime_leaves_the_guest_heap_as_the_program_made_it() {
     let _guard = hermit_run_guard();
     let build_root = process_build_root("liteinst-guest-heap");
@@ -1553,7 +1552,6 @@ ssize_t readlink(const char *path, char *buffer, size_t size) {
 /// untouched heap, no wrapper called before `main`, and the same first
 /// allocation as without the preload, under both in-guest backends.
 #[test]
-#[ignore = "known failure, minibeads dh-ofa2w3 (P1): since Reverie f52d98380 the in-guest runtime's COMMITTED_STACKS thread_local registers a glibc TLS destructor, so glibc mallocs on the guest heap before main; re-enable in the Reverie pin bump that carries the fix"]
 fn liteinst_in_guest_runtime_calls_none_of_the_converted_libc_wrappers() {
     let _guard = hermit_run_guard();
     let build_root = process_build_root("liteinst-guest-heap");
@@ -1674,7 +1672,6 @@ fn liteinst_in_guest_runtime_calls_none_of_the_converted_libc_wrappers() {
 /// refused). Reverie's `clock_allocations` test covers binding that fails, by
 /// denying perf_event_open to one thread.
 #[test]
-#[ignore = "known failure, minibeads dh-ofa2w3 (P1): since Reverie f52d98380 the in-guest runtime's COMMITTED_STACKS thread_local registers a glibc TLS destructor, so glibc mallocs on the guest heap before main; re-enable in the Reverie pin bump that carries the fix"]
 fn liteinst_in_guest_fork_child_heap_is_the_parents() {
     let _guard = hermit_run_guard();
     let build_root = process_build_root("liteinst-guest-heap");
@@ -1774,7 +1771,6 @@ fn liteinst_in_guest_fork_child_heap_is_the_parents() {
 /// `--backend=liteinst` with site patching off, the handler must be admitted
 /// and every line must match the native run.
 #[test]
-#[ignore = "known failure, minibeads dh-ofa2w3 (P1): since Reverie f52d98380 the in-guest runtime's COMMITTED_STACKS thread_local registers a glibc TLS destructor, so glibc mallocs on the guest heap before main; re-enable in the Reverie pin bump that carries the fix"]
 fn liteinst_in_guest_admitted_sigalrm_leaves_the_guest_heap_as_the_program_made_it() {
     let _guard = hermit_run_guard();
     let build_root = process_build_root("liteinst-guest-heap");

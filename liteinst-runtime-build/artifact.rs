@@ -54,14 +54,48 @@ pub(crate) fn constructor_qualifier_source(
     let targets = helper["targets"]
         .as_array()
         .ok_or("constructor qualifier has no targets")?;
-    if targets.len() != 1
-        || targets[0]["name"] != "reverie_liteinst_artifact"
-        || targets[0]["kind"] != serde_json::json!(["lib"])
-        || targets[0]["crate_types"] != serde_json::json!(["lib"])
-    {
+    let libraries: Vec<_> = targets
+        .iter()
+        .enumerate()
+        .filter(|(_, target)| {
+            target["kind"] == serde_json::json!(["lib"])
+                && target["crate_types"] == serde_json::json!(["lib"])
+        })
+        .collect();
+    if libraries.len() != 1 || libraries[0].1["name"] != "reverie_liteinst_artifact" {
         return Err("constructor qualifier is not the exact host-only library target".into());
     }
-    let source = targets[0]["src_path"]
+    let (library_index, library) = libraries[0];
+    let package = helper_manifest
+        .parent()
+        .ok_or("constructor qualifier manifest has no package directory")?;
+    // Cargo metadata also lists integration tests, even when the producer's
+    // explicit --lib selection does not build them. Admit only those targets
+    // and prove their real files stay inside this package's own tests tree.
+    for (index, target) in targets.iter().enumerate() {
+        if index == library_index {
+            continue;
+        }
+        if target["kind"] != serde_json::json!(["test"])
+            || target["crate_types"] != serde_json::json!(["bin"])
+        {
+            return Err("constructor qualifier has a non-integration-test extra target".into());
+        }
+        let tests = fs::canonicalize(package.join("tests"))
+            .map_err(|error| format!("canonicalize qualifier tests directory: {error}"))?;
+        if !tests.is_dir() || tests == package || !tests.starts_with(package) {
+            return Err("constructor qualifier tests directory escapes its package".into());
+        }
+        let test_source = target["src_path"]
+            .as_str()
+            .ok_or("constructor qualifier integration test has no source")?;
+        let test_source = fs::canonicalize(test_source)
+            .map_err(|error| format!("canonicalize qualifier test source: {error}"))?;
+        if !test_source.is_file() || test_source == tests || !test_source.starts_with(&tests) {
+            return Err("constructor qualifier integration test is outside its tests tree".into());
+        }
+    }
+    let source = library["src_path"]
         .as_str()
         .ok_or("constructor qualifier library has no source")?;
     let source = fs::canonicalize(source)
@@ -98,10 +132,14 @@ pub(crate) fn liteinst_cdylib_from_cargo_messages(
                 index + 1
             ));
         }
+        // Since https://github.com/rrnewton/reverie/pull/1375, liteinst is the
+        // preload's own feature. This is the FULL site-patching artifact on
+        // x86_64; dh-md601 replaces it with selectable FULL/TRAP. Without
+        // `liteinst` the staged runtime is trap-only.
         let expected_features = if allocator_fixture {
-            serde_json::json!(["allocator-fixture"])
+            serde_json::json!(["allocator-fixture", "liteinst"])
         } else {
-            serde_json::json!([])
+            serde_json::json!(["liteinst"])
         };
         if message["features"] != expected_features {
             return Err(format!(
@@ -205,6 +243,178 @@ mod tests {
 
     const PACKAGE: &str = "git+https://github.com/rrnewton/reverie.git?rev=0123456789012345678901234567890123456789#reverie-liteinst-preload@0.4.1";
     const MANIFEST: &str = "/git/reverie/reverie-liteinst-preload/Cargo.toml";
+
+    struct QualifierMetadataFixture {
+        root: PathBuf,
+        helper: Value,
+    }
+
+    impl QualifierMetadataFixture {
+        fn new() -> Self {
+            let serial = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "hermit-qualifier-targets-{}-{serial}",
+                std::process::id()
+            ));
+            for relative in [
+                "reverie-liteinst-preload",
+                "reverie-liteinst-artifact/src",
+                "reverie-liteinst-artifact/tests/nested",
+                "reverie-liteinst-artifact/tests-evil",
+                "scripts",
+            ] {
+                fs::create_dir_all(root.join(relative)).unwrap();
+            }
+            for relative in [
+                "reverie-liteinst-preload/Cargo.toml",
+                "reverie-liteinst-artifact/Cargo.toml",
+                "reverie-liteinst-artifact/src/lib.rs",
+                "reverie-liteinst-artifact/tests/tls_sources_self_check.rs",
+                "reverie-liteinst-artifact/tests-evil/outside.rs",
+                "scripts/outside.rs",
+            ] {
+                fs::write(root.join(relative), b"qualifier path identity control").unwrap();
+            }
+            let root = fs::canonicalize(root).unwrap();
+            // Captured from real offline Cargo metadata at Reverie b539143d.
+            // Only the checkout prefix is normalized; target fields are intact.
+            let mut helper: Value =
+                serde_json::from_str(include_str!("tests/fixtures/qualifier-package-b539.json"))
+                    .unwrap();
+            let rebase = |path: &mut Value| {
+                let relative = path.as_str().unwrap().strip_prefix("CHECKOUT/").unwrap();
+                *path = serde_json::json!(root.join(relative));
+            };
+            rebase(&mut helper["manifest_path"]);
+            for target in helper["targets"].as_array_mut().unwrap() {
+                rebase(&mut target["src_path"]);
+            }
+            Self { root, helper }
+        }
+
+        fn bind(&self, helper: Value) -> Result<PathBuf, String> {
+            constructor_qualifier_source(
+                &serde_json::json!({"packages": [helper]}),
+                &self.root.join("reverie-liteinst-preload/Cargo.toml"),
+                "b539143dd62aa11aa7dd94969f8509a27551beea",
+            )
+        }
+    }
+
+    impl Drop for QualifierMetadataFixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.root).expect("remove owned qualifier target fixture");
+        }
+    }
+
+    #[test]
+    fn selects_real_qualifier_library_with_in_tree_integration_tests() {
+        let fixture = QualifierMetadataFixture::new();
+        let expected = fixture.root.join("reverie-liteinst-artifact/src/lib.rs");
+        assert_eq!(fixture.bind(fixture.helper.clone()).unwrap(), expected);
+        let mut reordered = fixture.helper.clone();
+        reordered["targets"].as_array_mut().unwrap().reverse();
+        assert_eq!(fixture.bind(reordered).unwrap(), expected);
+        let mut library_only = fixture.helper.clone();
+        library_only["targets"].as_array_mut().unwrap().truncate(1);
+        assert_eq!(fixture.bind(library_only).unwrap(), expected);
+        let mut alias = fixture.helper.clone();
+        alias["targets"][1]["src_path"] = serde_json::json!(
+            fixture
+                .root
+                .join("reverie-liteinst-artifact/tests/nested/../tls_sources_self_check.rs")
+        );
+        assert_eq!(fixture.bind(alias).unwrap(), expected);
+    }
+
+    #[test]
+    fn refuses_other_qualifier_target_shapes_and_test_paths() {
+        let fixture = QualifierMetadataFixture::new();
+        let mut duplicate = fixture.helper.clone();
+        let second_library = duplicate["targets"][0].clone();
+        duplicate["targets"]
+            .as_array_mut()
+            .unwrap()
+            .push(second_library);
+        assert!(fixture.bind(duplicate).is_err());
+        let mut missing = fixture.helper.clone();
+        missing["targets"].as_array_mut().unwrap().remove(0);
+        assert!(fixture.bind(missing).is_err());
+        for kind in [
+            serde_json::json!(["lib"]),
+            serde_json::json!(["bin"]),
+            serde_json::json!(["example"]),
+            serde_json::json!(["bench"]),
+            serde_json::json!(["custom-build"]),
+            serde_json::json!(["proc-macro"]),
+            serde_json::json!(["test", "bin"]),
+            serde_json::json!(["unknown"]),
+            serde_json::json!([]),
+            serde_json::json!(null),
+        ] {
+            let mut wrong = fixture.helper.clone();
+            wrong["targets"][1]["kind"] = kind.clone();
+            assert!(fixture.bind(wrong).is_err(), "accepted extra kind {kind}");
+        }
+        for types in [
+            serde_json::json!(["lib"]),
+            serde_json::json!(["bin", "rlib"]),
+        ] {
+            let mut wrong = fixture.helper.clone();
+            wrong["targets"][1]["crate_types"] = types;
+            assert!(fixture.bind(wrong).is_err());
+        }
+        for path in [
+            "scripts/outside.rs",
+            "reverie-liteinst-artifact/tests-evil/outside.rs",
+            "reverie-liteinst-artifact/tests/../src/lib.rs",
+            "reverie-liteinst-artifact/tests",
+            "reverie-liteinst-artifact/tests/missing.rs",
+        ] {
+            let mut wrong = fixture.helper.clone();
+            wrong["targets"][1]["src_path"] = serde_json::json!(fixture.root.join(path));
+            assert!(fixture.bind(wrong).is_err(), "accepted test path {path}");
+        }
+        let mut malformed = fixture.helper.clone();
+        malformed["targets"][1]["src_path"] = serde_json::json!(null);
+        assert!(fixture.bind(malformed).is_err());
+        for target in [
+            serde_json::json!(null),
+            serde_json::json!("unknown"),
+            serde_json::json!({}),
+        ] {
+            let mut malformed = fixture.helper.clone();
+            malformed["targets"][1] = target;
+            assert!(fixture.bind(malformed).is_err());
+        }
+    }
+
+    #[test]
+    fn refuses_qualifier_test_file_and_directory_symlink_escapes() {
+        let fixture = QualifierMetadataFixture::new();
+        let tests = fixture.root.join("reverie-liteinst-artifact/tests");
+        std::os::unix::fs::symlink(
+            fixture.root.join("scripts/outside.rs"),
+            tests.join("escape.rs"),
+        )
+        .unwrap();
+        let mut escaped = fixture.helper.clone();
+        escaped["targets"][1]["src_path"] = serde_json::json!(tests.join("escape.rs"));
+        assert!(fixture.bind(escaped).is_err());
+        fs::rename(&tests, tests.with_file_name("saved-tests")).unwrap();
+        std::os::unix::fs::symlink(fixture.root.join("scripts"), &tests).unwrap();
+        let mut escaped = fixture.helper.clone();
+        escaped["targets"][1]["src_path"] = serde_json::json!(tests.join("outside.rs"));
+        assert!(fixture.bind(escaped).is_err());
+        fs::remove_file(&tests).unwrap();
+        std::os::unix::fs::symlink(tests.parent().unwrap(), &tests).unwrap();
+        let mut escaped = fixture.helper.clone();
+        escaped["targets"][1]["src_path"] = serde_json::json!(tests.join("src/lib.rs"));
+        assert!(fixture.bind(escaped).is_err());
+    }
 
     #[test]
     fn refuses_unbound_constructor_qualifier_packages_and_targets() {
@@ -325,7 +535,7 @@ mod tests {
             "reason": "compiler-artifact", "package_id": PACKAGE,
             "manifest_path": MANIFEST,
             "target": {"name":"reverie_liteinst_preload", "kind":["cdylib"], "crate_types":["cdylib"]},
-            "features": [],
+            "features": ["liteinst"],
             "filenames": ["/isolated/libreverie_liteinst_preload.so"], "fresh":true
         })
     }
@@ -501,6 +711,13 @@ mod tests {
             ),
             ("manifest_path", serde_json::json!("/lookalike/Cargo.toml")),
             ("features", serde_json::json!(["allocator-fixture"])),
+            // A trap-only preload: built without site patching.
+            ("features", serde_json::json!([])),
+            ("features", serde_json::json!(["liteinst", "x"])),
+            (
+                "features",
+                serde_json::json!(["allocator-fixture", "liteinst"]),
+            ),
             (
                 "filenames",
                 serde_json::json!(["/warm/libreverie_liteinst.so"]),
@@ -547,7 +764,7 @@ mod tests {
         };
         assert!(select_fixture(&artifact().to_string()).is_err());
         let mut message = artifact();
-        message["features"] = serde_json::json!(["allocator-fixture"]);
+        message["features"] = serde_json::json!(["allocator-fixture", "liteinst"]);
         assert!(select(&message.to_string()).is_err());
         assert_eq!(
             select_fixture(&message.to_string()).unwrap(),
@@ -561,6 +778,10 @@ mod tests {
             serde_json::json!(["other"]),
             serde_json::json!(["allocator-fixture", "other"]),
             serde_json::json!(["allocator-fixture", "allocator-fixture"]),
+            // Trap-only fixture, the non-fixture set, and an extra feature.
+            serde_json::json!(["allocator-fixture"]),
+            serde_json::json!(["liteinst"]),
+            serde_json::json!(["allocator-fixture", "liteinst", "x"]),
         ] {
             let mut wrong = message.clone();
             wrong["features"] = features;

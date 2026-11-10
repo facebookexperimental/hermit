@@ -5,7 +5,9 @@ edition = "2024"
 publish = false
 
 [dependencies]
-reverie-liteinst-preload = { version = "0.5.5", git = "https://github.com/rrnewton/reverie.git", rev = "e39f78dd604e4761b5eeea024001b9c1e26af901", default-features = false }
+# Explicit since https://github.com/rrnewton/reverie/pull/1375: FULL site
+# patching on x86_64. dh-md601 converts this to a forwarded feature.
+reverie-liteinst-preload = { version = "0.5.5", git = "https://github.com/rrnewton/reverie.git", rev = "131093f62a50f50c3428fc58c1897e770d864049", default-features = false, features = ["liteinst"] }
 
 [features]
 allocator-fixture = ["reverie-liteinst-preload/allocator-fixture"]
