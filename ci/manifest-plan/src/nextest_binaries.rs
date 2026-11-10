@@ -3605,7 +3605,7 @@ mod tests {
         // A stand-in for Cargo: it records how many listings overlap, prints
         // its arguments as the listing, and fails on request.
         let program = root.join("cargo");
-        fs::write(
+        crate::exec_safe_fs::write_executable(
             &program,
             "#!/bin/sh\n\
              mkdir \"$PWD/running.$$\"\n\
@@ -3614,9 +3614,9 @@ mod tests {
              rmdir \"$PWD/running.$$\"\n\
              echo \"$@\"\n\
              [ \"$1\" != fail ]\n",
+            0o755,
         )
         .unwrap();
-        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
         let listings: Vec<_> = (0..4)
             .map(|index| {
                 (
@@ -3800,8 +3800,7 @@ mod tests {
             for case in cases {
                 body.push_str(&format!("printf '%s: test\\n' '{case}'\n"));
             }
-            fs::write(path, body).unwrap();
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::exec_safe_fs::write_executable(path, body, 0o755).unwrap();
         }
         let root = std::env::temp_dir().join(format!(
             "harvest-cases-test-{}-{}",
@@ -4189,8 +4188,8 @@ mod tests {
             let target = root.join("custom-target");
             fs::create_dir(&target).unwrap();
             let executable = target.join("fixture-test");
-            fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
-            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::exec_safe_fs::write_executable(&executable, "#!/bin/sh\nexit 0\n", 0o755)
+                .unwrap();
             let package = format!("path+file://{}#fixture@1.0.0", root.display());
             let cargo = serde_json::json!({"target_directory": target, "packages": [{
                 "name": "fixture", "id": package, "source": null,
@@ -4253,8 +4252,8 @@ mod tests {
 
         fn cpu_wrapper(&self) -> CpuWrapperRecord {
             let executable = self.target.join(CPU_WRAPPER_TARGET);
-            fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
-            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::exec_safe_fs::write_executable(&executable, "#!/bin/sh\nexit 0\n", 0o755)
+                .unwrap();
             let metadata = self.root.join("cpu-wrapper.jsonl");
             fs::write(
                 &metadata,
@@ -4316,14 +4315,13 @@ mod tests {
             fs::create_dir_all(source.parent().unwrap()).unwrap();
             fs::write(&source, "source witness\n").unwrap();
             let path = directory.join(name);
-            fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::exec_safe_fs::write_executable(&path, "#!/bin/sh\nexit 0\n", 0o755).unwrap();
             let cargo_origin = if let Some((_, target, _)) = record_workloads::RUST_SOURCES
                 .into_iter()
                 .find(|(alias, _, _)| *alias == name)
             {
                 let origin = fixture.target.join(target);
-                fs::copy(&path, &origin).unwrap();
+                crate::exec_safe_fs::copy(&path, &origin).unwrap();
                 let target =
                     serde_json::json!({"name": target, "kind": ["bin"], "src_path": source});
                 targets.push(target.clone());

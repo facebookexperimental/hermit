@@ -12,10 +12,19 @@
 //! 134 of 2000 freshly written executables were busy.
 //!
 //! Writing to a temporary name and renaming does not help: the rename keeps
-//! the inode, and the stray child's descriptor names the inode.
+//! the inode, and the stray child's descriptor names the inode. Nothing here
+//! opens an executable target for writing in this process. A short-lived
+//! `install` child, which never forks, creates it instead, so no descriptor
+//! any other child can inherit ever refers to it. GNU `install` unlinks an
+//! existing destination first, so replacing an executable also yields a new
+//! inode that no earlier descriptor names.
 
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::process::Command;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 /// Write `contents` to `path` as a file with `mode`, creating or replacing it
 /// without this process ever holding the final inode open for writing.
@@ -24,15 +33,56 @@ pub fn write_executable(
     contents: impl AsRef<[u8]>,
     mode: u32,
 ) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let path = path.as_ref();
-    std::fs::write(path, contents)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::other(format!("{} names no file", path.display())))?;
+    // The staging inode is written here but never executed.
+    let staging = path.with_file_name(format!(
+        ".{}.staging.{}.{}",
+        name.to_string_lossy(),
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&staging, contents)?;
+    let installed = install(&staging, path, mode);
+    let removed = std::fs::remove_file(&staging);
+    installed?;
+    removed
 }
 
 /// `std::fs::copy`, except that an executable source is copied by a child.
 pub fn copy(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<u64> {
-    std::fs::copy(from, to)
+    let (from, to) = (from.as_ref(), to.as_ref());
+    let metadata = std::fs::metadata(from)?;
+    let mode = metadata.permissions().mode() & 0o7777;
+    if mode & 0o111 == 0 {
+        return std::fs::copy(from, to);
+    }
+    install(from, to, mode)?;
+    Ok(metadata.len())
+}
+
+fn install(from: &Path, to: &Path, mode: u32) -> io::Result<()> {
+    let output = Command::new("install")
+        .arg("-m")
+        .arg(format!("{mode:o}"))
+        .arg("-T")
+        .arg("--")
+        .arg(from)
+        .arg(to)
+        .output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "install {} -> {} failed ({}): {}",
+        from.display(),
+        to.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    )))
 }
 
 #[cfg(test)]

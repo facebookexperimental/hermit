@@ -4808,7 +4808,6 @@ mod tests {
     /// differs from ptrace's ("diverged").
     #[test]
     fn production_mixed_selection_runs_each_verify_cell_on_its_own_backend() {
-        use std::os::unix::fs::PermissionsExt;
         use std::path::PathBuf;
         use std::process::Command;
         use std::process::ExitCode;
@@ -4922,7 +4921,7 @@ mod tests {
             )
             .unwrap();
             let backend = path.join("native-backend-adapter");
-            fs::write(
+            hermit_manifest_plan::exec_safe_fs::write_executable(
                 &backend,
                 r#"#!/usr/bin/python3
 import json,pathlib,sys
@@ -4969,9 +4968,9 @@ assert '--verify-strict' in a and '--verify' not in a,a
 rundir.mkdir()
 (rundir/'verify-run.json').write_text(json.dumps({'backend':backend}))
 "#,
+                0o755,
             )
             .unwrap();
-            fs::set_permissions(&backend, fs::Permissions::from_mode(0o755)).unwrap();
             let result = Command::new("timeout")
                 .args(["--kill-after=2s", "30s"])
                 .arg(std::env::current_exe().unwrap())
@@ -5106,7 +5105,6 @@ rundir.mkdir()
     /// it is dropped.
     #[test]
     fn a_skid_overshoot_only_verify_attempt_earns_one_counted_skid_retry() {
-        use std::os::unix::fs::PermissionsExt;
         use std::path::PathBuf;
         use std::process::Command;
         use std::process::ExitCode;
@@ -5328,7 +5326,7 @@ rundir.mkdir()
             )
             .unwrap();
             let hermit = path.join("fake-hermit");
-            fs::write(
+            hermit_manifest_plan::exec_safe_fs::write_executable(
                 &hermit,
                 r#"#!/usr/bin/python3
 import json,os,pathlib,sys
@@ -5371,9 +5369,9 @@ if kind in ('skid','diverged','rejected','crashed'):
   'HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=2\n')
 sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'diverged':1,'unmarked-diverged':1}[kind])
 "#,
+                0o755,
             )
             .unwrap();
-            fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755)).unwrap();
             let result = Command::new("timeout")
                 .args(["--kill-after=2s", "60s"])
                 .arg(std::env::current_exe().unwrap())
@@ -6498,8 +6496,6 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
     /// A Hermit in `dir` that answers only `host-capabilities --json`, with a
     /// complete report whose `exact_branch_counter` verdict is `present`.
     fn host_capabilities_hermit(dir: &std::path::Path, present: bool) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
         use hermit_manifest_plan::host_capability::HostCapabilitiesReport;
 
         let verdict = |present| HostCapabilityVerdict {
@@ -6515,15 +6511,15 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
             exact_branch_counter: verdict(present),
         };
         let hermit = dir.join("hermit");
-        fs::write(
+        hermit_manifest_plan::exec_safe_fs::write_executable(
             &hermit,
             format!(
                 "#!/bin/sh\ntest \"$*\" = 'host-capabilities --json' || exit 2\ncat <<'EOF'\n{}\nEOF\n",
                 serde_json::to_string(&report).unwrap()
             ),
+            0o755,
         )
         .unwrap();
-        fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755)).unwrap();
         hermit
     }
 
@@ -7446,7 +7442,6 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
     /// retains the compared cells' logs.
     #[test]
     fn the_parity_post_pass_changes_no_determinism_output_and_runs_no_guest() {
-        use std::os::unix::fs::PermissionsExt;
         use std::path::Path;
         use std::path::PathBuf;
         use std::process::Command;
@@ -7645,7 +7640,7 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
         // it: the cell directory names are ASCII slugs with no quote or
         // backslash. Importing json and pathlib cost more than the rest of
         // the script. The log-diff stand-in starts with `-IS` too.
-        fs::write(
+        hermit_manifest_plan::exec_safe_fs::write_executable(
             &hermit,
             r#"#!/usr/bin/python3 -IS
 import sys
@@ -7693,9 +7688,9 @@ data=open(os.path.join(root,'verification-diverged.json' if failed else 'verific
 with open(report,'wb') as f:f.write(data)
 sys.exit(1 if failed else 0)
 "#,
+            0o755,
         )
         .unwrap();
-        fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755)).unwrap();
 
         let artifacts = fixture.join("artifacts");
         let child = |label: &str,
@@ -10114,7 +10109,6 @@ sys.exit(1 if failed else 0)
     /// step refuses before launching anything.
     #[test]
     fn validation_levels_privileged_dag_keeps_available_boxing_and_marks_only_the_unboxed_launch() {
-        use std::os::unix::fs::PermissionsExt;
         use std::path::PathBuf;
         use std::process::Command;
 
@@ -10163,11 +10157,11 @@ sys.exit(1 if failed else 0)
         }
         let repo = super::root(None);
         for relative in ["ci/run-dag.sh", "ci/configure-build-jobs.sh"] {
-            fs::copy(repo.join(relative), fixture.join(relative)).unwrap();
+            hermit_manifest_plan::exec_safe_fs::copy(repo.join(relative), fixture.join(relative))
+                .unwrap();
         }
         let write_executable = |path: PathBuf, body: String| {
-            fs::write(&path, body).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            hermit_manifest_plan::exec_safe_fs::write_executable(&path, body, 0o755).unwrap();
         };
         // The launcher looks here when DAGRUN_BIN is unset, which the step
         // guarantees with `env -u DAGRUN_BIN`.

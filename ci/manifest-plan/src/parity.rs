@@ -8440,7 +8440,6 @@ mod tests {
 
     impl Fixture {
         fn new(label: &str) -> Self {
-            use std::os::unix::fs::PermissionsExt;
             let dir = std::env::temp_dir().join(format!(
                 "hermit-parity-post-pass-{}-{label}",
                 std::process::id()
@@ -8448,8 +8447,7 @@ mod tests {
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(dir.join("artifacts")).unwrap();
             let hermit = dir.join("hermit");
-            fs::write(&hermit, FAKE_LOG_DIFF).unwrap();
-            fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::exec_safe_fs::write_executable(&hermit, FAKE_LOG_DIFF, 0o755).unwrap();
             Self { dir, hermit }
         }
 

@@ -11940,8 +11940,12 @@ mod tests {
         fs::create_dir_all(checkout.join(".git")).unwrap();
         let says = |name: &str, status: i32| {
             let path = base.join(name);
-            fs::write(&path, format!("#!/bin/sh\nexit {status}\n")).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::exec_safe_fs::write_executable(
+                &path,
+                format!("#!/bin/sh\nexit {status}\n"),
+                0o755,
+            )
+            .unwrap();
             path
         };
         let untracked = says("untracked-git", 1);
@@ -14673,7 +14677,7 @@ corpus:
         // A run's behaviour is `$FAKE_RUN<n>`: `record:<status>` commits a
         // record and exits with the status, `refuse` exits 122 with a class
         // line and no record. Each call is logged.
-        fs::write(
+        crate::exec_safe_fs::write_executable(
             &hermit,
             r#"#!/bin/sh
 log="$(dirname "$0")/calls"
@@ -14697,9 +14701,9 @@ case $behaviour in
   record:*) mkdir "$directory"; : > "$directory/verify-run.json"; exit "${behaviour#record:}" ;;
 esac
 "#,
+            0o755,
         )
         .unwrap();
-        fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755)).unwrap();
         let hermit = hermit.to_string_lossy().into_owned();
         let pair = |label: &str, allow: Option<&str>, runs: [&str; 2]| {
             let runs_dir = root.path().join(label);
@@ -15676,7 +15680,7 @@ esac
             r#"{"schema":1,"backend":"ptrace","comparison":{"strictness":"canonical","diagnostic_full_trace":false,"compare_io_buffers":true,"virtualize_time":true},"passthru_opt":false,"epoch":"2026-01-01T00:00:00Z","outcome":{"kind":"completed","status":{"kind":"exited","code":0},"skid_overshoots":0}}"#,
         )
         .unwrap();
-        fs::write(
+        crate::exec_safe_fs::write_executable(
             root.join("hermit"),
             r#"#!/bin/sh
 set -eu
@@ -15697,9 +15701,9 @@ if [ -n "$stage" ]; then
   cp "$PWD/record.json" "$stage/verify-run.json"
 fi
 "#,
+            0o755,
         )
         .unwrap();
-        fs::set_permissions(root.join("hermit"), fs::Permissions::from_mode(0o755)).unwrap();
         let mut context = run_context(&root);
         context.capture_custom_runs = true;
         let mut cell = ptrace_cell("custom");
@@ -15764,7 +15768,7 @@ fi
             r#"{"schema":1,"backend":"ptrace","comparison":{"strictness":"canonical","diagnostic_full_trace":false,"compare_io_buffers":true,"virtualize_time":true},"passthru_opt":false,"epoch":"2026-01-01T00:00:00Z","outcome":{"kind":"completed","status":{"kind":"exited","code":0},"skid_overshoots":0}}"#,
         )
         .unwrap();
-        fs::write(
+        crate::exec_safe_fs::write_executable(
             root.join("hermit"),
             r#"#!/bin/sh
     set -eu
@@ -15825,9 +15829,9 @@ fi
       *) printf 'unknown fixture scenario\n' >&2; exit 93 ;;
     esac
     "#,
+            0o755,
         )
         .unwrap();
-        fs::set_permissions(root.join("hermit"), fs::Permissions::from_mode(0o755)).unwrap();
         let context = run_context(&root);
         let mut cell = ptrace_cell("custom");
         cell.test.id = format!("fixture/custom-capture-{label}");
@@ -20425,8 +20429,12 @@ fi
         let root = cpu_reader_test_root("prior-work-before-spawn-failure");
         let context = run_context(&root);
         let program = root.join("remove-self");
-        fs::write(&program, "#!/bin/sh\nrm -- \"$0\"\nprintf measured\n").unwrap();
-        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::exec_safe_fs::write_executable(
+            &program,
+            "#!/bin/sh\nrm -- \"$0\"\nprintf measured\n",
+            0o755,
+        )
+        .unwrap();
         let mut cell = native_cpu_cell("unused", 2);
         cell.test.direct = Some(DirectCommand::Argv(vec![program.display().to_string()]));
         let failure = run_cell(&context, &cell).expect_err("second launch must fail after unlink");
@@ -23855,7 +23863,7 @@ backends_disabled:
         fs::write(root.join("exit-status"), exit_status).unwrap();
 
         let hermit = root.join("hermit");
-        fs::write(
+        crate::exec_safe_fs::write_executable(
             &hermit,
             r#"#!/bin/sh
 set -eu
@@ -23904,9 +23912,9 @@ fi
 cp "$PWD/verification.json" "$verdict"
 exit "$(cat "$PWD/exit-status")"
 "#,
+            0o755,
         )
         .unwrap();
-        fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut cell = ptrace_cell("verify");
         cell.test.id = "fixture/ordinary-verify-production".into();
@@ -27061,7 +27069,7 @@ exit "$(cat "$PWD/exit-status")"
         )
         .unwrap();
         let hermit = root.join("hermit");
-        fs::write(
+        crate::exec_safe_fs::write_executable(
             &hermit,
             format!(
                 r#"#!/bin/sh
@@ -27095,9 +27103,9 @@ cp "{}" "$verdict"
 "#,
                 root.join("verification.json").display()
             ),
+            0o755,
         )
         .unwrap();
-        fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut cell = ptrace_cell(mode);
         if mode != "verify" {

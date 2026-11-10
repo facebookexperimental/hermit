@@ -5912,26 +5912,23 @@ mod tests {
 
     #[test]
     fn pin_gate_uses_proxy_only_when_the_runner_provides_it() {
-        use std::os::unix::fs::PermissionsExt;
-
         let scratch = Scratch::create().unwrap();
         let root = scratch.0.join("pin checkout with 'quotes'");
         let bin = root.join("ci/rust-script-bin");
         fs::create_dir_all(&bin).unwrap();
         let checker = root.join("ci/run-reverie-pin-check.sh");
-        fs::write(
+        crate::exec_safe_fs::write_executable(
             &checker,
             "#!/bin/bash\nprintf 'checker\\0' >>\"$CAPTURE\"\nprintf '%s\\0' \"$@\" >>\"$CAPTURE\"\nexit \"$CHECKER_STATUS\"\n",
+            0o755,
         )
         .unwrap();
-        fs::set_permissions(&checker, fs::Permissions::from_mode(0o755)).unwrap();
         let capture = root.join("capture");
         let floor = "0123456789abcdef0123456789abcdef01234567";
         for proxied in [false, true] {
             if proxied {
                 let proxy = bin.join("with-proxy");
-                fs::write(&proxy, "#!/bin/bash\nprintf 'proxy\\0' >>\"$CAPTURE\"\nprintf '%s\\0' \"$@\" >>\"$CAPTURE\"\nexec \"$@\"\n").unwrap();
-                fs::set_permissions(proxy, fs::Permissions::from_mode(0o755)).unwrap();
+                crate::exec_safe_fs::write_executable(&proxy, "#!/bin/bash\nprintf 'proxy\\0' >>\"$CAPTURE\"\nprintf '%s\\0' \"$@\" >>\"$CAPTURE\"\nexec \"$@\"\n", 0o755).unwrap();
             }
             for tag in ["pre.reverie_pin", "pre.reverie_pin_on_host"] {
                 for admitted_floor in [None, Some(floor)] {
@@ -5978,8 +5975,6 @@ mod tests {
 
     #[test]
     fn rust_script_producer_prepares_tracked_dagrun_before_cargo_with_admitted_width() {
-        use std::os::unix::fs::PermissionsExt;
-
         use dagrun::model::command_with_inner_jobs;
         use dagrun::model::env_with_inner_jobs;
 
@@ -5996,20 +5991,19 @@ mod tests {
                     fs::create_dir_all(root.join("agent-utils/rs/bin")).unwrap();
                     fs::create_dir_all(root.join("ci")).unwrap();
                     let launcher = root.join("agent-utils/rs/bin/dagrun");
-                    fs::write(
+                    crate::exec_safe_fs::write_executable(
                         &launcher,
                         "#!/bin/bash\nprintf 'runner:%s:%s:%s\\n' \"${AGENT_UTILS_RS_ENSURE_ONLY:-}\" \"${CARGO_BUILD_JOBS:-}\" \"$#\" >> \"$CAPTURE\"\nexit \"$PREPARE_STATUS\"\n",
+                        0o755,
                     )
                     .unwrap();
                     let producer = root.join("ci/prepare-rust-scripts.sh");
-                    fs::write(
+                    crate::exec_safe_fs::write_executable(
                         &producer,
                         "#!/bin/bash\nprintf 'producer:%s:%s\\n' \"${CARGO_BUILD_JOBS:-}\" \"$#\" >> \"$CAPTURE\"\nexit \"$PRODUCER_STATUS\"\n",
+                        0o755,
                     )
                     .unwrap();
-                    for path in [&launcher, &producer] {
-                        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-                    }
                     let capture = root.join("capture");
                     let mut command = Command::new("timeout");
                     command
@@ -6057,12 +6051,12 @@ mod tests {
                     let root = &scratch.0;
                     fs::create_dir_all(root.join("tools")).unwrap();
                     let cargo = root.join("tools/cargo");
-                    fs::write(
+                    crate::exec_safe_fs::write_executable(
                         &cargo,
                         "#!/bin/bash\nprintf 'cargo:%s\\n' \"${CARGO_BUILD_JOBS:-}\" >> \"$CAPTURE\"\nprintf '<%s>\\n' \"$@\" >> \"$CAPTURE\"\nexit \"$CARGO_STATUS\"\n",
+                        0o755,
                     )
                     .unwrap();
-                    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
                     let capture = root.join("capture");
                     let mut command = Command::new("timeout");
                     command
@@ -6109,16 +6103,13 @@ mod tests {
     // argv, reconstructs only its declared environment, and maps exactly the two
     // fixed image assertion paths to inert files before executing the guard.
     fn renderer_wrapper_capture(step: &Step, width: i64, wrapped: bool) -> serde_json::Value {
-        use std::os::unix::fs::PermissionsExt;
-
         use dagrun::model::command_with_inner_jobs;
         use dagrun::model::env_with_inner_jobs;
 
         let scratch = Scratch::create().unwrap();
         let root = &scratch.0;
         let write_executable = |path: &Path, text: &[u8]| {
-            fs::write(path, text).unwrap();
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::exec_safe_fs::write_executable(path, text, 0o755).unwrap();
         };
         fs::create_dir_all(root.join("ci/hermetic")).unwrap();
         fs::create_dir_all(root.join("tools")).unwrap();
