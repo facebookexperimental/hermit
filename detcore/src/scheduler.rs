@@ -19049,6 +19049,11 @@ impl Scheduler {
         // Must precede `tentative_pop_next`: the run queue forbids pushes while a
         // selection transaction is live.
         self.hb_flush_wakes();
+        // An unrun reserved SIGALRM poll probe (dh-ru056 slice 1) whose
+        // thread is still out of the run queue once those gates are flushed
+        // cannot be selected below: release it now, charging the entry's
+        // loss, rather than let it outlive its precedence.
+        self.release_unqueued_sigalrm_reservation();
         // Also before the selection, since it moves queue entries.
         self.order_continuation_fairly();
         debug!(
@@ -19149,9 +19154,10 @@ impl Scheduler {
             // `sigchld_takers` class) resumes right after a group-exit
             // decider and ahead of every other choice here, so no other
             // thread's turn commits between its reservation and the probe
-            // (`reserved_probe_to_resume`). Its grant counts as an alarm
-            // grant for the bound of
-            // https://github.com/rrnewton/hermit/issues/4929.
+            // (`reserved_probe_to_resume`). Its grant spends the alarm
+            // priority of https://github.com/rrnewton/hermit/issues/4929;
+            // the probe itself, like a SIGCHLD taker, is exempt from that
+            // bound (one probe grant per due entry).
             let reserved_probe = if decider.is_none() {
                 self.reserved_probe_to_resume()
             } else {

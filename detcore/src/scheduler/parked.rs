@@ -331,7 +331,12 @@ pub(super) struct ParkedRequests {
     /// woken, so the run queue makes at least one choice of its own between
     /// any two alarm grants, for the same process or another
     /// (`Scheduler::alarm_priority_available`,
-    /// <https://github.com/rrnewton/hermit/issues/4929>).
+    /// <https://github.com/rrnewton/hermit/issues/4929>). One exception: a
+    /// reserved SIGALRM poll probe (dh-ru056 slice 1,
+    /// `Scheduler::reserved_probe_to_resume`) sets it, spending the alarm
+    /// priority, but is itself selected whether or not that priority is
+    /// available. Like a SIGCHLD taker it is exempt from the bound, which
+    /// holds it to one probe grant per due entry instead.
     pub alarm_priority_served: Option<DetPid>,
     /// The pollers `Scheduler::wake_polling_alarm_receiver` woke, until step 3
     /// next resumes each: their substituted request is a signal delivery the

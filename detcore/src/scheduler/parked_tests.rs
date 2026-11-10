@@ -7255,10 +7255,11 @@ fn the_completion_check_settles_a_probe_before_the_sweep_reaches_another_process
     s.fire_alarm(first_pid, first, Signal::SIGALRM);
     assert!(sigalrm_reserved_for(&s, first));
 
-    // Production order: step 3 resumes the first probe (its grant counts
-    // as an alarm grant, which no longer keeps another process's entry
-    // from being reserved), and the probe files its no-progress
-    // successor; the second process's read polls by the next pass's sweep.
+    // Production order: step 3 resumes the first probe (its grant spends
+    // the alarm priority of https://github.com/rrnewton/hermit/issues/4929,
+    // which does not keep another process's entry from being reserved), and
+    // the probe files its no-progress successor; the second process's read
+    // polls by the next pass's sweep.
     assert_eq!(grant_selected(&mut s), first);
     assert_eq!(s.parked.alarm_priority_served, Some(first_pid));
     file_probe_successor(&mut s, first, 1, false);
@@ -11403,17 +11404,20 @@ fn reserved_reader_behind(others: &[i32]) -> (Scheduler, DetTid, DetPid, Vec<Det
 }
 
 /// The production order of a no-progress settle, at step 2 (step 1 waits
-/// for every queued thread to file): step 3 resumes the reserved probe by
-/// alarm priority, step 6 requeues it, its successor retry is filed, and
-/// the next pass's step 2 replaces that retry with the wake. The thread is
-/// queued exactly once afterwards (the settle dequeues the requeued retry
-/// before the wake's requeue), at the front of its band, ahead of a writer
-/// queued before it (design 5.1: no writer turn between probe and wake).
+/// for every queued thread to file): step 3 selects the unrun probe ahead
+/// of a writer queued before it (placed precedence,
+/// `reserved_probe_to_resume`), step 6 requeues it, its successor retry is
+/// filed, and the next pass's step 2 replaces that retry with the wake. The
+/// thread is queued exactly once afterwards (the settle dequeues the
+/// requeued retry before the wake's requeue). The wake goes to the front of
+/// its band only; here the writer shares that band, so the wake runs first.
+/// A thread in a better band, or a chaos draw, could still run before it,
+/// and the wake grant's own attempt would then decide (R1).
 #[test]
 fn a_no_progress_probe_settles_at_step2_with_its_thread_requeued() {
     let (mut s, reader, pid, queued) = reserved_reader_behind(&[300]);
     let writer = queued[0];
-    assert_eq!(grant_selected(&mut s), reader, "alarm priority");
+    assert_eq!(grant_selected(&mut s), reader, "placed precedence");
     assert_eq!(s.parked.alarm_priority_served, Some(pid));
     file_probe_successor(&mut s, reader, 2, false);
 
@@ -11429,19 +11433,19 @@ fn a_no_progress_probe_settles_at_step2_with_its_thread_requeued() {
     assert_eq!(
         grant_selected(&mut s),
         reader,
-        "the wake runs before the writer"
+        "front of the band the writer shares"
     );
     assert_eq!(grant_selected(&mut s), writer);
 }
 
 /// Review item 1 (7cdd90dc): the probe's precedence ends with its settle.
 /// A placement that outlived the reservation kept the reader first at every
-/// other selection for the rest of the run. Placement is now the unrun
-/// probe's selection at step 3 (`reserved_probe_to_resume`) and registers no
-/// alarm taker; after the settle and the wake, selection is the run queue's
-/// own round robin.
+/// other selection for the rest of the run. Precedence is now only the unrun
+/// probe's selection at step 3 (`reserved_probe_to_resume`), which registers
+/// no alarm taker; after the settle and the wake, selection is the run
+/// queue's own round robin.
 #[test]
-fn the_reserved_probes_alarm_priority_ends_with_its_settle() {
+fn the_reserved_probes_precedence_ends_with_its_settle() {
     let (mut s, reader, pid, queued) = reserved_reader_behind(&[300, 500]);
     assert_eq!(s.reserved_probe_to_resume(), Some((pid, reader)));
     assert!(
@@ -11457,7 +11461,7 @@ fn the_reserved_probes_alarm_priority_ends_with_its_settle() {
     file_probe_successor(&mut s, reader, 2, false);
     s.step2_sigalrm_ledger();
     assert!(woken_by_sigalrm(&s, reader));
-    assert_eq!(s.reserved_probe_to_resume(), None, "placement ended");
+    assert_eq!(s.reserved_probe_to_resume(), None, "precedence ended");
 
     let mut selections = Vec::new();
     for _ in 0..9 {
@@ -11471,9 +11475,11 @@ fn the_reserved_probes_alarm_priority_ends_with_its_settle() {
 }
 
 /// Gate item 1, the other consumers: a completed probe, a G1 loss and the
-/// target's retirement each end the placement too.
+/// target's retirement each end the reservation too, so slice 1's single
+/// flight is free again: another process's due polling read is reserved
+/// afterwards. (A reservation left outstanding would refuse it.)
 #[test]
-fn every_reservation_consumer_ends_the_alarm_placement() {
+fn every_reservation_consumer_frees_the_single_flight() {
     for consumer in ["completed", "g1-loss", "retired"] {
         let (mut s, reader, pid, _) = reserved_reader_behind(&[300]);
         assert_eq!(grant_selected(&mut s), reader);
@@ -11490,7 +11496,15 @@ fn every_reservation_consumer_ends_the_alarm_placement() {
             _ => s.retire_sigalrm_thread(reader, pid),
         }
         assert_eq!(s.sigalrm_reserved_poll_target(), None, "{consumer}");
-        assert_eq!(s.reserved_probe_to_resume(), None, "{consumer}");
+
+        let (next, _, _) = add(&mut s, 500, 500);
+        let next_pid = DetPid::from_raw(500);
+        s.set_sigalrm_handled(next_pid, true);
+        file_pipe_read_attempt(&mut s, next, 1);
+        s.runqueue_push_back(next);
+        s.fire_alarm(next_pid, next, Signal::SIGALRM);
+        assert!(sigalrm_reserved_for(&s, next), "{consumer}");
+        assert!(!s.sigalrm_loss_recorded(next_pid), "{consumer}");
     }
 }
 
@@ -11612,7 +11626,11 @@ fn a_reservation_needs_its_thread_queued_outside_a_selection() {
 /// `rt_sigreturn` continuation of another thread with a vfork child queued
 /// (which would otherwise make the alarm taker yield to the vfork child),
 /// and a queued group-exit decider, which alone goes first. The probe's
-/// grant counts as an alarm grant (`alarm_priority_served`).
+/// grant spends the alarm priority (`alarm_priority_served`), but the probe
+/// is selected whether or not that priority is available: like a SIGCHLD
+/// taker it is exempt from the bound of
+/// https://github.com/rrnewton/hermit/issues/4929, one probe grant per due
+/// entry.
 #[test]
 fn the_unrun_probe_resumes_ahead_of_everything_but_a_group_exit_decider() {
     for case in [
@@ -11770,7 +11788,7 @@ fn a_completed_probe_is_classified_before_its_delivery_takes_the_entry() {
 /// classified `NewRead`, charged as a loss, not woken, never mistaken for
 /// the still-unrun probe.
 #[test]
-fn a_new_read_of_the_same_descriptor_classifies_the_probe_completed() {
+fn a_new_read_of_the_same_descriptor_charges_the_probe_a_loss() {
     let (mut s, reader, pid, _) = reserved_reader_behind(&[300]);
     assert_eq!(grant_selected(&mut s), reader);
     file_request(&mut s, pipe_read_request(reader, 0), false);
@@ -11801,4 +11819,85 @@ fn a_ran_probe_has_no_precedence_before_its_classification() {
     assert_eq!(s.reserved_probe_to_resume(), None, "the probe ran");
 
     assert_eq!(grant_selected(&mut s), other, "the run queue's own choice");
+}
+
+/// A happens-before program holding the reader (thread 100) at its syscall
+/// count 43 until thread 300 reaches its count 42.
+fn hb_hold_reader_spec() -> HbRuntime {
+    let program = detcore_model::happens_before::HappensBeforeSpec::from_json(
+        r#"{"version": 1,
+        "events": {"src": {"thread": "300", "syscalls": 42},
+                   "dst": {"thread": "100", "syscalls": 43}},
+        "edges": [{"before": "src", "after": "dst", "strength": "hard"}]}"#,
+    )
+    .unwrap()
+    .normalize()
+    .unwrap();
+    HbRuntime::new(program)
+}
+
+/// Review of 8f75151f, the happens-before edge: the reader reaches a
+/// happens-before hold only through its own checkpoint request, which is a
+/// successor of the probe. Driven through step 3 and step 4 with no step 2
+/// in between (the defensive path), the step-4 head classifies the
+/// reservation completed before the checkpoint parks the thread, so no
+/// reservation outlives into a hold.
+#[test]
+fn a_reserved_probe_never_outlives_into_a_happens_before_hold() {
+    let (mut s, reader, pid, queued) = reserved_reader_behind(&[300]);
+    let other = queued[0];
+    s.happens_before = Some(hb_hold_reader_spec());
+    assert_eq!(grant_selected(&mut s), reader, "the unrun probe first");
+    // The probe's read completed; its posthook checkpoint (count 43) is the
+    // successor, gated on 300's count 42, which has not fired.
+    let mut r = Resources::new(reader);
+    r.insert(ResourceID::HappensBeforeCheckpoint(43), Permission::W);
+    file_request(&mut s, r, false);
+    assert!(sigalrm_reserved_for(&s, reader), "not yet classified");
+    assert_eq!(s.reserved_probe_to_resume(), None, "the probe ran");
+    // Move the reader to the front so step 3 picks it now.
+    assert!(s.run_queue.remove_tid(other));
+    s.runqueue_push_back(other);
+    let (tid, req, resp) = s.step3_peek().expect("a selection");
+    assert_eq!(tid, reader);
+    let request = req.try_read().unwrap().unwrap();
+    assert!(
+        s.step4_resource_block(tid, &request, &resp).is_err(),
+        "held"
+    );
+    assert!(s.happens_before.as_ref().unwrap().parked.contains(&reader));
+    assert!(!s.run_queue.contains_tid(reader));
+    assert_eq!(s.sigalrm_reserved_poll_target(), None, "classified first");
+    assert!(!s.sigalrm_loss_recorded(pid));
+    assert!(s.sigalrm_pending(pid));
+}
+
+/// Review of 8f75151f, the happens-before edge's fail-closed release,
+/// constructed directly (no production path is known to leave a reserved
+/// target out of the run queue with its probe unrun): when step 3 begins,
+/// the reservation is released through the loss path
+/// (`release_unqueued_sigalrm_reservation`) instead of keeping a precedence
+/// that every turn committed meanwhile would outlive. The entry stays
+/// pending for delivery at a completion, and once the gate opens the
+/// readmitted reader has no precedence left.
+#[test]
+fn an_unrun_probe_out_of_the_run_queue_is_released_with_a_loss_at_step3() {
+    let (mut s, reader, pid, queued) = reserved_reader_behind(&[300, 500]);
+    let (other, third) = (queued[0], queued[1]);
+    let mut hb = hb_hold_reader_spec();
+    hb.parked.insert(reader);
+    s.happens_before = Some(hb);
+    assert!(s.run_queue.remove_tid(reader));
+    assert_eq!(s.reserved_probe_to_resume(), None, "held: not selectable");
+    assert!(!s.sigalrm_loss_recorded(pid));
+
+    assert_eq!(grant_selected(&mut s), other, "another turn commits");
+    assert_eq!(s.sigalrm_reserved_poll_target(), None, "released at step 3");
+    assert!(s.sigalrm_loss_recorded(pid), "charged as a loss");
+    assert!(s.sigalrm_pending(pid), "the entry stays pending");
+
+    s.happens_before.as_mut().unwrap().wake_pending = true;
+    assert_eq!(grant_selected(&mut s), third, "no precedence after release");
+    assert_eq!(grant_selected(&mut s), other);
+    assert_eq!(grant_selected(&mut s), reader);
 }
