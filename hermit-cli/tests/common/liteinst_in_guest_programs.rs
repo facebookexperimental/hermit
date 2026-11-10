@@ -1198,6 +1198,15 @@ fn in_guest_trap_sigalrm_interrupts_a_guest_held_pipe_read_as_ptrace_does() {
 ///   end the parent passed it over SCM_RIGHTS on a socketpair, a guest-held
 ///   channel; Linux's receiver holds the same description, so Linux returns
 ///   EAGAIN at once (finding 1 of coord7's review of 29b3e6a8).
+/// - `scmsetfl_nowait` and `scmmsetfl_nowait`: as `scmsetfl`, where the
+///   send, by `sendmsg` or a one-message `sendmmsg`, carries MSG_DONTWAIT and
+///   so runs once in the turn, outside the retry loop: only the handler's
+///   untracking reaches it (B2 of coord7's review of 4d17d5ab).
+/// - `scmrecv`: the child passes its read end to the parent, which reads the
+///   end it received while it still holds its own copy from the fork. The
+///   receiver's Detcore records a description of its own, which it marks
+///   guest-held; Linux's is the same blocking description, so Linux returns
+///   EINTR after the handler (B1 of coord7's review of 4d17d5ab).
 /// - `scmswitch`: as `scmsetfl`, where the end passed is named only after
 ///   the send waited: the second message of a `sendmmsg` batch, whose first
 ///   waited for room, has shared control data that the child rewrote from
@@ -1257,6 +1266,11 @@ fn in_guest_trap_refuses_by_name_the_sigalrm_pipe_reads_slice_2_does_not_place()
         // The read end was named only by the send's attempt after its wait,
         // which marked the parent's description untracked then.
         ("scmswitch", eagain, diverged),
+        // Sent once, in the turn: the handler's untracking alone.
+        ("scmsetfl_nowait", eagain, diverged),
+        ("scmmsetfl_nowait", eagain, diverged),
+        // The receiver's own description, untracked at the receipt.
+        ("scmrecv", SIGALRM_PIPE_READ_EINTR, diverged),
         (
             "stdin",
             concat!(
@@ -1372,6 +1386,14 @@ fn in_guest_trap_stops_by_name_when_a_waiting_pipe_reads_authority_is_revoked() 
              waits in a pipe read that signal phase 1 admitted because only guests held the pipe"
         ),
         "{stderr}"
+    );
+    // The scheduler's stop, not the read's end: the end-of-read check names
+    // its call instead (`sigalrm_pipe_authority_revoked_at_end_refusal`), and
+    // would stop the same run with the same status had the scheduler's stop
+    // not been taken (N2 of coord7's review of 4d17d5ab).
+    assert!(
+        !stderr.contains("was admitted by signal phase 1 because only guests held the pipe, and"),
+        "the scheduler stopped the run, not the read's end: {stderr}"
     );
 }
 

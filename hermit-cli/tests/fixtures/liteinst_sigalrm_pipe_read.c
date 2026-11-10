@@ -71,6 +71,15 @@
  *            a second pipe; it writes at 3s. Linux's received descriptor is
  *            the same description, so the read returns -1/EAGAIN at once,
  *            with no handler run.
+ *   scmsetfl_nowait, scmmsetfl_nowait: as scmsetfl, where the parent passes
+ *            the read end with MSG_DONTWAIT, which never waits, through
+ *            sendmsg or a one-message sendmmsg.
+ *   scmrecv: as eintr, where the parent reads the read end the child passed
+ *            it over a socketpair (SCM_RIGHTS) before the install. The
+ *            parent still holds its own copy of the same end from the fork.
+ *            Linux's received descriptor is the same blocking description,
+ *            so the read returns -1/EINTR after the handler, and a second
+ *            read returns the byte.
  *   scmswitch: as scmsetfl, where the end the child receives is named only
  *            after the parent's send waited. Before the install the parent
  *            fills the socketpair, tells the child, and sends a batch of two
@@ -132,8 +141,10 @@ static void on_alarm(int sig, siginfo_t *info, void *context) {
     frame_ip_after_syscall = ip[-2] == 0x0f && ip[-1] == 0x05;
 }
 
-/* Sends `fd` over SCM_RIGHTS on `socket`, with one data byte. */
-static ssize_t send_fd(int socket, int fd) {
+/* Sends `fd` over SCM_RIGHTS on `socket`, with one data byte and `flags`,
+ * through sendmsg, or through a one-message sendmmsg where `batch` is set: the
+ * bytes sent, or -1. */
+static ssize_t send_fd_with(int socket, int fd, int flags, int batch) {
     char byte = 'f';
     struct iovec iov = {&byte, 1};
     union {
@@ -151,7 +162,16 @@ static ssize_t send_fd(int socket, int fd) {
     cmsg->cmsg_type = SCM_RIGHTS;
     cmsg->cmsg_len = CMSG_LEN(sizeof(int));
     memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
-    return sendmsg(socket, &msg, 0);
+    if (batch) {
+        struct mmsghdr one = {msg, 0};
+        return sendmmsg(socket, &one, 1, flags) == 1 ? (ssize_t)one.msg_len : -1;
+    }
+    return sendmsg(socket, &msg, flags);
+}
+
+/* Sends `fd` over SCM_RIGHTS on `socket` with sendmsg, waiting if need be. */
+static ssize_t send_fd(int socket, int fd) {
+    return send_fd_with(socket, fd, 0, 0);
 }
 
 /* Receives one descriptor over SCM_RIGHTS on `socket`, or -1. */
@@ -274,8 +294,13 @@ int main(int argc, char **argv) {
     int setfl_mid = !strcmp(mode, "setfl_mid");
     int stdin_read = !strcmp(mode, "stdin");
     int setfl_exit = !strcmp(mode, "setfl_exit");
-    int scmsetfl = !strcmp(mode, "scmsetfl");
+    /* The parent passes the read end with MSG_DONTWAIT (scmsetfl_nowait,
+     * through sendmsg; scmmsetfl_nowait, through sendmmsg). */
+    int scmsetfl_nowait = !strcmp(mode, "scmsetfl_nowait");
+    int scmmsetfl_nowait = !strcmp(mode, "scmmsetfl_nowait");
+    int scmsetfl = !strcmp(mode, "scmsetfl") || scmsetfl_nowait || scmmsetfl_nowait;
     int revoke = !strcmp(mode, "revoke");
+    int scmrecv = !strcmp(mode, "scmrecv");
     int scmswitch = !strcmp(mode, "scmswitch");
     int scmswitch_other = !strcmp(mode, "scmswitch_other");
     /* The parent's send names the end the child receives only after it
@@ -285,8 +310,13 @@ int main(int argc, char **argv) {
      * another pipe's, before the read (setfl, fionbio, setfl_exit, scmsetfl,
      * scmswitch, scmswitch_other) or while it waits (setfl_mid). */
     int status_change = setfl || fionbio || setfl_mid || setfl_exit || scmsetfl || switched;
+    /* Where Linux returns EAGAIN at once (setfl, fionbio, setfl_exit, every
+     * scmsetfl and scmswitch), no second read follows an EINTR: a stale
+     * admission then shows in the output at the alarm, rather than as a
+     * second read that waits on the parent's own write end. */
+    int refused_shape = setfl || fionbio || setfl_exit || scmsetfl || scmswitch;
     if (!restart && !fifo && !eof && !data && !childexit && !blocked && !status_change &&
-        !stdin_read && !revoke && strcmp(mode, "eintr"))
+        !stdin_read && !revoke && !scmrecv && strcmp(mode, "eintr"))
         return 2;
     long write_ms = data ? 1000 : eof ? 1000 : childexit ? 500 : 3000;
     /* The windows' upper bound: the write, or 3s where the child writes
@@ -303,10 +333,10 @@ int main(int argc, char **argv) {
         printf("pipe errno=%d\n", errno);
         return 1;
     }
-    /* The channel the parent passes a read end over (scmsetfl, scmswitch,
-     * scmswitch_other). */
+    /* The channel a read end is passed over: by the parent (scmsetfl,
+     * scmswitch, scmswitch_other) or by the child (scmrecv). */
     int channel[2] = {-1, -1};
-    if ((scmsetfl || switched) && socketpair(AF_UNIX, SOCK_STREAM, 0, channel)) {
+    if ((scmsetfl || switched || scmrecv) && socketpair(AF_UNIX, SOCK_STREAM, 0, channel)) {
         printf("socketpair errno=%d\n", errno);
         return 1;
     }
@@ -394,6 +424,7 @@ int main(int argc, char **argv) {
             if (write(out, "x", 1) != 1) _exit(3);
             _exit(0);
         }
+        if (scmrecv && send_fd(channel[1], ends[0]) != 1) _exit(11);
         close(fifo ? in : ends[0]);
         if (revoke) {
             /* A socket that is not connected: the send fails, having
@@ -421,6 +452,11 @@ int main(int argc, char **argv) {
         in = ends[0];
         /* childexit and setfl_exit keep a writer, so the read could wait. */
         if (!childexit && !setfl_exit) close(ends[1]);
+        /* The end the child passed; the parent keeps its own copy. */
+        if (scmrecv && (in = receive_fd(channel[0])) < 0) {
+            printf("recvmsg errno=%d\n", errno);
+            return 1;
+        }
     }
     if (setfl_exit) {
         /* Before the install: the parent may wait for its child only while
@@ -432,7 +468,8 @@ int main(int argc, char **argv) {
         }
         reaped = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     }
-    if (scmsetfl && send_fd(channel[0], in) != 1) {
+    if (scmsetfl && send_fd_with(channel[0], in, scmsetfl_nowait || scmmsetfl_nowait ? MSG_DONTWAIT : 0,
+                                 scmmsetfl_nowait) != 1) {
         printf("sendmsg errno=%d\n", errno);
         return 1;
     }
@@ -491,7 +528,7 @@ int main(int argc, char **argv) {
     if (blocked) {
         int unblocked = sigprocmask(SIG_UNBLOCK, &alarm_set, NULL);
         printf("unblock=%d hits_at_return=%d\n", unblocked, (int)hits);
-    } else if (n < 0 && e == EINTR && !childexit && !stdin_read) {
+    } else if (n < 0 && e == EINTR && !childexit && !stdin_read && !refused_shape) {
         c = '?';
         errno = 0;
         n = read(in, &c, 1);
