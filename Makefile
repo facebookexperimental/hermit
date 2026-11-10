@@ -235,6 +235,8 @@ LINT_CHECK_TARGETS := \
     lint-check-whitespace \
     lint-check-verify-submodules \
     lint-check-reverie-pin \
+    lint-check-private-static-owned \
+    lint-check-private-static-pipeline \
     lint-check-musl-detcore \
     lint-check-nested-lockfiles \
     lint-check-record-version-floor \
@@ -379,6 +381,15 @@ lint-check-verify-submodules:
 
 lint-check-reverie-pin:
 	$(SUBMODULE_PROXY) ./ci/run-reverie-pin-check.sh $(_VALIDATE_PIN_ARG)
+
+# The private-static producer controls, including the runtime source rows
+# derived from this checkout's own H head and Reverie gitlink objects. -B and
+# PYTHONDONTWRITEBYTECODE keep __pycache__ out of the checkout.
+lint-check-private-static-owned:
+	PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s hermit-install/private-static/owned -p 'test_*.py'
+
+lint-check-private-static-pipeline:
+	PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s hermit-install/private-static -p test_run_pipeline.py
 
 lint-check-musl-detcore:
 	./ci/check-musl-detcore.sh

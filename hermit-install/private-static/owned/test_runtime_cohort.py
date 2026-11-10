@@ -7,6 +7,7 @@ from pathlib import Path
 import selectors
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -80,6 +81,86 @@ def _git_cat_file(owner, specs, limit):
                 child.wait()
 
 
+# Real Git fixtures for the derived cohort. Global and system configuration are
+# excluded so an operator's signing or hook settings cannot reach a fixture.
+LIVE = D.parents[2]
+TRAP = 'reverie-inguest/src/trap.rs'
+ORDINARY_GATE = 'reverie-liteinst-artifact/src/private_static/selected_initializers/ordinary_gate.rs'
+GIT_FIXTURE_ENV = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1',
+                       GIT_AUTHOR_NAME='fixture', GIT_AUTHOR_EMAIL='fixture@example.invalid',
+                       GIT_COMMITTER_NAME='fixture', GIT_COMMITTER_EMAIL='fixture@example.invalid',
+                       GIT_AUTHOR_DATE='2026-01-01T00:00:00Z', GIT_COMMITTER_DATE='2026-01-01T00:00:00Z')
+
+
+def fixture_git_bytes(path, *args):
+    return subprocess.run(['git', '-C', str(path), '-c', 'commit.gpgsign=false', '-c', 'init.defaultBranch=main',
+                           '-c', 'core.hooksPath=' + os.devnull, *args],
+                          check=True, capture_output=True, env=GIT_FIXTURE_ENV, timeout=60).stdout
+
+
+def fixture_git(path, *args):
+    return fixture_git_bytes(path, *args).decode().strip()
+
+
+def live_gitlink():
+    header = fixture_git(LIVE, 'ls-tree', '--full-tree', 'HEAD', 'reverie').split('\t')[0].split()
+    assert header[:2] == ['160000', 'commit'], header
+    return header[2]
+
+
+def live_reverie_object(path):
+    return fixture_git_bytes(LIVE / 'reverie', 'cat-file', 'blob', live_gitlink() + ':' + path)
+
+
+def lock_text(pin):
+    return ('[[package]]\nname = "reverie"\nversion = "0.1.0"\n'
+            'source = "git+https://github.com/rrnewton/reverie.git?rev={0}#{0}"\n'.format(pin))
+
+
+class PinnedTree:
+    """A Hermit checkout with a Reverie submodule, built from real commits."""
+
+    def __init__(self, root):
+        self.root = root
+        self.reverie = root / 'reverie'
+        self.reverie.mkdir()
+        fixture_git(self.reverie, 'init', '-q')
+        for label, path in cohort.DERIVED_ROWS:
+            if label == 'R':
+                self.write(self.reverie / path, live_reverie_object(TRAP) if path == TRAP
+                           else ('runtime ' + path + '\n').encode())
+        self.write(self.reverie / 'README.md', b'not a reviewed row\n')
+        self.rpin = self.commit(self.reverie)
+        fixture_git(root, 'init', '-q')
+        for label, path in cohort.DERIVED_ROWS:
+            if label == 'H':
+                self.write(root / path, ('host ' + path + '\n').encode())
+        self.write(root / 'tests/unrelated/Cargo.lock', b'[[package]]\nname = "unrelated"\n')
+        self.locks(self.rpin)
+        self.h_head = self.commit(root)
+
+    @staticmethod
+    def write(path, raw):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(raw)
+
+    @staticmethod
+    def commit(path):
+        fixture_git(path, 'add', '-A')
+        fixture_git(path, 'commit', '-q', '--allow-empty', '-m', 'fixture')
+        return fixture_git(path, 'rev-parse', 'HEAD')
+
+    def locks(self, pin, nested=None):
+        self.write(self.root / 'Cargo.lock', lock_text(pin).encode())
+        self.write(self.root / 'liteinst-runtime-build/Cargo.lock', lock_text(nested or pin).encode())
+
+    def repin(self, nested=None):
+        """Commit the Hermit side after a Reverie commit, pins kept current."""
+        self.rpin = fixture_git(self.reverie, 'rev-parse', 'HEAD')
+        self.locks(self.rpin, nested)
+        self.h_head = self.commit(self.root)
+
+
 class ContentCohort(unittest.TestCase):
     def fixture(self,root):
         (root/'reverie').mkdir()
@@ -91,7 +172,7 @@ class ContentCohort(unittest.TestCase):
         previous=cohort.COHORTS
         try:
             cohort.COHORTS=(('data-only',rows),)
-            return cohort.bind(root)
+            return cohort.select(root, cohort.COHORTS)
         finally:
             cohort.COHORTS=previous
     def test_identical_content_in_distinct_source_roots(self):
@@ -165,41 +246,6 @@ class ContentCohort(unittest.TestCase):
     def historical_current_fixture(self, root):
         self.historical_fixture(root, 'function-sections-054-content-v1')
 
-    def current_fixture(self, root):
-        source = D.parents[2]
-        for owner, path, _, _ in cohort.FINAL_FUNCTION_SECTIONS_054:
-            relative = Path(path) if owner == 'H' else Path('reverie') / path
-            target = root / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(source / relative, target)
-        # Construct the exact historical first-party source fixture. These
-        # inverses affect this temporary data fixture only, never cohort.bind's
-        # observed source or expected hashes; assert_complete_cohort checks all
-        # 31 original whole-file identities below.
-        inverses = {
-            'detcore-liteinst/build.rs': [
-                (b'//! src/lib.rs compiles common/inguest/glibc_compat.rs',
-                 b'//! src/lib.rs compiles detcore-sabre/src/glibc_compat.rs'),
-            ],
-            'detcore-liteinst/src/lib.rs': [
-                (b"// SHARED FILE: the guest preloads' glibc compatibility definitions, compiled",
-                 b"// SHARED FILE: the SaBRe plugin's glibc compatibility definitions, compiled"),
-                (b'#[path = "../../common/inguest/glibc_compat.rs"]',
-                 b'#[path = "../../detcore-sabre/src/glibc_compat.rs"]'),
-            ],
-            'reverie/reverie-inguest/Cargo.toml': [
-                (b'# Read-only native callback observations; no constructor or entry authority.\n'
-                 b'native-entry-observer = ["coordinator-rpc"]\n', b''),
-            ],
-        }
-        for relative, edits in inverses.items():
-            path = root / relative
-            raw = path.read_bytes()
-            for current, historical in edits:
-                self.assertEqual(raw.count(current), 1)
-                raw = raw.replace(current, historical)
-            path.write_bytes(raw)
-
     # Reverse only the two reviewed section-directive hunks in a temporary
     # fixture. The historical complete-file digest must still match exactly.
     trap_section_edits = (
@@ -239,16 +285,18 @@ class ContentCohort(unittest.TestCase):
         for path, fact in expected.items():
             raw = Path(path).read_bytes()
             self.assertEqual((len(raw), hashlib.sha256(raw).hexdigest()), fact)
-        result = cohort.bind(root)
+        result = cohort.select(root, cohort.COHORTS)
         self.assertEqual(result['cohort'], name)
         self.assertEqual(len(result['files']), 31)
         self.assertEqual({fact['path']: (fact['bytes'], fact['sha256'])
                           for fact in result['files']}, expected)
 
-    def test_current_runtime_source_cohort_keeps_all_31_exact_files(self):
+    def test_function_sections_fixture_keeps_all_31_exact_files(self):
+        # Historical cohorts are fixtures rebuilt from their reviewed objects;
+        # no fixture copies the live tree.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            self.current_fixture(root)
+            self.historical_current_fixture(root)
             self.assert_complete_cohort(root, 'function-sections-054-content-v1',
                                         cohort.FINAL_FUNCTION_SECTIONS_054)
 
@@ -271,7 +319,7 @@ class ContentCohort(unittest.TestCase):
                 self.assertEqual(raw.count(before), 1)
                 trap.write_bytes(raw.replace(before, after))
                 with self.assertRaisesRegex(RuntimeError, 'one complete reviewed content cohort'):
-                    cohort.bind(root)
+                    cohort.select(root, cohort.COHORTS)
 
     def test_one_previous_manifest_does_not_form_a_reviewed_cohort(self):
         for label, fixture, name, rows in [
@@ -287,7 +335,7 @@ class ContentCohort(unittest.TestCase):
                     self.assertIn(b'0.5.4', raw)
                     manifest.write_bytes(raw.replace(b'0.5.4', b'0.5.1'))
                     with self.assertRaisesRegex(RuntimeError, 'one complete reviewed content cohort'):
-                        cohort.bind(root)
+                        cohort.select(root, cohort.COHORTS)
 
     def test_unknown_manifest_version_is_not_a_runtime_source_identity(self):
         for label, fixture, name, rows in [
@@ -301,7 +349,7 @@ class ContentCohort(unittest.TestCase):
                     manifest = root / 'reverie' / path
                     manifest.write_bytes(manifest.read_bytes().replace(b'0.5.4', b'0.5.5'))
                 with self.assertRaisesRegex(RuntimeError, 'one complete reviewed content cohort'):
-                    cohort.bind(root)
+                    cohort.select(root, cohort.COHORTS)
 
 
 class NeutralCoreSupportCohort(unittest.TestCase):
@@ -325,10 +373,16 @@ class NeutralCoreSupportCohort(unittest.TestCase):
             with self.subTest(cohort=name):
                 facts = self.facts(rows, root)
                 with patch.object(cohort, 'observed_file', side_effect=lambda path: facts[str(path)]):
-                    self.assertEqual(cohort.bind(root)['cohort'], name)
+                    self.assertEqual(cohort.select(root, cohort.COHORTS)['cohort'], name)
 
-    def test_current_neutral_core_sources_match_complete_association(self):
-        self.assertEqual(cohort.bind(D.parents[2])['cohort'], 'current-split-runtime-content-v1')
+    def test_live_checkout_binds_rows_derived_from_its_own_pins(self):
+        # The live tree is admitted by the rows its own H_head and Reverie
+        # gitlink objects declare, never by a literal tuple of any vintage.
+        head = fixture_git(LIVE, 'rev-parse', 'HEAD')
+        result = cohort.bind(LIVE, head)
+        self.assertEqual(result['cohort'], cohort.DERIVED_COHORT)
+        self.assertEqual((result['h_head'], result['runtime_R_pin']), (head, live_gitlink()))
+        self.assertEqual(len(result['files']), len(cohort.DERIVED_ROWS))
 
     def test_mixed_old_and_neutral_support_rows_are_refused(self):
         root = Path('/data-only-cohort')
@@ -336,10 +390,10 @@ class NeutralCoreSupportCohort(unittest.TestCase):
         old = self.facts(cohort.FINAL_DEVELOPMENT_054, root)
         path = str(root / 'detcore-liteinst/build.rs')
         with patch.object(cohort, 'observed_file', side_effect=lambda path: facts[str(path)]):
-            self.assertEqual(cohort.bind(root)['cohort'], 'current-split-runtime-content-v1')
+            self.assertEqual(cohort.select(root, cohort.COHORTS)['cohort'], 'current-split-runtime-content-v1')
             facts[path] = old[path]
             with self.assertRaisesRegex(RuntimeError, 'one complete reviewed content cohort'):
-                cohort.bind(root)
+                cohort.select(root, cohort.COHORTS)
 
     def test_each_changed_source_refuses_same_size_mutation_and_truncation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -350,13 +404,387 @@ class NeutralCoreSupportCohort(unittest.TestCase):
                 original = path.read_bytes()
                 for changed in [bytes([original[0] ^ 1]) + original[1:], original[:-1]]:
                     with self.subTest(path=relative, size=len(changed)):
-                        self.assertEqual(cohort.bind(root)['cohort'], 'current-split-runtime-content-v1')
+                        self.assertEqual(cohort.select(root, cohort.COHORTS)['cohort'], 'current-split-runtime-content-v1')
                         path.write_bytes(changed)
                         try:
                             with self.assertRaisesRegex(RuntimeError, 'one complete reviewed content cohort'):
-                                cohort.bind(root)
+                                cohort.select(root, cohort.COHORTS)
                         finally:
                             path.write_bytes(original)
+
+
+class DerivedCohort(unittest.TestCase):
+    """Rows come from H_head and its Reverie gitlink objects, never the tree."""
+
+    def test_consumer_tests_row_is_dropped_and_the_other_30_rows_remain(self):
+        consumer = ('H', 'detcore-liteinst/src/exec_native/consumer_tests.rs')
+        self.assertNotIn(consumer, cohort.DERIVED_ROWS)
+        self.assertEqual(len(cohort.DERIVED_ROWS), 30)
+        self.assertEqual(set(cohort.DERIVED_ROWS) | {consumer},
+                         {(label, path) for label, path, _, _ in cohort.CURRENT_SPLIT_RUNTIME})
+
+    def test_clean_tree_binds_rows_read_from_objects(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            result = cohort.bind(tree.root, tree.h_head)
+            self.assertEqual(result['cohort'], cohort.DERIVED_COHORT)
+            self.assertEqual((result['h_head'], result['runtime_R_pin']), (tree.h_head, tree.rpin))
+            self.assertEqual(len(result['files']), 30)
+            for label, path, size, digest in result['rows']:
+                owner, rev = (tree.root, tree.h_head) if label == 'H' else (tree.reverie, tree.rpin)
+                raw = fixture_git_bytes(owner, 'cat-file', 'blob', rev + ':' + path)
+                self.assertEqual((size, digest), (len(raw), hashlib.sha256(raw).hexdigest()))
+            self.assertEqual(result['gate']['x86_64'], cohort.TRUSTED_SYSCALL_X86_64_BLOCK_SHA256)
+            self.assertEqual(cohort.bind(tree.root, tree.h_head, tree.rpin)['runtime_R_pin'], tree.rpin)
+
+    def test_derivation_never_reads_the_working_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            path = 'detcore-liteinst/build.rs'
+            committed = cohort.derive(tree.root, tree.h_head)['rows']
+            (tree.root / path).write_bytes(b'uncommitted edit\n')
+            self.assertEqual(cohort.derive(tree.root, tree.h_head)['rows'], committed)
+            with patch.object(cohort, 'observed_file', side_effect=AssertionError('working tree read')):
+                cohort.derive(tree.root, tree.h_head)
+
+    def test_working_tree_edit_is_refused_by_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            self.assertEqual(cohort.bind(tree.root, tree.h_head)['cohort'], cohort.DERIVED_COHORT)
+            path = 'detcore-liteinst/build.rs'
+            (tree.root / path).write_bytes(b'uncommitted edit\n')
+            with self.assertRaisesRegex(RuntimeError, 'one complete reviewed content cohort.*H ' + path +
+                                        ' observed 17:' + hashlib.sha256(b'uncommitted edit\n').hexdigest()):
+                cohort.bind(tree.root, tree.h_head)
+
+    def test_missing_objects_are_refused_by_name_without_fallback(self):
+        for label, path in [('R', 'reverie-loader/src/lib.rs'), ('H', 'detcore-liteinst/src/lib.rs')]:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                tree = PinnedTree(Path(directory))
+                self.assertEqual(cohort.bind(tree.root, tree.h_head)['cohort'], cohort.DERIVED_COHORT)
+                owner = tree.reverie if label == 'R' else tree.root
+                fixture_git(owner, 'rm', '-q', '--cached', path)
+                if label == 'R':
+                    fixture_git(owner, 'commit', '-q', '-m', 'drop row')
+                    tree.repin()
+                    rev = tree.rpin
+                else:
+                    fixture_git(owner, 'commit', '-q', '-m', 'drop row')
+                    rev = tree.h_head = fixture_git(owner, 'rev-parse', 'HEAD')
+                # The file is still present in the working tree; it is never consulted.
+                self.assertTrue((owner / path).is_file())
+                with patch.object(cohort, 'observed_file', side_effect=AssertionError('working tree read')):
+                    with self.assertRaisesRegex(RuntimeError, 'runtime cohort derivation: missing object ' +
+                                                label + ' ' + rev + ':' + path):
+                        cohort.bind(tree.root, tree.h_head)
+
+    def test_lock_pins_that_disagree_with_the_gitlink_are_refused_by_name(self):
+        other = 'f' * 40
+        for lock in ['Cargo.lock', 'liteinst-runtime-build/Cargo.lock']:
+            with self.subTest(lock=lock), tempfile.TemporaryDirectory() as directory:
+                tree = PinnedTree(Path(directory))
+                self.assertEqual(cohort.bind(tree.root, tree.h_head)['cohort'], cohort.DERIVED_COHORT)
+                text = (tree.root / lock).read_text()
+                (tree.root / lock).write_text(text.replace('#' + tree.rpin, '#' + other))
+                tree.h_head = tree.commit(tree.root)
+                with self.assertRaisesRegex(RuntimeError, 'runtime cohort derivation: ' + lock +
+                                            ':4 reverie pin ' + other + ' differs from the H_head gitlink ' + tree.rpin):
+                    cohort.bind(tree.root, tree.h_head)
+
+    def test_unpinned_or_absent_root_lock_reference_is_refused_by_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            self.assertEqual(cohort.bind(tree.root, tree.h_head)['cohort'], cohort.DERIVED_COHORT)
+            (tree.root / 'Cargo.lock').write_text(
+                '[[package]]\nname = "reverie"\nsource = "git+https://github.com/rrnewton/reverie.git?branch=main"\n')
+            tree.h_head = tree.commit(tree.root)
+            with self.assertRaisesRegex(RuntimeError, 'runtime cohort derivation: Cargo.lock:3 names reverie without a 40-hex pin'):
+                cohort.bind(tree.root, tree.h_head)
+            (tree.root / 'Cargo.lock').write_text('[[package]]\nname = "other"\n')
+            tree.h_head = tree.commit(tree.root)
+            with self.assertRaisesRegex(RuntimeError, 'runtime cohort derivation: root Cargo.lock carries no reverie pin'):
+                cohort.bind(tree.root, tree.h_head)
+
+    def test_absent_gitlink_is_refused_by_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            self.assertEqual(cohort.bind(tree.root, tree.h_head)['cohort'], cohort.DERIVED_COHORT)
+            fixture_git(tree.root, 'rm', '-q', '--cached', 'reverie')
+            fixture_git(tree.root, 'commit', '-q', '-m', 'drop gitlink')
+            head = fixture_git(tree.root, 'rev-parse', 'HEAD')
+            with self.assertRaisesRegex(RuntimeError, 'runtime cohort derivation: H_head ' + head + ' has no reverie gitlink'):
+                cohort.bind(tree.root, head)
+
+    def test_dirty_or_moved_submodule_is_refused_by_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            self.assertEqual(cohort.bind(tree.root, tree.h_head)['cohort'], cohort.DERIVED_COHORT)
+            readme = tree.reverie / 'README.md'
+            readme.write_bytes(b'dirty\n')
+            with self.assertRaisesRegex(RuntimeError, 'runtime cohort derivation: reverie submodule is dirty: .*README.md'):
+                cohort.bind(tree.root, tree.h_head)
+            fixture_git(tree.reverie, 'add', 'README.md')
+            with self.assertRaisesRegex(RuntimeError, 'runtime cohort derivation: reverie submodule is dirty: .*README.md'):
+                cohort.bind(tree.root, tree.h_head)
+            fixture_git(tree.reverie, 'commit', '-q', '-m', 'moved')
+            moved = fixture_git(tree.reverie, 'rev-parse', 'HEAD')
+            with self.assertRaisesRegex(RuntimeError, 'runtime cohort derivation: reverie submodule HEAD ' + moved +
+                                        ' is not the H_head gitlink ' + tree.rpin):
+                cohort.bind(tree.root, tree.h_head)
+
+    def test_wrong_heads_are_refused_by_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            self.assertEqual(cohort.bind(tree.root, tree.h_head)['cohort'], cohort.DERIVED_COHORT)
+            with self.assertRaisesRegex(RuntimeError, 'runtime cohort derivation: H_head must be 40 lowercase hex'):
+                cohort.bind(tree.root, 'HEAD')
+            fixture_git(tree.root, 'commit', '-q', '--allow-empty', '-m', 'later')
+            later = fixture_git(tree.root, 'rev-parse', 'HEAD')
+            with self.assertRaisesRegex(RuntimeError, 'runtime cohort derivation: H checkout HEAD ' + later +
+                                        ' is not H_head ' + tree.h_head):
+                cohort.bind(tree.root, tree.h_head)
+            with self.assertRaisesRegex(RuntimeError, 'runtime cohort derivation: declared runtime_R_pin ' + '0' * 40 +
+                                        ' differs from the H_head gitlink ' + tree.rpin):
+                cohort.bind(tree.root, later, '0' * 40)
+
+    def test_git_failure_never_falls_back_to_the_working_tree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            self.assertEqual(cohort.bind(tree.root, tree.h_head)['cohort'], cohort.DERIVED_COHORT)
+            with patch.object(cohort, 'observed_file', side_effect=AssertionError('working tree read')), \
+                 patch.dict(os.environ, {'PATH': str(Path(directory) / 'no-git-here')}):
+                with self.assertRaisesRegex(RuntimeError, 'runtime cohort derivation: git'):
+                    cohort.bind(tree.root, tree.h_head)
+
+    def test_gate_shape_is_checked_on_the_derived_trap_object(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            self.assertEqual(cohort.bind(tree.root, tree.h_head)['cohort'], cohort.DERIVED_COHORT)
+            trap = tree.reverie / TRAP
+            raw = trap.read_bytes()
+            x86 = next(b for b in cohort.gate_shape(raw)['blocks'] if b['arch'] == 'x86_64' and b['contributes'])
+            cut = raw.index(b'\n', raw.index(b'\n', x86['start']) + 1) + 1
+            trap.write_bytes(raw[:cut] + b'    // edit inside the x86_64 gate block\n' + raw[cut:])
+            fixture_git(tree.reverie, 'commit', '-q', '-am', 'gate edit')
+            tree.repin()
+            with self.assertRaisesRegex(RuntimeError, 'trusted syscall gate shape: x86_64 block sha256 [0-9a-f]{64} '
+                                        'differs from reviewed ' + cohort.TRUSTED_SYSCALL_X86_64_BLOCK_SHA256):
+                cohort.bind(tree.root, tree.h_head)
+
+
+class TrustedSyscallGateShape(unittest.TestCase):
+    """Per-arch binding of the global_asm! blocks that fill the gate section."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.base = live_reverie_object(TRAP)
+
+    def block(self, raw, arch, contributes=True):
+        blocks = [b for b in cohort.gate_shape(raw)['blocks']
+                  if b['arch'] == arch and b['contributes'] == contributes]
+        self.assertEqual(len(blocks), 1)
+        return blocks[0]
+
+    def edit_inside(self, raw, block, text):
+        """Insert an assembler comment just after the block's first line."""
+        cut = raw.index(b'\n', block['start']) + 1
+        cut = raw.index(b'\n', cut) + 1
+        self.assertLess(cut, block['end'])
+        return raw[:cut] + text + raw[cut:]
+
+    def test_live_trap_source_has_the_reviewed_x86_64_gate(self):
+        shape = cohort.gate_guard(self.base)
+        self.assertEqual(shape['x86_64'], cohort.TRUSTED_SYSCALL_X86_64_BLOCK_SHA256)
+        self.assertRegex(shape['aarch64'], '^[0-9a-f]{64}$')
+        contributing = [b for b in shape['blocks'] if b['contributes']]
+        self.assertEqual(sorted(b['arch'] for b in contributing), ['aarch64', 'x86_64'])
+        self.assertTrue(all(b['defines_entry'] for b in contributing))
+        self.assertFalse(any(b['defines_entry'] for b in shape['blocks'] if not b['contributes']))
+
+    def test_aarch64_only_edit_does_not_trip_the_guard(self):
+        changed = self.edit_inside(self.base, self.block(self.base, 'aarch64'), b'    // aarch64-only edit\n')
+        before, after = cohort.gate_guard(self.base), cohort.gate_guard(changed)
+        self.assertEqual(after['x86_64'], before['x86_64'])
+        self.assertNotEqual(after['aarch64'], before['aarch64'])
+
+    def test_x86_64_gate_edit_trips_the_guard(self):
+        cohort.gate_guard(self.base)
+        changed = self.edit_inside(self.base, self.block(self.base, 'x86_64'), b'    // x86_64 edit\n')
+        observed = cohort.gate_shape(changed)['x86_64']
+        with self.assertRaisesRegex(RuntimeError, 'trusted syscall gate shape: x86_64 block sha256 ' + observed +
+                                    ' differs from reviewed ' + cohort.TRUSTED_SYSCALL_X86_64_BLOCK_SHA256):
+            cohort.gate_guard(changed)
+
+    third = (b'\n#[cfg(target_arch = "%s")]\ncore::arch::global_asm!(\n    r#"\n'
+             b'    .pushsection .text.reverie_inguest_trusted_syscall,"ax",@progbits\n'
+             b'    nop\n    .popsection\n"#\n);\n')
+
+    def test_a_third_contributing_block_is_refused(self):
+        for arch in [b'riscv64', b'x86_64', b'aarch64']:
+            with self.subTest(arch=arch):
+                cohort.gate_guard(self.base)
+                with self.assertRaisesRegex(RuntimeError, 'trusted syscall gate shape: exactly one contributing block '
+                                            'per target_arch x86_64 and aarch64 required'):
+                    cohort.gate_guard(self.base + self.third % arch)
+
+    clone = (b'\n#[cfg(target_arch = "x86_64")]\ncore::arch::global_asm!(\n    r#"\n'
+             b'    %s\n    .p2align 4\n    .global reverie_inguest_thread_clone\n'
+             b'reverie_inguest_thread_clone:\n    ret\n"#\n);\n')
+
+    def test_thread_clone_outside_the_section_passes_and_moved_inside_is_refused(self):
+        outside = self.base + self.clone % b'.text'
+        shape = cohort.gate_guard(outside)
+        clone = [b for b in shape['blocks'] if b'reverie_inguest_thread_clone' in outside[b['start']:b['end']]]
+        self.assertTrue(clone and not any(b['contributes'] for b in clone))
+        inside = self.base + self.clone % b'.pushsection .text.reverie_inguest_trusted_syscall,"ax",@progbits'
+        with self.assertRaisesRegex(RuntimeError, 'trusted syscall gate shape: exactly one contributing block '
+                                    'per target_arch x86_64 and aarch64 required'):
+            cohort.gate_guard(inside)
+
+    def test_section_named_outside_a_global_asm_block_is_refused(self):
+        cohort.gate_guard(self.base)
+        changed = self.base + b'\n#[link_section = ".text.reverie_inguest_trusted_syscall"]\nfn extra() {}\n'
+        with self.assertRaisesRegex(RuntimeError, 'trusted syscall gate shape: section named outside a global_asm! block at line'):
+            cohort.gate_guard(changed)
+
+    def test_ungated_contributing_block_is_refused(self):
+        cohort.gate_guard(self.base)
+        x86 = self.block(self.base, 'x86_64')
+        attribute = b'#[cfg(target_arch = "x86_64")]\n'
+        self.assertEqual(self.base[x86['start'] - len(attribute):x86['start']], attribute)
+        changed = self.base[:x86['start'] - len(attribute)] + self.base[x86['start']:]
+        with self.assertRaisesRegex(RuntimeError, 'trusted syscall gate shape: contributing block at line [0-9]+ '
+                                    'has no single target_arch cfg'):
+            cohort.gate_guard(changed)
+
+    def test_contributing_block_must_define_the_entry(self):
+        cohort.gate_guard(self.base)
+        x86 = self.block(self.base, 'x86_64')
+        body = self.base[x86['start']:x86['end']]
+        self.assertEqual(body.count(b'\nreverie_inguest_trusted_syscall:\n'), 1)
+        changed = (self.base[:x86['start']] + body.replace(b'\nreverie_inguest_trusted_syscall:\n', b'\nrenamed_entry:\n')
+                   + self.base[x86['end']:])
+        with self.assertRaisesRegex(RuntimeError, 'trusted syscall gate shape: contributing x86_64 block at line [0-9]+ '
+                                    'does not define reverie_inguest_trusted_syscall'):
+            cohort.gate_shape(changed)
+
+    def test_compiled_check_pins_a_44_byte_dedicated_section(self):
+        # ordinary_gate.rs is the compiled half of this guard: the provider
+        # accepts the DedicatedFunction cohort only for a 44-byte input section
+        # of exactly this name. Cite it from the same pinned objects.
+        source = live_reverie_object(ORDINARY_GATE).decode()
+        self.assertIn('const DEDICATED_SECTION: &str = "' + cohort.TRUSTED_SYSCALL_SECTION + '";', source)
+        text_size = source[source.index('    fn text_size(self) -> u64 {'):]
+        text_size = text_size[:text_size.index('\n    }\n')]
+        self.assertIn('Self::DedicatedFunction => 44,', text_size)
+        body = source[source.index('const BODY: [u8; 44] = ['):]
+        body = body[body.index('[', body.index('=')) + 1:body.index('];')]
+        self.assertEqual(len([v for v in body.replace('\n', ' ').split(',') if v.strip()]), 44)
+
+
+class OrdinaryTrapSource(unittest.TestCase):
+    """prepare.py's trap.rs role check for the ordinary provider."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.prepare = load('prepare')
+        cls.base = live_reverie_object(TRAP)
+
+    def value(self, root, raw):
+        path = root / TRAP
+        path.parent.mkdir(parents=True)
+        path.write_bytes(raw)
+        return {'path': str(path), 'sha256': hashlib.sha256(raw).hexdigest()}
+
+    def test_dedicated_function_binds_the_gate_shape_not_a_file_literal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            value = self.value(Path(directory), self.base)
+            shape = self.prepare.ordinary_trap_source('DedicatedFunction', value)
+            self.assertEqual(shape['x86_64'], cohort.TRUSTED_SYSCALL_X86_64_BLOCK_SHA256)
+
+    def test_dedicated_function_refuses_an_x86_64_gate_edit(self):
+        x86 = next(b for b in cohort.gate_shape(self.base)['blocks'] if b['arch'] == 'x86_64' and b['contributes'])
+        cut = self.base.index(b'\n', self.base.index(b'\n', x86['start']) + 1) + 1
+        changed = self.base[:cut] + b'    // x86_64 edit\n' + self.base[cut:]
+        with tempfile.TemporaryDirectory() as good, tempfile.TemporaryDirectory() as bad:
+            self.prepare.ordinary_trap_source('DedicatedFunction', self.value(Path(good), self.base))
+            with self.assertRaisesRegex(RuntimeError, 'trusted syscall gate shape: x86_64 block sha256'):
+                self.prepare.ordinary_trap_source('DedicatedFunction', self.value(Path(bad), changed))
+
+    def test_reported_digest_must_be_the_file_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            value = self.value(Path(directory), self.base)
+            self.prepare.ordinary_trap_source('DedicatedFunction', value)
+            value['sha256'] = '0' * 64
+            with self.assertRaisesRegex(RuntimeError, 'ordinary source role differs from actual factory source'):
+                self.prepare.ordinary_trap_source('DedicatedFunction', value)
+
+    def test_historical_cohorts_keep_their_reviewed_literal(self):
+        legacy = '5c9249419574f00c540dec767359181c8ac03a47aa2df0f19e5cef0a59b5755b'
+        for name in ['LegacyE3', 'CheckedHandoff5b3']:
+            with self.subTest(cohort=name):
+                self.assertIsNone(self.prepare.ordinary_trap_source(
+                    name, {'path': '/unit/' + TRAP, 'sha256': legacy}))
+                with self.assertRaisesRegex(RuntimeError, 'ordinary source role differs from actual factory source'):
+                    self.prepare.ordinary_trap_source(name, {'path': '/unit/' + TRAP, 'sha256': '0' * 64})
+        with self.assertRaisesRegex(RuntimeError, 'ordinary unknown source/section cohort'):
+            self.prepare.ordinary_trap_source('Unknown', {'path': '/unit/' + TRAP, 'sha256': legacy})
+
+
+class PinBumpReport(unittest.TestCase):
+    """The review attention a re-pin needs, listed per changed R row."""
+
+    def bump(self, tree, path, raw):
+        target = tree.reverie / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(raw)
+        fixture_git(tree.reverie, 'add', '-A')
+        fixture_git(tree.reverie, 'commit', '-q', '-m', 'bump')
+        return fixture_git(tree.reverie, 'rev-parse', 'HEAD')
+
+    def test_report_names_a_changed_trap_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            old = tree.rpin
+            raw = (tree.reverie / TRAP).read_bytes() + b'// appended outside every gate block\n'
+            new = self.bump(tree, TRAP, raw)
+            rows = cohort.pin_bump_report(tree.reverie, old, new)
+            self.assertEqual([row['path'] for row in rows], [TRAP])
+            row = rows[0]
+            self.assertEqual(row['new_sha256'], hashlib.sha256(raw).hexdigest())
+            self.assertEqual(row['old_sha256'], hashlib.sha256(live_reverie_object(TRAP)).hexdigest())
+            self.assertEqual(row['stat'], '+1 -0')
+            self.assertEqual(row['gate']['old']['x86_64'], row['gate']['new']['x86_64'])
+            text = cohort.format_pin_bump_report(old, new, rows)
+            self.assertEqual([line.split()[1] for line in text.splitlines() if line.startswith('R ')], [TRAP])
+
+    def test_report_is_empty_when_no_reviewed_row_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            old = tree.rpin
+            new = self.bump(tree, 'README.md', b'only an unreviewed file changes\n')
+            rows = cohort.pin_bump_report(tree.reverie, old, new)
+            self.assertEqual(rows, [])
+            text = cohort.format_pin_bump_report(old, new, rows)
+            self.assertEqual([line for line in text.splitlines() if line.startswith('R ')], [])
+
+    def test_report_cli_prints_the_changed_row(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            old = tree.rpin
+            new = self.bump(tree, 'reverie-loader/src/lib.rs', b'changed loader\n')
+            child = subprocess.run([sys.executable, '-B', str(D.parent / 'pin_bump_report.py'),
+                                    '--reverie-git', str(tree.reverie), old, new],
+                                   capture_output=True, text=True, timeout=60, env=GIT_FIXTURE_ENV)
+            self.assertEqual(child.returncode, 0, child.stderr)
+            self.assertEqual([line.split()[1] for line in child.stdout.splitlines() if line.startswith('R ')],
+                             ['reverie-loader/src/lib.rs'])
+
+    def test_report_refuses_a_missing_revision_by_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            with self.assertRaisesRegex(RuntimeError, 'runtime cohort derivation: missing object R ' + 'e' * 40 + ':'):
+                cohort.pin_bump_report(tree.reverie, tree.rpin, 'e' * 40)
 
 
 class FixedPageData(unittest.TestCase):
@@ -499,7 +927,7 @@ class HistoricalFixtureControls(unittest.TestCase):
                         return traced
 
                     result = unittest.TestResult()
-                    with patch.object(cohort, 'bind', side_effect=observe(cohort.bind)), \
+                    with patch.object(cohort, 'select', side_effect=observe(cohort.select)), \
                          patch.object(publisher, 'fixed_gate_data', side_effect=observe(publisher.fixed_gate_data)):
                         cls(method).run(result)
                     self.assertEqual(result.errors + result.failures, [])

@@ -103,14 +103,14 @@ class CohortCloses(unittest.TestCase):
             self.install(lambda name, count: raised if (name, count) == ('c', 1) else None)
             with self.subTest(raised=raised):
                 with self.assertRaises(type(raised)) as caught:
-                    cohort.bind('/unit')
+                    cohort.select('/unit', cohort.COHORTS)
                 self.assertIs(caught.exception, raised)
                 self.assertEqual(self.reads, ['a', 'b', 'c', 'a', 'b'])
     def test_close_cancellation_runs_later_closes(self):
         raised = KeyboardInterrupt()
         self.install(lambda name, count: raised if (name, count) == ('a', 2) else None)
         with self.assertRaises(KeyboardInterrupt) as caught:
-            cohort.bind('/unit')
+            cohort.select('/unit', cohort.COHORTS)
         self.assertIs(caught.exception, raised)
         self.assertEqual(self.reads, ['a', 'b', 'c', 'a', 'b', 'c'])
         self.assertIn('KeyboardInterrupt', str(caught.exception.__cause__))
@@ -120,7 +120,7 @@ class CohortCloses(unittest.TestCase):
             if (name, count) == ('a', 2): return ValueError('secondary')
         self.install(fail)
         with self.assertRaises(RuntimeError) as caught:
-            cohort.bind('/unit')
+            cohort.select('/unit', cohort.COHORTS)
         self.assertIn('primary', str(caught.exception))
         self.assertIn('secondary', str(caught.exception))
         self.assertIsInstance(caught.exception.__cause__, OSError)
@@ -640,7 +640,7 @@ class CleanupCallbackOrdering(unittest.TestCase):
                  mock.patch.object(cohort, 'COHORTS', rows), \
                  mock.patch.object(cohort, 'observed_file', side_effect=observed):
                 with self.assertRaises(type(first)) as caught:
-                    cohort.bind('/unit')
+                    cohort.select('/unit', cohort.COHORTS)
             self.assertIs(caught.exception, first)
             self.assertEqual(calls, ['a', 'b', 'c', 'a', 'b', 'c'])
             for error in [first, second, 'last close']:

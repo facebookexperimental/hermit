@@ -51,6 +51,41 @@ python3 -m unittest discover -s hermit-install/private-static/owned -p 'test_*.p
 These controls are not a replacement for the actual fresh source-owned build,
 link, emitted-code inspection and physical guest/cancellation checks.
 
+Validation runs both control suites in the `check.lint_checks` node, through
+the `lint-check-private-static-owned` and `lint-check-private-static-pipeline`
+make targets, next to the Reverie pin-currency check.
+
+### Runtime source rows and Reverie pin bumps
+
+`owned/runtime_cohort.py` admits the 30 Hermit and Reverie runtime source
+files by rows it reads from Git objects: Hermit rows from the configured H
+head, Reverie rows from the commit that head's `reverie` gitlink records. Every
+Cargo.lock reverie revision in that head must equal the gitlink, and the
+`reverie` submodule must be checked out at it with no tracked changes. The
+working tree is then compared with those rows; it is never read to derive
+them. A missing object, a disagreeing pin or a dirty or moved submodule is
+refused by name. The literal cohorts in that file are historical fixtures.
+
+`reverie-inguest/src/trap.rs` is also bound by shape. Every `global_asm!`
+block that pushes `.text.reverie_inguest_trusted_syscall` is hashed: exactly
+one `x86_64` and one `aarch64` block, each defining
+`reverie_inguest_trusted_syscall`, and nothing else may name that section. The
+`x86_64` block's digest is the reviewed guard; the `aarch64` digest is
+recorded. Reverie's `ordinary_gate.rs` compiles the other half: the
+DedicatedFunction cohort accepts only a 44-byte input section of that name.
+
+Because a re-pin now changes the admitted rows without an edit here, every
+Hermit pull request that moves the Reverie pin pastes the pin-bump report
+into its description:
+
+```sh
+python3 -B hermit-install/private-static/pin_bump_report.py OLD_REVERIE_REV NEW_REVERIE_REV
+```
+
+It lists each derived Reverie row whose content changed, with both digests and
+a diff stat, and the trap.rs gate-block digests when trap.rs changed. No
+`R ` lines means no reviewed runtime source changed.
+
 
 ## Bounded producer launch
 

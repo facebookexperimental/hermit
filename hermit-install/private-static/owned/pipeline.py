@@ -124,7 +124,8 @@ def main():
         validate_config(c)
         module('publish.py',sources).validate_roles(c['data_roles'])
         owned = module('prepare.py',sources)
-        owned.runtime_content_preflight({'H': c['paths']['H']})
+        owned.runtime_content_preflight({'H': c['paths']['H'], 'H_head': c['heads']['H'],
+                                    'runtime_R_pin': c['heads']['runtime_R']})
         root = Path(args.evidence_root)
         need(root.is_absolute() and root.resolve() == root and root.is_dir() and
              re.fullmatch('[a-z0-9][a-z0-9-]{0,31}',args.name), 'canonical evidence root and bounded name required')
@@ -162,7 +163,8 @@ def main():
     observer = module('observe_coordinates.py',sources)
     publisher = module('publish.py',sources)
     package_requested = publisher.source_owned_roles(c['data_roles'])
-    owned.runtime_content_preflight({'H': c['paths']['H']})
+    owned.runtime_content_preflight({'H': c['paths']['H'], 'H_head': c['heads']['H'],
+                                    'runtime_R_pin': c['heads']['runtime_R']})
     out = Path(bound['out']); out.mkdir()
     paths,heads,digests = c['paths'],c['heads'],c['digests']
     journal = dict(state='RUNNING',qualification='NOT_PROVEN',readiness='NOT_PROVEN',

@@ -29,7 +29,7 @@ PRIVATE_INVENTORY_SHA256 = 'f825b66769fb55bee298b0a41277b38767970e5cad4beca8400f
 CODEGEN = '-C relocation-model=pic -C code-model=small -C target-feature=+crt-static -C link-self-contained=yes'
 STREAM = 64 * 1024 * 1024
 RUNTIME_COHORT = D / 'runtime_cohort.py'
-RUNTIME_COHORT_SHA256 = 'ca0e99c5e6fa5552fba8f986be5322e2aa5a3ea651470b4db57abaf087b40625'
+RUNTIME_COHORT_SHA256 = 'c07da9cff37339a886198a5535d3f676a0482335a918e3c7ed336c4336ee98b0'
 REQUIRED_HANDOFF_SOURCE_SHA256 = '85abd905256f3bc5b526840cf3cd5e090238e4aa770f03d320c2ae907ee7ae75'
 
 
@@ -291,13 +291,40 @@ def declared_child_environment(c, host=False):
     return child
 
 
-def runtime_content_preflight(c):
-    """Finite reviewed content selection; chosen full Git heads stay external."""
+def runtime_cohort_module():
     need(sha(RUNTIME_COHORT) == RUNTIME_COHORT_SHA256, 'runtime cohort declaration changed')
     spec = importlib.util.spec_from_file_location('existing_runtime_content_cohort', RUNTIME_COHORT)
     cohort = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(cohort)
-    return cohort.bind(Path(c['H']))
+    return cohort
+
+
+def runtime_content_preflight(c):
+    """Content rows derived from the chosen H head's objects and its Reverie gitlink."""
+    return runtime_cohort_module().bind(Path(c['H']), c['H_head'], c.get('runtime_R_pin'))
+
+
+ORDINARY_LEGACY_TRAP_SOURCE_SHA256 = '5c9249419574f00c540dec767359181c8ac03a47aa2df0f19e5cef0a59b5755b'
+
+
+def ordinary_trap_source(name, value):
+    """The ordinary provider's trap.rs role.
+
+    The two historical container cohorts keep their reviewed whole-file
+    identity. DedicatedFunction binds the gate-block shape its 44-byte section
+    depends on, read from the very file the provider reported.
+    """
+    need(name in ('LegacyE3', 'CheckedHandoff5b3', 'DedicatedFunction'), 'ordinary unknown source/section cohort')
+    need(type(value) is dict and type(value.get('path')) is str and Path(value['path']).is_absolute() and
+         value['path'].endswith('/reverie-inguest/src/trap.rs'),
+         'ordinary source role differs from actual factory source')
+    if name != 'DedicatedFunction':
+        need(value.get('sha256') == ORDINARY_LEGACY_TRAP_SOURCE_SHA256, 'ordinary source role differs from actual factory source')
+        return None
+    cohort = runtime_cohort_module()
+    fact, raw = cohort.observed_source(Path(value['path']))
+    need(fact['sha256'] == value.get('sha256'), 'ordinary source role differs from actual factory source')
+    return cohort.gate_guard(raw)
 
 
 def snapshot(c):
@@ -686,7 +713,7 @@ def main():
     if x.mode == 'prepare':
         for head in [x.h_head, x.tool_r_head, x.runtime_r_pin]:
             need(re.fullmatch('[0-9a-f]{40}', head), 'full independent expected heads required')
-        runtime_content_preflight({'H': x.H})
+        runtime_content_preflight({'H': x.H, 'H_head': x.h_head, 'runtime_R_pin': x.runtime_r_pin})
         need(bool(x.elf) == bool(x.objdump), 'ELF and objdump must be supplied together')
         need(bool(x.elf) == bool(x.elf_h_head) == bool(x.elf_runtime_r_pin), 'optional ELF requires independent declared retained H/R context')
         need(not x.elf, 'archive-build driver does not accept an ELF/root diagnostic')
@@ -1166,19 +1193,13 @@ def main():
                      provider['link_map'] == {'path':expected_map,'sha256':produced[expected_map]['sha256']},
                      'ordinary actual runtime archive/ELF/map identity differs')
                 result['ordinary_gate_physical_members'] = {'identity_policy':provider['identity_policy'], **physical_members}
-                trap_sources = {
-                    'LegacyE3': '5c9249419574f00c540dec767359181c8ac03a47aa2df0f19e5cef0a59b5755b',
-                    'CheckedHandoff5b3': '5c9249419574f00c540dec767359181c8ac03a47aa2df0f19e5cef0a59b5755b',
-                    'DedicatedFunction': '91c07be60ab719c9d353991a0230c058b22a457676d05f3866aab943ea55d6eb',
-                }
-                need(provider['cohort'] in trap_sources, 'ordinary unknown source/section cohort')
-                source_roles = [
-                    ('reverie-inguest/src/trap.rs',trap_sources[provider['cohort']]),
-                    ('reverie-inguest/src/trap/fixed_gates.rs','ff3f6f6c46e872734ae921e869dbccc0ce1aeefe4bc3af8f29363cf276501e54')]
                 need(len(provider['sources']) == 2, 'ordinary actual source roles incomplete')
-                for value,(suffix,digest) in zip(provider['sources'],source_roles):
-                    need(Path(value['path']).is_absolute() and value['path'].endswith('/'+suffix) and value['sha256'] == digest,
-                         'ordinary source role differs from actual factory source')
+                trap_value,fixed_value = provider['sources']
+                result['ordinary_gate_trap_shape'] = ordinary_trap_source(provider['cohort'], trap_value)
+                need(Path(fixed_value['path']).is_absolute() and
+                     fixed_value['path'].endswith('/reverie-inguest/src/trap/fixed_gates.rs') and
+                     fixed_value['sha256'] == 'ff3f6f6c46e872734ae921e869dbccc0ce1aeefe4bc3af8f29363cf276501e54',
+                     'ordinary source role differs from actual factory source')
                 for value in [provider['runtime_archive'],provider['artifact'],provider['link_map'],*provider['sources']]:
                     ordinary_identity_files[value['path']] = value['sha256']
                 transfer = ordinary_observation['entry_transfer_diagnostic']
