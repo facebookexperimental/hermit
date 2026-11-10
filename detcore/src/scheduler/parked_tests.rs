@@ -12293,8 +12293,8 @@ fn ptrace_choice_under_published_mask(
     );
     s.test_kernel_signal_states
         .insert(sibling, KernelSignalState::default());
-    s.saved_guest_sigmasks.insert(creator, temporary);
     file_temporary_mask_wait(&mut s, creator, TemporaryMaskWait::Ppoll, Some(temporary));
+    assert!(s.set_saved_guest_sigmask(creator, Some(temporary)));
     file_restartable_read(&mut s, sibling);
     let (receiver, moved) = s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD);
     (receiver, moved, creator, sibling)
@@ -12306,6 +12306,170 @@ fn a_ptrace_receiver_ignores_a_private_copy_its_waits_mask_blocks() {
     let (receiver, moved, creator, _) = ptrace_choice_under_published_mask(0, usr2);
     assert_eq!(receiver, Some(creator));
     assert_eq!(moved, None);
+}
+
+/// The wait mask's lifetime (the Astra delta review of
+/// https://github.com/rrnewton/hermit/pull/5259 at `232e34c8`): a scheduler
+/// send wakes the creator's `ppoll`, replacing its filed wait with the
+/// wake's `InboundSignal` request while the wait's published mask remains
+/// in force. The choice still reads that mask, not the physical one, so
+/// the pending private SIGUSR2 stays blocked until the waiter resumes.
+#[test]
+fn a_woken_ptrace_ppoll_keeps_its_mask_until_its_grant() {
+    let usr1 = kernel_signal_bit(libc::SIGUSR1);
+    let usr2 = kernel_signal_bit(libc::SIGUSR2);
+    // Both pending orientations: the temporary mask blocks the private
+    // copy (creator chosen, no move) or admits it (sibling, walk moves).
+    for (temporary, creator_chosen) in [(usr2, true), (0, false)] {
+        let own_blocked = usr2 & !temporary;
+        let mut s = Scheduler::new(&Config {
+            sequentialize_threads: true,
+            max_timeslice: None,
+            ..Config::default()
+                .with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE)
+        });
+        let (creator, _, _) = add(&mut s, 100, 100);
+        let (sibling, _, _) = add(&mut s, 100, 101);
+        s.test_kernel_signal_states.insert(
+            creator,
+            KernelSignalState {
+                thread_pending: usr2,
+                shared_pending: usr1,
+                blocked: own_blocked,
+                caught: usr1 | kernel_signal_bit(libc::SIGCHLD),
+                ..KernelSignalState::default()
+            },
+        );
+        s.test_kernel_signal_states
+            .insert(sibling, KernelSignalState::default());
+        file_temporary_mask_wait(&mut s, creator, TemporaryMaskWait::Ppoll, Some(temporary));
+        assert!(s.set_saved_guest_sigmask(creator, Some(temporary)));
+        file_restartable_read(&mut s, sibling);
+        let expected = if creator_chosen {
+            (Some(creator), None)
+        } else {
+            (Some(sibling), Some(sibling))
+        };
+        assert_eq!(
+            s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+            expected,
+            "filed wait, temporary {temporary:#x}"
+        );
+        // A scheduler send wakes the ppoll; its guest has not received any grant.
+        s.wake_signaled_guest(creator, SigWrapper(libc::SIGUSR1));
+        let req = s.next_turns[&creator].req.try_read().unwrap().unwrap();
+        assert!(
+            req.resources
+                .contains_key(&ResourceID::InboundSignal(SigWrapper(libc::SIGUSR1)))
+        );
+        assert_eq!(s.saved_guest_sigmasks.get(&creator), Some(&temporary));
+        assert!(!s.blocked.continuation_masks.contains_key(&creator));
+        assert!(!s.process_signal_takers.contains_key(&creator));
+        assert_eq!(
+            s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+            expected,
+            "woken, temporary {temporary:#x}: the choice is the filed wait's"
+        );
+    }
+}
+
+/// The replay-checkpoint twin of `a_woken_ptrace_ppoll_keeps_its_mask_until_its_grant`:
+/// `record_retry_event` inside the active `ppoll` can file `TraceReplay`
+/// under `--replay-schedule-from` while the call has not ended. Its
+/// still-published mask decides the choice, as before the checkpoint.
+#[test]
+fn a_ptrace_ppoll_keeps_its_mask_at_a_replay_checkpoint() {
+    let usr1 = kernel_signal_bit(libc::SIGUSR1);
+    let usr2 = kernel_signal_bit(libc::SIGUSR2);
+    // Both pending orientations, as in the woken test: record and replay
+    // choose identically, before and at the checkpoint.
+    for (temporary, creator_chosen) in [(usr2, true), (0, false)] {
+        let own_blocked = usr2 & !temporary;
+        let mut s = Scheduler::new(&Config {
+            sequentialize_threads: true,
+            max_timeslice: None,
+            ..Config::default()
+                .with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE)
+        });
+        let (creator, _, _) = add(&mut s, 100, 100);
+        let (sibling, _, _) = add(&mut s, 100, 101);
+        s.test_kernel_signal_states.insert(
+            creator,
+            KernelSignalState {
+                thread_pending: usr2,
+                shared_pending: 0,
+                blocked: own_blocked,
+                caught: usr1 | kernel_signal_bit(libc::SIGCHLD),
+                ..KernelSignalState::default()
+            },
+        );
+        s.test_kernel_signal_states
+            .insert(sibling, KernelSignalState::default());
+        file_temporary_mask_wait(&mut s, creator, TemporaryMaskWait::Ppoll, Some(temporary));
+        assert!(s.set_saved_guest_sigmask(creator, Some(temporary)));
+        file_restartable_read(&mut s, sibling);
+        let expected = if creator_chosen {
+            (Some(creator), None)
+        } else {
+            (Some(sibling), Some(sibling))
+        };
+        assert_eq!(
+            s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+            expected,
+            "record, temporary {temporary:#x}"
+        );
+        // record_retry_event can yield here while the ppoll remains active.
+        let mut checkpoint = Resources::new(creator);
+        checkpoint.insert(ResourceID::TraceReplay, Permission::RW);
+        s.next_turns.get_mut(&creator).unwrap().req = Ivar::full(Ok(checkpoint));
+        assert_eq!(s.saved_guest_sigmasks.get(&creator), Some(&temporary));
+        assert!(!s.blocked.continuation_masks.contains_key(&creator));
+        assert!(!s.process_signal_takers.contains_key(&creator));
+        assert_eq!(
+            s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+            expected,
+            "replay checkpoint, temporary {temporary:#x}: the choice is the record's"
+        );
+    }
+}
+
+/// Withdrawing the wait's publication ends its say: the choice falls back
+/// to the physical mask (here the creator's own, which admits the private
+/// copy), and no wait record remains.
+#[test]
+fn a_withdrawn_wait_publication_no_longer_decides_the_choice() {
+    let usr2 = kernel_signal_bit(libc::SIGUSR2);
+    let mut s = Scheduler::new(&Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE)
+    });
+    let (creator, _, _) = add(&mut s, 100, 100);
+    let (sibling, _, _) = add(&mut s, 100, 101);
+    s.test_kernel_signal_states.insert(
+        creator,
+        KernelSignalState {
+            thread_pending: usr2,
+            blocked: 0,
+            ..KernelSignalState::default()
+        },
+    );
+    s.test_kernel_signal_states
+        .insert(sibling, KernelSignalState::default());
+    file_temporary_mask_wait(&mut s, creator, TemporaryMaskWait::Ppoll, Some(usr2));
+    assert!(s.set_saved_guest_sigmask(creator, Some(usr2)));
+    file_restartable_read(&mut s, sibling);
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+        (Some(creator), None)
+    );
+    assert!(s.set_saved_guest_sigmask(creator, None));
+    assert!(!s.wait_published_masks.contains(&creator));
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+        (Some(sibling), Some(sibling)),
+        "withdrawn: the physical own mask admits the private copy"
+    );
 }
 
 #[test]

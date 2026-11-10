@@ -6632,6 +6632,9 @@ impl GlobalState {
             // in-guest delivery gate off, and for a rejoin, whose filing is
             // host-timed (recorded when the thread is readmitted instead).
             sched.record_request_guest_mask(dettid, &rs);
+            // The wait-publication record for the kernel-sent choice, in
+            // the same ordered filing (a no-op for other requests).
+            sched.record_wait_publication(dettid, &rs);
             // Whether it is a kernel-run call (A5 step 3c.1c, D44), recorded
             // in the same ordered filing; a no-op with the gate off.
             sched.record_request_kernel_run(dettid, &rs);

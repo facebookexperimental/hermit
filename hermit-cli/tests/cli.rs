@@ -27024,18 +27024,24 @@ fn assert_ptrace_refuses(mode: &str) {
         guest,
         mode,
     ]);
-    assert!(
-        !output.status.success(),
-        "{mode}: ptrace completed where it must refuse: {output:?}"
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{mode}: ptrace must refuse with the policy status: {output:?}"
     );
     let stdout = stdout(&output);
     assert!(
-        !stdout.contains("receiver="),
-        "{mode}: ptrace printed a receiver line where it must refuse: {stdout:?}"
+        stdout.is_empty(),
+        "{mode}: ptrace printed where it must refuse: {stdout:?}"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("cannot keep a held signal"),
+        stderr.contains("HERMIT_POLICY_REFUSAL"),
+        "{mode}: ptrace refused without the policy marker: {stderr}"
+    );
+    assert!(
+        stderr.contains("the ppoll wait cannot keep a held signal")
+            && stderr.contains("the pending SIGUSR2"),
         "{mode}: ptrace refused for an unrecorded reason: {stderr}"
     );
 }

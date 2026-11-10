@@ -2357,6 +2357,17 @@ pub struct Scheduler {
     /// take it too (`read_thread_blocked_mask_result`).
     saved_guest_sigmasks: BTreeMap<DetTid, u64>,
 
+    /// The threads whose `saved_guest_sigmasks` entry is a masked wait's
+    /// published mask still in force (`set_saved_guest_sigmask` records it
+    /// while a served wait is filed, and a wait's own republishing keeps
+    /// it): the kernel-sent choice reads the saved mask for these, through
+    /// any request the wait's place is later given (a wake's
+    /// `InboundSignal`, a replay checkpoint's `TraceReplay`), until the
+    /// wait's publication is withdrawn. A saved mask recorded with no
+    /// served wait filed is the guest's own under Detcore's private mask,
+    /// and the choice reads the physical mask there instead.
+    wait_published_masks: BTreeSet<DetTid>,
+
     /// Under the in-guest delivery gate, the threads that have published
     /// their own guest mask at a request (`record_request_guest_mask`), which
     /// shows that their backend keeps the guest's mask apart from the
@@ -6435,6 +6446,7 @@ impl Scheduler {
             delivery_mask_override: None,
             signal_control_caller: None,
             saved_guest_sigmasks: Default::default(),
+            wait_published_masks: Default::default(),
             unknown_guest_sigmasks: Default::default(),
             own_mask_publishers: Default::default(),
             temporary_mask_publications: Default::default(),
@@ -8023,6 +8035,7 @@ impl Scheduler {
         self.release_vfork_child(*dtid, false);
         self.vfork_registration_origins.remove(dtid);
         self.saved_guest_sigmasks.remove(dtid);
+        self.wait_published_masks.remove(dtid);
         if self.in_guest_signal_delivery {
             self.unknown_guest_sigmasks.remove(dtid);
             self.temporary_mask_publications.remove(dtid);
@@ -10008,6 +10021,31 @@ impl Scheduler {
         self.kernel_run_requests.get(&dettid).copied()
     }
 
+    /// Record that `dettid`'s filed request `rs` is a wait Detcore serves
+    /// by polling or sleeping, so a mask it already published
+    /// (`saved_guest_sigmasks`) is that wait's mask in force
+    /// (`wait_published_masks`). Called at the ordered filing of every
+    /// resource request, beside `record_request_guest_mask`: a wait's
+    /// first publication can precede its first filing, and this catches
+    /// it, as `set_saved_guest_sigmask` catches a publication that
+    /// follows its filing. A rejoin's filing is host-timed; its mask is
+    /// recorded at readmission instead (`keep_mask_for_continuation`).
+    pub(crate) fn record_wait_publication(&mut self, dettid: DetTid, rs: &Resources) {
+        if rs.is_rejoin() {
+            return;
+        }
+        let served = rs.blocked_signal_mask.is_some()
+            || rs.resources.keys().any(|resource| {
+                matches!(
+                    resource,
+                    ResourceID::InternalIOPolling | ResourceID::SleepUntil(_)
+                )
+            });
+        if served && self.saved_guest_sigmasks.contains_key(&dettid) {
+            self.wait_published_masks.insert(dettid);
+        }
+    }
+
     /// Record (`Some`) or clear (`None`) the mask Linux's `blocked` holds for
     /// `dettid` while its kernel `SigBlk` differs (`saved_guest_sigmasks`).
     /// Returns false for a thread the scheduler no longer knows. Under the
@@ -10019,8 +10057,41 @@ impl Scheduler {
             return false;
         }
         match mask {
-            Some(mask) => self.saved_guest_sigmasks.insert(dettid, mask),
-            None => self.saved_guest_sigmasks.remove(&dettid),
+            Some(mask) => {
+                // Provenance for the kernel-sent choice: a mask published
+                // while a served wait is filed (or republished by a wait
+                // already recorded) is that wait's mask, in force until
+                // withdrawn; a mask recorded over a futex wait is the
+                // guest's own under Detcore's private mask there, whose
+                // readers take the physical mask, so any wait record ends.
+                let filed = self
+                    .next_turns
+                    .get(&dettid)
+                    .and_then(|turn| turn.req.try_read())
+                    .and_then(Result::ok);
+                let over_futex = filed
+                    .as_ref()
+                    .is_some_and(|request| request.resources.contains_key(&ResourceID::FutexWait));
+                let in_served_wait = filed.as_ref().is_some_and(|request| {
+                    request.blocked_signal_mask.is_some()
+                        || request.resources.keys().any(|resource| {
+                            matches!(
+                                resource,
+                                ResourceID::InternalIOPolling | ResourceID::SleepUntil(_)
+                            )
+                        })
+                });
+                if over_futex {
+                    self.wait_published_masks.remove(&dettid);
+                } else if in_served_wait || self.wait_published_masks.contains(&dettid) {
+                    self.wait_published_masks.insert(dettid);
+                }
+                self.saved_guest_sigmasks.insert(dettid, mask)
+            }
+            None => {
+                self.wait_published_masks.remove(&dettid);
+                self.saved_guest_sigmasks.remove(&dettid)
+            }
         };
         if self.in_guest_signal_delivery {
             self.unknown_guest_sigmasks.remove(&dettid);
@@ -17039,32 +17110,24 @@ impl Scheduler {
                 Err(signal_state_reader::TemporaryMaskUnknown) => return None,
             }
         }
-        // The mask a masked wait published (`publish_wait_mask`): on
-        // ptrace a masked `ppoll`/`pselect6`/`sigsuspend` probe loop
-        // stores its temporary mask in `saved_guest_sigmasks` for the
-        // wait's duration, while the physical mask remains the thread's
-        // own. The choice reads that installed mask, as `wants_signal`
-        // does, for a thread filed in a wait Detcore serves by polling or
-        // sleeping. Outside such a wait a saved mask is the guest's own,
-        // held while Detcore's private mask is installed, and the
-        // physical read below decides there, as before; the recorded and
-        // control sources above keep their stronger precedence, and
-        // readers that need the physical mask (the background-entry
-        // barriers) do not come through here.
-        let in_served_wait = self
-            .next_turns
-            .get(&thread)
-            .and_then(|turn| turn.req.try_read())
-            .and_then(Result::ok)
-            .is_some_and(|request| {
-                request.resources.keys().any(|resource| {
-                    matches!(
-                        resource,
-                        ResourceID::InternalIOPolling | ResourceID::SleepUntil(_)
-                    )
-                })
-            });
-        if in_served_wait && let Some(published) = self.saved_guest_sigmasks.get(&thread) {
+        // The mask a masked wait published (`publish_wait_mask`), while
+        // its publication is in force (`wait_published_masks`, recorded
+        // at publication): on ptrace a masked `ppoll`/`pselect6`/
+        // `sigsuspend` probe loop stores its temporary mask in
+        // `saved_guest_sigmasks` for the wait's duration, while the
+        // physical mask remains the thread's own. The record survives
+        // any request the wait's place is later given (a wake's
+        // `InboundSignal`, a replay checkpoint's `TraceReplay`), so the
+        // choice reads the installed mask, as `wants_signal` does. A
+        // saved mask with no wait publication in force is the guest's
+        // own under Detcore's private mask, and the physical read below
+        // decides there, as before; the recorded and control sources
+        // above keep their stronger precedence, and readers that need
+        // the physical mask (the background-entry barriers) do not come
+        // through here.
+        if self.wait_published_masks.contains(&thread)
+            && let Some(published) = self.saved_guest_sigmasks.get(&thread)
+        {
             return Some(*published);
         }
         self.blocked_mask_for(thread, signal)
