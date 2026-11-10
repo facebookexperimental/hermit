@@ -815,17 +815,31 @@ def summary():
         lines += ["    " + l[:200] for l in tail]
     report = "cell__verify-1.json" if verify else "result.json"
     lines.append(f"  report: {report} among this test's Tpx artifacts")
+    if "artifact_dir" in (harness or {}):
+        lines.append("  artifact_dir (below) was this cell's scratch directory, deleted when the test ended"
+                     + ("; kept_dir names the kept copy" if kept else ""))
     if kept:
         lines.append(f"  kept artifacts: {kept}")
     elif kept_note:
         lines.append(f"  {kept_note}")
     return "\n".join(lines)
 
+details = (record.get("details") or "").split("\n")
+try:
+    harness = json.loads(details[-1])
+except ValueError:
+    harness = None
+harness = harness if isinstance(harness, dict) else None
+
 try:
     text = summary()
 except Exception as error:  # the summary is a reader's aid, never the verdict
     text = f"{cell}: summary unavailable: {type(error).__name__}: {error}"
-record["details"] = text + "\n" + (record.get("details") or "")
+if kept and harness is not None:
+    # The harness's artifact_dir is gone with the scratch directory; name the copy.
+    harness["kept_dir"] = kept
+    details[-1] = json.dumps(harness)
+record["details"] = text + "\n" + "\n".join(details)
 print(json.dumps(record))
 PY
 ) || record_line=${verdict_lines[0]}

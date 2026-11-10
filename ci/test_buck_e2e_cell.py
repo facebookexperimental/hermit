@@ -181,11 +181,11 @@ with open(results, "w") as f:
 with open(host(flag("--junit")), "w") as f:
     f.write("<testsuite/>\n")
 status = "passed" if outcome == "PASS" else "failed"
-with open(tpx, "w") as f:
-    f.write(json.dumps({"op": "test_done", "test": test + "/" + mode + "@" + backend, "status": status,
-                        "details": json.dumps({"outcome": outcome})}) + "\n")
 celldir = os.path.join(host(os.environ["E2E_RESULT_ROOT"]), "runs", os.environ["E2E_RUN_ID"],
                        os.environ["FAKE_SLUG"])
+with open(tpx, "w") as f:
+    f.write(json.dumps({"op": "test_done", "test": test + "/" + mode + "@" + backend, "status": status,
+                        "details": json.dumps({"outcome": outcome, "artifact_dir": celldir})}) + "\n")
 logs = os.path.join(celldir, "verify-logs", "verify-1")
 os.makedirs(logs, exist_ok=True)
 # Like hermit --keep-logs: a matched verify keeps only run 1's (golden) log, anything else
@@ -989,7 +989,9 @@ class CellTest(unittest.TestCase):
         self.assertEqual(lines[4], "  guest stdout (cell__verify-runs__1__run1__stdout, last 20 lines):")
         self.assertEqual(lines[5:25], ["    guest line %d" % i for i in range(5, 25)])
         self.assertEqual(lines[25], "  report: cell__verify-1.json among this test's Tpx artifacts")
-        self.assertEqual(len(lines), 27, lines)
+        self.assertEqual(lines[26], "  artifact_dir (below) was this cell's scratch directory, deleted when the test ended")
+        self.assertEqual(len(lines), 28, lines)
+        self.assertNotIn("kept_dir", details_json(done))
 
     def test_a_failing_cell_leads_its_details_with_the_summary_too(self) -> None:
         done, _ = self.run_cell(FAKE_RUN_ARTIFACTS="1", FAKE_OUTCOME="FAIL", FAKE_VERDICT="differed")
@@ -1020,6 +1022,13 @@ class CellTest(unittest.TestCase):
         self.assertTrue((kept / "verify-1.json").is_file())
         self.assertTrue((kept / "verify-runs" / "1" / "run1" / "stdout").is_file())
         self.assertIn(f"  kept artifacts: {kept}", done["details"].splitlines())
+        # The harness's artifact_dir names the deleted scratch copy; kept_dir names this one.
+        record = details_json(done)
+        self.assertEqual(record["kept_dir"], str(kept))
+        self.assertEqual(record["outcome"], "PASS")
+        self.assertFalse(Path(record["artifact_dir"]).exists())
+        self.assertIn("  artifact_dir (below) was this cell's scratch directory, deleted when the test ended;"
+                      " kept_dir names the kept copy", done["details"].splitlines())
 
     def test_no_artifacts_are_kept_by_default(self) -> None:
         keep = self.tmp / "kept"
@@ -1027,6 +1036,7 @@ class CellTest(unittest.TestCase):
         self.assertEqual(done["status"], "passed", done)
         self.assertFalse(keep.exists())
         self.assertNotIn("kept artifacts", done["details"])
+        self.assertNotIn("kept_dir", details_json(done))
 
     def test_an_re_cell_keeps_nothing_and_says_so(self) -> None:
         keep = self.tmp / "kept"
