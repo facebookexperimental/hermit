@@ -12,8 +12,8 @@
 # `fail` is the third-state bug: an abort that reads like a failure. scripts/
 # validate.rs:5362 reserves exit 75 (EX_TEMPFAIL) as "the only nonzero code that is
 # not a product failure"; outcome_is_no_result() classifies it `no_result` and
-# outcome_is_failure() excludes it. ci/run-with-reverie-dbt-budget.sh already uses
-# 75 for its pin-mismatch refusal, so this follows the established spelling rather
+# outcome_is_failure() excludes it. ci/run-with-core-build.sh also uses
+# 75 when its source pin cannot be identified, so this follows the established spelling rather
 # than inventing one. Every other nonzero exit from the target stays loud.
 #
 # The distinction is load-bearing in practice, not hypothetical: an agent hit this

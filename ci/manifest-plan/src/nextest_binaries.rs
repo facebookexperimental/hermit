@@ -1669,14 +1669,9 @@ fn cargo_output(root: &Path, args: &[String], destination: &Path) -> Result<(), 
 
 /// Runs each `program` (Cargo) command of `listings` (arguments, output file), which
 /// must compile nothing, such as `nextest list` given both metadata files, up
-/// to `jobs` at a time and without
-/// ci/run-with-reverie-dbt-budget.sh. That wrapper binds the Reverie DBT build
-/// budget to its pin with a pin check of about 0.8 s a call, and a command
-/// that builds nothing has no budget to bind; `run` already starts its
-/// `nextest` this way. Twenty such listings ran one at a time through it in
-/// build.workspace_in_pinned_root, about 16 s of pin checks on the critical
-/// path of every validation. The first failure is returned once every started
-/// listing has finished.
+/// to `jobs` at a time. Listings execute directly because no build source-pin
+/// check is needed. The first failure is returned once every started listing
+/// has finished.
 fn listing_outputs(
     root: &Path,
     program: &std::ffi::OsStr,

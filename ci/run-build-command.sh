@@ -15,7 +15,7 @@ if [[ -n ${HERMIT_CARGO_TIMINGS_DIR:-} && ${1:-} == cargo && ${2:-} == build ]];
     if ! mkdir -p -- "$HERMIT_CARGO_TIMINGS_DIR" ||
         ! find "$timings_reports" -maxdepth 1 -name 'cargo-timing-*.html' -newermt "@$timings_started" \
             -exec cp -- {} "$HERMIT_CARGO_TIMINGS_DIR/" \; ; then
-        echo "run-with-reverie-dbt-budget.sh: could not keep the cargo --timings report in $HERMIT_CARGO_TIMINGS_DIR (diagnostics only)" >&2
+        echo "run-build-command.sh: could not keep the cargo --timings report in $HERMIT_CARGO_TIMINGS_DIR (diagnostics only)" >&2
     fi
     exit "$timings_status"
 fi

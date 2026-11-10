@@ -8941,6 +8941,15 @@ mod process_group_scan_marker_tests {
     }
 
     #[test]
+    fn run_dag_keeps_the_committed_engine_and_width_contract() {
+        let root = std::path::Path::new(file!())
+            .parent()
+            .and_then(std::path::Path::parent)
+            .unwrap();
+        super::raw_run_dag_engine_bracket(root).unwrap();
+    }
+
+    #[test]
     fn run_dag_exports_the_process_group_scan_marker_only_for_unsafe_no_cgroups() {
         // A rust-script test runs in its cache project, outside the checkout.
         let root = std::path::Path::new(file!())

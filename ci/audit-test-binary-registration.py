@@ -65,7 +65,7 @@ _TOP_LEVEL_TEST_RE = re.compile(r"^hermit-cli/tests/([^/]+)\.rs$")
 # the invocation only when everything preceding `cargo` in its segment is a thing
 # that still leads to cargo running -- an environment assignment or a real wrapper
 # program. Hermit's DAG legitimately uses both (`CARGO_BUILD_JOBS=8 ...`,
-# `./ci/run-with-reverie-dbt-budget.sh cargo test ...`), so a bare command-position
+# `./ci/run-with-core-build.sh cargo test ...`), so a bare command-position
 # rule would reject the real registrations. `echo` and `printf` match nothing in
 # the allowlist and are refused.
 _SEGMENT_SPLIT_RE = re.compile(r"&&|\|\||[;|\n]")
@@ -78,7 +78,7 @@ _DURATION_RE = re.compile(r"^\d+[smhd]?$")
 # Do not accept prlimit's query/help/PID forms, or infer execution without its
 # explicit command delimiter. Other option shapes remain unrecognized.
 _PRLIMIT_FSIZE_RE = re.compile(r"--fsize=[0-9]{1,20}:[0-9]{1,20}")
-_PRLIMIT_SCRIPT_WRAPPERS = frozenset({"./ci/run-with-reverie-dbt-budget.sh"})
+_PRLIMIT_SCRIPT_WRAPPERS = frozenset({"./ci/run-with-core-build.sh"})
 # `--no-run` compiles the binary and never executes it, so it is not coverage.
 _NO_RUN_RE = re.compile(r"(?<![\w-])--no-run(?![\w-])")
 

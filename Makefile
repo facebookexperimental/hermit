@@ -151,7 +151,7 @@ check-skill-discovery: ## Verify Claude and stock Codex discover the same produc
 # `make lint` is unchanged for humans. The split exists because a single DAG node
 # running the whole target would re-run `cargo clippy` -- a measured 300s in
 # ci/dag/validate.json's lint.clippy hint -- a second time per validate, and would
-# run it OUTSIDE ci/run-with-reverie-dbt-budget.sh, which that node wraps it in.
+# run it OUTSIDE ci/run-with-core-build.sh, which that node wraps it in.
 # So lint-cargo holds exactly the two steps that already have byte-identical DAG
 # nodes (lint.rustfmt, lint.clippy) and stays unscheduled here; lint-checks holds
 # everything else and IS scheduled, as the single node check.lint_checks.

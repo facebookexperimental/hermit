@@ -178,7 +178,7 @@ fn usage() -> &'static str {
        -h, --help                          Show this help\n\
      \n\
      Canonical-pin scope: every tracked Cargo.toml and Cargo.lock from git ls-files.\n\
-     Derived local bindings checked separately: LiteInst cache keys, DBT budget sites,\n\
+     Derived local bindings checked separately: LiteInst cache keys\n\
      and hermit-cli/BUCK. Excludes other non-Cargo files, untracked/generated files,\n\
      and nested submodule contents."
 }
@@ -1710,43 +1710,11 @@ fn rewrite_manifest_pins(scan: &PinScan, main: &str) -> Result<(usize, usize), S
     Ok((written.len(), changed_entries))
 }
 
-/// The one site that records a JUDGEMENT rather than a reference.
-///
-/// This wrapper binds a *measured* build clamp and threshold to one exact
-/// Reverie revision on purpose -- its own comment says the check "prevents a pin
-/// bump from silently reusing an earlier revision's clamp and measured
-/// threshold". Rewriting it asserts that the measurement still applies, which is
-/// not something this tool can establish. Everything else that names the pin
-/// outside Cargo metadata merely RESTATES this value and is carried mechanically.
+/// Tombstone for the retired core DBT wrapper. Keep its exclusion from
+/// mechanical pin carries: restoring this filename must not silently assert a
+/// measured SDK budget still applies. Any future budget needs a production
+/// decision path; private-static's full_pins refuses a stale expected_pin.
 const BUDGET_CALIBRATION_SITE: &str = "ci/run-with-reverie-dbt-budget.sh";
-
-/// The revision the DBT build budget is currently calibrated for.
-#[cfg(test)]
-fn calibrated_pin(root: &Path) -> Result<Option<String>, String> {
-    let path = root.join(BUDGET_CALIBRATION_SITE);
-    if !path.is_file() {
-        return Ok(None);
-    }
-    let text = fs::read_to_string(&path)
-        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    for line in text.lines() {
-        if let Some(value) = line.trim().strip_prefix("expected_pin=") {
-            let value = value.trim().trim_matches(['"', '\''].as_slice());
-            if is_full_sha(value) {
-                return Ok(Some(value.to_string()));
-            }
-            return Err(format!(
-                "{}: expected_pin= is not an exact 40-hex revision: {value:?}",
-                path.display()
-            ));
-        }
-    }
-    Err(format!(
-        "{}: no expected_pin= line found; the calibration site moved and this \
-         tool can no longer find the decision it must not skip",
-        path.display()
-    ))
-}
 
 /// Carry `old` -> `main` across every tracked non-Cargo site that merely
 /// RESTATES the pin, leaving [`BUDGET_CALIBRATION_SITE`] untouched.
@@ -1806,48 +1774,6 @@ fn carry_derived_pin_sites(
     }
     touched.sort();
     Ok((touched, rewritten))
-}
-
-/// Refuse to report success while the calibration decision is unmade.
-///
-/// Deliberately NOT a value this tool guesses. A bump that silently rewrote the
-/// wrapper would assert a measured budget still applies, report success, and
-/// look exactly like a fix -- which is worse than the hand-carry it replaced.
-#[cfg(test)]
-fn calibration_decision_required(old: &str, main: &str) -> String {
-    format!(
-        "\n\
-         ======================================================================\n\
-         REVERIE PIN: DBT BUILD-BUDGET CALIBRATION DECISION REQUIRED\n\
-         ======================================================================\n\
-         Cargo metadata and every derived CI site now name {main}.\n\
-         {BUDGET_CALIBRATION_SITE} still names {old}, and this tool will not\n\
-         change it for you: that line asserts a MEASURED build clamp and\n\
-         threshold still apply, which is a judgement, not a lookup.\n\
-         \n\
-         Decide whether the budget carries. It governs one quantity: the elapsed\n\
-         time reverie-dbt/build.rs reports for a DynamoRIO content-key miss,\n\
-         hashed over {{reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs,\n\
-         $CMAKE, $CMAKE_GENERATOR}}. In a Reverie checkout:\n\
-         \n\
-         \x20 git -C <reverie> diff {old}:reverie-dbt/build.rs \\\n\
-         \x20     {main}:reverie-dbt/build.rs\n\
-         \x20 git -C <reverie> rev-parse {old}:reverie-dbt/vendor/dynamorio \\\n\
-         \x20     {main}:reverie-dbt/vendor/dynamorio\n\
-         \n\
-         Changed bytes do NOT by themselves mean recalibration: judge whether the\n\
-         diff can affect build TIME. A pure rename cannot. Note the DBI->DBT\n\
-         rename also MOVED these paths, so a query at an older revision can\n\
-         return nothing rather than a difference -- absent is not unchanged.\n\
-         \n\
-         If it carries: set expected_pin={main} in {BUDGET_CALIBRATION_SITE} and\n\
-         append a `CARRY TO` block to ci/configure-build-jobs.sh stating the\n\
-         evidence. If it does not: recalibrate and record the measurement.\n\
-         Then re-run this checker; it will report the tree policy-compliant.\n\
-         \n\
-         Nothing above needs redoing -- the Cargo sites and the derived CI sites\n\
-         are already written.\n"
-    )
 }
 
 fn update_to_latest(
@@ -1944,33 +1870,6 @@ fn finish_core_pin_update(
     }
 }
 
-/// Finish every non-build carry before judging whether the bumped tree builds.
-///
-/// `finish_ci_pin_sites` can still refuse an unsettled DBT calibration. Running
-/// it first preserves that decision boundary and ensures the compile result is
-/// about the complete candidate tree, not a half-carried pin.
-#[cfg(test)]
-fn finish_and_verify_pin_update_with(
-    root: &Path,
-    calibrated: Option<&str>,
-    main: &str,
-    cargo_already_current: bool,
-    verify_build: bool,
-    cargo_program: &Path,
-    cargo_prefix_args: &[&str],
-) -> Result<(), String> {
-    finish_ci_pin_sites(root, calibrated, main, cargo_already_current)?;
-    if verify_build {
-        verify_bumped_tree_builds(root, cargo_program, cargo_prefix_args)
-    } else {
-        eprintln!(
-            "WARNING: --no-verify-build was passed: pin consistency was checked, but pin \
-             viability was not. The bumped tree may not compile."
-        );
-        Ok(())
-    }
-}
-
 /// Compile the complete bumped tree without permitting lockfile re-resolution.
 fn verify_bumped_tree_builds(
     root: &Path,
@@ -1994,47 +1893,6 @@ fn verify_bumped_tree_builds(
         "BUMP REFUSED: the pin was updated consistently, but the tree does not compile \
          against it ({status}). The edits remain on disk for inspection; do not commit them."
     ))
-}
-
-/// Carry the derived CI sites, then refuse to claim success if the one
-/// calibration decision is still open.
-///
-/// Split out so the already-current path takes it too: "Cargo metadata is
-/// current" is a narrower fact than "the pin is carried", and reporting the
-/// former as the latter is what let 16 CI sites go stale behind a success
-/// message three times in one day.
-#[cfg(test)]
-fn finish_ci_pin_sites(
-    root: &Path,
-    calibrated: Option<&str>,
-    main: &str,
-    cargo_already_current: bool,
-) -> Result<(), String> {
-    let Some(old) = calibrated else {
-        if cargo_already_current {
-            println!("Reverie pin already equals the main tip: {main}");
-        }
-        return Ok(());
-    };
-    if old == main {
-        // The decision is settled and the derived sites restate this same value,
-        // so there is nothing left to carry. Counting the already-correct sites
-        // here would report work that did not happen.
-        if cargo_already_current {
-            println!("Reverie pin already equals the main tip: {main}");
-        }
-        return Ok(());
-    }
-
-    let (touched, rewritten) = carry_derived_pin_sites(root, old, main)?;
-    println!(
-        "Carried {rewritten} derived CI pin occurrence(s) from {old} in {} file(s):",
-        touched.len()
-    );
-    for path in &touched {
-        println!("  {}", path.display());
-    }
-    Err(calibration_decision_required(old, main))
 }
 
 fn loud_header(title: &str) {
@@ -3029,9 +2887,9 @@ mod tests {
         assert!(!is_full_sha("z123456789abcdef0123456789abcdef01234567"));
     }
 
-    /// A tree where the calibration site names `old` and one derived site does
-    /// too, so a carry has something real to move and something real to refuse.
-    fn calibration_fixture(label: &str, old: &str) -> PathBuf {
+    /// A synthetic derived site and the retired filename exercise the live
+    /// mechanical carry and its retained exclusion. No SDK calibration runs.
+    fn core_carry_fixture(label: &str, old: &str) -> PathBuf {
         let root = temp_path(label);
         fs::create_dir_all(root.join("ci")).expect("mkdir ci");
         fs::write(
@@ -3040,7 +2898,7 @@ mod tests {
         )
         .expect("write wrapper");
         fs::write(
-            root.join("ci/configure-build-jobs.sh"),
+            root.join("ci/derived-pin-fixture.sh"),
             format!("# bound to {old}\ncheck {old}\n"),
         )
         .expect("write derived");
@@ -3054,7 +2912,7 @@ mod tests {
     fn core_finish_refuses_interrupted_buck_and_cache_carries_without_calibration_authority() {
         let old = "1".repeat(40);
         let main = "2".repeat(40);
-        let root = calibration_fixture("core-interrupted-carry", &old);
+        let root = core_carry_fixture("core-interrupted-carry", &old);
         fs::create_dir_all(root.join("hermit-cli")).unwrap();
         let buck = |pin: &str| {
             format!(
@@ -3098,7 +2956,7 @@ mod tests {
     fn core_finish_carries_known_old_full_bindings_then_rechecks_the_real_core_sites() {
         let old = "1".repeat(40);
         let main = "2".repeat(40);
-        let root = calibration_fixture("core-complete-carry", &old);
+        let root = core_carry_fixture("core-complete-carry", &old);
         fs::create_dir_all(root.join("hermit-cli")).unwrap();
         fs::write(root.join(BUCK_BUILD_PIN_SITE), format!("hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{old}\",\n}}\nrust_library(\n    env = hermit_build_env,\n)\nrust_binary(\n    env = hermit_build_env,\n)\n")).unwrap();
         assert!(git_in(&root, &["add", "-A"]).unwrap().status.success());
@@ -3108,68 +2966,25 @@ mod tests {
                 .unwrap()
                 .contains(&main)
         );
+        let derived = fs::read_to_string(root.join("ci/derived-pin-fixture.sh")).unwrap();
+        assert!(derived.contains(&main));
         assert!(
-            fs::read_to_string(root.join("ci/configure-build-jobs.sh"))
-                .unwrap()
-                .contains(&main)
+            !derived.contains(&old),
+            "every old pin occurrence must be carried"
         );
+        let wrapper = fs::read_to_string(root.join(BUDGET_CALIBRATION_SITE)).unwrap();
+        assert!(wrapper.contains(&old));
         assert!(
-            fs::read_to_string(root.join(BUDGET_CALIBRATION_SITE))
-                .unwrap()
-                .contains(&old)
+            !wrapper.contains(&main),
+            "the calibration tombstone must not be carried"
         );
         fs::remove_dir_all(root).unwrap();
     }
 
-    /// NEGATIVE. The one judgement must never be defaulted.
-    ///
-    /// Automating the 15 derived sites while silently guessing the 16th would be
-    /// worse than the hand-carry it replaces, because the tool's own success
-    /// would be what hides it. So: carry the derived sites, leave the
-    /// calibration exactly as found, and refuse.
     #[test]
-    fn refuses_to_guess_the_budget_calibration_and_leaves_it_untouched() {
-        let old = "1".repeat(40);
+    fn derived_pin_carry_reports_no_work_when_already_current() {
         let main = "2".repeat(40);
-        let root = calibration_fixture("carry-refuse", &old);
-
-        let refusal = finish_ci_pin_sites(&root, Some(&old), &main, false)
-            .expect_err("an unsettled calibration must refuse, not succeed");
-        assert!(
-            refusal.contains("CALIBRATION DECISION REQUIRED"),
-            "{refusal}"
-        );
-        // Actionable, not merely negative: it must name the file to edit and the
-        // value to write, or the operator is back to rediscovering the step.
-        assert!(refusal.contains(BUDGET_CALIBRATION_SITE), "{refusal}");
-        assert!(
-            refusal.contains(&format!("expected_pin={main}")),
-            "{refusal}"
-        );
-
-        let wrapper = fs::read_to_string(root.join(BUDGET_CALIBRATION_SITE)).expect("read wrapper");
-        assert!(
-            wrapper.contains(&old) && !wrapper.contains(&main),
-            "the calibration was rewritten instead of being left as the decision: {wrapper}"
-        );
-        let derived = fs::read_to_string(root.join("ci/configure-build-jobs.sh")).expect("derived");
-        assert!(
-            derived.contains(&main) && !derived.contains(&old),
-            "the derived site should have been carried: {derived}"
-        );
-    }
-
-    /// POSITIVE. Once the decision is settled the tool completes, and reports no
-    /// work it did not do -- an earlier draft counted already-correct sites and
-    /// claimed to have carried them.
-    #[test]
-    fn settled_calibration_completes_without_reporting_phantom_carries() {
-        let main = "2".repeat(40);
-        let root = calibration_fixture("carry-settled", &main);
-
-        finish_ci_pin_sites(&root, Some(&main), &main, true)
-            .expect("a settled calibration must complete");
-
+        let root = core_carry_fixture("carry-current", &main);
         let (touched, rewritten) =
             carry_derived_pin_sites(&root, &main, &main).expect("no-op carry");
         assert_eq!(
@@ -3180,24 +2995,7 @@ mod tests {
             touched.is_empty(),
             "no file should be rewritten: {touched:?}"
         );
-    }
-
-    /// The calibration site is the tool's anchor for what it must not decide.
-    /// If it moves and we silently read "no pin" as "nothing to settle", the
-    /// refusal disappears and the tool starts succeeding over a missing check --
-    /// absence reading as agreement, which is the defect this tool exists to fix.
-    #[test]
-    fn a_calibration_site_without_the_marker_is_an_error_not_an_absence() {
-        let root = temp_path("carry-marker");
-        fs::create_dir_all(root.join("ci")).expect("mkdir ci");
-        fs::write(
-            root.join(BUDGET_CALIBRATION_SITE),
-            "#!/bin/bash\n# the expected_pin line was moved or renamed\n",
-        )
-        .expect("write wrapper");
-
-        let error = calibrated_pin(&root).expect_err("a marker-less calibration site must error");
-        assert!(error.contains("no expected_pin="), "{error}");
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn compile_fixture(label: &str, source: &str) -> PathBuf {
@@ -3229,7 +3027,6 @@ mod tests {
 
     #[test]
     fn post_carry_compile_gate_accepts_one_building_tree_and_refuses_one_nonbuilding_tree() {
-        let main = "2".repeat(40);
         let building = compile_fixture("building-bump", "pub fn value() -> u8 { 1 }\n");
         let nonbuilding = compile_fixture(
             "nonbuilding-bump",
@@ -3252,24 +3049,16 @@ mod tests {
 
         let mut accepted = 0;
         let mut refused = 0;
-        finish_and_verify_pin_update_with(
+        verify_bumped_tree_builds(
             &building,
-            None,
-            &main,
-            true,
-            true,
             Path::new("/bin/sh"),
             &[building_cargo.to_str().expect("UTF-8 fixture cargo path")],
         )
         .expect("a complete pin carry whose tree builds must be accepted");
         accepted += 1;
 
-        let error = finish_and_verify_pin_update_with(
+        let error = verify_bumped_tree_builds(
             &nonbuilding,
-            None,
-            &main,
-            true,
-            true,
             Path::new("/bin/sh"),
             &[nonbuilding_cargo
                 .to_str()
@@ -3283,47 +3072,6 @@ mod tests {
         assert_eq!((accepted, refused), (1, 1));
         fs::remove_dir_all(building).expect("remove building fixture");
         fs::remove_dir_all(nonbuilding).expect("remove nonbuilding fixture");
-    }
-
-    #[test]
-    fn calibration_refusal_precedes_build_verification() {
-        let old = "1".repeat(40);
-        let main = "2".repeat(40);
-        let root = compile_fixture(
-            "finish-before-build",
-            "pub fn value() -> u8 { missing_after_resolvable_bump() }\n",
-        );
-        fs::create_dir_all(root.join("ci")).expect("create CI fixture directory");
-        fs::write(
-            root.join(BUDGET_CALIBRATION_SITE),
-            format!("#!/bin/bash\nexpected_pin={old}\n"),
-        )
-        .expect("write calibration fixture");
-        fs::write(
-            root.join("ci/configure-build-jobs.sh"),
-            format!("# derived pin\ncheck {old}\n"),
-        )
-        .expect("write derived pin fixture");
-        init_fixture_repo(&root);
-        assert!(git_in(&root, &["add", "-A"]).unwrap().status.success());
-
-        let missing_cargo = root.join("must-not-run-cargo");
-        let error = finish_and_verify_pin_update_with(
-            &root,
-            Some(&old),
-            &main,
-            false,
-            true,
-            &missing_cargo,
-            &[],
-        )
-        .expect_err("an unsettled DBT calibration must refuse before cargo check runs");
-        assert!(error.contains("CALIBRATION DECISION REQUIRED"), "{error}");
-        assert!(
-            !error.contains("BUMP REFUSED"),
-            "build verification ran before finish_ci_pin_sites: {error}"
-        );
-        fs::remove_dir_all(root).expect("remove ordering fixture");
     }
 
     #[test]
