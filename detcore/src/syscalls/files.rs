@@ -2931,36 +2931,6 @@ impl<'a> StatTarget<'a> {
         }
     }
 
-    /// The path this target names, read now, where the `len` bytes of the
-    /// call's result at `result` overlap it, so that a check once the call
-    /// has run can look it up again
-    /// (`Detcore::stat_reached_absent_sysfs_object`). `None` for every other
-    /// target.
-    fn looked_up_if_overwritten<M: MemoryAccess>(
-        self,
-        memory: &M,
-        result: usize,
-        len: usize,
-    ) -> Option<procfs_levels::LookedUpPath> {
-        match self {
-            StatTarget::Path {
-                dirfd,
-                path,
-                follow,
-            } if path_overlaps_bytes(memory, path, result, len) => {
-                path?
-                    .read(memory)
-                    .ok()
-                    .map(|spelling| procfs_levels::LookedUpPath {
-                        dirfd,
-                        spelling,
-                        follow,
-                    })
-            }
-            _ => None,
-        }
-    }
-
     /// The descriptor the call describes itself, if it names no path.
     fn descriptor(&self) -> Option<RawFd> {
         match self {
@@ -7088,10 +7058,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                     return Err(Errno::ENOENT.into());
                 }
                 // Likewise a sysfs object the machine Detcore presents does
-                // not have (`Detcore::is_absent_sysfs_object`), which the
-                // lookup check leaves out by the guest's spelling: reached
-                // through a symbolic link to it, or to a directory above it,
-                // it is named here by the kernel's path for the descriptor.
+                // not have (`Detcore::is_absent_sysfs_object`), named by the
+                // kernel's path for the descriptor, which the lookup check's
+                // walk before the open did not reach (a link the guest
+                // changed in between). The same path names the attributes
+                // read with contents of their own (below).
                 let sysfs_object = self.opened_sysfs_object(guest, fd, identity.as_ref());
                 if let Some(object) = sysfs_object
                     .as_deref()
@@ -7869,19 +7840,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Errno::ENOENT.into()
                 } else {
                     e
-                };
-                // And one that went through a sysfs object the machine
-                // Detcore presents does not have, by a spelling the lookup
-                // check does not resolve, fails as an open of the object's
-                // own path does.
-                let e = match e {
-                    Error::Errno(errno) => {
-                        match Box::pin(self.failed_open_answer(guest, &call, &path, errno)).await {
-                            Some(answer) => answer,
-                            None => e,
-                        }
-                    }
-                    e => e,
                 };
                 resource_release_all(guest).await;
                 Err(e)
@@ -13641,13 +13599,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                 guest.memory().write_value(statptr.0, &stat.into())?;
                 return Ok(0);
             }
-            let overwritten = call.stat().and_then(|result| {
-                target.looked_up_if_overwritten(
-                    &guest.memory(),
-                    result.0.as_raw(),
-                    std::mem::size_of::<libc::stat>(),
-                )
-            });
             let target = match call.stat() {
                 Some(result) => target.unless_overwritten(
                     &guest.memory(),
@@ -13661,20 +13612,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.stat().map(|result| result.0.as_raw()),
                 std::mem::size_of::<libc::stat>(),
             );
-            if let Err(errno) = Self::inject_translated(guest, Syscall::from(call)).await {
-                // A lookup that failed below a sysfs object the machine
-                // Detcore presents does not have, reached through a spelling
-                // the lookup check does not resolve, fails as one that names
-                // the object does.
-                let absent = Box::pin(self.stat_reached_absent_sysfs_object(
-                    guest,
-                    Err(errno),
-                    target,
-                    overwritten,
-                ))
-                .await;
-                return Err(if absent { Errno::ENOENT } else { errno }.into());
-            }
+            Self::inject_translated(guest, Syscall::from(call)).await?;
             let statptr = call.stat().ok_or(Errno::EFAULT)?;
             let inode_override = target
                 .descriptor()
@@ -13697,25 +13635,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                     guest.memory().read_value(statptr.0)?
                 }
-            };
-            // A sysfs object the machine Detcore presents does not have,
-            // reached through a spelling the lookup check does not resolve:
-            // `ENOENT` too, the buffer as it was. Asked, in a boxed future,
-            // only of a result on sysfs, which is read again after it.
-            let stat = if self.may_reach_absent_sysfs_object(guest, dev) {
-                if Box::pin(self.stat_reached_absent_sysfs_object(
-                    guest,
-                    Ok(dev),
-                    target,
-                    overwritten,
-                ))
-                .await
-                {
-                    return Self::hidden_placeholder_stat(guest, statptr.0.as_raw(), before);
-                }
-                guest.memory().read_value(statptr.0)?
-            } else {
-                stat
             };
             let mut memory = guest.memory();
             // A placeholder another process made, or an earlier image of this
@@ -13799,13 +13718,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             } else if let Some(stat) = self.rendered_procfs_stat(guest, target).await? {
                 return self.write_rendered_statx(guest, call, stat).await;
             }
-            let overwritten = call.statx().and_then(|result| {
-                target.looked_up_if_overwritten(
-                    &guest.memory(),
-                    result.0.as_raw(),
-                    std::mem::size_of::<reverie::syscalls::linux_abi::Statx>(),
-                )
-            });
             let target = match call.statx() {
                 Some(result) => target.unless_overwritten(
                     &guest.memory(),
@@ -13827,20 +13739,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.statx().map(|result| result.0.as_raw()),
                 std::mem::size_of::<reverie::syscalls::linux_abi::Statx>(),
             );
-            if let Err(errno) =
-                Self::inject_translated(guest, Syscall::from(statx_asking_classic_mount_id(call)))
-                    .await
-            {
-                // An absent sysfs object, as for the other stat calls.
-                let absent = Box::pin(self.stat_reached_absent_sysfs_object(
-                    guest,
-                    Err(errno),
-                    target,
-                    overwritten,
-                ))
-                .await;
-                return Err(if absent { Errno::ENOENT } else { errno }.into());
-            }
+            Self::inject_translated(guest, Syscall::from(statx_asking_classic_mount_id(call)))
+                .await?;
             let statptr = call.statx().ok_or(Errno::EFAULT)?;
             let inode_override = target
                 .descriptor()
@@ -13865,22 +13765,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                     guest.memory().read_value(statptr.0)?
                 }
-            };
-            // An absent sysfs object, as for the other stat calls.
-            let stat = if self.may_reach_absent_sysfs_object(guest, dev) {
-                if Box::pin(self.stat_reached_absent_sysfs_object(
-                    guest,
-                    Ok(dev),
-                    target,
-                    overwritten,
-                ))
-                .await
-                {
-                    return Self::hidden_placeholder_stat(guest, statptr.0.as_raw(), before);
-                }
-                guest.memory().read_value(statptr.0)?
-            } else {
-                stat
             };
             let mut memory = guest.memory();
             // A placeholder another process made, or an earlier image of this

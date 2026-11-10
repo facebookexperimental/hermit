@@ -52806,10 +52806,12 @@ fn cpu_directory_reads_list_only_cpu0_on_every_path() {
 /// The same objects, looked up through symbolic links the test makes
 /// ([`sysfs_links`]), are found or not as by their own paths, also by an
 /// open for writing, `access(W_OK)`, `O_CREAT`, through the guest's own
-/// `/proc/self/fd/<n>` link to the device's directory, and by a stat whose
-/// result overwrites its path; the link itself stays found by lstat,
-/// readlink, `AT_SYMLINK_NOFOLLOW` and an `O_PATH|O_NOFOLLOW` open, and
-/// `O_NOFOLLOW` refuses it with ELOOP, as Linux does. Files of the test's own,
+/// `/proc/self/fd/<n>` link to the device's directory, by a stat whose
+/// result overwrites its path, by readlink, statfs, listxattr, inotify and
+/// chdir, and after a `..` that leaves the absent node directory; the link
+/// itself stays found by lstat, readlink, `AT_SYMLINK_NOFOLLOW`, llistxattr,
+/// `IN_DONT_FOLLOW` and an `O_PATH|O_NOFOLLOW` open, and `O_NOFOLLOW`
+/// refuses it with ELOOP, as Linux does. Files of the test's own,
 /// beside a `subsystem` link to the PCI bus or the NVMe class, keep their
 /// names and bytes, as do the files of an ordinary directory bound over all
 /// of `/sys`: the rules hold only on the guest's sysfs mount.
@@ -52962,7 +52964,21 @@ fn absent_cpu_node_backlinks(backend: &str) {
         "alias lookalike numa_node: \"7\"\n\
          alias nvme-lookalike numa_node: \"7\"\n\
          lookalike dotdot listing numa_node: 1\n\
-         lookalike dotdot openat numa_node: ok\n",
+         lookalike dotdot openat numa_node: ok\n\
+         readlink alias cpu/node0: ENOENT\n\
+         readlink alias cpu/subsystem: ok\n\
+         statfs alias attribute: ENOENT\n\
+         listxattr alias attribute: ENOENT\n\
+         llistxattr alias attribute: ok\n\
+         inotify alias attribute: ENOENT\n\
+         inotify IN_DONT_FOLLOW alias attribute: ok\n\
+         statfs alias control: ok\n\
+         listxattr alias control: ok\n\
+         inotify alias control: ok\n\
+         stat alias nodes/..: ENOENT\n\
+         stat alias cpu/..: ok\n\
+         chdir alias nodes: ENOENT\n\
+         chdir alias device: ok\n",
     );
     // On a host whose kernel has NUMA, the PCI device's attribute and the
     // CPU's node link exist, also through the links: their absence above
@@ -52981,6 +52997,10 @@ fn absent_cpu_node_backlinks(backend: &str) {
             "alias cpu/node0: ok\n",
             "fd stat numa_node: ok\n",
             "overwritten stat alias attribute: ok\n",
+            "readlink alias cpu/node0: ok\n",
+            "statfs alias attribute: ok\n",
+            "stat alias nodes/..: ok\n",
+            "chdir alias nodes: ok\n",
         ] {
             assert!(native.contains(line), "{line:?} natively:\n{native}");
         }

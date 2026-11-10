@@ -373,16 +373,6 @@ fn resolve_links(path: &Path) -> Option<PathBuf> {
     Some(resolved)
 }
 
-/// Whether a call numbered `sysno` is an access probe: `access`, `faccessat`
-/// or `faccessat2` (`Detcore::handle_access_probe`).
-pub(crate) fn is_access_probe(sysno: Sysno) -> bool {
-    #[cfg(target_arch = "x86_64")]
-    if sysno == Sysno::access {
-        return true;
-    }
-    matches!(sysno, Sysno::faccessat | Sysno::faccessat2)
-}
-
 /// Whether a lookup of `spelling` follows a symbolic link that its last name
 /// names, whatever the call's flags: a spelling that ends in `/`, or whose
 /// last name is `.` or `..`, which Linux resolves through what comes before.
@@ -391,43 +381,6 @@ fn follows_last_name(spelling: &Path) -> bool {
     bytes.ends_with(b"/")
         || bytes.rsplit(|byte| *byte == b'/').next() == Some(b".")
         || bytes.rsplit(|byte| *byte == b'/').next() == Some(b"..")
-}
-
-/// The kernel's path for what `named`, an absolute path in the tool's view,
-/// reaches, where that is on the guest's sysfs mount
-/// ([`rendered_procfs::sys_device`]): with every symbolic link on the way
-/// resolved as the kernel resolves them, the one its last name names only
-/// where `follow`, and otherwise that name kept as it is, below its resolved
-/// directory. Where `named` reaches nothing, the longest prefix of it that
-/// reaches something, so resolved, with the rest of its names after it, where
-/// that is on sysfs: the deepest object a lookup that failed below it can
-/// have reached. `None` elsewhere.
-fn resolved_on_sysfs(named: &Path, follow: bool) -> Option<PathBuf> {
-    let sysfs = rendered_procfs::sys_device()?;
-    let on_sysfs =
-        |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.dev() == sysfs);
-    let whole = if follow {
-        crate::util::canonicalize(named).ok()
-    } else {
-        named
-            .file_name()
-            .zip(named.parent())
-            .and_then(|(name, directory)| {
-                Some(crate::util::canonicalize(directory).ok()?.join(name))
-            })
-    };
-    if let Some(whole) = whole
-        && std::fs::symlink_metadata(&whole).is_ok()
-    {
-        return on_sysfs(&whole).then_some(whole);
-    }
-    for prefix in named.ancestors().skip(1) {
-        if let Ok(resolved) = crate::util::canonicalize(prefix) {
-            let rest = named.strip_prefix(prefix).ok()?;
-            return on_sysfs(&resolved).then(|| resolved.join(rest));
-        }
-    }
-    None
 }
 
 /// Whether Linux reports the failure `errno` of a call that looks up a path
@@ -457,12 +410,126 @@ fn fails_after_lookup(errno: Errno) -> bool {
     )
 }
 
-/// A path a call looked up, as the guest spelled it: relative to `dirfd`,
-/// following a symbolic link its last name names where `follow`.
-pub(crate) struct LookedUpPath {
-    pub(crate) dirfd: i32,
-    pub(crate) spelling: PathBuf,
-    pub(crate) follow: bool,
+/// Whether the call `sysno`, its arguments `values`, follows a symbolic link
+/// that the last name of its path operand number `operand` names (in
+/// [`path_operands`]' order), as Linux's lookup of it does
+/// (`LOOKUP_FOLLOW`, fs/namei.c): not for the calls that act on the name
+/// itself (`lstat`, `readlink`, `lchown`, the `l*xattr` calls, and every
+/// call that makes, removes or renames a name), nor where the call's flags
+/// say not to (`AT_SYMLINK_NOFOLLOW`, `O_NOFOLLOW`, `O_CREAT` with
+/// `O_EXCL`, `IN_DONT_FOLLOW`); `linkat` follows its old name only with
+/// `AT_SYMLINK_FOLLOW`. Every other call follows it.
+fn follows_last_link(sysno: Sysno, operand: usize, values: &[usize; 6]) -> bool {
+    // Linux declares the flags `int`.
+    let flags = |position: usize| values[position] as i32;
+    let opens_last = |flags: i32| {
+        flags & libc::O_NOFOLLOW == 0
+            && flags & (libc::O_CREAT | libc::O_EXCL) != libc::O_CREAT | libc::O_EXCL
+    };
+    match sysno {
+        #[cfg(target_arch = "x86_64")]
+        Sysno::lstat
+        | Sysno::lchown
+        | Sysno::readlink
+        | Sysno::mkdir
+        | Sysno::mknod
+        | Sysno::rmdir
+        | Sysno::unlink
+        | Sysno::symlink
+        | Sysno::rename
+        | Sysno::link => false,
+        Sysno::lgetxattr
+        | Sysno::lsetxattr
+        | Sysno::llistxattr
+        | Sysno::lremovexattr
+        | Sysno::readlinkat
+        | Sysno::mkdirat
+        | Sysno::mknodat
+        | Sysno::unlinkat
+        | Sysno::symlinkat
+        | Sysno::renameat
+        | Sysno::renameat2 => false,
+        Sysno::linkat => operand == 0 && flags(4) & libc::AT_SYMLINK_FOLLOW != 0,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::open => opens_last(flags(1)),
+        Sysno::openat => opens_last(flags(2)),
+        Sysno::statx => flags(2) & libc::AT_SYMLINK_NOFOLLOW == 0,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::newfstatat => flags(3) & libc::AT_SYMLINK_NOFOLLOW == 0,
+        #[cfg(target_arch = "aarch64")]
+        Sysno::fstatat => flags(3) & libc::AT_SYMLINK_NOFOLLOW == 0,
+        Sysno::faccessat2 | Sysno::fchmodat2 | Sysno::utimensat => {
+            flags(3) & libc::AT_SYMLINK_NOFOLLOW == 0
+        }
+        Sysno::fchownat | Sysno::execveat => flags(4) & libc::AT_SYMLINK_NOFOLLOW == 0,
+        // The mask is `u32`.
+        Sysno::inotify_add_watch => values[2] as u32 & libc::IN_DONT_FOLLOW == 0,
+        _ => true,
+    }
+}
+
+/// The first object that `is_absent` finds absent on Linux's walk of
+/// `named`, an absolute path in the tool's view, as the entry `name` of the
+/// directory the walk has reached (`is_absent(directory, name)`), with the
+/// names the walk had still to look up after it. The walk looks up each
+/// name in turn in the directory it has reached, follows the symbolic link
+/// that name is (the last name's only where `follow`), and takes a `..` in
+/// the directory it has reached, as `link_path_walk` does (fs/namei.c). It
+/// ends, finding nothing, at a name that is missing or below one that is no
+/// directory, where Linux's walk fails as it would without the absent
+/// object, and past `MAXSYMLINKS` links (ELOOP).
+fn absent_on_walk(
+    named: &Path,
+    follow: bool,
+    is_absent: impl Fn(&Path, &[u8]) -> bool,
+) -> Option<(PathBuf, PathBuf)> {
+    let mut pending = named.components().map(owned).collect::<VecDeque<_>>();
+    let mut resolved = PathBuf::from("/");
+    let mut links = 0;
+    while let Some(component) = pending.pop_front() {
+        let name = match component {
+            Owned::Root => {
+                resolved = PathBuf::from("/");
+                continue;
+            }
+            Owned::Current => continue,
+            Owned::Parent => {
+                resolved.pop();
+                continue;
+            }
+            Owned::Name(name) => name,
+        };
+        let next = resolved.join(&name);
+        if is_absent(&resolved, name.as_bytes()) {
+            let mut rest = PathBuf::new();
+            for component in pending {
+                match component {
+                    Owned::Name(name) => rest.push(name),
+                    Owned::Parent => rest.push(".."),
+                    Owned::Root | Owned::Current => {}
+                }
+            }
+            return Some((next, rest));
+        }
+        if pending.is_empty() && !follow {
+            return None;
+        }
+        match std::fs::read_link(&next) {
+            Ok(target) => {
+                links += 1;
+                if links > MAXSYMLINKS {
+                    return None;
+                }
+                for component in target.components().rev() {
+                    pending.push_front(owned(component));
+                }
+            }
+            // An object that is no symbolic link.
+            Err(error) if error.raw_os_error() == Some(libc::EINVAL) => resolved = next,
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 /// A path component, owned.
@@ -629,6 +696,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Lookups::Paths(operands) => {
                 let mut replacements = Vec::new();
                 for (index, (dirfd, path)) in operands.into_iter().enumerate() {
+                    let follow = follows_last_link(sysno, index, &values);
                     let decision = match PathPtr::from_ptr(values[path] as *const libc::c_char)
                         .and_then(|address| address.read(&guest.memory()).ok())
                     {
@@ -639,6 +707,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                                 &directory.join(&spelling),
                                 &root,
                                 numbers.as_ref(),
+                                follow,
                             ),
                             None => self.decide(
                                 guest,
@@ -646,6 +715,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                                 &spelling,
                                 &root,
                                 numbers.as_ref(),
+                                follow,
                             ),
                         },
                         None => Decision::default(),
@@ -671,9 +741,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 };
                 let Some(bytes) = self.substituted_socket_address(
                     guest,
+                    sysno,
                     values[address] as u64,
                     length_value,
-                    send,
                     &root,
                     numbers.as_ref(),
                 ) else {
@@ -709,9 +779,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .then(|| {
                         self.substituted_socket_address(
                             guest,
+                            sysno,
                             name,
                             length as usize,
-                            true,
                             &root,
                             numbers.as_ref(),
                         )
@@ -834,10 +904,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// What Detcore decides about `spelling`, relative to `dirfd` (`None`
-    /// for the working directory). It decides nothing for an empty or
-    /// overlong spelling, one it cannot place (a working directory outside
-    /// the root, a directory descriptor whose path it does not know, or, after
-    /// a `chroot`, any directory descriptor: its recorded path may be in the
+    /// for the working directory), which the call looks up following the
+    /// symbolic link its last name names where `follow`
+    /// ([`follows_last_link`]). It decides nothing for an empty or overlong
+    /// spelling, one it cannot place (a working directory outside the root, a
+    /// directory descriptor whose path it does not know, or, after a
+    /// `chroot`, any directory descriptor: its recorded path may be in the
     /// old root's view), and one whose omitted name is not in a procfs
     /// directory (a user bind over part of /proc).
     fn decide<G: Guest<Self>>(
@@ -847,6 +919,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         spelling: &Path,
         root: &Option<PathBuf>,
         numbers: Option<&BTreeMap<i32, Option<i32>>>,
+        follow: bool,
     ) -> Decision {
         let bytes = spelling.as_os_str().as_bytes();
         if bytes.is_empty() || bytes.len() >= PATH_MAX {
@@ -946,6 +1019,22 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             dashed_spelling(parent, &prefix, &observed, bytes)
         });
+        // Either, reached however the lookup reaches it: through a symbolic
+        // link to it or to a directory above it, a `..`, or the guest's own
+        // `/proc/self/fd/<n>`, as Linux's walk of the path in the tool's view
+        // does, for every call that looks a path up, following the link the
+        // last name names as the call does
+        // (`Detcore::absent_sysfs_object_on_walk`). The kernel is given the
+        // object's own path, dashed, and the names the walk had still to look
+        // up, so the call fails as one naming the object does.
+        let substituted = substituted.or_else(|| {
+            if !self.cfg.virtualize_metadata || root.is_some() || self.cfg.recordreplay_modes {
+                return None;
+            }
+            let (absent, rest) =
+                self.absent_sysfs_object_on_walk(guest, dirfd, spelling, follow)?;
+            dashed_spelling(absent.parent()?, &absent, &absent.join(rest), bytes)
+        });
         Decision {
             substituted,
             decided,
@@ -1012,21 +1101,25 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// An `AF_UNIX` address naming the substituted path, if the address at
-    /// `address`, `length` bytes long, is a pathname address that reaches a
-    /// `/proc` name outside the level. A send's address is looked up only by
-    /// a datagram socket, whose type the caller asks the socket for, so a
-    /// send is checked only outside record and replay (whose replayed
-    /// descriptor is not the socket); the caller refuses one whose
-    /// substituted address does not fit.
+    /// `address`, `length` bytes long, that the socket call `sysno` gives is
+    /// a pathname address that reaches a `/proc` name outside the level, or a
+    /// sysfs object the machine Detcore presents does not have. A send's
+    /// address is looked up only by a datagram socket, whose type the caller
+    /// asks the socket for, so a send is checked only outside record and
+    /// replay (whose replayed descriptor is not the socket); the caller
+    /// refuses one whose substituted address does not fit. A bind makes its
+    /// name, and a connect or a send looks it up, following a symbolic link
+    /// it names (`unix_find_bsd`, net/unix/af_unix.c).
     fn substituted_socket_address<G: Guest<Self>>(
         &self,
         guest: &G,
+        sysno: Sysno,
         address: u64,
         length: usize,
-        send: bool,
         root: &Option<PathBuf>,
         numbers: Option<&BTreeMap<i32, Option<i32>>>,
     ) -> Option<Vec<u8>> {
+        let send = matches!(sysno, Sysno::sendto | Sysno::sendmsg);
         if length > std::mem::size_of::<libc::sockaddr_un>()
             || (send && self.cfg.recordreplay_modes)
         {
@@ -1038,7 +1131,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             .read_exact(Addr::<u8>::from_raw(address as usize)?, &mut bytes)
             .ok()?;
         let path = PathBuf::from(OsStr::from_bytes(unix_address_path(&bytes)?));
-        let substituted = self.decide(guest, None, &path, root, numbers).substituted?;
+        let substituted = self
+            .decide(guest, None, &path, root, numbers, sysno != Sysno::bind)
+            .substituted?;
         unix_address(&substituted)
     }
 
@@ -1324,12 +1419,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    /// Whether Detcore checks the sysfs object a call reached
-    /// ([`Self::is_absent_sysfs_object`]) once the call has run: where the
-    /// lookup check leaves the same objects out by their spelling
-    /// ([`Self::decide`]) and the listings drop them
-    /// (`Detcore::drop_absent_entries`), in run mode with virtualized
-    /// metadata, where the guest's `/sys` is a sysfs mount
+    /// Whether Detcore checks the sysfs object an open reached
+    /// ([`Self::is_absent_sysfs_object`]) once the open has run: where the
+    /// lookup check leaves the same objects out ([`Self::decide`]) and the
+    /// listings drop them (`Detcore::drop_absent_entries`), in run mode with
+    /// virtualized metadata, where the guest's `/sys` is a sysfs mount
     /// ([`rendered_procfs::sys_device`]), and, as there, only before any
     /// `chroot`, as the tool reads the object's path in its own root.
     fn checks_reached_sysfs_objects<G: Guest<Self>>(&self, guest: &G) -> bool {
@@ -1401,29 +1495,33 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// `spelling`, which a call looks up relative to `dirfd`, as an absolute
     /// path in the tool's view that leads where the guest's lookup does:
-    /// below the guest's working directory ([`Self::observed_path`]) or the
-    /// descriptor's directory, by the kernel's path for it
-    /// ([`Self::descriptor_path_in_tool_view`]). Through the guest's own
-    /// `/proc/self` or `/proc/thread-self`: its descriptor's path for
-    /// `fd/<n>`, and `/` for its `root`; anything else there by the caller's
-    /// numbers where the tool's `/proc` entry for the caller is the caller's,
-    /// and not placed where it is not (KVM). `None` where it cannot be
-    /// placed.
+    /// below the guest's working directory or the descriptor's directory as
+    /// Detcore knows them ([`Self::observed_path`]), or, for a descriptor
+    /// whose recorded path is a descriptor link's spelling or that has none,
+    /// by the kernel's path for it ([`Self::descriptor_path_in_tool_view`]).
+    /// Through the guest's own `/proc/self` or `/proc/thread-self`: its
+    /// descriptor's path for `fd/<n>`, and `/` for its `root`; anything else
+    /// there by the caller's numbers where the tool's `/proc` entry for the
+    /// caller is the caller's, and not placed where it is not (KVM). `None`
+    /// where it cannot be placed.
     fn named_in_tool_view<G: Guest<Self>>(
         &self,
         guest: &G,
         dirfd: i32,
         spelling: &Path,
     ) -> Option<PathBuf> {
-        let named = if spelling.is_absolute() || dirfd == libc::AT_FDCWD {
-            Self::observed_path(guest, dirfd, spelling).ok()?
-        } else {
-            self.descriptor_path_in_tool_view(guest, dirfd)?
-                .join(spelling)
+        let named = match Self::observed_path(guest, dirfd, spelling) {
+            Ok(observed)
+                if observed.is_absolute()
+                    && !Self::starts_at_a_recorded_link(guest, dirfd, spelling) =>
+            {
+                observed
+            }
+            _ if dirfd != libc::AT_FDCWD && !spelling.is_absolute() => self
+                .descriptor_path_in_tool_view(guest, dirfd)?
+                .join(spelling),
+            _ => return None,
         };
-        if !named.is_absolute() {
-            return None;
-        }
         let Ok(below) = named.strip_prefix("/proc") else {
             return Some(named);
         };
@@ -1460,207 +1558,69 @@ impl<T: RecordOrReplay> Detcore<T> {
         Some(Path::new(&caller).join(below.components().skip(1).collect::<PathBuf>()))
     }
 
-    /// The kernel's path, in the tool's view, for the sysfs object the
-    /// machine Detcore presents does not have
-    /// ([`Self::is_absent_sysfs_object`]) that a lookup of `spelling`
-    /// relative to `dirfd` went through, following a symbolic link its last
-    /// name names where `follow` (or the spelling itself does:
-    /// [`follows_last_name`]), where Detcore checks such objects
-    /// ([`Self::checks_reached_sysfs_objects`]). For a call that `succeeded`,
-    /// the object it reached, asked first by a stat in the tool's view, so
-    /// that a lookup that reached no sysfs object costs one; for a call that
-    /// failed, the deepest object its lookup can have reached
-    /// ([`resolved_on_sysfs`]). `None` where it went through no such object.
-    pub(crate) async fn absent_sysfs_object_reached<G: Guest<Self>>(
+    /// The first sysfs object the machine Detcore presents does not have
+    /// that Linux's walk of `spelling`, relative to `dirfd`, reaches
+    /// ([`absent_on_walk`]), following the symbolic link its last name names
+    /// where `follow` (or where the spelling itself does:
+    /// [`follows_last_name`]), as a path in the tool's view, with the names
+    /// the walk had still to look up after it: a CPU or node entry of the
+    /// directories that list them, or a device's NUMA attribute that a
+    /// kernel without NUMA does not register
+    /// ([`crate::procfs::is_absent_cpu_entry`],
+    /// [`crate::procfs::is_absent_device_attribute`]), in a directory on the
+    /// guest's sysfs mount ([`rendered_procfs::sys_device`]). So a symbolic
+    /// link to such an object or to a directory above it, a `..`, and the
+    /// guest's own `/proc/self/fd/<n>` reach it as its own path does
+    /// ([`Self::named_in_tool_view`]).
+    ///
+    /// The walk reads each link on the way, so it runs only where a stat in
+    /// the tool's view, by the same `follow`, finds what the path names on
+    /// the guest's sysfs mount, or fails as only a lookup that found an
+    /// object fails ([`fails_after_lookup`]): a lookup that reaches no sysfs
+    /// object costs that one stat. One that fails with ENOENT is not walked,
+    /// as it fails with ENOENT on the machine Detcore presents too.
+    fn absent_sysfs_object_on_walk<G: Guest<Self>>(
         &self,
-        guest: &mut G,
+        guest: &G,
         dirfd: i32,
         spelling: &Path,
         follow: bool,
-        succeeded: bool,
-    ) -> Option<PathBuf> {
-        if !self.checks_reached_sysfs_objects(guest) {
-            return None;
-        }
-        let follow = follow || follows_last_name(spelling);
-        Self::prepare_guest_cwd(guest, dirfd, spelling).await;
+    ) -> Option<(PathBuf, PathBuf)> {
+        let sysfs = rendered_procfs::sys_device()?;
         let named = self.named_in_tool_view(guest, dirfd, spelling)?;
-        if succeeded {
-            let metadata = if follow {
-                std::fs::metadata(&named)
-            } else {
-                std::fs::symlink_metadata(&named)
-            };
-            if !metadata.is_ok_and(|metadata| Some(metadata.dev()) == rendered_procfs::sys_device())
-            {
-                return None;
-            }
-        }
-        resolved_on_sysfs(&named, follow).filter(|reached| self.is_absent_sysfs_object(reached))
-    }
-
-    /// Whether a stat call whose result is on the device `dev` may have
-    /// reached a sysfs object the machine Detcore presents does not have
-    /// ([`Self::stat_reached_absent_sysfs_object`] decides): a result on the
-    /// guest's sysfs mount, where Detcore checks such objects.
-    pub(crate) fn may_reach_absent_sysfs_object<G: Guest<Self>>(
-        &self,
-        guest: &G,
-        dev: u64,
-    ) -> bool {
-        Some(dev) == rendered_procfs::sys_device() && self.checks_reached_sysfs_objects(guest)
-    }
-
-    /// Whether a stat call that looked up `target` went through a sysfs
-    /// object the machine Detcore presents does not have
-    /// ([`Self::is_absent_sysfs_object`]), by a spelling the lookup check does
-    /// not resolve: a symbolic link to it, or to a directory above it. Where
-    /// the call's result overwrote its path, the path is `overwritten`, read
-    /// before the call. Of a call that succeeded (`outcome` the device of its
-    /// result), asked only for a result on the guest's sysfs mount; of one
-    /// that failed, only for a failure Linux reports once its lookup found an
-    /// object ([`fails_after_lookup`]).
-    pub(super) async fn stat_reached_absent_sysfs_object<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        outcome: Result<u64, Errno>,
-        target: super::StatTarget<'_>,
-        overwritten: Option<LookedUpPath>,
-    ) -> bool {
-        let succeeded = match outcome {
-            Ok(dev) if self.may_reach_absent_sysfs_object(guest, dev) => true,
-            Err(errno) if fails_after_lookup(errno) => false,
-            _ => return false,
+        let follow = follow || follows_last_name(spelling);
+        let reached = if follow {
+            std::fs::metadata(&named)
+        } else {
+            std::fs::symlink_metadata(&named)
         };
-        let looked_up = match target {
-            super::StatTarget::Descriptor(fd) => {
-                return succeeded
-                    && self
-                        .descriptor_path_in_tool_view(guest, fd)
-                        .is_some_and(|path| self.is_absent_sysfs_object(&path));
-            }
-            super::StatTarget::Cwd => Some(LookedUpPath {
-                dirfd: libc::AT_FDCWD,
-                spelling: PathBuf::from("."),
-                follow: true,
-            }),
-            super::StatTarget::Path {
-                dirfd,
-                path,
-                follow,
-            } => path
-                .and_then(|path| path.read(&guest.memory()).ok())
-                .map(|spelling| LookedUpPath {
-                    dirfd,
-                    spelling,
-                    follow,
-                }),
-            super::StatTarget::Overwritten => overwritten,
+        let walks = match reached {
+            Ok(metadata) => metadata.dev() == sysfs,
+            Err(error) => error
+                .raw_os_error()
+                .is_some_and(|errno| fails_after_lookup(Errno::new(errno))),
         };
-        let Some(LookedUpPath {
-            dirfd,
-            spelling,
-            follow,
-        }) = looked_up
-        else {
-            return false;
-        };
-        self.absent_sysfs_object_reached(guest, dirfd, &spelling, follow, succeeded)
-            .await
-            .is_some()
-    }
-
-    /// An access probe (`access`, `faccessat` or `faccessat2`), passed
-    /// through, but `ENOENT` where its lookup went through a sysfs object the
-    /// machine Detcore presents does not have
-    /// ([`Self::absent_sysfs_object_reached`]) by a spelling the lookup check
-    /// does not resolve, as a probe that names the object fails: whether the
-    /// probe succeeded or failed once its lookup found the object (`W_OK` on
-    /// a read-only attribute, say: [`fails_after_lookup`]).
-    pub(crate) async fn handle_access_probe<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        call: Syscall,
-    ) -> Result<i64, Error> {
-        let result = self.passthrough(guest, call).await;
-        let succeeded = match &result {
-            Ok(_) => true,
-            Err(Error::Errno(errno)) if fails_after_lookup(*errno) => false,
-            Err(_) => return result,
-        };
-        if !self.checks_reached_sysfs_objects(guest) {
-            return result;
-        }
-        let (sysno, args) = call.into_parts();
-        // Linux declares the flags `int`.
-        let (dirfd, path, flags) = match sysno {
-            #[cfg(target_arch = "x86_64")]
-            Sysno::access => (libc::AT_FDCWD, args.arg0, 0),
-            Sysno::faccessat => (args.arg0 as i32, args.arg1, 0),
-            _ => (args.arg0 as i32, args.arg1, args.arg3 as i32),
-        };
-        let Some(spelling) = PathPtr::from_ptr(path as *const libc::c_char)
-            .and_then(|path| path.read(&guest.memory()).ok())
-        else {
-            return result;
-        };
-        // An empty path with `AT_EMPTY_PATH` probes the directory itself.
-        let (spelling, follow) =
-            if spelling.as_os_str().is_empty() && flags & libc::AT_EMPTY_PATH != 0 {
-                (PathBuf::from("."), true)
-            } else {
-                (spelling, flags & libc::AT_SYMLINK_NOFOLLOW == 0)
-            };
-        match self
-            .absent_sysfs_object_reached(guest, dirfd, &spelling, follow, succeeded)
-            .await
-        {
-            Some(_) => Err(Errno::ENOENT.into()),
-            None => result,
-        }
-    }
-
-    /// The answer to the open `call` of `spelling`, which failed with
-    /// `errno`, where its lookup went through a sysfs object the machine
-    /// Detcore presents does not have
-    /// ([`Self::absent_sysfs_object_reached`]) by a spelling the lookup check
-    /// does not resolve: as an open of that object's own path fails
-    /// ([`Self::answer_open_of_absent_sysfs_object`]), not, say, with the
-    /// `EACCES` of a write to it. `None` elsewhere, where `errno` stands. With
-    /// `O_NOFOLLOW`, or `O_CREAT` and `O_EXCL`, a link the last name names is
-    /// not followed: the open is of the link.
-    pub(crate) async fn failed_open_answer<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        call: &syscalls::Openat,
-        spelling: &Path,
-        errno: Errno,
-    ) -> Option<Error> {
-        use nix::fcntl::OFlag;
-        if !fails_after_lookup(errno) {
+        if !walks {
             return None;
         }
-        let flags = call.flags();
-        let follow =
-            !flags.contains(OFlag::O_NOFOLLOW) && !flags.contains(OFlag::O_CREAT | OFlag::O_EXCL);
-        let object = self
-            .absent_sysfs_object_reached(guest, call.dirfd(), spelling, follow, false)
-            .await?;
-        Some(
-            self.answer_open_of_absent_sysfs_object(guest, call, &object)
-                .await,
-        )
+        let cpus = self.cfg.virtual_cpu_count();
+        absent_on_walk(&named, follow, |directory, name| {
+            (crate::procfs::is_absent_cpu_entry(directory, name, cpus)
+                || crate::procfs::is_absent_device_attribute(directory, name))
+                && std::fs::metadata(directory).is_ok_and(|metadata| metadata.dev() == sysfs)
+        })
     }
 
-    /// The answer to the open `call` where it went through `object`, a sysfs
-    /// object the machine Detcore presents does not have
-    /// ([`Self::is_absent_sysfs_object`]), by a spelling the lookup check
-    /// does not resolve: that of an open of the object's own path, with the
-    /// absent name dashed as the lookup check dashes it ([`dashed_spelling`]),
-    /// which is ENOENT, except that with `O_CREAT` the kernel says whether
-    /// the name could be made in that sysfs directory (it refuses, as a
-    /// read-only mount or for permission), so it is asked
-    /// ([`Self::issue_substituted`]).
+    /// The answer to the open `call` where the kernel opened `object`, a
+    /// sysfs object the machine Detcore presents does not have
+    /// ([`Self::is_absent_sysfs_object`]), which the lookup check
+    /// ([`Self::decide`]) did not find on the walk it made before the open (a
+    /// link the guest changed in between, say): that of an open of the
+    /// object's own path, with the absent name dashed as the lookup check
+    /// dashes it ([`dashed_spelling`]), which is ENOENT, except that with
+    /// `O_CREAT` the kernel says whether the name could be made in that sysfs
+    /// directory (it refuses, as a read-only mount or for permission), so it
+    /// is asked ([`Self::issue_substituted`]).
     pub(crate) async fn answer_open_of_absent_sysfs_object<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2284,10 +2244,10 @@ mod tests {
     }
 
     /// The failures Linux reports once its lookup found an object are the
-    /// ones a late check of the object looks at; those it reports before its
-    /// lookup, and `ENOENT`, are not.
+    /// ones for which a lookup is walked; those it reports before its lookup,
+    /// and `ENOENT`, are not.
     #[test]
-    fn only_a_failure_after_the_lookup_is_looked_at() {
+    fn only_a_failure_after_the_lookup_is_walked() {
         for errno in [
             Errno::EACCES,
             Errno::EPERM,
@@ -2309,58 +2269,156 @@ mod tests {
         ] {
             assert!(!fails_after_lookup(errno), "{errno}");
         }
-        #[cfg(target_arch = "x86_64")]
-        assert!(is_access_probe(Sysno::access));
-        assert!(is_access_probe(Sysno::faccessat));
-        assert!(is_access_probe(Sysno::faccessat2));
-        assert!(!is_access_probe(Sysno::newfstatat));
     }
 
-    /// What a path in the tool's view reaches on the guest's sysfs mount, as
-    /// the kernel resolves it: through links, the last one only where
-    /// followed; below an object a lookup cannot go into, the object and the
-    /// names after it; and nothing for what is not on sysfs. Skipped where
-    /// `/sys` is no sysfs mount.
+    /// Each call follows the symbolic link its last name names as Linux's
+    /// lookup does: not where the call acts on the name itself, nor where its
+    /// flags say not to; `linkat` follows its old name only with
+    /// `AT_SYMLINK_FOLLOW`, and never its new one.
     #[test]
-    fn a_path_resolves_to_what_it_reaches_on_sysfs() {
-        if rendered_procfs::sys_device().is_none() {
-            return;
+    fn each_call_follows_its_last_link_as_linux_does() {
+        let none = [0usize; 6];
+        let with = |position: usize, value: i32| {
+            let mut values = [0usize; 6];
+            values[position] = value as usize;
+            values
+        };
+        for sysno in [
+            Sysno::chdir,
+            Sysno::chroot,
+            Sysno::statfs,
+            Sysno::getxattr,
+            Sysno::listxattr,
+            Sysno::truncate,
+            Sysno::execve,
+            Sysno::faccessat,
+            Sysno::fchmodat,
+            Sysno::utimensat,
+            Sysno::inotify_add_watch,
+        ] {
+            assert!(follows_last_link(sysno, 0, &none), "{sysno:?}");
         }
-        let cpu = Path::new("/sys/devices/system/cpu/cpu0");
-        assert_eq!(
-            resolved_on_sysfs(&cpu.join("topology/core_id"), true).as_deref(),
-            Some(cpu.join("topology/core_id").as_path())
-        );
-        // `/sys/bus/cpu/devices/cpu0` is a link to cpu0's directory.
-        let alias = Path::new("/sys/bus/cpu/devices/cpu0");
-        assert_eq!(
-            resolved_on_sysfs(&alias.join("topology/core_id"), true).as_deref(),
-            Some(cpu.join("topology/core_id").as_path())
-        );
-        assert_eq!(resolved_on_sysfs(alias, true).as_deref(), Some(cpu));
-        assert_eq!(resolved_on_sysfs(alias, false).as_deref(), Some(alias));
-        assert_eq!(
-            resolved_on_sysfs(&cpu.join("topology/core_id/x"), true).as_deref(),
-            Some(cpu.join("topology/core_id/x").as_path())
-        );
+        for sysno in [
+            Sysno::readlinkat,
+            Sysno::lgetxattr,
+            Sysno::llistxattr,
+            Sysno::mkdirat,
+            Sysno::mknodat,
+            Sysno::unlinkat,
+            Sysno::renameat2,
+            Sysno::symlinkat,
+        ] {
+            assert!(!follows_last_link(sysno, 0, &none), "{sysno:?}");
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert!(follows_last_link(Sysno::stat, 0, &none));
+            assert!(!follows_last_link(Sysno::lstat, 0, &none));
+            assert!(!follows_last_link(Sysno::readlink, 0, &none));
+            assert!(follows_last_link(Sysno::open, 0, &with(1, libc::O_RDONLY)));
+            assert!(!follows_last_link(
+                Sysno::open,
+                0,
+                &with(1, libc::O_NOFOLLOW)
+            ));
+            assert!(follows_last_link(Sysno::newfstatat, 0, &none));
+            assert!(!follows_last_link(
+                Sysno::newfstatat,
+                0,
+                &with(3, libc::AT_SYMLINK_NOFOLLOW)
+            ));
+            assert!(!follows_last_link(Sysno::link, 0, &none));
+        }
+        let create = libc::O_CREAT | libc::O_WRONLY;
+        assert!(follows_last_link(Sysno::openat, 0, &with(2, create)));
+        assert!(!follows_last_link(
+            Sysno::openat,
+            0,
+            &with(2, create | libc::O_EXCL)
+        ));
+        assert!(!follows_last_link(
+            Sysno::openat,
+            0,
+            &with(2, libc::O_PATH | libc::O_NOFOLLOW)
+        ));
+        let nofollow = libc::AT_SYMLINK_NOFOLLOW;
+        assert!(!follows_last_link(Sysno::statx, 0, &with(2, nofollow)));
+        assert!(!follows_last_link(Sysno::faccessat2, 0, &with(3, nofollow)));
+        assert!(!follows_last_link(Sysno::fchownat, 0, &with(4, nofollow)));
+        assert!(!follows_last_link(Sysno::execveat, 0, &with(4, nofollow)));
+        assert!(!follows_last_link(
+            Sysno::inotify_add_watch,
+            0,
+            &with(2, libc::IN_DONT_FOLLOW as i32)
+        ));
+        let follow = with(4, libc::AT_SYMLINK_FOLLOW);
+        assert!(follows_last_link(Sysno::linkat, 0, &follow));
+        assert!(!follows_last_link(Sysno::linkat, 1, &follow));
+        assert!(!follows_last_link(Sysno::linkat, 0, &none));
+    }
+
+    /// Linux's walk of a path, as `absent_on_walk` takes it: each name in the
+    /// directory the walk has reached, the links on the way followed (the
+    /// last one only where the call follows it), and a `..` taken where the
+    /// walk is. It ends at the first absent entry, with the names after it;
+    /// it finds nothing at a missing name, below a file, or in a link loop.
+    #[test]
+    fn a_walk_ends_at_the_first_absent_entry() {
         let directory = tempfile::tempdir().unwrap();
-        let link = directory.path().join("link");
-        std::os::unix::fs::symlink(cpu, &link).unwrap();
-        assert_eq!(resolved_on_sysfs(&link, true).as_deref(), Some(cpu));
+        let root = crate::util::canonicalize(directory.path()).unwrap();
+        let tree = root.join("tree");
+        std::fs::create_dir_all(tree.join("cpu0")).unwrap();
+        std::fs::create_dir_all(tree.join("node/node0")).unwrap();
+        std::fs::write(tree.join("cpu0/core_id"), "0\n").unwrap();
+        std::fs::write(tree.join("node/node0/cpulist"), "0\n").unwrap();
+        std::os::unix::fs::symlink("../node/node0", tree.join("cpu0/node0")).unwrap();
+        let links = root.join("links");
+        std::fs::create_dir(&links).unwrap();
+        std::os::unix::fs::symlink(tree.join("cpu0"), links.join("cpu")).unwrap();
+        std::os::unix::fs::symlink(tree.join("node"), links.join("nodes")).unwrap();
+        std::os::unix::fs::symlink("cpu", links.join("again")).unwrap();
+        std::os::unix::fs::symlink("loop", links.join("loop")).unwrap();
+        // The `node` directory and every CPU's link to a node are absent.
+        let cpu0 = tree.join("cpu0");
+        let absent = |directory: &Path, name: &[u8]| {
+            (directory == tree && name == b"node")
+                || (directory == cpu0 && name.starts_with(b"node"))
+        };
+        let walk = |path: &Path, follow: bool| absent_on_walk(path, follow, absent);
+        // By its own path, below it, and through a link to it.
         assert_eq!(
-            resolved_on_sysfs(&link.join("topology/core_id"), false).as_deref(),
-            Some(cpu.join("topology/core_id").as_path())
-        );
-        // The link itself is no sysfs object, nor is an ordinary file.
-        assert_eq!(resolved_on_sysfs(&link, false), None);
-        std::fs::write(directory.path().join("file"), "").unwrap();
-        assert_eq!(
-            resolved_on_sysfs(&directory.path().join("file"), true),
-            None
+            walk(&tree.join("node"), true),
+            Some((tree.join("node"), PathBuf::new()))
         );
         assert_eq!(
-            resolved_on_sysfs(&directory.path().join("file/x"), true),
-            None
+            walk(&tree.join("node/node0/cpulist"), true),
+            Some((tree.join("node"), PathBuf::from("node0/cpulist")))
         );
+        assert_eq!(
+            walk(&links.join("nodes"), true),
+            Some((tree.join("node"), PathBuf::new()))
+        );
+        // The link itself, not followed, is the guest's own.
+        assert_eq!(walk(&links.join("nodes"), false), None);
+        // A CPU's node link, not followed, through links to its directory.
+        assert_eq!(
+            walk(&links.join("cpu/node0"), false),
+            Some((cpu0.join("node0"), PathBuf::new()))
+        );
+        assert_eq!(
+            walk(&links.join("again/node0"), true),
+            Some((cpu0.join("node0"), PathBuf::new()))
+        );
+        // A `..` after the absent object still went through it.
+        assert_eq!(
+            walk(&links.join("nodes/.."), true),
+            Some((tree.join("node"), PathBuf::from("..")))
+        );
+        // A neighbour stays, as do a missing name and a name below a file.
+        assert_eq!(walk(&links.join("cpu/core_id"), true), None);
+        assert_eq!(walk(&links.join("cpu/missing/node0"), true), None);
+        assert_eq!(walk(&links.join("cpu/core_id/node0"), true), None);
+        // A link loop ends the walk, as ELOOP ends Linux's.
+        assert_eq!(walk(&links.join("loop/x"), true), None);
     }
 }

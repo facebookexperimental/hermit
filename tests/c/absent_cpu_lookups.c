@@ -23,8 +23,8 @@
 // NUMA's too, and reads the attributes such a kernel keeps with a value of
 // its own: the first NVMe controller's `numa_node`, and a CXL DAX device's
 // `target_node`. Given a directory, `backlinks DIRECTORY` last looks up the
-// same objects through the symbolic links the caller made there (see
-// `aliases`).
+// same objects through the symbolic links the caller made there, by every
+// call that looks a path up (see `aliases`).
 //
 // The lookups name the absent entry absolutely, below it, relative to a
 // directory descriptor, through /sys/bus (including the processor driver's
@@ -41,8 +41,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/inotify.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/syscall.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 static void report(const char *what, int rc) {
@@ -265,8 +268,10 @@ static void node_value(const char *label, const char *devices, const char *name,
  * `nvme-lookalike`, directories each with a `numa_node` and a `subsystem`
  * link to the PCI bus or the NVMe class). Through a link, an object is
  * found, or not, as by its own path, whether the call follows the link or
- * fails once its lookup found the object; the link itself is found by
- * lstat, readlink and an O_PATH|O_NOFOLLOW open. */
+ * fails once its lookup found the object, by every call that looks a path
+ * up (readlink, statfs, the xattr calls, inotify, chdir), and after a `..`
+ * that leaves it; the link itself is found by lstat, readlink, llistxattr,
+ * IN_DONT_FOLLOW and an O_PATH|O_NOFOLLOW open. */
 static void aliases(const char *directory) {
     static const char *const names[] = {
         "attribute",       "control",
@@ -375,6 +380,45 @@ static void aliases(const char *directory) {
     print_contents("alias nvme-lookalike numa_node", path);
     snprintf(path, sizeof(path), "%s/lookalike/../lookalike", directory);
     listed_and_opened("lookalike dotdot", path, "numa_node");
+
+    /* The other calls that look a path up, each beside a control. */
+    struct statfs fs;
+    snprintf(path, sizeof(path), "%s/cpu/node0", directory);
+    report("readlink alias cpu/node0", (int)readlink(path, target, sizeof(target)));
+    snprintf(path, sizeof(path), "%s/cpu/subsystem", directory);
+    report("readlink alias cpu/subsystem", (int)readlink(path, target, sizeof(target)));
+    snprintf(path, sizeof(path), "%s/attribute", directory);
+    report("statfs alias attribute", statfs(path, &fs));
+    report("listxattr alias attribute", (int)listxattr(path, NULL, 0));
+    report("llistxattr alias attribute", (int)llistxattr(path, NULL, 0));
+    int notify = inotify_init1(IN_CLOEXEC);
+    report("inotify alias attribute", inotify_add_watch(notify, path, IN_ATTRIB));
+    report("inotify IN_DONT_FOLLOW alias attribute",
+           inotify_add_watch(notify, path, IN_ATTRIB | IN_DONT_FOLLOW));
+    snprintf(path, sizeof(path), "%s/control", directory);
+    report("statfs alias control", statfs(path, &fs));
+    report("listxattr alias control", (int)listxattr(path, NULL, 0));
+    report("inotify alias control", inotify_add_watch(notify, path, IN_ATTRIB));
+    if (notify >= 0) {
+        close(notify);
+    }
+    snprintf(path, sizeof(path), "%s/nodes/..", directory);
+    report("stat alias nodes/..", stat(path, &st));
+    snprintf(path, sizeof(path), "%s/cpu/..", directory);
+    report("stat alias cpu/..", stat(path, &st));
+    char here[PATH_MAX];
+    if (getcwd(here, sizeof(here)) != NULL) {
+        const char *const directories[] = {"nodes", "device"};
+        for (size_t i = 0; i < sizeof(directories) / sizeof(directories[0]); i++) {
+            snprintf(path, sizeof(path), "%s/%s", directory, directories[i]);
+            snprintf(label, sizeof(label), "chdir alias %s", directories[i]);
+            int changed = chdir(path);
+            report(label, changed);
+            if (changed == 0 && chdir(here) != 0) {
+                printf("chdir back: %s\n", strerrorname_np(errno));
+            }
+        }
+    }
 }
 
 static int backlinks(const char *directory) {

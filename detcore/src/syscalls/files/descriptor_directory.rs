@@ -1951,24 +1951,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// before the call writes it, where a placeholder directory exists (KVM:
     /// `DetConfig::directory_placeholder`), so that a call that reaches the
     /// directory can leave the buffer as Linux leaves it on its `ENOENT`,
-    /// untouched ([`Self::hidden_placeholder_stat`]); and so for a call that
-    /// reaches a sysfs object the machine Detcore presents does not have,
-    /// where Detcore checks such objects after the call (run mode with
-    /// virtualized metadata and a sysfs mount;
-    /// `Detcore::stat_reached_absent_sysfs_object`). `None` elsewhere, and
+    /// untouched ([`Self::hidden_placeholder_stat`]). `None` elsewhere, and
     /// for a buffer that cannot be read, which the call cannot write either.
     pub(crate) fn stat_buffer_before<G: Guest<Self>>(
         guest: &G,
         buffer: Option<usize>,
         size: usize,
     ) -> Option<Vec<u8>> {
-        let config = guest.config();
-        let checks_sysfs = config.virtualize_metadata
-            && !config.recordreplay_modes
-            && super::rendered_procfs::sys_device().is_some();
-        if config.directory_placeholder.is_none() && !checks_sysfs {
-            return None;
-        }
+        guest.config().directory_placeholder.as_ref()?;
         let start = reverie::syscalls::Addr::<u8>::from_raw(buffer?)?;
         let mut bytes = vec![0u8; size];
         guest.memory().read_exact(start, &mut bytes).ok()?;

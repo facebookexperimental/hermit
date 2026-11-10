@@ -8275,14 +8275,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 {
                     Box::pin(self.handle_memory_lock_call(guest, call)).await
                 }
-                // An access probe, which fails with ENOENT where it reached a
-                // sysfs object the machine Detcore presents does not have
-                // (`Detcore::handle_access_probe`), boxed for the same reason.
-                SyscallClassification::PassThrough
-                    if crate::syscalls::is_access_probe(call.number()) =>
-                {
-                    Box::pin(self.handle_access_probe(guest, call)).await
-                }
                 SyscallClassification::PassThrough => self.passthrough(guest, call).await,
                 // The kernel's restart of a wait Detcore emulates, or ran in the
                 // kernel as the guest made it, resumes it; any other

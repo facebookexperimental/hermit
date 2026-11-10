@@ -26,7 +26,6 @@ pub(crate) use files::descriptor_directory::SendInspection;
 /// enforces. Two values that must agree are one value.
 pub(crate) use files::deterministic_pipe_capacity_bytes;
 pub(crate) use files::may_name_file_or_descriptor;
-pub(crate) use files::procfs_levels::is_access_probe;
 pub(crate) use files::procfs_levels::take_proc_device;
 pub(crate) use files::read_guest_exact;
 pub(crate) use files::read_guest_prefix;
