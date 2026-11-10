@@ -29762,14 +29762,12 @@ cp "{}" "$verdict"
         // start-up on an idle host; the earlier 1.1 s sleeps under a 2 s
         // deadline left only 0.9 s per phase.
         let program = root.join("fixture.sh");
-        fs::write(
+        crate::exec_safe_fs::write_executable(
             &program,
             "#!/bin/sh\ncase \"$1\" in\n  --prepare) sleep 2.1 ;;\n  --run) sleep 2.1; printf 'complete\\n' ;;\n  *) exit 64 ;;\nesac\n",
+            0o755,
         )
         .unwrap();
-        let mut permissions = fs::metadata(&program).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&program, permissions).unwrap();
 
         // Widen the per-phase deadline against a measured reference
         // (dh-ravrz): time a real `sleep 0.5` spawn on this host; a loaded
