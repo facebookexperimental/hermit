@@ -654,6 +654,9 @@ class EntrySourcePins(unittest.TestCase):
     def test_literal_names_count_and_shape_are_strict(self):
         for change in ['missing', 'commented', 'duplicate', 'additional', 'comment_separator',
                        'raw_identifier', 'empty_prefix', 'unicode_substitute', 'unicode_additional',
+                       'punctuation_separator', 'string_separator', 'raw_separator', 'character_separator',
+                       'whitespace_0085', 'whitespace_200e', 'whitespace_200f', 'whitespace_2028',
+                       'whitespace_2029', 'unterminated_string',
                        'short', 'uppercase', 'expression']:
             with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
                 tree = PinnedTree(Path(directory))
@@ -678,6 +681,15 @@ class EntrySourcePins(unittest.TestCase):
                     raw = raw.replace(b'const ENTRY_SOURCE:', 'const λENTRY_SOURCE:'.encode())
                 elif change == 'unicode_additional':
                     raw += 'const Xλ_ENTRY_SOURCE: &str = "'.encode() + first + b'";\n'
+                elif change in ['punctuation_separator', 'string_separator', 'raw_separator', 'character_separator']:
+                    gap = {'punctuation_separator': b'=', 'string_separator': b'"example"',
+                           'raw_separator': b'r#"example"#', 'character_separator': b"'x'"}[change]
+                    raw = raw.replace(b'const ENTRY_SOURCE:', b'const ' + gap + b' ENTRY_SOURCE:')
+                elif change.startswith('whitespace_'):
+                    gap = chr(int(change.split('_')[1], 16)).encode()
+                    raw += b'const' + gap + b'NEW_ENTRY_SOURCE: &str = "' + first + b'";\n'
+                elif change == 'unterminated_string':
+                    raw += b'const EXAMPLE: &str = "unterminated'
                 elif change == 'short':
                     raw = raw.replace(first, first[:-1])
                 elif change == 'uppercase':
@@ -696,9 +708,10 @@ class EntrySourcePins(unittest.TestCase):
     def test_comments_separate_const_and_name_without_changing_the_literal(self):
         with tempfile.TemporaryDirectory() as directory:
             tree = PinnedTree(Path(directory))
-            raw = tree.terminal_source().replace(b'const ', b'const /* nested /* comment */ */ ')
+            raw = tree.terminal_source().replace(b'const ', b'const // line comment\n /* nested /* comment */ */ ')
             raw += b'const /* unrelated */ PRIVATE_SOURCE: &str = "unchanged";\n'
             raw += 'const λPRIVATE_SOURCE: &str = "unchanged";\n'.encode()
+            raw += b'const EXAMPLE: &str = "continued\\\n const NEW_ENTRY_SOURCE: &str = \\"ignored\\";";\n'
             tree.write(tree.reverie / TERMINAL, raw)
             tree.commit(tree.reverie)
             tree.repin()

@@ -373,13 +373,17 @@ def entry_source_guard(mapped, terminal, rpin):
     """
     where = 'runtime cohort derivation: Reverie ' + rpin + ' ' + TERMINAL_SOURCE
     refusal = where + ' requires exactly one literal each for ' + ', '.join(ENTRY_SOURCE_NAMES)
-    token = re.compile(rb'//[^\n]*|(?P<comment>/\*)|(?:br|cr|r)(?P<hashes>#{0,255})"|'
-                       rb'"(?:\\.|[^"\\])*"|(?:b)?\'(?:\\.|[^\'\\])\'|'
+    token = re.compile(rb'(?P<line>//[^\n]*)|(?P<comment>/\*)|(?:br|cr|r)(?P<hashes>#{0,255})"|'
+                       rb'(?P<string>")|(?:b)?\'(?:\\.|[^\'\\])\'|'
                        rb'(?P<identifier>(?:r\#)?[A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*)')
-    at, pins, after_const = 0, [], False
+    at, pins, after_const, gap_ok = 0, [], False, True
     while match := token.search(terminal, at):
+        if after_const and terminal[at:match.start()].strip():
+            gap_ok = False
         at = match.end()
-        if match['comment']:
+        if match['line']:
+            continue
+        elif match['comment']:
             depth = 1
             while depth:
                 end = re.search(rb'/\*|\*/', terminal[at:])
@@ -387,22 +391,41 @@ def entry_source_guard(mapped, terminal, rpin):
                 depth += 1 if end[0] == b'/*' else -1
                 at += end.end()
         elif match['hashes'] is not None:
+            gap_ok = False
             close = b'"' + match['hashes']
             end = terminal.find(close, at)
             need(end >= 0, refusal + ': unterminated raw string')
             at = end + len(close)
+        elif match['string']:
+            gap_ok = False
+            while at < len(terminal):
+                if terminal[at:at + 1] == b'\\':
+                    at += 2
+                elif terminal[at:at + 1] == b'"':
+                    at += 1
+                    break
+                else:
+                    at += 1
+            else:
+                raise RuntimeError(refusal + ': unterminated string')
         elif match['identifier']:
             # Keep non-ASCII bytes in the name, never a misleading ASCII suffix.
+            need(not re.search(rb'\xc2\x85|\xe2\x80[\x8e\x8f\xa8\xa9]', match['identifier']),
+                 refusal + ': unsupported non-ASCII whitespace')
             name = match['identifier'].decode(errors='replace')
             declaration, after_const = after_const, name == 'const'
+            valid_gap, gap_ok = gap_ok, True
             plain = name.removeprefix('r#')
             if not declaration or not (plain == 'ENTRY_SOURCE' or plain.endswith('_ENTRY_SOURCE')):
                 continue
+            need(valid_gap, refusal + ': malformed const/name separator for ' + name)
             need(name == plain, refusal + ': unsupported raw identifier ' + name)
             literal = re.match(rb'\s*:\s*&str\s*=\s*"([0-9a-f]{64})"\s*;', terminal[at:])
             need(literal is not None, refusal + ': malformed ' + name)
             pins.append((name, literal[1].decode()))
             at += literal.end()
+        else:
+            gap_ok = False  # A character literal cannot separate const and its name.
     need(sorted(name for name, _ in pins) == sorted(ENTRY_SOURCE_NAMES),
          refusal + ': found ' + ', '.join(name for name, _ in pins))
     accepted = dict(pins)
