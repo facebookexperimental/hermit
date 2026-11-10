@@ -49,6 +49,7 @@ buck-out/
 .buckconfig.local
 /shim/third-party/rust/.cargo/
 /shim/third-party/rust/BUCK
+/shim/third-party/rust/BUCK.stamp
 /shim/third-party/rust/vendor/
 /shim/rust-sysroot/
 /shim/pinned-rust-sysroot/

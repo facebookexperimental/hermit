@@ -55,8 +55,20 @@ TARGETS=(
   "hermit//detcore:tests_time|tests_time"
 )
 
-if [[ ! -f shim/third-party/rust/BUCK ]]; then
+# Regenerate when the content stamp is missing or differs: the generated
+# graph is gitignored, so a long-lived slot keeps its copy across Cargo.lock
+# bumps and would compile detcore against a vendored tokio/sha2 set the lock
+# no longer names (observed: tokio 1.53.1 vendor vs 1.54.1 lock -> E0599/E0277
+# in detcore). Keyed on content, not mtime: checkout/rsync/cp -p all make
+# mtimes lie in both directions.
+vendored_stamp() {
+  { sha256sum Cargo.lock shim/third-party/rust/reindeer.toml; } | sha256sum | awk '{print $1}'
+}
+stamp_file=shim/third-party/rust/BUCK.stamp
+if [[ ! -f shim/third-party/rust/BUCK || ! -f $stamp_file ||
+      $(cat "$stamp_file" 2>/dev/null) != "$(vendored_stamp)" ]]; then
   ./bootstrap/regenerate-rust-deps
+  vendored_stamp >"$stamp_file"
 fi
 
 mkdir -p target/validate/buck-harvest
