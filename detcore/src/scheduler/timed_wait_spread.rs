@@ -11,9 +11,12 @@
 //! Chaos reorders runnable threads, but a sleeping thread wakes when the
 //! global clock reaches its deadline, and the clock advances only with the
 //! other threads' work and the scheduler's turn charges. The ratio between a
-//! sleep and the work done meanwhile is therefore fixed by the program, and a
-//! race ordered by that ratio never changes order. This module draws, for
-//! each timed wait, a factor `f` log-uniformly from `[1/R, R)` and queues the
+//! sleep and the work done meanwhile is therefore set by the program, and a
+//! race ordered by that ratio changes order only as far as chaos's reordering
+//! of the other threads moves the clock (rarely, in the tests' guest: one
+//! seed in eight). This module draws, for each timed wait, a factor `f`
+//! log-uniformly from `[1/R, R)`, with `R` at most 1000
+//! (`detcore_model::config::MAX_CHAOS_TIMED_WAIT_SPREAD`), and queues the
 //! wait at the wake threshold `start + f * duration` instead of at its
 //! deadline. A threshold at or past the deadline oversleeps, which Linux
 //! allows. A threshold before the deadline is promised its deadline
