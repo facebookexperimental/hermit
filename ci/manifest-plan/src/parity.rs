@@ -2395,6 +2395,11 @@ thread_local! {
     /// itself running, to test that a panic leaves a failed status and no
     /// records.
     static PANIC_INSIDE_POST_PASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Makes the next post-pass on this thread wait this long after planning
+    /// and before it derives its deadline, standing in for the setup stall a
+    /// loaded host can cause, to test that an outer bound outlasts it.
+    static DELAY_BEFORE_COMPARISONS: std::cell::Cell<Duration> =
+        const { std::cell::Cell::new(Duration::ZERO) };
 }
 
 /// What one post-pass wrote.
@@ -3169,6 +3174,8 @@ fn measure(
 
     let log_diff_runs = AtomicUsize::new(0);
     if !comparisons.is_empty() || !run_comparisons.is_empty() {
+        #[cfg(test)]
+        thread::sleep(DELAY_BEFORE_COMPARISONS.with(|delay| delay.replace(Duration::ZERO)));
         let logdiff_dir = config.output_dir.join(PARITY_LOGDIFF_DIR);
         fs::create_dir_all(&logdiff_dir)
             .map_err(|error| format!("cannot create {}: {error}", logdiff_dir.display()))?;
@@ -10026,12 +10033,9 @@ mod tests {
         );
     }
 
-    /// A comparison no longer fits once an outer bound, such as the
-    /// enclosing dagrun step's, runs out: a slow log-diff is killed at that
-    /// bound, not at its own, and later comparisons never start.
-    #[test]
-    fn an_outer_deadline_stops_a_slow_comparison_and_the_ones_after_it() {
-        let fixture = Fixture::new("outer-deadline");
+    /// The rows and scope of the outer-deadline tests: a ptrace reference and
+    /// three candidates, so the first comparison can hang and two follow it.
+    fn outer_deadline_cells(fixture: &Fixture) -> (Vec<CellResult>, BTreeSet<ParityCellId>) {
         let rows = vec![
             fixture.row("fx/one", "ptrace", 1, "PASS", Some(REFERENCE)),
             fixture.row("fx/one", "kvm", 1, "PASS", Some(REFERENCE)),
@@ -10043,6 +10047,16 @@ mod tests {
             parity_cell("fx/one", ParityBackend::Liteinst),
             parity_cell("fx/one", ParityBackend::Sabre),
         ]);
+        (rows, scope)
+    }
+
+    /// Runs a post-pass whose first comparison hangs under an outer bound,
+    /// after `setup_delay` is planted between planning and the deadline, and
+    /// checks that the slow log-diff is killed at that bound, not at its own,
+    /// and that later comparisons never start.
+    fn outer_deadline_stops_the_comparisons(label: &str, setup_delay: Duration) -> Fixture {
+        let fixture = Fixture::new(label);
+        let (rows, scope) = outer_deadline_cells(&fixture);
         fixture.plant("hang");
         let mut config = fixture.config();
         assert_eq!(config.log_diff_timeout, PARITY_LOG_DIFF_TIMEOUT);
@@ -10051,6 +10065,7 @@ mod tests {
             at: Instant::now() + Duration::from_millis(400),
             bound: "the planted step bound".into(),
         });
+        DELAY_BEFORE_COMPARISONS.with(|delay| delay.set(setup_delay));
         let started = Instant::now();
         let report = post_pass(&config, &scope, &rows).unwrap();
         let elapsed = started.elapsed();
@@ -10082,6 +10097,16 @@ mod tests {
                 "the planted step bound ran out before this comparison started"
             );
         }
+        fixture
+    }
+
+    /// A comparison no longer fits once an outer bound, such as the
+    /// enclosing dagrun step's, runs out: a slow log-diff is killed at that
+    /// bound, not at its own, and later comparisons never start.
+    #[test]
+    fn an_outer_deadline_stops_a_slow_comparison_and_the_ones_after_it() {
+        let fixture = outer_deadline_stops_the_comparisons("outer-deadline", Duration::ZERO);
+        let (rows, scope) = outer_deadline_cells(&fixture);
         // The nearer of the budget and the outer bound is the one kept.
         fixture.plant("");
         let mut config = fixture.config();
@@ -10099,6 +10124,16 @@ mod tests {
                 .unwrap()
                 .contains("budget of 0 s ran out")
         }));
+    }
+
+    /// Everything a post-pass does before its first comparison (clearing
+    /// outputs, writing the status and golden, spawning the comparison
+    /// thread) runs inside the outer bound. A stall there, which a loaded
+    /// host causes, must not use the bound up before the slow comparison
+    /// starts (dh-1ppbr4).
+    #[test]
+    fn an_outer_deadline_outlasts_a_stalled_setup() {
+        outer_deadline_stops_the_comparisons("outer-deadline-stall", Duration::from_secs(1));
     }
 
     fn status(config: &PostPassConfig) -> PostPassStatus {
