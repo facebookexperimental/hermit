@@ -52791,15 +52791,35 @@ fn cpu_directory_reads_list_only_cpu0_on_every_path() {
 /// and of the first platform device, which a kernel without NUMA does not
 /// register (drivers/pci/pci-sysfs.c:633-635 and drivers/base/platform.c:1331-1340
 /// at v7.1), by the bus alias, the device's own path, its `subsystem` link,
-/// relative to its directory and below it, while `vendor` and `modalias`,
+/// relative to its directory, below it, and in the listing of the directory
+/// a `..` after its `subsystem` link reaches, while `vendor` and `modalias`,
 /// which every such device has, stay found; and so are memory tiering's
 /// directories and the NUMA and memory policy tunables (mm/Makefile:86 and 99).
+/// The first NVMe controller's `numa_node` reads -1
+/// (drivers/nvme/host/pci.c:2379 with include/linux/device.h:899-907), and
+/// a CXL DAX device's `target_node` 0 (drivers/dax/cxl.c:12-21 with
+/// include/linux/numa.h:57-64), beside no `numa_node`.
+///
+/// The same objects, looked up through symbolic links the test makes
+/// ([`sysfs_links`]), are found or not as by their own paths, also by an
+/// open for writing, `access(W_OK)`, `O_CREAT`, through the guest's own
+/// `/proc/self/fd/<n>` link to the device's directory, and by a stat whose
+/// result overwrites its path; the link itself stays found by lstat,
+/// readlink, `AT_SYMLINK_NOFOLLOW` and an `O_PATH|O_NOFOLLOW` open, and
+/// `O_NOFOLLOW` refuses it with ELOOP, as Linux does. Files of the test's own,
+/// beside a `subsystem` link to the PCI bus or the NVMe class, keep their
+/// names and bytes, as do the files of an ordinary directory bound over all
+/// of `/sys`: the rules hold only on the guest's sysfs mount.
 fn absent_cpu_node_backlinks(backend: &str) {
     let guest = futex_c_guest(&ABSENT_CPU_LOOKUPS_GUEST, "absent_cpu_lookups")
         .to_str()
         .unwrap()
         .to_owned();
-    let expected = "bound listing node0: 0\n\
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let links = sysfs_links(directory.path());
+    let links = links.to_str().unwrap();
+    let mut expected = String::from(
+        "bound listing node0: 0\n\
                     bound openat: ENOENT\n\
                     bound listing node0: 0\n\
                     bound openat: ENOENT\n\
@@ -52830,6 +52850,10 @@ fn absent_cpu_node_backlinks(backend: &str) {
                     pci below numa_node: ENOENT\n\
                     pci openat numa_node: ENOENT\n\
                     pci openat vendor: ok\n\
+                    pci dotdot listing numa_node: 0\n\
+                    pci dotdot openat numa_node: ENOENT\n\
+                    pci dotdot listing vendor: 1\n\
+                    pci dotdot openat vendor: ok\n\
                     platform listing numa_node: 0\n\
                     platform listing modalias: 1\n\
                     platform numa_node: ENOENT\n\
@@ -52843,6 +52867,10 @@ fn absent_cpu_node_backlinks(backend: &str) {
                     platform below numa_node: ENOENT\n\
                     platform openat numa_node: ENOENT\n\
                     platform openat modalias: ok\n\
+                    platform dotdot listing numa_node: 0\n\
+                    platform dotdot openat numa_node: ENOENT\n\
+                    platform dotdot listing modalias: 1\n\
+                    platform dotdot openat modalias: ok\n\
                     /sys/bus listing memory_tiering: 0\n\
                     access /sys/bus/memory_tiering: ENOENT\n\
                     /sys/devices/virtual listing memory_tiering: 0\n\
@@ -52851,20 +52879,109 @@ fn absent_cpu_node_backlinks(backend: &str) {
                     access /sys/kernel/mm/numa: ENOENT\n\
                     /sys/kernel/mm listing mempolicy: 0\n\
                     access /sys/kernel/mm/mempolicy: ENOENT\n\
-                    /sys/kernel/mm/numa/demotion_enabled: ENOENT\n";
-    // On a host whose kernel has NUMA, the PCI device's attribute exists:
-    // its absence above is Hermit's.
+                    /sys/kernel/mm/numa/demotion_enabled: ENOENT\n",
+    );
+    let first_entry = |path: &str| {
+        fs::read_dir(path).ok().and_then(|entries| {
+            entries
+                .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+                .min()
+        })
+    };
+    let nvme = first_entry("/sys/class/nvme");
+    expected.push_str(match nvme {
+        Some(_) => "nvme listing numa_node: 1\nnvme numa_node: \"-1\"\n",
+        None => "nvme: no device\n",
+    });
+    // A DAX device of a CXL region (this host's), whose region's node is
+    // `phys_to_target_node`'s 0 without NUMA.
+    expected.push_str(match first_entry("/sys/bus/dax/devices") {
+        None => "dax: no device\n",
+        Some(device)
+            if fs::read_link(
+                Path::new("/sys/bus/dax/devices")
+                    .join(&device)
+                    .join("../subsystem"),
+            )
+            .is_ok_and(|subsystem| subsystem.ends_with("bus/cxl")) =>
+        {
+            "dax listing target_node: 1\ndax listing numa_node: 0\ndax target_node: \"0\"\n"
+        }
+        Some(_) => "dax: no cxl device\n",
+    });
+    // Through the links.
+    for (name, found, link_found) in [
+        ("attribute", "ENOENT", "ok"),
+        ("control", "ok", "ok"),
+        ("nodes", "ENOENT", "ok"),
+        ("cpu/node0", "ENOENT", "ENOENT"),
+        ("cpu/topology/core_id", "ok", "ok"),
+        ("device/numa_node", "ENOENT", "ENOENT"),
+        ("device/vendor", "ok", "ok"),
+        ("attribute/x", "ENOENT", "ENOENT"),
+        ("own", "ok", "ok"),
+        ("lookalike/numa_node", "ok", "ok"),
+    ] {
+        expected.push_str(&format!(
+            "alias {name}: {found}\nstat alias {name}: {found}\n\
+             lstat alias {name}: {link_found}\naccess alias {name}: {found}\n"
+        ));
+    }
+    expected.push_str(
+        "write alias attribute: ENOENT\n\
+         access W_OK alias attribute: ENOENT\n\
+         readlink alias attribute: ok\n\
+         O_PATH|O_NOFOLLOW alias attribute: ok\n\
+         O_NOFOLLOW alias attribute: ELOOP\n\
+         nofollow access alias attribute: ok\n\
+         nofollow fstatat alias attribute: ok\n\
+         creat alias attribute: as by its path\n\
+         fd stat numa_node: ENOENT\n\
+         fd access numa_node: ENOENT\n\
+         fd open numa_node: ENOENT\n",
+    );
+    // KVM refuses every name below a guest's `/proc/self/fd/<n>` with ELOOP
+    // (as it did before Hermit presented a kernel without NUMA), where Linux
+    // walks into the directory.
+    expected.push_str(match backend {
+        "kvm" => "fd stat vendor: ELOOP\n",
+        _ => "fd stat vendor: ok\n",
+    });
+    expected.push_str(
+        "overwritten stat alias attribute: ENOENT\n\
+         overwritten stat alias control: ok\n",
+    );
+    expected.push_str(match nvme {
+        Some(_) => "alias nvme numa_node: \"-1\"\n",
+        None => "alias nvme numa_node: ENOENT\n",
+    });
+    expected.push_str(
+        "alias lookalike numa_node: \"7\"\n\
+         alias nvme-lookalike numa_node: \"7\"\n\
+         lookalike dotdot listing numa_node: 1\n\
+         lookalike dotdot openat numa_node: ok\n",
+    );
+    // On a host whose kernel has NUMA, the PCI device's attribute and the
+    // CPU's node link exist, also through the links: their absence above
+    // is Hermit's.
     if Path::new("/sys/devices/system/node").exists() {
         let native = Command::new(&guest)
-            .arg("backlinks")
+            .args(["backlinks", links])
             .output()
             .expect("failed to run the native sysfs control");
         let native = String::from_utf8_lossy(&native.stdout);
-        for line in ["pci listing numa_node: 1\n", "pci numa_node: ok\n"] {
+        for line in [
+            "pci listing numa_node: 1\n",
+            "pci numa_node: ok\n",
+            "pci dotdot listing numa_node: 1\n",
+            "alias attribute: ok\n",
+            "alias cpu/node0: ok\n",
+            "fd stat numa_node: ok\n",
+            "overwritten stat alias attribute: ok\n",
+        ] {
             assert!(native.contains(line), "{line:?} natively:\n{native}");
         }
     }
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let verdict = directory.path().join("verify.json");
     let mut args = vec![
         "--log=info",
@@ -52882,7 +52999,7 @@ fn absent_cpu_node_backlinks(backend: &str) {
     if backend != "kvm" {
         args.extend(["--timeout", "60"]);
     }
-    args.extend(["--", guest.as_str(), "backlinks"]);
+    args.extend(["--", guest.as_str(), "backlinks", links]);
     let (status, log) = run_with_deadline(
         hermit_command(&args),
         directory.path(),
@@ -52901,6 +53018,113 @@ fn absent_cpu_node_backlinks(backend: &str) {
         serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
             .expect("the verdict must be JSON");
     assert_eq!(report["bitwise_parity"], true, "{backend}: {report}");
+
+    // An ordinary directory bound over all of `/sys`, laid out as sysfs: its
+    // `numa_node` files beside `subsystem` links to the PCI bus and the NVMe
+    // class, and a node directory, are the guest's own, listed, found and
+    // read as they are. (KVM's strict mode refuses a run whose `/sys/module`
+    // cannot show that the host has no binder driver, so KVM runs this
+    // without it.)
+    let fake = directory.path().join("sys");
+    let pci = fake.join("devices/pci0000:00/0000:00:00.0");
+    fs::create_dir_all(pci.join("nvme/nvme0")).unwrap();
+    fs::create_dir_all(fake.join("bus/pci/devices")).unwrap();
+    fs::create_dir_all(fake.join("class/nvme")).unwrap();
+    fs::create_dir_all(fake.join("devices/system/node/node0")).unwrap();
+    let symlink = |target: &str, link: PathBuf| std::os::unix::fs::symlink(target, link).unwrap();
+    symlink("../../../bus/pci", pci.join("subsystem"));
+    symlink(
+        "../../../../../class/nvme",
+        pci.join("nvme/nvme0/subsystem"),
+    );
+    symlink(
+        "../../../devices/pci0000:00/0000:00:00.0",
+        fake.join("bus/pci/devices/0000:00:00.0"),
+    );
+    symlink(
+        "../../devices/pci0000:00/0000:00:00.0/nvme/nvme0",
+        fake.join("class/nvme/nvme0"),
+    );
+    fs::write(pci.join("numa_node"), "7\n").unwrap();
+    fs::write(pci.join("nvme/nvme0/numa_node"), "5\n").unwrap();
+    fs::write(fake.join("devices/system/node/node0/cpulist"), "0\n").unwrap();
+    let mount = format!("--mount=type=bind,source={},target=/sys", fake.display());
+    for (command, expected) in [
+        (
+            vec![
+                "/bin/cat",
+                "/sys/bus/pci/devices/0000:00:00.0/numa_node",
+                "/sys/class/nvme/nvme0/numa_node",
+                "/sys/devices/system/node/node0/cpulist",
+            ],
+            "7\n5\n0\n",
+        ),
+        (
+            vec![
+                guest.as_str(),
+                "bound",
+                "/sys/bus/pci/devices/0000:00:00.0",
+                "numa_node",
+            ],
+            "bound listing numa_node: 1\nbound openat: ok\n",
+        ),
+    ] {
+        let mut args = vec!["--backend", backend, "run"];
+        if backend != "kvm" {
+            args.push("--strict");
+        }
+        args.extend([mount.as_str(), "--"]);
+        args.extend(command);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{backend}: {}", stderr(&output));
+    }
+}
+
+/// The symbolic links [`absent_cpu_node_backlinks`] looks the sysfs objects
+/// up through, made in a new directory below `root`, which it returns:
+/// `attribute` to the first PCI device's `numa_node`, `control` to its
+/// `vendor`, `nodes` to the node directory, `cpu` to cpu0's directory,
+/// `device` to the PCI device's directory, and `nvme` to the first NVMe
+/// controller's `numa_node` (dangling without one); `own` to an ordinary
+/// file; and the directories `lookalike` and `nvme-lookalike`, each with a
+/// `numa_node` reading 7 and a `subsystem` link to the PCI bus or the NVMe
+/// class.
+fn sysfs_links(root: &Path) -> PathBuf {
+    let links = root.join("links");
+    fs::create_dir(&links).unwrap();
+    let first_entry = |path: &str| {
+        fs::read_dir(path)
+            .ok()
+            .and_then(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+                    .min()
+            })
+            .map(|name| name.to_string_lossy().into_owned())
+    };
+    let pci = first_entry("/sys/bus/pci/devices").expect("this test needs a PCI device");
+    let nvme = first_entry("/sys/class/nvme").unwrap_or_else(|| "none".to_owned());
+    let symlink = |target: String, name: &str| {
+        std::os::unix::fs::symlink(target, links.join(name)).unwrap();
+    };
+    symlink(format!("/sys/bus/pci/devices/{pci}/numa_node"), "attribute");
+    symlink(format!("/sys/bus/pci/devices/{pci}/vendor"), "control");
+    symlink("/sys/devices/system/node".to_owned(), "nodes");
+    symlink("/sys/devices/system/cpu/cpu0".to_owned(), "cpu");
+    symlink(format!("/sys/bus/pci/devices/{pci}"), "device");
+    symlink(format!("/sys/class/nvme/{nvme}/numa_node"), "nvme");
+    fs::write(links.join("own-file"), "guest-owned\n").unwrap();
+    symlink("own-file".to_owned(), "own");
+    for (lookalike, subsystem) in [
+        ("lookalike", "/sys/bus/pci"),
+        ("nvme-lookalike", "/sys/class/nvme"),
+    ] {
+        fs::create_dir(links.join(lookalike)).unwrap();
+        fs::write(links.join(lookalike).join("numa_node"), "7\n").unwrap();
+        symlink(subsystem.to_owned(), &format!("{lookalike}/subsystem"));
+    }
+    links
 }
 
 /// The CPUs other than number 0 that the sysfs listings leave out, and

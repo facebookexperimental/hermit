@@ -232,6 +232,13 @@ enum ProcfsKind {
     /// (`ProcfsFile::kernel_served`), as before. Appended last, so every
     /// other kind keeps its serialized number.
     ProcessComm,
+    /// A device's NUMA attribute in `/sys` that the kernel without NUMA
+    /// Detcore presents registers with contents of its own
+    /// ([`device_node_attribute`]). Classified by the object the kernel
+    /// opened, in run mode, where the same rule leaves the absent ones out;
+    /// never by a path alone. Appended last, so every other kind keeps its
+    /// serialized number.
+    DeviceNode(DeviceNodeFile),
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2126,7 +2133,19 @@ impl ProcfsFile {
         };
         let task = Self::per_process_name_of(&kind)
             .and_then(|filename| ProcfsTask::parse(task_path, filename));
-        Some(Self {
+        Some(Self::of_kind(kind, task, target_fd))
+    }
+
+    /// A device's NUMA attribute the kernel opened, which reads `file`'s
+    /// contents ([`ProcfsKind::DeviceNode`]).
+    pub(crate) fn device_node(file: DeviceNodeFile) -> Self {
+        Self::of_kind(ProcfsKind::DeviceNode(file), None, None)
+    }
+
+    /// A file of `kind`, of the task `task` names and, for an `fdinfo`, of
+    /// the descriptor `target_fd`, as yet unopened.
+    fn of_kind(kind: ProcfsKind, task: Option<ProcfsTask>, target_fd: Option<i32>) -> Self {
+        Self {
             kind,
             task,
             incarnation: None,
@@ -2146,7 +2165,7 @@ impl ProcfsFile {
             offset: 0,
             read_pos: None,
             sequence_shared: false,
-        })
+        }
     }
 
     /// The path within procfs of a file whose every byte Detcore renders from
@@ -3390,6 +3409,7 @@ impl ProcfsFile {
                 sanitize_cpu_mask(&contents, set.cpus(machine.cpus), machine.cpus)
             }
             ProcfsKind::CpuConstant(file) => file.contents(),
+            ProcfsKind::DeviceNode(file) => file.contents(&contents),
             ProcfsKind::Fixed(file) => file.contents(&machine),
             ProcfsKind::BtrfsBytesMayUse => sanitize_btrfs_bytes_may_use(&contents),
             ProcfsKind::BlockInflight => sanitize_block_inflight(&contents),
@@ -4153,50 +4173,194 @@ pub(crate) fn absent_cpu_entry_prefix(path: &Path, cpus: u32) -> Option<PathBuf>
     None
 }
 
-/// The buses whose devices have no `numa_node` attribute on a kernel built
-/// without NUMA, by the name their `subsystem` link ends in (Linux 7.1):
-/// - `pci`: the attribute is defined and registered only under `CONFIG_NUMA`
-///   (drivers/pci/pci-sysfs.c:361-398 and 633-635);
-/// - `platform`: it is hidden for a device on `NUMA_NO_NODE`
-///   (drivers/base/platform.c:1331-1340), and without NUMA `dev_to_node` is
-///   that for every device (include/linux/device.h:899-907);
-/// - `cxl` (a memory device's), `dax` and `nd` (NVDIMM): hidden under
-///   `!CONFIG_NUMA` (drivers/cxl/core/memdev.c:488, drivers/dax/bus.c:1384,
-///   drivers/nvdimm/bus.c:709);
-/// - `vmbus`: registered only under `CONFIG_NUMA`
-///   (drivers/hv/vmbus_drv.c:587-589).
-///
-/// The devices of other subsystems that have the attribute keep it on such a
-/// kernel, where it reads -1 (`NUMA_NO_NODE`): an NVMe controller's, for one.
-/// Those still read the host's node, a difference that remains.
-const BUSES_WITHOUT_NUMA_NODE: [&str; 6] = ["cxl", "dax", "nd", "pci", "platform", "vmbus"];
+/// What one of a device's NUMA attributes is on the kernel built without NUMA
+/// that Detcore presents (https://github.com/rrnewton/hermit/issues/5269).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeviceNodeAttribute {
+    /// The kernel registers no such attribute: a lookup finds nothing, and a
+    /// listing leaves it out.
+    Absent,
+    /// The kernel registers it, with these contents rather than the host's.
+    Reads(DeviceNodeFile),
+}
 
-/// Whether a device whose `subsystem` link reads `subsystem` (a bus's
-/// directory, `../../../bus/pci` for a PCI device) is on one of
-/// [`BUSES_WITHOUT_NUMA_NODE`].
-fn bus_hides_numa_node(subsystem: &Path) -> bool {
+/// A device's NUMA attribute that a kernel without NUMA registers, with
+/// contents of its own rather than the host's ([`device_node_attribute`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) enum DeviceNodeFile {
+    /// A node number that is the same for every such device: -1
+    /// (`NUMA_NO_NODE`) or node 0.
+    Node(i32),
+    /// An NVMe namespace path's `numa_nodes`: the nodes whose I/O takes this
+    /// path, printed as a node list (drivers/nvme/host/multipath.c:1084-1109
+    /// at v7.1), or nothing at all where the subsystem's I/O policy is not
+    /// `numa`. With one node, `for_each_node` visits node 0 alone
+    /// (include/linux/nodemask.h:476), so the list is `0` or empty: `0` here
+    /// where the host's list has node 0.
+    PathNodes,
+}
+
+impl DeviceNodeFile {
+    /// What the attribute reads, from `kernel`, the host's bytes, which are
+    /// kept as they are where they do not have the attribute's format.
+    fn contents(self, kernel: &[u8]) -> Vec<u8> {
+        let Some(line) = kernel
+            .strip_suffix(b"\n")
+            .and_then(|line| std::str::from_utf8(line).ok())
+        else {
+            return kernel.to_vec();
+        };
+        match self {
+            Self::Node(node) if line.parse::<i32>().is_ok() => format!("{node}\n").into_bytes(),
+            Self::PathNodes
+                if line
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || byte == b',' || byte == b'-') =>
+            {
+                // The list is sorted, so node 0 is in it where its first
+                // range starts at 0.
+                let first = line.split([',', '-']).next().unwrap_or_default();
+                if first == "0" {
+                    b"0\n".to_vec()
+                } else {
+                    b"\n".to_vec()
+                }
+            }
+            Self::Node(_) | Self::PathNodes => kernel.to_vec(),
+        }
+    }
+}
+
+/// How the subsystem a device's `subsystem` link names, as its last two
+/// components (`bus` or `class`, then the name), decides the device's NUMA
+/// attribute `name` on a kernel built without NUMA (Linux 7.1). `None` for
+/// every other attribute or subsystem: those are the kernel's.
+fn subsystem_node_rule(kind: &str, subsystem: &str, name: &[u8]) -> Option<SubsystemNodeRule> {
+    use DeviceNodeAttribute::Absent;
+    use DeviceNodeAttribute::Reads;
+    use DeviceNodeFile::Node;
+    use DeviceNodeFile::PathNodes;
+    use SubsystemNodeRule::ByDaxProvider;
+    use SubsystemNodeRule::Is;
+    Some(match (kind, subsystem, name) {
+        // - PCI defines and registers `numa_node` only under `CONFIG_NUMA`
+        //   (drivers/pci/pci-sysfs.c:361-398 and 633-635);
+        // - platform hides it for a device on `NUMA_NO_NODE`
+        //   (drivers/base/platform.c:1331-1340), which without NUMA
+        //   `dev_to_node` is for every device (include/linux/device.h:899-907);
+        // - CXL (a memory device's), DAX and NVDIMM hide it under
+        //   `!CONFIG_NUMA` (drivers/cxl/core/memdev.c:488,
+        //   drivers/dax/bus.c:1384-1385, drivers/nvdimm/bus.c:709), NVDIMM its
+        //   `target_node` with it (704-717);
+        // - VMBus registers it only under `CONFIG_NUMA`
+        //   (drivers/hv/vmbus_drv.c:587-589).
+        ("bus", "cxl" | "dax" | "pci" | "platform" | "vmbus", b"numa_node")
+        | ("bus", "nd", b"numa_node" | b"target_node") => Is(Absent),
+        // An NVMe controller prints its `numa_node`
+        // (drivers/nvme/host/sysfs.c:386 and 756), which every transport sets
+        // by `dev_to_node` (pci.c:2379, fc.c:3518, and rdma.c:791 through
+        // `ibdev_to_node`) or leaves `NUMA_NO_NODE` (core.c:5137); and an
+        // Intel DSA or IAA device prints `dev_to_node` of its PCI device
+        // (drivers/dma/idxd/sysfs.c:1450-1457 and 1803). Without NUMA that
+        // is -1 for every device.
+        ("class", "nvme", b"numa_node") | ("bus", "dsa", b"numa_node") => Is(Reads(Node(-1))),
+        // A SmartPQI controller's SCSI devices print the controller's node
+        // (drivers/scsi/smartpqi/smartpqi_init.c:7520-7529 and 7590), which
+        // for a device on `NUMA_NO_NODE` is `cpu_to_node(0)` (9316-9332):
+        // without NUMA 0 (include/asm-generic/topology.h:30-36, which x86's
+        // arch/x86/include/asm/topology.h:83-103 uses).
+        ("bus", "scsi", b"numa_node") => Is(Reads(Node(0))),
+        ("bus", "dax", b"target_node") => ByDaxProvider,
+        ("class", "block", b"numa_nodes") => Is(Reads(PathNodes)),
+        _ => return None,
+    })
+}
+
+/// A rule of [`subsystem_node_rule`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubsystemNodeRule {
+    Is(DeviceNodeAttribute),
+    /// A DAX device's `target_node`, which its region's provider decides
+    /// ([`dax_target_node`]).
+    ByDaxProvider,
+}
+
+/// The last two components of the `subsystem` link of the device whose sysfs
+/// directory the tool reaches at `directory` (`bus` and `pci` for
+/// `../../../bus/pci`), whichever spelling reached the directory: the device
+/// path, its bus alias (`/sys/bus/pci/devices/<address>`), a class device's
+/// `device` link, or a driver's link to a device it binds.
+fn device_subsystem(directory: &Path) -> Option<(String, String)> {
+    let subsystem = std::fs::read_link(directory.join("subsystem")).ok()?;
     let mut components = subsystem.components().rev();
     match (components.next(), components.next()) {
-        (Some(Component::Normal(bus)), Some(Component::Normal(parent))) => {
-            parent == "bus" && BUSES_WITHOUT_NUMA_NODE.iter().any(|name| bus == *name)
+        (Some(Component::Normal(name)), Some(Component::Normal(kind))) => {
+            Some((kind.to_str()?.to_owned(), name.to_str()?.to_owned()))
         }
-        _ => false,
+        _ => None,
+    }
+}
+
+/// A DAX device's `target_node` on a kernel built without NUMA: its region's
+/// node, which the bus shows only where it is not negative
+/// (drivers/dax/bus.c:1284-1298 and 1382-1383 at v7.1). The device's parent
+/// is its region's provider's device, which sets that node:
+/// - a CXL DAX region (bus `cxl`), by `phys_to_target_node`
+///   (drivers/dax/cxl.c:12-21);
+/// - a soft-reserved memory range's platform device, likewise
+///   (drivers/dax/hmem/device.c:88, drivers/dax/hmem/hmem.c:30-31);
+/// - an NVDIMM namespace's DAX device (bus `nd`), by its region's
+///   (drivers/dax/pmem.c:54-56), which ACPI's NFIT sets by `pxm_to_node` or
+///   `phys_to_target_node` (drivers/acpi/nfit/core.c:2632-2648), e820 and
+///   virtio-pmem by `phys_to_target_node` (drivers/nvdimm/e820.c:23-28,
+///   drivers/nvdimm/virtio_pmem.c:105), and a device tree's region by
+///   `dev_to_node` (drivers/nvdimm/of_pmem.c:63-64).
+///
+/// Without NUMA `phys_to_target_node` and `pxm_to_node` are 0
+/// (include/linux/numa.h:57-64, include/acpi/acpi_numa.h:33-36) and
+/// `dev_to_node` is -1, so the attribute reads 0, except for a device tree's
+/// region, whose DAX device has none. `None` for a provider of another kind.
+fn dax_target_node(directory: &Path) -> Option<DeviceNodeAttribute> {
+    let provider = directory.join("..");
+    match device_subsystem(&provider)? {
+        (kind, name) if kind == "bus" && (name == "cxl" || name == "platform") => {}
+        (kind, name) if kind == "bus" && name == "nd" => {
+            // The NVDIMM namespace's DAX device is its region's child, the
+            // region the NVDIMM bus's, and the bus its provider's device's.
+            let driver = std::fs::read_link(provider.join("../../../driver")).ok();
+            if driver.is_some_and(|driver| driver.file_name().is_some_and(|name| name == "of_pmem"))
+            {
+                return Some(DeviceNodeAttribute::Absent);
+            }
+        }
+        _ => return None,
+    }
+    Some(DeviceNodeAttribute::Reads(DeviceNodeFile::Node(0)))
+}
+
+/// What `name`, in the directory the tool reaches at `directory`, is on the
+/// kernel without NUMA Detcore presents, where it is a device's NUMA
+/// attribute that such a kernel leaves out or renders differently: by the
+/// device's subsystem ([`subsystem_node_rule`]). `None` elsewhere, where the
+/// kernel's file stands. The caller checks that `directory` is on sysfs, so
+/// that a guest's own file of that name, in a directory with a `subsystem`
+/// link of its own, stays.
+pub(crate) fn device_node_attribute(directory: &Path, name: &[u8]) -> Option<DeviceNodeAttribute> {
+    if !matches!(name, b"numa_node" | b"target_node" | b"numa_nodes") {
+        return None;
+    }
+    let (kind, subsystem) = device_subsystem(directory)?;
+    match subsystem_node_rule(&kind, &subsystem, name)? {
+        SubsystemNodeRule::Is(attribute) => Some(attribute),
+        SubsystemNodeRule::ByDaxProvider => dax_target_node(directory),
     }
 }
 
 /// Whether `name`, in the directory the tool reaches at `directory`, is a
-/// device's `numa_node` that the kernel without NUMA Detcore presents does not
-/// register ([`BUSES_WITHOUT_NUMA_NODE`];
-/// https://github.com/rrnewton/hermit/issues/5269). A device directory's own
-/// `subsystem` link names its bus, whichever spelling reached it: the device
-/// path, its bus alias (`/sys/bus/pci/devices/<address>`), a class device's
-/// `device` link, or a driver's link to a device it binds. The caller checks
-/// that `directory` is on sysfs, so that a guest's own file of that name, in a
-/// directory with a `subsystem` link of its own, stays.
+/// device's NUMA attribute that the kernel without NUMA Detcore presents does
+/// not register ([`device_node_attribute`]).
 pub(crate) fn is_absent_device_attribute(directory: &Path, name: &[u8]) -> bool {
-    name == b"numa_node"
-        && std::fs::read_link(directory.join("subsystem"))
-            .is_ok_and(|subsystem| bus_hides_numa_node(&subsystem))
+    device_node_attribute(directory, name) == Some(DeviceNodeAttribute::Absent)
 }
 
 /// The prefix of the absolute `path` that ends at the first component naming
@@ -9357,31 +9521,50 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
         }
     }
 
-    /// A device's `numa_node` is absent where the device's `subsystem` link
-    /// names a bus whose devices a kernel without NUMA gives none, by every
-    /// spelling of the device's directory, and stays for the devices of the
-    /// other subsystems, which keep it there.
+    /// A device's NUMA attribute is absent where its subsystem's devices have
+    /// none on a kernel without NUMA (an NVDIMM's `target_node` with its
+    /// `numa_node`), reads that kernel's value where they keep it (-1 for an
+    /// NVMe controller and a DSA device, 0 for a SmartPQI SCSI device), and
+    /// is the kernel's for every other attribute and subsystem.
     #[test]
-    fn a_device_numa_node_is_absent_on_the_buses_without_one() {
-        for (subsystem, absent) in [
-            ("../../../bus/pci", true),
-            ("../../../../bus/platform", true),
-            ("../../../bus/cxl", true),
-            ("../../bus/dax", true),
-            ("../../../bus/nd", true),
-            ("/sys/bus/vmbus", true),
-            // An NVMe controller keeps its `numa_node`, which reads -1 there.
-            ("../../../../../../class/nvme", false),
-            ("../../../bus/usb", false),
-            ("../../../pci", false),
-            ("../../../class/pci", false),
-            ("bus", false),
-            ("", false),
+    fn device_numa_attributes_follow_a_kernel_without_numa() {
+        use DeviceNodeAttribute::Absent;
+        use DeviceNodeAttribute::Reads;
+        use DeviceNodeFile::Node;
+        use DeviceNodeFile::PathNodes;
+        use SubsystemNodeRule::ByDaxProvider;
+        use SubsystemNodeRule::Is;
+        for (kind, subsystem, name, rule) in [
+            ("bus", "pci", &b"numa_node"[..], Some(Is(Absent))),
+            ("bus", "platform", b"numa_node", Some(Is(Absent))),
+            ("bus", "cxl", b"numa_node", Some(Is(Absent))),
+            ("bus", "dax", b"numa_node", Some(Is(Absent))),
+            ("bus", "nd", b"numa_node", Some(Is(Absent))),
+            ("bus", "nd", b"target_node", Some(Is(Absent))),
+            ("bus", "vmbus", b"numa_node", Some(Is(Absent))),
+            ("class", "nvme", b"numa_node", Some(Is(Reads(Node(-1))))),
+            ("bus", "dsa", b"numa_node", Some(Is(Reads(Node(-1))))),
+            ("bus", "scsi", b"numa_node", Some(Is(Reads(Node(0))))),
+            ("bus", "dax", b"target_node", Some(ByDaxProvider)),
+            ("class", "block", b"numa_nodes", Some(Is(Reads(PathNodes)))),
+            // The neighbouring attributes, and the same names elsewhere.
+            ("bus", "pci", b"vendor", None),
+            ("bus", "pci", b"target_node", None),
+            ("bus", "nd", b"devtype", None),
+            ("bus", "dax", b"size", None),
+            ("class", "nvme", b"cntlid", None),
+            ("class", "nvme", b"target_node", None),
+            ("class", "block", b"numa_node", None),
+            ("bus", "usb", b"numa_node", None),
+            ("class", "pci", b"numa_node", None),
+            ("class", "net", b"numa_node", None),
+            ("bus", "nvme", b"numa_node", None),
         ] {
             assert_eq!(
-                bus_hides_numa_node(Path::new(subsystem)),
-                absent,
-                "{subsystem:?}"
+                subsystem_node_rule(kind, subsystem, name),
+                rule,
+                "{kind}/{subsystem} {:?}",
+                String::from_utf8_lossy(name)
             );
         }
 
@@ -9390,33 +9573,110 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
         // that the directory is on sysfs.
         let root = tempfile::tempdir().unwrap();
         let root = root.path();
-        let pci = root.join("devices/pci0000:00/0000:00:00.0");
-        let nvme = pci.join("nvme/nvme0");
-        std::fs::create_dir_all(&nvme).unwrap();
-        std::fs::create_dir_all(root.join("bus/pci/devices")).unwrap();
-        std::fs::create_dir_all(root.join("class/nvme")).unwrap();
         let link = |target: &str, link: PathBuf| std::os::unix::fs::symlink(target, link).unwrap();
-        link("../../../bus/pci", pci.join("subsystem"));
-        link("../../../../../class/nvme", nvme.join("subsystem"));
+        // A device at `path` below the root, on the bus or class `subsystem`
+        // (`bus/pci`), linked to it as sysfs links it.
+        let device = |path: &str, subsystem: &str| {
+            let directory = root.join(path);
+            std::fs::create_dir_all(&directory).unwrap();
+            let up = "../".repeat(path.split('/').count());
+            link(&format!("{up}{subsystem}"), directory.join("subsystem"));
+            directory
+        };
+        let pci = device("devices/pci0000:00/0000:00:00.0", "bus/pci");
+        let nvme = device("devices/pci0000:00/0000:00:00.0/nvme/nvme0", "class/nvme");
+        let namespace = device(
+            "devices/pci0000:00/0000:00:00.0/nvme/nvme0/nvme0n1",
+            "class/block",
+        );
+        let dsa = device("devices/pci0000:00/0000:00:01.0/dsa0", "bus/dsa");
+        let scsi = device(
+            "devices/pci0000:00/0000:00:02.0/host0/target0:0:0/0:0:0:0",
+            "bus/scsi",
+        );
+        // An NVDIMM region from ACPI's NFIT, its namespace's DAX device on
+        // the nd bus and the DAX device on the dax bus below that; the same
+        // from a device tree; a CXL region's DAX device; a soft-reserved
+        // range's; and one below a provider of another kind.
+        let nfit = "devices/LNXSYSTM:00/ACPI0012:00";
+        device(nfit, "bus/acpi");
+        link(
+            "../../../bus/acpi/drivers/nfit",
+            root.join(nfit).join("driver"),
+        );
+        let region = device(&format!("{nfit}/ndbus0/region0"), "bus/nd");
+        let nd_dax = device(&format!("{nfit}/ndbus0/region0/dax0.1"), "bus/nd");
+        let nfit_dax = device(&format!("{nfit}/ndbus0/region0/dax0.1/dax0.0"), "bus/dax");
+        let tree = "devices/platform/pmem-region";
+        device(tree, "bus/platform");
+        link(
+            "../../../bus/platform/drivers/of_pmem",
+            root.join(tree).join("driver"),
+        );
+        device(&format!("{tree}/ndbus1/region1"), "bus/nd");
+        device(&format!("{tree}/ndbus1/region1/dax1.1"), "bus/nd");
+        let tree_dax = device(&format!("{tree}/ndbus1/region1/dax1.1/dax1.0"), "bus/dax");
+        let cxl = "devices/platform/ACPI0017:00/root0/decoder0.0/region0/dax_region0";
+        device(cxl, "bus/cxl");
+        let cxl_dax = device(&format!("{cxl}/dax2.0"), "bus/dax");
+        device("devices/platform/hmem.0", "bus/platform");
+        let hmem_dax = device("devices/platform/hmem.0/dax3.0", "bus/dax");
+        device("devices/virtual/other/provider", "class/other");
+        let other_dax = device("devices/virtual/other/provider/dax4.0", "bus/dax");
+        std::fs::create_dir_all(root.join("bus/pci/devices")).unwrap();
         link(
             "../../../devices/pci0000:00/0000:00:00.0",
             root.join("bus/pci/devices/0000:00:00.0"),
         );
+        std::fs::create_dir_all(root.join("bus/dax/devices")).unwrap();
+        link(
+            "../../../devices/platform/ACPI0017:00/root0/decoder0.0/region0/dax_region0/dax2.0",
+            root.join("bus/dax/devices/dax2.0"),
+        );
         let alias = root.join("bus/pci/devices/0000:00:00.0");
-        for directory in [pci.clone(), alias.clone(), pci.join("nvme/..")] {
-            assert!(
-                is_absent_device_attribute(&directory, b"numa_node"),
+        let dax_alias = root.join("bus/dax/devices/dax2.0");
+
+        for (directory, name, expected) in [
+            (&pci, &b"numa_node"[..], Some(Absent)),
+            (&alias, b"numa_node", Some(Absent)),
+            (&pci.join("nvme/.."), b"numa_node", Some(Absent)),
+            (&nvme, b"numa_node", Some(Reads(Node(-1)))),
+            (&dsa, b"numa_node", Some(Reads(Node(-1)))),
+            (&scsi, b"numa_node", Some(Reads(Node(0)))),
+            (&namespace, b"numa_nodes", Some(Reads(PathNodes))),
+            (&region, b"numa_node", Some(Absent)),
+            (&region, b"target_node", Some(Absent)),
+            (&nd_dax, b"target_node", Some(Absent)),
+            (&nfit_dax, b"target_node", Some(Reads(Node(0)))),
+            (&nfit_dax, b"numa_node", Some(Absent)),
+            (&tree_dax, b"target_node", Some(Absent)),
+            (&cxl_dax, b"target_node", Some(Reads(Node(0)))),
+            (&dax_alias, b"target_node", Some(Reads(Node(0)))),
+            (&hmem_dax, b"target_node", Some(Reads(Node(0)))),
+            (&other_dax, b"target_node", None),
+            // The neighbouring attributes stay the kernel's.
+            (&pci, b"vendor", None),
+            (&pci, b"numa_node0", None),
+            (&pci, b"subsystem", None),
+            (&nvme, b"cntlid", None),
+            (&region, b"devtype", None),
+            (&cxl_dax, b"size", None),
+            (&namespace, b"numa_node", None),
+            // And a directory without a `subsystem` link has none.
+            (&root.to_path_buf(), b"numa_node", None),
+        ] {
+            assert_eq!(
+                device_node_attribute(directory, name),
+                expected,
+                "{directory:?} {:?}",
+                String::from_utf8_lossy(name)
+            );
+            assert_eq!(
+                is_absent_device_attribute(directory, name),
+                expected == Some(Absent),
                 "{directory:?}"
             );
-            for name in [&b"vendor"[..], b"numa_node0", b"subsystem"] {
-                assert!(
-                    !is_absent_device_attribute(&directory, name),
-                    "{directory:?}"
-                );
-            }
         }
-        assert!(!is_absent_device_attribute(&nvme, b"numa_node"));
-        assert!(!is_absent_device_attribute(root, b"numa_node"));
 
         for path in [
             alias.join("numa_node"),
@@ -9424,6 +9684,8 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             pci.join("./numa_node"),
             pci.join("nvme/../numa_node"),
             alias.join("subsystem/devices/0000:00:00.0/numa_node"),
+            region.join("target_node"),
+            tree_dax.join("target_node"),
         ] {
             assert_eq!(
                 absent_device_attribute_prefix(&path).as_deref(),
@@ -9440,11 +9702,57 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
         for path in [
             alias.join("vendor"),
             nvme.join("numa_node"),
+            cxl_dax.join("target_node"),
+            region.join("devtype"),
             root.join("numa_node"),
             PathBuf::from("devices/pci0000:00/0000:00:00.0/numa_node"),
         ] {
             assert_eq!(absent_device_attribute_prefix(&path), None, "{path:?}");
         }
+    }
+
+    /// A device's NUMA attribute that a kernel without NUMA registers reads
+    /// that kernel's value in place of the host's, as a file Detcore
+    /// classified when the kernel opened it, and keeps the host's bytes
+    /// where they do not have the attribute's format.
+    #[test]
+    fn device_numa_attributes_read_a_kernel_without_numas_values() {
+        for (file, kernel, expected) in [
+            (DeviceNodeFile::Node(-1), &b"0\n"[..], &b"-1\n"[..]),
+            (DeviceNodeFile::Node(-1), b"1\n", b"-1\n"),
+            (DeviceNodeFile::Node(-1), b"-1\n", b"-1\n"),
+            (DeviceNodeFile::Node(0), b"1\n", b"0\n"),
+            (DeviceNodeFile::Node(0), b"-1\n", b"0\n"),
+            (DeviceNodeFile::Node(-1), b"node\n", b"node\n"),
+            (DeviceNodeFile::Node(-1), b"0", b"0"),
+            (DeviceNodeFile::Node(-1), b"", b""),
+            // An NVMe path's node list, of which only node 0 exists.
+            (DeviceNodeFile::PathNodes, b"", b""),
+            (DeviceNodeFile::PathNodes, b"\n", b"\n"),
+            (DeviceNodeFile::PathNodes, b"0\n", b"0\n"),
+            (DeviceNodeFile::PathNodes, b"0-1\n", b"0\n"),
+            (DeviceNodeFile::PathNodes, b"0,3\n", b"0\n"),
+            (DeviceNodeFile::PathNodes, b"1\n", b"\n"),
+            (DeviceNodeFile::PathNodes, b"1-3\n", b"\n"),
+            (DeviceNodeFile::PathNodes, b"2,5\n", b"\n"),
+            (DeviceNodeFile::PathNodes, b"10\n", b"\n"),
+            (DeviceNodeFile::PathNodes, b"x\n", b"x\n"),
+        ] {
+            assert_eq!(
+                file.contents(kernel),
+                expected,
+                "{file:?} {:?}",
+                String::from_utf8_lossy(kernel)
+            );
+            let mut opened = ProcfsFile::device_node(file);
+            opened.initialize(kernel.to_vec(), ProcfsSnapshotContext::default());
+            assert_eq!(opened.contents.as_deref(), Some(expected), "{file:?}");
+        }
+        // The classification survives the descriptor's serialization.
+        let file = ProcfsFile::device_node(DeviceNodeFile::Node(-1));
+        let restored: ProcfsFile =
+            serde_json::from_str(&serde_json::to_string(&file).unwrap()).unwrap();
+        assert_eq!(restored, file);
     }
 
     #[test]

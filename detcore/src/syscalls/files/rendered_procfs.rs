@@ -367,6 +367,21 @@ pub(super) fn proc_device() -> Option<u64> {
     *PROC_DEVICE.get_or_init(|| GuestProcfs::stat(c"/proc").ok().map(|stat| stat.st_dev))
 }
 
+/// The device of the guest's sysfs mount at `/sys`, read once, as
+/// [`proc_device`] is: every file of one sysfs mount has it. `None` where
+/// `/sys` is no sysfs mount (`statfs`'s `SYSFS_MAGIC`): in a container image
+/// that mounts none, and under a user bind over `/sys`, where it is an
+/// ordinary directory, whose files are the guest's own.
+pub(super) fn sys_device() -> Option<u64> {
+    static SYS_DEVICE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *SYS_DEVICE.get_or_init(|| {
+        if !super::procfs_levels::is_on_sysfs(Path::new("/sys")) {
+            return None;
+        }
+        GuestProcfs::stat(c"/sys").ok().map(|stat| stat.st_dev)
+    })
+}
+
 /// Linux's `MAXSYMLINKS` (include/linux/namei.h): `reserve_stack` fails the
 /// 41st symbolic link of one lookup with ELOOP.
 const MAXSYMLINKS: usize = 40;

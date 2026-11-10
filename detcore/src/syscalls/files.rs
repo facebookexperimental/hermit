@@ -56,9 +56,11 @@ use crate::config::SchedHeuristic;
 use crate::dirents::*;
 use crate::fd::*;
 use crate::fifo_peer::FifoPeer;
+use crate::procfs::DeviceNodeAttribute;
 use crate::procfs::MountInfoSnapshot;
 use crate::procfs::ProcfsFile;
 use crate::procfs::ProcfsSnapshotContext;
+use crate::procfs::device_node_attribute;
 use crate::procfs::is_absent_cpu_entry;
 use crate::procfs::is_absent_device_attribute;
 use crate::procfs::levels;
@@ -1818,16 +1820,23 @@ pub(crate) enum SyscallCwd {
 /// the supervisor's own tasks, whose descriptor of that number is no guest's,
 /// so its link is never read
 /// (<https://github.com/rrnewton/hermit/issues/4541>): the directory is the
-/// recorded path, with its `.` and `..` folded in by name, as the kernel's
-/// path has neither (`/sys/devices/system/cpu/.` is the directory the
-/// listing filters). `None` where the path is not absolute.
+/// kernel's path as the backend's `link_path` fact names it (`fact`), so that
+/// the directory a `..` spelling reaches through a link
+/// (`/sys/bus/pci/devices/<device>/subsystem/../pci/devices/<device>`, the
+/// device's own) is the one filtered, as on ptrace. Where the backend names
+/// none, it is the recorded path, with its `.` and `..` folded in by name, as
+/// the kernel's path has neither (`/sys/devices/system/cpu/.` is the
+/// directory the listing filters). `None` where the path is not absolute.
 fn listed_directory(
     tool_sees_caller: bool,
     linked: impl FnOnce() -> Option<PathBuf>,
+    fact: impl FnOnce() -> Option<PathBuf>,
     recorded: impl FnOnce() -> Option<PathBuf>,
 ) -> Option<PathBuf> {
     let directory = if tool_sees_caller {
         linked().or_else(recorded)
+    } else if let Some(fact) = fact().filter(|path| path.is_absolute()) {
+        Some(fact)
     } else {
         recorded().map(|path| {
             let mut folded = PathBuf::new();
@@ -1889,16 +1898,20 @@ mod listed_directory_tests {
     use super::*;
 
     /// Where the tool's `/proc` entry for the caller is not the caller's
-    /// (KVM), a listing's directory is the path the guest opened it by, its
-    /// `.` and `..` folded in, and the descriptor link of the entry is never
-    /// read; elsewhere the link is the directory, and the recorded path, as
-    /// it is, the fallback (<https://github.com/rrnewton/hermit/issues/4541>).
+    /// (KVM), a listing's directory is the kernel's path for it as the
+    /// backend's fact names it, or, where the backend names none, the path
+    /// the guest opened it by, its `.` and `..` folded in; the descriptor link
+    /// of the entry is never read. Elsewhere the link is the directory, the
+    /// fact is never asked, and the recorded path, as it is, is the fallback
+    /// (<https://github.com/rrnewton/hermit/issues/4541>).
     #[test]
     fn a_listing_is_named_by_the_link_only_where_the_entry_is_the_callers() {
         // Compared byte for byte: `Path`'s own comparison ignores a `.`.
         let bytes = |path: Option<PathBuf>| path.map(PathBuf::into_os_string);
         let cpu = || Some(PathBuf::from("/sys/devices/system/cpu"));
         let unread = || -> Option<PathBuf> { panic!("the link of a host task was read") };
+        let unasked = || -> Option<PathBuf> { panic!("the backend's fact was asked") };
+        let no_fact = || None;
         for recorded in [
             "/sys/devices/system/cpu/.",
             "/sys/devices/system/cpu/",
@@ -1906,21 +1919,48 @@ mod listed_directory_tests {
             "/sys/devices/system/cpu/../cpu",
         ] {
             assert_eq!(
-                bytes(listed_directory(false, unread, || Some(PathBuf::from(
-                    recorded
-                )))),
+                bytes(listed_directory(false, unread, no_fact, || Some(
+                    PathBuf::from(recorded)
+                ))),
                 bytes(cpu()),
                 "{recorded}"
             );
         }
         assert_eq!(
-            listed_directory(false, unread, || Some(PathBuf::from("cpu"))),
+            listed_directory(false, unread, no_fact, || Some(PathBuf::from("cpu"))),
             None
         );
+        // The device a `..` through its `subsystem` link reaches is named by
+        // the fact; folded by name, the spelling names no directory at all.
+        let device = || Some(PathBuf::from("/sys/devices/pci0000:00/0000:00:00.0"));
+        let through_subsystem = || {
+            Some(PathBuf::from(
+                "/sys/bus/pci/devices/0000:00:00.0/subsystem/../pci/devices/0000:00:00.0",
+            ))
+        };
         assert_eq!(
-            bytes(listed_directory(true, cpu, || Some(PathBuf::from(
-                "/tmp/x"
-            )))),
+            bytes(listed_directory(false, unread, device, through_subsystem)),
+            bytes(device())
+        );
+        assert_eq!(
+            bytes(listed_directory(false, unread, no_fact, through_subsystem)),
+            Some("/sys/bus/pci/devices/0000:00:00.0/pci/devices/0000:00:00.0".into())
+        );
+        // A fact that names no absolute path (an object the backend keeps
+        // itself) leaves the recorded path.
+        assert_eq!(
+            bytes(listed_directory(
+                false,
+                unread,
+                || Some(PathBuf::from("anon_inode:[eventfd]")),
+                || Some(PathBuf::from("/sys/devices/system/cpu/."))
+            )),
+            bytes(cpu())
+        );
+        assert_eq!(
+            bytes(listed_directory(true, cpu, unasked, || Some(
+                PathBuf::from("/tmp/x")
+            ))),
             bytes(cpu())
         );
         // Where the link cannot be read, the recorded path as it is.
@@ -1928,6 +1968,7 @@ mod listed_directory_tests {
             bytes(listed_directory(
                 true,
                 || None,
+                unasked,
                 || Some(PathBuf::from("/tmp/x/../y"))
             )),
             Some("/tmp/x/../y".into())
@@ -2887,6 +2928,36 @@ impl<'a> StatTarget<'a> {
                 StatTarget::Overwritten
             }
             target => target,
+        }
+    }
+
+    /// The path this target names, read now, where the `len` bytes of the
+    /// call's result at `result` overlap it, so that a check once the call
+    /// has run can look it up again
+    /// (`Detcore::stat_reached_absent_sysfs_object`). `None` for every other
+    /// target.
+    fn looked_up_if_overwritten<M: MemoryAccess>(
+        self,
+        memory: &M,
+        result: usize,
+        len: usize,
+    ) -> Option<procfs_levels::LookedUpPath> {
+        match self {
+            StatTarget::Path {
+                dirfd,
+                path,
+                follow,
+            } if path_overlaps_bytes(memory, path, result, len) => {
+                path?
+                    .read(memory)
+                    .ok()
+                    .map(|spelling| procfs_levels::LookedUpPath {
+                        dirfd,
+                        spelling,
+                        follow,
+                    })
+            }
+            _ => None,
         }
     }
 
@@ -7016,6 +7087,24 @@ impl<T: RecordOrReplay> Detcore<T> {
                     resource_release_all(guest).await;
                     return Err(Errno::ENOENT.into());
                 }
+                // Likewise a sysfs object the machine Detcore presents does
+                // not have (`Detcore::is_absent_sysfs_object`), which the
+                // lookup check leaves out by the guest's spelling: reached
+                // through a symbolic link to it, or to a directory above it,
+                // it is named here by the kernel's path for the descriptor.
+                let sysfs_object = self.opened_sysfs_object(guest, fd, identity.as_ref());
+                if let Some(object) = sysfs_object
+                    .as_deref()
+                    .filter(|object| self.is_absent_sysfs_object(object))
+                {
+                    guest.thread_state().remove_fd(fd);
+                    let _ = guest.inject(syscalls::Close::new().with_fd(fd)).await;
+                    let answer =
+                        Box::pin(self.answer_open_of_absent_sysfs_object(guest, &call, object))
+                            .await;
+                    resource_release_all(guest).await;
+                    return Err(answer);
+                }
                 // A FIFO (a named one, or a pipe reached by path that the
                 // check above left `Regular`) stays `Regular` and physically
                 // blocking, so a FIFO whose other end is on the host blocks as
@@ -7351,6 +7440,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                             .filter(|resolved| resolved != &observed_path)
                             .and_then(|resolved| ProcfsFile::of_kernel_open(&resolved, cpus));
                     }
+                }
+                // A device's NUMA attribute that the kernel without NUMA
+                // Detcore presents registers with contents of its own (an
+                // NVMe controller's `numa_node`, -1), by the object the
+                // kernel opened, as for the absent ones above.
+                if procfs.is_none()
+                    && let Some(object) = &sysfs_object
+                    && let (Some(directory), Some(name)) = (object.parent(), object.file_name())
+                    && let Some(DeviceNodeAttribute::Reads(file)) =
+                        device_node_attribute(directory, name.as_encoded_bytes())
+                {
+                    procfs = Some(ProcfsFile::device_node(file));
                 }
                 // A process's cgroup file bind-mounted at another path, or
                 // reached through another procfs mount, classifies by neither
@@ -7768,6 +7869,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Errno::ENOENT.into()
                 } else {
                     e
+                };
+                // And one that went through a sysfs object the machine
+                // Detcore presents does not have, by a spelling the lookup
+                // check does not resolve, fails as an open of the object's
+                // own path does.
+                let e = match e {
+                    Error::Errno(errno) => {
+                        match Box::pin(self.failed_open_answer(guest, &call, &path, errno)).await {
+                            Some(answer) => answer,
+                            None => e,
+                        }
+                    }
+                    e => e,
                 };
                 resource_release_all(guest).await;
                 Err(e)
@@ -13527,6 +13641,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 guest.memory().write_value(statptr.0, &stat.into())?;
                 return Ok(0);
             }
+            let overwritten = call.stat().and_then(|result| {
+                target.looked_up_if_overwritten(
+                    &guest.memory(),
+                    result.0.as_raw(),
+                    std::mem::size_of::<libc::stat>(),
+                )
+            });
             let target = match call.stat() {
                 Some(result) => target.unless_overwritten(
                     &guest.memory(),
@@ -13540,7 +13661,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.stat().map(|result| result.0.as_raw()),
                 std::mem::size_of::<libc::stat>(),
             );
-            Self::inject_translated(guest, Syscall::from(call)).await?;
+            if let Err(errno) = Self::inject_translated(guest, Syscall::from(call)).await {
+                // A lookup that failed below a sysfs object the machine
+                // Detcore presents does not have, reached through a spelling
+                // the lookup check does not resolve, fails as one that names
+                // the object does.
+                let absent = Box::pin(self.stat_reached_absent_sysfs_object(
+                    guest,
+                    Err(errno),
+                    target,
+                    overwritten,
+                ))
+                .await;
+                return Err(if absent { Errno::ENOENT } else { errno }.into());
+            }
             let statptr = call.stat().ok_or(Errno::EFAULT)?;
             let inode_override = target
                 .descriptor()
@@ -13563,6 +13697,25 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                     guest.memory().read_value(statptr.0)?
                 }
+            };
+            // A sysfs object the machine Detcore presents does not have,
+            // reached through a spelling the lookup check does not resolve:
+            // `ENOENT` too, the buffer as it was. Asked, in a boxed future,
+            // only of a result on sysfs, which is read again after it.
+            let stat = if self.may_reach_absent_sysfs_object(guest, dev) {
+                if Box::pin(self.stat_reached_absent_sysfs_object(
+                    guest,
+                    Ok(dev),
+                    target,
+                    overwritten,
+                ))
+                .await
+                {
+                    return Self::hidden_placeholder_stat(guest, statptr.0.as_raw(), before);
+                }
+                guest.memory().read_value(statptr.0)?
+            } else {
+                stat
             };
             let mut memory = guest.memory();
             // A placeholder another process made, or an earlier image of this
@@ -13646,6 +13799,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             } else if let Some(stat) = self.rendered_procfs_stat(guest, target).await? {
                 return self.write_rendered_statx(guest, call, stat).await;
             }
+            let overwritten = call.statx().and_then(|result| {
+                target.looked_up_if_overwritten(
+                    &guest.memory(),
+                    result.0.as_raw(),
+                    std::mem::size_of::<reverie::syscalls::linux_abi::Statx>(),
+                )
+            });
             let target = match call.statx() {
                 Some(result) => target.unless_overwritten(
                     &guest.memory(),
@@ -13667,8 +13827,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.statx().map(|result| result.0.as_raw()),
                 std::mem::size_of::<reverie::syscalls::linux_abi::Statx>(),
             );
-            Self::inject_translated(guest, Syscall::from(statx_asking_classic_mount_id(call)))
-                .await?;
+            if let Err(errno) =
+                Self::inject_translated(guest, Syscall::from(statx_asking_classic_mount_id(call)))
+                    .await
+            {
+                // An absent sysfs object, as for the other stat calls.
+                let absent = Box::pin(self.stat_reached_absent_sysfs_object(
+                    guest,
+                    Err(errno),
+                    target,
+                    overwritten,
+                ))
+                .await;
+                return Err(if absent { Errno::ENOENT } else { errno }.into());
+            }
             let statptr = call.statx().ok_or(Errno::EFAULT)?;
             let inode_override = target
                 .descriptor()
@@ -13693,6 +13865,22 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                     guest.memory().read_value(statptr.0)?
                 }
+            };
+            // An absent sysfs object, as for the other stat calls.
+            let stat = if self.may_reach_absent_sysfs_object(guest, dev) {
+                if Box::pin(self.stat_reached_absent_sysfs_object(
+                    guest,
+                    Ok(dev),
+                    target,
+                    overwritten,
+                ))
+                .await
+                {
+                    return Self::hidden_placeholder_stat(guest, statptr.0.as_raw(), before);
+                }
+                guest.memory().read_value(statptr.0)?
+            } else {
+                stat
             };
             let mut memory = guest.memory();
             // A placeholder another process made, or an earlier image of this
@@ -19568,17 +19756,19 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// [`is_absent_cpu_entry`]), so that a guest counting
     /// `/sys/devices/system/cpu/cpuN` finds the virtual CPUs, as `online` and
     /// `sched_getaffinity` report
-    /// (<https://github.com/rrnewton/hermit/issues/4160>); a device's
-    /// `numa_node` that a kernel without NUMA does not register (see
+    /// (<https://github.com/rrnewton/hermit/issues/4160>); a device's NUMA
+    /// attribute that a kernel without NUMA does not register (see
     /// [`is_absent_device_attribute`]); and the `/proc` names outside the
     /// run's `--proc` level, which lookups refuse (see
     /// [`levels::absent_entry`]).
     ///
     /// The directory is named by the kernel's path for the descriptor, so a
-    /// relative or symlinked spelling is recognized too. Not under record and
-    /// replay, where the replayer's descriptor does not name the recorded
-    /// directory, so the two runs would not drop alike; Detcore names no
-    /// procfs entry there either (see [`Self::procfs_entry`]).
+    /// relative, symlinked or `..` spelling is recognized too, where the tool
+    /// cannot read that path itself (KVM) by the backend's `link_path` fact
+    /// ([`listed_directory`]). Not under record and replay, where the
+    /// replayer's descriptor does not name the recorded directory, so the two
+    /// runs would not drop alike; Detcore names no procfs entry there either
+    /// (see [`Self::procfs_entry`]).
     async fn drop_absent_entries<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -19621,6 +19811,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             tool_sees_caller,
             || std::fs::read_link(&link).ok(),
             || {
+                Self::own_descriptor_link_from_fact(guest, fd)
+                    .flatten()
+                    .map(|link| {
+                        PathBuf::from(
+                            <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(link),
+                        )
+                    })
+            },
+            || {
                 guest
                     .thread_state()
                     .with_detfd(fd, |detfd| detfd.path())
@@ -19646,9 +19845,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             let has_absent_cpu = entries
                 .iter()
                 .any(|entry| is_absent_cpu_entry(&directory, &entry.name, cpus));
-            // A device's `numa_node`, which a kernel without NUMA does not
-            // register for a device on most buses: the device directory's
-            // `subsystem` link says which bus it is on.
+            // A device's NUMA attribute that a kernel without NUMA does not
+            // register (`numa_node` for a device on most buses, an NVDIMM's
+            // `target_node`): the device directory's `subsystem` link says
+            // which bus it is on.
             let has_absent_attribute = entries
                 .iter()
                 .any(|entry| is_absent_device_attribute(&directory, &entry.name));
@@ -19659,7 +19859,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             entries.retain(|entry| {
                 !(on_sysfs
                     && (is_absent_cpu_entry(&directory, &entry.name, cpus)
-                        || (has_absent_attribute && entry.name == b"numa_node")))
+                        || (has_absent_attribute
+                            && is_absent_device_attribute(&directory, &entry.name))))
                     && !(on_procfs && levels::absent_entry(&directory, &entry.name, level))
             });
         }
