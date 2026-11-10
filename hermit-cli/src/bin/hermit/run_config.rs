@@ -1557,6 +1557,11 @@ mod tests {
         ("no-deterministic-io", &["--no-deterministic-io"]),
         ("pin-threads", &["--pin-threads"]),
         ("pinned-cpu", &["--pinned-cpu=wait:30"]),
+        (
+            "pinned-cpu-dir",
+            &["--pinned-cpu-dir=/srv/hermit-cpu-locks"],
+        ),
+        ("pinned-cpu-notice", &["--pinned-cpu-notice=off"]),
         ("skid-margin", &["--skid-margin=5"]),
         (
             "mount",

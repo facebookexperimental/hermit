@@ -46,7 +46,17 @@ PRAGMA integrity_check;";
     hermit_test::hermit_output(
         "hermit run",
         Command::new(hermit)
-            .args(["--log", "off", "run", EPOCH, "--"])
+            // The two runs' Hermit stderr must match; a `--pinned-cpu`
+            // notice (another run holds the CPU in one of them) is
+            // placement, not what this checks.
+            .args([
+                "--log",
+                "off",
+                "run",
+                "--pinned-cpu-notice=off",
+                EPOCH,
+                "--",
+            ])
             .arg(sqlite)
             .arg(database)
             .arg(SQL),

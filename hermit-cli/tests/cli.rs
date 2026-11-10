@@ -5739,6 +5739,8 @@ fn readonly_proc_metadata_detects_replay_mismatch_and_accepts_older_recordings()
     let replay_args = ["replay", "--autopilot", "--data-dir", directory];
     // This counts every `hermit: warning:` line below; a `--pinned-cpu`
     // notice (another run holds the CPU) is placement, not what it checks.
+    // `hermit replay` takes no --pinned-cpu-notice flag, so the documented
+    // environment fallback turns the notice off.
     let replay = hermit_test::hermit_output(
         "hermit run",
         readonly_proc_command(&replay_args).env("HERMIT_PINNED_CPU_NOTICE", "0"),
@@ -21739,6 +21741,7 @@ fn run_kvm_preserves_closed_standard_input() {
             "--backend",
             backend,
             "run",
+            "--pinned-cpu-notice=off",
             "--strict",
             "--base-env=minimal",
             &epoch_arg,
@@ -21752,8 +21755,7 @@ fn run_kvm_preserves_closed_standard_input() {
                 .arg(guest)
                 .arg(mode)
                 .current_dir(native_dir.path())
-                .stdin(Stdio::null())
-                .env("HERMIT_PINNED_CPU_NOTICE", "0"),
+                .stdin(Stdio::null()),
         );
         assert_success(&output, &args);
         assert_eq!(stdout(&output), expected, "{backend} {mode}");

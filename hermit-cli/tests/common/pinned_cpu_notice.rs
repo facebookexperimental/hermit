@@ -10,8 +10,8 @@
 //! name on stderr (`hermit run --pinned-cpu`), and the CPU it lands on never
 //! reaches the guest. Each test forces the case it names without load: the
 //! run may use one CPU, and the test holds that CPU's lock file in a private
-//! lock directory (`HERMIT_PINNED_CPU_DIR`), as another run would. Nothing
-//! here spins; the guests are `echo` and `date`.
+//! lock directory (`--pinned-cpu-dir`), as another run would. Nothing
+//! here spins; the guests are `echo` and shell builtins.
 
 use std::fs;
 use std::os::fd::AsRawFd;
@@ -47,8 +47,9 @@ fn hold(dir: &Path, cpu: usize) -> fs::File {
     file
 }
 
-/// `hermit` with `args`, allowed only `cpu`, using the lock directory
-/// `dir`, with the notice left on (no `HERMIT_PINNED_CPU_NOTICE`). Hermit
+/// `hermit` with `args` (a `run` command), allowed only `cpu`, given the lock
+/// directory `dir` with `--pinned-cpu-dir`, with the notice left on (no
+/// `--pinned-cpu-notice`, and neither environment fallback set). Hermit
 /// starts in a new user and network namespace (`unshare -rn`), so the only
 /// runs that can hold its CPU are the ones this test arranges: the abstract
 /// socket names other tests' runs hold live in the test's namespace, which
@@ -56,9 +57,13 @@ fn hold(dir: &Path, cpu: usize) -> fs::File {
 fn pinned_hermit(cpu: usize, dir: &Path, args: &[&str]) -> Output {
     let mut command = Command::new("unshare");
     command.arg("-rn").arg(env!("CARGO_BIN_EXE_hermit"));
-    super::append_hermit_args(&mut command, args);
+    assert_eq!(args.first(), Some(&"run"));
+    let dir_arg = format!("--pinned-cpu-dir={}", dir.display());
+    let mut with_dir = vec!["run", dir_arg.as_str()];
+    with_dir.extend_from_slice(&args[1..]);
+    super::append_hermit_args(&mut command, &with_dir);
     command
-        .env("HERMIT_PINNED_CPU_DIR", dir)
+        .env_remove("HERMIT_PINNED_CPU_DIR")
         .env_remove("HERMIT_PINNED_CPU_NOTICE");
     // SAFETY: sched_setaffinity only, between fork and exec.
     unsafe {
@@ -118,13 +123,20 @@ fn refuse_and_wait_name_the_cpu_set_instead_of_sharing() {
     for (policy, expected) in [
         (
             "--pinned-cpu=refuse",
-            format!("--pinned-cpu=refuse: refusing the run on CPUs {cpu}: cpu-shared:"),
+            format!(
+                "--pinned-cpu=refuse: every allowed CPU ({cpu}) is held by another Hermit run, so \
+                 the run was not started. Retry when one is free, wait for one with \
+                 --pinned-cpu=wait[:SECONDS], allow more CPUs, or run on a shared CPU with \
+                 --pinned-cpu=share."
+            ),
         ),
         (
             "--pinned-cpu=wait:1",
             format!(
-                "--pinned-cpu=wait:1: refusing the run on CPUs {cpu}: every allowed CPU stayed \
-                 held by another Hermit run for the whole 1 s wait"
+                "--pinned-cpu=wait:1: every allowed CPU ({cpu}) stayed held by another Hermit run \
+                 for the whole 1 s wait, so the run was not started. Retry later, wait longer \
+                 with --pinned-cpu=wait:SECONDS, allow more CPUs, or run on a shared CPU with \
+                 --pinned-cpu=share."
             ),
         ),
     ] {
@@ -189,7 +201,7 @@ fn a_run_in_another_network_namespace_still_sees_a_held_cpu() {
 /// shares its CPU: a strict `--verify --verify-strict` run reaches bitwise
 /// parity both ways, and the guest's output, as the report hashes it, is the
 /// same in both. The notice is Hermit's own stderr, outside the compared
-/// guest streams.
+/// guest streams, and appears once for the invocation, not once per run.
 #[test]
 fn sharing_a_cpu_changes_nothing_the_guest_sees() {
     let cpu = one_cpu();
@@ -210,7 +222,11 @@ fn sharing_a_cpu_changes_nothing_the_guest_sees() {
             "--",
             "/bin/sh",
             "-c",
-            "date +%s.%N; echo $RANDOM $$",
+            // Shell builtins only: with `date` in it, this test's run with
+            // its CPU free failed --verify-strict in 2 of 5 tries (an fstat
+            // result buffer of `date` differed between the pair's two runs),
+            // which placement cannot cause and is not what this test checks.
+            "echo $RANDOM $$; echo $((RANDOM % 97))",
         ];
         let output = pinned_hermit(cpu, dir.path(), &args);
         assert!(output.status.success(), "{name}: {output:?}");
@@ -227,7 +243,13 @@ fn sharing_a_cpu_changes_nothing_the_guest_sees() {
     assert!(!super::stderr(&alone).contains("cpu-shared"), "{alone:?}");
     let _other_run = hold(dir.path(), cpu);
     let (shared, shared_report) = run("shared");
-    assert!(super::stderr(&shared).contains("cpu-shared"), "{shared:?}");
+    assert_eq!(
+        super::stderr(&shared)
+            .matches("hermit: warning: cpu-shared:")
+            .count(),
+        1,
+        "one notice for the whole --verify invocation, not one per run: {shared:?}"
+    );
     assert_eq!(super::stdout(&shared), super::stdout(&alone));
     assert_eq!(
         shared_report["compared_outputs"], alone_report["compared_outputs"],

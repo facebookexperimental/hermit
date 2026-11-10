@@ -1823,18 +1823,37 @@ pub struct RunOpts {
     /// it cannot keep every other Hermit run off its CPU: every allowed CPU is
     /// held by another run (cpu-shared), the reservation cannot be made
     /// (cpu-unreserved), or it can be made only against runs in this network
-    /// namespace (cpu-netns-only, when the lock directory `/dev/shm/hermit-pinned-cpu`,
-    /// or the one `HERMIT_PINNED_CPU_DIR` names, is unusable). `share` runs anyway and
-    /// prints a named `hermit: warning:` notice to stderr (`HERMIT_PINNED_CPU_NOTICE=0`
-    /// silences it); `refuse` refuses the run before the guest starts; `wait` (600 s) or
-    /// `wait:SECONDS` waits, sleeping, for a CPU to come free, then refuses. The CPU is
-    /// host placement only: guest-visible behavior is the same under every value.
+    /// namespace (cpu-netns-only: the lock directory, `--pinned-cpu-dir`, is
+    /// unusable). `share` runs anyway and prints a named `hermit: warning:`
+    /// notice to stderr (`--pinned-cpu-notice=off` silences it); `refuse`
+    /// refuses the run before the guest starts; `wait` (600 s) or
+    /// `wait:SECONDS` waits, sleeping, for a CPU to come free, bounded by
+    /// `--timeout` too, then refuses. The CPU is host placement only:
+    /// guest-visible behavior is the same under every value.
     #[clap(
         long,
         value_name = "share|refuse|wait[:SECONDS]",
         default_value = "share"
     )]
     pinned_cpu: super::pinned_cpu::PinnedCpuPolicy,
+
+    /// The directory whose per-CPU lock files reserve a pinned run's CPU
+    /// against Hermit runs in other network namespaces (default
+    /// `/dev/shm/hermit-pinned-cpu`, or `HERMIT_PINNED_CPU_DIR` when set). It
+    /// must be a real directory owned by this user, or root's shared mode-1777
+    /// sticky directory (`install -d -m 1777 -o root -g root PATH`). A container
+    /// with a private `/dev/shm` (the podman and Docker default) coordinates
+    /// only within itself unless one directory is bind-mounted into every
+    /// container and named here.
+    #[clap(long, value_name = "PATH")]
+    pinned_cpu_dir: Option<PathBuf>,
+
+    /// Whether a pinned run prints its cpu-shared, cpu-unreserved or
+    /// cpu-netns-only notice on stderr (default `on`, or `off` when
+    /// `HERMIT_PINNED_CPU_NOTICE=0`). Placement and `--pinned-cpu` are the
+    /// same either way.
+    #[clap(long, value_name = "on|off", value_parser = ["on", "off"])]
+    pinned_cpu_notice: Option<String>,
 
     /// Override the processor-specific PMU skid margin, in retired conditional branches.
     ///
@@ -12236,6 +12255,27 @@ impl RunOpts {
     /// A new executable does not inherit a ptrace-specific qualification just
     /// because the built-in default enum still exists in this compatibility
     /// step. Refuse unsupported core runtime switches before reading stdin.
+    /// How this run's pinned CPU is placed: `--pinned-cpu`,
+    /// `--pinned-cpu-dir` and `--pinned-cpu-notice`, with the environment's
+    /// fallbacks, and `--timeout` as the bound of a `wait`.
+    fn pinned_cpu_settings(&self) -> super::pinned_cpu::PinnedCpuSettings {
+        use super::pinned_cpu::PinnedCpuSettings;
+        PinnedCpuSettings {
+            policy: self.pinned_cpu,
+            dir: self
+                .pinned_cpu_dir
+                .clone()
+                .unwrap_or_else(PinnedCpuSettings::dir_from_env),
+            notice: match self.pinned_cpu_notice.as_deref() {
+                Some(value) => value == "on",
+                None => PinnedCpuSettings::notice_from_env(),
+            },
+            wait_cap: self
+                .timeout
+                .map(|seconds| std::time::Duration::from_secs(seconds.get())),
+        }
+    }
+
     fn refuse_unqualified_application_options(
         &self,
         cpu_profile_refusal: &'static str,
@@ -16417,7 +16457,7 @@ impl RunOpts {
             <detcore::Detcore as reverie::Tool>::facility_admission(&self.det_opts.det_config)?;
         }
         let gdbserver_port = self.bind_gdbserver_port()?;
-        super::pinned_cpu::set_policy(self.pinned_cpu);
+        super::pinned_cpu::set_settings(self.pinned_cpu_settings());
         let (mut container, tmpfs, identity, resources) = if self.no_namespace {
             let mut container = Container::new();
             apply_affinity(

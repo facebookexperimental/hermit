@@ -114,9 +114,6 @@ fn python_interpreter() -> PathBuf {
 
 fn run_stdlib_tests(python: &Path) -> Output {
     let mut command = Command::new("timeout");
-    // The two runs' Hermit stderr must match; a `--pinned-cpu` notice (another
-    // run holds the CPU in one of them) is placement, not what this checks.
-    command.env("HERMIT_PINNED_CPU_NOTICE", "0");
     command
         .arg(format!("--kill-after={HERMIT_KILL_GRACE_SECONDS}s"))
         .arg(format!("{HERMIT_TIMEOUT_SECONDS}s"))

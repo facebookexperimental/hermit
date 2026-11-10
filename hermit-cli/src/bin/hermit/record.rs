@@ -46,7 +46,15 @@ enum RecordCommand {
     Clean(CleanOpts),
 
     /// Start recording.
-    #[clap(name = "start")]
+    #[clap(
+        name = "start",
+        after_help = "The recording is pinned to one CPU, reserved against other Hermit runs as \
+                      `hermit run` reserves it, with the default policy (--pinned-cpu=share). \
+                      HERMIT_PINNED_CPU_DIR names its lock directory (the `hermit run` flag \
+                      --pinned-cpu-dir), and HERMIT_PINNED_CPU_NOTICE=0 silences its \
+                      cpu-shared, cpu-unreserved and cpu-netns-only notices (the `hermit run` \
+                      flag --pinned-cpu-notice=off)."
+    )]
     Start(Box<StartOpts>),
 }
 

@@ -1421,33 +1421,58 @@ the default equal-priority policy.
 
 A run with a timeslice (or `--pin-threads`) pins its tracer and guest threads to
 one host CPU, chosen from the tracer's allowed set, and reserves that CPU
-against other Hermit runs for its lifetime: an abstract Unix socket named
-`hermit-pinned-core:<cpu>` (visible within one network namespace) and an
-exclusive `flock` on `/dev/shm/hermit-pinned-cpu/<cpu>` (visible to every run
-that shares that directory, whatever its network namespace). The kernel drops
-both when the run's processes exit, however they exit, so no reservation is
-ever left behind. `HERMIT_PINNED_CPU_DIR` names another lock directory, for
-example one bind-mounted into several containers; it changes only the path.
-The directory must be a real directory owned by the user, or root's shared
-mode-1777 sticky directory; a lock file another user created and keeps only
-makes its CPU count as held.
+against other Hermit runs for its lifetime through two channels:
+
+- an abstract Unix socket named `hermit-pinned-core:<cpu>`, which runs in the
+  same network namespace see;
+- an exclusive `flock` on `<dir>/<cpu>` in a lock directory, by default
+  `/dev/shm/hermit-pinned-cpu`, which every run using that directory sees,
+  whatever its network namespace.
+
+The kernel drops both when the run's processes exit, however they exit, so no
+reservation is ever left behind. A CPU either channel holds counts as held.
+
+`hermit run --pinned-cpu-dir=PATH` names another lock directory
+(`HERMIT_PINNED_CPU_DIR` is the fallback, and the only setting for other
+subcommands such as `hermit record start`). It changes only the path: the
+directory must be a real directory (not a symlink) owned by the user, or root's
+shared form. Hermit creates a missing directory private to the user (mode 0700)
+unless it runs as root. For one directory that every user's runs share, create
+the shared form as root:
+
+```bash
+install -d -m 1777 -o root -g root /dev/shm/hermit-pinned-cpu
+```
+
+A lock file another user created and keeps only makes its CPU count as held;
+lock files are made mode 0644, so other users' runs can lock them too.
+
+A container with a private `/dev/shm` (the podman and Docker default) has its
+own copy of the default directory, so its runs coordinate only with runs in the
+same container, and nothing reports that. To coordinate across containers,
+bind-mount one host directory into every container and name it with
+`--pinned-cpu-dir`.
 
 When a run cannot keep every other Hermit run off its CPU, it says so by name
-on stderr:
+on stderr, once per invocation (a `--verify` pair prints it once):
 
 | Notice | Meaning |
 | --- | --- |
 | `hermit: warning: cpu-shared:` | Every allowed CPU is held by another Hermit run; this run shares one and runs slower. |
 | `hermit: warning: cpu-unreserved:` | The reservation could not be made; another run may be pinned to the same CPU. |
-| `hermit: warning: cpu-netns-only:` | The lock directory is unusable, so only runs in this network namespace see the reservation. |
+| `hermit: warning: cpu-netns-only:` | The lock directory is unusable (the notice says why), so only runs in this network namespace see the reservation. |
 
-`--pinned-cpu=share` (the default) runs anyway with the notice;
-`--pinned-cpu=refuse` refuses the run before the guest starts; `--pinned-cpu=wait`
-(600 seconds) or `--pinned-cpu=wait:SECONDS` sleeps and retries every 500 ms
-until a CPU comes free, then refuses, naming the CPU set and the wait.
-`HERMIT_PINNED_CPU_NOTICE=0` silences the notices without changing placement.
-The CPU is host placement only: guest-visible behavior, and `--verify`
-results, are the same whichever CPU a run gets.
+`--pinned-cpu=share` (the default) runs anyway with the notice.
+`--pinned-cpu=refuse` refuses the run before the guest starts (exit 122).
+`--pinned-cpu=wait` (600 seconds) or `--pinned-cpu=wait:SECONDS` prints one
+`hermit: waiting up to ... for a CPU` line, then sleeps and retries every
+500 ms until a CPU comes free. If none does within that time, or within
+`--timeout` when that is shorter, it refuses. Each refusal names the CPU set,
+why, and what to do instead.
+`--pinned-cpu-notice=off` (fallback `HERMIT_PINNED_CPU_NOTICE=0`) silences the
+notices without changing placement. The CPU is host placement only:
+guest-visible behavior, and `--verify` results, are the same whichever CPU a
+run gets.
 
 ### Exclusive-Loop Rewrite (aarch64)
 

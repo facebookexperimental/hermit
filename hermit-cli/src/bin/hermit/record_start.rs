@@ -517,6 +517,9 @@ impl StartOpts {
         network: NetworkingMode,
         backend_mounts: Vec<Mount>,
     ) -> Result<(Container, IdentityGuard), Error> {
+        // The defaults and their environment fallbacks, never a policy another
+        // subcommand of this process set.
+        super::pinned_cpu::set_settings(super::pinned_cpu::PinnedCpuSettings::from_env());
         let mut container = namespace_container(true, None)?;
         network.configure(&mut container, false);
         let (mut identity_mounts, mut identity_guard) = identity_hardening_mounts(None)?;

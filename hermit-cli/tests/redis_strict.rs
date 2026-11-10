@@ -133,13 +133,21 @@ fn run_deterministic_workload(
     // Compatibility workloads keep deterministic defaults while normal mode reports any
     // unsupported syscalls; strict fail-closed behavior is covered by dedicated tests.
     let mut command = Command::new("timeout");
-    // The two runs' Hermit stderr must match; a `--pinned-cpu` notice (another
-    // run holds the CPU in one of them) is placement, not what this checks.
-    command.env("HERMIT_PINNED_CPU_NOTICE", "0");
     command
         .arg("90")
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log", "off", "run", EPOCH, "--", "/bin/sh"])
+        // The two runs' Hermit stderr must match; a `--pinned-cpu` notice
+        // (another run holds the CPU in one of them) is placement, not what
+        // this checks.
+        .args([
+            "--log",
+            "off",
+            "run",
+            "--pinned-cpu-notice=off",
+            EPOCH,
+            "--",
+            "/bin/sh",
+        ])
         .arg(workload)
         .arg(redis_server)
         .arg(redis_cli)
