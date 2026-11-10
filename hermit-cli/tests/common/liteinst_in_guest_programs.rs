@@ -1207,6 +1207,18 @@ fn in_guest_trap_sigalrm_interrupts_a_guest_held_pipe_read_as_ptrace_does() {
 ///   receiver's Detcore records a description of its own, which it marks
 ///   guest-held; Linux's is the same blocking description, so Linux returns
 ///   EINTR after the handler (B1 of coord7's review of 4d17d5ab).
+/// - `scmmrecv`: as `scmrecv`, where the parent receives with `recvmmsg`,
+///   whose receipt untracks through its own call site (N1 of coord7's
+///   review of 858541a9).
+/// - `scmalias` and `scmalias_wait`: as `scmsetfl`, where the read end is
+///   passed by a two-message `sendmmsg` whose second `SCM_RIGHTS` item lies
+///   over the first entry's own `msg_len`, which names another pipe until
+///   Linux stores the first message's byte count there, the read end's
+///   number, before it copies the second message's control data. Sent with
+///   MSG_DONTWAIT and without, so through the handler alone and through the
+///   retry loop (finding 1 of rev5338-cx's review of 858541a9). Linux
+///   returns EAGAIN; the ptrace backend does not yet (see the loop), so its
+///   run is held to L2 repeatability only.
 /// - `scmswitch`: as `scmsetfl`, where the end passed is named only after
 ///   the send waited: the second message of a `sendmmsg` batch, whose first
 ///   waited for room, has shared control data that the child rewrote from
@@ -1236,6 +1248,27 @@ fn in_guest_trap_refuses_by_name_the_sigalrm_pipe_reads_slice_2_does_not_place()
     let diverged = "a pipe read whose status flags another process may have changed through a \
                     copy of the description that a fork or SCM_RIGHTS made, which this process's \
                     copy does not show";
+    // In-guest-trap refuses `mode`'s read at its entry, verified at L2, and
+    // names `reason` once on a single run's stderr.
+    let refused_by_name_in_guest = |mode: &str, reason: &str| {
+        let trap = strict_sigalrm_fixture_run(&guest, "in-guest-trap", Some("1"), "0", mode);
+        assert_eq!(
+            String::from_utf8_lossy(&trap),
+            refused,
+            "in-guest-trap/{mode}"
+        );
+        let (status, stdout, stderr) = single_sigalrm_pipe_read_run(&guest, "in-guest-trap", mode);
+        assert_eq!(status.code(), Some(0), "in-guest-trap/{mode}: {stderr}");
+        assert_eq!(stdout, refused, "in-guest-trap/{mode}");
+        let named = format!(
+            "read refused (EOPNOTSUPP) in a process that handles SIGALRM: {reason} (signal phase 1)."
+        );
+        assert_eq!(
+            stderr.matches(&named).count(),
+            1,
+            "in-guest-trap/{mode}: the one refusal, by name: {stderr}"
+        );
+    };
     for (mode, under_ptrace, reason) in [
         (
             "restart",
@@ -1271,6 +1304,7 @@ fn in_guest_trap_refuses_by_name_the_sigalrm_pipe_reads_slice_2_does_not_place()
         ("scmmsetfl_nowait", eagain, diverged),
         // The receiver's own description, untracked at the receipt.
         ("scmrecv", SIGALRM_PIPE_READ_EINTR, diverged),
+        ("scmmrecv", SIGALRM_PIPE_READ_EINTR, diverged),
         (
             "stdin",
             concat!(
@@ -1286,23 +1320,20 @@ fn in_guest_trap_refuses_by_name_the_sigalrm_pipe_reads_slice_2_does_not_place()
             under_ptrace,
             "ptrace/{mode}"
         );
-        let trap = strict_sigalrm_fixture_run(&guest, "in-guest-trap", Some("1"), "0", mode);
-        assert_eq!(
-            String::from_utf8_lossy(&trap),
-            refused,
-            "in-guest-trap/{mode}"
-        );
-        let (status, stdout, stderr) = single_sigalrm_pipe_read_run(&guest, "in-guest-trap", mode);
-        assert_eq!(status.code(), Some(0), "in-guest-trap/{mode}: {stderr}");
-        assert_eq!(stdout, refused, "in-guest-trap/{mode}");
-        let named = format!(
-            "read refused (EOPNOTSUPP) in a process that handles SIGALRM: {reason} (signal phase 1)."
-        );
-        assert_eq!(
-            stderr.matches(&named).count(),
-            1,
-            "in-guest-trap/{mode}: the one refusal, by name: {stderr}"
-        );
+        refused_by_name_in_guest(mode, reason);
+    }
+    // rev5338-cx's aliased batches (finding 1 of its review of 858541a9):
+    // Linux returns EAGAIN (`eagain`, measured natively with this fixture).
+    // The ptrace backend does not yet: the batch's msg_len overlaps its
+    // control data, so Detcore gives up following the rights it sent
+    // (`lose_peer_lockstep`), the receiver records a description of its
+    // own, and the O_NONBLOCK it sets never reaches the sender's model,
+    // whose read waits and returns EINTR (bead dh-lxp0wg, a pre-existing
+    // ptrace divergence that slice 2 does not touch). So its
+    // run is held to L2 repeatability, not compared with Linux.
+    for mode in ["scmalias", "scmalias_wait"] {
+        strict_sigalrm_fixture_run(&guest, "ptrace", Some("1"), "0", mode);
+        refused_by_name_in_guest(mode, diverged);
     }
 }
 

@@ -2,6 +2,7 @@
  * All rights reserved. Licensed under the BSD-style license in LICENSE. */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <stddef.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
@@ -80,6 +81,21 @@
  *            Linux's received descriptor is the same blocking description,
  *            so the read returns -1/EINTR after the handler, and a second
  *            read returns the byte.
+ *   scmmrecv: as scmrecv, where the parent receives with a one-message
+ *            recvmmsg.
+ *   scmalias, scmalias_wait: as scmsetfl, where the read end is passed by
+ *            a two-message sendmmsg on a SOCK_SEQPACKET socketpair whose
+ *            second message's SCM_RIGHTS item lies over the first entry's
+ *            own msg_controllen, msg_flags, padding and msg_len, so its
+ *            descriptor is that msg_len: another pipe's read end before
+ *            the call. Linux sends the first message (another pipe's write
+ *            end, with as many bytes as the read end's number), stores
+ *            that count in msg_len, and only then copies the second
+ *            message's control data, so it passes the read end; the child
+ *            checks that it received it, sets O_NONBLOCK on it and tells
+ *            the parent. The read returns -1/EAGAIN at once, with no
+ *            handler run. scmalias sends with MSG_DONTWAIT, scmalias_wait
+ *            with no flags, so that Hermit runs it through its retry loop.
  *   scmswitch: as scmsetfl, where the end the child receives is named only
  *            after the parent's send waited. Before the install the parent
  *            fills the socketpair, tells the child, and sends a batch of two
@@ -174,8 +190,9 @@ static ssize_t send_fd(int socket, int fd) {
     return send_fd_with(socket, fd, 0, 0);
 }
 
-/* Receives one descriptor over SCM_RIGHTS on `socket`, or -1. */
-static int receive_fd(int socket) {
+/* Receives one descriptor over SCM_RIGHTS on `socket`, through recvmsg, or
+ * through a one-message recvmmsg where `batch` is set, or -1. */
+static int receive_fd_with(int socket, int batch) {
     char byte;
     struct iovec iov = {&byte, 1};
     union {
@@ -187,12 +204,23 @@ static int receive_fd(int socket) {
     msg.msg_iovlen = 1;
     msg.msg_control = control.buf;
     msg.msg_controllen = sizeof(control.buf);
-    if (recvmsg(socket, &msg, 0) != 1) return -1;
+    if (batch) {
+        struct mmsghdr one = {msg, 0};
+        if (recvmmsg(socket, &one, 1, 0, NULL) != 1 || one.msg_len != 1) return -1;
+        msg = one.msg_hdr;
+    } else if (recvmsg(socket, &msg, 0) != 1) {
+        return -1;
+    }
     struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
     if (!cmsg || cmsg->cmsg_type != SCM_RIGHTS) return -1;
     int fd;
     memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
     return fd;
+}
+
+/* Receives one descriptor over SCM_RIGHTS on `socket` with recvmsg, or -1. */
+static int receive_fd(int socket) {
+    return receive_fd_with(socket, 0);
 }
 
 /* Fills `socket` with data until a nonblocking send would wait: 0, or -1. */
@@ -245,6 +273,48 @@ static int drain_to_fd(int socket) {
             return fd;
         }
     }
+}
+
+/* Sends, in one sendmmsg on `socket` with `flags`, `passed`'s write end and
+ * then a message whose SCM_RIGHTS item is the first entry's own
+ * msg_controllen, msg_flags, padding and msg_len (rev5338-cx's layout): it
+ * names `first_read` until Linux stores the first message's byte count,
+ * `read_end`, in msg_len. The number of messages sent, or -1. */
+static int send_aliased(int socket, int flags, int passed, int first_read, int read_end) {
+    _Static_assert(offsetof(struct msghdr, msg_controllen) == 40, "LP64 msghdr");
+    _Static_assert(offsetof(struct mmsghdr, msg_len) == 56, "LP64 mmsghdr");
+    static unsigned char data[4096];
+    if (read_end <= 0 || read_end > (int)sizeof(data)) return -1;
+    struct iovec iov[2] = {{data, (size_t)read_end}, {data, 1}};
+    union {
+        char buf[CMSG_SPACE(sizeof(int))];
+        struct cmsghdr align;
+    } control;
+    memset(&control, 0, sizeof(control));
+    struct cmsghdr *cmsg = (struct cmsghdr *)control.buf;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    memcpy(CMSG_DATA(cmsg), &passed, sizeof(int));
+    struct mmsghdr batch[2];
+    memset(batch, 0, sizeof(batch));
+    batch[0].msg_hdr.msg_iov = &iov[0];
+    batch[0].msg_hdr.msg_iovlen = 1;
+    batch[0].msg_hdr.msg_control = control.buf;
+    /* Also the second message's cmsg_len, level and type, then its
+     * descriptor, which Linux overwrites with the first message's count. */
+    batch[0].msg_hdr.msg_controllen = CMSG_LEN(sizeof(int));
+    batch[0].msg_hdr.msg_flags = SOL_SOCKET;
+    int type = SCM_RIGHTS;
+    memcpy((unsigned char *)&batch[0].msg_hdr + 52, &type, sizeof(type));
+    batch[0].msg_len = (unsigned int)first_read;
+    batch[1].msg_hdr.msg_iov = &iov[1];
+    batch[1].msg_hdr.msg_iovlen = 1;
+    batch[1].msg_hdr.msg_control = &batch[0].msg_hdr.msg_controllen;
+    batch[1].msg_hdr.msg_controllen = CMSG_SPACE(sizeof(int));
+    int sent = sendmmsg(socket, batch, 2, flags);
+    if (sent == 2 && batch[0].msg_len != (unsigned int)read_end) return -1;
+    return sent;
 }
 
 static void sleep_ms(long ms) {
@@ -300,7 +370,14 @@ int main(int argc, char **argv) {
     int scmmsetfl_nowait = !strcmp(mode, "scmmsetfl_nowait");
     int scmsetfl = !strcmp(mode, "scmsetfl") || scmsetfl_nowait || scmmsetfl_nowait;
     int revoke = !strcmp(mode, "revoke");
-    int scmrecv = !strcmp(mode, "scmrecv");
+    /* The parent reads an end the child passed it: received with recvmsg
+     * (scmrecv) or recvmmsg (scmmrecv). */
+    int scmmrecv = !strcmp(mode, "scmmrecv");
+    int scmrecv = !strcmp(mode, "scmrecv") || scmmrecv;
+    /* The read end is passed by an aliased batch (scmalias with
+     * MSG_DONTWAIT, scmalias_wait without). */
+    int scmalias_wait = !strcmp(mode, "scmalias_wait");
+    int aliased = !strcmp(mode, "scmalias") || scmalias_wait;
     int scmswitch = !strcmp(mode, "scmswitch");
     int scmswitch_other = !strcmp(mode, "scmswitch_other");
     /* The parent's send names the end the child receives only after it
@@ -309,12 +386,13 @@ int main(int argc, char **argv) {
     /* The child changes the read end's status, or, in scmswitch_other,
      * another pipe's, before the read (setfl, fionbio, setfl_exit, scmsetfl,
      * scmswitch, scmswitch_other) or while it waits (setfl_mid). */
-    int status_change = setfl || fionbio || setfl_mid || setfl_exit || scmsetfl || switched;
+    int status_change =
+        setfl || fionbio || setfl_mid || setfl_exit || scmsetfl || switched || aliased;
     /* Where Linux returns EAGAIN at once (setfl, fionbio, setfl_exit, every
      * scmsetfl and scmswitch), no second read follows an EINTR: a stale
      * admission then shows in the output at the alarm, rather than as a
      * second read that waits on the parent's own write end. */
-    int refused_shape = setfl || fionbio || setfl_exit || scmsetfl || scmswitch;
+    int refused_shape = setfl || fionbio || setfl_exit || scmsetfl || scmswitch || aliased;
     if (!restart && !fifo && !eof && !data && !childexit && !blocked && !status_change &&
         !stdin_read && !revoke && !scmrecv && strcmp(mode, "eintr"))
         return 2;
@@ -329,7 +407,7 @@ int main(int argc, char **argv) {
     int ends[2];
     /* The child's word that it changed the read end's status. */
     int sync[2] = {-1, -1};
-    if ((setfl || fionbio || scmsetfl || switched) && pipe(sync)) {
+    if ((setfl || fionbio || scmsetfl || switched || aliased) && pipe(sync)) {
         printf("pipe errno=%d\n", errno);
         return 1;
     }
@@ -337,6 +415,13 @@ int main(int argc, char **argv) {
      * scmswitch, scmswitch_other) or by the child (scmrecv). */
     int channel[2] = {-1, -1};
     if ((scmsetfl || switched || scmrecv) && socketpair(AF_UNIX, SOCK_STREAM, 0, channel)) {
+        printf("socketpair errno=%d\n", errno);
+        return 1;
+    }
+    /* A message-preserving channel for the aliased batch, and the pipe
+     * whose ends its scans see first (scmalias, scmalias_wait). */
+    int other[2] = {-1, -1};
+    if (aliased && (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, channel) || pipe(other))) {
         printf("socketpair errno=%d\n", errno);
         return 1;
     }
@@ -402,6 +487,15 @@ int main(int argc, char **argv) {
             if (setfl_mid) sleep_ms(500);
             int target = ends[0];
             if (scmsetfl && (target = receive_fd(channel[1])) < 0) _exit(6);
+            if (aliased) {
+                /* The batch's first message passes the other pipe's write
+                 * end; the second, the read end. */
+                int first = receive_fd(channel[1]);
+                if (first < 0 || (target = receive_fd(channel[1])) < 0) _exit(6);
+                struct stat got, want;
+                if (fstat(target, &got) || fstat(ends[0], &want) || got.st_ino != want.st_ino)
+                    _exit(10);
+            }
             if (switched) {
                 /* After the parent's send waited for room: name the end
                  * to pass, drain, and check what arrived. */
@@ -453,7 +547,7 @@ int main(int argc, char **argv) {
         /* childexit and setfl_exit keep a writer, so the read could wait. */
         if (!childexit && !setfl_exit) close(ends[1]);
         /* The end the child passed; the parent keeps its own copy. */
-        if (scmrecv && (in = receive_fd(channel[0])) < 0) {
+        if (scmrecv && (in = receive_fd_with(channel[0], scmmrecv)) < 0) {
             printf("recvmsg errno=%d\n", errno);
             return 1;
         }
@@ -472,6 +566,13 @@ int main(int argc, char **argv) {
                                  scmmsetfl_nowait) != 1) {
         printf("sendmsg errno=%d\n", errno);
         return 1;
+    }
+    if (aliased) {
+        int sent = send_aliased(channel[0], scmalias_wait ? 0 : MSG_DONTWAIT, other[1], other[0], in);
+        if (sent != 2) {
+            printf("sendmmsg=%d errno=%d\n", sent, errno);
+            return 1;
+        }
     }
     if (switched) {
         if (fill(channel[0])) {
