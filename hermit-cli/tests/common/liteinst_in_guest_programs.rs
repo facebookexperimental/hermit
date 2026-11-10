@@ -1219,6 +1219,11 @@ fn in_guest_trap_sigalrm_interrupts_a_guest_held_pipe_read_as_ptrace_does() {
 ///   retry loop (finding 1 of rev5338-cx's review of 858541a9). Linux
 ///   returns EAGAIN; the ptrace backend does not yet (see the loop), so its
 ///   run is held to L2 repeatability only.
+/// - `scmalias_shared` and `scmalias_shared_wait`: as `scmalias` and
+///   `scmalias_wait`, where the batch lies in one memfd page mapped twice,
+///   shared, and the second message reads its item through the other
+///   mapping, so no two of the batch's addresses meet (finding 1 of
+///   rev5338-cx's review of 8fec6777). Linux returns EAGAIN.
 /// - `scmswitch`: as `scmsetfl`, where the end passed is named only after
 ///   the send waited: the second message of a `sendmmsg` batch, whose first
 ///   waited for room, has shared control data that the child rewrote from
@@ -1305,6 +1310,12 @@ fn in_guest_trap_refuses_by_name_the_sigalrm_pipe_reads_slice_2_does_not_place()
         // The receiver's own description, untracked at the receipt.
         ("scmrecv", SIGALRM_PIPE_READ_EINTR, diverged),
         ("scmmrecv", SIGALRM_PIPE_READ_EINTR, diverged),
+        // The batch's second item read through a second shared mapping of
+        // the first entry's msg_len (finding 1 of rev5338-cx's review of
+        // 8fec6777): its msg_len's page may be seen elsewhere, so the send
+        // marked every pipe the parent holds untracked.
+        ("scmalias_shared", eagain, diverged),
+        ("scmalias_shared_wait", eagain, diverged),
         (
             "stdin",
             concat!(

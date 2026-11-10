@@ -96,6 +96,12 @@
  *            the parent. The read returns -1/EAGAIN at once, with no
  *            handler run. scmalias sends with MSG_DONTWAIT, scmalias_wait
  *            with no flags, so that Hermit runs it through its retry loop.
+ *   scmalias_shared, scmalias_shared_wait: as scmalias and scmalias_wait,
+ *            where the batch lies in one memfd page mapped twice, MAP_SHARED,
+ *            at P and Q, and the second message's control data is read
+ *            through Q: the same bytes at another address (finding 1 of
+ *            rev5338-cx's review of 8fec6777). The read returns -1/EAGAIN at
+ *            once, as in scmalias.
  *   scmswitch: as scmsetfl, where the end the child receives is named only
  *            after the parent's send waited. Before the install the parent
  *            fills the socketpair, tells the child, and sends a batch of two
@@ -279,8 +285,11 @@ static int drain_to_fd(int socket) {
  * then a message whose SCM_RIGHTS item is the first entry's own
  * msg_controllen, msg_flags, padding and msg_len (rev5338-cx's layout): it
  * names `first_read` until Linux stores the first message's byte count,
- * `read_end`, in msg_len. The number of messages sent, or -1. */
-static int send_aliased(int socket, int flags, int passed, int first_read, int read_end) {
+ * `read_end`, in msg_len. With `shared`, the batch lies in a memfd page
+ * mapped twice, at P and Q, and the second message reads its item through
+ * Q. The number of messages sent, or -1. */
+static int send_aliased(int socket, int flags, int passed, int first_read, int read_end,
+                        int shared) {
     _Static_assert(offsetof(struct msghdr, msg_controllen) == 40, "LP64 msghdr");
     _Static_assert(offsetof(struct mmsghdr, msg_len) == 56, "LP64 mmsghdr");
     static unsigned char data[4096];
@@ -296,8 +305,21 @@ static int send_aliased(int socket, int flags, int passed, int first_read, int r
     cmsg->cmsg_level = SOL_SOCKET;
     cmsg->cmsg_type = SCM_RIGHTS;
     memcpy(CMSG_DATA(cmsg), &passed, sizeof(int));
-    struct mmsghdr batch[2];
-    memset(batch, 0, sizeof(batch));
+    struct mmsghdr local[2];
+    struct mmsghdr *batch = local;
+    unsigned char *views[2] = {NULL, NULL};
+    long page = sysconf(_SC_PAGESIZE);
+    if (shared) {
+        int memfd = memfd_create("alias", 0);
+        if (memfd < 0 || ftruncate(memfd, page)) return -1;
+        for (int i = 0; i < 2; i++) {
+            views[i] = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
+            if (views[i] == MAP_FAILED) return -1;
+        }
+        close(memfd);
+        batch = (struct mmsghdr *)views[0];
+    }
+    memset(batch, 0, 2 * sizeof(*batch));
     batch[0].msg_hdr.msg_iov = &iov[0];
     batch[0].msg_hdr.msg_iovlen = 1;
     batch[0].msg_hdr.msg_control = control.buf;
@@ -310,10 +332,15 @@ static int send_aliased(int socket, int flags, int passed, int first_read, int r
     batch[0].msg_len = (unsigned int)first_read;
     batch[1].msg_hdr.msg_iov = &iov[1];
     batch[1].msg_hdr.msg_iovlen = 1;
-    batch[1].msg_hdr.msg_control = &batch[0].msg_hdr.msg_controllen;
+    /* Q + 40 is P + 40: the same bytes through the other mapping. */
+    batch[1].msg_hdr.msg_control =
+        shared ? (void *)(views[1] + offsetof(struct msghdr, msg_controllen))
+               : (void *)&batch[0].msg_hdr.msg_controllen;
     batch[1].msg_hdr.msg_controllen = CMSG_SPACE(sizeof(int));
     int sent = sendmmsg(socket, batch, 2, flags);
-    if (sent == 2 && batch[0].msg_len != (unsigned int)read_end) return -1;
+    if (sent == 2 && batch[0].msg_len != (unsigned int)read_end) sent = -1;
+    for (int i = 0; i < 2; i++)
+        if (views[i]) munmap(views[i], page);
     return sent;
 }
 
@@ -374,10 +401,14 @@ int main(int argc, char **argv) {
      * (scmrecv) or recvmmsg (scmmrecv). */
     int scmmrecv = !strcmp(mode, "scmmrecv");
     int scmrecv = !strcmp(mode, "scmrecv") || scmmrecv;
-    /* The read end is passed by an aliased batch (scmalias with
-     * MSG_DONTWAIT, scmalias_wait without). */
-    int scmalias_wait = !strcmp(mode, "scmalias_wait");
-    int aliased = !strcmp(mode, "scmalias") || scmalias_wait;
+    /* The read end is passed by an aliased batch (scmalias and
+     * scmalias_shared with MSG_DONTWAIT, the _wait modes without), whose
+     * second item is read through a second shared mapping in the _shared
+     * modes. */
+    int scmalias_shared_wait = !strcmp(mode, "scmalias_shared_wait");
+    int alias_shared = !strcmp(mode, "scmalias_shared") || scmalias_shared_wait;
+    int scmalias_wait = !strcmp(mode, "scmalias_wait") || scmalias_shared_wait;
+    int aliased = !strcmp(mode, "scmalias") || scmalias_wait || alias_shared;
     int scmswitch = !strcmp(mode, "scmswitch");
     int scmswitch_other = !strcmp(mode, "scmswitch_other");
     /* The parent's send names the end the child receives only after it
@@ -568,7 +599,8 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (aliased) {
-        int sent = send_aliased(channel[0], scmalias_wait ? 0 : MSG_DONTWAIT, other[1], other[0], in);
+        int sent = send_aliased(channel[0], scmalias_wait ? 0 : MSG_DONTWAIT, other[1], other[0], in,
+                                alias_shared);
         if (sent != 2) {
             printf("sendmmsg=%d errno=%d\n", sent, errno);
             return 1;
