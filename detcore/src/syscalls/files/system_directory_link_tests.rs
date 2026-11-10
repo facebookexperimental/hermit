@@ -88,7 +88,12 @@ fn readlinks_holding(
     let mut buffer = [0u8; 256];
     let tool = detcore::<NoopTool>();
     let mut answers = Vec::new();
-    for at in [false, true] {
+    // x86_64 exercises readlink and readlinkat; aarch64 has readlinkat alone.
+    #[cfg(target_arch = "x86_64")]
+    let ats = [false, true];
+    #[cfg(target_arch = "aarch64")]
+    let ats = [true];
+    for at in ats {
         let mut guest = kvm_thread(reply, proc_fd);
         let path_ptr = PathPtr::from_ptr(path.as_ptr());
         let buf = AddrMut::from_raw(buffer.as_mut_ptr() as usize);
@@ -104,14 +109,30 @@ fn readlinks_holding(
                 )
                 .await
             } else {
-                tool.handle_readlink(
-                    &mut guest,
-                    syscalls::Readlink::new()
-                        .with_path(path_ptr)
-                        .with_buf(buf)
-                        .with_bufsize(buffer.len()),
-                )
-                .await
+                // Only reached on x86_64 (`ats`); aarch64 has readlinkat alone.
+                #[cfg(target_arch = "x86_64")]
+                {
+                    tool.handle_readlink(
+                        &mut guest,
+                        syscalls::Readlink::new()
+                            .with_path(path_ptr)
+                            .with_buf(buf)
+                            .with_bufsize(buffer.len()),
+                    )
+                    .await
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    tool.handle_readlinkat(
+                        &mut guest,
+                        syscalls::Readlinkat::new()
+                            .with_dirfd(libc::AT_FDCWD)
+                            .with_path(path_ptr)
+                            .with_buf(buf)
+                            .with_buf_len(buffer.len()),
+                    )
+                    .await
+                }
             }
         });
         let forwarded = guest

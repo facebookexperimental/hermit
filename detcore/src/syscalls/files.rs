@@ -19873,14 +19873,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         staged.push(0);
         let stat = StatPtr(page.cast());
         let observed = if guest.memory().write_exact(parent_address, &staged).is_ok() {
-            let call = syscalls::Newfstatat::new()
-                .with_dirfd(dirfd)
-                .with_path(PathPtr::from_ptr(
-                    parent_address.as_raw() as *const libc::c_char
-                ))
-                .with_stat(Some(stat))
-                .with_flags(AtFlags::empty());
-            match Self::inject_translated_in_page(guest, Syscall::from(call)).await {
+            let call = crate::arch::fstatat_syscall(
+                syscalls::Fstatat::new()
+                    .with_dirfd(dirfd)
+                    .with_path(PathPtr::from_ptr(
+                        parent_address.as_raw() as *const libc::c_char
+                    ))
+                    .with_stat(Some(stat))
+                    .with_flags(AtFlags::empty()),
+            );
+            match Self::inject_translated_in_page(guest, call).await {
                 Ok(_) => stat.read(&guest.memory()).ok(),
                 Err(_) => None,
             }
@@ -23285,7 +23287,10 @@ mod inject_fstat_scratch {
             // SAFETY: every register is an integer; only the configured
             // stack pointer is needed by these translation controls.
             let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-            regs.rsp = self.rsp.expect("fd registration must not read registers") as u64;
+            crate::arch::set_stack_pointer(
+                &mut regs,
+                self.rsp.expect("fd registration must not read registers") as u64,
+            );
             regs
         }
         async fn stack(&mut self) -> Self::Stack {
@@ -23340,11 +23345,13 @@ mod inject_fstat_scratch {
                 }
                 return Ok(bytes.len() as i64);
             }
-            if matches!(
-                number,
-                Sysno::readlink | Sysno::readlinkat | Sysno::newfstatat
-            ) {
-                if number == Sysno::newfstatat {
+            // x86_64 only: aarch64 has readlinkat alone.
+            #[cfg(target_arch = "x86_64")]
+            let is_readlink = number == Sysno::readlink;
+            #[cfg(not(target_arch = "x86_64"))]
+            let is_readlink = false;
+            if is_readlink || matches!(number, Sysno::readlinkat | crate::arch::FSTATAT) {
+                if number == crate::arch::FSTATAT {
                     let path = PathPtr::from_ptr(args.arg1 as *const libc::c_char).unwrap();
                     self.statat_paths
                         .push(path.read(&self.memory())?.into_os_string().into_vec());
@@ -25135,6 +25142,19 @@ mod inject_fstat_scratch {
 
         use super::*;
 
+        /// Whether `call` is the readlink-family lookup this arch injects
+        /// (readlink on x86_64, readlinkat alone on aarch64).
+        fn is_readlink_family(call: &Sysno) -> bool {
+            #[cfg(target_arch = "x86_64")]
+            {
+                matches!(call, Sysno::readlink | Sysno::readlinkat)
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                matches!(call, Sysno::readlinkat)
+            }
+        }
+
         fn local_guest() -> (Detcore, ScriptedGuest) {
             let (_, mut guest) = ScriptedGuest::new(true, false);
             let pid = std::process::id() as i32;
@@ -25176,14 +25196,31 @@ mod inject_fstat_scratch {
             let path = path.and_then(|path| PathPtr::from_ptr(path.as_ptr()));
             match dirfd {
                 None => {
-                    tool.handle_readlink(
-                        guest,
-                        syscalls::Readlink::new()
-                            .with_path(path)
-                            .with_buf(buffer)
-                            .with_bufsize(size),
-                    )
-                    .await
+                    // x86_64 has readlink; aarch64 serves the same cwd
+                    // lookup through readlinkat with AT_FDCWD.
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        tool.handle_readlink(
+                            guest,
+                            syscalls::Readlink::new()
+                                .with_path(path)
+                                .with_buf(buffer)
+                                .with_bufsize(size),
+                        )
+                        .await
+                    }
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        tool.handle_readlinkat(
+                            guest,
+                            syscalls::Readlinkat::new()
+                                .with_dirfd(libc::AT_FDCWD)
+                                .with_path(path)
+                                .with_buf(buffer)
+                                .with_buf_len(size),
+                        )
+                        .await
+                    }
                 }
                 Some(dirfd) => {
                     tool.handle_readlinkat(
@@ -25279,10 +25316,10 @@ mod inject_fstat_scratch {
                         errno(result, Errno::ENOENT);
                         assert_eq!(bytes, [0xa5; 128], "{path:?}");
                         assert!(
-                            !guest.injected.iter().any(|call| matches!(
-                                call,
-                                Sysno::readlink | Sysno::readlinkat | Sysno::fstat
-                            )),
+                            !guest.injected.iter().any(|call| {
+                                matches!(call, Sysno::readlinkat | Sysno::fstat)
+                                    || is_readlink_family(call)
+                            }),
                             "{path:?}: {:?}",
                             guest.injected
                         );
@@ -25290,12 +25327,7 @@ mod inject_fstat_scratch {
                         assert_eq!(result.unwrap(), 9, "{path:?}");
                         assert_eq!(&bytes[..9], b"/dev/null");
                         assert_eq!(&bytes[9..], &[0xa5; 119]);
-                        assert!(
-                            guest
-                                .injected
-                                .iter()
-                                .any(|call| matches!(call, Sysno::readlink | Sysno::readlinkat))
-                        );
+                        assert!(guest.injected.iter().any(is_readlink_family));
                     }
                 }
             }
@@ -25400,10 +25432,10 @@ mod inject_fstat_scratch {
                         if fd == socket.as_raw_fd() {
                             errno(result, Errno::ENOENT);
                             assert_eq!(bytes, &[0xa5; 128]);
-                            assert!(!guest.injected.iter().any(|call| matches!(
-                                call,
-                                Sysno::readlink | Sysno::readlinkat | Sysno::fstat
-                            )));
+                            assert!(!guest.injected.iter().any(|call| {
+                                matches!(call, Sysno::readlinkat | Sysno::fstat)
+                                    || is_readlink_family(call)
+                            }));
                         } else {
                             assert_eq!(result.unwrap(), 9);
                             assert_eq!(&bytes[..9], b"/dev/null");
@@ -25537,7 +25569,10 @@ mod inject_fstat_scratch {
                 !matches!(&result, Err(Error::Errno(error)) if *error == Errno::ENOENT),
                 "{result:?}"
             );
+            #[cfg(target_arch = "x86_64")]
             assert!(guest.injected.contains(&Sysno::readlink));
+            #[cfg(target_arch = "aarch64")]
+            assert!(guest.injected.contains(&Sysno::readlinkat));
             assert_eq!(guest.mapped, guest.unmapped);
         }
 
@@ -25595,7 +25630,10 @@ mod inject_fstat_scratch {
                 .await;
                 // The guard declines these raw trailing forms. Preserve the
                 // no-write check without pinning an existence-revealing errno.
+                #[cfg(target_arch = "x86_64")]
                 assert!(guest.injected.contains(&Sysno::readlink));
+                #[cfg(target_arch = "aarch64")]
+                assert!(guest.injected.contains(&Sysno::readlinkat));
                 assert!(guest.mapped.is_empty());
                 assert_eq!(bytes, [0xa5; 128]);
             }

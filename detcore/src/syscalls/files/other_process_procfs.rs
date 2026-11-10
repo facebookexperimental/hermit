@@ -674,7 +674,7 @@ pub(super) fn arguments_refused_before_the_walk<M: MemoryAccess>(
         Sysno::fchmodat2 => flag(3) & !(libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH) != 0,
         Sysno::fchownat => flag(4) & !(libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH) != 0,
         Sysno::linkat => flag(4) & !(libc::AT_SYMLINK_FOLLOW | libc::AT_EMPTY_PATH) != 0,
-        Sysno::newfstatat => {
+        crate::arch::FSTATAT => {
             flag(3)
                 & !(libc::AT_SYMLINK_NOFOLLOW
                     | libc::AT_NO_AUTOMOUNT
@@ -1180,7 +1180,7 @@ mod tests {
             &at(libc::O_WRONLY | libc::O_CREAT)
         ));
         for sysno in [
-            Sysno::newfstatat,
+            crate::arch::FSTATAT,
             Sysno::statx,
             Sysno::faccessat2,
             Sysno::readlinkat,
@@ -1713,7 +1713,7 @@ mod tests {
         let memory = Pages::holding(&[]);
         for sysno in [
             Sysno::openat,
-            Sysno::newfstatat,
+            crate::arch::FSTATAT,
             Sysno::faccessat2,
             Sysno::readlinkat,
             Sysno::unlinkat,
@@ -1759,7 +1759,7 @@ mod tests {
                 [0, 0, 4, libc::AT_EACCESS as usize, 0, 0],
             ),
             (
-                Sysno::newfstatat,
+                crate::arch::FSTATAT,
                 [0, 0, 0, 0x4000_0000, 0, 0],
                 [0, 0, 0, libc::AT_SYMLINK_NOFOLLOW as usize, 0, 0],
             ),

@@ -1050,6 +1050,7 @@ fn ppoll(memory: &FormMemory, pollfd: usize) -> reverie::syscalls::Ppoll {
 #[tokio::test]
 async fn poll_retries_refresh_guest_held_authority_after_a_parked_fd_replacement() {
     for family in [
+        #[cfg(target_arch = "x86_64")]
         "poll",
         "ppoll",
         "masked-ppoll",
@@ -1103,6 +1104,7 @@ async fn poll_retries_refresh_guest_held_authority_after_a_parked_fd_replacement
                     VecDeque::from([Err(Errno::EAGAIN), Err(Errno::EAGAIN), Ok(1)]);
                 let tool = super::tool(&guest);
                 let result = match family {
+                    #[cfg(target_arch = "x86_64")]
                     "poll" => {
                         tool.handle_poll(
                             &mut guest,

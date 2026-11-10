@@ -26851,13 +26851,18 @@ mod test {
     /// it, at the recorded stream's position where the jump is made.
     #[test]
     fn a_recorded_run_writes_its_time_skips() {
+        // The polling number is poll on x86_64, ppoll on aarch64.
+        #[cfg(target_arch = "x86_64")]
+        let poll_sysno = Sysno::poll;
+        #[cfg(target_arch = "aarch64")]
+        let poll_sysno = Sysno::ppoll;
         let config = Config::default();
         let mut sched = Scheduler::new(&config);
         let mut writer = PreemptionWriter::new(None);
         for _ in 0..6 {
             writer.insert_schedevent(SchedEvent::syscall(
                 DetTid::from_raw(3),
-                Sysno::poll,
+                poll_sysno,
                 SyscallPhase::Polling,
             ));
         }

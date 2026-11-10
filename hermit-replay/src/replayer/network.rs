@@ -29,7 +29,6 @@ use reverie::syscalls::Timespec;
 use reverie::syscalls::family::SockOptFamily;
 
 use super::Replayer;
-#[cfg(target_arch = "x86_64")]
 use crate::event::InterruptedPoll;
 use crate::event::PollEvent;
 use crate::event::PpollEvent;
@@ -82,7 +81,6 @@ fn replay_pollfds<M: MemoryAccess>(
     Ok(())
 }
 
-#[cfg(target_arch = "x86_64")]
 fn replay_poll_event<M: MemoryAccess>(
     memory: &mut M,
     fds_address: Option<AddrMut<'_, PollFd>>,

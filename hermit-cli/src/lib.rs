@@ -49,6 +49,8 @@ use hermit_record_format::event_stream;
 pub mod gdbserver;
 pub mod happens_before;
 pub mod host_input_change;
+// The host-qualification cache serves the x86 XSTATE probe alone.
+#[cfg(target_arch = "x86_64")]
 mod host_qualification;
 mod id;
 #[cfg(feature = "liteinst")]

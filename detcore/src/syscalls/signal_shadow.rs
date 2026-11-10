@@ -963,6 +963,7 @@ fn sees_syscall(nr: i64) -> bool {
 
 /// Whether syscall number `nr` runs with no Tool callback because
 /// `--untrap-passthrough-syscalls` (`untrap`) leaves it untrapped.
+#[cfg(target_arch = "x86_64")]
 fn untrapped(untrap: bool, nr: i64) -> bool {
     untrap
         && crate::syscall_classification::UNTRAPPED_PASSTHROUGH

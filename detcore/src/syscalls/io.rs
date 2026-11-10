@@ -1157,6 +1157,8 @@ fn canonicalize_socket_timestamps(control: &mut [u8], now: LogicalTime) -> usize
 /// (`deadline`) keeps it for its rerun on a backend that restarts a woken call
 /// only through `ERESTARTSYS` (`restarts_only_through_erestartsys`), when a
 /// signal woke it (`woken`) or it ends with `ERESTARTSYS`.
+// Used by the x86_64 production path and by an arch-neutral unit test.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn keeps_poll_deadline_for_rerun(
     restarts_only_through_erestartsys: bool,
     deadline: Option<LogicalTime>,
@@ -6579,6 +6581,8 @@ mod tests {
         assert!(guest.thread_state().passed_descriptors_out_unreported);
     }
 
+    // x86_64 only: aarch64 has ppoll alone (kernel_poll_result is Poll-typed).
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_kernel_poll_without_a_deadline_restarts_by_running_again() {
         // Linux's code, and a signal that stopped the call before it ran.
@@ -6658,6 +6662,8 @@ mod tests {
         }
     }
 
+    // x86_64 only: aarch64 has ppoll alone (print_poll is Poll-typed).
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn print_poll_accepts_null_fds_without_touching_syscall_arguments() {
         let subscriber = tracing_subscriber::fmt()

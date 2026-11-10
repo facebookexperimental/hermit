@@ -460,8 +460,10 @@ async fn a_second_path_past_another_process_cmdline_is_refused_by_name() {
     // Each call, the argument of its first path, of its second, and its
     // other arguments.
     for (sysno, first, second, args) in [
+        #[cfg(target_arch = "x86_64")]
         (Sysno::link, 0, 1, [0; 6]),
         (Sysno::linkat, 1, 3, at),
+        #[cfg(target_arch = "x86_64")]
         (Sysno::rename, 0, 1, [0; 6]),
         (Sysno::renameat, 1, 3, at),
         (Sysno::renameat2, 1, 3, at),
@@ -506,6 +508,8 @@ async fn an_argument_the_kernel_refuses_before_the_walk_is_refused_as_linux_refu
         format!("/proc/{}/cmdline", OTHER.as_raw()),
         format!("/proc/{GONE}/cmdline"),
     ] {
+        // access on x86_64; aarch64 serves the same check as faccessat.
+        #[cfg(target_arch = "x86_64")]
         let (answer, reached) = decide(
             true,
             Sysno::access,
@@ -515,17 +519,39 @@ async fn an_argument_the_kernel_refuses_before_the_walk_is_refused_as_linux_refu
             Err(Errno::EINVAL),
         )
         .await;
+        #[cfg(target_arch = "aarch64")]
+        let (answer, reached) = decide(
+            true,
+            Sysno::faccessat,
+            &path,
+            1,
+            [libc::AT_FDCWD as usize, 0, 8, 0, 0, 0],
+            Err(Errno::EINVAL),
+        )
+        .await;
         assert!(
             matches!(answer, Some(Err(Error::Errno(Errno::EINVAL)))),
             "{path}: {answer:?}"
         );
         assert_eq!(reached.len(), 1, "{path}: {reached:?}");
+        // readlink on x86_64; aarch64 serves the same check as readlinkat.
+        #[cfg(target_arch = "x86_64")]
         let (answer, _) = decide(
             true,
             Sysno::readlink,
             &path.replace("cmdline", "fd/1"),
             0,
             [0, 0, 0, 0, 0, 0],
+            Err(Errno::EINVAL),
+        )
+        .await;
+        #[cfg(target_arch = "aarch64")]
+        let (answer, _) = decide(
+            true,
+            Sysno::readlinkat,
+            &path.replace("cmdline", "fd/1"),
+            1,
+            [libc::AT_FDCWD as usize, 0, 0, 0, 0, 0],
             Err(Errno::EINVAL),
         )
         .await;
@@ -573,6 +599,7 @@ async fn an_argument_linux_decides_before_the_walk_is_decided_from_the_arguments
     };
     for path in [&past, &gone] {
         for reply in [Err(Errno::EPERM), Err(Errno::ENOENT), Ok(0)] {
+            #[cfg_attr(target_arch = "aarch64", allow(unused_mut))]
             let mut cases = vec![
                 (
                     Sysno::mknodat,
@@ -723,7 +750,7 @@ async fn an_empty_pathname_is_the_descriptor_not_a_lookup() {
                 Sysno::statx,
                 [fd, 0, 0, libc::STATX_BASIC_STATS as usize, 0, 0],
             ),
-            (Sysno::newfstatat, [fd, 0, 0, empty, 0, 0]),
+            (crate::arch::FSTATAT, [fd, 0, 0, empty, 0, 0]),
             (Sysno::fchownat, [fd, 0, usize::MAX, usize::MAX, empty, 0]),
         ] {
             let (answer, reached) = on(recorded.clone(), sysno, 1, args).await;

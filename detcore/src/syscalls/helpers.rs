@@ -1615,7 +1615,14 @@ fn syscall_targets_guest_held_fd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     guest: &mut G,
     call: Syscall,
 ) -> bool {
+    // x86_64 has both epoll_wait and epoll_pwait; aarch64 has
+    // epoll_pwait (and epoll_pwait2) alone.
+    #[cfg(target_arch = "x86_64")]
     if matches!(call, Syscall::EpollWait(_) | Syscall::EpollPwait(_)) {
+        return false;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    if matches!(call, Syscall::EpollPwait(_)) {
         return false;
     }
     get_fd(call).is_some_and(|fd| {
@@ -1837,6 +1844,8 @@ impl GuestHeldPollProof {
         G: Guest<Detcore<T>>,
     {
         let (address, nfds) = match call {
+            // x86_64 only: aarch64 has ppoll alone.
+            #[cfg(target_arch = "x86_64")]
             Syscall::Poll(call) => (call.fds()?.as_raw(), call.nfds() as usize),
             Syscall::Ppoll(call) => (call.fds()?.as_raw(), call.nfds() as usize),
             _ => {
@@ -3881,7 +3890,7 @@ where
     if settled.handler_seen {
         return None;
     }
-    if guest.regs().await.orig_rax as i64 != settled.sysno as i64 {
+    if crate::arch::syscall_number(&guest.regs().await) as i64 != settled.sysno as i64 {
         return None;
     }
     let sets = guest.signal_sets(guest.tid()).ok();
@@ -4620,13 +4629,28 @@ where
 {
     let mut stack = guest.stack().await;
     let pollfd: AddrMut<libc::pollfd> = stack.reserve();
+    // aarch64 has ppoll alone: its zero timeout is a zero timespec on
+    // the same stack (x86_64 keeps the poll probe below).
+    #[cfg(target_arch = "aarch64")]
+    let timeout = stack.push(Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    });
     let Ok(_guard) = stack.commit() else {
         return false;
     };
+    #[cfg(target_arch = "x86_64")]
     let probe = syscalls::Poll::new()
         .with_fds(Some(pollfd.cast()))
         .with_nfds(1)
         .with_timeout(0);
+    #[cfg(target_arch = "aarch64")]
+    let probe = syscalls::Ppoll::new()
+        .with_fds(Some(pollfd.cast()))
+        .with_nfds(1)
+        // SAFETY: `timeout` points to exclusively owned stack storage
+        // kept alive by `_guard` for the injection below.
+        .with_timeout(Some(unsafe { timeout.into_mut() }));
     let request = libc::pollfd {
         fd,
         events: libc::POLLRDHUP,
@@ -8280,11 +8304,16 @@ mod tests {
     /// and every other backend, keeps its interrupt errno.
     #[test]
     fn a_woken_poll_restarts_through_erestartsys_where_linux_restarts_it() {
+        // x86_64 only: aarch64 has ppoll alone.
+        #[cfg(target_arch = "x86_64")]
         let poll = reverie::syscalls::Poll::new().with_timeout(-1);
+        #[cfg(target_arch = "x86_64")]
         let timed_poll = reverie::syscalls::Poll::new().with_timeout(100);
         let ppoll = reverie::syscalls::Ppoll::new();
         for control in [true, false] {
+            #[cfg(target_arch = "x86_64")]
             assert_eq!(woken_call_ends_through_erestartsys(control, &poll), control);
+            #[cfg(target_arch = "x86_64")]
             assert_eq!(
                 woken_call_ends_through_erestartsys(control, &timed_poll),
                 control
@@ -8293,6 +8322,7 @@ mod tests {
                 woken_call_ends_through_erestartsys(control, &ppoll),
                 control
             );
+            #[cfg(target_arch = "x86_64")]
             assert!(!woken_call_ends_through_erestartsys(
                 control,
                 &reverie::syscalls::EpollWait::new()
@@ -8471,6 +8501,7 @@ mod tests {
                 Syscall::from(syscalls::Sendto::new().with_fd(3)),
                 None,
             ),
+            #[cfg(target_arch = "x86_64")]
             ("poll", Syscall::from(syscalls::Poll::new()), None),
         ] {
             assert_eq!(receive_timeout_fd(syscall), fd, "{label}");
@@ -9156,10 +9187,24 @@ pub(crate) mod kernel_signal_wait_failures {
                         cfg: self.config.clone(),
                         record_or_replay: crate::record_or_replay::NoopTool,
                     };
+                    #[cfg(target_arch = "x86_64")]
                     assert_eq!(
                         tool.handle_dup2(
                             &mut sibling,
                             syscalls::Dup2::new().with_oldfd(from).with_newfd(to),
+                        )
+                        .await
+                        .unwrap(),
+                        i64::from(to)
+                    );
+                    #[cfg(target_arch = "aarch64")]
+                    assert_eq!(
+                        tool.handle_dup3(
+                            &mut sibling,
+                            syscalls::Dup3::new()
+                                .with_oldfd(from)
+                                .with_newfd(to)
+                                .with_flags(nix::fcntl::OFlag::empty()),
                         )
                         .await
                         .unwrap(),
@@ -9189,6 +9234,7 @@ pub(crate) mod kernel_signal_wait_failures {
     }
 
     /// Reuse the local-memory guest for descriptor guards that need no injections.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn fd_test_guest() -> impl Guest<Detcore> {
         WaitGuest::live(0).0
     }
@@ -9872,7 +9918,14 @@ pub(crate) mod kernel_signal_wait_failures {
                 .is_some_and(|script| script.lock().unwrap().observe_retry_masks)
             {
                 let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-                regs.rip = self.arena.as_ptr() as u64;
+                #[cfg(target_arch = "x86_64")]
+                {
+                    regs.rip = self.arena.as_ptr() as u64;
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    regs.pc = self.arena.as_ptr() as u64;
+                }
                 return regs;
             }
             panic!("a blocked wait must not read registers")
@@ -9890,6 +9943,7 @@ pub(crate) mod kernel_signal_wait_failures {
             let (number, args) = syscall.into_parts();
             if let Some(script) = &self.proof_script {
                 match Syscall::from_raw(number, args) {
+                    #[cfg(target_arch = "x86_64")]
                     Syscall::Dup2(call) => {
                         // These descriptors are owned by this test. The real
                         // handler performs the corresponding model update.
@@ -9897,7 +9951,21 @@ pub(crate) mod kernel_signal_wait_failures {
                         assert!(result >= 0, "owned fixture descriptor duplication failed");
                         return Ok(i64::from(result));
                     }
-                    Syscall::Readv(_) | Syscall::Poll(_) | Syscall::Ppoll(_) => {
+                    #[cfg(target_arch = "aarch64")]
+                    Syscall::Dup3(call) => {
+                        let result =
+                            unsafe { libc::dup3(call.oldfd(), call.newfd(), call.flags().bits()) };
+                        assert!(result >= 0, "owned fixture descriptor duplication failed");
+                        return Ok(i64::from(result));
+                    }
+                    // x86_64 only: aarch64 has ppoll alone (next arm).
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::Poll(_) => {
+                        let mut script = script.lock().unwrap();
+                        script.probes += 1;
+                        return if script.probes == 4 { Ok(1) } else { Ok(0) };
+                    }
+                    Syscall::Readv(_) | Syscall::Ppoll(_) => {
                         let mut script = script.lock().unwrap();
                         script.probes += 1;
                         return if script.probes == 4 {
@@ -10139,6 +10207,17 @@ pub(crate) mod kernel_signal_wait_failures {
             iov_base: (&mut byte as *mut u8).cast(),
             iov_len: 1,
         };
+        // The retry probe is poll on x86_64, ppoll on aarch64.
+        #[cfg(target_arch = "x86_64")]
+        let poll_probe = syscalls::Poll::new()
+            .with_fds(AddrMut::from_raw(address))
+            .with_nfds(1)
+            .with_timeout(-1);
+        #[cfg(target_arch = "aarch64")]
+        let poll_probe = syscalls::Ppoll::new()
+            .with_fds(AddrMut::from_raw(address))
+            .with_nfds(1)
+            .with_timeout(AddrMut::from_raw(&zero_timeout as *const _ as usize));
         let result = if generic_fd_entry {
             let tool = Detcore {
                 detpid: guest.thread.detpid.unwrap(),
@@ -10173,30 +10252,11 @@ pub(crate) mod kernel_signal_wait_failures {
             )
             .await
         } else if kernel_wait {
-            retry_blocking_wait_under_mask(
-                &mut guest,
-                syscalls::Poll::new()
-                    .with_fds(AddrMut::from_raw(address))
-                    .with_nfds(1)
-                    .with_timeout(-1),
-                resources,
-                None,
-                None,
-            )
-            .await
-            .0
+            retry_blocking_wait_under_mask(&mut guest, poll_probe, resources, None, None)
+                .await
+                .0
         } else if matches!(case, "operand" | "unknown") {
-            retry_nonblocking_syscall_helper(
-                &mut guest,
-                syscalls::Poll::new()
-                    .with_fds(AddrMut::from_raw(address))
-                    .with_nfds(1)
-                    .with_timeout(-1),
-                resources,
-                None,
-                None,
-            )
-            .await
+            retry_nonblocking_syscall_helper(&mut guest, poll_probe, resources, None, None).await
         } else {
             retry_nonblocking_syscall_helper(
                 &mut guest,
@@ -12683,6 +12743,8 @@ pub(crate) mod kernel_signal_wait_failures {
     /// is dropped, and the delivery's record of the result follows). A call
     /// that did not end that way, a result that is not one of the two, or
     /// sets the backend does not report, leave the result as it is.
+    // x86_64 only: the restart block is poll's; ppoll has none.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_woken_wait_is_settled_again_at_its_return() {
         let bit = |signal: i32| 1u64 << (signal - 1);
@@ -12836,7 +12898,18 @@ mod woken_return_tests {
     fn settled(send: bool, errno: Errno, pending: u64) -> SettledWait {
         SettledWait {
             send,
-            sysno: if send { Sysno::sendto } else { Sysno::poll },
+            sysno: if send {
+                Sysno::sendto
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    Sysno::poll
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    Sysno::ppoll
+                }
+            },
             errno,
             pending,
             handler_seen: false,

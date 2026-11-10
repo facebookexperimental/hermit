@@ -267,7 +267,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                  task {task:?} (a descriptor inherited across fork or received over SCM_RIGHTS); \
                  Detcore reads the reader's own descriptor table only"
             );
-            let sysno = Sysno::new(guest.regs().await.orig_rax as usize).unwrap_or(Sysno::read);
+            let sysno = Sysno::new(crate::arch::syscall_number(&guest.regs().await) as usize)
+                .unwrap_or(Sysno::read);
             return Err(Self::scratch_failure(guest, sysno, reason).await);
         }
         if !Self::table_holds(guest, target) {
@@ -286,7 +287,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             "the rendered fdinfo of descriptor {target}: {why}; Detcore cannot render it as \
              Linux prints it"
         );
-        let sysno = Sysno::new(guest.regs().await.orig_rax as usize).unwrap_or(Sysno::read);
+        let sysno = Sysno::new(crate::arch::syscall_number(&guest.regs().await) as usize)
+            .unwrap_or(Sysno::read);
         Self::scratch_failure(guest, sysno, reason).await
     }
 
@@ -340,7 +342,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                     "the backend's descriptor_status of descriptor {target}, which its fdinfo \
                      prints, failed: {error:?}"
                 );
-                let sysno = Sysno::new(guest.regs().await.orig_rax as usize).unwrap_or(Sysno::read);
+                let sysno = Sysno::new(crate::arch::syscall_number(&guest.regs().await) as usize)
+                    .unwrap_or(Sysno::read);
                 return Err(Self::scratch_failure(guest, sysno, reason).await);
             }
         };

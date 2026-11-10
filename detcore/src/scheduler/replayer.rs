@@ -2347,8 +2347,14 @@ mod tests {
         // A retry that probes with another call matches either number.
         let schedule = vec![
             b.syscall_pre(Sysno::pselect6, SOME_RIP, tid(3)),
+            #[cfg(target_arch = "x86_64")]
             polling(&mut b, Sysno::poll),
+            #[cfg(target_arch = "aarch64")]
+            polling(&mut b, Sysno::ppoll),
+            #[cfg(target_arch = "x86_64")]
             polling(&mut b, Sysno::poll),
+            #[cfg(target_arch = "aarch64")]
+            polling(&mut b, Sysno::ppoll),
             b.syscall_post(Sysno::pselect6, SOME_RIP, tid(3)),
         ];
         let mut replayer = Replayer::new(schedule.clone());
