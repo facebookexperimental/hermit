@@ -87,7 +87,7 @@
   {
     "bytes": 28022,
     "path": "section/prepare.py",
-    "sha256": "ffde3cad022a668b703ff37c16cfd4217b9d68d3b92641b4c4965774e668c3a8"
+    "sha256": "eaa6332904f30b420b2beac76f1379fdd236e535de65444d98f70387104948ee"
   },
   {
     "bytes": 4716,
@@ -138,5 +138,10 @@
     "bytes": 3847,
     "path": "test_zero_native_data.py",
     "sha256": "048a57f80aed61d25b5f09e2844fcb67b5115181272aeda022b12d0390a57f8b"
+  },
+  {
+    "bytes": 17067,
+    "path": "test_file_pins.py",
+    "sha256": "b31c59a09a3aebeed523aed1c18257f3c3e451355ddbd26adf9b7a30c7e5bc7d"
   }
 ]
