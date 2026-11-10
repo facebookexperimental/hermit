@@ -14804,6 +14804,13 @@
           "category": "compat",
           "test": "compat/shred",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/shred",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -15134,6 +15141,13 @@
           "test": "compat/sysctl-random-uuid",
           "mode": "verify",
           "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sysctl-random-uuid",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -19534,6 +19548,13 @@
           "category": "compat",
           "test": "compat/shred",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/shred",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -19815,6 +19836,13 @@
           "test": "compat/sysctl-random-uuid",
           "mode": "replay",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sysctl-random-uuid",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -58543,6 +58571,13 @@
           "category": "compat",
           "test": "compat/shred",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/shred",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -58873,6 +58908,13 @@
           "test": "compat/sysctl-random-uuid",
           "mode": "verify",
           "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sysctl-random-uuid",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",

@@ -1517,6 +1517,15 @@ corpus:
     # slices 2b-1 to 2b-3): 3 of 3 strict verify runs each in the pinned root
     # at Hermit 61eac51c (bitwise parity; 1133 INFO records each side for
     # pgrep, 825 for pkill), stdout identical to ptrace's.
+    # shred and sysctl-random-uuid rejoined on 2026-11-09, after DROP-6 and
+    # DROP-7 had returned them to unselected on 2026-11-06. shred's refusal
+    # (`cmp -n` ends with a zero-count read of a file on the pinned root's
+    # overlayfs /tmp) went away with Reverie a4ae6d73, which admits zero-count
+    # reads on overlayfs (https://github.com/rrnewton/reverie/issues/1354).
+    # sysctl-random-uuid's verify exit 125 (queue candidate 930ece78, whose
+    # log was not retained) does not reproduce at Hermit main 19b45f66, after
+    # the KVM /proc changes of 2026-11-07 and 2026-11-08. Both passed 3 of 3
+    # strict verify runs in the pinned root at 19b45f66, with bitwise parity.
     - backend: kvm
       rows:
         [
@@ -1714,42 +1723,6 @@ corpus:
       rows:
         [
           pkg-config
-        ]
-    # Dropped 2026-11-06 under DROP-6 (coordinator ruling): compat/shred
-    # verify/kvm, promoted by the 2026-11-05 sweep flip (1258b8ad), fails
-    # locally 6/6 with the KVM zero-count-read refusal below, so it
-    # returns to unselected with that reason. Main never selected this
-    # cell: at the flip base it sat in the pre-flip KVM crash-error
-    # block (pkg-config, shred, sysctl-random-uuid, top) and in
-    # ci/optional-e2e-cells.txt.
-    - backend: kvm
-      result: crash-error
-      evidence: https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md
-      reason: >-
-        Dropped under DROP-6: measured crash-error under KVM locally
-        6/6: unsupported KVM zero-count read on guest fd 3: the endpoint
-        may wait in the host
-      rows:
-        [
-          shred
-        ]
-    # Dropped 2026-11-06 under DROP-7 (coordinator ruling A): compat/
-    # sysctl-random-uuid verify/kvm, promoted by the 2026-11-05 sweep
-    # flip (1258b8ad), is the sole failure at 930ece78 (635/636 passed,
-    # both attempts, crash-error: verify exited with status 125 before
-    # producing a terminal comparison), so it returns to unselected.
-    # Main never selected it: same pre-flip KVM crash-error block and
-    # ci/optional-e2e-cells.txt line as shred above.
-    - backend: kvm
-      result: crash-error
-      evidence: https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-jn0hh.md
-      reason: >-
-        Dropped under DROP-7: measured crash-error under KVM at
-        930ece78, sole failure 635/636 (both attempts): verify exited
-        with status 125 before producing a terminal comparison
-      rows:
-        [
-          sysctl-random-uuid
         ]
     # Measured red on 2026-10-30 in the pinned hermetic image (full validate
     # validate-museland-9ab8418de603, 7 cells): the same image difference on

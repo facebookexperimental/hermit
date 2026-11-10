@@ -3520,7 +3520,7 @@ test:
           - ptrace
         backends_disabled:
           dbt: "Not yet measured on DBT: the run that added this cell (https://github.com/rrnewton/hermit/issues/5154) had no DBT-capable build; enable after a DBT verify run of this cell"
-          kvm: "KVM enforces no page protection in its vCPU page tables, so a direct access to a guard page does not fault (https://github.com/rrnewton/hermit/issues/5177); re-enable when hardware enforcement lands under Track B"
+          kvm: "KVM enforces no page protection in its vCPU page tables, so a direct access to a guard page does not fault (https://github.com/rrnewton/hermit/issues/5177); re-enable when hardware enforcement lands under Track B. A KVM verify probe still matches run to run (measured at Hermit 19b45f66), so a verify pass is no evidence here: its stdout reports no fault for every guard access, where ptrace's expected_stdout reports SIGSEGV SEGV_MAPERR. Re-enabling KVM must declare that same expected_stdout for kvm"
           sabre: "Not yet qualified on SaBRe: guard regions were measured on ptrace and KVM only (https://github.com/rrnewton/hermit/issues/5154)"
           liteinst: "Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)"
           in-guest-trap: "Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"

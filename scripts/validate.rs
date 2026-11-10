@@ -20700,7 +20700,10 @@ mod nextest_timeout_tests {
                 // 2995 with c-programs/procfs-identity-agreement verify/KVM
                 // (KVM's memory map lists every mapping since Reverie
                 // ce25725f, so the memfd's maps line agrees with stat).
-                assert_eq!(all.len(), 2995, "the original all-owner population is retained");
+                // 2997 with compat/shred and compat/sysctl-random-uuid
+                // verify/KVM back from DROP-6 and DROP-7 (3 of 3 strict
+                // verify runs each in the pinned root at 19b45f66).
+                assert_eq!(all.len(), 2997, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");

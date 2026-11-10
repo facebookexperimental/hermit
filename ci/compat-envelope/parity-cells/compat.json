@@ -10,10 +10,10 @@
     "all": {
       "cells": 1105,
       "applicable": 764,
-      "selectable": 536,
+      "selectable": 538,
       "population": 1060,
-      "population_candidate_selected": 536,
-      "population_candidate_not_selected": 211,
+      "population_candidate_selected": 538,
+      "population_candidate_not_selected": 209,
       "population_candidate_disabled": 313
     },
     "by_backend": {
@@ -38,10 +38,10 @@
       "kvm": {
         "cells": 221,
         "applicable": 216,
-        "selectable": 209,
+        "selectable": 211,
         "population": 212,
-        "population_candidate_selected": 209,
-        "population_candidate_not_selected": 2,
+        "population_candidate_selected": 211,
+        "population_candidate_not_selected": 0,
         "population_candidate_disabled": 1
       },
       "liteinst": {
@@ -912,7 +912,7 @@
     {"test_id":"compat/shell-build","backend":"sabre","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: Not in the SaBRe corpus this replaced (ci/compat/corpus-sabre.json had no shell-build row)"},
     {"test_id":"compat/shred","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/shred","backend":"in-guest-trap","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Did not pass 10 of 10 verify runs on in-guest-trap with the maximum timeslice disabled in the first local survey of 2026-10-08, which ran without the compat fixtures; the second survey did not run this sabre-compat-only row (https://github.com/rrnewton/hermit/issues/3745)"},
-    {"test_id":"compat/shred","backend":"kvm","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: kvm verify is not selected by full validation: Dropped under DROP-6: measured crash-error under KVM locally 6/6: unsupported KVM zero-count read on guest fd 3: the endpoint may wait in the host"},
+    {"test_id":"compat/shred","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/shred","backend":"liteinst","category":"compat","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: Did not pass 10 of 10 verify runs on liteinst with the maximum timeslice disabled in the first local survey of 2026-10-08, which ran without the compat fixtures; the second survey did not run this sabre-compat-only row (https://github.com/rrnewton/hermit/issues/3745)"},
     {"test_id":"compat/shred","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: The guest starts a second program image, and each image after the first makes 33 raw system calls in ld-linux and libc, which SaBRe's execution-path contract refuses (trusted_shared_object_sites > 0)"},
     {"test_id":"compat/shuf","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
@@ -982,7 +982,7 @@
     {"test_id":"compat/sync","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: The guest starts a second program image, and each image after the first makes 33 raw system calls in ld-linux and libc, which SaBRe's execution-path contract refuses (trusted_shared_object_sites > 0)"},
     {"test_id":"compat/sysctl-random-uuid","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/sysctl-random-uuid","backend":"in-guest-trap","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"compat/sysctl-random-uuid","backend":"kvm","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: kvm verify is not selected by full validation: Dropped under DROP-7: measured crash-error under KVM at 930ece78, sole failure 635/636 (both attempts): verify exited with status 125 before producing a terminal comparison"},
+    {"test_id":"compat/sysctl-random-uuid","backend":"kvm","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/sysctl-random-uuid","backend":"liteinst","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"compat/sysctl-random-uuid","backend":"sabre","category":"compat","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the sabre-compat-only run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"compat/tac","backend":"dbt","category":"compat","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
