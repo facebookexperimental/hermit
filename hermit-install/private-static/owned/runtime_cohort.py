@@ -375,8 +375,8 @@ def entry_source_guard(mapped, terminal, rpin):
     refusal = where + ' requires exactly one literal each for ' + ', '.join(ENTRY_SOURCE_NAMES)
     token = re.compile(rb'//[^\n]*|(?P<comment>/\*)|(?:br|cr|r)(?P<hashes>#{0,255})"|'
                        rb'"(?:\\.|[^"\\])*"|(?:b)?\'(?:\\.|[^\'\\])\'|'
-                       rb'\bconst\s+(?P<name>(?:[A-Za-z_][A-Za-z0-9_]*_)?ENTRY_SOURCE)\b')
-    at, pins = 0, []
+                       rb'(?P<identifier>(?:r\#)?[A-Za-z_][A-Za-z0-9_]*)')
+    at, pins, after_const = 0, [], False
     while match := token.search(terminal, at):
         at = match.end()
         if match['comment']:
@@ -391,10 +391,16 @@ def entry_source_guard(mapped, terminal, rpin):
             end = terminal.find(close, at)
             need(end >= 0, refusal + ': unterminated raw string')
             at = end + len(close)
-        elif match['name']:
+        elif match['identifier']:
+            name = match['identifier'].decode()
+            declaration, after_const = after_const, name == 'const'
+            plain = name.removeprefix('r#')
+            if not declaration or not (plain == 'ENTRY_SOURCE' or plain.endswith('_ENTRY_SOURCE')):
+                continue
+            need(name == plain, refusal + ': unsupported raw identifier ' + name)
             literal = re.match(rb'\s*:\s*&str\s*=\s*"([0-9a-f]{64})"\s*;', terminal[at:])
-            need(literal is not None, refusal + ': malformed ' + match['name'].decode())
-            pins.append((match['name'].decode(), literal[1].decode()))
+            need(literal is not None, refusal + ': malformed ' + name)
+            pins.append((name, literal[1].decode()))
             at += literal.end()
     need(sorted(name for name, _ in pins) == sorted(ENTRY_SOURCE_NAMES),
          refusal + ': found ' + ', '.join(name for name, _ in pins))

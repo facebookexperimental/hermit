@@ -652,7 +652,8 @@ class EntrySourcePins(unittest.TestCase):
                 self.refuse(tree, tree.entry_bytes)
 
     def test_literal_names_count_and_shape_are_strict(self):
-        for change in ['missing', 'commented', 'duplicate', 'additional', 'short', 'uppercase', 'expression']:
+        for change in ['missing', 'commented', 'duplicate', 'additional', 'comment_separator',
+                       'raw_identifier', 'empty_prefix', 'short', 'uppercase', 'expression']:
             with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
                 tree = PinnedTree(Path(directory))
                 raw = tree.terminal_source()
@@ -666,6 +667,12 @@ class EntrySourcePins(unittest.TestCase):
                     raw += raw[:raw.index(b'const BOOTSTRAP_ENTRY_SOURCE')]
                 elif change == 'additional':
                     raw += b'const NEW_ENTRY_SOURCE: &str = "' + first + b'";\n'
+                elif change == 'comment_separator':
+                    raw += b'const /* comment */ NEW_ENTRY_SOURCE: &str = "' + first + b'";\n'
+                elif change == 'raw_identifier':
+                    raw += b'const r#NEW_ENTRY_SOURCE: &str = "' + first + b'";\n'
+                elif change == 'empty_prefix':
+                    raw += b'const _ENTRY_SOURCE: &str = "' + first + b'";\n'
                 elif change == 'short':
                     raw = raw.replace(first, first[:-1])
                 elif change == 'uppercase':
@@ -680,6 +687,16 @@ class EntrySourcePins(unittest.TestCase):
                 for text in ['runtime cohort derivation:', tree.rpin, TERMINAL, 'ENTRY_SOURCE',
                              'BOOTSTRAP_ENTRY_SOURCE', 'literal']:
                     self.assertIn(text, str(failure.exception))
+
+    def test_comments_separate_const_and_name_without_changing_the_literal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            raw = tree.terminal_source().replace(b'const ', b'const /* nested /* comment */ */ ')
+            raw += b'const /* unrelated */ PRIVATE_SOURCE: &str = "unchanged";\n'
+            tree.write(tree.reverie / TERMINAL, raw)
+            tree.commit(tree.reverie)
+            tree.repin()
+            self.assertEqual(cohort.bind(tree.root, tree.h_head)['runtime_R_pin'], tree.rpin)
 
     def test_missing_terminal_object_refuses_despite_worktree_copy(self):
         with tempfile.TemporaryDirectory() as directory:
