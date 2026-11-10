@@ -19493,6 +19493,116 @@ mod tests {
         assert!(guest.requests.lock().unwrap().is_empty(), "no RPC");
     }
 
+    /// dev-hermit dh-ru056 slice 2, ruling C1.1 (T1.2): in a process that
+    /// handles SIGALRM, phase 1's gate admits `read` of a pipe end only while
+    /// it is a physically nonblocking pipe only guests hold, not a named FIFO,
+    /// and only under a handler without `SA_RESTART`. An end whose mark an
+    /// export withdrew, an inherited or received end Detcore polls but never
+    /// marked (a host pipe on fd 3 made nonblocking by `F_SETFL`), and a named
+    /// FIFO that joined polling, even one marked, are refused, as is a write.
+    /// No RPC either way.
+    #[tokio::test]
+    async fn sigalrm_phase1_gate_admits_only_guest_held_polled_pipe_reads() {
+        use reverie::Tool;
+        use reverie::syscalls::Syscall;
+        use reverie::syscalls::SyscallArgs;
+        use reverie::syscalls::Sysno;
+
+        use crate::fd::DetFd;
+        use crate::fd::FdType;
+        use crate::types::OpenFileId;
+
+        const HELD: i32 = 5;
+        const UNMARKED: i32 = 6;
+        const NAMED_FIFO: i32 = 7;
+        let (config, state, tid, pid) = cancellation_test_state();
+        install_test_registration(&state, tid, Ivar::new());
+        let tool: Detcore = Detcore::new(Tid::from_raw(tid.as_raw()), &config);
+        let mut thread = tool.init_thread_state(Tid::from_raw(tid.as_raw()), None);
+        thread.detpid = Some(pid);
+        thread.sigalrm_handled = true;
+        let pipe_end = |fd, sequence| {
+            let end = DetFd::new(
+                fd,
+                nix::fcntl::OFlag::O_RDONLY,
+                FdType::Pipe,
+                OpenFileId::new(pid, sequence),
+            );
+            end.set_physically_nonblocking();
+            end
+        };
+        let held = pipe_end(HELD, 90);
+        held.set_guest_held();
+        let unmarked = pipe_end(UNMARKED, 91);
+        let named = DetFd::new(
+            NAMED_FIFO,
+            nix::fcntl::OFlag::O_RDONLY,
+            FdType::Regular,
+            OpenFileId::new(pid, 92),
+        );
+        named.mark_fifo_awaiting_guest_peer();
+        named.fifo_joins_internal_polling();
+        // Detcore never marks a named FIFO guest-held; marking it here makes
+        // its refusal rest on `DetFd::is_named_fifo` alone.
+        named.set_guest_held();
+        {
+            let mut metadata = thread.file_metadata.lock().unwrap();
+            metadata.file_handles.insert(HELD, held);
+            metadata.file_handles.insert(UNMARKED, unmarked);
+            metadata.file_handles.insert(NAMED_FIFO, named);
+        }
+        let mut guest = RetirementGuest {
+            global: &state,
+            config: &config,
+            thread,
+            requests: Mutex::new(Vec::new()),
+            retired: std::sync::atomic::AtomicBool::new(false),
+            hold_private_memory_publication: false,
+        };
+        let raw = |sysno, fd: i32| {
+            Syscall::from_raw(sysno, SyscallArgs::new(fd as usize, 0x1000, 1, 0, 0, 0))
+        };
+        let refused = Some(nix::errno::Errno::EOPNOTSUPP);
+
+        assert_eq!(
+            tool.sigalrm_phase1_gate(&guest, raw(Sysno::read, HELD)),
+            None
+        );
+        assert_eq!(
+            tool.sigalrm_phase1_gate(&guest, raw(Sysno::write, HELD)),
+            refused
+        );
+        assert_eq!(
+            tool.sigalrm_phase1_gate(&guest, raw(Sysno::read, UNMARKED)),
+            refused
+        );
+        assert_eq!(
+            tool.sigalrm_phase1_gate(&guest, raw(Sysno::read, NAMED_FIFO)),
+            refused
+        );
+
+        guest.thread.sigalrm_restarts = true;
+        assert_eq!(
+            tool.sigalrm_phase1_gate(&guest, raw(Sysno::read, HELD)),
+            refused,
+            "SA_RESTART"
+        );
+        guest.thread.sigalrm_restarts = false;
+
+        // An export on a socket that is not guest-held withdraws the mark for
+        // good (`DetFd::clear_guest_held`).
+        guest
+            .thread
+            .with_detfd(HELD, |detfd| detfd.clear_guest_held())
+            .unwrap();
+        assert_eq!(
+            tool.sigalrm_phase1_gate(&guest, raw(Sysno::read, HELD)),
+            refused,
+            "exported"
+        );
+        assert!(guest.requests.lock().unwrap().is_empty(), "no RPC");
+    }
+
     /// While any process handles SIGALRM, a file lease is refused before the
     /// kernel: its break would make another process's open wait with no
     /// scheduler admission. Releasing a lease is not refused.

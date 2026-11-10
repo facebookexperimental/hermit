@@ -1863,9 +1863,16 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// state, inside this call's turn.
     async fn publish_virtual_sigalrm<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
         let (handled, blocked) = virtual_sigalrm_state(guest).await?;
+        // The handler's SA_RESTART bit, from the same virtual table, for
+        // phase 1's gate (`ThreadState::sigalrm_restarts`).
+        let restarts = handled
+            && super::helpers::caught_action_flags(guest, libc::SIGALRM).await?
+                & libc::SA_RESTART as u32 as u64
+                != 0;
         sigalrm_refuses(guest, SigalrmControl::Publish { handled, blocked }).await;
         guest.thread_state_mut().sigalrm_handled = handled;
         guest.thread_state_mut().sigalrm_blocked_published = blocked;
+        guest.thread_state_mut().sigalrm_restarts = restarts;
         Ok(())
     }
 

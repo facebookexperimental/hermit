@@ -234,6 +234,9 @@ struct TurnGuest {
     /// query fails instead.
     action_mask: u64,
     action_query_fails: bool,
+    /// What signal phase 1's ledger answers `SigalrmControl::DueEntry` with
+    /// (every other ledger control is answered `false`).
+    sigalrm_due: bool,
     /// Every injected syscall, in order.
     injected: Vec<Sysno>,
     /// What each injected `read` returns, in order (`EAGAIN` once empty).
@@ -398,7 +401,11 @@ impl GlobalRPC<GlobalState> for TurnGuest {
             ),
             GlobalRequest::NamesHermitTask(..) => GlobalResponse::NamesHermitTask(false),
             GlobalRequest::TouchFile(_) => GlobalResponse::TouchFile(()),
-            // Signal phase 1's ledger: no entry is due, nothing is refused.
+            // Signal phase 1's ledger: an entry is due only where the test
+            // says so; nothing is refused.
+            GlobalRequest::Sigalrm(crate::tool_global::SigalrmControl::DueEntry) => {
+                GlobalResponse::Sigalrm(self.sigalrm_due)
+            }
             GlobalRequest::Sigalrm(_) => GlobalResponse::Sigalrm(false),
             GlobalRequest::PendingRealTimeExpirations(_) => {
                 GlobalResponse::PendingRealTimeExpirations(0)
@@ -792,6 +799,7 @@ fn turn_guest(gate: bool, own_mask: Option<u64>) -> TurnGuest {
         action_flags: 0,
         action_mask: 0,
         action_query_fails: false,
+        sigalrm_due: false,
         injected: Vec::new(),
         read_results: VecDeque::new(),
         write_results: VecDeque::new(),
@@ -3467,3 +3475,155 @@ async fn under_the_gate_a_refused_send_s_unreadable_siginfo_is_efault_only_where
 }
 
 mod temporary_mask_turn_tests;
+
+/// dev-hermit dh-ru056 slice 2, rulings C2.1-C2.4 (T2.1, T2.2): at the
+/// restart checkpoint, in a process whose runtime virtualizes SIGALRM, a
+/// call's `-ERESTARTSYS` becomes `-EINTR` exactly when its process's SIGALRM
+/// entry is due, by Linux's table with the guest's own `sa_flags` (read by an
+/// injected query of the runtime's virtual action; flags without
+/// `SA_RESTART`, such as `SA_SIGINFO`, give `-EINTR`), and the call is
+/// marked for delivery at its completion. That value is what every later
+/// observer sees, since the checkpoint runs before them. An entry not due, a
+/// result that is no `-ERESTARTSYS`, a process without a handler, or a
+/// backend that does not virtualize SIGALRM leave the result as it is, with
+/// no query; an `SA_RESTART` action, which phase 1's gate refuses at the
+/// read's entry, stops the run by name.
+#[tokio::test]
+async fn the_sigalrm_restart_checkpoint_returns_eintr_only_for_a_due_entry() {
+    let restart = || Err::<i64, Error>(Errno::ERESTARTSYS.into());
+    for (case, handled, virtualizes, due, flags, res, eintr) in [
+        ("due", true, true, true, 0, restart(), true),
+        (
+            "due-siginfo",
+            true,
+            true,
+            true,
+            (libc::SA_SIGINFO | libc::SA_NODEFER) as u32 as u64,
+            restart(),
+            true,
+        ),
+        ("not-due", true, true, false, 0, restart(), false),
+        ("unhandled", false, true, true, 0, restart(), false),
+        ("not-virtualized", true, false, true, 0, restart(), false),
+        (
+            "eagain",
+            true,
+            true,
+            true,
+            0,
+            Err(Errno::EAGAIN.into()),
+            false,
+        ),
+        ("count", true, true, true, 0, Ok(1), false),
+    ] {
+        let mut guest = turn_guest(false, Some(0));
+        guest.config.backend.virtualizes_guest_sigalrm = virtualizes;
+        guest.thread.sigalrm_handled = handled;
+        guest.sigalrm_due = due;
+        guest.action_flags = flags;
+        let tool = Detcore::new(Pid::from_raw(THREAD.as_raw()), &guest.config);
+        let call = reverie::syscalls::Syscall::Read(reverie::syscalls::Read::new().with_fd(5));
+        let expected = if eintr {
+            Err(Errno::EINTR)
+        } else {
+            res.as_ref().map(|v| *v).map_err(|e| match e {
+                Error::Errno(errno) => *errno,
+                _ => unreachable!(),
+            })
+        };
+        let result = tool
+            .sigalrm_restart_checkpoint(&mut guest, &call, res)
+            .await;
+        let result = result.map_err(|e| match e {
+            Error::Errno(errno) => errno,
+            other => panic!("{case}: {other:?}"),
+        });
+        assert_eq!(result, expected, "{case}");
+        assert_eq!(guest.thread.sigalrm_interrupts_completion, eintr, "{case}");
+        let queried = guest.injected.contains(&Sysno::rt_sigaction);
+        assert_eq!(queried, eintr, "{case}: the virtual action is queried");
+        assert!(
+            !guest
+                .rpcs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|rpc| matches!(rpc, GlobalRequest::StoppingRefusal(_))),
+            "{case}"
+        );
+    }
+
+    // SA_RESTART: phase 1 refuses such a read at its entry; one that gets
+    // here stops the run by name (C2.4), and is never marked for delivery.
+    let mut guest = turn_guest(false, Some(0));
+    guest.config.backend.virtualizes_guest_sigalrm = true;
+    guest.thread.sigalrm_handled = true;
+    guest.sigalrm_due = true;
+    guest.action_flags = libc::SA_RESTART as u32 as u64;
+    let tool = Detcore::new(Pid::from_raw(THREAD.as_raw()), &guest.config);
+    let call = reverie::syscalls::Syscall::Read(reverie::syscalls::Read::new().with_fd(5));
+    let result = tool
+        .sigalrm_restart_checkpoint(&mut guest, &call, restart())
+        .await;
+    assert!(
+        matches!(result, Err(Error::Errno(Errno::EINTR))),
+        "{result:?}"
+    );
+    assert!(!guest.thread.sigalrm_interrupts_completion);
+    let rpcs = guest.rpcs.lock().unwrap();
+    assert!(
+        rpcs.iter()
+            .any(|rpc| matches!(rpc, GlobalRequest::StoppingRefusal(reason)
+            if reason.contains("HERMIT_SIGALRM_RESTART_AFTER_HANDLER"))),
+        "{rpcs:?}"
+    );
+}
+
+/// dev-hermit dh-ru056 slice 2, ruling C2.1 (T2.1): a completion the restart
+/// checkpoint marked must deliver its SIGALRM; one whose entry is no longer
+/// due stops the run by name rather than return `-EINTR` with no handler run.
+/// A completion that still returns `-ERESTARTSYS` asks the ledger nothing: no
+/// SIGALRM ended its wait, so the in-guest runtime restarts it, and an entry
+/// that fell due meanwhile is delivered at the restarted call's entry.
+#[tokio::test]
+async fn a_marked_sigalrm_completion_delivers_or_stops_the_run() {
+    let call = reverie::syscalls::Syscall::Read(reverie::syscalls::Read::new().with_fd(5));
+
+    let mut guest = turn_guest(false, Some(0));
+    guest.config.backend.virtualizes_guest_sigalrm = true;
+    guest.thread.sigalrm_handled = true;
+    guest.thread.sigalrm_interrupts_completion = true;
+    guest.sigalrm_due = false;
+    let tool = Detcore::new(Pid::from_raw(THREAD.as_raw()), &guest.config);
+    let result = tool
+        .complete_syscall(&mut guest, &call, Err(Errno::EINTR.into()))
+        .await;
+    assert!(matches!(result, Err(Error::Errno(Errno::EINTR))));
+    assert!(!guest.thread.sigalrm_interrupts_completion, "taken");
+    {
+        let rpcs = guest.rpcs.lock().unwrap();
+        assert!(
+            rpcs.iter()
+                .any(|rpc| matches!(rpc, GlobalRequest::StoppingRefusal(reason)
+                if reason.contains("HERMIT_SIGALRM_EINTR_WITHOUT_DELIVERY"))),
+            "{rpcs:?}"
+        );
+    }
+
+    let mut guest = turn_guest(false, Some(0));
+    guest.config.backend.virtualizes_guest_sigalrm = true;
+    guest.thread.sigalrm_handled = true;
+    guest.sigalrm_due = true;
+    let tool = Detcore::new(Pid::from_raw(THREAD.as_raw()), &guest.config);
+    let result = tool
+        .complete_syscall(&mut guest, &call, Err(Errno::ERESTARTSYS.into()))
+        .await;
+    assert!(matches!(result, Err(Error::Errno(Errno::ERESTARTSYS))));
+    let rpcs = guest.rpcs.lock().unwrap();
+    assert!(
+        !rpcs
+            .iter()
+            .any(|rpc| matches!(rpc, GlobalRequest::Sigalrm(_))),
+        "a restarted call asks the ledger nothing: {rpcs:?}"
+    );
+}

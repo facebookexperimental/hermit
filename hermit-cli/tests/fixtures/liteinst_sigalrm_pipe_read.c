@@ -1,0 +1,197 @@
+/* Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved. Licensed under the BSD-style license in LICENSE. */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <ucontext.h>
+#include <unistd.h>
+
+/* A guest-handled SIGALRM against a blocking read() of a pipe whose other end
+ * a child holds (dev-hermit dh-ru056 slice 2). The child is forked before the
+ * handler is installed, since a process that handles SIGALRM may not fork,
+ * and the parent closes its own write end before the install too, since it
+ * may not close a pipe afterwards. Every line is a function of the program
+ * and Linux's rules, never of host timing: times are reported only as the
+ * window they fall in, relative to the alarm and the child's write.
+ *
+ *   eintr:   alarm(1); the child writes at 3s. The read returns -1/EINTR
+ *            after the handler ran, whose frame holds -EINTR in its result
+ *            register just past the syscall instruction; a second read
+ *            returns the byte.
+ *   data:    the child writes at 1s; alarm(2). The read returns 1 first; the
+ *            handler runs after it, at the alarm, which a pause() awaits.
+ *   restart: as eintr, with SA_RESTART. Linux runs the handler and restarts
+ *            the read, which returns the byte at 3s.
+ *   eof:     the child closes its end and exits at 1s; alarm(3). The read
+ *            returns 0 with no handler run; the child's SIGCHLD, ignored by
+ *            default, interrupts nothing.
+ *   childexit: the parent keeps its own write end; the child exits at 0.5s
+ *            without writing; alarm(1). The child's SIGCHLD, ignored by
+ *            default, interrupts nothing: the read returns -1/EINTR at the
+ *            alarm, after the handler.
+ *   fifo:    as eintr, through a named FIFO opened before the install. The
+ *            parent opens the read end with O_NONBLOCK and then the write
+ *            end before the fork, so no open waits; the child writes
+ *            through the inherited write end, and the parent keeps its own
+ *            copy, which it may not close once it handles SIGALRM. The read
+ *            end is made blocking again before the install.
+ */
+
+static volatile sig_atomic_t hits;
+static volatile sig_atomic_t frame_result_is_eintr;
+static volatile sig_atomic_t frame_ip_after_syscall;
+static struct timespec start;
+
+static long elapsed_ms(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000;
+}
+
+/* The window a time falls in: before the alarm at 1s, between it and the
+ * write at 3s, or after that. */
+static const char *window(long ms, long alarm_ms, long write_ms) {
+    if (ms < alarm_ms) return "before_alarm";
+    if (ms < write_ms) return "at_alarm";
+    return "at_write";
+}
+
+static void on_alarm(int sig, siginfo_t *info, void *context) {
+    (void)sig;
+    (void)info;
+    ucontext_t *uc = context;
+    const unsigned char *ip = (const unsigned char *)uc->uc_mcontext.gregs[REG_RIP];
+    hits++;
+    frame_result_is_eintr = uc->uc_mcontext.gregs[REG_RAX] == -EINTR;
+    frame_ip_after_syscall = ip[-2] == 0x0f && ip[-1] == 0x05;
+}
+
+static void sleep_ms(long ms) {
+    struct timespec t = {ms / 1000, (ms % 1000) * 1000000};
+    while (nanosleep(&t, &t) && errno == EINTR) {
+    }
+}
+
+static int install(int restart) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = on_alarm;
+    sa.sa_flags = SA_SIGINFO | (restart ? SA_RESTART : 0);
+    sigemptyset(&sa.sa_mask);
+    return sigaction(SIGALRM, &sa, NULL);
+}
+
+/* Cancels the alarm and restores the default action, so the parent may wait
+ * for its child. */
+static int finish(pid_t child) {
+    alarm(0);
+    signal(SIGALRM, SIG_DFL);
+    int status = 0;
+    if (waitpid(child, &status, 0) != child) {
+        printf("waitpid errno=%d\n", errno);
+        return 1;
+    }
+    printf("child_exit=%d\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc != 2) return 2;
+    const char *mode = argv[1];
+    int restart = !strcmp(mode, "restart");
+    int fifo = !strcmp(mode, "fifo");
+    int eof = !strcmp(mode, "eof");
+    int data = !strcmp(mode, "data");
+    int childexit = !strcmp(mode, "childexit");
+    if (!restart && !fifo && !eof && !data && !childexit && strcmp(mode, "eintr")) return 2;
+    long write_ms = data ? 1000 : eof ? 1000 : childexit ? 500 : 3000;
+    /* The windows' upper bound: the write, or 3s where the child writes
+     * nothing after the alarm. */
+    long window_ms = childexit ? 3000 : write_ms;
+    long alarm_ms = data ? 2000 : eof ? 3000 : 1000;
+    setvbuf(stdout, NULL, _IONBF, 0);
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    int ends[2];
+    const char *path = "sigalrm_pipe_read.fifo";
+    int in = -1;
+    if (fifo) {
+        /* No unlink first: a stale FIFO fails mkfifo with EEXIST, a visible
+         * result, rather than make two runs differ. */
+        if (mkfifo(path, 0600)) {
+            printf("mkfifo errno=%d\n", errno);
+            return 1;
+        }
+        in = open(path, O_RDONLY | O_NONBLOCK);
+        ends[1] = open(path, O_WRONLY);
+        if (in < 0 || ends[1] < 0) {
+            printf("open errno=%d\n", errno);
+            return 1;
+        }
+        /* Unlinked while still unhandled: phase 1 refuses unlink once the
+         * process handles SIGALRM. The open ends stay usable. */
+        unlink(path);
+    } else if (pipe(ends)) {
+        printf("pipe errno=%d\n", errno);
+        return 1;
+    }
+    pid_t child = fork();
+    if (child < 0) {
+        printf("fork errno=%d\n", errno);
+        return 1;
+    }
+    if (child == 0) {
+        close(fifo ? in : ends[0]);
+        int out = ends[1];
+        sleep_ms(write_ms);
+        if (!eof && !childexit && write(out, "x", 1) != 1) _exit(3);
+        _exit(0);
+    }
+    if (fifo) {
+        if (fcntl(in, F_SETFL, fcntl(in, F_GETFL) & ~O_NONBLOCK)) {
+            printf("fcntl errno=%d\n", errno);
+            return 1;
+        }
+    } else {
+        in = ends[0];
+        /* childexit keeps a writer, so the read waits for the alarm. */
+        if (!childexit) close(ends[1]);
+    }
+    if (install(restart)) {
+        printf("sigaction errno=%d\n", errno);
+        return 1;
+    }
+    alarm(alarm_ms / 1000);
+
+    char c = '?';
+    errno = 0;
+    ssize_t n = read(in, &c, 1);
+    int e = errno;
+    long at = elapsed_ms();
+    printf("read=%zd errno=%d byte=%c window=%s hits_at_return=%d\n", n, n < 0 ? e : 0,
+           n == 1 ? c : '-', window(at, alarm_ms, window_ms), (int)hits);
+    if (hits) {
+        printf("frame result_eintr=%d ip_after_syscall=%d\n", (int)frame_result_is_eintr,
+               (int)frame_ip_after_syscall);
+    }
+    if (n < 0 && e == EINTR && !childexit) {
+        c = '?';
+        n = read(in, &c, 1);
+        printf("read2=%zd byte=%c window=%s\n", n, n == 1 ? c : '-',
+               window(elapsed_ms(), alarm_ms, window_ms));
+    } else if (data) {
+        errno = 0;
+        int p = pause();
+        printf("pause=%d errno=%d hits=%d\n", p, errno, (int)hits);
+    } else if (eof) {
+        printf("alarm_left=%u\n", alarm(0));
+    }
+    return finish(child);
+}

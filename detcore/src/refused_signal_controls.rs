@@ -274,6 +274,38 @@ pub(crate) fn realtime_instances_unknown_refusal(call: &str, signal: i32, caller
     )
 }
 
+/// The run-wide stopping refusal for a polled pipe read whose `-ERESTARTSYS`
+/// the restart checkpoint would turn into `-EINTR` for a due guest-handled
+/// SIGALRM whose action has `SA_RESTART` (dev-hermit dh-ru056 slice 2, ruling
+/// C2.4). Phase 1's gate refuses such a read at its entry, so this is a
+/// defect of that argument. Linux would run the handler and then restart the
+/// read, which the in-guest host cannot do. Fail closed.
+pub(crate) fn sigalrm_restart_after_handler_refusal(call: &str, caller: i32) -> String {
+    format!(
+        "hermit refused to continue the run (HERMIT_SIGALRM_RESTART_AFTER_HANDLER): {call} in \
+         thread {caller} finished with ERESTARTSYS while its process's due SIGALRM handler has \
+         SA_RESTART, which signal phase 1 refuses at the read's entry; Linux would run the \
+         handler and then restart the call, which the in-guest host cannot do (dev-hermit \
+         dh-ru056 slice 2, ruling C2.4)."
+    )
+}
+
+/// The run-wide stopping refusal for a call whose `-ERESTARTSYS` the restart
+/// checkpoint turned into `-EINTR` for a due guest-handled SIGALRM that its
+/// completion then did not deliver (dev-hermit dh-ru056 slice 2, ruling
+/// C2.1). The guest must never see `-EINTR` without the handler's run, and
+/// nothing in the calling thread's own turn can take or block the entry
+/// between the two points, so this is a defect of that argument. Fail
+/// closed.
+pub(crate) fn sigalrm_interrupt_without_delivery_refusal(call: &str, caller: i32) -> String {
+    format!(
+        "hermit refused to continue the run (HERMIT_SIGALRM_EINTR_WITHOUT_DELIVERY): {call} in \
+         thread {caller} was to return EINTR for its process's due SIGALRM, but the SIGALRM was \
+         not delivered at its completion; the guest would see EINTR with no handler run \
+         (dev-hermit dh-ru056 slice 2, ruling C2.1)."
+    )
+}
+
 /// The run-wide stopping refusal (A5 design D49) for a caught end whose
 /// restart table restarts the call with a code other than `ERESTARTSYS`
 /// (D40): the restart needs the register rewind and post-handler delivery of

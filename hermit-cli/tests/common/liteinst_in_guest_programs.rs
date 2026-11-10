@@ -1062,6 +1062,84 @@ fn liteinst_in_guest_pause_sleeps_through_a_discarded_or_blocked_timer_signal() 
     }
 }
 
+/// dev-hermit dh-ru056 slice 2 (T2.3, T2.4, T2.6, T2.7, T1.4, T1.6): a
+/// guest-handled SIGALRM against a blocking read of a pipe whose other end a
+/// child holds behaves, under in-guest-trap, as Linux and ptrace do, verified
+/// at L2 on both. The read returns EINTR after the handler, whose frame holds
+/// -EINTR in its result register just past the syscall (`eintr`). Data
+/// written before the alarm is returned first (`data`), as is EOF from a
+/// child that closed its end (`eof`). The SIGCHLD of a child that exits
+/// first interrupts nothing (`childexit`). In-guest refuses by name, with
+/// EOPNOTSUPP at the read's entry, a read under an SA_RESTART handler, which
+/// Linux would restart after the handler (`restart`), and a read of a named
+/// FIFO, which a process outside the container could fill (`fifo`); ptrace
+/// runs both as Linux does.
+#[test]
+fn in_guest_trap_sigalrm_interrupts_a_guest_held_pipe_read_as_ptrace_does() {
+    let _guard = hermit_run_guard();
+    let guest = sigalrm_fixture("liteinst_sigalrm_pipe_read");
+    let eintr = concat!(
+        "read=-1 errno=4 byte=- window=at_alarm hits_at_return=1\n",
+        "frame result_eintr=1 ip_after_syscall=1\n",
+        "read2=1 byte=x window=at_write\n",
+        "child_exit=0\n",
+    );
+    let refused = concat!(
+        "read=-1 errno=95 byte=- window=before_alarm hits_at_return=0\n",
+        "child_exit=0\n",
+    );
+    for (mode, linux, in_guest) in [
+        ("eintr", eintr, eintr),
+        (
+            "data",
+            concat!(
+                "read=1 errno=0 byte=x window=before_alarm hits_at_return=0\n",
+                "pause=-1 errno=4 hits=1\n",
+                "child_exit=0\n",
+            ),
+            "",
+        ),
+        (
+            "eof",
+            concat!(
+                "read=0 errno=0 byte=- window=before_alarm hits_at_return=0\n",
+                "alarm_left=2\n",
+                "child_exit=0\n",
+            ),
+            "",
+        ),
+        (
+            "childexit",
+            concat!(
+                "read=-1 errno=4 byte=- window=at_alarm hits_at_return=1\n",
+                "frame result_eintr=1 ip_after_syscall=1\n",
+                "child_exit=0\n",
+            ),
+            "",
+        ),
+        (
+            "restart",
+            concat!(
+                "read=1 errno=0 byte=x window=at_write hits_at_return=1\n",
+                "frame result_eintr=0 ip_after_syscall=0\n",
+                "child_exit=0\n",
+            ),
+            refused,
+        ),
+        ("fifo", eintr, refused),
+    ] {
+        let in_guest = if in_guest.is_empty() { linux } else { in_guest };
+        let ptrace = strict_sigalrm_fixture_run(&guest, "ptrace", Some("1"), "0", mode);
+        assert_eq!(String::from_utf8_lossy(&ptrace), linux, "ptrace/{mode}");
+        let trap = strict_sigalrm_fixture_run(&guest, "in-guest-trap", Some("1"), "0", mode);
+        assert_eq!(
+            String::from_utf8_lossy(&trap),
+            in_guest,
+            "in-guest-trap/{mode}"
+        );
+    }
+}
+
 /// This bridge covers emulated sleeps, not a running process's alarm. The
 /// existing missing-exit check must still refuse an alarm outside the bridge.
 #[test]

@@ -6708,6 +6708,22 @@ pub struct ThreadState<T> {
     /// virtual bit with this one and publishes a change.
     pub(crate) sigalrm_blocked_published: bool,
 
+    /// Whether this thread's process's guest SIGALRM action, as the runtime
+    /// last reported it, has `SA_RESTART` (dev-hermit dh-ru056 slice 2):
+    /// recorded with the disposition, in the turn of the `rt_sigaction` that
+    /// may change it (`publish_virtual_sigalrm`), and false while SIGALRM is
+    /// not handled. Signal phase 1's gate refuses a polled pipe read under
+    /// such a handler (`sigalrm_phase1::descriptor_class`): Linux runs the
+    /// handler and then restarts the read, which the in-guest host cannot do.
+    pub(crate) sigalrm_restarts: bool,
+
+    /// Set at the restart checkpoint when this call's `-ERESTARTSYS` became
+    /// `-EINTR` because a due guest-handled SIGALRM is to be delivered at its
+    /// completion (`Detcore::sigalrm_restart_checkpoint`); taken by that
+    /// completion, which must deliver it (dh-ru056 slice 2).
+    #[serde(skip)]
+    pub(crate) sigalrm_interrupts_completion: bool,
+
     /// The real-time signals this thread's process has already recorded as
     /// unblocked by a handler's restored mask
     /// (`Scheduler::handler_restore_unblocked`), so a delivery adds nothing
@@ -7964,6 +7980,8 @@ impl<T> ThreadState<T> {
             published_mask: Some(None),
             published_dispositions: Arc::default(),
             sigalrm_blocked_published: false,
+            sigalrm_restarts: false,
+            sigalrm_interrupts_completion: false,
             handler_restore_rt_reported: 0,
             signal_register_projection: None,
             last_accounted_user_time,

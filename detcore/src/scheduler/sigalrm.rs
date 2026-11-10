@@ -69,9 +69,10 @@
 //!   turns.
 //!
 //! Nothing publishes a handled SIGALRM until the runtime admits guest
-//! handlers; and phase 1 still refuses a pipe read in a handling process
-//! (`sigalrm_phase1::descriptor_class`), so no run reaches the reservation
-//! today.
+//! handlers. Phase 1 admits a pipe read in a handling process only on an end
+//! only guests hold, outside record and replay, and under a handler without
+//! `SA_RESTART` (`sigalrm_phase1::descriptor_class`, dh-ru056 slice 2); no
+//! other read reaches the reservation.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;

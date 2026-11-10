@@ -56,7 +56,14 @@
 //!   process after a fork. A write to the container's inherited stdout or
 //!   stderr runs, and `handle_write` records a loss if a SIGALRM is due once
 //!   its grant is taken (design closure 1; the cells print to captured
-//!   stdout).
+//!   stdout). A `read` of a pipe end only guests hold, which Detcore polls
+//!   rather than letting it sleep in the kernel, also runs (dev-hermit
+//!   dh-ru056 slice 2, `FdFacts::guest_held_polled_pipe`). The scheduler
+//!   places a SIGALRM that falls due during its wait, and the restart
+//!   checkpoint returns `-EINTR` for it (`Detcore::sigalrm_restart_checkpoint`).
+//!   It is refused by name under an `SA_RESTART` handler and under record or
+//!   replay, and an `lseek` of such a pipe runs, since Linux returns ESPIPE at
+//!   once.
 //! - [`OPENS`]: `open`, `openat`, `creat`. `handle_openat` refuses, after its
 //!   path grant (when no other guest can change the path), opening a FIFO
 //!   without `O_NONBLOCK` (it waits for the other end), and opening any
@@ -115,6 +122,27 @@ pub(crate) struct FdFacts {
     pub safe_snapshot: bool,
     /// Whether the kernel places it on procfs or sysfs.
     pub pseudo_fs: bool,
+    /// Whether it is a pipe end whose blocking `read` is the scheduler's
+    /// polling wait on guest state alone (dev-hermit dh-ru056 slice 2, ruling
+    /// C1.1): Detcore keeps it physically nonblocking under sequentialized
+    /// threads, so the read is a sequence of `InternalIOPolling` probes that
+    /// never sleep in the kernel; only guests hold it (`DetFd::is_guest_held`,
+    /// never set for an inherited or received end, and withdrawn for good on
+    /// an export); and it is no named FIFO, which a process outside the
+    /// container may open, nor an inherited external read. The scheduler
+    /// places a SIGALRM that becomes due during that wait
+    /// (`Scheduler::act_on_pending_sigalrm`).
+    pub guest_held_polled_pipe: bool,
+}
+
+/// What phase 1 knows of the calling process, for [`descriptor_class`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ProcessFacts {
+    /// Whether its guest SIGALRM action has `SA_RESTART`
+    /// (`ThreadState::sigalrm_restarts`).
+    pub sigalrm_restarts: bool,
+    /// Whether the run records or replays (`Config::recordreplay_modes`).
+    pub record_replay: bool,
 }
 
 /// What the kernel says a descriptor opened by a process that handles
@@ -306,13 +334,14 @@ pub(crate) enum Phase1Class {
 pub(crate) fn classify(
     sysno: Sysno,
     args: &SyscallArgs,
+    process: ProcessFacts,
     facts: impl FnOnce(i32) -> Option<FdFacts>,
 ) -> Phase1Class {
     if ALWAYS_ALLOWED.contains(&sysno) || OPENS.contains(&sysno) {
         return Phase1Class::Allowed;
     }
     if DESCRIPTOR_IO.contains(&sysno) {
-        return descriptor_class(sysno == Sysno::write, facts(args.arg0 as i32));
+        return descriptor_class(sysno == Sysno::write, process, facts(args.arg0 as i32));
     }
     if !CONDITIONAL.contains(&sysno) {
         return Phase1Class::Refused("a syscall phase 1 has not placed");
@@ -320,7 +349,10 @@ pub(crate) fn classify(
     match sysno {
         Sysno::close => close_class(facts(args.arg0 as i32)),
         // A seek on a live seq_file runs its show callback, as a read does.
-        Sysno::lseek => descriptor_class(false, facts(args.arg0 as i32)),
+        // It never waits, so neither its process's SA_RESTART bit nor record
+        // and replay matter: on a guest-held polled pipe Linux returns
+        // ESPIPE at once (`no_llseek`, ruling C1.3: pinned, not implicit).
+        Sysno::lseek => descriptor_class(false, ProcessFacts::default(), facts(args.arg0 as i32)),
         _ => unreachable!("{sysno} is not in CONDITIONAL"),
     }
 }
@@ -369,8 +401,13 @@ pub(crate) fn open_refused(lookup: Result<libc::stat, reverie::Errno>, nonblocki
     }
 }
 
-/// Classifies a `read` or `write` by what Detcore knows of its descriptor.
-pub(crate) fn descriptor_class(write: bool, facts: Option<FdFacts>) -> Phase1Class {
+/// Classifies a `read` or `write` by what Detcore knows of its descriptor
+/// and of the calling process.
+pub(crate) fn descriptor_class(
+    write: bool,
+    process: ProcessFacts,
+    facts: Option<FdFacts>,
+) -> Phase1Class {
     let Some(facts) = facts else {
         return Phase1Class::Refused("I/O on a descriptor Detcore does not model");
     };
@@ -385,6 +422,26 @@ pub(crate) fn descriptor_class(write: bool, facts: Option<FdFacts>) -> Phase1Cla
         FdType::Memfd => Phase1Class::Allowed,
         // Served from a snapshot whose capture cannot wait.
         FdType::Regular if facts.safe_snapshot => Phase1Class::Allowed,
+        // Its wait is the scheduler's polling wait on guest state, never a
+        // kernel sleep (dh-ru056 slice 2). A pipe write stays refused.
+        FdType::Pipe if !write && facts.guest_held_polled_pipe => {
+            if process.record_replay {
+                // Ruling C1.4: record and replay keep a polled read's
+                // guest-state authority from its entry, which an export does
+                // not revoke (`refresh_guest_poll_state`).
+                Phase1Class::Refused(
+                    "a pipe read under record or replay, where dh-ru056 slice 2 cannot revoke its guest-only readiness",
+                )
+            } else if process.sigalrm_restarts {
+                // Ruling C2.6: Linux would run the handler and then restart
+                // the read, which the in-guest host cannot do (slice 1b).
+                Phase1Class::Refused(
+                    "a pipe read under an SA_RESTART SIGALRM handler: dh-ru056 slice 2 admits only a handler without SA_RESTART",
+                )
+            } else {
+                Phase1Class::Allowed
+            }
+        }
         _ => Phase1Class::Refused("I/O on a descriptor that may sleep interruptibly"),
     }
 }
@@ -407,7 +464,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: Syscall,
     ) -> Option<Errno> {
         let (sysno, args) = call.into_parts();
-        let class = classify(sysno, &args, |fd| {
+        let process = ProcessFacts {
+            sigalrm_restarts: guest.thread_state().sigalrm_restarts,
+            record_replay: self.cfg.recordreplay_modes,
+        };
+        let class = classify(sysno, &args, process, |fd| {
             guest
                 .thread_state()
                 .with_detfd(fd, |detfd| FdFacts {
@@ -433,6 +494,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                     pseudo_fs: detfd
                         .sigalrm_phase1_provenance()
                         .is_some_and(|provenance| provenance.pseudo_fs),
+                    guest_held_polled_pipe: self.cfg.sequentialize_threads
+                        && detfd.ty() == FdType::Pipe
+                        && detfd.physically_nonblocking()
+                        && detfd.is_guest_held()
+                        && !detfd.is_named_fifo()
+                        && !detfd.fifo_awaiting_guest_peer()
+                        && detfd.inherited_external_read().is_none(),
                 })
                 .ok()
         });
@@ -561,7 +629,7 @@ mod tests {
                 continue;
             }
             assert_eq!(
-                classify(sysno, &args([0; 6]), no_fd),
+                classify(sysno, &args([0; 6]), ProcessFacts::default(), no_fd),
                 Phase1Class::Refused("a syscall phase 1 has not placed"),
                 "{sysno}"
             );
@@ -577,7 +645,7 @@ mod tests {
     fn sigalrm_phase1_scalar_identity_keeps_neighboring_refusals() {
         for sysno in [Sysno::getuid, Sysno::geteuid, Sysno::getgid, Sysno::getegid] {
             assert_eq!(
-                classify(sysno, &args([0; 6]), |_| panic!(
+                classify(sysno, &args([0; 6]), ProcessFacts::default(), |_| panic!(
                     "no descriptor for {sysno}"
                 )),
                 Phase1Class::Allowed,
@@ -606,7 +674,7 @@ mod tests {
             Sysno::readlinkat,
         ] {
             assert_eq!(
-                classify(sysno, &args([0; 6]), |_| panic!(
+                classify(sysno, &args([0; 6]), ProcessFacts::default(), |_| panic!(
                     "no descriptor for {sysno}"
                 )),
                 Phase1Class::Refused("a syscall phase 1 has not placed"),
@@ -780,6 +848,7 @@ mod tests {
                 safe_snapshot,
                 // A safe snapshot is on procfs or sysfs by its provenance.
                 pseudo_fs: safe_snapshot,
+                guest_held_polled_pipe: false,
             })
         };
         // A descriptor the kernel places on procfs or sysfs, not a snapshot.
@@ -794,6 +863,15 @@ mod tests {
                 mode,
                 safe_snapshot: false,
                 pseudo_fs: true,
+                guest_held_polled_pipe: false,
+            })
+        };
+        // A pipe end only guests hold, which Detcore reads by polling probes
+        // (dh-ru056 slice 2).
+        let polled_pipe = |stdio: Option<Device>| {
+            Some(FdFacts {
+                guest_held_polled_pipe: true,
+                ..facts(FdType::Pipe, stdio, None, false).unwrap()
             })
         };
         let reg = Some(libc::S_IFREG | 0o644);
@@ -809,6 +887,13 @@ mod tests {
             (facts(FdType::Regular, None, chr, false), true, false),
             (facts(FdType::Regular, None, None, false), false, false),
             (facts(FdType::Pipe, None, None, false), false, false),
+            // A guest-held polled pipe's read waits in the scheduler, never
+            // the kernel (ruling C1.1); its write, and the container's stdio,
+            // stay refused. A pipe end that is not guest-held (inherited,
+            // received, exported, or a named FIFO) is the row above.
+            (polled_pipe(None), false, true),
+            (polled_pipe(None), true, false),
+            (polled_pipe(Some(Device::ContainerStdin)), false, false),
             (facts(FdType::Socket, None, None, false), true, false),
             (facts(FdType::Signalfd, None, None, false), false, false),
             (facts(FdType::Eventfd, None, None, false), false, false),
@@ -841,7 +926,7 @@ mod tests {
             ),
             (None, true, false),
         ] {
-            let class = descriptor_class(write, case);
+            let class = descriptor_class(write, ProcessFacts::default(), case);
             assert_eq!(
                 class == Phase1Class::Allowed,
                 allowed,
@@ -849,7 +934,9 @@ mod tests {
             );
         }
 
-        let class = |sysno, values, fd| classify(sysno, &args(values), move |_| fd);
+        let class = |sysno, values, fd| {
+            classify(sysno, &args(values), ProcessFacts::default(), move |_| fd)
+        };
         assert!(matches!(
             class(
                 Sysno::read,
@@ -892,6 +979,8 @@ mod tests {
             (on_pseudo_fs(Some(Device::ContainerStdin), reg), false),
             (facts(FdType::Socket, None, None, false), false),
             (facts(FdType::Pipe, None, None, false), false),
+            // Closing a pipe stays refused, guest-held or not (ruling C1.3).
+            (polled_pipe(None), false),
             (None, false),
         ] {
             assert_eq!(
@@ -961,5 +1050,80 @@ mod tests {
         assert!(!is_container_output(&ResourceID::Device(
             Device::ContainerStdin
         )));
+    }
+
+    /// dh-ru056 slice 2, rulings C1.1, C1.3, C1.4 and C2.6: a guest-held
+    /// polled pipe's `read` runs, except under an `SA_RESTART` SIGALRM
+    /// handler or under record and replay, each refused by name; its `write`
+    /// stays refused; and an `lseek` of it runs whatever the process facts,
+    /// since Linux returns ESPIPE at once.
+    #[test]
+    fn sigalrm_phase1_guest_held_polled_pipe_rows() {
+        let pipe = |guest_held_polled_pipe| {
+            Some(FdFacts {
+                ty: FdType::Pipe,
+                container_stdin: false,
+                container_output: false,
+                mode: None,
+                safe_snapshot: false,
+                pseudo_fs: false,
+                guest_held_polled_pipe,
+            })
+        };
+        let plain = ProcessFacts::default();
+        let restarts = ProcessFacts {
+            sigalrm_restarts: true,
+            ..plain
+        };
+        let record_replay = ProcessFacts {
+            record_replay: true,
+            ..plain
+        };
+        let class = |sysno, process, facts| {
+            classify(sysno, &args([3, 0, 0, 0, 0, 0]), process, move |_| facts)
+        };
+        assert_eq!(class(Sysno::read, plain, pipe(true)), Phase1Class::Allowed);
+        assert_eq!(
+            class(Sysno::read, restarts, pipe(true)),
+            Phase1Class::Refused(
+                "a pipe read under an SA_RESTART SIGALRM handler: dh-ru056 slice 2 admits only a handler without SA_RESTART"
+            )
+        );
+        assert_eq!(
+            class(Sysno::read, record_replay, pipe(true)),
+            Phase1Class::Refused(
+                "a pipe read under record or replay, where dh-ru056 slice 2 cannot revoke its guest-only readiness"
+            )
+        );
+        for process in [plain, restarts, record_replay] {
+            assert_eq!(
+                class(Sysno::write, process, pipe(true)),
+                Phase1Class::Refused("I/O on a descriptor that may sleep interruptibly"),
+                "{process:?}"
+            );
+            assert_eq!(
+                class(Sysno::read, process, pipe(false)),
+                Phase1Class::Refused("I/O on a descriptor that may sleep interruptibly"),
+                "{process:?}"
+            );
+            assert_eq!(
+                class(Sysno::lseek, process, pipe(true)),
+                Phase1Class::Allowed,
+                "{process:?}"
+            );
+            assert!(
+                matches!(
+                    class(Sysno::close, process, pipe(true)),
+                    Phase1Class::Refused(_)
+                ),
+                "{process:?}"
+            );
+            // readv is not placed (ruling C1.3).
+            assert_eq!(
+                class(Sysno::readv, process, pipe(true)),
+                Phase1Class::Refused("a syscall phase 1 has not placed"),
+                "{process:?}"
+            );
+        }
     }
 }

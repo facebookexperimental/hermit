@@ -11884,16 +11884,20 @@ fn a_sigchld_taker_created_after_the_reservation_runs_after_the_probe() {
 /// Gate item 4: a poll whose readiness the host can change is not reserved,
 /// since whether the probe finds data or the wake substitutes would depend
 /// on host timing: a poll that is not on guest state only, one whose
-/// guest-held marks were revoked, and a named FIFO.
+/// guest-held marks were revoked, and a named FIFO. dh-ru056 slice 2, ruling
+/// C1.2 (T1.3): the same request with none of these is reserved, with no
+/// loss (the negative control).
 #[test]
 fn a_reserved_probe_refuses_a_poll_the_host_can_make_ready() {
-    for case in ["host-readiness", "marks-revoked", "named-fifo"] {
+    for case in ["control", "host-readiness", "marks-revoked", "named-fifo"] {
         let mut s = liteinst_scheduler();
         let (tid, _, _) = add(&mut s, 100, 100);
         let pid = DetPid::from_raw(100);
         s.set_sigalrm_handled(pid, true);
         let mut r = pipe_read_request(tid, 1);
+        assert!(r.relies_on_guest_held_marks, "as a plain run files it");
         match case {
+            "control" => {}
             "host-readiness" => r.polls_guest_state_only = false,
             "marks-revoked" => s.guest_held_marks_revoked = true,
             _ => r.polls_a_named_fifo = true,
@@ -11903,8 +11907,9 @@ fn a_reserved_probe_refuses_a_poll_the_host_can_make_ready() {
 
         s.fire_alarm(pid, tid, Signal::SIGALRM);
 
-        assert!(!sigalrm_reserved_for(&s, tid), "{case}");
-        assert!(s.sigalrm_loss_recorded(pid), "{case}");
+        let control = case == "control";
+        assert_eq!(sigalrm_reserved_for(&s, tid), control, "{case}");
+        assert_eq!(s.sigalrm_loss_recorded(pid), !control, "{case}");
     }
 }
 
