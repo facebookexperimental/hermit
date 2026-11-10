@@ -1417,6 +1417,38 @@ time slice; with `--max-timeslice=disabled`, a thread that never reaches an
 intercepted event can starve its peers. No separate fairness flag is needed for
 the default equal-priority policy.
 
+### The Pinned CPU
+
+A run with a timeslice (or `--pin-threads`) pins its tracer and guest threads to
+one host CPU, chosen from the tracer's allowed set, and reserves that CPU
+against other Hermit runs for its lifetime: an abstract Unix socket named
+`hermit-pinned-core:<cpu>` (visible within one network namespace) and an
+exclusive `flock` on `/dev/shm/hermit-pinned-cpu/<cpu>` (visible to every run
+that shares that directory, whatever its network namespace). The kernel drops
+both when the run's processes exit, however they exit, so no reservation is
+ever left behind. `HERMIT_PINNED_CPU_DIR` names another lock directory, for
+example one bind-mounted into several containers; it changes only the path.
+The directory must be a real directory owned by the user, or root's shared
+mode-1777 sticky directory; a lock file another user created and keeps only
+makes its CPU count as held.
+
+When a run cannot keep every other Hermit run off its CPU, it says so by name
+on stderr:
+
+| Notice | Meaning |
+| --- | --- |
+| `hermit: warning: cpu-shared:` | Every allowed CPU is held by another Hermit run; this run shares one and runs slower. |
+| `hermit: warning: cpu-unreserved:` | The reservation could not be made; another run may be pinned to the same CPU. |
+| `hermit: warning: cpu-netns-only:` | The lock directory is unusable, so only runs in this network namespace see the reservation. |
+
+`--pinned-cpu=share` (the default) runs anyway with the notice;
+`--pinned-cpu=refuse` refuses the run before the guest starts; `--pinned-cpu=wait`
+(600 seconds) or `--pinned-cpu=wait:SECONDS` sleeps and retries every 500 ms
+until a CPU comes free, then refuses, naming the CPU set and the wait.
+`HERMIT_PINNED_CPU_NOTICE=0` silences the notices without changing placement.
+The CPU is host placement only: guest-visible behavior, and `--verify`
+results, are the same whichever CPU a run gets.
+
 ### Exclusive-Loop Rewrite (aarch64)
 
 On aarch64, a load/store-exclusive retry loop (`LDXR`, then `STXR`, then a

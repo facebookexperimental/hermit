@@ -49,7 +49,16 @@
 //! run holds is passed over for the next draw from the same sample, and only
 //! when every allowed CPU is held does a run share one: the CPU it drew
 //! first. Sharing costs speed, never determinism. Runs in different network
-//! namespaces do not see each other's reservations.
+//! namespaces do not see each other's socket names, so a run also takes an
+//! exclusive `flock` on its CPU's file in a lock directory (`lock`,
+//! [`LOCK_DIR_DEFAULT`]), which every run sharing that directory sees, and
+//! which the kernel likewise releases with the last descriptor. A CPU either
+//! channel holds is held.
+//!
+//! A run that cannot keep other runs off its CPU (it shares one, cannot
+//! reserve one, or can reserve one only within its network namespace) says
+//! so by name on Hermit's own stderr, or, under `hermit run
+//! --pinned-cpu=refuse` or `wait`, refuses before the guest starts (`admit`).
 //!
 //! A process holds one reservation at a time (`HELD`). Its later runs (the
 //! second run of a `--verify` pair, `analyze` trials) sample again, count the
@@ -257,7 +266,16 @@ const RESERVATION_FD_FLOOR: libc::c_int = 1000;
 /// counts that CPU as free, and replacing the reservation closes the old
 /// descriptor, so a process never holds a CPU it moved away from. Runs one
 /// process makes at the same time (test threads, say) may draw its CPU too.
-static HELD: Mutex<Option<(usize, OwnedFd)>> = Mutex::new(None);
+static HELD: Mutex<Option<(usize, Reservation)>> = Mutex::new(None);
+
+/// The descriptors that hold a CPU: the abstract socket's name, and, where the
+/// lock directory is usable, the CPU's lock file (`lock`). Either one held by
+/// another run makes the CPU held.
+#[derive(Debug)]
+pub(crate) struct Reservation {
+    _socket: OwnedFd,
+    _lock: Option<OwnedFd>,
+}
 
 /// How a run holds its CPU against other Hermit runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -315,11 +333,23 @@ impl fmt::Display for Choice {
 /// Choose and reserve the CPU this run is pinned to from `allowed`, the
 /// tracer's affinity mask, over a fresh sample, counting the CPU this process
 /// already holds as free. `None` only when `allowed` is empty.
-pub(crate) fn choose_for_run(allowed: &[usize]) -> Option<Choice> {
+pub(crate) fn choose_for_run(allowed: &[usize]) -> Option<(Choice, Coordination)> {
     let mut held = HELD.lock().unwrap_or_else(|poison| poison.into_inner());
-    choose_for_run_with(allowed, observe, &mut held, |cpu| {
-        reserve(RESERVATION_PREFIX, cpu)
-    })
+    let base = std::env::var_os(LOCK_DIR_ENV)
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(LOCK_DIR_DEFAULT));
+    let coordination = match lock_dir(&base) {
+        Ok(()) => Coordination::Host(base),
+        Err(reason) => Coordination::NetworkNamespaceOnly(reason),
+    };
+    let dir = match &coordination {
+        Coordination::Host(dir) => Some(dir.as_path()),
+        Coordination::NetworkNamespaceOnly(_) => None,
+    };
+    let choice = choose_for_run_with(allowed, observe, &mut held, |cpu| {
+        reserve_both(RESERVATION_PREFIX, dir, cpu)
+    })?;
+    Some((choice, coordination))
 }
 
 /// [`choose_for_run`] with the observation, the process's reservation and
@@ -328,11 +358,11 @@ pub(crate) fn choose_for_run(allowed: &[usize]) -> Option<Choice> {
 /// A run that reserves a different CPU replaces `held`, closing the old
 /// descriptor; a run that shares or goes unreserved leaves `held` empty, since
 /// the process no longer runs on the CPU it held.
-fn choose_for_run_with(
+fn choose_for_run_with<R>(
     allowed: &[usize],
     observe: impl FnOnce(&[usize]) -> Option<Observation>,
-    held: &mut Option<(usize, OwnedFd)>,
-    mut reserve: impl FnMut(usize) -> io::Result<Option<OwnedFd>>,
+    held: &mut Option<(usize, R)>,
+    mut reserve: impl FnMut(usize) -> io::Result<Option<R>>,
 ) -> Option<Choice> {
     let own = held.as_ref().map(|(cpu, _)| *cpu);
     let mut taken = None;
@@ -411,22 +441,387 @@ fn reserve(prefix: &str, cpu: usize) -> io::Result<Option<OwnedFd>> {
         Err(error) if error.raw_os_error() == Some(libc::EADDRINUSE) => return Ok(None),
         Err(error) => return Err(error),
     };
-    // Keep the reservation on a high descriptor and close the low one it was
-    // bound on (`RESERVATION_FD_FLOOR`).
-    // SAFETY: `socket` is an open descriptor this function owns.
-    let moved = unsafe {
-        libc::fcntl(
-            socket.as_raw_fd(),
-            libc::F_DUPFD_CLOEXEC,
-            RESERVATION_FD_FLOOR,
-        )
-    };
-    if moved < 0 {
-        return Err(io::Error::last_os_error());
+    Ok(Some(move_high(OwnedFd::from(socket))?))
+}
+
+/// `fd` moved to a high close-on-exec descriptor, and its low number closed:
+/// at least [`RESERVATION_FD_FLOOR`] where the descriptor limit allows, and
+/// otherwise a free number just below the limit, so that a run under a
+/// low `RLIMIT_NOFILE` (1000 or less, where `F_DUPFD_CLOEXEC` from the floor
+/// fails with `EINVAL`) still reserves its CPU. Keeps `fd` where it is only
+/// when no number above it is free.
+fn move_high(fd: OwnedFd) -> io::Result<OwnedFd> {
+    // SAFETY: `fd` is an open descriptor this function owns.
+    let moved = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, RESERVATION_FD_FLOOR) };
+    if moved >= 0 {
+        // SAFETY: `moved` is a new descriptor nothing else owns; `fd` closes
+        // its own number when it drops.
+        return Ok(unsafe { OwnedFd::from_raw_fd(moved) });
     }
-    // SAFETY: `moved` is a new descriptor nothing else owns; `socket` closes
-    // its own number when it drops.
-    Ok(Some(unsafe { OwnedFd::from_raw_fd(moved) }))
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::EINVAL) {
+        return Err(error);
+    }
+    let limit = nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_NOFILE)
+        .map_err(io::Error::from)?
+        .0;
+    // `F_DUPFD_CLOEXEC` takes the lowest free number at or above its floor,
+    // atomically, so no other thread's descriptor is ever replaced. Lower the
+    // floor from just below the limit until a number is free (`EMFILE` means
+    // none is at or above that floor).
+    let limit = libc::c_int::try_from(limit.min(RESERVATION_FD_FLOOR as u64)).unwrap_or(0);
+    let mut step = 1;
+    while limit - step > fd.as_raw_fd() {
+        // SAFETY: `fd` is an open descriptor this function owns.
+        let moved = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, limit - step) };
+        if moved >= 0 {
+            // SAFETY: `moved` is a new descriptor nothing else owns.
+            return Ok(unsafe { OwnedFd::from_raw_fd(moved) });
+        }
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EMFILE) {
+            return Err(error);
+        }
+        step *= 2;
+    }
+    Ok(fd)
+}
+
+/// The directory whose per-CPU lock files hold reservations across network
+/// namespaces (`lock`), unless [`LOCK_DIR_ENV`] names another.
+pub(crate) const LOCK_DIR_DEFAULT: &str = "/dev/shm/hermit-pinned-cpu";
+
+/// Names the lock directory in place of [`LOCK_DIR_DEFAULT`]. It changes only
+/// the path: the directory is checked as the default one is.
+pub(crate) const LOCK_DIR_ENV: &str = "HERMIT_PINNED_CPU_DIR";
+
+/// Which Hermit runs a run's reservation keeps off its CPU.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Coordination {
+    /// Every run that uses this lock directory, whatever its network
+    /// namespace, as well as every run in this network namespace.
+    Host(std::path::PathBuf),
+    /// Only runs in this network namespace: the lock directory is unusable,
+    /// for the reason given.
+    NetworkNamespaceOnly(String),
+}
+
+/// Checks, or creates, the lock directory `base`. It must be a real directory
+/// (not a symlink), owned by this user, or else the shared form: owned by
+/// root, mode 1777 with the sticky bit, so no other user can remove or replace
+/// this user's lock files. A directory this creates is mode 1777 with the
+/// sticky bit, so other users' runs can lock in it too.
+fn lock_dir(base: &Path) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    let shown = base.display();
+    let metadata = match fs::symlink_metadata(base) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match fs::DirBuilder::new().mode(0o1777).create(base) {
+                Ok(()) => {
+                    // The umask may have cleared bits `mode` asked for.
+                    fs::set_permissions(base, fs::Permissions::from_mode(0o1777))
+                        .map_err(|error| format!("cannot set the mode of {shown}: {error}"))?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(format!("cannot create {shown}: {error}")),
+            }
+            fs::symlink_metadata(base).map_err(|error| format!("cannot read {shown}: {error}"))?
+        }
+        Err(error) => return Err(format!("cannot read {shown}: {error}")),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{shown} is a symbolic link"));
+    }
+    if !metadata.is_dir() {
+        return Err(format!("{shown} is not a directory"));
+    }
+    if !acceptable_owner(
+        metadata.uid(),
+        metadata.mode(),
+        nix::unistd::geteuid().as_raw(),
+    ) {
+        return Err(format!(
+            "{shown} belongs to user {} and is not the shared root-owned form (mode 1777, sticky)",
+            metadata.uid()
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a lock directory owned by `owner` with `mode` may be used by user
+/// `euid`: its own, or root's shared mode-1777 sticky directory.
+fn acceptable_owner(owner: u32, mode: u32, euid: u32) -> bool {
+    owner == euid || (owner == 0 && mode & 0o7777 == 0o1777)
+}
+
+/// Hold `cpu`'s lock file in `dir` while the returned descriptor is open: an
+/// exclusive `flock`, which the kernel releases when the last descriptor for
+/// it closes, however its holders exit. `Ok(None)` when the CPU counts as
+/// held: another run holds the lock, or the file is not one this run can lock
+/// (another user's that it cannot open, or not a regular file), which a
+/// squatter could arrange but which only ever makes this run pass the CPU
+/// over or share it. The file is opened without following a symlink and
+/// without blocking (a FIFO in its place cannot stall the run).
+fn lock(dir: &Path, cpu: usize) -> io::Result<Option<OwnedFd>> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = dir.join(cpu.to_string());
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(&path)
+        .or_else(|error| {
+            // Another user's file, readable: a shared lock file.
+            if error.raw_os_error() == Some(libc::EACCES) {
+                fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+                    .open(&path)
+            } else {
+                Err(error)
+            }
+        }) {
+        Ok(file) => file,
+        // Unopenable (another user's, unreadable), a symlink (`ELOOP`), a
+        // directory (`EISDIR`) or a device or socket with nothing behind it
+        // (`ENXIO`).
+        Err(error)
+            if matches!(
+                error.raw_os_error(),
+                Some(libc::EACCES | libc::ELOOP | libc::EISDIR | libc::ENXIO)
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.is_file() {
+        return Ok(None);
+    }
+    // SAFETY: flock on a descriptor this function owns.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(move_high(OwnedFd::from(file))?));
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        return Ok(None);
+    }
+    Err(error)
+}
+
+/// Reserve `cpu` through both channels: its lock file in `dir`, when there is
+/// one, and then its abstract socket name. `Ok(None)` when either is held.
+fn reserve_both(prefix: &str, dir: Option<&Path>, cpu: usize) -> io::Result<Option<Reservation>> {
+    let lock = match dir {
+        Some(dir) => match lock(dir, cpu)? {
+            Some(lock) => Some(lock),
+            None => return Ok(None),
+        },
+        None => None,
+    };
+    Ok(reserve(prefix, cpu)?.map(|socket| Reservation {
+        _socket: socket,
+        _lock: lock,
+    }))
+}
+
+/// What a pinned run does when it cannot hold a CPU of its own
+/// (`hermit run --pinned-cpu`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PinnedCpuPolicy {
+    /// Run anyway, on a CPU another run may share, with a notice saying so.
+    Share,
+    /// Refuse the run before the guest starts.
+    Refuse,
+    /// Wait up to this long for a CPU to come free, then refuse.
+    Wait(Duration),
+}
+
+/// The default `--pinned-cpu=wait` bound.
+pub(crate) const DEFAULT_WAIT: Duration = Duration::from_secs(600);
+
+/// How often `--pinned-cpu=wait` tries again. Each try sleeps; nothing spins.
+pub(crate) const WAIT_INTERVAL: Duration = Duration::from_millis(500);
+
+impl std::str::FromStr for PinnedCpuPolicy {
+    type Err = String;
+    fn from_str(text: &str) -> Result<Self, String> {
+        match text {
+            "share" => Ok(Self::Share),
+            "refuse" => Ok(Self::Refuse),
+            "wait" => Ok(Self::Wait(DEFAULT_WAIT)),
+            _ => match text.strip_prefix("wait:").map(str::parse::<u64>) {
+                Some(Ok(seconds)) if seconds > 0 => Ok(Self::Wait(Duration::from_secs(seconds))),
+                _ => Err(format!(
+                    "expected share, refuse, wait or wait:SECONDS (SECONDS above 0), got {text:?}"
+                )),
+            },
+        }
+    }
+}
+
+impl fmt::Display for PinnedCpuPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Share => f.write_str("share"),
+            Self::Refuse => f.write_str("refuse"),
+            Self::Wait(wait) if *wait == DEFAULT_WAIT => f.write_str("wait"),
+            Self::Wait(wait) => write!(f, "wait:{}", wait.as_secs()),
+        }
+    }
+}
+
+/// The policy `hermit run` set for this process (`set_policy`); `Share` for
+/// every other subcommand.
+static POLICY: Mutex<PinnedCpuPolicy> = Mutex::new(PinnedCpuPolicy::Share);
+
+/// Set the policy every later pinned run of this process follows.
+pub(crate) fn set_policy(policy: PinnedCpuPolicy) {
+    *POLICY.lock().unwrap_or_else(|poison| poison.into_inner()) = policy;
+}
+
+/// Turns off the notices when set to `0`, for a caller that asserts Hermit
+/// writes nothing to stderr. It does not change placement or the policy.
+pub(crate) const NOTICE_ENV: &str = "HERMIT_PINNED_CPU_NOTICE";
+
+/// A run that could not hold a CPU of its own, under `--pinned-cpu=refuse` or
+/// `wait`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PlacementRefusal(pub(crate) String);
+
+/// The notice a run gives when it cannot keep other Hermit runs off its CPU,
+/// or `None` when it can.
+fn notice(allowed: &[usize], choice: &Choice, coordination: &Coordination) -> Option<String> {
+    let set = cpu_set(allowed);
+    match (&choice.hold, coordination) {
+        (Hold::Shared, _) => Some(format!(
+            "hermit: warning: cpu-shared: every allowed CPU ({set}) is held by another Hermit \
+             run; this run shares CPU {} and runs slower (placement only: guest output is \
+             unaffected). --pinned-cpu=wait or =refuse avoids sharing.",
+            choice.cpu
+        )),
+        (Hold::Unreserved(error), _) => Some(format!(
+            "hermit: warning: cpu-unreserved: could not reserve CPU {} ({error}); another \
+             Hermit run may be pinned to it.",
+            choice.cpu
+        )),
+        (_, Coordination::NetworkNamespaceOnly(reason)) => Some(format!(
+            "hermit: warning: cpu-netns-only: CPU {} is reserved only against Hermit runs in \
+             this network namespace ({}): {reason}. Runs in other network namespaces may pick \
+             the same CPU; point {LOCK_DIR_ENV} at a directory they share.",
+            choice.cpu,
+            network_namespace()
+        )),
+        _ => None,
+    }
+}
+
+/// `0-3,8` for the CPUs in `cpus`.
+fn cpu_set(cpus: &[usize]) -> String {
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for &cpu in cpus {
+        match ranges.last_mut() {
+            Some((_, end)) if *end + 1 == cpu => *end = cpu,
+            _ => ranges.push((cpu, cpu)),
+        }
+    }
+    ranges
+        .iter()
+        .map(|&(start, end)| {
+            if start == end {
+                start.to_string()
+            } else {
+                format!("{start}-{end}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// This process's network namespace, as `/proc/self/ns/net` names it.
+fn network_namespace() -> String {
+    fs::read_link("/proc/self/ns/net")
+        .map(|link| link.display().to_string())
+        .unwrap_or_else(|_| "unknown".to_owned())
+}
+
+/// Place a pinned run on a CPU from `allowed` under `policy`, writing the
+/// notice for a CPU it may share to `notices` (`notice`). `choose` makes
+/// one attempt (`choose_for_run`); `pause` waits between attempts under
+/// `wait`, which tries again until the bound has passed. A refusal names the
+/// CPU set, why, and the wait.
+fn admit(
+    allowed: &[usize],
+    policy: PinnedCpuPolicy,
+    mut choose: impl FnMut(&[usize]) -> Option<(Choice, Coordination)>,
+    mut pause: impl FnMut(Duration),
+    notices: &mut dyn FnMut(&str),
+) -> Result<Option<Choice>, PlacementRefusal> {
+    let attempts = match policy {
+        PinnedCpuPolicy::Wait(wait) => wait.as_millis().div_ceil(WAIT_INTERVAL.as_millis()) + 1,
+        _ => 1,
+    };
+    for attempt in 1..=attempts {
+        let Some((choice, coordination)) = choose(allowed) else {
+            return Ok(None);
+        };
+        let Some(text) = notice(allowed, &choice, &coordination) else {
+            return Ok(Some(choice));
+        };
+        let refusal = |why: &str| {
+            PlacementRefusal(format!(
+                "--pinned-cpu={policy}: refusing the run on CPUs {}: {why}",
+                cpu_set(allowed)
+            ))
+        };
+        match policy {
+            PinnedCpuPolicy::Share => {
+                notices(&text);
+                return Ok(Some(choice));
+            }
+            PinnedCpuPolicy::Wait(wait) if choice.hold == Hold::Shared => {
+                if attempt < attempts {
+                    pause(WAIT_INTERVAL);
+                    continue;
+                }
+                return Err(refusal(&format!(
+                    "every allowed CPU stayed held by another Hermit run for the whole {} s wait",
+                    wait.as_secs()
+                )));
+            }
+            PinnedCpuPolicy::Refuse | PinnedCpuPolicy::Wait(_) => {
+                let why = text
+                    .split_once(": warning: ")
+                    .map_or(text.as_str(), |(_, why)| why);
+                return Err(refusal(why));
+            }
+        }
+    }
+    unreachable!("the last attempt returns")
+}
+
+/// [`admit`] for this process: the policy `set_policy` gave, real attempts and
+/// sleeps, and notices on Hermit's own stderr unless [`NOTICE_ENV`] is `0`.
+pub(crate) fn place(allowed: &[usize]) -> Result<Option<Choice>, PlacementRefusal> {
+    let policy = *POLICY.lock().unwrap_or_else(|poison| poison.into_inner());
+    let quiet = std::env::var_os(NOTICE_ENV).is_some_and(|value| value == "0");
+    admit(
+        allowed,
+        policy,
+        choose_for_run,
+        thread::sleep,
+        &mut |text| {
+            if !quiet {
+                use std::io::Write;
+                let _ = writeln!(io::stderr().lock(), "{text}");
+            }
+        },
+    )
 }
 
 /// Two readings of `/proc/stat`, [`SAMPLE_WINDOW`] apart, and the PMU-bound
@@ -1222,6 +1617,319 @@ mod tests {
             reserve(&prefix, 2).expect("bind").is_some(),
             "and the CPU the process held before is free again"
         );
+    }
+
+    /// A choice of `cpu` held as `hold`, for the admission tests.
+    fn chose(cpu: usize, hold: Hold) -> Choice {
+        Choice {
+            cpu,
+            basis: Basis::OnlyAllowed,
+            hold,
+        }
+    }
+
+    fn host() -> Coordination {
+        Coordination::Host("/dev/shm/hermit-pinned-cpu".into())
+    }
+
+    /// Runs `admit` with the attempts `answers` gives in turn, and returns
+    /// its result, the notices and the pauses.
+    fn admitted(
+        policy: PinnedCpuPolicy,
+        answers: Vec<(Choice, Coordination)>,
+    ) -> (
+        Result<Option<Choice>, PlacementRefusal>,
+        Vec<String>,
+        Vec<Duration>,
+    ) {
+        let mut answers = answers.into_iter();
+        let mut last = None;
+        let mut notices = Vec::new();
+        let mut pauses = Vec::new();
+        let result = admit(
+            &[2, 3],
+            policy,
+            |_| {
+                if let Some(answer) = answers.next() {
+                    last = Some(answer);
+                }
+                last.clone()
+            },
+            |pause| pauses.push(pause),
+            &mut |text| notices.push(text.to_owned()),
+        );
+        (result, notices, pauses)
+    }
+
+    /// (a) Every allowed CPU held: by default the run shares one and says so
+    /// by name, naming the CPU set; under `refuse` it is refused naming the
+    /// set; a reserved run says nothing.
+    #[test]
+    fn a_shared_cpu_is_noticed_by_name_and_refused_on_request() {
+        let (result, notices, _) = admitted(
+            PinnedCpuPolicy::Share,
+            vec![(chose(2, Hold::Shared), host())],
+        );
+        assert_eq!(result, Ok(Some(chose(2, Hold::Shared))));
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].starts_with("hermit: warning: cpu-shared: every allowed CPU (2-3) is held"),
+            "{notices:?}"
+        );
+        assert!(notices[0].contains("shares CPU 2"), "{notices:?}");
+
+        let (result, notices, _) = admitted(
+            PinnedCpuPolicy::Refuse,
+            vec![(chose(2, Hold::Shared), host())],
+        );
+        let refusal = result.expect_err("refused").0;
+        assert!(
+            refusal.starts_with("--pinned-cpu=refuse: refusing the run on CPUs 2-3: cpu-shared:"),
+            "{refusal}"
+        );
+        assert!(notices.is_empty(), "a refusal is the message: {notices:?}");
+
+        let reserved = chose(3, Hold::Reserved { passed_over: 1 });
+        for policy in [
+            PinnedCpuPolicy::Share,
+            PinnedCpuPolicy::Refuse,
+            PinnedCpuPolicy::Wait(DEFAULT_WAIT),
+        ] {
+            let (result, notices, pauses) = admitted(policy, vec![(reserved.clone(), host())]);
+            assert_eq!(result, Ok(Some(reserved.clone())), "{policy}");
+            assert!(notices.is_empty() && pauses.is_empty(), "{policy}");
+        }
+    }
+
+    /// `wait` sleeps between attempts (`WAIT_INTERVAL`, never a spin) until a
+    /// CPU comes free, and refuses after its bound, naming the CPU set and
+    /// the wait.
+    #[test]
+    fn wait_sleeps_until_a_cpu_frees_and_refuses_after_its_bound() {
+        let shared = (chose(2, Hold::Shared), host());
+        let freed = (chose(3, Hold::Reserved { passed_over: 0 }), host());
+        let (result, notices, pauses) = admitted(
+            PinnedCpuPolicy::Wait(Duration::from_secs(10)),
+            vec![shared.clone(), shared.clone(), freed.clone()],
+        );
+        assert_eq!(result, Ok(Some(freed.0)));
+        assert_eq!(pauses, vec![WAIT_INTERVAL; 2]);
+        assert!(notices.is_empty(), "{notices:?}");
+
+        let (result, _, pauses) =
+            admitted(PinnedCpuPolicy::Wait(Duration::from_secs(1)), vec![shared]);
+        let refusal = result.expect_err("refused after the wait").0;
+        assert_eq!(
+            refusal,
+            "--pinned-cpu=wait:1: refusing the run on CPUs 2-3: every allowed CPU stayed held by \
+             another Hermit run for the whole 1 s wait"
+        );
+        assert_eq!(
+            pauses,
+            vec![WAIT_INTERVAL; 2],
+            "1 s at 500 ms: three attempts"
+        );
+    }
+
+    /// (b) A reservation that could not be made is noticed by name, and
+    /// refused under `refuse` and `wait`, which cannot fix it.
+    #[test]
+    fn an_unreserved_cpu_is_noticed_by_name() {
+        let unreserved = (
+            chose(2, Hold::Unreserved("Operation not permitted".into())),
+            host(),
+        );
+        let (result, notices, _) = admitted(PinnedCpuPolicy::Share, vec![unreserved.clone()]);
+        assert!(result.is_ok());
+        assert_eq!(
+            notices,
+            vec![
+                "hermit: warning: cpu-unreserved: could not reserve CPU 2 (Operation not \
+                 permitted); another Hermit run may be pinned to it."
+                    .to_owned()
+            ]
+        );
+        for policy in [PinnedCpuPolicy::Refuse, PinnedCpuPolicy::Wait(DEFAULT_WAIT)] {
+            let (result, _, pauses) = admitted(policy, vec![unreserved.clone()]);
+            assert!(
+                result.expect_err("refused").0.contains("cpu-unreserved"),
+                "{policy}"
+            );
+            assert!(pauses.is_empty(), "{policy}: waiting cannot fix it");
+        }
+    }
+
+    /// (c) A run whose lock directory is unusable is reserved only within its
+    /// network namespace, and says so, naming the namespace and the reason.
+    #[test]
+    fn a_reservation_within_one_network_namespace_only_is_noticed_by_name() {
+        let netns_only = (
+            chose(2, Hold::Reserved { passed_over: 0 }),
+            Coordination::NetworkNamespaceOnly("/x is a symbolic link".into()),
+        );
+        let (result, notices, _) = admitted(PinnedCpuPolicy::Share, vec![netns_only.clone()]);
+        assert!(result.is_ok());
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].starts_with("hermit: warning: cpu-netns-only: CPU 2 is reserved only"),
+            "{notices:?}"
+        );
+        assert!(notices[0].contains("net:["), "{notices:?}");
+        assert!(notices[0].contains("/x is a symbolic link"), "{notices:?}");
+        assert!(notices[0].contains(LOCK_DIR_ENV), "{notices:?}");
+        let (result, _, _) = admitted(PinnedCpuPolicy::Refuse, vec![netns_only]);
+        assert!(result.expect_err("refused").0.contains("cpu-netns-only"));
+    }
+
+    #[test]
+    fn the_policy_parses_and_renders() {
+        for (text, policy) in [
+            ("share", PinnedCpuPolicy::Share),
+            ("refuse", PinnedCpuPolicy::Refuse),
+            ("wait", PinnedCpuPolicy::Wait(DEFAULT_WAIT)),
+            ("wait:30", PinnedCpuPolicy::Wait(Duration::from_secs(30))),
+        ] {
+            assert_eq!(text.parse::<PinnedCpuPolicy>(), Ok(policy));
+            assert_eq!(policy.to_string(), text);
+        }
+        for bad in ["", "wait:", "wait:0", "wait:-1", "spin", "wait:1s"] {
+            assert!(bad.parse::<PinnedCpuPolicy>().is_err(), "{bad:?}");
+        }
+        assert_eq!(cpu_set(&[0, 1, 2, 5, 7, 8]), "0-2,5,7-8");
+    }
+
+    /// A private lock directory for one test.
+    fn private_lock_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        lock_dir(dir.path()).expect("a directory this user owns is usable");
+        dir
+    }
+
+    /// The lock file holds a CPU against a run in any network namespace: the
+    /// kernel ties a `flock` to the open file, not to a namespace, so a second
+    /// lock (as from another namespace's run) is refused while the first is
+    /// open, and granted once it closes. A run that reserves through both
+    /// channels counts a CPU held when only the lock file is.
+    #[test]
+    fn a_held_lock_file_holds_its_cpu_whatever_the_socket_says() {
+        let dir = private_lock_dir();
+        let first = lock(dir.path(), 3).expect("lock").expect("free");
+        assert!(first.as_raw_fd() >= RESERVATION_FD_FLOOR, "{first:?}");
+        assert!(lock(dir.path(), 3).expect("lock").is_none(), "held");
+        let prefix = private_prefix();
+        assert!(
+            reserve_both(&prefix, Some(dir.path()), 3)
+                .expect("reserve")
+                .is_none(),
+            "a free socket name does not make a locked CPU free"
+        );
+        drop(first);
+        let both = reserve_both(&prefix, Some(dir.path()), 3)
+            .expect("reserve")
+            .expect("free once the lock closes");
+        assert!(
+            reserve(&prefix, 3).expect("bind").is_none(),
+            "the socket name is held too"
+        );
+        drop(both);
+        assert!(lock(dir.path(), 3).expect("lock").is_some());
+    }
+
+    /// A lock file another user squatted, or replaced with a symlink, a FIFO or
+    /// a directory, only makes its CPU count as held: no error, and no hang
+    /// (the FIFO is opened without blocking).
+    #[test]
+    fn a_squatted_lock_file_only_counts_its_cpu_as_held() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = private_lock_dir();
+        std::os::unix::fs::symlink("/etc/hostname", dir.path().join("1")).unwrap();
+        nix::unistd::mkfifo(&dir.path().join("2"), nix::sys::stat::Mode::S_IRWXU).unwrap();
+        fs::create_dir(dir.path().join("3")).unwrap();
+        for cpu in [1, 2, 3] {
+            assert!(
+                lock(dir.path(), cpu).expect("not an error").is_none(),
+                "CPU {cpu}"
+            );
+        }
+        // Another user's unreadable file (root can open any file, so this
+        // case holds only for other users).
+        let squatted = dir.path().join("4");
+        fs::write(&squatted, b"").unwrap();
+        fs::set_permissions(&squatted, fs::Permissions::from_mode(0o000)).unwrap();
+        if !nix::unistd::geteuid().is_root() {
+            assert!(lock(dir.path(), 4).expect("not an error").is_none());
+        }
+        // A readable file of another user's is a shared lock file: locked
+        // read-only. Here the same user, so it opens read-write.
+        let shared = dir.path().join("5");
+        fs::write(&shared, b"").unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o444)).unwrap();
+        assert!(lock(dir.path(), 5).expect("lock").is_some());
+    }
+
+    /// The lock directory must be a real directory of this user's, or root's
+    /// shared mode-1777 sticky one; `HERMIT_PINNED_CPU_DIR` changes only the
+    /// path these checks apply to.
+    #[test]
+    fn only_an_own_or_shared_root_lock_directory_is_used() {
+        let parent = tempfile::tempdir().unwrap();
+        let created = parent.path().join("locks");
+        lock_dir(&created).expect("created");
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            fs::metadata(&created).unwrap().permissions().mode() & 0o7777
+        };
+        assert_eq!(mode, 0o1777, "created shared and sticky");
+        let link = parent.path().join("link");
+        std::os::unix::fs::symlink(&created, &link).unwrap();
+        assert!(lock_dir(&link).unwrap_err().contains("symbolic link"));
+        let file = parent.path().join("file");
+        fs::write(&file, b"").unwrap();
+        assert!(lock_dir(&file).unwrap_err().contains("not a directory"));
+        assert!(acceptable_owner(1000, 0o40700, 1000));
+        assert!(acceptable_owner(0, 0o41777, 1000), "the shared root form");
+        assert!(!acceptable_owner(0, 0o40777, 1000), "root's, not sticky");
+        assert!(!acceptable_owner(0, 0o41775, 1000), "root's, not 1777");
+        assert!(!acceptable_owner(1001, 0o41777, 1000), "another user's");
+    }
+
+    /// Under a descriptor limit at or below the floor (`prlimit --nofile=256`)
+    /// a reservation is still made, just below the limit, close-on-exec,
+    /// instead of failing with `EINVAL` and leaving the run unreserved. Run
+    /// in a child process, so the limit does not reach other tests.
+    #[test]
+    fn a_low_descriptor_limit_still_reserves() {
+        let prefix = private_prefix();
+        // SAFETY: the child calls only async-signal-safe functions until it
+        // reaches `reserve`, and this test process runs no other test thread
+        // under nextest; the child exits without unwinding.
+        match unsafe { nix::unistd::fork() }.expect("fork") {
+            nix::unistd::ForkResult::Child => {
+                let code = (|| {
+                    nix::sys::resource::setrlimit(
+                        nix::sys::resource::Resource::RLIMIT_NOFILE,
+                        256,
+                        256,
+                    )
+                    .ok()?;
+                    let fd = reserve(&prefix, 7).ok()??;
+                    // SAFETY: F_GETFD on a descriptor this child owns.
+                    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+                    (fd.as_raw_fd() < 256 && fd.as_raw_fd() >= 128 && flags & libc::FD_CLOEXEC != 0)
+                        .then_some(0)
+                })()
+                .unwrap_or(1);
+                // SAFETY: exit the forked child without running destructors.
+                unsafe { libc::_exit(code) }
+            }
+            nix::unistd::ForkResult::Parent { child } => {
+                assert_eq!(
+                    nix::sys::wait::waitpid(child, None).expect("waitpid"),
+                    nix::sys::wait::WaitStatus::Exited(child, 0),
+                    "the child reserved below the limit, close-on-exec"
+                );
+            }
+        }
     }
 
     /// The CPUs this test process may run on.

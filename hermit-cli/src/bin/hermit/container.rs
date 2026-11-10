@@ -1475,7 +1475,7 @@ pub(super) fn apply_affinity(
     container: &mut Container,
     pin_threads: bool,
     cpu_profile_source: Option<usize>,
-) {
+) -> Result<(), Error> {
     if pin_threads {
         let affinity = sched_getaffinity(Pid::from_raw(0))
             .expect("failed to query the tracer's allowed CPU affinity mask");
@@ -1483,7 +1483,8 @@ pub(super) fn apply_affinity(
         if let Some(source) = cpu_profile_source.filter(|cpu| allowed.contains(cpu)) {
             allowed = vec![source];
         }
-        let choice = super::pinned_cpu::choose_for_run(&allowed)
+        let choice = super::pinned_cpu::place(&allowed)
+            .map_err(|refusal| Error::new(PolicyRefusal).context(refusal.0))?
             .expect("the tracer's allowed CPU affinity mask is empty");
         tracing::info!(
             "Pinning tracer and guest threads to core {} ({choice})",
@@ -1491,12 +1492,13 @@ pub(super) fn apply_affinity(
         );
         container.affinity(choice.cpu);
     }
+    Ok(())
 }
 
-pub fn default_container(pin_threads: bool) -> Container {
-    let mut container = namespace_container(pin_threads, None);
+pub fn default_container(pin_threads: bool) -> Result<Container, Error> {
+    let mut container = namespace_container(pin_threads, None)?;
     container.mount(container_proc_mount());
-    container
+    Ok(container)
 }
 
 /// [`default_container`] without its `/proc`: the namespaces and the private
@@ -1505,7 +1507,7 @@ pub fn default_container(pin_threads: bool) -> Container {
 pub(super) fn namespace_container(
     pin_threads: bool,
     cpu_profile_source: Option<usize>,
-) -> Container {
+) -> Result<Container, Error> {
     let mut container = Container::new();
     container
         .unshare(GUEST_NAMESPACES)
@@ -1517,8 +1519,8 @@ pub(super) fn namespace_container(
         // guest's mount table during a run. Cut that propagation first.
         .mount(Mount::new("/").rprivate());
 
-    apply_affinity(&mut container, pin_threads, cpu_profile_source);
-    container
+    apply_affinity(&mut container, pin_threads, cpu_profile_source)?;
+    Ok(container)
 }
 
 /// The namespaces a guest's container makes besides the user, mount and UTS
@@ -1861,7 +1863,7 @@ pub(super) fn image_container(
     // (mounts first, then chroot).
     container.chroot(rootfs);
 
-    apply_affinity(&mut container, pin_threads, cpu_profile_source);
+    apply_affinity(&mut container, pin_threads, cpu_profile_source)?;
     let mut identity_sources = IdentityGuard::empty();
     if private_tmp {
         identity_sources.add_private_tmp(tmpfs)?;
@@ -3782,7 +3784,7 @@ pub(super) mod declared_inputs {
                 .unwrap();
             let expected = checked_file_identity(&source, false, true).unwrap();
             let mut plan = root_plan(inputs, additions).unwrap();
-            let mut container = super::super::default_container(false);
+            let mut container = super::super::default_container(false).unwrap();
             plan.configure(&mut container).unwrap();
             let result: Result<(), String> = container
                 .checked_run(|| {
@@ -4130,7 +4132,7 @@ pub(super) mod declared_inputs {
             fn requires_send_sync<T: Send + Sync>() {}
             requires_send_sync::<GuestDeclaredRootSetup>();
             let mut plan = root_plan(data_inputs(), DeclaredRootAdditions::default()).unwrap();
-            let mut container = super::super::default_container(false);
+            let mut container = super::super::default_container(false).unwrap();
             assert!(unsafe { plan.materialize() }.is_err());
             plan.configure(&mut container).unwrap();
             assert!(plan.configure(&mut container).is_err());
@@ -4235,7 +4237,7 @@ pub(super) mod declared_inputs {
             .unwrap();
             let namespace = std::fs::metadata("/proc/self/ns/mnt").unwrap();
             let parent_namespace = (namespace.dev(), namespace.ino());
-            let mut container = super::super::default_container(false);
+            let mut container = super::super::default_container(false).unwrap();
             plan.configure(&mut container).unwrap();
             container
                 .checked_run(|| {
@@ -4271,7 +4273,7 @@ pub(super) mod declared_inputs {
             let directory = File::open(&socket_directory).unwrap();
             let short_rpc = format!("/proc/self/fd/{}/rpc.sock", directory.as_raw_fd());
             let _replacement = UnixListener::bind(&short_rpc).unwrap();
-            let mut container = super::super::default_container(false);
+            let mut container = super::super::default_container(false).unwrap();
             replaced.configure(&mut container).unwrap();
             match container
                 .checked_run(|| -> () { panic!("replacement endpoint reached workload") })
@@ -4298,7 +4300,7 @@ pub(super) mod declared_inputs {
             // Init builds the graph; a real forked guest child binds its proc.
             let inputs = data_inputs();
             let mut plan = root_plan(inputs.clone(), DeclaredRootAdditions::default()).unwrap();
-            let mut container = super::super::default_container(false);
+            let mut container = super::super::default_container(false).unwrap();
             plan.configure(&mut container).unwrap();
             let result: Result<(i32, i32, [u8; 8]), String> = container
                 .checked_run(|| {
@@ -4506,7 +4508,7 @@ pub(super) mod declared_inputs {
 /// nondeterministic host identity state. The returned [`IdentityGuard`] must be
 /// held until after `Container::run` returns.
 pub(super) fn deterministic_container() -> Result<(Container, IdentityGuard), Error> {
-    let mut container = default_container(true);
+    let mut container = default_container(true)?;
     let (mounts, identity_guard) = identity_hardening_mounts(None)?;
     container.mounts(mounts);
     Ok((container, identity_guard))
@@ -6447,7 +6449,7 @@ mod tests {
         }
         let facts = Container::new()
             .checked_run(|| {
-                let mut container = default_container(false);
+                let mut container = default_container(false).unwrap();
                 container.mount(directory_placeholder_mount(DIRECTORY_PLACEHOLDER));
                 container
                     .checked_run(placeholder_directory_facts)
@@ -6479,6 +6481,7 @@ mod tests {
             .checked_run(|| {
                 readonly_proc::deny_writable_mounts().map_err(|error| error.to_string())?;
                 default_container(false)
+                    .unwrap()
                     .checked_run(namespace_proc_contents)
                     .map_err(|error| format!("{error:?}"))?
             })

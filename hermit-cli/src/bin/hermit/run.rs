@@ -1819,6 +1819,23 @@ pub struct RunOpts {
     #[clap(long)]
     pin_threads: bool,
 
+    /// What a pinned run (one with a timeslice, or `--pin-threads`) does when
+    /// it cannot keep every other Hermit run off its CPU: every allowed CPU is
+    /// held by another run (cpu-shared), the reservation cannot be made
+    /// (cpu-unreserved), or it can be made only against runs in this network
+    /// namespace (cpu-netns-only, when the lock directory `/dev/shm/hermit-pinned-cpu`,
+    /// or the one `HERMIT_PINNED_CPU_DIR` names, is unusable). `share` runs anyway and
+    /// prints a named `hermit: warning:` notice to stderr (`HERMIT_PINNED_CPU_NOTICE=0`
+    /// silences it); `refuse` refuses the run before the guest starts; `wait` (600 s) or
+    /// `wait:SECONDS` waits, sleeping, for a CPU to come free, then refuses. The CPU is
+    /// host placement only: guest-visible behavior is the same under every value.
+    #[clap(
+        long,
+        value_name = "share|refuse|wait[:SECONDS]",
+        default_value = "share"
+    )]
+    pinned_cpu: super::pinned_cpu::PinnedCpuPolicy,
+
     /// Override the processor-specific PMU skid margin, in retired conditional branches.
     ///
     /// A precise timer event is programmed to interrupt the guest this many branches before its
@@ -8247,6 +8264,35 @@ fn pipe_wake_latency_parses_round_trips_and_is_refused_where_inert() {
 /// without Detcore's sequentializing scheduler. Executable-selected DBT is
 /// refused by application admission while this option remains unqualified.
 /// A logical `--target-timeslice` without the PMU maximum still ends slices.
+/// `--pinned-cpu` is host placement only: every value leaves the Detcore
+/// configuration the guest runs under, and the reproduce command, exactly as
+/// the default does, so the same seed gives the same guest-visible run with or
+/// without it.
+#[test]
+fn pinned_cpu_leaves_the_guest_visible_configuration_unchanged() {
+    let configured = |extra: &[&str]| {
+        let mut argv = vec!["fakehermit", "--strict", "--chaos", "--seed=7"];
+        argv.extend_from_slice(extra);
+        argv.push("fakeprog");
+        let mut opts = RunOpts::parse_from(argv);
+        opts.validate_args_with_perf_support(true).unwrap();
+        (
+            serde_json::to_string(&opts.effective_det_config()).unwrap(),
+            format!("{opts}"),
+            opts.pinned_cpu,
+        )
+    };
+    let (default_config, default_command, default_policy) = configured(&[]);
+    assert_eq!(default_policy, super::pinned_cpu::PinnedCpuPolicy::Share);
+    for value in ["share", "refuse", "wait", "wait:30"] {
+        let flag = format!("--pinned-cpu={value}");
+        let (config, command, policy) = configured(&[&flag]);
+        assert_eq!(policy.to_string(), value);
+        assert_eq!(config, default_config, "{flag}");
+        assert_eq!(command, default_command, "{flag}");
+    }
+}
+
 #[test]
 fn cap_preemption_charge_parses_round_trips_and_is_refused_where_inert() {
     let mut opts = RunOpts::parse_from(["fakehermit", "--cap-preemption-charge", "fakeprog"]);
@@ -16371,13 +16417,14 @@ impl RunOpts {
             <detcore::Detcore as reverie::Tool>::facility_admission(&self.det_opts.det_config)?;
         }
         let gdbserver_port = self.bind_gdbserver_port()?;
+        super::pinned_cpu::set_policy(self.pinned_cpu);
         let (mut container, tmpfs, identity, resources) = if self.no_namespace {
             let mut container = Container::new();
             apply_affinity(
                 &mut container,
                 self.pin_threads,
                 self.det_opts.det_config.cpu_profile_source,
-            );
+            )?;
             (
                 container,
                 None,
@@ -18133,7 +18180,7 @@ impl RunOpts {
         let mut container = namespace_container(
             self.pin_threads,
             self.det_opts.det_config.cpu_profile_source,
-        );
+        )?;
         self.network
             .configure(&mut container, self.analyze_networking);
 

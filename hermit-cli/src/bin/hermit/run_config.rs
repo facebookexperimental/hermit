@@ -1556,6 +1556,7 @@ mod tests {
         ("no-sequentialize-threads", &["--no-sequentialize-threads"]),
         ("no-deterministic-io", &["--no-deterministic-io"]),
         ("pin-threads", &["--pin-threads"]),
+        ("pinned-cpu", &["--pinned-cpu=wait:30"]),
         ("skid-margin", &["--skid-margin=5"]),
         (
             "mount",

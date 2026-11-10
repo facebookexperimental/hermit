@@ -517,7 +517,7 @@ impl StartOpts {
         network: NetworkingMode,
         backend_mounts: Vec<Mount>,
     ) -> Result<(Container, IdentityGuard), Error> {
-        let mut container = namespace_container(true, None);
+        let mut container = namespace_container(true, None)?;
         network.configure(&mut container, false);
         let (mut identity_mounts, mut identity_guard) = identity_hardening_mounts(None)?;
         let dev_shm = private_dev_shm(self.mount.iter().map(Mount::get_target));

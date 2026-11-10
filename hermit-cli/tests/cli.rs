@@ -93,6 +93,9 @@ mod liteinst_in_guest_programs;
 #[path = "common/readonly_proc.rs"]
 mod readonly_proc;
 
+#[path = "common/pinned_cpu_notice.rs"]
+mod pinned_cpu_notice;
+
 #[path = "common/process_tree.rs"]
 mod process_tree;
 use process_tree::process_tree_snapshot;
@@ -5734,7 +5737,12 @@ fn readonly_proc_metadata_detects_replay_mismatch_and_accepts_older_recordings()
     metadata["proc_readonly"] = false.into();
     fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
     let replay_args = ["replay", "--autopilot", "--data-dir", directory];
-    let replay = hermit_test::hermit_output("hermit run", &mut readonly_proc_command(&replay_args));
+    // This counts every `hermit: warning:` line below; a `--pinned-cpu`
+    // notice (another run holds the CPU) is placement, not what it checks.
+    let replay = hermit_test::hermit_output(
+        "hermit run",
+        readonly_proc_command(&replay_args).env("HERMIT_PINNED_CPU_NOTICE", "0"),
+    );
     assert_success(&replay, &replay_args);
     assert!(
         stderr(&replay)
@@ -21736,13 +21744,16 @@ fn run_kvm_preserves_closed_standard_input() {
             &epoch_arg,
             "--",
         ];
+        // An exact Hermit stderr: a `--pinned-cpu` notice (another run holds
+        // the CPU) is placement, not what this test checks.
         let output = hermit_test::hermit_output(
             "hermit run",
             hermit_command(&args)
                 .arg(guest)
                 .arg(mode)
                 .current_dir(native_dir.path())
-                .stdin(Stdio::null()),
+                .stdin(Stdio::null())
+                .env("HERMIT_PINNED_CPU_NOTICE", "0"),
         );
         assert_success(&output, &args);
         assert_eq!(stdout(&output), expected, "{backend} {mode}");
