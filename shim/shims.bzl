@@ -13,7 +13,7 @@ load("@prelude//utils:selects.bzl", "selects")
 
 load("@prelude//utils:type_defs.bzl", "is_dict", "is_list", "is_select", "is_tuple")
 load("@shim//build_defs:auto_headers.bzl", "AutoHeaders", "get_auto_headers")
-load("@shim//build_defs/lib:oss.bzl", "translate_target")
+load("@shim//build_defs/lib:oss.bzl", "translate_macros", "translate_target")
 
 prelude = native
 
@@ -242,10 +242,11 @@ def rust_library(
     cxx_bridge = None,
     test_rustc_flags = None,
     test_srcs = None,
+    test_labels = None,
     visibility = ["PUBLIC"],
     **kwargs,
 ):
-    _unused = (test_deps, test_env, autocargo, unittests, visibility, cpp_deps, cxx_bridge, test_rustc_flags, test_srcs)  # @unused
+    _unused = (test_deps, test_env, autocargo, unittests, visibility, cpp_deps, cxx_bridge, test_rustc_flags, test_srcs, test_labels)  # @unused
     deps = _fix_deps(deps)
     mapped_srcs = _maybe_select_map(mapped_srcs, _fix_mapped_srcs)
     if named_deps:
@@ -286,15 +287,32 @@ def rust_binary(
 
     # @lint-ignore BUCKLINT: avoid "Direct usage of native rules is not allowed."
     prelude.rust_binary(
-        name = name, edition = edition or _default_rust_edition(), rustc_flags = rustc_flags + [_CFG_BUCK_BUILD], deps = deps, visibility = visibility, **kwargs
+        name = name, edition = edition or _default_rust_edition(), rustc_flags = rustc_flags + [_CFG_BUCK_BUILD], deps = deps, visibility = visibility, **_fix_rust_labels(kwargs)
     )
 
-def rust_unittest(name, edition = None, rustc_flags = [], deps = [], visibility = ["PUBLIC"], **kwargs):
+def rust_unittest(name, edition = None, rustc_flags = [], deps = [], visibility = ["PUBLIC"], autocargo = None, allocator = None, **kwargs):
+    # As in rust_binary: autocargo describes an internal Cargo manifest, and
+    # allocator = "malloc" asks fbcode for the system allocator, which is the
+    # only one here.
+    _unused = (autocargo, allocator)  # @unused
     deps = _fix_deps(deps)
 
     prelude.rust_test(
-        name = name, edition = edition or _default_rust_edition(), rustc_flags = rustc_flags + [_CFG_BUCK_BUILD], deps = deps, visibility = visibility, **kwargs
+        name = name, edition = edition or _default_rust_edition(), rustc_flags = rustc_flags + [_CFG_BUCK_BUILD], deps = deps, visibility = visibility, **_fix_rust_labels(kwargs)
     )
+
+def _fix_rust_labels(kwargs):
+    """Translate the labels internal BUCK files pass to a Rust rule outside
+    `deps`: aliased dependencies, resources, and targets named inside the
+    macros of its environment variables."""
+    if kwargs.get("named_deps"):
+        kwargs["named_deps"] = _maybe_select_map(kwargs["named_deps"], _fix_named_deps)
+    if kwargs.get("resources"):
+        kwargs["resources"] = _fix_resources(kwargs["resources"])
+    for attr in ("env", "run_env"):
+        if kwargs.get(attr) and not is_select(kwargs[attr]):
+            kwargs[attr] = {k: translate_macros(v) for (k, v) in kwargs[attr].items()}
+    return kwargs
 
 def rust_protobuf_library(
     name,

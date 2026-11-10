@@ -6,7 +6,7 @@
 # of this source tree. You may select, at your option, one of the
 # above-listed licenses.
 
-load("@shim//build_defs/lib:oss.bzl", "translate_target")
+load("@shim//build_defs/lib:oss.bzl", "DEFAULT_REWRITE_CTX", "translate_macros", "translate_target")
 
 TEST_CTX = struct(
     cells = struct(
@@ -38,8 +38,22 @@ TEST_CTX = struct(
     },
 )
 
-def _test_target(target: str, expected: str):
-    actual = translate_target(target, TEST_CTX)
+# The same rules, seen from a BUCK file in the mapped `dep` cell.
+DEP_CTX = struct(
+    cells = struct(
+        active = "dep",
+        root = TEST_CTX.cells.root,
+        shim = TEST_CTX.cells.shim,
+        internal = TEST_CTX.cells.internal,
+    ),
+    project_dirs = TEST_CTX.project_dirs,
+    stripped_root_dirs = TEST_CTX.stripped_root_dirs,
+    prefix_mappings = TEST_CTX.prefix_mappings,
+    implicit_rewrite_rules = TEST_CTX.implicit_rewrite_rules,
+)
+
+def _test_target(target: str, expected: str, ctx = TEST_CTX):
+    actual = translate_target(target, ctx)
 
     if actual != expected:
         fail("Expected {} == {}".format(actual, expected))
@@ -72,3 +86,52 @@ def test_translate_target():
     _test_target("//dynamic:foo", "shim//DYNAMIC:FOO")
     _test_target("internal//dynamic:foo", "shim//DYNAMIC:FOO")
     _test_target("other//dynamic:foo", "other//dynamic:foo")
+
+    # In the mapped cell, cell-relative labels are internal ones too; local
+    # and explicitly-celled labels are unchanged.
+    _test_target(":foo", ":foo", DEP_CTX)
+    _test_target("//dep:foo", "dep//dep_rename:foo", DEP_CTX)
+    _test_target("//dep/with/subdir:foo", "dep//dep_rename/with/subdir:foo", DEP_CTX)
+    _test_target("//root_dir/foo:bar", "root//foo:bar", DEP_CTX)
+    _test_target("//third-party/lib/foo:bar", "shim//third_party/lib/foo:bar", DEP_CTX)
+    _test_target("//elsewhere:foo", "//elsewhere:foo", DEP_CTX)
+    _test_target("dep//dep_rename:foo", "dep//dep_rename:foo", DEP_CTX)
+    _test_target("other//dep:foo", "other//dep:foo", DEP_CTX)
+
+def test_real_rules():
+    # This repository's own rules (IMPLICIT_REWRITE_RULES and .buckconfig [oss]).
+    shim = DEFAULT_REWRITE_CTX.cells.shim
+    root = DEFAULT_REWRITE_CTX.cells.root
+    _test_target("fbcode//hermetic_infra/reverie:reverie", "reverie//:reverie", DEFAULT_REWRITE_CTX)
+    _test_target("fbcode//hermetic_infra/hermit/hermit-cli:hermit", root + "//hermit-cli:hermit", DEFAULT_REWRITE_CTX)
+    # Spelled in two parts so that scripts/check-buck-graph-drift.rs, which
+    # requires every third-party label in a tracked file to name a Reindeer
+    # target, does not read this test's input as a dependency.
+    _test_target("fbsource//third-party/rust:" + "sha2-010", shim + "//third-party/rust:sha2", DEFAULT_REWRITE_CTX)
+    _test_target("fbsource//third-party/rust:serde", shim + "//third-party/rust:serde", DEFAULT_REWRITE_CTX)
+
+def _test_macros(s: str, expected: str):
+    actual = translate_macros(s, TEST_CTX)
+
+    if actual != expected:
+        fail("Expected {} == {}".format(actual, expected))
+
+def test_translate_macros():
+    _test_macros("", "")
+    _test_macros("plain text", "plain text")
+    _test_macros("$(location //root_dir/foo:bar)", "$(location root//foo:bar)")
+    _test_macros("$(exe //root_dir/foo:bar)", "$(exe root//foo:bar)")
+    _test_macros("$(exe_target //root_dir/foo:bar)", "$(exe_target root//foo:bar)")
+    _test_macros("$(locations //root_dir/foo:bar[sub])", "$(locations root//foo:bar[sub])")
+    _test_macros("$(location :local)", "$(location :local)")
+    _test_macros("--x=$(location //dep:foo) --y", "--x=$(location dep//dep_rename:foo) --y")
+    _test_macros(
+        "$(location //root_dir/a:b) and $(location //third-party/lib:c)",
+        "$(location root//a:b) and $(location shim//third_party/lib:c)",
+    )
+
+    # Other macros, and text that only resembles one, are left alone.
+    _test_macros("$(query_targets deps(//root_dir/a:b))", "$(query_targets deps(//root_dir/a:b))")
+    _test_macros("$(location)", "$(location)")
+    _test_macros("$(location //root_dir/a:b", "$(location //root_dir/a:b")
+    _test_macros("${OUT} $(location //root_dir/a:b)", "${OUT} $(location root//a:b)")

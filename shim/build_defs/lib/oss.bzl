@@ -27,6 +27,11 @@ def _parse_prefix_mappings(raw_rules):
 # Cell the BUCK file being processed belongs to
 ACTIVE_CELL = native.get_cell_name()
 
+# The [oss] settings below live in the root cell's .buckconfig. They are read
+# from there so that BUCK files in other cells of the project (a submodule
+# mapped through prefix_mappings, which has no .buckconfig of its own) get the
+# same rewrites.
+
 # The root cell of this project, extracted from the "root" alias.
 # Targets that explicitly reference this cell will not be rewritten, and
 # targets that do not end up referencing a cell will be replaced with targets
@@ -35,14 +40,14 @@ ROOT_CELL = read_config("cell_aliases", "root", "root")
 
 # The cell this file and the rest of the shim directory belong to, generally
 # "shim" and does not need to be set.
-SHIM_CELL = read_config("oss", "shim_cell", "shim")
+SHIM_CELL = read_root_config("oss", "shim_cell", "shim")
 
 # The internal cell this project originally belonged to.
 #
 # When applying rewrites, the cell of the target is often considered. Targets
 # that do not explicitly specify a cell (eg: "//foo:bar") will be considered
 # to belong to INTERNAL_CELL.
-INTERNAL_CELL = read_config("oss", "internal_cell", "fbcode")
+INTERNAL_CELL = read_root_config("oss", "internal_cell", "fbcode")
 
 # There can be situations where a target specifies a cell explicitly and the
 # path is part of the local checkout, rather than potentially needing to be
@@ -57,7 +62,7 @@ INTERNAL_CELL = read_config("oss", "internal_cell", "fbcode")
 #
 # Examples:
 #     internal_cell//oss_project/foo:bar -> root//oss_project/foo:bar
-PROJECT_DIRS = _filter_empty_strings(read_config("oss", "project_dirs", "").split(" "))
+PROJECT_DIRS = _filter_empty_strings(read_root_config("oss", "project_dirs", "").split(" "))
 
 # There are some situations where prefix of the internal directory structure is
 # removed from the public filepaths, such as rewriting "internal/foo/bar/baz"
@@ -76,7 +81,7 @@ PROJECT_DIRS = _filter_empty_strings(read_config("oss", "project_dirs", "").spli
 # Examples:
 #     //oss_project/foo:bar -> root//foo:bar
 #     internal_cell//oss_project/foo:bar -> root//foo:bar
-STRIPPED_ROOT_DIRS = _filter_empty_strings(read_config("oss", "stripped_root_dirs", "").split(" "))
+STRIPPED_ROOT_DIRS = _filter_empty_strings(read_root_config("oss", "stripped_root_dirs", "").split(" "))
 
 # Internally, most code shares the same cell in a monorepo, but public projects
 # only contain a subset, importing dependencies via git submodules or other
@@ -99,7 +104,7 @@ STRIPPED_ROOT_DIRS = _filter_empty_strings(read_config("oss", "stripped_root_dir
 # Examples:
 #     internal//foo->foo//foo; internal//foo/bar:baz -> foo//foo/bar:baz
 PREFIX_MAPPINGS = _parse_prefix_mappings(
-    _filter_empty_strings(read_config("oss", "prefix_mappings", "").split(" ")),
+    _filter_empty_strings(read_root_config("oss", "prefix_mappings", "").split(" ")),
 )
 
 # Hardcoded rewrite rules that apply to many projects and only produce targets
@@ -118,6 +123,12 @@ IMPLICIT_REWRITE_RULES = {
         ],
     ),
     "fbsource": struct(
+        # Internal names that carry a major version because fbsource vendors
+        # several majors of the crate. This tree's Cargo.lock has one, and
+        # Reindeer names its alias without the suffix.
+        exact = {
+            "third-party/rust:sha2-010": "third-party/rust:sha2",
+        },
         dirs = [
             ("third-party", "third-party"),
         ],
@@ -166,7 +177,15 @@ def translate_target(target: str, ctx = DEFAULT_REWRITE_CTX) -> str:
         return target
 
     resolved_cell = ctx.cells.active if cell == "" else cell
-    internal_cell = ctx.cells.internal if resolved_cell == ctx.cells.root else resolved_cell
+
+    # A cell-relative label in the root cell, or in a cell that a prefix
+    # mapping maps an internal directory onto, was written in the internal
+    # cell: an internal BUCK file under a mapped directory names its own
+    # package by its internal path (//oss_project/dep:foo in dep's BUCK file).
+    if resolved_cell == ctx.cells.root or (cell == "" and _is_mapped_cell(resolved_cell, ctx)):
+        internal_cell = ctx.cells.internal
+    else:
+        internal_cell = resolved_cell
 
     if internal_cell == ctx.cells.internal:
         for d in ctx.project_dirs:
@@ -195,7 +214,49 @@ def translate_target(target: str, ctx = DEFAULT_REWRITE_CTX) -> str:
         if _path_rooted_in_dir(path, match_root_dir):
             return ctx.cells.shim + "//" + _swap_root_dir_for_path(path, match_root_dir, replace_root_dir)
 
+    for match_root_dir, rewrite in getattr(rules, "dynamic", []):
+        if _path_rooted_in_dir(path, match_root_dir):
+            return ctx.cells.shim + "//" + rewrite(path)
+
     return target
+
+# String-parameter macros whose argument is one target label. Internal BUCK
+# files name targets by internal path inside these macros too (for example
+# "$(location //oss_project/foo:bar)" in a test's args or env).
+_LABEL_MACROS = ["exe", "exe_target", "location", "location_exec", "locations"]
+
+"""
+Rewrite the target labels inside the string-parameter macros of `s` (each
+`$(MACRO LABEL)` whose MACRO is in _LABEL_MACROS) as translate_target rewrites
+a label. Text outside those macros, and every other macro, is unchanged.
+"""
+
+def translate_macros(s: str, ctx = DEFAULT_REWRITE_CTX) -> str:
+    out = ""
+    rest = s
+
+    # Each pass consumes at least one character, so len(s) passes suffice.
+    for _ in range(len(s)):
+        start = rest.find("$(")
+        if start < 0:
+            break
+        end = rest.find(")", start)
+        if end < 0:
+            break
+        out += rest[:start]
+        parts = rest[start + 2:end].split(" ", 1)
+        if len(parts) == 2 and parts[0] in _LABEL_MACROS:
+            out += "$(" + parts[0] + " " + translate_target(parts[1].strip(), ctx) + ")"
+        else:
+            out += rest[start:end + 1]
+        rest = rest[end + 1:]
+    return out + rest
+
+def _is_mapped_cell(cell: str, ctx) -> bool:
+    for rule in ctx.prefix_mappings:
+        if rule.match.cell == ctx.cells.internal and rule.replace.cell == cell:
+            return True
+    return False
 
 def _path_rooted_in_dir(path: str, d: str) -> bool:
     return d == "" or path == d or path.startswith(d + "/") or path.startswith(d + ":")
