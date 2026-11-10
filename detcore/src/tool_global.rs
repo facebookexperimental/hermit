@@ -20082,6 +20082,165 @@ mod tests {
         );
     }
 
+    /// Finding 1 of rev5338-cx's review of 4d17d5ab: an attempt of a send
+    /// after its wait passes the pipe read descriptions its messages and the
+    /// descriptor table name then, not those the handler read at entry
+    /// (`Detcore::pipe_reads_an_attempt_passes`). A `sendmsg`'s control data
+    /// stays the entry's, but a descriptor number in it may name another
+    /// description by the attempt, after a sibling's dup2; a `sendmmsg`'s
+    /// control data is read again. Each description is named once.
+    #[test]
+    fn a_send_attempt_names_the_pipes_it_passes_as_it_finds_them() {
+        use std::os::unix::net::UnixStream;
+
+        use nix::fcntl::OFlag;
+        use reverie::Tool;
+        use reverie::syscalls::Addr;
+        use reverie::syscalls::Syscall;
+
+        use crate::fd::FdType;
+
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        }
+        .with_backend(|backend| {
+            backend.needs_killed_thread_rpc_cancellation = true;
+            backend.virtualizes_guest_sigalrm = true;
+        });
+        let (config, state, tid, pid) = cancellation_test_state_with_config(config);
+        let tool: Detcore = Detcore::new(Tid::from_raw(tid.as_raw()), &config);
+        let mut thread = tool.init_thread_state(Tid::from_raw(tid.as_raw()), None);
+        thread.detpid = Some(pid);
+        let mut guest = RetirementGuest {
+            global: &state,
+            config: &config,
+            thread,
+            requests: Mutex::new(Vec::new()),
+            retired: std::sync::atomic::AtomicBool::new(false),
+            hold_private_memory_publication: false,
+            local_memory: true,
+        };
+        let (first_reader, _first_writer) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
+        let (second_reader, _second_writer) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
+        let (third_reader, _third_writer) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
+        let (channel, _peer) = UnixStream::pair().unwrap();
+        let first_fd = first_reader.as_raw_fd();
+        let second_fd = second_reader.as_raw_fd();
+        let third_fd = third_reader.as_raw_fd();
+        let channel_fd = channel.as_raw_fd();
+        for (fd, flags, ty) in [
+            (first_fd, OFlag::O_RDONLY, FdType::Pipe),
+            (second_fd, OFlag::O_RDONLY, FdType::Pipe),
+            (third_fd, OFlag::O_RDONLY, FdType::Pipe),
+            (channel_fd, OFlag::O_RDWR, FdType::Socket),
+        ] {
+            guest.thread.add_fd(fd, flags, ty, None).unwrap();
+        }
+        let id = |guest: &RetirementGuest<'_>, fd: i32| {
+            guest
+                .thread
+                .with_detfd(fd, |detfd| detfd.open_file_id())
+                .unwrap()
+        };
+        let (first, second, third) = (
+            id(&guest, first_fd),
+            id(&guest, second_fd),
+            id(&guest, third_fd),
+        );
+        // One SCM_RIGHTS message naming `fd`, in `control`.
+        let name = |control: &mut [u64; 3], fd: i32| {
+            let cmsg = control.as_mut_ptr().cast::<libc::cmsghdr>();
+            // SAFETY: the control buffer holds one SCM_RIGHTS header and its fd.
+            unsafe {
+                (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as usize;
+                (*cmsg).cmsg_level = libc::SOL_SOCKET;
+                (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+                std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<i32>(), fd);
+            }
+        };
+        let mut byte = b'x';
+        let mut iov = libc::iovec {
+            iov_base: (&raw mut byte).cast(),
+            iov_len: 1,
+        };
+        let none = BTreeSet::new();
+
+        let mut control = [0_u64; 3];
+        name(&mut control, first_fd);
+        // SAFETY: a plain C struct, all zero.
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &raw mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = std::mem::size_of_val(&control);
+        let sendmsg = Syscall::Sendmsg(
+            reverie::syscalls::Sendmsg::new()
+                .with_fd(channel_fd)
+                .with_msg(Addr::from_raw((&raw const message) as usize)),
+        );
+        assert_eq!(
+            Detcore::pipe_reads_an_attempt_passes(&guest, sendmsg, &none),
+            vec![first],
+            "the first attempt passes the pipe its control data names"
+        );
+        // A sibling's dup2 over the descriptor number while the call waited.
+        // SAFETY: both are open descriptors this test owns.
+        assert_eq!(unsafe { libc::dup2(second_fd, first_fd) }, first_fd);
+        guest
+            .thread
+            .dup_fd(second_fd, first_fd, OFlag::empty())
+            .unwrap();
+        assert_eq!(
+            Detcore::pipe_reads_an_attempt_passes(&guest, sendmsg, &BTreeSet::from([first])),
+            vec![second],
+            "the same number names the description dup2 put there"
+        );
+        assert_eq!(
+            Detcore::pipe_reads_an_attempt_passes(
+                &guest,
+                sendmsg,
+                &BTreeSet::from([first, second])
+            ),
+            Vec::new(),
+            "a description already untracked is not named again"
+        );
+
+        // A batch whose second message's control data is rewritten.
+        let mut plain_iov = libc::iovec {
+            iov_base: (&raw mut byte).cast(),
+            iov_len: 1,
+        };
+        let mut batch_control = [0_u64; 3];
+        name(&mut batch_control, third_fd);
+        // SAFETY: plain C structs, all zero.
+        let mut batch: [libc::mmsghdr; 2] = unsafe { std::mem::zeroed() };
+        batch[0].msg_hdr.msg_iov = &raw mut plain_iov;
+        batch[0].msg_hdr.msg_iovlen = 1;
+        batch[1].msg_hdr.msg_iov = &raw mut iov;
+        batch[1].msg_hdr.msg_iovlen = 1;
+        batch[1].msg_hdr.msg_control = batch_control.as_mut_ptr().cast();
+        batch[1].msg_hdr.msg_controllen = std::mem::size_of_val(&batch_control);
+        let sendmmsg = Syscall::Sendmmsg(
+            reverie::syscalls::Sendmmsg::new()
+                .with_sockfd(channel_fd)
+                .with_msgvec(Addr::from_raw(batch.as_ptr() as usize))
+                .with_vlen(2),
+        );
+        assert_eq!(
+            Detcore::pipe_reads_an_attempt_passes(&guest, sendmmsg, &none),
+            vec![third],
+            "the batch's second message names the third pipe at entry"
+        );
+        name(&mut batch_control, second_fd);
+        assert_eq!(
+            Detcore::pipe_reads_an_attempt_passes(&guest, sendmmsg, &BTreeSet::from([third])),
+            vec![second],
+            "an attempt after the rewrite passes the pipe now named"
+        );
+        drop((first_reader, second_reader, third_reader));
+    }
+
     /// While any process handles SIGALRM, a file lease is refused before the
     /// kernel: its break would make another process's open wait with no
     /// scheduler admission. Releasing a lease is not refused.

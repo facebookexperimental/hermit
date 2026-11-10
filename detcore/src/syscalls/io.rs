@@ -10,6 +10,7 @@
 //!
 //! Of course this overlaps somewhat with "files.rs".
 
+use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::os::unix::io::RawFd;
@@ -5121,16 +5122,70 @@ impl<T: RecordOrReplay> Detcore<T> {
         headers: &[usize],
         outside_turn: bool,
     ) {
-        if !(self.cfg.backend.virtualizes_guest_sigalrm && self.cfg.sequentialize_threads) {
-            return;
+        let ids = Self::pipe_reads_sent(guest, headers, outside_turn);
+        Self::untrack_pipe_statuses(guest, &ids).await;
+    }
+
+    /// The pipe read descriptions a send whose messages' headers are at
+    /// `headers` may pass over `SCM_RIGHTS`, read from the messages and the
+    /// descriptor table as they are now, for `untrack_sent_pipe_status`:
+    /// every one the table holds when the control data cannot be read or
+    /// the send runs outside the caller's turn. None unless the runtime
+    /// virtualizes SIGALRM in a run that sequentializes threads, the only
+    /// runs whose ledger records a pipe's status.
+    fn pipe_reads_sent<G: Guest<Self>>(
+        guest: &G,
+        headers: &[usize],
+        outside_turn: bool,
+    ) -> Vec<crate::types::OpenFileId> {
+        let config = guest.config();
+        if !(config.backend.virtualizes_guest_sigalrm && config.sequentialize_threads) {
+            return Vec::new();
         }
         let (sent, unread) = sent_descriptors(guest, headers);
-        let ids = if unread || outside_turn {
+        if unread || outside_turn {
             guest.thread_state().pipe_read_descriptions(None)
         } else {
             guest.thread_state().pipe_read_descriptions(Some(&sent))
+        }
+    }
+
+    /// The pipe read descriptions the attempt of `call`, a `sendmsg` or
+    /// `sendmmsg` about to run in the caller's turn, passes over
+    /// `SCM_RIGHTS`, other than those in `untracked`, read from its
+    /// messages and the descriptor table as the attempt will import them
+    /// (`untrack_sent_pipe_status`). The handler's untracking reads them at
+    /// entry, which no later attempt is bound to: Linux imports each
+    /// `sendmmsg` attempt's messages again, from memory another process may
+    /// have rewritten while the call waited, and a `sendmsg`'s descriptor
+    /// numbers, which the kernel looks up at each attempt, may name other
+    /// descriptions by then (`copy_msghdr_from_user` and `scm_fp_copy` per
+    /// attempt, Linux v6.12
+    /// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/socket.c?h=v6.12#n2529>,
+    /// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/core/scm.c?h=v6.12#n113>).
+    /// Without this, a pipe named only from the second attempt kept its
+    /// status, which its receiver could change unseen (finding 1 of
+    /// rev5338-cx's review of 4d17d5ab).
+    pub(crate) fn pipe_reads_an_attempt_passes<G: Guest<Self>>(
+        guest: &G,
+        call: Syscall,
+        untracked: &BTreeSet<crate::types::OpenFileId>,
+    ) -> Vec<crate::types::OpenFileId> {
+        let Some((_, headers)) = send_headers(call) else {
+            return Vec::new();
         };
-        for id in ids {
+        let mut ids = Self::pipe_reads_sent(guest, &headers, false);
+        ids.retain(|id| !untracked.contains(id));
+        ids
+    }
+
+    /// The pipe read descriptions `ids` each lose their tracked status in the
+    /// SIGALRM ledger (`SigalrmControl::UntrackPipeStatus`).
+    pub(crate) async fn untrack_pipe_statuses<G: Guest<Self>>(
+        guest: &mut G,
+        ids: &[crate::types::OpenFileId],
+    ) {
+        for &id in ids {
             crate::tool_global::sigalrm_refuses(
                 guest,
                 crate::tool_global::SigalrmControl::UntrackPipeStatus { id },
@@ -5233,23 +5288,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !config.sequentialize_threads || config.recordreplay_modes {
             return false;
         }
-        let (sockfd, headers): (RawFd, Vec<usize>) = match call {
-            Syscall::Sendmsg(call) => (
-                call.fd(),
-                call.msg()
-                    .map(|header| header.as_raw())
-                    .into_iter()
-                    .collect(),
-            ),
-            Syscall::Sendmmsg(call) => (
-                call.sockfd(),
-                call.msgvec().map_or_else(Vec::new, |vector| {
-                    (0..call.vlen().min(libc::UIO_MAXIOV as u32) as usize)
-                        .map(|index| vector.as_raw() + index * std::mem::size_of::<Mmsghdr>())
-                        .collect()
-                }),
-            ),
-            _ => return false,
+        let Some((sockfd, headers)) = send_headers(call) else {
+            return false;
         };
         let reaches_a_guest = guest
             .thread_state()
@@ -5473,6 +5513,31 @@ where
             .and_then(|header| guest.memory().read_value::<_, Msghdr>(header).ok())
             .is_none_or(|header| header.msg_namelen != 0)
     })
+}
+
+/// The socket of `call`, a `sendmsg` or `sendmmsg`, and the guest addresses
+/// of the message headers Linux could send: one for `sendmsg`, one per entry
+/// for `sendmmsg`, whose entries are `mmsghdr`s, each a `msghdr` followed by
+/// `msg_len`. `None` for any other call.
+fn send_headers(call: Syscall) -> Option<(RawFd, Vec<usize>)> {
+    match call {
+        Syscall::Sendmsg(call) => Some((
+            call.fd(),
+            call.msg()
+                .map(|header| header.as_raw())
+                .into_iter()
+                .collect(),
+        )),
+        Syscall::Sendmmsg(call) => Some((
+            call.sockfd(),
+            call.msgvec().map_or_else(Vec::new, |vector| {
+                (0..call.vlen().min(libc::UIO_MAXIOV as u32) as usize)
+                    .map(|index| vector.as_raw() + index * std::mem::size_of::<Mmsghdr>())
+                    .collect()
+            }),
+        )),
+        _ => None,
+    }
 }
 
 /// The descriptors the messages at `headers` name in `SCM_RIGHTS`, and
