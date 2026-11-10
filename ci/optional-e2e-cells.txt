@@ -13,8 +13,6 @@ compat/pkg-config replay ptrace
 compat/pkg-config verify dbt
 compat/pkg-config verify kvm
 compat/pkg-config verify ptrace
-compat/shred verify kvm
-compat/sysctl-random-uuid verify kvm
 compat/zip-unzip replay ptrace
 data-handling/jq-json-transform naked -
 data-handling/sqlite-query-determinism naked -
