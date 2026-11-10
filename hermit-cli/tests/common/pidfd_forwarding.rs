@@ -15,8 +15,11 @@ use syn::ImplItem;
 use syn::Item;
 use syn::ItemImpl;
 use syn::ItemTrait;
+use syn::Path;
 use syn::TraitItem;
 use syn::Type;
+use syn::token::For;
+use syn::token::Not;
 
 // The initialized Reverie gitlink is the source input, as for the loader
 // fixtures in first_instruction_cpuid. The repository pin check binds it to
@@ -36,14 +39,35 @@ fn guest_trait() -> ItemTrait {
     guest
 }
 
+/// The trait an `impl Trait for Type` names. syn 2 spells that header
+/// `(Option<Token![!]>, Path, Token![for])` and syn 3 `(Path, Token![for])`;
+/// Cargo builds this test with syn 2, and Meta's internal Buck build with syn 3.
+trait ImplementedTrait {
+    fn trait_path(&self) -> &Path;
+}
+
+impl ImplementedTrait for (Option<Not>, Path, For) {
+    fn trait_path(&self) -> &Path {
+        &self.1
+    }
+}
+
+impl ImplementedTrait for (Path, For) {
+    fn trait_path(&self) -> &Path {
+        &self.0
+    }
+}
+
 fn physical_spelling_impl() -> ItemImpl {
     let file = syn::parse_file(ADAPTER_SOURCE).expect("parse PhysicalSpelling source");
     let mut adapters = file.items.into_iter().filter_map(|item| {
         let Item::Impl(item) = item else {
             return None;
         };
-        let guest = item.trait_.as_ref().is_some_and(|(_, path, _)| {
-            path.segments
+        let guest = item.trait_.as_ref().is_some_and(|header| {
+            header
+                .trait_path()
+                .segments
                 .last()
                 .is_some_and(|part| part.ident == "Guest")
         });
