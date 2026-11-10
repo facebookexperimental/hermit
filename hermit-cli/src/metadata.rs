@@ -1004,7 +1004,20 @@ impl RecordVersion {
 // /sys/bus/node do not exist in run mode where their files read as one
 // node's. Replay answers each of these itself, so an older recording of
 // any of them would replay with different answers; it is refused here.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x19f);
+// 0x19f -> 0x1a0 (HIGHEST_SHIPPED+1 on main aba0bda2, which ships 0x19f;
+// reserved in minibeads dh-gxmvo; land-time numbering applies): Detcore
+// delivers nothing for a signal copy Linux discarded at send, which the
+// kernel still queues for a traced guest (item 2 of
+// https://github.com/rrnewton/hermit/issues/3995), and it chooses the
+// thread that takes a kernel-sent signal by the mask that thread has in
+// force: the temporary mask of a ppoll, pselect6 or sigsuspend, or the
+// guest's own mask while Hermit blocks the call. Record and replay both
+// run these rules, and replay recomputes them, so a recording made
+// before, in which a later handler ran for such a copy or another thread
+// took such a signal, would replay with different output. It is refused
+// here.
+// https://github.com/rrnewton/hermit/pull/5259
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x1a0);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -1029,7 +1042,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x19f);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x19f;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x1a0;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -2239,6 +2252,16 @@ mod tests {
         assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
     }
 
+    /// A recording older than 0x1a0 was made when a later handler still ran
+    /// for a signal copy Linux discarded at send, and when the thread that
+    /// took a kernel-sent signal was chosen without the mask in force
+    /// (https://github.com/rrnewton/hermit/pull/5259).
+    #[test]
+    fn record_version_rejects_streams_from_before_discarded_copies_stay_undelivered() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x19f)));
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+    }
+
     /// A recording older than 0x149 was made when /proc/cpuinfo showed the
     /// host's CPU while CPUID showed the virtual one
     /// (https://github.com/rrnewton/hermit/issues/4161).
@@ -2640,7 +2663,7 @@ mod tests {
     fn record_version_rejects_streams_from_before_the_corrected_rcb_event() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x19a)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x186)));
-        assert!(RECORD_VERSION.compatible_with(&RecordVersion(0x19f)));
+        assert!(RECORD_VERSION.compatible_with(&RecordVersion(0x1a0)));
     }
 
     #[test]
