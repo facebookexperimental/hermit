@@ -60,6 +60,7 @@ use crate::syscalls::helpers::REAL_TIME_SIGNALS;
 #[cfg(target_arch = "x86_64")]
 use crate::syscalls::helpers::RestartCall;
 use crate::syscalls::helpers::act_on_pending_real_time;
+use crate::syscalls::helpers::finish_wait_mask;
 use crate::syscalls::helpers::guest_signal_state_task;
 use crate::syscalls::helpers::is_accepted_connection;
 #[cfg(target_arch = "x86_64")]
@@ -2420,7 +2421,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         let result = match &mut signals {
             Some(signals) => {
                 let restored = signals.restore(guest, mask_cell).await;
-                publish_wait_mask(guest, None, &mut published).await;
+                finish_wait_mask(
+                    guest,
+                    matches!(
+                        result,
+                        Err(Error::Errno(
+                            reverie::syscalls::Errno::ERESTARTNOHAND
+                                | reverie::syscalls::Errno::EINTR
+                        ))
+                    ),
+                    &mut published,
+                )
+                .await;
                 result_after_restore(restored, result)?
             }
             None => result,
@@ -2806,7 +2818,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         let result = match &mut signals {
             Some(signals) => {
                 let restored = signals.restore(guest, mask_cell).await;
-                publish_wait_mask(guest, None, &mut published).await;
+                finish_wait_mask(
+                    guest,
+                    matches!(
+                        result,
+                        Err(Error::Errno(
+                            reverie::syscalls::Errno::ERESTARTNOHAND
+                                | reverie::syscalls::Errno::EINTR
+                        ))
+                    ),
+                    &mut published,
+                )
+                .await;
                 result_after_restore(restored, result)?
             }
             None => result,
@@ -3538,7 +3561,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             record_retry_event(guest, probe).await;
         };
-        publish_wait_mask(guest, None, &mut published).await;
+        finish_wait_mask(
+            guest,
+            matches!(
+                result,
+                Err(Error::Errno(
+                    reverie::syscalls::Errno::ERESTARTNOHAND | reverie::syscalls::Errno::EINTR
+                ))
+            ),
+            &mut published,
+        )
+        .await;
         refuse_held_signal_loss(guest, Sysno::ppoll, result).await
     }
 

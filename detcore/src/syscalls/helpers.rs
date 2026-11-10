@@ -1017,7 +1017,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Some(mut wait) => {
                 let restored = wait.restore(guest, Some(turn_mask_cell)).await;
                 if turn_mask.is_some() {
-                    crate::tool_global::set_saved_guest_sigmask(guest, None).await;
+                    crate::tool_global::withdraw_wait_mask(guest).await;
                 }
                 match result_after_restore(restored, result) {
                     Ok(result) => refuse_held_signal_loss(guest, Sysno::writev, result).await,
@@ -5041,7 +5041,7 @@ where
     let Some(mask) = wait.effective_mask() else {
         return Err(Errno::EFAULT.into());
     };
-    crate::tool_global::set_saved_guest_sigmask(guest, Some(mask)).await;
+    crate::tool_global::begin_wait_mask(guest, Some(mask)).await;
     Ok(mask)
 }
 
@@ -5696,8 +5696,39 @@ pub(crate) async fn publish_wait_mask<T, G>(
     if mask == published.0 || !publishes_guest_masks(guest.config()) {
         return;
     }
-    crate::tool_global::set_saved_guest_sigmask(guest, mask).await;
+    // A wait publication begins (or ends, for `None`) the thread's
+    // wait-mask interval, with the legacy saved mask in the same
+    // mutation (`Scheduler::begin_wait_mask` / `withdraw_wait_mask`).
+    match mask {
+        Some(mask) => crate::tool_global::begin_wait_mask(guest, Some(mask)).await,
+        None => crate::tool_global::withdraw_wait_mask(guest).await,
+    }
     published.0 = mask;
+}
+
+/// End a wait's publication at its return: an interrupted end hands the
+/// interval off to the delivery (the overlay ends; the legacy mask stays
+/// published until the thread's next request, as Linux keeps the
+/// temporary mask in `blocked` through the handler), and any other end
+/// withdraws it with the legacy saved mask. No publication in force is
+/// no end, as in `publish_wait_mask`.
+pub(crate) async fn finish_wait_mask<T, G>(
+    guest: &mut G,
+    interrupted: bool,
+    published: &mut PublishedWaitMask,
+) where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    if published.0.is_none() || !publishes_guest_masks(guest.config()) {
+        return;
+    }
+    if interrupted {
+        crate::tool_global::end_wait_mask(guest).await;
+    } else {
+        crate::tool_global::withdraw_wait_mask(guest).await;
+    }
+    published.0 = None;
 }
 
 async fn retry_blocking_wait_with_kernel_signal_state<T, G, C>(
@@ -5946,7 +5977,15 @@ where
 
     drop(guard);
     let restored = signals.restore(guest, None).await;
-    publish_wait_mask(guest, None, &mut published).await;
+    finish_wait_mask(
+        guest,
+        matches!(
+            result,
+            Err(Error::Errno(Errno::ERESTARTNOHAND | Errno::EINTR))
+        ),
+        &mut published,
+    )
+    .await;
     let result = match result_after_restore(restored, result) {
         Ok(result) => result,
         Err(error) => return (Err(error), false),
@@ -9807,6 +9846,24 @@ pub(crate) mod kernel_signal_wait_failures {
                         script.published_mask = *mask;
                         script.publications.push(*mask);
                         return (None, GlobalResponse::SetSavedGuestSigmask(()));
+                    }
+                    GlobalRequest::BeginWaitMask(mask) => {
+                        let mut script = script.lock().unwrap();
+                        script.published_mask = *mask;
+                        script.publications.push(*mask);
+                        return (None, GlobalResponse::BeginWaitMask(()));
+                    }
+                    GlobalRequest::WithdrawWaitMask => {
+                        let mut script = script.lock().unwrap();
+                        script.published_mask = None;
+                        script.publications.push(None);
+                        return (None, GlobalResponse::WithdrawWaitMask(()));
+                    }
+                    GlobalRequest::EndWaitMask => {
+                        return (None, GlobalResponse::EndWaitMask(()));
+                    }
+                    GlobalRequest::PopDeliveryMask => {
+                        return (None, GlobalResponse::PopDeliveryMask(()));
                     }
                     GlobalRequest::TraceSchedEvent(..) => {
                         let mut script = script.lock().unwrap();

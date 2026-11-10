@@ -12294,7 +12294,7 @@ fn ptrace_choice_under_published_mask(
     s.test_kernel_signal_states
         .insert(sibling, KernelSignalState::default());
     file_temporary_mask_wait(&mut s, creator, TemporaryMaskWait::Ppoll, Some(temporary));
-    assert!(s.set_saved_guest_sigmask(creator, Some(temporary)));
+    assert!(s.begin_wait_mask(creator, Some(temporary)));
     file_restartable_read(&mut s, sibling);
     let (receiver, moved) = s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD);
     (receiver, moved, creator, sibling)
@@ -12343,7 +12343,7 @@ fn a_woken_ptrace_ppoll_keeps_its_mask_until_its_grant() {
         s.test_kernel_signal_states
             .insert(sibling, KernelSignalState::default());
         file_temporary_mask_wait(&mut s, creator, TemporaryMaskWait::Ppoll, Some(temporary));
-        assert!(s.set_saved_guest_sigmask(creator, Some(temporary)));
+        assert!(s.begin_wait_mask(creator, Some(temporary)));
         file_restartable_read(&mut s, sibling);
         let expected = if creator_chosen {
             (Some(creator), None)
@@ -12406,7 +12406,7 @@ fn a_ptrace_ppoll_keeps_its_mask_at_a_replay_checkpoint() {
         s.test_kernel_signal_states
             .insert(sibling, KernelSignalState::default());
         file_temporary_mask_wait(&mut s, creator, TemporaryMaskWait::Ppoll, Some(temporary));
-        assert!(s.set_saved_guest_sigmask(creator, Some(temporary)));
+        assert!(s.begin_wait_mask(creator, Some(temporary)));
         file_restartable_read(&mut s, sibling);
         let expected = if creator_chosen {
             (Some(creator), None)
@@ -12457,18 +12457,268 @@ fn a_withdrawn_wait_publication_no_longer_decides_the_choice() {
     s.test_kernel_signal_states
         .insert(sibling, KernelSignalState::default());
     file_temporary_mask_wait(&mut s, creator, TemporaryMaskWait::Ppoll, Some(usr2));
-    assert!(s.set_saved_guest_sigmask(creator, Some(usr2)));
+    assert!(s.begin_wait_mask(creator, Some(usr2)));
     file_restartable_read(&mut s, sibling);
     assert_eq!(
         s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
         (Some(creator), None)
     );
-    assert!(s.set_saved_guest_sigmask(creator, None));
-    assert!(!s.wait_published_masks.contains(&creator));
+    assert!(s.withdraw_wait_mask(creator));
+    assert!(!s.wait_masks_in_force.contains_key(&creator));
     assert_eq!(
         s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
         (Some(sibling), Some(sibling)),
         "withdrawn: the physical own mask admits the private copy"
+    );
+}
+
+/// A plain select's first publication (the Astra probe at `4e61c6fe`):
+/// the first poll filing has no saved mask, its grant is consumed, and
+/// the wait then publishes its own mask with the request slot empty. A
+/// replay checkpoint in that interval reads the same in-force mask as
+/// the next poll filing does.
+#[test]
+fn a_first_wait_publication_is_visible_before_a_replay_checkpoint() {
+    let chld = kernel_signal_bit(libc::SIGCHLD);
+    let mut s = Scheduler::new(&Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE)
+    });
+    let (creator, _, _) = add(&mut s, 100, 100);
+    let (sibling, _, _) = add(&mut s, 100, 101);
+    s.test_kernel_signal_states.insert(
+        creator,
+        KernelSignalState {
+            blocked: 0,
+            caught: chld,
+            ..KernelSignalState::default()
+        },
+    );
+    s.test_kernel_signal_states
+        .insert(sibling, KernelSignalState::default());
+    let mut poll = Resources::new(creator);
+    poll.insert(ResourceID::InternalIOPolling, Permission::W);
+    poll.fyi("select");
+    poll.set_signal_interrupt_errno(reverie::syscalls::Errno::EINTR);
+    assert_eq!(poll.blocked_signal_mask, None);
+    s.next_turns.get_mut(&creator).unwrap().req = Ivar::full(Ok(poll.clone()));
+    s.runqueue_push_back(creator);
+    file_restartable_read(&mut s, sibling);
+    assert!(!s.wait_masks_in_force.contains_key(&creator));
+    // Its grant consumes that request. After the first unsuccessful probe,
+    // the wait installs a private mask and publishes the own mask.
+    s.clear_nextturn(creator).unwrap();
+    s.test_kernel_signal_states
+        .get_mut(&creator)
+        .unwrap()
+        .blocked = chld;
+    assert!(s.begin_wait_mask(creator, Some(0)));
+    assert_eq!(s.saved_guest_sigmasks.get(&creator), Some(&0));
+    // record_retry_event can yield before the next poll request is filed.
+    let mut checkpoint = Resources::new(creator);
+    checkpoint.insert(ResourceID::TraceReplay, Permission::RW);
+    s.next_turns.get_mut(&creator).unwrap().req = Ivar::full(Ok(checkpoint));
+    let at_checkpoint = s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD);
+    // Without that replay yield the same loop next files InternalIOPolling.
+    s.next_turns.get_mut(&creator).unwrap().req = Ivar::full(Ok(poll));
+    let at_next_poll = s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD);
+    assert_eq!(
+        at_next_poll,
+        (Some(creator), None),
+        "normal next-poll control"
+    );
+    assert_eq!(
+        at_checkpoint, at_next_poll,
+        "a first publication inside the active select must decide at its replay checkpoint too"
+    );
+}
+
+/// A saved mask recorded with no wait begun (a direct `SetSavedGuestSigmask`,
+/// as for a privately held thread) does not decide the choice: the physical
+/// mask does, here blocking SIGCHLD, so the walk reaches the sibling.
+#[test]
+fn a_saved_mask_without_a_wait_begun_does_not_decide_the_choice() {
+    let chld = kernel_signal_bit(libc::SIGCHLD);
+    let mut s = Scheduler::new(&Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE)
+    });
+    let (creator, _, _) = add(&mut s, 100, 100);
+    let (sibling, _, _) = add(&mut s, 100, 101);
+    s.test_kernel_signal_states.insert(
+        creator,
+        KernelSignalState {
+            blocked: chld,
+            caught: chld,
+            ..KernelSignalState::default()
+        },
+    );
+    s.test_kernel_signal_states
+        .insert(sibling, KernelSignalState::default());
+    file_restartable_read(&mut s, creator);
+    file_restartable_read(&mut s, sibling);
+    assert!(s.set_saved_guest_sigmask(creator, Some(0)));
+    assert!(!s.wait_masks_in_force.contains_key(&creator));
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+        (Some(sibling), Some(sibling)),
+        "the physical mask blocks SIGCHLD; the unbegun saved mask must not decide"
+    );
+}
+
+/// The interval ends and restarts with its waits: at the delivery
+/// handoff the thread's current handler mask decides (here it admits the
+/// private copy, so the waiter is busy), a fresh wait begins a fresh
+/// interval, and thread retirement clears the record.
+#[test]
+fn a_wait_mask_interval_ends_restarts_and_dies_with_its_thread() {
+    let usr2 = kernel_signal_bit(libc::SIGUSR2);
+    let mut s = Scheduler::new(&Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE)
+    });
+    let (creator, mm, _) = add(&mut s, 100, 100);
+    let (sibling, _, _) = add(&mut s, 100, 101);
+    s.test_kernel_signal_states.insert(
+        creator,
+        KernelSignalState {
+            thread_pending: usr2,
+            blocked: 0,
+            ..KernelSignalState::default()
+        },
+    );
+    s.test_kernel_signal_states
+        .insert(sibling, KernelSignalState::default());
+    file_temporary_mask_wait(&mut s, creator, TemporaryMaskWait::Ppoll, Some(usr2));
+    file_restartable_read(&mut s, sibling);
+    assert!(s.begin_wait_mask(creator, Some(usr2)));
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+        (Some(creator), None),
+        "in force: the temporary mask blocks the private copy"
+    );
+    // Delivery handoff: the handler's current mask (the physical one,
+    // admitting the copy) decides now, not the frozen temporary mask.
+    assert!(s.end_wait_mask(creator));
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+        (Some(sibling), Some(sibling)),
+        "handed off: the current handler mask admits the private copy"
+    );
+    // A restart after the handler begins a fresh interval.
+    assert!(s.begin_wait_mask(creator, Some(usr2)));
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+        (Some(creator), None),
+        "restarted: the fresh wait's mask decides"
+    );
+    let process = DetPid::from_raw(100);
+    s.logically_kill_thread(&creator, &process, mm);
+    assert!(
+        !s.wait_masks_in_force.contains_key(&creator),
+        "thread retirement clears the interval"
+    );
+}
+
+/// The delivery handoff: a wake that ends the wait for a caught handler
+/// pushes the delivery frame (wait value, `sa_mask`, the delivered
+/// signal) in the same mutation that ends the wait interval. It decides
+/// until `rt_sigreturn` pops it; a fresh wait inside the handler
+/// supersedes it.
+#[test]
+fn a_delivery_frame_decides_until_sigreturn_and_nests() {
+    let usr2 = kernel_signal_bit(libc::SIGUSR2);
+    let winch = kernel_signal_bit(libc::SIGWINCH);
+    let mut s = Scheduler::new(&Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE)
+    });
+    let (creator, _, _) = add(&mut s, 100, 100);
+    let (sibling, _, _) = add(&mut s, 100, 101);
+    s.test_kernel_signal_states.insert(
+        creator,
+        KernelSignalState {
+            thread_pending: winch,
+            blocked: 0,
+            ..KernelSignalState::default()
+        },
+    );
+    s.test_kernel_signal_states
+        .insert(sibling, KernelSignalState::default());
+    s.handler_masks
+        .insert((DetPid::from_raw(100), libc::SIGCHLD), (winch, false));
+    file_temporary_mask_wait(&mut s, creator, TemporaryMaskWait::Ppoll, Some(usr2));
+    file_restartable_read(&mut s, sibling);
+    assert!(s.begin_wait_mask(creator, Some(usr2)));
+    // Under the wait mask the WINCH copy is pending work: busy for SIGUSR1.
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGUSR1),
+        (Some(sibling), Some(sibling)),
+        "in force: the temporary mask admits the WINCH copy"
+    );
+    s.handoff_delivery(creator, SigWrapper(libc::SIGCHLD));
+    assert!(!s.wait_masks_in_force.contains_key(&creator));
+    // The delivery mask (temporary, sa_mask WINCH, SIGCHLD) blocks it.
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGUSR1),
+        (Some(creator), None),
+        "delivery: sa_mask blocks the WINCH copy"
+    );
+    // A fresh wait inside the handler supersedes the delivery frame.
+    assert!(s.begin_wait_mask(creator, Some(0)));
+    assert!(!s.delivery_masks.contains_key(&creator));
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGUSR1),
+        (Some(sibling), Some(sibling)),
+        "nested wait: its own mask admits the WINCH copy"
+    );
+    assert!(s.end_wait_mask(creator));
+    // Re-deliver and pop at sigreturn: the physical mask decides again.
+    assert!(s.begin_wait_mask(creator, Some(usr2)));
+    s.handoff_delivery(creator, SigWrapper(libc::SIGCHLD));
+    assert!(s.pop_delivery_mask(creator));
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGUSR1),
+        (Some(sibling), Some(sibling)),
+        "sigreturn: the physical own mask admits the WINCH copy"
+    );
+}
+
+/// A `sigtimedwait` wait publishes its own mask through the shared wait
+/// machinery: a signal it does not wait for stays eligible from that
+/// mask (not the private all-blocked physical mask), and the waited set
+/// comes off exactly once, in the caller's subtraction.
+#[test]
+fn a_sigtimedwait_wait_keeps_non_waited_signals_eligible() {
+    let usr1 = kernel_signal_bit(libc::SIGUSR1);
+    let mut s = Scheduler::new(&Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE)
+    });
+    let (creator, _, _) = add(&mut s, 100, 100);
+    let (sibling, _, _) = add(&mut s, 100, 101);
+    s.test_kernel_signal_states.insert(
+        creator,
+        KernelSignalState {
+            blocked: u64::MAX,
+            ..KernelSignalState::default()
+        },
+    );
+    s.test_kernel_signal_states
+        .insert(sibling, KernelSignalState::default());
+    file_restartable_read(&mut s, creator);
+    file_restartable_read(&mut s, sibling);
+    assert!(s.begin_wait_mask(creator, Some(0)));
+    assert!(s.set_sigtimedwait_set(creator, Some(usr1)));
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+        (Some(creator), None),
+        "a non-waited signal reads the published own mask, not the private physical one"
     );
 }
 

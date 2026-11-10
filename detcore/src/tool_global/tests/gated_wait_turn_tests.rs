@@ -450,6 +450,10 @@ impl GlobalRPC<GlobalState> for TurnGuest {
             GlobalRequest::PublishedGuestSigmask(_) => {
                 GlobalResponse::GuestSigmaskForStatus(self.status_mask)
             }
+            GlobalRequest::BeginWaitMask(_) => GlobalResponse::BeginWaitMask(()),
+            GlobalRequest::EndWaitMask => GlobalResponse::EndWaitMask(()),
+            GlobalRequest::WithdrawWaitMask => GlobalResponse::WithdrawWaitMask(()),
+            GlobalRequest::PopDeliveryMask => GlobalResponse::PopDeliveryMask(()),
             // A masked `ppoll` that would block, refused by name: a run that
             // allows unsupported operations reports it and goes on
             // (`Detcore::refuse_masked_ppoll_wait`).

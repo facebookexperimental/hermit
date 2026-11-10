@@ -5401,6 +5401,44 @@ impl GlobalState {
                     R::ThreadExited
                 }
             }
+            GlobalRequest::BeginWaitMask(mask) => {
+                let updated = self
+                    .lock_rpc_scheduler(false)
+                    .await
+                    .begin_wait_mask(dtid, mask);
+                if updated {
+                    R::BeginWaitMask(())
+                } else {
+                    R::ThreadExited
+                }
+            }
+            GlobalRequest::EndWaitMask => {
+                let updated = self.lock_rpc_scheduler(false).await.end_wait_mask(dtid);
+                if updated {
+                    R::EndWaitMask(())
+                } else {
+                    R::ThreadExited
+                }
+            }
+            GlobalRequest::WithdrawWaitMask => {
+                let updated = self
+                    .lock_rpc_scheduler(false)
+                    .await
+                    .withdraw_wait_mask(dtid);
+                if updated {
+                    R::WithdrawWaitMask(())
+                } else {
+                    R::ThreadExited
+                }
+            }
+            GlobalRequest::PopDeliveryMask => {
+                let updated = self.lock_rpc_scheduler(false).await.pop_delivery_mask(dtid);
+                if updated {
+                    R::PopDeliveryMask(())
+                } else {
+                    R::ThreadExited
+                }
+            }
             GlobalRequest::SetSigtimedwaitSet(set) => {
                 let updated = self
                     .lock_rpc_scheduler(false)
@@ -6632,9 +6670,6 @@ impl GlobalState {
             // in-guest delivery gate off, and for a rejoin, whose filing is
             // host-timed (recorded when the thread is readmitted instead).
             sched.record_request_guest_mask(dettid, &rs);
-            // The wait-publication record for the kernel-sent choice, in
-            // the same ordered filing (a no-op for other requests).
-            sched.record_wait_publication(dettid, &rs);
             // Whether it is a kernel-run call (A5 step 3c.1c, D44), recorded
             // in the same ordered filing; a no-op with the gate off.
             sched.record_request_kernel_run(dettid, &rs);
@@ -8499,8 +8534,11 @@ pub enum SignalScope {
 /// rebase). 55 adds the guest's mask and its ignored and caught sets to
 /// the in-guest sleep's owner-turn snapshot that `Resources` carries
 /// (https://github.com/rrnewton/hermit/issues/5338), and brings the types
-/// `Resources` carries from resources.rs into the digest; it is current.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 55;
+/// `Resources` carries from resources.rs into the digest. 56 adds the
+/// wait-mask lifetime requests (`BeginWaitMask`, `EndWaitMask`,
+/// `WithdrawWaitMask`, `PopDeliveryMask`) of
+/// https://github.com/rrnewton/hermit/pull/5259 and is current.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 56;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
@@ -8730,6 +8768,24 @@ pub enum GlobalRequest {
     /// while Detcore holds it under a private blocking mask, so the scheduler's
     /// child-exit classification reads the guest's mask, not Detcore's.
     SetSavedGuestSigmask(Option<u64>),
+
+    /// Begin the calling thread's wait-mask interval: its masked wait
+    /// published its effective mask (`None`: an unknown mask in force),
+    /// which the kernel-sent choice reads until the interval ends.
+    BeginWaitMask(Option<u64>),
+
+    /// End the calling thread's wait-mask interval at an interrupted
+    /// wait's delivery handoff, leaving its legacy saved mask published
+    /// until its next request.
+    EndWaitMask,
+
+    /// End the calling thread's wait-mask interval and clear its legacy
+    /// saved mask with it: a wait that returned with its own mask back.
+    WithdrawWaitMask,
+
+    /// Pop the calling thread's top delivery-mask frame: its
+    /// `rt_sigreturn` restored the mask the frame saved.
+    PopDeliveryMask,
 
     /// The guest's own signal mask that a thread published while Detcore
     /// holds it under a private blocking mask, if any
@@ -9581,6 +9637,10 @@ pub enum GlobalResponse {
     DeregisterThread(()),
     SetChildTidAddress(()),
     SetSavedGuestSigmask(()),
+    BeginWaitMask(()),
+    EndWaitMask(()),
+    WithdrawWaitMask(()),
+    PopDeliveryMask(()),
     PublishedGuestSigmask(Option<u64>),
     SetSigtimedwaitSet(()),
     OwnProcessSignalInputs(OwnProcessSignalInputs),
@@ -10601,6 +10661,74 @@ where
             GlobalResponse::SetSavedGuestSigmask(()) | GlobalResponse::ThreadExited
         ),
         "unexpected response to SetSavedGuestSigmask: {response:?}"
+    );
+}
+
+/// Begin the calling thread's wait-mask interval: its masked wait
+/// published its effective mask (`None`: an unknown mask in force).
+pub(crate) async fn begin_wait_mask<G, T>(guest: &mut G, mask: Option<u64>)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) = send_and_update_time(guest, GlobalRequest::BeginWaitMask(mask)).await;
+    assert!(
+        matches!(
+            response,
+            GlobalResponse::BeginWaitMask(()) | GlobalResponse::ThreadExited
+        ),
+        "unexpected response to BeginWaitMask: {response:?}"
+    );
+}
+
+/// End the calling thread's wait-mask interval at an interrupted wait's
+/// delivery handoff, leaving its legacy saved mask published.
+pub(crate) async fn end_wait_mask<G, T>(guest: &mut G)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) = send_and_update_time(guest, GlobalRequest::EndWaitMask).await;
+    assert!(
+        matches!(
+            response,
+            GlobalResponse::EndWaitMask(()) | GlobalResponse::ThreadExited
+        ),
+        "unexpected response to EndWaitMask: {response:?}"
+    );
+}
+
+/// Pop the calling thread's top delivery-mask frame: its `rt_sigreturn`
+/// restored the mask the frame saved.
+pub(crate) async fn pop_delivery_mask<G, T>(guest: &mut G)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) = send_and_update_time(guest, GlobalRequest::PopDeliveryMask).await;
+    assert!(
+        matches!(
+            response,
+            GlobalResponse::PopDeliveryMask(()) | GlobalResponse::ThreadExited
+        ),
+        "unexpected response to PopDeliveryMask: {response:?}"
+    );
+}
+
+/// End the calling thread's wait-mask interval and clear its legacy
+/// saved mask with it: its wait returned with its own mask back.
+pub(crate) async fn withdraw_wait_mask<G, T>(guest: &mut G)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) = send_and_update_time(guest, GlobalRequest::WithdrawWaitMask).await;
+    assert!(
+        matches!(
+            response,
+            GlobalResponse::WithdrawWaitMask(()) | GlobalResponse::ThreadExited
+        ),
+        "unexpected response to WithdrawWaitMask: {response:?}"
     );
 }
 

@@ -2357,16 +2357,26 @@ pub struct Scheduler {
     /// take it too (`read_thread_blocked_mask_result`).
     saved_guest_sigmasks: BTreeMap<DetTid, u64>,
 
-    /// The threads whose `saved_guest_sigmasks` entry is a masked wait's
-    /// published mask still in force (`set_saved_guest_sigmask` records it
-    /// while a served wait is filed, and a wait's own republishing keeps
-    /// it): the kernel-sent choice reads the saved mask for these, through
-    /// any request the wait's place is later given (a wake's
-    /// `InboundSignal`, a replay checkpoint's `TraceReplay`), until the
-    /// wait's publication is withdrawn. A saved mask recorded with no
-    /// served wait filed is the guest's own under Detcore's private mask,
-    /// and the choice reads the physical mask there instead.
-    wait_published_masks: BTreeSet<DetTid>,
+    /// Each thread's wait mask in force: the effective mask its masked
+    /// wait published (`begin_wait_mask`), with the address-space
+    /// incarnation that published it, from the wait's first publication
+    /// until its withdrawal (`end_wait_mask`), through any request the
+    /// wait's place is later given (a wake's `InboundSignal`, a replay
+    /// checkpoint's `TraceReplay`). A `None` mask is an unknown mask in
+    /// force: the choice reads it as unknown, never as an older value.
+    /// The kernel-sent choice reads this ahead of the physical mask;
+    /// a saved mask with no wait in force is the guest's own under
+    /// Detcore's private mask, and the choice reads the physical mask
+    /// there instead.
+    wait_masks_in_force: BTreeMap<DetTid, (MmId, Option<u64>)>,
+
+    /// Each thread's delivery-mask frames: at an interrupted wait's
+    /// delivery the wait mask hands off to the mask Linux installs for
+    /// the handler (the wait value, the handler's `sa_mask`, and the
+    /// delivered signal unless `SA_NODEFER`), which decides until
+    /// `rt_sigreturn` pops it. Nested deliveries push again; a fresh
+    /// wait or a newer published mask supersedes the top.
+    delivery_masks: BTreeMap<DetTid, Vec<Option<u64>>>,
 
     /// Under the in-guest delivery gate, the threads that have published
     /// their own guest mask at a request (`record_request_guest_mask`), which
@@ -6446,7 +6456,8 @@ impl Scheduler {
             delivery_mask_override: None,
             signal_control_caller: None,
             saved_guest_sigmasks: Default::default(),
-            wait_published_masks: Default::default(),
+            wait_masks_in_force: Default::default(),
+            delivery_masks: Default::default(),
             unknown_guest_sigmasks: Default::default(),
             own_mask_publishers: Default::default(),
             temporary_mask_publications: Default::default(),
@@ -7777,6 +7788,10 @@ impl Scheduler {
         // at moments host timing set.
         if succeeded {
             self.parent_death_exec_survivor = Some((process, caller));
+            // The surviving caller's old image is gone: no wait or
+            // delivery interval of its survives the exec.
+            self.wait_masks_in_force.remove(&caller);
+            self.delivery_masks.remove(&caller);
         }
         for tid in &retired {
             self.logically_kill_thread(tid, &process, mm);
@@ -8035,7 +8050,8 @@ impl Scheduler {
         self.release_vfork_child(*dtid, false);
         self.vfork_registration_origins.remove(dtid);
         self.saved_guest_sigmasks.remove(dtid);
-        self.wait_published_masks.remove(dtid);
+        self.wait_masks_in_force.remove(dtid);
+        self.delivery_masks.remove(dtid);
         if self.in_guest_signal_delivery {
             self.unknown_guest_sigmasks.remove(dtid);
             self.temporary_mask_publications.remove(dtid);
@@ -10030,20 +10046,125 @@ impl Scheduler {
     /// it, as `set_saved_guest_sigmask` catches a publication that
     /// follows its filing. A rejoin's filing is host-timed; its mask is
     /// recorded at readmission instead (`keep_mask_for_continuation`).
-    pub(crate) fn record_wait_publication(&mut self, dettid: DetTid, rs: &Resources) {
-        if rs.is_rejoin() {
+    /// Begin `dettid`'s wait-mask interval: its masked wait has published
+    /// its effective mask (`publish_wait_mask`), which Linux's `blocked`
+    /// holds until the wait withdraws it. The legacy saved-mask consumers
+    /// are updated in the same mutation, so no reader sees the interval
+    /// without the value or the value without the interval. A `None`
+    /// mask is an unknown mask in force. Returns false for a thread the
+    /// scheduler no longer knows, as `set_saved_guest_sigmask` does, so a
+    /// stale publication from a retired incarnation is refused.
+    pub(crate) fn begin_wait_mask(&mut self, dettid: DetTid, mask: Option<u64>) -> bool {
+        if !self.next_turns.contains_key(&dettid) {
+            return false;
+        }
+        let mm = self
+            .thread_mms
+            .get(&dettid)
+            .copied()
+            .unwrap_or_else(|| MmId::initial(DetPid::from_raw(dettid.as_raw())));
+        self.wait_masks_in_force.insert(dettid, (mm, mask));
+        // A fresh wait supersedes any delivery frame it nests in.
+        self.delivery_masks.remove(&dettid);
+        match mask {
+            Some(mask) => self.saved_guest_sigmasks.insert(dettid, mask),
+            None => self.saved_guest_sigmasks.remove(&dettid),
+        };
+        if self.in_guest_signal_delivery {
+            self.unknown_guest_sigmasks.remove(&dettid);
+            self.temporary_guest_sigmasks.remove(&dettid);
+            self.forget_temporary_mask_publication(dettid);
+        }
+        true
+    }
+
+    /// End `dettid`'s wait-mask interval without touching the legacy
+    /// saved mask: the delivery handoff at an interrupted wait's return,
+    /// where the thread's current handler mask (its physical `blocked`,
+    /// as the delivery installed it) decides from here, and the legacy
+    /// publication stays until the thread's next request.
+    pub(crate) fn end_wait_mask(&mut self, dettid: DetTid) -> bool {
+        if !self.next_turns.contains_key(&dettid) {
+            return false;
+        }
+        self.wait_masks_in_force.remove(&dettid);
+        true
+    }
+
+    /// End `dettid`'s wait-mask interval and clear the legacy saved mask
+    /// with it: a wait that returns without a delivery to hand off to,
+    /// whose thread's kernel `SigBlk` is its own mask again.
+    pub(crate) fn withdraw_wait_mask(&mut self, dettid: DetTid) -> bool {
+        if !self.next_turns.contains_key(&dettid) {
+            return false;
+        }
+        self.wait_masks_in_force.remove(&dettid);
+        self.saved_guest_sigmasks.remove(&dettid);
+        if self.in_guest_signal_delivery {
+            self.unknown_guest_sigmasks.remove(&dettid);
+            self.temporary_guest_sigmasks.remove(&dettid);
+            self.forget_temporary_mask_publication(dettid);
+        }
+        true
+    }
+
+    /// Hand `dettid`'s wait interval off to a delivery of `signal`: the
+    /// scheduler is committing the wake that ends its wait for a caught
+    /// handler, so Linux installs the handler's mask — the wait value,
+    /// the handler's `sa_mask`, and the delivered signal unless
+    /// `SA_NODEFER`, with the unblockable signals left out — which
+    /// decides until `rt_sigreturn`. One mutation: the wait interval
+    /// ends as the delivery frame is pushed, so no choice can run in a
+    /// gap between them. No interval, or no caught handler for `signal`,
+    /// is no handoff: the existing ignore/default/fatal paths decide.
+    fn handoff_delivery(&mut self, dettid: DetTid, signal: SigWrapper) {
+        let Some(wait) = self.wait_mask_in_force(dettid) else {
             return;
+        };
+        let process = self.sigchld_process(dettid);
+        let Some(&(sa_mask, nodefer)) = self.handler_masks.get(&(process, signal.raw())) else {
+            return;
+        };
+        let deferred = if nodefer {
+            0
+        } else {
+            kernel_signal_bit(signal.raw())
+        };
+        let unblockable = kernel_signal_bit(libc::SIGKILL) | kernel_signal_bit(libc::SIGSTOP);
+        let frame = wait.map(|wait| (wait | sa_mask | deferred) & !unblockable);
+        self.wait_masks_in_force.remove(&dettid);
+        self.delivery_masks.entry(dettid).or_default().push(frame);
+    }
+
+    /// Pop `dettid`'s top delivery frame, as `rt_sigreturn` restores the
+    /// mask its frame saved. Returns false for a thread the scheduler no
+    /// longer knows, as the other mask mutations do.
+    pub(crate) fn pop_delivery_mask(&mut self, dettid: DetTid) -> bool {
+        if !self.next_turns.contains_key(&dettid) {
+            return false;
         }
-        let served = rs.blocked_signal_mask.is_some()
-            || rs.resources.keys().any(|resource| {
-                matches!(
-                    resource,
-                    ResourceID::InternalIOPolling | ResourceID::SleepUntil(_)
-                )
-            });
-        if served && self.saved_guest_sigmasks.contains_key(&dettid) {
-            self.wait_published_masks.insert(dettid);
+        if let Some(stack) = self.delivery_masks.get_mut(&dettid) {
+            stack.pop();
+            if stack.is_empty() {
+                self.delivery_masks.remove(&dettid);
+            }
         }
+        true
+    }
+
+    /// The wait mask in force for `thread`, when its publishing
+    /// incarnation is still the thread's: `Some(mask)`, `None` for an
+    /// unknown mask in force, and no entry at all when no wait is in
+    /// force or its incarnation has been replaced (exec, tid reuse), in
+    /// which case its value must not decide.
+    fn wait_mask_in_force(&self, thread: DetTid) -> Option<Option<u64>> {
+        let (mm, mask) = self.wait_masks_in_force.get(&thread)?;
+        let current = self
+            .thread_mms
+            .get(&thread)
+            .copied()
+            .unwrap_or_else(|| MmId::initial(DetPid::from_raw(thread.as_raw())));
+        (current == *mm).then_some(*mask)
     }
 
     /// Record (`Some`) or clear (`None`) the mask Linux's `blocked` holds for
@@ -10057,41 +10178,8 @@ impl Scheduler {
             return false;
         }
         match mask {
-            Some(mask) => {
-                // Provenance for the kernel-sent choice: a mask published
-                // while a served wait is filed (or republished by a wait
-                // already recorded) is that wait's mask, in force until
-                // withdrawn; a mask recorded over a futex wait is the
-                // guest's own under Detcore's private mask there, whose
-                // readers take the physical mask, so any wait record ends.
-                let filed = self
-                    .next_turns
-                    .get(&dettid)
-                    .and_then(|turn| turn.req.try_read())
-                    .and_then(Result::ok);
-                let over_futex = filed
-                    .as_ref()
-                    .is_some_and(|request| request.resources.contains_key(&ResourceID::FutexWait));
-                let in_served_wait = filed.as_ref().is_some_and(|request| {
-                    request.blocked_signal_mask.is_some()
-                        || request.resources.keys().any(|resource| {
-                            matches!(
-                                resource,
-                                ResourceID::InternalIOPolling | ResourceID::SleepUntil(_)
-                            )
-                        })
-                });
-                if over_futex {
-                    self.wait_published_masks.remove(&dettid);
-                } else if in_served_wait || self.wait_published_masks.contains(&dettid) {
-                    self.wait_published_masks.insert(dettid);
-                }
-                self.saved_guest_sigmasks.insert(dettid, mask)
-            }
-            None => {
-                self.wait_published_masks.remove(&dettid);
-                self.saved_guest_sigmasks.remove(&dettid)
-            }
+            Some(mask) => self.saved_guest_sigmasks.insert(dettid, mask),
+            None => self.saved_guest_sigmasks.remove(&dettid),
         };
         if self.in_guest_signal_delivery {
             self.unknown_guest_sigmasks.remove(&dettid);
@@ -15658,6 +15746,10 @@ impl Scheduler {
             );
             return;
         }
+        // A wake that ends a masked wait for a caught handler hands its
+        // interval off to the delivery frame, in this same mutation
+        // (`handoff_delivery`), before any request is rewritten.
+        self.handoff_delivery(dettid, signal);
         debug!(
             "[dtid {}] make pending signal {} visible to the scheduler.",
             dettid, signal
@@ -17110,27 +17202,38 @@ impl Scheduler {
                 Err(signal_state_reader::TemporaryMaskUnknown) => return None,
             }
         }
-        // The mask a masked wait published (`publish_wait_mask`), while
-        // its publication is in force (`wait_published_masks`, recorded
-        // at publication): on ptrace a masked `ppoll`/`pselect6`/
-        // `sigsuspend` probe loop stores its temporary mask in
-        // `saved_guest_sigmasks` for the wait's duration, while the
-        // physical mask remains the thread's own. The record survives
-        // any request the wait's place is later given (a wake's
+        // The mask a masked wait published, while its interval is in
+        // force (`wait_masks_in_force`, begun at publication): on ptrace
+        // a masked `ppoll`/`pselect6`/`sigsuspend` probe loop publishes
+        // its temporary mask for the wait's duration, while the physical
+        // mask remains the thread's own. The interval survives any
+        // request the wait's place is later given (a wake's
         // `InboundSignal`, a replay checkpoint's `TraceReplay`), so the
-        // choice reads the installed mask, as `wants_signal` does. A
-        // saved mask with no wait publication in force is the guest's
-        // own under Detcore's private mask, and the physical read below
+        // choice reads the installed mask, as `wants_signal` does. An
+        // unknown mask in force reads as unknown, never as an older
+        // value. A saved mask with no wait in force is the guest's own
+        // under Detcore's private mask, and the physical read below
         // decides there, as before; the recorded and control sources
         // above keep their stronger precedence, and readers that need
         // the physical mask (the background-entry barriers) do not come
         // through here.
-        if self.wait_published_masks.contains(&thread)
-            && let Some(published) = self.saved_guest_sigmasks.get(&thread)
-        {
-            return Some(*published);
+        if let Some(in_force) = self.wait_mask_in_force(thread) {
+            return in_force;
         }
-        self.blocked_mask_for(thread, signal)
+        // A newer published mask (a handler's own `rt_sigprocmask`)
+        // supersedes the delivery frame under it, as Linux's current
+        // `blocked` supersedes the mask the delivery installed.
+        if let Some(published) = self.published_mask_for(thread, signal) {
+            return Some(published);
+        }
+        if let Some(frame) = self
+            .delivery_masks
+            .get(&thread)
+            .and_then(|stack| stack.last())
+        {
+            return *frame;
+        }
+        self.read_thread_blocked_mask(thread)
     }
 
     /// The sources of `thread_signal_mask` before the kernel's, in order;

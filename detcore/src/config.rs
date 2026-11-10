@@ -404,6 +404,12 @@ mod tests {
         // had changed the request's layout with the digest unchanged. The
         // enums' digest is unchanged; digest measured at this head.
         (55, "4a8fdaad9b3c03b7", "f8b1309588141fd0"),
+        // Adds `BeginWaitMask`, `EndWaitMask`, `WithdrawWaitMask` and
+        // `PopDeliveryMask` (the explicit wait-mask lifetime of
+        // https://github.com/rrnewton/hermit/pull/5259; 55 on its old
+        // base, renumbered to 56 at this rebase onto main's 55; digest
+        // measured at this head).
+        (56, "91f04fcd0dfc89dd", "f013e36743d8d9e6"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
