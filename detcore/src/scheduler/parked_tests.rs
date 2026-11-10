@@ -11982,6 +11982,157 @@ fn a_due_sigalrm_stops_the_run_for_a_deferred_read_whose_marks_were_revoked() {
     assert!(s.take_sigalrm_stop().is_some());
 }
 
+/// Finding 2 of the review of 29b3e6a8, through rev5338-cx's transition
+/// witness (`evidence/late-authority-witness.patch`), adopted with its
+/// assertions unchanged: a real no-progress settlement substitutes the signal
+/// wake, which is only at the front of its band, so a better band runs first
+/// and its `request_put` reports an export that revokes the guest-held marks
+/// the read relied on. The wake request names neither the read nor its
+/// descriptor; the next step 2 must still stop the run by name before the
+/// wake is granted and makes the read's final attempt. A scheduler caller
+/// and state witness, not an execution of SCM_RIGHTS.
+#[test]
+fn a_late_export_after_the_no_progress_wake_stops_before_its_grant() {
+    let (mut s, reader, pid, queued) = reserved_reader_behind(&[300]);
+    let exporter = queued[0];
+    s.requeue_with_new_priority(exporter, DEFAULT_PRIORITY - 1);
+    assert!(sigalrm_reserved_for(&s, reader));
+    assert_eq!(grant_selected(&mut s), reader, "the reserved probe first");
+    file_probe_successor(&mut s, reader, 1, false);
+    s.step2_sigalrm_ledger();
+    assert!(woken_by_sigalrm(&s, reader), "real no-progress settle");
+    assert_eq!(s.sigalrm_reserved_poll_target(), None);
+    assert!(s.sigalrm_pending(pid), "delivery has not happened yet");
+    assert!(!s.guest_held_marks_revoked_for_test());
+    assert_eq!(s.take_sigalrm_stop(), None, "the ordinary positive path");
+    {
+        let wake = s.next_turns[&reader].req.try_read().unwrap().unwrap();
+        assert_eq!(wake.read_fd, None, "substitution drops read identity");
+        assert!(!wake.resources.contains_key(&ResourceID::InternalIOPolling));
+    }
+
+    // Placed precedence ended at settlement. As the production wake's
+    // comment states, a better band may interpose before its last probe.
+    assert_eq!(grant_selected(&mut s), exporter, "a permitted interposer");
+    // resource_request carries this production export report before issue
+    // (`passed_descriptors_out_unreported` -> passes_descriptors_out).
+    // Exercise request_put's real authority revocation, rather than set the
+    // scheduler's private bit or fabricate a signal wake.
+    let mut report = Resources::new(exporter);
+    report.passes_descriptors_out = true;
+    let slot = s.next_turns[&exporter].req.clone();
+    let time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+    s.request_put(&slot, report, &time);
+    assert!(s.guest_held_marks_revoked_for_test());
+    assert!(woken_by_sigalrm(&s, reader));
+    assert!(s.sigalrm_pending(pid));
+
+    s.step2_sigalrm_ledger();
+    let stop = s.take_sigalrm_stop();
+    assert!(
+        stop.as_deref()
+            .is_some_and(|reason| { reason.contains("HERMIT_SIGALRM_PIPE_AUTHORITY_REVOKED") }),
+        "revoked authority must stop before the pending wake's final probe; got {stop:?}"
+    );
+}
+
+/// A pipe status change published without the serial grant while a process
+/// handles SIGALRM was recorded at a moment the host chose, so the ledger
+/// stops following the description's status: every copy then differs
+/// (coord7's review of 29b3e6a8, nit on `PublishPipeStatus`). Before any
+/// process handles SIGALRM, or with the grant, the published flags are kept
+/// as they are. Mutation "an ungranted publication is kept": the copy that
+/// matches the published flags reads as current.
+#[test]
+fn a_pipe_status_published_without_the_serial_grant_is_untracked() {
+    use crate::tool_global::SigalrmControl;
+    use crate::types::OpenFileId;
+
+    let mut s = liteinst_scheduler();
+    let (publisher, _, _) = add(&mut s, 100, 100);
+    let (reader, _, _) = add(&mut s, 300, 300);
+    let id = OpenFileId::new(DetPid::from_raw(100), 1);
+    let blocking = libc::O_RDONLY;
+    s.sigalrm_control(
+        publisher,
+        SigalrmControl::PublishPipeStatus {
+            id,
+            flags: blocking,
+        },
+    );
+    s.set_sigalrm_handled(DetPid::from_raw(300), true);
+    s.parked.running = Some(reader);
+    assert!(s.holds_serial_grant(reader));
+    assert!(!s.holds_serial_grant(publisher));
+    assert!(
+        !s.sigalrm_control(
+            reader,
+            SigalrmControl::PipeStatusDiffers {
+                id,
+                flags: blocking
+            }
+        ),
+        "published before any handler: kept"
+    );
+    s.sigalrm_control(
+        reader,
+        SigalrmControl::PublishPipeStatus {
+            id,
+            flags: blocking,
+        },
+    );
+    assert!(
+        !s.sigalrm_control(
+            reader,
+            SigalrmControl::PipeStatusDiffers {
+                id,
+                flags: blocking
+            }
+        ),
+        "published with the grant: kept"
+    );
+    s.sigalrm_control(
+        publisher,
+        SigalrmControl::PublishPipeStatus {
+            id,
+            flags: blocking,
+        },
+    );
+    assert!(
+        s.sigalrm_control(
+            reader,
+            SigalrmControl::PipeStatusDiffers {
+                id,
+                flags: blocking
+            }
+        ),
+        "published without the grant: no longer followed"
+    );
+}
+
+/// The wake's record (`SigalrmLedger::marked_wake`) ends at its grant: an
+/// export the scheduler learns of afterwards finds no wake of that read
+/// still filed and stops nothing here. The read's own end then decides,
+/// with the marks and the entry asked about at its restart checkpoint
+/// (`an_admitted_pipe_read_whose_marks_were_revoked_stops_at_its_end_while_due`).
+#[test]
+fn the_no_progress_wake_record_ends_at_its_grant() {
+    let (mut s, reader, pid, _) = reserved_reader_behind(&[300]);
+    assert_eq!(grant_selected(&mut s), reader, "the reserved probe first");
+    file_probe_successor(&mut s, reader, 1, false);
+    s.step2_sigalrm_ledger();
+    assert!(woken_by_sigalrm(&s, reader));
+    assert_eq!(
+        grant_selected(&mut s),
+        reader,
+        "the wake, at the front of its band"
+    );
+    s.revoke_guest_held_marks(DetTid::from_raw(300));
+    assert!(s.sigalrm_pending(pid), "delivered at the read's completion");
+    s.step2_sigalrm_ledger();
+    assert_eq!(s.take_sigalrm_stop(), None, "no wake of the read is filed");
+}
+
 /// R1 with the successor production files: the probe completed the read,
 /// so `complete_syscall` delivers the due entry and files its
 /// `InboundSignal(SIGALRM)` turn. Step 2 classifies that as completed (no

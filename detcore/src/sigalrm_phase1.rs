@@ -161,11 +161,15 @@ pub(crate) struct ProcessFacts {
     pub sigalrm_restarts: bool,
     /// Whether the run records or replays (`Config::recordreplay_modes`).
     pub record_replay: bool,
-    /// Whether the run replays a recorded schedule
-    /// (`Config::replay_schedule_from`, and its fair continuation), whose
-    /// intermediate replay yields the reserved probe's settlement cannot tell
-    /// from the read's completion (dh-ru056 slice 2, review P2).
-    pub schedule_replay: bool,
+    /// Whether the run records or replays a schedule
+    /// (`Config::observes_schedevents`: `--record-preemptions`,
+    /// `--replay-schedule-from` and its fair continuation). A replay's
+    /// intermediate yields the reserved probe's settlement cannot tell from
+    /// the read's completion (dh-ru056 slice 2, review P2 of 8871d444), so
+    /// the replay refuses the read, and so must the recording it replays,
+    /// or the two runs' guests diverge at that read (finding 3 of coord7's
+    /// review of 29b3e6a8).
+    pub schedule_trace: bool,
     /// Whether a descriptor may have left the guest, which revokes the
     /// authority of every guest-held mark for the rest of the run: an export
     /// the scheduler has recorded (`SigalrmControl::GuestHeldMarksRevoked`),
@@ -449,9 +453,10 @@ pub(crate) fn descriptor_class(
     }
     match facts.ty {
         // Named so the refusal says why (coord7 review of ec9b2177, S4(c)):
-        // no guest-held mark makes a FIFO's readiness the guests' alone.
+        // no guest-held mark makes a FIFO's readiness the guests' alone. An
+        // `lseek` reaches this row as a read does.
         _ if !write && facts.named_fifo => Phase1Class::Refused(
-            "a read of a named FIFO, which a process outside the container may open and fill",
+            "a read or seek of a named FIFO, which a process outside the container may open and fill",
         ),
         FdType::Memfd => Phase1Class::Allowed,
         // Served from a snapshot whose capture cannot wait.
@@ -468,11 +473,13 @@ pub(crate) fn descriptor_class(
                 Phase1Class::Refused(
                     "a pipe read under record or replay, where dh-ru056 slice 2 cannot revoke its guest-only readiness",
                 )
-            } else if process.schedule_replay {
-                // Review P2: an intermediate replay yield would read as the
-                // read's completion and settle its reserved probe.
+            } else if process.schedule_trace {
+                // Review P2 of 8871d444: an intermediate replay yield would
+                // read as the read's completion and settle its reserved
+                // probe; a recording is refused too, so that its replay
+                // agrees (finding 3 of coord7's review of 29b3e6a8).
                 Phase1Class::Refused(
-                    "a pipe read under schedule replay, whose replay yields dh-ru056 slice 2 cannot tell from the read's completion",
+                    "a pipe read under schedule recording or replay, whose replay dh-ru056 slice 2 cannot keep faithful: a replay yield reads as the read's completion",
                 )
             } else if process.guest_held_revoked {
                 // Review P1-a: the scheduler would not reserve its probe.
@@ -481,9 +488,12 @@ pub(crate) fn descriptor_class(
                 )
             } else if facts.status_diverged {
                 // Review P1-b: this process's copy of the description's
-                // status is not the description's.
+                // status may not be the description's: another process
+                // published a change, or the description left a process
+                // over SCM_RIGHTS, whose receiver's copy the ledger cannot
+                // follow (finding 1 of coord7's review of 29b3e6a8).
                 Phase1Class::Refused(
-                    "a pipe read whose status flags another process changed after a fork, which this process's copy does not show",
+                    "a pipe read whose status flags another process may have changed through a copy of the description that a fork or SCM_RIGHTS made, which this process's copy does not show",
                 )
             } else if process.sigalrm_restarts {
                 // Ruling C2.6: Linux would run the handler and then restart
@@ -529,7 +539,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut process = ProcessFacts {
             sigalrm_restarts: guest.thread_state().sigalrm_restarts,
             record_replay: self.cfg.recordreplay_modes,
-            schedule_replay: self.cfg.replay_schedule_from.is_some(),
+            schedule_trace: self.cfg.observes_schedevents(),
             guest_held_revoked: false,
         };
         // Only a read's class can depend on the ledger: its descriptor is
@@ -1172,9 +1182,9 @@ mod tests {
 
     /// dh-ru056 slice 2, rulings C1.1, C1.3, C1.4 and C2.6, and the reviews
     /// of ec9b2177 and 8871d444: a guest-held polled pipe's `read` runs,
-    /// except under record and replay, under schedule replay, after a
-    /// descriptor may have left the guest, on a description whose status
-    /// another process changed after a fork, or under an `SA_RESTART` SIGALRM
+    /// except under record and replay, under schedule recording or replay,
+    /// after a descriptor may have left the guest, on a description whose
+    /// status another process may have changed, or under an `SA_RESTART` SIGALRM
     /// handler, each refused by name; its
     /// `write` stays refused; and an `lseek` of it runs whatever the process
     /// facts, since Linux returns ESPIPE at once.
@@ -1203,8 +1213,8 @@ mod tests {
             record_replay: true,
             ..plain
         };
-        let schedule_replay = ProcessFacts {
-            schedule_replay: true,
+        let schedule_trace = ProcessFacts {
+            schedule_trace: true,
             ..plain
         };
         let revoked = ProcessFacts {
@@ -1228,9 +1238,9 @@ mod tests {
             )
         );
         assert_eq!(
-            class(Sysno::read, schedule_replay, pipe(true)),
+            class(Sysno::read, schedule_trace, pipe(true)),
             Phase1Class::Refused(
-                "a pipe read under schedule replay, whose replay yields dh-ru056 slice 2 cannot tell from the read's completion"
+                "a pipe read under schedule recording or replay, whose replay dh-ru056 slice 2 cannot keep faithful: a replay yield reads as the read's completion"
             )
         );
         assert_eq!(
@@ -1242,7 +1252,7 @@ mod tests {
         assert_eq!(
             class(Sysno::read, plain, facts(true, true)),
             Phase1Class::Refused(
-                "a pipe read whose status flags another process changed after a fork, which this process's copy does not show"
+                "a pipe read whose status flags another process may have changed through a copy of the description that a fork or SCM_RIGHTS made, which this process's copy does not show"
             )
         );
         // A named FIFO is refused by its own name, a write to one by the
@@ -1254,7 +1264,7 @@ mod tests {
         assert_eq!(
             class(Sysno::read, plain, fifo),
             Phase1Class::Refused(
-                "a read of a named FIFO, which a process outside the container may open and fill"
+                "a read or seek of a named FIFO, which a process outside the container may open and fill"
             )
         );
         assert_eq!(
@@ -1267,7 +1277,7 @@ mod tests {
             class(Sysno::read, plain, facts(false, true)),
             Phase1Class::Refused("I/O on a descriptor that may sleep interruptibly")
         );
-        for process in [plain, restarts, record_replay, schedule_replay, revoked] {
+        for process in [plain, restarts, record_replay, schedule_trace, revoked] {
             assert_eq!(
                 class(Sysno::write, process, pipe(true)),
                 Phase1Class::Refused("I/O on a descriptor that may sleep interruptibly"),

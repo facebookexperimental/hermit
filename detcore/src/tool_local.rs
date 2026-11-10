@@ -8850,6 +8850,27 @@ impl<T> ThreadState<T> {
             .any(|detfd| detfd.procfs_rendered_path().is_some())
     }
 
+    /// The pipe read descriptions this table's descriptors `fds` name, or,
+    /// with `None`, every one it holds, each once and in order: the
+    /// descriptions phase 1's SIGALRM ledger records a status for
+    /// (`SigalrmControl::PublishPipeStatus`, dh-ru056 slice 2).
+    pub(crate) fn pipe_read_descriptions(&self, fds: Option<&[RawFd]>) -> Vec<OpenFileId> {
+        let metadata = self.metadata();
+        let reads = |detfd: &DetFd| {
+            (detfd.ty() == FdType::Pipe && detfd.status_flags() & libc::O_ACCMODE != libc::O_WRONLY)
+                .then(|| detfd.open_file_id())
+        };
+        let ids: BTreeSet<OpenFileId> = match fds {
+            Some(fds) => fds
+                .iter()
+                .filter_map(|fd| metadata.file_handles.get(fd))
+                .filter_map(reads)
+                .collect(),
+            None => metadata.file_handles.values().filter_map(reads).collect(),
+        };
+        ids.into_iter().collect()
+    }
+
     /// Get a mutable reference of `DetFd` from a raw file descriptor, and
     /// run mutable function `f` on it (`&mut DetFd`).
     pub fn with_detfd<F, U>(&self, fd: RawFd, f: F) -> Result<U, Errno>

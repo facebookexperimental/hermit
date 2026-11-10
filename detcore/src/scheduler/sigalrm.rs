@@ -77,8 +77,10 @@
 //! (`sigalrm_phase1::descriptor_class`, dh-ru056 slice 2); no other read
 //! reaches the reservation. An admitted read whose guest-held marks an export
 //! revokes while it waits stops the run by name when its entry falls due
-//! (`SigalrmLedger::stop`). An entry that finds another process's probe
-//! reserved waits, with no loss, for a later sweep.
+//! (`SigalrmLedger::stop`), and so does one whose probe's wake is still
+//! filed, ungranted, when the export commits (`SigalrmLedger::marked_wake`).
+//! An entry that finds another process's probe reserved waits, with no loss,
+//! for a later sweep.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -174,16 +176,51 @@ pub(crate) struct SigalrmLedger {
     /// (`SigalrmControl::ArmProducer`). Never cleared: the producer may fire
     /// at any later time.
     producer_armed: bool,
-    /// The status flags last published for each pipe description
+    /// The status flags last published for each pipe read description
     /// (`SigalrmControl::PublishPipeStatus`): the description's status, which
     /// a process's own copy may not show after a fork (dh-ru056 slice 2,
-    /// review P1-b).
-    pipe_status: BTreeMap<OpenFileId, i32>,
+    /// review P1-b), with the processes that may hold it. An entry lasts
+    /// while any of them does (`PipeStatus::holders`).
+    pipe_status: BTreeMap<OpenFileId, PipeStatus>,
+    /// The thread whose filed request is the signal wake a no-progress probe
+    /// substituted (`act_on_sigalrm_reserved_poll`) for a polled pipe read
+    /// that relied on guest-held marks, until that wake is granted or
+    /// replaced (`end_sigalrm_polling_wait`). The wake request names neither
+    /// the read nor its descriptor, so this is what tells the sweep that the
+    /// wake's final attempt still rests on those marks (review of 29b3e6a8,
+    /// finding 2).
+    marked_wake: Option<DetTid>,
     /// The named refusal that ends the run before the next selection, set
     /// when a due entry finds an admitted pipe read whose guest-held
     /// authority was revoked while it waited (`act_on_pending_sigalrm`,
     /// review P1-a). Taken by the turn loop (`take_sigalrm_stop`).
     stop: Option<String>,
+}
+
+/// The latest status of one pipe read description (`SigalrmLedger::pipe_status`).
+#[derive(Debug, Default)]
+struct PipeStatus {
+    /// Its status flags, as the last process to set them published.
+    flags: i32,
+    /// Whether its status can no longer be followed: it may have left a
+    /// process over `SCM_RIGHTS` (`SigalrmControl::UntrackPipeStatus`), or a
+    /// change was published without the serial grant. Every copy then
+    /// differs (`SigalrmControl::PipeStatusDiffers`).
+    untracked: bool,
+    /// The processes that may hold the description: its creator, which
+    /// publishes it at the `pipe2` that made it, each process a holder's fork
+    /// creates (`Scheduler::sigalrm_process_created`), and any later
+    /// publisher. A holder leaves at the close of its last descriptor of it
+    /// (`Scheduler::release_pipe_status`, from the release Detcore sends for
+    /// every description's last local reference) or at its retirement
+    /// (`Scheduler::retire_sigalrm_thread`), and the entry goes with the last
+    /// one, so the ledger keeps only descriptions some process may still read
+    /// while a copy another process changed stays visible to every alias
+    /// (review of 29b3e6a8, finding 3). A process that receives the
+    /// description over `SCM_RIGHTS` is not counted until it publishes, which
+    /// is sound because that send revoked guest-held marks first, and phase 1
+    /// admits no read once they are revoked.
+    holders: BTreeSet<DetPid>,
 }
 
 impl Scheduler {
@@ -260,7 +297,20 @@ impl Scheduler {
                 return false;
             }
             SigalrmControl::PublishPipeStatus { id, flags } => {
-                self.sigalrm.pipe_status.insert(id, flags);
+                // A change published without the serial grant, while a
+                // process handles SIGALRM, was recorded at a moment the host
+                // chose: fail closed rather than keep it as the latest.
+                let untimed = !self.sigalrm.handled.is_empty() && !self.holds_serial_grant(thread);
+                let status = self.sigalrm.pipe_status.entry(id).or_default();
+                status.flags = flags;
+                status.untracked |= untimed;
+                status.holders.insert(process);
+                return false;
+            }
+            SigalrmControl::UntrackPipeStatus { id } => {
+                let status = self.sigalrm.pipe_status.entry(id).or_default();
+                status.untracked = true;
+                status.holders.insert(process);
                 return false;
             }
             SigalrmControl::DeliveryLost => {
@@ -315,7 +365,7 @@ impl Scheduler {
                     .sigalrm
                     .pipe_status
                     .get(&id)
-                    .is_some_and(|published| *published != flags);
+                    .is_some_and(|published| published.untracked || published.flags != flags);
             }
             SigalrmControl::TakeEntry => {
                 let taken = self.take_sigalrm(process, thread);
@@ -365,6 +415,7 @@ impl Scheduler {
             | SigalrmControl::EntryDeliveryUnfaithful
             | SigalrmControl::GuestHeldMarksRevoked
             | SigalrmControl::PublishPipeStatus { .. }
+            | SigalrmControl::UntrackPipeStatus { .. }
             | SigalrmControl::PipeStatusDiffers { .. } => unreachable!("answered above"),
             SigalrmControl::ArmRecurringTimer => {
                 self.sigalrm.handled.contains(&self.sigchld_process(thread))
@@ -707,6 +758,15 @@ impl Scheduler {
             ReservedProbeOutcome::NoProgressRetry => {
                 let taken = self.take_sigalrm_reserved_poll();
                 debug_assert_eq!(taken, Some(reserved));
+                // Whether the read's readiness rested on guest-held marks,
+                // read from the retry before the wake replaces it.
+                let relies_on_marks = self
+                    .next_turns
+                    .get(&reserved.target)
+                    .and_then(|turn| turn.req.try_read())
+                    .is_some_and(|request| {
+                        request.is_ok_and(|request| request.relies_on_guest_held_marks)
+                    });
                 // The successor retry is still queued (filed by
                 // the probe's syscall pass or the harness);
                 // dequeue it so force-unblock's requeue is its
@@ -729,6 +789,12 @@ impl Scheduler {
                     requeued,
                     "the no-progress wake requeues the reserved probe's thread"
                 );
+                // The wake's grant makes the read's final attempt, which
+                // still rests on those marks: an export committed before that
+                // grant stops the run (`act_on_pending_sigalrm`).
+                if requeued && relies_on_marks {
+                    self.sigalrm.marked_wake = Some(reserved.target);
+                }
             }
             ReservedProbeOutcome::Completed => {
                 let taken = self.take_sigalrm_reserved_poll();
@@ -804,6 +870,9 @@ impl Scheduler {
     /// substituted.
     pub(crate) fn end_sigalrm_polling_wait(&mut self, thread: DetTid) {
         self.sigalrm.polling.remove(&thread);
+        if self.sigalrm.marked_wake == Some(thread) {
+            self.sigalrm.marked_wake = None;
+        }
     }
 
     /// A retry of an `InternalIOPolling` operation after EAGAIN.
@@ -916,11 +985,62 @@ impl Scheduler {
         if self.sigalrm.reserved_poll.map(|r| r.target) == Some(thread) {
             let _ = self.take_sigalrm_reserved_poll();
         }
+        if self.sigalrm.marked_wake == Some(thread) {
+            self.sigalrm.marked_wake = None;
+        }
         if thread.as_raw() == process.as_raw() {
             self.sigalrm.handled.remove(&process);
             self.sigalrm.pending.remove(&process);
             self.sigalrm.lost.remove(&process);
+            // A retired process holds no descriptor.
+            self.sigalrm.pipe_status.retain(|_, status| {
+                status.holders.remove(&process);
+                !status.holders.is_empty()
+            });
         }
+    }
+
+    /// `child`, a new process, was created by `creator`'s thread: it holds a
+    /// copy of every descriptor its creator's process holds, as Linux's fork
+    /// copies the table (`dup_fd`), so it may hold every pipe description
+    /// that process may hold (`PipeStatus::holders`).
+    pub(crate) fn sigalrm_process_created(&mut self, creator: DetTid, child: DetPid) {
+        let parent = self.sigchld_process(creator);
+        for status in self.sigalrm.pipe_status.values_mut() {
+            if status.holders.contains(&parent) {
+                status.holders.insert(child);
+            }
+        }
+    }
+
+    /// `thread`'s process closed its last descriptor of open file description
+    /// `id` (the release Detcore sends for a description's last local
+    /// reference, `GlobalRequest::ReleasePort`): it no longer holds that
+    /// description, and a pipe status no process holds is forgotten.
+    pub(crate) fn release_pipe_status(&mut self, thread: DetTid, id: OpenFileId) {
+        let process = self.sigchld_process(thread);
+        if let Some(status) = self.sigalrm.pipe_status.get_mut(&id) {
+            status.holders.remove(&process);
+            if status.holders.is_empty() {
+                self.sigalrm.pipe_status.remove(&id);
+            }
+        }
+    }
+
+    /// The processes that may hold pipe description `id`, while its status is
+    /// recorded.
+    #[cfg(test)]
+    pub(crate) fn pipe_status_holders(&self, id: OpenFileId) -> Option<Vec<DetPid>> {
+        self.sigalrm
+            .pipe_status
+            .get(&id)
+            .map(|status| status.holders.iter().copied().collect())
+    }
+
+    /// How many pipe descriptions have a recorded status.
+    #[cfg(test)]
+    pub(crate) fn pipe_status_len(&self) -> usize {
+        self.sigalrm.pipe_status.len()
     }
 
     /// Wakes, reports or leaves `process`'s pending entry according to where its
@@ -944,6 +1064,17 @@ impl Scheduler {
                 return;
             }
         }
+        if self.guest_held_marks_revoked && self.sigalrm.marked_wake == Some(thread) {
+            // A no-progress probe of a read admitted on guest-held marks was
+            // replaced by the signal wake, whose grant makes the read's final
+            // attempt; the wake is not placed, so a better band could run
+            // first, and its export has revoked the marks that attempt rests
+            // on. Whether it finds data or returns EINTR may now depend on a
+            // process outside the guest: stop the run by name before the wake
+            // is granted (review of 29b3e6a8, finding 2).
+            self.stop_for_revoked_authority(thread);
+            return;
+        }
         if !matches!(self.thread_status(thread), ThreadStatus::NotRunning) {
             if self.sigalrm_reserved_poll_target() == Some(thread) {
                 // Outstanding reservation: the probe has not yet
@@ -960,14 +1091,7 @@ impl Scheduler {
                     // the read here; leaving it to wait, with only a loss
                     // recorded, could hold it until data or forever. Stop the
                     // run by name instead (dh-ru056 slice 2, review P1-a).
-                    if self.sigalrm.stop.is_none() {
-                        let refusal =
-                            crate::refused_signal_controls::sigalrm_pipe_authority_revoked_refusal(
-                                thread.as_raw(),
-                            );
-                        tracing::error!("[sched] {}", refusal);
-                        self.sigalrm.stop = Some(refusal);
-                    }
+                    self.stop_for_revoked_authority(thread);
                     return;
                 }
                 if self.sigalrm.reserved_poll.is_some() {
@@ -1032,6 +1156,24 @@ impl Scheduler {
                                 .contains_key(&ResourceID::InternalIOPolling)
                     })
                 })
+    }
+
+    /// Sets the run's named stop for `thread`'s pipe read, whose guest-held
+    /// authority was revoked, unless a stop is already set.
+    fn stop_for_revoked_authority(&mut self, thread: DetTid) {
+        if self.sigalrm.stop.is_none() {
+            let refusal = crate::refused_signal_controls::sigalrm_pipe_authority_revoked_refusal(
+                thread.as_raw(),
+            );
+            tracing::error!("[sched] {}", refusal);
+            self.sigalrm.stop = Some(refusal);
+        }
+    }
+
+    /// Whether a due entry set a named refusal for the run that the turn
+    /// loop has not taken yet (`take_sigalrm_stop`).
+    pub(crate) fn sigalrm_stop_pending(&self) -> bool {
+        self.sigalrm.stop.is_some()
     }
 
     /// Takes the named refusal a due entry set for the run

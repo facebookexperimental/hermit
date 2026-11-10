@@ -6552,7 +6552,11 @@ impl GlobalState {
                 R::AddUsedPort
             }
             GlobalRequest::ReleasePort(open_file_id) => {
-                let _sched = self.lock_rpc_scheduler(false).await;
+                let mut sched = self.lock_rpc_scheduler(false).await;
+                // The sender closed its last descriptor of the description:
+                // it no longer holds a pipe status there either
+                // (dh-ru056 slice 2, review of 29b3e6a8, finding 3).
+                sched.release_pipe_status(dtid, open_file_id);
                 R::ReleasePort(self.release_port(open_file_id))
             }
         };
@@ -7063,6 +7067,7 @@ impl GlobalState {
                 sched.work_span_note_spawn(parent_dettid, child_dettid);
                 if is_group_leader && flags.is_some() {
                     sched.post_crash_process_created(parent_dettid, child_dettid);
+                    sched.sigalrm_process_created(parent_dettid, child_dettid);
                 }
                 if is_group_leader {
                     sched.forget_previous_process_exit(child_dettid);
@@ -8481,6 +8486,17 @@ pub enum SigalrmControl {
         /// The caller's copy of its status flags.
         flags: i32,
     },
+    /// Records that pipe description `id` may leave the caller's process
+    /// over `SCM_RIGHTS`. A receiver where Detcore runs in each guest
+    /// process models the descriptor it receives as a description of its
+    /// own, so a status change it makes is published under another identity;
+    /// from then on [`SigalrmControl::PipeStatusDiffers`] says `id`'s status
+    /// may differ from any copy (finding 1 of coord7's review of 29b3e6a8).
+    /// Never refused.
+    UntrackPipeStatus {
+        /// The pipe's open file description.
+        id: crate::types::OpenFileId,
+    },
 }
 
 /// Messages to the global object.
@@ -8507,8 +8523,9 @@ pub enum SignalScope {
 /// fails until it does). That test digests the two enums' bodies,
 /// `Resources` and the types it carries from resources.rs, the
 /// StoreExclusive payload's types, the scheduled event
-/// and trace reply `TraceSchedEvent` carries, and the nested
-/// `HostFileIdentity`, and refuses a revision whose digests did not change, so no
+/// and trace reply `TraceSchedEvent` carries, the nested
+/// `HostFileIdentity`, and the `SigalrmControl` that `GlobalRequest::Sigalrm`
+/// carries, and refuses a revision whose digests did not change, so no
 /// revision can be appended by hand. A change to another payload type defined
 /// elsewhere (`CommittedSendWindow`, `PlaceholderDirectory`, ...) changes what
 /// is on the wire without changing the digest, so it must either keep every
@@ -8574,8 +8591,15 @@ pub enum SignalScope {
 /// `Resources` carries from resources.rs into the digest. 56 adds the
 /// wait-mask lifetime requests (`BeginWaitMask`, `EndWaitMask`,
 /// `WithdrawWaitMask`, `PopDeliveryMask`) and `DeliveryEntry` of
-/// https://github.com/rrnewton/hermit/pull/5259 and is current.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 56;
+/// https://github.com/rrnewton/hermit/pull/5259.
+/// 57 brings
+/// `SigalrmControl` into the digest, after dh-ru056 slice 2 appended
+/// `GuestHeldMarksRevoked`, `PublishPipeStatus` and `PipeStatusDiffers` to
+/// it: the in-guest runtimes send those controls, so the append rule above
+/// does not cover them (finding 1 of rev5338-cx's review of 29b3e6a8,
+/// finding 2 of coord7's; 56 on its first rebase, 57 at its rebase onto
+/// main's 56); it is current.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 57;
 
 /// A guest thread's descriptor table, which `GlobalRequest::HoldTable`
 /// carries to the global state, for the terminal receipt of a death by a
@@ -16730,6 +16754,7 @@ mod tests {
     mod gated_wait_turn_tests;
     mod guest_mask_publication_tests;
     mod other_process_procfs_tests;
+    mod pipe_status_retention_tests;
     mod priority_custody_tests;
     mod replay_departure_tests;
     mod replay_departure_transport;
@@ -19663,7 +19688,9 @@ mod tests {
 
         // The run's own facts, each read from the tool's configuration
         // (`ProcessFacts`), each refusing an otherwise admitted read: record
-        // or replay (ruling C1.4) and schedule replay (review P2).
+        // or replay (ruling C1.4), schedule replay (review P2 of 8871d444)
+        // and the schedule recording such a replay replays (finding 3 of
+        // coord7's review of 29b3e6a8).
         for (case, edit) in [
             (
                 "record-replay",
@@ -19671,6 +19698,9 @@ mod tests {
             ),
             ("schedule-replay", |c: &mut Config| {
                 c.replay_schedule_from = Some("/nonexistent/schedule".into())
+            }),
+            ("schedule-recording", |c: &mut Config| {
+                c.record_preemptions = true
             }),
         ] {
             let mut run = config.clone();
@@ -19724,6 +19754,23 @@ mod tests {
         );
         ledger_questions(&guest);
 
+        // A description that left a process over SCM_RIGHTS, whose
+        // receiver's copy the ledger cannot follow, refuses the read whatever
+        // this copy says (finding 1 of coord7's review of 29b3e6a8).
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .sigalrm_control(tid, SigalrmControl::UntrackPipeStatus { id: held_id });
+        assert_eq!(
+            tool.sigalrm_phase1_gate(&mut guest, raw(Sysno::read, HELD))
+                .await,
+            refused,
+            "status untracked"
+        );
+        assert_eq!(guest.thread.sigalrm_admitted_pipe_read, None);
+        ledger_questions(&guest);
+
         // A descriptor the caller passed out and has not yet reported
         // revokes the marks with no RPC; once reported, the scheduler's
         // run-wide record does (review P1-a).
@@ -19762,6 +19809,7 @@ mod tests {
             refused,
             "exported"
         );
+        assert!(ledger_questions(&guest).is_empty(), "exported: no RPC");
     }
 
     /// Review P1-a of 8871d444 (the reviewer's export-witness-v2, through the
@@ -19901,6 +19949,137 @@ mod tests {
             "refused through the scheduler's record"
         );
         assert_eq!(guest.thread.sigalrm_admitted_pipe_read, None);
+    }
+
+    /// Finding 1 of coord7's review of 29b3e6a8, through the helper both send
+    /// handlers call before the export is noted
+    /// (`Detcore::untrack_sent_pipe_status`, then
+    /// `Detcore::note_descriptors_passed_out`) and a real SCM_RIGHTS send: a
+    /// pipe's read end sent over a guest-held socketpair revokes no mark, but
+    /// its receiver, whose Detcore runs in its own process, would publish a
+    /// status change under an identity of its own. The sent description's
+    /// status becomes untracked in the scheduler's ledger, so phase 1's gate
+    /// refuses a read of it from then on, while another pipe's read end, not
+    /// sent, is still admitted. Mutation "the send leaves the status
+    /// tracked": the sent end's read is admitted.
+    #[tokio::test]
+    async fn a_guest_held_channel_send_untracks_the_sent_pipe_status() {
+        use std::os::unix::net::UnixStream;
+
+        use nix::fcntl::OFlag;
+        use reverie::Tool;
+
+        use crate::fd::FdType;
+
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        }
+        .with_backend(|backend| {
+            backend.needs_killed_thread_rpc_cancellation = true;
+            backend.virtualizes_guest_sigalrm = true;
+        });
+        let (config, state, tid, pid) = cancellation_test_state_with_config(config);
+        install_test_registration(&state, tid, Ivar::new());
+        let tool: Detcore = Detcore::new(Tid::from_raw(tid.as_raw()), &config);
+        let mut thread = tool.init_thread_state(Tid::from_raw(tid.as_raw()), None);
+        thread.detpid = Some(pid);
+        let mut guest = RetirementGuest {
+            global: &state,
+            config: &config,
+            thread,
+            requests: Mutex::new(Vec::new()),
+            retired: std::sync::atomic::AtomicBool::new(false),
+            hold_private_memory_publication: false,
+            local_memory: true,
+        };
+        let (sent_reader, _sent_writer) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
+        let (kept_reader, _kept_writer) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
+        let (channel, _peer) = UnixStream::pair().unwrap();
+        let sent_fd = sent_reader.as_raw_fd();
+        let kept_fd = kept_reader.as_raw_fd();
+        let channel_fd = channel.as_raw_fd();
+        for (fd, flags, ty) in [
+            (sent_fd, OFlag::O_RDONLY, FdType::Pipe),
+            (kept_fd, OFlag::O_RDONLY, FdType::Pipe),
+            (channel_fd, OFlag::O_RDWR, FdType::Socket),
+        ] {
+            guest.thread.add_fd(fd, flags, ty, None).unwrap();
+            guest
+                .thread
+                .with_detfd(fd, |detfd| {
+                    detfd.set_guest_held();
+                    if ty == FdType::Pipe {
+                        detfd.set_physically_nonblocking();
+                    }
+                })
+                .unwrap();
+        }
+        let read =
+            |fd: i32| reverie::syscalls::Syscall::Read(reverie::syscalls::Read::new().with_fd(fd));
+        guest.thread.sigalrm_handled = true;
+        for fd in [sent_fd, kept_fd] {
+            assert_eq!(
+                tool.sigalrm_phase1_gate(&mut guest, read(fd)).await,
+                None,
+                "the control: fd {fd} admitted before the send"
+            );
+        }
+        guest.thread.sigalrm_handled = false;
+
+        let mut control = [0_u64; 3];
+        let mut byte = b'x';
+        let mut iov = libc::iovec {
+            iov_base: (&raw mut byte).cast(),
+            iov_len: 1,
+        };
+        // SAFETY: a plain C struct, all zero.
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &raw mut iov;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = std::mem::size_of_val(&control);
+        // SAFETY: the control buffer holds one SCM_RIGHTS header and its fd.
+        unsafe {
+            let cmsg = message.msg_control.cast::<libc::cmsghdr>();
+            (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as usize;
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<i32>(), sent_fd);
+        }
+        let headers = [(&raw const message) as usize];
+        tool.untrack_sent_pipe_status(&mut guest, &headers, false)
+            .await;
+        Detcore::note_descriptors_passed_out(&mut guest, channel_fd, &headers, false);
+        assert!(
+            !guest.thread.passed_descriptors_out_unreported,
+            "a guest-held channel revokes no mark"
+        );
+        // SAFETY: the message and its buffers live to the end of the call.
+        assert_eq!(
+            unsafe { libc::sendmsg(channel_fd, &raw const message, libc::MSG_DONTWAIT) },
+            1
+        );
+        assert!(
+            !state
+                .sched
+                .lock()
+                .unwrap()
+                .guest_held_marks_revoked_for_test()
+        );
+
+        guest.thread.sigalrm_handled = true;
+        assert_eq!(
+            tool.sigalrm_phase1_gate(&mut guest, read(sent_fd)).await,
+            Some(nix::errno::Errno::EOPNOTSUPP),
+            "the sent description's status is no longer followed"
+        );
+        assert_eq!(guest.thread.sigalrm_admitted_pipe_read, None);
+        assert_eq!(
+            tool.sigalrm_phase1_gate(&mut guest, read(kept_fd)).await,
+            None,
+            "a description not sent is still admitted"
+        );
     }
 
     /// While any process handles SIGALRM, a file lease is refused before the

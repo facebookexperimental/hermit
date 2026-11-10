@@ -15490,22 +15490,30 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(result)
     }
 
-    /// After a guest's `F_SETFL` or `FIONBIO` on descriptor `fd`, where the
-    /// runtime virtualizes SIGALRM: a pipe description's status flags, as the
-    /// caller's process now holds them, go to the scheduler's SIGALRM ledger
-    /// (`SigalrmControl::PublishPipeStatus`). Such a backend runs Detcore in
-    /// each guest process and copies a description's model at a fork, while
-    /// Linux's processes share one `struct file` whose flags `setfl` changes
-    /// for all of them
+    /// After a guest's `pipe2`, `F_SETFL` or `FIONBIO` on descriptor `fd`,
+    /// where the runtime virtualizes SIGALRM: a pipe read description's status
+    /// flags, as the caller's process now holds them, go to the scheduler's
+    /// SIGALRM ledger (`SigalrmControl::PublishPipeStatus`). Such a backend
+    /// runs Detcore in each guest process and copies a description's model at
+    /// a fork, while Linux's processes share one `struct file` whose flags
+    /// `setfl` changes for all of them
     /// (<https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/fcntl.c?h=v6.12#n40>),
     /// so signal phase 1 admits a pipe read only where the reader's copy is
-    /// the description's latest status (dh-ru056 slice 2, review P1-b).
+    /// the description's latest status (dh-ru056 slice 2, review P1-b). The
+    /// publication at `pipe2` names the creator as the description's first
+    /// holder, which the ledger's record of holders starts from (review of
+    /// 29b3e6a8, finding 3). A write end is never read, so only a read end is
+    /// published. Only where phase 1's gate can admit a pipe read does the
+    /// ledger's record matter: a runtime that virtualizes a guest SIGALRM
+    /// handler, with sequentialized threads, the guard below.
     async fn publish_pipe_status<G: Guest<Self>>(&self, guest: &mut G, fd: RawFd) {
         if !(self.cfg.backend.virtualizes_guest_sigalrm && self.cfg.sequentialize_threads) {
             return;
         }
         let Ok(Some((id, flags))) = guest.thread_state().with_detfd(fd, |detfd| {
-            (detfd.ty() == FdType::Pipe).then(|| (detfd.open_file_id(), detfd.status_flags()))
+            let flags = detfd.status_flags();
+            (detfd.ty() == FdType::Pipe && flags & libc::O_ACCMODE != libc::O_WRONLY)
+                .then(|| (detfd.open_file_id(), flags))
         }) else {
             return;
         };
@@ -16879,6 +16887,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .thread_state()
                     .with_detfd(fd, |detfd| detfd.set_guest_held())?;
             }
+            // The read end's first status, which makes this process the
+            // first of the description's holders in the SIGALRM ledger
+            // (`publish_pipe_status`).
+            self.publish_pipe_status(guest, fds[0]).await;
             if internally_nonblocking {
                 self.maybe_set_nonblocking_fd(guest, fds[0]);
                 self.maybe_set_nonblocking_fd(guest, fds[1]);

@@ -410,6 +410,14 @@ mod tests {
         // its old base, renumbered to 56 at this rebase onto main's 55;
         // digest measured at this head).
         (56, "5f56003386aa361d", "f8b1309588141fd0"),
+        // Brings `SigalrmControl`, which `GlobalRequest::Sigalrm` carries and
+        // the in-guest runtimes send, into the digest (domain 10), after
+        // dh-ru056 slice 2 appended `GuestHeldMarksRevoked`,
+        // `PublishPipeStatus` and `PipeStatusDiffers` to it (finding 1 of the
+        // review of 29b3e6a8; finding 2 of coord7's). 55 on its own base, 56 at
+        // its rebase onto main's 55, and 57 at its rebase onto main's 56
+        // (https://github.com/rrnewton/hermit/pull/5259). Digest measured at this head.
+        (57, "09e838f3168a14bf", "f8b1309588141fd0"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -493,6 +501,14 @@ mod tests {
     /// tool_global.rs.
     const EXEC_STRINGS_WIRE: [&str; 1] = ["pub struct ExecStrings {"];
 
+    /// The control `GlobalRequest::Sigalrm` carries, in tool_global.rs. The
+    /// in-guest runtimes, the peers built apart from their coordinator, send
+    /// it, so a variant one side lacks fails to decode in the middle of a run
+    /// (or, from an older runtime, leaves a guard unasked). Its variants and
+    /// their fields are digested as the enums' own are (dh-ru056 slice 2,
+    /// finding 1 of the review of 29b3e6a8).
+    const SIGALRM_CONTROL_WIRE: [&str; 1] = ["pub enum SigalrmControl {"];
+
     /// The lines of code of the item `source` declares, unindented, on the
     /// line `header`: the attributes just above it (its derives and serde
     /// attributes decide its encoding), the header, and its body through
@@ -537,9 +553,9 @@ mod tests {
     /// scheduled event's wire items in `schedule`, of the trace reply's
     /// wire items in `source` and `replayer`, of the nested wire types
     /// in `host_input` (`HOST_INPUT_WIRE`), of 2b-1's payload types in
-    /// `source` and `task_stat`, and of 2b-3's in `source`: their variants,
-    /// fields, payload types, order
-    /// and attributes, not their documentation.
+    /// `source` and `task_stat`, of 2b-3's in `source`, and of the SIGALRM
+    /// control in `source` (`SIGALRM_CONTROL_WIRE`): their variants, fields,
+    /// payload types, order and attributes, not their documentation.
     fn definition_digest(
         source: &str,
         payload: &str,
@@ -568,6 +584,7 @@ mod tests {
         ]
         .join("\n");
         let exec_strings = wire_items(source, &EXEC_STRINGS_WIRE);
+        let sigalrm_control = wire_items(source, &SIGALRM_CONTROL_WIRE);
         fnv_domains(&[
             (0, request.as_bytes()),
             (1, response.as_bytes()),
@@ -577,6 +594,7 @@ mod tests {
             (6, nested.as_bytes()),
             (7, procfs.as_bytes()),
             (8, exec_strings.as_bytes()),
+            (10, sigalrm_control.as_bytes()),
         ])
     }
 
@@ -945,6 +963,48 @@ mod tests {
             digest
         );
 
+        // And the SIGALRM control: a variant appended, or a field of one
+        // retyped, changes the digest; a doc line does not.
+        let appended = source.replacen(
+            "    PipeStatusDiffers {\n",
+            "    Added(u32),\n    PipeStatusDiffers {\n",
+            1,
+        );
+        assert_ne!(appended, source);
+        assert_ne!(
+            definition_digest(
+                &appended, payload, schedule, replayer, host_input, task_stat
+            ),
+            digest
+        );
+        let retyped = source.replacen(
+            "pub enum SigalrmControl {\n",
+            "pub enum SigalrmControl {\n    Retyped(u64),\n",
+            1,
+        );
+        assert_ne!(retyped, source);
+        assert_ne!(
+            definition_digest(&retyped, payload, schedule, replayer, host_input, task_stat),
+            digest
+        );
+        let documented = source.replacen(
+            "pub enum SigalrmControl {\n",
+            "pub enum SigalrmControl {\n    /// Documentation only.\n",
+            1,
+        );
+        assert_ne!(documented, source);
+        assert_eq!(
+            definition_digest(
+                &documented,
+                payload,
+                schedule,
+                replayer,
+                host_input,
+                task_stat
+            ),
+            digest
+        );
+
         // The reply this change extends is covered the same way: a field
         // added to `TraceSchedEventResponse`, or its backstop removed,
         // changes the digest (domain 5); the positional response a runtime
@@ -1024,6 +1084,45 @@ mod tests {
         assert!(
             mismatch.contains(&ours) && mismatch.contains(&other),
             "{mismatch}"
+        );
+    }
+
+    /// A runtime built at revision 54 (the slice-2 branch at 29b3e6a8, whose
+    /// `SigalrmControl` already had the `GuestHeldMarksRevoked`,
+    /// `PublishPipeStatus` and `PipeStatusDiffers` controls) or at 55 (main
+    /// without slice 2, which lacks them) is refused by name before it
+    /// decodes anything: its configuration fingerprint is this build's, so
+    /// only the revision tells the pair apart (finding 1 of rev5338-cx's
+    /// review of 29b3e6a8, finding 2 of coord7's). The in-guest runtime makes
+    /// this comparison before it decodes its coordinator's configuration
+    /// (`detcore_liteinst::initialize_detcore`).
+    #[test]
+    fn a_runtime_from_before_the_slice_2_sigalrm_controls_is_refused() {
+        let model = detcore_model::config::config_wire_fingerprint();
+        for revision in [54, 55] {
+            let before = fingerprint_with_revision(&model, revision);
+            let mismatch = config_fingerprint_mismatch(std::ffi::OsStr::new(&before))
+                .unwrap_or_else(|| panic!("a revision-{revision} runtime is refused"));
+            assert!(
+                mismatch.contains(&before) && mismatch.contains(&config_wire_fingerprint()),
+                "{mismatch}"
+            );
+        }
+        let row = GLOBAL_RPC_REVISIONS
+            .iter()
+            .find(|(revision, _, _)| *revision == 55)
+            .expect("revision 55 is recorded");
+        let digest = definition_digest(
+            include_str!("tool_global.rs"),
+            include_str!("store_exclusive.rs"),
+            detcore_model::SCHEDULE_RS_SOURCE,
+            include_str!("scheduler/replayer.rs"),
+            detcore_model::HOST_INPUT_RS_SOURCE,
+            include_str!("procfs/task_stat.rs"),
+        );
+        assert_ne!(
+            digest, row.1,
+            "the wire definitions differ from revision 55's, whose digest did not see the controls"
         );
     }
 }

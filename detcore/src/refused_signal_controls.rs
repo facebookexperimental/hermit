@@ -322,18 +322,48 @@ pub(crate) fn sigalrm_pipe_authority_revoked_refusal(reader: i32) -> String {
 }
 
 /// The run-wide stopping refusal for a pipe read signal phase 1 admitted that
-/// finished while the pipe description's status flags, as another process
-/// last set them after a fork, differ from the reader's copy (dev-hermit
-/// dh-ru056 slice 2, review P1-b). Linux's `pipe_read` tests the shared
-/// `O_NONBLOCK` again whenever its wait ends with the pipe still empty and a
-/// writer present, so the result the reader's copy decided may not be
-/// Linux's. Fail closed.
+/// finished while the pipe description's status flags may differ from the
+/// reader's copy: another process published a change after a fork, or the
+/// description left a process over `SCM_RIGHTS`, whose receiver's copy
+/// Detcore cannot follow (dev-hermit dh-ru056 slice 2, review P1-b of
+/// 8871d444, finding 1 of coord7's review of 29b3e6a8).
+///
+/// A deliberate over-refusal: it is stricter than Linux in every case it
+/// fires. The read's end is a SIGALRM wake, data or end of file. An
+/// interrupted wait returns -ERESTARTSYS before any `O_NONBLOCK` test, so
+/// EINTR after a non-`SA_RESTART` handler; data and end of file are returned
+/// before that test too (`pipe_read`, fs/pipe.c at v6.12, lines 352-356 and
+/// 390-391,
+/// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/pipe.c?h=v6.12#n352>).
+/// The stop withholds a result Linux could give rather than reason about
+/// which copy of the status decided the wait (museli-lt's requirement (ii)
+/// for slice 2).
 pub(crate) fn sigalrm_pipe_status_diverged_refusal(call: &str, caller: i32) -> String {
     format!(
         "hermit refused to continue the run (HERMIT_SIGALRM_PIPE_STATUS_DIVERGED): {call} in \
          thread {caller} was admitted by signal phase 1 on a pipe whose status flags another \
-         process changed after a fork while it waited, which this process's copy of the \
-         description does not show (dev-hermit dh-ru056 slice 2)."
+         process may have changed while it waited, through a copy of the description that a \
+         fork or SCM_RIGHTS made, which this process's copy of the description does not show \
+         (dev-hermit dh-ru056 slice 2)."
+    )
+}
+
+/// The run-wide stopping refusal for a pipe read signal phase 1 admitted on
+/// guest-held marks, ending with its process's SIGALRM due after a
+/// descriptor export revoked those marks before its last attempt: the
+/// attempt a no-progress probe's wake makes, or one that found data
+/// (dev-hermit dh-ru056 slice 2, finding 2 of rev5338-cx's review of
+/// 29b3e6a8). Whether that attempt found data or returned the wake's EINTR
+/// may then have depended on a process outside the guest. The scheduler
+/// stops such a read before its wake is granted
+/// ([`sigalrm_pipe_authority_revoked_refusal`]); this is the read's own end.
+/// Fail closed.
+pub(crate) fn sigalrm_pipe_authority_revoked_at_end_refusal(call: &str, caller: i32) -> String {
+    format!(
+        "hermit refused to continue the run (HERMIT_SIGALRM_PIPE_AUTHORITY_REVOKED): {call} in \
+         thread {caller} was admitted by signal phase 1 because only guests held the pipe, and \
+         it ended with a SIGALRM due after a descriptor had left the guest, so its result may \
+         depend on a process outside the guest (dev-hermit dh-ru056 slice 2)."
     )
 }
 

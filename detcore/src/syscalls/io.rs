@@ -5002,6 +5002,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         // descriptor can reach another process.
         Box::pin(self.share_sent_record_sequences(guest, &headers)).await;
         let in_turn = self.completes_in_turn(guest, call);
+        self.untrack_sent_pipe_status(guest, &headers, outside_turn)
+            .await;
         if outside_turn || !sent_descriptors(guest, &headers).0.is_empty() {
             Self::note_descriptors_passed_out(guest, call.fd(), &headers, outside_turn);
         }
@@ -5093,6 +5095,48 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await?;
         guest.thread_state_mut().send_inspection = Some(inspection);
         Ok((copies, outside_turn))
+    }
+
+    /// Before a send that may pass descriptors over `SCM_RIGHTS`, where the
+    /// runtime virtualizes SIGALRM: each pipe read description it may pass
+    /// loses its tracked status in the SIGALRM ledger
+    /// (`SigalrmControl::UntrackPipeStatus`), whoever receives it. Linux's
+    /// receiver installs the same `struct file`, whose status flags `setfl`
+    /// then changes for every holder
+    /// (<https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/fcntl.c?h=v6.12#n40>),
+    /// but a receiver whose Detcore runs in its own process models the
+    /// descriptor as a description of its own and publishes a change under
+    /// that identity, which no reader of the sender's description would ask
+    /// about. A guest-held channel revokes no mark, so without this a read of
+    /// the sent description could be admitted on a status the receiver has
+    /// changed (finding 1 of coord7's review of 29b3e6a8). Control data
+    /// that cannot be read, or a send outside the caller's turn, may pass
+    /// any descriptor: every pipe read description the table holds loses
+    /// its status then. Sent before the send itself, regardless of its
+    /// result, as the export it accompanies is noted
+    /// (`note_descriptors_passed_out`).
+    pub(crate) async fn untrack_sent_pipe_status<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        headers: &[usize],
+        outside_turn: bool,
+    ) {
+        if !(self.cfg.backend.virtualizes_guest_sigalrm && self.cfg.sequentialize_threads) {
+            return;
+        }
+        let (sent, unread) = sent_descriptors(guest, headers);
+        let ids = if unread || outside_turn {
+            guest.thread_state().pipe_read_descriptions(None)
+        } else {
+            guest.thread_state().pipe_read_descriptions(Some(&sent))
+        };
+        for id in ids {
+            crate::tool_global::sigalrm_refuses(
+                guest,
+                crate::tool_global::SigalrmControl::UntrackPipeStatus { id },
+            )
+            .await;
+        }
     }
 
     /// Note, for the scheduler, that a send on `sockfd` may pass
@@ -5515,6 +5559,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             Err(refusal) => return refusal,
         };
         let in_turn = self.completes_in_turn(guest, call);
+        self.untrack_sent_pipe_status(guest, &headers, outside_turn)
+            .await;
         if outside_turn || !sent_descriptors(guest, &headers).0.is_empty() {
             Self::note_descriptors_passed_out(guest, call.sockfd(), &headers, outside_turn);
         }

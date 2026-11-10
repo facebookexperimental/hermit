@@ -274,6 +274,8 @@ struct TurnGuest {
     take_entry: bool,
     /// What the ledger answers `SigalrmControl::PipeStatusDiffers` with.
     pipe_status_differs: bool,
+    /// What the ledger answers `SigalrmControl::GuestHeldMarksRevoked` with.
+    guest_held_revoked: bool,
     /// Every signal the backend was asked to deliver after a syscall
     /// (`Guest::defer_signal_delivery`), in order.
     deliveries: Vec<i32>,
@@ -445,6 +447,9 @@ impl GlobalRPC<GlobalState> for TurnGuest {
             GlobalRequest::Sigalrm(crate::tool_global::SigalrmControl::PipeStatusDiffers {
                 ..
             }) => GlobalResponse::Sigalrm(self.pipe_status_differs),
+            GlobalRequest::Sigalrm(crate::tool_global::SigalrmControl::GuestHeldMarksRevoked) => {
+                GlobalResponse::Sigalrm(self.guest_held_revoked)
+            }
             GlobalRequest::Sigalrm(_) => GlobalResponse::Sigalrm(false),
             GlobalRequest::PendingRealTimeExpirations(_) => {
                 GlobalResponse::PendingRealTimeExpirations(0)
@@ -860,6 +865,7 @@ fn turn_guest(gate: bool, own_mask: Option<u64>) -> TurnGuest {
         due_after_wake: std::sync::atomic::AtomicBool::new(false),
         take_entry: false,
         pipe_status_differs: false,
+        guest_held_revoked: false,
         deliveries: Vec::new(),
         projected_returns: Mutex::new(Vec::new()),
         sigtimedwait_results: VecDeque::new(),
@@ -3724,6 +3730,80 @@ async fn an_admitted_pipe_read_whose_status_diverged_stops_at_its_end() {
         .await;
     assert!(matches!(res, Ok(1)));
     assert!(guest.rpcs().is_empty(), "{:?}", guest.rpcs());
+}
+
+/// Finding 2 of the review of 29b3e6a8: a pipe read phase 1 admitted on
+/// guest-held marks ends at the restart checkpoint however its last attempt
+/// went, including the attempt the wake of a no-progress probe makes. When a
+/// descriptor has left the guest since (the marks are revoked) and an entry
+/// is due, whether that attempt found data or the wake's EINTR may have
+/// depended on a process outside the guest, so the run stops by name and the
+/// guest never resumes, with the in-guest delivery gate on or off. With no
+/// entry due, or with the marks intact, the result goes on as before; a read
+/// the gate did not admit asks nothing about the marks.
+#[tokio::test]
+async fn an_admitted_pipe_read_whose_marks_were_revoked_stops_at_its_end_while_due() {
+    let id = crate::types::OpenFileId::new(DetPid::from_raw(THREAD.as_raw()), 731);
+    let call = reverie::syscalls::Syscall::Read(reverie::syscalls::Read::new().with_fd(5));
+    for (gate, admitted, revoked, due, res, stops) in [
+        // The wake's attempt found nothing: Linux's EINTR, but the marks it
+        // rested on are gone.
+        (false, true, true, true, Err(Errno::ERESTARTSYS), true),
+        (true, true, true, true, Err(Errno::ERESTARTSYS), true),
+        // The last attempt found data while an entry was due.
+        (false, true, true, true, Ok(1), true),
+        // Nothing raced the read: no entry is due.
+        (false, true, true, false, Ok(1), false),
+        // The marks still count: the wake's EINTR, as before.
+        (false, true, false, true, Err(Errno::ERESTARTSYS), false),
+        // Not admitted by the gate: the marks are not asked about.
+        (false, false, true, true, Err(Errno::ERESTARTSYS), false),
+    ] {
+        let mut guest = turn_guest(gate, Some(0));
+        guest.config.backend.virtualizes_guest_sigalrm = true;
+        guest.thread.sigalrm_handled = true;
+        if admitted {
+            guest.thread.sigalrm_admitted_pipe_read = Some((id, libc::O_RDONLY));
+        }
+        guest.guest_held_revoked = revoked;
+        guest.sigalrm_due = due;
+        let tool = Detcore::new(Pid::from_raw(THREAD.as_raw()), &guest.config);
+        let case = format!("gate={gate} admitted={admitted} revoked={revoked} due={due} {res:?}");
+        let interrupted = matches!(res, Err(Errno::ERESTARTSYS)) && due;
+        let res = res.map_err(Error::from);
+        let unchanged = format!("{res:?}");
+        let end = to_guest_end(tool.sigalrm_restart_checkpoint(&mut guest, &call, res)).await;
+        let asked = guest.rpcs.lock().unwrap().iter().any(|rpc| {
+            matches!(
+                rpc,
+                GlobalRequest::Sigalrm(crate::tool_global::SigalrmControl::GuestHeldMarksRevoked)
+            )
+        });
+        assert_eq!(asked, admitted, "{case}: the marks are asked about");
+        if stops {
+            let ended = end.expect_err("the guest never resumes");
+            assert!(
+                ended.contains("tail-injected exit_group"),
+                "{case}: {ended}"
+            );
+            assert!(
+                filed_stop(&guest, "HERMIT_SIGALRM_PIPE_AUTHORITY_REVOKED"),
+                "{case}"
+            );
+        } else {
+            let resumed = format!("{:?}", end.expect("resumes"));
+            if interrupted {
+                assert_eq!(
+                    resumed,
+                    format!("{:?}", Err::<i64, _>(Error::from(Errno::EINTR))),
+                    "{case}"
+                );
+            } else {
+                assert_eq!(resumed, unchanged, "{case}");
+            }
+            assert!(!filed_stop(&guest, "HERMIT_SIGALRM"), "{case}");
+        }
+    }
 }
 
 /// dev-hermit dh-ru056 slice 2, ruling C2.1 (T2.1): a completion the restart

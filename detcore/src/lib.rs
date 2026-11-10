@@ -1489,7 +1489,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// A pipe read phase 1 admitted also ends here first: the run stops by
     /// name if another process changed the description's status flags while
-    /// it waited (review P1-b of 8871d444).
+    /// it waited (review P1-b of 8871d444), or if a descriptor left the guest
+    /// before its last attempt while an entry is due for it (finding 2 of
+    /// the review of 29b3e6a8).
     ///
     /// Any other result, an entry that is not due, or a process that does not
     /// handle SIGALRM, is returned as it is: a raw `-ERESTARTSYS` goes back to
@@ -1514,22 +1516,47 @@ impl<T: RecordOrReplay> Detcore<T> {
         // A pipe read the gate admitted ends here however its wait ended (a
         // due SIGALRM's probe, data, or the last writer's close). While it
         // waited, another process may have changed the description's status,
-        // which this process's copy does not show, and Linux's `pipe_read`
-        // tests the shared `O_NONBLOCK` whenever its wait ends with the pipe
-        // still empty and a writer present: stop the run by name rather than
-        // return what the stale copy decided (review P1-b).
-        if let Some((id, flags)) = guest.thread_state_mut().sigalrm_admitted_pipe_read.take()
-            && tool_global::sigalrm_refuses(
+        // which this process's copy does not show. Linux returns EINTR, the
+        // data or end of file in each of those cases, before any O_NONBLOCK
+        // test, so the stop is a deliberate over-refusal, stricter than
+        // Linux wherever it fires: it withholds a result rather than reason
+        // about which copy of the status decided the wait (review P1-b,
+        // museli-lt's requirement (ii); finding 6 of coord7's review of
+        // 29b3e6a8; `sigalrm_pipe_status_diverged_refusal`).
+        if let Some((id, flags)) = guest.thread_state_mut().sigalrm_admitted_pipe_read.take() {
+            if tool_global::sigalrm_refuses(
                 guest,
                 tool_global::SigalrmControl::PipeStatusDiffers { id, flags },
             )
             .await
-        {
-            let reason = crate::refused_signal_controls::sigalrm_pipe_status_diverged_refusal(
-                call.number().name(),
-                guest.thread_state().dettid.as_raw(),
-            );
-            self.stop_guest_by_name(guest, reason).await
+            {
+                let reason = crate::refused_signal_controls::sigalrm_pipe_status_diverged_refusal(
+                    call.number().name(),
+                    guest.thread_state().dettid.as_raw(),
+                );
+                self.stop_guest_by_name(guest, reason).await
+            }
+            // The gate admitted the read on guest-held marks. If a descriptor
+            // has left the guest since, at any point up to this read's last
+            // attempt (the wake a no-progress probe substituted included),
+            // and an entry is due, whether that attempt found data or the
+            // wake's EINTR may have depended on a process outside the guest:
+            // stop the run by name rather than return either (review of
+            // 29b3e6a8, finding 2). With no entry due, nothing raced the read.
+            if tool_global::sigalrm_refuses(
+                guest,
+                tool_global::SigalrmControl::GuestHeldMarksRevoked,
+            )
+            .await
+                && tool_global::sigalrm_refuses(guest, tool_global::SigalrmControl::DueEntry).await
+            {
+                let reason =
+                    crate::refused_signal_controls::sigalrm_pipe_authority_revoked_at_end_refusal(
+                        call.number().name(),
+                        guest.thread_state().dettid.as_raw(),
+                    );
+                self.stop_guest_by_name(guest, reason).await
+            }
         }
         if !(self.cfg.backend.virtualizes_guest_sigalrm && guest.thread_state().sigalrm_handled)
             || !matches!(res, Err(Error::Errno(Errno::ERESTARTSYS)))
