@@ -7194,7 +7194,7 @@ mod tests {
         #[cfg(target_arch = "x86_64")]
         assert_eq!(absolute_operands(Sysno::rename), &[0, 1]);
         #[cfg(target_arch = "aarch64")]
-        assert_eq!(absolute_operands(Sysno::renameat), &[0, 1]);
+        assert_eq!(relative_operands(Sysno::renameat), &[(0, 1), (2, 3)]);
         assert_eq!(absolute_operands(Sysno::execve), &[] as &[usize]);
         assert_eq!(absolute_operands(Sysno::read), &[] as &[usize]);
     }
@@ -7539,6 +7539,10 @@ mod tests {
             "an empty path without AT_EMPTY_PATH names nothing"
         );
         // aarch64 number 84 (sync_file_range semantics) takes arg 0 too.
+        // Pin the number so a syscalls-crate renaming cannot silently
+        // change the arm above.
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(Sysno::sync_file_range2.id(), 84);
         #[cfg(target_arch = "aarch64")]
         assert_eq!(
             placeholder_operand(&memory, Sysno::sync_file_range2, &args([3, 0, 0, 0, 0, 0])),

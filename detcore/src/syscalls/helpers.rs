@@ -10217,7 +10217,8 @@ pub(crate) mod kernel_signal_wait_failures {
         let poll_probe = syscalls::Ppoll::new()
             .with_fds(AddrMut::from_raw(address))
             .with_nfds(1)
-            .with_timeout(AddrMut::from_raw(&zero_timeout as *const _ as usize));
+            // NULL timeout: ppoll's equivalent of poll(-1), an infinite wait.
+            .with_timeout(None);
         let result = if generic_fd_entry {
             let tool = Detcore {
                 detpid: guest.thread.detpid.unwrap(),
