@@ -1140,6 +1140,97 @@ fn in_guest_trap_sigalrm_interrupts_a_guest_held_pipe_read_as_ptrace_does() {
     }
 }
 
+/// dev-hermit dh-ru056 slice 2, design D6 (T2.5): record and replay of a
+/// SIGALRM-interrupted pipe read does not apply today, by named refusal.
+/// `hermit record` refuses both in-guest backends, the only ones that
+/// virtualize a guest SIGALRM handler, before any guest runs. Under ptrace,
+/// where the kernel delivers the signal and applies its restart table, the
+/// slice's restart checkpoint (`Detcore::sigalrm_restart_checkpoint`) never
+/// engages: the recorded read finishes with the kernel's `ERESTARTSYS`, which
+/// the checkpoint would have turned into `EINTR`, the guest sees Linux's
+/// result, and the replay matches the recording.
+#[test]
+fn sigalrm_pipe_read_record_is_refused_in_guest_and_untouched_under_ptrace() {
+    use super::kvm_cancellation::bounded_command_with_timeout;
+    use super::kvm_cancellation::bounded_read;
+
+    let _guard = hermit_run_guard();
+    let guest = sigalrm_fixture("liteinst_sigalrm_pipe_read");
+    let eintr = concat!(
+        "read=-1 errno=4 byte=- window=at_alarm hits_at_return=1\n",
+        "frame result_eintr=1 ip_after_syscall=1\n",
+        "read2=1 byte=x window=at_write\n",
+        "child_exit=0\n",
+    );
+    let run = |name: &str, args: &[&str]| {
+        let directory = process_build_root(&format!("sigalrm-pipe-record-{name}"));
+        fs::create_dir_all(&directory).expect("SIGALRM record directory");
+        let data = directory.join("data");
+        let mut command = Command::new(hermit_binary());
+        command
+            .args(args)
+            .arg(format!("--data-dir={}", data.display()))
+            .arg("--")
+            .arg(&guest)
+            .arg("eintr")
+            .env_remove("RUST_LOG")
+            .env_remove("HERMIT_LOG")
+            .env_remove("HERMIT_LOG_FILE")
+            .stdin(Stdio::null());
+        let status =
+            bounded_command_with_timeout(&mut command, &directory, Duration::from_secs(57));
+        let stdout = bounded_read(&directory.join("stdout"), 1024 * 1024);
+        let stderr = bounded_read(&directory.join("stderr"), 64 * 1024 * 1024);
+        (
+            status,
+            String::from_utf8_lossy(&stdout).into_owned(),
+            String::from_utf8_lossy(&stderr).into_owned(),
+        )
+    };
+
+    for backend in ["in-guest-trap", "liteinst"] {
+        let (status, stdout, stderr) = run(
+            backend,
+            &["--log=error", "--backend", backend, "record", "start"],
+        );
+        assert_eq!(status.code(), Some(125), "{backend}: {stderr}");
+        assert!(stdout.is_empty(), "{backend}: no guest ran: {stdout}");
+        let refusal = format!(
+            "the LiteInst preload backend is available only through `hermit --backend {backend} \
+             run`; other subcommands, including `analyze` and `bisect`, do not use the preload \
+             runtime"
+        );
+        assert!(stderr.contains(&refusal), "{backend}: {stderr}");
+    }
+
+    let (status, stdout, stderr) = run("ptrace", &["--log=info", "record", "start"]);
+    assert_eq!(status.code(), Some(0), "ptrace record: {stderr}");
+    assert_eq!(stdout, eintr, "ptrace record");
+    let interrupted = stderr
+        .lines()
+        .filter(|line| line.contains("DETLOG") && line.contains(": read(3, "))
+        .filter(|line| line.contains(", 1) = Err(Errno("))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        interrupted.len(),
+        1,
+        "one interrupted read: {interrupted:?}"
+    );
+    assert!(
+        interrupted[0].contains("= Err(Errno(ERESTARTSYS))"),
+        "the kernel's restart code, not the checkpoint's EINTR: {}",
+        interrupted[0]
+    );
+
+    let (status, stdout, stderr) = run("ptrace-verify", &["record", "--verify"]);
+    assert_eq!(status.code(), Some(0), "ptrace record --verify: {stderr}");
+    assert_eq!(stdout, eintr, "ptrace record --verify");
+    assert!(
+        stderr.contains("Success: replay matched recording."),
+        "ptrace record --verify: {stderr}"
+    );
+}
+
 /// This bridge covers emulated sleeps, not a running process's alarm. The
 /// existing missing-exit check must still refuse an alarm outside the bridge.
 #[test]
