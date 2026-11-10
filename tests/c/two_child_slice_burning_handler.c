@@ -110,8 +110,15 @@ static void on_child(int signo, siginfo_t *info, void *context) {
   (void)context;
   int saved_errno = errno;
   /* Burn CPU in place, past at least one timeslice, before returning:
-   * no syscall, so only a slice boundary can observe this handler. */
-  for (volatile unsigned long i = 0; i < 600000000UL; ++i) {
+   * no syscall, so only a slice boundary can observe this handler. The
+   * loop retires one conditional branch per iteration, and a default
+   * timeslice (200M virtual ns at 10 ns per branch) is about 20M of
+   * them, so 80M iterations span about four slices: a ptrace run of this
+   * guest timer-preempted its creator 5 times inside the first handler.
+   * The CLI test runs this guest seven times, two handlers each; with
+   * 600M iterations (about thirty slices) it used 39-54 CPU seconds
+   * against its 22-second budget, and with 80M about 7. */
+  for (volatile unsigned long i = 0; i < 80000000UL; ++i) {
   }
   for (int i = 0; i < 2; ++i) {
     if (info->si_pid == children[i]) {
