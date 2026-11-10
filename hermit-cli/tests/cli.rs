@@ -52174,12 +52174,15 @@ fn host_cpu_directories() -> usize {
 
 /// Every source a program can size a thread pool from reports the same
 /// count: sysconf, get_nprocs, sched_getaffinity, the /sys CPU lists and
-/// directories, /proc/cpuinfo, /proc/stat, Cpus_allowed, node 0, the
-/// distinct APIC IDs CPUID gives on each CPU, getcpu, sched_getcpu and
+/// directories, /proc/cpuinfo, /proc/stat, Cpus_allowed, the distinct APIC
+/// IDs CPUID gives on each CPU, getcpu, sched_getcpu and
 /// /proc/thread-self/stat on each pinned CPU and the distinct CPUs of one
 /// thread per CPU. One without `--virtual-cpus`, as
 /// before, and N with it, at bitwise parity. On a host with fewer than N CPU
 /// directories the run is refused with the count that would be admitted.
+/// (Node 0's CPU list is no source: the kernel without NUMA that Hermit
+/// presents has no node directory, as
+/// `absent_cpus_and_nodes_are_not_found_and_rseq_is_refused` checks.)
 #[test]
 fn virtual_cpus_every_cpu_count_agrees() {
     let guest = futex_c_guest(&VIRTUAL_CPUS_GUEST, "virtual_cpus")
@@ -52213,7 +52216,7 @@ fn virtual_cpus_every_cpu_count_agrees() {
         }
         assert_success(&output, &args);
         let counts = stdout(&output);
-        assert_eq!(counts.lines().count(), 17, "{flag:?}:\n{counts}");
+        assert_eq!(counts.lines().count(), 16, "{flag:?}:\n{counts}");
         for line in counts.lines() {
             assert!(
                 line.ends_with(&format!("={cpus}")),
