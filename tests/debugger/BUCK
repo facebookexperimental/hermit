@@ -1,4 +1,17 @@
 # @lint-ignore-every AUTODEPS2
 # These external debugger tests are not part of the fbsource Buck graph.
 
+load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup")
+
 oncall("hermit")
+
+# Guest sources for hermit-cli's Cargo integration tests (see
+# //hermetic_infra/hermit/tests:integration-tree).
+buck_filegroup(
+    name = "guest-sources",
+    srcs = {
+        "guests": "//hermetic_infra/hermit/tests/debugger/guests:guest-sources",
+    }
+    | {src: src for src in glob(["**"], exclude = ["BUCK"])},
+    visibility = ["//hermetic_infra/hermit/tests/..."],
+)

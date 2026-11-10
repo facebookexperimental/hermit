@@ -8,6 +8,8 @@ rust_library(
     name = "hermit-run-kvm",
     srcs = glob(["src/**/*.rs"]),
     autocargo = {"cargo_toml_dir": "."},
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
     deps = [
         "//hermetic_infra/hermit/detcore:detcore",
         "//hermetic_infra/reverie:reverie-kvm",

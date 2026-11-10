@@ -245,9 +245,13 @@ def rust_library(
     visibility = ["PUBLIC"],
     **kwargs,
 ):
-    _unused = (test_deps, test_env, named_deps, autocargo, unittests, visibility, cpp_deps, cxx_bridge, test_rustc_flags, test_srcs)  # @unused
+    _unused = (test_deps, test_env, autocargo, unittests, visibility, cpp_deps, cxx_bridge, test_rustc_flags, test_srcs)  # @unused
     deps = _fix_deps(deps)
     mapped_srcs = _maybe_select_map(mapped_srcs, _fix_mapped_srcs)
+    if named_deps:
+        # Internal BUCK files alias a dependency's crate this way; dropping
+        # the argument would drop the dependency itself.
+        kwargs["named_deps"] = _maybe_select_map(named_deps, _fix_named_deps)
 
     # Reset visibility because internal and external paths are different.
     visibility = ["PUBLIC"]
@@ -436,6 +440,9 @@ def _fix_mapped_srcs(xs: dict[str, str]):
     # For reasons, this is source -> file path, which is the opposite of what
     # it should be.
     return {translate_target(k): v for (k, v) in xs.items()}
+
+def _fix_named_deps(xs: dict[str, str]):
+    return {k: translate_target(v) for (k, v) in xs.items()}
 
 def _fix_deps(xs):
     if is_select(xs):

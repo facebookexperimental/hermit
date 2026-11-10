@@ -9,4 +9,6 @@ fbpkg.builder(
         "hermit": "//hermetic_infra/hermit/hermit-cli:hermit",
         "install.toml": "install.toml",
     },
+    # hermit is x86-64 only (detcore virtualizes the x86 cpuid instruction).
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
 )

@@ -8,6 +8,9 @@ rust_library(
     name = "hermit-record-format",
     srcs = glob(["src/**/*.rs"]),
     autocargo = {"cargo_toml_dir": "."},
+    named_deps = {"reverie": "//hermetic_infra/reverie:reverie"},
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
     test_deps = [
         "fbsource//third-party/rust:serde_json",
         "fbsource//third-party/rust:tempfile",
@@ -19,6 +22,5 @@ rust_library(
         "fbsource//third-party/rust:serde",
         "fbsource//third-party/rust:tracing",
         "//hermetic_infra/hermit/detcore:detcore",
-        "//hermetic_infra/reverie:reverie",
     ],
 )
