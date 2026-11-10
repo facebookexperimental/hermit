@@ -409,7 +409,7 @@ mod tests {
         // lifetime of https://github.com/rrnewton/hermit/pull/5259; 55 on
         // its old base, renumbered to 56 at this rebase onto main's 55;
         // digest measured at this head).
-        (56, "5f56003386aa361d", "f013e36743d8d9e6"),
+        (56, "5f56003386aa361d", "f8b1309588141fd0"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
