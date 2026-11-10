@@ -8441,7 +8441,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let rendered = match file {
             AddressSpaceFile::Smaps => match self.smaps_facts(guest).await {
-                Ok(facts) => smaps::render_smaps(&map, &facts),
+                Ok(facts) => smaps::render_smaps(&map, &facts, smaps::host_filesystems()),
                 Err(refusal) => Err(refusal),
             },
             AddressSpaceFile::SmapsRollup => smaps::render_smaps_rollup(&map),
@@ -8484,14 +8484,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
         }
         let protection_keys_enabled = false;
-        let thp_orders = smaps::host_thp()
-            .map_err(|error| {
-                format!(
-                    "Linux's smaps prints whether each mapping may have transparent huge pages, \
-                     which the host's settings decide, and they could not be read: {error}"
-                )
-            })?
-            .map_or(0, |thp| thp.anonymous_orders());
+        let host_thp = smaps::host_thp().map_err(|error| {
+            format!(
+                "Linux's smaps prints whether each mapping may have transparent huge pages, \
+                 which the host's settings decide, and they could not be read: {error}"
+            )
+        })?;
+        let thp_orders = host_thp.map_or(0, |thp| thp.anonymous_orders());
         let thp_disabled = if thp_orders == 0 {
             None
         } else {
@@ -8514,6 +8513,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             protection_keys_enabled,
             protection_keys_used: state.may_use_protection_keys(),
             mapping_flags_changed: state.mapping_flags_may_have_changed(),
+            thp_enabled: host_thp.map(|thp| thp.enabled),
             thp_orders,
             thp_disabled,
         })
