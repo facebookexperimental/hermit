@@ -74728,9 +74728,17 @@ fn proc_other_process_stat_guest() -> &'static Path {
 /// first, so a host that answers otherwise fails here rather than in the
 /// comparison.
 fn proc_other_process_stat_native(backend: &str) -> String {
+    proc_other_process_stat_native_with(backend, |_| {})
+}
+
+fn proc_other_process_stat_native_with(
+    backend: &str,
+    configure: impl FnOnce(&mut Command),
+) -> String {
     let args = proc_other_process_stat_args(backend);
     let mut command = Command::new(proc_other_process_stat_guest());
     without_core_dumps(&mut command);
+    configure(&mut command);
     let output = command
         .args(args)
         .stdin(Stdio::null())
@@ -74880,6 +74888,40 @@ fn guest_transcript_at_l2(backend: &str, guest: &Path, guest_args: &[&str]) -> S
         "{backend} compared no INFO messages: {verdict}"
     );
     stdout(&output)
+}
+
+/// An ignored disposition survives exec. The native control must establish
+/// its own SIGPIPE/SIGXFSZ preconditions, including when a runner ignores both.
+#[test]
+fn native_other_process_stat_is_independent_of_ignored_pipe_and_file_size_signals() {
+    for backend in ["ptrace", "kvm"] {
+        proc_other_process_stat_native_with(backend, |command| {
+            // SAFETY: this callback runs only in the child before exec and
+            // uses async-signal-safe sigaction/sigemptyset calls. The parallel
+            // test process's dispositions are never changed.
+            unsafe {
+                command.pre_exec(|| {
+                    let mut ignored = std::mem::zeroed::<libc::sigaction>();
+                    ignored.sa_sigaction = libc::SIG_IGN;
+                    if libc::sigemptyset(&mut ignored.sa_mask) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    for signal in [libc::SIGPIPE, libc::SIGXFSZ] {
+                        let mut observed = std::mem::zeroed::<libc::sigaction>();
+                        if libc::sigaction(signal, &ignored, std::ptr::null_mut()) == -1
+                            || libc::sigaction(signal, std::ptr::null(), &mut observed) == -1
+                        {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        if observed.sa_sigaction != libc::SIG_IGN {
+                            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+                        }
+                    }
+                    Ok(())
+                });
+            }
+        });
+    }
 }
 
 /// Another process's `/proc/<pid>/stat`, `task/<tid>/stat` and `comm`
