@@ -4061,15 +4061,23 @@ fn cpu_backlink_directory(directory: &Path) -> bool {
 /// Without `drivers/base/node.o` Linux registers no node subsystem, so the
 /// `node` directory itself is missing from `/sys/devices/system` and from
 /// `/sys/bus` — not an empty directory — and neither a memory block nor a
-/// CPU holds a link to a node. glibc's `get_nprocs_conf`
+/// CPU holds a link to a node; nor are there memory tiers or memory
+/// policies to list. glibc's `get_nprocs_conf`
 /// (`sysconf(_SC_NPROCESSORS_CONF)`,
 /// `nproc --all`) counts the `cpuN` entries of `/sys/devices/system/cpu`,
 /// and libnuma counts them and probes `/sys/devices/system/node`, which a
 /// kernel without NUMA does not have.
 pub(crate) fn is_absent_cpu_entry(directory: &Path, name: &[u8], cpus: u32) -> bool {
-    // The node directory itself, in each of its two parents.
-    match directory.to_str() {
-        Some("/sys/devices/system" | "/sys/bus") if name == b"node" => return true,
+    match (directory.to_str(), name) {
+        // The node directory itself, in each of its two parents.
+        (Some("/sys/devices/system" | "/sys/bus"), b"node") => return true,
+        // The directories of the rest of NUMA's code, which such a kernel
+        // does not build either (mm/Makefile:86 and 99 at v7.1): memory
+        // tiering's bus and its devices' root (mm/memory-tiers.c:50 and 910)
+        // and its tunables (991), and the memory policies' tunables
+        // (mm/mempolicy.c:3931).
+        (Some("/sys/bus" | "/sys/devices/virtual"), b"memory_tiering")
+        | (Some("/sys/kernel/mm"), b"numa" | b"mempolicy") => return true,
         _ => {}
     }
     // The backlink each CPU directory holds to its node is absent for every
@@ -5572,9 +5580,6 @@ fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
         "se.avg.last_update_time",
         "se.avg.util_est",
         "clock-delta",
-        "mm->numa_scan_seq",
-        "numa_pages_migrated",
-        "total_numa_faults",
     ];
     const STABLE_INTEGER_FIELDS: &[&str] = &[
         "se.load.weight",
@@ -5582,7 +5587,6 @@ fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
         "prio",
         "se.slice",
         "ext.enabled",
-        "numa_preferred_nid",
         "uclamp.min",
         "uclamp.max",
         "effective uclamp.min",
@@ -5593,6 +5597,18 @@ fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
         ("uclamp.max", "1024"),
         ("effective uclamp.min", "0"),
         ("effective uclamp.max", "1024"),
+    ];
+    // NUMA balancing's lines, with its `current_node=` line and a
+    // `numa_faults` line per node, which a kernel built without NUMA does
+    // not print (`sched_show_numa`, kernel/sched/debug.c:1250-1262 at v7.1,
+    // under `CONFIG_NUMA_BALANCING`, which depends on `CONFIG_NUMA`): each is
+    // checked as the others are and left out, as is how many nodes the host
+    // has.
+    const NUMA_BALANCING_FIELDS: &[&str] = &[
+        "mm->numa_scan_seq",
+        "numa_pages_migrated",
+        "numa_preferred_nid",
+        "total_numa_faults",
     ];
 
     let Ok(text) = std::str::from_utf8(contents) else {
@@ -5644,7 +5660,7 @@ fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
                 {
                     return Vec::new();
                 }
-                normalized.extend_from_slice(b"current_node=0, numa_group_id=0");
+                continue;
             } else if body.starts_with("numa_faults ") {
                 let fields = body.split_whitespace().skip(1).collect::<Vec<_>>();
                 let expected = [
@@ -5663,9 +5679,7 @@ fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
                 {
                     return Vec::new();
                 }
-                normalized.extend_from_slice(
-                    b"numa_faults node=0 task_private=0 task_shared=0 group_private=0 group_shared=0",
-                );
+                continue;
             } else {
                 return Vec::new();
             }
@@ -5675,6 +5689,12 @@ fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
             continue;
         };
         let label = left.trim();
+        if NUMA_BALANCING_FIELDS.contains(&label) {
+            if right.trim().parse::<i128>().is_err() {
+                return Vec::new();
+            }
+            continue;
+        }
         let replacement = if let Some(index) = FLOAT_FIELDS.iter().position(|field| *field == label)
         {
             let Ok(value) = right.trim().parse::<f64>() else {
@@ -9136,7 +9156,23 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
                 &["node"],
                 &["cpu", "memory", "node0", "nodes"],
             ),
-            ("/sys/bus", &["node"], &["cpu", "node0"]),
+            (
+                "/sys/bus",
+                &["node", "memory_tiering"],
+                &["cpu", "node0", "memory", "pci"],
+            ),
+            // So are memory tiering's directories and the NUMA and memory
+            // policy tunables.
+            (
+                "/sys/devices/virtual",
+                &["memory_tiering"],
+                &["misc", "memory_tier"],
+            ),
+            (
+                "/sys/kernel/mm",
+                &["numa", "mempolicy"],
+                &["transparent_hugepage", "hugepages", "ksm"],
+            ),
             (
                 "/sys/devices/system/node",
                 &["node0", "node1", "node12"],
@@ -9281,6 +9317,22 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             (
                 "/sys/bus/cpu/drivers/processor/cpu0/node0",
                 "/sys/bus/cpu/drivers/processor/cpu0/node0",
+            ),
+            (
+                "/sys/kernel/mm/numa/demotion_enabled",
+                "/sys/kernel/mm/numa",
+            ),
+            (
+                "/sys/kernel/mm/mempolicy/weighted_interleave/node0",
+                "/sys/kernel/mm/mempolicy",
+            ),
+            (
+                "/sys/bus/memory_tiering/devices/memory_tier4",
+                "/sys/bus/memory_tiering",
+            ),
+            (
+                "/sys/devices/virtual/memory_tiering/memory_tier4/nodelist",
+                "/sys/devices/virtual/memory_tiering",
             ),
         ] {
             assert_eq!(
@@ -9974,10 +10026,43 @@ effective uclamp.min : 0\n\
 effective uclamp.max : 1024\n\
 policy : 0\n\
 uclamp.max : 1024\n\
-new.kernel.counter : 0\n\
-current_node=0, numa_group_id=0\n\
-numa_faults node=0 task_private=0 task_shared=0 group_private=0 group_shared=0\n"
+new.kernel.counter : 0\n"
         );
+    }
+
+    /// A kernel built without NUMA prints none of NUMA balancing's lines
+    /// (kernel/sched/debug.c:1239-1262 at v7.1), so they are left out, the
+    /// one `numa_faults` line per host node with them; a malformed one still
+    /// leaves the guest nothing, as any malformed line does.
+    #[test]
+    fn self_sched_leaves_out_numa_balancing() {
+        let core = "cat (3, #threads: 1)\n\
+se.exec_start : 377650149.445644\n\
+se.vruntime : 133948666.432951\n\
+se.sum_exec_runtime : 3.637972\n";
+        let numa = "mm->numa_scan_seq                            :                    4\n\
+numa_pages_migrated                          :                    5\n\
+numa_preferred_nid                           :                   -1\n\
+total_numa_faults                            :                    6\n\
+current_node=1, numa_group_id=0\n\
+numa_faults node=0 task_private=0 task_shared=0 group_private=0 group_shared=0\n\
+numa_faults node=1 task_private=7 task_shared=0 group_private=0 group_shared=0\n";
+        let expected = sanitize_self_sched(core.as_bytes());
+        assert!(expected.starts_with(b"cat (0, #threads: 1)\n"));
+        assert_eq!(
+            sanitize_self_sched(format!("{core}{numa}").as_bytes()),
+            expected
+        );
+        for malformed in [
+            "numa_preferred_nid : none\n",
+            "current_node=1\n",
+            "numa_faults node=1 task_private=x task_shared=0 group_private=0 group_shared=0\n",
+        ] {
+            assert!(
+                sanitize_self_sched(format!("{core}{malformed}").as_bytes()).is_empty(),
+                "{malformed:?}"
+            );
+        }
     }
 
     // With kernel.sched_schedstats=1 the kernel adds these lines, printed with

@@ -52792,7 +52792,8 @@ fn cpu_directory_reads_list_only_cpu0_on_every_path() {
 /// register (drivers/pci/pci-sysfs.c:633-635 and drivers/base/platform.c:1331-1340
 /// at v7.1), by the bus alias, the device's own path, its `subsystem` link,
 /// relative to its directory and below it, while `vendor` and `modalias`,
-/// which every such device has, stay found.
+/// which every such device has, stay found; and so are memory tiering's
+/// directories and the NUMA and memory policy tunables (mm/Makefile:86 and 99).
 fn absent_cpu_node_backlinks(backend: &str) {
     let guest = futex_c_guest(&ABSENT_CPU_LOOKUPS_GUEST, "absent_cpu_lookups")
         .to_str()
@@ -52841,7 +52842,16 @@ fn absent_cpu_node_backlinks(backend: &str) {
                     platform subsystem numa_node: ENOENT\n\
                     platform below numa_node: ENOENT\n\
                     platform openat numa_node: ENOENT\n\
-                    platform openat modalias: ok\n";
+                    platform openat modalias: ok\n\
+                    /sys/bus listing memory_tiering: 0\n\
+                    access /sys/bus/memory_tiering: ENOENT\n\
+                    /sys/devices/virtual listing memory_tiering: 0\n\
+                    access /sys/devices/virtual/memory_tiering: ENOENT\n\
+                    /sys/kernel/mm listing numa: 0\n\
+                    access /sys/kernel/mm/numa: ENOENT\n\
+                    /sys/kernel/mm listing mempolicy: 0\n\
+                    access /sys/kernel/mm/mempolicy: ENOENT\n\
+                    /sys/kernel/mm/numa/demotion_enabled: ENOENT\n";
     // On a host whose kernel has NUMA, the PCI device's attribute exists:
     // its absence above is Hermit's.
     if Path::new("/sys/devices/system/node").exists() {

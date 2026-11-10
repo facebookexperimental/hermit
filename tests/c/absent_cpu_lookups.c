@@ -17,7 +17,9 @@
 // same for the `numa_node` attribute of the first PCI device and the first
 // platform device, which such a kernel does not register either, next to
 // an attribute every device on that bus has. It prints no device's name, so
-// that its output is the same on every host with such devices.
+// that its output is the same on every host with such devices. Last, it
+// looks for the directories of memory tiering and of the NUMA and memory
+// policy tunables, which are NUMA's too.
 //
 // The lookups name the absent entry absolutely, below it, relative to a
 // directory descriptor, through /sys/bus (including the processor driver's
@@ -177,6 +179,23 @@ static int backlinks(void) {
     open_and_close("/sys/devices/system/cpu/cpu0/topology/core_id");
     device_attributes("pci", "vendor");
     device_attributes("platform", "modalias");
+    /* The directories of memory tiering and of the NUMA and memory policy
+     * tunables, which such a kernel does not have either. */
+    const char *directories[][2] = {
+        {"/sys/bus", "memory_tiering"},
+        {"/sys/devices/virtual", "memory_tiering"},
+        {"/sys/kernel/mm", "numa"},
+        {"/sys/kernel/mm", "mempolicy"},
+    };
+    for (size_t i = 0; i < sizeof(directories) / sizeof(directories[0]); i++) {
+        char path[256], label[300];
+        printf("%s listing %s: %d\n", directories[i][0], directories[i][1],
+               listed(directories[i][0], directories[i][1]));
+        snprintf(path, sizeof(path), "%s/%s", directories[i][0], directories[i][1]);
+        snprintf(label, sizeof(label), "access %s", path);
+        report(label, access(path, F_OK));
+    }
+    open_and_close("/sys/kernel/mm/numa/demotion_enabled");
     return failed;
 }
 
