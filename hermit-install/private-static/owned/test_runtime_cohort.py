@@ -762,40 +762,58 @@ class OrdinaryTrapSource(unittest.TestCase):
         path.write_bytes(raw)
         return {'path': str(path), 'sha256': hashlib.sha256(raw).hexdigest()}
 
-    def test_dedicated_function_binds_the_gate_shape_not_a_file_literal(self):
+    def pinned(self, directory):
+        """A real pinned tree, its prepare context and the provider's view of its trap.rs."""
+        tree = PinnedTree(Path(directory))
+        c = {'H': str(tree.root), 'H_head': tree.h_head, 'runtime_R_pin': tree.rpin}
+        trap = tree.reverie / TRAP
+        return c, {'path': str(trap), 'sha256': hashlib.sha256(trap.read_bytes()).hexdigest()}
+
+    def test_dedicated_function_binds_the_gate_shape_and_the_pinned_object(self):
         with tempfile.TemporaryDirectory() as directory:
-            value = self.value(Path(directory), self.base)
-            shape = self.prepare.ordinary_trap_source('DedicatedFunction', value)
+            c, value = self.pinned(directory)
+            shape = self.prepare.ordinary_trap_source('DedicatedFunction', value, c)
             self.assertEqual(shape['x86_64'], cohort.TRUSTED_SYSCALL_X86_64_BLOCK_SHA256)
 
     def test_dedicated_function_refuses_an_x86_64_gate_edit(self):
         x86 = next(b for b in cohort.gate_shape(self.base)['blocks'] if b['arch'] == 'x86_64' and b['contributes'])
         cut = self.base.index(b'\n', self.base.index(b'\n', x86['start']) + 1) + 1
         changed = self.base[:cut] + b'    // x86_64 edit\n' + self.base[cut:]
-        with tempfile.TemporaryDirectory() as good, tempfile.TemporaryDirectory() as bad:
-            self.prepare.ordinary_trap_source('DedicatedFunction', self.value(Path(good), self.base))
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as bad:
+            c, value = self.pinned(directory)
+            self.prepare.ordinary_trap_source('DedicatedFunction', value, c)
             with self.assertRaisesRegex(RuntimeError, 'trusted syscall gate shape: x86_64 block sha256'):
-                self.prepare.ordinary_trap_source('DedicatedFunction', self.value(Path(bad), changed))
+                self.prepare.ordinary_trap_source('DedicatedFunction', self.value(Path(bad), changed), c)
+
+    def test_same_gate_block_with_a_different_body_is_refused_by_the_pin(self):
+        # coord7 finding 2: the gate block alone does not tie the file to the
+        # pin. Whole-file identity is kept, through the derived R row.
+        changed = self.base + b'// a body edit outside every gate block\n'
+        self.assertEqual(cohort.gate_guard(changed)['x86_64'], cohort.TRUSTED_SYSCALL_X86_64_BLOCK_SHA256)
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as bad:
+            c, value = self.pinned(directory)
+            self.prepare.ordinary_trap_source('DedicatedFunction', value, c)
+            with self.assertRaisesRegex(RuntimeError, '^ordinary trap source differs from its pinned Reverie object$'):
+                self.prepare.ordinary_trap_source('DedicatedFunction', self.value(Path(bad), changed), c)
 
     def test_reported_digest_must_be_the_file_read(self):
         with tempfile.TemporaryDirectory() as directory:
-            value = self.value(Path(directory), self.base)
-            self.prepare.ordinary_trap_source('DedicatedFunction', value)
+            c, value = self.pinned(directory)
+            self.prepare.ordinary_trap_source('DedicatedFunction', value, c)
             value['sha256'] = '0' * 64
             with self.assertRaisesRegex(RuntimeError, 'ordinary source role differs from actual factory source'):
-                self.prepare.ordinary_trap_source('DedicatedFunction', value)
+                self.prepare.ordinary_trap_source('DedicatedFunction', value, c)
 
     def test_historical_cohorts_keep_their_reviewed_literal(self):
         legacy = '5c9249419574f00c540dec767359181c8ac03a47aa2df0f19e5cef0a59b5755b'
         for name in ['LegacyE3', 'CheckedHandoff5b3']:
             with self.subTest(cohort=name):
                 self.assertIsNone(self.prepare.ordinary_trap_source(
-                    name, {'path': '/unit/' + TRAP, 'sha256': legacy}))
+                    name, {'path': '/unit/' + TRAP, 'sha256': legacy}, {}))
                 with self.assertRaisesRegex(RuntimeError, 'ordinary source role differs from actual factory source'):
-                    self.prepare.ordinary_trap_source(name, {'path': '/unit/' + TRAP, 'sha256': '0' * 64})
+                    self.prepare.ordinary_trap_source(name, {'path': '/unit/' + TRAP, 'sha256': '0' * 64}, {})
         with self.assertRaisesRegex(RuntimeError, 'ordinary unknown source/section cohort'):
-            self.prepare.ordinary_trap_source('Unknown', {'path': '/unit/' + TRAP, 'sha256': legacy})
-
+            self.prepare.ordinary_trap_source('Unknown', {'path': '/unit/' + TRAP, 'sha256': legacy}, {})
 
 class PinBumpReport(unittest.TestCase):
     """The review attention a re-pin needs, listed per changed R row."""

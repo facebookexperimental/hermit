@@ -307,12 +307,13 @@ def runtime_content_preflight(c):
 ORDINARY_LEGACY_TRAP_SOURCE_SHA256 = '5c9249419574f00c540dec767359181c8ac03a47aa2df0f19e5cef0a59b5755b'
 
 
-def ordinary_trap_source(name, value):
+def ordinary_trap_source(name, value, c):
     """The ordinary provider's trap.rs role.
 
     The two historical container cohorts keep their reviewed whole-file
     identity. DedicatedFunction binds the gate-block shape its 44-byte section
-    depends on, read from the very file the provider reported.
+    depends on, read from the very file the provider reported, and that file's
+    whole-file identity to the R row derived from the chosen heads' objects.
     """
     need(name in ('LegacyE3', 'CheckedHandoff5b3', 'DedicatedFunction'), 'ordinary unknown source/section cohort')
     need(type(value) is dict and type(value.get('path')) is str and Path(value['path']).is_absolute() and
@@ -324,7 +325,10 @@ def ordinary_trap_source(name, value):
     cohort = runtime_cohort_module()
     fact, raw = cohort.observed_source(Path(value['path']))
     need(fact['sha256'] == value.get('sha256'), 'ordinary source role differs from actual factory source')
-    return cohort.gate_guard(raw)
+    shape = cohort.gate_guard(raw)
+    need((fact['bytes'], fact['sha256']) == tuple(derived_runtime_row(c, 'R', cohort.TRAP_SOURCE)),
+         'ordinary trap source differs from its pinned Reverie object')
+    return shape
 
 
 def snapshot(c):
@@ -1204,7 +1208,7 @@ def main():
                 result['ordinary_gate_physical_members'] = {'identity_policy':provider['identity_policy'], **physical_members}
                 need(len(provider['sources']) == 2, 'ordinary actual source roles incomplete')
                 trap_value,fixed_value = provider['sources']
-                result['ordinary_gate_trap_shape'] = ordinary_trap_source(provider['cohort'], trap_value)
+                result['ordinary_gate_trap_shape'] = ordinary_trap_source(provider['cohort'], trap_value, c)
                 need(Path(fixed_value['path']).is_absolute() and
                      fixed_value['path'].endswith('/reverie-inguest/src/trap/fixed_gates.rs') and
                      fixed_value['sha256'] == 'ff3f6f6c46e872734ae921e869dbccc0ce1aeefe4bc3af8f29363cf276501e54',
