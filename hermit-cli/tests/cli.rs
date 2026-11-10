@@ -25820,8 +25820,11 @@ fn a_woken_poller_restarts_when_no_handler_runs() {
 /// Linux prints for each. In `mixedshared` the waiter and the leader race for
 /// the caught copy natively, and either line is Linux's: in 10 native runs the
 /// waiter took it in 8 (its poll fails with EINTR) and the leader in 2 (the
-/// waiter's poll is restarted); the line here is the leader's, which ptrace
-/// prints. What Linux never prints is EINTR with the handler on the leader.
+/// waiter's poll is restarted), and in 20 more on 2026-11-10 the waiter in 19
+/// and the leader in 1. The line here is the leader's, which KVM prints;
+/// ptrace prints the waiter's
+/// (`a_woken_poll_fails_with_eintr_when_any_handler_runs`). What Linux never
+/// prints is EINTR with the handler on the leader.
 const MIXED_PENDING_CASES: [(&str, &str); 4] = [
     (
         "mixedpoll",
@@ -26107,7 +26110,17 @@ fn a_woken_poll_fails_with_eintr_when_any_handler_runs() {
     for (mode, expected) in [
         MIXED_PENDING_CASES[0],
         MIXED_PENDING_CASES[2],
-        MIXED_PENDING_CASES[3],
+        // Not MIXED_PENDING_CASES[3], the leader's line, which KVM prints.
+        // On ptrace the SIGALRM falls due while the leader, still in its
+        // nanosleep, blocks it, and Detcore gives it to the waiter, as
+        // Linux's complete_signal does then: the waiter's line, which native
+        // prints in 8 of 10 and 19 of 20 runs. Until
+        // https://github.com/rrnewton/hermit/pull/5259 ptrace printed the
+        // leader's line, Linux's other one.
+        (
+            "mixedshared",
+            "mode=mixedshared first=-1 errno=EINTR eintr=1 usr1=1 on_waiter=1\n",
+        ),
         MIXED_LATE,
     ]
     .into_iter()
@@ -58148,8 +58161,7 @@ fn every_sigchld_copy_is_accounted_for_as_on_linux() {
 /// queue, sent at the sender's committed turn, so the wait does not hold it as
 /// it holds the kernel's shared copies. Before, the handler ran only after the
 /// wake (https://github.com/rrnewton/hermit/issues/4132). Every expected line
-/// is native output, apart from `futex-dfl-then-handler`'s handler counts (see
-/// its row), and each run reaches canonical bitwise parity.
+/// is native output, and each run reaches canonical bitwise parity.
 #[test]
 fn a_guests_sigchld_to_a_futex_waiting_sibling_ends_its_wait_as_on_linux() {
     verify_futex_sigchld_modes(&[
@@ -58163,13 +58175,14 @@ fn a_guests_sigchld_to_a_futex_waiting_sibling_ends_its_wait_as_on_linux() {
         ("futex-flush", "cond_wait", 0, 0),
         // SIGCHLD is SIG_DFL when main sends it, and main installs a handler
         // only after: Linux discards the signal at generation, so the wait
-        // returns 0 at the wake, with no handler before it, as natively. The
-        // handler does run once, after the wake, where native runs none: under
-        // ptrace the kernel queues the discarded copy for the tracer (item 2
-        // of https://github.com/rrnewton/hermit/issues/3995). Before the
-        // Claude review of https://github.com/rrnewton/hermit/pull/4290, the
-        // drain read the handler and ended the wait with EINTR.
-        ("futex-dfl-then-handler", "futex 0", 0, 1),
+        // returns 0 at the wake and no handler runs, before the wake or after
+        // it (native, 10 of 10 on 2026-11-10). Until
+        // https://github.com/rrnewton/hermit/pull/5259 the copy ptrace still
+        // queued reached that later handler after the wake (item 2 of
+        // https://github.com/rrnewton/hermit/issues/3995). Before the Claude
+        // review of https://github.com/rrnewton/hermit/pull/4290, the drain
+        // read the handler and ended the wait with EINTR.
+        ("futex-dfl-then-handler", "futex 0", 0, 0),
     ]);
 }
 
@@ -59379,6 +59392,11 @@ fn posix_timer_entries_hermit_refuses_or_diverges_on_are_named() {
 ///   last handler's clock read (T1).
 /// - `d1`: a discarded `SI_QUEUE` copy with bytes 32 to 47 set is pending
 ///   first, yet the handler sees exactly the timer's own 48-byte record.
+/// - `d2`: the same discarded copy with no timer reaches no handler, though
+///   one is installed before the parked worker dequeues it (10 of 10 native
+///   runs, 2026-11-10). Until https://github.com/rrnewton/hermit/pull/5259
+///   Hermit delivered it to that handler, the late-handler residual of
+///   https://github.com/rrnewton/hermit/issues/4293, pinned as a divergence.
 /// - The selection rows (R4-1, R5-1): a private `tgkill` USR2, a shared
 ///   SIGHUP and a private SIGRTMIN are each taken before a shared USR1
 ///   timer entry, valid or stale, by `rt_sigtimedwait` (also with a faulting
@@ -59498,6 +59516,7 @@ fn posix_timer_signal_rows_are_delivered_as_on_linux_at_bitwise_parity() {
             "ppoll_stale_valid",
             "ppoll_stale_valid ret=-1 errno=EINTR\nppoll_stale_valid deliveries=1\n  0 sig=10 SI_TIMER timer=1 overrun=0 value=0x2\n",
         ),
+        ("d2", "d2 deliveries=0\n"),
         (
             "rt2_fault",
             "rt2_fault first=EFAULT\n  sig_is_rtmin=1 code=-1 int=22\n  sig_is_rtmin=0 code=-2 int=111\n  take=EAGAIN\n",
@@ -59613,9 +59632,6 @@ fn posix_timer_signal_rows_are_delivered_as_on_linux_at_bitwise_parity() {
 ///   are excluded, and SIGALRM after `alarm()` is not followed, so a timer
 ///   beside a pending kill takes the fallback, where the sends merge
 ///   (disclosures 2 and 6);
-/// - `d2`: a copy Linux discarded while ignored, still queued for a parked
-///   worker, is delivered to a handler installed later: the late-handler
-///   residual of https://github.com/rrnewton/hermit/issues/4293, as on main.
 /// - `sigchld_timer` (rev 6 §9): a SIGCHLD timer while a child is unreaped
 ///   takes the fallback, whose expiries merge into the pending copy, so the
 ///   timer blocked for 5 periods reports overrun 0 where Linux reports 4
@@ -59655,7 +59671,6 @@ fn posix_timer_signal_rows_hermit_refuses_or_diverges_on_are_named() {
     }
     // (mode, Hermit's output, Linux's output)
     let divergences = [
-        ("d2", "d2 deliveries=1\n", "d2 deliveries=0\n"),
         (
             "fallback_alrm",
             "fallback_alrm deliveries=1\n  0 sig=14 code=0 own_pid=1 value=0\n",
@@ -68092,17 +68107,18 @@ fn a_blocking_fifo_open_with_a_host_peer_completes_as_on_linux() {
 /// sleep, wait4, sigtimedwait and signalfd rows ended at once (EINTR, a
 /// signal, a record). Each row is the hermit line under
 /// `--strict --verify --verify-strict` (ptrace, canonical bitwise parity), and
-/// the native line (Linux 7.1.3, 3 of 3 each) where it differs: the wait or
-/// take result is identical, and only the handler count differs, because the
-/// discarded copy is still delivered as the waiter returns to user mode
-/// (item 2 of https://github.com/rrnewton/hermit/issues/3995, whose
-/// suppression is a follow-up). A periodic timer's discarded expiry is
-/// parked and queued again when the signal stops being ignored, only while
-/// the expiry is current (Linux's `it_signal_seq`): rearmed far ahead,
-/// disarmed or deleted, nothing comes. In `signalfd-inread` and the two
-/// `signalfd-eintr` rows the worker is woken out of a real signalfd `read`
-/// outside the schedule by main's discarded SIGUSR1, and a guest-sent signal
-/// does not fix where such a thread rejoins
+/// the native line (Linux 7.1.3, 3 of 3 each) where it differs. None differs:
+/// until https://github.com/rrnewton/hermit/pull/5259 nine rows ran the
+/// handler once more than natively, because the discarded copy was still
+/// delivered as the waiter returned to user mode (item 2 of
+/// https://github.com/rrnewton/hermit/issues/3995); Detcore now delivers
+/// nothing for it (native `handled 0`, 10 of 10 each on 2026-11-10). A
+/// periodic timer's discarded expiry is parked and queued again when the
+/// signal stops being ignored, only while the expiry is current (Linux's
+/// `it_signal_seq`): rearmed far ahead, disarmed or deleted, nothing comes.
+/// In `signalfd-inread` and the two `signalfd-eintr` rows the worker is woken
+/// out of a real signalfd `read` outside the schedule by main's discarded
+/// SIGUSR1, and a guest-sent signal does not fix where such a thread rejoins
 /// (https://github.com/rrnewton/hermit/issues/4359). Those three rows failed
 /// `--verify` in 3 of 9 full validates, so they run under `--strict` alone
 /// until that is fixed; see `HOST_TIMED_REJOIN` in
@@ -68116,59 +68132,27 @@ fn a_blocking_fifo_open_with_a_host_peer_completes_as_on_linux() {
 fn a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take() {
     // (mode, hermit line, native line where it differs)
     assert_discard_at_send_rows(&[
-        (
-            "futex-dfl",
-            "futex -1 ETIMEDOUT, handled 1",
-            Some("futex -1 ETIMEDOUT, handled 0"),
-        ),
-        (
-            "futex-dfl-yield",
-            "futex -1 ETIMEDOUT, handled 1",
-            Some("futex -1 ETIMEDOUT, handled 0"),
-        ),
-        (
-            "futex-ign",
-            "futex -1 ETIMEDOUT, handled 1",
-            Some("futex -1 ETIMEDOUT, handled 0"),
-        ),
-        (
-            "futex-ign-yield",
-            "futex -1 ETIMEDOUT, handled 1",
-            Some("futex -1 ETIMEDOUT, handled 0"),
-        ),
-        (
-            "sleep-dfl",
-            "nanosleep 0 0, handled 1",
-            Some("nanosleep 0 0, handled 0"),
-        ),
-        (
-            "sleep-ign",
-            "nanosleep 0 0, handled 1",
-            Some("nanosleep 0 0, handled 0"),
-        ),
-        (
-            "wait4-dfl",
-            "wait4 child 0, status 7, handled 1",
-            Some("wait4 child 0, status 7, handled 0"),
-        ),
+        ("futex-dfl", "futex -1 ETIMEDOUT, handled 0", None),
+        ("futex-dfl-yield", "futex -1 ETIMEDOUT, handled 0", None),
+        ("futex-ign", "futex -1 ETIMEDOUT, handled 0", None),
+        ("futex-ign-yield", "futex -1 ETIMEDOUT, handled 0", None),
+        ("sleep-dfl", "nanosleep 0 0, handled 0", None),
+        ("sleep-ign", "nanosleep 0 0, handled 0", None),
+        ("wait4-dfl", "wait4 child 0, status 7, handled 0", None),
         ("kept-after-discard", "futex -1 EINTR, handled 1", None),
         ("blocked-keeps", "handled 1", None),
         ("self-take", "sigtimedwait 10 0, handled 0", None),
         (
             "sigtimedwait-ign",
-            "sigtimedwait -1 EAGAIN, handled 1",
-            Some("sigtimedwait -1 EAGAIN, handled 0"),
+            "sigtimedwait -1 EAGAIN, handled 0",
+            None,
         ),
         (
             "sigtimedwait-ign-inwait",
             "sigtimedwait -1 EAGAIN, handled 0",
             None,
         ),
-        (
-            "signalfd-ign",
-            "poll 0, read -1 EAGAIN, handled 1",
-            Some("poll 0, read -1 EAGAIN, handled 0"),
-        ),
+        ("signalfd-ign", "poll 0, read -1 EAGAIN, handled 0", None),
         (
             "sigpipe-take",
             "first -1 EAGAIN, write -1 EPIPE, second 13 0",
@@ -68885,7 +68869,9 @@ fn a_strict_preemption_replay_that_leaves_its_readmissions_ends_there() {
 /// parks decides, from `/proc`, where the copy shows pending and caught, and
 /// the record says Linux discarded it (`without_discarded`). Before, the
 /// wait or sleep ended at once (https://github.com/rrnewton/hermit/issues/4293).
-/// Native lines differ only in the handler count (item 2 of
+/// Each line is the native one. Until
+/// https://github.com/rrnewton/hermit/pull/5259 the first four rows also ran
+/// the handler for the discarded copy as the wait returned (item 2 of
 /// https://github.com/rrnewton/hermit/issues/3995).
 #[test]
 fn a_signal_linux_discarded_before_a_wait_files_does_not_end_it() {
@@ -68893,10 +68879,10 @@ fn a_signal_linux_discarded_before_a_wait_files_does_not_end_it() {
     let guest = guest_discard_at_send_guest().to_str().unwrap().to_owned();
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     for (mode, syscall, line) in [
-        ("futex-dfl", "futex", "futex -1 ETIMEDOUT, handled 1"),
-        ("futex-ign", "futex", "futex -1 ETIMEDOUT, handled 1"),
-        ("sleep-dfl", "clock_nanosleep", "nanosleep 0 0, handled 1"),
-        ("sleep-ign", "clock_nanosleep", "nanosleep 0 0, handled 1"),
+        ("futex-dfl", "futex", "futex -1 ETIMEDOUT, handled 0"),
+        ("futex-ign", "futex", "futex -1 ETIMEDOUT, handled 0"),
+        ("sleep-dfl", "clock_nanosleep", "nanosleep 0 0, handled 0"),
+        ("sleep-ign", "clock_nanosleep", "nanosleep 0 0, handled 0"),
         // A kept SIGEV_THREAD_ID timer expiry lands on the discarded copy
         // while the waiter is held: the scheduler's kept send clears the bit
         // (R5-3), so the wait ends as natively.
@@ -68959,22 +68945,22 @@ fn the_discarded_at_send_rows_record_and_replay() {
     let _guard = hermit_run_guard();
     let guest = guest_discard_at_send_guest().to_str().unwrap().to_owned();
     for (mode, line) in [
-        ("futex-dfl", "futex -1 ETIMEDOUT, handled 1"),
-        ("futex-dfl-yield", "futex -1 ETIMEDOUT, handled 1"),
-        ("futex-ign", "futex -1 ETIMEDOUT, handled 1"),
-        ("futex-ign-yield", "futex -1 ETIMEDOUT, handled 1"),
-        ("sleep-dfl", "nanosleep 0 0, handled 1"),
-        ("sleep-ign", "nanosleep 0 0, handled 1"),
-        ("wait4-dfl", "wait4 child 0, status 7, handled 1"),
+        ("futex-dfl", "futex -1 ETIMEDOUT, handled 0"),
+        ("futex-dfl-yield", "futex -1 ETIMEDOUT, handled 0"),
+        ("futex-ign", "futex -1 ETIMEDOUT, handled 0"),
+        ("futex-ign-yield", "futex -1 ETIMEDOUT, handled 0"),
+        ("sleep-dfl", "nanosleep 0 0, handled 0"),
+        ("sleep-ign", "nanosleep 0 0, handled 0"),
+        ("wait4-dfl", "wait4 child 0, status 7, handled 0"),
         ("kept-after-discard", "futex -1 EINTR, handled 1"),
         ("blocked-keeps", "handled 1"),
         ("self-take", "sigtimedwait 10 0, handled 0"),
-        ("sigtimedwait-ign", "sigtimedwait -1 EAGAIN, handled 1"),
+        ("sigtimedwait-ign", "sigtimedwait -1 EAGAIN, handled 0"),
         (
             "sigtimedwait-ign-inwait",
             "sigtimedwait -1 EAGAIN, handled 0",
         ),
-        ("signalfd-ign", "poll 0, read -1 EAGAIN, handled 1"),
+        ("signalfd-ign", "poll 0, read -1 EAGAIN, handled 0"),
         (
             "sigpipe-take",
             "first -1 EAGAIN, write -1 EPIPE, second 13 0",
@@ -69253,10 +69239,11 @@ fn a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity() {
 /// the R2b-1 design, R4-1, https://github.com/rrnewton/hermit/issues/4273).
 /// Before, the answer exempted it and the wait ended with EINTR. Two chaos
 /// seeds put the waiter's turn after the sender's; `futex -1 EINTR, h1 1,
-/// h2 0` would be the other legal line. Native (Linux 7.1.3, 6 of 6):
-/// `futex -1 ETIMEDOUT, h1 0, h2 0`; Hermit's `h2 1` is the discarded copy
-/// still delivered as the waiter returns (item 2 of
-/// https://github.com/rrnewton/hermit/issues/3995).
+/// h2 0` would be the other legal line. Native (Linux 7.1.3, 6 of 6, and 10
+/// of 10 on 2026-11-10): `futex -1 ETIMEDOUT, h1 0, h2 0`, which Hermit
+/// prints. Until https://github.com/rrnewton/hermit/pull/5259 it printed
+/// `h2 1`: the discarded copy was still delivered as the waiter returned
+/// (item 2 of https://github.com/rrnewton/hermit/issues/3995).
 #[test]
 fn a_flushed_then_discarded_copy_does_not_end_a_woken_futex_wait() {
     let _guard = hermit_run_guard();
@@ -69279,7 +69266,7 @@ fn a_flushed_then_discarded_copy_does_not_end_a_woken_futex_wait() {
         assert_success(&output, &args);
         assert_eq!(
             stdout(&output),
-            "futex-flush-resend: futex -1 ETIMEDOUT, h1 0, h2 1\n",
+            "futex-flush-resend: futex -1 ETIMEDOUT, h1 0, h2 0\n",
             "seed {seed}: stderr:\n{log}"
         );
         assert!(
@@ -69443,17 +69430,12 @@ fn poll_recheck_guest(name: &str) -> String {
 /// leaves it unblocked. Each row runs under `--strict --verify
 /// --verify-strict` at canonical parity. The native line (Linux 7.1.3, 3 of 3
 /// each) is the row's unless a comment gives it:
-/// - a late handler where native runs none is the discarded copy still
-///   delivered as the call returns (https://github.com/rrnewton/hermit/issues/3995);
 /// - the `rtign` rows (an RT signal ignored at the send, then a handler) are
 ///   outside the record of discarded copies
 ///   (https://github.com/rrnewton/hermit/issues/4319): native
 ///   `write 70000, h1 0`; so are the `rt-` flush rows a wake does not reach
 ///   before the flush (`rt-write-partial-flush 0`, both `rt-writev-` rows):
 ///   native `4096`;
-/// - `writev-partial-childexit`: the scheduler picks the SIGCHLD's target from
-///   `writev`'s private mask (https://github.com/rrnewton/hermit/issues/4394):
-///   native `writev 4096, h1 1`;
 /// - the partial-room `-h2` rows held only at the call's entry: a kept send to
 ///   a thread not yet in its call, flushed before the call begins, is not
 ///   counted (https://github.com/rrnewton/hermit/issues/4402): native
@@ -69467,6 +69449,16 @@ fn poll_recheck_guest(name: &str) -> String {
 ///   `writev` that requested a turn first let the flush run before the
 ///   delivery, and the taken copy reached `h2`
 ///   (https://github.com/rrnewton/hermit/issues/4379; arm A21).
+///
+/// Until https://github.com/rrnewton/hermit/pull/5259 two more kinds of row
+/// differed, and both now print the native line (10 of 10 native runs each,
+/// 2026-11-10): a handler where native runs none, the copy Linux discarded at
+/// send still delivered as the call returned (item 2 of
+/// https://github.com/rrnewton/hermit/issues/3995), and
+/// `writev-partial-childexit`, where the scheduler gave the child's SIGCHLD
+/// to main instead of the writer, reading the private mask Hermit blocks
+/// `writev` under (https://github.com/rrnewton/hermit/issues/4394), so the
+/// call wrote all 70000 bytes.
 ///
 /// The rows run as three tests, one per group of guests, so each verified run
 /// is charged to a test with its own CPU budget. Run as one test, the 56
@@ -69497,42 +69489,44 @@ fn run_pipe_calls_woken_by_signals(guests: &[&str], rows: usize) {
             before_flush: false,
             line: "caught-restart 0: read 1 0, h1 1, h2 0",
         },
-        // Native h1 0 (3995).
+        // Native; until https://github.com/rrnewton/hermit/pull/5259 these
+        // printed h1 1 (https://github.com/rrnewton/hermit/issues/3995 item 2).
         PollRecheckRow {
             guest: G,
             args: &["dflthandler", "0"],
             held_at: None,
             before_flush: false,
-            line: "dflthandler 0: read 1 0, h1 1, h2 0",
+            line: "dflthandler 0: read 1 0, h1 0, h2 0",
         },
         PollRecheckRow {
             guest: G,
             args: &["dflthandler", "1"],
             held_at: None,
             before_flush: false,
-            line: "dflthandler 1: read 1 0, h1 1, h2 0",
+            line: "dflthandler 1: read 1 0, h1 0, h2 0",
         },
         PollRecheckRow {
             guest: G,
             args: &["ignhandler", "0"],
             held_at: None,
             before_flush: false,
-            line: "ignhandler 0: read 1 0, h1 1, h2 0",
+            line: "ignhandler 0: read 1 0, h1 0, h2 0",
         },
         PollRecheckRow {
             guest: G,
             args: &["ignhandler", "1"],
             held_at: None,
             before_flush: false,
-            line: "ignhandler 1: read 1 0, h1 1, h2 0",
+            line: "ignhandler 1: read 1 0, h1 0, h2 0",
         },
-        // Native h2 0 (3995).
+        // Native; until https://github.com/rrnewton/hermit/pull/5259 this
+        // printed h2 1 (https://github.com/rrnewton/hermit/issues/3995 item 2).
         PollRecheckRow {
             guest: G,
             args: &["flushresend", "1"],
             held_at: None,
             before_flush: false,
-            line: "flushresend 1: read 1 0, h1 0, h2 1",
+            line: "flushresend 1: read 1 0, h1 0, h2 0",
         },
         // Linux's other legal line: the copy delivered before the flush.
         PollRecheckRow {
@@ -69652,13 +69646,14 @@ fn run_pipe_calls_woken_by_signals(guests: &[&str], rows: usize) {
             before_flush: false,
             line: "dataready 0: read 1 0, h1 1, h2 0",
         },
-        // Native h1 0 (3995).
+        // Native; until https://github.com/rrnewton/hermit/pull/5259 this
+        // printed h1 1 (https://github.com/rrnewton/hermit/issues/3995 item 2).
         PollRecheckRow {
             guest: P,
             args: &["write-partial-ign", "0"],
             held_at: None,
             before_flush: false,
-            line: "write-partial-ign 0: write 70000 0, h1 1",
+            line: "write-partial-ign 0: write 70000 0, h1 0",
         },
         PollRecheckRow {
             guest: P,
@@ -69689,13 +69684,14 @@ fn run_pipe_calls_woken_by_signals(guests: &[&str], rows: usize) {
             before_flush: false,
             line: "writev-partial-chld 0: writev 4096 0, h1 1",
         },
-        // Native writev 4096, h1 1 (4394).
+        // Native; until https://github.com/rrnewton/hermit/pull/5259 this
+        // printed writev 70000 (https://github.com/rrnewton/hermit/issues/4394).
         PollRecheckRow {
             guest: P,
             args: &["writev-partial-childexit", "0"],
             held_at: None,
             before_flush: false,
-            line: "writev-partial-childexit 0: writev 70000 0, h1 1",
+            line: "writev-partial-childexit 0: writev 4096 0, h1 1",
         },
         PollRecheckRow {
             guest: P,
@@ -69833,20 +69829,22 @@ fn run_pipe_calls_woken_by_signals(guests: &[&str], rows: usize) {
             line: "writev-partial-quiet-swap: writev 70000 0, h1 0, h2 0\nwritev-partial-quiet-swap: bytes from the first array",
         },
         // A copy Linux discarded at send, pending at entry, does not end the call
-        // (arm A17); native h1 0 (https://github.com/rrnewton/hermit/issues/3995).
+        // (arm A17), and no handler runs for it, as natively; until
+        // https://github.com/rrnewton/hermit/pull/5259 it ran h1
+        // (https://github.com/rrnewton/hermit/issues/3995 item 2).
         PollRecheckRow {
             guest: E,
             args: &["writev-full-ign"],
             held_at: Some("writev"),
             before_flush: false,
-            line: "writev-full-ign: writev 70000 0, h1 1, h2 0",
+            line: "writev-full-ign: writev 70000 0, h1 0, h2 0",
         },
         PollRecheckRow {
             guest: E,
             args: &["writev-partial-ign"],
             held_at: Some("writev"),
             before_flush: false,
-            line: "writev-partial-ign: writev 70000 0, h1 1, h2 0",
+            line: "writev-partial-ign: writev 70000 0, h1 0, h2 0",
         },
         PollRecheckRow {
             guest: E,
@@ -69995,13 +69993,12 @@ fn partial_and_timer_woken_pipe_calls_end_as_linux_does() {
 /// `KernelSignalWait::block_in_place`), so the attempt's result stands, as on
 /// Linux. Before that, the attempt was one plain injection that a pending
 /// copy stopped, and these rows gave `read -1 EINTR` or a short write
-/// (https://github.com/rrnewton/hermit/issues/4385). Natively:
-/// `read 1, h1 0` for `dflthandler` and `ignhandler`, `read 1, h1 0, h2 0` for
-/// `flushresend 1` and `write 70000, h1 0` for `write-partial-ign 0`: the late
-/// handler in each is the copy Linux discarded at send, still delivered as the
-/// call returns (https://github.com/rrnewton/hermit/issues/3995), as in run
-/// mode. `dataready 0`, `caught 0` and `write-partial-flush 1` give the native
-/// line.
+/// (https://github.com/rrnewton/hermit/issues/4385). Each row gives the
+/// native line, as in run mode. Until
+/// https://github.com/rrnewton/hermit/pull/5259 `dflthandler`, `ignhandler`,
+/// `flushresend 1` and `write-partial-ign 0` ran one more handler than
+/// natively, for the copy Linux discarded at send, still delivered as the
+/// call returned (https://github.com/rrnewton/hermit/issues/3995).
 #[test]
 fn pipe_wake_rows_under_record_and_replay() {
     let _guard = hermit_run_guard();
@@ -70012,22 +70009,22 @@ fn pipe_wake_rows_under_record_and_replay() {
         (
             G,
             &["dflthandler", "0"],
-            "dflthandler 0: read 1 0, h1 1, h2 0",
+            "dflthandler 0: read 1 0, h1 0, h2 0",
         ),
         (
             G,
             &["dflthandler", "1"],
-            "dflthandler 1: read 1 0, h1 1, h2 0",
+            "dflthandler 1: read 1 0, h1 0, h2 0",
         ),
         (
             G,
             &["ignhandler", "0"],
-            "ignhandler 0: read 1 0, h1 1, h2 0",
+            "ignhandler 0: read 1 0, h1 0, h2 0",
         ),
         (
             G,
             &["flushresend", "1"],
-            "flushresend 1: read 1 0, h1 0, h2 1",
+            "flushresend 1: read 1 0, h1 0, h2 0",
         ),
         (G, &["dataready", "0"], "dataready 0: read 1 0, h1 1, h2 0"),
         (G, &["caught", "0"], "caught 0: read -1 EINTR, h1 1, h2 0"),
@@ -70039,7 +70036,7 @@ fn pipe_wake_rows_under_record_and_replay() {
         (
             P,
             &["write-partial-ign", "0"],
-            "write-partial-ign 0: write 70000 0, h1 1",
+            "write-partial-ign 0: write 70000 0, h1 0",
         ),
         // The rewrite of the iovec array lands between the call's entry and
         // its first attempt, in the recording and in the replay (R1).
