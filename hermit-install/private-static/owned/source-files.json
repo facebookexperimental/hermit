@@ -70,9 +70,9 @@
     "sha256": "6c1687b14bbb982acad2be7f3b4863b25d551d8c8ba0430cb552622a300ee009"
   },
   {
-    "bytes": 92166,
+    "bytes": 92650,
     "path": "prepare.py",
-    "sha256": "5c1204e9b81979d3385c9850c61ab94e6d84ab78615dde0d789e7bd5fc934169"
+    "sha256": "2056e0079b81a639e3d02794654d6155b201482229e1b3e060554622f7409fc5"
   },
   {
     "bytes": 34384,
@@ -100,14 +100,14 @@
     "sha256": "8f78379193e766fbcd2480cf1b1c5dfe654f27cc306c203841430f15e5b37009"
   },
   {
-    "bytes": 45017,
+    "bytes": 45049,
     "path": "test_cancellation.py",
-    "sha256": "c48589c4140c9ad22c17f01ad969252bc510c41abaabdf48c5b1a341bab8bba0"
+    "sha256": "b41103fa7f60290d5836aa87978d7f8828a798d1025f972510164a1b64cc9b15"
   },
   {
-    "bytes": 5258,
+    "bytes": 6580,
     "path": "test_handoff_cohort.py",
-    "sha256": "0d3dcc68415030850b36a66c2b9cf1315115738601ee549e81a3079d15a1f7b7"
+    "sha256": "4ab039acec171218ffc78a55d6b0aa8025f51bf42e48d0ae9ddc781c5ba22153"
   },
   {
     "bytes": 23404,
@@ -130,9 +130,9 @@
     "sha256": "7ee3656c58f4ad0a07c14c53b7244e4ce3753f66aa23610f200840d8afd3a5e4"
   },
   {
-    "bytes": 9044,
+    "bytes": 9256,
     "path": "view_leaf_protocol.py",
-    "sha256": "d6ef0e73d539ba0f8824610ad1140ffa1170eee72e11bd7863e0843993fdafa5"
+    "sha256": "dc26da7940c5827f367fef9ea0d3f8048096e9cc06f377a10b6416d2cdc55cf9"
   },
   {
     "bytes": 3847,

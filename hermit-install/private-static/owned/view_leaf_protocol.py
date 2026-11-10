@@ -6,7 +6,6 @@ import re
 import stat
 
 CAP = 128 * 1024 * 1024
-HANDOFF_SOURCE_SHA256 = '85abd905256f3bc5b526840cf3cd5e090238e4aa770f03d320c2ae907ee7ae75'
 
 def require(ok, message):
     if not ok:
@@ -24,14 +23,19 @@ def fact(path):
             'view evidence changed while reading: ' + str(path))
     return {'path': str(path), 'sha256': hashlib.sha256(raw).hexdigest()}, raw
 
-def parse(diagnostic, logs, *, source_closed, tool_head, h_head, runtime_pin,
+def parse(diagnostic, logs, *, source_closed, tool_head, h_head, runtime_pin, handoff_sha,
           site_sha, table_sha, helper_sha, archive_identity, elf_identity, map_identity):
     """Reconcile all evidence even when another owned consumer returned failure.
+
+    handoff_sha is the handoff source digest the driver's preflight checked
+    against the pinned Reverie object; the report cannot nominate its own.
 
     A returned REFUSED is data, never execution authority. Malformed/incomplete
     protocol raises; the outer caller must retain that error and still inspect
     the actual ELF via its existing independent-final-inspection path.
     """
+    require(type(handoff_sha) is str and re.fullmatch('[0-9a-f]{64}', handoff_sha) is not None,
+            'view handoff source digest malformed')
     lines = diagnostic.splitlines()
     def one(key):
         values = [line[len(key)+1:] for line in lines if line.startswith(key + '=')]
@@ -103,7 +107,7 @@ def parse(diagnostic, logs, *, source_closed, tool_head, h_head, runtime_pin,
                                         ('artifact', elf_identity), ('link_map', map_identity)]:
                     require(observation.get(field) == expected, 'view leaf actual identity differs: ' + field)
                 require(observation.get('source', {}).get('sha256') ==
-                        HANDOFF_SOURCE_SHA256,
+                        handoff_sha,
                         'view leaf actual handoff source differs')
                 source_identity, _ = read(observation['source']['path'])
                 require(source_identity == observation['source'], 'view actual resolved source changed')

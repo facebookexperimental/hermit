@@ -30,7 +30,7 @@ CODEGEN = '-C relocation-model=pic -C code-model=small -C target-feature=+crt-st
 STREAM = 64 * 1024 * 1024
 RUNTIME_COHORT = D / 'runtime_cohort.py'
 RUNTIME_COHORT_SHA256 = 'c07da9cff37339a886198a5535d3f676a0482335a918e3c7ed336c4336ee98b0'
-REQUIRED_HANDOFF_SOURCE_SHA256 = '85abd905256f3bc5b526840cf3cd5e090238e4aa770f03d320c2ae907ee7ae75'
+HANDOFF_SOURCE = 'reverie-loader/src/handoff.rs'
 
 
 def need(ok, why):
@@ -418,12 +418,20 @@ def file_fact(path):
     return {'path': str(p), 'bytes': p.stat().st_size, 'sha256': sha(p)}
 
 
+def derived_runtime_row(c, label, relative):
+    """(bytes, sha256) of one runtime source row derived from the chosen heads' objects."""
+    rows = runtime_cohort_module().derive(Path(c['H']), c['H_head'], c.get('runtime_R_pin'))['rows']
+    found = [row[2:] for row in rows if row[:2] == (label, relative)]
+    need(len(found) == 1, 'runtime source row is not derived: ' + label + ' ' + relative)
+    return found[0]
+
+
 def runtime_handoff_preflight(c):
-    """Check real nested runtime source against the independently declared cohort."""
-    path = Path(c['H']) / 'reverie/reverie-loader/src/handoff.rs'
+    """Check the real nested handoff source against its row from the pinned Reverie object."""
+    path = Path(c['H']) / 'reverie' / HANDOFF_SOURCE
     identity = file_fact(path)
-    need(identity['sha256'] == REQUIRED_HANDOFF_SOURCE_SHA256,
-         'actual runtime handoff source differs from declared V10 cohort')
+    need((identity['bytes'], identity['sha256']) == tuple(derived_runtime_row(c, 'R', HANDOFF_SOURCE)),
+         'actual runtime handoff source differs from its pinned Reverie object')
     return identity
 
 
@@ -770,7 +778,7 @@ def main():
                        Path(c['cargo']), Path(c['rustc']), Path(c['host-cargo']), Path(c['host-rustc']), Path(c['git']), Path(c['python']), Path(c['runner']),
                        *([Path(c['elf']), Path(c['objdump'])] if x.elf else [])]}
         c['files'][str(native_reference)] = x.native_inputs_sha256
-        c['files'][c['runtime_handoff_source']['path']] = REQUIRED_HANDOFF_SOURCE_SHA256
+        c['files'][c['runtime_handoff_source']['path']] = c['runtime_handoff_source']['sha256']
         c['files'].update(reference['host_tools_sha256'])
         c['files'].update({str(p): sha(p) for p in [PRIVATE_GUARD, native_reference, inventory, prefix / 'bin/rustdoc']})
         need(all(sha(p) == h for p, h in c['files'].items()), 'known native/tool identity mismatch')
@@ -877,7 +885,7 @@ def main():
     try:
         handoff_source = runtime_handoff_preflight(c)
         need(handoff_source == c['runtime_handoff_source'] and
-             c['files'].get(handoff_source['path']) == REQUIRED_HANDOFF_SOURCE_SHA256,
+             c['files'].get(handoff_source['path']) == handoff_source['sha256'],
              'bound runtime handoff preflight identity differs')
         result['runtime_handoff_source_preflight'] = handoff_source
         files_close(c)
@@ -1018,6 +1026,7 @@ def main():
                 parsed0 = parser0.parse(diagnostic, out / 'runner',
                     source_closed=result['owned_source_footer'], tool_head=c['tool_R_head'],
                     h_head=c['H_head'], runtime_pin=c['runtime_R_pin'],
+                    handoff_sha=c['runtime_handoff_source']['sha256'],
                     site_sha=c['view_site_module_sha256'], table_sha=c['view_table_module_sha256'],
                     helper_sha=c['files'][str(D / 'view_leaf_controls.rs')],
                     archive_identity=slim(c['prepared_archive']),

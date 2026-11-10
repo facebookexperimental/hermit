@@ -279,8 +279,8 @@ class MainCleanup(unittest.TestCase):
                 'native_leaf_controls.rs', 'optional_controls.rs', 'ordinary_controls.rs',
                 'terminal_observation.rs', 'view_leaf_controls.rs', 'view_leaf_protocol.py']
             config['files'] = {str(D/name): owned.sha(D/name) for name in names}
-            config['runtime_handoff_source'] = {'path': '/unit/handoff.rs'}
-            config['files']['/unit/handoff.rs'] = owned.REQUIRED_HANDOFF_SOURCE_SHA256
+            config['runtime_handoff_source'] = {'path': '/unit/handoff.rs', 'sha256': 'd' * 64}
+            config['files']['/unit/handoff.rs'] = 'd' * 64
         binding = root / 'binding.json'; binding.write_text(json.dumps(config))
         return config, [module.__file__, 'run', '--binding', str(binding),
                         '--binding-sha256', module.sha(binding)]
@@ -345,7 +345,7 @@ class MainCleanup(unittest.TestCase):
                 if module is owned:
                     patches.enter_context(mock.patch.object(module, 'runtime_content_preflight'))
                     patches.enter_context(mock.patch.object(module, 'runtime_handoff_preflight',
-                                                           return_value={'path': '/unit/handoff.rs'}))
+                                                           return_value={'path': '/unit/handoff.rs', 'sha256': 'd' * 64}))
                 with self.assertRaises(KeyboardInterrupt) as caught:
                     module.main()
                 self.assertIs(caught.exception, raised)
@@ -704,7 +704,7 @@ class CleanupCallbackOrdering(unittest.TestCase):
                     if module is owned:
                         patches.enter_context(mock.patch.object(module, 'runtime_content_preflight'))
                         patches.enter_context(mock.patch.object(module, 'runtime_handoff_preflight',
-                                                               return_value={'path': '/unit/handoff.rs'}))
+                                                               return_value={'path': '/unit/handoff.rs', 'sha256': 'd' * 64}))
                     with self.assertRaises(type(first)) as caught:
                         module.main()
                     self.assertIs(caught.exception, first)
