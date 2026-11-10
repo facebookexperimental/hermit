@@ -10,6 +10,13 @@
 //! case left out, 0 of 10 failed. Cargo runs test binaries one after another,
 //! and Nextest runs each test in a process of its own, so neither runs this
 //! storm beside those tests' in-process parallel load.
+//!
+//! The storm costs CPU on purpose, and Nextest charges a test for its
+//! children against the default 22 CPU-s cap. Six spawners and 100 iterations
+//! measured 7.2 to 7.6 CPU-s in about 1.2 s of wall time. 8 and 200 measured
+//! 17 to 18 CPU-s. Against an in-process write or copy, 6 and 100 still found
+//! 6 to 23 busy executables of 300 in each of 13 runs per mutant; one fails
+//! the test.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -39,7 +46,7 @@ fn helpers_create_executables_that_are_never_busy_under_concurrent_spawns() {
     );
     std::fs::create_dir(&dir.0).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
-    let spawners = (0..8)
+    let spawners = (0..6)
         .map(|_| {
             let stop = stop.clone();
             std::thread::spawn(move || {
@@ -56,7 +63,7 @@ fn helpers_create_executables_that_are_never_busy_under_concurrent_spawns() {
         Ok(status) if status.code() == Some(want) => {}
         other => failures.push(format!("{}: {other:?}", path.display())),
     };
-    for index in 0..200 {
+    for index in 0..100 {
         let written = dir.0.join(format!("written-{index}"));
         write_executable(&written, SCRIPT, 0o700).unwrap();
         run(&written, 0);
