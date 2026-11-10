@@ -194,6 +194,10 @@ exit 17
                  dict(env, PATH=str(external) + os.pathsep + env["PATH"]))
     assert output.returncode == 1, output
     assert b"1 of 2 script test suites failed" in output.stderr
+    # The deliberately failing fake suite (alpha) is named on the final
+    # summary line itself, so a bounded tail still identifies it.
+    assert output.stderr.rstrip(b"\n").split(b"\n")[-1] == \
+        b"run-script-tests: 1 of 2 script test suites failed: scripts/alpha.rs", output
     ordinary = roots(output)
     assert len(ordinary) == 2 and len(set(ordinary)) == 2
     assert output.stdout.count(b"fixture stdout\n") == 2

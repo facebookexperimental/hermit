@@ -288,7 +288,11 @@ done
 
 failed=${#failed_files[@]}
 if [ "$failed" -ne 0 ]; then
-    echo "run-script-tests: ${failed} of ${total} script test suites failed" >&2
+    # Name the failed suites on the final line itself: callers often see
+    # only a bounded tail, where the per-suite FAILED lines have scrolled
+    # away (queue ejection of PR 5340 named no suite).
+    failed_names=$(printf '%s\n' "${!failed_files[@]}" | LC_ALL=C sort | paste -sd ', ' -)
+    echo "run-script-tests: ${failed} of ${total} script test suites failed: ${failed_names}" >&2
     exit 1
 fi
 
