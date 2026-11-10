@@ -175,6 +175,11 @@ def host_system_libraries(libraries, packages):
             src = "staged",
         )
         for name, (_pkgconfig_name, flags) in libraries.items():
+            if read_config("hermit", "rust_sysroot", "") == "pinned-rust-sysroot":
+                # The pinned image's nix libunwind ships only shared libs;
+                # link its ptrace flavour shared, as Cargo twins do (their
+                # NEEDED lists libunwind-ptrace.so.0).
+                flags = ["-lunwind-ptrace" if f == "-l:libunwind-ptrace.a" else f for f in flags]
             native.prebuilt_cxx_library(
                 name = name,
                 exported_linker_flags = ["-L$(location :staged)"] + flags,

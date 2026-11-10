@@ -15,6 +15,7 @@ load("@prelude//toolchains:python.bzl", "system_python_bootstrap_toolchain", "sy
 load("@prelude//toolchains:remote_test_execution.bzl", "remote_test_execution_toolchain")
 load("@prelude//toolchains:rust.bzl", "system_rust_toolchain")
 load("//platforms:defs.bzl", "hermit_input_rust_toolchain", "remote_linking_cxx_toolchain")
+load("//:pinned_link_args.bzl", "PINNED_GCC", "PINNED_GXX", "PINNED_LINK_ARGS")
 
 oncall("open_source")
 
@@ -83,7 +84,10 @@ platform(
 
 system_cxx_toolchain(
     name = "cxx-system" if _RUST_SYSROOT else "cxx",
-    compiler = "gcc",
+    # Pinned-harvest mode compiles and links with the pinned image's nix
+    # gcc wrapper, whose search dirs are all /nix/store: no host paths can
+    # leak into RUNPATH. Other modes keep the host gcc.
+    compiler = PINNED_GCC if _RUST_SYSROOT == "pinned-rust-sysroot" else "gcc",
     # `compiler_type = "gcc"` is required in addition to the compiler
     # binary names. The prelude gates many flags on `compiler_type`
     # rather than the binary name (e.g. `prelude/cxx/compiler.bzl` adds
@@ -91,7 +95,7 @@ system_cxx_toolchain(
     # `compiler_type in ["clang", ...]`). Without this, gcc is invoked
     # with clang-only flags and rejects them.
     compiler_type = "gcc",
-    cxx_compiler = "g++",
+    cxx_compiler = PINNED_GXX if _RUST_SYSROOT == "pinned-rust-sysroot" else "g++",
     cxx_flags = ["-std=c++20"],
     # The sandcastle OSS-bootstrap environment has `gcc`/`g++` on PATH but
     # not `clang`/`clang++` or `lld`, which are the defaults pulled in by
@@ -99,7 +103,7 @@ system_cxx_toolchain(
     # linker also causes `prelude/toolchains/cxx.bzl` to drop its
     # automatic `-fuse-ld=lld` link flag (see the g++-gated branch there),
     # so we don't need lld either.
-    linker = "g++",
+    linker = PINNED_GXX if _RUST_SYSROOT == "pinned-rust-sysroot" else "g++",
     visibility = ["PUBLIC"],
 )
 
@@ -156,7 +160,12 @@ _RUST_RELEASE_FLAGS = select({
     hermit_input_rust_toolchain(
         name = "rust",
         default_edition = "2024",
-        rustc_flags = _RUST_RELEASE_FLAGS,
+        # Pinned-harvest mode only: link against the pinned image's nix
+        # libs with its interp + RUNPATH (like Cargo twins) so binaries
+        # execute inside the pinned root. The nix interp keeps the same
+        # flags runnable on the build host (its /nix/store holds the
+        # pinned closure), so build scripts stay consistent too.
+        rustc_flags = _RUST_RELEASE_FLAGS + (PINNED_LINK_ARGS if _RUST_SYSROOT == "pinned-rust-sysroot" else []),
         sysroot = ":rust-sysroot",
         visibility = ["PUBLIC"],
     )

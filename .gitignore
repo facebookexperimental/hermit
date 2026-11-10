@@ -51,6 +51,7 @@ buck-out/
 /shim/third-party/rust/BUCK
 /shim/third-party/rust/vendor/
 /shim/rust-sysroot/
+/shim/pinned-rust-sysroot/
 /.buck2
 /ci/buck-e2e/staged/
 /shim/third-party/libunwind/staged/
