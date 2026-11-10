@@ -1475,14 +1475,21 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// (`caught_signal_return`, with the guest's own `sa_flags`, read from the
     /// runtime's virtual table): `-EINTR`, since phase 1's gate admits no
     /// such call under an `SA_RESTART` handler (one that gets here stops the
-    /// run by name, C2.4). The delivery itself stays at the completion
-    /// ([`Self::complete_syscall`]), after the observers, where ptrace's
-    /// signal-delivery stop also follows the syscall's exit; this marks the
-    /// call (`ThreadState::sigalrm_interrupts_completion`) so that the
-    /// completion delivers it or stops the run (C2.1). Between the two points
-    /// nothing can take or block the entry: in-guest processes are
-    /// single-threaded, so only this thread takes it, and only its own calls
-    /// change its mask or disposition.
+    /// run by name and ends the guest, C2.4). The delivery itself stays at
+    /// the completion ([`Self::complete_syscall`]), after the observers,
+    /// where ptrace's signal-delivery stop also follows the syscall's exit;
+    /// this marks the call (`ThreadState::sigalrm_interrupts_completion`) so
+    /// that the completion delivers it or stops the run (C2.1). Between the
+    /// two points no other thread can take or block the entry: in-guest
+    /// processes are single-threaded, so only this thread takes it, and only
+    /// its own calls change its mask or disposition. The observers between
+    /// them may yield to the scheduler only under `--happens-before` (the
+    /// posthook anchor and the post-handler hook), which launch refuses on
+    /// the in-guest backends.
+    ///
+    /// A pipe read phase 1 admitted also ends here first: the run stops by
+    /// name if another process changed the description's status flags while
+    /// it waited (review P1-b of 8871d444).
     ///
     /// Any other result, an entry that is not due, or a process that does not
     /// handle SIGALRM, is returned as it is: a raw `-ERESTARTSYS` goes back to
@@ -1493,7 +1500,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// record, as the guest sees it. Under ptrace the kernel applies the table
     /// and Hermit's record shows the restart code: a named record difference
     /// between the backends (C2.5), like the default-fatal row of
-    /// [`Self::wait_end_checkpoint`].
+    /// [`Self::wait_end_checkpoint`]. The posthook happens-before anchor
+    /// differs the same way: a plain `HappensBeforeSyscallCheckpoint` here,
+    /// `HappensBeforePosthookInterrupted` with `ERESTARTSYS` under ptrace.
     async fn sigalrm_restart_checkpoint<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1502,6 +1511,26 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         use crate::signal_restart::CaughtSignalReturn;
         guest.thread_state_mut().sigalrm_interrupts_completion = false;
+        // A pipe read the gate admitted ends here however its wait ended (a
+        // due SIGALRM's probe, data, or the last writer's close). While it
+        // waited, another process may have changed the description's status,
+        // which this process's copy does not show, and Linux's `pipe_read`
+        // tests the shared `O_NONBLOCK` whenever its wait ends with the pipe
+        // still empty and a writer present: stop the run by name rather than
+        // return what the stale copy decided (review P1-b).
+        if let Some((id, flags)) = guest.thread_state_mut().sigalrm_admitted_pipe_read.take()
+            && tool_global::sigalrm_refuses(
+                guest,
+                tool_global::SigalrmControl::PipeStatusDiffers { id, flags },
+            )
+            .await
+        {
+            let reason = crate::refused_signal_controls::sigalrm_pipe_status_diverged_refusal(
+                call.number().name(),
+                guest.thread_state().dettid.as_raw(),
+            );
+            self.stop_guest_by_name(guest, reason).await
+        }
         if !(self.cfg.backend.virtualizes_guest_sigalrm && guest.thread_state().sigalrm_handled)
             || !matches!(res, Err(Error::Errno(Errno::ERESTARTSYS)))
             || !tool_global::sigalrm_refuses(guest, tool_global::SigalrmControl::DueEntry).await
@@ -1520,11 +1549,28 @@ impl<T: RecordOrReplay> Detcore<T> {
                     call.number().name(),
                     guest.thread_state().dettid.as_raw(),
                 );
-                tracing::error!("{}", reason);
-                crate::tool_global::stopping_refusal(guest, reason).await;
-                Err(Errno::EINTR.into())
+                self.stop_guest_by_name(guest, reason).await
             }
         }
+    }
+
+    /// Ends the run with the named refusal `reason`, for a slice-2 SIGALRM
+    /// backstop (dev-hermit dh-ru056): the coordinator records the policy
+    /// refusal (`tool_global::stopping_refusal`), which ends the run where the
+    /// in-guest delivery gate is on, and then the guest's process ends with
+    /// the backend's `exit_group`, as [`Self::stop_after_sigalrm_loss`] ends
+    /// it, so the guest never resumes with the result, whatever the gate
+    /// (coord7 review of ec9b2177, S1).
+    async fn stop_guest_by_name<G: Guest<Self>>(&self, guest: &mut G, reason: String) -> ! {
+        tracing::error!("{}", reason);
+        crate::tool_global::stopping_refusal(guest, reason).await;
+        guest_log::flush_unsent();
+        match guest
+            .tail_inject(
+                reverie::syscalls::ExitGroup::new()
+                    .with_status(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+            )
+            .await {}
     }
 
     /// Ends the run with the named refusal `refusal` of a woken wait's return
@@ -1544,12 +1590,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// A call the restart checkpoint marked (`-ERESTARTSYS` turned `-EINTR`
     /// for a due SIGALRM, [`Self::sigalrm_restart_checkpoint`]) must deliver
-    /// it here, and the run stops by name if it does not (dh-ru056 slice 2,
-    /// ruling C2.1). A call that still returns `-ERESTARTSYS` delivers
-    /// nothing: no SIGALRM ended its wait, Linux would restart it, and the
-    /// in-guest runtime does, so an entry that fell due meanwhile is delivered
-    /// at the restarted call's entry (`sigalrm_at_syscall_entry`), not handed
-    /// to a frame the restart would skip.
+    /// it here, and the run stops by name, ending the guest, if it does not
+    /// (dh-ru056 slice 2, ruling C2.1). A call that still returns
+    /// `-ERESTARTSYS` delivers nothing: no SIGALRM ended its wait, Linux
+    /// would restart it, and the in-guest runtime does, so an entry that fell
+    /// due meanwhile is delivered at the restarted call's entry
+    /// (`sigalrm_at_syscall_entry`), not handed to a frame the restart would
+    /// skip.
     async fn complete_syscall<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1575,8 +1622,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         call.number().name(),
                         guest.thread_state().dettid.as_raw(),
                     );
-                tracing::error!("{}", reason);
-                crate::tool_global::stopping_refusal(guest, reason).await;
+                self.stop_guest_by_name(guest, reason).await
             }
         }
         res
@@ -6061,6 +6107,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     sigalrm_restarts: pts.1.sigalrm_restarts,
                     // A new thread has made no syscall yet.
                     sigalrm_interrupts_completion: false,
+                    sigalrm_admitted_pipe_read: None,
                     handler_restore_rt_reported: pts.1.handler_restore_rt_reported,
                     signal_register_projection: None,
                     last_accounted_user_time,
@@ -7103,7 +7150,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // Signal phase 1: a process that handles SIGALRM runs only the calls
             // its table places (`sigalrm_phase1`).
             let sigalrm_refusal = if guest.thread_state().sigalrm_handled {
-                self.sigalrm_phase1_gate(guest, call)
+                Box::pin(self.sigalrm_phase1_gate(guest, call)).await
             } else {
                 None
             };

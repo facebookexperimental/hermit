@@ -4987,6 +4987,10 @@ async fn do_ordinary_turn_blocking(
             drop(sched);
             exit_on_scheduler_refusal(&refusal);
         }
+        if let Some(refusal) = sched.take_sigalrm_stop() {
+            drop(sched);
+            exit_on_scheduler_refusal(&refusal);
+        }
         blocked?;
         sched.step3_peek().ok_or(SkipTurn)?
     };

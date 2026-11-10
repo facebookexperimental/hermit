@@ -14058,6 +14058,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         detfd.set_physically_nonblocking();
                     }
                 })?;
+                self.publish_pipe_status(guest, fd).await;
                 Ok(result)
             }
             F_DUPFD(_) | F_DUPFD_CLOEXEC(_) => {
@@ -15441,6 +15442,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 guest.thread_state().with_detfd(fd, |detfd| {
                     detfd.set_logical_nonblocking(enabled);
                 })?;
+                self.publish_pipe_status(guest, fd).await;
                 return Ok(0);
             }
         }
@@ -15481,8 +15483,37 @@ impl<T: RecordOrReplay> Detcore<T> {
                     detfd.set_nonblocking(enabled);
                 }
             })?;
+            if nonblocking.is_some() {
+                self.publish_pipe_status(guest, fd).await;
+            }
         }
         Ok(result)
+    }
+
+    /// After a guest's `F_SETFL` or `FIONBIO` on descriptor `fd`, where the
+    /// runtime virtualizes SIGALRM: a pipe description's status flags, as the
+    /// caller's process now holds them, go to the scheduler's SIGALRM ledger
+    /// (`SigalrmControl::PublishPipeStatus`). Such a backend runs Detcore in
+    /// each guest process and copies a description's model at a fork, while
+    /// Linux's processes share one `struct file` whose flags `setfl` changes
+    /// for all of them
+    /// (<https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/fcntl.c?h=v6.12#n40>),
+    /// so signal phase 1 admits a pipe read only where the reader's copy is
+    /// the description's latest status (dh-ru056 slice 2, review P1-b).
+    async fn publish_pipe_status<G: Guest<Self>>(&self, guest: &mut G, fd: RawFd) {
+        if !(self.cfg.backend.virtualizes_guest_sigalrm && self.cfg.sequentialize_threads) {
+            return;
+        }
+        let Ok(Some((id, flags))) = guest.thread_state().with_detfd(fd, |detfd| {
+            (detfd.ty() == FdType::Pipe).then(|| (detfd.open_file_id(), detfd.status_flags()))
+        }) else {
+            return;
+        };
+        crate::tool_global::sigalrm_refuses(
+            guest,
+            crate::tool_global::SigalrmControl::PublishPipeStatus { id, flags },
+        )
+        .await;
     }
 
     /// `Self::run_binder_call_with` from a fresh snapshot of the call's

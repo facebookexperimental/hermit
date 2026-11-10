@@ -306,6 +306,37 @@ pub(crate) fn sigalrm_interrupt_without_delivery_refusal(call: &str, caller: i32
     )
 }
 
+/// The scheduler's run-ending refusal for a pipe read that signal phase 1
+/// admitted on guest-held marks, found by a due guest-handled SIGALRM after a
+/// descriptor export revoked those marks while it waited (dev-hermit dh-ru056
+/// slice 2, review P1-a). Whether the reserved probe would find data could
+/// then depend on a process outside the guest, so no probe is reserved, and
+/// Linux would interrupt the read here. Fail closed.
+pub(crate) fn sigalrm_pipe_authority_revoked_refusal(reader: i32) -> String {
+    format!(
+        "hermit refused to continue the run (HERMIT_SIGALRM_PIPE_AUTHORITY_REVOKED): thread \
+         {reader} waits in a pipe read that signal phase 1 admitted because only guests held \
+         the pipe, and a descriptor has since left the guest, so a due SIGALRM cannot \
+         interrupt it deterministically (dev-hermit dh-ru056 slice 2)."
+    )
+}
+
+/// The run-wide stopping refusal for a pipe read signal phase 1 admitted that
+/// finished while the pipe description's status flags, as another process
+/// last set them after a fork, differ from the reader's copy (dev-hermit
+/// dh-ru056 slice 2, review P1-b). Linux's `pipe_read` tests the shared
+/// `O_NONBLOCK` again whenever its wait ends with the pipe still empty and a
+/// writer present, so the result the reader's copy decided may not be
+/// Linux's. Fail closed.
+pub(crate) fn sigalrm_pipe_status_diverged_refusal(call: &str, caller: i32) -> String {
+    format!(
+        "hermit refused to continue the run (HERMIT_SIGALRM_PIPE_STATUS_DIVERGED): {call} in \
+         thread {caller} was admitted by signal phase 1 on a pipe whose status flags another \
+         process changed after a fork while it waited, which this process's copy of the \
+         description does not show (dev-hermit dh-ru056 slice 2)."
+    )
+}
+
 /// The run-wide stopping refusal (A5 design D49) for a caught end whose
 /// restart table restarts the call with a code other than `ERESTARTSYS`
 /// (D40): the restart needs the register rewind and post-handler delivery of

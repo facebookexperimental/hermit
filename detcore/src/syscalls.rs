@@ -33,6 +33,8 @@ pub(crate) use files::rendered_procfs;
 pub(crate) use files::vectored_offset;
 pub(crate) use threads::VIRTUAL_CPUSET_BYTES;
 mod io;
+#[cfg(test)]
+pub(crate) use io::sent_descriptors;
 pub(crate) mod memory;
 mod misc;
 mod namespace;

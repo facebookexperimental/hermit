@@ -6724,6 +6724,14 @@ pub struct ThreadState<T> {
     #[serde(skip)]
     pub(crate) sigalrm_interrupts_completion: bool,
 
+    /// The open file description and status flags of the pipe read signal
+    /// phase 1's gate admitted for this call as a guest-held polled pipe
+    /// (`Detcore::sigalrm_phase1_gate`), cleared at every gate. Taken at the
+    /// call's end, which stops the run by name if another process has since
+    /// changed the description's status (dh-ru056 slice 2, review P1-b).
+    #[serde(skip)]
+    pub(crate) sigalrm_admitted_pipe_read: Option<(crate::types::OpenFileId, i32)>,
+
     /// The real-time signals this thread's process has already recorded as
     /// unblocked by a handler's restored mask
     /// (`Scheduler::handler_restore_unblocked`), so a delivery adds nothing
@@ -7982,6 +7990,7 @@ impl<T> ThreadState<T> {
             sigalrm_blocked_published: false,
             sigalrm_restarts: false,
             sigalrm_interrupts_completion: false,
+            sigalrm_admitted_pipe_read: None,
             handler_restore_rt_reported: 0,
             signal_register_projection: None,
             last_accounted_user_time,
