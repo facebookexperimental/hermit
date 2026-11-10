@@ -42,9 +42,6 @@ Node 0, zone      DMA
       nr_sec_page_table_pages 0
       nr_iommu_pages 0
       nr_swapcached 0
-      pgpromote_success 0
-      pgpromote_candidate 0
-      pgpromote_candidate_nrl 0
       pgdemote_kswapd 0
       pgdemote_direct 0
       pgdemote_khugepaged 0
@@ -92,12 +89,6 @@ Node 0, zone      DMA
       nr_zspages   0
       nr_free_cma  0
       nr_unaccepted 0
-      numa_hit     0
-      numa_miss    0
-      numa_foreign 0
-      numa_interleave 0
-      numa_local   0
-      numa_other   0
   pagesets
 @PAGESETS@
   node_unreclaimable:  0
@@ -128,12 +119,6 @@ Node 0, zone    DMA32
       nr_zspages   0
       nr_free_cma  0
       nr_unaccepted 0
-      numa_hit     0
-      numa_miss    0
-      numa_foreign 0
-      numa_interleave 0
-      numa_local   0
-      numa_other   0
   pagesets
 @PAGESETS@
   node_unreclaimable:  0
@@ -164,12 +149,6 @@ Node 0, zone   Normal
       nr_zspages   0
       nr_free_cma  0
       nr_unaccepted 0
-      numa_hit     0
-      numa_miss    0
-      numa_foreign 0
-      numa_interleave 0
-      numa_local   0
-      numa_other   0
   pagesets
 @PAGESETS@
   node_unreclaimable:  0

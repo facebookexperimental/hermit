@@ -10,12 +10,6 @@ nr_mlock
 nr_zspages
 nr_free_cma
 nr_unaccepted
-numa_hit
-numa_miss
-numa_foreign
-numa_interleave
-numa_local
-numa_other
 nr_inactive_anon
 nr_active_anon
 nr_inactive_file
@@ -58,9 +52,6 @@ nr_page_table_pages
 nr_sec_page_table_pages
 nr_iommu_pages
 nr_swapcached
-pgpromote_success
-pgpromote_candidate
-pgpromote_candidate_nrl
 pgdemote_kswapd
 pgdemote_direct
 pgdemote_khugepaged
@@ -117,8 +108,6 @@ pgmajfault
 pglazyfreed
 pgreuse
 pgscan_direct_throttle
-zone_reclaim_success
-zone_reclaim_failed
 pginodesteal
 slabs_scanned
 kswapd_inodesteal
@@ -129,11 +118,6 @@ pgrotated
 drop_pagecache
 drop_slab
 oom_kill
-numa_pte_updates
-numa_huge_pte_updates
-numa_hint_faults
-numa_hint_faults_local
-numa_pages_migrated
 pgmigrate_success
 pgmigrate_fail
 thp_migration_success
