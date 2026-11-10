@@ -240,6 +240,9 @@ DERIVED_COHORT = 'derived-from-pinned-objects-v1'
 DERIVED_ROWS = tuple((label, path) for label, path, _, _ in CURRENT_SPLIT_RUNTIME
                      if path != 'detcore-liteinst/src/exec_native/consumer_tests.rs')
 TRAP_SOURCE = 'reverie-inguest/src/trap.rs'
+MAPPED_ENTRY_SOURCE = 'detcore-liteinst/src/exec_initial/mapped_entry.rs'
+TERMINAL_SOURCE = 'reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs'
+ENTRY_SOURCE_NAMES = ('ENTRY_SOURCE', 'BOOTSTRAP_ENTRY_SOURCE')
 LOCK_REVERIE = 'github.com/rrnewton/reverie'
 # The gate shape the ordinary provider's DedicatedFunction cohort depends on.
 # ordinary_gate.rs compiles the other half: a 44-byte input section of exactly
@@ -361,6 +364,48 @@ def lock_pins(workspace, h_head, rpin):
     return rows
 
 
+def entry_source_guard(mapped, terminal, rpin):
+    """Compare H's entry blob with the two literal declarations in pinned R.
+
+    This only recognizes the literal const form the terminal guard uses. Skip
+    comments and string/character literals so examples cannot supply a missing
+    declaration; every other entry-constant form requires an explicit update.
+    """
+    where = 'runtime cohort derivation: Reverie ' + rpin + ' ' + TERMINAL_SOURCE
+    refusal = where + ' requires exactly one literal each for ' + ', '.join(ENTRY_SOURCE_NAMES)
+    token = re.compile(rb'//[^\n]*|(?P<comment>/\*)|(?:br|cr|r)(?P<hashes>#{0,255})"|'
+                       rb'"(?:\\.|[^"\\])*"|(?:b)?\'(?:\\.|[^\'\\])\'|'
+                       rb'\bconst\s+(?P<name>(?:[A-Za-z_][A-Za-z0-9_]*_)?ENTRY_SOURCE)\b')
+    at, pins = 0, []
+    while match := token.search(terminal, at):
+        at = match.end()
+        if match['comment']:
+            depth = 1
+            while depth:
+                end = re.search(rb'/\*|\*/', terminal[at:])
+                need(end is not None, refusal + ': unterminated comment')
+                depth += 1 if end[0] == b'/*' else -1
+                at += end.end()
+        elif match['hashes'] is not None:
+            close = b'"' + match['hashes']
+            end = terminal.find(close, at)
+            need(end >= 0, refusal + ': unterminated raw string')
+            at = end + len(close)
+        elif match['name']:
+            literal = re.match(rb'\s*:\s*&str\s*=\s*"([0-9a-f]{64})"\s*;', terminal[at:])
+            need(literal is not None, refusal + ': malformed ' + match['name'].decode())
+            pins.append((match['name'].decode(), literal[1].decode()))
+            at += literal.end()
+    need(sorted(name for name, _ in pins) == sorted(ENTRY_SOURCE_NAMES),
+         refusal + ': found ' + ', '.join(name for name, _ in pins))
+    accepted = dict(pins)
+    digest = hashlib.sha256(mapped).hexdigest()
+    need(digest in accepted.values(),
+         'runtime cohort derivation: Hermit ' + MAPPED_ENTRY_SOURCE + ' sha256 ' + digest +
+         ' is not accepted by Reverie ' + rpin + ' ' + TERMINAL_SOURCE + ' (' +
+         ', '.join(name + ' ' + accepted[name] for name in ENTRY_SOURCE_NAMES) + ')')
+
+
 def derive(workspace, h_head, runtime_r_pin=None):
     """Rows read from H_head's objects and the Reverie commit its gitlink names.
 
@@ -400,6 +445,8 @@ def derive(workspace, h_head, runtime_r_pin=None):
         blobs.update({(label, path): found[rev + ':' + path] for path in paths})
     rows = tuple((label, path, len(blobs[label, path]), hashlib.sha256(blobs[label, path]).hexdigest())
                  for label, path in DERIVED_ROWS)
+    terminal = rpin + ':' + TERMINAL_SOURCE
+    entry_source_guard(blobs['H', MAPPED_ENTRY_SOURCE], objects(reverie, 'R', [terminal])[terminal], rpin)
     return dict(h_head=h_head, runtime_R_pin=rpin, rows=rows, lock_pins=pins,
                 gate=gate_guard(blobs['R', TRAP_SOURCE]))
 
