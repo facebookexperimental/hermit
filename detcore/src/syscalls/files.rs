@@ -12929,6 +12929,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 object: SharedMemoryObjectId,
                 offset: u64,
             },
+            /// A descriptor Detcore cannot look up: the mapping is shared,
+            /// with an unknown backing object.
+            Unresolved,
         }
 
         let backing = if call.flags().contains(MapFlags::MAP_SHARED) {
@@ -12951,6 +12954,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         SharedBacking::File { object, offset }
                     })
                     .ok()
+                    .or(Some(SharedBacking::Unresolved))
             }
         } else {
             None
@@ -12977,6 +12981,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .thread_state()
                     .map_shared_object(start, len, object, offset);
             }
+            Some(SharedBacking::Unresolved) => guest.thread_state().map_shared_unresolved(),
             None => {}
         }
         // A file mapping keeps its open file description, and a flock lock it

@@ -5605,11 +5605,20 @@ fn send_headers(call: Syscall) -> Option<(RawFd, Vec<usize>)> {
 /// descriptor no scan before the call sees: an `SCM_RIGHTS`
 /// item whose descriptor is an earlier entry's `msg_len` passes the
 /// descriptor numbered by that entry's payload length (finding 1 of
-/// rev5338-cx's review of 858541a9). Before the call, as
-/// `msg_len_may_overwrite_control` decides after it, conservatively: any
-/// earlier entry's `msg_len` over any later entry's control buffer, or a
-/// header that cannot be read. Never true for one message (`sendmsg`, or a
-/// one-entry batch).
+/// rev5338-cx's review of 858541a9). The same holds for a control buffer
+/// that reaches those bytes through another address: two shared mappings
+/// of one page (finding 1 of rev5338-cx's review of 8fec6777). Before the
+/// call, conservatively:
+/// - any earlier entry's `msg_len` over any later entry's control buffer by
+///   address, as `msg_len_may_overwrite_control` decides after it, or a
+///   header that cannot be read;
+/// - any earlier entry's `msg_len` whose store may be seen through another
+///   address (`MemoryMetadata::may_share_backing`): in a shared mapping, or
+///   anywhere once a shared mapping's backing is unknown. Elsewhere its page
+///   is private, so the store reaches a later control buffer only at its
+///   own address, which the first test covers.
+///
+/// Never true for one message (`sendmsg`, or a one-entry batch).
 pub(crate) fn batch_results_may_feed_control<T, G>(guest: &G, headers: &[usize]) -> bool
 where
     T: RecordOrReplay,
@@ -5617,8 +5626,20 @@ where
 {
     // Every entry but the last writes a result a later entry may read; every
     // entry but the first may read one. A header that cannot be read counts.
-    headers.len() > 1
-        && msg_len_may_overwrite_control(guest, &headers[..headers.len() - 1], &headers[1..])
+    let Some((_, results)) = headers.split_last() else {
+        return false;
+    };
+    !results.is_empty()
+        && (msg_len_may_overwrite_control(guest, results, &headers[1..])
+            || results.iter().any(|header| {
+                header
+                    .checked_add(std::mem::offset_of!(Mmsghdr, msg_len))
+                    .is_none_or(|length| {
+                        guest
+                            .thread_state()
+                            .memory_may_share_backing(length, std::mem::size_of::<u32>())
+                    })
+            }))
 }
 
 /// The descriptors the messages at `headers` name in `SCM_RIGHTS`, and

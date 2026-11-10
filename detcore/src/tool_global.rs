@@ -20469,23 +20469,43 @@ mod tests {
         }
     }
 
-    /// Finding 1 of rev5338-cx's review of 858541a9: a `sendmmsg` batch whose
-    /// second `SCM_RIGHTS` item lies over the first entry's own `msg_len`
-    /// passes whatever descriptor Linux's count for the first message names,
-    /// which no scan before the call can know, so every pipe read description
-    /// the table holds loses its status (`batch_results_may_feed_control`). A
-    /// batch whose control data lies elsewhere untracks only the pipe it
-    /// names (the control). Mutation "no aliasing guard": the unnamed pipe
-    /// stays admitted.
+    /// Finding 1 of rev5338-cx's reviews of 858541a9 and 8fec6777: a
+    /// `sendmmsg` batch whose second `SCM_RIGHTS` item lies over the first
+    /// entry's own `msg_len`, at its address or through a second shared
+    /// mapping of its page, passes whatever descriptor Linux's count for the
+    /// first message names, which no scan before the call can know, so every
+    /// pipe read description the table holds loses its status
+    /// (`batch_results_may_feed_control`). A batch in private memory whose
+    /// control data lies elsewhere untracks only the pipe it names (the
+    /// control). Mutations "no aliasing guard" and "numeric only": the
+    /// unnamed pipe stays admitted.
     #[tokio::test]
     async fn an_aliased_batch_untracks_every_pipe_status() {
         use std::os::unix::net::UnixStream;
 
         use nix::fcntl::OFlag;
 
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Layout {
+            /// The control data in a buffer of its own, the batch private.
+            Separate,
+            /// The second item over the first entry's fields, by address.
+            SameAddress,
+            /// The batch at P, the second item at Q + 40, where P and Q map
+            /// one memfd page shared.
+            SharedBacking,
+        }
+
         let read =
             |fd: i32| reverie::syscalls::Syscall::Read(reverie::syscalls::Read::new().with_fd(fd));
-        for aliased in [false, true] {
+        // SAFETY: arithmetic on lengths, with no memory access.
+        let (item_len, item_space) = unsafe {
+            (
+                libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as usize,
+                libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) as usize,
+            )
+        };
+        for layout in [Layout::Separate, Layout::SameAddress, Layout::SharedBacking] {
             let (config, state, tid, pid) =
                 cancellation_test_state_with_config(sigalrm_pipe_status_config());
             install_test_registration(&state, tid, Ivar::new());
@@ -20502,45 +20522,83 @@ mod tests {
                 channel.as_raw_fd(),
             );
             // SAFETY: plain C structs, all zero.
-            let mut batch: [libc::mmsghdr; 2] = unsafe { std::mem::zeroed() };
+            let mut local: [libc::mmsghdr; 2] = unsafe { std::mem::zeroed() };
             let mut separate = [0_u64; 3];
-            let item = if aliased {
-                // rev5338-cx's layout: the first entry's msg_controllen,
-                // msg_flags, padding and msg_len are the second item's
-                // cmsg_len, level, type and descriptor.
-                // SAFETY: arithmetic on a length, with no memory access.
-                batch[0].msg_hdr.msg_controllen =
-                    unsafe { libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) } as usize;
-                batch[0].msg_hdr.msg_flags = libc::SOL_SOCKET;
-                // SAFETY: the padding word and msg_len lie inside `batch[0]`.
+            // P and Q, mapped for the shared layout only.
+            let mut views: Vec<(*mut libc::c_void, usize)> = Vec::new();
+            let batch: *mut libc::mmsghdr = if layout == Layout::SharedBacking {
+                // SAFETY: a new memfd, sized to one page and mapped twice.
                 unsafe {
-                    let base = (&raw mut batch[0]).cast::<u8>();
-                    std::ptr::write_unaligned(base.add(52).cast::<i32>(), libc::SCM_RIGHTS);
+                    let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+                    let memfd = libc::memfd_create(c"alias".as_ptr(), 0);
+                    assert!(memfd >= 0);
+                    assert_eq!(libc::ftruncate(memfd, page as libc::off_t), 0);
+                    let mut stat: libc::stat = std::mem::zeroed();
+                    assert_eq!(libc::fstat(memfd, &mut stat), 0);
+                    for _ in 0..2 {
+                        let view = libc::mmap(
+                            std::ptr::null_mut(),
+                            page,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            libc::MAP_SHARED,
+                            memfd,
+                            0,
+                        );
+                        assert_ne!(view, libc::MAP_FAILED);
+                        // What Detcore's mmap handler records for each.
+                        guest.thread.map_shared_object(
+                            view as usize,
+                            page,
+                            crate::types::SharedMemoryObjectId::File {
+                                device: stat.st_dev,
+                                inode: stat.st_ino,
+                            },
+                            0,
+                        );
+                        views.push((view, page));
+                    }
+                    libc::close(memfd);
+                    views[0].0.cast()
                 }
-                batch[0].msg_len = named as u32;
-                (&raw mut batch[0].msg_hdr.msg_controllen).cast::<libc::c_void>()
             } else {
-                let cmsg = separate.as_mut_ptr().cast::<libc::cmsghdr>();
-                // SAFETY: the buffer holds one SCM_RIGHTS header and its fd.
-                unsafe {
-                    (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as usize;
+                local.as_mut_ptr()
+            };
+            // SAFETY: `batch` is two zeroed mmsghdrs, on the stack or at P,
+            // and every write below stays inside them or `separate`.
+            unsafe {
+                let first = &mut *batch;
+                let second = &mut *batch.add(1);
+                if layout == Layout::Separate {
+                    let cmsg = separate.as_mut_ptr().cast::<libc::cmsghdr>();
+                    (*cmsg).cmsg_len = item_len;
                     (*cmsg).cmsg_level = libc::SOL_SOCKET;
                     (*cmsg).cmsg_type = libc::SCM_RIGHTS;
                     std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<i32>(), named);
+                    second.msg_hdr.msg_control = separate.as_mut_ptr().cast();
+                } else {
+                    // rev5338-cx's layout: the first entry's msg_controllen,
+                    // msg_flags, padding and msg_len are the second item's
+                    // cmsg_len, level, type and descriptor.
+                    first.msg_hdr.msg_controllen = item_len;
+                    first.msg_hdr.msg_flags = libc::SOL_SOCKET;
+                    let base = batch.cast::<u8>();
+                    std::ptr::write_unaligned(base.add(52).cast::<i32>(), libc::SCM_RIGHTS);
+                    first.msg_len = named as u32;
+                    let fields = std::mem::offset_of!(libc::msghdr, msg_controllen);
+                    second.msg_hdr.msg_control = if layout == Layout::SharedBacking {
+                        // Q + 40: the same bytes through the other mapping.
+                        views[1].0.cast::<u8>().add(fields).cast()
+                    } else {
+                        base.add(fields).cast()
+                    };
                 }
-                separate.as_mut_ptr().cast::<libc::c_void>()
-            };
-            batch[1].msg_hdr.msg_control = item;
-            // SAFETY: arithmetic on a length, with no memory access.
-            batch[1].msg_hdr.msg_controllen =
-                unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) } as usize;
-            let headers = [
-                (&raw const batch[0]) as usize,
-                (&raw const batch[1]) as usize,
-            ];
+                second.msg_hdr.msg_controllen = item_space;
+            }
+            let headers = [batch as usize, batch.wrapping_add(1) as usize];
             assert_eq!(
                 crate::syscalls::batch_results_may_feed_control(&guest, &headers),
-                aliased
+                layout != Layout::Separate,
+                "{layout:?}"
             );
             tool.untrack_sent_pipe_status(&mut guest, &headers, false)
                 .await;
@@ -20548,13 +20606,17 @@ mod tests {
             assert_eq!(
                 tool.sigalrm_phase1_gate(&mut guest, read(named)).await,
                 Some(nix::errno::Errno::EOPNOTSUPP),
-                "aliased {aliased}: the named pipe's status is no longer followed"
+                "{layout:?}: the named pipe's status is no longer followed"
             );
             assert_eq!(
                 tool.sigalrm_phase1_gate(&mut guest, read(other)).await,
-                aliased.then_some(nix::errno::Errno::EOPNOTSUPP),
-                "aliased {aliased}: the unnamed pipe"
+                (layout != Layout::Separate).then_some(nix::errno::Errno::EOPNOTSUPP),
+                "{layout:?}: the unnamed pipe"
             );
+            for (view, page) in views {
+                // SAFETY: each view was mapped above, with this length.
+                assert_eq!(unsafe { libc::munmap(view, page) }, 0);
+            }
         }
     }
 

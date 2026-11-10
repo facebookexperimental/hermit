@@ -8565,6 +8565,24 @@ impl<T> ThreadState<T> {
             .map_object(start, len, object, object_offset);
     }
 
+    /// Record a shared mapping whose backing object is unknown
+    /// (`MemoryMetadata::map_unresolved_shared`).
+    pub(crate) fn map_shared_unresolved(&self) {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .map_unresolved_shared();
+    }
+
+    /// Whether a store to the `len` bytes at `start` may be seen through
+    /// another address (`MemoryMetadata::may_share_backing`).
+    pub(crate) fn memory_may_share_backing(&self, start: usize, len: usize) -> bool {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .may_share_backing(start, len)
+    }
+
     /// Remove a range from the shared mapping model.
     pub(crate) fn unmap_memory(&self, start: usize, len: usize) {
         self.memory_metadata
