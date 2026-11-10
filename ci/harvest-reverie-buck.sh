@@ -64,8 +64,11 @@ mkdir -p target/validate/buck-harvest
 # particular binaries from a previous target set) so prepare's
 # no-undeclared-files check sees exactly this run's manifest.
 find target/validate/buck-harvest -maxdepth 1 -type f -delete
-BUILD_LOG=$(mktemp target/validate/buck-harvest/build.XXXXXX.log)
-trap 'rm -f "$BUILD_LOG"' EXIT
+# Retain the buck2 build log OUTSIDE buck-harvest/ (prepare refuses any
+# undeclared file inside it) so the run's cache hit rate stays measurable
+# from retained evidence instead of cache-byte deltas; overwritten per run.
+BUILD_LOG=target/validate/buck-harvest-build.log
+: > "$BUILD_LOG"
 
 BUCK_TARGETS=()
 for entry in "${TARGETS[@]}"; do
@@ -75,9 +78,12 @@ done
 echo "harvest-reverie-buck: building ${#BUCK_TARGETS[@]} detcore targets with $BUCK2" >&2
 "$BUCK2" build --show-output "${BUCK_TARGETS[@]}" > "$BUILD_LOG" 2>&1 || {
   tail -n 30 "$BUILD_LOG" >&2
-  echo "harvest-reverie-buck: buck build failed" >&2
+  echo "harvest-reverie-buck: buck build failed (log retained at $BUILD_LOG)" >&2
   exit 2
 }
+# Surface the build's own cache counters in this node's log; the full log
+# stays at $BUILD_LOG for anything the summary lines do not carry.
+grep -E 'Cache hits|Jobs completed|BUILD (SUCCEEDED|FAILED)|Network:' "$BUILD_LOG" >&2 || true
 
 ENTRIES=""
 for entry in "${TARGETS[@]}"; do
