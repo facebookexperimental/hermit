@@ -547,6 +547,16 @@ class DerivedCohort(unittest.TestCase):
                                         ' differs from the H_head gitlink ' + tree.rpin):
                 cohort.bind(tree.root, later, '0' * 40)
 
+    def test_prepare_preflight_carries_the_declared_runtime_pin(self):
+        prepare = load('prepare')
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            c = {'H': str(tree.root), 'H_head': tree.h_head, 'runtime_R_pin': tree.rpin}
+            self.assertEqual(prepare.runtime_content_preflight(c)['runtime_R_pin'], tree.rpin)
+            with self.assertRaisesRegex(RuntimeError, 'runtime cohort derivation: declared runtime_R_pin ' + '0' * 40 +
+                                        ' differs from the H_head gitlink ' + tree.rpin):
+                prepare.runtime_content_preflight(dict(c, runtime_R_pin='0' * 40))
+
     def test_git_failure_never_falls_back_to_the_working_tree(self):
         with tempfile.TemporaryDirectory() as directory:
             tree = PinnedTree(Path(directory))
