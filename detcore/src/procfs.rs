@@ -4031,19 +4031,6 @@ impl CpuConstantFile {
     }
 }
 
-/// Whether `name`, an entry of the directory at the canonical path
-/// `directory`, is absent from the machine Detcore presents: a CPU or
-/// cpufreq policy numbered `cpus` or more, which a machine with `cpus`
-/// CPUs does not have, and every NUMA node name, because that machine is
-/// a kernel built without NUMA (https://github.com/rrnewton/hermit/issues/5269).
-/// Without `drivers/base/node.o` Linux registers no node subsystem, so the
-/// `node` directory itself is missing from `/sys/devices/system` and from
-/// `/sys/bus` — not an empty directory — and neither a memory block nor a
-/// CPU holds a link to a node. glibc's `get_nprocs_conf`
-/// (`sysconf(_SC_NPROCESSORS_CONF)`,
-/// `nproc --all`) counts the `cpuN` entries of `/sys/devices/system/cpu`,
-/// and libnuma counts them and probes `/sys/devices/system/node`, which a
-/// kernel without NUMA does not have.
 /// Whether `directory` is one CPU's own sysfs directory, by any of its
 /// spellings: the device directory, its bus alias, or through the processor
 /// driver's link to it. Only a direct `cpu<N>` child of those parents names
@@ -4066,6 +4053,19 @@ fn cpu_backlink_directory(directory: &Path) -> bool {
     })
 }
 
+/// Whether `name`, an entry of the directory at the canonical path
+/// `directory`, is absent from the machine Detcore presents: a CPU or
+/// cpufreq policy numbered `cpus` or more, which a machine with `cpus`
+/// CPUs does not have, and every NUMA node name, because that machine is
+/// a kernel built without NUMA (https://github.com/rrnewton/hermit/issues/5269).
+/// Without `drivers/base/node.o` Linux registers no node subsystem, so the
+/// `node` directory itself is missing from `/sys/devices/system` and from
+/// `/sys/bus` — not an empty directory — and neither a memory block nor a
+/// CPU holds a link to a node. glibc's `get_nprocs_conf`
+/// (`sysconf(_SC_NPROCESSORS_CONF)`,
+/// `nproc --all`) counts the `cpuN` entries of `/sys/devices/system/cpu`,
+/// and libnuma counts them and probes `/sys/devices/system/node`, which a
+/// kernel without NUMA does not have.
 pub(crate) fn is_absent_cpu_entry(directory: &Path, name: &[u8], cpus: u32) -> bool {
     // The node directory itself, in each of its two parents.
     match directory.to_str() {
@@ -4141,6 +4141,79 @@ pub(crate) fn absent_cpu_entry_prefix(path: &Path, cpus: u32) -> Option<PathBuf>
             return Some(prefix);
         }
         prefix.push(name);
+    }
+    None
+}
+
+/// The buses whose devices have no `numa_node` attribute on a kernel built
+/// without NUMA, by the name their `subsystem` link ends in (Linux 7.1):
+/// - `pci`: the attribute is defined and registered only under `CONFIG_NUMA`
+///   (drivers/pci/pci-sysfs.c:361-398 and 633-635);
+/// - `platform`: it is hidden for a device on `NUMA_NO_NODE`
+///   (drivers/base/platform.c:1331-1340), and without NUMA `dev_to_node` is
+///   that for every device (include/linux/device.h:899-907);
+/// - `cxl` (a memory device's), `dax` and `nd` (NVDIMM): hidden under
+///   `!CONFIG_NUMA` (drivers/cxl/core/memdev.c:488, drivers/dax/bus.c:1384,
+///   drivers/nvdimm/bus.c:709);
+/// - `vmbus`: registered only under `CONFIG_NUMA`
+///   (drivers/hv/vmbus_drv.c:587-589).
+///
+/// The devices of other subsystems that have the attribute keep it on such a
+/// kernel, where it reads -1 (`NUMA_NO_NODE`): an NVMe controller's, for one.
+/// Those still read the host's node, a difference that remains.
+const BUSES_WITHOUT_NUMA_NODE: [&str; 6] = ["cxl", "dax", "nd", "pci", "platform", "vmbus"];
+
+/// Whether a device whose `subsystem` link reads `subsystem` (a bus's
+/// directory, `../../../bus/pci` for a PCI device) is on one of
+/// [`BUSES_WITHOUT_NUMA_NODE`].
+fn bus_hides_numa_node(subsystem: &Path) -> bool {
+    let mut components = subsystem.components().rev();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(bus)), Some(Component::Normal(parent))) => {
+            parent == "bus" && BUSES_WITHOUT_NUMA_NODE.iter().any(|name| bus == *name)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `name`, in the directory the tool reaches at `directory`, is a
+/// device's `numa_node` that the kernel without NUMA Detcore presents does not
+/// register ([`BUSES_WITHOUT_NUMA_NODE`];
+/// https://github.com/rrnewton/hermit/issues/5269). A device directory's own
+/// `subsystem` link names its bus, whichever spelling reached it: the device
+/// path, its bus alias (`/sys/bus/pci/devices/<address>`), a class device's
+/// `device` link, or a driver's link to a device it binds. The caller checks
+/// that `directory` is on sysfs, so that a guest's own file of that name, in a
+/// directory with a `subsystem` link of its own, stays.
+pub(crate) fn is_absent_device_attribute(directory: &Path, name: &[u8]) -> bool {
+    name == b"numa_node"
+        && std::fs::read_link(directory.join("subsystem"))
+            .is_ok_and(|subsystem| bus_hides_numa_node(&subsystem))
+}
+
+/// The prefix of the absolute `path` that ends at the first component naming
+/// a device attribute [`is_absent_device_attribute`] leaves out, in the
+/// tool's view: `/sys/bus/pci/devices/0000:00:00.0/numa_node` for itself, or
+/// with a name below it. Unlike [`absent_cpu_entry_prefix`], the walk goes on
+/// through a `..`: the tool's lookup of the directory resolves it as the
+/// guest's does. `None` for a relative path, and where no component is
+/// absent.
+pub(crate) fn absent_device_attribute_prefix(path: &Path) -> Option<PathBuf> {
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir) {
+        return None;
+    }
+    let mut prefix = PathBuf::from("/");
+    for component in components {
+        if component == Component::CurDir {
+            continue;
+        }
+        let absent = matches!(component, Component::Normal(name)
+            if is_absent_device_attribute(&prefix, name.as_encoded_bytes()));
+        prefix.push(component);
+        if absent {
+            return Some(prefix);
+        }
     }
     None
 }
@@ -9225,6 +9298,96 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             "/tmp/cpu1/x",
         ] {
             assert_eq!(absent_cpu_entry_prefix(Path::new(path), 1), None, "{path}");
+        }
+    }
+
+    /// A device's `numa_node` is absent where the device's `subsystem` link
+    /// names a bus whose devices a kernel without NUMA gives none, by every
+    /// spelling of the device's directory, and stays for the devices of the
+    /// other subsystems, which keep it there.
+    #[test]
+    fn a_device_numa_node_is_absent_on_the_buses_without_one() {
+        for (subsystem, absent) in [
+            ("../../../bus/pci", true),
+            ("../../../../bus/platform", true),
+            ("../../../bus/cxl", true),
+            ("../../bus/dax", true),
+            ("../../../bus/nd", true),
+            ("/sys/bus/vmbus", true),
+            // An NVMe controller keeps its `numa_node`, which reads -1 there.
+            ("../../../../../../class/nvme", false),
+            ("../../../bus/usb", false),
+            ("../../../pci", false),
+            ("../../../class/pci", false),
+            ("bus", false),
+            ("", false),
+        ] {
+            assert_eq!(
+                bus_hides_numa_node(Path::new(subsystem)),
+                absent,
+                "{subsystem:?}"
+            );
+        }
+
+        // A device tree laid out as sysfs lays it out, in an ordinary
+        // directory: these functions read links, and their callers check
+        // that the directory is on sysfs.
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let pci = root.join("devices/pci0000:00/0000:00:00.0");
+        let nvme = pci.join("nvme/nvme0");
+        std::fs::create_dir_all(&nvme).unwrap();
+        std::fs::create_dir_all(root.join("bus/pci/devices")).unwrap();
+        std::fs::create_dir_all(root.join("class/nvme")).unwrap();
+        let link = |target: &str, link: PathBuf| std::os::unix::fs::symlink(target, link).unwrap();
+        link("../../../bus/pci", pci.join("subsystem"));
+        link("../../../../../class/nvme", nvme.join("subsystem"));
+        link(
+            "../../../devices/pci0000:00/0000:00:00.0",
+            root.join("bus/pci/devices/0000:00:00.0"),
+        );
+        let alias = root.join("bus/pci/devices/0000:00:00.0");
+        for directory in [pci.clone(), alias.clone(), pci.join("nvme/..")] {
+            assert!(
+                is_absent_device_attribute(&directory, b"numa_node"),
+                "{directory:?}"
+            );
+            for name in [&b"vendor"[..], b"numa_node0", b"subsystem"] {
+                assert!(
+                    !is_absent_device_attribute(&directory, name),
+                    "{directory:?}"
+                );
+            }
+        }
+        assert!(!is_absent_device_attribute(&nvme, b"numa_node"));
+        assert!(!is_absent_device_attribute(root, b"numa_node"));
+
+        for path in [
+            alias.join("numa_node"),
+            pci.join("numa_node"),
+            pci.join("./numa_node"),
+            pci.join("nvme/../numa_node"),
+            alias.join("subsystem/devices/0000:00:00.0/numa_node"),
+        ] {
+            assert_eq!(
+                absent_device_attribute_prefix(&path).as_deref(),
+                Some(path.as_path()),
+                "{path:?}"
+            );
+            // A name below it is not found either.
+            assert_eq!(
+                absent_device_attribute_prefix(&path.join("x")).as_deref(),
+                Some(path.as_path()),
+                "{path:?}"
+            );
+        }
+        for path in [
+            alias.join("vendor"),
+            nvme.join("numa_node"),
+            root.join("numa_node"),
+            PathBuf::from("devices/pci0000:00/0000:00:00.0/numa_node"),
+        ] {
+            assert_eq!(absent_device_attribute_prefix(&path), None, "{path:?}");
         }
     }
 

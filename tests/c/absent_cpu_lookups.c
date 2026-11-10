@@ -13,7 +13,11 @@
 // with ENOSYS under the default policy; natively, on a host with more
 // than one CPU, the cpu1 lookups succeed. Its `backlinks` mode lists a
 // present CPU's directory and looks up its `node<N>` backlink by every
-// spelling, which a kernel without NUMA does not create.
+// spelling, which a kernel without NUMA does not create. It then does the
+// same for the `numa_node` attribute of the first PCI device and the first
+// platform device, which such a kernel does not register either, next to
+// an attribute every device on that bus has. It prints no device's name, so
+// that its output is the same on every host with such devices.
 //
 // The lookups name the absent entry absolutely, below it, relative to a
 // directory descriptor, through /sys/bus (including the processor driver's
@@ -25,8 +29,10 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -64,6 +70,103 @@ static void probe_backlink(const char *path) {
     report(label, (int)readlink(path, target, sizeof(target)));
 }
 
+/* How many entries of the directory at `path` are named `name`. */
+static int listed(const char *path, const char *name) {
+    DIR *directory = opendir(path);
+    if (directory == NULL) {
+        return -1;
+    }
+    int matches = 0;
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        matches += strcmp(entry->d_name, name) == 0;
+    }
+    closedir(directory);
+    return matches;
+}
+
+/* The smallest name in the directory at `path` other than `.` and `..`, so
+ * that every listing order picks the same one. */
+static int smallest_entry(const char *path, char *name, size_t size) {
+    DIR *directory = opendir(path);
+    if (directory == NULL) {
+        return 0;
+    }
+    int found = 0;
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        if (!found || strcmp(entry->d_name, name) < 0) {
+            snprintf(name, size, "%s", entry->d_name);
+            found = 1;
+        }
+    }
+    closedir(directory);
+    return found;
+}
+
+static void open_labeled(const char *label, const char *path) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    report(label, fd);
+    if (fd >= 0) {
+        close(fd);
+    }
+}
+
+/* The `numa_node` attribute of the first device on `bus`, and the `control`
+ * attribute every device there has: listed, opened, stat'ed and accessed
+ * through the bus's alias for the device, opened through the device's own
+ * path, through its `subsystem` link, relative to its directory, and below
+ * it. */
+static void device_attributes(const char *bus, const char *control) {
+    char devices[64], device[256], alias[512], path[PATH_MAX + 64], label[128];
+    char canonical[PATH_MAX];
+    struct stat st;
+    snprintf(devices, sizeof(devices), "/sys/bus/%s/devices", bus);
+    if (!smallest_entry(devices, device, sizeof(device))) {
+        printf("%s: no device\n", bus);
+        return;
+    }
+    snprintf(alias, sizeof(alias), "%s/%s", devices, device);
+    printf("%s listing numa_node: %d\n", bus, listed(alias, "numa_node"));
+    printf("%s listing %s: %d\n", bus, control, listed(alias, control));
+    const char *names[] = {"numa_node", control};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        snprintf(path, sizeof(path), "%s/%s", alias, names[i]);
+        snprintf(label, sizeof(label), "%s %s", bus, names[i]);
+        open_labeled(label, path);
+        snprintf(label, sizeof(label), "stat %s %s", bus, names[i]);
+        report(label, stat(path, &st));
+        snprintf(label, sizeof(label), "access %s %s", bus, names[i]);
+        report(label, access(path, F_OK));
+    }
+    if (realpath(alias, canonical) != NULL) {
+        snprintf(path, sizeof(path), "%s/numa_node", canonical);
+        snprintf(label, sizeof(label), "%s device path numa_node", bus);
+        open_labeled(label, path);
+    }
+    snprintf(path, sizeof(path), "%s/subsystem/devices/%s/numa_node", alias, device);
+    snprintf(label, sizeof(label), "%s subsystem numa_node", bus);
+    open_labeled(label, path);
+    snprintf(path, sizeof(path), "%s/numa_node/x", alias);
+    snprintf(label, sizeof(label), "%s below numa_node", bus);
+    open_labeled(label, path);
+    int directory = open(alias, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        int fd = openat(directory, names[i], O_RDONLY | O_CLOEXEC);
+        snprintf(label, sizeof(label), "%s openat %s", bus, names[i]);
+        report(label, fd);
+        if (fd >= 0) {
+            close(fd);
+        }
+    }
+    if (directory >= 0) {
+        close(directory);
+    }
+}
+
 static int backlinks(void) {
     int failed = bound_entry("/sys/devices/system/cpu/cpu0", "node0");
     failed |= bound_entry("/sys/bus/cpu/devices/cpu0", "node0");
@@ -72,6 +175,8 @@ static int backlinks(void) {
     probe_backlink("/sys/bus/cpu/drivers/processor/cpu0/node0");
     open_and_close("/sys/devices/system/cpu/cpu0/node0/cpulist");
     open_and_close("/sys/devices/system/cpu/cpu0/topology/core_id");
+    device_attributes("pci", "vendor");
+    device_attributes("platform", "modalias");
     return failed;
 }
 

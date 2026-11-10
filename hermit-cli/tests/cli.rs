@@ -52787,7 +52787,12 @@ fn cpu_directory_reads_list_only_cpu0_on_every_path() {
 /// The `node<N>` backlink in a present CPU's directory, by its device and
 /// bus spellings, is absent from its listing and every lookup of it is
 /// ENOENT on `backend`, at bitwise parity, while a neighbouring topology
-/// file stays found.
+/// file stays found. So is the `numa_node` attribute of the first PCI device
+/// and of the first platform device, which a kernel without NUMA does not
+/// register (drivers/pci/pci-sysfs.c:633-635 and drivers/base/platform.c:1331-1340
+/// at v7.1), by the bus alias, the device's own path, its `subsystem` link,
+/// relative to its directory and below it, while `vendor` and `modalias`,
+/// which every such device has, stay found.
 fn absent_cpu_node_backlinks(backend: &str) {
     let guest = futex_c_guest(&ABSENT_CPU_LOOKUPS_GUEST, "absent_cpu_lookups")
         .to_str()
@@ -52810,7 +52815,45 @@ fn absent_cpu_node_backlinks(backend: &str) {
                     lstat /sys/bus/cpu/drivers/processor/cpu0/node0: ENOENT\n\
                     readlink /sys/bus/cpu/drivers/processor/cpu0/node0: ENOENT\n\
                     /sys/devices/system/cpu/cpu0/node0/cpulist: ENOENT\n\
-                    /sys/devices/system/cpu/cpu0/topology/core_id: ok\n";
+                    /sys/devices/system/cpu/cpu0/topology/core_id: ok\n\
+                    pci listing numa_node: 0\n\
+                    pci listing vendor: 1\n\
+                    pci numa_node: ENOENT\n\
+                    stat pci numa_node: ENOENT\n\
+                    access pci numa_node: ENOENT\n\
+                    pci vendor: ok\n\
+                    stat pci vendor: ok\n\
+                    access pci vendor: ok\n\
+                    pci device path numa_node: ENOENT\n\
+                    pci subsystem numa_node: ENOENT\n\
+                    pci below numa_node: ENOENT\n\
+                    pci openat numa_node: ENOENT\n\
+                    pci openat vendor: ok\n\
+                    platform listing numa_node: 0\n\
+                    platform listing modalias: 1\n\
+                    platform numa_node: ENOENT\n\
+                    stat platform numa_node: ENOENT\n\
+                    access platform numa_node: ENOENT\n\
+                    platform modalias: ok\n\
+                    stat platform modalias: ok\n\
+                    access platform modalias: ok\n\
+                    platform device path numa_node: ENOENT\n\
+                    platform subsystem numa_node: ENOENT\n\
+                    platform below numa_node: ENOENT\n\
+                    platform openat numa_node: ENOENT\n\
+                    platform openat modalias: ok\n";
+    // On a host whose kernel has NUMA, the PCI device's attribute exists:
+    // its absence above is Hermit's.
+    if Path::new("/sys/devices/system/node").exists() {
+        let native = Command::new(&guest)
+            .arg("backlinks")
+            .output()
+            .expect("failed to run the native sysfs control");
+        let native = String::from_utf8_lossy(&native.stdout);
+        for line in ["pci listing numa_node: 1\n", "pci numa_node: ok\n"] {
+            assert!(native.contains(line), "{line:?} natively:\n{native}");
+        }
+    }
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let verdict = directory.path().join("verify.json");
     let mut args = vec![
@@ -53025,6 +53068,51 @@ fn absent_cpus_and_nodes_are_not_found_and_rseq_is_refused() {
         let output = hermit(&args);
         assert_success(&output, &args);
         assert_eq!(stdout(&output), expected, "{target}: {}", stderr(&output));
+    }
+
+    // A guest-owned `numa_node` in an ordinary directory bound over a PCI
+    // device's, beside a `subsystem` link to the PCI bus as sysfs has one,
+    // stays too: only the attribute on sysfs is absent.
+    let first_pci_device = fs::read_dir("/sys/bus/pci/devices")
+        .ok()
+        .and_then(|entries| {
+            entries
+                .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+                .min()
+        });
+    if let Some(device) = first_pci_device {
+        let alias = Path::new("/sys/bus/pci/devices").join(device);
+        let target = fs::canonicalize(&alias).unwrap();
+        let lookalike = directory.path().join("device");
+        fs::create_dir(&lookalike).unwrap();
+        fs::write(lookalike.join("numa_node"), "guest-owned attribute name").unwrap();
+        std::os::unix::fs::symlink("/sys/bus/pci", lookalike.join("subsystem")).unwrap();
+        let expected = "bound listing numa_node: 1\nbound openat: ok\n";
+        let native = Command::new(&guest)
+            .args(["bound", lookalike.to_str().unwrap(), "numa_node"])
+            .output()
+            .expect("failed to run the native attribute control");
+        assert_success(&native, &["native", guest.as_str(), "bound"]);
+        assert_eq!(stdout(&native), expected);
+        let mount = format!(
+            "--mount=type=bind,source={},target={}",
+            lookalike.display(),
+            target.display()
+        );
+        let alias = alias.to_str().unwrap();
+        let args = [
+            "run",
+            "--strict",
+            &mount,
+            "--",
+            &guest,
+            "bound",
+            alias,
+            "numa_node",
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{alias}: {}", stderr(&output));
     }
 
     absent_cpu_node_backlinks("ptrace");

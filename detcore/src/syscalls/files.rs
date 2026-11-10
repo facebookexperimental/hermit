@@ -60,6 +60,7 @@ use crate::procfs::MountInfoSnapshot;
 use crate::procfs::ProcfsFile;
 use crate::procfs::ProcfsSnapshotContext;
 use crate::procfs::is_absent_cpu_entry;
+use crate::procfs::is_absent_device_attribute;
 use crate::procfs::levels;
 use crate::procfs_inode;
 use crate::procfs_inode::DirectoryInodes;
@@ -19567,8 +19568,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// [`is_absent_cpu_entry`]), so that a guest counting
     /// `/sys/devices/system/cpu/cpuN` finds the virtual CPUs, as `online` and
     /// `sched_getaffinity` report
-    /// (<https://github.com/rrnewton/hermit/issues/4160>); and the `/proc`
-    /// names outside the run's `--proc` level, which lookups refuse (see
+    /// (<https://github.com/rrnewton/hermit/issues/4160>); a device's
+    /// `numa_node` that a kernel without NUMA does not register (see
+    /// [`is_absent_device_attribute`]); and the `/proc` names outside the
+    /// run's `--proc` level, which lookups refuse (see
     /// [`levels::absent_entry`]).
     ///
     /// The directory is named by the kernel's path for the descriptor, so a
@@ -19643,12 +19646,20 @@ impl<T: RecordOrReplay> Detcore<T> {
             let has_absent_cpu = entries
                 .iter()
                 .any(|entry| is_absent_cpu_entry(&directory, &entry.name, cpus));
-            let on_sysfs = has_absent_cpu
+            // A device's `numa_node`, which a kernel without NUMA does not
+            // register for a device on most buses: the device directory's
+            // `subsystem` link says which bus it is on.
+            let has_absent_attribute = entries
+                .iter()
+                .any(|entry| is_absent_device_attribute(&directory, &entry.name));
+            let on_sysfs = (has_absent_cpu || has_absent_attribute)
                 && self
                     .descriptor_is_on_filesystem(guest, fd, libc::SYSFS_MAGIC)
                     .await?;
             entries.retain(|entry| {
-                !(on_sysfs && is_absent_cpu_entry(&directory, &entry.name, cpus))
+                !(on_sysfs
+                    && (is_absent_cpu_entry(&directory, &entry.name, cpus)
+                        || (has_absent_attribute && entry.name == b"numa_node")))
                     && !(on_procfs && levels::absent_entry(&directory, &entry.name, level))
             });
         }

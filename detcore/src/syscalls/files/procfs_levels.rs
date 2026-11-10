@@ -839,6 +839,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             dashed_spelling(parent, &prefix, &observed, bytes)
         });
+        // A device's `numa_node` that the kernel without NUMA does not
+        // register (`crate::procfs::is_absent_device_attribute`), by whatever
+        // spelling reaches the device: the listings leave it out too, under
+        // the same conditions.
+        let substituted = substituted.or_else(|| {
+            if !self.cfg.virtualize_metadata || root.is_some() || self.cfg.recordreplay_modes {
+                return None;
+            }
+            let prefix = crate::procfs::absent_device_attribute_prefix(&observed)?;
+            let parent = prefix.parent()?;
+            if !is_on_sysfs(parent) {
+                return None;
+            }
+            dashed_spelling(parent, &prefix, &observed, bytes)
+        });
         Decision {
             substituted,
             decided,
