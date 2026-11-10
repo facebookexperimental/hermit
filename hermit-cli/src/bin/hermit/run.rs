@@ -8411,7 +8411,8 @@ fn a_replay_under_another_cap_preemption_charge_is_refused() {
 }
 
 /// `--chaos-timed-wait-spread` parses, is rendered into the reproduce command
-/// and round-trips. It is refused below 1 or non-finite, on a fresh run
+/// and round-trips. It is refused at or below 1, above 1000, or non-finite
+/// (infinite or NaN), on a fresh run
 /// without `--chaos`, with `--namespace-only`, with `--replay-schedule-from`
 /// (which cannot reproduce its sleep draws), and on a backend other than
 /// ptrace; a preemption or schedule replay may carry it without `--chaos`. (`--chaos`
@@ -8439,6 +8440,14 @@ fn chaos_timed_wait_spread_parses_round_trips_and_is_refused_where_inert() {
         reparsed.det_opts.det_config.chaos_timed_wait_spread,
         Some(10.0)
     );
+
+    let mut widest = RunOpts::parse_from([
+        "fakehermit",
+        "--chaos",
+        "--chaos-timed-wait-spread=1000",
+        "fakeprog",
+    ]);
+    widest.validate_args_with_perf_support(true).unwrap();
 
     let mut default = RunOpts::parse_from(["fakehermit", "--chaos", "fakeprog"]);
     default.validate_args_with_perf_support(true).unwrap();
@@ -8487,7 +8496,7 @@ fn chaos_timed_wait_spread_parses_round_trips_and_is_refused_where_inert() {
                 "--chaos-timed-wait-spread=0.5",
                 "fakeprog",
             ],
-            "must be a finite factor above 1 (received 0.5)",
+            "must be a finite factor above 1 and at most 1000 (received 0.5)",
         ),
         (
             vec![
@@ -8508,6 +8517,26 @@ fn chaos_timed_wait_spread_parses_round_trips_and_is_refused_where_inert() {
                 "fakeprog",
             ],
             "must be a finite factor above 1",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--chaos",
+                "--chaos-timed-wait-spread=NaN",
+                "fakeprog",
+            ],
+            "must be a finite factor above 1 and at most 1000 (received NaN)",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--chaos",
+                "--chaos-timed-wait-spread=1000.5",
+                "fakeprog",
+            ],
+            "at most 1000 (received 1000.5)",
         ),
         (
             vec![
@@ -14266,12 +14295,13 @@ impl RunOpts {
         // check the maximum the run will use.
         self.resolve_seeded_chaos_timeslice()?;
         let config = &mut self.det_opts.det_config;
+        let maximum = detcore_model::config::MAX_CHAOS_TIMED_WAIT_SPREAD;
         if let Some(spread) = config.chaos_timed_wait_spread
-            && (!spread.is_finite() || spread <= 1.0)
+            && (!spread.is_finite() || spread <= 1.0 || spread > maximum)
         {
             anyhow::bail!(
-                "--chaos-timed-wait-spread must be a finite factor above 1 (received {spread}); \
-                 10 draws factors from 0.1 to 10, and 1 would spread nothing"
+                "--chaos-timed-wait-spread must be a finite factor above 1 and at most {maximum} \
+                 (received {spread}); 10 draws factors from 0.1 to 10, and 1 would spread nothing"
             );
         }
         let minimum_max_timeslice = config.minimum_max_timeslice_nanos();

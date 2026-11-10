@@ -13,7 +13,7 @@
 //! other threads' work and the scheduler's turn charges. The ratio between a
 //! sleep and the work done meanwhile is therefore fixed by the program, and a
 //! race ordered by that ratio never changes order. This module draws, for
-//! each timed wait, a factor `f` log-uniformly from `[1/R, R]` and queues the
+//! each timed wait, a factor `f` log-uniformly from `[1/R, R)` and queues the
 //! wait at the wake threshold `start + f * duration` instead of at its
 //! deadline. A threshold at or past the deadline oversleeps, which Linux
 //! allows. A threshold before the deadline is promised its deadline

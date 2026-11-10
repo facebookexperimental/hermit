@@ -50,7 +50,7 @@ use crate::types::SchedEvent;
 /// assembles from its trials, whose seeds it keeps itself).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct RecordedTimedWaitSpread {
-    /// The spread `R`: factors are drawn from `[1/R, R]`.
+    /// The spread `R`: factors are drawn from `[1/R, R)`.
     pub spread: f64,
     /// The scheduler seed the factors were drawn from.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -3508,7 +3508,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/timed_wait_spread.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/timed_wait_spread.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test runs this guest's sleep and condwait modes under --chaos across seeds, with and without --chaos-timed-wait-spread, and asserts that the spread reorders the timed wait against the worker while the waiter's own clock never shows less than its 50 ms; it remains a guest fixture because a generic manifest cannot assert a set of outcomes across seeds."
+      "why": "tests/c/timed_wait_spread.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests run its six modes (nanosleep, relative and absolute clock_nanosleep, a raw futex wait, a condition wait, three staggered condition waits) under --chaos at the same seeds with and without --chaos-timed-wait-spread, assert that the spread changes some seed's outcome, and replay each spread recording with --replay-schedule-from; the guest itself fails any wait that ends before its deadline on its own clock, measured around the call. It remains a guest fixture because a generic manifest cannot compare outcomes across seeds and options."
     },
     {
       "disposition": "guest-fixture",

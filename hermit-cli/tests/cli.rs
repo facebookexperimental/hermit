@@ -28935,86 +28935,127 @@ fn prctl_set_ptracer_answers_as_the_host_kernel_does() {
     assert_eq!(stdout(&output), native_stdout);
 }
 
-/// `--chaos-timed-wait-spread` reorders a sleep, and a timed futex wait,
-/// against a worker's progress across seeds, which chaos alone never does:
-/// without the spread every seed sees the same order. The waiter never sees
-/// less than its 50 ms on the guest's own clock, even when its wait ends
-/// early in the worker's progress; the guest prints SHORT and exits 1
-/// otherwise, and a spread run repeats under `--verify --verify-strict`. No
-/// PMU timer is needed: the worker's turns advance the clock. The timed
-/// futex wait is the mode that needs the clock jump to its deadline: a sleep
-/// woken early without it would be filed again, with a fresh draw, until the
-/// clock reached its deadline.
+/// The modes of `tests/c/timed_wait_spread.c`: each one 50 ms timed wait
+/// raced against a worker (`multi`: three condition waits).
+const TIMED_WAIT_SPREAD_MODES: [&str; 6] = [
+    "sleep",
+    "clock-rel",
+    "clock-abs",
+    "futex",
+    "condwait",
+    "multi",
+];
+
+/// The strict chaos run of the timed-wait-spread guest, for `seed`, with
+/// `extra` options: first-pass sleep registration both with and without the
+/// spread, so a spread run and its control differ in the spread alone.
+fn timed_wait_spread_args(seed: &str, extra: &[&'static str]) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "run",
+        "--strict",
+        "--chaos",
+        "--max-timeslice=disabled",
+        "--no-virtualize-cpuid",
+        "--sleep-registration=first-pass",
+    ]
+    .iter()
+    .map(|arg| (*arg).to_owned())
+    .collect();
+    args.push(seed.to_owned());
+    args.extend(extra.iter().map(|arg| (*arg).to_owned()));
+    args
+}
+
+/// The `first=` outcomes the guest printed, one per wait.
+fn timed_wait_spread_outcomes(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| line.split("first=").nth(1))
+        .map(|rest| rest.split_whitespace().next().unwrap_or("").to_owned())
+        .collect()
+}
+
+/// `--chaos-timed-wait-spread` changes which of a timed wait and a worker's
+/// progress comes first: for every mode (nanosleep, relative and absolute
+/// clock_nanosleep, a raw futex wait, a condition wait, and three staggered
+/// condition waits), some seed in 1-8 gives a different outcome with the
+/// spread than the same seed without it, both under first-pass sleep
+/// registration. (Measured at the change: sleep and both clock_nanosleep
+/// forms differ at seeds 2, 4 and 5; futex and condwait at 2, 5 and 7; multi
+/// at 7.) An inert spread fails this. Every run, with and without the spread,
+/// passes the guest's own oracle: no sleep or timeout ends before its
+/// deadline on the guest's clock, measured around the call itself, and no
+/// call returns an unexpected error. A spread run of each mode also repeats
+/// under `--verify --verify-strict`. No PMU timer is needed: the worker's
+/// turns advance the clock.
 #[test]
 fn chaos_timed_wait_spread_reorders_a_wait_against_work_and_keeps_the_clock_honest() {
     let program = timed_wait_spread_guest()
         .to_str()
         .expect("timed-wait-spread guest path should be UTF-8");
-    for (mode, unspread, spread_only) in [
-        ("sleep", "sleeper", "worker"),
-        ("condwait", "timeout", "worker"),
-    ] {
-        let first = |extra: &[&str], seed: u64| {
+    for mode in TIMED_WAIT_SPREAD_MODES {
+        let outcomes = |seed: u64, extra: &[&'static str]| {
             let seed = format!("--seed={seed}");
-            let mut args = vec![
-                "run",
-                "--strict",
-                "--chaos",
-                "--max-timeslice=disabled",
-                "--no-virtualize-cpuid",
-                seed.as_str(),
-            ];
-            args.extend_from_slice(extra);
-            args.extend(["--", program, mode]);
+            let mut args = timed_wait_spread_args(&seed, extra);
+            args.extend(["--".to_owned(), program.to_owned(), mode.to_owned()]);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
             let output = hermit(&args);
             assert_success(&output, &args);
             let out = stdout(&output);
-            out.strip_prefix("first=")
-                .and_then(|rest| rest.split_whitespace().next())
-                .unwrap_or_else(|| panic!("{args:?}: unexpected output {out:?}"))
-                .to_owned()
+            let outcomes = timed_wait_spread_outcomes(&out);
+            assert!(!outcomes.is_empty(), "{args:?}: unexpected output {out:?}");
+            outcomes
         };
-        assert_eq!(first(&[], 1), unspread, "{mode}, seed 1, no spread");
-        first(
+        let differing: Vec<u64> = (1..=8)
+            .filter(|seed| {
+                outcomes(*seed, &[]) != outcomes(*seed, &["--chaos-timed-wait-spread=10"])
+            })
+            .collect();
+        assert!(
+            !differing.is_empty(),
+            "{mode}: the spread changed no outcome at seeds 1-8"
+        );
+        outcomes(
+            1,
             &[
                 "--chaos-timed-wait-spread=10",
                 "--verify",
                 "--verify-strict",
             ],
-            1,
-        );
-        let spread: std::collections::BTreeSet<String> = (1..=8)
-            .map(|seed| first(&["--chaos-timed-wait-spread=10"], seed))
-            .collect();
-        assert_eq!(
-            spread,
-            [unspread, spread_only]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
-            "{mode}: seeds 1-8 under the spread"
         );
     }
 }
 
-/// A schedule replay of a `--chaos-timed-wait-spread` recording follows it:
-/// the recording registers its sleeps at the first pass, by default under the
-/// spread, and so does the replay, which draws each sleep's wake time from the
-/// same committed time. Each of seeds 1-4 replays with no desync and prints
-/// the recording's order and wait; the wait is the spread sleep's, so a
-/// replay that drew it from another clock prints another (measured: 101.46 ms
-/// instead of 135.47 ms at seed 2 when sleeps were registered when chosen). A
-/// recording made under `--sleep-registration=when-chosen` is refused, naming
-/// the registration to record with.
+/// A schedule replay of a `--chaos-timed-wait-spread` recording follows it,
+/// for every mode, including the timed futex and condition waits and the
+/// three staggered condition waits, whose replay switches to a waiter whose
+/// shortened threshold is due while other timed events are due too. The
+/// recording registers its sleeps at the first pass, by default under the
+/// spread, and so does the replay. Each case replays with no desync and
+/// prints the recording's outcomes and waits; a replay that drew a wait
+/// from another clock, or woke a shortened wait before its deadline, prints
+/// another, or SHORT. A recording made under
+/// `--sleep-registration=when-chosen` is refused, naming the registration to
+/// record with.
 #[test]
 fn a_schedule_replay_of_a_timed_wait_spread_recording_follows_it() {
     let program = timed_wait_spread_guest()
         .to_str()
         .expect("timed-wait-spread guest path should be UTF-8");
     let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    for seed in 1..=4u64 {
+    // Seeds 1-4 of every mode, and the two seeds at which the replay of
+    // 7b08dd88 (before the replay switch honoured a promised deadline and a
+    // pass that requeues a promised wake always ended without a commit) left
+    // its recording without a desync: condwait seed 20 (ETIMEDOUT recorded,
+    // a wake replayed) and multi seed 6 (every wait 3 ms short of the
+    // recording's).
+    let cases = TIMED_WAIT_SPREAD_MODES
+        .iter()
+        .flat_map(|mode| (1..=4u64).map(move |seed| (*mode, seed)))
+        .chain([("condwait", 20), ("multi", 6)]);
+    for (mode, seed) in cases {
         let seed_arg = format!("--seed={seed}");
-        let record = dir.path().join(format!("spread-{seed}.json"));
+        let record = dir.path().join(format!("spread-{mode}-{seed}.json"));
         let record_arg = format!("--record-preemptions-to={}", record.display());
         let common = [
             "run",
@@ -29026,10 +29067,12 @@ fn a_schedule_replay_of_a_timed_wait_spread_recording_follows_it() {
             seed_arg.as_str(),
         ];
         let mut args = common.to_vec();
-        args.extend([record_arg.as_str(), "--", program, "sleep"]);
+        args.extend([record_arg.as_str(), "--", program, mode]);
         let recorded = hermit(&args);
         assert_success(&recorded, &args);
-        let summary = dir.path().join(format!("replay-{seed}.summary.json"));
+        let summary = dir
+            .path()
+            .join(format!("replay-{mode}-{seed}.summary.json"));
         let summary_arg = format!("--summary-json={}", summary.display());
         let replay_arg = format!("--replay-schedule-from={}", record.display());
         let mut args = common.to_vec();
@@ -29038,14 +29081,17 @@ fn a_schedule_replay_of_a_timed_wait_spread_recording_follows_it() {
             summary_arg.as_str(),
             "--",
             program,
-            "sleep",
+            mode,
         ]);
         let replayed = hermit(&args);
         assert_success(&replayed, &args);
-        assert_eq!(stdout(&replayed), stdout(&recorded), "seed {seed}");
+        assert_eq!(stdout(&replayed), stdout(&recorded), "{mode} seed {seed}");
         let summary: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
-        assert_eq!(summary["schedevent_desynced"], 0, "seed {seed}: {summary}");
+        assert_eq!(
+            summary["schedevent_desynced"], 0,
+            "{mode} seed {seed}: {summary}"
+        );
     }
 
     let record = dir.path().join("when-chosen.json");

@@ -226,6 +226,15 @@ impl TimedEvents {
         self.insert_thread_event(wake, dt);
     }
 
+    /// The deadline promised to `dt`, if its queued wake threshold `at` came
+    /// before it (`insert_spread`), without taking it out of the record.
+    pub fn promised_deadline(&self, dt: DetTid, at: LogicalTime) -> Option<LogicalTime> {
+        match self.promised.get(&dt) {
+            Some(&(wake, deadline)) if wake == at => Some(deadline),
+            _ => None,
+        }
+    }
+
     /// The deadline promised to `dt` whose wake threshold `at` just popped,
     /// taken out of the record; `None` when its wait ended at its deadline.
     pub fn take_promise(&mut self, dt: DetTid, at: LogicalTime) -> Option<LogicalTime> {

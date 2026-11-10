@@ -1596,7 +1596,7 @@ pub struct Scheduler {
     timed_wait_spread: Option<timed_wait_spread::TimedWaitSpread>,
     /// The thread whose spread wait came due before its deadline in this
     /// pass's step 2b and was queued again at the deadline
-    /// (`reach_promised_deadline`), for `replay_waits_for_a_requeued_wake`.
+    /// (`reach_promised_deadline`), for `took_a_requeued_promised_wake`.
     promised_wake_requeued: Option<DetTid>,
 
     /// INVARIANT: Thread IDs in `blocked` are absent from `run_queue`.
@@ -5046,7 +5046,11 @@ pub async fn do_a_turn_blocking(
                         // or the next pass.
                         state.step2_register_queued_sleeps();
                         if !timed_event_processed {
+                            state.promised_wake_requeued = None;
                             timed_event_processed = state.step2b_process_timed(&global_time);
+                            if state.took_a_requeued_promised_wake() {
+                                return Err(SkipTurn);
+                            }
                         }
                         // Idempotent and spends no event budget, so it runs on
                         // every refresh.
@@ -5078,7 +5082,11 @@ pub async fn do_a_turn_blocking(
                                 return Err(SkipTurn);
                             }
                             if !timed_event_processed {
+                                state.promised_wake_requeued = None;
                                 timed_event_processed = state.step2b_process_timed(&global_time);
+                                if state.took_a_requeued_promised_wake() {
+                                    return Err(SkipTurn);
+                                }
                             }
                             state.step2b_restore_due_pollers();
                             state.upgrade_pollers_on_time();
@@ -7459,12 +7467,39 @@ impl Scheduler {
         if self.run_queue.contains_tid(target) || self.blocked.sigchld_deferred.contains(&target) {
             return;
         }
-        let Some(deadline) = self.blocked.timed_waiters.thread_deadline(target) else {
+        let Some(queued_at) = self.blocked.timed_waiters.thread_deadline(target) else {
             return;
         };
-        if deadline > self.committed_time || deadline.is_indefinite() {
+        if queued_at > self.committed_time || queued_at.is_indefinite() {
             return;
         }
+        // A `--chaos-timed-wait-spread` wait queued at a threshold before its
+        // deadline was promised that deadline (`insert_spread`). While
+        // committed time is still short of it, waking the thread here would
+        // end the wait early: a futex wait would be granted ETIMEDOUT before
+        // its deadline, and the promise, which `remove` drops, would be lost.
+        // Leave the threshold queued instead. Timed-event maintenance pops it
+        // at a quiesced point of the next pass, as the recording's did, moves
+        // the clock to the deadline and queues the wait there
+        // (`reach_promised_deadline`); the pass then holds for the requeued
+        // wake (`took_a_requeued_promised_wake`), and the thread wakes once
+        // committed time reaches its deadline.
+        let deadline = match self
+            .blocked
+            .timed_waiters
+            .promised_deadline(target, queued_at)
+        {
+            Some(deadline) if deadline > self.committed_time => {
+                trace!(
+                    "[replay] dtid {} left asleep for the trace's switch: its threshold {} passed, \
+                     but committed time {} is short of its promised deadline {}",
+                    target, queued_at, self.committed_time, deadline
+                );
+                return;
+            }
+            Some(deadline) => deadline,
+            None => queued_at,
+        };
         self.blocked.timed_waiters.remove(target);
         trace!(
             "[replay] dtid {} woken at its passed deadline {} (committed {}) for the trace's switch",
@@ -11836,22 +11871,22 @@ impl Scheduler {
         }
     }
 
-    /// Under `--replay-schedule-from`, whether the thread the schedule runs
-    /// next went back to sleep in this pass's step 2b: a spread wait that came
-    /// due before its deadline popped and was queued again at the deadline
-    /// (`reach_promised_deadline`). Its recording ran no other thread before
-    /// it, since its next event is that thread's, so the pass ends without a
-    /// commit. The next pass's step 1 brings committed time to the deadline,
-    /// where the thread wakes, as it did in the recording. Without the wait,
-    /// the pass gives the turn to another queued thread, which the recording
-    /// did not run there, and the replay leaves its schedule.
-    fn replay_waits_for_a_requeued_wake(&self) -> bool {
-        self.promised_wake_requeued.is_some_and(|requeued| {
-            self.replayer
-                .as_ref()
-                .and_then(|replayer| replayer.next_resume())
-                .is_some_and(|(tid, _)| tid == requeued)
-        })
+    /// Whether this pass's timed-event maintenance just popped a spread
+    /// wait's threshold before its deadline, moved the clock to the deadline
+    /// and queued the wait there (`reach_promised_deadline`); taking the
+    /// mark. Such a pass ends without a commit, whatever thread is queued, in
+    /// every mode: the jump stands for every other thread having been
+    /// descheduled for the rest of the wait, so none may run before committed
+    /// time catches up with it. The next pass's step 1 brings committed time
+    /// to the deadline, where the wait ends unless something earlier is due.
+    /// Ending the pass here, not only when a schedule replay runs the waiter
+    /// next, also keeps a recording and its schedule replay alike: otherwise
+    /// whether another thread ran first, at the old committed time, would
+    /// depend on whether that pass happened to end without a commit for
+    /// another reason (a chaos priority change point, which a schedule replay
+    /// does not repeat).
+    fn took_a_requeued_promised_wake(&mut self) -> bool {
+        self.promised_wake_requeued.take().is_some()
     }
 
     fn step2_process_blocked(
@@ -11901,7 +11936,7 @@ impl Scheduler {
         self.replay_fast_forward_to_recorded_pops(global_time);
         self.promised_wake_requeued = None;
         self.step2b_process_timed(global_time);
-        if self.replay_waits_for_a_requeued_wake() {
+        if self.took_a_requeued_promised_wake() {
             return Err(SkipTurn);
         }
         let held_for_replayed_wake =
@@ -37764,6 +37799,155 @@ mod test {
             .expect("a seed with such a factor")
     }
 
+    /// A schedule replay's switch to a spread sleeper whose shortened
+    /// threshold has passed leaves it asleep until its deadline is reached
+    /// through the promise, never waking it at the threshold (coord7's review
+    /// probe, `review_probe_replay_switch_honours_a_spread_promise`).
+    #[test]
+    fn a_replayed_switch_honours_a_spread_sleepers_promised_deadline() {
+        let sleeper = DetTid::from_raw(5);
+        let (seed, factor) = spread_seed(sleeper, |factor| factor < 0.5);
+        let (mut scheduler, global_time, start, deadline) = spread_sleeper(Some(seed), sleeper);
+        let wake = start + LogicalTime::from_nanos((1_000_000.0 * factor).round() as u64);
+        global_time
+            .lock()
+            .unwrap()
+            .add_extra_time(wake.duration_since(start));
+        scheduler.committed_time = wake;
+        scheduler.wake_due_replay_target(sleeper);
+        let now = global_time.lock().unwrap().as_nanos();
+        assert!(
+            !scheduler.run_queue.contains_tid(sleeper) || now >= deadline,
+            "replay switch woke the spread sleeper at {wake} with global time {now}, before its \
+             deadline {deadline}"
+        );
+        assert_eq!(
+            scheduler
+                .blocked
+                .timed_waiters
+                .promised_deadline(sleeper, wake),
+            Some(deadline)
+        );
+    }
+
+    /// A schedule replay's switch to a thread in a spread timed futex wait
+    /// whose threshold has passed but whose deadline has not (threshold <=
+    /// committed < deadline) must not wake it for the switch: that would grant
+    /// the futex ETIMEDOUT before its deadline and drop the promised deadline.
+    /// The thread stays asleep at its threshold; maintenance pops an earlier
+    /// competing timed event first, then the threshold, which moves the clock
+    /// to the deadline and requeues the wait there; and the futex times out
+    /// only once committed time reaches the deadline. (Review of
+    /// https://github.com/rrnewton/hermit/pull/4654's port, finding 1.)
+    #[test]
+    fn a_replayed_switch_never_times_out_a_spread_futex_wait_before_its_deadline() {
+        let waiter = DetTid::from_raw(5);
+        let running = DetTid::from_raw(3);
+        let competitor = DetTid::from_raw(7);
+        let (seed, _) = spread_seed(waiter, |factor| factor < 0.5);
+        let config = Config {
+            chaos: true,
+            chaos_timed_wait_spread: Some(10.0),
+            sched_seed: Some(seed),
+            ..Config::default()
+        };
+        let mut sched = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let start = global_time.lock().unwrap().as_nanos();
+        sched.committed_time = start;
+        for tid in [running, waiter, competitor] {
+            sched.priorities.insert(tid, DEFAULT_PRIORITY);
+        }
+        sched.next_turns.insert(
+            waiter,
+            ThreadNextTurn {
+                dettid: waiter,
+                child_tid_addr: 0,
+                req: Ivar::new(),
+                resp: Ivar::new(),
+                protocol: Default::default(),
+            },
+        );
+        let deadline = start + LogicalTime::from_nanos(1_000_000);
+        let futex = FutexID::private(MmId::initial(waiter), 0x404100);
+        sched.sleep_futex_waiter(&waiter, futex, Some(deadline), u32::MAX, None);
+        let threshold = sched
+            .blocked
+            .timed_waiters
+            .thread_deadline(waiter)
+            .expect("queued at its threshold");
+        assert!(threshold < deadline, "a shortened wait");
+        // Other threads' work has moved time past the threshold, short of
+        // the deadline, and an earlier timed event is due ahead of it.
+        let now = threshold + LogicalTime::from_nanos(1_000);
+        assert!(now < deadline);
+        global_time
+            .lock()
+            .unwrap()
+            .add_extra_time(now.duration_since(start));
+        sched.committed_time = now;
+        queue_request(
+            &mut sched,
+            competitor,
+            sleep_request(competitor, threshold - LogicalTime::from_nanos(1)),
+        );
+        assert!(sched.run_queue.remove_tid(competitor));
+        sched
+            .blocked
+            .timed_waiters
+            .insert(threshold - LogicalTime::from_nanos(1), competitor);
+        // The recording: the running thread blocks in a futex wait, and the
+        // waiter's futex wait returns next.
+        let blocks =
+            SchedEvent::syscall(running, Sysno::futex, SyscallPhase::Prehook).with_time(now);
+        let returns =
+            SchedEvent::syscall(waiter, Sysno::futex, SyscallPhase::Posthook).with_time(deadline);
+        sched.replayer = Some(Replayer::new(vec![blocks.clone(), returns]));
+        let timed_out = |sched: &Scheduler| sched.blocked.timed_out_futex_waiters.contains(&waiter);
+
+        let _ = sched.consume_schedevent(&blocks);
+        assert!(!timed_out(&sched), "no timeout at {now}, before {deadline}");
+        assert!(!sched.run_queue.contains_tid(waiter));
+        assert_eq!(
+            sched.blocked.timed_waiters.thread_deadline(waiter),
+            Some(threshold)
+        );
+        assert_eq!(
+            sched
+                .blocked
+                .timed_waiters
+                .promised_deadline(waiter, threshold),
+            Some(deadline),
+            "the promise survives the switch"
+        );
+
+        // Maintenance pops the competitor, then the threshold, which moves
+        // the clock to the deadline and requeues the wait there.
+        assert!(sched.step2b_process_timed(&global_time));
+        assert!(sched.run_queue.contains_tid(competitor));
+        assert!(!timed_out(&sched));
+        assert!(sched.step2b_process_timed(&global_time));
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+        assert_eq!(
+            sched.blocked.timed_waiters.thread_deadline(waiter),
+            Some(deadline)
+        );
+        assert!(
+            !timed_out(&sched),
+            "still short of the deadline in committed time"
+        );
+        // A switch now, with committed time still short, still leaves it.
+        sched.wake_due_replay_target(waiter);
+        assert!(!timed_out(&sched));
+
+        // Committed time reaches the deadline: the futex wait times out there.
+        sched.committed_time = deadline;
+        assert!(sched.step2b_process_timed(&global_time));
+        assert!(timed_out(&sched));
+        assert!(sched.run_queue.contains_tid(waiter));
+        assert!(global_time.lock().unwrap().as_nanos() >= deadline);
+    }
+
     /// `--chaos-timed-wait-spread`: a wait whose threshold comes before its
     /// deadline pops at the threshold, the clock advances to its deadline
     /// before it runs, and it wakes once committed time reaches the deadline;
@@ -37838,14 +38022,25 @@ mod test {
         let sleeper = DetTid::from_raw(5);
         let (seed, factor) = spread_seed(sleeper, |factor| factor < 0.5);
         let event = SchedEvent::syscall(sleeper, Sysno::nanosleep, SyscallPhase::Posthook);
-        for (events, spread) in [(vec![event], true), (vec![], false)] {
+        // A recorded background start still to take is part of the schedule
+        // too (`Replayer::has_events_left`), with every event replayed.
+        let start_left = [crate::preemptions::BackgroundStart {
+            after: 0,
+            thread: DetTid::from_raw(7),
+            call: 1,
+        }];
+        for (events, starts, spread) in [
+            (vec![event], &[][..], true),
+            (vec![], &start_left[..], true),
+            (vec![], &[][..], false),
+        ] {
             let config = Config {
                 chaos_timed_wait_spread: Some(10.0),
                 sched_seed: Some(seed),
                 ..Config::default()
             };
             let mut scheduler = Scheduler::new(&config);
-            scheduler.replayer = Some(Replayer::new(events));
+            scheduler.replayer = Some(Replayer::new(events).with_background_starts(starts, true));
             let start = scheduler.committed_time;
             let deadline = start + LogicalTime::from_nanos(1_000_000);
             scheduler.file_timed_wait(sleeper, deadline);
@@ -37857,40 +38052,52 @@ mod test {
             assert_eq!(
                 scheduler.blocked.timed_waiters.thread_deadline(sleeper),
                 Some(expected),
-                "recorded events left: {spread}"
+                "schedule left: {spread}"
             );
         }
     }
 
-    /// A schedule replay whose next event is a spread sleeper's waits, in a
-    /// pass of its own, for the sleeper that step 2b put back to sleep until
-    /// its deadline, as its recording did, and does not wait for one when the
-    /// schedule runs another thread next.
+    /// A pass whose maintenance pops a spread wait's threshold before its
+    /// deadline, moving the clock to the deadline, ends without a commit
+    /// whatever thread is queued, recording or schedule replay alike, so no
+    /// other thread runs at the old committed time. The next pass brings
+    /// committed time to the deadline and wakes the waiter there, before the
+    /// queued thread's turn.
     #[test]
-    fn a_schedule_replay_waits_for_its_next_thread_put_back_to_sleep() {
+    fn a_pass_that_requeues_a_promised_wake_ends_without_a_commit() {
         let sleeper = DetTid::from_raw(5);
+        let other = DetTid::from_raw(7);
         let (seed, factor) = spread_seed(sleeper, |factor| factor < 0.5);
-        for (next, waits) in [(sleeper, true), (DetTid::from_raw(7), false)] {
+        for next in [None, Some(sleeper), Some(other)] {
             let (mut scheduler, global_time, start, deadline) = spread_sleeper(Some(seed), sleeper);
-            let event = SchedEvent::syscall(next, Sysno::nanosleep, SyscallPhase::Posthook);
-            scheduler.replayer = Some(Replayer::new(vec![event]));
-            assert!(!scheduler.replay_waits_for_a_requeued_wake());
+            if let Some(next) = next {
+                let event = SchedEvent::syscall(next, Sysno::nanosleep, SyscallPhase::Posthook);
+                scheduler.replayer = Some(Replayer::new(vec![event]));
+            }
+            queue_worker(&mut scheduler, other);
             let wake = start + LogicalTime::from_nanos((1_000_000.0 * factor).round() as u64);
             global_time
                 .lock()
                 .unwrap()
                 .add_extra_time(wake.duration_since(start));
             scheduler.committed_time = wake;
-            assert!(scheduler.step2b_process_timed(&global_time));
+            assert!(
+                scheduler.step2_process_blocked(&global_time).is_err(),
+                "next event by {next:?}: the pass ends without a commit"
+            );
+            assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
             assert_eq!(
                 scheduler.blocked.timed_waiters.thread_deadline(sleeper),
                 Some(deadline)
             );
-            assert_eq!(
-                scheduler.replay_waits_for_a_requeued_wake(),
-                waits,
-                "next event by {next}"
+            assert!(
+                !scheduler.took_a_requeued_promised_wake(),
+                "the mark is taken"
             );
+            // Step 1 of the next pass.
+            scheduler.committed_time = deadline;
+            assert!(scheduler.step2b_process_timed(&global_time));
+            assert!(scheduler.run_queue.contains_tid(sleeper), "{next:?}");
         }
     }
 

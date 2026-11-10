@@ -313,6 +313,12 @@ pub struct PropertyFile {
     pub name: String,
 }
 
+/// The largest `--chaos-timed-wait-spread`: factors from 1/1000 to 1000. A
+/// larger spread would only push overslept wake times toward the end of the
+/// virtual clock's range (a long sleep times a huge factor), where the
+/// threshold is clamped just short of the indefinite sentinel.
+pub const MAX_CHAOS_TIMED_WAIT_SPREAD: f64 = 1000.0;
+
 /// Configuration options for detcore.
 #[derive(Debug, Serialize, Deserialize, Clone, Parser)]
 pub struct Config {
@@ -990,10 +996,11 @@ pub struct Config {
     /// Spread the timed waits of a `--chaos` run: end each sleep, and each futex wait with a
     /// timeout in the default precise futex mode, when the global clock reaches the time the
     /// scheduler queues the wait plus its remaining duration times a factor drawn
-    /// log-uniformly from `[1/R, R]`, where `R` is this value. Chaos alone only
-    /// reorders threads, so the ratio between a sleep and other threads' work is fixed by the
-    /// program, and a race ordered by that ratio (a test that sleeps while a worker computes,
-    /// a periodic timer against a teardown) never changes order. A factor of at least one
+    /// log-uniformly from `[1/R, R)`, where `R` is this value. Chaos alone only
+    /// reorders runnable threads and never moves a sleeper's wake against the clock, so a race
+    /// ordered by the ratio between a sleep and other threads' work (a test that sleeps while
+    /// a worker computes, a periodic timer against a teardown) changes order only as far as
+    /// that reordering moves the clock. A factor of at least one
     /// oversleeps, as Linux may. A factor below one ends the wait after that fraction of
     /// other threads' progress, and first advances the global clock to the wait's deadline,
     /// as if every other thread had been descheduled for the rest of the wait, so the waiter
@@ -1003,7 +1010,8 @@ pub struct Config {
     /// Not spread: poll, epoll and select timeouts, signal timers, and waits with no finite
     /// future deadline. Needs `--chaos`, or a replay of preemptions recorded with it, threads
     /// sequentialized by Detcore's scheduler, and the ptrace backend (or e9patch preprocessing,
-    /// which runs on it); must be finite and above 1. Unset (the default), nothing changes.
+    /// which runs on it); must be finite, above 1 and at most 1000
+    /// (`MAX_CHAOS_TIMED_WAIT_SPREAD`). Unset (the default), nothing changes.
     /// Its sleeps are registered at the first scheduler pass by default
     /// (`--sleep-registration=first-pass`), so a schedule replay draws each wake time from the
     /// committed time the recording drew it from; `--replay-schedule-from` refuses a record of
@@ -2162,9 +2170,10 @@ impl Config {
         }
         if let Some(spread) = self.chaos_timed_wait_spread {
             assert!(
-                spread.is_finite() && spread > 1.0,
-                "chaos_timed_wait_spread must be finite and above 1, as \
-                 `hermit run --chaos-timed-wait-spread` requires, got {spread}"
+                spread.is_finite() && spread > 1.0 && spread <= MAX_CHAOS_TIMED_WAIT_SPREAD,
+                "chaos_timed_wait_spread must be finite, above 1 and at most \
+                 {MAX_CHAOS_TIMED_WAIT_SPREAD}, as `hermit run --chaos-timed-wait-spread` \
+                 requires, got {spread}"
             );
         }
         let minimum_max_timeslice = self.minimum_max_timeslice_nanos();
@@ -7111,6 +7120,31 @@ mod tests {
     /// unless `--sleep-registration` says otherwise, under `--chaos` as well,
     /// so a schedule replay can reproduce its wake times; `hermit record` and
     /// `hermit replay` still register them when chosen.
+    /// The model refuses every spread the CLI refuses: NaN, infinities, 1
+    /// and below, and above `MAX_CHAOS_TIMED_WAIT_SPREAD`; it accepts the
+    /// bound itself.
+    #[test]
+    fn only_a_finite_spread_above_1_and_within_the_bound_is_valid() {
+        let with = |spread| Config {
+            chaos: true,
+            chaos_timed_wait_spread: Some(spread),
+            ..Default::default()
+        };
+        with(MAX_CHAOS_TIMED_WAIT_SPREAD).validate_invariants();
+        with(1.5).validate_invariants();
+        for spread in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1.0,
+            0.5,
+            MAX_CHAOS_TIMED_WAIT_SPREAD + 0.5,
+        ] {
+            let refused = std::panic::catch_unwind(|| with(spread).validate_invariants());
+            assert!(refused.is_err(), "{spread} was accepted");
+        }
+    }
+
     #[test]
     fn a_timed_wait_spread_registers_sleeps_at_the_first_pass_by_default() {
         let spread = Config {

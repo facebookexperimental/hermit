@@ -670,10 +670,12 @@ impl Replayer {
             .find(|thread| *thread != except && threads.contains(thread))
     }
 
-    /// Whether every recorded event has been replayed, so the run continues
-    /// past its schedule.
+    /// Whether the run has gone past its schedule: every recorded event has
+    /// been replayed and every recorded background start taken, or the replay
+    /// released its schedule. The same notion of "the schedule's end" that
+    /// `has_events_left` gives.
     pub(super) fn ran_out(&self) -> bool {
-        self.cursor.peek().is_none()
+        !self.has_events_left()
     }
 
     fn peek_next(&self) -> Option<SchedEvent> {

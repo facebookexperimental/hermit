@@ -601,10 +601,12 @@ Chaos reorders threads but never changes how long a timed wait lasts against
 other threads' work: a sleeping thread wakes when the virtual clock, which
 advances with that work, reaches its deadline. A race ordered by that ratio
 (a test that sleeps while a worker computes, a periodic timer against a
-teardown) therefore keeps one order under every seed.
+teardown) therefore changes order only as far as chaos's reordering of the
+other threads moves the clock, and for many programs keeps one order under
+every seed.
 `--chaos-timed-wait-spread=R` ends each sleep, and each futex wait with a
 timeout (in the default precise futex mode), after its remaining duration
-times a seeded factor drawn log-uniformly from `[1/R, R]` of the clock's
+times a seeded factor drawn log-uniformly from `[1/R, R)` (R at most 1000) of the clock's
 progress. When the factor is below one, the clock
 first jumps to the wait's deadline, as if the other threads had been
 descheduled, so the waiter still observes its full duration; above one, the
@@ -1369,7 +1371,7 @@ that their order decides the failure.
 | `--chaos-timeslice-range=MIN..MAX` | With `--chaos`, draws each slice's mean log-uniformly from MIN..MAX virtual nanoseconds and caps slices at MAX (the run's `--max-timeslice`). Not with `--chaos-seeded-timeslice`, which draws the maximum instead. |
 | `--chaos-timeslice-draw=run` | Discovery mode: draws the run's `--max-timeslice` once from the range (without one, the recommended 1000..200000000), from the scheduler seed. Fine draws make runs much slower. |
 | `--chaos-timeslice-draw=slice` | The default draw: each slice's mean from `--chaos-timeslice-range`, which it needs; what a range alone does. |
-| `--chaos-timed-wait-spread=R` | Ends each sleep and futex timeout after its duration times a seeded factor in `[1/R, R]`, never before its deadline on the guest's clock. |
+| `--chaos-timed-wait-spread=R` | Ends each sleep and futex timeout after its duration times a seeded factor in `[1/R, R)` (R at most 1000), never before its deadline on the guest's clock. |
 
 A thread that polls with timed waits shorter than a scheduler turn's charge
 (`--scheduler-turn-cost`) would otherwise burn a full charge of virtual time
