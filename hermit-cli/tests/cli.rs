@@ -27066,6 +27066,107 @@ fn two_children_after_a_handler_return_choose_the_creator() {
     }
 }
 
+/// The slice-coverage oracle for the test below: was thread M (the
+/// creator, identified by its `ppoll` inbound line) timer-preempted
+/// after its first handler/`ppoll` return and before the second signal
+/// delivery, in detlog order?
+///
+/// The return itself logs no line at info level, so the interval opens
+/// at the first log event that proves it happened: the second child's
+/// `exit_group`. The guest releases that child only from the store
+/// after both the handler and `ppoll` have returned, so any M slice end
+/// after that line is in the post-return, syscall-free window, and any
+/// before it may be the handler's own burn and does not count. A slice
+/// end counts only when sourced by a timer: an `inbound timer
+/// preemption event` for M immediately ending M's timeslice. A yield-
+/// or syscall-ended slice (the cooperative fallback) does not count,
+/// and a run with timeslices disabled has no timer event at all, so
+/// both fail this oracle while still printing M/M.
+fn timer_preemption_of_m_after_first_return(detlog: &str) -> Result<(), String> {
+    let lines: Vec<&str> = detlog.lines().collect();
+    let creator = lines
+        .iter()
+        .find(|line| line.contains("inbound syscall: ppoll("))
+        .and_then(|line| line.split("[detcore, dtid ").nth(1))
+        .and_then(|rest| rest.split(']').next())
+        .ok_or("no ppoll inbound line identifies the creator")?;
+    let timer = format!("[detcore, dtid {creator}] inbound timer preemption event");
+    let ending = format!("[detcore, dtid {creator}] ending timeslice");
+    let delivered = format!("[dtid {creator}] handling inbound signal (#0)");
+    let first_delivery = lines
+        .iter()
+        .position(|line| line.contains(&delivered))
+        .ok_or("the first SIGCHLD delivery to the creator is missing")?;
+    // The first exit after that delivery is the second child's: the
+    // first child exited before it, and nobody else exits until after
+    // the second delivery.
+    let second_child_exit = lines[first_delivery + 1..]
+        .iter()
+        .position(|line| {
+            line.contains("inbound syscall: exit_group")
+                && !line.contains(&format!("[detcore, dtid {creator}]"))
+        })
+        .map(|offset| first_delivery + 1 + offset)
+        .ok_or("the second child's exit is missing")?;
+    let handling = format!("[dtid {creator}] handling inbound signal");
+    let alarm = format!("[dtid {creator}] Alarm fired, delivering signal");
+    let second_delivery = lines[second_child_exit + 1..]
+        .iter()
+        .position(|line| line.contains(&handling) || line.contains(&alarm))
+        .map(|offset| second_child_exit + 1 + offset)
+        .ok_or("the second SIGCHLD delivery is missing")?;
+    for index in second_child_exit + 1..second_delivery {
+        if lines[index].contains(&timer)
+            && lines[index + 1..second_delivery]
+                .iter()
+                .take(2)
+                .any(|line| line.contains(&ending))
+        {
+            return Ok(());
+        }
+    }
+    Err(
+        "no timer-sourced timeslice end for the creator after its first \
+         handler/ppoll return and before the second delivery"
+            .to_string(),
+    )
+}
+
+/// The oracle above must tell a timer preemption in the post-return
+/// window from the two ways a run can print M/M without one: handler
+/// burns before the return, and cooperative yields after it.
+#[test]
+fn timer_preemption_oracle_distinguishes_timer_yield_and_disabled_logs() {
+    let header = "[detcore, dtid 3] inbound syscall: ppoll(NULL, 0, 0x0, 0x0, 8) = ?";
+    let delivered = "[dtid 3] handling inbound signal (#0) SIGCHLD";
+    let child_exit = "[detcore, dtid 7] inbound syscall: exit_group(0) = ?";
+    let second = "[dtid 3] handling inbound signal (#1) SIGCHLD";
+    // Timer preemptions during the handler burn (before the return the
+    // second child's exit proves) never qualify on their own.
+    let burn = format!(
+        "{header}\n{delivered}\n\
+         [detcore, dtid 3] inbound timer preemption event\n\
+         [detcore, dtid 3] ending timeslice T1. 0 syscalls and 0 signals this timeslice.\n\
+         {child_exit}\n"
+    );
+    let positive = format!(
+        "{burn}\
+         [detcore, dtid 3] inbound timer preemption event\n\
+         [detcore, dtid 3] ending timeslice T2. 0 syscalls and 0 signals this timeslice.\n\
+         {second}\n"
+    );
+    assert!(timer_preemption_of_m_after_first_return(&positive).is_ok());
+    // The cooperative fallback ends the creator's slices by yield.
+    let cooperative = format!(
+        "{burn}\
+         [detcore, dtid 3] ending timeslice T2. 2 syscalls and 0 signals this timeslice.\n\
+         {second}\n"
+    );
+    assert!(timer_preemption_of_m_after_first_return(&cooperative).is_err());
+    // Timeslices disabled: no timer event anywhere after the return.
+    assert!(timer_preemption_of_m_after_first_return(&format!("{burn}{second}\n")).is_err());
+}
+
 /// The slice-burning variant of the two-child regression
 /// (tests/c/two_child_slice_burning_handler.c): the first handler burns
 /// CPU past a timeslice before returning, and the creator makes no
@@ -27143,10 +27244,12 @@ fn two_children_after_a_slice_burning_handler_return_choose_the_creator() {
         assert_eq!(stdout(&output), native, "{backend:?}");
         if backend.is_empty() {
             // The slice observation: a plain ptrace run of the same guest
-            // must show timeslice endings in its log, proving a PMU
-            // timeslice actually expired while the guest ran (the burn
-            // produces most of them). Without one, the case above passed
-            // without crossing a slice boundary and proves nothing.
+            // must show a timer-sourced preemption of the creator after
+            // its first handler/ppoll return and before the second
+            // delivery (see timer_preemption_of_m_after_first_return).
+            // Counting timeslice endings over the whole log would also
+            // credit the handler's burns and the cooperative yield
+            // fallback, neither of which is a preemption in that window.
             let qargs = [
                 "--log",
                 "info",
@@ -27161,12 +27264,37 @@ fn two_children_after_a_slice_burning_handler_return_choose_the_creator() {
             ];
             let qualify = hermit(&qargs);
             assert_success(&qualify, &qargs);
+            assert_eq!(stdout(&qualify), native, "qualify run");
             let detlog = fs::read_to_string(&log).expect("the qualify run wrote no log");
-            let endings = detlog.matches("ending timeslice").count();
+            timer_preemption_of_m_after_first_return(&detlog)
+                .unwrap_or_else(|reason| panic!("qualify run has no slice coverage: {reason}"));
+            // Negative control: with timeslices disabled the guest still
+            // prints M/M (the ordinary two-child outcome), but the same
+            // oracle must fail. That proves the oracle distinguishes a
+            // timer preemption in the window from a passing guest.
+            let disabled_log = directory.path().join("slice-disabled.detlog");
+            let disabled_arg = disabled_log.to_str().expect("log path should be UTF-8");
+            let dargs = [
+                "--log",
+                "info",
+                "--log-file",
+                disabled_arg,
+                "run",
+                "--strict",
+                "--base-env=minimal",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--max-timeslice=disabled",
+                "--",
+                guest,
+            ];
+            let disabled = hermit(&dargs);
+            assert_success(&disabled, &dargs);
+            assert_eq!(stdout(&disabled), native, "disabled-timeslice run");
+            let disabled_detlog =
+                fs::read_to_string(&disabled_log).expect("the disabled run wrote no log");
             assert!(
-                endings >= 10,
-                "only {endings} timeslice endings in the qualify run; \
-                 no PMU preemption observed inside the window"
+                timer_preemption_of_m_after_first_return(&disabled_detlog).is_err(),
+                "the oracle accepted a --max-timeslice=disabled run as slice coverage"
             );
         }
     }
