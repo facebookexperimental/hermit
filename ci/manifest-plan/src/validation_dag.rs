@@ -295,7 +295,8 @@ pub const HOSTED_PORTABLE_EXCLUDED_BACKENDS: &[&str] = &["kvm", "liteinst", "in-
 /// cases run guests under the same runtime with site patching off
 /// (`--backend=in-guest-trap`), and the three self-signal-death cases run
 /// guests under both in-guest backends. The two scalar SIGALRM tests also
-/// require this runtime capability. Only `test.cli_on_host`
+/// require this runtime capability, as do the three in-guest-trap SIGALRM
+/// pipe-read cases (dev-hermit dh-ru056 slice 2). Only `test.cli_on_host`
 /// excludes them, with one exact-name filterset (`-E 'not (test(=NAME) |
 /// ...)'`) rather than substring `--skip`s; the local `test.cli` keeps running
 /// every one in the pinned root, and a test below holds both sides to this
@@ -305,8 +306,11 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_backend_stats_report_the_guests_own_dispatch_paths",
     "liteinst_in_guest_programs::in_guest_trap_dispatch_record_reports_no_patched_sites",
     "liteinst_in_guest_programs::in_guest_trap_keeps_site_patching_off_whatever_a_guest_library_does",
+    "liteinst_in_guest_programs::in_guest_trap_refuses_by_name_the_sigalrm_pipe_reads_slice_2_does_not_place",
     "liteinst_in_guest_programs::in_guest_trap_sets_site_patching_off_and_refuses_a_caller_who_turns_it_on",
+    "liteinst_in_guest_programs::in_guest_trap_sigalrm_interrupts_a_guest_held_pipe_read_as_ptrace_does",
     "liteinst_in_guest_programs::in_guest_trap_sigalrm_scalar_identity_matches_ptrace",
+    "liteinst_in_guest_programs::in_guest_trap_stops_by_name_when_a_waiting_pipe_reads_status_changes",
     "liteinst_in_guest_programs::in_guest_trap_verifies_a_program_with_no_site_patched",
     "liteinst_in_guest_programs::in_guest_unsequentialized_runs_refuse_a_caught_handler_by_name",
     "liteinst_in_guest_programs::liteinst_in_guest_a_root_that_aborts_ends_with_its_own_status",
