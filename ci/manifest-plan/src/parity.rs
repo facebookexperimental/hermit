@@ -10054,6 +10054,12 @@ mod tests {
     /// after `setup_delay` is planted between planning and the deadline, and
     /// checks that the slow log-diff is killed at that bound, not at its own,
     /// and that later comparisons never start.
+    ///
+    /// The bound is 3 s. Everything before the first comparison runs inside
+    /// it: 1.4 ms alone, and 13.6 to 121 ms in ten full loaded
+    /// `cargo test --lib` runs, where the earlier 400 ms bound ran out before
+    /// the first comparison 2 times in 30 (dh-1ppbr4). The hanging log-diff,
+    /// not the setup, is what uses the bound up.
     fn outer_deadline_stops_the_comparisons(label: &str, setup_delay: Duration) -> Fixture {
         let fixture = Fixture::new(label);
         let (rows, scope) = outer_deadline_cells(&fixture);
@@ -10061,8 +10067,9 @@ mod tests {
         let mut config = fixture.config();
         assert_eq!(config.log_diff_timeout, PARITY_LOG_DIFF_TIMEOUT);
         assert_eq!(config.budget, PARITY_POST_PASS_BUDGET);
+        let outer_bound = Duration::from_secs(3);
         config.outer_deadline = Some(PostPassDeadline {
-            at: Instant::now() + Duration::from_millis(400),
+            at: Instant::now() + outer_bound,
             bound: "the planted step bound".into(),
         });
         DELAY_BEFORE_COMPARISONS.with(|delay| delay.set(setup_delay));
@@ -10074,6 +10081,7 @@ mod tests {
             "the post-pass outlived its outer bound: {elapsed:?}"
         );
         assert_eq!(report.log_diff_runs, 1, "{:?}", report.records);
+        assert_eq!(fixture.log_diff_calls(), 1, "a later comparison started");
         let reasons = report
             .records
             .iter()
@@ -10087,9 +10095,22 @@ mod tests {
                 record.reason.clone().unwrap()
             })
             .collect::<Vec<_>>();
+        // The log-diff's own bound is what is left of the outer one, never
+        // its own 120 s, and it ran until that bound killed it.
+        let killed_at = reasons[0]
+            .strip_prefix("hermit log-diff exceeded its ")
+            .and_then(|rest| rest.split_once(" s bound and was killed"))
+            .and_then(|(seconds, _)| seconds.parse::<f64>().ok())
+            .unwrap_or_else(|| panic!("{reasons:?}"));
         assert!(
-            reasons[0].contains("hermit log-diff exceeded its 0.") && reasons[0].contains("killed"),
+            killed_at > 0.0 && killed_at <= outer_bound.as_secs_f64(),
             "{reasons:?}"
+        );
+        assert!(killed_at < PARITY_LOG_DIFF_TIMEOUT.as_secs_f64());
+        // The reason rounds to 0.1 s.
+        assert!(
+            elapsed.as_secs_f64() >= killed_at - 0.05,
+            "killed before its bound: {elapsed:?} against {killed_at} s"
         );
         for reason in &reasons[1..] {
             assert_eq!(
