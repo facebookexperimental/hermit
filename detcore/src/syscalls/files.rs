@@ -26482,8 +26482,8 @@ mod untraced_code_tests {
 
     /// A thread cloned without CLONE_FILES has its own descriptor table, so
     /// a descriptor is read through the thread that opened it. Through its
-    /// leader the same number names nothing here, which would make an
-    /// ordinary write-mode open count as unreadable (a false `/` that
+    /// leader the same number names some other file or nothing, which would
+    /// make an ordinary write-mode open count as unreadable (a false `/` that
     /// withholds a real host input change) and would miss the thread's own
     /// process-memory file.
     #[test]
@@ -26516,7 +26516,10 @@ mod untraced_code_tests {
                 drop(file);
                 let identity = descriptor_identity(tid, number);
                 assert!(identity.is_some(), "{number}");
-                assert_eq!(descriptor_identity(leader, number), None, "{number}");
+                // The leader's table is shared by every concurrent test
+                // thread, so its slot may hold another test's descriptor; it
+                // must just never be this thread's file.
+                assert_ne!(descriptor_identity(leader, number), identity, "{number}");
                 assert_eq!(
                     may_write_process_memory(
                         OFlag::O_WRONLY,
