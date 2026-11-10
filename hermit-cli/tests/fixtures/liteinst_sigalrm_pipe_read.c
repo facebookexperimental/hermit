@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -42,6 +43,25 @@
  *            through the inherited write end, and the parent keeps its own
  *            copy, which it may not close once it handles SIGALRM. The read
  *            end is made blocking again before the install.
+ *   blocked: as eintr, with SIGALRM blocked by sigprocmask across the read.
+ *            The read returns the byte at 3s with no handler run; the
+ *            handler runs when the parent unblocks SIGALRM, before
+ *            sigprocmask returns.
+ *   setfl:   the child sets O_NONBLOCK on the shared read end with F_SETFL
+ *            and then tells the parent, through a second pipe read before
+ *            the install; it writes at 3s. Linux's processes share the
+ *            description's flags, so the read returns -1/EAGAIN at once,
+ *            with no handler run.
+ *   fionbio: as setfl, with ioctl(FIONBIO).
+ *   setfl_mid: as eintr, but the child sets O_NONBLOCK on the shared read
+ *            end at 0.5s, while the parent's read waits. Linux's interrupted
+ *            wait returns -ERESTARTSYS whatever the flags, so the read
+ *            returns -1/EINTR after the handler; a second read then returns
+ *            -1/EAGAIN at once.
+ *   hostpipe: as eintr, on standard input, a pipe the host passed in whose
+ *            writer the host keeps open and never writes; the child exits at
+ *            once. The read returns -1/EINTR after the handler. In-guest
+ *            refuses it: the host could fill the pipe at any time.
  */
 
 static volatile sig_atomic_t hits;
@@ -110,7 +130,17 @@ int main(int argc, char **argv) {
     int eof = !strcmp(mode, "eof");
     int data = !strcmp(mode, "data");
     int childexit = !strcmp(mode, "childexit");
-    if (!restart && !fifo && !eof && !data && !childexit && strcmp(mode, "eintr")) return 2;
+    int blocked = !strcmp(mode, "blocked");
+    int setfl = !strcmp(mode, "setfl");
+    int fionbio = !strcmp(mode, "fionbio");
+    int setfl_mid = !strcmp(mode, "setfl_mid");
+    int hostpipe = !strcmp(mode, "hostpipe");
+    /* The child changes the read end's status before the read (setfl,
+     * fionbio) or while it waits (setfl_mid). */
+    int status_change = setfl || fionbio || setfl_mid;
+    if (!restart && !fifo && !eof && !data && !childexit && !blocked && !status_change &&
+        !hostpipe && strcmp(mode, "eintr"))
+        return 2;
     long write_ms = data ? 1000 : eof ? 1000 : childexit ? 500 : 3000;
     /* The windows' upper bound: the write, or 3s where the child writes
      * nothing after the alarm. */
@@ -120,6 +150,12 @@ int main(int argc, char **argv) {
     clock_gettime(CLOCK_MONOTONIC, &start);
 
     int ends[2];
+    /* The child's word that it changed the read end's status. */
+    int sync[2] = {-1, -1};
+    if ((setfl || fionbio) && pipe(sync)) {
+        printf("pipe errno=%d\n", errno);
+        return 1;
+    }
     const char *path = "sigalrm_pipe_read.fifo";
     int in = -1;
     if (fifo) {
@@ -138,6 +174,8 @@ int main(int argc, char **argv) {
         /* Unlinked while still unhandled: phase 1 refuses unlink once the
          * process handles SIGALRM. The open ends stay usable. */
         unlink(path);
+    } else if (hostpipe) {
+        in = 0;
     } else if (pipe(ends)) {
         printf("pipe errno=%d\n", errno);
         return 1;
@@ -148,13 +186,28 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (child == 0) {
-        close(fifo ? in : ends[0]);
+        if (hostpipe) _exit(0);
         int out = ends[1];
+        if (status_change) {
+            /* The read end stays open here: its status is the shared
+             * description's, which the child changes. */
+            if (setfl_mid) sleep_ms(500);
+            int changed = fionbio ? ioctl(ends[0], FIONBIO, &(int){1})
+                                  : fcntl(ends[0], F_SETFL, fcntl(ends[0], F_GETFL) | O_NONBLOCK);
+            if (changed) _exit(4);
+            if (!setfl_mid && write(sync[1], "s", 1) != 1) _exit(5);
+            sleep_ms(write_ms - (setfl_mid ? 500 : 0));
+            if (write(out, "x", 1) != 1) _exit(3);
+            _exit(0);
+        }
+        close(fifo ? in : ends[0]);
         sleep_ms(write_ms);
         if (!eof && !childexit && write(out, "x", 1) != 1) _exit(3);
         _exit(0);
     }
-    if (fifo) {
+    if (hostpipe) {
+        /* The host's descriptor, kept as it came. */
+    } else if (fifo) {
         if (fcntl(in, F_SETFL, fcntl(in, F_GETFL) & ~O_NONBLOCK)) {
             printf("fcntl errno=%d\n", errno);
             return 1;
@@ -164,8 +217,25 @@ int main(int argc, char **argv) {
         /* childexit keeps a writer, so the read waits for the alarm. */
         if (!childexit) close(ends[1]);
     }
+    if (sync[0] >= 0) {
+        /* Before the install: the parent may not close a pipe afterwards. */
+        char s = '?';
+        if (read(sync[0], &s, 1) != 1) {
+            printf("sync errno=%d\n", errno);
+            return 1;
+        }
+        close(sync[0]);
+        close(sync[1]);
+    }
+    sigset_t alarm_set;
+    sigemptyset(&alarm_set);
+    sigaddset(&alarm_set, SIGALRM);
     if (install(restart)) {
         printf("sigaction errno=%d\n", errno);
+        return 1;
+    }
+    if (blocked && sigprocmask(SIG_BLOCK, &alarm_set, NULL)) {
+        printf("sigprocmask errno=%d\n", errno);
         return 1;
     }
     alarm(alarm_ms / 1000);
@@ -181,10 +251,14 @@ int main(int argc, char **argv) {
         printf("frame result_eintr=%d ip_after_syscall=%d\n", (int)frame_result_is_eintr,
                (int)frame_ip_after_syscall);
     }
-    if (n < 0 && e == EINTR && !childexit) {
+    if (blocked) {
+        int unblocked = sigprocmask(SIG_UNBLOCK, &alarm_set, NULL);
+        printf("unblock=%d hits_at_return=%d\n", unblocked, (int)hits);
+    } else if (n < 0 && e == EINTR && !childexit && !hostpipe) {
         c = '?';
+        errno = 0;
         n = read(in, &c, 1);
-        printf("read2=%zd byte=%c window=%s\n", n, n == 1 ? c : '-',
+        printf("read2=%zd errno=%d byte=%c window=%s\n", n, n < 0 ? errno : 0, n == 1 ? c : '-',
                window(elapsed_ms(), alarm_ms, window_ms));
     } else if (data) {
         errno = 0;
