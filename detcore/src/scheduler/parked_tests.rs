@@ -12643,6 +12643,7 @@ fn a_delivery_frame_decides_until_sigreturn_and_nests() {
         creator,
         KernelSignalState {
             thread_pending: winch,
+            shared_pending: kernel_signal_bit(libc::SIGCHLD),
             blocked: 0,
             ..KernelSignalState::default()
         },
@@ -12660,7 +12661,10 @@ fn a_delivery_frame_decides_until_sigreturn_and_nests() {
         (Some(sibling), Some(sibling)),
         "in force: the temporary mask admits the WINCH copy"
     );
-    s.handoff_delivery(creator, SigWrapper(libc::SIGCHLD));
+    // Entry before the wait's finish: the wake queues the entry, the
+    // handler's entry (its delivery recorded) hands the interval off.
+    s.wake_signaled_guest(creator, SigWrapper(libc::SIGCHLD));
+    s.record_delivery_entry(creator);
     assert!(!s.wait_masks_in_force.contains_key(&creator));
     // The delivery mask (temporary, sa_mask WINCH, SIGCHLD) blocks it.
     assert_eq!(
@@ -12679,7 +12683,8 @@ fn a_delivery_frame_decides_until_sigreturn_and_nests() {
     assert!(s.end_wait_mask(creator));
     // Re-deliver and pop at sigreturn: the physical mask decides again.
     assert!(s.begin_wait_mask(creator, Some(usr2)));
-    s.handoff_delivery(creator, SigWrapper(libc::SIGCHLD));
+    s.wake_signaled_guest(creator, SigWrapper(libc::SIGCHLD));
+    s.record_delivery_entry(creator);
     assert!(s.pop_delivery_mask(creator));
     assert_eq!(
         s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGUSR1),

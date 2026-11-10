@@ -27027,11 +27027,15 @@ fn two_children_after_a_handler_return_choose_the_creator() {
         String::from_utf8(output.stdout).expect("guest stdout should be UTF-8")
     };
     assert_eq!(native, "first=M second=M\n", "natively");
-    if !Path::new("/dev/kvm").exists() {
+    // ptrace first: it is the half that catches a surviving delivery
+    // frame, and it must not be skipped when /dev/kvm is absent.
+    let mut backends: Vec<&[&str]> = vec![&[][..]];
+    if Path::new("/dev/kvm").exists() {
+        backends.push(&["--backend=kvm"][..]);
+    } else {
         eprintln!("skipping the KVM two-child case: /dev/kvm is unavailable");
-        return;
     }
-    for backend in [&["--backend=kvm"][..], &[][..]] {
+    for backend in backends {
         let _guard = hermit_run_guard();
         let guest = guest_path.to_str().expect("guest path should be UTF-8");
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
