@@ -13,8 +13,9 @@ if [[ ! -x "$hermit_bin" ]]; then
     exit 1
 fi
 
-if [[ $(rustc --version) != *nightly* ]]; then
-    printf "The fixture requires Hermit's pinned nightly rustc.\n" >&2
+pinned_channel=$(sed -n 's/^channel = "\([^"]*\)".*/\1/p' "$repo_root/rust-toolchain.toml" | head -n 1)
+if [[ $(rustc --version) != *"$pinned_channel"* ]]; then
+    printf "The fixture requires Hermit's pinned rustc (%s).\n" "$pinned_channel" >&2
     exit 1
 fi
 
@@ -29,6 +30,9 @@ if [[ -z "$macro" ]]; then
 fi
 
 mkdir -p "$artifact_dir"
+# -Z threads=1 is unstable; the pinned stable compiler accepts it only
+# with bootstrap permission, as the E2E fixture already does.
+export RUSTC_BOOTSTRAP=1
 compile=(
     rustc
     -Z threads=1

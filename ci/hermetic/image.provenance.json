@@ -117,7 +117,7 @@
                 "loaded_reference": "localhost/hermit-hermetic-validate@sha256:8cc3da4d4aad5a5322ab6358bfb805c4f3662db1ce5cab217289547cb3f5752f",
                 "manifest_media_type": "application/vnd.docker.distribution.manifest.v2+json",
                 "manifest_digest": "sha256:8cc3da4d4aad5a5322ab6358bfb805c4f3662db1ce5cab217289547cb3f5752f",
-                "manifest_size_bytes": 391,
+                "manifest_size_bytes": 598,
                 "config_digest": "sha256:f9589929b552324217208af9f21e1c4e91f424c5626fa5376088936083b20741",
                 "config_size_bytes": 21917,
                 "layers": [
@@ -161,7 +161,7 @@
                 "loaded_reference": "localhost/hermit-hermetic-validate@sha256:8cc3da4d4aad5a5322ab6358bfb805c4f3662db1ce5cab217289547cb3f5752f",
                 "manifest_media_type": "application/vnd.docker.distribution.manifest.v2+json",
                 "manifest_digest": "sha256:8cc3da4d4aad5a5322ab6358bfb805c4f3662db1ce5cab217289547cb3f5752f",
-                "manifest_size_bytes": 391,
+                "manifest_size_bytes": 598,
                 "config_digest": "sha256:f9589929b552324217208af9f21e1c4e91f424c5626fa5376088936083b20741",
                 "config_size_bytes": 21917,
                 "layers": [

@@ -454,6 +454,32 @@ fn validate_artifact(artifact: &Value, context: &str) -> Result<(), String> {
             ));
         }
     }
+    // The recorded manifest length must be the length of the compact
+    // Docker-v2 manifest those descriptors reconstruct to; a nonzero
+    // length alone once let a wrong 391 stand for the real 598.
+    let mut reconstructed = format!(
+        "{{\"schemaVersion\":2,\"mediaType\":\"{}\",\"config\":{{\"mediaType\":\"application/vnd.docker.container.image.v1+json\",\"digest\":\"{}\",\"size\":{}}},\"layers\":[",
+        string(artifact, "manifest_media_type", context)?,
+        string(artifact, "config_digest", context)?,
+        unsigned(artifact, "config_size_bytes", context)?,
+    );
+    for (index, layer) in layers.iter().enumerate() {
+        if index > 0 {
+            reconstructed.push(',');
+        }
+        reconstructed.push_str(&format!(
+            "{{\"mediaType\":\"application/vnd.docker.image.rootfs.diff.tar.gzip\",\"digest\":\"{}\",\"size\":{}}}",
+            string(layer, "digest", &format!("{context}.layers[{index}]"))?,
+            unsigned(layer, "size_bytes", &format!("{context}.layers[{index}]"))?,
+        ));
+    }
+    reconstructed.push_str("]}");
+    if reconstructed.len() as u64 != unsigned(artifact, "manifest_size_bytes", context)? {
+        return Err(format!(
+            "{context}.manifest_size_bytes does not equal the reconstructed manifest length {}",
+            reconstructed.len()
+        ));
+    }
     Ok(())
 }
 
@@ -965,6 +991,15 @@ mod tests {
                 .unwrap_err()
                 .contains("must retain the 4e1605ec build's df1f0dd4 archive SHA-256")
         );
+    }
+
+    #[test]
+    fn rejects_a_manifest_length_that_is_not_the_reconstructed_length() {
+        let mut wrong = record();
+        *mutate(&mut wrong, "/runs/0/artifact/manifest_size_bytes") = Value::from(391);
+        assert!(validate_semantics(&wrong)
+            .unwrap_err()
+            .contains("does not equal the reconstructed manifest length"));
     }
 
     #[test]

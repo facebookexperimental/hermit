@@ -10,18 +10,33 @@
 //! which needs std's unstable `internal_output_capture`. A feature alone
 //! cannot express "nightly channel": `--all-features` on stable would turn
 //! the feature on and fail with E0554. Detect the channel here and set
-//! `detcore_testutils_nightly` only on a nightly/dev compiler (or a stable
-//! compiler run with RUSTC_BOOTSTRAP), so stable builds compile the capture
-//! code out exactly as they do with the feature off.
+//! `detcore_testutils_nightly` only on a nightly/dev compiler, or where
+//! `RUSTC_BOOTSTRAP` actually permits unstable features for this crate,
+//! so stable builds compile the capture code out exactly as they do with
+//! the feature off. Bootstrap's value carries meaning: `1` permits every
+//! crate, a comma-separated crate list permits only the named crates,
+//! and `0`, `-1` or the empty string permit nothing.
 
 use std::process::Command;
+
+/// Whether a `RUSTC_BOOTSTRAP` value permits unstable features for this
+/// crate (`detcore_testutils`): only `1` or a crate list naming it.
+fn bootstrap_permits(value: Option<&str>) -> bool {
+    match value {
+        Some("1") => true,
+        Some(list) => list
+            .split(',')
+            .any(|name| name.trim() == "detcore_testutils"),
+        None => false,
+    }
+}
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(detcore_testutils_nightly)");
     println!("cargo:rerun-if-env-changed=RUSTC");
     println!("cargo:rerun-if-env-changed=RUSTC_BOOTSTRAP");
 
-    if std::env::var_os("RUSTC_BOOTSTRAP").is_some() {
+    if bootstrap_permits(std::env::var("RUSTC_BOOTSTRAP").ok().as_deref()) {
         println!("cargo:rustc-cfg=detcore_testutils_nightly");
         return;
     }

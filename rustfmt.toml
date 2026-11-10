@@ -1,3 +1,7 @@
+# Formatting is checked with the dedicated formatter toolchain
+# nightly-2026-07-12 (see the lint.rustfmt DAG step), not with the
+# stable compiler pin: the nightly-only options below are silently
+# ignored by stable rustfmt.
 # Get help on options with `rustfmt --help=config`
 # Please keep these in alphabetical order.
 edition = "2024"

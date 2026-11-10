@@ -30,7 +30,7 @@ the fixture's ignored `target/reproducible-builds/` directory for inspection.
   artifact claim.
 - Artifact: an ELF object produced with `rustc --emit=obj`. Avoiding the linker
   keeps the example focused on the compile-time clock input.
-- Compiler: Hermit's pinned nightly with `-Z threads=1`, which keeps `rustc`
+- Compiler: Hermit's pinned toolchain with `-Z threads=1` (under `RUSTC_BOOTSTRAP=1` on the stable pin), which keeps `rustc`
   compatible with deterministic thread serialization.
 
 The dependency graph is compiled natively once before measurement. The

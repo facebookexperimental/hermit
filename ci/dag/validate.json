@@ -709,13 +709,13 @@
       "group": "lint",
       "job": "rustfmt",
       "desc": "Rustfmt (cargo fmt --all -- --check)",
-      "description": "Runs `cargo fmt --all -- --check` over the root workspace (agent-utils is excluded) with the toolchain rust-toolchain.toml pins, which the nightly-only rustfmt.toml options require: std, external and crate import groups, one import per item, and formatted code in doc comments. It prints the would-be diff and exits nonzero instead of rewriting, which keeps formatting changes out of unrelated diffs. A brace import such as `use std::{fs, path::Path};`, or a std import placed after an external-crate import, is reported.",
+      "description": "Runs `cargo fmt --all -- --check` over the root workspace (agent-utils is excluded) with the dedicated formatter toolchain nightly-2026-07-12, pinned separately from the stable compiler pin because the rustfmt.toml options it enforces (std, external and crate import groups, one import per item, and formatted code in doc comments) are nightly-only: stable rustfmt warns about and ignores them, so running the check with the compiler toolchain would silently stop enforcing them. It prints the would-be diff and exits nonzero instead of rewriting, which keeps formatting changes out of unrelated diffs. A brace import such as `use std::{fs, path::Path};`, or a std import placed after an external-crate import, is reported.",
       "labels": [
         "full",
         "hosted-portable",
         "portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo fmt --all -- --check",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; RUSTUP_TOOLCHAIN=nightly-2026-07-12 cargo fmt --all -- --check",
       "result_manifests": [],
       "deps": [
         "build.rust_scripts",
