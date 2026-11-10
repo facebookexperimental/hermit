@@ -12261,6 +12261,61 @@ fn a_kvm_child_exit_receiver_counts_private_pending_under_the_temporary_mask() {
     }
 }
 
+/// The ptrace half of the dual review of
+/// https://github.com/rrnewton/hermit/pull/5259, P1 (delta round): a thread
+/// waiting in `ppoll` on ptrace publishes its temporary mask
+/// (`publish_wait_mask` stores it in `saved_guest_sigmasks`), while the
+/// physical mask the kernel-sent caller otherwise reads is the thread's
+/// own. The choice must read the published mask: the creator (100) waits
+/// in `ppoll` beside a sibling (101), with a private SIGUSR2 pending whose
+/// state is scripted through the real reader seam, exactly as in the KVM
+/// test above. Returns the choice and the moved curr_target.
+fn ptrace_choice_under_published_mask(
+    own_blocked: u64,
+    temporary: u64,
+) -> (Option<DetTid>, Option<DetTid>, DetTid, DetTid) {
+    let usr2 = kernel_signal_bit(libc::SIGUSR2);
+    let mut s = Scheduler::new(&Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE)
+    });
+    assert!(s.models_signal_targets);
+    let (creator, _, _) = add(&mut s, 100, 100);
+    let (sibling, _, _) = add(&mut s, 100, 101);
+    s.test_kernel_signal_states.insert(
+        creator,
+        KernelSignalState {
+            thread_pending: usr2,
+            blocked: own_blocked,
+            ..KernelSignalState::default()
+        },
+    );
+    s.test_kernel_signal_states
+        .insert(sibling, KernelSignalState::default());
+    s.saved_guest_sigmasks.insert(creator, temporary);
+    file_temporary_mask_wait(&mut s, creator, TemporaryMaskWait::Ppoll, Some(temporary));
+    file_restartable_read(&mut s, sibling);
+    let (receiver, moved) = s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD);
+    (receiver, moved, creator, sibling)
+}
+
+#[test]
+fn a_ptrace_receiver_ignores_a_private_copy_its_waits_mask_blocks() {
+    let usr2 = kernel_signal_bit(libc::SIGUSR2);
+    let (receiver, moved, creator, _) = ptrace_choice_under_published_mask(0, usr2);
+    assert_eq!(receiver, Some(creator));
+    assert_eq!(moved, None);
+}
+
+#[test]
+fn a_ptrace_receiver_counts_a_private_copy_its_waits_mask_admits() {
+    let usr2 = kernel_signal_bit(libc::SIGUSR2);
+    let (receiver, moved, _, sibling) = ptrace_choice_under_published_mask(usr2, 0);
+    assert_eq!(receiver, Some(sibling));
+    assert_eq!(moved, Some(sibling));
+}
+
 /// The Codex review of https://github.com/rrnewton/hermit/pull/5259, P1: an
 /// unblocked SIGURG sent to a KVM thread while it is ignored by default is
 /// one Linux discards before it is queued (`prepare_signal`,

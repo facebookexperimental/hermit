@@ -26601,6 +26601,11 @@ enum TargetExpectation {
     Linux,
     /// A KNOWN DIVERGENCE: the line it records, until it closes.
     Diverges(KnownDivergence),
+    /// The backend refuses the run before any line: Detcore chooses Linux's
+    /// receiver, and ending that receiver's wait is a recorded unsupported
+    /// case (a masked `ppoll` that cannot keep a held signal). Judged by the
+    /// refusal itself, never by a substitute line.
+    Refuses,
 }
 
 use TargetExpectation::Diverges;
@@ -26628,25 +26633,6 @@ const fn target_case(
         kvm,
     }
 }
-
-/// ptrace's KNOWN DIVERGENCE of the #4991 class
-/// (`PROCESS_SIGNAL_TARGET_CASES`).
-const PTRACE_POLLER_PASSED_OVER: TargetExpectation = Diverges(KnownDivergence {
-    issue: "https://github.com/rrnewton/hermit/issues/4991",
-    line: "receiver=W1 interrupted=W1\n",
-});
-
-/// ptrace's KNOWN DIVERGENCE in `chld-ppoll-keeps-out`
-/// (`PROCESS_SIGNAL_TARGET_CASES`): the traced scheduler chooses a `ppoll`
-/// waiter by its own mask, not the call's temporary one, which ptrace's
-/// `ppoll` request does not carry, so it names M, whose call blocks SIGCHLD,
-/// and M takes the copy only after its call. KVM's half of the same finding
-/// is fixed (the Codex review of <https://github.com/rrnewton/hermit/pull/5259>,
-/// P1); ptrace printed the same before it.
-const PTRACE_TEMPORARY_MASK_UNREAD: TargetExpectation = Diverges(KnownDivergence {
-    issue: "https://github.com/rrnewton/hermit/pull/5259",
-    line: "receiver=M interrupted=none\n",
-});
 
 /// tests/c/process_signal_target.c's modes and the line Linux prints for each:
 /// every boundary the line depends on is reached causally and required (the
@@ -26679,16 +26665,16 @@ const PTRACE_TEMPORARY_MASK_UNREAD: TargetExpectation = Diverges(KnownDivergence
 /// the merge is then not seen, before S3b as after it (dh-yvwnk,
 /// https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-yvwnk.md).
 ///
-/// ptrace's KNOWN DIVERGENCES are the scheduler's process-directed sends that
-/// it leaves to the host kernel, which finds every guest thread stopped: in
-/// `chld-creator` and `alrm-leader` the copy is taken by W1, which a drain
-/// resumes before M, polling (its poll blocks every signal in place, so the
-/// choice passes it over), takes it
-/// (https://github.com/rrnewton/hermit/issues/4991's class), and the same in
-/// `chld-ppoll-lets-in` and `chld-pselect-lets-in`, whose M polls under a
-/// temporary mask that lets SIGCHLD in; in `chld-ppoll-keeps-out` the traced
-/// scheduler reads M's own mask rather than its `ppoll`'s
-/// (`PTRACE_TEMPORARY_MASK_UNREAD`).
+/// ptrace's kernel-sent choice reads the one installed mask on every
+/// backend (`kernel_sent_signal_mask`: a wait's published mask included),
+/// so the modes that once printed a sibling's line here — `chld-creator`,
+/// `alrm-leader`, `chld-ppoll-lets-in`, `chld-pselect-lets-in` (the
+/// https://github.com/rrnewton/hermit/issues/4991 passed-over class) and
+/// `chld-ppoll-keeps-out` (a `ppoll` chosen by its own mask) — print
+/// Linux's line since the one-mask correction in
+/// https://github.com/rrnewton/hermit/pull/5259; their divergence records
+/// are dropped, and `judge_process_signal_target` fails if they diverge
+/// again.
 /// `alrm-ignored-unblocked` holds W2 in a vfork wait, so that the guest sees
 /// the ignored expiry generated, and W2 takes and discards it on its return
 /// from the wait, as Linux does; the #5014 class, a queued ignored expiry
@@ -26719,21 +26705,11 @@ const PTRACE_TEMPORARY_MASK_UNREAD: TargetExpectation = Diverges(KnownDivergence
 /// names it. Before SIGSHARE S3b that copy merged into the child's, which no
 /// thread had taken, and was not seen.
 const PROCESS_SIGNAL_TARGET_CASES: [ProcessSignalTargetCase; 30] = [
-    target_case(
-        "chld-creator",
-        "receiver=M interrupted=M\n",
-        PTRACE_POLLER_PASSED_OVER,
-        Linux,
-    ),
+    target_case("chld-creator", "receiver=M interrupted=M\n", Linux, Linux),
     target_case("chld-walk", "receiver=W2 interrupted=W2\n", Linux, Linux),
     target_case("chld-worker", "receiver=W1 interrupted=W1\n", Linux, Linux),
     target_case("chld-queued", "pending=1 receiver=W2\n", Linux, Linux),
-    target_case(
-        "alrm-leader",
-        "receiver=M interrupted=M\n",
-        PTRACE_POLLER_PASSED_OVER,
-        Linux,
-    ),
+    target_case("alrm-leader", "receiver=M interrupted=M\n", Linux, Linux),
     target_case("alrm-walk", "receiver=W2 interrupted=W2\n", Linux, Linux),
     target_case("alrm-queued", "pending=1 receiver=W1\n", Linux, Linux),
     target_case(
@@ -26841,19 +26817,19 @@ const PROCESS_SIGNAL_TARGET_CASES: [ProcessSignalTargetCase; 30] = [
     target_case(
         "chld-ppoll-lets-in",
         "receiver=M interrupted=M\n",
-        PTRACE_POLLER_PASSED_OVER,
+        Linux,
         Linux,
     ),
     target_case(
         "chld-ppoll-keeps-out",
         "receiver=W1 interrupted=W1\n",
-        PTRACE_TEMPORARY_MASK_UNREAD,
+        Linux,
         Linux,
     ),
     target_case(
         "chld-pselect-lets-in",
         "receiver=M interrupted=M\n",
-        PTRACE_POLLER_PASSED_OVER,
+        Linux,
         Linux,
     ),
     target_case(
@@ -26877,7 +26853,7 @@ const PROCESS_SIGNAL_TARGET_CASES: [ProcessSignalTargetCase; 30] = [
     target_case(
         "chld-ppoll-pending-temp",
         "receiver=M interrupted=M\n",
-        PTRACE_POLLER_PASSED_OVER,
+        TargetExpectation::Refuses,
         Linux,
     ),
 ];
@@ -26957,6 +26933,9 @@ fn judge_process_signal_target(
     printed: &str,
 ) {
     match expectation {
+        TargetExpectation::Refuses => {
+            panic!("{mode}: refusals are judged by assert_ptrace_refuses, not a line")
+        }
         Linux => assert_eq!(printed, linux, "{mode}: {backend}"),
         Diverges(KnownDivergence { issue, line }) => {
             eprintln!(
@@ -27017,9 +26996,48 @@ fn a_kernel_sent_process_signal_reaches_the_thread_linux_chooses_natively_and_on
             "{}: natively",
             case.mode
         );
+        if matches!(case.ptrace, TargetExpectation::Refuses) {
+            assert_ptrace_refuses(case.mode);
+            continue;
+        }
         let ptrace = process_signal_target_at_l2(&[], case.mode);
         judge_process_signal_target("ptrace", case.mode, case.linux, case.ptrace, &ptrace);
     }
+}
+
+/// `mode` on ptrace refuses: Detcore chooses Linux's receiver (the creator
+/// in its masked `ppoll`), and ending that wait cannot keep the held
+/// private copy, a recorded unsupported case. The refusal, with no
+/// receiver line, is the outcome; a completed run — Linux's line or a
+/// sibling's — fails here, so a wrong receiver cannot hide behind it.
+fn assert_ptrace_refuses(mode: &str) {
+    let _guard = hermit_run_guard();
+    let guest = process_signal_target_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let output = hermit(&[
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--",
+        guest,
+        mode,
+    ]);
+    assert!(
+        !output.status.success(),
+        "{mode}: ptrace completed where it must refuse: {output:?}"
+    );
+    let stdout = stdout(&output);
+    assert!(
+        !stdout.contains("receiver="),
+        "{mode}: ptrace printed a receiver line where it must refuse: {stdout:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot keep a held signal"),
+        "{mode}: ptrace refused for an unrecorded reason: {stderr}"
+    );
 }
 
 /// <https://github.com/rrnewton/hermit/issues/4929> (the Claude review of

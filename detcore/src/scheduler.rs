@@ -17039,6 +17039,34 @@ impl Scheduler {
                 Err(signal_state_reader::TemporaryMaskUnknown) => return None,
             }
         }
+        // The mask a masked wait published (`publish_wait_mask`): on
+        // ptrace a masked `ppoll`/`pselect6`/`sigsuspend` probe loop
+        // stores its temporary mask in `saved_guest_sigmasks` for the
+        // wait's duration, while the physical mask remains the thread's
+        // own. The choice reads that installed mask, as `wants_signal`
+        // does, for a thread filed in a wait Detcore serves by polling or
+        // sleeping. Outside such a wait a saved mask is the guest's own,
+        // held while Detcore's private mask is installed, and the
+        // physical read below decides there, as before; the recorded and
+        // control sources above keep their stronger precedence, and
+        // readers that need the physical mask (the background-entry
+        // barriers) do not come through here.
+        let in_served_wait = self
+            .next_turns
+            .get(&thread)
+            .and_then(|turn| turn.req.try_read())
+            .and_then(Result::ok)
+            .is_some_and(|request| {
+                request.resources.keys().any(|resource| {
+                    matches!(
+                        resource,
+                        ResourceID::InternalIOPolling | ResourceID::SleepUntil(_)
+                    )
+                })
+            });
+        if in_served_wait && let Some(published) = self.saved_guest_sigmasks.get(&thread) {
+            return Some(*published);
+        }
         self.blocked_mask_for(thread, signal)
     }
 
