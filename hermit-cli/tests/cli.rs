@@ -27089,11 +27089,10 @@ fn two_children_after_a_slice_burning_handler_return_choose_the_creator() {
     // expire inside the guest's syscall-free window, the case would pass
     // vacuously, and it is skipped with this named reason instead. The
     // ordinary two-child regression above stays unconditional.
-    let pmu_usable = Path::new("/sys/bus/event_source/devices/cpu/events/branch-instructions")
-        .exists()
-        && fs::read_to_string("/proc/sys/kernel/perf_event_paranoid")
-            .map(|level| level.trim().parse::<i32>().unwrap_or(4) <= 3)
-            .unwrap_or(false);
+    // The launcher's own qualification (run.rs's timer support):
+    // a supported perf counter and a host PMU profile.
+    let pmu_usable =
+        reverie_ptrace::is_perf_supported() && reverie_ptrace::host_pmu_profile().is_ok();
     if !pmu_usable {
         eprintln!(
             "skipping the slice-burning case: no usable PMU (branch events unavailable), \
@@ -27142,6 +27141,34 @@ fn two_children_after_a_slice_burning_handler_return_choose_the_creator() {
         .expect("strict verification verdict is valid JSON");
         assert_eq!(verdict["bitwise_parity"], true, "{backend:?}: {verdict}");
         assert_eq!(stdout(&output), native, "{backend:?}");
+        if backend.is_empty() {
+            // The slice observation: a plain ptrace run of the same guest
+            // must show timeslice endings in its log, proving a PMU
+            // timeslice actually expired while the guest ran (the burn
+            // produces most of them). Without one, the case above passed
+            // without crossing a slice boundary and proves nothing.
+            let qargs = [
+                "--log",
+                "info",
+                "--log-file",
+                log_arg,
+                "run",
+                "--strict",
+                "--base-env=minimal",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--",
+                guest,
+            ];
+            let qualify = hermit(&qargs);
+            assert_success(&qualify, &qargs);
+            let detlog = fs::read_to_string(&log).expect("the qualify run wrote no log");
+            let endings = detlog.matches("ending timeslice").count();
+            assert!(
+                endings >= 10,
+                "only {endings} timeslice endings in the qualify run; \
+                 no PMU preemption observed inside the window"
+            );
+        }
     }
 }
 

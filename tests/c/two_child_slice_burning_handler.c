@@ -192,10 +192,11 @@ int main(void) {
    * the second child. */
   /* Iteration-budgeted, not wall-clocked: under a branch-accounted
    * clock the burn above already ate any from-start wall bound. The
-   * syscall-free window is 40M iterations: at roughly five retired
-   * branches per iteration that is some 200M branches, ten times the
-   * default 200M-virtual-ns timeslice (about 20M branches at 10 ns
-   * per retired conditional branch), so a PMU timeslice expires inside
+   * syscall-free window is 250M iterations: the O1 loop has one
+   * inner conditional back-edge, so that is about 250M retired
+   * conditional branches, over twelve times the default
+   * 200M-virtual-ns timeslice (about 20M branches at 10 ns per
+   * retired conditional branch), so a PMU timeslice expires inside
    * it or the run is not testing slices at all. Past the window the
    * loop yields, so a no-preemption configuration degrades to the
    * ordinary two-child case instead of starving the child. */
@@ -204,7 +205,7 @@ int main(void) {
   while (atomic_load_explicit(&receivers[1], memory_order_acquire) < 0) {
     for (volatile int i = 0; i < 1000; ++i) {
     }
-    if (++budget == 40000UL) {
+    if (++budget == 250000UL) {
       bounded_yield();
       budget = 0;
       if (++yields > 100UL) unconfirmed("second handler observation expired");

@@ -12956,4 +12956,3 @@ fn a_kvm_copy_linux_discarded_at_send_is_never_taken_by_a_later_handler() {
         );
     }
 }
-
