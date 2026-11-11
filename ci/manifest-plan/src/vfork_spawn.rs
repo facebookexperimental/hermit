@@ -286,9 +286,12 @@ pub(crate) fn start(support: &Clone3Support, program: &Program) -> Started {
     // reports.
     let failure = prepared.state.failure.load(Ordering::Relaxed);
     if failure != 0 {
-        // The child stored why it could not exec and exited; reap it.
+        // The child stored why it could not exec and exited; reap it, retrying
+        // a wait that a signal interrupts so no zombie is left.
         let mut status = 0;
-        unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+        while unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) } == -1
+            && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+        {}
         return Started::Failed(io::Error::from_raw_os_error(failure));
     }
     Started::Running { pid }
@@ -712,7 +715,7 @@ unsafe extern "C" fn vfork_child(state: *const ChildState) -> ! {
         let mut index = 0;
         while index < state.candidate_count {
             let path = *state.candidates.add(index);
-            let errno = -syscall6(
+            let mut errno = -syscall6(
                 libc::SYS_execve,
                 [
                     path as usize,
@@ -723,23 +726,25 @@ unsafe extern "C" fn vfork_child(state: *const ChildState) -> ! {
                     0,
                 ],
             );
+            if errno as i32 == libc::ENOEXEC {
+                // As glibc's execvp (`maybe_script_execute`): run the file
+                // under the shell, and judge the shell's error like any other
+                // candidate's, so a missing shell continues the search.
+                *state.shell_argv.add(1) = path;
+                let shell = *state.shell_argv;
+                errno = -syscall6(
+                    libc::SYS_execve,
+                    [
+                        shell as usize,
+                        state.shell_argv as usize,
+                        state.envp as usize,
+                        0,
+                        0,
+                        0,
+                    ],
+                );
+            }
             match errno as i32 {
-                libc::ENOEXEC => {
-                    *state.shell_argv.add(1) = path;
-                    let shell = *state.shell_argv;
-                    let errno = -syscall6(
-                        libc::SYS_execve,
-                        [
-                            shell as usize,
-                            state.shell_argv as usize,
-                            state.envp as usize,
-                            0,
-                            0,
-                            0,
-                        ],
-                    );
-                    fail(errno);
-                }
                 libc::EACCES => denied = true,
                 libc::ENOENT | libc::ENOTDIR | libc::ESTALE | libc::ENODEV | libc::ETIMEDOUT => {}
                 _ => fail(errno),

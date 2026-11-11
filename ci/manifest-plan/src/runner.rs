@@ -18312,6 +18312,14 @@ fi
     #[test]
     fn an_unwritable_cgroup_fails_that_spawn_and_the_next_uses_clone3() {
         let test = "an_unwritable_cgroup_fails_that_spawn_and_the_next_uses_clone3";
+        // Mode 0444 refuses only a writer without CAP_DAC_OVERRIDE, so as root
+        // this refusal cannot be produced this way.
+        if unsafe { libc::geteuid() } == 0 {
+            println!(
+                "SKIPPED {test}: running as root, which mode 0444 on cgroup.procs does not refuse"
+            );
+            return;
+        }
         let root = spawn_test_root("clone3-unwritable");
         let clone3 = crate::vfork_spawn::Clone3Support::new();
         let read_only = |cgroup: &Path| {
