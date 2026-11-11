@@ -18450,9 +18450,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             let (targets, zombie) = resolve_kill_targets_and_exit(guest, process).await;
             if targets.is_empty() && zombie == Some(false) {
-                return self.gone_pidfd_signal_answer(guest, call, signal).await;
+                return self
+                    .terminal_pidfd_signal_answer(guest, call, signal, false)
+                    .await;
             }
             terminal_no_effect = targets.is_empty() && zombie == Some(true);
+            // A zombie is answered from Detcore's model where the backend's
+            // own record of the reap is not read (section 3 of the KVM
+            // cross-process signal design).
+            if terminal_no_effect
+                && crate::syscalls::signal::answers_non_live_targets(guest.config())
+            {
+                return self
+                    .terminal_pidfd_signal_answer(guest, call, signal, true)
+                    .await;
+            }
         }
         // The thread scope sends to the thread whose id is the pid, like
         // `tgkill(pid, pid)`; the process scope to its process.
@@ -18662,47 +18674,63 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(value)
     }
 
-    /// The answer to a `pidfd_send_signal` whose target Detcore saw exit and
-    /// that is gone, in Linux's order: a non-NULL `info` is copied and its
-    /// layout checked against its own `si_signo` (EFAULT, E2BIG), then that
-    /// `si_signo` against the signal (EINVAL), then a forged `si_code`
-    /// (EPERM), and only then is the task missing (ESRCH). The copy, the layout
-    /// check and the `si_code` check are the kernel's: the same `info` goes to
+    /// The answer to a `pidfd_send_signal` whose target Detcore saw exit, in
+    /// Linux's order: a non-NULL `info` is copied and its layout checked
+    /// against its own `si_signo` (EFAULT, E2BIG), then that `si_signo`
+    /// against the signal (EINVAL), then a forged `si_code` (EPERM). Then a
+    /// process that is gone is missing (ESRCH), and a zombie (`zombie`) is
+    /// found, so the signal number is checked (EINVAL) and the signal dropped
+    /// (0, `prepare_signal` during the group exit); Detcore answers a zombie
+    /// only where it answers targets that are not live itself
+    /// (`answers_non_live_targets`). The copy, the layout check and the
+    /// `si_code` check are the kernel's: the same `info` goes to
     /// `rt_sigqueueinfo` naming a pid no task can have, which makes those
     /// checks and sends nothing (as
     /// <https://github.com/rrnewton/hermit/issues/4124> does for that call).
     /// `rt_sigqueueinfo` checks the layout against the signal it is given, so
     /// it is given the info's own `si_signo`.
-    async fn gone_pidfd_signal_answer<G: Guest<Self>>(
+    async fn terminal_pidfd_signal_answer<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: Syscall,
         signal: i32,
+        zombie: bool,
     ) -> Result<i64, Error> {
+        let found = |signal: i32| -> Result<i64, Error> {
+            if !zombie {
+                Err(Errno::ESRCH.into())
+            } else if crate::syscalls::signal::valid_signal(signal) {
+                Ok(0)
+            } else {
+                Err(Errno::EINVAL.into())
+            }
+        };
         let info = match call {
             Syscall::Other(_, args) => args.arg2,
             _ => 0,
         };
         let Some(info) = AddrMut::<GuestSiginfo>::from_raw(info) else {
-            return Err(Errno::ESRCH.into());
+            return found(signal);
         };
         let signo = guest.memory().read_value(info.cast::<libc::c_int>()).ok();
         let probe = syscalls::RtSigqueueinfo::new()
             .with_tgid(super::signal::NO_SUCH_PID)
             .with_sig(signo.unwrap_or(signal))
             .with_siginfo(Some(info.cast()));
-        let checked = guest.inject(probe).await;
-        let answer = match checked {
-            Err(errno @ (Errno::EPERM | Errno::ESRCH)) => errno,
+        let forged = match guest.inject(probe).await {
+            Err(Errno::EPERM) => true,
+            // A backend that checks the signal number before the target
+            // refuses it with EINVAL after the siginfo checks; the number is
+            // checked below, as Linux checks it once the target is found.
+            Ok(_) | Err(Errno::ESRCH | Errno::EINVAL) => false,
             Err(errno) => return Err(errno.into()),
-            Ok(_) => Errno::ESRCH,
         };
         // The copy succeeded, so the kernel could read `si_signo`; a page
         // only the kernel reaches (`[vvar]`) cannot be decided here.
         let Some(signo) = signo else {
             tracing::error!(
-                "[detcore, dtid {}] pidfd_send_signal to a gone process with a siginfo_t at \
-                 {:#x} is not supported: Hermit cannot read its si_signo \
+                "[detcore, dtid {}] pidfd_send_signal to a process that has exited with a \
+                 siginfo_t at {:#x} is not supported: Hermit cannot read its si_signo \
                  (https://github.com/rrnewton/hermit/issues/4108)",
                 guest.thread_state().dettid,
                 info.as_raw(),
@@ -18714,7 +18742,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         if signo != signal {
             return Err(Errno::EINVAL.into());
         }
-        Err(answer.into())
+        if forged {
+            return Err(Errno::EPERM.into());
+        }
+        found(signal)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
