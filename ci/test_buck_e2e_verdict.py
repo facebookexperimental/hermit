@@ -26,6 +26,7 @@ import sys
 import tempfile
 import time
 import unittest
+from decimal import Decimal
 from pathlib import Path
 
 import test_buck_e2e_ingest as ingest_test
@@ -821,17 +822,9 @@ esac
 exit 0
 """
 # What the stand-in run leaves in --work: a hybrid run's two invocations, one with an event log.
-# The retention budget the stalled-summary test gives validate-node, and what the stall may cost
-# it after its exit phase: that budget plus an allowance for everything else (each stalled
-# command's 0.5 s `timeout -k` grace, copying the records, `buck2 kill`, process exit). Measured on
-# the validation host with the test pinned to one CPU shared with 8 busy loops, the interval ran
-# at most 1.217 s beyond a 1 s budget over 128 sub-cases (80 here: 1.175-1.374 s; one of 48 in
-# the review of https://github.com/rrnewton/hermit/pull/4017 reached 2.217 s); idle it is about
-# 0.1 s beyond. The 2 s allowance covers that worst case with 0.78 s to spare, and the 3 s budget
-# keeps a doubled budget (6 s) well above the bound.
-# https://github.com/rrnewton/hermit/issues/3923
+# The stalled-summary test checks the node's actual deadline and remaining timeout budgets.
+# Time spent scheduling the test's observer after node exit is not retention work.
 STALLED_SUMMARY_RETENTION_SECONDS = 3
-AFTER_EXIT_BOUND_SECONDS = STALLED_SUMMARY_RETENTION_SECONDS + 2.0
 
 RECORDS = {
     "re.log": "re console\n", "re.rc": "0\n", "re.test_id": "re\n", "re.times": "1.5\n9.25\n",
@@ -1044,10 +1037,58 @@ class ValidateNodeTest(unittest.TestCase):
                     self.assertIn("validate-node: the stage summary of the re invocation is incomplete",
                                   process.stderr)
 
+    def assert_retention_deadline_trace(self, trace):
+        """Check the real Bash decisions and expanded timeout argv, not observer wall time."""
+        deadline = remaining = None
+        expired = False
+        commands = []
+        # Admit only shell builtins/control flow and the checked time_left helper. External
+        # retention work must use timeout; an unbounded sleep/copy/helper must not pass.
+        builtins = {"keep_invocations": {"local", "for", "[[", "time_left", "echo", "return"},
+                    "time_left": {"local", "printf", "return"}}
+        for line in trace.splitlines():
+            if not line.lstrip("+").startswith("retention\t"):
+                continue
+            _, function, now, observed_deadline, _left, command = line.split("\t", 5)
+            if deadline is not None:
+                self.assertIn(function, {"on_exit", *builtins}, "unexpected retention helper")
+            if function == "on_exit" and command.startswith("keep_invocations "):
+                self.assertIsNone(deadline, "retention received a second deadline")
+                deadline = int(observed_deadline)
+                self.assertEqual(deadline - int(now), STALLED_SUMMARY_RETENTION_SECONDS * 1_000_000)
+                self.assertEqual(shlex.split(command)[1], observed_deadline)
+            elif function == "time_left" and re.fullmatch(r"\(\(\s*now < deadline\s*\)\)", command):
+                self.assertIsNotNone(deadline, "retention checked time before receiving its deadline")
+                self.assertEqual(int(observed_deadline), deadline, "retention renewed its deadline")
+                remaining = deadline - int(now)
+                expired = expired or remaining <= 0
+            elif function == "keep_invocations" and command.startswith("timeout "):
+                self.assertIsNotNone(remaining, "retention waited without checking its deadline")
+                self.assertFalse(expired, "retention started a command after its deadline expired")
+                argv = shlex.split(command)
+                self.assertEqual(argv[:4], ["timeout", "--foreground", "-k", "0.5"])
+                self.assertEqual(Decimal(argv[4]) * 1_000_000, remaining,
+                                 "timeout did not receive only the remaining retention budget")
+                commands.append(argv[5:])
+            elif function in builtins:
+                self.assertIn(shlex.split(command)[0], builtins[function],
+                              f"retention ran an unbounded or unrecognized command: {command}")
+        self.assertIsNotNone(deadline, "retention's deadline was not observed")
+        self.assertTrue(expired, "the stalled summary did not exhaust the retention deadline")
+        self.assertEqual(sum(command[:2] == [str(self.buck2), "log"] for command in commands), 1)
+        self.assertEqual(sum(command[:1] == ["python3"] for command in commands), 1)
+
     def test_a_stalled_stage_summary_costs_only_the_summary(self):
         results = self.root / "e2e-results"
         kills = self.root / "kills"
         summarizer = self.checkout / "ci" / "buck-e2e" / "stages.py"
+        trace = self.root / "retention.trace"
+        observer = self.root / "trace-retention.sh"
+        # Bash records the actual local clock/deadline values and expanded command arguments.
+        # No command is replaced: both pipeline legs still execute GNU timeout normally.
+        observer.write_text('exec 9>"$FAKE_RETENTION_TRACE"\nBASH_XTRACEFD=9\n'
+                            "PS4='+retention\t${FUNCNAME[0]:-main}\t${now-}\t${deadline-}\t${left-}\t'\n"
+                            "set -x\n")
         for stalled, run_status in (("log show", 0), ("log show", 7), ("stages.py", 0), ("stages.py", 7)):
             with self.subTest(stalled=stalled, run_status=run_status):
                 kills.unlink(missing_ok=True)
@@ -1059,16 +1100,9 @@ class ValidateNodeTest(unittest.TestCase):
                 process = self.validate_node(str(results), FAKE_RUN_RECORDS=json.dumps(RECORDS),
                                              FAKE_RUN_RC=str(run_status), FAKE_BUCK2_KILLS=str(kills),
                                              HERMIT_VALIDATE_BUCK_RETENTION_SECONDS=str(STALLED_SUMMARY_RETENTION_SECONDS),
-                                             **added)
-                ended = time.time()
+                                             BASH_ENV=str(observer), FAKE_RETENTION_TRACE=str(trace), **added)
                 self.assertEqual(process.returncode, run_status, process.stdout + process.stderr)
-                # What the stall may cost is what the node does after its exit phase: keeping the
-                # records and the summary within the retention budget, each command's 0.5 s kill
-                # grace, and stopping the daemon. The node's steps before its exit (staging,
-                # regenerating the Buck rules) are not under test, and their wall time is mostly
-                # host load.
-                after_exit = ended - self.exit_phase_time(results)
-                self.assertLess(after_exit, AFTER_EXIT_BOUND_SECONDS, process.stderr)
+                self.assert_retention_deadline_trace(trace.read_text())
                 self.assertIn("validate-node: the stage summary of the re invocation is incomplete", process.stderr)
                 self.assertEqual((self.kept(results) / "re.log").read_text(), RECORDS["re.log"])
                 self.assertEqual(self.phases(results)[-1], f"exit {run_status}")
