@@ -142,7 +142,11 @@ fn refuse_and_wait_name_the_cpu_set_instead_of_sharing() {
     ] {
         let args = ["run", "--pin-threads", policy, "--", "/bin/echo", "never"];
         let output = pinned_hermit(cpu, dir.path(), &args);
-        assert_eq!(output.status.code(), Some(122), "{policy}: {output:?}");
+        assert_eq!(
+            output.status.code(),
+            Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+            "{policy}: {output:?}"
+        );
         assert_eq!(super::stdout(&output), "", "{policy}: the guest never ran");
         assert!(
             super::stderr(&output).contains(&expected),
