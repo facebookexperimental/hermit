@@ -823,7 +823,8 @@ exit 0
 """
 # What the stand-in run leaves in --work: a hybrid run's two invocations, one with an event log.
 # The stalled-summary test checks the node's actual deadline and remaining timeout budgets.
-# Time spent scheduling the test's observer after node exit is not retention work.
+# Each remaining-time check permits one command or the concurrent summary pipeline.
+# The sibling step-wall and retention-budget tests retain the total after-exit wall bounds.
 STALLED_SUMMARY_RETENTION_SECONDS = 3
 
 RECORDS = {
@@ -988,13 +989,6 @@ class ValidateNodeTest(unittest.TestCase):
         self.assertEqual(times, sorted(times))
         return [what for _, what in rows]
 
-    def exit_phase_time(self, results):
-        """The epoch time at which the node recorded its exit phase, before keeping its records."""
-        rows = [line.split("\t") for line in (self.kept(results) / "phases.tsv").read_text().splitlines()]
-        exits = [float(time) for time, what in rows if what.startswith("exit ")]
-        self.assertEqual(len(exits), 1, rows)
-        return exits[0]
-
     def test_each_invocations_record_is_kept_below_the_e2e_result_root(self):
         results = self.root / "e2e-results"
         (self.kept(results)).mkdir(parents=True)
@@ -1042,9 +1036,10 @@ class ValidateNodeTest(unittest.TestCase):
         deadline = remaining = None
         expired = False
         commands = []
+        checked_commands = []
         # Admit only shell builtins/control flow and the checked time_left helper. External
         # retention work must use timeout; an unbounded sleep/copy/helper must not pass.
-        builtins = {"keep_invocations": {"local", "for", "[[", "time_left", "echo", "return"},
+        builtins = {"keep_invocations": {"local", "for", "[[", "time_left", "echo", "return", "continue"},
                     "time_left": {"local", "printf", "return"}}
         for line in trace.splitlines():
             if not line.lstrip("+").startswith("retention\t"):
@@ -1062,6 +1057,7 @@ class ValidateNodeTest(unittest.TestCase):
                 self.assertEqual(int(observed_deadline), deadline, "retention renewed its deadline")
                 remaining = deadline - int(now)
                 expired = expired or remaining <= 0
+                checked_commands = []
             elif function == "keep_invocations" and command.startswith("timeout "):
                 self.assertIsNotNone(remaining, "retention waited without checking its deadline")
                 self.assertFalse(expired, "retention started a command after its deadline expired")
@@ -1069,6 +1065,13 @@ class ValidateNodeTest(unittest.TestCase):
                 self.assertEqual(argv[:4], ["timeout", "--foreground", "-k", "0.5"])
                 self.assertEqual(Decimal(argv[4]) * 1_000_000, remaining,
                                  "timeout did not receive only the remaining retention budget")
+                checked_commands.append(argv[5:])
+                if len(checked_commands) > 1:
+                    self.assertCountEqual(
+                        [command[:2] for command in checked_commands],
+                        [[str(self.buck2), "log"],
+                         ["python3", str(self.checkout / "ci/buck-e2e/stages.py")]],
+                        f"commands shared one remaining-time check: {checked_commands}")
                 commands.append(argv[5:])
             elif function in builtins:
                 self.assertIn(shlex.split(command)[0], builtins[function],
