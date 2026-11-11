@@ -1388,7 +1388,7 @@ fn in_guest_trap_stops_by_name_when_a_waiting_pipe_reads_status_changes() {
         single_sigalrm_pipe_read_run(&guest, "in-guest-trap", "setfl_mid");
     assert_eq!(
         status.code(),
-        Some(122),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
         "the policy refusal's status: {stderr}"
     );
     assert_eq!(stdout, "", "the guest saw no result of the read");
@@ -1427,7 +1427,7 @@ fn in_guest_trap_stops_by_name_when_a_waiting_pipe_reads_authority_is_revoked() 
     let (status, stdout, stderr) = single_sigalrm_pipe_read_run(&guest, "in-guest-trap", "revoke");
     assert_eq!(
         status.code(),
-        Some(122),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
         "the policy refusal's status: {stderr}"
     );
     assert_eq!(stdout, "", "the guest saw no result of the read");
@@ -1496,7 +1496,11 @@ fn sigalrm_pipe_read_record_is_refused_in_guest_and_untouched_under_ptrace() {
             backend,
             &["--log=error", "--backend", backend, "record", "start"],
         );
-        assert_eq!(status.code(), Some(125), "{backend}: {stderr}");
+        assert_eq!(
+            status.code(),
+            Some(hermit::HERMIT_INTERNAL_FAILURE_EXIT),
+            "{backend}: {stderr}"
+        );
         assert!(stdout.is_empty(), "{backend}: no guest ran: {stdout}");
         let refusal = format!(
             "the LiteInst preload backend is available only through `hermit --backend {backend} \
