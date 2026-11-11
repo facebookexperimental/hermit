@@ -1557,6 +1557,44 @@ fn sigalrm_pipe_read_record_is_refused_in_guest_and_untouched_under_ptrace() {
         interrupted[0]
     );
 
+    // Replay returns the clock values the recording observed (record mode's
+    // real host clock, hermit-cli/src/lib.rs:149), so it must reproduce THIS
+    // recording's `window=` labels exactly: the recording, not the fixture
+    // constant, is the reference, and `without_windows` does not apply here.
+    let windows = |text: &str| -> Vec<String> {
+        text.split_whitespace()
+            .filter(|field| field.starts_with("window="))
+            .map(str::to_owned)
+            .collect()
+    };
+    let recorded = stdout;
+    let recording = process_build_root("sigalrm-pipe-record-ptrace").join("data");
+    for attempt in 1..=2 {
+        let directory = process_build_root(&format!("sigalrm-pipe-replay-{attempt}"));
+        fs::create_dir_all(&directory).expect("SIGALRM replay directory");
+        let mut command = Command::new(hermit_binary());
+        command
+            .args(["--log=info", "replay", "--autopilot"])
+            .arg(format!("--data-dir={}", recording.display()))
+            .env_remove("RUST_LOG")
+            .env_remove("HERMIT_LOG")
+            .env_remove("HERMIT_LOG_FILE")
+            .stdin(Stdio::null());
+        let status =
+            bounded_command_with_timeout(&mut command, &directory, Duration::from_secs(57));
+        let replayed = bounded_read(&directory.join("stdout"), 1024 * 1024);
+        let replayed = String::from_utf8_lossy(&replayed).into_owned();
+        let stderr = bounded_read(&directory.join("stderr"), 64 * 1024 * 1024);
+        let stderr = String::from_utf8_lossy(&stderr);
+        assert_eq!(status.code(), Some(0), "replay {attempt}: {stderr}");
+        assert_eq!(
+            windows(&replayed),
+            windows(&recorded),
+            "replay {attempt} reproduces the recording's labels: {replayed}"
+        );
+        assert_eq!(replayed, recorded, "replay {attempt}");
+    }
+
     let (status, stdout, stderr) = run("ptrace-verify", &["record", "--verify"]);
     assert_eq!(status.code(), Some(0), "ptrace record --verify: {stderr}");
     assert_eq!(
