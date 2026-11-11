@@ -17698,6 +17698,78 @@ fi
         fs::remove_dir_all(root).unwrap();
     }
 
+    thread_local! {
+        /// How many times this thread has called fork(), counted by a
+        /// `pthread_atfork` prepare handler. glibc runs the handlers in the
+        /// thread that calls fork() and not for posix_spawn, which starts the
+        /// child without copying this process.
+        static FORKS_ON_THIS_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// The number of fork() calls this thread has made since the counter was
+    /// installed in this process.
+    fn forks_on_this_thread() -> u64 {
+        extern "C" fn count_fork() {
+            FORKS_ON_THIS_THREAD.with(|forks| forks.set(forks.get() + 1));
+        }
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            assert_eq!(
+                unsafe { libc::pthread_atfork(Some(count_fork), None, None) },
+                0
+            );
+        });
+        FORKS_ON_THIS_THREAD.with(std::cell::Cell::get)
+    }
+
+    /// An invocation with no CPU budget, and so no invocation cgroup, starts
+    /// without fork() of this process (dh-7n47nt). fork() copies the address
+    /// space under the memory-map lock: in loaded library runs each one took a
+    /// median 94-177 ms and up to 2.3 s, and every other thread that page-faulted
+    /// meanwhile waited, so CPU readers and census walks in the same process
+    /// stalled off-CPU. The child still leads a process group of its own.
+    #[test]
+    fn an_invocation_without_a_cgroup_starts_without_forking_this_process() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-no-cgroup-spawn-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut observations = Vec::new();
+        let before = forks_on_this_thread();
+        let output = execute_process(
+            ProcessRequest::new(
+                InvocationRole::Execution {
+                    attempt_index: "1".into(),
+                    backend: RequiredNullable::Null,
+                },
+                &root,
+                "/bin/sh",
+                &[
+                    "-c".into(),
+                    "printf '%s ' $$; cut -d' ' -f5 /proc/$$/stat".into(),
+                ],
+                &BTreeMap::new(),
+                &root.join("group.stdout"),
+                &root.join("group.stderr"),
+            ),
+            (Instant::now() + Duration::from_secs(60), None),
+            &mut observations,
+        )
+        .unwrap();
+        let forks = forks_on_this_thread() - before;
+        assert!(output.status.success());
+        assert_eq!(forks, 0, "starting the invocation forked this process");
+        let reported = fs::read_to_string(root.join("group.stdout")).unwrap();
+        let (pid, pgid) = reported.trim().split_once(' ').unwrap();
+        assert_eq!(
+            pid, pgid,
+            "the invocation does not lead its own process group"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn bounded_process(
         root: &Path,
         label: &str,
