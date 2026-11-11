@@ -10,25 +10,22 @@
 //! which needs std's unstable `internal_output_capture`. A feature alone
 //! cannot express "nightly channel": `--all-features` on stable would turn
 //! the feature on and fail with E0554. Detect the channel here and set
-//! `detcore_testutils_nightly` only on a nightly/dev compiler, or where
-//! `RUSTC_BOOTSTRAP` actually permits unstable features for this crate,
-//! so stable builds compile the capture code out exactly as they do with
-//! the feature off. Bootstrap's value carries meaning: `1` permits every
-//! crate, a comma-separated crate list permits only the named crates,
-//! and `0`, `-1` or the empty string permit nothing.
+//! `detcore_testutils_nightly` only where rustc will allow this crate
+//! unstable features: as `src/bootstrap.rs` decides from `RUSTC_BOOTSTRAP`
+//! and the compiler's channel, exactly as rustc does. Stable builds compile
+//! the capture code out exactly as they do with the feature off.
 
 use std::process::Command;
 
-/// Whether a `RUSTC_BOOTSTRAP` value permits unstable features for this
-/// crate (`detcore_testutils`): only `1` or a crate list naming it.
-fn bootstrap_permits(value: Option<&str>) -> bool {
-    match value {
-        Some("1") => true,
-        Some(list) => list
-            .split(',')
-            .any(|name| name.trim() == "detcore_testutils"),
-        None => false,
-    }
+include!("src/bootstrap.rs");
+
+/// Whether `rustc` is a nightly or dev build, from its `-vV` output.
+fn nightly_channel(rustc: &str) -> bool {
+    let Ok(output) = Command::new(rustc).arg("-vV").output() else {
+        return false;
+    };
+    let version = String::from_utf8_lossy(&output.stdout);
+    version.contains("nightly") || version.contains("-dev")
 }
 
 fn main() {
@@ -36,16 +33,13 @@ fn main() {
     println!("cargo:rerun-if-env-changed=RUSTC");
     println!("cargo:rerun-if-env-changed=RUSTC_BOOTSTRAP");
 
-    if bootstrap_permits(std::env::var("RUSTC_BOOTSTRAP").ok().as_deref()) {
-        println!("cargo:rustc-cfg=detcore_testutils_nightly");
-        return;
-    }
+    let bootstrap = std::env::var("RUSTC_BOOTSTRAP").ok();
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_owned());
-    let Ok(output) = Command::new(rustc).arg("-vV").output() else {
-        return;
-    };
-    let version = String::from_utf8_lossy(&output.stdout);
-    if version.contains("nightly") || version.contains("-dev") {
+    if unstable_features_allowed(
+        bootstrap.as_deref(),
+        "detcore_testutils",
+        nightly_channel(&rustc),
+    ) {
         println!("cargo:rustc-cfg=detcore_testutils_nightly");
     }
 }
