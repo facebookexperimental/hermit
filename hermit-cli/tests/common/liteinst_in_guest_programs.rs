@@ -1464,7 +1464,30 @@ fn sigalrm_pipe_read_record_is_refused_in_guest_and_untouched_under_ptrace() {
 
     let _guard = hermit_run_guard();
     let guest = sigalrm_fixture("liteinst_sigalrm_pipe_read");
-    let eintr = SIGALRM_PIPE_READ_EINTR;
+    // Record mode's contract is a real host clock: it runs without virtual
+    // time (`hermit::RECORD_REPLAY_VIRTUALIZES_TIME` is `false`,
+    // hermit-cli/src/lib.rs:149), so the guest's `clock_gettime` reads the host
+    // clock while its alarm and the child's sleep run on Detcore's timers, and
+    // the fixture's `window=` labels measure the host's speed, not the program.
+    // Only those labels are left out of the record comparisons, which still
+    // require exactly two of them; every other field is the program's and
+    // Linux's, and is compared exactly. Run mode, on virtual time, compares
+    // the labels too.
+    let without_windows = |text: &str| -> String {
+        text.split_inclusive('\n')
+            .map(|line| {
+                let (body, end) = line
+                    .strip_suffix('\n')
+                    .map_or((line, ""), |body| (body, "\n"));
+                let fields = body
+                    .split(' ')
+                    .filter(|field| !field.starts_with("window="))
+                    .collect::<Vec<_>>();
+                format!("{}{end}", fields.join(" "))
+            })
+            .collect()
+    };
+    let eintr = without_windows(SIGALRM_PIPE_READ_EINTR);
     let run = |name: &str, args: &[&str]| {
         let directory = process_build_root(&format!("sigalrm-pipe-record-{name}"));
         fs::create_dir_all(&directory).expect("SIGALRM record directory");
@@ -1512,7 +1535,12 @@ fn sigalrm_pipe_read_record_is_refused_in_guest_and_untouched_under_ptrace() {
 
     let (status, stdout, stderr) = run("ptrace", &["--log=info", "record", "start"]);
     assert_eq!(status.code(), Some(0), "ptrace record: {stderr}");
-    assert_eq!(stdout, eintr, "ptrace record");
+    assert_eq!(
+        stdout.matches(" window=").count(),
+        2,
+        "ptrace record: {stdout}"
+    );
+    assert_eq!(without_windows(&stdout), eintr, "ptrace record: {stdout}");
     let interrupted = stderr
         .lines()
         .filter(|line| line.contains("DETLOG") && line.contains(": read(3, "))
@@ -1531,7 +1559,16 @@ fn sigalrm_pipe_read_record_is_refused_in_guest_and_untouched_under_ptrace() {
 
     let (status, stdout, stderr) = run("ptrace-verify", &["record", "--verify"]);
     assert_eq!(status.code(), Some(0), "ptrace record --verify: {stderr}");
-    assert_eq!(stdout, eintr, "ptrace record --verify");
+    assert_eq!(
+        stdout.matches(" window=").count(),
+        2,
+        "ptrace record --verify: {stdout}"
+    );
+    assert_eq!(
+        without_windows(&stdout),
+        eintr,
+        "ptrace record --verify: {stdout}"
+    );
     assert!(
         stderr.contains("Success: replay matched recording."),
         "ptrace record --verify: {stderr}"
