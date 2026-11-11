@@ -1037,6 +1037,10 @@ class ValidateNodeTest(unittest.TestCase):
         expired = False
         commands = []
         checked_commands = []
+        pending = {}
+        intervals = {}
+        summary_commands = ([str(self.buck2), "log"],
+                            ["python3", str(self.checkout / "ci/buck-e2e/stages.py")])
         # Admit only shell builtins/control flow and the checked time_left helper. External
         # retention work must use timeout; an unbounded sleep/copy/helper must not pass.
         builtins = {"keep_invocations": {"local", "for", "[[", "time_left", "echo", "return", "continue"},
@@ -1044,9 +1048,10 @@ class ValidateNodeTest(unittest.TestCase):
         for line in trace.splitlines():
             if not line.lstrip("+").startswith("retention\t"):
                 continue
-            _, function, now, observed_deadline, _left, command = line.split("\t", 5)
+            _, pid, timestamp, function, now, observed_deadline, _left, command = line.split("\t", 7)
+            clock = Decimal(timestamp) * 1_000_000
             if deadline is not None:
-                self.assertIn(function, {"on_exit", *builtins}, "unexpected retention helper")
+                self.assertIn(function, {"on_exit", "timeout", *builtins}, "unexpected retention helper")
             if function == "on_exit" and command.startswith("keep_invocations "):
                 self.assertIsNone(deadline, "retention received a second deadline")
                 deadline = int(observed_deadline)
@@ -1073,6 +1078,32 @@ class ValidateNodeTest(unittest.TestCase):
                          ["python3", str(self.checkout / "ci/buck-e2e/stages.py")]],
                         f"commands shared one remaining-time check: {checked_commands}")
                 commands.append(argv[5:])
+                self.assertNotIn(pid, pending, "timeout observer overlapped itself")
+                pending[pid] = {"argv": argv}
+            elif function == "timeout" and deadline is not None:
+                self.assertIn(pid, pending, "unbound timeout observer")
+                observed = pending[pid]
+                if command.startswith("command timeout "):
+                    self.assertEqual(shlex.split(command)[1:], observed["argv"],
+                                     "timeout observer changed the production arguments")
+                    self.assertNotIn("start", observed, "timeout observer dispatched twice")
+                    observed["start"] = clock
+                    if observed["argv"][5:7] in summary_commands:
+                        self.assertLess(clock, deadline, "summary command started after the deadline")
+                elif re.fullmatch(r"local observed_status=\d+", command):
+                    self.assertIn("start", observed, "timeout observer ended before dispatch")
+                    self.assertNotIn("end", observed, "timeout observer ended twice")
+                    observed["end"] = clock
+                    observed["status"] = command.split("=", 1)[1]
+                else:
+                    self.assertIn("end", observed, "timeout observer omitted its return witness")
+                    self.assertEqual(shlex.split(command), ["return", observed["status"]],
+                                     "timeout observer changed the production exit status")
+                    if observed["argv"][5:7] in summary_commands:
+                        key = tuple(observed["argv"][5:7])
+                        self.assertNotIn(key, intervals, "summary command repeated")
+                        intervals[key] = observed["start"], observed["end"]
+                    del pending[pid]
             elif function in builtins:
                 self.assertIn(shlex.split(command)[0], builtins[function],
                               f"retention ran an unbounded or unrecognized command: {command}")
@@ -1080,6 +1111,11 @@ class ValidateNodeTest(unittest.TestCase):
         self.assertTrue(expired, "the stalled summary did not exhaust the retention deadline")
         self.assertEqual(sum(command[:2] == [str(self.buck2), "log"] for command in commands), 1)
         self.assertEqual(sum(command[:1] == ["python3"] for command in commands), 1)
+        self.assertFalse(pending, "timeout observer did not finish")
+        self.assertCountEqual(intervals, [tuple(command) for command in summary_commands])
+        self.assertLess(max(start for start, _end in intervals.values()),
+                        min(end for _start, end in intervals.values()),
+                        f"summary command intervals did not overlap: {intervals}")
 
     def test_a_stalled_stage_summary_costs_only_the_summary(self):
         results = self.root / "e2e-results"
@@ -1087,18 +1123,33 @@ class ValidateNodeTest(unittest.TestCase):
         summarizer = self.checkout / "ci" / "buck-e2e" / "stages.py"
         trace = self.root / "retention.trace"
         observer = self.root / "trace-retention.sh"
-        # Bash records the actual local clock/deadline values and expanded command arguments.
-        # No command is replaced: both pipeline legs still execute GNU timeout normally.
+        # The observer preserves GNU timeout's argv/status and records immediately before
+        # dispatch and after return. These are shell-observed command intervals, not kernel
+        # exec timestamps; PS4's fresh clock detects a stale $left used after the deadline.
         observer.write_text('exec 9>"$FAKE_RETENTION_TRACE"\nBASH_XTRACEFD=9\n'
-                            "PS4='+retention\t${FUNCNAME[0]:-main}\t${now-}\t${deadline-}\t${left-}\t'\n"
+                            'timeout() { command timeout "$@"; local observed_status=$?; '
+                            'return "$observed_status"; }\n'
+                            "PS4='+retention\t${BASHPID}\t${EPOCHREALTIME}\t${FUNCNAME[0]:-main}"
+                            "\t${now-}\t${deadline-}\t${left-}\t'\n"
                             "set -x\n")
+        # A tiny log can finish before the pipeline reader is scheduled. This bounded
+        # fixture exceeds any unprivileged pipe capacity, keeping its writer active while
+        # stages.py stalls without reading. It is data, not synthetic CPU load.
+        pipe_max = int(Path("/proc/sys/fs/pipe-max-size").read_text())
+        self.assertTrue(0 < pipe_max <= 16 * 1024 * 1024,
+                        f"unsupported-test-pipe-max-size: {pipe_max}")
+        pipe_filling_log = self.root / "pipe-filling-log"
+        pipe_filling_log.write_bytes(b"x" * (pipe_max + 1))
         for stalled, run_status in (("log show", 0), ("log show", 7), ("stages.py", 0), ("stages.py", 7)):
             with self.subTest(stalled=stalled, run_status=run_status):
                 kills.unlink(missing_ok=True)
                 shutil.copy2(BUCK_E2E / "stages.py", summarizer)
+                self.buck2.write_text(FAKE_NODE_BUCK2)
                 added = {"FAKE_BUCK2_LOG_SHOW_HANGS": "1"}
                 if stalled == "stages.py":
                     summarizer.write_text("import time\ntime.sleep(600)\n")
+                    self.buck2.write_text(FAKE_NODE_BUCK2.replace(
+                        'exec cat -- "$3"', f"exec cat -- {shlex.quote(str(pipe_filling_log))}"))
                     added = {}
                 process = self.validate_node(str(results), FAKE_RUN_RECORDS=json.dumps(RECORDS),
                                              FAKE_RUN_RC=str(run_status), FAKE_BUCK2_KILLS=str(kills),
@@ -1174,8 +1225,8 @@ class ValidateNodeTest(unittest.TestCase):
         """Run validate-node as the validation DAG runs a step with a WALL-second bound: in its own
         process group, with the start in DAGRUN_STEP_STARTED_MONOTONIC_NS and the bound in
         HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS. Fail if it is still running at the bound, where
-        dagrun would mark it timed out and reap it; return the process and its seconds from the
-        start."""
+        dagrun would mark it timed out and reap it; return the process and the epoch time when
+        its exit was observed."""
         started_ns = time.monotonic_ns()
         environment = self.node_environment(str(results), "buck-local", dict(
             FAKE_RUN_RECORDS=json.dumps(RECORDS), HERMIT_VALIDATE_BUCK_STEP_WALL_SECONDS=str(wall),
@@ -1185,6 +1236,9 @@ class ValidateNodeTest(unittest.TestCase):
                                        env=environment, start_new_session=True)
         try:
             process.wait(timeout=started_ns / 1e9 + wall - time.monotonic())
+            # Observe the full node exit, including cleanup, before any caller work. A pause
+            # before this capture can still delay the observation; this is not a kernel timestamp.
+            observed_exit_at = time.time()
         except subprocess.TimeoutExpired:
             os.killpg(process.pid, signal.SIGTERM)
             process.wait(timeout=30)
@@ -1194,7 +1248,7 @@ class ValidateNodeTest(unittest.TestCase):
             if process.poll() is None:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
-        return process, time.monotonic() - started_ns / 1e9
+        return process, observed_exit_at
 
     def test_keeping_the_records_ends_inside_the_steps_wall_bound(self):
         # The step's bound less the 10 s reserve is shorter than the 30 s retention budget, so it
@@ -1212,10 +1266,9 @@ class ValidateNodeTest(unittest.TestCase):
                 for wall in (13, 25, 60):
                     kills.unlink(missing_ok=True)
                     started = time.time()
-                    process, _elapsed = self.run_as_step(results, wall, FAKE_RUN_RC=str(run_status),
+                    process, ended = self.run_as_step(results, wall, FAKE_RUN_RC=str(run_status),
                                                          FAKE_BUCK2_KILLS=str(kills), FAKE_BUCK2_LOG_SHOW_HANGS="1",
                                                          HERMIT_VALIDATE_BUCK_RETENTION_SECONDS="30")
-                    ended = time.time()
                     stderr = (self.root / "node.stderr").read_text()
                     self.assertEqual(process.returncode, run_status, stderr)
                     deadline = started + wall - 10
@@ -1243,7 +1296,7 @@ class ValidateNodeTest(unittest.TestCase):
         for run_status in (0, 7):
             with self.subTest(run_status=run_status):
                 kills.unlink(missing_ok=True)
-                process, _elapsed = self.run_as_step(results, 9, FAKE_RUN_RC=str(run_status),
+                process, _ended = self.run_as_step(results, 9, FAKE_RUN_RC=str(run_status),
                                                      FAKE_BUCK2_KILLS=str(kills))
                 stderr = (self.root / "node.stderr").read_text()
                 self.assertEqual(process.returncode, run_status, stderr)
@@ -1255,9 +1308,8 @@ class ValidateNodeTest(unittest.TestCase):
 
     def test_the_retention_budget_still_bounds_the_records_inside_a_long_wall_bound(self):
         results = self.root / "e2e-results"
-        process, _elapsed = self.run_as_step(results, 3600, FAKE_BUCK2_LOG_SHOW_HANGS="1",
+        process, ended = self.run_as_step(results, 3600, FAKE_BUCK2_LOG_SHOW_HANGS="1",
                                              HERMIT_VALIDATE_BUCK_RETENTION_SECONDS="1")
-        ended = time.time()
         stderr = (self.root / "node.stderr").read_text()
         self.assertEqual(process.returncode, 0, stderr)
         # The 1 s budget counts from the node's exit, however long it took to get there; the
@@ -1301,7 +1353,7 @@ class ValidateNodeTest(unittest.TestCase):
         # At a load of about 450, hermit 32e1c019's validation refused the node because the
         # interpreter reading CLOCK_MONOTONIC did not start within the 2 s it was given.
         self.slow_clock_python3(3, ":")
-        process, _elapsed = self.run_as_step(self.root / "e2e-results", 3600)
+        process, _ended = self.run_as_step(self.root / "e2e-results", 3600)
         stderr = (self.root / "node.stderr").read_text()
         self.assertEqual(process.returncode, 0, stderr)
         self.assertEqual([call[0] for call in calls_in(self.calls)], ["regenerate-rust-deps", "stage", "run"])
