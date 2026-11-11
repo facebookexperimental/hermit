@@ -17,7 +17,7 @@ load(
 )
 load("@fbcode//hermetic_infra/hermit/tests:record_workloads.bzl", "record_c_workloads")
 load("@fbcode_macros//build_defs:cpp_binary.bzl", "cpp_binary")
-load("@fbcode_macros//build_defs:export_files.bzl", "export_file")
+load("@fbcode_macros//build_defs:export_files.bzl", "buck_export_file", "export_file")
 load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup", "buck_genrule", "buck_sh_binary", "cxx_genrule")
 load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
 load(
@@ -753,3 +753,10 @@ buck_filegroup(
 )
 
 record_c_workloads("tests")
+
+# This package's Cargo manifest, for the tree check.backend_abstraction runs
+# on (//hermetic_infra/hermit:backend-abstraction-repository).
+buck_export_file(
+    name = "Cargo.toml",
+    visibility = ["//hermetic_infra/hermit:"],
+)

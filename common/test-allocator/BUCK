@@ -1,3 +1,4 @@
+load("@fbcode_macros//build_defs:export_files.bzl", "buck_export_file")
 load("@fbcode_macros//build_defs:native_rules.bzl", "buck_sh_test")
 load("@fbcode_macros//build_defs:sanitizers.bzl", "sanitizers")
 load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
@@ -37,4 +38,11 @@ buck_sh_test(
     name = "run_test_bin",
     args = [],
     test = ":test_bin",
+)
+
+# This package's Cargo manifest, for the tree check.backend_abstraction runs
+# on (//hermetic_infra/hermit:backend-abstraction-repository).
+buck_export_file(
+    name = "Cargo.toml",
+    visibility = ["//hermetic_infra/hermit:"],
 )

@@ -45,3 +45,10 @@ buck_export_file(
     src = "src/canonical_test_epoch.rs",
     visibility = ["//hermetic_infra/hermit/ci/manifest-plan:"],
 )
+
+# This package's Cargo manifest, for the tree check.backend_abstraction runs
+# on (//hermetic_infra/hermit:backend-abstraction-repository).
+buck_export_file(
+    name = "Cargo.toml",
+    visibility = ["//hermetic_infra/hermit:"],
+)

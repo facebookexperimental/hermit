@@ -1,6 +1,7 @@
 # (c) Facebook, Inc. and its affiliates. Confidential and proprietary.
 
 load("@fbcode_macros//build_defs:cpp_unittest.bzl", "cpp_unittest")
+load("@fbcode_macros//build_defs:export_files.bzl", "buck_export_file")
 load("@fbcode_macros//build_defs:native_rules.bzl", "buck_sh_test")
 load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
 load("@fbsource//tools/build_defs:testpilot_defs.bzl", "tpx_labels")
@@ -129,4 +130,11 @@ buck_sh_test(
     # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
     target_compatible_with = ["ovr_config//cpu:x86_64"],
     test = "external_flaky_service/flaky_server_test.sh",
+)
+
+# This package's Cargo manifest, for the tree check.backend_abstraction runs
+# on (//hermetic_infra/hermit:backend-abstraction-repository).
+buck_export_file(
+    name = "Cargo.toml",
+    visibility = ["//hermetic_infra/hermit:"],
 )

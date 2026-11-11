@@ -1,4 +1,4 @@
-load("@fbcode//hermetic_infra/hermit/fb-only/contract_checks:backend_abstraction.bzl", "WORKSPACE_MEMBERS")
+load("@fbcode//hermetic_infra/hermit/fb-only/contract_checks:backend_abstraction.bzl", "MEMBER_MANIFESTS")
 load("@fbcode//hermetic_infra/hermit/hermit-cli:integration_tests_data.bzl", "EXTERNAL_SRCS")
 load("@fbcode//hermetic_infra/hermit_import:excluded_paths.bzl", "excluded_paths_test")
 load("@fbcode_macros//build_defs:export_files.bzl", "buck_export_file", "export_file")
@@ -116,14 +116,6 @@ buck_export_file(
     visibility = ["//hermetic_infra/hermit/fb-only/integration_tests/tests:"],
 )
 
-# hermit-cli's Cargo manifest; its [[test]] required-features gate binaries.
-# oss_cargo/ (the Cargo manifests as exported) exists only in fbsource.
-buck_export_file(
-    name = "oss_cargo/hermit-cli/Cargo.toml.oss",
-    target_compatible_with = ["fbcode//opensource/macros:broken-in-oss"],
-    visibility = ["//hermetic_infra/hermit/fb-only/integration_tests/tests:"],
-)
-
 # The per-test budgets and validation environment that the generator carries
 # into the DAG nodes' wrappers.
 [
@@ -229,10 +221,10 @@ buck_filegroup(
 )
 
 # The tree check.backend_abstraction runs on: the root Cargo.toml, each of its
-# workspace members' upstream manifest (oss_cargo/<member>/Cargo.toml.oss) at
-# <member>/Cargo.toml, detcore/src, the DAG it checks its budget against, and
-# the script beside its source gate, built by fb-only/contract_checks. Those
-# manifests and that script exist only in fbsource.
+# workspace members' manifest at <member>/Cargo.toml (MEMBER_MANIFESTS names
+# the target that exports it), detcore/src, the DAG it checks its budget
+# against, and the script beside its source gate, built by
+# fb-only/contract_checks. That script exists only in fbsource.
 buck_filegroup(
     name = "backend-abstraction-repository",
     srcs = {
@@ -242,7 +234,7 @@ buck_filegroup(
         "scripts/check-detcore-backend-abstraction.sh": "//hermetic_infra/hermit/scripts:check-detcore-backend-abstraction.sh",
         "scripts/detcore-backend-source.rs": "//hermetic_infra/hermit/fb-only/contract_checks:detcore-backend-source-release",
     }
-    | {member + "/Cargo.toml": "oss_cargo/{}/Cargo.toml.oss".format(member) for member in WORKSPACE_MEMBERS},
+    | {member + "/Cargo.toml": manifest for member, manifest in MEMBER_MANIFESTS.items()},
     target_compatible_with = ["fbcode//opensource/macros:broken-in-oss"],
     visibility = ["//hermetic_infra/hermit/fb-only/contract_checks:"],
 )

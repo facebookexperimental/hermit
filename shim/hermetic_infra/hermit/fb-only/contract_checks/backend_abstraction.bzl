@@ -10,9 +10,10 @@
 # fbcode//hermetic_infra/hermit/fb-only/contract_checks:backend_abstraction.bzl,
 # which the root BUCK loads as
 # "@fbcode//hermetic_infra/hermit/fb-only/contract_checks:backend_abstraction.bzl"
-# (the fbcode cell is this shim here). Internally WORKSPACE_MEMBERS feeds the
-# tree that check.backend_abstraction runs on; the open-source build runs that
-# check as scripts/check-detcore-backend-abstraction.sh instead, so the tree
-# has no members here.
+# (the fbcode cell is this shim here). Internally MEMBER_MANIFESTS lays out the
+# workspace members' manifests in the tree that check.backend_abstraction runs
+# on; the open-source build runs that check as
+# scripts/check-detcore-backend-abstraction.sh instead, so the tree has no
+# members here.
 
-WORKSPACE_MEMBERS = []
+MEMBER_MANIFESTS = {}

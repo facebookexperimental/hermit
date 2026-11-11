@@ -1,6 +1,6 @@
 load("@fbcode//hermetic_infra/hermit/fb-only/gated_tests:defs.bzl", "gated_test", "run_gated_only")
 load("@fbcode_macros//build_defs:clippy_configuration.bzl", "clippy_configuration")
-load("@fbcode_macros//build_defs:export_files.bzl", "export_file")
+load("@fbcode_macros//build_defs:export_files.bzl", "buck_export_file", "export_file")
 load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup", "buck_sh_test")
 load("@fbcode_macros//build_defs:sanitizers.bzl", "sanitizers")
 load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
@@ -380,3 +380,19 @@ buck_filegroup(
     srcs = {path[len("src/") :]: path for path in glob(["src/**"])},
     visibility = ["//hermetic_infra/hermit:"],
 )
+
+# The Cargo manifests of this package's workspace members, for the tree
+# check.backend_abstraction runs on
+# (//hermetic_infra/hermit:backend-abstraction-repository).
+[
+    buck_export_file(
+        name = manifest,
+        visibility = ["//hermetic_infra/hermit:"],
+    )
+    for manifest in [
+        "Cargo.toml",
+        "tests/Cargo.toml",
+        "tests/lit-guests/Cargo.toml",
+        "tests/testutils/Cargo.toml",
+    ]
+]

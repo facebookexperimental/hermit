@@ -79,7 +79,7 @@ LIBHERMIT_TEST_DEPS = [
 
 LIBHERMIT_ENV = {
     # src/bin/hermit/version.rs reports it in `hermit --version`. Keep in sync
-    # with the version in oss_cargo/hermit-cli/Cargo.toml.oss.
+    # with the version in Cargo.toml.
     "CARGO_PKG_VERSION": "0.5.6",
     # The open-source Buck build's version string names these (an fbcode
     # build reports BuildInfo instead); a regular build embeds no date or
@@ -173,11 +173,11 @@ rust_library(
                     ("syn", "fbsource//third-party/rust:syn2"),
                 ],
             },
-            # The OSS package's backend features (oss_cargo/hermit-cli/
-            # Cargo.toml.oss), declared but empty, which keeps
-            # `cfg(feature = ...)` known to clippy's `-D warnings` in
-            # fb-only/ci.sh. Of those backends fbsource builds only LiteInst,
-            # whose dependencies the Buck targets list unconditionally.
+            # The OSS package's backend features (Cargo.toml), declared but
+            # empty, which keeps `cfg(feature = ...)` known to clippy's
+            # `-D warnings` in fb-only/ci.sh. Of those backends fbsource builds
+            # only LiteInst, whose dependencies the Buck targets list
+            # unconditionally.
             "features": {
                 "dbt": [],
                 "default": [],
@@ -410,6 +410,7 @@ buck_filegroup(
     # generated file: the open-source tree does not carry it, so the glob
     # names it without requiring it, and the target is fbsource-only.
     srcs = [
+        "Cargo.toml",
         "build.rs",
         "build_support.rs",
         "reverie_pin.rs",
@@ -483,3 +484,10 @@ hermit_host_test(
         ("verify_run_record.rs", "src/verify_run_record.rs"),
     ]
 ]
+
+# This package's Cargo manifest, for the tree check.backend_abstraction runs
+# on (//hermetic_infra/hermit:backend-abstraction-repository).
+buck_export_file(
+    name = "Cargo.toml",
+    visibility = ["//hermetic_infra/hermit:"],
+)
