@@ -417,7 +417,7 @@ mod tests {
         // review of 29b3e6a8; finding 2 of coord7's). 55 on its own base, 56 at
         // its rebase onto main's 55, and 57 at its rebase onto main's 56
         // (https://github.com/rrnewton/hermit/pull/5259). Digest measured at this head.
-        (57, "09e838f3168a14bf", "f8b1309588141fd0"),
+        (57, "42fff6542bd35935", "f8b1309588141fd0"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
@@ -1090,8 +1090,10 @@ mod tests {
     /// A runtime built at any earlier revision, among them 54 (the slice-2
     /// branch at 29b3e6a8, whose `SigalrmControl` already had the
     /// `GuestHeldMarksRevoked`, `PublishPipeStatus` and `PipeStatusDiffers`
-    /// controls) and 55 (main without slice 2, which lacks them), is refused
-    /// by name before it decodes anything: its configuration fingerprint is this build's, so
+    /// controls), 55 (main without slice 2, which lacks them) and 56 (main
+    /// with https://github.com/rrnewton/hermit/pull/5259, which lacks them
+    /// too), is refused by name before it decodes anything: its configuration
+    /// fingerprint is this build's, so
     /// only the revision tells the pair apart (finding 1 of rev5338-cx's
     /// review of 29b3e6a8, finding 2 of coord7's). The in-guest runtime makes
     /// this comparison before it decodes its coordinator's configuration
