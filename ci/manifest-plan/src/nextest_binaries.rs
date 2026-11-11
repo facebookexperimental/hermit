@@ -836,12 +836,11 @@ fn same_core_package(
     Ok(())
 }
 
-/// Hold the original core producer's shared generation lock. Consumers retain
-/// this guard until their actual Nextest child has joined, alongside their own
-/// project lock. There is no fallback to building a wrapper in a test node.
 /// A prepared project's core tool owner: its store, locked shared, and its
 /// published record. It is step 1 of the global lock order, taken before the
 /// project's own store; its target is locked with the project's own in step 3.
+/// Consumers keep it until their Nextest child has joined. There is no
+/// fallback to building a wrapper in a test node.
 struct ToolOwner {
     project: PreparedProject,
     record: PreparedRecord,
@@ -1211,6 +1210,47 @@ pub fn budget_context(
     budget_context_with(root, args, launch, None)
 }
 
+/// The selection the Nextest budgets calibrate: the regular crates, which
+/// belong to the default cohort.
+const REGULAR_BUDGET_SELECTION: [&str; 9] = [
+    "--workspace",
+    "--exclude",
+    "hermit-detcore",
+    "--exclude",
+    "hermit-detcore-tests",
+    "--exclude",
+    "hermit-run",
+    "--exclude",
+    "hermetic_infra_hermit_flaky-tests",
+];
+
+/// What `run` hands its budget check. A default-cohort run passes its own
+/// record and Cargo metadata, whose locks it already holds. Another cohort's
+/// selection needs none: the check answers it without a lock. A non-default
+/// cohort running the regular selection is refused by name, because its
+/// check would need the default cohort's store after this run's target.
+fn budget_held<'a>(
+    cohort: PreparedCohort,
+    build: &[String],
+    record: &'a PreparedRecord,
+    cargo: &'a Value,
+) -> Result<Option<(&'a PreparedRecord, &'a Value)>, String> {
+    if cohort.is_default() {
+        return Ok(Some((record, cargo)));
+    }
+    if REGULAR_BUDGET_SELECTION
+        .iter()
+        .copied()
+        .eq(build.iter().map(String::as_str))
+    {
+        return Err(format!(
+            "prepared Nextest run refused: cohort {} runs the regular budget selection, which belongs to the default cohort; resolve and run its budgets in a default-cohort run",
+            cohort.name()
+        ));
+    }
+    Ok(None)
+}
+
 /// HELD is the default cohort's record and its verified Cargo metadata when
 /// the caller already holds their locks, as `run` of the default cohort
 /// does: it may take no lock after its targets.
@@ -1225,18 +1265,7 @@ fn budget_context_with(
         None => (None, None),
     };
     let parsed = split_arguments(args)?;
-    let regular = [
-        "--workspace",
-        "--exclude",
-        "hermit-detcore",
-        "--exclude",
-        "hermit-detcore-tests",
-        "--exclude",
-        "hermit-run",
-        "--exclude",
-        "hermetic_infra_hermit_flaky-tests",
-    ];
-    if parsed.build != regular {
+    if parsed.build != REGULAR_BUDGET_SELECTION {
         return Ok("null".into());
     }
     // The regular selection belongs to the default cohort.
@@ -1788,18 +1817,23 @@ fn acquire_targets(requests: &[(&Path, bool)]) -> Result<Vec<TargetLock>, String
 /// holds it exclusively for its whole build. Every reader of a published
 /// generation holds it shared for as long as its store lock. A writer
 /// therefore never rebuilds binaries beneath a reader of the same target,
-/// whichever artifact store each of them uses. The key is the canonical
-/// target Cargo itself reports, so `CARGO_TARGET_DIR`,
-/// `CARGO_BUILD_TARGET_DIR`, `build.target-dir` and symlinks all reach the
-/// same file. The file is `ci/nextest-binaries/target.lock` under the
-/// target, distinct from every store's own lock even for the checkout's
-/// `target/`, so the two kinds of lock never alias.
+/// whichever artifact store each of them uses. Writers find the target
+/// Cargo itself reports, so `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR` and
+/// `build.target-dir` all lead to it; the lock is keyed by that directory's
+/// [`directory_key`], so symlink and bind-mount spellings are one target.
+/// The file is `ci/nextest-binaries/target.lock` under the target, distinct
+/// from every store's own lock even for the checkout's `target/`, so the two
+/// kinds of lock never alias.
+///
+/// A TargetLock is not `Send`: [`TARGETS_HELD`] counts the locks of the
+/// thread that took them, so they must be released on that thread.
 struct TargetLock {
     target: PathBuf,
     /// The target directory's [`directory_key`].
     key: (u64, u64),
     exclusive: bool,
     _lock: fs::File,
+    _this_thread: std::marker::PhantomData<*const ()>,
 }
 
 impl Drop for TargetLock {
@@ -1857,6 +1891,7 @@ impl TargetLock {
             key,
             exclusive,
             _lock: lock,
+            _this_thread: std::marker::PhantomData,
         })
     }
 }
@@ -3777,7 +3812,7 @@ pub fn run(
                 &root,
                 args,
                 launch,
-                cohort.is_default().then_some((&record, &cargo)),
+                budget_held(cohort, &parsed.build, &record, &cargo)?,
             )?)
             .map_err(|e| e.to_string())?;
         if actual.as_ref() != Some(&map.context) {
@@ -4816,13 +4851,31 @@ mod tests {
                 .contains("checked without holding its Cargo target lock")
         );
         drop(unlocked);
+        // A project record also needs its tool owner's target lock held.
+        let owner_target = fixture.root.join("owner-target");
+        fs::create_dir_all(&owner_target).unwrap();
+        let owner_target = owner_target.canonicalize().unwrap();
+        let (core, project) = published_core(&owner_target);
+        let owner = ToolOwner::open(Some(project)).unwrap().unwrap();
         let mut held = LockedArtifacts::open(&fixture.root, false, DEFAULT_COHORT).unwrap();
         held.lock_targets(&old_schema.target, None).unwrap();
+        let unheld_owner =
+            verify_record(&fixture.root, &old_schema, &held, Some(&owner)).unwrap_err();
+        assert!(
+            unheld_owner.contains(&format!(
+                "checked without holding its Cargo target lock {}",
+                owner_target.display()
+            )),
+            "{unheld_owner}"
+        );
         assert!(
             verify_record(&fixture.root, &old_schema, &held, None)
                 .unwrap_err()
                 .contains("schema")
         );
+        drop(held);
+        drop(owner);
+        fs::remove_dir_all(&core.root).unwrap();
     }
 
     #[test]
@@ -6379,10 +6432,13 @@ esac
         let target = root.join("target");
         fs::create_dir_all(&target).unwrap();
         let cargo = serde_json::json!({ "target_directory": target });
-        let producer = |owner: Option<ToolOwner>| {
+        // A ToolOwner holds locks of the thread that opened it, so each
+        // producer opens its own.
+        let producer = |project: Option<PreparedProject>| {
             let (root, cargo) = (root.clone(), cargo.clone());
             let (send, receive) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
+                let owner = ToolOwner::open(project).unwrap();
                 let mut artifacts = LockedArtifacts::open(&root, true, DEFAULT_COHORT).unwrap();
                 let result = lock_producer_target(
                     &mut artifacts,
@@ -6423,8 +6479,7 @@ esac
         }
 
         let (tools, project) = published_core(&target);
-        let owner = ToolOwner::open(Some(project)).unwrap();
-        let refused = producer(owner)
+        let refused = producer(Some(project))
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("HANG: the project producer waited on its own tool owner's target lock")
             .unwrap_err();
@@ -6466,6 +6521,48 @@ esac
         fs::remove_dir_all(&root).unwrap();
     }
 
+    /// coord7 review of e99604a2, F2 and F7. A default-cohort `run` must hand
+    /// its budget check its own record: the check could not lock the default
+    /// cohort again after run's target, and without the record it is refused
+    /// "lock order violated" (shown last). Another cohort's run of the regular
+    /// selection is refused by name before any lock; its other selections
+    /// need no record.
+    #[test]
+    fn run_hands_its_budget_check_its_own_record() {
+        let fixture = Fixture::new();
+        let (record, _) = fixture.selection();
+        let regular = REGULAR_BUDGET_SELECTION.map(String::from).to_vec();
+        let held = budget_held(DEFAULT_COHORT, &regular, &record, &fixture.cargo).unwrap();
+        assert!(
+            held.is_some_and(
+                |(held, cargo)| std::ptr::eq(held, &record) && std::ptr::eq(cargo, &fixture.cargo)
+            ),
+            "a default-cohort run must pass its own record"
+        );
+        let refused = budget_held(NATIVE_EXEC_COHORT, &regular, &record, &fixture.cargo)
+            .err()
+            .unwrap();
+        assert!(
+            refused.contains(&format!(
+                "cohort {} runs the regular budget selection, which belongs to the default cohort",
+                NATIVE_EXEC_COHORT.name()
+            )),
+            "{refused}"
+        );
+        let other = vec!["-p".to_string(), "fixture".into(), "--lib".into()];
+        assert!(
+            budget_held(NATIVE_EXEC_COHORT, &other, &record, &fixture.cargo)
+                .unwrap()
+                .is_none()
+        );
+        let root = fixture.root.canonicalize().unwrap();
+        let target = acquire_targets(&[(&fixture.target.canonicalize().unwrap(), false)]).unwrap();
+        let unheld = budget_context_with(&root, &regular, None, None).unwrap_err();
+        assert!(unheld.starts_with("lock order violated"), "{unheld}");
+        drop(target);
+        fs::remove_dir_all(&fixture.root).unwrap();
+    }
+
     /// A core checkout whose published default-cohort record names Cargo
     /// target TARGET, and a prepared project whose tool owner it is.
     fn published_core(target: &Path) -> (Fixture, PreparedProject) {
@@ -6487,15 +6584,26 @@ esac
         (core, project)
     }
 
-    /// Whether some thread waits in flock(2) for the lock file PATH: a "->"
-    /// line of /proc/locks naming its inode. The readiness barrier of the
-    /// lock-order tests: it shows a contender has reached its contested lock.
+    /// Whether a thread of this process waits in flock(2) for the lock file
+    /// PATH: a "->" line of /proc/locks with this process's pid and PATH's
+    /// inode. The readiness barrier of the lock-order tests: it shows a
+    /// contender has reached its contested lock. The device field is not
+    /// compared: on btrfs, /proc/locks names the filesystem's device while
+    /// stat(2) names the subvolume's (measured: 00:2c against 0:48 for one
+    /// file), so only the inode and pid identify the file and the waiter.
     fn flock_waiter_on(path: &Path) -> bool {
-        let inode = format!(":{} ", fs::metadata(path).unwrap().ino());
+        let inode = format!(":{}", fs::metadata(path).unwrap().ino());
+        let pid = std::process::id().to_string();
         fs::read_to_string("/proc/locks")
             .unwrap()
             .lines()
-            .any(|line| line.contains("-> FLOCK") && line.contains(&inode))
+            .any(|line| {
+                let fields = line.split_whitespace().collect::<Vec<_>>();
+                fields.get(1) == Some(&"->")
+                    && fields.get(2) == Some(&"FLOCK")
+                    && fields.get(5) == Some(&pid.as_str())
+                    && fields.get(6).is_some_and(|file| file.ends_with(&inode))
+            })
     }
 
     fn within_30_s(mut condition: impl FnMut() -> bool) -> bool {
