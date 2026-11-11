@@ -17964,6 +17964,12 @@ fi
     /// never execed: a child that clone3 made keeps the creating thread's
     /// name until it execs, and libtest names each test's thread after the
     /// test. A failed start that did not reap its child leaves one here.
+    ///
+    /// The kernel keeps only 15 bytes of a thread's name, and every
+    /// `runner::tests::` thread's is "runner::tests::", so in the parallel
+    /// libtest process this also sees another test's child that failed to
+    /// exec and is not reaped yet. A test that asserts on it runs alone, in
+    /// the child process [`alone_in_a_child_process`] starts.
     fn unreaped_children_of_this_thread() -> Vec<String> {
         let me = std::process::id().to_string();
         let comm = fs::read_to_string("/proc/thread-self/comm").unwrap();
@@ -17985,6 +17991,34 @@ fi
             }
         }
         zombies
+    }
+
+    /// Whether this is the child process that runs the test `case` alone.
+    /// In the libtest process, this runs `case` in a child libtest process
+    /// with no other test, asserts that the child ran it and that it passed,
+    /// and returns false: the caller then returns.
+    fn alone_in_a_child_process(case: &str) -> bool {
+        const CHILD: &str = "HERMIT_TEST_ALONE_IN_A_CHILD_PROCESS";
+        if std::env::var_os(CHILD).is_some_and(|value| value == case) {
+            return true;
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", case, "--nocapture"])
+            .env(CHILD, case)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("test result: ok. 1 passed;"),
+            "the child process did not run {case}: {stdout}"
+        );
+        print!("{stdout}");
+        false
     }
 
     /// Waits for and reaps `leader`, and returns how it ended.
@@ -18381,6 +18415,9 @@ fi
     #[test]
     fn a_missing_working_directory_reads_as_it_does_through_command() {
         let test = "a_missing_working_directory_reads_as_it_does_through_command";
+        if !alone_in_a_child_process(&format!("runner::tests::{test}")) {
+            return;
+        }
         let root = spawn_test_root("missing-cwd");
         let missing = root.join("no-such-directory");
         let command = crate::vfork_spawn::Clone3Support::refusing(libc::ENOSYS);
@@ -18480,6 +18517,9 @@ fi
     #[test]
     fn a_program_that_cannot_be_executed_in_a_cgroup_is_named_with_its_error() {
         let test = "a_program_that_cannot_be_executed_in_a_cgroup_is_named_with_its_error";
+        if !alone_in_a_child_process(&format!("runner::tests::{test}")) {
+            return;
+        }
         let root = spawn_test_root("unexecutable");
         let missing = root.join("missing-program");
         let Some(error) = spawn_in_a_fresh_cgroup(test, &root, missing.to_str().unwrap(), &[], &[])
@@ -18962,10 +19002,17 @@ fi
         let history = CellCpuHistoryV1::from_source_rows(&[(row.attempt, source.clone())])
             .unwrap()
             .unwrap();
-        assert_eq!(
-            history.attempts[0].observations(),
-            row.cpu_observations.as_ref()
-        );
+        // How a process was started is kept in memory only (LaunchObservation's
+        // `method` is not serialized, dh-7n47nt), so every record reads back as
+        // SpawnMethod::Unrecorded. The round trip must give back everything
+        // else exactly, and that one field as Unrecorded.
+        let mut recorded = row.cpu_observations.clone();
+        for invocation in recorded.iter_mut().flat_map(|o| o.invocations.iter_mut()) {
+            if let LaunchObservation::Spawned { method, .. } = &mut invocation.launch {
+                *method = crate::cpu_evidence::SpawnMethod::Unrecorded;
+            }
+        }
+        assert_eq!(history.attempts[0].observations(), recorded.as_ref());
         for pointer in [
             "/cpu_observations/binding/run_id",
             "/cpu_observations/invocations/0/live/polls",
