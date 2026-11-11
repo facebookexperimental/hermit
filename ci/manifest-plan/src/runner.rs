@@ -17772,6 +17772,246 @@ fi
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// A budgeted invocation, which joins an invocation cgroup, starts
+    /// without fork() of this process (dh-7n47nt stage 2): the cgroup join is
+    /// made by clone3's CLONE_INTO_CGROUP instead of a pre_exec closure, which
+    /// forces fork(). Its program is in the invocation cgroup from its first
+    /// instruction.
+    #[test]
+    fn an_invocation_in_a_cgroup_starts_without_forking_this_process() {
+        let test = "an_invocation_in_a_cgroup_starts_without_forking_this_process";
+        let Some(mut probe) = crate::invocation_cgroup::tests::real_cgroup_or_declared_absent(test)
+        else {
+            return;
+        };
+        probe.finish().unwrap();
+        let root =
+            std::env::temp_dir().join(format!("hermit-runner-cgroup-spawn-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut observations = Vec::new();
+        let before = forks_on_this_thread();
+        let output = execute_process(
+            ProcessRequest::new(
+                InvocationRole::Execution {
+                    attempt_index: "1".into(),
+                    backend: RequiredNullable::Null,
+                },
+                &root,
+                "/bin/cat",
+                &["/proc/self/cgroup".into()],
+                &BTreeMap::new(),
+                &root.join("cgroup.stdout"),
+                &root.join("cgroup.stderr"),
+            ),
+            (Instant::now() + Duration::from_secs(60), Some(5_000_000)),
+            &mut observations,
+        )
+        .unwrap();
+        let forks = forks_on_this_thread() - before;
+        assert!(output.status.success());
+        let LiveCpuObservation::Enabled(live) = &observations[0].live else {
+            panic!("a budgeted invocation enables live CPU observation");
+        };
+        assert_eq!(live.source, LiveCpuSource::CgroupV2InvocationCpuStatV1);
+        assert_eq!(forks, 0, "starting the invocation forked this process");
+        let cgroup = fs::read_to_string(root.join("cgroup.stdout")).unwrap();
+        let invocation = format!("/hermit-e2e-invocation-{}-", std::process::id());
+        assert!(
+            cgroup.starts_with("0::/") && cgroup.contains(&invocation),
+            "the program was not in its invocation cgroup: {cgroup:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// What a program `spawn_process` started in a fresh invocation cgroup
+    /// did, once it exited.
+    struct CgroupSpawned {
+        status: ExitStatus,
+        stdout: String,
+        stderr: String,
+    }
+
+    /// Starts `program` with `args` and environment overrides `env` through
+    /// `spawn_process` in a fresh invocation cgroup, waits for it, and removes
+    /// the cgroup. `None` when this environment declares it has no cgroups.
+    fn spawn_in_a_fresh_cgroup(
+        test: &str,
+        root: &Path,
+        program: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Option<Result<CgroupSpawned, String>> {
+        let mut cgroup = crate::invocation_cgroup::tests::real_cgroup_or_declared_absent(test)?;
+        let request = ProcessRequest::new(
+            InvocationRole::Execution {
+                attempt_index: "1".into(),
+                backend: RequiredNullable::Null,
+            },
+            root,
+            program,
+            &args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>(),
+            &env.iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            &root.join("spawned.stdout"),
+            &root.join("spawned.stderr"),
+        );
+        let mut observation = InvocationCpuObservation::pending(
+            1,
+            request.role,
+            request.command,
+            Some(LiveCpuSource::CgroupV2InvocationCpuStatV1),
+        );
+        let spawned = spawn_process(
+            &request.cwd,
+            &request.stdout,
+            &request.stderr,
+            Some((cgroup.enrollment_fd(), cgroup.path())),
+            &mut observation,
+        )
+        .map(|mut child| CgroupSpawned {
+            status: child.wait().unwrap(),
+            stdout: fs::read_to_string(&request.stdout).unwrap(),
+            stderr: fs::read_to_string(&request.stderr).unwrap(),
+        });
+        cgroup.finish().unwrap();
+        Some(spawned)
+    }
+
+    /// A fresh directory for one of the spawn tests below.
+    fn spawn_test_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-spawn-{label}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// A program that cannot be executed in a cgroup is a spawn failure that
+    /// names the program and the exec's error: a missing file (ENOENT) and a
+    /// file without execute permission (EACCES).
+    #[test]
+    fn a_program_that_cannot_be_executed_in_a_cgroup_is_named_with_its_error() {
+        let test = "a_program_that_cannot_be_executed_in_a_cgroup_is_named_with_its_error";
+        let root = spawn_test_root("unexecutable");
+        let missing = root.join("missing-program");
+        let Some(error) = spawn_in_a_fresh_cgroup(test, &root, missing.to_str().unwrap(), &[], &[])
+        else {
+            return;
+        };
+        assert_eq!(
+            error.err(),
+            Some(format!(
+                "cannot execute {}: No such file or directory (os error 2)",
+                missing.display()
+            ))
+        );
+        let plain = root.join("not-executable");
+        fs::write(&plain, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&plain, fs::Permissions::from_mode(0o644)).unwrap();
+        let error =
+            spawn_in_a_fresh_cgroup(test, &root, plain.to_str().unwrap(), &[], &[]).unwrap();
+        assert_eq!(
+            error.err(),
+            Some(format!(
+                "cannot execute {}: Permission denied (os error 13)",
+                plain.display()
+            ))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An executable file without a `#!` line runs under /bin/sh, as execvp
+    /// runs it (ENOEXEC).
+    #[test]
+    fn an_executable_without_an_interpreter_line_runs_under_the_shell() {
+        let test = "an_executable_without_an_interpreter_line_runs_under_the_shell";
+        let root = spawn_test_root("no-shebang");
+        let script = root.join("plain-script");
+        fs::write(&script, "printf 'ran %s' \"$1\"\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let Some(spawned) =
+            spawn_in_a_fresh_cgroup(test, &root, script.to_str().unwrap(), &["arg"], &[])
+        else {
+            return;
+        };
+        let spawned = spawned.unwrap();
+        assert!(spawned.status.success(), "{}", spawned.stderr);
+        assert_eq!(spawned.stdout, "ran arg");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A program named without a `/` is looked up in the PATH the
+    /// invocation's environment overrides set, not in this process's PATH.
+    #[test]
+    fn a_program_is_looked_up_in_the_overridden_path() {
+        let test = "a_program_is_looked_up_in_the_overridden_path";
+        let root = spawn_test_root("override-path");
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let script = bin.join("hermit-spawn-path-probe");
+        fs::write(&script, "#!/bin/sh\nprintf found\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+        let Some(spawned) = spawn_in_a_fresh_cgroup(
+            test,
+            &root,
+            "hermit-spawn-path-probe",
+            &[],
+            &[("PATH", &path)],
+        ) else {
+            return;
+        };
+        let spawned = spawned.unwrap();
+        assert!(spawned.status.success(), "{}", spawned.stderr);
+        assert_eq!(spawned.stdout, "found");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The program starts as std::process::Command starts one: leading a
+    /// process group of its own, in its working directory, with stdin on
+    /// /dev/null, no blocked signals and SIGPIPE at its default action.
+    #[test]
+    fn a_program_in_a_cgroup_starts_with_the_process_state_command_gives() {
+        let test = "a_program_in_a_cgroup_starts_with_the_process_state_command_gives";
+        let root = spawn_test_root("process-state");
+        let script = "set -e; \
+            read -r _ _ _ _ pgid _ < /proc/$$/stat; \
+            printf 'group=%s\\n' \"$([ \"$pgid\" = $$ ] && echo own || echo other)\"; \
+            printf 'cwd=%s\\n' \"$(pwd -P)\"; \
+            printf 'stdin=%s\\n' \"$(readlink /proc/$$/fd/0)\"; \
+            grep -E '^(SigBlk|SigIgn):' /proc/$$/status";
+        let Some(spawned) = spawn_in_a_fresh_cgroup(test, &root, "/bin/sh", &["-c", script], &[])
+        else {
+            return;
+        };
+        let spawned = spawned.unwrap();
+        assert!(spawned.status.success(), "{}", spawned.stderr);
+        let line = |key: &str| {
+            spawned
+                .stdout
+                .lines()
+                .find_map(|line| line.strip_prefix(key))
+                .map(str::trim)
+                .unwrap_or_else(|| panic!("no {key} in {:?}", spawned.stdout))
+                .to_string()
+        };
+        assert_eq!(line("group="), "own");
+        assert_eq!(line("cwd="), root.canonicalize().unwrap().to_str().unwrap());
+        assert_eq!(line("stdin="), "/dev/null");
+        assert_eq!(line("SigBlk:"), "0000000000000000");
+        let ignored = u64::from_str_radix(&line("SigIgn:"), 16).unwrap();
+        assert_eq!(
+            ignored & (1 << (libc::SIGPIPE - 1)),
+            0,
+            "SIGPIPE is ignored in the program: SigIgn {ignored:016x}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn bounded_process(
         root: &Path,
         label: &str,
