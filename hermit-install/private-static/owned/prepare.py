@@ -29,7 +29,7 @@ PRIVATE_INVENTORY_SHA256 = 'f825b66769fb55bee298b0a41277b38767970e5cad4beca8400f
 CODEGEN = '-C relocation-model=pic -C code-model=small -C target-feature=+crt-static -C link-self-contained=yes'
 STREAM = 64 * 1024 * 1024
 RUNTIME_COHORT = D / 'runtime_cohort.py'
-RUNTIME_COHORT_SHA256 = '76ac93a73ed73df2df4bc4bde98ad183fb9670f87a5998d3ace40116431325c7'
+RUNTIME_COHORT_SHA256 = 'bf07f89bd91b3452aeea0681447a1ac54c86353053508d69aa19a7503f0ef773'
 HANDOFF_SOURCE = 'reverie-loader/src/handoff.rs'
 
 

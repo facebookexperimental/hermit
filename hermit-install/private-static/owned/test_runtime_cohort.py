@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import selectors
 import shutil
 import subprocess
@@ -88,8 +89,7 @@ LIVE = D.parents[2]
 TRAP = 'reverie-inguest/src/trap.rs'
 ORDINARY_GATE = 'reverie-liteinst-artifact/src/private_static/selected_initializers/ordinary_gate.rs'
 MAPPED_ENTRY = 'detcore-liteinst/src/exec_initial/mapped_entry.rs'
-TERMINAL = 'reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs'
-ENTRY_NAMES = ('ENTRY_SOURCE', 'BOOTSTRAP_ENTRY_SOURCE')
+CONSUMER = 'reverie-liteinst-artifact/src/private_static/selected_initializers.rs'
 GIT_FIXTURE_ENV = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM='1',
                        GIT_AUTHOR_NAME='fixture', GIT_AUTHOR_EMAIL='fixture@example.invalid',
                        GIT_COMMITTER_NAME='fixture', GIT_COMMITTER_EMAIL='fixture@example.invalid',
@@ -134,9 +134,11 @@ class PinnedTree:
                 self.write(self.reverie / path, live_reverie_object(TRAP) if path == TRAP
                            else ('runtime ' + path + '\n').encode())
         self.entry_bytes = ('host ' + MAPPED_ENTRY + '\n').encode()
-        self.entry_pins = dict(zip(ENTRY_NAMES, (hashlib.sha256(b'alternative fixture entry\n').hexdigest(),
-                                               hashlib.sha256(self.entry_bytes).hexdigest())))
-        self.write(self.reverie / TERMINAL, self.terminal_source())
+        self.entry_relative = MAPPED_ENTRY
+        self.accepted = [hashlib.sha256(b'alternative fixture entry\n').hexdigest(),
+                         hashlib.sha256(self.entry_bytes).hexdigest()]
+        self.other_accepted = [hashlib.sha256(b'another consumer entry\n').hexdigest()]
+        self.write(self.reverie / CONSUMER, self.consumer_source())
         self.write(self.reverie / 'README.md', b'not a reviewed row\n')
         self.rpin = self.commit(self.reverie)
         fixture_git(root, 'init', '-q')
@@ -147,9 +149,26 @@ class PinnedTree:
         self.locks(self.rpin)
         self.h_head = self.commit(root)
 
-    def terminal_source(self):
-        return ''.join('const %s: &str =\n    "%s";\n' % (name, digest)
-                       for name, digest in self.entry_pins.items()).encode()
+    def consumer_source(self):
+        """Reverie's descriptor form: DETCORE, then another consumer's descriptor."""
+        def descriptor(name, relative, accepted):
+            return ('const %s: MappedConsumerSource = MappedConsumerSource {\n'
+                    '    layout: "%s_mapped_layout",\n'
+                    '    first: Some(MappedGenerationSymbols {\n'
+                    '        entry: "%s_mapped_entry",\n'
+                    '        terminal_exact: Some("_RNv%s"),\n'
+                    '    }),\n'
+                    '    successor: None,\n'
+                    '    entry_source_relative: "%s",\n'
+                    '    accepted_entry_sources: &[\n%s    ],\n'
+                    '    binding: WorkspaceBinding::HermitGitlink {\n'
+                    '        reverie_gitlink_relative: "reverie",\n'
+                    '    },\n'
+                    '    features: &["exec-native-injection", "exec-private-init"],\n'
+                    '};\n' % (name, name.lower(), name.lower(), name.lower(), relative,
+                              ''.join('        "%s",\n' % digest for digest in accepted)))
+        return (descriptor('DETCORE', self.entry_relative, self.accepted) + '\n' +
+                descriptor('LITEROOT', 'preload/src/mapped_entry.rs', self.other_accepted)).encode()
 
     @staticmethod
     def write(path, raw):
@@ -604,29 +623,38 @@ class DerivedCohort(unittest.TestCase):
 
 
 class EntrySourcePins(unittest.TestCase):
-    """The gitlink's terminal literals must accept the committed Hermit entry."""
+    """The gitlink's Detcore consumer descriptor must accept the committed Hermit entry."""
 
     def refuse(self, tree, raw):
         with self.assertRaises(RuntimeError) as failure:
             cohort.derive(tree.root, tree.h_head)
         message = str(failure.exception)
         for text in ['runtime cohort derivation:', MAPPED_ENTRY, hashlib.sha256(raw).hexdigest(),
-                     tree.rpin, TERMINAL, *tree.entry_pins.keys(), *tree.entry_pins.values()]:
+                     tree.rpin, CONSUMER, 'DETCORE accepted_entry_sources', *tree.accepted]:
             self.assertIn(text, message)
 
-    def test_each_named_alternative_accepts_the_committed_entry(self):
-        for accepted in ENTRY_NAMES:
-            with self.subTest(accepted=accepted), tempfile.TemporaryDirectory() as directory:
+    @staticmethod
+    def recommit(tree, raw=None):
+        tree.write(tree.reverie / CONSUMER, tree.consumer_source() if raw is None else raw)
+        tree.commit(tree.reverie)
+        tree.repin()
+
+    def test_live_descriptor_accepts_the_live_entry(self):
+        relative, accepted = cohort.consumer_entry_sources(live_reverie_object(CONSUMER), 'live')
+        self.assertEqual(relative, MAPPED_ENTRY)
+        entry = fixture_git_bytes(LIVE, 'cat-file', 'blob', 'HEAD:' + MAPPED_ENTRY)
+        self.assertIn(hashlib.sha256(entry).hexdigest(), accepted)
+
+    def test_each_listed_digest_accepts_the_committed_entry(self):
+        for size, position in [(1, 0), (3, 0), (3, 1), (3, 2)]:
+            with self.subTest(size=size, position=position), tempfile.TemporaryDirectory() as directory:
                 tree = PinnedTree(Path(directory))
-                other = next(name for name in ENTRY_NAMES if name != accepted)
-                tree.entry_pins[accepted] = hashlib.sha256(tree.entry_bytes).hexdigest()
-                tree.entry_pins[other] = hashlib.sha256(b'not this fixture entry').hexdigest()
-                tree.write(tree.reverie / TERMINAL, tree.terminal_source())
-                tree.commit(tree.reverie)
-                tree.repin()
+                tree.accepted = [hashlib.sha256(b'not this fixture entry %d' % n).hexdigest() for n in range(size)]
+                tree.accepted[position] = hashlib.sha256(tree.entry_bytes).hexdigest()
+                self.recommit(tree)
                 self.assertEqual(cohort.bind(tree.root, tree.h_head)['runtime_R_pin'], tree.rpin)
 
-    def test_one_byte_committed_entry_change_refuses_with_both_named_pins(self):
+    def test_one_byte_committed_entry_change_refuses_with_every_accepted_digest(self):
         with tempfile.TemporaryDirectory() as directory:
             tree = PinnedTree(Path(directory))
             changed = bytes([tree.entry_bytes[0] ^ 1]) + tree.entry_bytes[1:]
@@ -634,98 +662,173 @@ class EntrySourcePins(unittest.TestCase):
             tree.h_head = tree.commit(tree.root)
             self.refuse(tree, changed)
 
-    def test_changed_accepting_literal_at_new_gitlink_refuses_with_both_named_pins(self):
-        for accepted in ENTRY_NAMES:
-            with self.subTest(accepted=accepted), tempfile.TemporaryDirectory() as directory:
+    def test_changed_accepting_digest_at_new_gitlink_refuses_with_every_accepted_digest(self):
+        for position in [0, 1]:
+            with self.subTest(position=position), tempfile.TemporaryDirectory() as directory:
                 tree = PinnedTree(Path(directory))
-                other = next(name for name in ENTRY_NAMES if name != accepted)
-                tree.entry_pins[accepted] = hashlib.sha256(tree.entry_bytes).hexdigest()
-                tree.entry_pins[other] = hashlib.sha256(b'other entry').hexdigest()
-                tree.write(tree.reverie / TERMINAL, tree.terminal_source())
-                tree.commit(tree.reverie)
-                tree.repin()
+                tree.accepted = [hashlib.sha256(b'other entry %d' % n).hexdigest() for n in range(2)]
+                tree.accepted[position] = hashlib.sha256(tree.entry_bytes).hexdigest()
+                self.recommit(tree)
                 cohort.derive(tree.root, tree.h_head)
-                tree.entry_pins[accepted] = hashlib.sha256(b'changed literal entry').hexdigest()
-                tree.write(tree.reverie / TERMINAL, tree.terminal_source())
-                tree.commit(tree.reverie)
-                tree.repin()
+                tree.accepted[position] = hashlib.sha256(b'changed literal entry').hexdigest()
+                self.recommit(tree)
                 self.refuse(tree, tree.entry_bytes)
 
-    def test_literal_names_count_and_shape_are_strict(self):
-        for change in ['missing', 'commented', 'duplicate', 'additional', 'comment_separator',
-                       'raw_identifier', 'empty_prefix', 'unicode_substitute', 'unicode_additional',
-                       'punctuation_separator', 'string_separator', 'raw_separator', 'character_separator',
-                       'whitespace_0085', 'whitespace_200e', 'whitespace_200f', 'whitespace_2028',
-                       'whitespace_2029', 'unterminated_string',
-                       'short', 'uppercase', 'expression']:
+    def test_another_consumers_digest_does_not_accept_the_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            tree.accepted = [hashlib.sha256(b'not this fixture entry').hexdigest()]
+            tree.other_accepted = [hashlib.sha256(tree.entry_bytes).hexdigest()]
+            self.recommit(tree)
+            self.refuse(tree, tree.entry_bytes)
+
+    def test_empty_accepted_list_refuses_the_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            tree.accepted = []
+            self.recommit(tree)
+            with self.assertRaisesRegex(RuntimeError, 'is not accepted by Reverie ' + tree.rpin + ' ' +
+                                        re.escape(CONSUMER) + r' DETCORE accepted_entry_sources \(none\)'):
+                cohort.derive(tree.root, tree.h_head)
+
+    def test_moved_entry_source_path_refuses_by_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tree = PinnedTree(Path(directory))
+            tree.entry_relative = 'detcore-liteinst/src/exec_initial/moved_entry.rs'
+            self.recommit(tree)
+            with self.assertRaises(RuntimeError) as failure:
+                cohort.derive(tree.root, tree.h_head)
+            for text in ['runtime cohort derivation:', tree.rpin, CONSUMER + ' DETCORE entry_source_relative ' +
+                         tree.entry_relative + ' is not Hermit ' + MAPPED_ENTRY]:
+                self.assertIn(text, str(failure.exception))
+
+    def test_descriptor_count_and_shape_are_strict(self):
+        def detcore(raw):
+            return raw[:raw.index(b'const LITEROOT')], raw[raw.index(b'const LITEROOT'):]
+
+        def without_list(raw):
+            start = raw.index(b'    accepted_entry_sources:')
+            return raw[:start] + raw[raw.index(b'    ],\n', start) + len(b'    ],\n'):]
+
+        def list_field(raw):
+            start = raw.index(b'    accepted_entry_sources:')
+            return raw[start:raw.index(b'    ],\n', start) + len(b'    ],\n')]
+
+        def gap(change):
+            return chr(int(change.split('_')[1], 16)).encode()
+
+        changes = {
+            'missing': (lambda tree, raw: raw.replace(b'const DETCORE:', b'const DETCORE_OLD:'), 'found 0'),
+            'static': (lambda tree, raw: raw.replace(b'const DETCORE:', b'static DETCORE:'), 'found 0'),
+            'block_comment': (lambda tree, raw: b'/*\n' + detcore(raw)[0] + b'*/\n' + detcore(raw)[1], 'found 0'),
+            'line_comments': (lambda tree, raw: b''.join(b'// ' + line for line in detcore(raw)[0].splitlines(True)) +
+                              detcore(raw)[1], 'found 0'),
+            'raw_string_example': (lambda tree, raw: b'const EXAMPLE: &str = r#"' + detcore(raw)[0] + b'"#;\n' +
+                                   detcore(raw)[1], 'found 0'),
+            'string_example': (lambda tree, raw: b'const EXAMPLE: &str = "' + detcore(raw)[0].replace(b'"', b'\\"') +
+                               b'";\n' + detcore(raw)[1], 'found 0'),
+            'duplicate': (lambda tree, raw: raw + detcore(raw)[0], 'found 2'),
+            'raw_identifier': (lambda tree, raw: raw.replace(b'const DETCORE:', b'const r#DETCORE:'),
+                               'malformed declaration'),
+            'renamed_type': (lambda tree, raw: raw.replace(b'DETCORE: MappedConsumerSource = MappedConsumerSource {',
+                                                           b'DETCORE: MappedConsumer = MappedConsumer {'),
+                             'malformed declaration'),
+            'missing_path': (lambda tree, raw: raw.replace(b'    entry_source_relative: "' + MAPPED_ENTRY.encode() +
+                                                           b'",\n', b''), 'malformed entry_source_relative'),
+            'raw_path': (lambda tree, raw: raw.replace(b'"' + MAPPED_ENTRY.encode() + b'"',
+                                                       b'r"' + MAPPED_ENTRY.encode() + b'"'),
+                         'malformed entry_source_relative'),
+            'concat_path': (lambda tree, raw: raw.replace(b'"' + MAPPED_ENTRY.encode() + b'"',
+                                                          b'concat!("' + MAPPED_ENTRY.encode() + b'")'),
+                            'malformed entry_source_relative'),
+            'missing_list': (lambda tree, raw: without_list(raw), 'malformed accepted_entry_sources'),
+            'duplicate_list': (lambda tree, raw: raw.replace(b'    binding:', b'    accepted_entry_sources: &[],\n'
+                                                             b'    binding:', 1), 'duplicate accepted_entry_sources'),
+            'nested_list': (lambda tree, raw: without_list(raw).replace(
+                b'        entry: "detcore_mapped_entry",\n',
+                b'        entry: "detcore_mapped_entry",\n    ' + list_field(raw), 1),
+                            'malformed accepted_entry_sources'),
+            'shorthand': (lambda tree, raw: raw.replace(list_field(raw), b'    accepted_entry_sources,\n', 1),
+                          'malformed field'),
+            'const_reference': (lambda tree, raw: raw.replace(list_field(raw),
+                                                              b'    accepted_entry_sources: DETCORE_SOURCES,\n', 1),
+                                'malformed accepted_entry_sources'),
+            'array_value': (lambda tree, raw: raw.replace(b'accepted_entry_sources: &[', b'accepted_entry_sources: [',
+                                                          1), 'malformed accepted_entry_sources'),
+            'raw_digest': (lambda tree, raw: raw.replace(b'"' + tree.accepted[0].encode() + b'"',
+                                                         b'r"' + tree.accepted[0].encode() + b'"'),
+                           'malformed accepted_entry_sources'),
+            'byte_digest': (lambda tree, raw: raw.replace(b'"' + tree.accepted[0].encode() + b'"',
+                                                          b'b"' + tree.accepted[0].encode() + b'"'),
+                            'malformed accepted_entry_sources'),
+            'short': (lambda tree, raw: raw.replace(tree.accepted[0].encode(), tree.accepted[0][:-1].encode()),
+                      'malformed accepted_entry_sources'),
+            'uppercase': (lambda tree, raw: raw.replace(tree.accepted[0].encode(), tree.accepted[0].upper().encode()),
+                          'malformed accepted_entry_sources'),
+            'expression': (lambda tree, raw: raw.replace(b'"' + tree.accepted[0].encode() + b'"',
+                                                         b'concat!("' + tree.accepted[0].encode() + b'")'),
+                           'malformed accepted_entry_sources'),
+            'missing_comma': (lambda tree, raw: raw.replace(tree.accepted[0].encode() + b'",',
+                                                            tree.accepted[0].encode() + b'"'),
+                              'malformed accepted_entry_sources'),
+            'double_comma': (lambda tree, raw: raw.replace(tree.accepted[0].encode() + b'",',
+                                                           tree.accepted[0].encode() + b'",,'),
+                             'malformed accepted_entry_sources'),
+            'unbalanced': (lambda tree, raw: raw.replace(b'    }),\n    successor', b'    ]),\n    successor', 1),
+                           'unbalanced first'),
+            'unterminated_descriptor': (lambda tree, raw: raw[:raw.index(b'    binding:')],
+                                        'unterminated DETCORE'),
+            'missing_semicolon': (lambda tree, raw: raw.replace(b'};\n', b'}\n', 1), 'malformed end'),
+            'unterminated_string': (lambda tree, raw: raw + b'const EXAMPLE: &str = "unterminated',
+                                    'unterminated string'),
+            'unterminated_raw_string': (lambda tree, raw: raw + b'const EXAMPLE: &str = r#"unterminated"',
+                                        'unterminated raw string'),
+            'unterminated_comment': (lambda tree, raw: raw + b'/* unterminated /* nested */',
+                                     'unterminated comment'),
+        }
+        for change in ['whitespace_0085', 'whitespace_200e', 'whitespace_200f', 'whitespace_2028', 'whitespace_2029']:
+            changes[change] = ((lambda gap: lambda tree, raw: raw.replace(b'const DETCORE', b'const' + gap + b'DETCORE'))
+                               (gap(change)), 'unsupported non-ASCII whitespace')
+        for change, (mutate, detail) in changes.items():
             with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
                 tree = PinnedTree(Path(directory))
-                raw = tree.terminal_source()
-                first = tree.entry_pins['ENTRY_SOURCE'].encode()
-                if change == 'missing':
-                    raw = raw[raw.index(b'const BOOTSTRAP_ENTRY_SOURCE'):]
-                elif change == 'commented':
-                    at = raw.index(b'const BOOTSTRAP_ENTRY_SOURCE')
-                    raw = b'/*\n' + raw[:at] + b'*/\n' + raw[at:]
-                elif change == 'duplicate':
-                    raw += raw[:raw.index(b'const BOOTSTRAP_ENTRY_SOURCE')]
-                elif change == 'additional':
-                    raw += b'const NEW_ENTRY_SOURCE: &str = "' + first + b'";\n'
-                elif change == 'comment_separator':
-                    raw += b'const /* comment */ NEW_ENTRY_SOURCE: &str = "' + first + b'";\n'
-                elif change == 'raw_identifier':
-                    raw += b'const r#NEW_ENTRY_SOURCE: &str = "' + first + b'";\n'
-                elif change == 'empty_prefix':
-                    raw += b'const _ENTRY_SOURCE: &str = "' + first + b'";\n'
-                elif change == 'unicode_substitute':
-                    raw = raw.replace(b'const ENTRY_SOURCE:', 'const λENTRY_SOURCE:'.encode())
-                elif change == 'unicode_additional':
-                    raw += 'const Xλ_ENTRY_SOURCE: &str = "'.encode() + first + b'";\n'
-                elif change in ['punctuation_separator', 'string_separator', 'raw_separator', 'character_separator']:
-                    gap = {'punctuation_separator': b'=', 'string_separator': b'"example"',
-                           'raw_separator': b'r#"example"#', 'character_separator': b"'x'"}[change]
-                    raw = raw.replace(b'const ENTRY_SOURCE:', b'const ' + gap + b' ENTRY_SOURCE:')
-                elif change.startswith('whitespace_'):
-                    gap = chr(int(change.split('_')[1], 16)).encode()
-                    raw += b'const' + gap + b'NEW_ENTRY_SOURCE: &str = "' + first + b'";\n'
-                elif change == 'unterminated_string':
-                    raw += b'const EXAMPLE: &str = "unterminated'
-                elif change == 'short':
-                    raw = raw.replace(first, first[:-1])
-                elif change == 'uppercase':
-                    raw = raw.replace(first, first.upper())
-                else:
-                    raw = raw.replace(b'"' + first + b'"', b'concat!("' + first + b'")')
-                tree.write(tree.reverie / TERMINAL, raw)
-                tree.commit(tree.reverie)
-                tree.repin()
+                raw = mutate(tree, tree.consumer_source())
+                self.assertNotEqual(raw, tree.consumer_source())
+                self.recommit(tree, raw)
                 with self.assertRaises(RuntimeError) as failure:
                     cohort.derive(tree.root, tree.h_head)
-                for text in ['runtime cohort derivation:', tree.rpin, TERMINAL, 'ENTRY_SOURCE',
-                             'BOOTSTRAP_ENTRY_SOURCE', 'literal']:
+                for text in ['runtime cohort derivation:', tree.rpin, CONSUMER + ' DETCORE requires one literal',
+                             'entry_source_relative', 'accepted_entry_sources', ': ' + detail]:
                     self.assertIn(text, str(failure.exception))
 
-    def test_comments_separate_const_and_name_without_changing_the_literal(self):
+    def test_comments_and_examples_leave_the_descriptor_unchanged(self):
         with tempfile.TemporaryDirectory() as directory:
             tree = PinnedTree(Path(directory))
-            raw = tree.terminal_source().replace(b'const ', b'const // line comment\n /* nested /* comment */ */ ')
-            raw += b'const /* unrelated */ PRIVATE_SOURCE: &str = "unchanged";\n'
-            raw += 'const λPRIVATE_SOURCE: &str = "unchanged";\n'.encode()
-            raw += b'const EXAMPLE: &str = "continued\\\n const NEW_ENTRY_SOURCE: &str = \\"ignored\\";";\n'
-            tree.write(tree.reverie / TERMINAL, raw)
-            tree.commit(tree.reverie)
-            tree.repin()
+            example = tree.consumer_source()
+            raw = tree.consumer_source()
+            raw = raw.replace(b'const DETCORE', b'const // line comment\n /* nested /* comment */ */ DETCORE', 1)
+            raw = raw.replace(b'    accepted_entry_sources: &[\n',
+                              b'    // accepted_entry_sources: &["' + b'0' * 64 + b'"],\n'
+                              b'    accepted_entry_sources: /* list */ &[ // first\n', 1)
+            raw = (b'/// const DETCORE: MappedConsumerSource = MappedConsumerSource {\n'
+                   b'/** const DETCORE: MappedConsumerSource = MappedConsumerSource { */\n'
+                   b"const QUOTE: char = '\"';\n"
+                   b"const NAME: &'static str = \"const DETCORE: MappedConsumerSource = MappedConsumerSource {\";\n"
+                   b'const ESCAPED: &str = "continued\\\n const DETCORE: MappedConsumerSource = \\"ignored\\";";\n'
+                   b'const EXAMPLE: &str = r#"' + example + b'"#;\n' + raw)
+            self.assertEqual(cohort.consumer_entry_sources(raw, 'fixture'), (MAPPED_ENTRY, tree.accepted))
+            self.recommit(tree, raw)
             self.assertEqual(cohort.bind(tree.root, tree.h_head)['runtime_R_pin'], tree.rpin)
 
-    def test_missing_terminal_object_refuses_despite_worktree_copy(self):
+    def test_missing_consumer_object_refuses_despite_worktree_copy(self):
         with tempfile.TemporaryDirectory() as directory:
             tree = PinnedTree(Path(directory))
-            fixture_git(tree.reverie, 'rm', '-q', '--cached', TERMINAL)
-            fixture_git(tree.reverie, 'commit', '-q', '-m', 'drop terminal object')
+            fixture_git(tree.reverie, 'rm', '-q', '--cached', CONSUMER)
+            fixture_git(tree.reverie, 'commit', '-q', '-m', 'drop consumer object')
             tree.repin()
-            self.assertTrue((tree.reverie / TERMINAL).is_file())
+            self.assertTrue((tree.reverie / CONSUMER).is_file())
             with self.assertRaisesRegex(RuntimeError, 'runtime cohort derivation: missing object R ' +
-                                        tree.rpin + ':' + TERMINAL):
+                                        tree.rpin + ':' + CONSUMER):
                 cohort.derive(tree.root, tree.h_head)
 
     def test_entry_check_reads_committed_bytes_not_worktree_bytes(self):

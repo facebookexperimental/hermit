@@ -46,11 +46,18 @@
 //! cell serves both. An uninitialized submodule is a no-result (exit
 //! 75), never a pass.
 //!
-//! Three referenced crates have no generated target and are named here
-//! instead of being silently skipped: `num_cpus`, `quickcheck_macros`
-//! and `test-case` are test-only dependencies outside what Reindeer
-//! resolves. Giving them targets, trimming the test targets that name
-//! them, or another resolution is an open decision; until it is taken
+//! A reference counts by the name the shim resolves it to: the shim
+//! renames a few internal crate names (`sha2-010`) in the exact rewrite
+//! rules of `shim/build_defs/lib/oss.bzl`, which this check reads. Labels
+//! inside an `autocargo = {...}` argument are not references: that dict
+//! describes the Cargo manifest autocargo generates internally, the shim
+//! swallows it, and Buck never resolves the labels in it.
+//!
+//! Four referenced crates have no generated target and are named here
+//! instead of being silently skipped: `io-uring`, `num_cpus`,
+//! `quickcheck_macros` and `test-case` are test-only dependencies outside
+//! what Reindeer resolves. Giving them targets, trimming the test targets
+//! that name them, or another resolution is an open decision; until it is taken
 //! they are the only tolerated gaps, and the check fails if one stops
 //! being referenced or gains coverage, so the exception cannot rot.
 //! Three more names, `prost`, `tonic` and `tonic-prost`, occur only
@@ -100,11 +107,15 @@ const REF_PREFIX: &str = "fbsource//third-party/rust:";
 /// The Meta-only test parameters both shim entry points must swallow.
 const SWALLOWED_TEST_PARAMS: [&str; 3] = ["test_deps", "test_env", "test_srcs"];
 /// Referenced crates with no Reindeer target; resolution undecided.
-const KNOWN_MISSING: [&str; 3] = ["num_cpus", "quickcheck_macros", "test-case"];
+/// `io-uring` is a dependency of Reverie's KVM unit tests
+/// (reverie-kvm-unittest).
+const KNOWN_MISSING: [&str; 4] = ["io-uring", "num_cpus", "quickcheck_macros", "test-case"];
 /// Names only the shim's dead `rust_protobuf_library` may mention.
 const DEAD_REFS: [&str; 3] = ["prost", "tonic", "tonic-prost"];
 const DEAD_REF_FILES: [&str; 1] = ["shim/shims.bzl"];
 const SHIMS: &str = "shim/shims.bzl";
+/// The shim's label rewrite rules, whose exact entries rename crates.
+const REWRITES: &str = "shim/build_defs/lib/oss.bzl";
 const ALIASES: &str = "shim/third-party/rust/shared-cell-aliases.txt";
 const GENERIC_ARRAY_FIXUPS: &str = "shim/third-party/rust/fixups/generic-array/fixups.toml";
 /// The cfg generic-array's build script emits on rustc >= 1.41.0.
@@ -213,18 +224,25 @@ fn run() -> Result<String, Outcome> {
     }
 
     // References from both cells, and what covers them (B3).
+    let rewrites = read(&root, REWRITES)?;
+    let renames = shim_renames(&rewrites);
+    let label_renames = first_party_renames(&rewrites);
     let mut ref_files: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut label_files: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
     let mut files_scanned = 0usize;
-    for file in tracked_build_files(&root)? {
+    for file in tracked_build_files(&root)?
+        .into_iter()
+        .chain(reverie_build_files(&root)?)
+    {
         files_scanned += 1;
-        for name in extract_refs(&read(&root, &file)?) {
+        let text = without_autocargo(&read(&root, &file)?);
+        for name in extract_refs(&text) {
             ref_files.entry(name).or_default().insert(file.clone());
         }
-    }
-    for file in reverie_build_files(&root)? {
-        files_scanned += 1;
-        for name in extract_refs(&read(&root, &file)?) {
-            ref_files.entry(name).or_default().insert(file.clone());
+        for label in label_renames.keys() {
+            if references_label(&text, label) {
+                label_files.entry(label).or_default().insert(file.clone());
+            }
         }
     }
     let direct = direct_deps(&root)?;
@@ -234,9 +252,11 @@ fn run() -> Result<String, Outcome> {
     let mut via_direct = 0usize;
     for (name, files) in &ref_files {
         let shown = files.iter().next().map(String::as_str).unwrap_or("?");
-        if shared_set.contains(name.as_str()) {
+        // The target the shim resolves the reference to.
+        let resolved = renames.get(name).unwrap_or(name);
+        if shared_set.contains(resolved.as_str()) {
             via_shared += 1;
-        } else if direct.contains(name) {
+        } else if direct.contains(resolved) {
             via_direct += 1;
         } else if known.contains(name.as_str()) {
             // Tolerated gap, named in the summary.
@@ -279,8 +299,33 @@ fn run() -> Result<String, Outcome> {
             ));
         }
     }
+    // A first-party label the shim renames to a crate counts as a reference
+    // to that crate, and needs the crate's target as any reference does.
+    for (label, krate) in &label_renames {
+        match label_files.get(label.as_str()) {
+            None => violations.push(format!(
+                "{REWRITES}: the rule renaming `{label}` to `third-party/rust:{krate}` \
+                 matches no reference in any BUCK file; remove the stale rule"
+            )),
+            Some(files) => {
+                let shown = files.iter().next().map(String::as_str).unwrap_or("?");
+                if shared_set.contains(krate.as_str()) {
+                    via_shared += 1;
+                } else if direct.contains(krate) {
+                    via_direct += 1;
+                } else {
+                    violations.push(format!(
+                        "{shown}: `{label}`, which {REWRITES} renames to \
+                         `third-party/rust:{krate}`, has no target: `{krate}` is \
+                         neither in {ALIASES} nor a direct dependency of a \
+                         workspace member"
+                    ));
+                }
+            }
+        }
+    }
     for entry in &shared {
-        if !ref_files.contains_key(entry) {
+        if !ref_files.contains_key(entry) && !label_renames.values().any(|krate| krate == entry) {
             violations.push(format!(
                 "{ALIASES}: `{entry}` is referenced by no BUCK file in either \
                  cell; remove the stale alias"
@@ -303,12 +348,19 @@ fn run() -> Result<String, Outcome> {
 
     if violations.is_empty() {
         Ok(format!(
-            "{} unsuffixed third-party references in {files_scanned} build files: \
+            "{} unsuffixed third-party references and {} first-party label(s) the \
+             shim renames to a crate ({}) in {files_scanned} build files: \
              {via_shared} via the shared-cell list ({} entries, all locked crates), \
              {via_direct} via Reindeer's direct-dependency aliases, {} known-missing \
              tolerated ({}), {} dead shim-only tolerated ({}); shim test-parameter \
              parity holds; generic-array preserves `{RELAXED_COHERENCE}`",
             ref_files.len(),
+            label_renames.len(),
+            label_renames
+                .values()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
             shared.len(),
             KNOWN_MISSING.len(),
             KNOWN_MISSING.join(", "),
@@ -403,6 +455,96 @@ fn reverie_build_files(root: &Path) -> Result<Vec<String>, Outcome> {
 }
 
 /// Every `fbsource//third-party/rust:<name>` target named in `text`.
+/// `text` with the value of every `autocargo = {...}` argument removed.
+/// A dict that does not close is kept whole, so that what this cannot
+/// parse still counts.
+fn without_autocargo(text: &str) -> String {
+    const KEY: &str = "autocargo = {";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(KEY) {
+        let open = at + KEY.len() - 1;
+        let mut depth = 0i32;
+        let mut close = None;
+        for (offset, byte) in rest[open..].bytes().enumerate() {
+            match byte {
+                b'{' | b'[' | b'(' => depth += 1,
+                b'}' | b']' | b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            break;
+        };
+        out.push_str(&rest[..open]);
+        out.push_str("{}");
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The crate renames among the shim's exact rewrite rules: each
+/// `"third-party/rust:<from>": "third-party/rust:<to>",` line.
+fn shim_renames(text: &str) -> BTreeMap<String, String> {
+    const CRATE: &str = "\"third-party/rust:";
+    let mut renames = BTreeMap::new();
+    for line in text.lines() {
+        let Some(rest) = line.trim().strip_prefix(CRATE) else {
+            continue;
+        };
+        let Some((from, rest)) = rest.split_once("\": ") else {
+            continue;
+        };
+        let Some(rest) = rest.strip_prefix(CRATE) else {
+            continue;
+        };
+        let Some(to) = rest.strip_suffix("\",") else {
+            continue;
+        };
+        renames.insert(from.to_string(), to.to_string());
+    }
+    renames
+}
+
+/// The shim's exact rules that rename a first-party internal label to a crate,
+/// `"hermetic_infra/<package>:<name>": "third-party/rust:<crate>",`: fbsource
+/// builds that code under its own tree (fb-only/), where this tree takes the
+/// crate. Keyed by the label as BUCK files spell it, `//hermetic_infra/...`.
+fn first_party_renames(text: &str) -> BTreeMap<String, String> {
+    const FIRST_PARTY: &str = "\"hermetic_infra/";
+    const CRATE: &str = "\"third-party/rust:";
+    let mut renames = BTreeMap::new();
+    for line in text.lines() {
+        let Some(rest) = line.trim().strip_prefix(FIRST_PARTY) else {
+            continue;
+        };
+        let Some((from, rest)) = rest.split_once("\": ") else {
+            continue;
+        };
+        let Some(rest) = rest.strip_prefix(CRATE) else {
+            continue;
+        };
+        let Some(to) = rest.strip_suffix("\",") else {
+            continue;
+        };
+        renames.insert(format!("//hermetic_infra/{from}"), to.to_string());
+    }
+    renames
+}
+
+/// Whether build-file `text` names `label` (`//hermetic_infra/...`) as a
+/// quoted label, cell-relative or in the fbcode cell.
+fn references_label(text: &str, label: &str) -> bool {
+    text.contains(&format!("\"{label}\"")) || text.contains(&format!("\"fbcode{label}\""))
+}
+
 fn extract_refs(text: &str) -> Vec<String> {
     let mut names = Vec::new();
     let mut rest = text;
@@ -622,6 +764,69 @@ mod tests {
             vec!["linux-raw-sys", "num_cpus", "serde_json"]
         );
         assert!(extract_refs("third-party/rust without the cell").is_empty());
+    }
+
+    #[test]
+    fn autocargo_labels_are_not_references() {
+        let text = "rust_library(\n    autocargo = {\"extra\": [(\"cc\", \
+                    \"fbsource//third-party/rust:cc\")], \"x\": {}},\n    \
+                    deps = [\"fbsource//third-party/rust:libc\"],\n)\n";
+        assert_eq!(extract_refs(&without_autocargo(text)), vec!["libc"]);
+        // A dict that does not close is kept, so its labels still count.
+        let open = "autocargo = {\"fbsource//third-party/rust:cc\",";
+        assert_eq!(extract_refs(&without_autocargo(open)), vec!["cc"]);
+        let plain = "deps = [\"fbsource//third-party/rust:libc\"]";
+        assert_eq!(without_autocargo(plain), plain);
+    }
+
+    #[test]
+    fn shim_renames_read_exact_crate_rules() {
+        let text = "    \"fbcode\": struct(\n        exact = {\n            \
+                    \"common/rust/shed/fbinit:fbinit\": \"third-party/rust:fbinit\",\n        \
+                    },\n    \"fbsource\": struct(\n        exact = {\n            \
+                    \"third-party/rust:sha2-010\": \"third-party/rust:sha2\",\n        },\n";
+        let renames = shim_renames(text);
+        assert_eq!(renames.len(), 1);
+        assert_eq!(renames.get("sha2-010").map(String::as_str), Some("sha2"));
+    }
+
+    #[test]
+    fn first_party_renames_read_only_project_labels_renamed_to_crates() {
+        let text = "    \"fbcode\": struct(\n        exact = {\n            \
+                    \"common/rust/shed/fbinit:fbinit\": \"third-party/rust:fbinit\",\n            \
+                    \"hermetic_infra/hermit/fb-only/dagrun:dagrun\": \"third-party/rust:dagrun\",\n            \
+                    \"hermetic_infra/hermit/x:y\": \"third-party/ocaml:y\",\n        },\n    \
+                    \"fbsource\": struct(\n        exact = {\n            \
+                    \"third-party/rust:sha2-010\": \"third-party/rust:sha2\",\n        },\n";
+        let renames = first_party_renames(text);
+        assert_eq!(renames.len(), 1, "{renames:?}");
+        assert_eq!(
+            renames
+                .get("//hermetic_infra/hermit/fb-only/dagrun:dagrun")
+                .map(String::as_str),
+            Some("dagrun")
+        );
+    }
+
+    #[test]
+    fn references_label_matches_quoted_labels_only() {
+        let label = "//hermetic_infra/hermit/fb-only/dagrun:dagrun";
+        assert!(references_label(
+            "deps = [\"//hermetic_infra/hermit/fb-only/dagrun:dagrun\"]",
+            label
+        ));
+        assert!(references_label(
+            "\"fbcode//hermetic_infra/hermit/fb-only/dagrun:dagrun\",",
+            label
+        ));
+        assert!(!references_label(
+            "\"//hermetic_infra/hermit/fb-only/dagrun:dagrun-extra\"",
+            label
+        ));
+        assert!(!references_label(
+            "# //hermetic_infra/hermit/fb-only/dagrun:dagrun",
+            label
+        ));
     }
 
     #[test]

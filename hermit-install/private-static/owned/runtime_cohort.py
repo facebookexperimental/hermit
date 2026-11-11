@@ -241,8 +241,15 @@ DERIVED_ROWS = tuple((label, path) for label, path, _, _ in CURRENT_SPLIT_RUNTIM
                      if path != 'detcore-liteinst/src/exec_native/consumer_tests.rs')
 TRAP_SOURCE = 'reverie-inguest/src/trap.rs'
 MAPPED_ENTRY_SOURCE = 'detcore-liteinst/src/exec_initial/mapped_entry.rs'
-TERMINAL_SOURCE = 'reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs'
-ENTRY_SOURCE_NAMES = ('ENTRY_SOURCE', 'BOOTSTRAP_ENTRY_SOURCE')
+# Reverie names the Hermit entry sources it accepts in its reviewed Detcore
+# consumer descriptor: entry_source_relative is the file above and
+# accepted_entry_sources lists its accepted sha256 digests. Reverie's dh-axoec
+# change moved them there from terminal_observation.rs's ENTRY_SOURCE and
+# BOOTSTRAP_ENTRY_SOURCE literals.
+CONSUMER_SOURCE = 'reverie-liteinst-artifact/src/private_static/selected_initializers.rs'
+CONSUMER_DESCRIPTOR = 'DETCORE'
+CONSUMER_TYPE = 'MappedConsumerSource'
+CONSUMER_FIELDS = ('entry_source_relative', 'accepted_entry_sources')
 LOCK_REVERIE = 'github.com/rrnewton/reverie'
 # The gate shape the ordinary provider's DedicatedFunction cohort depends on.
 # ordinary_gate.rs compiles the other half: a 44-byte input section of exactly
@@ -364,76 +371,124 @@ def lock_pins(workspace, h_head, rpin):
     return rows
 
 
-def entry_source_guard(mapped, terminal, rpin):
-    """Compare H's entry blob with the two literal declarations in pinned R.
+RUST_TOKEN = re.compile(rb'(?P<space>[ \t\n\r\f\v]+)|(?P<line>//[^\n]*)|(?P<comment>/\*)|'
+                        rb'(?P<raw>(?:br|cr|r)(?P<hashes>#{0,255})")|(?P<string>")|'
+                        rb'(?P<character>b?\'(?:\\.|[^\'\\])\')|'
+                        rb'(?P<identifier>(?:r\#)?[A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*)|'
+                        rb'(?P<number>[0-9][A-Za-z0-9_]*)|(?P<punct>.)', re.S)
+COMMENT_EDGE = re.compile(rb'/\*|\*/')
+BRACKETS = {b'(': b')', b'[': b']', b'{': b'}'}
 
-    This only recognizes the literal const form the terminal guard uses. Skip
-    comments and string/character literals so examples cannot supply a missing
-    declaration; every other entry-constant form requires an explicit update.
+
+def rust_tokens(source, refusal):
+    """(kind, bytes) for each Rust token outside comments, in order.
+
+    Every byte is whitespace, part of a comment or part of exactly one token,
+    so nothing is skipped unclassified, and a comment or literal cannot supply
+    a declaration. A string token carries the bytes between its quotes with
+    escapes left as written; callers compare them exactly.
     """
-    where = 'runtime cohort derivation: Reverie ' + rpin + ' ' + TERMINAL_SOURCE
-    refusal = where + ' requires exactly one literal each for ' + ', '.join(ENTRY_SOURCE_NAMES)
-    token = re.compile(rb'(?P<line>//[^\n]*)|(?P<comment>/\*)|(?:br|cr|r)(?P<hashes>#{0,255})"|'
-                       rb'(?P<string>")|(?:b)?\'(?:\\.|[^\'\\])\'|'
-                       rb'(?P<identifier>(?:r\#)?[A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*)')
-    at, pins, after_const, gap_ok = 0, [], False, True
-    while match := token.search(terminal, at):
-        if after_const and terminal[at:match.start()].strip():
-            gap_ok = False
+    tokens, at = [], 0
+    while at < len(source):
+        match = RUST_TOKEN.match(source, at)
         at = match.end()
-        if match['line']:
+        if match['space'] or match['line']:
             continue
         elif match['comment']:
             depth = 1
             while depth:
-                end = re.search(rb'/\*|\*/', terminal[at:])
+                end = COMMENT_EDGE.search(source, at)
                 need(end is not None, refusal + ': unterminated comment')
                 depth += 1 if end[0] == b'/*' else -1
-                at += end.end()
-        elif match['hashes'] is not None:
-            gap_ok = False
+                at = end.end()
+        elif match['raw']:
             close = b'"' + match['hashes']
-            end = terminal.find(close, at)
+            end = source.find(close, at)
             need(end >= 0, refusal + ': unterminated raw string')
+            tokens.append(('raw', source[at:end]))
             at = end + len(close)
         elif match['string']:
-            gap_ok = False
-            while at < len(terminal):
-                if terminal[at:at + 1] == b'\\':
-                    at += 2
-                elif terminal[at:at + 1] == b'"':
-                    at += 1
-                    break
-                else:
-                    at += 1
-            else:
-                raise RuntimeError(refusal + ': unterminated string')
-        elif match['identifier']:
-            # Keep non-ASCII bytes in the name, never a misleading ASCII suffix.
-            need(not re.search(rb'\xc2\x85|\xe2\x80[\x8e\x8f\xa8\xa9]', match['identifier']),
-                 refusal + ': unsupported non-ASCII whitespace')
-            name = match['identifier'].decode(errors='replace')
-            declaration, after_const = after_const, name == 'const'
-            valid_gap, gap_ok = gap_ok, True
-            plain = name.removeprefix('r#')
-            if not declaration or not (plain == 'ENTRY_SOURCE' or plain.endswith('_ENTRY_SOURCE')):
-                continue
-            need(valid_gap, refusal + ': malformed const/name separator for ' + name)
-            need(name == plain, refusal + ': unsupported raw identifier ' + name)
-            literal = re.match(rb'\s*:\s*&str\s*=\s*"([0-9a-f]{64})"\s*;', terminal[at:])
-            need(literal is not None, refusal + ': malformed ' + name)
-            pins.append((name, literal[1].decode()))
-            at += literal.end()
+            start = at
+            while at < len(source) and source[at:at + 1] != b'"':
+                at += 2 if source[at:at + 1] == b'\\' else 1
+            need(at < len(source), refusal + ': unterminated string')
+            tokens.append(('string', source[start:at]))
+            at += 1
         else:
-            gap_ok = False  # A character literal cannot separate const and its name.
-    need(sorted(name for name, _ in pins) == sorted(ENTRY_SOURCE_NAMES),
-         refusal + ': found ' + ', '.join(name for name, _ in pins))
-    accepted = dict(pins)
+            # Keep non-ASCII bytes in the name, never a misleading ASCII suffix.
+            need(match.lastgroup != 'identifier' or
+                 not re.search(rb'\xc2\x85|\xe2\x80[\x8e\x8f\xa8\xa9]', match[0]),
+                 refusal + ': unsupported non-ASCII whitespace')
+            tokens.append((match.lastgroup, match[0]))
+    return tokens
+
+
+def consumer_entry_sources(source, where):
+    """DETCORE's entry_source_relative and accepted_entry_sources, as written.
+
+    This only recognizes the literal form Reverie uses: one
+    `const DETCORE: MappedConsumerSource = MappedConsumerSource { ... };` whose
+    top level names each field once, as `entry_source_relative: "<path>"` and
+    `accepted_entry_sources: &["<sha256>", ...]` with plain string literals.
+    Comments and literals are skipped, so an example cannot supply a missing
+    descriptor; every other form requires an explicit update here.
+    """
+    refusal = (where + ' requires one literal ' + CONSUMER_DESCRIPTOR + ' descriptor naming ' +
+               ' and '.join(CONSUMER_FIELDS) + ' once each')
+    tokens = rust_tokens(source, refusal)
+    name, kind = CONSUMER_DESCRIPTOR.encode(), CONSUMER_TYPE.encode()
+    starts = [at for at in range(1, len(tokens)) if tokens[at - 1] == ('identifier', b'const') and
+              tokens[at][0] == 'identifier' and tokens[at][1].removeprefix(b'r#') == name]
+    need(len(starts) == 1, refusal + ': found ' + str(len(starts)))
+    at = starts[0]
+    head = [('identifier', name), ('punct', b':'), ('identifier', kind), ('punct', b'='),
+            ('identifier', kind), ('punct', b'{')]
+    need(tokens[at:at + len(head)] == head, refusal + ': malformed declaration')
+    at += len(head)
+    fields = {}
+    while tokens[at:at + 1] != [('punct', b'}')]:
+        need(at < len(tokens), refusal + ': unterminated ' + CONSUMER_DESCRIPTOR)
+        need(tokens[at][0] == 'identifier' and tokens[at + 1:at + 2] == [('punct', b':')],
+             refusal + ': malformed field')
+        field, value, pending = tokens[at][1].decode(errors='replace'), [], []
+        at += 2
+        while pending or tokens[at:at + 1] not in ([('punct', b',')], [('punct', b'}')]):
+            need(at < len(tokens), refusal + ': unterminated ' + CONSUMER_DESCRIPTOR)
+            token = tokens[at]
+            if token[0] == 'punct' and token[1] in BRACKETS:
+                pending.append(BRACKETS[token[1]])
+            elif token[0] == 'punct' and token[1] in BRACKETS.values():
+                need(pending and pending.pop() == token[1], refusal + ': unbalanced ' + field)
+            value.append(token)
+            at += 1
+        need(field not in fields, refusal + ': duplicate ' + field)
+        fields[field] = value
+        if tokens[at] == ('punct', b','):
+            at += 1
+    need(tokens[at + 1:at + 2] == [('punct', b';')], refusal + ': malformed end')
+    relative = fields.get('entry_source_relative')
+    need(relative is not None and len(relative) == 1 and relative[0][0] == 'string',
+         refusal + ': malformed entry_source_relative')
+    listed = fields.get('accepted_entry_sources') or []
+    items = listed[2:-1]
+    need(listed[:2] == [('punct', b'&'), ('punct', b'[')] and listed[-1:] == [('punct', b']')] and
+         all(token == ('punct', b',') for token in items[1::2]) and
+         all(token[0] == 'string' and re.fullmatch(rb'[0-9a-f]{64}', token[1]) for token in items[0::2]),
+         refusal + ': malformed accepted_entry_sources')
+    return relative[0][1].decode(errors='replace'), [token[1].decode() for token in items[0::2]]
+
+
+def entry_source_guard(mapped, consumers, rpin):
+    """Refuse H's entry blob unless the pinned R's Detcore descriptor accepts it."""
+    where = 'runtime cohort derivation: Reverie ' + rpin + ' ' + CONSUMER_SOURCE + ' ' + CONSUMER_DESCRIPTOR
+    relative, accepted = consumer_entry_sources(consumers, where)
+    need(relative == MAPPED_ENTRY_SOURCE,
+         where + ' entry_source_relative ' + relative + ' is not Hermit ' + MAPPED_ENTRY_SOURCE)
     digest = hashlib.sha256(mapped).hexdigest()
-    need(digest in accepted.values(),
+    need(digest in accepted,
          'runtime cohort derivation: Hermit ' + MAPPED_ENTRY_SOURCE + ' sha256 ' + digest +
-         ' is not accepted by Reverie ' + rpin + ' ' + TERMINAL_SOURCE + ' (' +
-         ', '.join(name + ' ' + accepted[name] for name in ENTRY_SOURCE_NAMES) + ')')
+         ' is not accepted by Reverie ' + rpin + ' ' + CONSUMER_SOURCE + ' ' + CONSUMER_DESCRIPTOR +
+         ' accepted_entry_sources (' + (', '.join(accepted) or 'none') + ')')
 
 
 def derive(workspace, h_head, runtime_r_pin=None):
@@ -475,8 +530,8 @@ def derive(workspace, h_head, runtime_r_pin=None):
         blobs.update({(label, path): found[rev + ':' + path] for path in paths})
     rows = tuple((label, path, len(blobs[label, path]), hashlib.sha256(blobs[label, path]).hexdigest())
                  for label, path in DERIVED_ROWS)
-    terminal = rpin + ':' + TERMINAL_SOURCE
-    entry_source_guard(blobs['H', MAPPED_ENTRY_SOURCE], objects(reverie, 'R', [terminal])[terminal], rpin)
+    consumers = rpin + ':' + CONSUMER_SOURCE
+    entry_source_guard(blobs['H', MAPPED_ENTRY_SOURCE], objects(reverie, 'R', [consumers])[consumers], rpin)
     return dict(h_head=h_head, runtime_R_pin=rpin, rows=rows, lock_pins=pins,
                 gate=gate_guard(blobs['R', TRAP_SOURCE]))
 
