@@ -5736,15 +5736,16 @@ fn readonly_proc_metadata_detects_replay_mismatch_and_accepts_older_recordings()
     // remains read-only. A mismatch is diagnostic, not an event-format change.
     metadata["proc_readonly"] = false.into();
     fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
-    let replay_args = ["replay", "--autopilot", "--data-dir", directory];
     // This counts every `hermit: warning:` line below; a `--pinned-cpu`
     // notice (another run holds the CPU) is placement, not what it checks.
-    // `hermit replay` takes no --pinned-cpu-notice flag, so the documented
-    // environment fallback turns the notice off.
-    let replay = hermit_test::hermit_output(
-        "hermit run",
-        readonly_proc_command(&replay_args).env("HERMIT_PINNED_CPU_NOTICE", "0"),
-    );
+    let replay_args = [
+        "replay",
+        "--autopilot",
+        "--pinned-cpu-notice=off",
+        "--data-dir",
+        directory,
+    ];
+    let replay = hermit_test::hermit_output("hermit run", &mut readonly_proc_command(&replay_args));
     assert_success(&replay, &replay_args);
     assert!(
         stderr(&replay)

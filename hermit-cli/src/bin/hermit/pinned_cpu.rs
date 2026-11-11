@@ -729,9 +729,9 @@ impl fmt::Display for PinnedCpuPolicy {
 }
 
 /// How this process's pinned runs are placed: `hermit run`'s
-/// `--pinned-cpu`, `--pinned-cpu-dir`, `--pinned-cpu-notice` and `--timeout`
-/// (`RunOpts`), or, for every other subcommand, the defaults with the
-/// environment's fallbacks (`from_env`).
+/// `--pinned-cpu` and `--timeout` (`RunOpts`), and the
+/// [`PinnedCpuPlacementArgs`] every pinning subcommand takes; for any other
+/// caller, the defaults with the environment's fallbacks (`from_env`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PinnedCpuSettings {
     pub(crate) policy: PinnedCpuPolicy,
@@ -764,6 +764,67 @@ impl PinnedCpuSettings {
     /// Whether [`NOTICE_ENV`] leaves the notices on.
     pub(crate) fn notice_from_env() -> bool {
         std::env::var_os(NOTICE_ENV).is_none_or(|value| value != "0")
+    }
+}
+
+/// `--pinned-cpu-dir` and `--pinned-cpu-notice`, shared by every subcommand
+/// that pins a guest (`hermit run`, `hermit record start` and `hermit
+/// replay`). Each falls back to its environment variable when absent.
+#[derive(Clone, Debug, Default, clap::Args)]
+pub(crate) struct PinnedCpuPlacementArgs {
+    /// The directory whose per-CPU lock files reserve a pinned run's CPU
+    /// against Hermit runs in other network namespaces (default
+    /// `/dev/shm/hermit-pinned-cpu`, or `HERMIT_PINNED_CPU_DIR` when set). It
+    /// must be a real directory owned by this user, or root's shared mode-1777
+    /// sticky directory (`install -d -m 1777 -o root -g root PATH`). A container
+    /// with a private `/dev/shm` (the podman and Docker default) coordinates
+    /// only within itself unless one directory is bind-mounted into every
+    /// container and named here.
+    #[clap(long, value_name = "PATH")]
+    pub(crate) pinned_cpu_dir: Option<std::path::PathBuf>,
+
+    /// Whether a pinned run prints its cpu-shared, cpu-unreserved or
+    /// cpu-netns-only notice on stderr (default `on`, or `off` when
+    /// `HERMIT_PINNED_CPU_NOTICE=0`). Placement is the same either way.
+    #[clap(long, value_name = "on|off", value_parser = ["on", "off"])]
+    pub(crate) pinned_cpu_notice: Option<String>,
+}
+
+impl PinnedCpuPlacementArgs {
+    /// The settings these flags give under `policy` and `wait_cap`, with
+    /// [`LOCK_DIR_ENV`] and [`NOTICE_ENV`] as the fallbacks.
+    pub(crate) fn settings(
+        &self,
+        policy: PinnedCpuPolicy,
+        wait_cap: Option<Duration>,
+    ) -> PinnedCpuSettings {
+        PinnedCpuSettings {
+            policy,
+            dir: self
+                .pinned_cpu_dir
+                .clone()
+                .unwrap_or_else(PinnedCpuSettings::dir_from_env),
+            notice: match self.pinned_cpu_notice.as_deref() {
+                Some(value) => value == "on",
+                None => PinnedCpuSettings::notice_from_env(),
+            },
+            wait_cap,
+        }
+    }
+
+    /// The flags that were given, spelled for another `hermit` command line
+    /// (`hermit replay`'s rerun through `hermit run --from`).
+    pub(crate) fn to_args(&self) -> Vec<std::ffi::OsString> {
+        let mut args = Vec::new();
+        if let Some(dir) = &self.pinned_cpu_dir {
+            let mut arg = std::ffi::OsString::from("--pinned-cpu-dir=");
+            arg.push(dir);
+            args.push(arg);
+        }
+        if let Some(notice) = &self.pinned_cpu_notice {
+            args.push(format!("--pinned-cpu-notice={notice}").into());
+        }
+        args
     }
 }
 
@@ -1207,6 +1268,80 @@ fn candidates(allowed: &[usize], observation: &Observation) -> Option<(Vec<usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every subcommand that pins a guest takes both placement flags and
+    /// documents them in its `--help` (owner CLI rule 2: an environment
+    /// variable is never the only interface).
+    #[test]
+    fn every_pinning_subcommand_takes_the_placement_flags() {
+        use clap::CommandFactory;
+        let mut hermit = crate::app::Args::command();
+        hermit.build();
+        let run = hermit.find_subcommand("run").expect("run");
+        let replay = hermit.find_subcommand("replay").expect("replay");
+        let start = hermit
+            .find_subcommand("record")
+            .and_then(|record| record.find_subcommand("start"))
+            .expect("record start");
+        for (name, command) in [("run", run), ("replay", replay), ("record start", start)] {
+            for flag in ["pinned-cpu-dir", "pinned-cpu-notice"] {
+                let arg = command
+                    .get_arguments()
+                    .find(|arg| arg.get_long() == Some(flag))
+                    .unwrap_or_else(|| panic!("`hermit {name}` has no --{flag}"));
+                assert!(!arg.is_hide_set(), "`hermit {name} --{flag}` is hidden");
+                assert!(
+                    arg.get_help().is_some(),
+                    "`hermit {name} --{flag}` has no help"
+                );
+            }
+        }
+    }
+
+    /// Given flags win over the environment, and a rerun passes on exactly
+    /// the flags that were given, spelled so that they parse back the same.
+    #[test]
+    fn placement_flags_give_the_settings_and_pass_on_unchanged() {
+        #[derive(clap::Parser)]
+        struct Wrapper {
+            #[clap(flatten)]
+            placement: PinnedCpuPlacementArgs,
+        }
+        use clap::Parser;
+        let given = Wrapper::parse_from([
+            "hermit",
+            "--pinned-cpu-dir=/srv/locks with space",
+            "--pinned-cpu-notice=off",
+        ])
+        .placement;
+        let settings = given.settings(PinnedCpuPolicy::Share, Some(Duration::from_secs(9)));
+        assert_eq!(
+            settings,
+            PinnedCpuSettings {
+                policy: PinnedCpuPolicy::Share,
+                dir: "/srv/locks with space".into(),
+                notice: false,
+                wait_cap: Some(Duration::from_secs(9)),
+            }
+        );
+        let args = given.to_args();
+        assert_eq!(
+            args,
+            [
+                "--pinned-cpu-dir=/srv/locks with space",
+                "--pinned-cpu-notice=off"
+            ]
+        );
+        let reparsed = Wrapper::parse_from(std::iter::once("hermit".into()).chain(args)).placement;
+        assert_eq!(
+            reparsed.settings(PinnedCpuPolicy::Share, None).dir,
+            settings.dir
+        );
+        assert_eq!(reparsed.pinned_cpu_notice.as_deref(), Some("off"));
+        assert!(PinnedCpuPlacementArgs::default().to_args().is_empty());
+        let on = Wrapper::parse_from(["hermit", "--pinned-cpu-notice=on"]).placement;
+        assert!(on.settings(PinnedCpuPolicy::Refuse, None).notice);
+    }
 
     /// A `/proc/stat` with the aggregate line, two full CPU lines, one short
     /// pre-2.6.11 line and the lines that follow the CPUs.

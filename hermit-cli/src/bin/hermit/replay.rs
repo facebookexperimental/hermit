@@ -82,6 +82,12 @@ pub struct ReplayOpts {
         conflicts_with_all = ["autopilot", "serve_only", "gdbex"]
     )]
     dap_listen: Option<String>,
+
+    /// `--pinned-cpu-dir` and `--pinned-cpu-notice`, as for `hermit run`. A
+    /// replay is pinned to one CPU under the default policy,
+    /// `--pinned-cpu=share`; a rerun passes both flags on to `hermit run`.
+    #[clap(flatten)]
+    pinned_cpu_placement: super::pinned_cpu::PinnedCpuPlacementArgs,
 }
 
 impl ReplayOpts {
@@ -94,6 +100,12 @@ impl ReplayOpts {
             // first, whatever the recording turns out to be.
             super::dap_adapter::hermit_dap_beside_hermit()?;
         }
+        // Before either container is built: this subcommand's own flags under
+        // the default policy.
+        super::pinned_cpu::set_settings(
+            self.pinned_cpu_placement
+                .settings(super::pinned_cpu::PinnedCpuPolicy::Share, None),
+        );
         let store = HermitData::from(self.data_dir.as_ref());
         let spec = self
             .recording
@@ -345,6 +357,7 @@ impl ReplayOpts {
         let error = std::process::Command::new(&exe)
             .args(&self.global_argv)
             .arg("run")
+            .args(self.pinned_cpu_placement.to_args())
             .arg("--from")
             .arg(path)
             .env("HERMIT_DATA_DIR", data_dir)

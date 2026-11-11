@@ -222,10 +222,14 @@ fn sharing_a_cpu_changes_nothing_the_guest_sees() {
             "--",
             "/bin/sh",
             "-c",
-            // Shell builtins only: with `date` in it, this test's run with
-            // its CPU free failed --verify-strict in 2 of 5 tries (an fstat
-            // result buffer of `date` differed between the pair's two runs),
-            // which placement cannot cause and is not what this test checks.
+            // Shell builtins only, so the guest loads no shared library after
+            // the shell. With `date` in it, this test's run with its CPU free
+            // failed --verify-strict twice: `date`'s loader saw Hermit's frozen
+            // /etc/ld.so.cache in one run of the pair and the host's own cache
+            // in the other, because the host renamed a new cache over the old
+            // one mid-run and Linux detached the container's bind mount
+            // (https://github.com/rrnewton/hermit/issues/4799). Placement
+            // cannot cause that, and it is not what this test checks.
             "echo $RANDOM $$; echo $((RANDOM % 97))",
         ];
         let output = pinned_hermit(cpu, dir.path(), &args);

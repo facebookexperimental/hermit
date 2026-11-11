@@ -1432,9 +1432,9 @@ against other Hermit runs for its lifetime through two channels:
 The kernel drops both when the run's processes exit, however they exit, so no
 reservation is ever left behind. A CPU either channel holds counts as held.
 
-`hermit run --pinned-cpu-dir=PATH` names another lock directory
-(`HERMIT_PINNED_CPU_DIR` is the fallback, and the only setting for other
-subcommands such as `hermit record start`). It changes only the path: the
+`--pinned-cpu-dir=PATH` names another lock directory; `hermit run`,
+`hermit record start` and `hermit replay` all take it, and
+`HERMIT_PINNED_CPU_DIR` is the fallback. It changes only the path: the
 directory must be a real directory (not a symlink) owned by the user, or root's
 shared form. Hermit creates a missing directory private to the user (mode 0700)
 unless it runs as root. For one directory that every user's runs share, create
@@ -1468,9 +1468,11 @@ on stderr, once per invocation (a `--verify` pair prints it once):
 `hermit: waiting up to ... for a CPU` line, then sleeps and retries every
 500 ms until a CPU comes free. If none does within that time, or within
 `--timeout` when that is shorter, it refuses. Each refusal names the CPU set,
-why, and what to do instead.
-`--pinned-cpu-notice=off` (fallback `HERMIT_PINNED_CPU_NOTICE=0`) silences the
-notices without changing placement. The CPU is host placement only:
+why, and what to do instead. The wait comes before the run's own `--timeout`
+starts, so a wait and the run together can take up to twice `--timeout`.
+`--pinned-cpu-notice=off` (fallback `HERMIT_PINNED_CPU_NOTICE=0`, and taken by
+the same three subcommands) silences the notices without changing placement.
+`hermit record start` and `hermit replay` always use `--pinned-cpu=share`. The CPU is host placement only:
 guest-visible behavior, and `--verify` results, are the same whichever CPU a
 run gets.
 
