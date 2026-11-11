@@ -6,6 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::io::Read;
 use std::io::Write;
 
 use clap::Args;
@@ -136,10 +137,45 @@ pub(crate) fn exact_branch_counter_verdict() -> CapabilityVerdict {
 
 /// The CPU vendor, family, model and microcode from `/proc/cpuinfo`, which is
 /// what ties a counter erratum to a CPU model.
+///
+/// Only the first processor's block is read. Linux generates the file one CPU
+/// at a time as it is read (`seq_file`), so the whole file costs one block per
+/// online CPU: 617 KB and about 2 ms of CPU time on a 316-CPU host, against
+/// one 4 KiB read for the first block.
 pub(crate) fn cpu_identity() -> String {
-    std::fs::read_to_string("/proc/cpuinfo")
+    std::fs::File::open("/proc/cpuinfo")
+        .and_then(first_block)
         .map(|text| cpu_identity_from(&text))
         .unwrap_or_else(|error| format!("CPU unknown (/proc/cpuinfo: {error})"))
+}
+
+/// The most of `/proc/cpuinfo` that [`first_block`] reads when no blank line
+/// ends a block: far more than one processor's block (about 2 KB with every
+/// x86 flag), far less than the whole file of a large host.
+const FIRST_BLOCK_LIMIT: usize = 64 * 1024;
+
+/// `cpuinfo`'s text up to the blank line that ends its first block, or all of
+/// it if it has none, reading no more than [`FIRST_BLOCK_LIMIT`] bytes.
+fn first_block(mut cpuinfo: impl Read) -> std::io::Result<String> {
+    let mut text = Vec::new();
+    let mut chunk = [0; 4096];
+    while text.len() < FIRST_BLOCK_LIMIT {
+        let read = match cpuinfo.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        // A block's end can straddle two reads.
+        let searched = text.len().saturating_sub(1);
+        text.extend_from_slice(&chunk[..read]);
+        if let Some(end) = text[searched..].windows(2).position(|pair| pair == b"\n\n") {
+            text.truncate(searched + end + 1);
+            break;
+        }
+    }
+    String::from_utf8(text)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 fn cpu_identity_from(cpuinfo: &str) -> String {
@@ -304,6 +340,80 @@ mod tests {
         assert_eq!(
             cpu_identity_from(""),
             "CPU unknown (unknown family unknown model unknown microcode unknown)"
+        );
+    }
+
+    /// A reader that hands out `piece` bytes per read and counts what it gave.
+    struct Pieces<'a> {
+        text: &'a [u8],
+        piece: usize,
+        given: usize,
+    }
+
+    impl Read for Pieces<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let rest = &self.text[self.given.min(self.text.len())..];
+            let n = rest.len().min(self.piece).min(buf.len());
+            buf[..n].copy_from_slice(&rest[..n]);
+            self.given += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn cpu_identity_reads_only_the_first_block() {
+        let cpuinfo = "processor\t: 0\nvendor_id\t: AuthenticAMD\ncpu family\t: 25\n\
+                       model\t\t: 160\nmodel name\t: AMD EPYC 9D64 88-Core Processor\n\
+                       microcode\t: 0xaa0021c\n\nprocessor\t: 1\nvendor_id\t: Other\n";
+        let end = cpuinfo.find("\n\n").unwrap() + 2;
+        // 1, 2 and 7 bytes per read put the blank line across two reads.
+        for piece in [1, 2, 7, 4096] {
+            let mut reader = Pieces {
+                text: cpuinfo.as_bytes(),
+                piece,
+                given: 0,
+            };
+            let block = first_block(&mut reader).unwrap();
+            assert_eq!(block, cpuinfo[..end - 1], "{piece} bytes per read");
+            assert_eq!(
+                cpu_identity_from(&block),
+                cpu_identity_from(cpuinfo),
+                "{piece} bytes per read"
+            );
+            // It stops reading in the read that ends the block.
+            assert!(
+                reader.given < end + piece,
+                "{piece} bytes per read: read {} bytes, the block ends at {end}",
+                reader.given
+            );
+        }
+    }
+
+    #[test]
+    fn a_cpuinfo_without_a_blank_line_is_read_to_its_end_or_the_limit() {
+        let one_block = "processor\t: 0\nvendor_id\t: GenuineIntel\n";
+        assert_eq!(first_block(one_block.as_bytes()).unwrap(), one_block);
+        let mut endless = Pieces {
+            text: &[b'x'; 4 * FIRST_BLOCK_LIMIT],
+            piece: 4096,
+            given: 0,
+        };
+        let text = first_block(&mut endless).unwrap();
+        assert!(text.len() >= FIRST_BLOCK_LIMIT && text.len() < FIRST_BLOCK_LIMIT + 4096);
+        assert_eq!(endless.given, text.len());
+    }
+
+    /// On this host, the first block names the same CPU as the whole file.
+    #[test]
+    fn cpu_identity_matches_the_whole_file() {
+        let whole = std::fs::read_to_string("/proc/cpuinfo").expect("read /proc/cpuinfo");
+        assert_eq!(cpu_identity(), cpu_identity_from(&whole));
+        // x86 names the family in every block; other architectures do not.
+        #[cfg(target_arch = "x86_64")]
+        assert!(
+            !cpu_identity().contains("unknown family"),
+            "{}",
+            cpu_identity()
         );
     }
 }
