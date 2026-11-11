@@ -528,8 +528,15 @@ impl Scheduler {
     /// outcome. Not under record or replay: there a polled read keeps the
     /// guest-state authority taken at its entry, which descriptor exports do
     /// not revoke (`execute_nonblockable_fd_syscall`), and the record/replay
-    /// test the design requires (D6) does not exist yet. Returns the request
-    /// identity to bind, or `None` to keep phase 1's loss.
+    /// test the design requires (D6) does not exist yet. Not under a schedule
+    /// replay either, whichever cursor replays it (`has_schedule_replay`: a
+    /// legacy record's `replayer` or a slice-boundary record's
+    /// `boundary_replayer`): a replay yield would read as the read's
+    /// completion and settle the probe (slice 2, review P2). Phase 1's gate
+    /// refuses such a read first (`ProcessFacts::schedule_trace`), so this
+    /// refusal is reached only if that gate is relaxed (dev-hermit
+    /// dh-xw2yzs). Returns the request identity to bind, or `None` to keep
+    /// phase 1's loss.
     fn reservable_pipe_read(
         &self,
         request: &Resources,
@@ -543,7 +550,7 @@ impl Scheduler {
             || !self.polls_only_guest_state(request)
             || request.polls_a_named_fifo
             || self.recordreplay_modes
-            || self.replayer.is_some()
+            || self.has_schedule_replay()
         {
             return None;
         }
