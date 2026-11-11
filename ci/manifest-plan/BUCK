@@ -103,8 +103,8 @@ rust_binary(
 # The rest of the bins Cargo builds with `cargo build -p hermit-manifest-plan
 # --bins`, each with the dependencies it uses beside the library (fbsource
 # refuses an unused one). With the two above they are the open-source build's
-# Buck pilot for validate's setup.manifest_plan node (dh-cqlkz). fbsource's
-# Cargo manifest for this package does not list them (autocargo ignores them).
+# Buck pilot for validate's setup.manifest_plan node (dh-cqlkz). autocargo
+# skips them (ignore_rule).
 _PILOT_BINS = {
     "bind-executable": ["fbsource//third-party/rust:serde_json"],
     "generate-parity-cells": [],

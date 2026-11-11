@@ -1,6 +1,7 @@
 # @lint-ignore-every AUTODEPS2
 # These external debugger tests are not part of the fbsource Buck graph.
 
+load("@fbcode_macros//build_defs:export_files.bzl", "buck_export_file")
 load("@fbcode_macros//build_defs:native_rules.bzl", "buck_filegroup")
 
 oncall("hermit")
@@ -14,4 +15,11 @@ buck_filegroup(
     }
     | {src: src for src in glob(["**"], exclude = ["BUCK"])},
     visibility = ["//hermetic_infra/hermit/tests/..."],
+)
+
+# Upstream's test inventory names this file; the glob above skips dotfiles. The
+# e2e source snapshot (//hermetic_infra/hermit/ci/buck-e2e:src) copies it.
+buck_export_file(
+    name = ".gitignore",
+    visibility = ["//hermetic_infra/hermit/ci/buck-e2e:"],
 )

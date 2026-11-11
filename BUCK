@@ -117,8 +117,10 @@ buck_export_file(
 )
 
 # hermit-cli's Cargo manifest; its [[test]] required-features gate binaries.
+# oss_cargo/ (the Cargo manifests as exported) exists only in fbsource.
 buck_export_file(
     name = "oss_cargo/hermit-cli/Cargo.toml.oss",
+    target_compatible_with = ["fbcode//opensource/macros:broken-in-oss"],
     visibility = ["//hermetic_infra/hermit/fb-only/integration_tests/tests:"],
 )
 
@@ -153,7 +155,8 @@ buck_filegroup(
         # rr_suite.rs compiles the pinned rr test programs at run time from
         # repository()/third-party/rr (its generated_dir prerequisite). This
         # package is in the fbcode cell; the rr producer is in the fbsource
-        # root cell, so the cell is named explicitly.
+        # root cell, so the cell is named explicitly. That producer exists only
+        # in fbsource.
         "third-party/rr": "fbsource//third-party/rr:test-sources",
     }
     | {
@@ -167,11 +170,40 @@ buck_filegroup(
             "reverie.submodule.txt",
         ]
     },
+    target_compatible_with = ["fbcode//opensource/macros:broken-in-oss"],
     visibility = [
         "//hermetic_infra/hermit/fb-only/shell_tests/tests:",
         "//hermetic_infra/hermit/hermit-cli:",
         "//hermetic_infra/hermit/tests:",
     ],
+)
+
+# The source snapshot the e2e cells read: the src/ of
+# //hermetic_infra/hermit/ci/buck-e2e:bundle, at upstream paths. It holds what
+# `test-harness run`, the manifest planner's --source-snapshot check and the
+# guests' arguments read for the cells that package defines (measured: every
+# other file can be absent),
+# where upstream's bundle holds a full `git archive`. .gitmodules lets the
+# planner treat programs in the uninitialized rr submodule as not available
+# here rather than missing. The open-source build, whose bundle takes that
+# `git archive` (ci/buck-e2e/stage), does not build it (tests:e2e-source-tree).
+buck_filegroup(
+    name = "e2e-source-snapshot",
+    srcs = {"tests": "//hermetic_infra/hermit/tests:e2e-source-tree"}
+    | {
+        src: src
+        for src in [
+            ".gitmodules",
+            # c-programs/record-replay-lseek-seek-cur passes it as a guest argument.
+            "README.md",
+            "ci/ci-reason-baseline.json",
+            "ci/execution-owners.json",
+            "ci/expected-e2e-plan.json",
+            "ci/matrix-symmetry-baseline.json",
+        ]
+    },
+    target_compatible_with = ["fbcode//opensource/macros:broken-in-oss"],
+    visibility = ["//hermetic_infra/hermit/ci/buck-e2e:"],
 )
 
 # The three roots check.exit_status_class scans (hermit-cli/tests,
@@ -199,7 +231,8 @@ buck_filegroup(
 # The tree check.backend_abstraction runs on: the root Cargo.toml, each of its
 # workspace members' upstream manifest (oss_cargo/<member>/Cargo.toml.oss) at
 # <member>/Cargo.toml, detcore/src, the DAG it checks its budget against, and
-# the script beside its source gate, built by fb-only/contract_checks.
+# the script beside its source gate, built by fb-only/contract_checks. Those
+# manifests and that script exist only in fbsource.
 buck_filegroup(
     name = "backend-abstraction-repository",
     srcs = {
@@ -210,5 +243,6 @@ buck_filegroup(
         "scripts/detcore-backend-source.rs": "//hermetic_infra/hermit/fb-only/contract_checks:detcore-backend-source-release",
     }
     | {member + "/Cargo.toml": "oss_cargo/{}/Cargo.toml.oss".format(member) for member in WORKSPACE_MEMBERS},
+    target_compatible_with = ["fbcode//opensource/macros:broken-in-oss"],
     visibility = ["//hermetic_infra/hermit/fb-only/contract_checks:"],
 )
