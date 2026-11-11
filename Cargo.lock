@@ -448,7 +448,7 @@ dependencies = [
 [[package]]
 name = "dagrun"
 version = "0.15.0"
-source = "git+https://github.com/rrnewton/agent-utils.git?rev=ce0db627e62427960e3b7593955399bc8b8ca446#ce0db627e62427960e3b7593955399bc8b8ca446"
+source = "git+https://github.com/rrnewton/agent-utils.git?rev=071c76f64340dedd3af2ebd782f689fbbdde047b#071c76f64340dedd3af2ebd782f689fbbdde047b"
 dependencies = [
  "libc",
  "serde",
@@ -2390,7 +2390,7 @@ dependencies = [
 [[package]]
 name = "testrun-core"
 version = "0.1.0"
-source = "git+https://github.com/rrnewton/agent-utils.git?rev=ce0db627e62427960e3b7593955399bc8b8ca446#ce0db627e62427960e3b7593955399bc8b8ca446"
+source = "git+https://github.com/rrnewton/agent-utils.git?rev=071c76f64340dedd3af2ebd782f689fbbdde047b#071c76f64340dedd3af2ebd782f689fbbdde047b"
 dependencies = [
  "libc",
  "serde",
