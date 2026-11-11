@@ -920,6 +920,35 @@ fn super_stress_selection_bracket(
         return Err("the no-runner note printed for an explicit selection".into());
     }
 
+    // Nothing selected and nothing removed as pressure tier: every probe is
+    // still not selected, but the note's claim (super's pressure filter
+    // removed them) would be false, so it is absent.
+    let rates = stress_rates(classes, complete, 20, &BTreeSet::new(), &BTreeSet::new());
+    let (lines, blocking) = super::super_stress_verdict_lines(&rates, 20, 1, 1);
+    for probe in STRESS_PROBES {
+        let line = line_of(&lines, probe.slug())?;
+        let rate = rates.iter().find(|rate| rate.probe == *probe).unwrap();
+        if rate.selection == ProbeSelection::Selected
+            || rate.selection == ProbeSelection::PressureTier
+            || rate.ran != 0
+            || !line.contains("not selected (")
+            || line.contains("NO_RESULT")
+        {
+            return Err(format!(
+                "an unselected probe outside the pressure tier was not named as not selected: {line}"
+            ));
+        }
+    }
+    if blocking != 0
+        || lines
+            .iter()
+            .any(|line| line.contains("No scheduled runner selects superstress.*"))
+    {
+        return Err(format!(
+            "the no-runner note printed with no probe removed as pressure tier: {lines:?}"
+        ));
+    }
+
     // A probe selected only through the second DAG of an execution plan is
     // selected: the live caller's executed set covers both DAGs.
     let node = |group: &str, job: &str| {
