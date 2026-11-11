@@ -11900,11 +11900,18 @@ fn a_sigchld_taker_created_after_the_reservation_runs_after_the_probe() {
 /// since whether the probe finds data or the wake substitutes would depend
 /// on host timing: a poll that is not on guest state only, a named FIFO, and
 /// any read under schedule replay (dh-ru056 slice 2, review P2: a replay
-/// yield would read as its completion). dh-ru056 slice 2, ruling C1.2
-/// (T1.3): the same request with none of these is reserved, with no loss
-/// (the negative control). A read phase 1 admitted on guest-held marks that
-/// an export revoked while it waited stops the run by name, with no
-/// reservation and no loss (review P1-a): Linux would interrupt it here.
+/// yield would read as its completion), whichever cursor replays the
+/// schedule: a legacy record's `replayer` or a slice-boundary record's
+/// `boundary_replayer` (dev-hermit dh-xw2yzs). The two replay cases are unit
+/// level: they file the request and fire the alarm on the scheduler itself,
+/// so they reach `reservable_pipe_read` directly. A real run never gets that
+/// far, because phase 1's gate already refuses a guest-held pipe read under
+/// any schedule recording or replay (`ProcessFacts::schedule_trace`), so they
+/// pin the scheduler's own refusal, not a reachable wake. dh-ru056 slice 2,
+/// ruling C1.2 (T1.3): the same request with none of these is reserved, with
+/// no loss (the negative control). A read phase 1 admitted on guest-held
+/// marks that an export revoked while it waited stops the run by name, with
+/// no reservation and no loss (review P1-a): Linux would interrupt it here.
 #[test]
 fn a_reserved_probe_refuses_a_poll_the_host_can_make_ready() {
     for case in [
@@ -11913,6 +11920,7 @@ fn a_reserved_probe_refuses_a_poll_the_host_can_make_ready() {
         "marks-revoked",
         "named-fifo",
         "schedule-replay",
+        "boundary-schedule-replay",
     ] {
         let mut s = liteinst_scheduler();
         let (tid, _, _) = add(&mut s, 100, 100);
@@ -11926,6 +11934,12 @@ fn a_reserved_probe_refuses_a_poll_the_host_can_make_ready() {
             "marks-revoked" => s.revoke_guest_held_marks(tid),
             "schedule-replay" => {
                 s.replayer = Some(crate::scheduler::replayer::Replayer::new([]));
+            }
+            "boundary-schedule-replay" => {
+                s.boundary_replayer =
+                    Some(crate::scheduler::boundary_replayer::BoundaryReplayer::new(
+                        detcore_model::schedule::boundary::Schedule::new(vec![]).unwrap(),
+                    ));
             }
             _ => r.polls_a_named_fifo = true,
         }
