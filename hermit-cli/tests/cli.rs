@@ -29126,7 +29126,11 @@ fn a_schedule_replay_of_a_timed_wait_spread_recording_follows_it() {
         "sleep",
     ];
     let refused = hermit(&args);
-    assert_eq!(refused.status.code(), Some(122), "{args:?}");
+    assert_eq!(
+        refused.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{args:?}"
+    );
     assert!(
         stderr(&refused).contains("Record with --sleep-registration=first-pass"),
         "{}",
