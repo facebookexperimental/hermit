@@ -152,10 +152,7 @@ jq '.rules = [] | .bypass_actors = []' "$tmp/state/gate.json" >"$tmp/state/rules
 mv "$tmp/state/ruleset.next" "$tmp/state/gate.json"
 jq '
   .enforcement = "active" |
-  .rules = [.rules[] | select(
-    .type == "deletion" or .type == "non_fast_forward" or
-    .type == "required_linear_history"
-  )] |
+  .rules = [.rules[] | select(.type == "deletion" or .type == "non_fast_forward")] |
   .bypass_actors = [] |
   .conditions.ref_name.include = ["refs/heads/not-main"]
 ' "$tmp/state/history.json" >"$tmp/state/ruleset.next"
@@ -172,27 +169,50 @@ else
     exit 1
 fi
 
-# All three history rules are load-bearing. A rule-empty gate does not make a
-# default-branch history policy correct when linear-history enforcement is
+# Both history rules are load-bearing. A rule-empty gate does not make a
+# default-branch history policy correct when non-fast-forward protection is
 # missing.
 write_drifted_policy
 jq '.rules = [] | .bypass_actors = []' "$tmp/state/gate.json" >"$tmp/state/ruleset.next"
 mv "$tmp/state/ruleset.next" "$tmp/state/gate.json"
 jq '
   .enforcement = "active" |
-  .rules = [.rules[] | select(.type != "required_linear_history")] |
+  .rules = [.rules[] | select(.type == "deletion")] |
   .bypass_actors = []
 ' "$tmp/state/history.json" >"$tmp/state/ruleset.next"
 mv "$tmp/state/ruleset.next" "$tmp/state/history.json"
-if run_configure --check >"$tmp/check-no-linear.out" 2>&1; then
-    echo "FAIL: missing linear-history protection was accepted" >&2
+if run_configure --check >"$tmp/check-no-nff.out" 2>&1; then
+    echo "FAIL: missing non-fast-forward protection was accepted" >&2
     exit 1
-elif grep -Fq 'types=deletion,non_fast_forward' "$tmp/check-no-linear.out" &&
-     grep -Fq 'required_linear_history' "$tmp/check-no-linear.out"; then
+elif grep -Fq 'types=deletion enforcement=active' "$tmp/check-no-nff.out" &&
+     grep -Fq 'expected deletion,non_fast_forward /' "$tmp/check-no-nff.out"; then
     negative=$((negative + 1))
 else
-    cat "$tmp/check-no-linear.out" >&2
-    echo "FAIL: missing-linear refusal did not report the exact policy delta" >&2
+    cat "$tmp/check-no-nff.out" >&2
+    echo "FAIL: missing-non-fast-forward refusal did not report the exact policy delta" >&2
+    exit 1
+fi
+
+# A linear-history rule is drift, not extra safety: it refuses the exact
+# ancestry merges that facebookexperimental imports land as
+# (https://github.com/rrnewton/hermit/pull/5377,
+# https://github.com/rrnewton/hermit/pull/5385,
+# https://github.com/rrnewton/hermit/pull/5391).
+write_drifted_policy
+jq '.rules = [] | .bypass_actors = []' "$tmp/state/gate.json" >"$tmp/state/ruleset.next"
+mv "$tmp/state/ruleset.next" "$tmp/state/gate.json"
+jq '.enforcement = "active" | .bypass_actors = []' "$tmp/state/history.json" \
+    >"$tmp/state/ruleset.next"
+mv "$tmp/state/ruleset.next" "$tmp/state/history.json"
+if run_configure --check >"$tmp/check-linear.out" 2>&1; then
+    echo "FAIL: a linear-history rule that refuses ancestry-merge imports was accepted" >&2
+    exit 1
+elif grep -Fq 'types=deletion,non_fast_forward,required_linear_history' "$tmp/check-linear.out" &&
+     grep -Fq 'expected deletion,non_fast_forward /' "$tmp/check-linear.out"; then
+    negative=$((negative + 1))
+else
+    cat "$tmp/check-linear.out" >&2
+    echo "FAIL: the linear-history refusal did not report the exact policy delta" >&2
     exit 1
 fi
 
@@ -203,7 +223,7 @@ run_configure --apply >"$tmp/apply.out"
   .target == "branch" and .enforcement == "active" and (.bypass_actors == []) and
   .conditions == {"ref_name":{"exclude":[],"include":["~DEFAULT_BRANCH"]}}
 ' "$tmp/state/gate.json") == true ]]
-[[ $(jq '[.rules[].type] | sort == ["deletion","non_fast_forward","required_linear_history"]' \
+[[ $(jq '[.rules[].type] | sort == ["deletion","non_fast_forward"]' \
     "$tmp/state/history.json") == true ]]
 [[ $(jq '
   .target == "branch" and .enforcement == "active" and (.bypass_actors == []) and
@@ -297,7 +317,7 @@ else
     exit 1
 fi
 
-printf 'NEGATIVE refusals: %d/7   POSITIVE acceptances: %d/3\n' \
+printf 'NEGATIVE refusals: %d/8   POSITIVE acceptances: %d/3\n' \
     "$negative" "$positive"
-[[ $negative == 7 && $positive == 3 ]]
-echo "PASS: zero-bypass deletion, non-fast-forward, and linear-history rules remain active; one upstream ruleset is tolerated and never rewritten"
+[[ $negative == 8 && $positive == 3 ]]
+echo "PASS: zero-bypass deletion and non-fast-forward rules remain active with no linear-history rule; one upstream ruleset is tolerated and never rewritten"

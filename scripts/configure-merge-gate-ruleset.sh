@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
 # Reconcile Hermit's landing-branch rulesets with the owner policy: green
-# branches may land by fast-forward; branch deletion, non-fast-forward updates,
-# and nonlinear history are prohibited. Hosted checks and PR state remain
-# advisory.
+# branches may land by fast-forward; branch deletion and non-fast-forward
+# updates are prohibited. Hosted checks and PR state remain advisory.
+#
+# There is deliberately no linear-history rule (none on the live history
+# ruleset since 2026-11-09). Imports from facebookexperimental land on the
+# landing branch as exact ancestry merges: two-parent merge commits that keep
+# the imported history as an ancestor, which a linear-history rule refuses.
+# Examples: https://github.com/rrnewton/hermit/pull/5377 (29da3587),
+# https://github.com/rrnewton/hermit/pull/5385 (7c04b4bc) and
+# https://github.com/rrnewton/hermit/pull/5391 (f8b2162f). --check therefore
+# refuses a history ruleset that carries required_linear_history, and --apply
+# removes it.
 #
 # The two landing rulesets name the repository's default branch
 # (~DEFAULT_BRANCH), so they follow it when the landing branch is renamed.
@@ -42,7 +51,7 @@ Usage: scripts/configure-merge-gate-ruleset.sh MODE [options]
 Modes:
   --check          Verify the exact owner policy without changing GitHub.
   --apply          Empty the check-gating ruleset and enforce zero-bypass
-                   deletion + non-fast-forward + linear-history rules.
+                   deletion + non-fast-forward rules (no linear-history rule).
 
 Options:
   --repo R                  Repository (default: rrnewton/hermit).
@@ -190,10 +199,13 @@ if [[ $mode == check ]]; then
         failed=1
         gate_matches=false
     fi
-    if [[ $history_types != deletion,non_fast_forward,required_linear_history ||
+    # Exactly these two rules: required_linear_history would refuse the
+    # ancestry merges that facebookexperimental imports land as (see the
+    # header).
+    if [[ $history_types != deletion,non_fast_forward ||
           $history_bypass_count != 0 || $history_enforcement != active ]] ||
        ! scope_is_default_branch <<<"$current_history"; then
-        printf 'FAIL: history ruleset %s has types=%s enforcement=%s bypass_count=%s scope=%s; expected deletion,non_fast_forward,required_linear_history / active / 0 / branch default-only.\n' \
+        printf 'FAIL: history ruleset %s has types=%s enforcement=%s bypass_count=%s scope=%s; expected deletion,non_fast_forward / active / 0 / branch default-only.\n' \
             "$history_ruleset_id" "${history_types:-none}" "$history_enforcement" \
             "$history_bypass_count" "$(scope_state <<<"$current_history")" >&2
         failed=1
@@ -242,7 +254,7 @@ if [[ $mode == check ]]; then
         if ((${#upstream_ids[@]} == 1)); then
             upstream_note="; upstream ruleset ${upstream_ids[0]} protects $upstream_ref (its rules are not judged here)"
         fi
-        printf 'PASS: check-gating ruleset %s is inert; history ruleset %s enforces zero-bypass deletion + non-fast-forward + linear history%s.\n' \
+        printf 'PASS: check-gating ruleset %s is inert; history ruleset %s enforces zero-bypass deletion + non-fast-forward, with no linear-history rule%s.\n' \
             "$gate_ruleset_id" "$history_ruleset_id" "$upstream_note"
     fi
     exit 0
@@ -276,8 +288,7 @@ desired_history=$(jq '
     conditions: {ref_name: {exclude: [], include: ["~DEFAULT_BRANCH"]}},
     rules: [
       {type: "deletion"},
-      {type: "non_fast_forward"},
-      {type: "required_linear_history"}
+      {type: "non_fast_forward"}
     ],
     bypass_actors: []
   }
@@ -315,5 +326,5 @@ if [[ $(policy_fingerprint <<<"$updated_gate") != $(policy_fingerprint <<<"$desi
     exit 1
 fi
 
-printf 'APPLIED: check-gating ruleset %s is inert; history ruleset %s enforces zero-bypass deletion + non-fast-forward + linear history.\n' \
+printf 'APPLIED: check-gating ruleset %s is inert; history ruleset %s enforces zero-bypass deletion + non-fast-forward, with no linear-history rule.\n' \
     "$gate_ruleset_id" "$history_ruleset_id"
