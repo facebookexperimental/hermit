@@ -12520,6 +12520,9 @@ struct Plan {
     /// True for the `super` stress suite, so its pass-rate table is printed and
     /// its verdict comes from the ratchet rather than the raw node count.
     super_mode: bool,
+    /// Pressure-tier nodes that super's selection removed (empty otherwise),
+    /// so the stress table can say which probes were not selected and why.
+    pressure_excluded: BTreeSet<String>,
     /// Set for `--envelope-only`/`--envelope-compare`: the measurement is scored
     /// and emitted afterwards, and an optional baseline is enforced.
     envelope: Option<EnvelopePlan>,
@@ -12607,6 +12610,7 @@ impl Default for Plan {
             compat_prefix: None,
             suite_complete: false,
             super_mode: false,
+            pressure_excluded: BTreeSet::new(),
             envelope: None,
             nonblocking: BTreeSet::new(),
             force_keep_going: false,
@@ -15504,7 +15508,18 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         // alerting super selection must not contain them. An explicit
         // --selected naming one is the caller's deliberate choice and is
         // not filtered. Ancestry must not smuggle one back in.
+        let mut pressure_excluded = BTreeSet::new();
         if label == "super" && args.selected.is_none() {
+            pressure_excluded = cfg
+                .steps
+                .iter()
+                .filter(|step| {
+                    step.labels
+                        .iter()
+                        .any(|l| l == hermit_manifest_plan::validation_dag::PRESSURE_LABEL)
+                })
+                .map(Step::tag)
+                .collect();
             let kept: Vec<String> = cfg
                 .steps
                 .iter()
@@ -15566,6 +15581,7 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
             compat_prefix,
             suite_complete,
             super_mode: label == "super",
+            pressure_excluded,
             envelope: match &args.focused {
                 Some(Focused::Envelope { baseline }) => Some(EnvelopePlan {
                     reps: validate_envelope::L4_REPS_DEFAULT,
@@ -17651,31 +17667,96 @@ fn print_super_stress_verdict(
     jobs: i64,
     host_cpus: usize,
 ) -> usize {
-    println!("\n== Super stress pass rates ==");
-    println!("Repetitions: {reps}; scheduler width: {jobs}; online CPUs: {host_cpus}");
+    let (lines, blocking) = super_stress_verdict_lines(rates, reps, jobs, host_cpus);
+    println!();
+    for line in lines {
+        println!("{line}");
+    }
+    blocking
+}
+
+/// The super stress table as printed lines, and its blocking count.
+///
+/// A probe that was not selected ran no repetition and none was expected, so
+/// it is named as not selected, never as NO_RESULT. A selected probe that
+/// produced no product result is still NO_RESULT, and its node's own failure
+/// is counted where every failed node is (`blocking_failures`).
+fn super_stress_verdict_lines(
+    rates: &[validate_super::ProbeRate],
+    reps: i64,
+    jobs: i64,
+    host_cpus: usize,
+) -> (Vec<String>, usize) {
+    use validate_super::ProbeSelection;
+    let mut lines = vec![
+        "== Super stress pass rates ==".to_string(),
+        format!("Repetitions: {reps}; scheduler width: {jobs}; online CPUs: {host_cpus}"),
+    ];
+    if rates
+        .iter()
+        .all(|rate| rate.selection != ProbeSelection::Selected)
+        && rates
+            .iter()
+            .any(|rate| rate.selection == ProbeSelection::PressureTier)
+    {
+        lines.push(
+            "  No scheduled runner selects superstress.* today: super excludes the pressure \
+             tier, and the nightly pressure sweep (ci/compat-envelope/pressure-test.rs) does not \
+             run these nodes. Select one directly with `dagrun run --labels pressure` or \
+             `--selected superstress.<probe>`."
+                .to_string(),
+        );
+    }
     let mut blocking = 0usize;
     for rate in rates {
         let slug = rate.probe.slug();
+        match rate.selection {
+            ProbeSelection::Selected => {}
+            ProbeSelection::PressureTier => {
+                lines.push(format!(
+                    "  -  {slug:<24} not selected (pressure tier): no repetition ran, and none \
+                     was expected"
+                ));
+                continue;
+            }
+            ProbeSelection::NoNode => {
+                lines.push(format!(
+                    "  -  {slug:<24} not selected (no node in the validation DAG): no repetition \
+                     ran, and none was expected"
+                ));
+                continue;
+            }
+            ProbeSelection::NotSelected => {
+                lines.push(format!(
+                    "  -  {slug:<24} not selected (not in this run's selection): no repetition \
+                     ran, and none was expected"
+                ));
+                continue;
+            }
+        }
         let product_failures = rate.ran.saturating_sub(rate.passed);
         let without_product_result = rate.planned.saturating_sub(rate.ran);
         if rate.ran == 0 {
-            println!(
+            lines.push(format!(
                 "  NO_RESULT {slug:<24} 0/{} selected repetition(s) produced a product result",
                 rate.planned
-            );
+            ));
             continue;
         }
         let pct = 100 * rate.passed / rate.ran.max(1);
         if product_failures == 0 && without_product_result == 0 {
-            println!("  ✅ {slug:<24} {}/{} (100%)", rate.passed, rate.ran);
+            lines.push(format!(
+                "  ✅ {slug:<24} {}/{} (100%)",
+                rate.passed, rate.ran
+            ));
         } else if product_failures == 0 {
-            println!(
+            lines.push(format!(
                 "  NO_RESULT {slug:<24} {}/{} product result(s) passed ({pct}%); {} of {} \
                  selected repetition(s) did not produce a product result",
                 rate.passed, rate.ran, without_product_result, rate.planned,
-            );
+            ));
         } else if rate.probe.nonblocking() {
-            println!(
+            lines.push(format!(
                 "  ⚠️  {slug:<24} {}/{} product result(s) passed ({pct}%){} — NONBLOCKING: this \
                  row was dead code in validate.sh (`backend_selector_supported` is undefined, so \
                  the guard was always false) and has never been measured; reporting it, not \
@@ -17691,9 +17772,9 @@ fn print_super_stress_verdict(
                         rate.planned
                     )
                 },
-            );
+            ));
         } else {
-            println!(
+            lines.push(format!(
                 "  ⚠️  {slug:<24} {}/{} product result(s) passed ({pct}%){}",
                 rate.passed,
                 rate.ran,
@@ -17706,11 +17787,11 @@ fn print_super_stress_verdict(
                         rate.planned
                     )
                 },
-            );
+            ));
             blocking += 1;
         }
     }
-    blocking
+    (lines, blocking)
 }
 
 /// The plan header's host-inapplicable clause, empty when there is none.
@@ -32266,7 +32347,25 @@ check_build_mode_selection(
     // Super stress pass rates, from typed outcomes rather than a scraped report.
     if plan.super_mode {
         let reps = validate_super::repetitions();
-        let rates = validate_classification::stress_rates(&classification, &outcomes, reps);
+        let executed: BTreeSet<String> = execution_plan
+            .cfg
+            .steps
+            .iter()
+            .chain(
+                execution_plan
+                    .second
+                    .iter()
+                    .flat_map(|second| second.steps.iter()),
+            )
+            .map(Step::tag)
+            .collect();
+        let rates = validate_classification::stress_rates(
+            &classification,
+            &outcomes,
+            reps,
+            &executed,
+            &plan.pressure_excluded,
+        );
         // This is a per-PROBE display summary of repetition rows. A probe node
         // with a failed repetition is already in `blocking_failures`, so the
         // row count must not be added to the final node count.
