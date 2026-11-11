@@ -8770,17 +8770,19 @@ fn spawn_process(
         .stdout(stdout_file)
         .stderr(stderr_file);
     command.envs(identity.env_overrides.iter());
-    let enrollment_fd = enrollment.map(|(fd, _)| fd);
+    // The child leads a process group of its own. With no pre_exec closure,
+    // std starts it with posix_spawn, which does not copy this process: a
+    // fork() copies the address space under the memory-map lock, and every
+    // other thread that page-faults waits for it (dh-7n47nt).
+    command.process_group(0);
     let join_report_fd = join_report.as_ref().map(|(_, write)| write.as_raw_fd());
-    unsafe {
-        command.pre_exec(move || {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // Join the invocation cgroup before exec, so every CPU cycle of the
-            // program and of anything it starts is charged to that cgroup. The
-            // descriptor is close-on-exec, so the program never sees it.
-            if let Some(fd) = enrollment_fd {
+    if let Some((fd, _)) = enrollment {
+        // Join the invocation cgroup before exec, so every CPU cycle of the
+        // program and of anything it starts is charged to that cgroup. The
+        // descriptor is close-on-exec, so the program never sees it. std sets
+        // the process group before it runs this closure.
+        unsafe {
+            command.pre_exec(move || {
                 let joined = loop {
                     let written = libc::write(fd, b"0\n".as_ptr().cast(), 2);
                     if written == 2 {
@@ -8801,9 +8803,9 @@ fn spawn_process(
                     }
                     return Err(error);
                 }
-            }
-            Ok(())
-        });
+                Ok(())
+            });
+        }
     }
     let spawned = command.spawn();
     // The child wrote its report, if any, before it sent the error that ends
