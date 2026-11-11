@@ -55,20 +55,27 @@ TARGETS=(
   "hermit//detcore:tests_time|tests_time"
 )
 
-# Regenerate when the content stamp is missing or differs: the generated
-# graph is gitignored, so a long-lived slot keeps its copy across Cargo.lock
-# bumps and would compile detcore against a vendored tokio/sha2 set the lock
-# no longer names (observed: tokio 1.53.1 vendor vs 1.54.1 lock -> E0599/E0277
-# in detcore). Keyed on content, not mtime: checkout/rsync/cp -p all make
-# mtimes lie in both directions.
-vendored_stamp() {
-  { sha256sum Cargo.lock shim/third-party/rust/reindeer.toml; } | sha256sum | awk '{print $1}'
-}
-stamp_file=shim/third-party/rust/BUCK.stamp
-if [[ ! -f shim/third-party/rust/BUCK || ! -f $stamp_file ||
-      $(cat "$stamp_file" 2>/dev/null) != "$(vendored_stamp)" ]]; then
+# Regenerate when the authoritative cache key differs: the generated
+# graph is gitignored, so a long-lived slot keeps its copy across input
+# bumps and would compile detcore against a vendored set the tree no
+# longer names (observed: tokio 1.53.1 vendor vs 1.54.1 lock ->
+# E0599/E0277 in detcore). The key comes from
+# bootstrap/rust-deps-cache-key.rs, the same input list the rust-deps
+# cache trusts. Its decline (exit 3) or error (exit 1) means
+# regenerate unconditionally and write no stamp. The stamp lives in
+# vendor/, which the key walk excludes, so it never feeds its own key.
+stamp_file=shim/third-party/rust/vendor/.stamp
+vendored_key=$(./bootstrap/rust-deps-cache-key.rs . 2>/dev/null) && key_rc=0 || key_rc=$?
+if [[ $key_rc -ne 0 || ! -f shim/third-party/rust/BUCK || ! -f $stamp_file ||
+      $(cat "$stamp_file" 2>/dev/null) != "$vendored_key" ]]; then
   ./bootstrap/regenerate-rust-deps
-  vendored_stamp >"$stamp_file"
+  if [[ $key_rc -eq 0 ]]; then
+    stamp_tmp=$(mktemp shim/third-party/rust/vendor/.stamp.XXXXXX)
+    printf '%s\n' "$vendored_key" >"$stamp_tmp"
+    mv "$stamp_tmp" "$stamp_file"
+  else
+    rm -f "$stamp_file"
+  fi
 fi
 
 mkdir -p target/validate/buck-harvest
