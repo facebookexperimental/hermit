@@ -403,19 +403,23 @@ buck_export_file(
     visibility = ["//hermetic_infra/hermit/fb-only/contract_checks:"],
 )
 
-# Inputs of fb-only/integration_tests/generate.py, checked for drift by its test.
+# Inputs of fb-only/integration_tests/generate.py, checked for drift by its test,
+# which also evaluates integration_tests.bzl's wiring of the generated policy.
 buck_filegroup(
     name = "integration-generator-inputs",
     # integration_tests_data.bzl, the one *_data.bzl, is fbsource's own
-    # generated file: the open-source tree does not carry it, so the glob
-    # names it without requiring it, and the target is fbsource-only.
+    # generated file, and integration_tests.bzl is fbsource's own too (the
+    # open-source tree loads a shim of it): the open-source tree carries
+    # neither, so the glob names them without requiring them (a wildcard,
+    # since buildifier refuses a constant glob pattern), and the target is
+    # fbsource-only.
     srcs = [
         "Cargo.toml",
         "build.rs",
         "build_support.rs",
         "reverie_pin.rs",
     ]
-    + glob(["*_data.bzl", "src/**", "tests/**"]),
+    + glob(["*_data.bzl", "integration_tests*.bzl", "src/**", "tests/**"]),
     target_compatible_with = ["fbcode//opensource/macros:broken-in-oss"],
     visibility = [
         "//hermetic_infra/hermit/fb-only/integration_tests/tests:",

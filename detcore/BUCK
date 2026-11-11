@@ -373,6 +373,14 @@ buck_filegroup(
     visibility = ["//hermetic_infra/hermit:"],
 )
 
+# detcore/tests/fixtures: C guests hermit-cli's integration tests compile at
+# run time from their CARGO_MANIFEST_DIR (chosen_terminal.rs).
+buck_filegroup(
+    name = "tests-fixtures",
+    srcs = {path[len("tests/fixtures/") :]: path for path in glob(["tests/fixtures/**"])},
+    visibility = ["//hermetic_infra/hermit:"],
+)
+
 # detcore/src, which check.backend_abstraction's source gate scans, keyed
 # relative to src/ so that it materializes where it is mapped.
 buck_filegroup(

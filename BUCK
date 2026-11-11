@@ -141,6 +141,7 @@ buck_export_file(
 buck_filegroup(
     name = "integration-repository",
     srcs = {
+        "detcore/tests/fixtures": "//hermetic_infra/hermit/detcore:tests-fixtures",
         "detcore/tests/lit": "//hermetic_infra/hermit/detcore/tests/lit:guest-sources",
         "hermit-cli": "//hermetic_infra/hermit/hermit-cli:integration-cli-tree",
         "tests": "//hermetic_infra/hermit/tests:integration-tree",
