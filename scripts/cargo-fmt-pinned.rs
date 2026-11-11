@@ -22,6 +22,11 @@
 //!    which installs it first when absent, as `RUSTUP_TOOLCHAIN=<channel>` did
 //!    before this script).
 //!
+//! Either way the script runs that toolchain's own `bin/rustfmt` and
+//! `bin/cargo-fmt` by absolute path, with `RUSTFMT` set to the former for the
+//! latter: neither PATH, CARGO_HOME nor an inherited `RUSTFMT` picks the
+//! formatter, and `--self-test` runs the same two executables as the check.
+//!
 //! Neither, or a formatter whose `rustfmt --version` is not the pinned line,
 //! exits 2 before anything is formatted. The rustfmt on PATH is never used.
 //! The pinned validation image has neither yet, so the offline split's
@@ -54,6 +59,9 @@ const PIN_FILE: &str = "ci/rustfmt-toolchain.toml";
 const TOOLCHAIN_ENV: &str = "HERMIT_RUSTFMT_TOOLCHAIN";
 /// The follow-up that packages the pinned formatter in the pinned image.
 const IMAGE_FOLLOW_UP: &str = "https://github.com/rrnewton/hermit/issues/5397";
+/// The self-test fixtures' package: standalone, so no enclosing workspace claims it.
+const SELF_TEST_MANIFEST: &str =
+    "[package]\nname = \"fmt-self-test\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[workspace]\n";
 
 /// What `ci/rustfmt-toolchain.toml` pins.
 #[derive(Debug, PartialEq, Eq)]
@@ -116,53 +124,96 @@ impl Formatter {
         }
     }
 
-    /// A command running this toolchain's `program` (`rustfmt` or `cargo`).
-    fn command(&self, program: &str) -> Command {
-        match self {
-            Formatter::Toolchain(root) => {
-                let bin = root.join("bin");
-                if program == "cargo" {
-                    // cargo-fmt runs the rustfmt that RUSTFMT names; the cargo
-                    // it calls for metadata is whichever cargo is on PATH.
-                    let mut command = Command::new(bin.join("cargo-fmt"));
-                    command.env("RUSTFMT", bin.join("rustfmt"));
-                    command
-                } else {
-                    Command::new(bin.join(program))
-                }
-            }
+    /// The toolchain root holding the pinned formatter. For rustup it is the
+    /// pinned channel's sysroot, installed first when absent.
+    fn toolchain_root(&self) -> Result<PathBuf, String> {
+        let root = match self {
+            Formatter::Toolchain(root) => root.clone(),
             Formatter::Rustup(channel) => {
-                let mut command = Command::new("rustup");
-                command
-                    .arg("run")
-                    .arg("--install")
+                let output = Command::new("rustup")
+                    .args(["run", "--install"])
                     .arg(channel)
-                    .arg(program);
-                if program == "cargo" {
-                    command.arg("fmt");
+                    .args(["rustc", "--print", "sysroot"])
+                    .output()
+                    .map_err(|error| format!("cannot run rustup for {channel}: {error}"))?;
+                if !output.status.success() {
+                    return Err(format!(
+                        "`rustup run --install {channel} rustc --print sysroot` failed ({}): {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    ));
                 }
-                command
+                PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
             }
-        }
+        };
+        fs::canonicalize(&root)
+            .map_err(|error| format!("{} ({}): {error}", root.display(), self.describe()))
     }
 
-    /// The `rustfmt --version` line of this formatter.
+    /// The pinned toolchain's `rustfmt` and `cargo-fmt`, by absolute path.
+    fn resolve(&self) -> Result<Resolved, String> {
+        let bin = self.toolchain_root()?.join("bin");
+        let resolved = Resolved {
+            rustfmt: bin.join("rustfmt"),
+            cargo_fmt: bin.join("cargo-fmt"),
+        };
+        for path in [&resolved.rustfmt, &resolved.cargo_fmt] {
+            if !path.is_file() {
+                return Err(format!("{} has no {}", self.describe(), path.display()));
+            }
+        }
+        Ok(resolved)
+    }
+}
+
+/// The pinned formatter's executables. They are only ever run by these paths.
+#[derive(Debug, PartialEq, Eq)]
+struct Resolved {
+    rustfmt: PathBuf,
+    cargo_fmt: PathBuf,
+}
+
+impl Resolved {
+    /// The `rustfmt --version` line of the pinned rustfmt.
     fn version(&self) -> Result<String, String> {
-        let output = self
-            .command("rustfmt")
+        let output = Command::new(&self.rustfmt)
             .arg("--version")
             .output()
-            .map_err(|error| format!("cannot run rustfmt from {}: {error}", self.describe()))?;
+            .map_err(|error| format!("cannot run {}: {error}", self.rustfmt.display()))?;
         if !output.status.success() {
             return Err(format!(
-                "rustfmt --version from {} failed ({}): {}",
-                self.describe(),
+                "{} --version failed ({}): {}",
+                self.rustfmt.display(),
                 output.status,
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
+
+    /// `cargo fmt` with the pinned formatter: the pinned cargo-fmt by path,
+    /// with RUSTFMT set to the pinned rustfmt, overriding any inherited value.
+    /// The cargo that cargo-fmt runs for `cargo metadata` only lists packages.
+    fn cargo_fmt(&self) -> Command {
+        let mut command = Command::new(&self.cargo_fmt);
+        command.env("RUSTFMT", &self.rustfmt);
+        command
+    }
+}
+
+/// `cargo fmt ARGS` in `dir` with the pinned formatter, as the check runs it.
+fn cargo_fmt_in(resolved: &Resolved, args: &[OsString], dir: &Path) -> Command {
+    let mut command = resolved.cargo_fmt();
+    command.args(args).current_dir(dir);
+    command
+}
+
+/// Runs [`cargo_fmt_in`] with the caller's output streams; its exit status.
+fn run_cargo_fmt(resolved: &Resolved, args: &[OsString], dir: &Path) -> Result<i32, String> {
+    let status = cargo_fmt_in(resolved, args, dir)
+        .status()
+        .map_err(|error| format!("cannot run {}: {error}", resolved.cargo_fmt.display()))?;
+    Ok(status.code().unwrap_or(1))
 }
 
 /// Picks the formatter: the toolchain root in `toolchain`, else rustup. With
@@ -208,30 +259,41 @@ fn check_identity(found: &str, pin: &Pin, formatter: &Formatter) -> Result<(), S
     }
 }
 
-/// The selected formatter must reject a brace import, which the nightly-only
-/// `imports_granularity = "Item"` splits, and accept its split form. Stable
-/// rustfmt accepts both.
-fn self_test(formatter: &Formatter, root: &Path) -> Result<(), String> {
+/// The resolved formatter, run exactly as the check runs it (`cargo fmt --all
+/// -- --check` through [`cargo_fmt_in`], its output kept quiet), must reject a brace import, which
+/// the nightly-only `imports_granularity = "Item"` splits, and accept its split
+/// form. Stable rustfmt accepts both.
+fn self_test(formatter: &Resolved, root: &Path) -> Result<(), String> {
     const BAD: &str = "use std::{fs, path::Path};\n\nfn main() {\n    let _ = fs::metadata(Path::new(\".\"));\n}\n";
     const GOOD: &str = "use std::fs;\nuse std::path::Path;\n\nfn main() {\n    let _ = fs::metadata(Path::new(\".\"));\n}\n";
     let scratch = env::temp_dir().join(format!("cargo-fmt-pinned-{}", std::process::id()));
     fs::create_dir_all(&scratch).map_err(|error| format!("{}: {error}", scratch.display()))?;
     let result = (|| {
-        for (name, text, expected) in [("bad.rs", BAD, 1), ("good.rs", GOOD, 0)] {
-            let path = scratch.join(name);
-            fs::write(&path, text).map_err(|error| format!("{}: {error}", path.display()))?;
-            let status = formatter
-                .command("rustfmt")
-                .arg("--check")
-                .arg("--config-path")
-                .arg(root.join("rustfmt.toml"))
-                .arg(&path)
+        for (name, text, expected) in [("bad", BAD, 1), ("good", GOOD, 0)] {
+            let dir = scratch.join(name);
+            let src = dir.join("src");
+            fs::create_dir_all(&src).map_err(|error| format!("{}: {error}", src.display()))?;
+            for (path, contents) in [
+                (dir.join("Cargo.toml"), SELF_TEST_MANIFEST),
+                (src.join("main.rs"), text),
+            ] {
+                fs::write(&path, contents)
+                    .map_err(|error| format!("{}: {error}", path.display()))?;
+            }
+            let mut args: Vec<OsString> = ["--all", "--", "--check", "--config-path"]
+                .into_iter()
+                .map(OsString::from)
+                .collect();
+            args.push(root.join("rustfmt.toml").into_os_string());
+            let code = cargo_fmt_in(formatter, &args, &dir)
                 .output()
-                .map_err(|error| format!("cannot run rustfmt: {error}"))?
-                .status;
-            if status.code() != Some(expected) {
+                .map_err(|error| format!("cannot run {}: {error}", formatter.cargo_fmt.display()))?
+                .status
+                .code()
+                .unwrap_or(1);
+            if code != expected {
                 return Err(format!(
-                    "self-test: rustfmt --check on the {name} fixture exited {status}, expected {expected}"
+                    "self-test: cargo fmt --all -- --check on the {name} fixture exited {code}, expected {expected}"
                 ));
             }
         }
@@ -282,18 +344,21 @@ fn run() -> Result<ExitCode, String> {
         _ => path_rustfmt_version(),
     };
     let formatter = select(&pin, toolchain, rustup, path_rustfmt.as_deref())?;
-    check_identity(&formatter.version()?, &pin, &formatter)?;
+    let resolved = formatter.resolve()?;
+    check_identity(&resolved.version()?, &pin, &formatter)?;
     let args: Vec<OsString> = env::args_os().skip(1).collect();
     match args.first().and_then(|arg| arg.to_str()) {
         Some("--show") => {
             println!(
-                "formatter: {}\nidentity: {}",
+                "formatter: {}\nrustfmt: {}\ncargo-fmt: {}\nidentity: {}",
                 formatter.describe(),
+                resolved.rustfmt.display(),
+                resolved.cargo_fmt.display(),
                 pin.identity
             );
             Ok(ExitCode::SUCCESS)
         }
-        Some("--self-test") => match self_test(&formatter, &root) {
+        Some("--self-test") => match self_test(&resolved, &root) {
             Ok(()) => {
                 println!(
                     "cargo-fmt-pinned: self-test passed with {} ({})",
@@ -308,20 +373,8 @@ fn run() -> Result<ExitCode, String> {
             }
         },
         _ => {
-            let status = formatter
-                .command("cargo")
-                .args(&args)
-                .current_dir(&root)
-                .status()
-                .map_err(|error| {
-                    format!(
-                        "cannot run cargo fmt from {}: {error}",
-                        formatter.describe()
-                    )
-                })?;
-            Ok(ExitCode::from(
-                status.code().map_or(1, |code| code.clamp(0, 255) as u8),
-            ))
+            let code = run_cargo_fmt(&resolved, &args, &root)?;
+            Ok(ExitCode::from(code.clamp(0, 255) as u8))
         }
     }
 }
@@ -515,13 +568,25 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("bin")).unwrap();
-        let script = format!(
+        let rustfmt = format!(
             "#!/bin/sh\nif [ \"$1\" = --version ]; then echo '{version}'; exit 0; fi\nfor last; do :; done\n{check}\n"
         );
-        let rustfmt = root.join("bin/rustfmt");
-        fs::write(&rustfmt, script).unwrap();
-        fs::set_permissions(&rustfmt, fs::Permissions::from_mode(0o755)).unwrap();
+        executable(&root.join("bin/rustfmt"), &rustfmt);
+        executable(&root.join("bin/cargo-fmt"), FAKE_CARGO_FMT);
         root
+    }
+
+    /// A stand-in for cargo-fmt: runs $RUSTFMT --check on each src/*.rs of the
+    /// package in the working directory, as the real one does through RUSTFMT.
+    const FAKE_CARGO_FMT: &str = "#!/bin/sh\nrc=0\nfor f in src/*.rs; do \"$RUSTFMT\" --check \"$f\" || rc=$?; done\nexit $rc\n";
+
+    /// A fake rustfmt check that rejects a brace import, as the pinned one does.
+    const STRICT: &str = "if grep -q 'use std::{' \"$last\"; then exit 1; fi\nexit 0";
+
+    fn executable(path: &Path, contents: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
@@ -533,14 +598,18 @@ mod tests {
             "exit 0",
         );
         let formatter = Formatter::Toolchain(stable.clone());
-        let found = formatter.version().unwrap();
+        let found = formatter.resolve().unwrap().version().unwrap();
         let error = check_identity(&found, &pin, &formatter).unwrap_err();
         assert!(error.contains("refusing the formatter"), "{error}");
         assert!(error.contains(&pin.identity), "{error}");
         let pinned = fake_toolchain("pinned", &pin.identity, "exit 0");
         let formatter = Formatter::Toolchain(pinned.clone());
         assert_eq!(
-            check_identity(&formatter.version().unwrap(), &pin, &formatter),
+            check_identity(
+                &formatter.resolve().unwrap().version().unwrap(),
+                &pin,
+                &formatter
+            ),
             Ok(())
         );
         fs::remove_dir_all(stable).unwrap();
@@ -553,19 +622,141 @@ mod tests {
     #[test]
     fn the_self_test_fails_a_formatter_that_accepts_a_brace_import() {
         let root = test_root();
-        let strict = fake_toolchain(
-            "strict",
-            "x",
-            "if grep -q 'use std::{' \"$last\"; then exit 1; fi\nexit 0",
-        );
-        assert_eq!(
-            self_test(&Formatter::Toolchain(strict.clone()), &root),
-            Ok(())
-        );
+        let strict = fake_toolchain("strict", "x", STRICT);
+        let resolved = Formatter::Toolchain(strict.clone()).resolve().unwrap();
+        assert_eq!(self_test(&resolved, &root), Ok(()));
         let lenient = fake_toolchain("lenient", "x", "exit 0");
-        let error = self_test(&Formatter::Toolchain(lenient.clone()), &root).unwrap_err();
-        assert!(error.contains("bad.rs fixture exited"), "{error}");
+        let resolved = Formatter::Toolchain(lenient.clone()).resolve().unwrap();
+        let error = self_test(&resolved, &root).unwrap_err();
+        assert!(error.contains("bad fixture exited 0"), "{error}");
         fs::remove_dir_all(strict).unwrap();
         fs::remove_dir_all(lenient).unwrap();
+    }
+
+    /// The command that formats names the pinned cargo-fmt by absolute path
+    /// and sets RUSTFMT to the pinned rustfmt, so the child cannot inherit
+    /// another one; a toolchain root missing either executable is refused.
+    #[test]
+    fn the_formatting_command_binds_both_pinned_executables() {
+        let root = fake_toolchain("bound", "x", "exit 0");
+        let resolved = Formatter::Toolchain(root.clone()).resolve().unwrap();
+        let canonical = fs::canonicalize(&root).unwrap();
+        assert_eq!(resolved.rustfmt, canonical.join("bin/rustfmt"));
+        assert_eq!(resolved.cargo_fmt, canonical.join("bin/cargo-fmt"));
+        let command = resolved.cargo_fmt();
+        assert_eq!(Path::new(command.get_program()), resolved.cargo_fmt);
+        assert!(resolved.cargo_fmt.is_absolute());
+        let rustfmt = command
+            .get_envs()
+            .find(|(name, _)| *name == "RUSTFMT")
+            .and_then(|(_, value)| value);
+        assert_eq!(rustfmt, Some(resolved.rustfmt.as_os_str()));
+        fs::remove_file(root.join("bin/cargo-fmt")).unwrap();
+        let error = Formatter::Toolchain(root.clone()).resolve().unwrap_err();
+        assert!(error.contains("has no"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    const PROBE_CRATE: &str = "CARGO_FMT_PINNED_PROBE_CRATE";
+    const PROBE_IDENTITY: &str = "rustfmt 0.0.0-nightly (fake pinned)";
+
+    /// The final formatting path, run in a child test process (see
+    /// [`final_path_with`]) whose environment carries the decoy under test.
+    #[test]
+    #[ignore = "run by the_final_path_ignores_* in a child process"]
+    fn final_path_probe() {
+        let Some(krate) = env::var_os(PROBE_CRATE) else {
+            return;
+        };
+        let pin = Pin {
+            channel: "nightly-2026-07-12".into(),
+            identity: PROBE_IDENTITY.into(),
+        };
+        let formatter = select(&pin, env::var_os(TOOLCHAIN_ENV), rustup_available(), None).unwrap();
+        assert_eq!(formatter, Formatter::Rustup(pin.channel.clone()));
+        let resolved = formatter.resolve().unwrap();
+        check_identity(&resolved.version().unwrap(), &pin, &formatter).unwrap();
+        let args: Vec<OsString> = ["--all", "--", "--check"].map(OsString::from).to_vec();
+        assert_eq!(
+            run_cargo_fmt(&resolved, &args, Path::new(&krate)),
+            Ok(1),
+            "the brace import passed the final path"
+        );
+    }
+
+    /// Runs [`final_path_probe`] in a child process: a fake rustup first on
+    /// PATH reports a fake pinned toolchain (strict rustfmt with the probe
+    /// identity) as the channel's sysroot, and runs anything else from PATH;
+    /// `decoys` adds the bypass under test. The package holds a brace import.
+    fn final_path_with(label: &str, decoys: &[(&str, &Path)], path_front: Option<&Path>) {
+        let base = env::temp_dir().join(format!(
+            "cargo-fmt-pinned-probe-{label}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let pinned = fake_toolchain(&format!("probe-pinned-{label}"), PROBE_IDENTITY, STRICT);
+        executable(
+            &base.join("rustup/rustup"),
+            &format!(
+                "#!/bin/sh\n[ \"$1\" = --version ] && {{ echo 'rustup (fake)'; exit 0; }}\n[ \"$1\" = run ] || exit 1\nshift; [ \"$1\" = --install ] && shift; shift\nif [ \"$*\" = 'rustc --print sysroot' ]; then echo '{}'; exit 0; fi\nexec \"$@\"\n",
+                pinned.display()
+            ),
+        );
+        let krate = base.join("crate");
+        executable(
+            &krate.join("src/main.rs"),
+            "use std::{fs, path::Path};\n\nfn main() {\n    let _ = fs::metadata(Path::new(\".\"));\n}\n",
+        );
+        let mut path = vec![base.join("rustup")];
+        path.extend(path_front.map(Path::to_path_buf));
+        path.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
+        let mut child = Command::new(env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "tests::final_path_probe",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env_remove(TOOLCHAIN_ENV)
+            .env("PATH", env::join_paths(path).unwrap())
+            .env(PROBE_CRATE, &krate);
+        for (name, value) in decoys {
+            child.env(name, value);
+        }
+        let output = child.output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("test tests::final_path_probe ... ok"),
+            "{label}: {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_dir_all(base).unwrap();
+        fs::remove_dir_all(pinned).unwrap();
+    }
+
+    /// Bypass (a): an inherited RUSTFMT naming a formatter that accepts the
+    /// brace import does not reach the final path.
+    #[test]
+    fn the_final_path_ignores_an_inherited_rustfmt() {
+        let lenient = fake_toolchain("probe-lenient-a", "rustfmt 1.9.0-stable (fake)", "exit 0");
+        final_path_with("a", &[("RUSTFMT", &lenient.join("bin/rustfmt"))], None);
+        fs::remove_dir_all(lenient).unwrap();
+    }
+
+    /// Bypass (b): a CARGO_HOME whose bin holds a cargo-fmt (and cargo and
+    /// rustfmt) that accept the brace import, also first on PATH, does not
+    /// reach the final path.
+    #[test]
+    fn the_final_path_ignores_a_cargo_fmt_in_cargo_home() {
+        let home = fake_toolchain("probe-home-b", "rustfmt 1.9.0-stable (fake)", "exit 0");
+        executable(&home.join("bin/cargo-fmt"), "#!/bin/sh\nexit 0\n");
+        executable(
+            &home.join("bin/cargo"),
+            "#!/bin/sh\n[ \"$1\" = fmt ] && shift\nexec \"$(dirname \"$0\")/cargo-fmt\" \"$@\"\n",
+        );
+        final_path_with("b", &[("CARGO_HOME", &home)], Some(&home.join("bin")));
+        fs::remove_dir_all(home).unwrap();
     }
 }
