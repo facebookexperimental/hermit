@@ -60,6 +60,7 @@ use crate::syscalls::helpers::REAL_TIME_SIGNALS;
 #[cfg(target_arch = "x86_64")]
 use crate::syscalls::helpers::RestartCall;
 use crate::syscalls::helpers::act_on_pending_real_time;
+use crate::syscalls::helpers::finish_wait_mask;
 use crate::syscalls::helpers::guest_signal_state_task;
 use crate::syscalls::helpers::is_accepted_connection;
 #[cfg(target_arch = "x86_64")]
@@ -1157,6 +1158,8 @@ fn canonicalize_socket_timestamps(control: &mut [u8], now: LogicalTime) -> usize
 /// (`deadline`) keeps it for its rerun on a backend that restarts a woken call
 /// only through `ERESTARTSYS` (`restarts_only_through_erestartsys`), when a
 /// signal woke it (`woken`) or it ends with `ERESTARTSYS`.
+// Used by the x86_64 production path and by an arch-neutral unit test.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn keeps_poll_deadline_for_rerun(
     restarts_only_through_erestartsys: bool,
     deadline: Option<LogicalTime>,
@@ -2203,8 +2206,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                     // Each probe is a new select call, so a descriptor closed during
                     // the wait gets EBADF, where Linux reports it ready. Without the
                     // kernel's signal state, a scheduler `Signaled` answer still ends
-                    // the call before the probe.
-                    if signals.is_none() && signaled && !gated {
+                    // the call before the probe, unless the probes carry the call's
+                    // temporary mask (`probe_mask_cell`, KVM): the probe then takes
+                    // the signal that woke the wait under that mask, which the backend
+                    // delivers there as it answers EINTR, as Linux delivers it before
+                    // it restores the thread's own mask (`restore_saved_sigmask`).
+                    // Ended before the probe, the call answered EINTR with the signal
+                    // still pending under an own mask that blocks it, and no handler
+                    // ran (`chld-pselect-lets-in` in tests/c/process_signal_target.c,
+                    // the Codex review of https://github.com/rrnewton/hermit/pull/5259).
+                    if signals.is_none() && signaled && !gated && probe_mask_cell.is_none() {
                         self.write_pselect6_remaining(guest, call, deadline).await?;
                         return Err(Errno::EINTR.into());
                     }
@@ -2410,7 +2421,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         let result = match &mut signals {
             Some(signals) => {
                 let restored = signals.restore(guest, mask_cell).await;
-                publish_wait_mask(guest, None, &mut published).await;
+                finish_wait_mask(
+                    guest,
+                    matches!(
+                        result,
+                        Err(Error::Errno(
+                            reverie::syscalls::Errno::ERESTARTNOHAND
+                                | reverie::syscalls::Errno::EINTR
+                        ))
+                    ),
+                    &mut published,
+                )
+                .await;
                 result_after_restore(restored, result)?
             }
             None => result,
@@ -2796,7 +2818,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         let result = match &mut signals {
             Some(signals) => {
                 let restored = signals.restore(guest, mask_cell).await;
-                publish_wait_mask(guest, None, &mut published).await;
+                finish_wait_mask(
+                    guest,
+                    matches!(
+                        result,
+                        Err(Error::Errno(
+                            reverie::syscalls::Errno::ERESTARTNOHAND
+                                | reverie::syscalls::Errno::EINTR
+                        ))
+                    ),
+                    &mut published,
+                )
+                .await;
                 result_after_restore(restored, result)?
             }
             None => result,
@@ -3528,7 +3561,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             record_retry_event(guest, probe).await;
         };
-        publish_wait_mask(guest, None, &mut published).await;
+        finish_wait_mask(
+            guest,
+            matches!(
+                result,
+                Err(Error::Errno(
+                    reverie::syscalls::Errno::ERESTARTNOHAND | reverie::syscalls::Errno::EINTR
+                ))
+            ),
+            &mut published,
+        )
+        .await;
         refuse_held_signal_loss(guest, Sysno::ppoll, result).await
     }
 
@@ -6579,6 +6622,8 @@ mod tests {
         assert!(guest.thread_state().passed_descriptors_out_unreported);
     }
 
+    // x86_64 only: aarch64 has ppoll alone (kernel_poll_result is Poll-typed).
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_kernel_poll_without_a_deadline_restarts_by_running_again() {
         // Linux's code, and a signal that stopped the call before it ran.
@@ -6658,6 +6703,8 @@ mod tests {
         }
     }
 
+    // x86_64 only: aarch64 has ppoll alone (print_poll is Poll-typed).
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn print_poll_accepts_null_fds_without_touching_syscall_arguments() {
         let subscriber = tracing_subscriber::fmt()

@@ -468,7 +468,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if length > SCRATCH_LIMIT {
             return None;
         }
-        let rsp = usize::try_from(guest.regs().await.rsp).ok()?;
+        let rsp = usize::try_from(crate::arch::stack_pointer(&guest.regs().await)).ok()?;
         let top = rsp.checked_sub(SCRATCH_GAP)?;
         let lowest = top.checked_sub(length)? & !15;
         // Another argument the call reads (a second path, a buffer) must not

@@ -43,7 +43,7 @@
 //!
 //! ```cargo
 //! [dependencies]
-//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "cc487cc3c65015ba798f295fd3d02ed3d71281a8" }
+//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "d2d102aa2e508d279b2a798b096dfb46d0f6977b" }
 //! hermit-manifest-plan = { path = "../ci/manifest-plan" }
 //! serde_json = "1"
 //! toml = "0.8.23"
@@ -1490,6 +1490,47 @@ fn establish_build_mode_environment(
     Ok(build_mode)
 }
 
+/// Refuse buck build mode outside an unfocused full run, by name and
+/// before any node runs. Only the full producer carries the build-mode
+/// segment into prepare (`prepare full --build-mode`); the quick, super
+/// and portable-only levels and every focused profile (privileged-only,
+/// hosted-portable-only, and the rest — all of which parse with the
+/// default full level) select prepares that stamp cargo records, which a
+/// buck run's consumers would then refuse late and obscurely. Buck in
+/// those selections earns admission by threading the mode through their
+/// producers, not by falling through to cargo here.
+///
+/// Plan-only invocations (`show_plan`: --show-plan, --show-plan-json,
+/// --write-constructed-dag, --write-generated-plan) are exempt: they
+/// print a plan and execute no node, and the validation's own tooling
+/// (run-split-validate's fetch phase, check-shard-coverage) probes the
+/// hosted-portable plan this way from inside a buck run's nodes, where
+/// the ambient build mode is buck. Refusing there would kill the full
+/// buck run at setup.pinned_root_fetch — observed as exit 75 with an
+/// empty detail block — without protecting any prepare.
+fn check_build_mode_selection(
+    build_mode: &str,
+    level: Level,
+    focused: Option<&Focused>,
+    show_plan: bool,
+) -> Result<(), String> {
+    if build_mode != BUILD_MODE_BUCK || show_plan {
+        return Ok(());
+    }
+    match (level, focused) {
+        (Level::Full, None) => Ok(()),
+        (_, Some(focused)) => Err(format!(
+            "--build-mode buck is supported only by an unfocused full run; focused mode --{} (profile {}) prepares its Nextest selections with cargo and has no buck harvest. Rerun unfocused at the full level, or drop --build-mode buck.",
+            focused.cli_name(),
+            focused.profile()
+        )),
+        (level, None) => Err(format!(
+            "--build-mode buck is supported only at the full level; level {} prepares its Nextest selections with cargo and has no buck harvest. Rerun at the full level, or drop --build-mode buck.",
+            level.name()
+        )),
+    }
+}
+
 #[cfg(test)]
 mod build_mode_environment_tests {
     use super::*;
@@ -1532,6 +1573,78 @@ mod build_mode_environment_tests {
         // buck mode into unrelated fixture prepares.
         establish_build_mode_environment(None, None).unwrap();
         assert_eq!(std::env::var(BUILD_MODE_ENV).unwrap(), BUILD_MODE_CARGO);
+        // Buck is an unfocused-full mode: every other level and every
+        // focused profile refuses by name, and cargo is admitted in
+        // every selection.
+        for level in [Level::Quick, Level::PortableOnly, Level::Super] {
+            let error = check_build_mode_selection(BUILD_MODE_BUCK, level, None, false).unwrap_err();
+            assert!(error.contains(level.name()), "{error}");
+            assert!(error.contains("only at the full level"), "{error}");
+            check_build_mode_selection(BUILD_MODE_CARGO, level, None, false).unwrap();
+        }
+        check_build_mode_selection(BUILD_MODE_BUCK, Level::Full, None, false).unwrap();
+        check_build_mode_selection(BUILD_MODE_CARGO, Level::Full, None, false).unwrap();
+        for focused in [Focused::PrivilegedOnly, Focused::HostedPortable] {
+            let error =
+                check_build_mode_selection(BUILD_MODE_BUCK, Level::Full, Some(&focused), false)
+                    .unwrap_err();
+            assert!(error.contains(focused.cli_name()), "{error}");
+            assert!(error.contains("unfocused full"), "{error}");
+            check_build_mode_selection(BUILD_MODE_CARGO, Level::Full, Some(&focused), false)
+                .unwrap();
+            // A plan-only probe of the same selection executes nothing and
+            // is admitted in either mode: run-split-validate's fetch phase
+            // and check-shard-coverage probe the hosted plan this way from
+            // inside a buck run's own nodes.
+            check_build_mode_selection(BUILD_MODE_BUCK, Level::Full, Some(&focused), true)
+                .unwrap();
+        }
+        // Parser to policy: the focused flags parse with the default full
+        // level, so the refusal must come from the focused selection, not
+        // the level. --privileged-only executes, so it refuses; the
+        // hosted probe carries --show-plan (its parser guard requires it
+        // or the off-record opt-in), so the same policy admits it as a
+        // plan print and still refuses it as a run (show_plan forced off).
+        let privileged = parse_argv(&[
+            "--privileged-only".into(),
+            "--build-mode".into(),
+            "buck".into(),
+        ])
+        .expect("privileged buck argv parses; policy refuses it");
+        assert_eq!(privileged.level, Level::Full);
+        assert!(!privileged.show_plan);
+        let error = check_build_mode_selection(
+            BUILD_MODE_BUCK,
+            privileged.level,
+            privileged.focused.as_ref(),
+            privileged.show_plan,
+        )
+        .unwrap_err();
+        assert!(error.contains("unfocused full"), "{error}");
+        let hosted_probe = parse_argv(&[
+            "--hosted-portable-only".into(),
+            "--show-plan".into(),
+            "--build-mode".into(),
+            "buck".into(),
+        ])
+        .expect("hosted buck plan argv parses");
+        assert_eq!(hosted_probe.level, Level::Full);
+        assert!(hosted_probe.show_plan);
+        assert_eq!(hosted_probe.build_mode.as_deref(), Some(BUILD_MODE_BUCK));
+        check_build_mode_selection(
+            BUILD_MODE_BUCK,
+            hosted_probe.level,
+            hosted_probe.focused.as_ref(),
+            hosted_probe.show_plan,
+        )
+        .unwrap();
+        assert!(check_build_mode_selection(
+            BUILD_MODE_BUCK,
+            hosted_probe.level,
+            hosted_probe.focused.as_ref(),
+            false,
+        )
+        .is_err());
         // A non-UTF-8 ambient value refuses by variable name for both
         // variables, instead of collapsing to unset.
         #[cfg(unix)]
@@ -1672,8 +1785,11 @@ fn usage() -> &'static str {
      \x20                  HERMIT_VALIDATE_BUILD_MODE). buck substitutes Buck-built\n\
      \x20                  detcore test binaries into the test.detcore_* selections\n\
      \x20                  (exact name-set and Cargo-twin case-set equality enforced\n\
-     \x20                  in prepare); a buck run never mints a receipt. Admission\n\
-     \x20                  paths that forward no environment use this flag.\n\
+     \x20                  in prepare); a buck run never mints a receipt. Full level\n\
+     \x20                  only; other levels refuse buck by name. A buck run is\n\
+     \x20                  mixed-mode: the native-exec cohort stays cargo-built\n\
+     \x20                  (the ledger names every cohort's mode). Admission paths\n\
+     \x20                  that forward no environment use this flag.\n\
      \x20 --buck-release DOTSLASH\n\
      \x20                  Build release Hermit with Buck2 through the named absolute\n\
      \x20                  public DotSlash launcher. Cargo remains the default. Buck\n\
@@ -1681,9 +1797,9 @@ fn usage() -> &'static str {
      \x20 HERMIT_VALIDATE_BUILD_MODE=cargo|buck\n\
      \x20                  How tests are compiled. cargo (default) stages through\n\
      \x20                  nextest-binaries. buck harvests Buck-built detcore test\n\
-     \x20                  binaries for the test.detcore_* selections. Any other\n\
-     \x20                  value is refused with exit 2, never silently replaced\n\
-     \x20                  by cargo.\n\
+     \x20                  binaries for the test.detcore_* selections (full level\n\
+     \x20                  only; native-exec stays cargo). Any other value is\n\
+     \x20                  refused with exit 2, never silently replaced by cargo.\n\
      \x20 HERMIT_VALIDATE_RUN_MODE=cargo\n\
      \x20                  Who executes the tests (environment only). cargo is the\n\
      \x20                  only supported run mode until the deferred RUN switch;\n\
@@ -8822,6 +8938,15 @@ mod process_group_scan_marker_tests {
     #[test]
     fn a_boxed_run_refuses_a_callers_process_group_scan_marker() {
         super::process_group_scan_marker_bracket().unwrap();
+    }
+
+    #[test]
+    fn run_dag_keeps_the_committed_engine_and_width_contract() {
+        let root = std::path::Path::new(file!())
+            .parent()
+            .and_then(std::path::Path::parent)
+            .unwrap();
+        super::raw_run_dag_engine_bracket(root).unwrap();
     }
 
     #[test]
@@ -20697,6 +20822,13 @@ mod nextest_timeout_tests {
                 // 2994 after system-utils/procfs-sanitized-paths verify/KVM
                 // left under dh-9j8ue (this PR; Detcore refuses smaps VmFlags
                 // for file mappings while MappingFact carries none).
+                // 2990 after compat/numactl-hardware and compat/numastat left
+                // liteinst and in-guest-trap (four cells) with the no-NUMA
+                // platform (https://github.com/rrnewton/hermit/issues/5269):
+                // their shell wrappers exec, which the in-guest backends
+                // refuse; ptrace and KVM keep proving the new answers.
+                // 2994 again when the direct utility rows restore those four
+                // cells with no wrapper to exec.
                 // 2995 with c-programs/procfs-identity-agreement verify/KVM
                 // (KVM's memory map lists every mapping since Reverie
                 // ce25725f, so the memfd's maps line agrees with stat).
@@ -23714,6 +23846,11 @@ struct LedgerCtx {
     /// runner's cells execute the same validate-profile target/validate/hermit,
     /// built on the host by `ci/buck-e2e/stage --from-cargo`.
     e2e_runner: &'static str,
+    /// `cargo` or `buck`: the whole-run build mode ([`BUILD_MODE_ENV`]).
+    /// The ledger row pairs it with `prepared_cohort_modes`, the per-cohort
+    /// resolved modes, so a mixed-mode buck run (native-exec pinned to
+    /// cargo) is never read as pure buck.
+    build_mode: String,
     cache_state: String,
     commit: String,
     tree: String,
@@ -27475,6 +27612,13 @@ fn write_ledger_with_snapshot(
         "selection_mode": ctx.selection_mode,
         "release_builder": ctx.release_builder,
         "e2e_runner": ctx.e2e_runner,
+        "build_mode": ctx.build_mode,
+        "prepared_cohort_modes": hermit_manifest_plan::nextest_binaries::cohort_build_modes(
+            &ctx.build_mode,
+        )
+        .into_iter()
+        .map(|(cohort, mode)| (cohort.to_string(), serde_json::Value::String(mode)))
+        .collect::<serde_json::Map<String, serde_json::Value>>(),
         "e2e_payload": e2e_payload_identity(ctx.release_builder),
         "cache_state": ctx.cache_state,
         "commit": ctx.commit,
@@ -30159,6 +30303,16 @@ fn run(
             return RunSummary::refused(2, args.level.name(), "build mode", vec![error]);
         }
     };
+    if let Err(error) =
+check_build_mode_selection(
+            &build_mode,
+            args.level,
+            args.focused.as_ref(),
+            args.show_plan,
+        )
+    {
+        return RunSummary::refused(2, args.level.name(), "build mode", vec![error]);
+    }
 
     let level_name = args.level.name().to_string();
     let root = repo_root();
@@ -31893,6 +32047,7 @@ fn run(
         selection_mode: plan.selection_mode.into(),
         release_builder,
         e2e_runner: args.e2e_runner,
+        build_mode: build_mode.clone(),
         cache_state: cache.into(),
         commit: commit.clone(),
         tree: admitted_context
@@ -32801,6 +32956,7 @@ fn stop_test_seam(
         selection_mode: "full".into(),
         release_builder: RELEASE_BUILDER_CARGO,
         e2e_runner: E2E_RUNNER_CARGO,
+        build_mode: BUILD_MODE_CARGO.into(),
         cache_state: cache_state(root).into(),
         commit,
         tree: git_tree(),
@@ -35975,17 +36131,12 @@ mod prepared_command_tests {
                 .unwrap();
         assert!(prepared_nextest_commands_bracket(host, &changed).is_err());
 
-        for workspace in [pinned] {
-            let payload = guarded_command_source(&workspace.tag(), &workspace.cmd).unwrap();
-            let mut changed = workspace.clone();
-            changed.cmd = bracket_command_with_payload(
-                workspace,
-                &format!("{payload} --planted-after-preparation"),
-            )
-            .unwrap();
-            assert!(prepared_nextest_commands_bracket(&changed, barrier).is_err());
-        }
         let payload = guarded_command_source(&pinned.tag(), &pinned.cmd).unwrap();
+        let mut changed = pinned.clone();
+        changed.cmd =
+            bracket_command_with_payload(pinned, &format!("{payload} --planted-after-preparation"))
+                .unwrap();
+        assert!(prepared_nextest_commands_bracket(&changed, barrier).is_err());
         let changed = outer_decoy(
             pinned,
             &payload.replacen(NEXTEST_FULL_PREPARE_COMMAND, "missing-preparation", 1),
@@ -37573,6 +37724,7 @@ with (root/'calls.jsonl').open('a') as out:
             selection_mode: "selected".into(),
             release_builder: RELEASE_BUILDER_CARGO,
             e2e_runner: E2E_RUNNER_CARGO,
+            build_mode: BUILD_MODE_CARGO.into(),
             cache_state: "cold".into(),
             commit,
             tree,

@@ -1055,12 +1055,7 @@ fn lsan_canary_leak_child() {
 fn asan_runtime_present() -> bool {
     let mut symbol = b"__asan".to_vec();
     symbol.extend_from_slice(b"_init\0");
-    let found = unsafe {
-        libc::dlsym(
-            libc::RTLD_DEFAULT,
-            symbol.as_ptr().cast::<libc::c_char>(),
-        )
-    };
+    let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, symbol.as_ptr().cast::<libc::c_char>()) };
     !found.is_null()
 }
 
@@ -1077,7 +1072,10 @@ fn remove_owner_never_takes_a_non_empty_map() {
     assert_eq!(owners.len(), 1);
     assert_eq!(owners.get(&2), Some(&20), "the live entry must stay put");
 
-    assert!(!remove_owner(&mut owners, &99), "a missing key removes nothing");
+    assert!(
+        !remove_owner(&mut owners, &99),
+        "a missing key removes nothing"
+    );
     assert_eq!(owners.len(), 1);
 }
 

@@ -61,7 +61,24 @@ use serde_json::json;
 const POINTER: &str = "target/ci/m1-allocator-fixtures.path";
 const STACK_POINTER: &str = "target/ci/m2-stack-fixtures.path";
 const COLD_POINTER: &str = "target/ci/cold-stack-fixtures.path";
-const FEATURES: [&str; 1] = ["allocator-fixture"];
+// Since https://github.com/rrnewton/reverie/pull/1375, liteinst is the preload's
+// own feature. This is the FULL site-patching artifact on x86_64; dh-md601
+// replaces it with selectable FULL/TRAP.
+const FEATURES: [&str; 2] = ["allocator-fixture", "liteinst"];
+
+fn leaf_features(standalone: bool) -> Vec<String> {
+    let features: &[&str] = if standalone {
+        &FEATURES
+    } else {
+        // Detcore enables liteinst on its dependency, not on its own package.
+        &["allocator-fixture"]
+    };
+    features
+        .iter()
+        .map(|feature| (*feature).to_owned())
+        .collect()
+}
+
 
 fn require(ok: bool, message: &str) -> Result<()> {
     if ok { Ok(()) } else { Err(message.to_owned()) }
@@ -325,7 +342,7 @@ fn build_leaf(
     }
     let output = run_cargo_build(&mut runner, name, &build_arguments, root)?;
     compiled_sources.verify_unchanged(&mut runner)?;
-    let features: Vec<String> = FEATURES.into_iter().map(str::to_owned).collect();
+    let features = leaf_features(standalone);
     let cargo_artifact = m1_artifact::select_artifact(
         std::str::from_utf8(&output).map_err(|e| e.to_string())?,
         &package,
@@ -904,6 +921,95 @@ fn main() -> ExitCode {
         Err(error) => {
             eprintln!("M1 fixture producer: {error}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standalone_fixture_requires_the_full_feature_set() {
+        let root = std::env::temp_dir().join(format!(
+            "full-fixture-features-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let root = fs::canonicalize(root).unwrap();
+        for name in [
+            "Cargo.toml",
+            "lib.rs",
+            "libreverie_liteinst_preload.so",
+            "libdetcore_liteinst.so",
+        ] {
+            fs::write(root.join(name), b"artifact selection fixture").unwrap();
+        }
+        let package = m1_artifact::PackageIdentity {
+            id: "fixture-preload".into(),
+            name: "reverie-liteinst-preload".into(),
+            manifest: root.join("Cargo.toml"),
+            source: None,
+            target: "reverie_liteinst_preload".into(),
+            kind: vec!["cdylib".into()],
+            crate_types: vec!["cdylib".into()],
+            target_source: root.join("lib.rs"),
+        };
+        let results: Vec<_> = [
+            (true, vec!["allocator-fixture", "liteinst"], true),
+            (true, vec!["allocator-fixture"], false),
+            (
+                true,
+                vec!["allocator-fixture", "liteinst", "unreviewed"],
+                false,
+            ),
+            (false, vec!["allocator-fixture"], true),
+            (false, vec!["allocator-fixture", "liteinst"], false),
+        ]
+        .into_iter()
+        .map(|(standalone, features, accepted)| {
+            let mut package = package.clone();
+            if !standalone {
+                package.name = "detcore-liteinst".into();
+                package.target = "detcore_liteinst".into();
+            }
+            let profile = cargo_profile(!standalone);
+            let output = root.join(format!("lib{}.so", package.target));
+            let expected = leaf_features(standalone);
+            let artifact = json!({
+                "reason": "compiler-artifact", "package_id": package.id,
+                "manifest_path": package.manifest,
+                "target": {"name": package.target, "kind": package.kind,
+                    "crate_types": package.crate_types, "src_path": package.target_source},
+                "features": features, "profile": profile, "fresh": false,
+                "filenames": [output]
+            });
+            let messages = format!(
+                "{artifact}\n{}\n",
+                json!({
+                    "reason": "build-finished", "success": true
+                })
+            );
+            let result =
+                m1_artifact::select_artifact(&messages, &package, &expected, &profile, &root);
+            (features, accepted, result)
+        })
+        .collect();
+        fs::remove_dir_all(root).unwrap();
+        for (features, accepted, result) in results {
+            if accepted {
+                assert!(result.is_ok(), "FULL fixture refused: {result:?}");
+            } else {
+                let error = result.expect_err("non-FULL fixture accepted");
+                assert!(
+                    error.starts_with("artifact feature set differs:"),
+                    "{features:?}: {error}"
+                );
+            }
         }
     }
 }

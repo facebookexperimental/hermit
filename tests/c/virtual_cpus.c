@@ -11,11 +11,12 @@
 // `virtual_cpus counts` prints, one per line, how many CPUs each source a
 // program may size a thread pool from reports: sysconf, glibc's get_nprocs,
 // sched_getaffinity, the CPU lists and directories in /sys, /proc/cpuinfo,
-// /proc/stat, /proc/self/status, node 0, the distinct APIC IDs CPUID reports
-// on each CPU of the affinity mask, the CPUs on which getcpu, sched_getcpu and
+// /proc/stat, /proc/self/status, the distinct APIC IDs CPUID reports on each
+// CPU of the affinity mask, the CPUs on which getcpu, sched_getcpu and
 // /proc/thread-self/stat name the CPU the thread is pinned to, and the
 // distinct CPUs of one unpinned thread per CPU. On a machine of N CPUs every
-// line says N.
+// line says N. (Not node 0's CPU list: Hermit presents a kernel without NUMA,
+// which has no /sys/devices/system/node.)
 //
 // `virtual_cpus affinity` checks sched_setaffinity and what follows from it on
 // the first three CPUs of the caller's mask: a set mask reads back; Linux's
@@ -263,8 +264,6 @@ static int counts(void) {
     printf("/sys/devices/system/cpu/present=%d\n",
            file_list_count("/sys/devices/system/cpu/present"));
     printf("/sys/devices/system/cpu/cpuN=%d\n", cpu_directories());
-    printf("/sys/devices/system/node/node0/cpulist=%d\n",
-           file_list_count("/sys/devices/system/node/node0/cpulist"));
     printf("/proc/cpuinfo processor=%d\n", count_lines("/proc/cpuinfo", "processor", 0));
     printf("/proc/stat cpuN=%d\n", count_lines("/proc/stat", "cpu", 1));
     char allowed[4096];

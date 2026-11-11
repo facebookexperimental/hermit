@@ -1,0 +1,37 @@
+{
+  "name": "reverie-liteinst-artifact",
+  "version": "0.5.5",
+  "id": "git+https://github.com/rrnewton/reverie.git?rev=b539143dd62aa11aa7dd94969f8509a27551beea#reverie-liteinst-artifact@0.5.5",
+  "source": "git+https://github.com/rrnewton/reverie.git?rev=b539143dd62aa11aa7dd94969f8509a27551beea#b539143dd62aa11aa7dd94969f8509a27551beea",
+  "manifest_path": "CHECKOUT/reverie-liteinst-artifact/Cargo.toml",
+  "targets": [
+    {
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ],
+      "name": "reverie_liteinst_artifact",
+      "src_path": "CHECKOUT/reverie-liteinst-artifact/src/lib.rs",
+      "edition": "2021",
+      "doc": true,
+      "doctest": true,
+      "test": true
+    },
+    {
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ],
+      "name": "tls_sources_self_check",
+      "src_path": "CHECKOUT/reverie-liteinst-artifact/tests/tls_sources_self_check.rs",
+      "edition": "2021",
+      "doc": false,
+      "doctest": false,
+      "test": true
+    }
+  ]
+}

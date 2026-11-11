@@ -257,6 +257,29 @@ manifest_is_complete() {
     done
 }
 
+# The allocator qualifier tests resolve the separate Reverie workspace with
+# `cargo metadata --locked --offline` at runtime. Its lockfile is not the
+# generated script workspace's build dependency graph. Prepare those exact
+# sources in the active Cargo home even when the harness binaries are reused;
+# the publication stamp deliberately does not bind a particular Cargo home.
+# The pinned-root producer is release-only and publishes no test harnesses.
+# Honor Cargo's existing offline policy: acquisition with missing inputs must
+# fail when the caller requests offline operation, never silently go online.
+if [[ $mode != check && $publication == full ]]; then
+    for source in "${test_entrypoints[@]}"; do
+        if [[ $source == ci/build-liteinst-allocator-fixtures.rs ]]; then
+            runtime_manifest=$ROOT_DIR/reverie/Cargo.toml
+            output=$packages/runtime-metadata-inputs.output
+            if ! cargo fetch --locked --manifest-path "$runtime_manifest" >"$output" 2>&1; then
+                report_cargo_failure "$source" "$runtime_manifest" "$output" \
+                    'prepare offline test inputs for' || exit $?
+            fi
+            cat "$output"
+            break
+        fi
+    done
+fi
+
 if [[ $mode != fetch ]] && manifest_is_complete; then
     if [[ $publication == release-only ]]; then
         printf 'prepare-rust-scripts: reused %d entrypoints (release-only, no test harnesses) from %s\n' \

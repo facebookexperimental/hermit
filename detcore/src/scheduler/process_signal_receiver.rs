@@ -590,7 +590,7 @@ impl Scheduler {
         {
             return Wants::Busy;
         }
-        match self.reliable_pending(thread) {
+        match self.reliable_pending(thread, mask) {
             Some(0) => Wants::Yes,
             Some(_) => Wants::Busy,
             None => Wants::Unknown,
@@ -661,7 +661,7 @@ impl Scheduler {
         // coord7 review of https://github.com/rrnewton/hermit/pull/5221,
         // finding 2). It is busy only for a signal it was not woken for.
         let woken_for = self.committed_own_signal_wake(thread).unwrap_or(0);
-        match self.reliable_pending(thread) {
+        match self.reliable_pending(thread, mask) {
             Some(pending) if pending & !woken_for != 0 => Wants::Busy,
             _ => Wants::Yes,
         }
@@ -727,18 +727,25 @@ impl Scheduler {
         Some(mask & !self.sigtimedwait_sets.get(&thread).copied().unwrap_or(0))
     }
 
-    /// The signals in `thread`'s own queue that it does not block, when it is
-    /// stopped at a request or parked, without those a host-timed source may
-    /// have posted (`host_timed_signals`) and Reverie's preemption marker,
-    /// which the schedule does not fix, and without a copy Linux discarded as
-    /// it was generated (`discarded_bits`), which the kernel or the backend
-    /// still holds (a traced task's ignored signal is queued whatever its
-    /// disposition) but Linux never queued, so it sets no `TIF_SIGPENDING`.
-    /// A copy that was blocked when generated, and so queued although
-    /// ignored, still counts (the revastra2 review of SIGSHARE S3b's fix
-    /// round, delta F2).
-    fn reliable_pending(&self, thread: DetTid) -> Option<u64> {
-        let mask = self.stopped_thread_mask(thread)?;
+    /// The signals in `thread`'s own queue that the mask in force does not
+    /// block, when it is stopped at a request or parked, without those a
+    /// host-timed source may have posted (`host_timed_signals`) and
+    /// Reverie's preemption marker, which the schedule does not fix, and
+    /// without a copy Linux discarded as it was generated
+    /// (`discarded_bits`), which the kernel or the backend still holds (a
+    /// traced task's ignored signal is queued whatever its disposition) but
+    /// Linux never queued, so it sets no `TIF_SIGPENDING`. A copy that was
+    /// blocked when generated, and so queued although ignored, still counts
+    /// (the revastra2 review of SIGSHARE S3b's fix round, delta F2).
+    ///
+    /// `mask` is the one installed mask Linux's `blocked` holds for the
+    /// thread, already less any `rt_sigtimedwait` set: the same value the
+    /// caller tested the incoming signal against, so both halves of
+    /// `wants_signal` read one mask. A waiting call's temporary mask is
+    /// that mask; the thread's own mask alone would misread a private copy
+    /// the call blocks, or one it admits (the dual review of
+    /// https://github.com/rrnewton/hermit/pull/5259, P1).
+    fn reliable_pending(&self, thread: DetTid, mask: u64) -> Option<u64> {
         let state = self.stopped_thread_signal_state(thread).ok()?;
         let unreliable =
             self.host_timed_signals(thread) | kernel_signal_bit(reverie::PERF_EVENT_SIGNAL as i32);

@@ -3293,7 +3293,7 @@ mod runtime {
                 root.is_absolute(),
                 "HERMIT_AARCH64_TEST_ROOT must be absolute"
             );
-            let root = root.canonicalize().unwrap_or_else(|error| {
+            let root = crate::util::canonicalize(&root).unwrap_or_else(|error| {
                 panic!(
                     "this host cannot run this test: {}: {error}",
                     root.display()

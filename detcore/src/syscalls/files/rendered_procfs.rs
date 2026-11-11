@@ -367,6 +367,21 @@ pub(super) fn proc_device() -> Option<u64> {
     *PROC_DEVICE.get_or_init(|| GuestProcfs::stat(c"/proc").ok().map(|stat| stat.st_dev))
 }
 
+/// The device of the guest's sysfs mount at `/sys`, read once, as
+/// [`proc_device`] is: every file of one sysfs mount has it. `None` where
+/// `/sys` is no sysfs mount (`statfs`'s `SYSFS_MAGIC`): in a container image
+/// that mounts none, and under a user bind over `/sys`, where it is an
+/// ordinary directory, whose files are the guest's own.
+pub(super) fn sys_device() -> Option<u64> {
+    static SYS_DEVICE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *SYS_DEVICE.get_or_init(|| {
+        if !super::procfs_levels::is_on_sysfs(Path::new("/sys")) {
+            return None;
+        }
+        GuestProcfs::stat(c"/sys").ok().map(|stat| stat.st_dev)
+    })
+}
+
 /// Linux's `MAXSYMLINKS` (include/linux/namei.h): `reserve_stack` fails the
 /// 41st symbolic link of one lookup with ELOOP.
 const MAXSYMLINKS: usize = 40;
@@ -3391,7 +3406,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Err(Errno::EINVAL.into());
         }
-        // A process's `smaps`, `smaps_rollup` or `numa_maps` takes the task's
+        // A process's `smaps` or `smaps_rollup` takes the task's
         // memory map at its open (`proc_maps_open`, `smaps_rollup_open`):
         // bind the address space the task holds now where the task is of the
         // opener's own process, whose address space it shares, which its
@@ -4835,7 +4850,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         file.is_process_environ() && !self.serves_exec_strings()
     }
 
-    /// Whether `file` is a process's `smaps`, `smaps_rollup` or `numa_maps`
+    /// Whether `file` is a process's `smaps` or `smaps_rollup`
     /// and the guest's procfs is the kernel's
     /// ([`Detcore::renders_address_space_files`] is false): then every
     /// spelling of every process's, its lookup, metadata and listing
@@ -8487,7 +8502,7 @@ const fn nofollow() -> u64 {
 /// itself: its last component is a rendered file's name or a descriptor
 /// number. A task's `comm` is one only where Detcore may render it
 /// (`renders_comm`: its record is the name's source, package K slice A+),
-/// and a process's `smaps`, `smaps_rollup` and `numa_maps` only where the
+/// and a process's `smaps` and `smaps_rollup` only where the
 /// session renders them (`files.address_space`, package K slice N4).
 /// Elsewhere the kernel serves every one of those, and a path call's
 /// spelling of one (`faccessat(dirfd, "smaps")`, `getxattr`, `chmod`) goes
@@ -8499,12 +8514,8 @@ fn could_name_rendered(path: &Path, files: RenderedFiles, renders_comm: bool) ->
         return false;
     };
     let last = last.as_bytes();
-    let address_space_names = [
-        AddressSpaceFile::Smaps,
-        AddressSpaceFile::SmapsRollup,
-        AddressSpaceFile::NumaMaps,
-    ]
-    .map(AddressSpaceFile::name);
+    let address_space_names =
+        [AddressSpaceFile::Smaps, AddressSpaceFile::SmapsRollup].map(AddressSpaceFile::name);
     rendered_paths(files).any(|rendered| rendered_name(rendered) == last)
         || ProcfsFile::PER_PROCESS_NAMES
             .iter()
@@ -8766,7 +8777,7 @@ mod tests {
     }
 
     /// Where the guest's procfs is the kernel's (ptrace's capabilities),
-    /// every spelling of a process's `smaps`, `smaps_rollup` and `numa_maps`
+    /// every spelling of a process's `smaps` and `smaps_rollup`
     /// is the kernel's, decided from the configuration before any request to
     /// the global tool, as before Detcore rendered them (package K slice N4):
     /// an open's, and a path call's too (`faccessat(dirfd, "smaps")`), which
@@ -8795,7 +8806,7 @@ mod tests {
             for path in [
                 "/proc/self/smaps",
                 "/proc/3/smaps_rollup",
-                "/proc/self/task/3/numa_maps",
+                "/proc/self/task/3/smaps",
             ] {
                 let file = ProcfsFile::from_path(Path::new(path)).expect(path);
                 assert_eq!(
@@ -8831,6 +8842,13 @@ mod tests {
             RenderedFiles::ALL,
             false
         ));
+        // No NUMA: `numa_maps` names no rendered file on any backend.
+        assert!(!could_name_rendered(
+            Path::new("/proc/self/numa_maps"),
+            RenderedFiles::ALL,
+            false
+        ));
+        assert!(ProcfsFile::from_path(Path::new("/proc/self/numa_maps")).is_none());
     }
 
     /// A guest for [`Detcore::bind_task_identity`]: its registers name the

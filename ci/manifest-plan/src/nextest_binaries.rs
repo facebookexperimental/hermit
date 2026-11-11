@@ -140,6 +140,44 @@ impl PreparedCohort {
             Some(_) => unreachable!("from_slug admits only registered cohorts"),
         }
     }
+
+    /// The build mode this cohort is pinned to regardless of the run's
+    /// mode, by cohort name only. The native-exec cohort has no Buck
+    /// harvest twins (option (d) substitutes only the default cohort's
+    /// detcore selections), so its binaries are Cargo-built in every run
+    /// and its record stays cargo-stamped and per-binary truthful; a buck
+    /// run is therefore mixed-mode, which the run record and ledger name
+    /// through [`cohort_build_modes`]. The default cohort follows the run.
+    pub fn pinned_build_mode(self) -> Option<&'static str> {
+        match self.slug {
+            None => None,
+            Some("native-exec") => Some("cargo"),
+            Some(_) => unreachable!("from_slug admits only registered cohorts"),
+        }
+    }
+
+    /// The build mode this cohort's record must name in a run whose mode
+    /// is `run_mode`: the cohort's pin when it has one, else the run mode.
+    pub fn resolve_build_mode(self, run_mode: &str) -> &str {
+        self.pinned_build_mode().unwrap_or(run_mode)
+    }
+}
+
+/// Every registered cohort's resolved build mode for a run in `run_mode`,
+/// as `(cohort name, build mode)` pairs in registration order. This is
+/// the mixed-mode disclosure the run record and ledger carry: a buck run
+/// whose native-exec cohort is pinned to cargo is named mixed, never
+/// pure buck.
+pub fn cohort_build_modes(run_mode: &str) -> Vec<(&'static str, String)> {
+    [DEFAULT_COHORT, NATIVE_EXEC_COHORT]
+        .into_iter()
+        .map(|cohort| {
+            (
+                cohort.name(),
+                cohort.resolve_build_mode(run_mode).to_string(),
+            )
+        })
+        .collect()
 }
 
 /// The cohort whose producer and consumer nodes `materialize` marks, by tag.
@@ -165,6 +203,17 @@ pub fn expected_build_mode() -> Result<String, String> {
         )),
         Err(_) => Ok("cargo".into()),
     }
+}
+
+/// The build mode `cohort`'s prepared record must name in this run: the
+/// whole-run [`expected_build_mode`], overridden by the cohort's pin
+/// ([`PreparedCohort::pinned_build_mode`]). Consumers check through this
+/// so a buck run accepts the native-exec cohort's truthful cargo record
+/// — the exemption is by cohort name only, never a general mode waive.
+pub fn expected_build_mode_for(cohort: PreparedCohort) -> Result<String, String> {
+    Ok(cohort
+        .resolve_build_mode(&expected_build_mode()?)
+        .to_string())
 }
 
 #[cfg_attr(not(buck_build), path = "../../cargo-guest-binaries.rs")]
@@ -1620,14 +1669,9 @@ fn cargo_output(root: &Path, args: &[String], destination: &Path) -> Result<(), 
 
 /// Runs each `program` (Cargo) command of `listings` (arguments, output file), which
 /// must compile nothing, such as `nextest list` given both metadata files, up
-/// to `jobs` at a time and without
-/// ci/run-with-reverie-dbt-budget.sh. That wrapper binds the Reverie DBT build
-/// budget to its pin with a pin check of about 0.8 s a call, and a command
-/// that builds nothing has no budget to bind; `run` already starts its
-/// `nextest` this way. Twenty such listings ran one at a time through it in
-/// build.workspace_in_pinned_root, about 16 s of pin checks on the critical
-/// path of every validation. The first failure is returned once every started
-/// listing has finished.
+/// to `jobs` at a time. Listings execute directly because no build source-pin
+/// check is needed. The first failure is returned once every started listing
+/// has finished.
 fn listing_outputs(
     root: &Path,
     program: &std::ffi::OsStr,
@@ -2449,10 +2493,14 @@ pub fn unified_prebuild_command(
 }
 
 /// The exact payload a non-default cohort's prepare node runs: prepare the
-/// cohort under the run's build mode, then assert the published record, so
-/// every consumer's ancestry contains the cohort check by construction.
-/// The cohort's compile node built its test executables first (the prepare
-/// listings then compile only the test harnesses), mirroring the workspace
+/// cohort, then assert the published record, so every consumer's ancestry
+/// contains the cohort check by construction. A cohort with a pinned build
+/// mode ([`PreparedCohort::pinned_build_mode`]) prepares in that literal
+/// mode in every run — its binaries never come from the Buck harvest, so
+/// forwarding the run's mode would either refuse (buck) or mislabel the
+/// record; an unpinned cohort forwards the run's mode. The cohort's
+/// compile node built its test executables first (the prepare listings
+/// then compile only the test harnesses), mirroring the workspace
 /// compile/prepare split without the unified workspace build: a cohort
 /// selection must never widen to the workspace union.
 pub fn cohort_prepare_command(profile: &str, cohort: PreparedCohort) -> Result<String, String> {
@@ -2464,8 +2512,12 @@ pub fn cohort_prepare_command(profile: &str, cohort: PreparedCohort) -> Result<S
             "profile {profile} lists each selection separately and has no cohort prepare command"
         ));
     }
+    let build_mode = match cohort.pinned_build_mode() {
+        Some(pinned) => pinned.to_string(),
+        None => "\"${HERMIT_VALIDATE_BUILD_MODE:-cargo}\"".to_string(),
+    };
     Ok(format!(
-        "./ci/nextest-binaries.rs prepare {profile} --build-mode \"${{HERMIT_VALIDATE_BUILD_MODE:-cargo}}\" --cohort {slug} && ./ci/nextest-binaries.rs assert {profile} --cohort {slug}"
+        "./ci/nextest-binaries.rs prepare {profile} --build-mode {build_mode} --cohort {slug} && ./ci/nextest-binaries.rs assert {profile} --cohort {slug}"
     ))
 }
 
@@ -2936,11 +2988,14 @@ pub fn prepare(
     // The buck harvest names only the default cohort's detcore selections;
     // no non-default cohort has harvest twins. Refuse by name rather than
     // skip the substitution, which would publish a Cargo record under a
-    // buck build_mode.
+    // buck build_mode. A pinned cohort's producer passes its literal mode
+    // (see cohort_prepare_command), so reaching here with buck means a
+    // caller forwarded the run mode past the pin.
     if build_mode == "buck" && !cohort.is_default() {
         return Err(PreparationError::from(format!(
-            "buck build mode prepares only the default cohort; cohort {} has no buck harvest",
-            cohort.name()
+            "buck build mode prepares only the default cohort; cohort {} has no buck harvest and prepares in its pinned {} mode",
+            cohort.name(),
+            cohort.pinned_build_mode().unwrap_or("cargo")
         )));
     }
     let root = root.canonicalize().map_err(|e| e.to_string())?;
@@ -3309,7 +3364,7 @@ pub fn run(
         &value,
         &format!("prepared Nextest {operation}"),
         cohort,
-        &expected_build_mode()?,
+        &expected_build_mode_for(cohort)?,
         cohort.expected_feature_set(),
     )?;
     let record = artifacts.record_from(value)?;
@@ -3434,7 +3489,7 @@ pub fn assert_profile(
             format!("assert {profile} --prepared-by {producer}")
         },
         cohort,
-        &expected_build_mode()?,
+        &expected_build_mode_for(cohort)?,
         Some(&expected_feature_set),
     )?;
     let record = artifacts.record_from(value)?;
@@ -3467,7 +3522,7 @@ pub fn executable(root: &Path, package: &str, name: &str) -> Result<PathBuf, Str
         &value,
         "prepared executable lookup",
         cohort,
-        &expected_build_mode()?,
+        &expected_build_mode_for(cohort)?,
         cohort.expected_feature_set(),
     )?;
     let record = artifacts.record_from(value)?;
@@ -3550,7 +3605,7 @@ mod tests {
         // A stand-in for Cargo: it records how many listings overlap, prints
         // its arguments as the listing, and fails on request.
         let program = root.join("cargo");
-        fs::write(
+        crate::exec_safe_fs::write_executable(
             &program,
             "#!/bin/sh\n\
              mkdir \"$PWD/running.$$\"\n\
@@ -3559,9 +3614,9 @@ mod tests {
              rmdir \"$PWD/running.$$\"\n\
              echo \"$@\"\n\
              [ \"$1\" != fail ]\n",
+            0o755,
         )
         .unwrap();
-        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
         let listings: Vec<_> = (0..4)
             .map(|index| {
                 (
@@ -3745,8 +3800,7 @@ mod tests {
             for case in cases {
                 body.push_str(&format!("printf '%s: test\\n' '{case}'\n"));
             }
-            fs::write(path, body).unwrap();
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::exec_safe_fs::write_executable(path, body, 0o755).unwrap();
         }
         let root = std::env::temp_dir().join(format!(
             "harvest-cases-test-{}-{}",
@@ -4134,8 +4188,8 @@ mod tests {
             let target = root.join("custom-target");
             fs::create_dir(&target).unwrap();
             let executable = target.join("fixture-test");
-            fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
-            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::exec_safe_fs::write_executable(&executable, "#!/bin/sh\nexit 0\n", 0o755)
+                .unwrap();
             let package = format!("path+file://{}#fixture@1.0.0", root.display());
             let cargo = serde_json::json!({"target_directory": target, "packages": [{
                 "name": "fixture", "id": package, "source": null,
@@ -4198,8 +4252,8 @@ mod tests {
 
         fn cpu_wrapper(&self) -> CpuWrapperRecord {
             let executable = self.target.join(CPU_WRAPPER_TARGET);
-            fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
-            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::exec_safe_fs::write_executable(&executable, "#!/bin/sh\nexit 0\n", 0o755)
+                .unwrap();
             let metadata = self.root.join("cpu-wrapper.jsonl");
             fs::write(
                 &metadata,
@@ -4261,14 +4315,13 @@ mod tests {
             fs::create_dir_all(source.parent().unwrap()).unwrap();
             fs::write(&source, "source witness\n").unwrap();
             let path = directory.join(name);
-            fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::exec_safe_fs::write_executable(&path, "#!/bin/sh\nexit 0\n", 0o755).unwrap();
             let cargo_origin = if let Some((_, target, _)) = record_workloads::RUST_SOURCES
                 .into_iter()
                 .find(|(alias, _, _)| *alias == name)
             {
                 let origin = fixture.target.join(target);
-                fs::copy(&path, &origin).unwrap();
+                crate::exec_safe_fs::copy(&path, &origin).unwrap();
                 let target =
                     serde_json::json!({"name": target, "kind": ["bin"], "src_path": source});
                 targets.push(target.clone());
@@ -5731,6 +5784,75 @@ mod tests {
         assert!(
             check_prepared_cohort(&default_record, "run", DEFAULT_COHORT, "buck", None).is_err()
         );
+    }
+
+    #[test]
+    fn pinned_cohort_resolves_cargo_in_a_buck_run_by_name_only() {
+        // Option (ii): native-exec is pinned to cargo by cohort name, so a
+        // buck run's consumer expects its truthful cargo record, while the
+        // default cohort still follows the run mode exactly.
+        assert_eq!(NATIVE_EXEC_COHORT.pinned_build_mode(), Some("cargo"));
+        assert_eq!(DEFAULT_COHORT.pinned_build_mode(), None);
+        assert_eq!(NATIVE_EXEC_COHORT.resolve_build_mode("buck"), "cargo");
+        assert_eq!(NATIVE_EXEC_COHORT.resolve_build_mode("cargo"), "cargo");
+        assert_eq!(DEFAULT_COHORT.resolve_build_mode("buck"), "buck");
+        assert_eq!(DEFAULT_COHORT.resolve_build_mode("cargo"), "cargo");
+        // The mixed-mode disclosure names every cohort's resolved mode.
+        assert_eq!(
+            cohort_build_modes("buck"),
+            vec![
+                ("default", "buck".to_string()),
+                ("native-exec", "cargo".to_string())
+            ]
+        );
+        assert_eq!(
+            cohort_build_modes("cargo"),
+            vec![
+                ("default", "cargo".to_string()),
+                ("native-exec", "cargo".to_string())
+            ]
+        );
+        // End to end through the consumer check: the cargo-stamped
+        // native-exec record passes under the buck run's resolved mode,
+        // and a buck-stamped native-exec record (which prepare refuses
+        // to produce) is refused.
+        let native_features = NATIVE_EXEC_COHORT.expected_feature_set().unwrap();
+        let cargo_record = serde_json::json!({
+            "schema": RECORD_SCHEMA, "prepared_for": "full",
+            "cargo_profile": "validate", "build_mode": "cargo",
+            "feature_set": native_features,
+        });
+        check_prepared_cohort(
+            &cargo_record,
+            "prepared Nextest run",
+            NATIVE_EXEC_COHORT,
+            NATIVE_EXEC_COHORT.resolve_build_mode("buck"),
+            Some(native_features),
+        )
+        .unwrap();
+        let buck_record = serde_json::json!({
+            "schema": RECORD_SCHEMA, "prepared_for": "full",
+            "cargo_profile": "validate", "build_mode": "buck",
+            "feature_set": native_features,
+        });
+        assert!(
+            check_prepared_cohort(
+                &buck_record,
+                "prepared Nextest run",
+                NATIVE_EXEC_COHORT,
+                NATIVE_EXEC_COHORT.resolve_build_mode("buck"),
+                Some(native_features),
+            )
+            .is_err()
+        );
+        // The pinned producer command carries the literal mode, never the
+        // run-mode forwarding that prepare would refuse under buck.
+        let command = cohort_prepare_command("full", NATIVE_EXEC_COHORT).unwrap();
+        assert!(
+            command.contains("--build-mode cargo --cohort native-exec"),
+            "{command}"
+        );
+        assert!(!command.contains("HERMIT_VALIDATE_BUILD_MODE"), "{command}");
     }
 
     #[test]

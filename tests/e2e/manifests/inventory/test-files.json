@@ -874,7 +874,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/get_mempolicy_one_node.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/get_mempolicy_one_node.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test get_mempolicy_answers_as_a_one_node_machine compiles this guest, which asks get_mempolicy the questions libnuma asks (MPOL_F_MEMS_ALLOWED, the default policy, refused flag combinations, maxnode 0 and 1, the node of an address) and requires the exact answers of a one-node Linux machine at bitwise parity under hermit run --strict --verify --verify-strict (https://github.com/rrnewton/hermit/issues/4214: MPOL_F_MEMS_ALLOWED left the node mask unwritten); it remains a guest fixture because a generic manifest cannot assert this exact output."
+      "why": "tests/c/get_mempolicy_one_node.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test memory_policy_syscalls_answer_enosys_as_without_numa compiles this guest, which asks get_mempolicy the questions libnuma asks (MPOL_F_MEMS_ALLOWED, the default policy, refused flag combinations, maxnode 0 and 1, the node of an address) and calls set_mempolicy, mbind, migrate_pages, move_pages and set_mempolicy_home_node, requiring ENOSYS from every one at bitwise parity under hermit run --strict --verify --verify-strict, as on the kernel built without NUMA that Hermit presents (https://github.com/rrnewton/hermit/issues/5269); it remains a guest fixture because a generic manifest cannot assert this exact output."
     },
     {
       "disposition": "manifest-test",
@@ -2128,7 +2128,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/process_signal_target.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/process_signal_target.c is owned by hermit-cli/tests/cli.rs: a_kernel_sent_process_signal_reaches_the_thread_linux_chooses_natively_and_on_ptrace compiles this guest, in which the kernel itself sends a three-thread process a process-directed signal (a child's exit SIGCHLD, an ITIMER_REAL expiry or a POSIX timer expiry; the named thread, the walk from curr_target, a thread waiting in sigtimedwait, a busy thread, a thread holding only a copy Linux discarded, a coalesced SIGCHLD that moves no curr_target, an explicitly ignored SIGCHLD that moves none, and a default-ignored SIGCHLD a blocked creator leaves queued that moves it though its receiver discards it), and requires natively, in one run, the thread Linux's complete_signal chooses; on ptrace, at bitwise parity, that thread except where a mode records a known divergence (chld-creator and alrm-leader, issue 4991; suppressed-child-curr, dh-90p9w). Its KVM half arrives with SIGSHARE S3b's flip of kernel_signal_targets_are_predictable on KVM. The guest ends unconfirmed, with no line, when a prerequisite boundary is not reached (SIGSHARE S3b)."
+      "why": "tests/c/process_signal_target.c is owned by hermit-cli/tests/cli.rs: run_kvm_a_kernel_sent_process_signal_reaches_the_thread_linux_chooses and a_kernel_sent_process_signal_reaches_the_thread_linux_chooses_natively_and_on_ptrace compile this guest, in which the kernel itself sends a three-thread process a process-directed signal (a child's exit SIGCHLD, an ITIMER_REAL expiry or a POSIX timer expiry; the named thread, the walk from curr_target, a thread waiting in sigtimedwait, a busy thread, a thread holding only a copy Linux discarded, a coalesced SIGCHLD that moves no curr_target, an explicitly ignored SIGCHLD that moves none, a default-ignored SIGCHLD a blocked creator leaves queued that moves it though its receiver discards it, and a creator waiting in ppoll, pselect or sigsuspend under a temporary mask that lets SIGCHLD in or keeps it out, and a creator in ppoll whose temporary mask blocks a privately pending SIGUSR2), and require natively, in one run, the thread Linux's complete_signal chooses; on KVM and on ptrace, at bitwise parity, that thread except where a mode records a known divergence (ptrace: suppressed-child-curr, issue 5242; chld-ppoll-pending-temp refuses on ptrace, where Detcore chooses the creator and ending its masked ppoll cannot keep the held private copy; KVM: posix-walk, posix-curr-target and posix-busy, a POSIX timer signal other than SIGALRM published with no receiver chosen, issue 4995; chld-busy, a SIGCHLD the KVM backend queues for a child whose exit signal is 0, https://github.com/rrnewton/reverie/issues/1300). The guest ends unconfirmed, with no line, when a prerequisite boundary is not reached (SIGSHARE S3b)."
     },
     {
       "disposition": "manifest-test",
@@ -2477,6 +2477,12 @@
       "path": "tests/c/record_replay_poll_partial_copyout.c",
       "runner": "hermit-cli/tests/record_replay.rs",
       "why": "tests/c/record_replay_poll_partial_copyout.c is owned by hermit-cli/tests/record_replay.rs: The dedicated integration suite compiles this workload and checks partial poll copyout behavior at multiple controlled record/replay boundaries."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_procfs_listing.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_procfs_listing.c is owned by hermit-cli/tests/record_replay.rs: record_replay_omits_numa_maps_from_task_directory_listings compiles this raw-getdents64 guest and runs it under record start --strict --verify --verify-strict on an ordinary directory argument, requiring every task-directory spelling to omit numa_maps while stat (and a process directory's task) stays listed, the ordinary directory's own numa_maps file to stay listed, and opening /proc/self/numa_maps to fail ENOENT, in recording and replay alike (https://github.com/rrnewton/hermit/issues/5269). It stays a fixture because it needs an ordinary directory argument and a record/replay command that a generic manifest does not express."
     },
     {
       "disposition": "guest-fixture",
@@ -3500,6 +3506,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/timed_wait_spread.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/timed_wait_spread.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests run its six modes (nanosleep, relative and absolute clock_nanosleep, a raw futex wait, a condition wait, three staggered condition waits) under --chaos at the same seeds with and without --chaos-timed-wait-spread, assert that the spread changes some seed's outcome, and replay each spread recording with --replay-schedule-from; the guest itself fails any wait that ends before its deadline on its own clock, measured around the call. It remains a guest fixture because a generic manifest cannot compare outcomes across seeds and options."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/timer_coalesce.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/timer_coalesce.c is owned by hermit-cli/tests/cli.rs: posix_timer_entries_are_delivered_as_on_linux_at_bitwise_parity runs each mode (a POSIX timer's entry beside an ordinary copy of its signal, overruns, stale entries, parked and unignored expiries, the order of a signalfd read, the forged SI_TIMER rows) and requires Linux's output at bitwise parity, and posix_timer_entries_hermit_refuses_or_diverges_on_are_named requires the named refusal and the known divergence (https://github.com/rrnewton/hermit/issues/4262). It stays a fixture because a generic manifest cannot assert these per-mode outputs."
@@ -3563,6 +3575,18 @@
       "path": "tests/c/tool_output_protection.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/tool_output_protection.c is owned by hermit-cli/tests/cli.rs: tool_output_respects_page_protection_and_the_private_page runs it under ptrace, --strict and not, and requires that Detcore's syscall outputs respect page protection (https://github.com/rrnewton/reverie/issues/1064): an rt_sigprocmask whose pushed mask the guest aims at an executable read-only page or at the ud2 on Reverie's private page gets EFAULT with the bytes unchanged, and time(tloc) across a writable/read-only page boundary gets EFAULT with none of its eight bytes written. It stays a fixture because a generic manifest cannot compare guest memory before and after against a Hermit-specific expectation (the stack cases differ from native by design)."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/two_child_after_handler.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/two_child_after_handler.c is owned by hermit-cli/tests/cli.rs: two_children_after_a_handler_return_choose_the_creator compiles this guest, in which two children are created before the creator's ppoll, the first exits while it waits, its SIGCHLD handler returns and the ppoll returns EINTR, and only then is the second child released with no new wait or mask change; it prints which thread each handler ran on and requires the creator twice natively, on KVM and on ptrace at bitwise parity, so a delivery frame that survives the first handler (remembering SIGCHLD's automatic handler block) is caught giving the second exit to the worker."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/two_child_slice_burning_handler.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/two_child_slice_burning_handler.c is owned by hermit-cli/tests/cli.rs: two_children_after_a_slice_burning_handler_return_choose_the_creator compiles this guest, in which the first child's SIGCHLD handler burns CPU past a timeslice before returning and the creator makes no syscall between its return and the second child's exit; it requires the creator twice natively, on KVM and on ptrace at bitwise parity, so only a slice boundary can retire what the return left behind and a delivery frame surviving it is caught."
     },
     {
       "disposition": "manifest-test",

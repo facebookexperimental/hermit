@@ -597,6 +597,30 @@ range sets the run's `--max-timeslice` to MAX; give one or the other, and do
 not combine it with `--target-timeslice`. It needs PMU-backed preemption. A
 small MIN makes runs slower, because fine slices mean many preemptions.
 
+Chaos reorders threads but never changes how long a timed wait lasts against
+other threads' work: a sleeping thread wakes when the virtual clock, which
+advances with that work, reaches its deadline. A race ordered by that ratio
+(a test that sleeps while a worker computes, a periodic timer against a
+teardown) therefore changes order only as far as chaos's reordering of the
+other threads moves the clock, and for many programs keeps one order under
+every seed.
+`--chaos-timed-wait-spread=R` ends each sleep, and each futex wait with a
+timeout (in the default precise futex mode), after its remaining duration
+times a seeded factor drawn log-uniformly from `[1/R, R)` (R at most 1000) of the clock's
+progress. When the factor is below one, the clock
+first jumps to the wait's deadline, as if the other threads had been
+descheduled, so the waiter still observes its full duration; above one, the
+wait oversleeps. Poll, epoll and select timeouts and signal timers are not
+spread. A recording stores the spread and seed, and a replay under others is
+refused. With the option, sleeps are registered at the first scheduler pass
+unless `--sleep-registration` says otherwise, so a recording replays with
+`--replay-schedule-from` and the recorded spread and seed, or with
+`--replay-preemptions-from` and `--chaos` as well. A schedule replay refuses a
+recording of sleeps registered when chosen, and spreads no wait it files after
+its schedule has run out, since the run then continues without chaos. `hermit analyze` cannot bisect or
+minimize such a run: its trials replay schedules found under different
+scheduler seeds, and the spread's factors are keyed on the seed.
+
 Advanced investigations can save preemption decisions with
 `--record-preemptions-to=FILE` and replay them with
 `--replay-preemptions-from=FILE`. A record edited after it was recorded (for
@@ -1347,6 +1371,7 @@ that their order decides the failure.
 | `--chaos-timeslice-range=MIN..MAX` | With `--chaos`, draws each slice's mean log-uniformly from MIN..MAX virtual nanoseconds and caps slices at MAX (the run's `--max-timeslice`). Not with `--chaos-seeded-timeslice`, which draws the maximum instead. |
 | `--chaos-timeslice-draw=run` | Discovery mode: draws the run's `--max-timeslice` once from the range (without one, the recommended 1000..200000000), from the scheduler seed. Fine draws make runs much slower. |
 | `--chaos-timeslice-draw=slice` | The default draw: each slice's mean from `--chaos-timeslice-range`, which it needs; what a range alone does. |
+| `--chaos-timed-wait-spread=R` | Ends each sleep and futex timeout after its duration times a seeded factor in `[1/R, R)` (R at most 1000), never before its deadline on the guest's clock. |
 
 A thread that polls with timed waits shorter than a scheduler turn's charge
 (`--scheduler-turn-cost`) would otherwise burn a full charge of virtual time
@@ -1391,6 +1416,69 @@ standard library's reader/writer-lock preference policy. PMU preemption bounds a
 time slice; with `--max-timeslice=disabled`, a thread that never reaches an
 intercepted event can starve its peers. No separate fairness flag is needed for
 the default equal-priority policy.
+
+### The Pinned CPU
+
+A run with a timeslice (or `--pin-threads`) pins its tracer and guest threads to
+one host CPU, chosen from the tracer's allowed set, and reserves that CPU
+against other Hermit runs for its lifetime through two channels:
+
+- an abstract Unix socket named `hermit-pinned-core:<cpu>`, which runs in the
+  same network namespace see;
+- an exclusive `flock` on `<dir>/<cpu>` in a lock directory, by default
+  `/dev/shm/hermit-pinned-cpu`, which every run using that directory sees,
+  whatever its network namespace.
+
+The kernel drops both when the run's processes exit, however they exit, so no
+reservation is ever left behind. A CPU either channel holds counts as held.
+
+`--pinned-cpu-dir=PATH` names another lock directory; `hermit run`,
+`hermit record start` and `hermit replay` all take it, and
+`HERMIT_PINNED_CPU_DIR` is the fallback. It changes only the path: the
+directory must be a real directory (not a symlink) owned by the user, or root's
+shared form. Hermit creates a missing directory private to the user (mode 0700)
+unless it runs as root. For one directory that every user's runs share, create
+the shared form as root:
+
+```bash
+install -d -m 1777 -o root -g root /dev/shm/hermit-pinned-cpu
+```
+
+A lock file another user created and keeps only makes its CPU count as held;
+lock files are made mode 0644, so other users' runs can lock them too.
+
+A container with a private `/dev/shm` (the podman and Docker default) has its
+own copy of the default directory, so its runs coordinate only with runs in the
+same container, and nothing reports that. To coordinate across containers,
+bind-mount one host directory into every container and name it with
+`--pinned-cpu-dir`.
+
+When a run cannot keep every other Hermit run off its CPU, it says so by name
+on stderr, once per invocation (a `--verify` pair prints it once):
+
+| Notice | Meaning |
+| --- | --- |
+| `hermit: warning: cpu-shared:` | Every allowed CPU is held by another Hermit run; this run shares one and runs slower. |
+| `hermit: warning: cpu-unreserved:` | The reservation could not be made; another run may be pinned to the same CPU. |
+| `hermit: warning: cpu-netns-only:` | The lock directory is unusable (the notice says why), so only runs in this network namespace see the reservation. |
+
+`--pinned-cpu=share` (the default) runs anyway with the notice.
+`--pinned-cpu=refuse` refuses the run before the guest starts (exit 122).
+`--pinned-cpu=wait` (600 seconds) or `--pinned-cpu=wait:SECONDS` prints one
+`hermit: waiting up to ... for a CPU` line, then sleeps and retries every
+500 ms until a CPU comes free. If none does within that time, or within
+`--timeout` when that is shorter, it refuses. Each refusal names the CPU set,
+why, and what to do instead. The wait comes before the run's own `--timeout`
+starts, so a wait and the run together can take up to twice `--timeout`.
+`--pinned-cpu-notice=off` (fallback `HERMIT_PINNED_CPU_NOTICE=0`, and taken by
+the same three subcommands) silences the notices without changing placement.
+`hermit record start` and `hermit replay` always use `--pinned-cpu=share`. A run
+manifest (`hermit run --from`) does not record `--pinned-cpu-dir` or
+`--pinned-cpu-notice`, as it does not record `--log-file`: a rerun uses its own
+host's settings. `hermit replay --dap-listen` passes both on to the replay
+`hermit-dap` starts, as `HERMIT_PINNED_CPU_DIR` and `HERMIT_PINNED_CPU_NOTICE`. The CPU is host placement only:
+guest-visible behavior, and `--verify` results, are the same whichever CPU a
+run gets.
 
 ### Exclusive-Loop Rewrite (aarch64)
 

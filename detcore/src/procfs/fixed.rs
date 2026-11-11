@@ -22,7 +22,12 @@
 //!
 //! The tables follow the formats of Linux 7.1, the kernel of the reference
 //! host, where `uname` reports release 5.2.0; the few format changes between
-//! the two are not worth a second copy of each table.
+//! the two are not worth a second copy of each table. That kernel is built
+//! without NUMA (<https://github.com/rrnewton/hermit/issues/5269>), so the
+//! counters Linux compiles only under `CONFIG_NUMA` or
+//! `CONFIG_NUMA_BALANCING` (which depends on it) are in neither
+//! `/proc/vmstat` nor `/proc/zoneinfo`; a test names each one with the line
+//! of Linux's `mm/vmstat.c` that guards it.
 
 use std::path::Path;
 
@@ -91,7 +96,8 @@ pub(crate) enum FixedProcfsFile {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-905): Review the /proc/buddyinfo field policy.
     Buddyinfo,
-    /// `/proc/zoneinfo`: node 0's zones, a page set per CPU.
+    /// `/proc/zoneinfo`: node 0's zones, a page set per CPU, without the
+    /// NUMA counters.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-913): Review host memory-zone accounting normalization.
     Zoneinfo,
@@ -105,7 +111,8 @@ pub(crate) enum FixedProcfsFile {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-951): Review the /proc/key-users quota accounting policy.
     KeyUsers,
-    /// `/proc/vmstat`: the reference kernel's counters.
+    /// `/proc/vmstat`: the reference kernel's counters, without the NUMA
+    /// ones.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-938): Review host VM accounting normalization.
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -495,7 +502,9 @@ fn buddyinfo() -> String {
 }
 
 /// `/proc/zoneinfo` of the reference kernel's node 0, every number zero, with
-/// a page set per CPU.
+/// a page set per CPU. Built without NUMA, the kernel prints no NUMA event
+/// counters for a zone (`zoneinfo_show_print`) and has no promotion counters
+/// among the node's.
 fn zoneinfo(cpus: u32) -> String {
     let pagesets = (0..cpus)
         .map(|cpu| ZONEINFO_PAGESET.replace("@CPU@", &cpu.to_string()))
@@ -520,7 +529,9 @@ fn schedstat(cpus: u32) -> String {
     out
 }
 
-/// `/proc/vmstat` (`vmstat_show`): the reference kernel's counters, each 0.
+/// `/proc/vmstat` (`vmstat_show`): the reference kernel's counters, each 0,
+/// none of them a NUMA counter, which that kernel built without NUMA does not
+/// have (`vmstat_text`).
 fn vmstat() -> String {
     include_str!("tables/vmstat_names.txt")
         .lines()
@@ -728,7 +739,10 @@ mod tests {
         }
 
         let vmstat = contents(FixedProcfsFile::Vmstat);
-        assert_eq!(vmstat.lines().count(), 206);
+        // The reference kernel's 206 counters less its 16 NUMA ones, which a
+        // kernel built without NUMA does not have
+        // (`the_tables_have_no_numa_counters`).
+        assert_eq!(vmstat.lines().count(), 190);
         assert!(
             vmstat
                 .lines()
@@ -758,6 +772,83 @@ mod tests {
             }
         }
         assert!(!zoneinfo.contains('@'), "an unexpanded marker");
+    }
+
+    /// The counters Linux 7.1 has only when built with NUMA, each with the
+    /// line of `mm/vmstat.c` that names it inside the guard leaving it out of
+    /// `vmstat_text` otherwise
+    /// (<https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/mm/vmstat.c?h=v7.1#n1210>).
+    /// `CONFIG_NUMA_BALANCING` needs `CONFIG_NUMA_MIGRATION` (init/Kconfig:1014),
+    /// which needs `CONFIG_NUMA` (mm/Kconfig:635).
+    const NUMA_ONLY_COUNTERS: [(&str, &str, u32); 16] = [
+        // `enum numa_stat_item` (mm/vmstat.c:1210-1217), which
+        // `zoneinfo_show_print` prints for each zone under the same guard
+        // (1809-1814).
+        ("numa_hit", NUMA, 1211),
+        ("numa_miss", NUMA, 1212),
+        ("numa_foreign", NUMA, 1213),
+        ("numa_interleave", NUMA, 1214),
+        ("numa_local", NUMA, 1215),
+        ("numa_other", NUMA, 1216),
+        // Node counters (1271-1275), also in zoneinfo's per-node stats.
+        ("pgpromote_success", BALANCING, 1272),
+        ("pgpromote_candidate", BALANCING, 1273),
+        ("pgpromote_candidate_nrl", BALANCING, 1274),
+        // Events (1340-1343, 1357-1363).
+        ("zone_reclaim_success", NUMA, 1341),
+        ("zone_reclaim_failed", NUMA, 1342),
+        ("numa_pte_updates", BALANCING, 1358),
+        ("numa_huge_pte_updates", BALANCING, 1359),
+        ("numa_hint_faults", BALANCING, 1360),
+        ("numa_hint_faults_local", BALANCING, 1361),
+        ("numa_pages_migrated", BALANCING, 1362),
+    ];
+    const NUMA: &str = "CONFIG_NUMA";
+    const BALANCING: &str = "CONFIG_NUMA_BALANCING";
+
+    /// Neither `/proc/vmstat` nor `/proc/zoneinfo` has a NUMA counter, and
+    /// the counters Linux prints around each guarded block, whatever its
+    /// configuration, are still next to each other.
+    #[test]
+    fn the_tables_have_no_numa_counters() {
+        let vmstat = contents(FixedProcfsFile::Vmstat);
+        let zoneinfo = contents(FixedProcfsFile::Zoneinfo);
+        for (name, guard, source_line) in NUMA_ONLY_COUNTERS {
+            let row = format!("{name} ");
+            let source = format!("{guard}, mm/vmstat.c:{source_line}");
+            assert!(
+                !vmstat.lines().any(|line| line.starts_with(&row)),
+                "/proc/vmstat has {name} ({source})"
+            );
+            assert!(
+                !zoneinfo
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(&row)),
+                "/proc/zoneinfo has {name} ({source})"
+            );
+        }
+        for neighbors in [
+            "nr_unaccepted 0\nnr_inactive_anon 0\n",
+            "nr_swapcached 0\npgdemote_kswapd 0\n",
+            "pgscan_direct_throttle 0\npginodesteal 0\n",
+            "oom_kill 0\npgmigrate_success 0\n",
+        ] {
+            assert!(vmstat.contains(neighbors), "{neighbors:?}");
+        }
+        // The node's statistics, printed with the first populated zone.
+        assert_eq!(
+            zoneinfo
+                .matches("      nr_swapcached 0\n      pgdemote_kswapd 0\n")
+                .count(),
+            1
+        );
+        // Each populated zone's counters end with the last zone counter.
+        assert_eq!(
+            zoneinfo
+                .matches("      nr_unaccepted 0\n  pagesets\n")
+                .count(),
+            3
+        );
     }
 
     /// The tables agree with each other and with the description: a column,

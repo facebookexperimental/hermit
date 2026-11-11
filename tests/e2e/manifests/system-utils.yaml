@@ -1423,10 +1423,11 @@ test:
         ci:
           ptrace: true
           dbt: true
-        # KVM qualified 2026-11-01, once Detcore renders smaps and numa_maps from the backend's
+        # KVM qualified 2026-11-01, once Detcore renders smaps from the backend's
         # memory map: 21 of 21 canonical strict verify pairs (bitwise parity, 1256 INFO records
-        # each side); stdout identical to ptrace's. KVM is disabled under dh-9j8ue below since
-        # Reverie #1319 made the KVM memory map complete.
+        # each side); stdout identical to ptrace's. The guest's numa_maps check
+        # now asserts the file's absence (no-NUMA platform, issue 5269). KVM is disabled under
+        # dh-9j8ue below since Reverie #1319 made the KVM memory map complete.
         compare_io_buffers: true
         rcb_time: false
         rcb_time_disabled_reason: The guest intentionally parses sanitizer outputs whose non-sanitized fields may vary; RCB-derived virtual time would turn legitimate data-dependent assertion work into unrelated INFO timestamp divergence.

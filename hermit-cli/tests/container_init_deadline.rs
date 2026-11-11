@@ -34,6 +34,7 @@ use std::path::Path;
 use std::process::Child;
 use std::process::Command;
 use std::process::Stdio;
+use std::ptr;
 use std::sync::Mutex;
 use std::thread::sleep;
 use std::time::Duration;
@@ -84,18 +85,60 @@ const _: () =
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 /// Fields of `/proc/<pid>/stat` after the comm field, which is parenthesised and
-/// may itself contain spaces and parentheses. Index 0 is `state`, so `session`
-/// (the sixth field overall) is index 3.
+/// may itself contain spaces and parentheses. Index 0 is `state` (the third
+/// field overall), so `session` (the sixth) is index 3 and `num_threads` (the
+/// twentieth) is index 17.
+const STAT_STATE_INDEX: usize = 0;
 const STAT_SESSION_INDEX: usize = 3;
+const STAT_NUM_THREADS_INDEX: usize = 17;
 
-fn session_of(pid: i32) -> Option<i32> {
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after_comm = &stat[stat.rfind(')')? + 1..];
-    after_comm
-        .split_whitespace()
-        .nth(STAT_SESSION_INDEX)?
-        .parse()
-        .ok()
+/// The fields of one `/proc/<pid>/stat` read that these tests use. They come
+/// from a single read, so they describe the same moment.
+#[derive(Debug)]
+struct ProcStat {
+    /// The state letter of the thread-group leader.
+    state: Option<String>,
+    session: Option<i32>,
+    /// The threads the kernel still counts in the group, the leader included.
+    threads: Option<u64>,
+}
+
+impl ProcStat {
+    fn parse(stat: &str) -> Self {
+        let after_comm = stat.rfind(')').map_or("", |end| &stat[end + 1..]);
+        let fields: Vec<&str> = after_comm.split_whitespace().collect();
+        let field = |index: usize| fields.get(index).copied();
+        Self {
+            state: field(STAT_STATE_INDEX).map(str::to_owned),
+            session: field(STAT_SESSION_INDEX).and_then(|session| session.parse().ok()),
+            threads: field(STAT_NUM_THREADS_INDEX).and_then(|threads| threads.parse().ok()),
+        }
+    }
+
+    /// `None` once `pid` is gone from `/proc` altogether.
+    fn read(pid: i32) -> Option<Self> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        Some(Self::parse(&stat))
+    }
+
+    /// Whether the process has exited and only its unreaped exit status is left.
+    ///
+    /// An exited process keeps its `/proc` entry, session included, as a zombie
+    /// (`Z`) until its parent reaps it. A container init that outlives its
+    /// `hermit` parent is reparented, and under a PID 1 that never reaps
+    /// orphans, as in some test sandboxes, it stays a zombie for good. It runs
+    /// nothing, so it is not a survivor.
+    ///
+    /// The state is the thread-group leader's alone, though: a leader whose own
+    /// thread has exited shows `Z` while the rest of its process runs on. The
+    /// kernel counts every thread it has not yet released in `num_threads`, the
+    /// zombie leader included, so `Z`, or `X` while it is being reaped, means
+    /// exited only when no other thread is left. A line too short to show the
+    /// count never means exited.
+    fn exited(&self) -> bool {
+        matches!(self.state.as_deref(), Some("Z" | "X"))
+            && self.threads.is_some_and(|threads| threads <= 1)
+    }
 }
 
 /// Every live pid in `session`, which is how we see the whole run -- the
@@ -109,7 +152,7 @@ fn pids_in_session(session: i32) -> Vec<i32> {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
             continue;
         };
-        if session_of(pid) == Some(session) {
+        if ProcStat::read(pid).is_some_and(|stat| stat.session == Some(session) && !stat.exited()) {
             pids.push(pid);
         }
     }
@@ -132,8 +175,10 @@ fn is_namespace_init(pid: i32) -> bool {
         })
 }
 
+/// Whether `pid` still has a thread that has not exited; see
+/// [`ProcStat::exited`].
 fn alive(pid: i32) -> bool {
-    Path::new(&format!("/proc/{pid}")).exists()
+    ProcStat::read(pid).is_some_and(|stat| !stat.exited())
 }
 
 fn poll_until<T>(budget: Duration, mut probe: impl FnMut() -> Option<T>) -> Option<T> {
@@ -553,4 +598,179 @@ fn virtual_clock_exhaustion_under_a_scheduler_turn_cost_ends_the_run() {
     );
     assert!(!stderr.contains("unreachable"), "{stderr}");
     assert_session_drains(session, "a run ended by clock exhaustion");
+}
+
+/// A `/proc/<pid>/stat` line, laid out as Linux writes it, for pid 4242 in
+/// session 4242 with the given comm, state and thread count.
+fn stat_line(comm: &str, state: &str, threads: u64) -> String {
+    format!(
+        "4242 ({comm}) {state} 1 4242 4242 0 -1 4194564 120 0 0 0 3 1 0 0 20 0 {threads} 0 \
+         11857783 0 0 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0 0 0 0 0 0 0 0 0 \
+         0 0\n"
+    )
+}
+
+/// The classification behind [`alive`] and [`pids_in_session`], against the
+/// stat lines it has to tell apart.
+#[test]
+fn proc_stat_counts_a_zombie_as_exited_only_once_no_other_thread_is_left() {
+    for (comm, state, threads, exited) in [
+        ("sh", "R", 1, false),
+        ("hermit", "S", 9, false),
+        // An exited process that nobody has reaped, and one being reaped.
+        ("hermit", "Z", 1, true),
+        ("hermit", "X", 0, true),
+        // A leader whose own thread exited while its other threads run on.
+        ("hermit", "Z", 2, false),
+        ("hermit", "Z", 9, false),
+        // A comm may hold spaces and parentheses, even text that reads like
+        // the fields after it.
+        ("a) Z 1 1 1 (b", "S", 1, false),
+        ("a) S 1 1 1 (b", "Z", 1, true),
+    ] {
+        let line = stat_line(comm, state, threads);
+        let stat = ProcStat::parse(&line);
+        assert_eq!(stat.session, Some(4242), "{line}");
+        assert_eq!(stat.exited(), exited, "{line}");
+    }
+    assert!(
+        !ProcStat::parse("4242 (sh) Z 1 4242 4242").exited(),
+        "a line too short to show the thread count must not read as exited"
+    );
+}
+
+/// A child forked from this test process, killed and reaped when dropped so
+/// that a failed assertion cannot leave it behind.
+struct ForkedChild(i32);
+
+impl ForkedChild {
+    /// Forks a child that runs `child` and then exits with status 0. The child
+    /// is a copy of a multithreaded process, so `child` may make only
+    /// async-signal-safe calls.
+    fn spawn(child: impl FnOnce()) -> Self {
+        // SAFETY: the child runs only `child`, which makes async-signal-safe
+        // calls, and then `_exit`, so it never waits on a lock that another
+        // thread of this process held at the fork and runs no destructor or
+        // exit handler copied from it.
+        let pid = unsafe { libc::fork() };
+        if pid == 0 {
+            child();
+            // SAFETY: as above.
+            unsafe { libc::_exit(0) };
+        }
+        assert!(pid > 0, "fork failed: {}", io::Error::last_os_error());
+        Self(pid)
+    }
+
+    /// Polls this child's `/proc/<pid>/stat` until it is in `shape`.
+    fn await_stat(&self, what: &str, shape: impl Fn(&ProcStat) -> bool) -> ProcStat {
+        let pid = self.0;
+        poll_until(STARTUP_BUDGET, || {
+            ProcStat::read(pid).filter(|stat| shape(stat))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "child {pid} never became {what} within {STARTUP_BUDGET:?}; its stat now \
+                 reads {:?}",
+                ProcStat::read(pid)
+            )
+        })
+    }
+}
+
+impl Drop for ForkedChild {
+    fn drop(&mut self) {
+        // SAFETY: `kill` takes a pid and a signal number and touches no caller
+        // memory, and `waitpid` accepts a null status pointer. The pid is our
+        // own child, unreaped until here, so it cannot have been reused.
+        unsafe {
+            libc::kill(self.0, libc::SIGKILL);
+            libc::waitpid(self.0, ptr::null_mut(), 0);
+        }
+    }
+}
+
+/// An exited child that nobody has reaped is what a container init stranded
+/// under a PID 1 that never reaps orphans looks like: still listed in `/proc`,
+/// but running nothing. It must not count as alive, or the tests above whose
+/// outer `hermit` dies first fail wherever that happens.
+#[test]
+fn an_unreaped_zombie_is_not_alive() {
+    let child = ForkedChild::spawn(|| {});
+    let stat = child.await_stat("a zombie", |stat| stat.state.as_deref() == Some("Z"));
+    let pid = child.0;
+    assert!(
+        Path::new(&format!("/proc/{pid}")).exists(),
+        "zombie {pid} should stay listed in /proc until it is reaped"
+    );
+    assert!(
+        stat.exited(),
+        "zombie {pid} has no thread left, so it has exited: {stat:?}"
+    );
+    assert!(!alive(pid), "unreaped zombie {pid} must not count as alive");
+}
+
+/// How long the second thread of the child in
+/// [`a_zombie_leader_with_a_live_thread_is_alive`] sleeps before it exits on
+/// its own, which bounds how long a test process that dies mid-test can leave
+/// that child behind.
+const PARKED_THREAD_LIFETIME_SECS: u32 = 120;
+const _: () = assert!(STARTUP_BUDGET.as_secs() < PARKED_THREAD_LIFETIME_SECS as u64);
+
+/// A process whose leader thread has exited while another of its threads runs
+/// on shows `Z` in `/proc/<pid>/stat`, just as a finished one does. It is
+/// still running, so it must count as alive; otherwise a container init in
+/// that shape would pass these tests while it kept running.
+#[test]
+fn a_zombie_leader_with_a_live_thread_is_alive() {
+    extern "C" fn sleep_then_exit(_: *mut libc::c_void) -> libc::c_int {
+        // SAFETY: `sleep` takes a number of seconds and touches no memory of
+        // ours.
+        unsafe { libc::sleep(PARKED_THREAD_LIFETIME_SECS) };
+        0
+    }
+
+    let mut stack = vec![0u8; 64 * 1024];
+    let top = (stack.as_mut_ptr() as usize + stack.len()) & !15;
+    let child = ForkedChild::spawn(move || {
+        let thread = libc::CLONE_VM
+            | libc::CLONE_FS
+            | libc::CLONE_FILES
+            | libc::CLONE_SIGHAND
+            | libc::CLONE_THREAD
+            | libc::CLONE_SYSVSEM;
+        let status: libc::c_long = 0;
+        // SAFETY: `close_range` closes every descriptor the fork copied, so
+        // this child cannot hold another test's pipe open while it lives.
+        // `clone` then starts a second thread of this process on the
+        // 16-byte-aligned end of `stack`, which nothing else in the child
+        // uses. The raw `exit` system call ends only the calling thread, the
+        // group leader, and does not return.
+        unsafe {
+            libc::syscall(libc::SYS_close_range, 0, libc::c_uint::MAX, 0);
+            if libc::clone(
+                sleep_then_exit,
+                top as *mut libc::c_void,
+                thread,
+                ptr::null_mut(),
+            ) == -1
+            {
+                libc::_exit(1);
+            }
+            libc::syscall(libc::SYS_exit, status);
+        }
+    });
+    let stat = child.await_stat("a zombie leader with one other thread", |stat| {
+        stat.state.as_deref() == Some("Z") && stat.threads == Some(2)
+    });
+    let pid = child.0;
+    assert!(
+        !stat.exited(),
+        "process {pid} still has a running thread, so it has not exited: {stat:?}"
+    );
+    assert!(
+        alive(pid),
+        "process {pid}, whose leader is a zombie but whose other thread runs, must count \
+         as alive"
+    );
 }

@@ -28,16 +28,50 @@
 //!   pause is already parked. Either way the pause returns EINTR.
 //! - A due entry whose owner is blocked in any other wait records a
 //!   determinism loss: Linux would interrupt that wait, and phase 1 cannot.
-//!   That includes a polling wait (`InternalIOPolling` retried after EAGAIN),
-//!   whose thread stays on the run queue between retries. A running thread, or
-//!   one whose filed request has not blocked, takes the entry at its syscall's
-//!   completion; that delivery is the runtime's (later steps).
-//! - Every change happens at a scheduler commit: an expiry, an admission, or
-//!   the sweep that opens step 2. So what is pending, and what is due, is a
-//!   function of the schedule.
+//!   A running thread, or one whose filed request has not blocked, takes the
+//!   entry at its syscall's completion; that delivery is the runtime's.
+//! - One polling wait is modelled instead (dev-hermit dh-ru056 slice 1,
+//!   signal phase-2 design revision 2, section 5.1): a restartable pipe read
+//!   retried after EAGAIN (`InternalIOPolling` with a `read_fd`) on a
+//!   descriptor only guest actions make ready, outside record and replay. The
+//!   entry is reserved to the owner (`ReservedPoll`) and the filed retry made
+//!   runnable. While that probe is unrun, step 3 selects its thread right
+//!   after a group-exit decider (`reserved_probe_to_resume`), so no other
+//!   thread's turn commits between the reservation and the probe. The probe's
+//!   successor request is classified at the next pass's step 2, before the
+//!   sweep (step 1 waits for every queued thread to file), or defensively at
+//!   that request's step-4 head:
+//!   - a retry that moved nothing is replaced by the `InboundSignal` wake, at
+//!     the front of its band (only: a better band or a chaos draw can still
+//!     run first, and the wake grant's own attempt then decides, R1);
+//!   - a retry that moved bytes is a protocol violation charged as a loss
+//!     (G1);
+//!   - a new read of the same descriptor is charged as a loss;
+//!   - any other successor that is not a retry is classified completed
+//!     without further checks: in production the delivery at the read's
+//!     completion, or the request of a scheduler wake that replaced the
+//!     unrun probe (requeued in its band, possibly at the back, not as a
+//!     placed taker). The entry stays pending for delivery at a completion.
+//!
+//!   An unrun probe whose thread is out of the run queue when step 3 begins
+//!   is released with a loss (`release_unqueued_sigalrm_reservation`; no
+//!   production path is known to reach it). Every other polling wait, a read
+//!   that does not pass these checks, an entry whose process already has a
+//!   loss recorded (kept per process: one the runtime reports after a take
+//!   also covers that process's later entries), and a second process's entry
+//!   while one probe is reserved, keep the loss.
+//! - Every change happens at a scheduler commit: an expiry, an admission, the
+//!   step-2 completion check and sweep, the step-3 selection, or the
+//!   successor's step-4 head. So what is pending, what is due, and what is
+//!   reserved is a function of the schedule. One exception, shared with the
+//!   ledger's existing retirement: a thread's retirement
+//!   (`retire_sigalrm_thread`) runs from `logically_kill_thread`, outside the
+//!   turns.
 //!
 //! Nothing publishes a handled SIGALRM until the runtime admits guest
-//! handlers, so this module changes no run today.
+//! handlers; and phase 1 still refuses a pipe read in a handling process
+//! (`sigalrm_phase1::descriptor_class`), so no run reaches the reservation
+//! today.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -56,6 +90,58 @@ use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::SigWrapper;
 
+/// A due SIGALRM entry reserved for one deterministic probe of a
+/// polling pipe read (dh-ru056 slice 1, design revision 2 §5.1):
+/// the entry stays in `pending`; this binds the probe target until
+/// the probe's successor request is classified (at the next pass's
+/// step 2, before the sweep, or at that request's step-4 head), the
+/// target retires, or an unqueued unrun probe is released with a
+/// loss at step 3. Nothing else ends it: a take or a mask
+/// publication that would release it unclassified is deliberately
+/// unreachable, and the owned scheduler code asserts that (G1)
+/// rather than invent restore semantics for the pre-reservation
+/// request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReservedPoll {
+    /// Process whose pending entry is reserved.
+    pub(crate) owner: DetPid,
+    /// Only thread that may consume the reservation, by running
+    /// the bound probe request.
+    pub(crate) target: DetTid,
+    /// Descriptor-table identity and fd of the bound read request.
+    pub(crate) read_fd: (detcore_model::fd::FilesId, i32),
+    /// Attempt lineage of the probe request as stored for its
+    /// grant: (`poll_attempt == 0`, this `upgraded_from_attempt`).
+    pub(crate) bound_upgraded_from_attempt: u32,
+}
+
+/// How the reserved probe's syscall pass ended, read from the
+/// profile fields of the successor request it filed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReservedProbeOutcome {
+    /// The successor is the next retry of the same read and the
+    /// probe moved no bytes: substitute the wake (section 6 R2).
+    NoProgressRetry,
+    /// The successor is the next retry but the probe moved bytes: a
+    /// single blocking pipe read that moved bytes returns, so this is
+    /// a protocol violation slice 1 charges as a loss (G1).
+    ProgressRetry,
+    /// Any successor that is not a retry of the bound read, not checked
+    /// further: the probe's read ended without the reserved wake. In
+    /// production it is the due entry's delivery filed by the read's
+    /// completion (R1, post-result), or the request of a scheduler wake
+    /// that replaced the unrun probe, requeued in its band (a cross-task
+    /// drain wake goes to the back of it) rather than as a placed taker.
+    /// Records no loss; the entry stays pending for delivery at a
+    /// completion.
+    Completed,
+    /// The successor is a first attempt of another lineage on the same
+    /// descriptor: a new read began after a completion that delivered
+    /// no due entry, which the completion path never does with an entry
+    /// due (section 5.1 protocol violation). Records a loss.
+    NewRead,
+}
+
 /// The scheduler's record of guest-handled SIGALRMs.
 #[derive(Debug, Default)]
 pub(crate) struct SigalrmLedger {
@@ -71,6 +157,8 @@ pub(crate) struct SigalrmLedger {
     /// attempt count (`upgrade_polled_to_runnable`); cleared when the request
     /// is granted (`clear_nextturn`) or substituted (`force_unblock_thread`).
     polling: BTreeSet<DetTid>,
+    /// The one reserved poll probe, if any (dh-ru056 slice 1).
+    reserved_poll: Option<ReservedPoll>,
     /// Pending entries whose determinism loss is already recorded, so a
     /// stranded entry is reported once.
     lost: BTreeSet<DetPid>,
@@ -97,12 +185,28 @@ impl Scheduler {
         self.sigalrm.pending.contains(&process)
     }
 
+    /// The wake a no-progress reserved probe substitutes: the
+    /// ordinary signal wake, suffixed in the durable marker trail
+    /// so post-hoc audits can see that it came from the
+    /// reserved-probe completion check.
+    fn sigalrm_wake_probe(thread: DetTid) -> Resources {
+        let mut wake = Self::sigalrm_wake(thread);
+        wake.fyi("InboundSignal,SIGALRM (sigalrm wake).sigalrm_wake_probe");
+        wake
+    }
+
     /// Records `process`'s SIGALRM disposition, published by its runtime inside
     /// the turn of the call that changed it. A handler that becomes ignored or
     /// default discards a pending entry, as Linux discards a pending signal that
     /// becomes ignored. The runtime refuses the change to default while an
     /// entry is pending, so a default-acted signal is never discarded here.
     pub(crate) fn set_sigalrm_handled(&mut self, process: DetPid, handled: bool) {
+        if !handled {
+            self.assert_no_reserved_poll_release(
+                process.as_raw(),
+                "its disposition left the handler",
+            );
+        }
         if handled {
             self.sigalrm.handled.insert(process);
         } else {
@@ -252,7 +356,406 @@ impl Scheduler {
     /// runtime inside the turn of the call that changed its mask (and at
     /// handler admission).
     pub(crate) fn set_sigalrm_blocked(&mut self, thread: DetTid, blocked: bool) {
+        if blocked {
+            self.assert_no_reserved_poll_release(thread.as_raw(), "it blocked SIGALRM");
+        }
         self.sigalrm.blocked.insert(thread, blocked);
+    }
+
+    /// Review gate G1: in slice 1 a reservation is never released back to
+    /// `Pending`. The argument rests on this ordering, which the code
+    /// enforces where it says so. The target is single-threaded. From the
+    /// reservation (step 2) until its probe is granted, step 3 selects no
+    /// other thread except a group-exit decider (`reserved_probe_to_resume`),
+    /// and the target itself holds no turn; the probe is a retry inside the
+    /// same read, not a syscall entry, so no mask or disposition publication
+    /// of its own runs in it. If the target is out of the run queue when step
+    /// 3 begins, the reservation is released with a loss, not back to
+    /// `Pending` (`release_unqueued_sigalrm_reservation`). Any successor that
+    /// is not a retry, including the request of a scheduler wake that
+    /// replaced the unrun probe (requeued in its band, possibly at the back),
+    /// is classified completed, without further checks, before it is
+    /// granted, and the entry stays pending. The successor
+    /// request is filed before the next pass's step 2 (step 1 waits for every
+    /// queued thread to file) and classified there, before the sweep, or at
+    /// that request's step-4 head; either way before the request is granted.
+    /// A completed read's successor is its delivery's `InboundSignal` turn
+    /// (`Detcore::complete_syscall`, `deliver_due_sigalrm`), so the take in
+    /// that turn comes after the classification. A publication or take that
+    /// would release the reservation therefore cannot occur; one that does
+    /// is a defect of this argument, which stops the run rather than invent
+    /// restore semantics for the pre-reservation request (design rev.2
+    /// section 5, approval gate G1).
+    fn assert_no_reserved_poll_release(&self, raw: i32, what: &str) {
+        if let Some(reserved) = self.sigalrm.reserved_poll {
+            assert!(
+                reserved.target.as_raw() != raw && reserved.owner.as_raw() != raw,
+                "dh-ru056 slice 1 G1: the reserved pipe-read probe's thread {} would \
+                 release its reservation because {what}; slice 1 keeps release unreachable",
+                reserved.target
+            );
+        }
+    }
+
+    /// The target of the outstanding reserved poll probe, if any.
+    pub(crate) fn sigalrm_reserved_poll_target(&self) -> Option<DetTid> {
+        self.sigalrm.reserved_poll.map(|reserved| reserved.target)
+    }
+
+    /// Record the reservation created by the step-2 reserved-probe
+    /// transition. Asserts the slice-1 single-flight discipline:
+    /// a reservation already being outstanding would mean a second
+    /// reserve raced the first probe, which placed precedence
+    /// forbids by construction.
+    pub(crate) fn record_sigalrm_reserved_poll(&mut self, reserved: ReservedPoll) {
+        assert!(
+            self.sigalrm.reserved_poll.is_none(),
+            "dh-ru056 slice 1: a second reserved poll while one is outstanding"
+        );
+        self.sigalrm.reserved_poll = Some(reserved);
+    }
+
+    /// Take the outstanding reservation: the probe has run and its
+    /// successor request is being classified. This consumes the
+    /// reservation (not the ledger entry, which stays pending
+    /// until its ordinary owner-turn take).
+    pub(crate) fn take_sigalrm_reserved_poll(&mut self) -> Option<ReservedPoll> {
+        self.sigalrm.reserved_poll.take()
+    }
+
+    /// Reserved-probe eligibility for the slice-1 pipe-read shape:
+    /// exactly the request `detcore`'s pipe read files for its
+    /// polling probes (`execute_nonblockable_fd_syscall`): an
+    /// `InternalIOPolling` resource plus `read_fd`, restartable
+    /// (`signal_interrupt_errno` is `ERESTARTSYS`, design rev.2
+    /// section 5.1), with no earlier progress, on a descriptor whose
+    /// readiness only guest actions change (`polls_only_guest_state`,
+    /// and not a named FIFO a process outside the container may hold):
+    /// otherwise whether the probe finds data or the wake substitutes
+    /// would depend on host timing. Any other errno (a deadline wait's
+    /// EINTR, or none) must never be replaced by the restart table's
+    /// outcome. Not under record or replay: there a polled read keeps the
+    /// guest-state authority taken at its entry, which descriptor exports do
+    /// not revoke (`execute_nonblockable_fd_syscall`), and the record/replay
+    /// test the design requires (D6) does not exist yet. Returns the request
+    /// identity to bind, or `None` to keep phase 1's loss.
+    fn reservable_pipe_read(
+        &self,
+        request: &Resources,
+    ) -> Option<(detcore_model::fd::FilesId, i32)> {
+        if request.previous_attempt_made_progress
+            || request.signal_interrupt_errno()
+                != Some(reverie::syscalls::Errno::ERESTARTSYS.into_raw())
+            || !request
+                .resources
+                .contains_key(&ResourceID::InternalIOPolling)
+            || !self.polls_only_guest_state(request)
+            || request.polls_a_named_fifo
+            || self.recordreplay_modes
+        {
+            return None;
+        }
+        request.read_fd
+    }
+
+    /// Reserve `process`'s due entry for one deterministic probe
+    /// of its polling pipe read (dh-ru056 slice 1 §5.1). The filed
+    /// substate is normalized by the same upgrade step 4 applies
+    /// (`upgraded_to_runnable`); the deferred-poller substate
+    /// keeps its stored request untouched and is only restored to
+    /// the run queue. Nothing is substituted here: the probe must
+    /// run first so a writer commit that preceded the expiry is
+    /// observed by the read (R1) instead of being masked by an
+    /// early wake. Returns whether a reservation was created.
+    fn reserve_sigalrm_poll(&mut self, process: DetPid, thread: DetTid) -> bool {
+        // Single flight: another process's probe is outstanding (its
+        // owner's sweep returns before reaching here). Slice 1 holds
+        // one reservation, so this entry keeps phase 1's loss rather
+        // than compete with that probe for placed precedence.
+        if self.sigalrm.reserved_poll.is_some() {
+            return false;
+        }
+        let deferred = self.sigalrm.polling.contains(&thread);
+        let filed = self
+            .next_turns
+            .get(&thread)
+            .and_then(|turn| turn.req.try_read())
+            .filter(|request| request.is_ok())
+            .map(|request| request.unwrap());
+        let Some(mut request) = filed else {
+            return false;
+        };
+        let Some(read_fd) = self.reservable_pipe_read(&request) else {
+            return false;
+        };
+        // The third slice-1 admission gate. Placed precedence is enforced
+        // where step 3 selects (`reserved_probe_to_resume`): the probe
+        // resumes right after a group-exit decider while it is unrun. So
+        // the reservation needs only what that selection and the poller
+        // restore below need: no open selection (the restore is a queue
+        // operation) and the thread queued to run. An entry whose loss is
+        // already recorded is not reserved again: the loss stands, and the
+        // entry is delivered at a completion as before. `lost` is kept per
+        // process, not per entry: a loss the runtime reports after its take
+        // (`DeliveryLost`, `EntryDeliveryUnfaithful`) stays recorded until
+        // the next take, so a later, distinct entry of that process is
+        // refused here too, with no second notice. Fail-closed and
+        // deterministic; phase 1's own rule, which this slice leaves as is.
+        if self.run_queue.tentative_pop_in_progress()
+            || !self.run_queue.contains_tid(thread)
+            || self.sigalrm.lost.contains(&process)
+        {
+            return false;
+        }
+        let bound_upgraded_from_attempt = request.upgraded_from_attempt.max(request.poll_attempt);
+        self.record_sigalrm_reserved_poll(ReservedPoll {
+            owner: process,
+            target: thread,
+            read_fd,
+            bound_upgraded_from_attempt,
+        });
+        if deferred {
+            // Deferred poller: step 4 already rewrote the stored request
+            // to its runnable copy and backed the thread off. Restore its
+            // normal priority and drop its poll deadline (section 5.1);
+            // the stored request is not rewritten.
+            self.run_queue.restore_poller_priority(thread);
+            self.forget_poll_deadline(thread);
+        } else {
+            // Filed substate: normalize with the same upgrade step 4
+            // applies, in place, so the stored request becomes the
+            // runnable probe (attempt 0). In place, not
+            // `substitute_request`: substituting would mint a second
+            // Ivar in between that retired/Cancelled the live
+            // request's response token.
+            request = request.upgraded_to_runnable();
+            let turn = self
+                .next_turns
+                .get_mut(&thread)
+                .expect("reservation target has a filed request");
+            turn.req = crate::ivar::Ivar::full(Ok(request));
+        }
+        debug_assert_eq!(
+            self.reserved_probe_to_resume(),
+            Some((process, thread)),
+            "a new reservation's probe is unrun and queued for step 3"
+        );
+        true
+    }
+
+    /// The reserved probe step 3 resumes next, with its process: the
+    /// outstanding reservation's target while its stored request is still
+    /// the unrun bound probe (`InternalIOPolling` on the bound `read_fd`,
+    /// attempt 0 at the bound lineage) and it is queued. Step 3 selects it
+    /// right after a group-exit decider (design rev.2 section 5, placed
+    /// precedence: the `sigchld_takers` class), ahead of signal takers,
+    /// alarm takers, `rt_sigreturn` continuations and a vfork child, so no
+    /// other thread's turn commits between the reservation and the probe.
+    /// Once the probe is granted, or a wake replaced it, this is `None`.
+    pub(super) fn reserved_probe_to_resume(&self) -> Option<(DetPid, DetTid)> {
+        let reserved = self.unrun_sigalrm_reserved_probe()?;
+        self.run_queue
+            .contains_tid(reserved.target)
+            .then_some((reserved.owner, reserved.target))
+    }
+
+    /// The outstanding reservation while its target's stored request is
+    /// still the unrun bound probe, queued or not.
+    fn unrun_sigalrm_reserved_probe(&self) -> Option<ReservedPoll> {
+        let reserved = self.sigalrm.reserved_poll?;
+        let request = self
+            .next_turns
+            .get(&reserved.target)
+            .and_then(|turn| turn.req.try_read())
+            .and_then(Result::ok)?;
+        let unrun = request
+            .resources
+            .contains_key(&ResourceID::InternalIOPolling)
+            && request.read_fd == Some(reserved.read_fd)
+            && request.poll_attempt == 0
+            && request.upgraded_from_attempt == reserved.bound_upgraded_from_attempt;
+        unrun.then_some(reserved)
+    }
+
+    /// Fails closed on an unrun reserved probe whose thread is out of the
+    /// run queue when step 3 begins: step 3 cannot select it, so its
+    /// precedence would be outlived by every turn committed meanwhile.
+    /// Releases the reservation through the loss path
+    /// (`record_sigalrm_reserved_poll_loss`), never back to `Pending`
+    /// (G1). No production path is known to reach this: the reservation
+    /// needs its thread queued, step 3 selects it next, and its only
+    /// happens-before hold is its own checkpoint, a successor request the
+    /// step-4 head classifies before the hold parks it.
+    pub(super) fn release_unqueued_sigalrm_reservation(&mut self) {
+        let Some(reserved) = self.unrun_sigalrm_reserved_probe() else {
+            return;
+        };
+        if self.run_queue.contains_tid(reserved.target) {
+            return;
+        }
+        self.record_sigalrm_reserved_poll_loss(
+            reserved.owner,
+            reserved.target,
+            "its reserved pipe-read probe left the run queue before it ran",
+        );
+    }
+
+    /// Successor classification of an outstanding reserved probe,
+    /// from the scheduler-owned profile fields of the request the
+    /// probe's syscall pass filed. `None` means no classifiable
+    /// successor has arrived yet: the stored request still reads
+    /// as the bound probe through every observable field (an
+    /// actual retry whose syscall pass already ran differs by
+    /// `poll_attempt`/`upgraded_from_attempt` lineage; a
+    /// completion differs by resource/read_fd shape).
+    fn peek_sigalrm_reserved_poll_result(&self) -> Option<(ReservedPoll, ReservedProbeOutcome)> {
+        let reserved = self.sigalrm.reserved_poll?;
+        let successor = self
+            .next_turns
+            .get(&reserved.target)
+            .and_then(|turn| turn.req.try_read())
+            .filter(|request| request.is_ok())
+            .map(|request| request.unwrap())?;
+        let is_retry = successor
+            .resources
+            .contains_key(&ResourceID::InternalIOPolling)
+            && successor.read_fd == Some(reserved.read_fd);
+        if !is_retry {
+            return Some((reserved, ReservedProbeOutcome::Completed));
+        }
+        if successor.poll_attempt == 0 {
+            if successor.upgraded_from_attempt == reserved.bound_upgraded_from_attempt {
+                // The stored request is still the bound probe itself:
+                // the probe has not granted, so no successor exists
+                // yet to classify.
+                return None;
+            }
+            // A first attempt of another lineage: a new read of the
+            // same descriptor began, so the bound read ended without
+            // its due entry's delivery. A retry of the bound read
+            // advances its lineage.
+            return Some((reserved, ReservedProbeOutcome::NewRead));
+        }
+        Some((
+            reserved,
+            if successor.previous_attempt_made_progress {
+                ReservedProbeOutcome::ProgressRetry
+            } else {
+                ReservedProbeOutcome::NoProgressRetry
+            },
+        ))
+    }
+
+    /// Act on a classified reserved probe at the step-2 completion
+    /// check: substitute the successor retry with the signal wake
+    /// (section 6 R2 wake/state), suffixed
+    /// `.sigalrm_wake_probe` in the durable run-marker trail so a
+    /// substitution before a data-ready probe remains visible.
+    fn act_on_sigalrm_reserved_poll(
+        &mut self,
+        (reserved, outcome): (ReservedPoll, ReservedProbeOutcome),
+    ) {
+        match outcome {
+            ReservedProbeOutcome::ProgressRetry => {
+                // G1: a single blocking pipe read that moved bytes
+                // returns; it cannot still be polling the same read.
+                // Seeing progress here is a protocol violation, not a
+                // state to carry across retries. (Defensive: slice 1
+                // reserves only a read with no earlier progress, and
+                // the probe is its one attempt.)
+                self.record_sigalrm_reserved_poll_loss(
+                    reserved.owner,
+                    reserved.target,
+                    "its reserved pipe-read probe reported progress but re-polled, \
+                     which slice 1 keeps unrepresentable (G1)",
+                );
+            }
+            ReservedProbeOutcome::NoProgressRetry => {
+                let taken = self.take_sigalrm_reserved_poll();
+                debug_assert_eq!(taken, Some(reserved));
+                // The successor retry is still queued (filed by
+                // the probe's syscall pass or the harness);
+                // dequeue it so force-unblock's requeue is its
+                // only queue entry.
+                self.run_queue.remove_tid(reserved.target);
+                // Front of its band only: a thread in a better band,
+                // or a targeted-chaos draw (`force_unblock_thread_at`),
+                // can still run before the wake, and the wake grant's
+                // own attempt then decides (R1: data that arrived in
+                // between is returned). Placed precedence for the wake
+                // itself would break the bound of
+                // https://github.com/rrnewton/hermit/issues/4929 (design
+                // section 5.1 amendment pending with its owner).
+                let requeued = self.force_unblock_thread_at(
+                    reserved.target,
+                    Self::sigalrm_wake_probe(reserved.target),
+                    true,
+                );
+                debug_assert!(
+                    requeued,
+                    "the no-progress wake requeues the reserved probe's thread"
+                );
+            }
+            ReservedProbeOutcome::Completed => {
+                let taken = self.take_sigalrm_reserved_poll();
+                debug_assert_eq!(taken, Some(reserved));
+                // The read ended without a wake: its result stands
+                // (R1) and the entry remains pending for the delivery
+                // at its completion (the successor itself, or the
+                // completion of the call a scheduler wake ended).
+            }
+            ReservedProbeOutcome::NewRead => {
+                self.record_sigalrm_reserved_poll_loss(
+                    reserved.owner,
+                    reserved.target,
+                    "its reserved pipe-read probe's read ended and a new read began \
+                     without the due entry's delivery (section 5.1)",
+                );
+            }
+        }
+    }
+
+    /// Record determinism loss for `process`'s pending entry (the
+    /// reserved-probe completion check's protocol-violation arm).
+    pub(crate) fn record_sigalrm_reserved_poll_loss(
+        &mut self,
+        process: DetPid,
+        thread: DetTid,
+        why: &str,
+    ) {
+        // A consumed reservation whose probe turn then cannot be
+        // accounted for: settle it before recording the loss.
+        if self.sigalrm.reserved_poll.map(|r| r.target) == Some(thread) {
+            let _ = self.take_sigalrm_reserved_poll();
+        }
+        self.record_sigalrm_loss(process, thread, why);
+    }
+
+    /// Settles an outstanding reservation of `thread` when its successor
+    /// request reaches step 4 as the selected head unclassified. In
+    /// production the step-2 check classifies the successor first (step 1
+    /// waits for every queued thread to file), so this is the defensive path
+    /// for a successor filed after that check (G2: still before step 4 can
+    /// defer it). Returns whether the wake was substituted: step 4 must then
+    /// end this turn rather than act on `thread`'s stale retry, so the
+    /// selection step 3 opened is committed first, and the substitution's
+    /// requeue is the thread's only queue entry. A completed or progressed
+    /// probe leaves the selection open and step 4 goes on with the head
+    /// request.
+    pub(super) fn act_on_sigalrm_reserved_head(&mut self, thread: DetTid) -> bool {
+        let Some(element) = self
+            .peek_sigalrm_reserved_poll_result()
+            .filter(|(reserved, _)| reserved.target == thread)
+        else {
+            return false;
+        };
+        let substitutes = element.1 == ReservedProbeOutcome::NoProgressRetry;
+        if substitutes {
+            let popped = self.run_queue.commit_tentative_pop();
+            assert_eq!(popped, thread, "step 4's head is the selected thread");
+        }
+        self.act_on_sigalrm_reserved_poll(element);
+        substitutes
     }
 
     /// Notes that step 4 deferred `thread`'s polling retry `request` as a
@@ -319,6 +822,18 @@ impl Scheduler {
     /// first-pass registration, includes a plain sleep filed in the last pass. It runs before the timed
     /// events, so a sleep that blocked and is now expiring is seen blocked.
     pub(crate) fn step2_sigalrm_ledger(&mut self) {
+        // Reserved-probe completion check (dh-ru056 slice 1 §5.1,
+        // review gate G2): classify the probe's successor request
+        // before the sweep acts on any other entry, and so before
+        // step 4 can defer the successor. A settled reservation is
+        // then free for another process the sweep finds due in a
+        // polling read (single flight). A reservation the sweep
+        // creates below has no successor yet, and a silent
+        // outstanding one means the probe has not granted: either
+        // stays outstanding until a later pass.
+        if let Some(reserved) = self.peek_sigalrm_reserved_poll_result() {
+            self.act_on_sigalrm_reserved_poll(reserved);
+        }
         let pending: Vec<DetPid> = self.sigalrm.pending.iter().copied().collect();
         for process in pending {
             self.act_on_pending_sigalrm(process);
@@ -345,6 +860,7 @@ impl Scheduler {
     /// Takes `process`'s entry for delivery, if it has one and it is due for
     /// `thread`. The caller has checked that `thread` holds the serial grant.
     pub(crate) fn take_sigalrm(&mut self, process: DetPid, thread: DetTid) -> bool {
+        self.assert_no_reserved_poll_release(process.as_raw(), "its entry was taken unclassified");
         if !self.sigalrm.handled.contains(&process)
             || self.sigalrm.blocked.get(&thread) != Some(&false)
             || !self.sigalrm.pending.remove(&process)
@@ -360,6 +876,12 @@ impl Scheduler {
     pub(crate) fn retire_sigalrm_thread(&mut self, thread: DetTid, process: DetPid) {
         self.sigalrm.blocked.remove(&thread);
         self.sigalrm.polling.remove(&thread);
+        // A reservation bound to the retiring thread dies with it:
+        // its probe will never grant, and a stale reservation
+        // would block every later reserve (failed wake, G2).
+        if self.sigalrm.reserved_poll.map(|r| r.target) == Some(thread) {
+            let _ = self.take_sigalrm_reserved_poll();
+        }
         if thread.as_raw() == process.as_raw() {
             self.sigalrm.handled.remove(&process);
             self.sigalrm.pending.remove(&process);
@@ -389,12 +911,22 @@ impl Scheduler {
             }
         }
         if !matches!(self.thread_status(thread), ThreadStatus::NotRunning) {
+            if self.sigalrm_reserved_poll_target() == Some(thread) {
+                // Outstanding reservation: the probe has not yet
+                // produced a successor; leave pending, no loss.
+                return;
+            }
             if self.in_polling_wait(thread) {
-                self.record_sigalrm_loss(
-                    process,
-                    thread,
-                    "a due SIGALRM found it in a polling wait that phase 1 cannot interrupt",
-                );
+                // dh-ru056 slice 1 (§5.1): reserve a deterministic
+                // probe for eligible pipe reads instead of
+                // recording the loss the phase-1 sweep recorded.
+                if !self.reserve_sigalrm_poll(process, thread) {
+                    self.record_sigalrm_loss(
+                        process,
+                        thread,
+                        "a due SIGALRM found it in a polling wait that phase 1 cannot interrupt",
+                    );
+                }
             }
             // Otherwise running, or a filed request that has not blocked: a
             // pause is resolved at its admission, any other call takes the

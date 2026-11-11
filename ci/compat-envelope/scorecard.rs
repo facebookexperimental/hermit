@@ -1725,14 +1725,24 @@ fn default_attempt() -> u64 {
 #[serde(tag = "declaration", rename_all = "snake_case", deny_unknown_fields)]
 enum ExpectedOutputFailure {
     /// Both compared runs printed these bytes, not the declared exact bytes.
-    ExpectedStdout {
+    #[serde(rename = "expected_stdout")]
+    Stdout {
         observed_stdout_bytes: u64,
         observed_stdout_sha256: String,
         declared_stdout_bytes: u64,
         declared_stdout_sha256: String,
     },
+    /// Both compared runs printed these stderr bytes, not the declared exact bytes.
+    #[serde(rename = "expected_stderr")]
+    Stderr {
+        observed_stderr_bytes: u64,
+        observed_stderr_sha256: String,
+        declared_stderr_bytes: u64,
+        declared_stderr_sha256: String,
+    },
     /// Both compared runs printed these bytes, which omit the declared text.
-    ExpectedStdoutContains {
+    #[serde(rename = "expected_stdout_contains")]
+    StdoutContains {
         observed_stdout_bytes: u64,
         observed_stdout_sha256: String,
         declared_text: String,
@@ -1744,7 +1754,7 @@ impl ExpectedOutputFailure {
     /// formatter.
     fn runner_reason(&self) -> String {
         match self {
-            Self::ExpectedStdout {
+            Self::Stdout {
                 observed_stdout_bytes,
                 observed_stdout_sha256,
                 declared_stdout_bytes,
@@ -1756,7 +1766,19 @@ impl ExpectedOutputFailure {
                 *declared_stdout_bytes,
                 declared_stdout_sha256,
             ),
-            Self::ExpectedStdoutContains {
+            Self::Stderr {
+                observed_stderr_bytes,
+                observed_stderr_sha256,
+                declared_stderr_bytes,
+                declared_stderr_sha256,
+            } => hermit_manifest_plan::runner::expected_stderr_mismatch_reason(
+                "first",
+                *observed_stderr_bytes,
+                observed_stderr_sha256,
+                *declared_stderr_bytes,
+                declared_stderr_sha256,
+            ),
+            Self::StdoutContains {
                 observed_stdout_bytes,
                 observed_stdout_sha256,
                 declared_text,
@@ -1771,7 +1793,7 @@ impl ExpectedOutputFailure {
     /// Why a stored record could not have come from the runner, or `None`.
     fn malformation(&self) -> Option<&'static str> {
         match self {
-            Self::ExpectedStdout {
+            Self::Stdout {
                 observed_stdout_bytes,
                 observed_stdout_sha256,
                 declared_stdout_bytes,
@@ -1787,7 +1809,23 @@ impl ExpectedOutputFailure {
                     None
                 }
             }
-            Self::ExpectedStdoutContains {
+            Self::Stderr {
+                observed_stderr_bytes,
+                observed_stderr_sha256,
+                declared_stderr_bytes,
+                declared_stderr_sha256,
+            } => {
+                if !is_sha256(observed_stderr_sha256) || !is_sha256(declared_stderr_sha256) {
+                    Some("a stderr digest is not SHA-256")
+                } else if observed_stderr_bytes == declared_stderr_bytes
+                    && observed_stderr_sha256 == declared_stderr_sha256
+                {
+                    Some("the declared stderr is the observed stderr")
+                } else {
+                    None
+                }
+            }
+            Self::StdoutContains {
                 observed_stdout_sha256,
                 declared_text,
                 ..
@@ -2566,18 +2604,39 @@ impl ResultRow {
                         "it names the {run} run, but the first run of a matched pair printed the same bytes"
                     )));
                 }
-                ExpectedOutputFailure::ExpectedStdout {
+                ExpectedOutputFailure::Stdout {
                     observed_stdout_bytes: observed_bytes,
                     observed_stdout_sha256: observed_sha256,
                     declared_stdout_bytes: declared_bytes,
                     declared_stdout_sha256: declared_sha256,
                 }
             }
+            ExpectedOutputFailureReason::ExactStderr {
+                run,
+                observed_bytes,
+                observed_sha256,
+                declared_bytes,
+                declared_sha256,
+            } => {
+                // The runner names the first run whose stderr differs, and
+                // both runs of a matched report print the same bytes.
+                if run != "first" {
+                    return Err(contradiction(&format!(
+                        "it names the {run} run, but the first run of a matched pair printed the same bytes"
+                    )));
+                }
+                ExpectedOutputFailure::Stderr {
+                    observed_stderr_bytes: observed_bytes,
+                    observed_stderr_sha256: observed_sha256,
+                    declared_stderr_bytes: declared_bytes,
+                    declared_stderr_sha256: declared_sha256,
+                }
+            }
             ExpectedOutputFailureReason::Contains {
                 captured_bytes,
                 captured_sha256,
                 text,
-            } => ExpectedOutputFailure::ExpectedStdoutContains {
+            } => ExpectedOutputFailure::StdoutContains {
                 observed_stdout_bytes: captured_bytes,
                 observed_stdout_sha256: captured_sha256,
                 declared_text: text,
@@ -2586,29 +2645,41 @@ impl ResultRow {
         if let Some(why) = failure.malformation() {
             return Err(contradiction(why));
         }
-        let (ExpectedOutputFailure::ExpectedStdout {
-            observed_stdout_bytes: bytes,
-            observed_stdout_sha256: digest,
-            ..
-        }
-        | ExpectedOutputFailure::ExpectedStdoutContains {
-            observed_stdout_bytes: bytes,
-            observed_stdout_sha256: digest,
-            ..
-        }) = &failure;
+        let (bytes, digest, stderr) = match &failure {
+            ExpectedOutputFailure::Stdout {
+                observed_stdout_bytes,
+                observed_stdout_sha256,
+                ..
+            }
+            | ExpectedOutputFailure::StdoutContains {
+                observed_stdout_bytes,
+                observed_stdout_sha256,
+                ..
+            } => (observed_stdout_bytes, observed_stdout_sha256, false),
+            ExpectedOutputFailure::Stderr {
+                observed_stderr_bytes,
+                observed_stderr_sha256,
+                ..
+            } => (observed_stderr_bytes, observed_stderr_sha256, true),
+        };
         let outputs = report
             .compared_outputs
             .as_ref()
             .ok_or_else(|| contradiction("the matched report records no compared outputs"))?;
         for (run, output) in [("first", &outputs.left), ("second", &outputs.right)] {
-            if output.stdout_bytes != *bytes || &output.stdout_sha256 != digest {
+            let (printed_bytes, printed_sha256, stream) = if stderr {
+                (output.stderr_bytes, &output.stderr_sha256, "stderr")
+            } else {
+                (output.stdout_bytes, &output.stdout_sha256, "stdout")
+            };
+            if printed_bytes != *bytes || printed_sha256 != digest {
                 return Err(contradiction(&format!(
-                    "the report's {run} run printed {} bytes with sha256 {}, not the stdout the reason names",
-                    output.stdout_bytes, output.stdout_sha256
+                    "the report's {run} run printed {} bytes with sha256 {}, not the {stream} the reason names",
+                    printed_bytes, printed_sha256
                 )));
             }
         }
-        if let ExpectedOutputFailure::ExpectedStdoutContains { declared_text, .. } = &failure {
+        if let ExpectedOutputFailure::StdoutContains { declared_text, .. } = &failure {
             // The runner records a capture it cannot read as UTF-8 text as
             // empty, so an empty capture of nonempty output is absent, not
             // other bytes.
@@ -38099,7 +38170,7 @@ mod post_verdict_transaction_tests {
             },
         )]);
         let sha256 = |text: &str| format!("{:x}", Sha256::digest(text.as_bytes()));
-        let exact_failure = ExpectedOutputFailure::ExpectedStdout {
+        let exact_failure = ExpectedOutputFailure::Stdout {
             observed_stdout_bytes: observed.len() as u64,
             observed_stdout_sha256: sha256(observed),
             declared_stdout_bytes: expected.len() as u64,
@@ -38146,7 +38217,7 @@ mod post_verdict_transaction_tests {
                     &expected_stdout_contains_reason(observed, marker),
                 ),
                 "declared expected_stdout_contains",
-                ExpectedOutputFailure::ExpectedStdoutContains {
+                ExpectedOutputFailure::StdoutContains {
                     observed_stdout_bytes: observed.len() as u64,
                     observed_stdout_sha256: sha256(observed),
                     declared_text: marker.into(),
@@ -38345,7 +38416,7 @@ mod post_verdict_transaction_tests {
         let expected = "getrandom[0] a29a84d6\n";
         let undeclared = with_captured_stdout(&undeclared, observed);
         let sha256 = |text: &str| format!("{:x}", Sha256::digest(text.as_bytes()));
-        let failure = ExpectedOutputFailure::ExpectedStdout {
+        let failure = ExpectedOutputFailure::Stdout {
             observed_stdout_bytes: observed.len() as u64,
             observed_stdout_sha256: sha256(observed),
             declared_stdout_bytes: expected.len() as u64,
@@ -38515,7 +38586,7 @@ mod post_verdict_transaction_tests {
             "declared stdout is the observed stdout",
             &id,
             &|_, _, attempt| {
-                attempt.expected_output_failure = Some(ExpectedOutputFailure::ExpectedStdout {
+                attempt.expected_output_failure = Some(ExpectedOutputFailure::Stdout {
                     observed_stdout_bytes: observed.len() as u64,
                     observed_stdout_sha256: sha256(observed),
                     declared_stdout_bytes: observed.len() as u64,
@@ -38524,7 +38595,7 @@ mod post_verdict_transaction_tests {
             },
         );
         refuses("empty declared text", &id, &|_, _, attempt| {
-            attempt.expected_output_failure = Some(ExpectedOutputFailure::ExpectedStdoutContains {
+            attempt.expected_output_failure = Some(ExpectedOutputFailure::StdoutContains {
                 observed_stdout_bytes: observed.len() as u64,
                 observed_stdout_sha256: sha256(observed),
                 declared_text: String::new(),

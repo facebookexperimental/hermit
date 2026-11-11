@@ -91,7 +91,9 @@ thread_local! {
 fn remove_owner<K: Ord, V>(owners: &mut ManuallyDrop<BTreeMap<K, V>>, key: &K) -> bool {
     let removed = owners.remove(key).is_some();
     if owners.is_empty() {
-        drop(std::mem::ManuallyDrop::into_inner(std::mem::take(&mut *owners)));
+        drop(std::mem::ManuallyDrop::into_inner(std::mem::take(
+            &mut *owners,
+        )));
     }
     removed
 }

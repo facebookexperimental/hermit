@@ -1318,6 +1318,7 @@ mod ledger_tests {
                 selection_mode: "full".into(),
                 release_builder: super::super::RELEASE_BUILDER_CARGO,
                 e2e_runner: super::super::E2E_RUNNER_CARGO,
+                build_mode: super::super::BUILD_MODE_CARGO.into(),
                 cache_state: "warm".into(),
                 commit: "535b48a113390f0084eac204b54de67dacc24f29".into(),
                 tree: "d0fc13f45eb671585d1aa26c7fcf3fdb4ca480c7".into(),

@@ -276,7 +276,10 @@ static int list_count(const char* list) {
 }
 
 /* Whether the affinity lines are what sched_getaffinity of `pid` and
- * get_mempolicy(MPOL_F_MEMS_ALLOWED) answer. */
+ * get_mempolicy(MPOL_F_MEMS_ALLOWED) answer. On a kernel without NUMA --
+ * the one Hermit presents -- get_mempolicy itself is ENOSYS and the lines
+ * name its one node, 0, which is the same comparison by that kernel's
+ * answer. */
 static int affinity_as_queries(const char* text, pid_t pid, int* mems) {
   cpu_set_t set;
   CPU_ZERO(&set);
@@ -285,13 +288,22 @@ static int affinity_as_queries(const char* text, pid_t pid, int* mems) {
              field(text, "Cpus_allowed_list", value, sizeof value) &&
              list_count(value) == CPU_COUNT(&set);
   unsigned long nodes[16] = {0};
+  errno = 0;
   long answered = syscall(SYS_get_mempolicy, NULL, nodes, 1024, NULL, MPOL_F_MEMS_ALLOWED);
-  int count = 0;
-  for (size_t i = 0; i < COUNT(nodes); i++) {
-    count += __builtin_popcountl(nodes[i]);
+  int answered_errno = errno;
+  if (answered == 0) {
+    int count = 0;
+    for (size_t i = 0; i < COUNT(nodes); i++) {
+      count += __builtin_popcountl(nodes[i]);
+    }
+    *mems = field(text, "Mems_allowed_list", value, sizeof value) &&
+            list_count(value) == count;
+  } else if (answered_errno == ENOSYS) {
+    *mems = field(text, "Mems_allowed_list", value, sizeof value) &&
+            strcmp(value, "0") == 0;
+  } else {
+    *mems = 0;
   }
-  *mems = answered == 0 && field(text, "Mems_allowed_list", value, sizeof value) &&
-          list_count(value) == count;
   return cpus;
 }
 

@@ -235,6 +235,45 @@ fn assert_deterministic_at_epoch(path: &str, epoch: Option<&str>, validate: impl
     }
 }
 
+/// `path` does not exist for the guest, in every run: `cat` fails with
+/// ENOENT's text. The absent NUMA surfaces
+/// (https://github.com/rrnewton/hermit/issues/5269).
+fn assert_absent(path: &str) {
+    let _guard = hermit_run_lock();
+    for run in 1..=RUNS {
+        let mut command = Command::new(hermit_test::hermit_binary());
+        command.args([
+            "--log=error",
+            "run",
+            "--base-env=minimal",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            "--",
+            "/bin/cat",
+            path,
+        ]);
+        hermit_test::configure_guest_execution(&mut command);
+        let rendered = format!("{command:?}");
+        let output = hermit_test::hermit_output(&rendered, &mut command);
+        assert!(
+            !output.status.success(),
+            "run {run}: {path} read succeeded ({rendered})\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            combined.contains("No such file or directory"),
+            "run {run}: {path} did not fail with ENOENT ({rendered}):\n{combined}"
+        );
+    }
+}
+
 fn first_hwmon_input() -> Option<PathBuf> {
     let mut hwmon_dirs = fs::read_dir("/sys/class/hwmon")
         .ok()?
@@ -311,7 +350,7 @@ fn proc_self_status_is_deterministic() {
         assert!(pid > 0);
         assert!(text.contains("Cpus_allowed:\t00000000,00000000,00000000,00000001\n"));
         assert!(text.contains("Cpus_allowed_list:\t0\n"));
-        assert!(text.contains("Mems_allowed:\t00000000,00000001\n"));
+        assert!(text.contains("Mems_allowed:\t1\n"));
         assert!(text.contains("Mems_allowed_list:\t0\n"));
         assert!(text.contains("voluntary_ctxt_switches:\t0\n"));
         assert!(text.contains("nonvoluntary_ctxt_switches:\t0\n"));
@@ -729,17 +768,17 @@ fn sys_cpu_lists_report_one_virtual_cpu() {
         "/sys/devices/system/cpu/present",
         "/sys/devices/system/cpu/cpu0/topology/thread_siblings_list",
         "/sys/devices/system/cpu/cpu0/topology/package_cpus_list",
-        "/sys/devices/system/node/node0/cpulist",
         "/sys/devices/system/cpu/cpu0/cache/index0/shared_cpu_list",
     ] {
         assert_deterministic(path, |contents| assert_eq!(contents, b"0\n", "{path}"));
     }
-    for path in [
+    assert_deterministic(
         "/sys/devices/system/cpu/cpu0/topology/thread_siblings",
-        "/sys/devices/system/node/node0/cpumap",
-    ] {
-        assert_deterministic(path, |contents| assert_eq!(contents, b"1\n", "{path}"));
-    }
+        |contents| assert_eq!(contents, b"1\n"),
+    );
+    // The node directory's lists and masks are gone with the directory.
+    assert_absent("/sys/devices/system/node/node0/cpulist");
+    assert_absent("/sys/devices/system/node/node0/cpumap");
     for path in ["/proc/interrupts", "/proc/softirqs"] {
         assert_deterministic(path, |contents| {
             let text = std::str::from_utf8(contents).expect("interrupt table should be UTF-8");
@@ -762,16 +801,16 @@ fn sys_cpu_lists_report_one_virtual_cpu() {
     }
 }
 
-/// The CPU and node files that are numbers, flags or node lists describe one
-/// CPU on one node, as on such a machine: the highest supported CPU number
-/// sizes the 128-bit mask `sched_getaffinity` answers with, no SMT sibling is
-/// active or supported, cpu0's topology IDs are 0, the node lists name node 0
-/// and node 0's distances list only its own
-/// (https://github.com/rrnewton/hermit/issues/4160). A file the host kernel
-/// does not have (no SMT control, no NUMA, no cluster ID) is skipped, as the
-/// guest cannot open it either.
+/// The CPU files that are numbers or flags describe one CPU, as on such a
+/// machine: the highest supported CPU number sizes the 128-bit mask
+/// `sched_getaffinity` answers with, no SMT sibling is active or supported,
+/// and cpu0's topology IDs are 0
+/// (https://github.com/rrnewton/hermit/issues/4160). The node files are
+/// absent with their directory, as on a kernel without NUMA. A file the
+/// host kernel does not have (no SMT control, no cluster ID) is skipped,
+/// as the guest cannot open it either.
 #[test]
-fn sys_cpu_numbers_and_node_files_describe_one_cpu_and_node() {
+fn sys_cpu_numbers_describe_one_cpu_and_no_node() {
     for (path, expected) in [
         ("/sys/devices/system/cpu/kernel_max", &b"127\n"[..]),
         ("/sys/devices/system/cpu/enabled", b"0\n"),
@@ -784,19 +823,23 @@ fn sys_cpu_numbers_and_node_files_describe_one_cpu_and_node() {
             "/sys/devices/system/cpu/cpu0/topology/physical_package_id",
             b"0\n",
         ),
-        ("/sys/devices/system/node/online", b"0\n"),
-        ("/sys/devices/system/node/possible", b"0\n"),
-        ("/sys/devices/system/node/has_cpu", b"0\n"),
-        ("/sys/devices/system/node/has_memory", b"0\n"),
-        ("/sys/devices/system/node/has_normal_memory", b"0\n"),
-        ("/sys/devices/system/node/has_generic_initiator", b"\n"),
-        ("/sys/devices/system/node/node0/distance", b"10\n"),
     ] {
         if !Path::new(path).exists() {
             eprintln!("skipping {path}: the host kernel does not have it");
             continue;
         }
         assert_deterministic(path, |contents| assert_eq!(contents, expected, "{path}"));
+    }
+    for path in [
+        "/sys/devices/system/node/online",
+        "/sys/devices/system/node/possible",
+        "/sys/devices/system/node/has_cpu",
+        "/sys/devices/system/node/has_memory",
+        "/sys/devices/system/node/has_normal_memory",
+        "/sys/devices/system/node/has_generic_initiator",
+        "/sys/devices/system/node/node0/distance",
+    ] {
+        assert_absent(path);
     }
 }
 
@@ -831,11 +874,13 @@ fn cpu_count_queries_agree_on_one_virtual_cpu() {
 
 /// `nproc --all` and `getconf _NPROCESSORS_CONF` ask glibc's
 /// `get_nprocs_conf`, which counts the `cpuN` entries of
-/// `/sys/devices/system/cpu`; libnuma counts those and the `nodeN` entries of
-/// `/sys/devices/system/node`. They must list Hermit's one CPU and one node,
-/// as `online` does (https://github.com/rrnewton/hermit/issues/4160).
+/// `/sys/devices/system/cpu`; libnuma counts those and probes
+/// `/sys/devices/system/node`. They must list Hermit's one CPU, as
+/// `online` does (https://github.com/rrnewton/hermit/issues/4160), and no
+/// node directory at all: a kernel without NUMA registers none, so the
+/// third count below (the `node` entries of `/sys/devices/system`) is 0.
 #[test]
-fn cpu_and_node_directories_list_one_cpu_and_node() {
+fn cpu_directory_lists_one_cpu_and_no_node_directory() {
     let _guard = hermit_run_lock();
     let mut command = Command::new(hermit_test::hermit_binary());
     command.args([
@@ -847,7 +892,7 @@ fn cpu_and_node_directories_list_one_cpu_and_node() {
         "-c",
         "nproc --all; getconf _NPROCESSORS_CONF; \
          ls /sys/devices/system/cpu | grep -c '^cpu[0-9]'; \
-         ls /sys/devices/system/node | grep -c '^node[0-9]'; \
+         ls /sys/devices/system | grep -c '^node$'; \
          cd /sys/devices/system && ls cpu | grep '^cpu[0-9]'; \
          ls /sys/bus/cpu/devices",
     ]);
@@ -862,7 +907,7 @@ fn cpu_and_node_directories_list_one_cpu_and_node() {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "1\n1\n1\n1\ncpu0\ncpu0\n"
+        "1\n1\n1\n0\ncpu0\ncpu0\n"
     );
 }
 
@@ -2789,19 +2834,16 @@ fn proc_modules_are_deterministic() {
     }
 }
 
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-865): Review NUMA and hwmon snapshot coverage.
+/// There is no NUMA node accounting to read: the kernel Hermit presents
+/// is built without NUMA, so the node directory itself — and every file
+/// below it, by either spelling — does not exist for the guest, whatever
+/// the host's sysfs holds.
 #[test]
 fn sysfs_numa_accounting_is_deterministic() {
-    assert_deterministic("/sys/devices/system/node/node0/numastat", |contents| {
-        let text = std::str::from_utf8(contents).expect("numastat should be UTF-8");
-        assert!(text.lines().all(|line| line.ends_with(" 0")));
-    });
-    assert_deterministic("/sys/devices/system/node/node0/meminfo", |contents| {
-        let text = std::str::from_utf8(contents).expect("node meminfo should be UTF-8");
-        assert!(text.contains("MemTotal: 1048576 kB\n"));
-        assert!(text.contains("MemFree: 1048576 kB\n"));
-    });
+    assert_absent("/sys/devices/system/node/node0/numastat");
+    assert_absent("/sys/devices/system/node/node0/meminfo");
+    assert_absent("/sys/devices/system/node");
+    assert_absent("/sys/bus/node/devices/node0/numastat");
 }
 
 #[test]

@@ -670,6 +670,14 @@ impl Replayer {
             .find(|thread| *thread != except && threads.contains(thread))
     }
 
+    /// Whether the run has gone past its schedule: every recorded event has
+    /// been replayed and every recorded background start taken, or the replay
+    /// released its schedule. The same notion of "the schedule's end" that
+    /// `has_events_left` gives.
+    pub(super) fn ran_out(&self) -> bool {
+        !self.has_events_left()
+    }
+
     fn peek_next(&self) -> Option<SchedEvent> {
         self.cursor.peek().cloned()
     }
@@ -2347,8 +2355,14 @@ mod tests {
         // A retry that probes with another call matches either number.
         let schedule = vec![
             b.syscall_pre(Sysno::pselect6, SOME_RIP, tid(3)),
+            #[cfg(target_arch = "x86_64")]
             polling(&mut b, Sysno::poll),
+            #[cfg(target_arch = "aarch64")]
+            polling(&mut b, Sysno::ppoll),
+            #[cfg(target_arch = "x86_64")]
             polling(&mut b, Sysno::poll),
+            #[cfg(target_arch = "aarch64")]
+            polling(&mut b, Sysno::ppoll),
             b.syscall_post(Sysno::pselect6, SOME_RIP, tid(3)),
         ];
         let mut replayer = Replayer::new(schedule.clone());

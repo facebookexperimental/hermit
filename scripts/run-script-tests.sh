@@ -64,25 +64,11 @@ declare -A shards=(
 #   validate.rs test except this complete DBT-positive case. Its source
 #   assertions remain intact; third-party nightly registration and execution
 #   are pending, not supplied by this filter.
-# - ci/build-liteinst-allocator-fixtures.rs compiles Reverie's
-#   reverie-liteinst-artifact/src/lib.rs by #[path], so its unit tests run here
-#   too. This one (Reverie 55f3dfce9) runs a factory transaction over the Reverie
-#   workspace it finds at CARGO_MANIFEST_DIR/.., a clean Git checkout with an
-#   offline Cargo cache for its locked metadata. Compiled into the package
-#   ci/prepare-rust-scripts.sh generates, CARGO_MANIFEST_DIR is that package's
-#   deleted temporary directory, not the crate's, so the test cannot name its
-#   workspace here; Reverie's own `cargo test -p reverie-liteinst-artifact`
-#   runs it. Follow-up minibeads dh-ui60v (Reverie, P1): move the test into
-#   reverie-liteinst-artifact/tests/, then drop this entry. The entry requires
-#   the identity to exist, so it holds only with a Reverie pin that has
-#   55f3dfce9 (523d3672 and later).
 declare -A deferred_cases=(
     [scripts/validate.rs]=validate_evidence::tests::requalification_captures_and_publishes_the_committed_owner_without_full_authority
-    [ci/build-liteinst-allocator-fixtures.rs]=m1_artifact::preparation_identity::tests::qualify_transfers_refuses_nonidentity_missing_sources_and_wrong_owned_entry
 )
 declare -A deferred_reasons=(
     [scripts/validate.rs]='core scope, one DBT case deferred'
-    [ci/build-liteinst-allocator-fixtures.rs]='one Reverie-workspace case deferred'
 )
 
 files=()
@@ -302,7 +288,11 @@ done
 
 failed=${#failed_files[@]}
 if [ "$failed" -ne 0 ]; then
-    echo "run-script-tests: ${failed} of ${total} script test suites failed" >&2
+    # Name the failed suites on the final line itself: callers often see
+    # only a bounded tail, where the per-suite FAILED lines have scrolled
+    # away (queue ejection of PR 5340 named no suite).
+    failed_names=$(printf '%s\n' "${!failed_files[@]}" | LC_ALL=C sort | paste -sd ', ' -)
+    echo "run-script-tests: ${failed} of ${total} script test suites failed: ${failed_names}" >&2
     exit 1
 fi
 

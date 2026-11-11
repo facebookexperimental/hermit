@@ -413,6 +413,30 @@ pub const KVM_RATCHET_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 1] = [TimeoutCa
     configured_wall_seconds: 80,
 }];
 
+/// The KVM verify cell of rustc-hello, given a measured budget by fd5b1cc1
+/// ("Give rustc-hello verify/kvm a measured budget for the Reverie 1319 CPU
+/// regression") when Reverie PR 1319 made the KVM memory model track every
+/// mapping change; the fix is tracked in minibeads dh-ss1l0, which restores
+/// the default bound. CPU: the three validate-profile runs that commit
+/// recorded (26.31/26.82/27.15 CPU s), so ceil(1.5 x 27.15) = 41. Wall: that
+/// commit recorded no wall times, so the wall sample is the one passing
+/// queue validation of e4c69917 on 2026-11-09 (35.607 s; that run used
+/// 29.83 CPU s, 73% of the cap). The configured wall is 8 x the CPU cap
+/// under the owner's 2026-11-01 rule, not the p90 wall formula, so this
+/// table stays out of the formula-drift check, like the 2026-10-30 table.
+pub const KVM_2026_11_08_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 1] = [TimeoutCalibration {
+    test: "language-runtimes/rustc-hello",
+    mode: "verify",
+    backend: "kvm",
+    samples: 3,
+    p90_cpu_usec: 27_150_000,
+    p90_wall_millis: 35_607,
+    required_cpu_seconds: 41,
+    required_wall_seconds: 328,
+    configured_cpu_seconds: 41,
+    configured_wall_seconds: 328,
+}];
+
 /// The DBT verify cell of the Python random example, from its 249 passing
 /// result rows in coordinator-launched full validations of 2026-10-11 to
 /// 2026-10-25 (row-level `cpu_usage_usec` and `duration_ms`), after the

@@ -21,7 +21,7 @@
 //! | `Name` | the task's name, as its `stat` shows it, escaped as Linux escapes it |
 //! | `State` | as `stat`'s state letter: `R (running)` for the reader, `Z (zombie)`, else `S (sleeping)` |
 //! | `Tgid`, `Pid`, `PPid`, `NStgid`, `NSpid` | the process table, numbered as the reader's `getpid` and `getppid` answer |
-//! | `Ngid`, `TracerPid`, `Kthread` | 0: Hermit's single virtual NUMA node, Detcore refuses `ptrace` to every guest, and no guest task is a kernel thread |
+//! | `Ngid`, `TracerPid`, `Kthread` | 0: the one node of a kernel without NUMA, Detcore refuses `ptrace` to every guest, and no guest task is a kernel thread |
 //! | `Uid`, `Gid` | Detcore's virtual root, which `getuid`, `geteuid`, `getgid` and `getegid` answer on every backend (0) |
 //! | `Groups` | the reader's own `getgroups` answer: Detcore makes `setgroups` a no-op, so every guest task keeps the groups the run started with |
 //! | `NSpgid`, `NSsid` | Detcore's model, as `getpgid` and `getsid` answer |
@@ -31,7 +31,7 @@
 //! | `CapInh`, `CapPrm`, `CapEff` | `capget` of the task, where the backend answers it |
 //! | `CapBnd`, `CapAmb` | the reader's own `PR_CAPBSET_READ` and `PR_CAP_AMBIENT_IS_SET` answers, for the reader's own task only: no call answers them for another |
 //! | `Cpus_allowed`, `Cpus_allowed_list` | Detcore's affinity, as `sched_getaffinity` answers |
-//! | `Mems_allowed`, `Mems_allowed_list` | node 0, as `get_mempolicy(MPOL_F_MEMS_ALLOWED)` answers |
+//! | `Mems_allowed`, `Mems_allowed_list` | node 0 alone, as a kernel built without NUMA prints them: `1` and `0`, a mask of `MAX_NUMNODES` (1) bits; `get_mempolicy` itself is ENOSYS there |
 //! | `voluntary_ctxt_switches`, `nonvoluntary_ctxt_switches` | 0, as `getrusage` answers |
 //!
 //! A line whose source does not answer for the task is left out: the signal
@@ -308,7 +308,7 @@ pub(crate) fn render_status(status: &TaskStatus) -> Vec<u8> {
             line("Cpus_allowed_list", "0".to_owned());
         }
     }
-    line("Mems_allowed", "00000000,00000001".to_owned());
+    line("Mems_allowed", "1".to_owned());
     line("Mems_allowed_list", "0".to_owned());
     line("voluntary_ctxt_switches", "0".to_owned());
     line("nonvoluntary_ctxt_switches", "0".to_owned());
@@ -429,7 +429,7 @@ mod tests {
             CapEff:\t000001ffffffffff\n\
             Cpus_allowed:\t00000000,00000000,00000000,00000001\n\
             Cpus_allowed_list:\t0\n\
-            Mems_allowed:\t00000000,00000001\n\
+            Mems_allowed:\t1\n\
             Mems_allowed_list:\t0\n\
             voluntary_ctxt_switches:\t0\n\
             nonvoluntary_ctxt_switches:\t0\n";

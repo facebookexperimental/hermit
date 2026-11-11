@@ -990,6 +990,78 @@ fn liteinst_in_guest_noninterrupting_alarms_preserve_sleep_and_pending_state() {
     }
 }
 
+/// A child's exit SIGCHLD that Linux discards (its default action, or
+/// SIG_IGN) or keeps pending (blocked) leaves a `pause` asleep until its
+/// SIGALRM, whose handler runs first, as on Linux; only a caught, unblocked
+/// signal ends a sleep. Before, in-guest LiteInst woke the pause at the
+/// child's exit and it returned EINTR with no handler run
+/// (https://github.com/rrnewton/hermit/issues/5338). Each backend's output is
+/// Linux's, apart from the in-guest backends' refusal (EOPNOTSUPP) of
+/// `waitpid` and `sigtimedwait` in a process with a SIGALRM handler, so the
+/// blocked SIGCHLD that Linux keeps pending is shown taken by
+/// `sigtimedwait` under ptrace only. True patched LiteInst refuses the
+/// handler itself (`liteinst_sigalrm_scalar_identity_keeps_handler_admission_controls`).
+#[test]
+fn liteinst_in_guest_pause_sleeps_through_a_discarded_or_blocked_sigchld() {
+    let _guard = hermit_run_guard();
+    let guest = sigalrm_fixture("liteinst_sigalrm_pause_scheduler_signal");
+    for (mode, linux, in_guest) in [
+        (
+            "default",
+            "default: waitpid=child errno=0\n",
+            "default: waitpid=-1 errno=95\n",
+        ),
+        (
+            "ignored",
+            "ignored: waitpid=-1 errno=10\n",
+            "ignored: waitpid=-1 errno=95\n",
+        ),
+        (
+            "blocked",
+            "blocked: sigtimedwait=17 from_child=1\nblocked: waitpid=child errno=0\n",
+            "blocked: sigtimedwait=-1 errno=95\nblocked: waitpid=-1 errno=95\n",
+        ),
+    ] {
+        let paused = format!("{mode}: pause=-1 errno=4 at_alarm=1 handled_first=1\n");
+        for backend in ["ptrace", "in-guest-trap", "liteinst"] {
+            let rest = if backend == "ptrace" { linux } else { in_guest };
+            let stdout = strict_sigalrm_fixture_run(&guest, backend, Some("1"), "0", mode);
+            assert_eq!(
+                String::from_utf8_lossy(&stdout),
+                format!("{paused}{rest}"),
+                "{backend}/{mode}"
+            );
+        }
+    }
+}
+
+/// A POSIX timer's signal that Linux discards (SIGURG at its default action,
+/// SIGUSR1 set to SIG_IGN) or keeps pending (SIGUSR1 blocked) leaves a
+/// `pause` asleep, so the process dies of its default-fatal SIGALRM at 3 s,
+/// as on Linux. Before, in-guest LiteInst woke the pause at the timer's
+/// expiry and it returned EINTR at 1 s
+/// (https://github.com/rrnewton/hermit/issues/5338).
+#[test]
+fn liteinst_in_guest_pause_sleeps_through_a_discarded_or_blocked_timer_signal() {
+    let _guard = hermit_run_guard();
+    let guest = sigalrm_fixture("liteinst_sigalrm_pause_scheduler_signal");
+    for mode in ["timer-urg", "timer-ignored", "timer-blocked"] {
+        for (backend, patching) in [
+            ("ptrace", "0"),
+            ("in-guest-trap", "0"),
+            ("liteinst", "0"),
+            ("liteinst", "1"),
+        ] {
+            let stdout = strict_sigalrm_fixture_run(&guest, backend, None, patching, mode);
+            assert_eq!(
+                String::from_utf8_lossy(&stdout),
+                format!("{mode}: child_signal=14\n"),
+                "{backend}/{mode} patching={patching}"
+            );
+        }
+    }
+}
+
 /// This bridge covers emulated sleeps, not a running process's alarm. The
 /// existing missing-exit check must still refuse an alarm outside the bridge.
 #[test]

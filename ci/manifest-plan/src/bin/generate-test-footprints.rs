@@ -1167,7 +1167,7 @@ mod tests {
         );
         assert_eq!(
             cargo_command_packages(
-                "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh --workspace --exclude b",
+                "./ci/run-with-core-build.sh ./ci/run-nextest-counted.sh --workspace --exclude b",
                 &all,
                 &defaults
             ),

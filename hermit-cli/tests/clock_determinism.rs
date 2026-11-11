@@ -537,6 +537,10 @@ fn preemption_replay_preserves_equal_rcb_software_callback_boundaries() {
         }
         command
             .arg(format!("--record-preemptions-to={}", record.display()))
+            // This test asserts an empty Hermit stderr; a `--pinned-cpu`
+            // notice (another run holds the CPU) is placement, not what it
+            // checks.
+            .arg("--pinned-cpu-notice=off")
             .arg("--")
             .arg(callback_boundary_guest());
         hermit_binary::configure_guest_execution(&mut command);

@@ -32,7 +32,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         // The hermit_unit selection plus native-exec, prepared in its own
         // cohort (nextest_binaries::NATIVE_EXEC_COHORT) so the feature never
         // enters the default workspace union or the production binary. The
-        // node's filters own exactly the cases this feature adds.
+        // node's filters own exactly the cases this feature adds, plus the
+        // run-config sample-table cases that check its feature-gated options.
         "test.hermit_native_exec" => Some(&[
             "-p",
             "hermit-run",
@@ -720,11 +721,10 @@ fn preparation_profile<'a>(
         return Err(format!("{tag} has duplicate prepared commands"));
     }
     let profile = rest.split_whitespace().next().unwrap_or("");
-    for cohort in [crate::nextest_binaries::NATIVE_EXEC_COHORT] {
-        if let Ok(expected) = crate::nextest_binaries::cohort_prepare_command(profile, cohort) {
-            if expected.strip_prefix(marker) == Some(rest) {
-                return Ok(Some((profile, cohort)));
-            }
+    let cohort = crate::nextest_binaries::NATIVE_EXEC_COHORT;
+    if let Ok(expected) = crate::nextest_binaries::cohort_prepare_command(profile, cohort) {
+        if expected.strip_prefix(marker) == Some(rest) {
+            return Ok(Some((profile, cohort)));
         }
     }
     // The full producer appends `--build-mode "${HERMIT_VALIDATE_BUILD_MODE:-cargo}"`

@@ -225,7 +225,7 @@ fn relative_operands(sysno: Sysno) -> &'static [(usize, usize)] {
     match sysno {
         Sysno::openat
         | Sysno::openat2
-        | Sysno::newfstatat
+        | crate::arch::FSTATAT
         | Sysno::statx
         | Sysno::faccessat
         | Sysno::faccessat2
@@ -237,8 +237,10 @@ fn relative_operands(sysno: Sysno) -> &'static [(usize, usize)] {
         | Sysno::fchmodat2
         | Sysno::fchownat
         | Sysno::utimensat
-        | Sysno::futimesat
         | Sysno::name_to_handle_at => &[(0, 1)],
+        // x86_64 only: aarch64 has no futimesat (utimensat above).
+        #[cfg(target_arch = "x86_64")]
+        Sysno::futimesat => &[(0, 1)],
         Sysno::symlinkat => &[(1, 2)],
         Sysno::renameat | Sysno::renameat2 | Sysno::linkat => &[(0, 1), (2, 3)],
         _ => &[],
@@ -253,24 +255,9 @@ fn relative_operands(sysno: Sysno) -> &'static [(usize, usize)] {
 /// it.
 fn absolute_operands(sysno: Sysno) -> &'static [usize] {
     match sysno {
-        Sysno::open
-        | Sysno::creat
-        | Sysno::stat
-        | Sysno::lstat
-        | Sysno::access
-        | Sysno::readlink
-        | Sysno::chdir
+        Sysno::chdir
         | Sysno::chroot
-        | Sysno::mkdir
-        | Sysno::rmdir
-        | Sysno::unlink
-        | Sysno::chmod
-        | Sysno::chown
-        | Sysno::lchown
         | Sysno::truncate
-        | Sysno::utime
-        | Sysno::utimes
-        | Sysno::mknod
         | Sysno::statfs
         | Sysno::getxattr
         | Sysno::lgetxattr
@@ -280,8 +267,29 @@ fn absolute_operands(sysno: Sysno) -> &'static [usize] {
         | Sysno::llistxattr
         | Sysno::removexattr
         | Sysno::lremovexattr => &[0],
+        // x86_64 only: aarch64 has no non-*at forms of these calls;
+        // its libc uses the *at forms the relative table lists.
+        #[cfg(target_arch = "x86_64")]
+        Sysno::open
+        | Sysno::creat
+        | Sysno::stat
+        | Sysno::lstat
+        | Sysno::access
+        | Sysno::readlink
+        | Sysno::mkdir
+        | Sysno::rmdir
+        | Sysno::unlink
+        | Sysno::chmod
+        | Sysno::chown
+        | Sysno::lchown
+        | Sysno::utime
+        | Sysno::utimes
+        | Sysno::mknod => &[0],
+        #[cfg(target_arch = "x86_64")]
         Sysno::link | Sysno::rename => &[0, 1],
-        Sysno::symlink | Sysno::inotify_add_watch => &[1],
+        #[cfg(target_arch = "x86_64")]
+        Sysno::symlink => &[1],
+        Sysno::inotify_add_watch => &[1],
         _ => &[],
     }
 }
@@ -300,24 +308,26 @@ fn follows_final(sysno: Sysno, args: &syscalls::SyscallArgs, path: usize) -> boo
     const IN_DONT_FOLLOW: i32 = 0x0200_0000;
     let flags = |index: usize| args_flag(args, index);
     match sysno {
-        Sysno::stat
-        | Sysno::access
-        | Sysno::faccessat
+        Sysno::faccessat
         | Sysno::chdir
         | Sysno::chroot
-        | Sysno::chmod
         | Sysno::fchmodat
-        | Sysno::chown
         | Sysno::truncate
-        | Sysno::utime
-        | Sysno::utimes
-        | Sysno::futimesat
         | Sysno::statfs
         | Sysno::getxattr
         | Sysno::setxattr
         | Sysno::listxattr
         | Sysno::removexattr => true,
-        Sysno::newfstatat | Sysno::faccessat2 | Sysno::fchmodat2 | Sysno::utimensat => {
+        // x86_64 only: aarch64 has no non-*at forms (nor futimesat).
+        #[cfg(target_arch = "x86_64")]
+        Sysno::stat
+        | Sysno::access
+        | Sysno::chmod
+        | Sysno::chown
+        | Sysno::utime
+        | Sysno::utimes
+        | Sysno::futimesat => true,
+        crate::arch::FSTATAT | Sysno::faccessat2 | Sysno::fchmodat2 | Sysno::utimensat => {
             flags(3) & libc::AT_SYMLINK_NOFOLLOW == 0
         }
         Sysno::statx => flags(2) & libc::AT_SYMLINK_NOFOLLOW == 0,
@@ -915,8 +925,7 @@ fn placeholder_operand<M: MemoryAccess>(
             )
     };
     match sysno {
-        Sysno::getdents
-        | Sysno::getdents64
+        Sysno::getdents64
         | Sysno::lseek
         | Sysno::fchdir
         | Sysno::fcntl
@@ -945,8 +954,16 @@ fn placeholder_operand<M: MemoryAccess>(
         | Sysno::fallocate
         | Sysno::fadvise64
         | Sysno::readahead
-        | Sysno::sync_file_range
         | Sysno::fstatfs => Some(0),
+        // x86_64 only: aarch64 has getdents64 alone (above).
+        #[cfg(target_arch = "x86_64")]
+        Sysno::getdents | Sysno::sync_file_range => Some(0),
+        // aarch64 number 84 is sys_sync_file_range with the same
+        // (fd, offset, nbytes, flags) order: arm64 does not select
+        // __ARCH_WANT_SYNC_FILE_RANGE2, so the crate's
+        // sync_file_range2 name carries sync_file_range semantics.
+        #[cfg(target_arch = "aarch64")]
+        Sysno::sync_file_range2 => Some(0),
         // A file-backed mapping only: an anonymous one ignores its
         // descriptor argument (`ksys_mmap_pgoff`).
         Sysno::mmap if args.arg3 as i32 & libc::MAP_ANONYMOUS == 0 => Some(4),
@@ -1890,13 +1907,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         let buffer = stack.reserve::<libc::stat>();
         let stack_guard = stack.commit().map_err(|_| Errno::EFAULT)?;
         let looked_up = guest
-            .inject(
-                syscalls::Newfstatat::new()
+            .inject(crate::arch::fstatat_syscall(
+                syscalls::Fstatat::new()
                     .with_dirfd(libc::AT_FDCWD)
                     .with_path(PathPtr::from_ptr(staged.as_raw() as *const libc::c_char))
                     .with_stat(Some(reverie::syscalls::StatPtr(buffer)))
                     .with_flags(nix::fcntl::AtFlags::empty()),
-            )
+            ))
             .await;
         let stat = looked_up.and_then(|_| guest.memory().read_value(buffer));
         drop(stack_guard);
@@ -3406,6 +3423,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::EBADF.into());
         }
         let (buf, capacity, format) = match call {
+            // x86_64 only: aarch64 has Getdents64 alone.
+            #[cfg(target_arch = "x86_64")]
             Syscall::Getdents(c) => (
                 c.dirent().map(|dirent| dirent.cast::<u8>()),
                 c.count() as usize,
@@ -4065,11 +4084,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         // The calls whose descriptor lookup (`fdget`, `fdget_pos`) refuses
         // an `O_PATH` descriptor before they look at anything else.
+        // x86_64 only: aarch64 has getdents64 alone.
+        #[cfg(target_arch = "x86_64")]
+        let x86_only_path_only = matches!(sysno, Sysno::getdents | Sysno::sync_file_range);
+        #[cfg(not(target_arch = "x86_64"))]
+        let x86_only_path_only = false;
+        #[cfg(target_arch = "aarch64")]
+        let aarch64_path_only = sysno == Sysno::sync_file_range2;
+        #[cfg(not(target_arch = "aarch64"))]
+        let aarch64_path_only = false;
         let path_only_refused = state.path_only
-            && matches!(
+            && (matches!(
                 sysno,
-                Sysno::getdents
-                    | Sysno::getdents64
+                Sysno::getdents64
                     | Sysno::lseek
                     | Sysno::read
                     | Sysno::readv
@@ -4084,10 +4111,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     | Sysno::fallocate
                     | Sysno::fadvise64
                     | Sysno::readahead
-                    | Sysno::sync_file_range
                     | Sysno::flistxattr
                     | Sysno::mmap
-            );
+            )
+            || x86_only_path_only
+            // aarch64 number 84: sys_sync_file_range semantics (above).
+            || aarch64_path_only);
         if path_only_refused {
             return Some(Err(Errno::EBADF.into()));
         }
@@ -4114,7 +4143,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Some(answer);
         }
         Some(match call {
-            Syscall::Getdents(_) | Syscall::Getdents64(_)
+            Syscall::Getdents64(_)
                 if matches!(
                     state.directory,
                     PlaceholderDirectory::Root
@@ -4124,6 +4153,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             {
                 self.serve_root_placeholder(guest, call, fd, state).await
             }
+            // x86_64 only: aarch64 has Getdents64 alone.
+            #[cfg(target_arch = "x86_64")]
+            Syscall::Getdents(_)
+                if matches!(
+                    state.directory,
+                    PlaceholderDirectory::Root
+                        | PlaceholderDirectory::Task(_)
+                        | PlaceholderDirectory::System(_)
+                ) =>
+            {
+                self.serve_root_placeholder(guest, call, fd, state).await
+            }
+            #[cfg(target_arch = "x86_64")]
             Syscall::Getdents(c) => {
                 self.serve_descriptor_directory(
                     guest,
@@ -4188,7 +4230,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Sysno::fadvise64 => {
                     fadvise_answer(args.arg2 as i64, args.arg3 as i32).map_err(Into::into)
                 }
+                #[cfg(target_arch = "x86_64")]
                 Sysno::sync_file_range => {
+                    sync_file_range_answer(args.arg1 as i64, args.arg2 as i64, args.arg3 as u32)
+                        .map_err(Into::into)
+                }
+                // aarch64 number 84 is sys_sync_file_range with the
+                // same (fd, offset, nbytes, flags) order (see above).
+                #[cfg(target_arch = "aarch64")]
+                Sysno::sync_file_range2 => {
                     sync_file_range_answer(args.arg1 as i64, args.arg2 as i64, args.arg3 as u32)
                         .map_err(Into::into)
                 }
@@ -6163,9 +6213,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             })
             .fold(0_u64, |absent, (index, _)| absent | 1 << index);
         let stat = reached.stat();
+        // st_nlink is u64 on x86_64 and u32 on aarch64.
+        #[cfg(target_arch = "x86_64")]
+        let nlink = stat.st_nlink;
+        #[cfg(target_arch = "aarch64")]
+        let nlink = u64::from(stat.st_nlink);
         SystemObject {
             mode: stat.st_mode,
-            nlink: stat.st_nlink,
+            nlink,
             uid: stat.st_uid,
             gid: stat.st_gid,
             size: stat.st_size,
@@ -7136,7 +7191,10 @@ mod tests {
         assert_eq!(relative_operands(Sysno::fchmodat2), &[(0, 1)]);
         assert_eq!(relative_operands(Sysno::openat2), &[(0, 1)]);
         assert_eq!(relative_operands(Sysno::execveat), &[] as &[(usize, usize)]);
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(absolute_operands(Sysno::rename), &[0, 1]);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(relative_operands(Sysno::renameat), &[(0, 1), (2, 3)]);
         assert_eq!(absolute_operands(Sysno::execve), &[] as &[usize]);
         assert_eq!(absolute_operands(Sysno::read), &[] as &[usize]);
     }
@@ -7158,11 +7216,6 @@ mod tests {
         for sysno in [
             Sysno::chdir,
             Sysno::chroot,
-            Sysno::access,
-            Sysno::stat,
-            Sysno::chmod,
-            Sysno::chown,
-            Sysno::utimes,
             Sysno::statfs,
             Sysno::getxattr,
             Sysno::setxattr,
@@ -7172,25 +7225,24 @@ mod tests {
         ] {
             assert!(follows_final(sysno, &none, 0), "{sysno}");
         }
+        // x86_64-only numbers (aarch64 has the *at forms alone).
+        #[cfg(target_arch = "x86_64")]
         for sysno in [
-            Sysno::lstat,
-            Sysno::readlink,
-            Sysno::lchown,
-            Sysno::lgetxattr,
-            Sysno::unlink,
-            Sysno::rmdir,
-            Sysno::mkdir,
-            Sysno::rename,
-            Sysno::open,
-            Sysno::openat,
-            Sysno::execve,
+            Sysno::access,
+            Sysno::stat,
+            Sysno::chmod,
+            Sysno::chown,
+            Sysno::utimes,
         ] {
+            assert!(follows_final(sysno, &none, 0), "{sysno}");
+        }
+        for sysno in [Sysno::lgetxattr, Sysno::openat, Sysno::execve] {
             assert!(!follows_final(sysno, &none, 0), "{sysno}");
         }
         let nofollow = libc::AT_SYMLINK_NOFOLLOW as usize;
-        assert!(follows_final(Sysno::newfstatat, &none, 1));
+        assert!(follows_final(crate::arch::FSTATAT, &none, 1));
         assert!(!follows_final(
-            Sysno::newfstatat,
+            crate::arch::FSTATAT,
             &args([0, 0, 0, nofollow, 0, 0]),
             1
         ));
@@ -7199,6 +7251,20 @@ mod tests {
             &args([0, 0, nofollow, 0, 0, 0]),
             1
         ));
+        // x86_64-only numbers (aarch64 has the *at forms alone).
+        #[cfg(target_arch = "x86_64")]
+        for sysno in [
+            Sysno::lstat,
+            Sysno::readlink,
+            Sysno::lchown,
+            Sysno::unlink,
+            Sysno::rmdir,
+            Sysno::mkdir,
+            Sysno::rename,
+            Sysno::open,
+        ] {
+            assert!(!follows_final(sysno, &none, 0), "{sysno}");
+        }
         assert!(!follows_final(
             Sysno::fchownat,
             &args([0, 0, 0, 0, nofollow, 0]),
@@ -7400,7 +7466,6 @@ mod tests {
             Sysno::fallocate,
             Sysno::fadvise64,
             Sysno::readahead,
-            Sysno::sync_file_range,
             Sysno::fstatfs,
         ] {
             assert_eq!(
@@ -7473,8 +7538,29 @@ mod tests {
             None,
             "an empty path without AT_EMPTY_PATH names nothing"
         );
+        // aarch64 number 84 (sync_file_range semantics) takes arg 0 too.
+        // Pin the number so a syscalls-crate renaming cannot silently
+        // change the arm above.
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(Sysno::sync_file_range2.id(), 84);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(
+            placeholder_operand(&memory, Sysno::sync_file_range2, &args([3, 0, 0, 0, 0, 0])),
+            Some(0)
+        );
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            placeholder_operand(&memory, Sysno::sync_file_range, &args([3, 0, 0, 0, 0, 0])),
+            Some(0)
+        );
         // The descriptor-table calls are the kernel's.
-        for sysno in [Sysno::close, Sysno::dup, Sysno::dup2, Sysno::dup3] {
+        for sysno in [
+            Sysno::close,
+            Sysno::dup,
+            Sysno::dup3,
+            #[cfg(target_arch = "x86_64")]
+            Sysno::dup2,
+        ] {
             assert_eq!(
                 placeholder_operand(&memory, sysno, &args([3, 4, 0, 0, 0, 0])),
                 None

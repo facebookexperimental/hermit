@@ -626,6 +626,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 internal_fd && get_fd(wrapped).is_some_and(|fd| is_named_fifo(guest, fd));
             // A pipe read: a recorded private `SIGCHLD` ends it as on Linux.
             rsrc.private_sigchld_decides = reads_a_pipe(guest, wrapped);
+            // ... and names the read it polls for, which binds a SIGALRM
+            // reserved for one of its probes (`Scheduler::reserve_sigalrm_poll`).
+            if rsrc.private_sigchld_decides {
+                rsrc.read_fd =
+                    read_family_fd(wrapped).map(|fd| (guest.thread_state().files_id(), fd));
+            }
             // A read waits for data, a write for room (`--pipe-wake-latency`).
             rsrc.polls_channel = crate::pipe_wake::poll_of(&wrapped).and_then(|(fd, wants)| {
                 self.pipe_channel_end(guest, fd)
@@ -1011,7 +1017,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Some(mut wait) => {
                 let restored = wait.restore(guest, Some(turn_mask_cell)).await;
                 if turn_mask.is_some() {
-                    crate::tool_global::set_saved_guest_sigmask(guest, None).await;
+                    crate::tool_global::withdraw_wait_mask(guest).await;
                 }
                 match result_after_restore(restored, result) {
                     Ok(result) => refuse_held_signal_loss(guest, Sysno::writev, result).await,
@@ -1609,7 +1615,14 @@ fn syscall_targets_guest_held_fd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
     guest: &mut G,
     call: Syscall,
 ) -> bool {
+    // x86_64 has both epoll_wait and epoll_pwait; aarch64 has
+    // epoll_pwait (and epoll_pwait2) alone.
+    #[cfg(target_arch = "x86_64")]
     if matches!(call, Syscall::EpollWait(_) | Syscall::EpollPwait(_)) {
+        return false;
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    if matches!(call, Syscall::EpollPwait(_)) {
         return false;
     }
     get_fd(call).is_some_and(|fd| {
@@ -1831,6 +1844,8 @@ impl GuestHeldPollProof {
         G: Guest<Detcore<T>>,
     {
         let (address, nfds) = match call {
+            // x86_64 only: aarch64 has ppoll alone.
+            #[cfg(target_arch = "x86_64")]
             Syscall::Poll(call) => (call.fds()?.as_raw(), call.nfds() as usize),
             Syscall::Ppoll(call) => (call.fds()?.as_raw(), call.nfds() as usize),
             _ => {
@@ -3875,7 +3890,7 @@ where
     if settled.handler_seen {
         return None;
     }
-    if guest.regs().await.orig_rax as i64 != settled.sysno as i64 {
+    if crate::arch::syscall_number(&guest.regs().await) as i64 != settled.sysno as i64 {
         return None;
     }
     let sets = guest.signal_sets(guest.tid()).ok();
@@ -4614,13 +4629,28 @@ where
 {
     let mut stack = guest.stack().await;
     let pollfd: AddrMut<libc::pollfd> = stack.reserve();
+    // aarch64 has ppoll alone: its zero timeout is a zero timespec on
+    // the same stack (x86_64 keeps the poll probe below).
+    #[cfg(target_arch = "aarch64")]
+    let timeout = stack.push(Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    });
     let Ok(_guard) = stack.commit() else {
         return false;
     };
+    #[cfg(target_arch = "x86_64")]
     let probe = syscalls::Poll::new()
         .with_fds(Some(pollfd.cast()))
         .with_nfds(1)
         .with_timeout(0);
+    #[cfg(target_arch = "aarch64")]
+    let probe = syscalls::Ppoll::new()
+        .with_fds(Some(pollfd.cast()))
+        .with_nfds(1)
+        // SAFETY: `timeout` points to exclusively owned stack storage
+        // kept alive by `_guard` for the injection below.
+        .with_timeout(Some(unsafe { timeout.into_mut() }));
     let request = libc::pollfd {
         fd,
         events: libc::POLLRDHUP,
@@ -5011,7 +5041,7 @@ where
     let Some(mask) = wait.effective_mask() else {
         return Err(Errno::EFAULT.into());
     };
-    crate::tool_global::set_saved_guest_sigmask(guest, Some(mask)).await;
+    crate::tool_global::begin_wait_mask(guest, Some(mask)).await;
     Ok(mask)
 }
 
@@ -5666,8 +5696,39 @@ pub(crate) async fn publish_wait_mask<T, G>(
     if mask == published.0 || !publishes_guest_masks(guest.config()) {
         return;
     }
-    crate::tool_global::set_saved_guest_sigmask(guest, mask).await;
+    // A wait publication begins (or ends, for `None`) the thread's
+    // wait-mask interval, with the legacy saved mask in the same
+    // mutation (`Scheduler::begin_wait_mask` / `withdraw_wait_mask`).
+    match mask {
+        Some(mask) => crate::tool_global::begin_wait_mask(guest, Some(mask)).await,
+        None => crate::tool_global::withdraw_wait_mask(guest).await,
+    }
     published.0 = mask;
+}
+
+/// End a wait's publication at its return: an interrupted end hands the
+/// interval off to the delivery (the overlay ends; the legacy mask stays
+/// published until the thread's next request, as Linux keeps the
+/// temporary mask in `blocked` through the handler), and any other end
+/// withdraws it with the legacy saved mask. No publication in force is
+/// no end, as in `publish_wait_mask`.
+pub(crate) async fn finish_wait_mask<T, G>(
+    guest: &mut G,
+    interrupted: bool,
+    published: &mut PublishedWaitMask,
+) where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    if published.0.is_none() || !publishes_guest_masks(guest.config()) {
+        return;
+    }
+    if interrupted {
+        crate::tool_global::end_wait_mask(guest).await;
+    } else {
+        crate::tool_global::withdraw_wait_mask(guest).await;
+    }
+    published.0 = None;
 }
 
 async fn retry_blocking_wait_with_kernel_signal_state<T, G, C>(
@@ -5916,7 +5977,15 @@ where
 
     drop(guard);
     let restored = signals.restore(guest, None).await;
-    publish_wait_mask(guest, None, &mut published).await;
+    finish_wait_mask(
+        guest,
+        matches!(
+            result,
+            Err(Error::Errno(Errno::ERESTARTNOHAND | Errno::EINTR))
+        ),
+        &mut published,
+    )
+    .await;
     let result = match result_after_restore(restored, result) {
         Ok(result) => result,
         Err(error) => return (Err(error), false),
@@ -8274,11 +8343,16 @@ mod tests {
     /// and every other backend, keeps its interrupt errno.
     #[test]
     fn a_woken_poll_restarts_through_erestartsys_where_linux_restarts_it() {
+        // x86_64 only: aarch64 has ppoll alone.
+        #[cfg(target_arch = "x86_64")]
         let poll = reverie::syscalls::Poll::new().with_timeout(-1);
+        #[cfg(target_arch = "x86_64")]
         let timed_poll = reverie::syscalls::Poll::new().with_timeout(100);
         let ppoll = reverie::syscalls::Ppoll::new();
         for control in [true, false] {
+            #[cfg(target_arch = "x86_64")]
             assert_eq!(woken_call_ends_through_erestartsys(control, &poll), control);
+            #[cfg(target_arch = "x86_64")]
             assert_eq!(
                 woken_call_ends_through_erestartsys(control, &timed_poll),
                 control
@@ -8287,6 +8361,7 @@ mod tests {
                 woken_call_ends_through_erestartsys(control, &ppoll),
                 control
             );
+            #[cfg(target_arch = "x86_64")]
             assert!(!woken_call_ends_through_erestartsys(
                 control,
                 &reverie::syscalls::EpollWait::new()
@@ -8465,6 +8540,7 @@ mod tests {
                 Syscall::from(syscalls::Sendto::new().with_fd(3)),
                 None,
             ),
+            #[cfg(target_arch = "x86_64")]
             ("poll", Syscall::from(syscalls::Poll::new()), None),
         ] {
             assert_eq!(receive_timeout_fd(syscall), fd, "{label}");
@@ -9150,10 +9226,24 @@ pub(crate) mod kernel_signal_wait_failures {
                         cfg: self.config.clone(),
                         record_or_replay: crate::record_or_replay::NoopTool,
                     };
+                    #[cfg(target_arch = "x86_64")]
                     assert_eq!(
                         tool.handle_dup2(
                             &mut sibling,
                             syscalls::Dup2::new().with_oldfd(from).with_newfd(to),
+                        )
+                        .await
+                        .unwrap(),
+                        i64::from(to)
+                    );
+                    #[cfg(target_arch = "aarch64")]
+                    assert_eq!(
+                        tool.handle_dup3(
+                            &mut sibling,
+                            syscalls::Dup3::new()
+                                .with_oldfd(from)
+                                .with_newfd(to)
+                                .with_flags(nix::fcntl::OFlag::empty()),
                         )
                         .await
                         .unwrap(),
@@ -9183,6 +9273,7 @@ pub(crate) mod kernel_signal_wait_failures {
     }
 
     /// Reuse the local-memory guest for descriptor guards that need no injections.
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn fd_test_guest() -> impl Guest<Detcore> {
         WaitGuest::live(0).0
     }
@@ -9756,6 +9847,24 @@ pub(crate) mod kernel_signal_wait_failures {
                         script.publications.push(*mask);
                         return (None, GlobalResponse::SetSavedGuestSigmask(()));
                     }
+                    GlobalRequest::BeginWaitMask(mask) => {
+                        let mut script = script.lock().unwrap();
+                        script.published_mask = *mask;
+                        script.publications.push(*mask);
+                        return (None, GlobalResponse::BeginWaitMask(()));
+                    }
+                    GlobalRequest::WithdrawWaitMask => {
+                        let mut script = script.lock().unwrap();
+                        script.published_mask = None;
+                        script.publications.push(None);
+                        return (None, GlobalResponse::WithdrawWaitMask(()));
+                    }
+                    GlobalRequest::EndWaitMask => {
+                        return (None, GlobalResponse::EndWaitMask(()));
+                    }
+                    GlobalRequest::PopDeliveryMask => {
+                        return (None, GlobalResponse::PopDeliveryMask(()));
+                    }
                     GlobalRequest::TraceSchedEvent(..) => {
                         let mut script = script.lock().unwrap();
                         assert!(script.observe_retry_masks);
@@ -9866,7 +9975,14 @@ pub(crate) mod kernel_signal_wait_failures {
                 .is_some_and(|script| script.lock().unwrap().observe_retry_masks)
             {
                 let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-                regs.rip = self.arena.as_ptr() as u64;
+                #[cfg(target_arch = "x86_64")]
+                {
+                    regs.rip = self.arena.as_ptr() as u64;
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    regs.pc = self.arena.as_ptr() as u64;
+                }
                 return regs;
             }
             panic!("a blocked wait must not read registers")
@@ -9884,6 +10000,7 @@ pub(crate) mod kernel_signal_wait_failures {
             let (number, args) = syscall.into_parts();
             if let Some(script) = &self.proof_script {
                 match Syscall::from_raw(number, args) {
+                    #[cfg(target_arch = "x86_64")]
                     Syscall::Dup2(call) => {
                         // These descriptors are owned by this test. The real
                         // handler performs the corresponding model update.
@@ -9891,7 +10008,21 @@ pub(crate) mod kernel_signal_wait_failures {
                         assert!(result >= 0, "owned fixture descriptor duplication failed");
                         return Ok(i64::from(result));
                     }
-                    Syscall::Readv(_) | Syscall::Poll(_) | Syscall::Ppoll(_) => {
+                    #[cfg(target_arch = "aarch64")]
+                    Syscall::Dup3(call) => {
+                        let result =
+                            unsafe { libc::dup3(call.oldfd(), call.newfd(), call.flags().bits()) };
+                        assert!(result >= 0, "owned fixture descriptor duplication failed");
+                        return Ok(i64::from(result));
+                    }
+                    // x86_64 only: aarch64 has ppoll alone (next arm).
+                    #[cfg(target_arch = "x86_64")]
+                    Syscall::Poll(_) => {
+                        let mut script = script.lock().unwrap();
+                        script.probes += 1;
+                        return if script.probes == 4 { Ok(1) } else { Ok(0) };
+                    }
+                    Syscall::Readv(_) | Syscall::Ppoll(_) => {
                         let mut script = script.lock().unwrap();
                         script.probes += 1;
                         return if script.probes == 4 {
@@ -10133,6 +10264,18 @@ pub(crate) mod kernel_signal_wait_failures {
             iov_base: (&mut byte as *mut u8).cast(),
             iov_len: 1,
         };
+        // The retry probe is poll on x86_64, ppoll on aarch64.
+        #[cfg(target_arch = "x86_64")]
+        let poll_probe = syscalls::Poll::new()
+            .with_fds(AddrMut::from_raw(address))
+            .with_nfds(1)
+            .with_timeout(-1);
+        #[cfg(target_arch = "aarch64")]
+        let poll_probe = syscalls::Ppoll::new()
+            .with_fds(AddrMut::from_raw(address))
+            .with_nfds(1)
+            // NULL timeout: ppoll's equivalent of poll(-1), an infinite wait.
+            .with_timeout(None);
         let result = if generic_fd_entry {
             let tool = Detcore {
                 detpid: guest.thread.detpid.unwrap(),
@@ -10167,30 +10310,11 @@ pub(crate) mod kernel_signal_wait_failures {
             )
             .await
         } else if kernel_wait {
-            retry_blocking_wait_under_mask(
-                &mut guest,
-                syscalls::Poll::new()
-                    .with_fds(AddrMut::from_raw(address))
-                    .with_nfds(1)
-                    .with_timeout(-1),
-                resources,
-                None,
-                None,
-            )
-            .await
-            .0
+            retry_blocking_wait_under_mask(&mut guest, poll_probe, resources, None, None)
+                .await
+                .0
         } else if matches!(case, "operand" | "unknown") {
-            retry_nonblocking_syscall_helper(
-                &mut guest,
-                syscalls::Poll::new()
-                    .with_fds(AddrMut::from_raw(address))
-                    .with_nfds(1)
-                    .with_timeout(-1),
-                resources,
-                None,
-                None,
-            )
-            .await
+            retry_nonblocking_syscall_helper(&mut guest, poll_probe, resources, None, None).await
         } else {
             retry_nonblocking_syscall_helper(
                 &mut guest,
@@ -12677,6 +12801,8 @@ pub(crate) mod kernel_signal_wait_failures {
     /// is dropped, and the delivery's record of the result follows). A call
     /// that did not end that way, a result that is not one of the two, or
     /// sets the backend does not report, leave the result as it is.
+    // x86_64 only: the restart block is poll's; ppoll has none.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_woken_wait_is_settled_again_at_its_return() {
         let bit = |signal: i32| 1u64 << (signal - 1);
@@ -12830,7 +12956,18 @@ mod woken_return_tests {
     fn settled(send: bool, errno: Errno, pending: u64) -> SettledWait {
         SettledWait {
             send,
-            sysno: if send { Sysno::sendto } else { Sysno::poll },
+            sysno: if send {
+                Sysno::sendto
+            } else {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    Sysno::poll
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    Sysno::ppoll
+                }
+            },
             errno,
             pending,
             handler_seen: false,
@@ -13495,9 +13632,12 @@ mod turn_decision_tests {
                 sequentialize_threads,
                 ..Config::default().with_backend(|b| *b = backend)
             };
-            // KVM keeps the record only once its Reverie pin declares
-            // `kernel_signal_targets_are_predictable` (SIGSHARE S3b's flip),
-            // which this pin does not: the KVM row holds either way.
+            if name == "kvm" {
+                assert!(
+                    crate::scheduler::discarded_at_send::records(&cfg),
+                    "KVM keeps the record since S3b"
+                );
+            }
             assert_eq!(turn_decides_interruption(&cfg), expected, "{name}");
         }
     }

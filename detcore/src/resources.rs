@@ -61,16 +61,60 @@ pub(crate) enum SigalrmSleepDisposition {
     Handled,
 }
 
-/// Signal state attached to one exact emulated sleep, never a global cache.
+/// Signal state attached to one exact emulated sleep, never a global cache:
+/// the guest's actions and mask as its own owner turn read them
+/// (`Detcore::in_guest_sleep_sigalrm_snapshot`). SIGALRM's are kept apart
+/// for its virtual alarm; the sets hold every signal a scheduler send can
+/// reach the sleep with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct InGuestSleepSigalrm {
     pub disposition: SigalrmSleepDisposition,
     pub blocked: bool,
+    /// The guest's signal mask.
+    pub mask: u64,
+    /// The signals whose action is `SIG_IGN`.
+    pub ignored: u64,
+    /// The signals whose action is a handler.
+    pub caught: u64,
 }
 
 impl InGuestSleepSigalrm {
+    /// The snapshot for the guest's `mask` and the signals it ignores and
+    /// catches, with SIGALRM's disposition and blocked bit taken from them.
+    pub(crate) fn from_actions(mask: u64, ignored: u64, caught: u64) -> Self {
+        let alarm = crate::syscalls::kernel_sigset_bit(libc::SIGALRM);
+        let disposition = if caught & alarm != 0 {
+            SigalrmSleepDisposition::Handled
+        } else if ignored & alarm != 0 {
+            SigalrmSleepDisposition::Ignored
+        } else {
+            SigalrmSleepDisposition::Default
+        };
+        Self {
+            disposition,
+            blocked: mask & alarm != 0,
+            mask,
+            ignored,
+            caught,
+        }
+    }
+
     pub(crate) fn ends_process(self) -> bool {
         self.disposition == SigalrmSleepDisposition::Default && !self.blocked
+    }
+
+    /// Whether a `signal` the scheduler sends while the sleep waits leaves it
+    /// asleep, as Linux leaves a `pause` or `nanosleep` for it: blocked, it
+    /// stays pending and wakes nothing (`complete_signal` wakes only a task
+    /// that `wants_signal`, kernel/signal.c:946-948 at v7.1.3); unblocked and
+    /// ignored, `SIG_IGN` or `SIG_DFL` for SIGCHLD, SIGURG, SIGWINCH or
+    /// SIGCONT, it is discarded as it is sent (`prepare_signal` returns
+    /// `!sig_ignored`, :935; `sig_handler_ignored`, :77-82; `sig_ignored`,
+    /// :106-125). Only a caught signal ends the sleep with EINTR; one whose
+    /// default action ends or stops the process is left to those paths.
+    pub(crate) fn send_leaves_asleep(self, signal: i32) -> bool {
+        let bit = crate::syscalls::kernel_sigset_bit(signal);
+        (self.mask | crate::syscalls::ignored_at_generation(self.ignored, self.caught)) & bit != 0
     }
 }
 
@@ -608,8 +652,11 @@ pub struct Resources {
     #[serde(default)]
     pub(crate) reads_signalfd: bool,
     /// The descriptor a `BlockingExternalIO` request's `read`, `readv` or
-    /// `preadv2` reads, whatever it is, with the identity of the descriptor
-    /// table it is in; `None` for every other request. Under
+    /// `preadv2` reads, whatever it is, or an `InternalIOPolling` pipe read's
+    /// (`read`, `readv`), with the identity of the descriptor table it is in;
+    /// `None` for every other request. A polled pipe read's names the read a
+    /// reserved SIGALRM probe is bound to (`Scheduler::reserve_sigalrm_poll`,
+    /// dh-ru056 slice 1); nothing else reads it on such a request. Under
     /// record and replay the scheduler asks the kernel, as it grants the
     /// request, whether that descriptor is a signalfd and which signals it
     /// reads, so that a signalfd Detcore's table does not record as one (one
@@ -1334,10 +1381,7 @@ mod tests {
         let mut request = Resources::new(DetTid::from_raw(1));
         request.insert(ResourceID::SleepUntil(deadline), Permission::W);
         request.fyi(fyi);
-        request.in_guest_sleep_sigalrm = Some(InGuestSleepSigalrm {
-            disposition: SigalrmSleepDisposition::Default,
-            blocked: false,
-        });
+        request.in_guest_sleep_sigalrm = Some(InGuestSleepSigalrm::from_actions(0, 0, 0));
         request
     }
 

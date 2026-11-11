@@ -7010,6 +7010,391 @@ fn a_due_sigalrm_with_a_filed_request_that_has_not_blocked_is_no_loss() {
     assert!(!woken_by_sigalrm(&s, tid));
 }
 
+/// A pipe read's polling request as `execute_nonblockable_fd_syscall`
+/// and `retry_nonblocking_syscall_helper` file it: `InternalIOPolling`
+/// alone, restartable (`ERESTARTSYS`), naming its `read_fd`.
+fn pipe_read_request(tid: DetTid, attempt: u32) -> Resources {
+    let mut r = Resources::new(tid);
+    r.insert(ResourceID::InternalIOPolling, Permission::W);
+    r.fyi("read");
+    r.poll_attempt = attempt;
+    r.set_signal_interrupt_errno(reverie::syscalls::Errno::ERESTARTSYS);
+    r.read_fd = Some((detcore_model::fd::FilesId::initial(tid), 4));
+    // As a plain run's guest-held pipe end files its retries
+    // (`refresh_guest_poll_state` sets both from the held mark).
+    r.polls_guest_state_only = true;
+    r.relies_on_guest_held_marks = true;
+    r.private_sigchld_decides = true;
+    r
+}
+
+/// Files a pipe read's polling retry number `attempt`.
+fn file_pipe_read_attempt(s: &mut Scheduler, tid: DetTid, attempt: u32) {
+    file_request(s, pipe_read_request(tid, attempt), false);
+}
+
+/// Files the successor request the probe's syscall pass produced: the
+/// next retry of the same logical read, at the attempt lineage the
+/// probe advanced, with the probe's progress bit.
+fn file_probe_successor(s: &mut Scheduler, tid: DetTid, attempt: u32, progress: bool) {
+    let mut r = pipe_read_request(tid, attempt);
+    r.previous_attempt_made_progress = progress;
+    file_request(s, r, false);
+}
+
+/// Files a follow-up syscall request of the original shape after a probe
+/// completed: its presence is the R1 post-result state.
+fn file_post_result(s: &mut Scheduler, tid: DetTid) {
+    file(s, tid, ResourceID::SleepUntil(at(0)), false);
+}
+
+/// Whether `tid` still has a due SIGALRM reserved for its reserved probe.
+fn sigalrm_reserved_for(s: &Scheduler, tid: DetTid) -> bool {
+    s.sigalrm_reserved_poll_target() == Some(tid)
+}
+
+/// The stored request's (poll_attempt, upgraded_from_attempt) pair:
+/// the upgrade resets the former to 0 and keeps the lineage in the
+/// latter.
+fn stored_attempts(s: &Scheduler, tid: DetTid) -> (u32, u32) {
+    let stored = s.next_turns[&tid].req.try_read().unwrap().unwrap();
+    (stored.poll_attempt, stored.upgraded_from_attempt)
+}
+
+/// dh-ru056 slice 1 (rev.2 section 5.1): a due SIGALRM in an
+/// `InternalIOPolling` pipe-read wait is no longer a loss. The entry is
+/// reserved to the owner, its request is normalized by the same
+/// upgrade step 4 applies, and nothing is substituted until the written
+/// probe proves no progress; then the `InboundSignal` wake replaces the
+/// successor retry. This is the filed-but-ungranted substate.
+#[test]
+fn a_due_sigalrm_reserves_a_filed_pipe_read_and_wakes_after_a_no_progress_probe() {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    s.set_sigalrm_handled(pid, true);
+    file_pipe_read_attempt(&mut s, tid, 1);
+    s.runqueue_push_back(tid);
+
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    s.step2_sigalrm_ledger();
+
+    assert!(sigalrm_reserved_for(&s, tid), "reserved, not lost");
+    assert!(!s.sigalrm_loss_recorded(pid));
+    assert!(s.sigalrm_pending(pid), "still pending until taken");
+    assert!(
+        !woken_by_sigalrm(&s, tid),
+        "no substitution before the probe"
+    );
+    assert_eq!(
+        stored_attempts(&s, tid),
+        (0, 1),
+        "normalized by the upgrade"
+    );
+    // Placed precedence: step 3 resumes the unrun probe first (None
+    // before any alarm fires).
+    assert_eq!(
+        s.reserved_probe_to_resume(),
+        Some((pid, tid)),
+        "the probe is placed"
+    );
+
+    // The probe is selected (popped), grants, and files the next
+    // retry: no bytes moved.
+    assert_eq!(s.run_queue.tentative_pop_tid(tid), Some(tid));
+    assert_eq!(s.run_queue.commit_tentative_pop(), tid);
+    s.clear_nextturn(tid).unwrap();
+    file_probe_successor(&mut s, tid, 1, false);
+    s.step2_sigalrm_ledger();
+
+    assert!(woken_by_sigalrm(&s, tid), "wake substitutes the successor");
+    assert!(s.sigalrm_pending(pid));
+    assert!(!sigalrm_reserved_for(&s, tid));
+}
+
+/// Same transition from the deferred-poller substate: step 4 already
+/// deferred the retry and reset its count; reservation restores the
+/// probe without rewriting the stored request.
+#[test]
+fn a_due_sigalrm_reserves_a_deferred_pipe_poller_and_wakes_after_a_no_progress_probe() {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    s.set_sigalrm_handled(pid, true);
+    file_pipe_read_attempt(&mut s, tid, 1);
+    s.runqueue_push_back(tid);
+    assert_eq!(s.run_queue.tentative_pop_tid(tid), Some(tid));
+    let stored = s.next_turns[&tid].req.try_read().unwrap().unwrap();
+    assert!(s.step4_resource_block(tid, &stored, &Ivar::new()).is_err());
+    let stored = s.next_turns[&tid].req.try_read().unwrap().unwrap();
+    assert_eq!(stored.poll_attempt, 0, "deferral reset the count");
+
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    s.step2_sigalrm_ledger();
+
+    assert!(sigalrm_reserved_for(&s, tid));
+    assert!(!s.sigalrm_loss_recorded(pid));
+    assert_eq!(
+        s.reserved_probe_to_resume(),
+        Some((pid, tid)),
+        "poller restored and placed for its probe"
+    );
+
+    assert_eq!(s.run_queue.tentative_pop_tid(tid), Some(tid));
+    assert_eq!(s.run_queue.commit_tentative_pop(), tid);
+    s.clear_nextturn(tid).unwrap();
+    file_probe_successor(&mut s, tid, 1, false);
+    s.step2_sigalrm_ledger();
+    assert!(woken_by_sigalrm(&s, tid));
+    assert!(!sigalrm_reserved_for(&s, tid));
+}
+
+/// R1: a writer whose commit precedes the expiry has its data in the
+/// pipe when the reserved probe runs: the probe completes, its result
+/// stands untouched, and the entry stays pending for the ordinary
+/// post-result completion delivery — never an EINTR substitution.
+#[test]
+fn a_reserved_pipe_probe_that_completes_keeps_its_result_and_stays_pending() {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    s.set_sigalrm_handled(pid, true);
+    file_pipe_read_attempt(&mut s, tid, 1);
+    s.runqueue_push_back(tid);
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    s.step2_sigalrm_ledger();
+    assert!(sigalrm_reserved_for(&s, tid));
+
+    // The probe is selected (popped) and completes the read (data
+    // already there); the thread's next request is an unrelated
+    // follow-up syscall.
+    assert_eq!(s.run_queue.tentative_pop_tid(tid), Some(tid));
+    assert_eq!(s.run_queue.commit_tentative_pop(), tid);
+    s.clear_nextturn(tid).unwrap();
+    file_post_result(&mut s, tid);
+    s.runqueue_push_back(tid);
+    s.step2_sigalrm_ledger();
+
+    assert!(!woken_by_sigalrm(&s, tid), "no wake substituted a result");
+    assert!(s.sigalrm_pending(pid), "delivery remains post-result");
+    assert!(!sigalrm_reserved_for(&s, tid), "reservation consumed");
+}
+
+/// G1: a single blocking pipe read that moved bytes returns; it
+/// cannot still be polling the same read. A progressed-but-repolls
+/// successor therefore means a second attached probe ran between
+/// reservation and classification — a protocol violation slice 1
+/// keeps unrepresentable. The reservation is consumed into the
+/// ordinary due-entry loss, never carried across retries.
+#[test]
+fn a_reserved_probe_that_progressed_but_repolls_is_a_g1_loss() {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    s.set_sigalrm_handled(pid, true);
+    file_pipe_read_attempt(&mut s, tid, 1);
+    s.runqueue_push_back(tid);
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    s.step2_sigalrm_ledger();
+    assert!(sigalrm_reserved_for(&s, tid));
+
+    assert_eq!(s.run_queue.tentative_pop_tid(tid), Some(tid));
+    assert_eq!(s.run_queue.commit_tentative_pop(), tid);
+    s.clear_nextturn(tid).unwrap();
+    file_probe_successor(&mut s, tid, 1, true);
+    s.runqueue_push_back(tid);
+    s.step2_sigalrm_ledger();
+
+    assert!(
+        !sigalrm_reserved_for(&s, tid),
+        "violation consumes the reservation"
+    );
+    assert!(!woken_by_sigalrm(&s, tid));
+    assert!(s.sigalrm_loss_recorded(pid));
+}
+
+/// Failed wake (review gate G2): if the reserved target exits
+/// before its probe grants, retiring the thread must tear the
+/// reservation down with it — no stale reservation may outlive
+/// its target and block every later reserve.
+#[test]
+fn retiring_the_reserved_target_leaves_no_stale_reservation() {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    s.set_sigalrm_handled(pid, true);
+    file_pipe_read_attempt(&mut s, tid, 1);
+    s.runqueue_push_back(tid);
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    s.step2_sigalrm_ledger();
+    assert!(sigalrm_reserved_for(&s, tid));
+
+    s.retire_sigalrm_thread(tid, pid);
+
+    assert!(!sigalrm_reserved_for(&s, tid), "no stale reservation");
+    assert_eq!(s.sigalrm_reserved_poll_target(), None);
+}
+
+/// G2 position: the completion check runs before the sweep acts on
+/// any other entry. When one process's probe has filed its successor
+/// and, in the same pass, the sweep finds another process's
+/// already-pending entry in a polling read, the first reservation
+/// settles (its wake substitutes) before the sweep reaches the second,
+/// which is then reserved rather than charged phase 1's loss. A check
+/// placed after the sweep leaves the first reservation outstanding
+/// there and charges the loss.
+#[test]
+fn the_completion_check_settles_a_probe_before_the_sweep_reaches_another_process() {
+    let (mut s, [(first, first_pid), (second, second_pid)]) = two_polling_readers();
+    // The second process's entry fell due while it ran: pending, no loss.
+    eligibility(&mut s, second, false);
+    s.fire_alarm(second_pid, second, Signal::SIGALRM);
+    assert!(!s.sigalrm_loss_recorded(second_pid));
+    file_pipe_read_attempt(&mut s, first, 1);
+    s.runqueue_push_back(first);
+    s.fire_alarm(first_pid, first, Signal::SIGALRM);
+    assert!(sigalrm_reserved_for(&s, first));
+
+    // Production order: step 3 resumes the first probe (its grant spends
+    // the alarm priority of https://github.com/rrnewton/hermit/issues/4929,
+    // which does not keep another process's entry from being reserved), and
+    // the probe files its no-progress successor; the second process's read
+    // polls by the next pass's sweep.
+    assert_eq!(grant_selected(&mut s), first);
+    assert_eq!(s.parked.alarm_priority_served, Some(first_pid));
+    file_probe_successor(&mut s, first, 1, false);
+    file_pipe_read_attempt(&mut s, second, 1);
+    s.runqueue_push_back(second);
+    s.step2_sigalrm_ledger();
+
+    assert!(woken_by_sigalrm(&s, first), "first probe settled");
+    assert!(sigalrm_reserved_for(&s, second), "second reserved");
+    assert!(!s.sigalrm_loss_recorded(second_pid), "no loss for second");
+    assert!(!s.sigalrm_loss_recorded(first_pid));
+}
+
+/// Only a restartable read is reserved (design rev.2 section 5.1:
+/// `signal_interrupt_errno` is `ERESTARTSYS`). A polled wait that
+/// returns its own errno when a signal ends it (a deadline wait's
+/// EINTR), or one that names none, must never take the restart
+/// table's outcome: reservation refuses it and the due-entry loss is
+/// preserved exactly as before this machinery.
+#[test]
+fn a_reserved_probe_refuses_a_poll_that_is_not_restartable() {
+    for errno in [Some(libc::EINTR), Some(libc::ETIMEDOUT), None] {
+        let mut s = liteinst_scheduler();
+        let (tid, _, _) = add(&mut s, 100, 100);
+        let pid = DetPid::from_raw(100);
+        s.set_sigalrm_handled(pid, true);
+        let mut r = pipe_read_request(tid, 1);
+        r.signal_interrupt_errno = errno;
+        file_request(&mut s, r, false);
+        s.runqueue_push_back(tid);
+
+        s.fire_alarm(pid, tid, Signal::SIGALRM);
+        s.step2_sigalrm_ledger();
+
+        assert!(!sigalrm_reserved_for(&s, tid), "{errno:?}");
+        assert!(s.sigalrm_loss_recorded(pid), "{errno:?}: out of scope");
+    }
+}
+
+/// A pipe read with no `read_fd` (no request production files for
+/// a pipe read now) is not a bound read: the loss stands.
+#[test]
+fn a_reserved_probe_refuses_a_poll_without_a_read_fd() {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    s.set_sigalrm_handled(pid, true);
+    let mut r = pipe_read_request(tid, 1);
+    r.read_fd = None;
+    file_request(&mut s, r, false);
+    s.runqueue_push_back(tid);
+
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    s.step2_sigalrm_ledger();
+
+    assert!(!sigalrm_reserved_for(&s, tid));
+    assert!(s.sigalrm_loss_recorded(pid));
+}
+
+/// Two single-threaded handling processes, each in a polling pipe
+/// read, with `first` (DetPid 100) and `second` (DetPid 300) both
+/// handling SIGALRM.
+fn two_polling_readers() -> (Scheduler, [(DetTid, DetPid); 2]) {
+    let mut s = liteinst_scheduler();
+    let (first, _, _) = add(&mut s, 100, 100);
+    let (second, _, _) = add(&mut s, 300, 300);
+    let first_pid = DetPid::from_raw(100);
+    let second_pid = DetPid::from_raw(300);
+    for pid in [first_pid, second_pid] {
+        s.set_sigalrm_handled(pid, true);
+    }
+    (s, [(first, first_pid), (second, second_pid)])
+}
+
+/// Single flight across processes, decided by the schedule alone.
+/// Slice 1 holds one reservation, so of two entries that fall due
+/// while their owners poll pipe reads, the first to fall due at a
+/// step-2 point is reserved and the other keeps phase 1's loss — no
+/// panic (the reserve used to assert). Two orders decide "first":
+/// expiries diverted at step 2b act in timed-pop order (here the
+/// higher DetPid fires first and wins); entries already pending when
+/// the sweep finds both polling act in the sweep's ledger order
+/// (ascending DetPid). Either way the reserved probe still wakes.
+#[test]
+fn a_second_process_due_in_the_same_sweep_keeps_the_phase1_loss() {
+    // Diverted expiries: timed-pop order, second fired first.
+    let (mut s, [(first, first_pid), (second, second_pid)]) = two_polling_readers();
+    for (tid, pid) in [(second, second_pid), (first, first_pid)] {
+        file_pipe_read_attempt(&mut s, tid, 1);
+        s.runqueue_push_back(tid);
+        s.fire_alarm(pid, tid, Signal::SIGALRM);
+    }
+    s.step2_sigalrm_ledger();
+    assert!(sigalrm_reserved_for(&s, second), "first to fall due");
+    assert!(!s.sigalrm_loss_recorded(second_pid));
+    assert!(
+        s.sigalrm_loss_recorded(first_pid),
+        "the other keeps the loss"
+    );
+    assert!(!woken_by_sigalrm(&s, first));
+
+    // The reserved probe runs, moves no bytes, and is woken as usual.
+    assert_eq!(s.run_queue.tentative_pop_tid(second), Some(second));
+    assert_eq!(s.run_queue.commit_tentative_pop(), second);
+    s.clear_nextturn(second).unwrap();
+    file_probe_successor(&mut s, second, 1, false);
+    s.step2_sigalrm_ledger();
+    assert!(woken_by_sigalrm(&s, second));
+    // The completion check settled before the sweep, but the other
+    // entry's loss is already recorded, so it is not reserved again: the
+    // loss stands and the entry waits for a completion's delivery.
+    assert_eq!(s.sigalrm_reserved_poll_target(), None);
+    assert!(s.sigalrm_loss_recorded(first_pid));
+
+    // Entries pending before either read polled: the sweep's
+    // ascending-DetPid order, whatever order they were filed in.
+    let (mut s, [(first, first_pid), (second, second_pid)]) = two_polling_readers();
+    for (tid, pid) in [(second, second_pid), (first, first_pid)] {
+        eligibility(&mut s, tid, false);
+        s.fire_alarm(pid, tid, Signal::SIGALRM);
+        assert!(!s.sigalrm_loss_recorded(pid), "running: not a loss");
+    }
+    for tid in [second, first] {
+        file_pipe_read_attempt(&mut s, tid, 1);
+        s.runqueue_push_back(tid);
+    }
+    s.step2_sigalrm_ledger();
+    assert!(
+        sigalrm_reserved_for(&s, first),
+        "lowest DetPid in the sweep"
+    );
+    assert!(!s.sigalrm_loss_recorded(first_pid));
+    assert!(s.sigalrm_loss_recorded(second_pid));
+}
+
 /// A due SIGALRM finds its thread in a polling wait, an `InternalIOPolling`
 /// operation retried after EAGAIN, which stays on the run queue between
 /// retries: a loss, whether step 4 has yet to see the filed retry or has
@@ -8697,7 +9082,8 @@ fn kvm_fixture() -> (Scheduler, Arc<Backend>) {
         max_timeslice: None,
         ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::KVM)
     });
-    assert!(!s.models_signal_targets);
+    // SIGSHARE S3b: KVM's kernel signal targets are predictable.
+    assert!(s.models_signal_targets);
     let backend = Arc::new(Backend::default());
     assert_eq!(
         s.install_signal_control(
@@ -8901,12 +9287,14 @@ fn a_controlled_exit_to_a_one_thread_parent_is_classified_at_its_grant() {
             false,
             Some(N::Undecided),
         ),
+        // SIGSHARE S3b: KVM models signal targets, so a parent with another
+        // live thread is decided too, as on ptrace.
         (
             "two threads",
             sigchld_sets(false, false, true),
             true,
             true,
-            None,
+            Some(N::Deliver),
         ),
     ] {
         let (mut s, backend) = kvm_fixture();
@@ -8939,6 +9327,25 @@ fn a_controlled_exit_to_a_one_thread_parent_is_classified_at_its_grant() {
         // No hold waits for a kernel publication report on this backend.
         assert!(s.child_exit_publications_pending.is_empty(), "{name}");
     }
+    // Where the scheduler does not model signal targets (before S3b), a
+    // parent with another live thread keeps the backend's decision.
+    let (mut s, backend) = kvm_fixture();
+    s.models_signal_targets = false;
+    let (parent, _, _) = add(&mut s, 100, 100);
+    let _ = add(&mut s, 100, 101);
+    let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
+    backend
+        .signal_sets
+        .lock()
+        .unwrap()
+        .insert(100, sigchld_sets(false, false, true));
+    file_restartable_read(&mut s, parent);
+    grant_group_exit(&mut s, child, child_mm);
+    assert_eq!(
+        s.controlled_child_exits_decision(DetPid::from_raw(200)),
+        None
+    );
+    assert!(child_exit_timers(&s).is_empty());
 }
 
 /// The cross-check table (design S4 and S0 correction 2): the only allowed
@@ -9050,6 +9457,111 @@ fn controlled_child_exit_to_pop_from(
     let clock = committed_clock(&s);
     s.step2b_process_timed(&clock);
     (s, backend, parent)
+}
+
+/// Revastra2's round-2 review of SIGSHARE S3b, F1: a child-exit SIGCHLD that
+/// KVM's publication sends nothing for moves no `curr_target`. The parent's
+/// leader (the creator) blocks SIGCHLD and sleeps in a wait the grant leaves
+/// Undecided (a `nanosleep`, as a futex wait is), and its second thread 101
+/// leaves SIGCHLD unblocked, so the walk from the leader chooses 101. Queued
+/// (caught), the copy reaches `complete_signal` and `curr_target` moves to
+/// 101; suppressed (explicit SIG_IGN: `do_notify_parent` sends nothing,
+/// whatever the masks) or coalesced, it reaches none and `curr_target`
+/// stays. Before, every effect committed the walk. Mutation "commit for
+/// every landed publication". Left SIG_DFL (ignored by default), the copy
+/// the blocked creator has queued still reaches `complete_signal`, so
+/// `curr_target` moves to 101, which discards it as it dequeues it: the
+/// receiver's discard is not one at generation by the named thread (the
+/// round-3 reviews, P1; `default-child-curr`). Mutation "a receiver's
+/// discard marks no walk".
+#[test]
+fn a_child_exit_kvm_published_no_copy_for_moves_no_curr_target() {
+    let bit = kernel_signal_bit(libc::SIGCHLD);
+    let caught = reverie::SignalSets::new(0, 0, bit, 0, bit);
+    let ignored = reverie::SignalSets::new(0, 0, bit, bit, 0);
+    let defaulted = reverie::SignalSets::new(0, 0, bit, 0, 0);
+    for (name, leader, worker_sets, effect, waitable, moved) in [
+        (
+            "queued",
+            caught,
+            sigchld_sets(false, false, true),
+            ChildExitPublicationEffect::Queued,
+            true,
+            true,
+        ),
+        (
+            "coalesced",
+            caught,
+            sigchld_sets(false, false, true),
+            ChildExitPublicationEffect::Coalesced,
+            true,
+            false,
+        ),
+        (
+            "suppressed",
+            ignored,
+            sigchld_sets(false, true, false),
+            ChildExitPublicationEffect::SuppressedExplicitIgnore,
+            false,
+            false,
+        ),
+        (
+            "default, discarded by its receiver",
+            defaulted,
+            sigchld_sets(false, false, false),
+            ChildExitPublicationEffect::Queued,
+            true,
+            true,
+        ),
+    ] {
+        let (mut s, backend) = kvm_fixture();
+        let (parent, _, _) = add(&mut s, 100, 100);
+        let (worker, _, _) = add(&mut s, 100, 101);
+        let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
+        backend.signal_sets.lock().unwrap().insert(100, leader);
+        backend.signal_sets.lock().unwrap().insert(101, worker_sets);
+        *backend.child_effect.lock().unwrap() = Some(effect);
+        park_nanosleep(&mut s, parent);
+        file_restartable_read(&mut s, worker);
+        grant_group_exit(&mut s, child, child_mm);
+        let permit = s.parked.exit_fences[&child].permit;
+        s.consume_signal_boundary(SignalBoundaryReceipt {
+            permit,
+            outcome: SignalBoundaryOutcome::Terminated {
+                group: true,
+                wait_status: 7 << 8,
+            },
+        })
+        .unwrap();
+        let event = child_exit_event(
+            task(100, 100).process,
+            task(200, 200).process,
+            ExitStatus::Exited(7),
+            waitable,
+        );
+        let scheduler = Arc::new(Mutex::new(s));
+        let mut publication = Box::pin(super::signal_control::ChildExitPublicationFuture::new(
+            scheduler.clone(),
+            event,
+        ));
+        assert!(matches!(poll_child_exit(&mut publication), Poll::Pending));
+        assert!(matches!(
+            poll_child_exit(&mut publication),
+            Poll::Ready(Ok(()))
+        ));
+        drop(publication);
+        let mut s = Arc::try_unwrap(scheduler).unwrap().into_inner().unwrap();
+        s.committed_time = s.committed_time + LogicalTime::from_nanos(1);
+        let clock = committed_clock(&s);
+        s.step2b_process_timed(&clock);
+        assert!(child_exit_timers(&s).is_empty(), "{name}: the timer popped");
+        assert_eq!(s.controlled_child_exits.refusal_for_test(), None, "{name}");
+        assert_eq!(
+            s.signal_curr_targets.get(&DetPid::from_raw(100)),
+            moved.then_some(&worker),
+            "{name}"
+        );
+    }
 }
 
 /// Mutations "Queued wakes nobody" (design G5: the parent's read is never
@@ -9495,6 +10007,10 @@ enum AlarmThread {
     FutexWait,
     /// A vfork parent waiting for its child; SIGALRM unblocked.
     VforkParent,
+    /// A vfork parent waiting for its child outside the schedule
+    /// (`external_io_blockers`), SIGALRM unblocked, with SIGUSR1, which it
+    /// does not block either, pending for it alone.
+    BusyVforkParent,
     /// Polling `poll`, whose probe never takes a pending signal, with the
     /// EINTR marker its request carries for the idle-poller diagnosis
     /// (`Detcore::handle_internal_poll_until`); SIGALRM unblocked.
@@ -9568,7 +10084,7 @@ fn choose_alarm_receiver(
         };
         let usr1 = 1 << (libc::SIGUSR1 - 1);
         let (pending, ignored) = match state {
-            AlarmThread::Busy | AlarmThread::BusyPause => (usr1, 0),
+            AlarmThread::Busy | AlarmThread::BusyPause | AlarmThread::BusyVforkParent => (usr1, 0),
             AlarmThread::IgnoredPending => (usr1, usr1),
             _ => (0, 0),
         };
@@ -9622,6 +10138,12 @@ fn choose_alarm_receiver(
             }
             AlarmThread::VforkParent => {
                 file_ordinary(&mut s, tid);
+                s.vfork_barriers.insert(tid, None);
+            }
+            AlarmThread::BusyVforkParent => {
+                s.blocked
+                    .external_io_blockers
+                    .insert(tid, ExternalOpId::new(tid, 1));
                 s.vfork_barriers.insert(tid, None);
             }
             AlarmThread::PollPoller => file_poller(&mut s, tid, "poll", Some(Errno::EINTR)),
@@ -9721,7 +10243,7 @@ fn alarm_action(
 fn one_receiver_choice_takes_a_published_alarm_as_complete_signal_chooses() {
     use AlarmThread::*;
     let t = DetTid::from_raw;
-    let cases: [ReceiverCase; 32] = [
+    let cases: [ReceiverCase; 33] = [
         (
             "a runnable leader that wants it, beside a parked sibling",
             &[Runnable, Pause],
@@ -9872,6 +10394,20 @@ fn one_receiver_choice_takes_a_published_alarm_as_complete_signal_chooses() {
             &[VforkParent, Runnable],
             None,
             None,
+            None,
+        ),
+        // SIGSHARE S3b-1 fix 9 (`alarm_wants`): a vfork parent's pending set
+        // is read although it waits outside the schedule, since no host
+        // timing ends its call or posts it a signal, so with a signal pending
+        // it is busy and the walk passes it over (`wants_signal`,
+        // kernel/signal.c:958-961 at v6.17). Mutation "a vfork parent outside
+        // the schedule is never busy": the leader is chosen, and the copy
+        // waits for it.
+        (
+            "a busy vfork parent leader outside the schedule is passed over",
+            &[BusyVforkParent, Runnable],
+            None,
+            Some(t(101)),
             None,
         ),
         (
@@ -10857,5 +11393,1566 @@ fn the_linux_choice_differs_from_the_backends_only_by_the_named_gap() {
             "{threads:?}"
         );
         assert_eq!(s.alarm_receiver(pid, &recipients), backend, "{threads:?}");
+    }
+}
+
+/// The defensive step-4 settle of a no-progress probe: a successor that
+/// reaches step 4 as the selected head unclassified (in production the
+/// step-2 check classifies it first, as
+/// `a_no_progress_probe_settles_at_step2_with_its_thread_requeued` covers).
+/// The settle must close step 3's open selection before it substitutes (the
+/// run queue refuses a removal inside an open selection: 0cde5810 panicked
+/// here), and step 4 must end the turn rather than defer or grant the stale
+/// retry: the stored request is the wake, the retry's response stays
+/// unanswered, and the thread is queued exactly once, for the wake turn.
+#[test]
+fn a_no_progress_probe_settled_at_its_step4_head_skips_the_stale_retry() {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    s.set_sigalrm_handled(pid, true);
+    file_pipe_read_attempt(&mut s, tid, 1);
+    s.runqueue_push_back(tid);
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    assert!(sigalrm_reserved_for(&s, tid));
+    // The probe is granted and its thread requeued (step 6).
+    assert_eq!(s.run_queue.tentative_pop_tid(tid), Some(tid));
+    assert_eq!(s.run_queue.commit_tentative_pop(), tid);
+    s.clear_nextturn(tid).unwrap();
+    s.runqueue_push_back(tid);
+    // Step 3 reselects it; its successor retry arrives (no bytes moved).
+    assert_eq!(s.run_queue.tentative_pop_tid(tid), Some(tid));
+    file_probe_successor(&mut s, tid, 1, false);
+    let successor = s.next_turns[&tid].req.try_read().unwrap().unwrap();
+    let resp = s.next_turns[&tid].resp.clone();
+
+    assert!(s.step4_resource_block(tid, &successor, &resp).is_err());
+
+    assert!(woken_by_sigalrm(&s, tid), "the wake replaced the retry");
+    assert_eq!(s.sigalrm_reserved_poll_target(), None);
+    assert!(resp.try_read().is_none(), "the stale retry is not answered");
+    assert!(s.sigalrm_pending(pid), "taken in the wake turn");
+    assert_eq!(s.run_queue.tentative_pop_tid(tid), Some(tid), "queued");
+    assert_eq!(s.run_queue.commit_tentative_pop(), tid);
+    assert!(!s.run_queue.contains_tid(tid), "queued exactly once");
+}
+
+/// A completed probe settled at its step-4 head leaves the turn to
+/// step 4: the head request (the completion's follow-up) proceeds as
+/// it would without a reservation, which the settle consumed.
+#[test]
+fn a_completed_probe_settled_at_its_step4_head_lets_the_turn_proceed() {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    s.set_sigalrm_handled(pid, true);
+    file_pipe_read_attempt(&mut s, tid, 1);
+    s.runqueue_push_back(tid);
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    assert_eq!(s.run_queue.tentative_pop_tid(tid), Some(tid));
+    assert_eq!(s.run_queue.commit_tentative_pop(), tid);
+    s.clear_nextturn(tid).unwrap();
+    s.runqueue_push_back(tid);
+    assert_eq!(s.run_queue.tentative_pop_tid(tid), Some(tid));
+    file_post_result(&mut s, tid);
+    let follow_up = s.next_turns[&tid].req.try_read().unwrap().unwrap();
+    let resp = s.next_turns[&tid].resp.clone();
+
+    assert!(s.step4_resource_block(tid, &follow_up, &resp).is_ok());
+
+    assert!(!woken_by_sigalrm(&s, tid), "no wake substituted a result");
+    assert_eq!(s.sigalrm_reserved_poll_target(), None);
+    assert!(s.sigalrm_pending(pid), "delivery remains post-result");
+}
+
+/// A thread with an outstanding reservation in the probe substate.
+fn reserved_reader() -> (Scheduler, DetTid, DetPid) {
+    let mut s = liteinst_scheduler();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    s.set_sigalrm_handled(pid, true);
+    file_pipe_read_attempt(&mut s, tid, 1);
+    s.runqueue_push_back(tid);
+    s.fire_alarm(pid, tid, Signal::SIGALRM);
+    assert!(sigalrm_reserved_for(&s, tid));
+    (s, tid, pid)
+}
+
+/// Gate G1: slice 1 never releases a reservation back to `Pending`; a
+/// mask block published by the reserved target, which would release
+/// it, stops the run instead of restoring the pre-reservation request.
+#[test]
+#[should_panic(expected = "G1")]
+fn g1_a_mask_block_by_the_reserved_target_is_unreachable() {
+    let (mut s, tid, _) = reserved_reader();
+    s.set_sigalrm_blocked(tid, true);
+}
+
+/// Gate G1: likewise a disposition leaving the handler.
+#[test]
+#[should_panic(expected = "G1")]
+fn g1_a_disposition_change_by_the_reserved_owner_is_unreachable() {
+    let (mut s, _, pid) = reserved_reader();
+    s.set_sigalrm_handled(pid, false);
+}
+
+/// Gate G1: an entry is taken only after its reservation is classified.
+#[test]
+#[should_panic(expected = "G1")]
+fn g1_a_take_before_classification_is_unreachable() {
+    let (mut s, tid, pid) = reserved_reader();
+    let _ = s.take_sigalrm(pid, tid);
+}
+
+/// Gate G1's assertions bind only the reserved thread and process: an
+/// unblocked publication, and any publication or take by another
+/// process, proceed as before.
+#[test]
+fn g1_publications_elsewhere_proceed_while_a_probe_is_reserved() {
+    let (mut s, tid, pid) = reserved_reader();
+    let (other, _, _) = add(&mut s, 300, 300);
+    let other_pid = DetPid::from_raw(300);
+    s.set_sigalrm_blocked(tid, false);
+    s.set_sigalrm_handled(other_pid, true);
+    s.set_sigalrm_blocked(other, true);
+    s.set_sigalrm_handled(other_pid, false);
+    assert!(!s.take_sigalrm(other_pid, other));
+    assert!(sigalrm_reserved_for(&s, tid));
+    assert!(s.sigalrm_pending(pid));
+}
+
+/// Step 3 selects (`step3_peek`), the selected thread's turn completes, and
+/// step 6 requeues it at the back with an empty request slot: the real
+/// order around a grant.
+fn grant_selected(s: &mut Scheduler) -> DetTid {
+    let (tid, _, _) = s.step3_peek().expect("a selection");
+    assert_eq!(s.run_queue.commit_tentative_pop_completed_turn(), tid);
+    s.clear_nextturn(tid).unwrap();
+    s.runqueue_push_back(tid);
+    tid
+}
+
+/// A reader polling a pipe (DetPid 100, queued last) and two ordinary
+/// threads (300, 500) queued ahead of it, with the reader's entry due and
+/// reserved.
+fn reserved_reader_behind(others: &[i32]) -> (Scheduler, DetTid, DetPid, Vec<DetTid>) {
+    let mut s = liteinst_scheduler();
+    let (reader, _, _) = add(&mut s, 100, 100);
+    let pid = DetPid::from_raw(100);
+    let mut queued = Vec::new();
+    for &other in others {
+        let (t, _, _) = add(&mut s, other, other);
+        file_ordinary(&mut s, t);
+        s.runqueue_push_back(t);
+        queued.push(t);
+    }
+    s.set_sigalrm_handled(pid, true);
+    file_pipe_read_attempt(&mut s, reader, 1);
+    s.runqueue_push_back(reader);
+    s.fire_alarm(pid, reader, Signal::SIGALRM);
+    assert!(sigalrm_reserved_for(&s, reader));
+    (s, reader, pid, queued)
+}
+
+/// The production order of a no-progress settle, at step 2 (step 1 waits
+/// for every queued thread to file): step 3 selects the unrun probe ahead
+/// of a writer queued before it (placed precedence,
+/// `reserved_probe_to_resume`), step 6 requeues it, its successor retry is
+/// filed, and the next pass's step 2 replaces that retry with the wake. The
+/// thread is queued exactly once afterwards (the settle dequeues the
+/// requeued retry before the wake's requeue). The wake goes to the front of
+/// its band only; here the writer shares that band, so the wake runs first.
+/// A thread in a better band, or a chaos draw, could still run before it,
+/// and the wake grant's own attempt would then decide (R1).
+#[test]
+fn a_no_progress_probe_settles_at_step2_with_its_thread_requeued() {
+    let (mut s, reader, pid, queued) = reserved_reader_behind(&[300]);
+    let writer = queued[0];
+    assert_eq!(grant_selected(&mut s), reader, "placed precedence");
+    assert_eq!(s.parked.alarm_priority_served, Some(pid));
+    file_probe_successor(&mut s, reader, 2, false);
+
+    s.step2_sigalrm_ledger();
+
+    assert!(woken_by_sigalrm(&s, reader));
+    assert_eq!(s.sigalrm_reserved_poll_target(), None);
+    assert_eq!(
+        s.run_queue.tids().filter(|t| **t == reader).count(),
+        1,
+        "queued exactly once"
+    );
+    assert_eq!(
+        grant_selected(&mut s),
+        reader,
+        "front of the band the writer shares"
+    );
+    assert_eq!(grant_selected(&mut s), writer);
+}
+
+/// Review item 1 (7cdd90dc): the probe's precedence ends with its settle.
+/// A placement that outlived the reservation kept the reader first at every
+/// other selection for the rest of the run. Precedence is now only the unrun
+/// probe's selection at step 3 (`reserved_probe_to_resume`), which registers
+/// no alarm taker; after the settle and the wake, selection is the run
+/// queue's own round robin.
+#[test]
+fn the_reserved_probes_precedence_ends_with_its_settle() {
+    let (mut s, reader, pid, queued) = reserved_reader_behind(&[300, 500]);
+    assert_eq!(s.reserved_probe_to_resume(), Some((pid, reader)));
+    assert!(
+        s.parked.alarm_takers.is_empty(),
+        "no alarm taker registered"
+    );
+    assert_eq!(grant_selected(&mut s), reader, "placed precedence");
+    assert_eq!(
+        s.reserved_probe_to_resume(),
+        None,
+        "granted: no longer unrun"
+    );
+    file_probe_successor(&mut s, reader, 2, false);
+    s.step2_sigalrm_ledger();
+    assert!(woken_by_sigalrm(&s, reader));
+    assert_eq!(s.reserved_probe_to_resume(), None, "precedence ended");
+
+    let mut selections = Vec::new();
+    for _ in 0..9 {
+        let t = grant_selected(&mut s);
+        selections.push(t.as_raw());
+        file_ordinary(&mut s, t);
+    }
+    let (b, c) = (queued[0].as_raw(), queued[1].as_raw());
+    let r = reader.as_raw();
+    assert_eq!(selections, [r, b, c, r, b, c, r, b, c]);
+}
+
+/// Gate item 1, the other consumers: a completed probe, a G1 loss and the
+/// target's retirement each end the reservation too, so slice 1's single
+/// flight is free again: another process's due polling read is reserved
+/// afterwards. (A reservation left outstanding would refuse it.)
+#[test]
+fn every_reservation_consumer_frees_the_single_flight() {
+    for consumer in ["completed", "g1-loss", "retired"] {
+        let (mut s, reader, pid, _) = reserved_reader_behind(&[300]);
+        assert_eq!(grant_selected(&mut s), reader);
+        match consumer {
+            "completed" => {
+                file_post_result(&mut s, reader);
+                s.step2_sigalrm_ledger();
+            }
+            "g1-loss" => {
+                file_probe_successor(&mut s, reader, 2, true);
+                s.step2_sigalrm_ledger();
+                assert!(s.sigalrm_loss_recorded(pid));
+            }
+            _ => s.retire_sigalrm_thread(reader, pid),
+        }
+        assert_eq!(s.sigalrm_reserved_poll_target(), None, "{consumer}");
+
+        let (next, _, _) = add(&mut s, 500, 500);
+        let next_pid = DetPid::from_raw(500);
+        s.set_sigalrm_handled(next_pid, true);
+        file_pipe_read_attempt(&mut s, next, 1);
+        s.runqueue_push_back(next);
+        s.fire_alarm(next_pid, next, Signal::SIGALRM);
+        assert!(sigalrm_reserved_for(&s, next), "{consumer}");
+        assert!(!s.sigalrm_loss_recorded(next_pid), "{consumer}");
+    }
+}
+
+/// Gate item 2: a poller step 4 already backed off gets placed precedence
+/// when reserved (design 5.1): its priority is restored, its poll deadline
+/// dropped, and step 3 resumes it ahead of a writer that became runnable
+/// after the deferral.
+#[test]
+fn a_backed_off_poller_reserved_for_its_probe_runs_before_a_writer() {
+    // Attempt 1 backs off a band or two; attempt 20 reaches the last band,
+    // whose restore keeps the entry counted as a poller until it runs
+    // (`deadline_restored`), which the reserved probe's placement allows.
+    for attempt in [1, 20] {
+        let mut s = liteinst_scheduler();
+        let (reader, _, _) = add(&mut s, 100, 100);
+        let (writer, _, _) = add(&mut s, 300, 300);
+        let pid = DetPid::from_raw(100);
+        s.set_sigalrm_handled(pid, true);
+        let mut retry = pipe_read_request(reader, attempt);
+        retry.poll_deadline = Some(at(5_000_000_000));
+        file_request(&mut s, retry, false);
+        s.runqueue_push_back(reader);
+        assert_eq!(s.run_queue.tentative_pop_tid(reader), Some(reader));
+        let stored = s.next_turns[&reader].req.try_read().unwrap().unwrap();
+        assert!(
+            s.step4_resource_block(reader, &stored, &Ivar::new())
+                .is_err()
+        );
+        assert!(!s.run_queue.contains_non_polling_tid(reader), "backed off");
+        assert!(s.poll_deadline_of.contains_key(&reader), "deadline noted");
+        file_ordinary(&mut s, writer);
+        s.runqueue_push_back(writer);
+
+        s.fire_alarm(pid, reader, Signal::SIGALRM);
+
+        assert!(sigalrm_reserved_for(&s, reader), "attempt {attempt}");
+        assert_eq!(
+            s.reserved_probe_to_resume(),
+            Some((pid, reader)),
+            "attempt {attempt}"
+        );
+        assert!(
+            !s.poll_deadline_of.contains_key(&reader),
+            "attempt {attempt}: deadline dropped"
+        );
+        assert_eq!(
+            s.run_queue.restore_poller_priority(reader),
+            PollerRestore::NotBackedOff,
+            "attempt {attempt}: its normal priority was restored"
+        );
+        assert_eq!(
+            grant_selected(&mut s),
+            reader,
+            "attempt {attempt}: probe before the writer"
+        );
+    }
+}
+
+/// The reservation's remaining refusals, where phase 1's loss stands and
+/// nothing is placed: a selection already open (the poller restore is a
+/// queue operation), the thread not queued to run (step 3 could not select
+/// it), record and replay (excluded until the design's D6 test exists), and
+/// an entry whose loss is already recorded (never reserved again).
+#[test]
+fn a_reservation_needs_its_thread_queued_outside_a_selection() {
+    for case in [
+        "open-selection",
+        "not-queued",
+        "record-replay",
+        "already-lost",
+    ] {
+        let mut s = liteinst_scheduler();
+        let (reader, _, _) = add(&mut s, 100, 100);
+        let (other, _, _) = add(&mut s, 300, 300);
+        let pid = DetPid::from_raw(100);
+        s.set_sigalrm_handled(pid, true);
+        file_ordinary(&mut s, other);
+        s.runqueue_push_back(other);
+        match case {
+            "open-selection" => {
+                file_pipe_read_attempt(&mut s, reader, 1);
+                s.runqueue_push_back(reader);
+                assert_eq!(s.run_queue.tentative_pop_tid(other), Some(other));
+            }
+            "not-queued" => file_pipe_read_attempt(&mut s, reader, 1),
+            "record-replay" => {
+                s.recordreplay_modes = true;
+                file_pipe_read_attempt(&mut s, reader, 1);
+                s.runqueue_push_back(reader);
+            }
+            _ => {
+                // First due in a poll slice 1 does not reserve: the loss.
+                let mut r = pipe_read_request(reader, 1);
+                r.polls_guest_state_only = false;
+                file_request(&mut s, r, false);
+                s.runqueue_push_back(reader);
+                s.fire_alarm(pid, reader, Signal::SIGALRM);
+                assert!(s.sigalrm_loss_recorded(pid));
+                // Then the same entry, still pending, in a reservable one.
+                s.clear_nextturn(reader).unwrap();
+                file_pipe_read_attempt(&mut s, reader, 2);
+                s.step2_sigalrm_ledger();
+            }
+        }
+        if case != "already-lost" {
+            s.fire_alarm(pid, reader, Signal::SIGALRM);
+        }
+
+        assert!(!sigalrm_reserved_for(&s, reader), "{case}");
+        assert!(s.sigalrm_loss_recorded(pid), "{case}: phase 1's loss");
+        assert_eq!(s.reserved_probe_to_resume(), None, "{case}");
+    }
+}
+
+/// Placed precedence enforced where step 3 selects (design rev.2 section 5,
+/// review of e1ff4299 item (i)): an unrun reserved probe resumes right after
+/// a group-exit decider and ahead of every other choice, whatever arrives
+/// after the reservation: a spent alarm priority, an alarm taker, a
+/// `rt_sigreturn` continuation of another thread with a vfork child queued
+/// (which would otherwise make the alarm taker yield to the vfork child),
+/// and a queued group-exit decider, which alone goes first. The probe's
+/// grant spends the alarm priority (`alarm_priority_served`), but the probe
+/// is selected whether or not that priority is available: like a SIGCHLD
+/// taker it is exempt from the bound of
+/// https://github.com/rrnewton/hermit/issues/4929, one probe grant per due
+/// entry.
+#[test]
+fn the_unrun_probe_resumes_ahead_of_everything_but_a_group_exit_decider() {
+    for case in [
+        "served",
+        "alarm-taker",
+        "sigreturn-continuation-and-vfork-child",
+        "group-exit-decider",
+    ] {
+        let (mut s, reader, pid, queued) = reserved_reader_behind(&[300, 500]);
+        let (other, child) = (queued[0], queued[1]);
+        // All of these arrive after the reservation.
+        match case {
+            "served" => s.parked.alarm_priority_served = Some(DetPid::from_raw(300)),
+            "alarm-taker" => {
+                s.parked.alarm_takers.insert(DetPid::from_raw(300), other);
+            }
+            "sigreturn-continuation-and-vfork-child" => {
+                let mut delivery = Resources::new(other);
+                delivery.insert(
+                    ResourceID::InboundSignal(SigWrapper::from(Signal::SIGUSR1)),
+                    Permission::W,
+                );
+                delivery.continues_sigreturn = true;
+                s.clear_nextturn(other).unwrap();
+                s.next_turns[&other].req.put(Ok(delivery));
+                s.sigreturn_continuations.insert(other);
+                s.vfork_barriers.insert(DetTid::from_raw(900), Some(child));
+            }
+            _ => s.group_exit_decider = Some(other),
+        }
+        assert!(sigalrm_reserved_for(&s, reader), "{case}");
+
+        if case == "group-exit-decider" {
+            assert_eq!(grant_selected(&mut s), other, "{case}: the decider first");
+            // Its turn was its group exit: no longer the decider.
+            s.group_exit_decider = None;
+        }
+        assert_eq!(grant_selected(&mut s), reader, "{case}: the probe");
+        assert_eq!(s.parked.alarm_priority_served, Some(pid), "{case}");
+        assert!(!s.sigalrm_loss_recorded(pid), "{case}");
+    }
+}
+
+/// A scheduler signal wake that replaces the reader's own unrun probe (its
+/// child's exit SIGCHLD, sent after the reservation): the probe is no
+/// longer unrun, so step 3 resumes the thread as the signal taker; the
+/// replaced request is classified completed before that turn is granted (no
+/// loss, no G1 stop), and the entry stays pending for delivery at the
+/// interrupted call's completion, where the take succeeds.
+#[test]
+fn a_signal_wake_replacing_the_unrun_probe_classifies_it_completed() {
+    let (mut s, reader, pid, _) = reserved_reader_behind(&[300]);
+    s.test_kernel_signal_states
+        .insert(reader, KernelSignalState::default());
+    s.wake_signaled_guest(reader, Signal::SIGCHLD);
+    assert_eq!(s.reserved_probe_to_resume(), None, "replaced: not unrun");
+    assert!(sigalrm_reserved_for(&s, reader), "until classified");
+
+    let (tid, req, resp) = s.step3_peek().expect("a selection");
+    assert_eq!(tid, reader, "the signal taker");
+    let request = req.try_read().unwrap().unwrap();
+    assert!(s.step4_resource_block(tid, &request, &resp).is_ok());
+
+    assert_eq!(
+        s.sigalrm_reserved_poll_target(),
+        None,
+        "classified completed"
+    );
+    assert!(!s.sigalrm_loss_recorded(pid));
+    assert!(s.sigalrm_pending(pid), "delivered at the completion");
+    assert!(s.take_sigalrm(pid, reader), "taken after classification");
+}
+
+/// A SIGCHLD taker created after the reservation, later in the same pass
+/// (step 2b's child-exit pop), does not overtake the unrun probe: it
+/// resumes after it.
+#[test]
+fn a_sigchld_taker_created_after_the_reservation_runs_after_the_probe() {
+    let (mut s, reader, _pid, queued) = reserved_reader_behind(&[300]);
+    let other = queued[0];
+    // `other` polls a pipe read of its own, which the SIGCHLD wakes.
+    s.clear_nextturn(other).unwrap();
+    let mut r = pipe_read_request(other, 1);
+    r.read_fd = Some((detcore_model::fd::FilesId::initial(other), 7));
+    s.next_turns[&other].req.put(Ok(r));
+    s.test_kernel_signal_states
+        .insert(other, KernelSignalState::default());
+    s.wake_signaled_guest(other, Signal::SIGCHLD);
+    assert!(s.blocked.sigchld_takers.contains(&other));
+
+    assert_eq!(grant_selected(&mut s), reader, "the probe first");
+    file_probe_successor(&mut s, reader, 2, false);
+    s.step2_sigalrm_ledger();
+    assert!(woken_by_sigalrm(&s, reader));
+    assert_eq!(grant_selected(&mut s), other, "then the taker");
+}
+
+/// Gate item 4: a poll whose readiness the host can change is not reserved,
+/// since whether the probe finds data or the wake substitutes would depend
+/// on host timing: a poll that is not on guest state only, one whose
+/// guest-held marks were revoked, and a named FIFO.
+#[test]
+fn a_reserved_probe_refuses_a_poll_the_host_can_make_ready() {
+    for case in ["host-readiness", "marks-revoked", "named-fifo"] {
+        let mut s = liteinst_scheduler();
+        let (tid, _, _) = add(&mut s, 100, 100);
+        let pid = DetPid::from_raw(100);
+        s.set_sigalrm_handled(pid, true);
+        let mut r = pipe_read_request(tid, 1);
+        match case {
+            "host-readiness" => r.polls_guest_state_only = false,
+            "marks-revoked" => s.guest_held_marks_revoked = true,
+            _ => r.polls_a_named_fifo = true,
+        }
+        file_request(&mut s, r, false);
+        s.runqueue_push_back(tid);
+
+        s.fire_alarm(pid, tid, Signal::SIGALRM);
+
+        assert!(!sigalrm_reserved_for(&s, tid), "{case}");
+        assert!(s.sigalrm_loss_recorded(pid), "{case}");
+    }
+}
+
+/// R1 with the successor production files: the probe completed the read,
+/// so `complete_syscall` delivers the due entry and files its
+/// `InboundSignal(SIGALRM)` turn. Step 2 classifies that as completed (no
+/// wake substituted: the stored request is the delivery's own), and the
+/// take in its turn then succeeds, after the classification (G1).
+#[test]
+fn a_completed_probe_is_classified_before_its_delivery_takes_the_entry() {
+    let (mut s, reader, pid, _) = reserved_reader_behind(&[300]);
+    assert_eq!(grant_selected(&mut s), reader);
+    let mut delivery = Resources::new(reader);
+    delivery.insert(
+        ResourceID::InboundSignal(SigWrapper::from(Signal::SIGALRM)),
+        Permission::W,
+    );
+    delivery.fyi("deliver-sigalrm");
+    file_request(&mut s, delivery, false);
+
+    s.step2_sigalrm_ledger();
+
+    assert_eq!(s.sigalrm_reserved_poll_target(), None);
+    let stored = s.next_turns[&reader].req.try_read().unwrap().unwrap();
+    assert_eq!(stored.fyi, "deliver-sigalrm", "no wake substituted");
+    assert!(s.sigalrm_pending(pid), "delivery remains post-result");
+    assert!(s.take_sigalrm(pid, reader), "taken in its turn");
+    assert!(!s.sigalrm_pending(pid));
+}
+
+/// A first attempt of another lineage on the same descriptor means a new
+/// read began after the bound read ended without its due entry's delivery,
+/// which the completion path never does with an entry due (design 5.1):
+/// classified `NewRead`, charged as a loss, not woken, never mistaken for
+/// the still-unrun probe.
+#[test]
+fn a_new_read_of_the_same_descriptor_charges_the_probe_a_loss() {
+    let (mut s, reader, pid, _) = reserved_reader_behind(&[300]);
+    assert_eq!(grant_selected(&mut s), reader);
+    file_request(&mut s, pipe_read_request(reader, 0), false);
+
+    s.step2_sigalrm_ledger();
+
+    assert_eq!(s.sigalrm_reserved_poll_target(), None, "classified");
+    assert!(
+        s.sigalrm_loss_recorded(pid),
+        "a protocol violation: the loss"
+    );
+    assert!(!woken_by_sigalrm(&s, reader), "no wake for a new read");
+    assert!(s.sigalrm_pending(pid));
+}
+
+/// Precedence belongs to the unrun probe only. Once the probe ran and its
+/// successor retry is filed but not yet classified (the defensive step-4
+/// path: no step 2 in between), step 3 makes the run queue's own choice:
+/// the thread queued ahead runs first, and the reader's successor is settled
+/// at its own step-4 head when it is reached.
+#[test]
+fn a_ran_probe_has_no_precedence_before_its_classification() {
+    let (mut s, reader, _pid, queued) = reserved_reader_behind(&[300]);
+    let other = queued[0];
+    assert_eq!(grant_selected(&mut s), reader, "the unrun probe first");
+    file_probe_successor(&mut s, reader, 2, false);
+    assert!(sigalrm_reserved_for(&s, reader), "not yet classified");
+    assert_eq!(s.reserved_probe_to_resume(), None, "the probe ran");
+
+    assert_eq!(grant_selected(&mut s), other, "the run queue's own choice");
+}
+
+/// A happens-before program holding the reader (thread 100) at its syscall
+/// count 43 until thread 300 reaches its count 42.
+fn hb_hold_reader_spec() -> HbRuntime {
+    let program = detcore_model::happens_before::HappensBeforeSpec::from_json(
+        r#"{"version": 1,
+        "events": {"src": {"thread": "300", "syscalls": 42},
+                   "dst": {"thread": "100", "syscalls": 43}},
+        "edges": [{"before": "src", "after": "dst", "strength": "hard"}]}"#,
+    )
+    .unwrap()
+    .normalize()
+    .unwrap();
+    HbRuntime::new(program)
+}
+
+/// Review of 8f75151f, the happens-before edge: the reader reaches a
+/// happens-before hold only through its own checkpoint request, which is a
+/// successor of the probe. Driven through step 3 and step 4 with no step 2
+/// in between (the defensive path), the step-4 head classifies the
+/// reservation completed before the checkpoint parks the thread, so no
+/// reservation outlives into a hold.
+#[test]
+fn a_reserved_probe_never_outlives_into_a_happens_before_hold() {
+    let (mut s, reader, pid, queued) = reserved_reader_behind(&[300]);
+    let other = queued[0];
+    s.happens_before = Some(hb_hold_reader_spec());
+    assert_eq!(grant_selected(&mut s), reader, "the unrun probe first");
+    // The probe's read completed; its posthook checkpoint (count 43) is the
+    // successor, gated on 300's count 42, which has not fired.
+    let mut r = Resources::new(reader);
+    r.insert(ResourceID::HappensBeforeCheckpoint(43), Permission::W);
+    file_request(&mut s, r, false);
+    assert!(sigalrm_reserved_for(&s, reader), "not yet classified");
+    assert_eq!(s.reserved_probe_to_resume(), None, "the probe ran");
+    // Move the reader to the front so step 3 picks it now.
+    assert!(s.run_queue.remove_tid(other));
+    s.runqueue_push_back(other);
+    let (tid, req, resp) = s.step3_peek().expect("a selection");
+    assert_eq!(tid, reader);
+    let request = req.try_read().unwrap().unwrap();
+    assert!(
+        s.step4_resource_block(tid, &request, &resp).is_err(),
+        "held"
+    );
+    assert!(s.happens_before.as_ref().unwrap().parked.contains(&reader));
+    assert!(!s.run_queue.contains_tid(reader));
+    assert_eq!(s.sigalrm_reserved_poll_target(), None, "classified first");
+    assert!(!s.sigalrm_loss_recorded(pid));
+    assert!(s.sigalrm_pending(pid));
+}
+
+/// Review of 8f75151f, the happens-before edge's fail-closed release,
+/// constructed directly (no production path is known to leave a reserved
+/// target out of the run queue with its probe unrun): when step 3 begins,
+/// the reservation is released through the loss path
+/// (`release_unqueued_sigalrm_reservation`) instead of keeping a precedence
+/// that every turn committed meanwhile would outlive. The entry stays
+/// pending for delivery at a completion, and once the gate opens the
+/// readmitted reader has no precedence left.
+#[test]
+fn an_unrun_probe_out_of_the_run_queue_is_released_with_a_loss_at_step3() {
+    let (mut s, reader, pid, queued) = reserved_reader_behind(&[300, 500]);
+    let (other, third) = (queued[0], queued[1]);
+    let mut hb = hb_hold_reader_spec();
+    hb.parked.insert(reader);
+    s.happens_before = Some(hb);
+    assert!(s.run_queue.remove_tid(reader));
+    assert_eq!(s.reserved_probe_to_resume(), None, "held: not selectable");
+    assert!(!s.sigalrm_loss_recorded(pid));
+
+    assert_eq!(grant_selected(&mut s), other, "another turn commits");
+    assert_eq!(s.sigalrm_reserved_poll_target(), None, "released at step 3");
+    assert!(s.sigalrm_loss_recorded(pid), "charged as a loss");
+    assert!(s.sigalrm_pending(pid), "the entry stays pending");
+
+    s.happens_before.as_mut().unwrap().wake_pending = true;
+    assert_eq!(grant_selected(&mut s), third, "no precedence after release");
+    assert_eq!(grant_selected(&mut s), other);
+    assert_eq!(grant_selected(&mut s), reader);
+}
+/// A call a KVM thread waits in under a temporary mask, as its request
+/// stands where the kernel-sent receiver choice reads it.
+#[derive(Clone, Copy, Debug)]
+enum TemporaryMaskWait {
+    /// A masked `ppoll`'s wait turn (`masked_ppoll_wait_request`).
+    Ppoll,
+    /// A masked `pselect6`'s probe turn (`handle_internal_pselect6`).
+    Pselect6,
+    /// A backend-served `rt_sigsuspend`, parked (`backend_rt_sigsuspend`).
+    ParkedSuspend,
+    /// The same, woken by the step-2 drain for another signal and not yet
+    /// granted (`backend_suspend_woken`).
+    WokenSuspend,
+}
+
+/// File `tid`'s `wait` under the temporary mask `temporary` (`None`: the
+/// request says the mask is unknown), queued.
+fn file_temporary_mask_wait(
+    s: &mut Scheduler,
+    tid: DetTid,
+    wait: TemporaryMaskWait,
+    temporary: Option<u64>,
+) {
+    let mut request = Resources::new(tid);
+    match wait {
+        TemporaryMaskWait::Ppoll | TemporaryMaskWait::Pselect6 => {
+            request.insert(ResourceID::InternalIOPolling, Permission::W);
+            request.fyi(if matches!(wait, TemporaryMaskWait::Ppoll) {
+                "ppoll"
+            } else {
+                "pselect6"
+            });
+            request.set_signal_interrupt_errno(reverie::syscalls::Errno::EINTR);
+        }
+        TemporaryMaskWait::ParkedSuspend | TemporaryMaskWait::WokenSuspend => {
+            request.insert(
+                ResourceID::SleepUntil(LogicalTime::INDEFINITE),
+                Permission::W,
+            );
+            request.fyi(crate::resources::RT_SIGSUSPEND_FYI);
+        }
+    }
+    request.blocked_signal_mask = temporary;
+    request.blocked_signal_mask_unknown = temporary.is_none();
+    s.next_turns.get_mut(&tid).unwrap().req = Ivar::full(Ok(request));
+    if matches!(wait, TemporaryMaskWait::WokenSuspend) {
+        // The drain's wake replaces the request and keeps the suspend's mask.
+        s.note_backend_suspend_replaced(tid);
+        let mut woken = Resources::new(tid);
+        woken.insert(
+            ResourceID::WaitidSignals(vec![SigWrapper(libc::SIGUSR1)]),
+            Permission::W,
+        );
+        s.next_turns.get_mut(&tid).unwrap().req = Ivar::full(Ok(woken));
+    }
+    s.runqueue_push_back(tid);
+}
+
+/// The Codex review of https://github.com/rrnewton/hermit/pull/5259, P1: on
+/// KVM the receiver of a child's exit `SIGCHLD` is chosen by the mask Linux's
+/// `blocked` holds, which for a thread waiting in `ppoll`, `pselect6` or
+/// `rt_sigsuspend` is the call's temporary mask (`set_user_sigmask`,
+/// kernel/signal.c:3272 at v6.17; `sigsuspend`, line 4833; `wants_signal`,
+/// line 948), not its own. The creator M (100) waits in each call, under
+/// both orientations, beside an eligible sibling W (101) in a pipe read:
+/// - its own mask blocks SIGCHLD and the call's lets it in: Linux names M,
+///   which wants it, and the queued copy interrupts M's wait;
+/// - its own mask lets SIGCHLD in and the call's blocks it: M does not want
+///   it, the walk reaches W, and on M the copy would stay pending.
+///
+/// A temporary mask the request says is unknown makes M no target: W.
+/// Mutation "the own mask read" (`thread_signal_mask_for` in
+/// `kernel_signal_choice`, the backend's sets in `queued_sigchld_fate`):
+/// every row fails, choosing W for M and M for W.
+#[test]
+fn a_kvm_child_exit_receiver_is_chosen_by_the_temporary_mask_its_call_installs() {
+    use super::controlled_child_exit::QueuedSigchld;
+    let sigchld = kernel_signal_bit(libc::SIGCHLD);
+    for wait in [
+        TemporaryMaskWait::Ppoll,
+        TemporaryMaskWait::Pselect6,
+        TemporaryMaskWait::ParkedSuspend,
+        TemporaryMaskWait::WokenSuspend,
+    ] {
+        for (own_blocks, temporary, expected_m) in [(true, 0, true), (false, sigchld, false)] {
+            let case = format!("{wait:?}, own mask blocks SIGCHLD: {own_blocks}");
+            let (mut s, backend) = kvm_fixture();
+            let (creator, _, _) = add(&mut s, 100, 100);
+            let (sibling, _, _) = add(&mut s, 100, 101);
+            backend
+                .signal_sets
+                .lock()
+                .unwrap()
+                .insert(100, sigchld_sets(own_blocks, false, true));
+            backend
+                .signal_sets
+                .lock()
+                .unwrap()
+                .insert(101, sigchld_sets(false, false, true));
+            file_temporary_mask_wait(&mut s, creator, wait, Some(temporary));
+            file_restartable_read(&mut s, sibling);
+            assert_eq!(
+                s.controlled_temporary_mask(creator),
+                Ok(Some(temporary)),
+                "{case}"
+            );
+            let expected = if expected_m { creator } else { sibling };
+            assert_eq!(
+                s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD)
+                    .0,
+                Some(expected),
+                "{case}"
+            );
+            assert_eq!(
+                s.queued_sigchld_fate(creator),
+                if expected_m {
+                    QueuedSigchld::Interrupts
+                } else {
+                    QueuedSigchld::StaysPending
+                },
+                "{case}"
+            );
+        }
+        // Unknown: never the own mask, which lets SIGCHLD in here.
+        let (mut s, backend) = kvm_fixture();
+        let (creator, _, _) = add(&mut s, 100, 100);
+        let (sibling, _, _) = add(&mut s, 100, 101);
+        backend
+            .signal_sets
+            .lock()
+            .unwrap()
+            .insert(100, sigchld_sets(false, false, true));
+        backend
+            .signal_sets
+            .lock()
+            .unwrap()
+            .insert(101, sigchld_sets(false, false, true));
+        file_temporary_mask_wait(&mut s, creator, wait, None);
+        file_restartable_read(&mut s, sibling);
+        if !matches!(wait, TemporaryMaskWait::WokenSuspend) {
+            assert_eq!(
+                s.controlled_temporary_mask(creator),
+                Err(TemporaryMaskUnknown),
+                "{wait:?}"
+            );
+            assert_eq!(
+                s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD)
+                    .0,
+                Some(sibling),
+                "{wait:?}: unknown temporary mask"
+            );
+        }
+    }
+}
+
+/// The dual review of https://github.com/rrnewton/hermit/pull/5259, P1: the
+/// private-pending half of `wants_signal` (`task_sigpending`,
+/// kernel/signal.c:960 at v6.17) reads the same installed mask as the
+/// blocks-target half. A copy pending for M alone counts only if the mask
+/// in force — the wait's temporary mask, not M's own — leaves it unblocked:
+/// - own admits SIGUSR2, the temporary mask blocks it: the copy is not
+///   pending work, M wants the child's SIGCHLD and is chosen;
+/// - own blocks SIGUSR2, the temporary mask admits it: the copy is pending
+///   work, M is busy and the walk reaches the sibling.
+///
+/// The pending state is scripted through the real reader seam
+/// (`test_kernel_signal_states`), so the pending filter itself, with its
+/// exclusions, is the code under test.
+#[test]
+fn a_kvm_child_exit_receiver_counts_private_pending_under_the_temporary_mask() {
+    let usr2 = kernel_signal_bit(libc::SIGUSR2);
+    let chld = kernel_signal_bit(libc::SIGCHLD);
+    for (own_blocked, temporary, expected_m, case) in [
+        (0, usr2, true, "the temporary mask blocks the private copy"),
+        (usr2, 0, false, "the temporary mask admits the private copy"),
+    ] {
+        let (mut s, backend) = kvm_fixture();
+        let (creator, _, _) = add(&mut s, 100, 100);
+        let (sibling, _, _) = add(&mut s, 100, 101);
+        backend
+            .signal_sets
+            .lock()
+            .unwrap()
+            .insert(100, reverie::SignalSets::new(0, 0, own_blocked, 0, chld));
+        backend
+            .signal_sets
+            .lock()
+            .unwrap()
+            .insert(101, sigchld_sets(false, false, true));
+        s.test_kernel_signal_states.insert(
+            creator,
+            KernelSignalState {
+                thread_pending: usr2,
+                blocked: own_blocked,
+                ..KernelSignalState::default()
+            },
+        );
+        file_temporary_mask_wait(&mut s, creator, TemporaryMaskWait::Ppoll, Some(temporary));
+        file_restartable_read(&mut s, sibling);
+        let expected = if expected_m { creator } else { sibling };
+        assert_eq!(
+            s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD)
+                .0,
+            Some(expected),
+            "{case}"
+        );
+    }
+}
+
+/// The ptrace half of the dual review of
+/// https://github.com/rrnewton/hermit/pull/5259, P1 (delta round): a thread
+/// waiting in `ppoll` on ptrace publishes its temporary mask
+/// (`publish_wait_mask` stores it in `saved_guest_sigmasks`), while the
+/// physical mask the kernel-sent caller otherwise reads is the thread's
+/// own. The choice must read the published mask: the creator (100) waits
+/// in `ppoll` beside a sibling (101), with a private SIGUSR2 pending whose
+/// state is scripted through the real reader seam, exactly as in the KVM
+/// test above. Returns the choice and the moved curr_target.
+fn ptrace_choice_under_published_mask(
+    own_blocked: u64,
+    temporary: u64,
+) -> (Option<DetTid>, Option<DetTid>, DetTid, DetTid) {
+    let usr2 = kernel_signal_bit(libc::SIGUSR2);
+    let mut s = Scheduler::new(&Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE)
+    });
+    assert!(s.models_signal_targets);
+    let (creator, _, _) = add(&mut s, 100, 100);
+    let (sibling, _, _) = add(&mut s, 100, 101);
+    s.test_kernel_signal_states.insert(
+        creator,
+        KernelSignalState {
+            thread_pending: usr2,
+            blocked: own_blocked,
+            ..KernelSignalState::default()
+        },
+    );
+    s.test_kernel_signal_states
+        .insert(sibling, KernelSignalState::default());
+    file_temporary_mask_wait(&mut s, creator, TemporaryMaskWait::Ppoll, Some(temporary));
+    assert!(s.begin_wait_mask(creator, Some(temporary)));
+    file_restartable_read(&mut s, sibling);
+    let (receiver, moved) = s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD);
+    (receiver, moved, creator, sibling)
+}
+
+#[test]
+fn a_ptrace_receiver_ignores_a_private_copy_its_waits_mask_blocks() {
+    let usr2 = kernel_signal_bit(libc::SIGUSR2);
+    let (receiver, moved, creator, _) = ptrace_choice_under_published_mask(0, usr2);
+    assert_eq!(receiver, Some(creator));
+    assert_eq!(moved, None);
+}
+
+/// The wait mask's lifetime (the Astra delta review of
+/// https://github.com/rrnewton/hermit/pull/5259 at `232e34c8`): a scheduler
+/// send wakes the creator's `ppoll`, replacing its filed wait with the
+/// wake's `InboundSignal` request while the wait's published mask remains
+/// in force. The choice still reads that mask, not the physical one, so
+/// the pending private SIGUSR2 stays blocked until the waiter resumes.
+#[test]
+fn a_woken_ptrace_ppoll_keeps_its_mask_until_its_grant() {
+    let usr1 = kernel_signal_bit(libc::SIGUSR1);
+    let usr2 = kernel_signal_bit(libc::SIGUSR2);
+    // Both pending orientations: the temporary mask blocks the private
+    // copy (creator chosen, no move) or admits it (sibling, walk moves).
+    for (temporary, creator_chosen) in [(usr2, true), (0, false)] {
+        let own_blocked = usr2 & !temporary;
+        let mut s = Scheduler::new(&Config {
+            sequentialize_threads: true,
+            max_timeslice: None,
+            ..Config::default()
+                .with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE)
+        });
+        let (creator, _, _) = add(&mut s, 100, 100);
+        let (sibling, _, _) = add(&mut s, 100, 101);
+        s.test_kernel_signal_states.insert(
+            creator,
+            KernelSignalState {
+                thread_pending: usr2,
+                shared_pending: usr1,
+                blocked: own_blocked,
+                caught: usr1 | kernel_signal_bit(libc::SIGCHLD),
+                ..KernelSignalState::default()
+            },
+        );
+        s.test_kernel_signal_states
+            .insert(sibling, KernelSignalState::default());
+        file_temporary_mask_wait(&mut s, creator, TemporaryMaskWait::Ppoll, Some(temporary));
+        assert!(s.begin_wait_mask(creator, Some(temporary)));
+        file_restartable_read(&mut s, sibling);
+        let expected = if creator_chosen {
+            (Some(creator), None)
+        } else {
+            (Some(sibling), Some(sibling))
+        };
+        assert_eq!(
+            s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+            expected,
+            "filed wait, temporary {temporary:#x}"
+        );
+        // A scheduler send wakes the ppoll; its guest has not received any grant.
+        s.wake_signaled_guest(creator, SigWrapper(libc::SIGUSR1));
+        let req = s.next_turns[&creator].req.try_read().unwrap().unwrap();
+        assert!(
+            req.resources
+                .contains_key(&ResourceID::InboundSignal(SigWrapper(libc::SIGUSR1)))
+        );
+        assert_eq!(s.saved_guest_sigmasks.get(&creator), Some(&temporary));
+        assert!(!s.blocked.continuation_masks.contains_key(&creator));
+        assert!(!s.process_signal_takers.contains_key(&creator));
+        assert_eq!(
+            s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+            expected,
+            "woken, temporary {temporary:#x}: the choice is the filed wait's"
+        );
+    }
+}
+
+/// The replay-checkpoint twin of `a_woken_ptrace_ppoll_keeps_its_mask_until_its_grant`:
+/// `record_retry_event` inside the active `ppoll` can file `TraceReplay`
+/// under `--replay-schedule-from` while the call has not ended. Its
+/// still-published mask decides the choice, as before the checkpoint.
+#[test]
+fn a_ptrace_ppoll_keeps_its_mask_at_a_replay_checkpoint() {
+    let usr1 = kernel_signal_bit(libc::SIGUSR1);
+    let usr2 = kernel_signal_bit(libc::SIGUSR2);
+    // Both pending orientations, as in the woken test: record and replay
+    // choose identically, before and at the checkpoint.
+    for (temporary, creator_chosen) in [(usr2, true), (0, false)] {
+        let own_blocked = usr2 & !temporary;
+        let mut s = Scheduler::new(&Config {
+            sequentialize_threads: true,
+            max_timeslice: None,
+            ..Config::default()
+                .with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE)
+        });
+        let (creator, _, _) = add(&mut s, 100, 100);
+        let (sibling, _, _) = add(&mut s, 100, 101);
+        s.test_kernel_signal_states.insert(
+            creator,
+            KernelSignalState {
+                thread_pending: usr2,
+                shared_pending: 0,
+                blocked: own_blocked,
+                caught: usr1 | kernel_signal_bit(libc::SIGCHLD),
+                ..KernelSignalState::default()
+            },
+        );
+        s.test_kernel_signal_states
+            .insert(sibling, KernelSignalState::default());
+        file_temporary_mask_wait(&mut s, creator, TemporaryMaskWait::Ppoll, Some(temporary));
+        assert!(s.begin_wait_mask(creator, Some(temporary)));
+        file_restartable_read(&mut s, sibling);
+        let expected = if creator_chosen {
+            (Some(creator), None)
+        } else {
+            (Some(sibling), Some(sibling))
+        };
+        assert_eq!(
+            s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+            expected,
+            "record, temporary {temporary:#x}"
+        );
+        // record_retry_event can yield here while the ppoll remains active.
+        let mut checkpoint = Resources::new(creator);
+        checkpoint.insert(ResourceID::TraceReplay, Permission::RW);
+        s.next_turns.get_mut(&creator).unwrap().req = Ivar::full(Ok(checkpoint));
+        assert_eq!(s.saved_guest_sigmasks.get(&creator), Some(&temporary));
+        assert!(!s.blocked.continuation_masks.contains_key(&creator));
+        assert!(!s.process_signal_takers.contains_key(&creator));
+        assert_eq!(
+            s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+            expected,
+            "replay checkpoint, temporary {temporary:#x}: the choice is the record's"
+        );
+    }
+}
+
+/// Withdrawing the wait's publication ends its say: the choice falls back
+/// to the physical mask (here the creator's own, which admits the private
+/// copy), and no wait record remains.
+#[test]
+fn a_withdrawn_wait_publication_no_longer_decides_the_choice() {
+    let usr2 = kernel_signal_bit(libc::SIGUSR2);
+    let mut s = Scheduler::new(&Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE)
+    });
+    let (creator, _, _) = add(&mut s, 100, 100);
+    let (sibling, _, _) = add(&mut s, 100, 101);
+    s.test_kernel_signal_states.insert(
+        creator,
+        KernelSignalState {
+            thread_pending: usr2,
+            blocked: 0,
+            ..KernelSignalState::default()
+        },
+    );
+    s.test_kernel_signal_states
+        .insert(sibling, KernelSignalState::default());
+    file_temporary_mask_wait(&mut s, creator, TemporaryMaskWait::Ppoll, Some(usr2));
+    assert!(s.begin_wait_mask(creator, Some(usr2)));
+    file_restartable_read(&mut s, sibling);
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+        (Some(creator), None)
+    );
+    assert!(s.withdraw_wait_mask(creator));
+    assert!(!s.wait_masks_in_force.contains_key(&creator));
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+        (Some(sibling), Some(sibling)),
+        "withdrawn: the physical own mask admits the private copy"
+    );
+}
+
+/// A plain select's first publication (the Astra probe at `4e61c6fe`):
+/// the first poll filing has no saved mask, its grant is consumed, and
+/// the wait then publishes its own mask with the request slot empty. A
+/// replay checkpoint in that interval reads the same in-force mask as
+/// the next poll filing does.
+#[test]
+fn a_first_wait_publication_is_visible_before_a_replay_checkpoint() {
+    let chld = kernel_signal_bit(libc::SIGCHLD);
+    let mut s = Scheduler::new(&Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE)
+    });
+    let (creator, _, _) = add(&mut s, 100, 100);
+    let (sibling, _, _) = add(&mut s, 100, 101);
+    s.test_kernel_signal_states.insert(
+        creator,
+        KernelSignalState {
+            blocked: 0,
+            caught: chld,
+            ..KernelSignalState::default()
+        },
+    );
+    s.test_kernel_signal_states
+        .insert(sibling, KernelSignalState::default());
+    let mut poll = Resources::new(creator);
+    poll.insert(ResourceID::InternalIOPolling, Permission::W);
+    poll.fyi("select");
+    poll.set_signal_interrupt_errno(reverie::syscalls::Errno::EINTR);
+    assert_eq!(poll.blocked_signal_mask, None);
+    s.next_turns.get_mut(&creator).unwrap().req = Ivar::full(Ok(poll.clone()));
+    s.runqueue_push_back(creator);
+    file_restartable_read(&mut s, sibling);
+    assert!(!s.wait_masks_in_force.contains_key(&creator));
+    // Its grant consumes that request. After the first unsuccessful probe,
+    // the wait installs a private mask and publishes the own mask.
+    s.clear_nextturn(creator).unwrap();
+    s.test_kernel_signal_states
+        .get_mut(&creator)
+        .unwrap()
+        .blocked = chld;
+    assert!(s.begin_wait_mask(creator, Some(0)));
+    assert_eq!(s.saved_guest_sigmasks.get(&creator), Some(&0));
+    // record_retry_event can yield before the next poll request is filed.
+    let mut checkpoint = Resources::new(creator);
+    checkpoint.insert(ResourceID::TraceReplay, Permission::RW);
+    s.next_turns.get_mut(&creator).unwrap().req = Ivar::full(Ok(checkpoint));
+    let at_checkpoint = s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD);
+    // Without that replay yield the same loop next files InternalIOPolling.
+    s.next_turns.get_mut(&creator).unwrap().req = Ivar::full(Ok(poll));
+    let at_next_poll = s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD);
+    assert_eq!(
+        at_next_poll,
+        (Some(creator), None),
+        "normal next-poll control"
+    );
+    assert_eq!(
+        at_checkpoint, at_next_poll,
+        "a first publication inside the active select must decide at its replay checkpoint too"
+    );
+}
+
+/// A saved mask recorded with no wait begun (a direct `SetSavedGuestSigmask`,
+/// as for a privately held thread) does not decide the choice: the physical
+/// mask does, here blocking SIGCHLD, so the walk reaches the sibling.
+#[test]
+fn a_saved_mask_without_a_wait_begun_does_not_decide_the_choice() {
+    let chld = kernel_signal_bit(libc::SIGCHLD);
+    let mut s = Scheduler::new(&Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE)
+    });
+    let (creator, _, _) = add(&mut s, 100, 100);
+    let (sibling, _, _) = add(&mut s, 100, 101);
+    s.test_kernel_signal_states.insert(
+        creator,
+        KernelSignalState {
+            blocked: chld,
+            caught: chld,
+            ..KernelSignalState::default()
+        },
+    );
+    s.test_kernel_signal_states
+        .insert(sibling, KernelSignalState::default());
+    file_restartable_read(&mut s, creator);
+    file_restartable_read(&mut s, sibling);
+    assert!(s.set_saved_guest_sigmask(creator, Some(0)));
+    assert!(!s.wait_masks_in_force.contains_key(&creator));
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+        (Some(sibling), Some(sibling)),
+        "the physical mask blocks SIGCHLD; the unbegun saved mask must not decide"
+    );
+}
+
+/// The interval ends and restarts with its waits: at the delivery
+/// handoff the thread's current handler mask decides (here it admits the
+/// private copy, so the waiter is busy), a fresh wait begins a fresh
+/// interval, and thread retirement clears the record.
+#[test]
+fn a_wait_mask_interval_ends_restarts_and_dies_with_its_thread() {
+    let usr2 = kernel_signal_bit(libc::SIGUSR2);
+    let mut s = Scheduler::new(&Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE)
+    });
+    let (creator, mm, _) = add(&mut s, 100, 100);
+    let (sibling, _, _) = add(&mut s, 100, 101);
+    s.test_kernel_signal_states.insert(
+        creator,
+        KernelSignalState {
+            thread_pending: usr2,
+            blocked: 0,
+            ..KernelSignalState::default()
+        },
+    );
+    s.test_kernel_signal_states
+        .insert(sibling, KernelSignalState::default());
+    file_temporary_mask_wait(&mut s, creator, TemporaryMaskWait::Ppoll, Some(usr2));
+    file_restartable_read(&mut s, sibling);
+    assert!(s.begin_wait_mask(creator, Some(usr2)));
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+        (Some(creator), None),
+        "in force: the temporary mask blocks the private copy"
+    );
+    // Delivery handoff: the handler's current mask (the physical one,
+    // admitting the copy) decides now, not the frozen temporary mask.
+    assert!(s.end_wait_mask(creator));
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+        (Some(sibling), Some(sibling)),
+        "handed off: the current handler mask admits the private copy"
+    );
+    // A restart after the handler begins a fresh interval.
+    assert!(s.begin_wait_mask(creator, Some(usr2)));
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+        (Some(creator), None),
+        "restarted: the fresh wait's mask decides"
+    );
+    let process = DetPid::from_raw(100);
+    s.logically_kill_thread(&creator, &process, mm);
+    assert!(
+        !s.wait_masks_in_force.contains_key(&creator),
+        "thread retirement clears the interval"
+    );
+}
+
+/// The delivery handoff: a wake that ends the wait for a caught handler
+/// pushes the delivery frame (wait value, `sa_mask`, the delivered
+/// signal) in the same mutation that ends the wait interval. It decides
+/// until `rt_sigreturn` pops it; a fresh wait inside the handler
+/// supersedes it.
+#[test]
+fn a_delivery_frame_decides_until_sigreturn_and_nests() {
+    let usr2 = kernel_signal_bit(libc::SIGUSR2);
+    let winch = kernel_signal_bit(libc::SIGWINCH);
+    let mut s = Scheduler::new(&Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE)
+    });
+    let (creator, _, _) = add(&mut s, 100, 100);
+    let (sibling, _, _) = add(&mut s, 100, 101);
+    s.test_kernel_signal_states.insert(
+        creator,
+        KernelSignalState {
+            thread_pending: winch,
+            shared_pending: kernel_signal_bit(libc::SIGCHLD),
+            blocked: 0,
+            ..KernelSignalState::default()
+        },
+    );
+    s.test_kernel_signal_states
+        .insert(sibling, KernelSignalState::default());
+    s.handler_masks
+        .insert((DetPid::from_raw(100), libc::SIGCHLD), (winch, false));
+    file_temporary_mask_wait(&mut s, creator, TemporaryMaskWait::Ppoll, Some(usr2));
+    file_restartable_read(&mut s, sibling);
+    assert!(s.begin_wait_mask(creator, Some(usr2)));
+    // Under the wait mask the WINCH copy is pending work: busy for SIGUSR1.
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGUSR1),
+        (Some(sibling), Some(sibling)),
+        "in force: the temporary mask admits the WINCH copy"
+    );
+    // Entry before the wait's finish: the wake queues the entry, the
+    // handler's entry (its delivery recorded) hands the interval off.
+    s.wake_signaled_guest(creator, SigWrapper(libc::SIGCHLD));
+    s.record_delivery_entry(creator);
+    assert!(!s.wait_masks_in_force.contains_key(&creator));
+    // The delivery mask (temporary, sa_mask WINCH, SIGCHLD) blocks it.
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGUSR1),
+        (Some(creator), None),
+        "delivery: sa_mask blocks the WINCH copy"
+    );
+    // A fresh wait inside the handler supersedes the delivery frame.
+    assert!(s.begin_wait_mask(creator, Some(0)));
+    assert!(!s.delivery_masks.contains_key(&creator));
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGUSR1),
+        (Some(sibling), Some(sibling)),
+        "nested wait: its own mask admits the WINCH copy"
+    );
+    assert!(s.end_wait_mask(creator));
+    // Re-deliver and pop at sigreturn: the physical mask decides again.
+    // Re-file the wait first, as a handler that waits again would: the
+    // previous wake left an InboundSignal request, against which no new
+    // entry could be recorded.
+    let mut refiled = Resources::new(creator);
+    refiled.insert(ResourceID::InternalIOPolling, Permission::W);
+    refiled.blocked_signal_mask = Some(usr2);
+    s.next_turns.get_mut(&creator).unwrap().req = Ivar::full(Ok(refiled));
+    assert!(s.begin_wait_mask(creator, Some(usr2)));
+    s.wake_signaled_guest(creator, SigWrapper(libc::SIGCHLD));
+    s.record_delivery_entry(creator);
+    assert!(
+        s.delivery_masks.contains_key(&creator),
+        "the second delivery must leave a frame for the pop to retire"
+    );
+    assert!(s.pop_delivery_mask(creator));
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGUSR1),
+        (Some(sibling), Some(sibling)),
+        "sigreturn: the physical own mask admits the WINCH copy"
+    );
+}
+
+/// A wake has not entered the handler (the Astra delivery probes at
+/// `4de0cdc9`): its `sa_mask` cannot affect a second send yet, so the
+/// next SIGCHLD still reads the wait mask until the waiter's grant.
+#[test]
+fn a_caught_wake_does_not_install_the_handler_mask_before_its_grant() {
+    let usr1 = kernel_signal_bit(libc::SIGUSR1);
+    let chld = kernel_signal_bit(libc::SIGCHLD);
+    let mut s = Scheduler::new(&Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE)
+    });
+    let (creator, _, _) = add(&mut s, 100, 100);
+    let (sibling, _, _) = add(&mut s, 100, 101);
+    s.test_kernel_signal_states.insert(
+        creator,
+        KernelSignalState {
+            blocked: 0,
+            shared_pending: usr1,
+            caught: usr1 | chld,
+            ..KernelSignalState::default()
+        },
+    );
+    s.test_kernel_signal_states
+        .insert(sibling, KernelSignalState::default());
+    s.handler_masks
+        .insert((DetPid::from_raw(100), libc::SIGUSR1), (chld, false));
+    assert!(s.begin_wait_mask(creator, Some(0)));
+    file_temporary_mask_wait(&mut s, creator, TemporaryMaskWait::Ppoll, Some(0));
+    file_restartable_read(&mut s, sibling);
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+        (Some(creator), None)
+    );
+    s.wake_signaled_guest(creator, SigWrapper(libc::SIGUSR1));
+    let request = s.next_turns[&creator].req.try_read().unwrap().unwrap();
+    assert!(
+        request
+            .resources
+            .contains_key(&ResourceID::InboundSignal(SigWrapper(libc::SIGUSR1)))
+    );
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+        (Some(creator), None),
+        "SIGUSR1 only woke the ppoll; no grant or handler entry has installed sa_mask yet"
+    );
+}
+
+/// The scheduler can queue a blocked timer signal without any handler
+/// delivery: its `sa_mask` fabricates no handler mask.
+#[test]
+fn a_blocked_alarm_keeps_the_wait_mask_in_force() {
+    let alrm = kernel_signal_bit(libc::SIGALRM);
+    let chld = kernel_signal_bit(libc::SIGCHLD);
+    let mut s = Scheduler::new(&Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE)
+    });
+    let (creator, _, _) = add(&mut s, 100, 100);
+    let (sibling, _, _) = add(&mut s, 100, 101);
+    s.test_kernel_signal_states.insert(
+        creator,
+        KernelSignalState {
+            blocked: alrm,
+            shared_pending: alrm,
+            caught: alrm | chld,
+            ..KernelSignalState::default()
+        },
+    );
+    s.test_kernel_signal_states.insert(
+        sibling,
+        KernelSignalState {
+            blocked: alrm,
+            ..KernelSignalState::default()
+        },
+    );
+    s.handler_masks
+        .insert((DetPid::from_raw(100), libc::SIGALRM), (chld, false));
+    assert!(s.begin_wait_mask(creator, Some(alrm)));
+    file_temporary_mask_wait(&mut s, creator, TemporaryMaskWait::Ppoll, Some(alrm));
+    file_restartable_read(&mut s, sibling);
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+        (Some(creator), None)
+    );
+    s.wake_signaled_guest(creator, SigWrapper(libc::SIGALRM));
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+        (Some(creator), None),
+        "blocked SIGALRM stays pending; its handler sa_mask cannot block SIGCHLD"
+    );
+}
+
+/// After an actual handler changes its mask, its current publication
+/// must decide: the stale legacy saved mask goes at the delivery
+/// handoff (`end_wait_mask`), so the handler's published mask wins.
+#[test]
+fn a_handler_sigprocmask_supersedes_its_delivery_frame() {
+    let usr1 = kernel_signal_bit(libc::SIGUSR1);
+    let chld = kernel_signal_bit(libc::SIGCHLD);
+    let mut s = Scheduler::new(&Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE)
+    });
+    let (creator, mm, _) = add(&mut s, 100, 100);
+    let (sibling, _, _) = add(&mut s, 100, 101);
+    s.test_kernel_signal_states.insert(
+        creator,
+        KernelSignalState {
+            blocked: usr1,
+            caught: usr1 | chld,
+            ..KernelSignalState::default()
+        },
+    );
+    s.test_kernel_signal_states
+        .insert(sibling, KernelSignalState::default());
+    s.handler_masks
+        .insert((DetPid::from_raw(100), libc::SIGUSR1), (0, false));
+    assert!(s.begin_wait_mask(creator, Some(0)));
+    file_temporary_mask_wait(&mut s, creator, TemporaryMaskWait::Ppoll, Some(0));
+    file_restartable_read(&mut s, sibling);
+    s.handoff_delivery(creator, SigWrapper(libc::SIGUSR1));
+    assert!(s.end_wait_mask(creator));
+    // The handler has entered and executes sigprocmask(SIG_BLOCK, {SIGCHLD}).
+    s.test_kernel_signal_states
+        .get_mut(&creator)
+        .unwrap()
+        .blocked = usr1 | chld;
+    assert!(s.publish_signal_mask(creator, mm, Some(usr1 | chld)));
+    let mut checkpoint = Resources::new(creator);
+    checkpoint.insert(ResourceID::TraceReplay, Permission::RW);
+    s.next_turns.get_mut(&creator).unwrap().req = Ivar::full(Ok(checkpoint));
+    assert!(
+        !s.saved_guest_sigmasks.contains_key(&creator),
+        "the handoff cleared the stale legacy publication"
+    );
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+        (Some(sibling), Some(sibling)),
+        "a handler's current blocked mask must supersede the delivery frame"
+    );
+}
+
+/// A `sigtimedwait` wait publishes its own mask through the shared wait
+/// machinery: a signal it does not wait for stays eligible from that
+/// mask (not the private all-blocked physical mask), and the waited set
+/// comes off exactly once, in the caller's subtraction.
+#[test]
+fn a_sigtimedwait_wait_keeps_non_waited_signals_eligible() {
+    let usr1 = kernel_signal_bit(libc::SIGUSR1);
+    let mut s = Scheduler::new(&Config {
+        sequentialize_threads: true,
+        max_timeslice: None,
+        ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE)
+    });
+    let (creator, _, _) = add(&mut s, 100, 100);
+    let (sibling, _, _) = add(&mut s, 100, 101);
+    s.test_kernel_signal_states.insert(
+        creator,
+        KernelSignalState {
+            blocked: u64::MAX,
+            ..KernelSignalState::default()
+        },
+    );
+    s.test_kernel_signal_states
+        .insert(sibling, KernelSignalState::default());
+    file_restartable_read(&mut s, creator);
+    file_restartable_read(&mut s, sibling);
+    assert!(s.begin_wait_mask(creator, Some(0)));
+    assert!(s.set_sigtimedwait_set(creator, Some(usr1)));
+    assert_eq!(
+        s.kernel_signal_choice(DetPid::from_raw(100), creator, libc::SIGCHLD),
+        (Some(creator), None),
+        "a non-waited signal reads the published own mask, not the private physical one"
+    );
+}
+
+#[test]
+fn a_ptrace_receiver_counts_a_private_copy_its_waits_mask_admits() {
+    let usr2 = kernel_signal_bit(libc::SIGUSR2);
+    let (receiver, moved, _, sibling) = ptrace_choice_under_published_mask(usr2, 0);
+    assert_eq!(receiver, Some(sibling));
+    assert_eq!(moved, Some(sibling));
+}
+
+/// The Codex review of https://github.com/rrnewton/hermit/pull/5259, P1: an
+/// unblocked SIGURG sent to a KVM thread while it is ignored by default is
+/// one Linux discards before it is queued (`prepare_signal`,
+/// `__send_signal_locked`, kernel/signal.c:935 and 1053 at v6.17), so a
+/// handler installed afterwards never sees it, though the backend keeps the
+/// copy for the Tool. The parked observation must not count it as the
+/// thread's own signal to take (`has_own_signal_to_take`), and a delivery
+/// stop that dequeues it delivers nothing
+/// (`delivers_a_copy_linux_discarded`). A copy that was blocked when sent was
+/// queued (`sig_ignored`, lines 113-114) and is taken under the late handler
+/// as before; one still ignored is delivered as before (the kernel ignores
+/// it). Mutation "the current disposition alone": the first row counts the
+/// discarded copy and delivers it.
+#[test]
+fn a_kvm_copy_linux_discarded_at_send_is_never_taken_by_a_later_handler() {
+    let urg = kernel_signal_bit(libc::SIGURG);
+    for (name, blocked_at_send, caught_now, takes, suppressed) in [
+        ("unblocked at send, caught now", false, true, false, true),
+        ("blocked at send, caught now", true, true, true, false),
+        (
+            "unblocked at send, still ignored",
+            false,
+            false,
+            false,
+            false,
+        ),
+    ] {
+        let (mut s, backend) = kvm_fixture();
+        let (_, _, _) = add(&mut s, 100, 100);
+        let (waiter, _, _) = add(&mut s, 100, 101);
+        file_restartable_read(&mut s, waiter);
+        let at_send = if blocked_at_send { urg } else { 0 };
+        backend
+            .signal_sets
+            .lock()
+            .unwrap()
+            .insert(101, reverie::SignalSets::new(0, 0, at_send, 0, 0));
+        // The sibling's send, as the guest hooks record it.
+        let token = s.discard_pre_send(
+            waiter,
+            discarded_at_send::QueueId::Thread(waiter),
+            libc::SIGURG,
+            None,
+        );
+        assert_eq!(token.discarded, !blocked_at_send, "{name}");
+        s.discard_note_send(token, None, None);
+        // The copy is pending for the waiter, unblocked now, and a handler
+        // may have been installed since.
+        backend.signal_sets.lock().unwrap().insert(
+            101,
+            reverie::SignalSets::new(urg, 0, 0, 0, if caught_now { urg } else { 0 }),
+        );
+        assert_eq!(s.has_own_signal_to_take(waiter), takes, "{name}");
+        // A delivery stop dequeued it: nothing is pending after.
+        backend.signal_sets.lock().unwrap().insert(
+            101,
+            reverie::SignalSets::new(0, 0, 0, 0, if caught_now { urg } else { 0 }),
+        );
+        assert_eq!(
+            s.delivers_a_copy_linux_discarded(waiter, libc::SIGURG),
+            suppressed,
+            "{name}"
+        );
     }
 }

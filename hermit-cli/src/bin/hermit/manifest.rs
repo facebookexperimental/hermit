@@ -117,6 +117,11 @@ const RUN_OUTPUTS: &[&str] = &[
     "verify-log-dir",
     "verify-run",
     "work-span-report",
+    // Host placement, not inputs either: where this host's CPU lock files
+    // live and whether a notice is printed. Neither reaches the guest, and a
+    // rerun on another host should take that host's own defaults.
+    "pinned-cpu-dir",
+    "pinned-cpu-notice",
 ];
 
 /// Removes the output destinations from a manifest's `global` and `run`

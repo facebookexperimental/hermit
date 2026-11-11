@@ -59,7 +59,11 @@ pub(crate) fn stack_pointer(regs: &libc::user_regs_struct) -> u64 {
     return regs.sp;
 }
 
-/// The six syscall argument registers, in argument order.
+/// The six syscall argument registers, in argument order. Test-only now:
+/// its last production reader was the one-node `get_mempolicy` emulation,
+/// which the no-NUMA platform replaced with an `ENOSYS` gate that reads
+/// no argument.
+#[cfg(test)]
 pub(crate) fn syscall_arguments(regs: &libc::user_regs_struct) -> [u64; 6] {
     #[cfg(target_arch = "x86_64")]
     return [regs.rdi, regs.rsi, regs.rdx, regs.r10, regs.r8, regs.r9];

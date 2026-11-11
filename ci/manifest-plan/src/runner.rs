@@ -95,6 +95,8 @@ use crate::timeouts::EXPLICIT_TIMEOUT_CALIBRATIONS;
 #[cfg(test)]
 use crate::timeouts::FLIP_2026_10_30_TIMEOUT_CALIBRATIONS;
 #[cfg(test)]
+use crate::timeouts::KVM_2026_11_08_TIMEOUT_CALIBRATIONS;
+#[cfg(test)]
 use crate::timeouts::KVM_RATCHET_TIMEOUT_CALIBRATIONS;
 #[cfg(test)]
 use crate::timeouts::LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS;
@@ -645,6 +647,12 @@ pub struct ModeRecipe {
     /// prints, so two runs that agree on output lacking it do not pass.
     #[serde(default)]
     pub expected_stdout_contains: BTreeMap<String, String>,
+    /// The exact guest stderr a verify cell requires, per enabled backend,
+    /// as `expected_stdout` is for stdout: a tool whose diagnostic is the
+    /// stderr half of its answer (numastat's, on a machine with no NUMA
+    /// nodes to read) has no stdout to name, and the wording is the test.
+    #[serde(default)]
+    pub expected_stderr: BTreeMap<String, String>,
     /// Hermit `run` flags a verify cell adds after the runner's own, per
     /// enabled backend, for a test whose recorded policy runs a specific
     /// configuration on that backend. Only the flags in ALLOWED_HERMIT_ARGS
@@ -919,7 +927,9 @@ pub enum Comparator {
     Stripped,
 }
 
-/// The one nonzero guest disposition a verify cell requires.
+/// The one guest disposition a verify cell requires: nonzero there, while
+/// a replay recipe may instead restate success where record mode answers
+/// a different disposition from run mode.
 ///
 /// Hermit's default `--verify` policy rejects a first run that does not exit
 /// 0, so a guest that fails on purpose never reaches a comparison. Naming the
@@ -1018,13 +1028,30 @@ fn inherited<'a, T>(
     inherited_recipes(cell).find_map(pick)
 }
 
-/// The recipe whose declared guest exit and stdout a cell's verdict checks.
+/// The recipe whose declared stdout (and, absent a replay override, guest
+/// exit) a cell's verdict checks.
 ///
-/// Validation admits those declarations only on a verify recipe, so a replay
+/// Validation admits stdout declarations only on a verify recipe, so a replay
 /// cell reads its verify recipe's, and no other mode has any; the same field
-/// on another mode's recipe is not authority for a pass there.
+/// on another mode's recipe is not authority for a pass there. A replay
+/// recipe may declare its own guest exit instead (see
+/// [`cell_expected_guest_exit`]).
 fn expectation_recipe(cell: &SelectedCell) -> Option<&ModeRecipe> {
-    matches!(cell.id.mode.as_str(), "verify" | "replay")
+    if cell.id.mode == "replay" {
+        // A replay recipe that declares its own guest exit restates record
+        // mode's expectations whole: its stream declarations (or their
+        // absence) govern, not the verify recipe's.
+        let own = cell
+            .test
+            .modes
+            .get("replay")
+            .filter(|recipe| recipe.expected_guest_exit.is_some());
+        if own.is_some() {
+            return own;
+        }
+        return cell.test.modes.get("verify");
+    }
+    matches!(cell.id.mode.as_str(), "verify")
         .then(|| cell.test.modes.get("verify"))
         .flatten()
 }
@@ -1064,6 +1091,11 @@ fn cell_mode_env(cell: &SelectedCell) -> BTreeMap<String, String> {
 }
 
 /// The declared guest disposition for a selected verify or replay cell.
+///
+/// A replay recipe's own declaration wins for its cell, so record mode can
+/// require success (or another exact disposition) where its verify recipe
+/// requires a failure; without one a replay cell inherits verify's, as
+/// `expectation_recipe` chooses for its stdout.
 pub fn cell_expected_guest_exit(cell: &SelectedCell) -> Option<ExpectedGuestExit> {
     expectation_recipe(cell)?.expected_guest_exit.clone()
 }
@@ -1086,12 +1118,22 @@ fn cell_expected_stdout_contains(cell: &SelectedCell) -> Option<String> {
         .cloned()
 }
 
+/// The exact stderr a selected verify or replay cell requires, if its backend declares one.
+fn cell_expected_stderr(cell: &SelectedCell) -> Option<String> {
+    let backend = cell.id.backend.as_ref()?;
+    expectation_recipe(cell)?
+        .expected_stderr
+        .get(backend)
+        .cloned()
+}
+
 /// Both stdout assertions a selected verify or replay cell declares for its
 /// backend, in the form a skid attempt records them ([`DeclaredStdout`]).
 pub fn cell_declared_stdout(cell: &SelectedCell) -> DeclaredStdout {
     DeclaredStdout {
         exact: cell_expected_stdout(cell),
         contains: cell_expected_stdout_contains(cell),
+        stderr_exact: cell_expected_stderr(cell),
     }
 }
 
@@ -1187,6 +1229,21 @@ pub fn expected_stdout_mismatch_reason(
 /// both compared runs' stdout, omits the cell's declared
 /// `expected_stdout_contains` text. Shared with the scorecard reader exactly
 /// as [`expected_stdout_mismatch_reason`] is.
+/// The reason a verify attempt FAILs when a compared run's stderr is not the
+/// declared `expected_stderr` bytes. Shared with the scorecard reader exactly
+/// as [`expected_stdout_mismatch_reason`] is.
+pub fn expected_stderr_mismatch_reason(
+    run: &str,
+    observed_bytes: u64,
+    observed_sha256: &str,
+    expected_bytes: u64,
+    expected_sha256: &str,
+) -> String {
+    format!(
+        "verify {run} run stderr ({observed_bytes} bytes, sha256 {observed_sha256}) differs from the declared expected_stderr ({expected_bytes} bytes, sha256 {expected_sha256})"
+    )
+}
+
 pub fn expected_stdout_contains_mismatch_reason(
     captured_bytes: u64,
     captured_sha256: &str,
@@ -1206,6 +1263,14 @@ pub fn expected_stdout_contains_mismatch_reason(
 pub enum ExpectedOutputFailureReason {
     /// The named compared run's stdout is not the declared exact bytes.
     Exact {
+        run: String,
+        observed_bytes: u64,
+        observed_sha256: String,
+        declared_bytes: u64,
+        declared_sha256: String,
+    },
+    /// The named compared run's stderr is not the declared exact bytes.
+    ExactStderr {
         run: String,
         observed_bytes: u64,
         observed_sha256: String,
@@ -1245,6 +1310,25 @@ impl ExpectedOutputFailureReason {
                     )
                 } else if observed_bytes == declared_bytes && observed_sha256 == declared_sha256 {
                     Some("the declared stdout is the observed stdout")
+                } else {
+                    None
+                }
+            }
+            Self::ExactStderr {
+                run,
+                observed_bytes,
+                observed_sha256,
+                declared_bytes,
+                declared_sha256,
+            } => {
+                if !is_lower_sha256(observed_sha256) || !is_lower_sha256(declared_sha256) {
+                    Some("a stderr digest is not SHA-256")
+                } else if run != "first" {
+                    Some(
+                        "it names a later run, but the first run of a matched pair printed the same bytes",
+                    )
+                } else if observed_bytes == declared_bytes && observed_sha256 == declared_sha256 {
+                    Some("the declared stderr is the observed stderr")
                 } else {
                     None
                 }
@@ -1328,6 +1412,28 @@ pub fn parse_expected_output_failure_reason(reason: &str) -> Option<ExpectedOutp
                 captured_sha256: captured_sha256.into(),
                 text,
             })
+    } else if reason.contains(" run stderr (") {
+        let (run, rest) = reason
+            .strip_prefix("verify ")?
+            .split_once(" run stderr (")?;
+        let (observed_bytes, observed_sha256, rest) = split_sized_digest(rest)?;
+        let rest = rest.strip_prefix(" differs from the declared expected_stderr (")?;
+        let (declared_bytes, declared_sha256, rest) = split_sized_digest(rest)?;
+        (rest.is_empty()
+            && expected_stderr_mismatch_reason(
+                run,
+                observed_bytes,
+                observed_sha256,
+                declared_bytes,
+                declared_sha256,
+            ) == reason)
+            .then(|| ExpectedOutputFailureReason::ExactStderr {
+                run: run.into(),
+                observed_bytes,
+                observed_sha256: observed_sha256.into(),
+                declared_bytes,
+                declared_sha256: declared_sha256.into(),
+            })
     } else {
         let (run, rest) = reason
             .strip_prefix("verify ")?
@@ -1376,6 +1482,35 @@ fn check_expected_stdout(
                     run,
                     output.stdout_bytes,
                     &output.stdout_sha256,
+                    expected_bytes,
+                    &expected_sha256,
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Compare both runs a verify report compared with the declared stderr bytes,
+/// as [`check_expected_stdout`] does for stdout.
+fn check_expected_stderr(
+    expected: &str,
+    report: &VerificationReport,
+) -> Result<(), ExpectedStdoutError> {
+    let outputs = report.compared_outputs.as_ref().ok_or_else(|| {
+        ExpectedStdoutError::Unevidenced(
+            "verification report omitted compared_outputs, so the declared expected_stderr cannot be checked".into(),
+        )
+    })?;
+    let expected_sha256 = hex_digest(expected.as_bytes());
+    let expected_bytes = expected.len() as u64;
+    for (run, output) in [("first", &outputs.left), ("second", &outputs.right)] {
+        if output.stderr_sha256 != expected_sha256 || output.stderr_bytes != expected_bytes {
+            return Err(ExpectedStdoutError::Mismatch(
+                expected_stderr_mismatch_reason(
+                    run,
+                    output.stderr_bytes,
+                    &output.stderr_sha256,
                     expected_bytes,
                     &expected_sha256,
                 ),
@@ -1443,6 +1578,13 @@ fn declared_stdout_error(
     {
         return Some(error);
     }
+    if let Some(Err(error)) = spec
+        .expected_stderr
+        .as_deref()
+        .map(|expected| check_expected_stderr(expected, report))
+    {
+        return Some(error);
+    }
     spec.expected_stdout_contains
         .as_deref()
         .and_then(|text| match fs::read(stdout_path) {
@@ -1462,52 +1604,54 @@ pub fn validate_expected_guest_exit(
     let Some(expected) = expected else {
         return Ok(());
     };
-    if mode != "verify" {
+    if !matches!(mode, "verify" | "replay") {
         return Err(format!(
-            "{id}: expected_guest_exit is supported only by verify mode"
+            "{id}: expected_guest_exit is supported only by verify and replay modes"
         ));
     }
     match (expected.code, expected.signal) {
+        // A replay declaration restates record mode's disposition, which
+        // may be the success a verify declaration cannot name.
+        (Some(code), None) if mode == "replay" && (0..=255).contains(&code) => {}
         (Some(code), None) if (1..=255).contains(&code) => {}
         (Some(code), None) => {
             return Err(format!(
-                "{id}: verify expected_guest_exit.code must be a nonzero exit status in 1..=255, not {code}"
+                "{id}: {mode} expected_guest_exit.code must be an exit status in {}..=255, not {code}",
+                if mode == "replay" { 0 } else { 1 }
             ));
         }
         (None, Some(signal)) if (1..=64).contains(&signal) => {}
         (None, Some(signal)) => {
             return Err(format!(
-                "{id}: verify expected_guest_exit.signal must be a signal number in 1..=64, not {signal}"
+                "{id}: {mode} expected_guest_exit.signal must be a signal number in 1..=64, not {signal}"
             ));
         }
         _ => {
             return Err(format!(
-                "{id}: verify expected_guest_exit must name exactly one of code or signal"
+                "{id}: {mode} expected_guest_exit must name exactly one of code or signal"
             ));
         }
     }
     if expected.reason.trim().is_empty() {
         return Err(format!(
-            "{id}: verify expected_guest_exit.reason must be substantive"
+            "{id}: {mode} expected_guest_exit.reason must be substantive"
         ));
     }
     Ok(())
 }
 
 /// Check a declared guest exit that a result row, or a series row built from
-/// one, carries in `mode`. A replay cell inherits its verify recipe's
-/// declaration ([`cell_expected_guest_exit`]) and passes on it only through
-/// the verify cell's gate (a matched canonical replay whose guest and Hermit
-/// both end exactly that way), so a row may carry it in verify or replay mode.
-/// A recipe may still declare it only in verify mode
-/// ([`validate_expected_guest_exit`]).
+/// one, carries in `mode`. A replay cell carries its own replay recipe's
+/// declaration where it has one, else its verify recipe's
+/// ([`cell_expected_guest_exit`]), and passes on it only through the verify
+/// cell's gate (a matched canonical replay whose guest and Hermit both end
+/// exactly that way), so a row is checked by its own mode's rules.
 pub fn validate_result_expected_guest_exit(
     id: &str,
     mode: &str,
     expected: Option<&ExpectedGuestExit>,
 ) -> Result<(), String> {
-    let recipe_mode = if mode == "replay" { "verify" } else { mode };
-    validate_expected_guest_exit(id, recipe_mode, expected)
+    validate_expected_guest_exit(id, mode, expected)
 }
 
 /// Whether `hermit_args`, an attempt's argv before the guest separator, is an
@@ -2998,6 +3142,13 @@ fn validate_mode_with_cpu(
     validate_expected_guest_exit(id, mode, recipe.expected_guest_exit.as_ref())?;
     validate_expected_stdout(id, mode, &recipe.expected_stdout, &enabled)?;
     validate_expected_stdout_contains(id, mode, &recipe.expected_stdout_contains, &enabled)?;
+    validate_verify_stdout_table(
+        id,
+        mode,
+        "expected_stderr",
+        &recipe.expected_stderr,
+        &enabled,
+    )?;
     Ok(())
 }
 
@@ -3266,6 +3417,9 @@ pub struct CellRunSpec {
     /// Text the captured verify stdout must contain, if declared.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_stdout_contains: Option<String>,
+    /// The exact stderr both compared verify runs must print, if declared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_stderr: Option<String>,
     /// The comparison a verify cell's report must pass; always `Strict` for
     /// every other mode.
     pub comparator: Comparator,
@@ -3502,6 +3656,10 @@ pub struct DeclaredStdout {
     pub exact: Option<String>,
     #[serde(deserialize_with = "deserialize_required_nullable")]
     pub contains: Option<String>,
+    /// The exact stderr bytes declared, where any. Defaulted so a row
+    /// written before the field existed still reads.
+    #[serde(default)]
+    pub stderr_exact: Option<String>,
 }
 
 /// Reads a member that must be present but may be `null`. A field with a
@@ -4573,6 +4731,10 @@ pub fn host_input_change_only(result: &CellResult) -> bool {
                         .exact
                         .as_deref()
                         .is_none_or(|expected| check_expected_stdout(expected, &report).is_ok())
+                    && declared
+                        .stderr_exact
+                        .as_deref()
+                        .is_none_or(|expected| check_expected_stderr(expected, &report).is_ok())
                     && declared.contains.as_deref().is_none_or(|text| {
                         check_expected_stdout_contains(text, attempt.stdout.as_bytes(), &report)
                             .is_ok()
@@ -4860,6 +5022,10 @@ fn attempt_skid_overshoot_reports(
         .exact
         .as_deref()
         .is_some_and(|expected| check_expected_stdout(expected, &report).is_err())
+        || declared
+            .stderr_exact
+            .as_deref()
+            .is_some_and(|expected| check_expected_stderr(expected, &report).is_err())
         || declared.contains.as_deref().is_some_and(|text| {
             check_expected_stdout_contains(text, attempt.stdout.as_bytes(), &report).is_err()
         })
@@ -4932,9 +5098,10 @@ const HERMIT_INTERNAL_FAILURE_CLASS_PREFIX: &str = "HERMIT_INTERNAL_FAILURE clas
 ///   its report's, which the runner copies onto it, and the row's are the
 ///   first runtime and the divergence position its attempts give, so no
 ///   retained copy carries evidence that only a copy, not the report, holds;
-/// - the report satisfies the stdout assertions `declared` (the exact bytes
-///   against both compared runs' digests, and the contained text in the
-///   attempt's captured stdout, which must be both runs' stdout);
+/// - the report satisfies the stream assertions `declared` (the exact
+///   stdout and stderr bytes against both compared runs' digests, and the
+///   contained text in the attempt's captured stdout, which must be both
+///   runs' stdout);
 /// - the attempt ended as the row's recorded `expected_guest_exit` requires
 ///   (that guest disposition and the Hermit status reporting it), or with
 ///   Hermit exit status 0 when the row records none;
@@ -5058,6 +5225,13 @@ pub fn retained_verify_pass_error(
             .as_deref()
             .map(|expected| check_expected_stdout(expected, &report))
             .transpose()
+            .and_then(|_| {
+                declared
+                    .stderr_exact
+                    .as_deref()
+                    .map(|expected| check_expected_stderr(expected, &report))
+                    .transpose()
+            })
             .and_then(|_| {
                 declared
                     .contains
@@ -6198,6 +6372,7 @@ pub fn build_spec(
         expected_guest_exit: cell_expected_guest_exit(cell),
         expected_stdout: cell_expected_stdout(cell),
         expected_stdout_contains: cell_expected_stdout_contains(cell),
+        expected_stderr: cell_expected_stderr(cell),
         comparator: if cell.id.mode == "verify" {
             mode_recipe.comparator.unwrap_or(Comparator::Strict)
         } else {
@@ -8595,17 +8770,19 @@ fn spawn_process(
         .stdout(stdout_file)
         .stderr(stderr_file);
     command.envs(identity.env_overrides.iter());
-    let enrollment_fd = enrollment.map(|(fd, _)| fd);
+    // The child leads a process group of its own. With no pre_exec closure,
+    // std starts it with posix_spawn, which does not copy this process: a
+    // fork() copies the address space under the memory-map lock, and every
+    // other thread that page-faults waits for it (dh-7n47nt).
+    command.process_group(0);
     let join_report_fd = join_report.as_ref().map(|(_, write)| write.as_raw_fd());
-    unsafe {
-        command.pre_exec(move || {
-            if libc::setpgid(0, 0) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            // Join the invocation cgroup before exec, so every CPU cycle of the
-            // program and of anything it starts is charged to that cgroup. The
-            // descriptor is close-on-exec, so the program never sees it.
-            if let Some(fd) = enrollment_fd {
+    if let Some((fd, _)) = enrollment {
+        // Join the invocation cgroup before exec, so every CPU cycle of the
+        // program and of anything it starts is charged to that cgroup. The
+        // descriptor is close-on-exec, so the program never sees it. std sets
+        // the process group before it runs this closure.
+        unsafe {
+            command.pre_exec(move || {
                 let joined = loop {
                     let written = libc::write(fd, b"0\n".as_ptr().cast(), 2);
                     if written == 2 {
@@ -8626,9 +8803,9 @@ fn spawn_process(
                     }
                     return Err(error);
                 }
-            }
-            Ok(())
-        });
+                Ok(())
+            });
+        }
     }
     let spawned = command.spawn();
     // The child wrote its report, if any, before it sent the error that ends
@@ -10522,7 +10699,9 @@ fn copy_tree(source: &Path, destination: &Path) -> Result<(), String> {
         if entry.file_type().map_err(|e| e.to_string())?.is_dir() {
             copy_tree(&entry.path(), &target)?;
         } else {
-            fs::copy(entry.path(), target).map_err(|e| e.to_string())?;
+            // A prebuilt `fixtures/program` runs as soon as preparation
+            // returns, so it must not be copied in-process (ETXTBSY).
+            crate::exec_safe_fs::copy(entry.path(), target).map_err(|e| e.to_string())?;
         }
     }
     Ok(())
@@ -11765,8 +11944,12 @@ mod tests {
         fs::create_dir_all(checkout.join(".git")).unwrap();
         let says = |name: &str, status: i32| {
             let path = base.join(name);
-            fs::write(&path, format!("#!/bin/sh\nexit {status}\n")).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::exec_safe_fs::write_executable(
+                &path,
+                format!("#!/bin/sh\nexit {status}\n"),
+                0o755,
+            )
+            .unwrap();
             path
         };
         let untracked = says("untracked-git", 1);
@@ -14498,7 +14681,7 @@ corpus:
         // A run's behaviour is `$FAKE_RUN<n>`: `record:<status>` commits a
         // record and exits with the status, `refuse` exits 122 with a class
         // line and no record. Each call is logged.
-        fs::write(
+        crate::exec_safe_fs::write_executable(
             &hermit,
             r#"#!/bin/sh
 log="$(dirname "$0")/calls"
@@ -14522,9 +14705,9 @@ case $behaviour in
   record:*) mkdir "$directory"; : > "$directory/verify-run.json"; exit "${behaviour#record:}" ;;
 esac
 "#,
+            0o755,
         )
         .unwrap();
-        fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755)).unwrap();
         let hermit = hermit.to_string_lossy().into_owned();
         let pair = |label: &str, allow: Option<&str>, runs: [&str; 2]| {
             let runs_dir = root.path().join(label);
@@ -15501,7 +15684,7 @@ esac
             r#"{"schema":1,"backend":"ptrace","comparison":{"strictness":"canonical","diagnostic_full_trace":false,"compare_io_buffers":true,"virtualize_time":true},"passthru_opt":false,"epoch":"2026-01-01T00:00:00Z","outcome":{"kind":"completed","status":{"kind":"exited","code":0},"skid_overshoots":0}}"#,
         )
         .unwrap();
-        fs::write(
+        crate::exec_safe_fs::write_executable(
             root.join("hermit"),
             r#"#!/bin/sh
 set -eu
@@ -15522,9 +15705,9 @@ if [ -n "$stage" ]; then
   cp "$PWD/record.json" "$stage/verify-run.json"
 fi
 "#,
+            0o755,
         )
         .unwrap();
-        fs::set_permissions(root.join("hermit"), fs::Permissions::from_mode(0o755)).unwrap();
         let mut context = run_context(&root);
         context.capture_custom_runs = true;
         let mut cell = ptrace_cell("custom");
@@ -15589,7 +15772,7 @@ fi
             r#"{"schema":1,"backend":"ptrace","comparison":{"strictness":"canonical","diagnostic_full_trace":false,"compare_io_buffers":true,"virtualize_time":true},"passthru_opt":false,"epoch":"2026-01-01T00:00:00Z","outcome":{"kind":"completed","status":{"kind":"exited","code":0},"skid_overshoots":0}}"#,
         )
         .unwrap();
-        fs::write(
+        crate::exec_safe_fs::write_executable(
             root.join("hermit"),
             r#"#!/bin/sh
     set -eu
@@ -15650,9 +15833,9 @@ fi
       *) printf 'unknown fixture scenario\n' >&2; exit 93 ;;
     esac
     "#,
+            0o755,
         )
         .unwrap();
-        fs::set_permissions(root.join("hermit"), fs::Permissions::from_mode(0o755)).unwrap();
         let context = run_context(&root);
         let mut cell = ptrace_cell("custom");
         cell.test.id = format!("fixture/custom-capture-{label}");
@@ -17256,6 +17439,7 @@ fi
             .chain(&DBT_2026_10_25_TIMEOUT_CALIBRATIONS)
             .chain(&DBT_FLIP_2026_10_27_TIMEOUT_CALIBRATIONS)
             .chain(&FLIP_2026_10_30_TIMEOUT_CALIBRATIONS)
+            .chain(&KVM_2026_11_08_TIMEOUT_CALIBRATIONS)
             .map(|calibration| {
                 (
                     (calibration.test, calibration.mode, calibration.backend),
@@ -17363,6 +17547,7 @@ fi
             expected_guest_exit: None,
             expected_stdout: None,
             expected_stdout_contains: None,
+            expected_stderr: None,
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: root.join("workdir/1"),
@@ -17511,6 +17696,78 @@ fi
             "adding 128 MiB of descendant hashing did not move CPU usage: low={} high={}",
             low.cpu_usage_usec,
             high.cpu_usage_usec
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    thread_local! {
+        /// How many times this thread has called fork(), counted by a
+        /// `pthread_atfork` prepare handler. glibc runs the handlers in the
+        /// thread that calls fork() and not for posix_spawn, which starts the
+        /// child without copying this process.
+        static FORKS_ON_THIS_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
+    /// The number of fork() calls this thread has made since the counter was
+    /// installed in this process.
+    fn forks_on_this_thread() -> u64 {
+        extern "C" fn count_fork() {
+            FORKS_ON_THIS_THREAD.with(|forks| forks.set(forks.get() + 1));
+        }
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            assert_eq!(
+                unsafe { libc::pthread_atfork(Some(count_fork), None, None) },
+                0
+            );
+        });
+        FORKS_ON_THIS_THREAD.with(std::cell::Cell::get)
+    }
+
+    /// An invocation with no CPU budget, and so no invocation cgroup, starts
+    /// without fork() of this process (dh-7n47nt). fork() copies the address
+    /// space under the memory-map lock: in loaded library runs each one took a
+    /// median 94-177 ms and up to 2.3 s, and every other thread that page-faulted
+    /// meanwhile waited, so CPU readers and census walks in the same process
+    /// stalled off-CPU. The child still leads a process group of its own.
+    #[test]
+    fn an_invocation_without_a_cgroup_starts_without_forking_this_process() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-no-cgroup-spawn-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut observations = Vec::new();
+        let before = forks_on_this_thread();
+        let output = execute_process(
+            ProcessRequest::new(
+                InvocationRole::Execution {
+                    attempt_index: "1".into(),
+                    backend: RequiredNullable::Null,
+                },
+                &root,
+                "/bin/sh",
+                &[
+                    "-c".into(),
+                    "printf '%s ' $$; cut -d' ' -f5 /proc/$$/stat".into(),
+                ],
+                &BTreeMap::new(),
+                &root.join("group.stdout"),
+                &root.join("group.stderr"),
+            ),
+            (Instant::now() + Duration::from_secs(60), None),
+            &mut observations,
+        )
+        .unwrap();
+        let forks = forks_on_this_thread() - before;
+        assert!(output.status.success());
+        assert_eq!(forks, 0, "starting the invocation forked this process");
+        let reported = fs::read_to_string(root.join("group.stdout")).unwrap();
+        let (pid, pgid) = reported.trim().split_once(' ').unwrap();
+        assert_eq!(
+            pid, pgid,
+            "the invocation does not lead its own process group"
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -18546,6 +18803,7 @@ fi
             expected_guest_exit: None,
             expected_stdout: None,
             expected_stdout_contains: None,
+            expected_stderr: None,
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: root.join(label).join("workdir/1"),
@@ -20247,8 +20505,12 @@ fi
         let root = cpu_reader_test_root("prior-work-before-spawn-failure");
         let context = run_context(&root);
         let program = root.join("remove-self");
-        fs::write(&program, "#!/bin/sh\nrm -- \"$0\"\nprintf measured\n").unwrap();
-        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::exec_safe_fs::write_executable(
+            &program,
+            "#!/bin/sh\nrm -- \"$0\"\nprintf measured\n",
+            0o755,
+        )
+        .unwrap();
         let mut cell = native_cpu_cell("unused", 2);
         cell.test.direct = Some(DirectCommand::Argv(vec![program.display().to_string()]));
         let failure = run_cell(&context, &cell).expect_err("second launch must fail after unlink");
@@ -23677,7 +23939,7 @@ backends_disabled:
         fs::write(root.join("exit-status"), exit_status).unwrap();
 
         let hermit = root.join("hermit");
-        fs::write(
+        crate::exec_safe_fs::write_executable(
             &hermit,
             r#"#!/bin/sh
 set -eu
@@ -23726,9 +23988,9 @@ fi
 cp "$PWD/verification.json" "$verdict"
 exit "$(cat "$PWD/exit-status")"
 "#,
+            0o755,
         )
         .unwrap();
-        fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut cell = ptrace_cell("verify");
         cell.test.id = "fixture/ordinary-verify-production".into();
@@ -24082,6 +24344,7 @@ exit "$(cat "$PWD/exit-status")"
             expected_guest_exit: None,
             expected_stdout: None,
             expected_stdout_contains: None,
+            expected_stderr: None,
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
@@ -24133,6 +24396,7 @@ exit "$(cat "$PWD/exit-status")"
             expected_guest_exit: None,
             expected_stdout: None,
             expected_stdout_contains: None,
+            expected_stderr: None,
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
@@ -25464,6 +25728,7 @@ exit "$(cat "$PWD/exit-status")"
             row.declared_stdout = Some(DeclaredStdout {
                 exact: Some(golden.to_string()),
                 contains: None,
+                stderr_exact: None,
             });
             row
         };
@@ -25478,6 +25743,47 @@ exit "$(cat "$PWD/exit-status")"
         assert_eq!(met.reason.as_deref(), Some(plain.as_str()), "{met:?}");
         let met_row = declaring(verify_row_from_attempts(vec![met]));
         assert!(host_input_change_only(&met_row));
+
+        // The same retained attempt answers to the declared stderr too:
+        // both compared runs print the declared diagnostic, while another
+        // declared diagnostic refuses the row.
+        let diag = "sar-diag\n";
+        let change_with_stderr = |stderr: &str| {
+            let mut report = change_with(golden, golden);
+            let outputs = report.compared_outputs.as_mut().unwrap();
+            for output in [&mut outputs.left, &mut outputs.right] {
+                output.stderr_sha256 = hex_digest(stderr.as_bytes());
+                output.stderr_bytes = stderr.len() as u64;
+            }
+            report
+        };
+        let stderr_attempt = attempt_with_stdout_assertions(
+            Some(golden),
+            None,
+            change_with_stderr(diag),
+            golden,
+            "exit 1",
+        );
+        assert_eq!(
+            stderr_attempt.reason.as_deref(),
+            Some(plain.as_str()),
+            "{stderr_attempt:?}"
+        );
+        let mut stderr_met_row = declaring(verify_row_from_attempts(vec![stderr_attempt.clone()]));
+        stderr_met_row
+            .declared_stdout
+            .as_mut()
+            .unwrap()
+            .stderr_exact = Some(diag.to_string());
+        assert!(host_input_change_only(&stderr_met_row));
+        let mut stderr_wrong_row = declaring(verify_row_from_attempts(vec![stderr_attempt]));
+        stderr_wrong_row
+            .declared_stdout
+            .as_mut()
+            .unwrap()
+            .stderr_exact = Some("sar-other-diag\n".to_string());
+        assert!(!host_input_change_only(&stderr_wrong_row));
+
         // A row without the recorded declaration never qualifies.
         let mut undeclared = met_row;
         undeclared.declared_stdout = None;
@@ -26642,6 +26948,7 @@ exit "$(cat "$PWD/exit-status")"
             expected_guest_exit: expected,
             expected_stdout: None,
             expected_stdout_contains: None,
+            expected_stderr: None,
             comparator,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
@@ -26838,7 +27145,7 @@ exit "$(cat "$PWD/exit-status")"
         )
         .unwrap();
         let hermit = root.join("hermit");
-        fs::write(
+        crate::exec_safe_fs::write_executable(
             &hermit,
             format!(
                 r#"#!/bin/sh
@@ -26872,9 +27179,9 @@ cp "{}" "$verdict"
 "#,
                 root.join("verification.json").display()
             ),
+            0o755,
         )
         .unwrap();
-        fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut cell = ptrace_cell(mode);
         if mode != "verify" {
@@ -27222,24 +27529,38 @@ cp "{}" "$verdict"
         // the contained text, from the attempt's captured stdout when it is
         // both compared runs' stdout.
         let golden = "golden\n";
+        let golden_stderr = "diag\n";
         let mut golden_report = expected_exit_report(Some(7), None);
         let outputs = golden_report.compared_outputs.as_mut().unwrap();
         for output in [&mut outputs.left, &mut outputs.right] {
             output.stdout_sha256 = hex_digest(golden.as_bytes());
             output.stdout_bytes = golden.len() as u64;
+            output.stderr_sha256 = hex_digest(golden_stderr.as_bytes());
+            output.stderr_bytes = golden_stderr.len() as u64;
         }
         let mut golden_pass = with_report(&pass, &golden_report);
         golden_pass.attempts[0].stdout = golden.into();
         let exact = |text: &str| DeclaredStdout {
             exact: Some(text.into()),
             contains: None,
+            stderr_exact: None,
         };
         let contains = |text: &str| DeclaredStdout {
             exact: None,
             contains: Some(text.into()),
+            stderr_exact: None,
+        };
+        let stderr_exact = |text: &str| DeclaredStdout {
+            exact: None,
+            contains: None,
+            stderr_exact: Some(text.into()),
         };
         assert_eq!(
             retained_verify_pass_error(&golden_pass, &exact(golden)),
+            None
+        );
+        assert_eq!(
+            retained_verify_pass_error(&golden_pass, &stderr_exact(golden_stderr)),
             None
         );
         assert_eq!(
@@ -27250,6 +27571,12 @@ cp "{}" "$verdict"
             "stdout other than the declared bytes",
             &pass,
             &exact(golden),
+            "declared stdout assertion",
+        );
+        refused(
+            "stderr other than the declared bytes",
+            &golden_pass,
+            &stderr_exact("other diag\n"),
             "declared stdout assertion",
         );
         refused(
@@ -27398,7 +27725,7 @@ cp "{}" "$verdict"
         );
         assert_eq!(
             skid_row["declared_stdout"],
-            serde_json::json!({"exact": null, "contains": null}),
+            serde_json::json!({"exact": null, "contains": null, "stderr_exact": null}),
             "{skid_row}"
         );
         assert_eq!(skid_overshoot_only_reports(&skid_result), Some(2));
@@ -27446,6 +27773,7 @@ cp "{}" "$verdict"
             DeclaredStdout {
                 exact: Some("golden\n".into()),
                 contains: Some("gold".into()),
+                stderr_exact: None,
             }
         );
         assert_eq!(
@@ -27454,8 +27782,11 @@ cp "{}" "$verdict"
         );
     }
 
-    /// Only a verify cell carries a declaration; the same recipe field on any
-    /// other mode is not authority for a nonzero pass there.
+    /// Only verify and replay cells carry a declaration (a replay cell its
+    /// own, where declared; here its recipe's field is what
+    /// `cell_expected_guest_exit` reads, with no verify recipe beside it);
+    /// the same recipe field on any other mode is not authority for a
+    /// nonzero pass there.
     #[test]
     fn only_a_verify_cell_carries_its_declared_expected_exit() {
         let mut verify = ptrace_cell("verify");
@@ -27469,7 +27800,7 @@ cp "{}" "$verdict"
             cell_expected_guest_exit(&verify),
             Some(expected_exit(Some(3), None))
         );
-        for mode in ["chaos", "replay", "naked"] {
+        for mode in ["chaos", "naked"] {
             let mut other = ptrace_cell(mode);
             other.test.modes.get_mut(mode).unwrap().expected_guest_exit =
                 Some(expected_exit(Some(3), None));
@@ -27530,9 +27861,9 @@ cp "{}" "$verdict"
         assert_ne!(undeclared.outcome, "PASS", "{:?}", undeclared.reason);
     }
 
-    /// A result row may carry a declared guest exit in verify or replay mode,
-    /// since a replay cell inherits its verify recipe's declaration, while a
-    /// recipe may declare one only in verify mode. A reader credits it only
+    /// A result row may carry a declared guest exit in verify or replay mode:
+    /// a replay cell carries its own replay recipe's declaration where it
+    /// has one, else its verify recipe's. A reader credits it only
     /// from the invocation the runner writes for it: a verify comparison with
     /// `--verify-allow=failure`, or a replay's `record start`, whose
     /// comparison takes `--verify-allow=both`.
@@ -27548,9 +27879,11 @@ cp "{}" "$verdict"
                 "{mode}"
             );
         }
-        assert!(validate_expected_guest_exit("recipe", "replay", Some(&expected)).is_err());
+        validate_expected_guest_exit("recipe", "replay", Some(&expected)).unwrap();
         let zero = expected_exit(Some(0), None);
-        assert!(validate_result_expected_guest_exit("row", "replay", Some(&zero)).is_err());
+        validate_result_expected_guest_exit("row", "replay", Some(&zero)).unwrap();
+        assert!(validate_expected_guest_exit("recipe", "verify", Some(&zero)).is_err());
+        assert!(validate_result_expected_guest_exit("row", "verify", Some(&zero)).is_err());
         let verify = ["hermit", "run", "--verify-allow=failure"];
         let replay = [
             "hermit-verify-pair",
@@ -27570,6 +27903,37 @@ cp "{}" "$verdict"
             &["hermit", "log-diff", "--verify-allow=both", "hermit", "run"]
         ));
         assert!(!invocation_admits_declared_guest_exit("chaos", &replay));
+    }
+
+    /// A replay recipe may declare its own expected guest exit where record
+    /// mode answers a different disposition from run mode, success
+    /// included; it wins over the verify recipe's declaration for the
+    /// replay cell alone, and its result row may carry that success.
+    #[test]
+    fn a_replay_recipe_may_override_the_inherited_expected_exit_with_success() {
+        let base = ptrace_cell("verify").test.modes["verify"].clone();
+        let mut verify = base.clone();
+        verify.expected_guest_exit = Some(expected_exit(Some(1), None));
+        let mut replay = base.clone();
+        replay.expected_guest_exit = Some(expected_exit(Some(0), None));
+        validate_expected_guest_exit(
+            "fixture/test",
+            "replay",
+            replay.expected_guest_exit.as_ref(),
+        )
+        .unwrap();
+        let cell = replay_cell_with_verify(verify.clone(), replay);
+        assert_eq!(
+            cell_expected_guest_exit(&cell),
+            Some(expected_exit(Some(0), None))
+        );
+        let inherited = replay_cell_with_verify(verify, base);
+        assert_eq!(
+            cell_expected_guest_exit(&inherited),
+            Some(expected_exit(Some(1), None))
+        );
+        validate_result_expected_guest_exit("row", "replay", Some(&expected_exit(Some(0), None)))
+            .unwrap();
     }
 
     fn replay_cell_with_verify(verify: ModeRecipe, replay: ModeRecipe) -> SelectedCell {
@@ -28056,6 +28420,7 @@ cp "{}" "$verdict"
             expected_guest_exit: None,
             expected_stdout: exact.map(str::to_string),
             expected_stdout_contains: contains.map(str::to_string),
+            expected_stderr: None,
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
@@ -28148,6 +28513,48 @@ cp "{}" "$verdict"
             error.starts_with("verify first run stdout (3 bytes"),
             "{error}"
         );
+    }
+
+    /// The exact stderr check mirrors stdout's: each compared run is
+    /// checked on its own stderr digest, the mismatch reason names the
+    /// run, and the shared parser reads that reason back.
+    #[test]
+    fn expected_stderr_names_the_run_that_differs() {
+        let stderr_report = |left: &str, right: &str| {
+            let mut report = stdout_report("ok\n", "ok\n");
+            let outputs = report.compared_outputs.as_mut().unwrap();
+            outputs.left.stderr_bytes = left.len() as u64;
+            outputs.left.stderr_sha256 = hex_digest(left.as_bytes());
+            outputs.right.stderr_bytes = right.len() as u64;
+            outputs.right.stderr_sha256 = hex_digest(right.as_bytes());
+            report
+        };
+        assert_eq!(
+            check_expected_stderr("err\n", &stderr_report("err\n", "err\n")),
+            Ok(())
+        );
+        let second = stderr_report("err\n", "no\n");
+        let Err(ExpectedStdoutError::Mismatch(error)) = check_expected_stderr("err\n", &second)
+        else {
+            panic!("second-run stderr difference was not a mismatch");
+        };
+        assert!(
+            error.starts_with("verify second run stderr (3 bytes"),
+            "{error}"
+        );
+        assert_eq!(
+            parse_expected_output_failure_reason(&error),
+            Some(ExpectedOutputFailureReason::ExactStderr {
+                run: "second".into(),
+                observed_bytes: 3,
+                observed_sha256: hex_digest(b"no\n"),
+                declared_bytes: 4,
+                declared_sha256: hex_digest(b"err\n"),
+            })
+        );
+        // An empty declaration is a real assertion, not an absent one.
+        assert_eq!(check_expected_stderr("", &stderr_report("", "")), Ok(()));
+        assert!(check_expected_stderr("", &stderr_report("x", "x")).is_err());
     }
 
     /// Matching bytes never rescue a diverged comparison or a failed Hermit
@@ -28330,6 +28737,15 @@ cp "{}" "$verdict"
         let golden = "syscall-file-io-ok count=5\n";
         let unmarked = "syscall-file-io count=5\n";
         let marker = "-ok ";
+        let skid_with_stderr = |stderr: &str| {
+            let mut report = skid_with(golden, golden);
+            let outputs = report.compared_outputs.as_mut().unwrap();
+            for output in [&mut outputs.left, &mut outputs.right] {
+                output.stderr_sha256 = hex_digest(stderr.as_bytes());
+                output.stderr_bytes = stderr.len() as u64;
+            }
+            report
+        };
         let skid = skid_overshoot_reason(2);
         // The row `run_cell_inner` publishes for a cell declaring `exact`
         // and/or `contains`.
@@ -28337,6 +28753,7 @@ cp "{}" "$verdict"
             row.declared_stdout = Some(DeclaredStdout {
                 exact: exact.map(str::to_string),
                 contains: contains.map(str::to_string),
+                stderr_exact: None,
             });
             row
         };
@@ -28530,6 +28947,36 @@ cp "{}" "$verdict"
             );
             verify_row_from_attempts(vec![attempt])
         };
+        // The same imported row answers to the declared stderr too: the
+        // compared runs print the declared diagnostic, while another
+        // declared diagnostic refuses the row.
+        let diag = "syscall-file-io-diag\n";
+        let imported_with_stderr = |stderr: &str| {
+            let attempt = attempt_with_stdout_assertions(
+                None,
+                None,
+                skid_with_stderr(stderr),
+                golden,
+                &ending,
+            );
+            assert_eq!(
+                (attempt.outcome.as_str(), attempt.error_kind.as_deref()),
+                ("ERROR", Some("infrastructure")),
+                "{attempt:?}"
+            );
+            verify_row_from_attempts(vec![attempt])
+        };
+        let mut stderr_met = declaring(imported_with_stderr(diag), Some(golden), None);
+        stderr_met.declared_stdout.as_mut().unwrap().stderr_exact = Some(diag.to_string());
+        assert_eq!(
+            skid_overshoot_only_reports(&stderr_met),
+            Some(2),
+            "a recorded row whose evidence meets its declared stderr keeps its skid-only reading"
+        );
+        let mut stderr_wrong = declaring(imported_with_stderr(diag), Some(golden), None);
+        stderr_wrong.declared_stdout.as_mut().unwrap().stderr_exact =
+            Some("syscall-file-io-other-diag\n".to_string());
+        refused_whatever_its_reason("a compared pair off the declared stderr", stderr_wrong);
         let mut unrecorded = imported("", "", "");
         unrecorded.declared_stdout = None;
         assert_eq!(
@@ -28737,11 +29184,11 @@ cp "{}" "$verdict"
         for (expected, message) in [
             (
                 expected_exit(Some(0), None),
-                "code must be a nonzero exit status",
+                "code must be an exit status in 1..=255",
             ),
             (
                 expected_exit(Some(256), None),
-                "code must be a nonzero exit status",
+                "code must be an exit status in 1..=255",
             ),
             (
                 expected_exit(None, Some(0)),
@@ -28770,7 +29217,7 @@ cp "{}" "$verdict"
         assert!(
             check("chaos", expected_exit(Some(7), None))
                 .unwrap_err()
-                .contains("supported only by verify mode")
+                .contains("supported only by verify and replay modes")
         );
     }
 
@@ -28978,6 +29425,7 @@ cp "{}" "$verdict"
             expected_guest_exit: None,
             expected_stdout: None,
             expected_stdout_contains: None,
+            expected_stderr: None,
             comparator: Comparator::Strict,
             attempt: "1".into(),
             fixed_workdir_source: dir.join("workdir/1"),
@@ -29390,14 +29838,12 @@ cp "{}" "$verdict"
         // start-up on an idle host; the earlier 1.1 s sleeps under a 2 s
         // deadline left only 0.9 s per phase.
         let program = root.join("fixture.sh");
-        fs::write(
+        crate::exec_safe_fs::write_executable(
             &program,
             "#!/bin/sh\ncase \"$1\" in\n  --prepare) sleep 2.1 ;;\n  --run) sleep 2.1; printf 'complete\\n' ;;\n  *) exit 64 ;;\nesac\n",
+            0o755,
         )
         .unwrap();
-        let mut permissions = fs::metadata(&program).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&program, permissions).unwrap();
 
         // Widen the per-phase deadline against a measured reference
         // (dh-ravrz): time a real `sleep 0.5` spawn on this host; a loaded

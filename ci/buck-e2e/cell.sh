@@ -30,13 +30,31 @@
 #        HERMIT_E2E_DIGEST_CACHE_DIR
 #                                  where cells on this host share verified file digests
 #                                  (default /tmp/hermit-e2e-digests-UID; host cells only)
+#        HERMIT_E2E_REQUIRE_HOST_CAPS
+#                                  "1": a cell the harness withholds as HOST-INAPPLICABLE on
+#                                  a local route FAILS instead of being skipped (for a CI
+#                                  host that must have the capability: a skip there would
+#                                  read as coverage nobody got); "0" or unset: skipped, as
+#                                  before. Any other value fails the cell.
+#        HERMIT_E2E_KEEP_ARTIFACTS "1": copy this cell's artifact directory (one cell's, its
+#                                  final attempt's) to HERMIT_E2E_KEEP_DIR/<run id>/ before
+#                                  the scratch directory is removed, and name the copy in
+#                                  the summary; local cells only. "0" or unset: nothing
+#                                  is kept (the default). Any other value fails the cell.
+#        HERMIT_E2E_KEEP_DIR       where kept artifacts go (default $HOME/hermit-e2e-kept)
 #        HERMIT_E2E_SESSION_CENSUS the file cells on this host share the harness's process
 #                                  session census through (default
 #                                  /tmp/hermit-e2e-session-census-UID; host cells only)
 # stdout: Tpx HPHP-JSON (`type = "json"`): the harness's test_done for the cell, turned
 #         into a failure if its evidence is incomplete, then all_done. Always exits 0.
+#         The record's details start with a short human summary (backend and mode, each
+#         run's exit status, wall time and INFO-message count, the log-comparison verdict,
+#         the guest's stdout tail and the report's name), so `buck2 test ... --
+#         --print-passing-details` and TestX show it; their LAST line is the JSON object
+#         the harness wrote.
 #         A cell the harness withholds as HOST-INAPPLICABLE on a local route is reported
-#         skipped, with the harness's reason; on RE it stays failed, so Tpx retries it on
+#         skipped, with the harness's reason (failed, naming that reason, under
+#         HERMIT_E2E_REQUIRE_HOST_CAPS=1); on RE it stays failed, so Tpx retries it on
 #         another worker (see ci/buck-e2e/run).
 set -u
 TEST=$1 MODE=$2 BACKEND=$3
@@ -104,6 +122,14 @@ workdir=
 # harness still tries a cgroup first and only then uses the agent-utils process-group
 # scan, whose rows name that source. A local cell runs in a cgroup it can use, so it
 # never inherits a caller's marker; neither does the pinned-root container.
+case ${HERMIT_E2E_REQUIRE_HOST_CAPS:-} in
+"" | 0 | 1) ;;
+*) emit_fatal "HERMIT_E2E_REQUIRE_HOST_CAPS must be 0 or 1, not '${HERMIT_E2E_REQUIRE_HOST_CAPS}'" ;;
+esac
+case ${HERMIT_E2E_KEEP_ARTIFACTS:-} in
+"" | 0 | 1) ;;
+*) emit_fatal "HERMIT_E2E_KEEP_ARTIFACTS must be 0 or 1, not '${HERMIT_E2E_KEEP_ARTIFACTS}'" ;;
+esac
 if [[ ${HERMIT_E2E_ROUTE:-} == re ]]; then
     cpu_scan_env=(HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN=1)
 else
@@ -503,6 +529,22 @@ PY
 for f in result.json tpx.jsonl summary.json results.jsonl harness.stderr; do
     [[ -f $A/$f ]] && printf '{"type": {"generic_text_log": {}}, "description": "%s"}\n' "$f" >"$N/$f.annotation"
 done
+# HERMIT_E2E_KEEP_ARTIFACTS=1: this one cell's artifact directory outlives the scratch
+# directory, for a person reading a local run. RE workers keep nothing past the action.
+kept= kept_note=
+if [[ ${HERMIT_E2E_KEEP_ARTIFACTS:-} == 1 ]]; then
+    if [[ ${HERMIT_E2E_ROUTE:-} != local ]]; then
+        kept_note="not kept: HERMIT_E2E_KEEP_ARTIFACTS applies to local cells, this one ran on '${HERMIT_E2E_ROUTE:-}'"
+    elif [[ ! -d $celldir ]]; then
+        kept_note="not kept: the harness wrote no artifact directory for this cell"
+    else
+        kept=${HERMIT_E2E_KEEP_DIR:-$HOME/hermit-e2e-kept}/$run_id/$(basename "$celldir")
+        if ! { mkdir -p "$(dirname "$kept")" && cp -a "$celldir" "$kept"; } 2>"$W/keep.err"; then
+            kept_note="not kept: copying to $kept failed: $(head -c 300 "$W/keep.err")"
+            kept=
+        fi
+    fi
+fi
 rm -rf "${W:?}"
 
 # Exactly one record, named for this cell, whatever the harness wrote, and the verdict on
@@ -514,9 +556,9 @@ rm -rf "${W:?}"
 # three lines does cell.sh publish the completion, by renaming a finished copy of
 # result.json over the original, so a normalizer or publication that fails at any point
 # leaves result.json without producer_completion, which ingest.py refuses.
-verdict_out=$(python3 - "$A/tpx.jsonl" "$CELL" "$evidence_complete" "$harness_rc" "${missing[*]}" "${HERMIT_E2E_ROUTE:-}" "$rows_seen" <<'PY'
+verdict_out=$(python3 - "$A/tpx.jsonl" "$CELL" "$evidence_complete" "$harness_rc" "${missing[*]}" "${HERMIT_E2E_ROUTE:-}" "$rows_seen" "${HERMIT_E2E_REQUIRE_HOST_CAPS:-}" <<'PY'
 import json, os, re, sys
-path, cell, complete, rc, missing, route, rows_seen = sys.argv[1:8]
+path, cell, complete, rc, missing, route, rows_seen, require_host_caps = sys.argv[1:9]
 
 class Invalid(Exception):
     """The harness output breaks its contract with this cell; the reason says how."""
@@ -586,13 +628,24 @@ def withheld_here(pair):
 
     A local host that lacks a capability lacks it on a retry too, so the cell is
     reported skipped with the harness's reason, never as a pass. Only a local route
-    qualifies: an RE worker that lacks the capability is retried on another worker."""
-    if route != "local" or pair is None:
+    qualifies: an RE worker that lacks the capability is retried on another worker.
+    Under HERMIT_E2E_REQUIRE_HOST_CAPS=1 nothing qualifies: required_here fails it."""
+    if route != "local" or pair is None or require_host_caps == "1":
         return None
     record, details = pair
     reason = details.get("reason")
     details["reason"] = "SKIP: " + (reason if isinstance(reason, str) and reason else "host-inapplicable")
     return dict(record, details=json.dumps(details))
+
+def required_here(pair):
+    """A failure for the withheld cell on a local route whose host must have the
+    capability (HERMIT_E2E_REQUIRE_HOST_CAPS=1); else None."""
+    if route != "local" or pair is None or require_host_caps != "1":
+        return None
+    reason = pair[1].get("reason")
+    return failed("HOST-INAPPLICABLE on a local route with HERMIT_E2E_REQUIRE_HOST_CAPS=1, "
+                  "which requires the capability here: "
+                  + (reason if isinstance(reason, str) and reason else "host-inapplicable"))
 
 def no_result_pair(done, rows):
     """The cell's own record when the harness ran this one cell and got no result back:
@@ -620,6 +673,9 @@ def verdict():
     skip = withheld_here(pair)
     if skip:
         return skip
+    required = required_here(pair)
+    if required:
+        return required
     if pair:
         # A withheld cell fails there; ci/buck-e2e/run reruns it locally (Tpx retries are off).
         return failed(f"harness rc={rc} produced {len(done)} test_done records")
@@ -709,5 +765,83 @@ PY
     rm -f -- "$candidate"
     emit_fatal "cannot publish the producer completion in result.json (harness rc=$harness_rc)"
 fi
-printf '%s\n' "${verdict_lines[0]}" "${verdict_lines[1]}"
+# The human summary leads the record's details; the harness's JSON stays the last line.
+# A summary that cannot be built says so and never changes the record's status.
+record_line=$(python3 - "$A" "$CELL" "$MODE" "$BACKEND" "${verdict_lines[0]}" "$kept" "$kept_note" <<'PY'
+import glob, json, os, sys
+art, cell, mode, backend, record, kept, kept_note = sys.argv[1:8]
+record = json.loads(record)
+
+def load(name):
+    try:
+        with open(os.path.join(art, name)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+def summary():
+    details = record.get("details") or ""
+    try:
+        outcome = json.loads(details.splitlines()[-1]).get("outcome") if details else None
+    except (ValueError, AttributeError, IndexError):
+        outcome = None
+    lines = [f"{cell}: {outcome or record.get('status', '?').upper()} ({mode} on the {backend} backend)"]
+    verify = load("cell__verify-1.json") or {}
+    outputs = verify.get("compared_outputs") or {}
+    infos = verify.get("compared_log_messages") or {}
+    for n, side in ((1, "left"), (2, "right")):
+        run = load(f"cell__verify-runs__1__run{n}__summary.json") or {}
+        out = outputs.get(side) or {}
+        if not run and not out:
+            continue
+        status = ("exit %s" % out["exit_code"] if out.get("exit_code") is not None
+                  else "signal %s" % out["signal"] if out.get("signal") is not None else "exit unknown")
+        real = run.get("realtime_elapsed") or {}
+        wall = ("%.3f s wall" % (real.get("secs", 0) + real.get("nanos", 0) / 1e9)) if real else "wall unknown"
+        info = "%s INFO messages" % infos[side] if side in infos else "INFO count unknown"
+        lines.append(f"  run {n}: {status}, {wall}, {info}")
+    if verify.get("verdict"):
+        parity = verify.get("bitwise_parity")
+        lines.append("  log comparison: " + verify["verdict"]
+                     + ("" if parity is None else " (bitwise parity)" if parity else " (no bitwise parity)"))
+    else:
+        lines.append(f"  log comparison: none recorded for this {mode} cell")
+    stdouts = sorted(glob.glob(os.path.join(art, "cell__verify-runs__1__run1__stdout"))
+                     or glob.glob(os.path.join(art, "cell__*__stdout")))
+    if stdouts:
+        with open(stdouts[0], errors="replace") as f:
+            tail = f.read().splitlines()[-20:]
+        lines.append(f"  guest stdout ({os.path.basename(stdouts[0])}, last {len(tail)} lines):")
+        lines += ["    " + l[:200] for l in tail]
+    report = "cell__verify-1.json" if verify else "result.json"
+    lines.append(f"  report: {report} among this test's Tpx artifacts")
+    if "artifact_dir" in (harness or {}):
+        lines.append("  artifact_dir (below) was this cell's scratch directory, deleted when the test ended"
+                     + ("; kept_dir names the kept copy" if kept else ""))
+    if kept:
+        lines.append(f"  kept artifacts: {kept}")
+    elif kept_note:
+        lines.append(f"  {kept_note}")
+    return "\n".join(lines)
+
+details = (record.get("details") or "").split("\n")
+try:
+    harness = json.loads(details[-1])
+except ValueError:
+    harness = None
+harness = harness if isinstance(harness, dict) else None
+
+try:
+    text = summary()
+except Exception as error:  # the summary is a reader's aid, never the verdict
+    text = f"{cell}: summary unavailable: {type(error).__name__}: {error}"
+if kept and harness is not None:
+    # The harness's artifact_dir is gone with the scratch directory; name the copy.
+    harness["kept_dir"] = kept
+    details[-1] = json.dumps(harness)
+record["details"] = text + "\n" + "\n".join(details)
+print(json.dumps(record))
+PY
+) || record_line=${verdict_lines[0]}
+printf '%s\n' "$record_line" "${verdict_lines[1]}"
 exit 0

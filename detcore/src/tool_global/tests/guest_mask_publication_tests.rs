@@ -253,6 +253,24 @@ impl GlobalRPC<GlobalState> for PublishingGuest {
                     .set_saved_guest_sigmask(THREAD, mask);
                 GlobalResponse::SetSavedGuestSigmask(())
             }
+            GlobalRequest::BeginWaitMask(mask) => {
+                self.wait_masks.lock().unwrap().push(mask);
+                self.scheduler.lock().unwrap().begin_wait_mask(THREAD, mask);
+                GlobalResponse::BeginWaitMask(())
+            }
+            GlobalRequest::WithdrawWaitMask => {
+                self.wait_masks.lock().unwrap().push(None);
+                self.scheduler.lock().unwrap().withdraw_wait_mask(THREAD);
+                GlobalResponse::WithdrawWaitMask(())
+            }
+            GlobalRequest::EndWaitMask => {
+                self.scheduler.lock().unwrap().end_wait_mask(THREAD);
+                GlobalResponse::EndWaitMask(())
+            }
+            GlobalRequest::PopDeliveryMask => {
+                self.scheduler.lock().unwrap().pop_delivery_mask(THREAD);
+                GlobalResponse::PopDeliveryMask(())
+            }
             GlobalRequest::PublishedGuestSigmask(thread) => GlobalResponse::PublishedGuestSigmask(
                 self.scheduler
                     .lock()

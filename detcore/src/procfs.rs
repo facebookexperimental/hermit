@@ -85,7 +85,12 @@ enum ProcfsKind {
     ProcessIo,
     Uptime,
     BlockStat,
+    /// A node's `meminfo`. Classified for record mode, which leaves sysfs
+    /// lookups alone; in run mode the node directory is absent
+    /// (https://github.com/rrnewton/hermit/issues/5269), so no lookup
+    /// reaches it.
     NodeMeminfo,
+    /// A node's `numastat`, classified as [`Self::NodeMeminfo`] is.
     NodeNumastat,
     HwmonInput,
     ScalingCurFreq,
@@ -93,6 +98,11 @@ enum ProcfsKind {
     PtyNr,
     SelfSched,
     Fdinfo,
+    /// `/proc/<pid>/numa_maps`, from when Detcore presented one virtual
+    /// NUMA node. No path is classified as it now: the kernel Detcore
+    /// presents is built without NUMA and registers no such file
+    /// (https://github.com/rrnewton/hermit/issues/5269). Retained so every
+    /// other kind keeps its serialized number.
     NumaMaps,
     SmapsRollup,
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -222,6 +232,13 @@ enum ProcfsKind {
     /// (`ProcfsFile::kernel_served`), as before. Appended last, so every
     /// other kind keeps its serialized number.
     ProcessComm,
+    /// A device's NUMA attribute in `/sys` that the kernel without NUMA
+    /// Detcore presents registers with contents of its own
+    /// ([`device_node_attribute`]). Classified by the object the kernel
+    /// opened, in run mode, where the same rule leaves the absent ones out;
+    /// never by a path alone. Appended last, so every other kind keeps its
+    /// serialized number.
+    DeviceNode(DeviceNodeFile),
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1022,10 +1039,10 @@ pub(crate) struct RenderedFiles {
     /// (`procfs_inode::tool_can_name_guest_descriptors`, KVM), so there is no
     /// kernel file to keep the guest's rows of.
     pub(crate) locks: bool,
-    /// Whether Detcore renders every process's `smaps`, `smaps_rollup` and
-    /// `numa_maps` from the backend's memory map (`memory_map::smaps`,
-    /// package K slice N4): exactly where the guest's procfs is not the
-    /// kernel's (KVM), so there is no kernel file to sanitize.
+    /// Whether Detcore renders every process's `smaps` and `smaps_rollup`
+    /// from the backend's memory map (`memory_map::smaps`, package K slice
+    /// N4): exactly where the guest's procfs is not the kernel's (KVM), so
+    /// there is no kernel file to sanitize.
     pub(crate) address_space: bool,
 }
 
@@ -1077,8 +1094,6 @@ pub(crate) enum AddressSpaceFile {
     Smaps,
     /// `/proc/<pid>/smaps_rollup`.
     SmapsRollup,
-    /// `/proc/<pid>/numa_maps`.
-    NumaMaps,
 }
 
 impl AddressSpaceFile {
@@ -1087,7 +1102,6 @@ impl AddressSpaceFile {
         match self {
             Self::Smaps => "smaps",
             Self::SmapsRollup => "smaps_rollup",
-            Self::NumaMaps => "numa_maps",
         }
     }
 }
@@ -1195,8 +1209,7 @@ pub(crate) fn maps_task_at(path: &Path, pid: i32, tid: i32) -> Option<BoundTask>
     let normalized = normalize_observed_path(path)?;
     let path = normalized.to_str()?;
     ProcfsTask::parse(path, "maps")
-        .or_else(|| ProcfsTask::parse(path, "smaps"))
-        .or_else(|| ProcfsTask::parse(path, "numa_maps"))?
+        .or_else(|| ProcfsTask::parse(path, "smaps"))?
         .bound_to(pid, tid)
         .bound()
 }
@@ -1444,7 +1457,7 @@ pub(crate) struct ProcfsFile {
     /// one that task held at the open, which was the opener's own
     /// ([`ProcfsFile::bind_memory_map`]). `None` where the open bound none;
     /// the file is then read from the kernel's, as before. For a process's
-    /// `smaps`, `smaps_rollup` and `numa_maps` Detcore opened as rendered,
+    /// `smaps` and `smaps_rollup` Detcore opened as rendered,
     /// the same; `None` there is a task of another process, or one that held
     /// no address space at the open (`Detcore::render_address_space_file`).
     #[serde(default)]
@@ -2010,6 +2023,10 @@ impl ProcfsFile {
             other if let Some(file) = CpuConstantFile::from_path(other) => {
                 ProcfsKind::CpuConstant(file)
             }
+            // In run mode no lookup reaches a node file — the directory
+            // itself is absent (is_absent_cpu_entry). These kinds serve
+            // record mode, which leaves sysfs lookups alone by design, so
+            // a recording's node accounting is sanitized and stable.
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-939): Review NUMA node VM accounting normalization.
             other if is_node_vmstat_path(other) => ProcfsKind::NodeVmstat,
@@ -2019,9 +2036,6 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-931): Review fdinfo backing-identity normalization.
             _ if target_fd.is_some() => ProcfsKind::Fdinfo,
-            // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-934): Review host NUMA observation normalization.
-            other if is_process_file_path(other, "numa_maps") => ProcfsKind::NumaMaps,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-937): Review smaps rollup accounting normalization.
             other if is_process_file_path(other, "smaps_rollup") => ProcfsKind::SmapsRollup,
@@ -2119,7 +2133,19 @@ impl ProcfsFile {
         };
         let task = Self::per_process_name_of(&kind)
             .and_then(|filename| ProcfsTask::parse(task_path, filename));
-        Some(Self {
+        Some(Self::of_kind(kind, task, target_fd))
+    }
+
+    /// A device's NUMA attribute the kernel opened, which reads `file`'s
+    /// contents ([`ProcfsKind::DeviceNode`]).
+    pub(crate) fn device_node(file: DeviceNodeFile) -> Self {
+        Self::of_kind(ProcfsKind::DeviceNode(file), None, None)
+    }
+
+    /// A file of `kind`, of the task `task` names and, for an `fdinfo`, of
+    /// the descriptor `target_fd`, as yet unopened.
+    fn of_kind(kind: ProcfsKind, task: Option<ProcfsTask>, target_fd: Option<i32>) -> Self {
+        Self {
             kind,
             task,
             incarnation: None,
@@ -2139,7 +2165,7 @@ impl ProcfsFile {
             offset: 0,
             read_pos: None,
             sequence_shared: false,
-        })
+        }
     }
 
     /// The path within procfs of a file whose every byte Detcore renders from
@@ -2247,16 +2273,16 @@ impl ProcfsFile {
     /// The per-process files Detcore renders, and their names. `mountinfo`
     /// and `mounts` only in a session with a container mount table
     /// ([`RenderedFiles::mounts`]), `arch_status` only in a session that
-    /// renders `/proc/cpuinfo` ([`RenderedFiles::cpuinfo`]), and `smaps`,
-    /// `smaps_rollup` and `numa_maps` only where the guest's procfs is not
-    /// the kernel's ([`RenderedFiles::address_space`]). A name's index
+    /// renders `/proc/cpuinfo` ([`RenderedFiles::cpuinfo`]), and `smaps`
+    /// and `smaps_rollup` only where the guest's procfs is not the kernel's
+    /// ([`RenderedFiles::address_space`]). A name's index
     /// numbers its files' inodes (`procfs_inode::per_process_inode`), so a new
     /// name goes last. A task's `status` (package K item 2b slice 2b-2) is
     /// rendered only where Detcore renders it
     /// (`Detcore::kernel_serves_every_status`, `kept_by_kernel`); every
     /// other open of one stays the kernel's. So is a process's `environ`
     /// (package K item 2b slice 2b-3: `Detcore::kernel_serves_every_environ`).
-    const PER_PROCESS_KINDS: [(ProcfsKind, &'static str); 15] = [
+    const PER_PROCESS_KINDS: [(ProcfsKind, &'static str); 14] = [
         (ProcfsKind::ProcessCgroup, "cgroup"),
         (ProcfsKind::ProcessAuxv, "auxv"),
         (ProcfsKind::Mountinfo, "mountinfo"),
@@ -2269,13 +2295,12 @@ impl ProcfsFile {
         (ProcfsKind::ArchStatus, "arch_status"),
         (ProcfsKind::Smaps, "smaps"),
         (ProcfsKind::SmapsRollup, "smaps_rollup"),
-        (ProcfsKind::NumaMaps, "numa_maps"),
         (ProcfsKind::ProcessStatus, "status"),
         (ProcfsKind::ProcessEnviron, "environ"),
     ];
 
     /// The names of the per-process files Detcore renders.
-    pub(crate) const PER_PROCESS_NAMES: [&'static str; 15] = [
+    pub(crate) const PER_PROCESS_NAMES: [&'static str; 14] = [
         "cgroup",
         "auxv",
         "mountinfo",
@@ -2288,7 +2313,6 @@ impl ProcfsFile {
         "arch_status",
         "smaps",
         "smaps_rollup",
-        "numa_maps",
         "status",
         "environ",
     ];
@@ -2385,7 +2409,7 @@ impl ProcfsFile {
     /// Nor `cmdline`, whose every read reads the process's memory again
     /// ([`Self::renders_at_every_read`]).
     ///
-    /// Nor `smaps`, `smaps_rollup` and `numa_maps`, whose snapshot Detcore
+    /// Nor `smaps` and `smaps_rollup`, whose snapshot Detcore
     /// takes at the first read and keeps, whether it renders the file
     /// (package K slice N4) or the kernel opened it, so that every backend
     /// serves them alike ([`Self::lists_address_space`]).
@@ -2401,20 +2425,19 @@ impl ProcfsFile {
             && (self.rendered || !self.is_task_status())
     }
 
-    /// Whether this is a process's `smaps`, `smaps_rollup` or `numa_maps`,
+    /// Whether this is a process's `smaps` or `smaps_rollup`,
     /// the per-process files Detcore renders from the backend's memory map
     /// where it renders them (`RenderedFiles::address_space`).
     pub(crate) fn lists_rendered_address_space(&self) -> bool {
         self.address_space_file().is_some()
     }
 
-    /// Which of a process's `smaps`, `smaps_rollup` and `numa_maps` this is,
-    /// if it is one.
+    /// Which of a process's `smaps` and `smaps_rollup` this is, if it is
+    /// one.
     pub(crate) fn address_space_file(&self) -> Option<AddressSpaceFile> {
         match self.kind {
             ProcfsKind::Smaps => Some(AddressSpaceFile::Smaps),
             ProcfsKind::SmapsRollup => Some(AddressSpaceFile::SmapsRollup),
-            ProcfsKind::NumaMaps => Some(AddressSpaceFile::NumaMaps),
             _ => None,
         }
     }
@@ -2679,14 +2702,10 @@ impl ProcfsFile {
             ProcfsKind::Diskstats => Some(Path::new("/proc/diskstats")),
             ProcfsKind::Fixed(file) => Some(file.path()),
             ProcfsKind::Mountinfo | ProcfsKind::ProcessMounts if !files.mounts => None,
-            // A process's `smaps`, `smaps_rollup` and `numa_maps`, rendered
-            // from the backend's memory map where there is no kernel file to
+            // A process's `smaps` and `smaps_rollup`, rendered from the
+            // backend's memory map where there is no kernel file to
             // sanitize (`memory_map::smaps`).
-            ProcfsKind::Smaps | ProcfsKind::SmapsRollup | ProcfsKind::NumaMaps
-                if !files.address_space =>
-            {
-                None
-            }
+            ProcfsKind::Smaps | ProcfsKind::SmapsRollup if !files.address_space => None,
             // A task's `arch_status` describes the CPU the guest's CPUID
             // instruction reports, so Detcore renders it exactly where it
             // renders `/proc/cpuinfo`, from the same table.
@@ -2899,7 +2918,7 @@ impl ProcfsFile {
             // The text is the address space's mappings as the backend's
             // memory map lists them at the first read
             // (`Detcore::render_address_space_file`).
-            ProcfsKind::Smaps | ProcfsKind::SmapsRollup | ProcfsKind::NumaMaps => b"",
+            ProcfsKind::Smaps | ProcfsKind::SmapsRollup => b"",
             _ => unreachable!("{:?} has no rendered path", self.kind),
         }
     }
@@ -2920,8 +2939,6 @@ impl ProcfsFile {
             Some(private_maps::Format::Maps)
         } else if self.kind == ProcfsKind::Smaps {
             Some(private_maps::Format::Smaps)
-        } else if self.kind == ProcfsKind::NumaMaps {
-            Some(private_maps::Format::NumaMaps)
         } else {
             None
         }
@@ -2939,10 +2956,10 @@ impl ProcfsFile {
     /// Bind a process's `maps` to the task its open found and the address
     /// space that task held then, as Linux takes the task's memory map at the
     /// open (`proc_maps_open`). Only for a task of the opener's own process,
-    /// whose address space is the opener's. So too a process's `smaps`,
-    /// `smaps_rollup` and `numa_maps` Detcore opened as rendered (package K
-    /// slice N4), whose opens take the memory map the same way
-    /// (`pid_smaps_open`, `smaps_rollup_open`, `pid_numa_maps_open`).
+    /// whose address space is the opener's. So too a process's `smaps` and
+    /// `smaps_rollup` Detcore opened as rendered (package K slice N4),
+    /// whose opens take the memory map the same way (`pid_smaps_open`,
+    /// `smaps_rollup_open`).
     pub(crate) fn bind_memory_map(&mut self, binding: memory_map::Binding) {
         assert!(
             self.is_maps() || self.lists_rendered_address_space(),
@@ -2977,7 +2994,7 @@ impl ProcfsFile {
     pub(crate) fn lists_address_space(&self) -> bool {
         matches!(
             self.kind,
-            ProcfsKind::Maps | ProcfsKind::Smaps | ProcfsKind::NumaMaps | ProcfsKind::SmapsRollup
+            ProcfsKind::Maps | ProcfsKind::Smaps | ProcfsKind::SmapsRollup
         )
     }
 
@@ -3392,6 +3409,7 @@ impl ProcfsFile {
                 sanitize_cpu_mask(&contents, set.cpus(machine.cpus), machine.cpus)
             }
             ProcfsKind::CpuConstant(file) => file.contents(),
+            ProcfsKind::DeviceNode(file) => file.contents(&contents),
             ProcfsKind::Fixed(file) => file.contents(&machine),
             ProcfsKind::BtrfsBytesMayUse => sanitize_btrfs_bytes_may_use(&contents),
             ProcfsKind::BlockInflight => sanitize_block_inflight(&contents),
@@ -3842,9 +3860,13 @@ const CPU_TOPOLOGY_ATTRIBUTES: [&str; 6] = [
 ];
 
 /// What a CPU-list or CPU-mask file in `/sys` names, on the machine
-/// `--virtual-cpus` describes: single-core sockets on one node. Each is a
-/// set of CPU numbers, except the node lists', which number nodes and print
-/// the same way.
+/// `--virtual-cpus` describes: single-core sockets on one node. In run
+/// mode the node directory itself is absent, as on a kernel built
+/// without NUMA (https://github.com/rrnewton/hermit/issues/5269), so the
+/// node entries below classify only what record mode — which leaves
+/// sysfs lookups alone by design — can still open. Each is a set of CPU
+/// numbers, except the node lists', which number nodes and print the
+/// same way.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum CpuFileSet {
     /// Every CPU: `cpu/{online,possible,present,enabled}` and `node0`'s
@@ -4029,27 +4051,77 @@ impl CpuConstantFile {
     }
 }
 
+/// Whether `directory` is one CPU's own sysfs directory, by any of its
+/// spellings: the device directory, its bus alias, or through the processor
+/// driver's link to it. Only a direct `cpu<N>` child of those parents names
+/// one; a directory below a CPU (its `topology`, say) or the `cpufreq`
+/// directory does not.
+fn cpu_backlink_directory(directory: &Path) -> bool {
+    let Some(directory) = directory.to_str() else {
+        return false;
+    };
+    [
+        "/sys/devices/system/cpu/cpu",
+        "/sys/bus/cpu/devices/cpu",
+        "/sys/bus/cpu/drivers/processor/cpu",
+    ]
+    .into_iter()
+    .any(|prefix| {
+        directory
+            .strip_prefix(prefix)
+            .is_some_and(|cpu| !cpu.is_empty() && cpu.bytes().all(|byte| byte.is_ascii_digit()))
+    })
+}
+
 /// Whether `name`, an entry of the directory at the canonical path
-/// `directory`, is a CPU or cpufreq policy numbered `cpus` or more, or a node
-/// other than number 0, which a machine with `cpus` CPUs on one node does not
-/// have: in the CPU and node directories and their `/sys/bus` counterparts, and
-/// as the links node0, the processor driver and a memory block hold to them.
-/// glibc's `get_nprocs_conf` (`sysconf(_SC_NPROCESSORS_CONF)`, `nproc
-/// --all`) counts the `cpuN` entries of `/sys/devices/system/cpu`, and
-/// libnuma counts them and the `nodeN` entries of `/sys/devices/system/node`.
+/// `directory`, is absent from the machine Detcore presents: a CPU or
+/// cpufreq policy numbered `cpus` or more, which a machine with `cpus`
+/// CPUs does not have, and every NUMA node name, because that machine is
+/// a kernel built without NUMA (https://github.com/rrnewton/hermit/issues/5269).
+/// Without `drivers/base/node.o` Linux registers no node subsystem, so the
+/// `node` directory itself is missing from `/sys/devices/system` and from
+/// `/sys/bus` — not an empty directory — and neither a memory block nor a
+/// CPU holds a link to a node; nor are there memory tiers or memory
+/// policies to list. glibc's `get_nprocs_conf`
+/// (`sysconf(_SC_NPROCESSORS_CONF)`,
+/// `nproc --all`) counts the `cpuN` entries of `/sys/devices/system/cpu`,
+/// and libnuma counts them and probes `/sys/devices/system/node`, which a
+/// kernel without NUMA does not have.
 pub(crate) fn is_absent_cpu_entry(directory: &Path, name: &[u8], cpus: u32) -> bool {
+    match (directory.to_str(), name) {
+        // The node directory itself, in each of its two parents.
+        (Some("/sys/devices/system" | "/sys/bus"), b"node") => return true,
+        // The directories of the rest of NUMA's code, which such a kernel
+        // does not build either (mm/Makefile:86 and 99 at v7.1): memory
+        // tiering's bus and its devices' root (mm/memory-tiers.c:50 and 910)
+        // and its tunables (991), and the memory policies' tunables
+        // (mm/mempolicy.c:3931).
+        (Some("/sys/bus" | "/sys/devices/virtual"), b"memory_tiering")
+        | (Some("/sys/kernel/mm"), b"numa" | b"mempolicy") => return true,
+        _ => {}
+    }
+    // The backlink each CPU directory holds to its node is absent for every
+    // node number, on a present CPU just as on an absent one: without the
+    // node subsystem no CPU is registered on a node (`register_cpu`'s
+    // `register_cpu_under_node` is a `CONFIG_NUMA` stub returning 0).
+    if cpu_backlink_directory(directory) {
+        return name
+            .strip_prefix(b"node")
+            .is_some_and(|node| !node.is_empty() && node.iter().all(u8::is_ascii_digit));
+    }
     let (prefix, present): (&[u8], u32) = match directory.to_str() {
         Some(
             "/sys/devices/system/cpu"
             | "/sys/bus/cpu/devices"
-            // node0's link to each of its CPUs, and the processor driver's
-            // link to each CPU it binds.
-            | "/sys/devices/system/node/node0"
+            // The processor driver's link to each CPU it binds. (A node's
+            // links to its CPUs went with the node directory.)
             | "/sys/bus/cpu/drivers/processor",
         ) => (b"cpu", cpus),
-        Some("/sys/devices/system/node" | "/sys/bus/node/devices") => (b"node", 1),
+        // Inside the node directories themselves, should a listing of one
+        // ever be filtered: no node is present.
+        Some("/sys/devices/system/node" | "/sys/bus/node/devices") => (b"node", 0),
         Some("/sys/devices/system/cpu/cpufreq") => (b"policy", cpus),
-        // A memory block's link to the node it belongs to.
+        // A memory block's link to the node it belongs to: none, without NUMA.
         Some(directory)
             if directory
                 .strip_prefix("/sys/devices/system/memory/memory")
@@ -4057,7 +4129,7 @@ pub(crate) fn is_absent_cpu_entry(directory: &Path, name: &[u8], cpus: u32) -> b
                     !block.is_empty() && block.bytes().all(|byte| byte.is_ascii_digit())
                 }) =>
         {
-            (b"node", 1)
+            (b"node", 0)
         }
         _ => return false,
     };
@@ -4074,12 +4146,12 @@ pub(crate) fn is_absent_cpu_entry(directory: &Path, name: &[u8], cpus: u32) -> b
 
 /// The prefix of the absolute `path` that ends at the first component
 /// [`is_absent_cpu_entry`] leaves out of its directory, walking `path`'s
-/// normal components from the left: `/sys/devices/system/node/node1` for
-/// `/sys/devices/system/node/node1/cpulist`. `None` where no component is
+/// normal components from the left: `/sys/devices/system/node` for
+/// `/sys/devices/system/node/node0/cpulist`. `None` where no component is
 /// absent, for a relative path, and at a `..` (the kernel's to resolve,
 /// through any link before it). A lookup of the prefix, or of a name below
-/// it, finds nothing, as on the machine with `cpus` CPUs on one node that the
-/// listings, `online` and `sched_getaffinity` describe.
+/// it, finds nothing, as on the machine with `cpus` CPUs and no NUMA that
+/// the listings, `online` and `sched_getaffinity` describe.
 pub(crate) fn absent_cpu_entry_prefix(path: &Path, cpus: u32) -> Option<PathBuf> {
     let mut components = path.components();
     if components.next() != Some(Component::RootDir) {
@@ -4097,6 +4169,223 @@ pub(crate) fn absent_cpu_entry_prefix(path: &Path, cpus: u32) -> Option<PathBuf>
             return Some(prefix);
         }
         prefix.push(name);
+    }
+    None
+}
+
+/// What one of a device's NUMA attributes is on the kernel built without NUMA
+/// that Detcore presents (https://github.com/rrnewton/hermit/issues/5269).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeviceNodeAttribute {
+    /// The kernel registers no such attribute: a lookup finds nothing, and a
+    /// listing leaves it out.
+    Absent,
+    /// The kernel registers it, with these contents rather than the host's.
+    Reads(DeviceNodeFile),
+}
+
+/// A device's NUMA attribute that a kernel without NUMA registers, with
+/// contents of its own rather than the host's ([`device_node_attribute`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) enum DeviceNodeFile {
+    /// A node number that is the same for every such device: -1
+    /// (`NUMA_NO_NODE`) or node 0.
+    Node(i32),
+    /// An NVMe namespace path's `numa_nodes`: the nodes whose I/O takes this
+    /// path, printed as a node list (drivers/nvme/host/multipath.c:1084-1109
+    /// at v7.1), or nothing at all where the subsystem's I/O policy is not
+    /// `numa`. With one node, `for_each_node` visits node 0 alone
+    /// (include/linux/nodemask.h:476), so the list is `0` or empty: `0` here
+    /// where the host's list has node 0.
+    PathNodes,
+}
+
+impl DeviceNodeFile {
+    /// What the attribute reads, from `kernel`, the host's bytes, which are
+    /// kept as they are where they do not have the attribute's format.
+    fn contents(self, kernel: &[u8]) -> Vec<u8> {
+        let Some(line) = kernel
+            .strip_suffix(b"\n")
+            .and_then(|line| std::str::from_utf8(line).ok())
+        else {
+            return kernel.to_vec();
+        };
+        match self {
+            Self::Node(node) if line.parse::<i32>().is_ok() => format!("{node}\n").into_bytes(),
+            Self::PathNodes
+                if line
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || byte == b',' || byte == b'-') =>
+            {
+                // The list is sorted, so node 0 is in it where its first
+                // range starts at 0.
+                let first = line.split([',', '-']).next().unwrap_or_default();
+                if first == "0" {
+                    b"0\n".to_vec()
+                } else {
+                    b"\n".to_vec()
+                }
+            }
+            Self::Node(_) | Self::PathNodes => kernel.to_vec(),
+        }
+    }
+}
+
+/// How the subsystem a device's `subsystem` link names, as its last two
+/// components (`bus` or `class`, then the name), decides the device's NUMA
+/// attribute `name` on a kernel built without NUMA (Linux 7.1). `None` for
+/// every other attribute or subsystem: those are the kernel's.
+fn subsystem_node_rule(kind: &str, subsystem: &str, name: &[u8]) -> Option<SubsystemNodeRule> {
+    use DeviceNodeAttribute::Absent;
+    use DeviceNodeAttribute::Reads;
+    use DeviceNodeFile::Node;
+    use DeviceNodeFile::PathNodes;
+    use SubsystemNodeRule::ByDaxProvider;
+    use SubsystemNodeRule::Is;
+    Some(match (kind, subsystem, name) {
+        // - PCI defines and registers `numa_node` only under `CONFIG_NUMA`
+        //   (drivers/pci/pci-sysfs.c:361-398 and 633-635);
+        // - platform hides it for a device on `NUMA_NO_NODE`
+        //   (drivers/base/platform.c:1331-1340), which without NUMA
+        //   `dev_to_node` is for every device (include/linux/device.h:899-907);
+        // - CXL (a memory device's), DAX and NVDIMM hide it under
+        //   `!CONFIG_NUMA` (drivers/cxl/core/memdev.c:488,
+        //   drivers/dax/bus.c:1384-1385, drivers/nvdimm/bus.c:709), NVDIMM its
+        //   `target_node` with it (704-717);
+        // - VMBus registers it only under `CONFIG_NUMA`
+        //   (drivers/hv/vmbus_drv.c:587-589).
+        ("bus", "cxl" | "dax" | "pci" | "platform" | "vmbus", b"numa_node")
+        | ("bus", "nd", b"numa_node" | b"target_node") => Is(Absent),
+        // An NVMe controller prints its `numa_node`
+        // (drivers/nvme/host/sysfs.c:386 and 756), which every transport sets
+        // by `dev_to_node` (pci.c:2379, fc.c:3518, and rdma.c:791 through
+        // `ibdev_to_node`) or leaves `NUMA_NO_NODE` (core.c:5137); and an
+        // Intel DSA or IAA device prints `dev_to_node` of its PCI device
+        // (drivers/dma/idxd/sysfs.c:1450-1457 and 1803). Without NUMA that
+        // is -1 for every device.
+        ("class", "nvme", b"numa_node") | ("bus", "dsa", b"numa_node") => Is(Reads(Node(-1))),
+        // A SmartPQI controller's SCSI devices print the controller's node
+        // (drivers/scsi/smartpqi/smartpqi_init.c:7520-7529 and 7590), which
+        // for a device on `NUMA_NO_NODE` is `cpu_to_node(0)` (9316-9332):
+        // without NUMA 0 (include/asm-generic/topology.h:30-36, which x86's
+        // arch/x86/include/asm/topology.h:83-103 uses).
+        ("bus", "scsi", b"numa_node") => Is(Reads(Node(0))),
+        ("bus", "dax", b"target_node") => ByDaxProvider,
+        ("class", "block", b"numa_nodes") => Is(Reads(PathNodes)),
+        _ => return None,
+    })
+}
+
+/// A rule of [`subsystem_node_rule`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubsystemNodeRule {
+    Is(DeviceNodeAttribute),
+    /// A DAX device's `target_node`, which its region's provider decides
+    /// ([`dax_target_node`]).
+    ByDaxProvider,
+}
+
+/// The last two components of the `subsystem` link of the device whose sysfs
+/// directory the tool reaches at `directory` (`bus` and `pci` for
+/// `../../../bus/pci`), whichever spelling reached the directory: the device
+/// path, its bus alias (`/sys/bus/pci/devices/<address>`), a class device's
+/// `device` link, or a driver's link to a device it binds.
+fn device_subsystem(directory: &Path) -> Option<(String, String)> {
+    let subsystem = std::fs::read_link(directory.join("subsystem")).ok()?;
+    let mut components = subsystem.components().rev();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(name)), Some(Component::Normal(kind))) => {
+            Some((kind.to_str()?.to_owned(), name.to_str()?.to_owned()))
+        }
+        _ => None,
+    }
+}
+
+/// A DAX device's `target_node` on a kernel built without NUMA: its region's
+/// node, which the bus shows only where it is not negative
+/// (drivers/dax/bus.c:1284-1298 and 1382-1383 at v7.1). The device's parent
+/// is its region's provider's device, which sets that node:
+/// - a CXL DAX region (bus `cxl`), by `phys_to_target_node`
+///   (drivers/dax/cxl.c:12-21);
+/// - a soft-reserved memory range's platform device, likewise
+///   (drivers/dax/hmem/device.c:88, drivers/dax/hmem/hmem.c:30-31);
+/// - an NVDIMM namespace's DAX device (bus `nd`), by its region's
+///   (drivers/dax/pmem.c:54-56), which ACPI's NFIT sets by `pxm_to_node` or
+///   `phys_to_target_node` (drivers/acpi/nfit/core.c:2632-2648), e820 and
+///   virtio-pmem by `phys_to_target_node` (drivers/nvdimm/e820.c:23-28,
+///   drivers/nvdimm/virtio_pmem.c:105), and a device tree's region by
+///   `dev_to_node` (drivers/nvdimm/of_pmem.c:63-64).
+///
+/// Without NUMA `phys_to_target_node` and `pxm_to_node` are 0
+/// (include/linux/numa.h:57-64, include/acpi/acpi_numa.h:33-36) and
+/// `dev_to_node` is -1, so the attribute reads 0, except for a device tree's
+/// region, whose DAX device has none. `None` for a provider of another kind.
+fn dax_target_node(directory: &Path) -> Option<DeviceNodeAttribute> {
+    let provider = directory.join("..");
+    match device_subsystem(&provider)? {
+        (kind, name) if kind == "bus" && (name == "cxl" || name == "platform") => {}
+        (kind, name) if kind == "bus" && name == "nd" => {
+            // The NVDIMM namespace's DAX device is its region's child, the
+            // region the NVDIMM bus's, and the bus its provider's device's.
+            let driver = std::fs::read_link(provider.join("../../../driver")).ok();
+            if driver.is_some_and(|driver| driver.file_name().is_some_and(|name| name == "of_pmem"))
+            {
+                return Some(DeviceNodeAttribute::Absent);
+            }
+        }
+        _ => return None,
+    }
+    Some(DeviceNodeAttribute::Reads(DeviceNodeFile::Node(0)))
+}
+
+/// What `name`, in the directory the tool reaches at `directory`, is on the
+/// kernel without NUMA Detcore presents, where it is a device's NUMA
+/// attribute that such a kernel leaves out or renders differently: by the
+/// device's subsystem ([`subsystem_node_rule`]). `None` elsewhere, where the
+/// kernel's file stands. The caller checks that `directory` is on sysfs, so
+/// that a guest's own file of that name, in a directory with a `subsystem`
+/// link of its own, stays.
+pub(crate) fn device_node_attribute(directory: &Path, name: &[u8]) -> Option<DeviceNodeAttribute> {
+    if !matches!(name, b"numa_node" | b"target_node" | b"numa_nodes") {
+        return None;
+    }
+    let (kind, subsystem) = device_subsystem(directory)?;
+    match subsystem_node_rule(&kind, &subsystem, name)? {
+        SubsystemNodeRule::Is(attribute) => Some(attribute),
+        SubsystemNodeRule::ByDaxProvider => dax_target_node(directory),
+    }
+}
+
+/// Whether `name`, in the directory the tool reaches at `directory`, is a
+/// device's NUMA attribute that the kernel without NUMA Detcore presents does
+/// not register ([`device_node_attribute`]).
+pub(crate) fn is_absent_device_attribute(directory: &Path, name: &[u8]) -> bool {
+    device_node_attribute(directory, name) == Some(DeviceNodeAttribute::Absent)
+}
+
+/// The prefix of the absolute `path` that ends at the first component naming
+/// a device attribute [`is_absent_device_attribute`] leaves out, in the
+/// tool's view: `/sys/bus/pci/devices/0000:00:00.0/numa_node` for itself, or
+/// with a name below it. Unlike [`absent_cpu_entry_prefix`], the walk goes on
+/// through a `..`: the tool's lookup of the directory resolves it as the
+/// guest's does. `None` for a relative path, and where no component is
+/// absent.
+pub(crate) fn absent_device_attribute_prefix(path: &Path) -> Option<PathBuf> {
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir) {
+        return None;
+    }
+    let mut prefix = PathBuf::from("/");
+    for component in components {
+        if component == Component::CurDir {
+            continue;
+        }
+        let absent = matches!(component, Component::Normal(name)
+            if is_absent_device_attribute(&prefix, name.as_encoded_bytes()));
+        prefix.push(component);
+        if absent {
+            return Some(prefix);
+        }
     }
     None
 }
@@ -4295,10 +4584,14 @@ fn sanitize_status_held(
     const SIGBLK: &[u8] = b"SigBlk:";
     const CPUS_ALLOWED: &[u8] = b"Cpus_allowed:";
     const CPUS_ALLOWED_LIST: &[u8] = b"Cpus_allowed_list:";
-    // The nodes the task may allocate from: Hermit's single virtual node, as
-    // the node lists in /sys/devices/system/node report
-    // (https://github.com/rrnewton/hermit/issues/4160). The mask has 64 bits,
-    // a fixed width, as Cpus_allowed's 128 bits are.
+    // The nodes the task may allocate from: node 0 alone, the one node a
+    // kernel built without NUMA has. Its `MAX_NUMNODES` is 1, without
+    // `CONFIG_NODES_SHIFT` (include/linux/nodemask_types.h:7-13 and
+    // arch/x86/Kconfig:1555-1561 at v7.1), the width
+    // `cpuset_task_status_allowed` prints the mask with
+    // (kernel/cgroup/cpuset.c:4385-4391, include/linux/nodemask.h:104-109),
+    // so the mask is the one hexadecimal digit `1` (`bitmap_string`,
+    // lib/vsprintf.c:1232-1273) and the list `0`.
     const MEMS_ALLOWED: &[u8] = b"Mems_allowed:";
     const MEMS_ALLOWED_LIST: &[u8] = b"Mems_allowed_list:";
     const VOLUNTARY: &[u8] = b"voluntary_ctxt_switches:";
@@ -4438,7 +4731,7 @@ fn sanitize_status_held(
             }
         } else if body.starts_with(MEMS_ALLOWED) {
             normalized.extend_from_slice(MEMS_ALLOWED);
-            normalized.extend_from_slice(b"\t00000000,00000001");
+            normalized.extend_from_slice(b"\t1");
         } else if body.starts_with(MEMS_ALLOWED_LIST) {
             normalized.extend_from_slice(MEMS_ALLOWED_LIST);
             normalized.extend_from_slice(b"\t0");
@@ -5451,9 +5744,6 @@ fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
         "se.avg.last_update_time",
         "se.avg.util_est",
         "clock-delta",
-        "mm->numa_scan_seq",
-        "numa_pages_migrated",
-        "total_numa_faults",
     ];
     const STABLE_INTEGER_FIELDS: &[&str] = &[
         "se.load.weight",
@@ -5461,7 +5751,6 @@ fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
         "prio",
         "se.slice",
         "ext.enabled",
-        "numa_preferred_nid",
         "uclamp.min",
         "uclamp.max",
         "effective uclamp.min",
@@ -5472,6 +5761,18 @@ fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
         ("uclamp.max", "1024"),
         ("effective uclamp.min", "0"),
         ("effective uclamp.max", "1024"),
+    ];
+    // NUMA balancing's lines, with its `current_node=` line and a
+    // `numa_faults` line per node, which a kernel built without NUMA does
+    // not print (`sched_show_numa`, kernel/sched/debug.c:1250-1262 at v7.1,
+    // under `CONFIG_NUMA_BALANCING`, which depends on `CONFIG_NUMA`): each is
+    // checked as the others are and left out, as is how many nodes the host
+    // has.
+    const NUMA_BALANCING_FIELDS: &[&str] = &[
+        "mm->numa_scan_seq",
+        "numa_pages_migrated",
+        "numa_preferred_nid",
+        "total_numa_faults",
     ];
 
     let Ok(text) = std::str::from_utf8(contents) else {
@@ -5523,7 +5824,7 @@ fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
                 {
                     return Vec::new();
                 }
-                normalized.extend_from_slice(b"current_node=0, numa_group_id=0");
+                continue;
             } else if body.starts_with("numa_faults ") {
                 let fields = body.split_whitespace().skip(1).collect::<Vec<_>>();
                 let expected = [
@@ -5542,9 +5843,7 @@ fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
                 {
                     return Vec::new();
                 }
-                normalized.extend_from_slice(
-                    b"numa_faults node=0 task_private=0 task_shared=0 group_private=0 group_shared=0",
-                );
+                continue;
             } else {
                 return Vec::new();
             }
@@ -5554,6 +5853,12 @@ fn sanitize_self_sched(contents: &[u8]) -> Vec<u8> {
             continue;
         };
         let label = left.trim();
+        if NUMA_BALANCING_FIELDS.contains(&label) {
+            if right.trim().parse::<i128>().is_err() {
+                return Vec::new();
+            }
+            continue;
+        }
         let replacement = if let Some(index) = FLOAT_FIELDS.iter().position(|field| *field == label)
         {
             let Ok(value) = right.trim().parse::<f64>() else {
@@ -6818,12 +7123,8 @@ mod tests {
                 .kind,
             ProcfsKind::Fixed(FixedProcfsFile::AioMaxNr)
         );
-        assert_eq!(
-            ProcfsFile::from_path(Path::new("/proc/self/numa_maps"))
-                .unwrap()
-                .kind,
-            ProcfsKind::NumaMaps
-        );
+        // No NUMA: the kernel Detcore presents registers no `numa_maps`.
+        assert!(ProcfsFile::from_path(Path::new("/proc/self/numa_maps")).is_none());
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/self/smaps_rollup"))
                 .unwrap()
@@ -7048,21 +7349,16 @@ mod tests {
                 .kind,
             ProcfsKind::Maps
         );
-        // Sibling names must NOT collide with it: `numa_maps` and `smaps` are
-        // their own kinds and `is_process_file_path` compares the final
-        // component exactly, which this pins.
+        // Sibling names must NOT collide with it: `smaps` is its own kind
+        // and `is_process_file_path` compares the final component exactly,
+        // which this pins; `numa_maps` names no file at all now.
         assert_eq!(
             ProcfsFile::from_path(Path::new("/proc/self/smaps"))
                 .unwrap()
                 .kind,
             ProcfsKind::Smaps
         );
-        assert_eq!(
-            ProcfsFile::from_path(Path::new("/proc/self/numa_maps"))
-                .unwrap()
-                .kind,
-            ProcfsKind::NumaMaps
-        );
+        assert!(ProcfsFile::from_path(Path::new("/proc/self/numa_maps")).is_none());
         for path in [
             "/proc/self/maps",
             "/proc/123/maps",
@@ -7918,6 +8214,9 @@ Rss:                   4 kB\n" as &[u8];
 
     #[test]
     fn recognizes_only_numa_node_vmstat_paths() {
+        // Classified for record mode, which leaves sysfs lookups alone; in
+        // run mode the absent-entry gate refuses every lookup below the
+        // missing node directory before classification is consulted.
         assert_eq!(
             ProcfsFile::from_path(Path::new("/sys/devices/system/node/node0/vmstat"))
                 .unwrap()
@@ -8335,7 +8634,7 @@ Rss:                   4 kB\n" as &[u8];
         let input = b"Name:\tcat\nTgid:\t1234\nPid:\t1234\nPPid:\t1200\nTracerPid:\t0\nNStgid:\t1234\nNSpid:\t1234\nNSpgid:\t1200\nNSsid:\t1190\nSigQ:\t426/2042342\nVmHWM:\t1572 kB\nVmRSS:\t1568 kB\nRssFile:\t1452 kB\nCpus_allowed:\tffffffff,ffffffff\nCpus_allowed_list:\t0-63\nMems_allowed:\t00000000,00000003\nMems_allowed_list:\t0-1\nvoluntary_ctxt_switches:\t120\nnonvoluntary_ctxt_switches:\t3\n";
         assert_eq!(
             sanitize_status(input, Some((3, 3, 1)), None, false),
-            b"Name:\tcat\nTgid:\t3\nPid:\t3\nPPid:\t1\nTracerPid:\t0\nNStgid:\t3\nNSpid:\t3\nNSpgid:\t0\nNSsid:\t0\nSigQ:\t0/0\nVmHWM:\t0 kB\nVmRSS:\t0 kB\nRssFile:\t0 kB\nCpus_allowed:\t00000000,00000000,00000000,00000001\nCpus_allowed_list:\t0\nMems_allowed:\t00000000,00000001\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
+            b"Name:\tcat\nTgid:\t3\nPid:\t3\nPPid:\t1\nTracerPid:\t0\nNStgid:\t3\nNSpid:\t3\nNSpgid:\t0\nNSsid:\t0\nSigQ:\t0/0\nVmHWM:\t0 kB\nVmRSS:\t0 kB\nRssFile:\t0 kB\nCpus_allowed:\t00000000,00000000,00000000,00000001\nCpus_allowed_list:\t0\nMems_allowed:\t1\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
         );
     }
 
@@ -9014,17 +9313,36 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
                 ][..],
             ),
             ("/sys/bus/cpu/devices", &["cpu7"], &["cpu0"]),
+            // The node directory itself is absent from each parent, as on a
+            // kernel without NUMA; its neighbours stay.
+            (
+                "/sys/devices/system",
+                &["node"],
+                &["cpu", "memory", "node0", "nodes"],
+            ),
+            (
+                "/sys/bus",
+                &["node", "memory_tiering"],
+                &["cpu", "node0", "memory", "pci"],
+            ),
+            // So are memory tiering's directories and the NUMA and memory
+            // policy tunables.
+            (
+                "/sys/devices/virtual",
+                &["memory_tiering"],
+                &["misc", "memory_tier"],
+            ),
+            (
+                "/sys/kernel/mm",
+                &["numa", "mempolicy"],
+                &["transparent_hugepage", "hugepages", "ksm"],
+            ),
             (
                 "/sys/devices/system/node",
-                &["node1", "node12"],
-                &["node0", "online", "has_cpu", "node"],
+                &["node0", "node1", "node12"],
+                &["online", "has_cpu", "node"],
             ),
-            ("/sys/bus/node/devices", &["node1"], &["node0"]),
-            (
-                "/sys/devices/system/node/node0",
-                &["cpu1", "cpu57"],
-                &["cpu0", "cpulist", "meminfo", "memory12"],
-            ),
+            ("/sys/bus/node/devices", &["node0", "node1"], &["cpu0"]),
             (
                 "/sys/bus/cpu/drivers/processor",
                 &["cpu3"],
@@ -9032,9 +9350,33 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             ),
             (
                 "/sys/devices/system/memory/memory12",
-                &["node1"],
-                &["node0", "online"],
+                &["node0", "node1"],
+                &["online"],
             ),
+            // A CPU's backlink to its node is absent for every node number,
+            // on a present CPU just as on an absent one; only an actual
+            // `node<N>` child is dropped, not the CPU's other entries.
+            (
+                "/sys/devices/system/cpu/cpu0",
+                &["node0", "node2", "node999"],
+                &["node", "nodex", "online", "topology"],
+            ),
+            (
+                "/sys/bus/cpu/devices/cpu0",
+                &["node0", "node999"],
+                &["node", "driver", "subsystem", "topology"],
+            ),
+            (
+                "/sys/bus/cpu/drivers/processor/cpu0",
+                &["node0"],
+                &["node", "topology"],
+            ),
+            (
+                "/sys/devices/system/cpu/cpu0/topology",
+                &[][..],
+                &["node0", "core_id"],
+            ),
+            ("/sys/devices/system/cpu/cpufreq", &[][..], &["node0"]),
             (
                 "/sys/devices/system/cpu/cpufreq",
                 &["policy1", "policy315"],
@@ -9055,7 +9397,7 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             }
         }
         // A machine of 4 CPUs lists cpu0 to cpu3 and policy0 to policy3, and
-        // still one node.
+        // still no node.
         for (directory, name, absent) in [
             ("/sys/devices/system/cpu", "cpu3", false),
             ("/sys/devices/system/cpu", "cpu4", true),
@@ -9064,6 +9406,9 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             ("/sys/devices/system/cpu/cpufreq", "policy3", false),
             ("/sys/devices/system/cpu/cpufreq", "policy4", true),
             ("/sys/devices/system/node", "node1", true),
+            ("/sys/devices/system/cpu/cpu3", "node0", true),
+            ("/sys/devices/system/cpu/cpu3", "node99", true),
+            ("/sys/devices/system/cpu/cpu3", "topology", false),
         ] {
             assert_eq!(
                 is_absent_cpu_entry(Path::new(directory), name.as_bytes(), 4),
@@ -9089,12 +9434,12 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
         for (path, prefix) in [
             (
                 "/sys/devices/system/node/node1/cpulist",
-                "/sys/devices/system/node/node1",
+                "/sys/devices/system/node",
             ),
-            (
-                "/sys/devices/system/node/node1",
-                "/sys/devices/system/node/node1",
-            ),
+            ("/sys/devices/system/node/node1", "/sys/devices/system/node"),
+            ("/sys/devices/system/node", "/sys/devices/system/node"),
+            ("/sys/bus/node", "/sys/bus/node"),
+            ("/sys/bus/node/devices/node0/numastat", "/sys/bus/node"),
             (
                 "/sys/devices/system/cpu/cpu1/topology/core_id",
                 "/sys/devices/system/cpu/cpu1",
@@ -9104,17 +9449,14 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
                 "/sys/devices/system/cpu/cpu12",
             ),
             ("/sys/bus/cpu/devices/cpu3", "/sys/bus/cpu/devices/cpu3"),
-            (
-                "/sys/bus/node/devices/node1/meminfo",
-                "/sys/bus/node/devices/node1",
-            ),
+            ("/sys/bus/node/devices/node1/meminfo", "/sys/bus/node"),
             (
                 "/sys/devices/system/cpu/cpufreq/policy2/scaling_cur_freq",
                 "/sys/devices/system/cpu/cpufreq/policy2",
             ),
             (
                 "/sys/devices/system/node/node0/cpu1/topology/core_id",
-                "/sys/devices/system/node/node0/cpu1",
+                "/sys/devices/system/node",
             ),
             (
                 "/sys/bus/cpu/drivers/processor/cpu1/online",
@@ -9124,6 +9466,38 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
                 "/sys/devices/system/memory/memory3/node1/cpulist",
                 "/sys/devices/system/memory/memory3/node1",
             ),
+            (
+                "/sys/devices/system/cpu/cpu0/node0",
+                "/sys/devices/system/cpu/cpu0/node0",
+            ),
+            (
+                "/sys/devices/system/cpu/cpu0/node0/cpulist",
+                "/sys/devices/system/cpu/cpu0/node0",
+            ),
+            (
+                "/sys/bus/cpu/devices/cpu0/node2/meminfo",
+                "/sys/bus/cpu/devices/cpu0/node2",
+            ),
+            (
+                "/sys/bus/cpu/drivers/processor/cpu0/node0",
+                "/sys/bus/cpu/drivers/processor/cpu0/node0",
+            ),
+            (
+                "/sys/kernel/mm/numa/demotion_enabled",
+                "/sys/kernel/mm/numa",
+            ),
+            (
+                "/sys/kernel/mm/mempolicy/weighted_interleave/node0",
+                "/sys/kernel/mm/mempolicy",
+            ),
+            (
+                "/sys/bus/memory_tiering/devices/memory_tier4",
+                "/sys/bus/memory_tiering",
+            ),
+            (
+                "/sys/devices/virtual/memory_tiering/memory_tier4/nodelist",
+                "/sys/devices/virtual/memory_tiering",
+            ),
         ] {
             assert_eq!(
                 absent_cpu_entry_prefix(Path::new(path), 1).as_deref(),
@@ -9132,7 +9506,8 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             );
         }
         for path in [
-            "/sys/devices/system/node/node0/cpulist",
+            "/sys/devices/system/cpu/cpu0/topology/node0",
+            "/sys/devices/system/cpu/cpufreq/node0",
             "/sys/devices/system/cpu/cpu0/topology/core_id",
             "/sys/devices/system/cpu/online",
             "/sys/devices/system/cpu/cpufreq/policy0/scaling_cur_freq",
@@ -9144,6 +9519,240 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
         ] {
             assert_eq!(absent_cpu_entry_prefix(Path::new(path), 1), None, "{path}");
         }
+    }
+
+    /// A device's NUMA attribute is absent where its subsystem's devices have
+    /// none on a kernel without NUMA (an NVDIMM's `target_node` with its
+    /// `numa_node`), reads that kernel's value where they keep it (-1 for an
+    /// NVMe controller and a DSA device, 0 for a SmartPQI SCSI device), and
+    /// is the kernel's for every other attribute and subsystem.
+    #[test]
+    fn device_numa_attributes_follow_a_kernel_without_numa() {
+        use DeviceNodeAttribute::Absent;
+        use DeviceNodeAttribute::Reads;
+        use DeviceNodeFile::Node;
+        use DeviceNodeFile::PathNodes;
+        use SubsystemNodeRule::ByDaxProvider;
+        use SubsystemNodeRule::Is;
+        for (kind, subsystem, name, rule) in [
+            ("bus", "pci", &b"numa_node"[..], Some(Is(Absent))),
+            ("bus", "platform", b"numa_node", Some(Is(Absent))),
+            ("bus", "cxl", b"numa_node", Some(Is(Absent))),
+            ("bus", "dax", b"numa_node", Some(Is(Absent))),
+            ("bus", "nd", b"numa_node", Some(Is(Absent))),
+            ("bus", "nd", b"target_node", Some(Is(Absent))),
+            ("bus", "vmbus", b"numa_node", Some(Is(Absent))),
+            ("class", "nvme", b"numa_node", Some(Is(Reads(Node(-1))))),
+            ("bus", "dsa", b"numa_node", Some(Is(Reads(Node(-1))))),
+            ("bus", "scsi", b"numa_node", Some(Is(Reads(Node(0))))),
+            ("bus", "dax", b"target_node", Some(ByDaxProvider)),
+            ("class", "block", b"numa_nodes", Some(Is(Reads(PathNodes)))),
+            // The neighbouring attributes, and the same names elsewhere.
+            ("bus", "pci", b"vendor", None),
+            ("bus", "pci", b"target_node", None),
+            ("bus", "nd", b"devtype", None),
+            ("bus", "dax", b"size", None),
+            ("class", "nvme", b"cntlid", None),
+            ("class", "nvme", b"target_node", None),
+            ("class", "block", b"numa_node", None),
+            ("bus", "usb", b"numa_node", None),
+            ("class", "pci", b"numa_node", None),
+            ("class", "net", b"numa_node", None),
+            ("bus", "nvme", b"numa_node", None),
+        ] {
+            assert_eq!(
+                subsystem_node_rule(kind, subsystem, name),
+                rule,
+                "{kind}/{subsystem} {:?}",
+                String::from_utf8_lossy(name)
+            );
+        }
+
+        // A device tree laid out as sysfs lays it out, in an ordinary
+        // directory: these functions read links, and their callers check
+        // that the directory is on sysfs.
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        let link = |target: &str, link: PathBuf| std::os::unix::fs::symlink(target, link).unwrap();
+        // A device at `path` below the root, on the bus or class `subsystem`
+        // (`bus/pci`), linked to it as sysfs links it.
+        let device = |path: &str, subsystem: &str| {
+            let directory = root.join(path);
+            std::fs::create_dir_all(&directory).unwrap();
+            let up = "../".repeat(path.split('/').count());
+            link(&format!("{up}{subsystem}"), directory.join("subsystem"));
+            directory
+        };
+        let pci = device("devices/pci0000:00/0000:00:00.0", "bus/pci");
+        let nvme = device("devices/pci0000:00/0000:00:00.0/nvme/nvme0", "class/nvme");
+        let namespace = device(
+            "devices/pci0000:00/0000:00:00.0/nvme/nvme0/nvme0n1",
+            "class/block",
+        );
+        let dsa = device("devices/pci0000:00/0000:00:01.0/dsa0", "bus/dsa");
+        let scsi = device(
+            "devices/pci0000:00/0000:00:02.0/host0/target0:0:0/0:0:0:0",
+            "bus/scsi",
+        );
+        // An NVDIMM region from ACPI's NFIT, its namespace's DAX device on
+        // the nd bus and the DAX device on the dax bus below that; the same
+        // from a device tree; a CXL region's DAX device; a soft-reserved
+        // range's; and one below a provider of another kind.
+        let nfit = "devices/LNXSYSTM:00/ACPI0012:00";
+        device(nfit, "bus/acpi");
+        link(
+            "../../../bus/acpi/drivers/nfit",
+            root.join(nfit).join("driver"),
+        );
+        let region = device(&format!("{nfit}/ndbus0/region0"), "bus/nd");
+        let nd_dax = device(&format!("{nfit}/ndbus0/region0/dax0.1"), "bus/nd");
+        let nfit_dax = device(&format!("{nfit}/ndbus0/region0/dax0.1/dax0.0"), "bus/dax");
+        let tree = "devices/platform/pmem-region";
+        device(tree, "bus/platform");
+        link(
+            "../../../bus/platform/drivers/of_pmem",
+            root.join(tree).join("driver"),
+        );
+        device(&format!("{tree}/ndbus1/region1"), "bus/nd");
+        device(&format!("{tree}/ndbus1/region1/dax1.1"), "bus/nd");
+        let tree_dax = device(&format!("{tree}/ndbus1/region1/dax1.1/dax1.0"), "bus/dax");
+        let cxl = "devices/platform/ACPI0017:00/root0/decoder0.0/region0/dax_region0";
+        device(cxl, "bus/cxl");
+        let cxl_dax = device(&format!("{cxl}/dax2.0"), "bus/dax");
+        device("devices/platform/hmem.0", "bus/platform");
+        let hmem_dax = device("devices/platform/hmem.0/dax3.0", "bus/dax");
+        device("devices/virtual/other/provider", "class/other");
+        let other_dax = device("devices/virtual/other/provider/dax4.0", "bus/dax");
+        std::fs::create_dir_all(root.join("bus/pci/devices")).unwrap();
+        link(
+            "../../../devices/pci0000:00/0000:00:00.0",
+            root.join("bus/pci/devices/0000:00:00.0"),
+        );
+        std::fs::create_dir_all(root.join("bus/dax/devices")).unwrap();
+        link(
+            "../../../devices/platform/ACPI0017:00/root0/decoder0.0/region0/dax_region0/dax2.0",
+            root.join("bus/dax/devices/dax2.0"),
+        );
+        let alias = root.join("bus/pci/devices/0000:00:00.0");
+        let dax_alias = root.join("bus/dax/devices/dax2.0");
+
+        for (directory, name, expected) in [
+            (&pci, &b"numa_node"[..], Some(Absent)),
+            (&alias, b"numa_node", Some(Absent)),
+            (&pci.join("nvme/.."), b"numa_node", Some(Absent)),
+            (&nvme, b"numa_node", Some(Reads(Node(-1)))),
+            (&dsa, b"numa_node", Some(Reads(Node(-1)))),
+            (&scsi, b"numa_node", Some(Reads(Node(0)))),
+            (&namespace, b"numa_nodes", Some(Reads(PathNodes))),
+            (&region, b"numa_node", Some(Absent)),
+            (&region, b"target_node", Some(Absent)),
+            (&nd_dax, b"target_node", Some(Absent)),
+            (&nfit_dax, b"target_node", Some(Reads(Node(0)))),
+            (&nfit_dax, b"numa_node", Some(Absent)),
+            (&tree_dax, b"target_node", Some(Absent)),
+            (&cxl_dax, b"target_node", Some(Reads(Node(0)))),
+            (&dax_alias, b"target_node", Some(Reads(Node(0)))),
+            (&hmem_dax, b"target_node", Some(Reads(Node(0)))),
+            (&other_dax, b"target_node", None),
+            // The neighbouring attributes stay the kernel's.
+            (&pci, b"vendor", None),
+            (&pci, b"numa_node0", None),
+            (&pci, b"subsystem", None),
+            (&nvme, b"cntlid", None),
+            (&region, b"devtype", None),
+            (&cxl_dax, b"size", None),
+            (&namespace, b"numa_node", None),
+            // And a directory without a `subsystem` link has none.
+            (&root.to_path_buf(), b"numa_node", None),
+        ] {
+            assert_eq!(
+                device_node_attribute(directory, name),
+                expected,
+                "{directory:?} {:?}",
+                String::from_utf8_lossy(name)
+            );
+            assert_eq!(
+                is_absent_device_attribute(directory, name),
+                expected == Some(Absent),
+                "{directory:?}"
+            );
+        }
+
+        for path in [
+            alias.join("numa_node"),
+            pci.join("numa_node"),
+            pci.join("./numa_node"),
+            pci.join("nvme/../numa_node"),
+            alias.join("subsystem/devices/0000:00:00.0/numa_node"),
+            region.join("target_node"),
+            tree_dax.join("target_node"),
+        ] {
+            assert_eq!(
+                absent_device_attribute_prefix(&path).as_deref(),
+                Some(path.as_path()),
+                "{path:?}"
+            );
+            // A name below it is not found either.
+            assert_eq!(
+                absent_device_attribute_prefix(&path.join("x")).as_deref(),
+                Some(path.as_path()),
+                "{path:?}"
+            );
+        }
+        for path in [
+            alias.join("vendor"),
+            nvme.join("numa_node"),
+            cxl_dax.join("target_node"),
+            region.join("devtype"),
+            root.join("numa_node"),
+            PathBuf::from("devices/pci0000:00/0000:00:00.0/numa_node"),
+        ] {
+            assert_eq!(absent_device_attribute_prefix(&path), None, "{path:?}");
+        }
+    }
+
+    /// A device's NUMA attribute that a kernel without NUMA registers reads
+    /// that kernel's value in place of the host's, as a file Detcore
+    /// classified when the kernel opened it, and keeps the host's bytes
+    /// where they do not have the attribute's format.
+    #[test]
+    fn device_numa_attributes_read_a_kernel_without_numas_values() {
+        for (file, kernel, expected) in [
+            (DeviceNodeFile::Node(-1), &b"0\n"[..], &b"-1\n"[..]),
+            (DeviceNodeFile::Node(-1), b"1\n", b"-1\n"),
+            (DeviceNodeFile::Node(-1), b"-1\n", b"-1\n"),
+            (DeviceNodeFile::Node(0), b"1\n", b"0\n"),
+            (DeviceNodeFile::Node(0), b"-1\n", b"0\n"),
+            (DeviceNodeFile::Node(-1), b"node\n", b"node\n"),
+            (DeviceNodeFile::Node(-1), b"0", b"0"),
+            (DeviceNodeFile::Node(-1), b"", b""),
+            // An NVMe path's node list, of which only node 0 exists.
+            (DeviceNodeFile::PathNodes, b"", b""),
+            (DeviceNodeFile::PathNodes, b"\n", b"\n"),
+            (DeviceNodeFile::PathNodes, b"0\n", b"0\n"),
+            (DeviceNodeFile::PathNodes, b"0-1\n", b"0\n"),
+            (DeviceNodeFile::PathNodes, b"0,3\n", b"0\n"),
+            (DeviceNodeFile::PathNodes, b"1\n", b"\n"),
+            (DeviceNodeFile::PathNodes, b"1-3\n", b"\n"),
+            (DeviceNodeFile::PathNodes, b"2,5\n", b"\n"),
+            (DeviceNodeFile::PathNodes, b"10\n", b"\n"),
+            (DeviceNodeFile::PathNodes, b"x\n", b"x\n"),
+        ] {
+            assert_eq!(
+                file.contents(kernel),
+                expected,
+                "{file:?} {:?}",
+                String::from_utf8_lossy(kernel)
+            );
+            let mut opened = ProcfsFile::device_node(file);
+            opened.initialize(kernel.to_vec(), ProcfsSnapshotContext::default());
+            assert_eq!(opened.contents.as_deref(), Some(expected), "{file:?}");
+        }
+        // The classification survives the descriptor's serialization.
+        let file = ProcfsFile::device_node(DeviceNodeFile::Node(-1));
+        let restored: ProcfsFile =
+            serde_json::from_str(&serde_json::to_string(&file).unwrap()).unwrap();
+        assert_eq!(restored, file);
     }
 
     #[test]
@@ -9725,10 +10334,43 @@ effective uclamp.min : 0\n\
 effective uclamp.max : 1024\n\
 policy : 0\n\
 uclamp.max : 1024\n\
-new.kernel.counter : 0\n\
-current_node=0, numa_group_id=0\n\
-numa_faults node=0 task_private=0 task_shared=0 group_private=0 group_shared=0\n"
+new.kernel.counter : 0\n"
         );
+    }
+
+    /// A kernel built without NUMA prints none of NUMA balancing's lines
+    /// (kernel/sched/debug.c:1239-1262 at v7.1), so they are left out, the
+    /// one `numa_faults` line per host node with them; a malformed one still
+    /// leaves the guest nothing, as any malformed line does.
+    #[test]
+    fn self_sched_leaves_out_numa_balancing() {
+        let core = "cat (3, #threads: 1)\n\
+se.exec_start : 377650149.445644\n\
+se.vruntime : 133948666.432951\n\
+se.sum_exec_runtime : 3.637972\n";
+        let numa = "mm->numa_scan_seq                            :                    4\n\
+numa_pages_migrated                          :                    5\n\
+numa_preferred_nid                           :                   -1\n\
+total_numa_faults                            :                    6\n\
+current_node=1, numa_group_id=0\n\
+numa_faults node=0 task_private=0 task_shared=0 group_private=0 group_shared=0\n\
+numa_faults node=1 task_private=7 task_shared=0 group_private=0 group_shared=0\n";
+        let expected = sanitize_self_sched(core.as_bytes());
+        assert!(expected.starts_with(b"cat (0, #threads: 1)\n"));
+        assert_eq!(
+            sanitize_self_sched(format!("{core}{numa}").as_bytes()),
+            expected
+        );
+        for malformed in [
+            "numa_preferred_nid : none\n",
+            "current_node=1\n",
+            "numa_faults node=1 task_private=x task_shared=0 group_private=0 group_shared=0\n",
+        ] {
+            assert!(
+                sanitize_self_sched(format!("{core}{malformed}").as_bytes()).is_empty(),
+                "{malformed:?}"
+            );
+        }
     }
 
     // With kernel.sched_schedstats=1 the kernel adds these lines, printed with
@@ -11605,7 +12247,7 @@ total_commit_ms 0\n"
         assert!(rendered.rendering_template().is_empty());
         assert!(rendered.reads_memory_at_every_read());
         assert_eq!(rendered.rendered_snapshot(), None);
-        assert_eq!(ProcfsFile::PER_PROCESS_NAMES[14], "environ");
+        assert_eq!(ProcfsFile::PER_PROCESS_NAMES[13], "environ");
     }
 
     /// A new image's argument and environment areas, from its initial stack,
@@ -11991,25 +12633,25 @@ total_commit_ms 0\n"
         );
     }
 
-    /// A task's `smaps`, `smaps_rollup` and `numa_maps` are per-process files
+    /// A task's `smaps` and `smaps_rollup` are per-process files
     /// Detcore renders only where the guest's procfs is not the kernel's
     /// (package K slice N4); elsewhere the kernel opens them and Detcore
     /// sanitizes its bytes, as before. Either way the snapshot is taken at
     /// the first read and kept, with no `show` at each rewind, so that every
     /// backend serves them alike.
     #[test]
-    fn a_task_smaps_rollup_and_numa_maps_are_rendered_only_where_procfs_is_not_the_kernels() {
+    fn a_task_smaps_and_rollup_are_rendered_only_where_procfs_is_not_the_kernels() {
         assert_eq!(
-            ProcfsFile::PER_PROCESS_NAMES[10..13],
-            ["smaps", "smaps_rollup", "numa_maps"]
+            ProcfsFile::PER_PROCESS_NAMES[10..12],
+            ["smaps", "smaps_rollup"]
         );
+        assert!(!ProcfsFile::PER_PROCESS_NAMES.contains(&"numa_maps"));
         // KVM's session, and ptrace's (the kernel's procfs).
         let backend_procfs = RenderedFiles::of(true, true, false, true);
         let kernel_procfs = RenderedFiles::of(true, true, false, false);
         for (name, file) in [
             ("smaps", AddressSpaceFile::Smaps),
             ("smaps_rollup", AddressSpaceFile::SmapsRollup),
-            ("numa_maps", AddressSpaceFile::NumaMaps),
         ] {
             assert_eq!(file.name(), name);
             for (spelling, path) in [

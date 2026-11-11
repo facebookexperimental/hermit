@@ -181,11 +181,11 @@ with open(results, "w") as f:
 with open(host(flag("--junit")), "w") as f:
     f.write("<testsuite/>\n")
 status = "passed" if outcome == "PASS" else "failed"
-with open(tpx, "w") as f:
-    f.write(json.dumps({"op": "test_done", "test": test + "/" + mode + "@" + backend, "status": status,
-                        "details": json.dumps({"outcome": outcome})}) + "\n")
 celldir = os.path.join(host(os.environ["E2E_RESULT_ROOT"]), "runs", os.environ["E2E_RUN_ID"],
                        os.environ["FAKE_SLUG"])
+with open(tpx, "w") as f:
+    f.write(json.dumps({"op": "test_done", "test": test + "/" + mode + "@" + backend, "status": status,
+                        "details": json.dumps({"outcome": outcome, "artifact_dir": celldir})}) + "\n")
 logs = os.path.join(celldir, "verify-logs", "verify-1")
 os.makedirs(logs, exist_ok=True)
 # Like hermit --keep-logs: a matched verify keeps only run 1's (golden) log, anything else
@@ -194,9 +194,26 @@ os.makedirs(logs, exist_ok=True)
 # FAKE_DETLOG_LINES how many lines each log has (default 1).
 verdict = os.environ.get("FAKE_VERDICT", "matched")
 verify_json = os.environ.get("FAKE_VERIFY_JSON", "")
+# FAKE_RUN_ARTIFACTS=1: also each run's stdout and summary, and the verdict file's
+# per-run exit status and INFO counts, as hermit writes them, for the human summary.
+rich = os.environ.get("FAKE_RUN_ARTIFACTS") == "1"
 if verify_json != "missing":
     with open(os.path.join(celldir, "verify-1.json"), "w") as f:
-        f.write("not json\n" if verify_json == "garbage" else json.dumps({"verdict": verdict}) + "\n")
+        body = {"verdict": verdict}
+        if rich:
+            body.update(bitwise_parity=verdict == "matched",
+                        compared_log_messages={"left": 7, "right": 7 if verdict == "matched" else 8},
+                        compared_outputs={"left": {"exit_code": 0, "signal": None},
+                                          "right": {"exit_code": 0 if verdict == "matched" else 3, "signal": None}})
+        f.write("not json\n" if verify_json == "garbage" else json.dumps(body) + "\n")
+if rich:
+    for n in (1, 2):
+        rundir = os.path.join(celldir, "verify-runs", "1", "run%d" % n)
+        os.makedirs(rundir, exist_ok=True)
+        with open(os.path.join(rundir, "stdout"), "w") as f:
+            f.write("".join("guest line %d\n" % i for i in range(25)))
+        with open(os.path.join(rundir, "summary.json"), "w") as f:
+            json.dump({"realtime_elapsed": {"secs": n, "nanos": 500000000}}, f)
 for n in os.environ.get("FAKE_DETLOGS", "1" if verdict == "matched" else "12"):
     with open(os.path.join(logs, "run%s_log_detlog" % n), "w") as f:
         f.write("".join("run %s detlog line %d\n" % (n, i) for i in range(int(os.environ.get("FAKE_DETLOG_LINES", "1")))))
@@ -352,6 +369,12 @@ def write_exe(path: Path, text: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
+def details_json(record: dict) -> dict:
+    """The JSON object a cell record's details end with; cell.sh puts a human summary
+    on the lines before it."""
+    return json.loads(record["details"].splitlines()[-1])
+
+
 class CellTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="buck-e2e-cell-test."))
@@ -407,7 +430,7 @@ class CellTest(unittest.TestCase):
 
     def assert_error(self, done: dict, *needles: str) -> None:
         self.assertEqual(done["status"], "failed")
-        details = json.loads(done["details"])
+        details = details_json(done)
         self.assertEqual(details["outcome"], "ERROR")
         for needle in needles:
             self.assertIn(needle, details["reason"])
@@ -417,7 +440,7 @@ class CellTest(unittest.TestCase):
         done, result = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root",
                                      HERMIT_E2E_CONTAINER_REASON="privileged lane")
         self.assertEqual(done["status"], "passed", done)
-        self.assertEqual(json.loads(done["details"])["outcome"], "PASS")
+        self.assertEqual(details_json(done)["outcome"], "PASS")
         self.assertEqual(len(self.calls_by("check-image")), 1)
         [wrapper] = self.calls_by("wrapper")
         opts, command = wrapper["opts"], wrapper["command"]
@@ -575,7 +598,7 @@ class CellTest(unittest.TestCase):
     def test_pinned_root_failure_is_reported(self) -> None:
         done, result = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root", FAKE_OUTCOME="FAIL")
         self.assertEqual(done["status"], "failed")
-        self.assertEqual(json.loads(done["details"])["outcome"], "FAIL")
+        self.assertEqual(details_json(done)["outcome"], "FAIL")
         self.assertEqual(result["outcome"], "FAIL")
         self.assertEqual(result["harness_rc"], 1, "the harness's own exit status must reach the result")
 
@@ -849,7 +872,7 @@ class CellTest(unittest.TestCase):
 
     def assert_evidence(self, complete: bool, missing: str = "detlogs", **env: str) -> None:
         done, result = self.run_cell(**env)
-        details = json.loads(done["details"])
+        details = details_json(done)
         if complete:
             self.assertEqual(done["status"], "passed", done)
             self.assertTrue(result["evidence_complete"], result)
@@ -903,7 +926,7 @@ class CellTest(unittest.TestCase):
         done, result = self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="local")
         self.assertEqual(done["test"], CELL)
         self.assertEqual(done["status"], "skipped", done)
-        details = json.loads(done["details"])
+        details = details_json(done)
         self.assertEqual(details["outcome"], "HOST-INAPPLICABLE")
         self.assertEqual(details["reason"],
                          "SKIP: NOT RUN, NOT a pass, no coverage: this machine lacks exact-branch-counter")
@@ -913,13 +936,126 @@ class CellTest(unittest.TestCase):
         # ci/buck-e2e/run relies on the failure: Tpx retries the cell on another RE worker.
         done, _ = self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="re")
         self.assertEqual(done["status"], "failed", done)
-        self.assertIn("produced 2 test_done records", json.loads(done["details"])["reason"])
+        self.assertIn("produced 2 test_done records", details_json(done)["reason"])
+
+    # HERMIT_E2E_REQUIRE_HOST_CAPS=1: a CI host that must have the capability. A withheld
+    # cell there is a failure naming the harness's reason, never a skip that reads as
+    # coverage; every other verdict, and the RE route, are unchanged.
+    def test_required_host_capability_turns_the_local_skip_into_a_failure(self) -> None:
+        done, result = self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="local",
+                                     HERMIT_E2E_REQUIRE_HOST_CAPS="1")
+        self.assertEqual(done["test"], CELL)
+        self.assertEqual(done["status"], "failed", done)
+        details = details_json(done)
+        self.assertEqual(details["outcome"], "ERROR")
+        self.assertEqual(details["reason"],
+                         "HOST-INAPPLICABLE on a local route with HERMIT_E2E_REQUIRE_HOST_CAPS=1, which "
+                         "requires the capability here: NOT RUN, NOT a pass, no coverage: this machine "
+                         "lacks exact-branch-counter")
+        self.assertEqual(result["harness_rc"], 1)
+
+    def test_require_host_caps_0_keeps_the_local_skip(self) -> None:
+        done, _ = self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="local",
+                                HERMIT_E2E_REQUIRE_HOST_CAPS="0")
+        self.assertEqual(done["status"], "skipped", done)
+
+    def test_require_host_caps_leaves_a_passing_cell_passing(self) -> None:
+        done, _ = self.run_cell(HERMIT_E2E_ROUTE="local", HERMIT_E2E_REQUIRE_HOST_CAPS="1")
+        self.assertEqual(done["status"], "passed", done)
+
+    def test_require_host_caps_on_re_keeps_the_plain_failure_tpx_retries(self) -> None:
+        done, _ = self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="re",
+                                HERMIT_E2E_REQUIRE_HOST_CAPS="1")
+        self.assertEqual(done["status"], "failed", done)
+        self.assertIn("produced 2 test_done records", details_json(done)["reason"])
+
+    def test_an_invalid_require_host_caps_value_fails_the_cell(self) -> None:
+        done, _ = self.run_cell(HERMIT_E2E_ROUTE="local", HERMIT_E2E_REQUIRE_HOST_CAPS="yes")
+        self.assertEqual(done["status"], "failed", done)
+        self.assertIn("HERMIT_E2E_REQUIRE_HOST_CAPS must be 0 or 1, not 'yes'",
+                      details_json(done)["reason"])
+
+    # The human summary at the head of the record's details, for
+    # --print-passing-details and TestX; the harness's JSON stays the last line.
+    def test_a_passing_cell_leads_its_details_with_a_human_summary(self) -> None:
+        done, _ = self.run_cell(FAKE_RUN_ARTIFACTS="1")
+        self.assertEqual(done["status"], "passed", done)
+        lines = done["details"].splitlines()
+        self.assertEqual(details_json(done)["outcome"], "PASS")
+        self.assertEqual(lines[0], f"{CELL}: PASS ({MODE} on the {BACKEND} backend)")
+        self.assertEqual(lines[1], "  run 1: exit 0, 1.500 s wall, 7 INFO messages")
+        self.assertEqual(lines[2], "  run 2: exit 0, 2.500 s wall, 7 INFO messages")
+        self.assertEqual(lines[3], "  log comparison: matched (bitwise parity)")
+        self.assertEqual(lines[4], "  guest stdout (cell__verify-runs__1__run1__stdout, last 20 lines):")
+        self.assertEqual(lines[5:25], ["    guest line %d" % i for i in range(5, 25)])
+        self.assertEqual(lines[25], "  report: cell__verify-1.json among this test's Tpx artifacts")
+        self.assertEqual(lines[26], "  artifact_dir (below) was this cell's scratch directory, deleted when the test ended")
+        self.assertEqual(len(lines), 28, lines)
+        self.assertNotIn("kept_dir", details_json(done))
+
+    def test_a_failing_cell_leads_its_details_with_the_summary_too(self) -> None:
+        done, _ = self.run_cell(FAKE_RUN_ARTIFACTS="1", FAKE_OUTCOME="FAIL", FAKE_VERDICT="differed")
+        self.assertEqual(done["status"], "failed", done)
+        lines = done["details"].splitlines()
+        self.assertEqual(details_json(done)["outcome"], "FAIL")
+        self.assertEqual(lines[0], f"{CELL}: FAIL ({MODE} on the {BACKEND} backend)")
+        self.assertEqual(lines[2], "  run 2: exit 3, 2.500 s wall, 8 INFO messages")
+        self.assertEqual(lines[3], "  log comparison: differed (no bitwise parity)")
+
+    def test_a_summary_without_run_artifacts_names_what_it_lacks(self) -> None:
+        done, _ = self.run_cell()
+        self.assertEqual(done["status"], "passed", done)
+        lines = done["details"].splitlines()
+        self.assertEqual(lines[:3], [f"{CELL}: PASS ({MODE} on the {BACKEND} backend)",
+                                     "  log comparison: matched",
+                                     "  report: cell__verify-1.json among this test's Tpx artifacts"])
+
+    # HERMIT_E2E_KEEP_ARTIFACTS=1: one cell's artifact directory outlives
+    # the scratch directory; never by default, never on RE.
+    def test_kept_artifacts_are_one_cells_directory_named_in_the_summary(self) -> None:
+        keep = self.tmp / "kept"
+        done, result = self.run_cell(FAKE_RUN_ARTIFACTS="1", HERMIT_E2E_KEEP_ARTIFACTS="1",
+                                     HERMIT_E2E_KEEP_DIR=str(keep))
+        self.assertEqual(done["status"], "passed", done)
+        kept = keep / result["run_id"] / SLUG
+        self.assertEqual(sorted(p.name for p in keep.iterdir()), [result["run_id"]])
+        self.assertTrue((kept / "verify-1.json").is_file())
+        self.assertTrue((kept / "verify-runs" / "1" / "run1" / "stdout").is_file())
+        self.assertIn(f"  kept artifacts: {kept}", done["details"].splitlines())
+        # The harness's artifact_dir names the deleted scratch copy; kept_dir names this one.
+        record = details_json(done)
+        self.assertEqual(record["kept_dir"], str(kept))
+        self.assertEqual(record["outcome"], "PASS")
+        self.assertFalse(Path(record["artifact_dir"]).exists())
+        self.assertIn("  artifact_dir (below) was this cell's scratch directory, deleted when the test ended;"
+                      " kept_dir names the kept copy", done["details"].splitlines())
+
+    def test_no_artifacts_are_kept_by_default(self) -> None:
+        keep = self.tmp / "kept"
+        done, _ = self.run_cell(FAKE_RUN_ARTIFACTS="1", HERMIT_E2E_KEEP_DIR=str(keep))
+        self.assertEqual(done["status"], "passed", done)
+        self.assertFalse(keep.exists())
+        self.assertNotIn("kept artifacts", done["details"])
+        self.assertNotIn("kept_dir", details_json(done))
+
+    def test_an_re_cell_keeps_nothing_and_says_so(self) -> None:
+        keep = self.tmp / "kept"
+        done, _ = self.run_cell(HERMIT_E2E_ROUTE="re", HERMIT_E2E_KEEP_ARTIFACTS="1",
+                                HERMIT_E2E_KEEP_DIR=str(keep))
+        self.assertFalse(keep.exists())
+        self.assertIn("  not kept: HERMIT_E2E_KEEP_ARTIFACTS applies to local cells, this one ran on 're'",
+                      done["details"].splitlines())
+
+    def test_an_invalid_keep_artifacts_value_fails_the_cell(self) -> None:
+        done, _ = self.run_cell(HERMIT_E2E_KEEP_ARTIFACTS="please")
+        self.assertEqual(done["status"], "failed", done)
+        self.assertIn("HERMIT_E2E_KEEP_ARTIFACTS must be 0 or 1, not 'please'", details_json(done)["reason"])
 
     def test_host_inapplicable_cell_with_another_run_failure_still_fails(self) -> None:
         done, _ = self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="local",
                                 FAKE_RUN_FAILURES=json.dumps(["cannot write the test-count file"]))
         self.assertEqual(done["status"], "failed", done)
-        self.assertIn("produced 2 test_done records", json.loads(done["details"])["reason"])
+        self.assertIn("produced 2 test_done records", details_json(done)["reason"])
 
     # The verdict normalizer: whatever the harness wrote or however it exited, cell.sh
     # prints exactly one record named for the cell (run_cell checks the count), and only a
@@ -933,7 +1069,7 @@ class CellTest(unittest.TestCase):
         done, result = self.run_cell(**env)
         self.assertEqual(done["test"], CELL)
         self.assertEqual(done["status"], "failed", done)
-        details = json.loads(done["details"])
+        details = details_json(done)
         self.assertEqual(details["outcome"], "ERROR")
         self.assertIn(needle, details["reason"])
         return result
@@ -989,7 +1125,7 @@ class CellTest(unittest.TestCase):
     def test_a_guest_failure_with_valid_details_stays_a_failure(self) -> None:
         done, result = self.run_cell(FAKE_OUTCOME="FAIL")
         self.assertEqual(done["status"], "failed")
-        self.assertEqual(json.loads(done["details"])["outcome"], "FAIL")
+        self.assertEqual(details_json(done)["outcome"], "FAIL")
         self.assertEqual(result["harness_rc"], 1)
 
     def test_the_deadline_kills_the_harness_and_its_children(self) -> None:
@@ -1011,7 +1147,7 @@ class CellTest(unittest.TestCase):
         done, _ = self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="local", **env)
         self.assertEqual(done["test"], CELL)
         self.assertEqual(done["status"], "failed", done)
-        self.assertIn("produced 2 test_done records", json.loads(done["details"])["reason"])
+        self.assertIn("produced 2 test_done records", details_json(done)["reason"])
 
     def test_a_skipped_record_for_another_cell_still_fails(self) -> None:
         self.assert_withheld_variant_fails(FAKE_WITHHELD_TEST="other_cell/strict@ptrace")
@@ -1168,7 +1304,7 @@ class CellTest(unittest.TestCase):
         with self.subTest("the harness's own pair: a valid failure"):
             done, result = self.run_cell(FAKE_OUTCOME="NO-RESULT")
             self.assertEqual(done["status"], "failed", done)
-            self.assertEqual(json.loads(done["details"]), {"outcome": None, "reason": "the selected cell returned no result"})
+            self.assertEqual(details_json(done), {"outcome": None, "reason": "the selected cell returned no result"})
             self.assertEqual(result["producer_completion"], {"version": 1, "status": "valid", "reason": None})
         with self.subTest("the same pair from the raw payload: a valid failure"):
             done, result = self.run_cell(FAKE_TPX_RAW=pair(), FAKE_RESULTS_RAW="", FAKE_EXIT="1")
@@ -1208,12 +1344,12 @@ class CellTest(unittest.TestCase):
     def test_control_3_a_valid_diagnostic_skip_survives_and_a_malformed_one_does_not(self) -> None:
         done, result = self.run_cell(FAKE_OUTCOME="FAIL", FAKE_EXIT="0", FAKE_TPX_RAW=self.diagnostic_skip())
         self.assertEqual(done["status"], "skipped", done)
-        self.assertEqual(json.loads(done["details"])["outcome"], "FAIL")
+        self.assertEqual(details_json(done)["outcome"], "FAIL")
         self.assertEqual(result["producer_completion"], {"version": 1, "status": "valid", "reason": None})
         self.assert_ingest_accepts()
         with self.subTest("a failed ERROR with its ERROR row stays a valid failure"):
             done, result = self.run_cell(FAKE_OUTCOME="ERROR")
-            self.assertEqual((done["status"], json.loads(done["details"])["outcome"]), ("failed", "ERROR"))
+            self.assertEqual((done["status"], details_json(done)["outcome"]), ("failed", "ERROR"))
             self.assertEqual(result["producer_completion"], {"version": 1, "status": "valid", "reason": None})
             self.assert_ingest_accepts()
         # (name, reason, payload, the row's outcome[, raw rows]): only an excused FAIL is a lone skip.
@@ -1244,7 +1380,7 @@ class CellTest(unittest.TestCase):
             self.assertEqual(self.assert_ingest_accepts()["remote"]["evidence_complete_executions"], 1)
         with self.subTest("a guest FAIL, rc 1"):
             done, result = self.run_cell(FAKE_OUTCOME="FAIL")
-            self.assertEqual((done["status"], json.loads(done["details"])["outcome"]), ("failed", "FAIL"))
+            self.assertEqual((done["status"], details_json(done)["outcome"]), ("failed", "FAIL"))
             self.assertEqual((result["harness_rc"], result["producer_completion"]), (1, valid))
             self.assert_ingest_accepts()
         with self.subTest("withheld locally, rc 1"):
@@ -1256,7 +1392,7 @@ class CellTest(unittest.TestCase):
             # Failed, so Tpx retries it; ingest.py names it for a local rerun.
             done, result = self.run_cell(FAKE_OUTCOME="HOST-INAPPLICABLE", HERMIT_E2E_ROUTE="re")
             self.assertEqual(done["status"], "failed", done)
-            self.assertIn("produced 2 test_done records", json.loads(done["details"])["reason"])
+            self.assertIn("produced 2 test_done records", details_json(done)["reason"])
             self.assertEqual((result["harness_rc"], result["producer_completion"]), (1, valid))
             for route, proc in self.ingest("--withheld-on-re", str(self.tmp / "{route}-rerun.txt")).items():
                 with self.subTest(ingest=route):
@@ -1277,7 +1413,7 @@ class CellTest(unittest.TestCase):
             if Path(f"/proc/{child}").exists():
                 os.kill(child, 9)
             self.assertEqual(done["status"], "failed", done)
-            self.assertIn("produced 0 test_done records", json.loads(done["details"])["reason"])
+            self.assertIn("produced 0 test_done records", details_json(done)["reason"])
             self.assertEqual(result["producer_completion"], valid, "a harness death is a failure, not invalid output")
             killed = self.snapshot("killed")
             self.run_cell()
@@ -1412,7 +1548,8 @@ class _Anything:
         return self
 
 
-def evaluate_cells(routing: str, pmu_on_re: str = "true", cpuid_on_re: str | None = None) -> dict[str, dict]:
+def evaluate_cells(routing: str, pmu_on_re: str = "true", cpuid_on_re: str | None = None,
+                   **cells_kwargs) -> dict[str, dict]:
     """Runs defs.bzl's hermit_e2e_cells over the real plan; returns each target's attrs by name.
 
     cpuid_on_re=None leaves the key unset, so defs.bzl's own default applies; any
@@ -1440,7 +1577,8 @@ def evaluate_cells(routing: str, pmu_on_re: str = "true", cpuid_on_re: str | Non
     }
     exec(compile(DEFS.read_text(), str(DEFS), "exec"), namespace)
     assert "_cell_test_impl" in rule_calls, rule_calls
-    namespace["hermit_e2e_cells"](json.loads(PLAN.read_text()), json.loads(RE_EXCLUSIONS.read_text()))
+    namespace["hermit_e2e_cells"](json.loads(PLAN.read_text()), json.loads(RE_EXCLUSIONS.read_text()),
+                                  **cells_kwargs)
     return targets
 
 
@@ -1461,6 +1599,26 @@ def load_defs() -> tuple[dict, list[str]]:
     }
     exec(compile(DEFS.read_text(), str(DEFS), "exec"), namespace)
     return namespace, attr_names
+
+
+class RequireHostCapsTest(unittest.TestCase):
+    """hermit_e2e_cells(require_host_caps=True) sets cell.sh's HERMIT_E2E_REQUIRE_HOST_CAPS=1
+    on exactly the local cells; by default no cell carries it."""
+
+    def test_only_local_cells_carry_the_flag_when_required(self) -> None:
+        # cpuid_on_re=true is the configuration that routes some cells to RE (by default
+        # every cell is local), so both routes are checked.
+        targets = evaluate_cells("hybrid", "true", "true", require_host_caps=True)
+        routes = {t["route"] for t in targets.values()}
+        self.assertEqual(routes, {"local", "re"})
+        for target in targets.values():
+            expected = "1" if target["route"] == "local" else None
+            self.assertEqual(target["env"].get("HERMIT_E2E_REQUIRE_HOST_CAPS"), expected, target["name"])
+
+    def test_no_cell_carries_the_flag_by_default(self) -> None:
+        for routing in ("hybrid", "local"):
+            for target in evaluate_cells(routing).values():
+                self.assertNotIn("HERMIT_E2E_REQUIRE_HOST_CAPS", target["env"], target["name"])
 
 
 class ContainerChoiceTest(unittest.TestCase):

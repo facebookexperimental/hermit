@@ -1008,6 +1008,18 @@ fn qualify_host_cached() -> Result<Qualification, AdmissionRefusal> {
     qualify_host_with(cached_probe)
 }
 
+/// [`admit`]'s host half on a non-x86-64 host: the x86-64-v3 profile
+/// qualifies an x86 XSTATE probe, so no qualification exists here and
+/// admission refuses by name (issue 5131).
+#[cfg(not(target_arch = "x86_64"))]
+fn qualify_host_cached() -> Result<Qualification, AdmissionRefusal> {
+    Err(
+        "host qualification for the x86-64-v3 CPU profile is not available \
+         on this architecture (aarch64 has no x86 XSTATE probe)"
+            .into(),
+    )
+}
+
 /// The name of the XINUSE probe's file in the host qualification cache.
 #[cfg(target_arch = "x86_64")]
 const PROBE_CACHE_NAME: &str = "cpu-profile-x86-64-v3-probe";

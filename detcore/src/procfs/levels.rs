@@ -126,11 +126,13 @@ const PROCESS_MINIMAL: &[&str] = &[
 ];
 
 /// The names `standard` adds to a process's or a thread's directory.
+/// `numa_maps` is in no level: Detcore presents a kernel built without
+/// NUMA, which registers no such file
+/// (https://github.com/rrnewton/hermit/issues/5269).
 const PROCESS_STANDARD: &[&str] = &[
     "arch_status",
     "children",
     "io",
-    "numa_maps",
     "sched",
     "schedstat",
     "smaps_rollup",
@@ -158,9 +160,10 @@ const PROCESS_UNDECIDED_BELOW: &[&str] = &["cwd", "exe", "fd", "fdinfo", "net", 
 const PROCESS_KERNEL: &[&str] = &["gid_map", "mem", "setgroups", "uid_map"];
 
 /// The names of a process's directory in Linux's order, `tgid_base_stuff`
-/// (fs/proc/base.c:3314-3426 at v6.17), with every configuration's entries:
-/// `proc_pident_readdir` emits the table's entries in this order
-/// (fs/proc/base.c:2738-2760), so a listing of fewer names keeps it.
+/// (fs/proc/base.c:3314-3426 at v6.17), with every configuration's entries
+/// but `numa_maps`, which the `!CONFIG_NUMA` kernel Detcore presents does
+/// not register: `proc_pident_readdir` emits the table's entries in this
+/// order (fs/proc/base.c:2738-2760), so a listing of fewer names keeps it.
 const PROCESS_ORDER: &[&str] = &[
     "task",
     "fd",
@@ -182,7 +185,6 @@ const PROCESS_ORDER: &[&str] = &[
     "stat",
     "statm",
     "maps",
-    "numa_maps",
     "mem",
     "cwd",
     "root",
@@ -247,7 +249,6 @@ const THREAD_ORDER: &[&str] = &[
     "statm",
     "maps",
     "children",
-    "numa_maps",
     "mem",
     "cwd",
     "root",
@@ -613,6 +614,11 @@ mod tests {
             ("/proc/self/task/x", Omitted),
             ("/proc/self/io", From(Standard)),
             ("/proc/1/timerslack_ns", From(Standard)),
+            // No NUMA: a kernel built without it registers no `numa_maps`
+            // in a process's or a thread's directory, at either level.
+            ("/proc/self/numa_maps", Omitted),
+            ("/proc/thread-self/numa_maps", Omitted),
+            ("/proc/1/task/1/numa_maps", Omitted),
             ("/proc/self/limits", Omitted),
             ("/proc/self/mem", Undecided),
             ("/proc/1/task/1/mem", Undecided),
@@ -700,6 +706,12 @@ mod tests {
             level
         ));
         assert!(absent_entry(Path::new("/proc/self"), b"limits", level));
+        assert!(absent_entry(Path::new("/proc/self"), b"numa_maps", level));
+        assert!(absent_entry(
+            Path::new("/proc/self"),
+            b"numa_maps",
+            ProcLevel::Minimal
+        ));
         assert!(!absent_entry(Path::new("/proc/42"), b"status", level));
         assert!(absent_entry(
             Path::new("/proc/42"),

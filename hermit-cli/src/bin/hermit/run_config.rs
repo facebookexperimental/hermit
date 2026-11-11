@@ -1287,6 +1287,14 @@ mod tests {
     /// The `run` rows of the sample table; see [`GLOBAL_SAMPLES`].
     const RUN_SAMPLES: &[(&str, &[&str])] = &[
         ("in-guest-exec-stop", &["--in-guest-exec-stop"]),
+        #[cfg(any(feature = "native-exec", feature = "native-exec-input-admission"))]
+        (
+            "native-exec-inputs",
+            &[
+                "--verify",
+                "--native-exec-inputs=/fixtures/native-exec-inputs.json",
+            ],
+        ),
         ("happens-before", &["--happens-before=/tmp/hb.json"]),
         (
             "hb-list-events",
@@ -1350,6 +1358,10 @@ mod tests {
         (
             "chaos-instruction-offset",
             &["--chaos-instruction-offset=8"],
+        ),
+        (
+            "chaos-timed-wait-spread",
+            &["--chaos-timed-wait-spread=2.5"],
         ),
         ("record-preemptions", &["--record-preemptions"]),
         (
@@ -1544,6 +1556,12 @@ mod tests {
         ("no-sequentialize-threads", &["--no-sequentialize-threads"]),
         ("no-deterministic-io", &["--no-deterministic-io"]),
         ("pin-threads", &["--pin-threads"]),
+        ("pinned-cpu", &["--pinned-cpu=wait:30"]),
+        (
+            "pinned-cpu-dir",
+            &["--pinned-cpu-dir=/srv/hermit-cpu-locks"],
+        ),
+        ("pinned-cpu-notice", &["--pinned-cpu-notice=off"]),
         ("skid-margin", &["--skid-margin=5"]),
         (
             "mount",

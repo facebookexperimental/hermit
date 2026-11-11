@@ -50,6 +50,7 @@ mod signal_state_reader;
 #[cfg(test)]
 mod signal_state_reader_tests;
 mod sleep_signal;
+mod timed_wait_spread;
 pub mod timed_waiters;
 pub(crate) mod user_namespaces;
 pub(crate) mod work_span;
@@ -123,6 +124,7 @@ use crate::config::RunsPostFork;
 use crate::cpu_set::CpuSet;
 use crate::cpu_set::TaskAffinity;
 use crate::cpu_set::TaskCpus;
+use crate::detlog;
 use crate::detlog_debug;
 use crate::ivar::Ivar;
 use crate::preemptions::PREEMPTION_RECORD_FORMAT_MAX;
@@ -1589,6 +1591,14 @@ pub struct Scheduler {
     /// recording stores it.
     queued_sleeps_registered_at_first_pass: bool,
 
+    /// `--chaos-timed-wait-spread`: the seeded wake thresholds of timed waits
+    /// (`Scheduler::file_timed_wait`). `None` with the option unset.
+    timed_wait_spread: Option<timed_wait_spread::TimedWaitSpread>,
+    /// The thread whose spread wait came due before its deadline in this
+    /// pass's step 2b and was queued again at the deadline
+    /// (`reach_promised_deadline`), for `took_a_requeued_promised_wake`.
+    promised_wake_requeued: Option<DetTid>,
+
     /// INVARIANT: Thread IDs in `blocked` are absent from `run_queue`.
     pub blocked: BlockedPool,
 
@@ -2147,6 +2157,10 @@ pub struct Scheduler {
     /// process (`sigalrm`).
     sigalrm: sigalrm::SigalrmLedger,
 
+    /// Whether this run recorded the loss of a sleep woken for a signal whose
+    /// disposition nothing read (`note_sleep_wake_without_disposition`).
+    sleep_wake_without_disposition_noted: bool,
+
     /// The determinism losses this scheduler recorded (`note_determinism_loss`).
     #[cfg(test)]
     determinism_losses: Vec<String>,
@@ -2342,6 +2356,45 @@ pub struct Scheduler {
     /// `SigBlk` may then be the in-guest runtime's mask; and those two readers
     /// take it too (`read_thread_blocked_mask_result`).
     saved_guest_sigmasks: BTreeMap<DetTid, u64>,
+
+    /// Each thread's wait mask in force: the effective mask its masked
+    /// wait published (`begin_wait_mask`), with the address-space
+    /// incarnation that published it, from the wait's first publication
+    /// until its withdrawal (`end_wait_mask`), through any request the
+    /// wait's place is later given (a wake's `InboundSignal`, a replay
+    /// checkpoint's `TraceReplay`). A `None` mask is an unknown mask in
+    /// force: the choice reads it as unknown, never as an older value.
+    /// The kernel-sent choice reads this ahead of the physical mask;
+    /// a saved mask with no wait in force is the guest's own under
+    /// Detcore's private mask, and the choice reads the physical mask
+    /// there instead.
+    wait_masks_in_force: BTreeMap<DetTid, (MmId, Option<u64>)>,
+
+    /// Each thread's delivery-mask frame: at an interrupted wait's
+    /// delivery the wait mask hands off to the mask Linux installs for
+    /// the handler (the wait value, the handler's `sa_mask`, and the
+    /// delivered signal unless `SA_NODEFER`), which decides until
+    /// `rt_sigreturn` pops it. Depth one by design: only a wait hands
+    /// off, a fresh wait supersedes the frame, and any later delivery
+    /// is already in the thread's physical mask, which decides then.
+    ///
+    /// Unreachable on every backend today, kept defensively: the Tool
+    /// callback completes before signal selection and frame delivery,
+    /// the backend-served wait loops never begin a wait interval, and
+    /// KVM reports no sigreturns through it — so in production the
+    /// interval has always already ended (or never began) when a
+    /// handler is entered, and the entry-before-finish ordering is
+    /// proven only at scheduler level. If a backend ever enters a
+    /// handler inside a live interval, this decides correctly instead
+    /// of reading a restored mask.
+    delivery_masks: BTreeMap<DetTid, Vec<Option<u64>>>,
+
+    /// Threads the scheduler woke for a caught signal whose handler has
+    /// not entered yet: at the waiter's next filing the wake's wait
+    /// interval hands off to its delivery frame (`record_delivery_entry`).
+    /// Until then the wait mask still decides: a wake alone installs no
+    /// handler mask.
+    pending_delivery: BTreeMap<DetTid, SigWrapper>,
 
     /// Under the in-guest delivery gate, the threads that have published
     /// their own guest mask at a request (`record_request_guest_mask`), which
@@ -5032,7 +5085,11 @@ pub async fn do_a_turn_blocking(
                         // or the next pass.
                         state.step2_register_queued_sleeps();
                         if !timed_event_processed {
+                            state.promised_wake_requeued = None;
                             timed_event_processed = state.step2b_process_timed(&global_time);
+                            if state.took_a_requeued_promised_wake() {
+                                return Err(SkipTurn);
+                            }
                         }
                         // Idempotent and spends no event budget, so it runs on
                         // every refresh.
@@ -5064,7 +5121,11 @@ pub async fn do_a_turn_blocking(
                                 return Err(SkipTurn);
                             }
                             if !timed_event_processed {
+                                state.promised_wake_requeued = None;
                                 timed_event_processed = state.step2b_process_timed(&global_time);
+                                if state.took_a_requeued_promised_wake() {
+                                    return Err(SkipTurn);
+                                }
                             }
                             state.step2b_restore_due_pollers();
                             state.upgrade_pollers_on_time();
@@ -6040,7 +6101,13 @@ impl Scheduler {
                 .with_uncapped_slices(
                     cfg.replay_preemptions_from.is_some() || uncapped_replay_backstop.is_some(),
                 )
-                .with_max_timeslice(cfg.max_timeslice);
+                .with_max_timeslice(cfg.max_timeslice)
+                .with_timed_wait_spread(cfg.chaos_timed_wait_spread.map(|spread| {
+                    crate::preemptions::RecordedTimedWaitSpread {
+                        spread,
+                        seed: Some(cfg.sched_seed()),
+                    }
+                }));
             // This run's own record lists every switch it takes, possibly
             // none, so its replay can refuse an unrecorded one.
             let writer = if cfg.post_crash_timeslice_in_effect().is_some() {
@@ -6234,6 +6301,10 @@ impl Scheduler {
             turn_clocks: BTreeMap::new(),
             preemption_cap: None,
             guest_held_marks_revoked: false,
+            promised_wake_requeued: None,
+            timed_wait_spread: cfg
+                .chaos_timed_wait_spread
+                .map(|spread| timed_wait_spread::TimedWaitSpread::new(spread, cfg.sched_seed())),
             blocked: Default::default(),
             vfork_barriers: Default::default(),
             background_entry_barriers: Default::default(),
@@ -6364,6 +6435,7 @@ impl Scheduler {
             real_timers: Default::default(),
             parked: Default::default(),
             sigalrm: Default::default(),
+            sleep_wake_without_disposition_noted: false,
             #[cfg(test)]
             determinism_losses: Vec::new(),
             #[cfg(test)]
@@ -6402,6 +6474,9 @@ impl Scheduler {
             delivery_mask_override: None,
             signal_control_caller: None,
             saved_guest_sigmasks: Default::default(),
+            wait_masks_in_force: Default::default(),
+            delivery_masks: Default::default(),
+            pending_delivery: Default::default(),
             unknown_guest_sigmasks: Default::default(),
             own_mask_publishers: Default::default(),
             temporary_mask_publications: Default::default(),
@@ -7434,12 +7509,39 @@ impl Scheduler {
         if self.run_queue.contains_tid(target) || self.blocked.sigchld_deferred.contains(&target) {
             return;
         }
-        let Some(deadline) = self.blocked.timed_waiters.thread_deadline(target) else {
+        let Some(queued_at) = self.blocked.timed_waiters.thread_deadline(target) else {
             return;
         };
-        if deadline > self.committed_time || deadline.is_indefinite() {
+        if queued_at > self.committed_time || queued_at.is_indefinite() {
             return;
         }
+        // A `--chaos-timed-wait-spread` wait queued at a threshold before its
+        // deadline was promised that deadline (`insert_spread`). While
+        // committed time is still short of it, waking the thread here would
+        // end the wait early: a futex wait would be granted ETIMEDOUT before
+        // its deadline, and the promise, which `remove` drops, would be lost.
+        // Leave the threshold queued instead. Timed-event maintenance pops it
+        // at a quiesced point of the next pass, as the recording's did, moves
+        // the clock to the deadline and queues the wait there
+        // (`reach_promised_deadline`); the pass then holds for the requeued
+        // wake (`took_a_requeued_promised_wake`), and the thread wakes once
+        // committed time reaches its deadline.
+        let deadline = match self
+            .blocked
+            .timed_waiters
+            .promised_deadline(target, queued_at)
+        {
+            Some(deadline) if deadline > self.committed_time => {
+                trace!(
+                    "[replay] dtid {} left asleep for the trace's switch: its threshold {} passed, \
+                     but committed time {} is short of its promised deadline {}",
+                    target, queued_at, self.committed_time, deadline
+                );
+                return;
+            }
+            Some(deadline) => deadline,
+            None => queued_at,
+        };
         self.blocked.timed_waiters.remove(target);
         trace!(
             "[replay] dtid {} woken at its passed deadline {} (committed {}) for the trace's switch",
@@ -7705,6 +7807,10 @@ impl Scheduler {
         // at moments host timing set.
         if succeeded {
             self.parent_death_exec_survivor = Some((process, caller));
+            // The surviving caller's old image is gone: no wait or
+            // delivery interval of its survives the exec.
+            self.wait_masks_in_force.remove(&caller);
+            self.delivery_masks.remove(&caller);
         }
         for tid in &retired {
             self.logically_kill_thread(tid, &process, mm);
@@ -7963,6 +8069,9 @@ impl Scheduler {
         self.release_vfork_child(*dtid, false);
         self.vfork_registration_origins.remove(dtid);
         self.saved_guest_sigmasks.remove(dtid);
+        self.wait_masks_in_force.remove(dtid);
+        self.delivery_masks.remove(dtid);
+        self.pending_delivery.remove(dtid);
         if self.in_guest_signal_delivery {
             self.unknown_guest_sigmasks.remove(dtid);
             self.temporary_mask_publications.remove(dtid);
@@ -9948,6 +10057,174 @@ impl Scheduler {
         self.kernel_run_requests.get(&dettid).copied()
     }
 
+    /// Record that `dettid`'s filed request `rs` is a wait Detcore serves
+    /// by polling or sleeping, so a mask it already published
+    /// (`saved_guest_sigmasks`) is that wait's mask in force
+    /// (`wait_published_masks`). Called at the ordered filing of every
+    /// resource request, beside `record_request_guest_mask`: a wait's
+    /// first publication can precede its first filing, and this catches
+    /// it, as `set_saved_guest_sigmask` catches a publication that
+    /// follows its filing. A rejoin's filing is host-timed; its mask is
+    /// recorded at readmission instead (`keep_mask_for_continuation`).
+    /// Begin `dettid`'s wait-mask interval: its masked wait has published
+    /// its effective mask (`publish_wait_mask`), which Linux's `blocked`
+    /// holds until the wait withdraws it. The legacy saved-mask consumers
+    /// are updated in the same mutation, so no reader sees the interval
+    /// without the value or the value without the interval. A `None`
+    /// mask is an unknown mask in force. Returns false for a thread the
+    /// scheduler no longer knows, as `set_saved_guest_sigmask` does, so a
+    /// stale publication from a retired incarnation is refused.
+    ///
+    /// Incarnation safety without an `mm` argument: the publication is
+    /// awaited in the publishing thread's own turn under the scheduler
+    /// mutex, so no second incarnation of the tid can be live while it
+    /// lands; a retired incarnation's late publication finds no
+    /// registration and is refused, and the consult
+    /// (`wait_mask_in_force`) ignores a value whose incarnation has been
+    /// replaced, as after an exec.
+    pub(crate) fn begin_wait_mask(&mut self, dettid: DetTid, mask: Option<u64>) -> bool {
+        if !self.next_turns.contains_key(&dettid) {
+            return false;
+        }
+        let mm = self
+            .thread_mms
+            .get(&dettid)
+            .copied()
+            .unwrap_or_else(|| MmId::initial(DetPid::from_raw(dettid.as_raw())));
+        self.wait_masks_in_force.insert(dettid, (mm, mask));
+        // A fresh wait supersedes any delivery frame it nests in, and
+        // any wake still awaiting its handler entry.
+        self.delivery_masks.remove(&dettid);
+        self.pending_delivery.remove(&dettid);
+        match mask {
+            Some(mask) => self.saved_guest_sigmasks.insert(dettid, mask),
+            None => self.saved_guest_sigmasks.remove(&dettid),
+        };
+        if self.in_guest_signal_delivery {
+            self.unknown_guest_sigmasks.remove(&dettid);
+            self.temporary_guest_sigmasks.remove(&dettid);
+            self.forget_temporary_mask_publication(dettid);
+        }
+        true
+    }
+
+    /// End `dettid`'s wait-mask interval at an interrupted wait's
+    /// delivery handoff: the thread's current handler mask (its physical
+    /// `blocked`, as the delivery installed it, or a mask it published
+    /// since) decides from here. The stale legacy saved mask goes with
+    /// the interval, so a newer publication is not refused for it
+    /// (`published_mask_for` declines while a saved mask exists).
+    pub(crate) fn end_wait_mask(&mut self, dettid: DetTid) -> bool {
+        if !self.next_turns.contains_key(&dettid) {
+            return false;
+        }
+        self.wait_masks_in_force.remove(&dettid);
+        self.saved_guest_sigmasks.remove(&dettid);
+        if self.in_guest_signal_delivery {
+            self.unknown_guest_sigmasks.remove(&dettid);
+            self.temporary_guest_sigmasks.remove(&dettid);
+            self.forget_temporary_mask_publication(dettid);
+        }
+        true
+    }
+
+    /// End `dettid`'s wait-mask interval and clear the legacy saved mask
+    /// with it: a wait that returns without a delivery to hand off to,
+    /// whose thread's kernel `SigBlk` is its own mask again.
+    pub(crate) fn withdraw_wait_mask(&mut self, dettid: DetTid) -> bool {
+        if !self.next_turns.contains_key(&dettid) {
+            return false;
+        }
+        self.wait_masks_in_force.remove(&dettid);
+        self.saved_guest_sigmasks.remove(&dettid);
+        if self.in_guest_signal_delivery {
+            self.unknown_guest_sigmasks.remove(&dettid);
+            self.temporary_guest_sigmasks.remove(&dettid);
+            self.forget_temporary_mask_publication(dettid);
+        }
+        true
+    }
+
+    /// Hand `dettid`'s wait interval off to a delivery of `signal`: the
+    /// scheduler is committing the wake that ends its wait for a caught
+    /// handler, so Linux installs the handler's mask — the wait value,
+    /// the handler's `sa_mask`, and the delivered signal unless
+    /// `SA_NODEFER`, with the unblockable signals left out — which
+    /// decides until `rt_sigreturn`. One mutation: the wait interval
+    /// ends as the delivery frame is pushed, so no choice can run in a
+    /// gap between them. No interval, or no caught handler for `signal`,
+    /// is no handoff: the existing ignore/default/fatal paths decide.
+    fn handoff_delivery(&mut self, dettid: DetTid, signal: SigWrapper) {
+        let Some(wait) = self.wait_mask_in_force(dettid) else {
+            return;
+        };
+        let process = self.sigchld_process(dettid);
+        let Some(&(sa_mask, nodefer)) = self.handler_masks.get(&(process, signal.raw())) else {
+            return;
+        };
+        let deferred = if nodefer {
+            0
+        } else {
+            kernel_signal_bit(signal.raw())
+        };
+        let unblockable = kernel_signal_bit(libc::SIGKILL) | kernel_signal_bit(libc::SIGSTOP);
+        let frame = wait.map(|wait| (wait | sa_mask | deferred) & !unblockable);
+        self.wait_masks_in_force.remove(&dettid);
+        self.delivery_masks.entry(dettid).or_default().push(frame);
+    }
+
+    /// Record `dettid`'s handler entry (`pending_delivery`): hand its
+    /// wait interval off to the delivery frame now, when the handler is
+    /// actually entered (the signal-state copy recorded the delivery),
+    /// not at the wake that only queued it. A thread with no wake
+    /// awaiting entry is unaffected.
+    pub(crate) fn record_delivery_entry(&mut self, dettid: DetTid) {
+        let Some(signal) = self.pending_delivery.remove(&dettid) else {
+            return;
+        };
+        self.handoff_delivery(dettid, signal);
+    }
+
+    /// Pop `dettid`'s top delivery frame, as `rt_sigreturn` restores the
+    /// mask its frame saved. Returns false for a thread the scheduler no
+    /// longer knows, as the other mask mutations do.
+    pub(crate) fn pop_delivery_mask(&mut self, dettid: DetTid) -> bool {
+        if !self.next_turns.contains_key(&dettid) {
+            return false;
+        }
+        if let Some(stack) = self.delivery_masks.get_mut(&dettid) {
+            stack.pop();
+            if stack.is_empty() {
+                self.delivery_masks.remove(&dettid);
+            }
+        }
+        // The frame's leftover legacy saved mask goes in the same
+        // mutation: after the return, the thread's published and
+        // physical masks decide again, not the wait's stale publication.
+        self.saved_guest_sigmasks.remove(&dettid);
+        if self.in_guest_signal_delivery {
+            self.unknown_guest_sigmasks.remove(&dettid);
+            self.temporary_guest_sigmasks.remove(&dettid);
+            self.forget_temporary_mask_publication(dettid);
+        }
+        true
+    }
+
+    /// The wait mask in force for `thread`, when its publishing
+    /// incarnation is still the thread's: `Some(mask)`, `None` for an
+    /// unknown mask in force, and no entry at all when no wait is in
+    /// force or its incarnation has been replaced (exec, tid reuse), in
+    /// which case its value must not decide.
+    fn wait_mask_in_force(&self, thread: DetTid) -> Option<Option<u64>> {
+        let (mm, mask) = self.wait_masks_in_force.get(&thread)?;
+        let current = self
+            .thread_mms
+            .get(&thread)
+            .copied()
+            .unwrap_or_else(|| MmId::initial(DetPid::from_raw(thread.as_raw())));
+        (current == *mm).then_some(*mask)
+    }
+
     /// Record (`Some`) or clear (`None`) the mask Linux's `blocked` holds for
     /// `dettid` while its kernel `SigBlk` differs (`saved_guest_sigmasks`).
     /// Returns false for a thread the scheduler no longer knows. Under the
@@ -10662,8 +10939,77 @@ impl Scheduler {
         );
         // A futex with timeout waits in both the futex_waiters and timed_events structures:
         if let Some(target_time) = maybe_timeout {
-            self.blocked.timed_waiters.insert(target_time, *dettid);
+            self.file_timed_wait(*dettid, target_time);
         }
+    }
+
+    /// Queue a thread's timed wait (a sleep's `SleepUntil` or a futex wait's
+    /// timeout) to end at `deadline`, or, under `--chaos-timed-wait-spread`,
+    /// at the wake threshold drawn for it (`timed_wait_spread`). A threshold
+    /// before the deadline is promised the deadline, which
+    /// `Scheduler::reach_promised_deadline` makes the clock reach before the
+    /// waiter runs.
+    fn file_timed_wait(&mut self, dettid: DetTid, deadline: LogicalTime) {
+        // A schedule replay spreads the waits its schedule covers, as its
+        // recording did, and no wait filed after the schedule has run out:
+        // the run then continues without chaos decisions, as `hermit analyze`
+        // continues a replayed prefix, and the spread is one of them.
+        let past_the_schedule = self.replayer.as_ref().is_some_and(|r| r.ran_out());
+        let Some(spread) = self
+            .timed_wait_spread
+            .as_mut()
+            .filter(|_| !past_the_schedule)
+        else {
+            self.blocked.timed_waiters.insert(deadline, dettid);
+            return;
+        };
+        let (wake, factor) = spread.wake_threshold(dettid, self.committed_time, deadline);
+        if wake != deadline {
+            detlog!(
+                "[sched] CHAOSWAIT dtid {} deadline {} spread by {} to {} (committed time {})",
+                dettid,
+                deadline,
+                factor,
+                wake,
+                self.committed_time
+            );
+        }
+        self.blocked
+            .timed_waiters
+            .insert_spread(wake, deadline, dettid);
+    }
+
+    /// A spread wait's threshold `wake` came due before its `deadline`
+    /// (`file_timed_wait`): advance the global clock to the deadline, as if
+    /// every other thread had been descheduled for the rest of the wait, and
+    /// queue the wait at its deadline, where the ordinary path wakes it once
+    /// committed time reaches it. The waiter thus never observes less than
+    /// the duration it asked for. The jump is taken at a fixed point of the
+    /// schedule (a popped timed event, with every thread parked), so both
+    /// runs of `--verify` and a replay take it alike.
+    fn reach_promised_deadline(
+        &mut self,
+        global_time: &Mutex<GlobalTime>,
+        dettid: DetTid,
+        wake: LogicalTime,
+        deadline: LogicalTime,
+    ) {
+        let mut gtime = global_time.lock().unwrap();
+        let now = gtime.as_nanos();
+        if deadline > now {
+            gtime.add_extra_time(deadline.duration_since(now));
+        }
+        detlog!(
+            "[sched] CHAOSWAIT dtid {} woke at {} before its deadline {}; global time {} -> {}",
+            dettid,
+            wake,
+            deadline,
+            now,
+            gtime.as_nanos()
+        );
+        drop(gtime);
+        self.blocked.timed_waiters.insert(deadline, dettid);
+        self.promised_wake_requeued = Some(dettid);
     }
 
     /// Reschedule a single thread that has been blocked on futex.
@@ -11742,6 +12088,24 @@ impl Scheduler {
         }
     }
 
+    /// Whether this pass's timed-event maintenance just popped a spread
+    /// wait's threshold before its deadline, moved the clock to the deadline
+    /// and queued the wait there (`reach_promised_deadline`); taking the
+    /// mark. Such a pass ends without a commit, whatever thread is queued, in
+    /// every mode: the jump stands for every other thread having been
+    /// descheduled for the rest of the wait, so none may run before committed
+    /// time catches up with it. The next pass's step 1 brings committed time
+    /// to the deadline, where the wait ends unless something earlier is due.
+    /// Ending the pass here, not only when a schedule replay runs the waiter
+    /// next, also keeps a recording and its schedule replay alike: otherwise
+    /// whether another thread ran first, at the old committed time, would
+    /// depend on whether that pass happened to end without a commit for
+    /// another reason (a chaos priority change point, which a schedule replay
+    /// does not repeat).
+    fn took_a_requeued_promised_wake(&mut self) -> bool {
+        self.promised_wake_requeued.take().is_some()
+    }
+
     fn step2_process_blocked(
         &mut self,
         global_time: &Arc<Mutex<GlobalTime>>,
@@ -11787,7 +12151,11 @@ impl Scheduler {
         // Likewise for the timed events the recording popped in this turn
         // before its next readmission (`replay_holds_for_recorded_pops`).
         self.replay_fast_forward_to_recorded_pops(global_time);
+        self.promised_wake_requeued = None;
         self.step2b_process_timed(global_time);
+        if self.took_a_requeued_promised_wake() {
+            return Err(SkipTurn);
+        }
         let held_for_replayed_wake =
             held_for_replayed_wake || self.replay_holds_for_recorded_pops();
         if !held_for_replayed_wake {
@@ -13034,7 +13402,9 @@ impl Scheduler {
                 "[dtid {}] queued sleep registered as a timed waiter at {}",
                 tid, target
             );
-            self.blocked.timed_waiters.insert(target, tid);
+            // Through `file_timed_wait`, like a sleep registered when chosen,
+            // so `--chaos-timed-wait-spread` spreads it too.
+            self.file_timed_wait(tid, target);
             assert!(self.run_queue.remove_tid(tid));
         }
     }
@@ -13052,7 +13422,14 @@ impl Scheduler {
         {
             self.note_timed_pop(time_ns, evt);
             match evt {
-                TimedEvent::ThreadEvt(tid) => self.wake_timed_event(time_ns, tid),
+                TimedEvent::ThreadEvt(tid) => {
+                    match self.blocked.timed_waiters.take_promise(tid, time_ns) {
+                        Some(deadline) => {
+                            self.reach_promised_deadline(global_time, tid, time_ns, deadline)
+                        }
+                        None => self.wake_timed_event(time_ns, tid),
+                    }
+                }
                 TimedEvent::SignalEvt(id, tid, sig) => {
                     let observed_now = global_time.lock().unwrap().as_nanos();
                     self.dispatch_timed_signal(time_ns, id, tid, sig, true, observed_now)
@@ -15408,17 +15785,23 @@ impl Scheduler {
         }
         // The physical send has already happened. Preserve its real kernel
         // pending/ignored semantics, but never invent an interrupted sleep
-        // for an alarm this exact owner snapshot blocks or ignores. This
-        // covers both filed requests and sleeps already outside the queue.
-        if signal.raw() == libc::SIGALRM
-            && self
-                .in_guest_sleep_sigalrm(dettid)
-                .is_some_and(|(snapshot, _)| {
-                    snapshot.blocked
-                        || snapshot.disposition
-                            == crate::resources::SigalrmSleepDisposition::Ignored
-                })
+        // for a signal this exact owner snapshot blocks or ignores
+        // (`send_leaves_asleep`): an alarm, a child's exit SIGCHLD, or a POSIX
+        // timer's signal. This backend does not model signal targets, so the
+        // send was never classified (`discarded_when_sent_to`), and its woken
+        // sleep cannot read the guest's state to tell
+        // (`sleep_signal::SleepSignal::Held`): every wake returned EINTR,
+        // even for a default-ignored SIGCHLD Linux discards
+        // (https://github.com/rrnewton/hermit/issues/5338). This covers both
+        // filed requests and sleeps already outside the queue.
+        if self
+            .in_guest_sleep_sigalrm(dettid)
+            .is_some_and(|(snapshot, _)| snapshot.send_leaves_asleep(signal.raw()))
         {
+            debug!(
+                "[dtid {}] signal {} is blocked or ignored by its sleep's owner snapshot; leaving it.",
+                dettid, signal
+            );
             return;
         }
         debug!(
@@ -15773,10 +16156,47 @@ impl Scheduler {
                         dettid, signal
                     );
                 } else {
+                    self.note_sleep_wake_without_disposition(dettid, signal);
                     self.force_unblock_thread(dettid, rsrcs);
                 }
             }
         }
+    }
+
+    /// Record the determinism loss of a wake `wake_signaled_guest` is about
+    /// to force on `dettid`'s parked emulated `pause` or `nanosleep` for
+    /// `signal`, where nothing read the guest's disposition or mask for it:
+    /// the scheduler neither models signal targets nor runs the in-guest
+    /// delivery gate (`signal_sleep`), no process signal control publishes the
+    /// send (`child_exit_sink`), the woken sleep cannot read the guest's
+    /// state (`supports_blocked_wait_signal_interruption` off, so it answers
+    /// `SleepSignal::Held`, EINTR), and the sleep has no owner-turn snapshot
+    /// (`in_guest_sleep_sigalrm`). That is DBT and SaBRe. Linux leaves the
+    /// sleep asleep for a blocked or ignored signal, so the EINTR may be one
+    /// Linux never returns (https://github.com/rrnewton/hermit/issues/5338).
+    /// The wake is kept, so a program that runs on those backends today still
+    /// runs, but the run is marked and verification refuses to compare it.
+    /// Recorded once per run.
+    fn note_sleep_wake_without_disposition(&mut self, dettid: DetTid, signal: SigWrapper) {
+        if self.sleep_wake_without_disposition_noted
+            || self.models_signal_targets
+            || self.in_guest_signal_delivery
+            || self.signal_control_installed()
+            || self.backend.supports_blocked_wait_signal_interruption
+            || self.in_guest_sleep_sigalrm(dettid).is_some()
+        {
+            return;
+        }
+        let Some(sleep) = self.filed_signal_sleep(dettid) else {
+            return;
+        };
+        self.sleep_wake_without_disposition_noted = true;
+        self.note_determinism_loss(format!(
+            "HERMIT_UNCLASSIFIED_SIGNAL_WAKE_WITHOUT_DISPOSITION: [dtid {dettid}] signal {signal} \
+             woke its emulated {sleep:?} on a backend that reads neither the guest's disposition \
+             nor its mask for it, so the sleep returns EINTR even where Linux discards the \
+             signal or keeps it pending (https://github.com/rrnewton/hermit/issues/5338)"
+        ));
     }
 
     /// For a thread that `wake_signaled_guest` unblocked (`woken`) to take
@@ -16547,7 +16967,7 @@ impl Scheduler {
     /// (`process_signal_receiver::complete_signal`): `named` if it
     /// `wants_signal`, else the first thread that does, walking the thread
     /// list from `curr_target`. A thread wants it (`kernel_sent_wants`) under
-    /// the mask Linux's `blocked` holds now (`thread_signal_mask_for`) less a
+    /// the mask Linux's `blocked` holds now (`kernel_sent_signal_mask`) less a
     /// set it waits for in `rt_sigtimedwait` (`sigtimedwait_sets`), which
     /// Linux unblocks for the wait (`do_sigtimedwait`, kernel/signal.c:3777),
     /// when it is not exiting and has no other unblocked signal pending for it
@@ -16569,7 +16989,7 @@ impl Scheduler {
         let bit = kernel_signal_bit(signo);
         let threads = self.process_signal_targets(process);
         let mask = |thread: DetTid| {
-            self.thread_signal_mask_for(thread, signo)
+            self.kernel_sent_signal_mask(thread, signo)
                 .map(|mask| mask & !self.sigtimedwait_sets.get(&thread).copied().unwrap_or(0))
         };
         if let Some(sleeper) = threads.iter().copied().find(|thread| {
@@ -16804,6 +17224,70 @@ impl Scheduler {
     fn thread_signal_mask_for(&self, thread: DetTid, signal: i32) -> Option<u64> {
         self.recorded_signal_mask(thread)
             .unwrap_or_else(|| self.blocked_mask_for(thread, signal))
+    }
+
+    /// `thread_signal_mask_for` for a signal the kernel itself generates
+    /// between turns (`kernel_signal_choice`): with a process signal control
+    /// installed (KVM), the temporary mask Linux holds installed for a call
+    /// `thread` waits in (`controlled_temporary_mask`) takes the place of the
+    /// published and backend masks, which are the thread's own between a
+    /// call's probes. `ppoll` and `pselect6` install the call's mask for the
+    /// whole call (`set_user_sigmask`, kernel/signal.c:3272-3288 at v6.17)
+    /// and `rt_sigsuspend` until its signal is delivered (`sigsuspend`, lines
+    /// 4833-4844), and `wants_signal` (line 948) tests that installed
+    /// `blocked` set. A mask the scheduler recorded comes first, as before
+    /// (`recorded_signal_mask`: a delivery's override, a parked futex wait's
+    /// watch, a call outside the schedule, a readmitted call's continuation
+    /// mask), and a temporary mask the request says is unknown makes the mask
+    /// unknown (`None`: no target), never the thread's own.
+    ///
+    /// Before, the own mask was read: a creator that blocks `SIGCHLD` but lets
+    /// it in for its `ppoll` was passed over for a sibling, and one whose
+    /// `ppoll` blocks it was chosen and never took it (the Codex review of
+    /// <https://github.com/rrnewton/hermit/pull/5259>, P1).
+    fn kernel_sent_signal_mask(&self, thread: DetTid, signal: i32) -> Option<u64> {
+        if let Some(recorded) = self.recorded_signal_mask(thread) {
+            return recorded;
+        }
+        if self.reads_signal_state_through_control() {
+            match self.controlled_temporary_mask(thread) {
+                Ok(Some(temporary)) => return Some(temporary),
+                Ok(None) => {}
+                Err(signal_state_reader::TemporaryMaskUnknown) => return None,
+            }
+        }
+        // The mask a masked wait published, while its interval is in
+        // force (`wait_masks_in_force`, begun at publication): on ptrace
+        // a masked `ppoll`/`pselect6`/`sigsuspend` probe loop publishes
+        // its temporary mask for the wait's duration, while the physical
+        // mask remains the thread's own. The interval survives any
+        // request the wait's place is later given (a wake's
+        // `InboundSignal`, a replay checkpoint's `TraceReplay`), so the
+        // choice reads the installed mask, as `wants_signal` does. An
+        // unknown mask in force reads as unknown, never as an older
+        // value. A saved mask with no wait in force is the guest's own
+        // under Detcore's private mask, and the physical read below
+        // decides there, as before; the recorded and control sources
+        // above keep their stronger precedence, and readers that need
+        // the physical mask (the background-entry barriers) do not come
+        // through here.
+        if let Some(in_force) = self.wait_mask_in_force(thread) {
+            return in_force;
+        }
+        // A newer published mask (a handler's own `rt_sigprocmask`)
+        // supersedes the delivery frame under it, as Linux's current
+        // `blocked` supersedes the mask the delivery installed.
+        if let Some(published) = self.published_mask_for(thread, signal) {
+            return Some(published);
+        }
+        if let Some(frame) = self
+            .delivery_masks
+            .get(&thread)
+            .and_then(|stack| stack.last())
+        {
+            return *frame;
+        }
+        self.read_thread_blocked_mask(thread)
     }
 
     /// The sources of `thread_signal_mask` before the kernel's, in order;
@@ -17184,6 +17668,21 @@ impl Scheduler {
 
         self.note_backend_suspend_replaced(dettid);
         if let Some(nxt) = self.next_turns.get_mut(&dettid) {
+            // A wake's InboundSignal awaits its handler entry: the wait
+            // mask stays in force until the waiter's next filing hands it
+            // off (`record_delivery_entry`). Other substitutions clear
+            // any wake still awaiting entry.
+            match rsrcs.resources.keys().find_map(|resource| match resource {
+                ResourceID::InboundSignal(signal) => Some(*signal),
+                _ => None,
+            }) {
+                Some(signal) => {
+                    self.pending_delivery.insert(dettid, signal);
+                }
+                None => {
+                    self.pending_delivery.remove(&dettid);
+                }
+            }
             // Counterfeit the entry as though the thread had requested this resource from the start:
             nxt.req = Ivar::full(Ok(rsrcs));
         }
@@ -19017,7 +19516,14 @@ impl Scheduler {
                 };
 
                 match evt {
-                    TimedEvent::ThreadEvt(dtid) => self.wake_timed_event(event_ns, dtid),
+                    TimedEvent::ThreadEvt(dtid) => {
+                        match self.blocked.timed_waiters.take_promise(dtid, event_ns) {
+                            Some(deadline) => {
+                                self.reach_promised_deadline(global_time, dtid, event_ns, deadline)
+                            }
+                            None => self.wake_timed_event(event_ns, dtid),
+                        }
+                    }
                     TimedEvent::SignalEvt(id, dtid, sig) => {
                         self.dispatch_timed_signal(event_ns, id, dtid, sig, false, observed_now)
                     }
@@ -19049,6 +19555,11 @@ impl Scheduler {
         // Must precede `tentative_pop_next`: the run queue forbids pushes while a
         // selection transaction is live.
         self.hb_flush_wakes();
+        // An unrun reserved SIGALRM poll probe (dh-ru056 slice 1) whose
+        // thread is still out of the run queue once those gates are flushed
+        // cannot be selected below: release it now, charging the entry's
+        // loss, rather than let it outlive its precedence.
+        self.release_unqueued_sigalrm_reservation();
         // Also before the selection, since it moves queue entries.
         self.order_continuation_fairly();
         debug!(
@@ -19144,7 +19655,28 @@ impl Scheduler {
                 self.first_alarm_taker_entry()
             };
             let decider = self.queued_group_exit_decider();
-            let by_alarm = decider.is_none() && taker.is_none() && process_taker.is_none();
+            // An unrun reserved SIGALRM poll probe (dh-ru056 slice 1,
+            // design rev.2 section 5: placed precedence, the
+            // `sigchld_takers` class) resumes right after a group-exit
+            // decider and ahead of every other choice here, so no other
+            // thread's turn commits between its reservation and the probe
+            // (`reserved_probe_to_resume`). Its grant spends the alarm
+            // priority of https://github.com/rrnewton/hermit/issues/4929;
+            // the probe itself, like a SIGCHLD taker, is exempt from that
+            // bound (one probe grant per due entry).
+            let reserved_probe = if decider.is_none() {
+                self.reserved_probe_to_resume()
+            } else {
+                None
+            };
+            if let Some((pid, _)) = reserved_probe {
+                self.parked.alarm_priority_served = Some(pid);
+            }
+            let reserved_probe = reserved_probe.map(|(_, thread)| thread);
+            let by_alarm = decider.is_none()
+                && reserved_probe.is_none()
+                && taker.is_none()
+                && process_taker.is_none();
             let alarm_taker = alarm_taker.map(|(pid, thread)| {
                 if by_alarm {
                     self.parked.alarm_priority_served = Some(pid);
@@ -19152,6 +19684,7 @@ impl Scheduler {
                 thread
             });
             let next_dtid = match decider
+                .or(reserved_probe)
                 .or(taker)
                 .or(process_taker)
                 .or(alarm_taker)
@@ -19261,6 +19794,17 @@ impl Scheduler {
         rs: &Resources,
         resp: &Ivar<SchedResponse>,
     ) -> Result<(), SkipTurn> {
+        // The reserved probe's settle fires at its CheckTurn, before
+        // this retry can be deferred (G2); an unexpected ProgressRetry
+        // is triaged to loss there first. A substituted wake replaced
+        // `rs`, which this turn must no longer act on.
+        if self.act_on_sigalrm_reserved_head(dettid) {
+            info!(
+                "[scheduler] >>>>>>>\n\n NONCOMMIT turn {}, SKIP dettid {}: its reserved pipe-read probe moved nothing; SIGALRM wake substituted",
+                self.turn, dettid
+            );
+            return self.skip_turn();
+        }
         if rs.priority_row.is_some() {
             assert!(
                 rs.resources.len() == 1
@@ -19520,7 +20064,7 @@ impl Scheduler {
                     // for one queued after that within the same pass (no such path
                     // is known). Under `when-chosen` registration (race search,
                     // record and replay) this is where a sleep is registered.
-                    self.blocked.timed_waiters.insert(*target_ns, dettid);
+                    self.file_timed_wait(dettid, *target_ns);
                     self.skip_turn_blocked(dettid)
                 }
             }
@@ -26765,13 +27309,18 @@ mod test {
     /// it, at the recorded stream's position where the jump is made.
     #[test]
     fn a_recorded_run_writes_its_time_skips() {
+        // The polling number is poll on x86_64, ppoll on aarch64.
+        #[cfg(target_arch = "x86_64")]
+        let poll_sysno = Sysno::poll;
+        #[cfg(target_arch = "aarch64")]
+        let poll_sysno = Sysno::ppoll;
         let config = Config::default();
         let mut sched = Scheduler::new(&config);
         let mut writer = PreemptionWriter::new(None);
         for _ in 0..6 {
             writer.insert_schedevent(SchedEvent::syscall(
                 DetTid::from_raw(3),
-                Sysno::poll,
+                poll_sysno,
                 SyscallPhase::Polling,
             ));
         }
@@ -37498,6 +38047,372 @@ mod test {
         assert_eq!(place(&mut scheduler, 10, 7, &named), RejoinPlace::Due);
     }
 
+    /// A scheduler under `--chaos --chaos-timed-wait-spread=10` (or without
+    /// the spread for `None`) with `sleeper` asleep from now until 1 ms from
+    /// now, filed through `file_timed_wait`; returns the clock, the start and
+    /// the deadline.
+    fn spread_sleeper(
+        seed: Option<u64>,
+        sleeper: DetTid,
+    ) -> (Scheduler, Arc<Mutex<GlobalTime>>, LogicalTime, LogicalTime) {
+        let config = Config {
+            chaos: true,
+            chaos_timed_wait_spread: seed.map(|_| 10.0),
+            sched_seed: seed,
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let start = global_time.lock().unwrap().as_nanos();
+        scheduler.committed_time = start;
+        scheduler.priorities.insert(sleeper, DEFAULT_PRIORITY);
+        scheduler.next_turns.insert(
+            sleeper,
+            ThreadNextTurn {
+                dettid: sleeper,
+                child_tid_addr: 0,
+                req: Ivar::new(),
+                resp: Ivar::new(),
+                protocol: Default::default(),
+            },
+        );
+        let deadline = start + LogicalTime::from_nanos(1_000_000);
+        scheduler.file_timed_wait(sleeper, deadline);
+        (scheduler, global_time, start, deadline)
+    }
+
+    /// The first spread factor of `sleeper` under `seed`, and the first seed
+    /// in 0..256 whose factor satisfies `pick`.
+    fn spread_seed(sleeper: DetTid, pick: impl Fn(f64) -> bool) -> (u64, f64) {
+        (0..256)
+            .map(|seed| {
+                (
+                    seed,
+                    timed_wait_spread::timed_wait_factor(seed, sleeper, 0, 10.0),
+                )
+            })
+            .find(|(_, factor)| pick(*factor))
+            .expect("a seed with such a factor")
+    }
+
+    /// A schedule replay's switch to a spread sleeper whose shortened
+    /// threshold has passed leaves it asleep until its deadline is reached
+    /// through the promise, never waking it at the threshold (coord7's review
+    /// probe, `review_probe_replay_switch_honours_a_spread_promise`).
+    #[test]
+    fn a_replayed_switch_honours_a_spread_sleepers_promised_deadline() {
+        let sleeper = DetTid::from_raw(5);
+        let (seed, factor) = spread_seed(sleeper, |factor| factor < 0.5);
+        let (mut scheduler, global_time, start, deadline) = spread_sleeper(Some(seed), sleeper);
+        let wake = start + LogicalTime::from_nanos((1_000_000.0 * factor).round() as u64);
+        global_time
+            .lock()
+            .unwrap()
+            .add_extra_time(wake.duration_since(start));
+        scheduler.committed_time = wake;
+        scheduler.wake_due_replay_target(sleeper);
+        let now = global_time.lock().unwrap().as_nanos();
+        assert!(
+            !scheduler.run_queue.contains_tid(sleeper) || now >= deadline,
+            "replay switch woke the spread sleeper at {wake} with global time {now}, before its \
+             deadline {deadline}"
+        );
+        assert_eq!(
+            scheduler
+                .blocked
+                .timed_waiters
+                .promised_deadline(sleeper, wake),
+            Some(deadline)
+        );
+    }
+
+    /// A schedule replay's switch to a thread in a spread timed futex wait
+    /// whose threshold has passed but whose deadline has not (threshold <=
+    /// committed < deadline) must not wake it for the switch: that would grant
+    /// the futex ETIMEDOUT before its deadline and drop the promised deadline.
+    /// The thread stays asleep at its threshold; maintenance pops an earlier
+    /// competing timed event first, then the threshold, which moves the clock
+    /// to the deadline and requeues the wait there; and the futex times out
+    /// only once committed time reaches the deadline. (Review of
+    /// https://github.com/rrnewton/hermit/pull/4654's port, finding 1.)
+    #[test]
+    fn a_replayed_switch_never_times_out_a_spread_futex_wait_before_its_deadline() {
+        let waiter = DetTid::from_raw(5);
+        let running = DetTid::from_raw(3);
+        let competitor = DetTid::from_raw(7);
+        let (seed, _) = spread_seed(waiter, |factor| factor < 0.5);
+        let config = Config {
+            chaos: true,
+            chaos_timed_wait_spread: Some(10.0),
+            sched_seed: Some(seed),
+            ..Config::default()
+        };
+        let mut sched = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let start = global_time.lock().unwrap().as_nanos();
+        sched.committed_time = start;
+        for tid in [running, waiter, competitor] {
+            sched.priorities.insert(tid, DEFAULT_PRIORITY);
+        }
+        sched.next_turns.insert(
+            waiter,
+            ThreadNextTurn {
+                dettid: waiter,
+                child_tid_addr: 0,
+                req: Ivar::new(),
+                resp: Ivar::new(),
+                protocol: Default::default(),
+            },
+        );
+        let deadline = start + LogicalTime::from_nanos(1_000_000);
+        let futex = FutexID::private(MmId::initial(waiter), 0x404100);
+        sched.sleep_futex_waiter(&waiter, futex, Some(deadline), u32::MAX, None);
+        let threshold = sched
+            .blocked
+            .timed_waiters
+            .thread_deadline(waiter)
+            .expect("queued at its threshold");
+        assert!(threshold < deadline, "a shortened wait");
+        // Other threads' work has moved time past the threshold, short of
+        // the deadline, and an earlier timed event is due ahead of it.
+        let now = threshold + LogicalTime::from_nanos(1_000);
+        assert!(now < deadline);
+        global_time
+            .lock()
+            .unwrap()
+            .add_extra_time(now.duration_since(start));
+        sched.committed_time = now;
+        queue_request(
+            &mut sched,
+            competitor,
+            sleep_request(competitor, threshold - LogicalTime::from_nanos(1)),
+        );
+        assert!(sched.run_queue.remove_tid(competitor));
+        sched
+            .blocked
+            .timed_waiters
+            .insert(threshold - LogicalTime::from_nanos(1), competitor);
+        // The recording: the running thread blocks in a futex wait, and the
+        // waiter's futex wait returns next.
+        let blocks =
+            SchedEvent::syscall(running, Sysno::futex, SyscallPhase::Prehook).with_time(now);
+        let returns =
+            SchedEvent::syscall(waiter, Sysno::futex, SyscallPhase::Posthook).with_time(deadline);
+        sched.replayer = Some(Replayer::new(vec![blocks.clone(), returns]));
+        let timed_out = |sched: &Scheduler| sched.blocked.timed_out_futex_waiters.contains(&waiter);
+
+        let _ = sched.consume_schedevent(&blocks);
+        assert!(!timed_out(&sched), "no timeout at {now}, before {deadline}");
+        assert!(!sched.run_queue.contains_tid(waiter));
+        assert_eq!(
+            sched.blocked.timed_waiters.thread_deadline(waiter),
+            Some(threshold)
+        );
+        assert_eq!(
+            sched
+                .blocked
+                .timed_waiters
+                .promised_deadline(waiter, threshold),
+            Some(deadline),
+            "the promise survives the switch"
+        );
+
+        // Maintenance pops the competitor, then the threshold, which moves
+        // the clock to the deadline and requeues the wait there.
+        assert!(sched.step2b_process_timed(&global_time));
+        assert!(sched.run_queue.contains_tid(competitor));
+        assert!(!timed_out(&sched));
+        assert!(sched.step2b_process_timed(&global_time));
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+        assert_eq!(
+            sched.blocked.timed_waiters.thread_deadline(waiter),
+            Some(deadline)
+        );
+        assert!(
+            !timed_out(&sched),
+            "still short of the deadline in committed time"
+        );
+        // A switch now, with committed time still short, still leaves it.
+        sched.wake_due_replay_target(waiter);
+        assert!(!timed_out(&sched));
+
+        // Committed time reaches the deadline: the futex wait times out there.
+        sched.committed_time = deadline;
+        assert!(sched.step2b_process_timed(&global_time));
+        assert!(timed_out(&sched));
+        assert!(sched.run_queue.contains_tid(waiter));
+        assert!(global_time.lock().unwrap().as_nanos() >= deadline);
+    }
+
+    /// `--chaos-timed-wait-spread`: a wait whose threshold comes before its
+    /// deadline pops at the threshold, the clock advances to its deadline
+    /// before it runs, and it wakes once committed time reaches the deadline;
+    /// a threshold past the deadline oversleeps and wakes with no jump; and
+    /// without the option the wait is queued at its deadline.
+    #[test]
+    fn a_spread_wait_wakes_at_its_threshold_and_never_before_its_deadline() {
+        let sleeper = DetTid::from_raw(5);
+        let (scheduler, _, _, deadline) = spread_sleeper(None, sleeper);
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+            Some(deadline)
+        );
+
+        let (seed, factor) = spread_seed(sleeper, |factor| factor < 0.5);
+        let (mut scheduler, global_time, start, deadline) = spread_sleeper(Some(seed), sleeper);
+        let wake = start + LogicalTime::from_nanos((1_000_000.0 * factor).round() as u64);
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+            Some(wake)
+        );
+        // Other threads' work moves the clock to the threshold.
+        global_time
+            .lock()
+            .unwrap()
+            .add_extra_time(wake.duration_since(start));
+        scheduler.committed_time = wake;
+        assert!(scheduler.step2b_process_timed(&global_time));
+        assert_eq!(
+            global_time.lock().unwrap().as_nanos(),
+            deadline,
+            "the clock reaches the deadline before the waiter runs"
+        );
+        assert!(!scheduler.run_queue.contains_tid(sleeper));
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+            Some(deadline)
+        );
+        scheduler.committed_time = deadline;
+        assert!(scheduler.step2b_process_timed(&global_time));
+        assert!(scheduler.run_queue.contains_tid(sleeper));
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+
+        let (seed, factor) = spread_seed(sleeper, |factor| factor > 2.0);
+        let (mut scheduler, global_time, start, deadline) = spread_sleeper(Some(seed), sleeper);
+        let wake = start + LogicalTime::from_nanos((1_000_000.0 * factor).round() as u64);
+        global_time
+            .lock()
+            .unwrap()
+            .add_extra_time(deadline.duration_since(start));
+        scheduler.committed_time = deadline;
+        assert!(
+            !scheduler.step2b_process_timed(&global_time),
+            "an overslept wait is not woken at its deadline"
+        );
+        global_time
+            .lock()
+            .unwrap()
+            .add_extra_time(wake.duration_since(deadline));
+        scheduler.committed_time = wake;
+        assert!(scheduler.step2b_process_timed(&global_time));
+        assert!(scheduler.run_queue.contains_tid(sleeper));
+        assert_eq!(global_time.lock().unwrap().as_nanos(), wake, "no jump");
+    }
+
+    /// A schedule replay spreads a wait it files while recorded events
+    /// remain, as its recording did, and files one at its deadline once its
+    /// schedule has run out: the run then continues without chaos decisions,
+    /// as `hermit analyze` continues a replayed prefix.
+    #[test]
+    fn a_schedule_replay_spreads_no_wait_filed_past_its_schedule() {
+        let sleeper = DetTid::from_raw(5);
+        let (seed, factor) = spread_seed(sleeper, |factor| factor < 0.5);
+        let event = SchedEvent::syscall(sleeper, Sysno::nanosleep, SyscallPhase::Posthook);
+        // A recorded background start still to take is part of the schedule
+        // too (`Replayer::has_events_left`), with every event replayed.
+        let start_left = [crate::preemptions::BackgroundStart {
+            after: 0,
+            thread: DetTid::from_raw(7),
+            call: 1,
+        }];
+        for (events, starts, spread) in [
+            (vec![event], &[][..], true),
+            (vec![], &start_left[..], true),
+            (vec![], &[][..], false),
+        ] {
+            let config = Config {
+                chaos_timed_wait_spread: Some(10.0),
+                sched_seed: Some(seed),
+                ..Config::default()
+            };
+            let mut scheduler = Scheduler::new(&config);
+            scheduler.replayer = Some(Replayer::new(events).with_background_starts(starts, true));
+            let start = scheduler.committed_time;
+            let deadline = start + LogicalTime::from_nanos(1_000_000);
+            scheduler.file_timed_wait(sleeper, deadline);
+            let expected = if spread {
+                start + LogicalTime::from_nanos((1_000_000.0 * factor).round() as u64)
+            } else {
+                deadline
+            };
+            assert_eq!(
+                scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+                Some(expected),
+                "schedule left: {spread}"
+            );
+        }
+    }
+
+    /// A pass whose maintenance pops a spread wait's threshold before its
+    /// deadline, moving the clock to the deadline, ends without a commit
+    /// whatever thread is queued, recording or schedule replay alike, so no
+    /// other thread runs at the old committed time. The next pass brings
+    /// committed time to the deadline and wakes the waiter there, before the
+    /// queued thread's turn.
+    #[test]
+    fn a_pass_that_requeues_a_promised_wake_ends_without_a_commit() {
+        let sleeper = DetTid::from_raw(5);
+        let other = DetTid::from_raw(7);
+        let (seed, factor) = spread_seed(sleeper, |factor| factor < 0.5);
+        for next in [None, Some(sleeper), Some(other)] {
+            let (mut scheduler, global_time, start, deadline) = spread_sleeper(Some(seed), sleeper);
+            if let Some(next) = next {
+                let event = SchedEvent::syscall(next, Sysno::nanosleep, SyscallPhase::Posthook);
+                scheduler.replayer = Some(Replayer::new(vec![event]));
+            }
+            queue_worker(&mut scheduler, other);
+            let wake = start + LogicalTime::from_nanos((1_000_000.0 * factor).round() as u64);
+            global_time
+                .lock()
+                .unwrap()
+                .add_extra_time(wake.duration_since(start));
+            scheduler.committed_time = wake;
+            assert!(
+                scheduler.step2_process_blocked(&global_time).is_err(),
+                "next event by {next:?}: the pass ends without a commit"
+            );
+            assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+            assert_eq!(
+                scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+                Some(deadline)
+            );
+            assert!(
+                !scheduler.took_a_requeued_promised_wake(),
+                "the mark is taken"
+            );
+            // Step 1 of the next pass.
+            scheduler.committed_time = deadline;
+            assert!(scheduler.step2b_process_timed(&global_time));
+            assert!(scheduler.run_queue.contains_tid(sleeper), "{next:?}");
+        }
+    }
+
+    /// With nothing runnable, the empty-queue fast-forward of a spread wait
+    /// moves the clock to the threshold and then to the deadline, and the
+    /// next pass wakes the waiter there: the clock never stops between them.
+    #[test]
+    fn an_empty_queue_fast_forwards_a_spread_wait_to_its_deadline() {
+        let sleeper = DetTid::from_raw(5);
+        let (seed, _) = spread_seed(sleeper, |factor| factor < 0.5);
+        let (mut scheduler, global_time, _, deadline) = spread_sleeper(Some(seed), sleeper);
+        assert!(scheduler.step2_process_blocked(&global_time).is_err());
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+        assert!(!scheduler.run_queue.contains_tid(sleeper));
+        assert!(scheduler.step2_process_blocked(&global_time).is_err());
+        assert!(scheduler.run_queue.contains_tid(sleeper));
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+    }
+
     /// With a backgrounded call unfinished and nothing queued, record wakes a
     /// thread sleeping in virtual time instead of spinning: the call may wait
     /// on that thread (https://github.com/rrnewton/hermit/issues/3881).
@@ -43754,6 +44669,95 @@ mod test {
         scheduler.blocked.continuation_masks.insert(thread, None);
         scheduler.logically_kill_thread(&thread, &thread, MmId::initial(thread));
         assert!(!scheduler.blocked.continuation_masks.contains_key(&thread));
+    }
+
+    /// dh-ru056 slice 1, placed precedence enforced at selection: a SIGALRM
+    /// entry due while its owner polls a pipe read is reserved for one probe,
+    /// and step 3 resumes that probe ahead of a queued `SIGCHLD` taker or
+    /// process-signal taker (both of which resume ahead of an alarm taker).
+    /// The process-signal case is defensive: on in-guest LiteInst, the only
+    /// backend that virtualizes guest SIGALRM handlers, the scheduler does
+    /// not model signal targets, so no process-signal taker exists there.
+    #[test]
+    fn a_sigalrm_poll_probe_resumes_ahead_of_queued_signal_takers() {
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        for case in ["none", "sigchld-taker", "process-signal-taker"] {
+            let reader = DetTid::from_raw(200);
+            let other = DetTid::from_raw(300);
+            let mm = MmId::initial(DetPid::from_raw(300));
+            let mut scheduler = gated_scheduler();
+            for thread in [reader, other] {
+                scheduler.thread_tree.add_child(thread, thread, true);
+                register_known_thread(&mut scheduler, thread);
+            }
+            match case {
+                "sigchld-taker" => {
+                    let futex = FutexID::private(mm, 0x404110);
+                    scheduler.sleep_futex_waiter(
+                        &other,
+                        futex,
+                        None,
+                        u32::MAX,
+                        Some(signal_watch(chld)),
+                    );
+                    scheduler
+                        .test_kernel_signal_states
+                        .insert(other, signal_state(chld, 0));
+                    assert!(scheduler.note_group_send(other, Signal::SIGCHLD, false));
+                    scheduler.wake_signaled_guest(other, Signal::SIGCHLD);
+                    assert_eq!(scheduler.first_sigchld_taker(), Some(other), "{case}");
+                }
+                "process-signal-taker" => {
+                    scheduler.next_turns[&other]
+                        .req
+                        .put(Ok(Resources::new(other)));
+                    scheduler.runqueue_push_back(other);
+                    scheduler.test_kernel_signal_states.insert(
+                        other,
+                        KernelSignalState {
+                            shared_pending: usr1,
+                            ..Default::default()
+                        },
+                    );
+                    scheduler.process_signal_takers.insert(other, usr1);
+                    assert_eq!(
+                        scheduler.first_process_signal_taker(),
+                        Some(other),
+                        "{case}"
+                    );
+                }
+                _ => {
+                    scheduler.next_turns[&other]
+                        .req
+                        .put(Ok(Resources::new(other)));
+                    scheduler.runqueue_push_back(other);
+                }
+            }
+            let process = DetPid::from_raw(200);
+            scheduler.set_sigalrm_handled(process, true);
+            scheduler.set_sigalrm_blocked(reader, false);
+            let mut read = Resources::new(reader);
+            read.insert(ResourceID::InternalIOPolling, Permission::W);
+            read.poll_attempt = 1;
+            read.set_signal_interrupt_errno(reverie::syscalls::Errno::ERESTARTSYS);
+            read.read_fd = Some((detcore_model::fd::FilesId::initial(reader), 4));
+            read.polls_guest_state_only = true;
+            scheduler.next_turns[&reader].req.put(Ok(read));
+            scheduler.runqueue_push_back(reader);
+
+            scheduler.fire_alarm(process, reader, Signal::SIGALRM);
+
+            assert_eq!(
+                scheduler.sigalrm_reserved_poll_target(),
+                Some(reader),
+                "{case}"
+            );
+            assert!(!scheduler.sigalrm_loss_recorded(process), "{case}");
+            let (selected, _, _) = scheduler.step3_peek().expect("a thread is runnable");
+            scheduler.run_queue.undo_tentative_pop();
+            assert_eq!(selected, reader, "{case}: the unrun probe first");
+        }
     }
 
     /// A5 step 2b: the first SIGCHLD taker is chosen by the mask its thread
@@ -54123,7 +55127,17 @@ mod test {
         fyi: &str,
         queued: bool,
     ) -> DetTid {
-        let target = DetTid::from_raw(100);
+        filed_sleep_on(scheduler, DetTid::from_raw(100), deadline, fyi, queued)
+    }
+
+    /// [`filed_sleep`] for thread `target`.
+    fn filed_sleep_on(
+        scheduler: &mut Scheduler,
+        target: DetTid,
+        deadline: LogicalTime,
+        fyi: &str,
+        queued: bool,
+    ) -> DetTid {
         register_known_thread(scheduler, target);
         let mut request = Resources::new(target);
         request.insert(ResourceID::SleepUntil(deadline), Permission::W);
@@ -55908,10 +56922,7 @@ mod test {
     }
 
     fn default_sleep_alarm_snapshot() -> crate::resources::InGuestSleepSigalrm {
-        crate::resources::InGuestSleepSigalrm {
-            disposition: crate::resources::SigalrmSleepDisposition::Default,
-            blocked: false,
-        }
+        crate::resources::InGuestSleepSigalrm::from_actions(0, 0, 0)
     }
 
     /// An in-guest SIGALRM sleep is recognized from the backend's
@@ -56150,20 +57161,12 @@ mod test {
     #[test]
     fn in_guest_ignored_and_blocked_alarm_preserve_filed_or_parked_sleep() {
         use crate::resources::InGuestSleepSigalrm;
-        use crate::resources::SigalrmSleepDisposition;
+        let alarm = kernel_signal_bit(libc::SIGALRM);
         for snapshot in [
-            InGuestSleepSigalrm {
-                disposition: SigalrmSleepDisposition::Ignored,
-                blocked: false,
-            },
-            InGuestSleepSigalrm {
-                disposition: SigalrmSleepDisposition::Default,
-                blocked: true,
-            },
-            InGuestSleepSigalrm {
-                disposition: SigalrmSleepDisposition::Handled,
-                blocked: true,
-            },
+            // Ignored, default and blocked, caught and blocked.
+            InGuestSleepSigalrm::from_actions(0, alarm, 0),
+            InGuestSleepSigalrm::from_actions(alarm, 0, 0),
+            InGuestSleepSigalrm::from_actions(alarm, 0, alarm),
         ] {
             for (deadline, fyi) in [
                 (LogicalTime::INDEFINITE, PAUSE_FYI),
@@ -56200,6 +57203,213 @@ mod test {
                 }
             }
         }
+    }
+
+    /// A scheduler send of a signal other than SIGALRM to an in-guest sleep
+    /// (a child's exit SIGCHLD, a POSIX timer's signal) wakes it only as
+    /// Linux's would: caught and unblocked. Blocked, it stays pending; with
+    /// its action `SIG_IGN`, or `SIG_DFL` for a default-ignored signal, Linux
+    /// discards it as it is sent. Before, this backend, which does not
+    /// classify its sends, woke every such sleep, and the woken sleep, which
+    /// cannot read the guest's state, returned EINTR: a `pause` returned at a
+    /// child's exit with its SIGCHLD at `SIG_DFL`
+    /// (https://github.com/rrnewton/hermit/issues/5338). The snapshots are
+    /// those the owner turn builds from the actions and mask it reads; an
+    /// unrelated signal's action changes nothing. SIGUSR1, whose default
+    /// action ends the process, is woken for at its default action as
+    /// before: that path is not this change's.
+    #[test]
+    fn in_guest_sleep_wakes_only_for_a_caught_unblocked_scheduler_signal() {
+        use crate::resources::InGuestSleepSigalrm;
+        for (signal, default_ignored) in [
+            (Signal::SIGCHLD, true),
+            (Signal::SIGURG, true),
+            (Signal::SIGUSR1, false),
+        ] {
+            let bit = kernel_signal_bit(signal as i32);
+            let other = kernel_signal_bit(libc::SIGWINCH) | kernel_signal_bit(libc::SIGUSR2);
+            for (label, snapshot, wakes) in [
+                (
+                    "default",
+                    InGuestSleepSigalrm::from_actions(0, 0, 0),
+                    !default_ignored,
+                ),
+                (
+                    "ignored",
+                    InGuestSleepSigalrm::from_actions(0, bit, 0),
+                    false,
+                ),
+                (
+                    "default, blocked",
+                    InGuestSleepSigalrm::from_actions(bit, 0, 0),
+                    false,
+                ),
+                (
+                    "caught, blocked",
+                    InGuestSleepSigalrm::from_actions(bit, 0, bit),
+                    false,
+                ),
+                (
+                    "default, others caught",
+                    InGuestSleepSigalrm::from_actions(0, 0, other),
+                    !default_ignored,
+                ),
+                ("caught", InGuestSleepSigalrm::from_actions(0, 0, bit), true),
+                (
+                    "caught, others ignored and blocked",
+                    InGuestSleepSigalrm::from_actions(other, other, bit),
+                    true,
+                ),
+            ] {
+                assert_eq!(
+                    snapshot.send_leaves_asleep(signal as i32),
+                    !wakes,
+                    "{signal} {label}"
+                );
+                for (deadline, fyi) in [
+                    (LogicalTime::INDEFINITE, PAUSE_FYI),
+                    (LogicalTime::from_nanos(20), NANOSLEEP_FYI),
+                ] {
+                    let context = format!("{signal} {label} {fyi}");
+                    let (mut scheduler, target, _) =
+                        in_guest_alarm_sleep(deadline, fyi, snapshot, false);
+                    scheduler.wake_signaled_guest(target, signal);
+                    let request = scheduler.next_turns[&target]
+                        .req
+                        .try_read()
+                        .unwrap()
+                        .unwrap();
+                    if wakes {
+                        assert!(scheduler.run_queue.contains_tid(target), "{context}");
+                        assert_eq!(
+                            scheduler.blocked.timed_waiters.thread_deadline(target),
+                            None,
+                            "{context}"
+                        );
+                        assert!(
+                            request
+                                .resources
+                                .contains_key(&ResourceID::InboundSignal(signal.into())),
+                            "{context}"
+                        );
+                    } else {
+                        assert!(!scheduler.run_queue.contains_tid(target), "{context}");
+                        assert_eq!(
+                            scheduler.blocked.timed_waiters.thread_deadline(target),
+                            Some(deadline),
+                            "{context}"
+                        );
+                        assert_eq!(
+                            request.in_guest_sigalrm_sleep(),
+                            Some((snapshot, deadline)),
+                            "{context}"
+                        );
+                        assert!(!scheduler.blocked.woken_sleeps.contains(&target));
+                    }
+                }
+                // A sleep still queued is left queued, its request unchanged.
+                if !wakes {
+                    let (mut scheduler, target, _) =
+                        in_guest_alarm_sleep(LogicalTime::INDEFINITE, PAUSE_FYI, snapshot, true);
+                    scheduler.wake_signaled_guest(target, signal);
+                    assert!(scheduler.run_queue.contains_tid(target));
+                    assert_eq!(
+                        scheduler.next_turns[&target]
+                            .req
+                            .try_read()
+                            .unwrap()
+                            .unwrap()
+                            .in_guest_sigalrm_sleep(),
+                        Some((snapshot, LogicalTime::INDEFINITE)),
+                        "{signal} {label} queued"
+                    );
+                }
+            }
+        }
+    }
+
+    /// On a backend that reads neither the guest's state nor a sleep
+    /// snapshot (DBT, SaBRe), a scheduler send still wakes a parked emulated
+    /// sleep, which then returns EINTR whether or not Linux would have
+    /// discarded or held the signal; the run records that as a named
+    /// determinism loss, once, so verification refuses to compare it
+    /// (https://github.com/rrnewton/hermit/issues/5338). An in-guest sleep
+    /// whose snapshot shows the signal caught wakes with no loss, and so does
+    /// a KVM sleep, whose process signal control's publication decides the
+    /// send's fate (`child_exit_sink`) before it reaches the same wake.
+    #[test]
+    fn a_sleep_woken_without_a_disposition_records_a_named_loss() {
+        const NAME: &str = "HERMIT_UNCLASSIFIED_SIGNAL_WAKE_WITHOUT_DISPOSITION";
+        let woken_for = |scheduler: &Scheduler, target: DetTid, signal: Signal| {
+            scheduler.run_queue.contains_tid(target)
+                && scheduler
+                    .blocked
+                    .timed_waiters
+                    .thread_deadline(target)
+                    .is_none()
+                && scheduler.next_turns[&target]
+                    .req
+                    .try_read()
+                    .unwrap()
+                    .unwrap()
+                    .resources
+                    .contains_key(&ResourceID::InboundSignal(signal.into()))
+        };
+        for backend in [BackendCapabilities::DBT, BackendCapabilities::SABRE] {
+            for (deadline, fyi) in [
+                (LogicalTime::INDEFINITE, PAUSE_FYI),
+                (LogicalTime::from_nanos(20), NANOSLEEP_FYI),
+            ] {
+                let config = Config {
+                    sequentialize_threads: true,
+                    ..Config::default()
+                }
+                .with_backend(|capabilities| *capabilities = backend);
+                let mut scheduler = Scheduler::new(&config);
+                assert!(!scheduler.models_signal_targets);
+                let target = filed_sleep(&mut scheduler, deadline, fyi, false);
+                scheduler.wake_signaled_guest(target, Signal::SIGCHLD);
+                assert!(woken_for(&scheduler, target, Signal::SIGCHLD), "{fyi}");
+                assert_eq!(scheduler.determinism_losses.len(), 1, "{fyi}");
+                assert!(
+                    scheduler.determinism_losses[0].starts_with(NAME),
+                    "{fyi}: {:?}",
+                    scheduler.determinism_losses
+                );
+                // Once per run: a second parked sleeper, another thread, is
+                // woken the same way and adds no second record.
+                let again =
+                    filed_sleep_on(&mut scheduler, DetTid::from_raw(101), deadline, fyi, false);
+                scheduler.wake_signaled_guest(again, Signal::SIGURG);
+                assert!(woken_for(&scheduler, again, Signal::SIGURG), "{fyi}");
+                assert_eq!(scheduler.determinism_losses.len(), 1, "{fyi}");
+            }
+        }
+        for (deadline, fyi) in [
+            (LogicalTime::INDEFINITE, PAUSE_FYI),
+            (LogicalTime::from_nanos(20), NANOSLEEP_FYI),
+        ] {
+            let control = Arc::new(signal_state_reader_tests::ScriptedControl::default());
+            let mut scheduler = signal_state_reader_tests::kvm_scheduler(&control, true);
+            let target = filed_sleep(&mut scheduler, deadline, fyi, false);
+            scheduler.wake_signaled_guest(target, Signal::SIGCHLD);
+            assert!(woken_for(&scheduler, target, Signal::SIGCHLD), "KVM {fyi}");
+            assert!(
+                scheduler.determinism_losses.is_empty(),
+                "KVM {fyi}: {:?}",
+                scheduler.determinism_losses
+            );
+        }
+        let caught = crate::resources::InGuestSleepSigalrm::from_actions(
+            0,
+            0,
+            kernel_signal_bit(libc::SIGCHLD),
+        );
+        let (mut scheduler, target, _) =
+            in_guest_alarm_sleep(LogicalTime::INDEFINITE, PAUSE_FYI, caught, false);
+        scheduler.wake_signaled_guest(target, Signal::SIGCHLD);
+        assert!(scheduler.run_queue.contains_tid(target));
+        assert!(scheduler.determinism_losses.is_empty());
     }
 
     #[test]
@@ -56485,10 +57695,11 @@ mod test {
 
     #[test]
     fn in_guest_handled_sleep_alarm_still_uses_existing_ledger() {
-        let snapshot = crate::resources::InGuestSleepSigalrm {
-            disposition: crate::resources::SigalrmSleepDisposition::Handled,
-            blocked: false,
-        };
+        let snapshot = crate::resources::InGuestSleepSigalrm::from_actions(
+            0,
+            0,
+            kernel_signal_bit(libc::SIGALRM),
+        );
         let (mut scheduler, target, _) =
             in_guest_alarm_sleep(LogicalTime::INDEFINITE, PAUSE_FYI, snapshot, false);
         scheduler.set_sigalrm_handled(target, true);

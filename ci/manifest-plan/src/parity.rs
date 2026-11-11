@@ -2395,6 +2395,11 @@ thread_local! {
     /// itself running, to test that a panic leaves a failed status and no
     /// records.
     static PANIC_INSIDE_POST_PASS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Makes the next post-pass on this thread wait this long after planning
+    /// and before it derives its deadline, standing in for the setup stall a
+    /// loaded host can cause, to test that an outer bound outlasts it.
+    static DELAY_BEFORE_COMPARISONS: std::cell::Cell<Duration> =
+        const { std::cell::Cell::new(Duration::ZERO) };
 }
 
 /// What one post-pass wrote.
@@ -3169,6 +3174,8 @@ fn measure(
 
     let log_diff_runs = AtomicUsize::new(0);
     if !comparisons.is_empty() || !run_comparisons.is_empty() {
+        #[cfg(test)]
+        thread::sleep(DELAY_BEFORE_COMPARISONS.with(|delay| delay.replace(Duration::ZERO)));
         let logdiff_dir = config.output_dir.join(PARITY_LOGDIFF_DIR);
         fs::create_dir_all(&logdiff_dir)
             .map_err(|error| format!("cannot create {}: {error}", logdiff_dir.display()))?;
@@ -8440,7 +8447,6 @@ mod tests {
 
     impl Fixture {
         fn new(label: &str) -> Self {
-            use std::os::unix::fs::PermissionsExt;
             let dir = std::env::temp_dir().join(format!(
                 "hermit-parity-post-pass-{}-{label}",
                 std::process::id()
@@ -8448,8 +8454,7 @@ mod tests {
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(dir.join("artifacts")).unwrap();
             let hermit = dir.join("hermit");
-            fs::write(&hermit, FAKE_LOG_DIFF).unwrap();
-            fs::set_permissions(&hermit, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::exec_safe_fs::write_executable(&hermit, FAKE_LOG_DIFF, 0o755).unwrap();
             Self { dir, hermit }
         }
 
@@ -10028,12 +10033,9 @@ mod tests {
         );
     }
 
-    /// A comparison no longer fits once an outer bound, such as the
-    /// enclosing dagrun step's, runs out: a slow log-diff is killed at that
-    /// bound, not at its own, and later comparisons never start.
-    #[test]
-    fn an_outer_deadline_stops_a_slow_comparison_and_the_ones_after_it() {
-        let fixture = Fixture::new("outer-deadline");
+    /// The rows and scope of the outer-deadline tests: a ptrace reference and
+    /// three candidates, so the first comparison can hang and two follow it.
+    fn outer_deadline_cells(fixture: &Fixture) -> (Vec<CellResult>, BTreeSet<ParityCellId>) {
         let rows = vec![
             fixture.row("fx/one", "ptrace", 1, "PASS", Some(REFERENCE)),
             fixture.row("fx/one", "kvm", 1, "PASS", Some(REFERENCE)),
@@ -10045,14 +10047,32 @@ mod tests {
             parity_cell("fx/one", ParityBackend::Liteinst),
             parity_cell("fx/one", ParityBackend::Sabre),
         ]);
+        (rows, scope)
+    }
+
+    /// Runs a post-pass whose first comparison hangs under an outer bound,
+    /// after `setup_delay` is planted between planning and the deadline, and
+    /// checks that the slow log-diff is killed at that bound, not at its own,
+    /// and that later comparisons never start.
+    ///
+    /// The bound is 3 s. Everything before the first comparison runs inside
+    /// it: 1.4 ms alone, and 13.6 to 121 ms in ten full loaded
+    /// `cargo test --lib` runs, where the earlier 400 ms bound ran out before
+    /// the first comparison 2 times in 30 (dh-1ppbr4). The hanging log-diff,
+    /// not the setup, is what uses the bound up.
+    fn outer_deadline_stops_the_comparisons(label: &str, setup_delay: Duration) -> Fixture {
+        let fixture = Fixture::new(label);
+        let (rows, scope) = outer_deadline_cells(&fixture);
         fixture.plant("hang");
         let mut config = fixture.config();
         assert_eq!(config.log_diff_timeout, PARITY_LOG_DIFF_TIMEOUT);
         assert_eq!(config.budget, PARITY_POST_PASS_BUDGET);
+        let outer_bound = Duration::from_secs(3);
         config.outer_deadline = Some(PostPassDeadline {
-            at: Instant::now() + Duration::from_millis(400),
+            at: Instant::now() + outer_bound,
             bound: "the planted step bound".into(),
         });
+        DELAY_BEFORE_COMPARISONS.with(|delay| delay.set(setup_delay));
         let started = Instant::now();
         let report = post_pass(&config, &scope, &rows).unwrap();
         let elapsed = started.elapsed();
@@ -10061,6 +10081,7 @@ mod tests {
             "the post-pass outlived its outer bound: {elapsed:?}"
         );
         assert_eq!(report.log_diff_runs, 1, "{:?}", report.records);
+        assert_eq!(fixture.log_diff_calls(), 1, "a later comparison started");
         let reasons = report
             .records
             .iter()
@@ -10074,9 +10095,22 @@ mod tests {
                 record.reason.clone().unwrap()
             })
             .collect::<Vec<_>>();
+        // The log-diff's own bound is what is left of the outer one, never
+        // its own 120 s, and it ran until that bound killed it.
+        let killed_at = reasons[0]
+            .strip_prefix("hermit log-diff exceeded its ")
+            .and_then(|rest| rest.split_once(" s bound and was killed"))
+            .and_then(|(seconds, _)| seconds.parse::<f64>().ok())
+            .unwrap_or_else(|| panic!("{reasons:?}"));
         assert!(
-            reasons[0].contains("hermit log-diff exceeded its 0.") && reasons[0].contains("killed"),
+            killed_at > 0.0 && killed_at <= outer_bound.as_secs_f64(),
             "{reasons:?}"
+        );
+        assert!(killed_at < PARITY_LOG_DIFF_TIMEOUT.as_secs_f64());
+        // The reason rounds to 0.1 s.
+        assert!(
+            elapsed.as_secs_f64() >= killed_at - 0.05,
+            "killed before its bound: {elapsed:?} against {killed_at} s"
         );
         for reason in &reasons[1..] {
             assert_eq!(
@@ -10084,6 +10118,16 @@ mod tests {
                 "the planted step bound ran out before this comparison started"
             );
         }
+        fixture
+    }
+
+    /// A comparison no longer fits once an outer bound, such as the
+    /// enclosing dagrun step's, runs out: a slow log-diff is killed at that
+    /// bound, not at its own, and later comparisons never start.
+    #[test]
+    fn an_outer_deadline_stops_a_slow_comparison_and_the_ones_after_it() {
+        let fixture = outer_deadline_stops_the_comparisons("outer-deadline", Duration::ZERO);
+        let (rows, scope) = outer_deadline_cells(&fixture);
         // The nearer of the budget and the outer bound is the one kept.
         fixture.plant("");
         let mut config = fixture.config();
@@ -10101,6 +10145,16 @@ mod tests {
                 .unwrap()
                 .contains("budget of 0 s ran out")
         }));
+    }
+
+    /// Everything a post-pass does before its first comparison (clearing
+    /// outputs, writing the status and golden, spawning the comparison
+    /// thread) runs inside the outer bound. A stall there, which a loaded
+    /// host causes, must not use the bound up before the slow comparison
+    /// starts (dh-1ppbr4).
+    #[test]
+    fn an_outer_deadline_outlasts_a_stalled_setup() {
+        outer_deadline_stops_the_comparisons("outer-deadline-stall", Duration::from_secs(1));
     }
 
     fn status(config: &PostPassConfig) -> PostPassStatus {

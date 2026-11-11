@@ -161,11 +161,13 @@ const _: () = assert!(TAG_BITS + 2 * PID_BITS + 2 * INCARNATION_BITS == 64);
 /// with index 0) is every fdinfo's ([`fdinfo_inode`]). A tag of 1 or more
 /// puts a per-process number at 2^60 or above, out of the range of a
 /// system-wide rendered file's number (below 2^32) and of every number
-/// Detcore's inode pool mints (counting up from a few thousand). The
-/// fifteenth file, `environ` (package K item 2b slice 2b-3), takes the one
-/// tag left, 0: its number is its task's fields alone, at 2^38 or above (a
-/// task's pid is at least 1), out of both ranges too, and below every other
-/// per-process number.
+/// Detcore's inode pool mints (counting up from a few thousand). A
+/// fifteenth file would take the one tag left, 0: its number would be its
+/// task's fields alone, at 2^38 or above (a task's pid is at least 1), out
+/// of both ranges too, and below every other per-process number.
+/// (`environ` (package K item 2b slice 2b-3) was that fifteenth file
+/// until the no-NUMA policy removed `numa_maps`; it is the fourteenth
+/// now and takes tag 7.)
 fn per_process_tag(index: usize) -> u64 {
     const SECOND_LAYOUT_FILES: usize = 7;
     if index < FIRST_LAYOUT_FILES {
@@ -683,6 +685,70 @@ fn procfs_mounts_in(mountinfo: &[u8], device: u64, guest_root: &Path) -> Vec<Pro
         .collect()
 }
 
+/// The path within its procfs mount of the object at `canonical`, reached
+/// through the mount `mount_id` of the device `device`, as one `mountinfo`
+/// table names them: the table's one row for that mount, whose device and
+/// `proc` file system type must agree, gives the mount's root within
+/// procfs and its mount point, and the object's path below the mount point
+/// is carried below the root, as in [`path_within`]. `None` where the
+/// table has no such row or `canonical` is not at or below the row's mount
+/// point. Every name here is in the guest's view, which is the view a
+/// recorded descriptor link and a recorded mount table share, so a caller
+/// under record and replay, which can read neither the guest's own table
+/// through a task view of its own nor a live mount root, still names the
+/// object by its recording alone.
+pub(crate) fn mount_internal_path(
+    canonical: &Path,
+    mount_id: u64,
+    device: u64,
+    mountinfo: &[u8],
+) -> Option<PathBuf> {
+    let canonical = canonical.as_os_str().as_bytes();
+    if !canonical.starts_with(b"/") {
+        return None;
+    }
+    let wanted_device = format!("{}:{}", libc::major(device), libc::minor(device));
+    let line = mountinfo.split(|byte| *byte == b'\n').find(|line| {
+        line.split(|byte| *byte == b' ')
+            .next()
+            .and_then(|id| std::str::from_utf8(id).ok())
+            .and_then(|id| id.parse::<u64>().ok())
+            == Some(mount_id)
+    })?;
+    let fields: Vec<&[u8]> = line.split(|byte| *byte == b' ').collect();
+    if fields.get(2).copied() != Some(wanted_device.as_bytes()) {
+        return None;
+    }
+    let separator = 6 + fields.get(6..)?.iter().position(|field| *field == b"-")?;
+    if fields.get(separator + 1).copied() != Some(b"proc".as_slice()) {
+        return None;
+    }
+    let root = unescape(fields.get(3).copied()?);
+    let point = unescape(fields.get(4).copied()?);
+    if !root.as_os_str().as_bytes().starts_with(b"/")
+        || !point.as_os_str().as_bytes().starts_with(b"/")
+    {
+        return None;
+    }
+    let root = root.as_os_str().as_bytes();
+    let point = point.as_os_str().as_bytes();
+    let suffix = if point == b"/" {
+        canonical
+    } else {
+        let suffix = canonical.strip_prefix(point)?;
+        if !suffix.is_empty() && !suffix.starts_with(b"/") {
+            return None;
+        }
+        suffix
+    };
+    let mut internal = root.to_vec();
+    if internal.ends_with(b"/") && suffix.starts_with(b"/") {
+        internal.pop();
+    }
+    internal.extend_from_slice(suffix);
+    Some(PathBuf::from(OsString::from_vec(internal)))
+}
+
 /// A `mountinfo` path with its octal escapes (`\040` for a space) decoded.
 fn unescape(field: &[u8]) -> PathBuf {
     let mut path = Vec::with_capacity(field.len());
@@ -1152,6 +1218,43 @@ mod tests {
 
     use super::*;
 
+    /// A recorded mount table names a bind-mounted task directory by its
+    /// root within procfs: the bind's own row, matched by mount ID and
+    /// device, carries a task opened at the bind or below it to its
+    /// procfs-internal path, while another mount's ID, another device, a
+    /// non-proc row and a merely prefixed path name nothing.
+    #[test]
+    fn a_mount_internal_path_follows_the_mounts_root() {
+        let device = libc::makedev(0, 23);
+        let mountinfo = b"26 25 0:23 / /proc rw - proc proc rw\n\
+            42 26 0:23 /1 /ordinary/task\\040bind rw - proc proc rw\n\
+            43 26 0:23 /sys /ordinary/sys-bind rw - proc proc rw\n"
+            .as_slice();
+        let at = |path: &str, id, dev| mount_internal_path(Path::new(path), id, dev, mountinfo);
+        assert_eq!(
+            at("/ordinary/task bind", 42, device),
+            Some(PathBuf::from("/1"))
+        );
+        assert_eq!(
+            at("/ordinary/task bind/fd", 42, device),
+            Some(PathBuf::from("/1/fd"))
+        );
+        assert_eq!(
+            at("/proc/self/stat", 26, device),
+            Some(PathBuf::from("/self/stat"))
+        );
+        assert_eq!(at("/ordinary/task bind", 26, device), None);
+        assert_eq!(at("/ordinary/task bind", 42, libc::makedev(0, 24)), None);
+        assert_eq!(at("/ordinary/task bind", 99, device), None);
+        assert_eq!(at("/ordinary/task binder", 42, device), None);
+        assert_eq!(at("ordinary/task bind", 42, device), None);
+        let not_proc = b"42 26 0:23 /1 /ordinary/task\\040bind rw - tmpfs tmpfs rw\n".as_slice();
+        assert_eq!(
+            mount_internal_path(Path::new("/ordinary/task bind"), 42, device, not_proc),
+            None
+        );
+    }
+
     /// A rendered fdinfo's inode number (package K slice K8-h) is a
     /// per-process file's (bit 63) whose file index is 0, which no other
     /// per-process file takes, so it is no other file's number; two fdinfo
@@ -1214,17 +1317,17 @@ mod tests {
 
     /// The first seven per-process files keep the numbers they had when the
     /// field above the pid was bit 63 and a 3-bit index from 1 (tags 9 to
-    /// 15); the next seven take tags 1 to 7 below them, and `environ` the
-    /// last tag, 0, below fdinfo's 8; and every file of one task has a number
-    /// of its own, at 2^38 or above, and at 2^60 or above for all but
-    /// `environ`.
+    /// 15); the next seven take tags 1 to 7 below them, below fdinfo's 8;
+    /// and every file of one task has a number of its own, at 2^60 or above.
+    /// (`environ` took tag 0 as the fifteenth file until the no-NUMA policy
+    /// removed `numa_maps` ahead of it.)
     #[test]
     fn per_process_files_take_tags_that_keep_the_first_seven_numbers() {
         assert_eq!(
             (0..crate::procfs::ProcfsFile::PER_PROCESS_NAMES.len())
                 .map(per_process_tag)
                 .collect::<Vec<_>>(),
-            [9, 10, 11, 12, 13, 14, 15, 1, 2, 3, 4, 5, 6, 7, 0]
+            [9, 10, 11, 12, 13, 14, 15, 1, 2, 3, 4, 5, 6, 7]
         );
         let task = 3 << (PID_BITS + 2 * INCARNATION_BITS) | 1 << INCARNATION_BITS;
         let inode = |name: &str| {
@@ -1247,9 +1350,10 @@ mod tests {
         assert_eq!(inode("arch_status"), 3 << 60 | task);
         assert_eq!(inode("smaps"), 4 << 60 | task);
         assert_eq!(inode("smaps_rollup"), 5 << 60 | task);
-        assert_eq!(inode("numa_maps"), 6 << 60 | task);
-        assert_eq!(inode("status"), 7 << 60 | task);
-        assert_eq!(inode("environ"), task);
+        // `numa_maps` held tag 6 until the no-NUMA policy removed the file;
+        // the names after it take the next tags in order.
+        assert_eq!(inode("status"), 6 << 60 | task);
+        assert_eq!(inode("environ"), 7 << 60 | task);
         let numbers = crate::procfs::ProcfsFile::PER_PROCESS_NAMES
             .iter()
             .map(|name| inode(name))

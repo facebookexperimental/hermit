@@ -984,6 +984,8 @@ fn syscall_clears_pending(syscall: Syscall, fd: libc::c_int) -> bool {
     // the dup handlers once the recorded dup is known to have
     // succeeded, so a shell's open-then-dup-to-9 shape reaches its
     // flock with the pending open still attached to descriptor 9.
+    // x86_64 only: aarch64 has no dup2 (dup3 below serves it).
+    #[cfg(target_arch = "x86_64")]
     if let Syscall::Dup2(call) = syscall {
         return call.newfd() == fd && call.oldfd() != call.newfd();
     }
@@ -1031,13 +1033,11 @@ fn syscall_clears_pending(syscall: Syscall, fd: libc::c_int) -> bool {
         | Sysno::fsync
         | Sysno::fdatasync
         | Sysno::readahead
-        | Sysno::sync_file_range
         | Sysno::fallocate
         | Sysno::fadvise64
         | Sysno::fstat
         | Sysno::fstatfs
         | Sysno::ioctl
-        | Sysno::getdents
         | Sysno::getdents64
         | Sysno::fchmod
         | Sysno::fchown
@@ -1045,7 +1045,6 @@ fn syscall_clears_pending(syscall: Syscall, fd: libc::c_int) -> bool {
         | Sysno::fsetxattr
         | Sysno::fremovexattr
         | Sysno::syncfs
-        | Sysno::epoll_wait
         | Sysno::epoll_pwait
         | Sysno::epoll_pwait2
         | Sysno::accept
@@ -1063,7 +1062,6 @@ fn syscall_clears_pending(syscall: Syscall, fd: libc::c_int) -> bool {
         | Sysno::vmsplice
         | Sysno::inotify_add_watch
         | Sysno::inotify_rm_watch
-        | Sysno::signalfd
         | Sysno::signalfd4
         | Sysno::timerfd_settime
         | Sysno::timerfd_gettime
@@ -1076,16 +1074,26 @@ fn syscall_clears_pending(syscall: Syscall, fd: libc::c_int) -> bool {
         | Sysno::fchownat
         | Sysno::fchmodat
         | Sysno::fchmodat2
-        | Sysno::newfstatat
         | Sysno::readlinkat
         | Sysno::faccessat
         | Sysno::faccessat2
-        | Sysno::futimesat
         | Sysno::utimensat
         | Sysno::execveat
         | Sysno::statx
         | Sysno::name_to_handle_at
         | Sysno::open_by_handle_at => arg(args.arg0),
+        // x86_64 only: aarch64 lacks these numbers entirely.
+        #[cfg(target_arch = "x86_64")]
+        Sysno::sync_file_range | Sysno::getdents | Sysno::epoll_wait | Sysno::signalfd => {
+            arg(args.arg0)
+        }
+        // aarch64 number 84 is sys_sync_file_range (descriptor in arg0).
+        #[cfg(target_arch = "aarch64")]
+        Sysno::sync_file_range2 => arg(args.arg0),
+        #[cfg(target_arch = "x86_64")]
+        Sysno::newfstatat | Sysno::futimesat => arg(args.arg0),
+        #[cfg(target_arch = "aarch64")]
+        Sysno::fstatat => arg(args.arg0),
         // Two descriptor arguments.
         Sysno::sendfile => arg(args.arg0) || arg(args.arg1),
         Sysno::splice | Sysno::copy_file_range => arg(args.arg0) || arg(args.arg2),
@@ -1099,9 +1107,7 @@ fn syscall_clears_pending(syscall: Syscall, fd: libc::c_int) -> bool {
         Sysno::kcmp => arg(args.arg3) || arg(args.arg4),
         // Descriptor lists or ancillary data in guest memory, or a ring
         // whose entries name descriptors: undecodable here, always clear.
-        Sysno::poll
-        | Sysno::ppoll
-        | Sysno::select
+        Sysno::ppoll
         | Sysno::pselect6
         | Sysno::io_uring_enter
         | Sysno::io_uring_register
@@ -1111,6 +1117,9 @@ fn syscall_clears_pending(syscall: Syscall, fd: libc::c_int) -> bool {
         | Sysno::sendmmsg
         | Sysno::recvmmsg
         | Sysno::bpf => true,
+        // x86_64 only: aarch64 has ppoll/pselect6 alone.
+        #[cfg(target_arch = "x86_64")]
+        Sysno::poll | Sysno::select => true,
         // Proven to take no descriptor argument: identity/time/signal/
         // memory bookkeeping, process lifecycle (a fork and exec between
         // the open and the flock is the shell-to-helper shape; the
@@ -1125,7 +1134,6 @@ fn syscall_clears_pending(syscall: Syscall, fd: libc::c_int) -> bool {
         | Sysno::geteuid
         | Sysno::getgid
         | Sysno::getegid
-        | Sysno::getpgrp
         | Sysno::getsid
         | Sysno::getpgid
         | Sysno::setpgid
@@ -1146,7 +1154,6 @@ fn syscall_clears_pending(syscall: Syscall, fd: libc::c_int) -> bool {
         | Sysno::clock_settime
         | Sysno::gettimeofday
         | Sysno::settimeofday
-        | Sysno::time
         | Sysno::sysinfo
         | Sysno::uname
         | Sysno::getrandom
@@ -1162,7 +1169,6 @@ fn syscall_clears_pending(syscall: Syscall, fd: libc::c_int) -> bool {
         | Sysno::mlockall
         | Sysno::munlock
         | Sysno::munlockall
-        | Sysno::arch_prctl
         | Sysno::set_tid_address
         | Sysno::set_robust_list
         | Sysno::get_robust_list
@@ -1177,7 +1183,6 @@ fn syscall_clears_pending(syscall: Syscall, fd: libc::c_int) -> bool {
         | Sysno::rt_sigsuspend
         | Sysno::rt_sigtimedwait
         | Sysno::sigaltstack
-        | Sysno::pause
         | Sysno::sched_yield
         | Sysno::sched_getaffinity
         | Sysno::sched_setaffinity
@@ -1194,8 +1199,6 @@ fn syscall_clears_pending(syscall: Syscall, fd: libc::c_int) -> bool {
         | Sysno::prlimit64
         | Sysno::getrusage
         | Sysno::membarrier
-        | Sysno::fork
-        | Sysno::vfork
         | Sysno::clone
         | Sysno::clone3
         | Sysno::execve
@@ -1209,26 +1212,8 @@ fn syscall_clears_pending(syscall: Syscall, fd: libc::c_int) -> bool {
         | Sysno::getcwd
         | Sysno::chdir
         | Sysno::umask
-        | Sysno::open
-        | Sysno::creat
-        | Sysno::stat
-        | Sysno::lstat
         | Sysno::statfs
-        | Sysno::access
-        | Sysno::readlink
-        | Sysno::mkdir
-        | Sysno::rmdir
-        | Sysno::unlink
-        | Sysno::rename
-        | Sysno::link
-        | Sysno::symlink
         | Sysno::truncate
-        | Sysno::chmod
-        | Sysno::chown
-        | Sysno::lchown
-        | Sysno::mknod
-        | Sysno::utime
-        | Sysno::utimes
         | Sysno::setxattr
         | Sysno::lsetxattr
         | Sysno::getxattr
@@ -1240,19 +1225,46 @@ fn syscall_clears_pending(syscall: Syscall, fd: libc::c_int) -> bool {
         | Sysno::dup
         | Sysno::socket
         | Sysno::socketpair
-        | Sysno::pipe
         | Sysno::pipe2
-        | Sysno::eventfd
         | Sysno::eventfd2
-        | Sysno::epoll_create
         | Sysno::epoll_create1
         | Sysno::timerfd_create
-        | Sysno::inotify_init
         | Sysno::inotify_init1
         | Sysno::io_uring_setup
         | Sysno::memfd_create
         | Sysno::userfaultfd
         | Sysno::pidfd_open => false,
+        // x86_64 only: aarch64 lacks these numbers (its libc uses the
+        // *at / newer forms, which are classified above).
+        #[cfg(target_arch = "x86_64")]
+        Sysno::getpgrp
+        | Sysno::time
+        | Sysno::arch_prctl
+        | Sysno::pause
+        | Sysno::fork
+        | Sysno::vfork
+        | Sysno::open
+        | Sysno::creat
+        | Sysno::stat
+        | Sysno::lstat
+        | Sysno::access
+        | Sysno::readlink
+        | Sysno::mkdir
+        | Sysno::rmdir
+        | Sysno::unlink
+        | Sysno::rename
+        | Sysno::link
+        | Sysno::symlink
+        | Sysno::chmod
+        | Sysno::chown
+        | Sysno::lchown
+        | Sysno::mknod
+        | Sysno::utime
+        | Sysno::utimes
+        | Sysno::pipe
+        | Sysno::eventfd
+        | Sysno::epoll_create
+        | Sysno::inotify_init => false,
         // Anything unclassified: not proven descriptor-free.
         _ => true,
     }

@@ -40,7 +40,6 @@ use reverie::syscalls::family::SockOptFamily;
 use super::Recorder;
 use crate::event::AcceptEvent;
 use crate::event::EpollWaitEvent;
-#[cfg(target_arch = "x86_64")]
 use crate::event::InterruptedPoll;
 use crate::event::PollEvent;
 use crate::event::PpollEvent;
@@ -379,7 +378,6 @@ fn capture_pollfds<M: MemoryAccess>(
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 fn capture_poll_event<M: MemoryAccess>(
     memory: &M,
     fds_address: Option<AddrMut<'_, PollFd>>,

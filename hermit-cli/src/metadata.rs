@@ -993,7 +993,31 @@ impl RecordVersion {
 // identity is refused before the guest starts. An older recording would
 // place its events elsewhere; it is refused here.
 // https://github.com/rrnewton/hermit/pull/4668
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x19e);
+// 0x19e -> 0x19f (HIGHEST_SHIPPED+1 at this change's rebase onto main
+// shipping 0x19e; reserved in minibeads dh-gxmvo, renumbered from its
+// provisional 0x19e when that number landed first): Detcore presents a
+// kernel built without NUMA
+// (https://github.com/rrnewton/hermit/issues/5269). The six
+// memory-policy syscalls answer ENOSYS where they answered as a one-node
+// machine, /proc/<pid>/numa_maps does not exist at any --proc level
+// where the standard level listed it, and /sys/devices/system/node and
+// /sys/bus/node do not exist in run mode where their files read as one
+// node's. Replay answers each of these itself, so an older recording of
+// any of them would replay with different answers; it is refused here.
+// 0x19f -> 0x1a0 (HIGHEST_SHIPPED+1 on main aba0bda2, which ships 0x19f;
+// reserved in minibeads dh-gxmvo; land-time numbering applies): Detcore
+// delivers nothing for a signal copy Linux discarded at send, which the
+// kernel still queues for a traced guest (item 2 of
+// https://github.com/rrnewton/hermit/issues/3995), and it chooses the
+// thread that takes a kernel-sent signal by the mask that thread has in
+// force: the temporary mask of a ppoll, pselect6 or sigsuspend, or the
+// guest's own mask while Hermit blocks the call. Record and replay both
+// run these rules, and replay recomputes them, so a recording made
+// before, in which a later handler ran for such a copy or another thread
+// took such a signal, would replay with different output. It is refused
+// here.
+// https://github.com/rrnewton/hermit/pull/5259
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x1a0);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -1018,7 +1042,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x19e);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x19e;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x1a0;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1442,6 +1466,10 @@ fn record_or_replay_config_with_timer_support(
         cap_preemption_charge: false,
         // A `hermit run` option; record and replay take none.
         virtual_timeout: None,
+        // A chaos option of `hermit run`, like `pipe_wake_latency`: record
+        // mode's own scheduling, and recordings made before the option
+        // existed, wake every timed wait at its deadline.
+        chaos_timed_wait_spread: None,
         seed: default_config.seed,
         rng_seed: default_config.rng_seed,
         imprecise_timers: false,
@@ -2213,6 +2241,27 @@ mod tests {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x147)));
     }
 
+    /// A recording older than 0x19f was made when the memory-policy
+    /// syscalls answered as a one-node machine, the standard /proc level
+    /// listed numa_maps, and the sysfs node files read as one node's;
+    /// Detcore now presents a kernel without NUMA
+    /// (https://github.com/rrnewton/hermit/issues/5269).
+    #[test]
+    fn record_version_rejects_streams_from_before_the_no_numa_platform() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x19e)));
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+    }
+
+    /// A recording older than 0x1a0 was made when a later handler still ran
+    /// for a signal copy Linux discarded at send, and when the thread that
+    /// took a kernel-sent signal was chosen without the mask in force
+    /// (https://github.com/rrnewton/hermit/pull/5259).
+    #[test]
+    fn record_version_rejects_streams_from_before_discarded_copies_stay_undelivered() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x19f)));
+        assert!(RECORD_VERSION.compatible_with(&RECORD_VERSION));
+    }
+
     /// A recording older than 0x149 was made when /proc/cpuinfo showed the
     /// host's CPU while CPUID showed the virtual one
     /// (https://github.com/rrnewton/hermit/issues/4161).
@@ -2614,7 +2663,7 @@ mod tests {
     fn record_version_rejects_streams_from_before_the_corrected_rcb_event() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x19a)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x186)));
-        assert!(RECORD_VERSION.compatible_with(&RecordVersion(0x19e)));
+        assert!(RECORD_VERSION.compatible_with(&RecordVersion(0x1a0)));
     }
 
     #[test]

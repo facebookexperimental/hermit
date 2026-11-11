@@ -215,7 +215,7 @@ if [[ $verb != run ]]; then
     exit 2
 fi
 
-echo "run-dag.sh: lane=$lane selection-label=$selection_label runner=$runner verb=$verb cargo-jobs=$CARGO_BUILD_JOBS reverie-dbt-budget=portable-build-child-only" >&2
+echo "run-dag.sh: lane=$lane selection-label=$selection_label runner=$runner verb=$verb cargo-jobs=$CARGO_BUILD_JOBS" >&2
 if [[ $verb == run ]]; then
     export HERMIT_REAL_RUST_SCRIPT
     HERMIT_REAL_RUST_SCRIPT=$(command -v rust-script) || {

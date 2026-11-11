@@ -163,6 +163,12 @@ impl Scheduler {
         if self.signal_control_installed() {
             return None;
         }
+        self.filed_signal_sleep(dettid)
+    }
+
+    /// The sleep `dettid`'s filed request is, on any backend: an emulated
+    /// `pause` or `nanosleep`, or the gate's parked `rt_sigsuspend`.
+    pub(super) fn filed_signal_sleep(&self, dettid: DetTid) -> Option<SignalSleep> {
         let resources = self.next_turns.get(&dettid)?.req.try_read()?.ok()?;
         if resources.resources.len() != 1 {
             return None;

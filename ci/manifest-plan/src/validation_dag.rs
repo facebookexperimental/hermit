@@ -106,7 +106,7 @@ const PINNED_NATIVE_EXEC_COMPILE_DESC: &str = "Build the native-exec cohort's he
 const PINNED_NATIVE_EXEC_COMPILE_DESCRIPTION: &str = "The Cargo half of the native-exec cohort producer (dh-10l17): builds exactly the cohort selection, -p hermit-run --features liteinst,kvm-native-test-support,native-exec --lib --bins, in the [profile.validate] profile into the cohort target directory (target/cohort-native-exec, from the cohort declaration in nextest_binaries), then the dev-profile nextest-cpu-wrapper the prepare half records. Nothing in it runs a rust-script, so it starts beside build.rust_scripts_in_pinned_root like the workspace compile; it keeps the rust-script environment so a rust-script added here later fails at once. Its only completion consumer is build.hermit_native_exec_in_pinned_root. Why split: measured 2026-11-08 at hermit d9ac2c5e on the development host in a cgroup box at 32 jobs, the unsplit cold build+list took 471.535 s wall and 3055.371 CPU-s (1.5x wall 707 s, above the 600 s bound, and no ceiling exception was taken); this compile half cold took 298.979 s wall and 2502.180 CPU-s, plus 48.837 s and 162.345 CPU-s for the wrapper, so 4200 CPU-s is the next 300-second bucket above 1.5 times their sum (3996) and the 600-second wall covers 1.5 times their summed wall (522). Memory: the cold cohort build peaked at 14631858176 bytes of cgroup memory.peak in the same measurements, so rss_baseline is 14 GiB and the hard cap 18 GiB. preferred_inner_jobs=32 is the measured width.";
 const PINNED_NATIVE_EXEC_PREPARE_DESC: &str =
     "List the native-exec cohort's prepared executables and publish and assert its record";
-const PINNED_NATIVE_EXEC_PREPARE_DESCRIPTION: &str = "The preparation half of the native-exec cohort producer (dh-10l17). Once build.hermit_native_exec_compile_in_pinned_root has built the cohort selection and build.rust_scripts_in_pinned_root has published the tools, nextest-binaries.rs prepare full --cohort native-exec lists the test harnesses from that build in the cohort target directory, hashes them, and publishes the one selection at target/ci/nextest-binaries/cohorts/native-exec.json under its own lock; the immediately following assert full --cohort native-exec verifies the published record, so the consumer's ancestry contains the cohort check by construction. It deliberately does not run stage-detcore-liteinst: the assumption, tested by the targeted pinned run in dh-10l17, is that the 81 native-exec cases need the LiteInst runtime only at link time through the embedded native bundle, not the staged artifact. Measured 2026-11-08 at hermit d9ac2c5e on the development host in a cgroup box at 32 jobs: the listing half on the compile node's warm artifacts took 238.299 s wall and 882.438 CPU-s; 1800 CPU-s is the next 300-second bucket above 1.5 times that listing plus prepare's hashing and publication overhead, to be re-derived from this node's first targeted pinned receipt. The 600-second wall covers 1.5 times the measured wall. Memory keeps the compile half's 14-GiB baseline and 18-GiB hard cap from the same cold measurements.";
+const PINNED_NATIVE_EXEC_PREPARE_DESCRIPTION: &str = "The preparation half of the native-exec cohort producer (dh-10l17). Once build.hermit_native_exec_compile_in_pinned_root has built the cohort selection and build.rust_scripts_in_pinned_root has published the tools, nextest-binaries.rs prepare full --build-mode cargo --cohort native-exec lists the test harnesses from that build in the cohort target directory, hashes them, and publishes the one selection at target/ci/nextest-binaries/cohorts/native-exec.json under its own lock; the immediately following assert full --cohort native-exec verifies the published record, so the consumer's ancestry contains the cohort check by construction. The cohort is pinned to cargo build mode by name (it has no Buck harvest twins), so a --build-mode buck run is mixed-mode: this record stays cargo-stamped and its consumers resolve the pin instead of the run mode. It deliberately does not run stage-detcore-liteinst: the assumption, tested by the targeted pinned run in dh-10l17, is that the 81 native-exec cases need the LiteInst runtime only at link time through the embedded native bundle, not the staged artifact. Measured 2026-11-08 at hermit d9ac2c5e on the development host in a cgroup box at 32 jobs: the listing half on the compile node's warm artifacts took 238.299 s wall and 882.438 CPU-s; 1800 CPU-s is the next 300-second bucket above 1.5 times that listing plus prepare's hashing and publication overhead, to be re-derived from this node's first targeted pinned receipt. The 600-second wall covers 1.5 times the measured wall. Memory keeps the compile half's 14-GiB baseline and 18-GiB hard cap from the same cold measurements.";
 pub const PINNED_E2E_ARTIFACT_TAG: &str = "build.e2e_artifact_in_pinned_root";
 pub const HERMIT_BIN_ARTIFACT: &str = "hermit-bin";
 const HERMIT_BIN_SIGNAL_SUFFIX: &str = " --message-format json-render-diagnostics > >(python3 ./ci/cargo-artifact-ready.py hermit-bin)";
@@ -5912,26 +5912,23 @@ mod tests {
 
     #[test]
     fn pin_gate_uses_proxy_only_when_the_runner_provides_it() {
-        use std::os::unix::fs::PermissionsExt;
-
         let scratch = Scratch::create().unwrap();
         let root = scratch.0.join("pin checkout with 'quotes'");
         let bin = root.join("ci/rust-script-bin");
         fs::create_dir_all(&bin).unwrap();
         let checker = root.join("ci/run-reverie-pin-check.sh");
-        fs::write(
+        crate::exec_safe_fs::write_executable(
             &checker,
             "#!/bin/bash\nprintf 'checker\\0' >>\"$CAPTURE\"\nprintf '%s\\0' \"$@\" >>\"$CAPTURE\"\nexit \"$CHECKER_STATUS\"\n",
+            0o755,
         )
         .unwrap();
-        fs::set_permissions(&checker, fs::Permissions::from_mode(0o755)).unwrap();
         let capture = root.join("capture");
         let floor = "0123456789abcdef0123456789abcdef01234567";
         for proxied in [false, true] {
             if proxied {
                 let proxy = bin.join("with-proxy");
-                fs::write(&proxy, "#!/bin/bash\nprintf 'proxy\\0' >>\"$CAPTURE\"\nprintf '%s\\0' \"$@\" >>\"$CAPTURE\"\nexec \"$@\"\n").unwrap();
-                fs::set_permissions(proxy, fs::Permissions::from_mode(0o755)).unwrap();
+                crate::exec_safe_fs::write_executable(&proxy, "#!/bin/bash\nprintf 'proxy\\0' >>\"$CAPTURE\"\nprintf '%s\\0' \"$@\" >>\"$CAPTURE\"\nexec \"$@\"\n", 0o755).unwrap();
             }
             for tag in ["pre.reverie_pin", "pre.reverie_pin_on_host"] {
                 for admitted_floor in [None, Some(floor)] {
@@ -5978,8 +5975,6 @@ mod tests {
 
     #[test]
     fn rust_script_producer_prepares_tracked_dagrun_before_cargo_with_admitted_width() {
-        use std::os::unix::fs::PermissionsExt;
-
         use dagrun::model::command_with_inner_jobs;
         use dagrun::model::env_with_inner_jobs;
 
@@ -5996,20 +5991,19 @@ mod tests {
                     fs::create_dir_all(root.join("agent-utils/rs/bin")).unwrap();
                     fs::create_dir_all(root.join("ci")).unwrap();
                     let launcher = root.join("agent-utils/rs/bin/dagrun");
-                    fs::write(
+                    crate::exec_safe_fs::write_executable(
                         &launcher,
                         "#!/bin/bash\nprintf 'runner:%s:%s:%s\\n' \"${AGENT_UTILS_RS_ENSURE_ONLY:-}\" \"${CARGO_BUILD_JOBS:-}\" \"$#\" >> \"$CAPTURE\"\nexit \"$PREPARE_STATUS\"\n",
+                        0o755,
                     )
                     .unwrap();
                     let producer = root.join("ci/prepare-rust-scripts.sh");
-                    fs::write(
+                    crate::exec_safe_fs::write_executable(
                         &producer,
                         "#!/bin/bash\nprintf 'producer:%s:%s\\n' \"${CARGO_BUILD_JOBS:-}\" \"$#\" >> \"$CAPTURE\"\nexit \"$PRODUCER_STATUS\"\n",
+                        0o755,
                     )
                     .unwrap();
-                    for path in [&launcher, &producer] {
-                        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-                    }
                     let capture = root.join("capture");
                     let mut command = Command::new("timeout");
                     command
@@ -6057,12 +6051,12 @@ mod tests {
                     let root = &scratch.0;
                     fs::create_dir_all(root.join("tools")).unwrap();
                     let cargo = root.join("tools/cargo");
-                    fs::write(
+                    crate::exec_safe_fs::write_executable(
                         &cargo,
                         "#!/bin/bash\nprintf 'cargo:%s\\n' \"${CARGO_BUILD_JOBS:-}\" >> \"$CAPTURE\"\nprintf '<%s>\\n' \"$@\" >> \"$CAPTURE\"\nexit \"$CARGO_STATUS\"\n",
+                        0o755,
                     )
                     .unwrap();
-                    fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
                     let capture = root.join("capture");
                     let mut command = Command::new("timeout");
                     command
@@ -6109,16 +6103,13 @@ mod tests {
     // argv, reconstructs only its declared environment, and maps exactly the two
     // fixed image assertion paths to inert files before executing the guard.
     fn renderer_wrapper_capture(step: &Step, width: i64, wrapped: bool) -> serde_json::Value {
-        use std::os::unix::fs::PermissionsExt;
-
         use dagrun::model::command_with_inner_jobs;
         use dagrun::model::env_with_inner_jobs;
 
         let scratch = Scratch::create().unwrap();
         let root = &scratch.0;
         let write_executable = |path: &Path, text: &[u8]| {
-            fs::write(path, text).unwrap();
-            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+            crate::exec_safe_fs::write_executable(path, text, 0o755).unwrap();
         };
         fs::create_dir_all(root.join("ci/hermetic")).unwrap();
         fs::create_dir_all(root.join("tools")).unwrap();
@@ -9508,7 +9499,7 @@ sys.exit(37)
             step.timeout = crate::validation_dag_static::WORKSPACE_WALL_SECONDS
         });
         assert!(
-            hosted_wall.contains("not the hosted 2100s"),
+            hosted_wall.contains("not the hosted 3300s"),
             "{hosted_wall}"
         );
         let hosted_cpu = mutated("build.workspace_on_host", &|step| step.cpu_timeout += 1);

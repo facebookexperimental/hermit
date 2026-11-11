@@ -2030,48 +2030,42 @@ fn ptrace_futex_wait_is_ended_by_a_signal_caught_after_it_parked() {
 /// parked, from a child that then dies by `exit_group` (`chldlate`), by SIGKILL
 /// (`chldkill`), or by its only thread calling `exit` (`chldthrexit`).
 ///
-/// In precise mode, for every death the scheduler commits the SIGCHLD to the
-/// parked waiter through its child-exit timer, and the wake ends the wait
-/// with EINTR near the child's death, timed or not, as on Linux
+/// In both futex modes, for every death the SIGCHLD ends the wait with EINTR
+/// near the child's death, timed or not, as on Linux
 /// (https://github.com/rrnewton/hermit/issues/4005): for a child that calls
 /// `exit_group`; one that a sibling SIGKILLs (the kill commits its CLD_KILLED
 /// notification, https://github.com/rrnewton/hermit/issues/3994); and one
 /// whose only thread calls `exit`, which ends the process as `exit_group`
 /// does and has registered the timer since
-/// https://github.com/rrnewton/hermit/issues/3895. Natively all three end the
-/// wait with EINTR at 100-101 ms (measured 2026-10-13). Round 9 of
-/// https://github.com/rrnewton/hermit/pull/3361 had made it hold the SIGCHLD.
+/// https://github.com/rrnewton/hermit/issues/3895. In precise mode the
+/// scheduler commits the SIGCHLD to the parked waiter through its child-exit
+/// timer. Round 9 of https://github.com/rrnewton/hermit/pull/3361 had made it
+/// hold the SIGCHLD.
 ///
-/// Hermit still holds the SIGCHLD until the call returns (the guest's `held`
-/// option) in polling mode, where the waiter is not the thread the scheduler
-/// commits the signal to. A timed wait then returns ETIMEDOUT at its 300 ms
-/// deadline, and an untimed one is ended by the sibling's FUTEX_WAKE, which
-/// polling mode reports as EAGAIN. Linux ends these waits with EINTR too.
-/// Each futex mode is its own test, to stay inside the per-test wall and CPU
-/// bounds.
+/// Linux: the sibling blocks SIGCHLD, so `complete_signal`
+/// (kernel/signal.c:963 at v6.17) passes over the forking sibling, which does
+/// not want the signal (`wants_signal`, 946), and wakes the waiter, the only
+/// thread that does. A timed `futex_wait` that a signal interrupts returns
+/// -ERESTART_RESTARTBLOCK (kernel/futex/waitwake.c:724-732), and with a
+/// handler `handle_signal` makes that EINTR (arch/x86/kernel/signal.c:267-269),
+/// so the wait is not restarted. Natively all six cells print EINTR at
+/// 100-101 ms, 10 of 10 runs each (2026-11-10; 2026-10-13 for the precise
+/// cells).
+///
+/// Until https://github.com/rrnewton/hermit/pull/5259, polling mode held the
+/// SIGCHLD until the call returned (the guest's `held` option): a timed wait
+/// returned ETIMEDOUT at its 300 ms deadline, and an untimed one was ended by
+/// the sibling's FUTEX_WAKE, which polling mode reports as EAGAIN. With that
+/// change it ends with EINTR as precise mode does. The polling test keeps its
+/// name, which the PMU nodes' case filters in
+/// ci/manifest-plan/src/validation_dag_static.rs select it by. Each futex mode
+/// is its own test, to stay inside the per-test wall and CPU bounds.
 fn assert_caught_sigchld_after_parking(backend: &str, mode: FutexMode) {
     for flip in ["chldlate", "chldkill", "chldthrexit"] {
-        match mode {
-            FutexMode::Precise => {
-                for timed in [None, Some("timed")] {
-                    let mut args = vec!["futex", "thread", flip, "held"];
-                    args.extend(timed);
-                    assert_woken_cell(backend, mode, &args, EINTR_FUTEX);
-                }
-            }
-            _ => {
-                assert_quiet_cell(
-                    backend,
-                    mode,
-                    &["futex", "thread", flip, "held", "timed"],
-                    "RESULT call=futex ret=-1 errno=ETIMEDOUT handler=1",
-                );
-                let untimed = match mode {
-                    FutexMode::Precise => "RESULT call=futex ret=0 errno=none handler=1",
-                    FutexMode::Polling => "RESULT call=futex ret=-1 errno=EAGAIN handler=1",
-                };
-                assert_quiet_cell(backend, mode, &["futex", "thread", flip, "held"], untimed);
-            }
+        for timed in [None, Some("timed")] {
+            let mut args = vec!["futex", "thread", flip, "held"];
+            args.extend(timed);
+            assert_woken_cell(backend, mode, &args, EINTR_FUTEX);
         }
     }
 }

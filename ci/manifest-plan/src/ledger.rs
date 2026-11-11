@@ -63,6 +63,16 @@ pub struct HistoryRow {
     pub profile: Option<String>,
     #[serde(default)]
     pub selection_mode: Option<String>,
+    /// Whole-run build mode (`cargo` or `buck`); absent on rows written
+    /// before the field existed (those runs were all cargo). Skipped when
+    /// absent so receipt canonicalization v1 bytes are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_mode: Option<String>,
+    /// Per-cohort resolved build modes: a buck run is mixed-mode while
+    /// the native-exec cohort is pinned to cargo, and this map is what
+    /// keeps such a row from reading as pure buck.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prepared_cohort_modes: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default)]
     pub commit: Option<String>,
     #[serde(default)]

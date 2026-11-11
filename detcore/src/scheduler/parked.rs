@@ -42,6 +42,7 @@ use crate::ivar::Ivar;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::syscalls::KernelSignalState;
 use crate::tool_global::ResumeStatus;
 use crate::types::ChildWaitExitClass;
 use crate::types::ChildWaitSpec;
@@ -331,7 +332,12 @@ pub(super) struct ParkedRequests {
     /// woken, so the run queue makes at least one choice of its own between
     /// any two alarm grants, for the same process or another
     /// (`Scheduler::alarm_priority_available`,
-    /// <https://github.com/rrnewton/hermit/issues/4929>).
+    /// <https://github.com/rrnewton/hermit/issues/4929>). One exception: a
+    /// reserved SIGALRM poll probe (dh-ru056 slice 1,
+    /// `Scheduler::reserved_probe_to_resume`) sets it, spending the alarm
+    /// priority, but is itself selected whether or not that priority is
+    /// available. Like a SIGCHLD taker it is exempt from the bound, which
+    /// holds it to one probe grant per due entry instead.
     pub alarm_priority_served: Option<DetPid>,
     /// The pollers `Scheduler::wake_polling_alarm_receiver` woke, until step 3
     /// next resumes each: their substituted request is a signal delivery the
@@ -1800,8 +1806,9 @@ impl Scheduler {
 
     /// Whether `thread` has a signal pending for it alone that it neither
     /// blocks nor ignores (Linux's `task_sigpending` after `prepare_signal`
-    /// dropped the ignored ones), read as `alarm_wants` reads a busy thread.
-    fn has_own_signal_to_take(&self, thread: DetTid) -> bool {
+    /// dropped the ignored ones), read as `alarm_wants` reads a busy thread
+    /// (`own_signals_to_take`).
+    pub(super) fn has_own_signal_to_take(&self, thread: DetTid) -> bool {
         if !self.reads_settled_signal_state(thread) {
             return false;
         }
@@ -1810,8 +1817,27 @@ impl Scheduler {
         };
         self.read_guest_signal_state(thread).is_ok_and(|state| {
             let mask = temporary.unwrap_or(state.blocked);
-            state.thread_pending & !mask & !state.ignored_at_generation() != 0
+            self.own_signals_to_take(thread, &state, mask) != 0
         })
+    }
+
+    /// The signals pending for `thread` alone (`state`, the reader's) that it
+    /// takes under `mask`: not blocked, not ignored now, and not a copy Linux
+    /// discarded as it was sent (`discarded_bits`). An unblocked signal the
+    /// thread ignored when it was sent was never queued
+    /// (`prepare_signal` returns `!sig_ignored`, and `__send_signal_locked`
+    /// returns before queueing, kernel/signal.c:935 and 1053-1054 at v6.17),
+    /// so a handler installed afterwards never sees it (`sig_ignored`, lines
+    /// 106-125). This backend keeps such a copy for the Tool to observe; read
+    /// by the current disposition alone, it counted as caught once a handler
+    /// was installed, and the observation interrupted a parked `waitid` for a
+    /// `SIGURG` Linux had discarded (the Codex review of
+    /// <https://github.com/rrnewton/hermit/pull/5259>, P1). A copy that was
+    /// blocked when sent was queued, and keeps counting: the record keeps its
+    /// bit clear (`DiscardedAtSend::note_send`).
+    fn own_signals_to_take(&self, thread: DetTid, state: &KernelSignalState, mask: u64) -> u64 {
+        let (discarded, _) = self.discarded_bits(thread);
+        state.thread_pending & !mask & !state.ignored_at_generation() & !discarded
     }
 
     /// The thread Linux's `complete_signal` wakes for a SIGALRM in `pid`'s
@@ -1961,7 +1987,7 @@ impl Scheduler {
                 let busy = !outside
                     && self.read_guest_signal_state(thread).is_ok_and(|state| {
                         let mask = temporary.unwrap_or(state.blocked) & !waited;
-                        state.thread_pending & !mask & !state.ignored_at_generation() != 0
+                        self.own_signals_to_take(thread, &state, mask) != 0
                     });
                 (thread, if busy { Wants::Busy } else { Wants::Yes })
             })
@@ -2466,8 +2492,7 @@ impl Scheduler {
         if let Some((parent, spec)) = self.blocked.child_waiters.remove(&tid) {
             return SavedMembership::ChildWait { parent, spec };
         }
-        if let Some(deadline) = self.blocked.timed_waiters.thread_deadline(tid) {
-            self.blocked.timed_waiters.remove(tid);
+        if let Some(deadline) = self.blocked.timed_waiters.suspend_thread(tid) {
             return SavedMembership::Timed(deadline);
         }
         let priority = self.get_priority(tid);
@@ -2843,7 +2868,7 @@ impl Scheduler {
             match membership {
                 SavedMembership::Timed(deadline) => {
                     self.run_queue.remove_tid(tid);
-                    self.blocked.timed_waiters.insert(deadline, tid);
+                    self.blocked.timed_waiters.resume_thread(deadline, tid);
                 }
                 SavedMembership::Queued(entry) => {
                     let priority = self.get_priority(tid);

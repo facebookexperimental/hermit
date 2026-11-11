@@ -493,6 +493,7 @@ use crate::syscall_classification::is_futex2_enosys_syscall;
 use crate::syscall_classification::is_host_kernel_probe_syscall;
 use crate::syscall_classification::is_host_security_identity_probe_syscall;
 use crate::syscall_classification::is_landlock_sandbox_syscall;
+use crate::syscall_classification::is_memory_policy_syscall;
 use crate::syscall_classification::is_mount_introspection_enosys_syscall;
 use crate::syscall_classification::is_mount_ns_admin_refused_syscall;
 use crate::syscall_classification::is_optional_memory_feature_syscall;
@@ -1665,8 +1666,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         result
     }
 
-    /// Whether this session renders a process's `smaps`, `smaps_rollup` and
-    /// `numa_maps` from the backend's memory map
+    /// Whether this session renders a process's `smaps` and
+    /// `smaps_rollup` from the backend's memory map
     /// (`procfs::RenderedFiles::address_space`): exactly where the guest's
     /// procfs is not the kernel's (`procfs_inode::tool_can_name_guest_descriptors`
     /// is false, KVM). A function of the configuration alone.
@@ -1676,7 +1677,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Whether the pages that hold `[start, start + len)`, the range a call
     /// acted on, overlap a mapping the backend's memory map lists, the only
-    /// mappings a rendered `smaps` or `numa_maps` shows
+    /// mappings a rendered `smaps` shows
     /// (`procfs::memory_map::smaps`). True where the backend gives no map,
     /// which cannot show that the call reached none.
     ///
@@ -2495,7 +2496,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             match answer {
                 DiscardedSignalAnswer::Delivery(DeliveryAnswer::Suppress) => {
                     info!(
-                        "[dtid {}] signal {} is a stale POSIX timer entry; skipped",
+                        "[dtid {}] signal {} is a stale POSIX timer entry, or a copy Linux discarded as it was sent; skipped",
                         guest.thread_state().dettid,
                         signal
                     );
@@ -2538,6 +2539,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             grants_at_stop,
         } = stop;
         let delivery = scope == TurnScope::Delivery;
+        // A reported sigreturn since the last event ends its delivery
+        // interval before this stop's turn can be chosen for.
+        if reported {
+            crate::tool_global::pop_delivery_mask(guest).await;
+        }
         // The kernel dequeued `signal` before this stop: a hold for it ends
         // here, and this stop's hooks may end the slice
         // (`own_signal_turn_hold`).
@@ -3082,7 +3088,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         // and a wake that syscall made no longer ends the slice.
         guest.thread_state_mut().in_uncharged_bootstrap_syscall = false;
         guest.thread_state_mut().yield_after_futex_wake = false;
-        guest.thread_state_mut().returned_from_sigreturn = false;
+        // A reported sigreturn since the last event ends its delivery
+        // interval here too: a timeslice can expire after the return and
+        // before any syscall or inbound stop, and clearing the report
+        // without popping would leave the frame deciding indefinitely.
+        if std::mem::take(&mut guest.thread_state_mut().returned_from_sigreturn)
+            && crate::syscalls::signal_shadow::observes_sigreturns(&self.cfg)
+        {
+            crate::tool_global::pop_delivery_mask(guest).await;
+        }
         let dettid = guest.thread_state().dettid;
         let timer_event = matches!(entry, Some(slice_boundary::callbacks::Callback::PmuTimer));
         let evs = self
@@ -6004,6 +6018,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     own_signal_turn_hold: None,
                     delivered_since_request: false,
                     returned_from_sigreturn: false,
+                    delivery_entered: false,
                     // A child starts with no announcement: its parent
                     // settles its own before it returns from the clone.
                     signal_announcements: Vec::new(),
@@ -6666,6 +6681,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if crate::fifo_peer::any_orphaned_page() {
             Self::unmap_orphaned_staging_pages(guest).await;
         }
+        // A reported `rt_sigreturn` since the last event ends its
+        // delivery interval here, at the thread's next syscall entry, on
+        // every backend (the ordinary syscall route to it is one no
+        // backend exposes; `Tool::handle_sigreturn` reports it instead).
+        if std::mem::take(&mut guest.thread_state_mut().returned_from_sigreturn)
+            && crate::syscalls::signal_shadow::observes_sigreturns(&self.cfg)
+        {
+            crate::tool_global::pop_delivery_mask(guest).await;
+        }
+        // A delivery the copy recorded since the last event is entered
+        // now: a queued wake's wait interval hands off to its delivery
+        // frame before this syscall's first scheduler request.
+        if std::mem::take(&mut guest.thread_state_mut().delivery_entered) {
+            crate::tool_global::record_delivery_entry(guest).await;
+        }
         crate::syscalls::signal_shadow::at_syscall_entry(guest);
         // An armed crash handler that has returned disarms before this call
         // runs (`post_crash`).
@@ -7321,15 +7351,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     syscall_histogram::mark_refused::<T, _>(guest);
                     Err(Error::Errno(Errno::EPERM))
                 }
-                // AUTONOMOUS-BOT-IMPLEMENTED
-                // TODO-HUMAN-REVIEW(#720): set_mempolicy_home_node is untyped in the
-                // pinned Reverie revision. Hermit exposes a single virtual NUMA node,
-                // so setting a memory range's home node has no observable effect: a
-                // deterministic no-op.
-                SyscallClassification::Determinized
-                    if call.number() == Sysno::set_mempolicy_home_node =>
-                {
-                    Ok(0)
+                // Detcore presents a kernel built without NUMA
+                // (https://github.com/rrnewton/hermit/issues/5269): every
+                // memory-policy syscall is a `cond_syscall` stub there and
+                // returns ENOSYS before its arguments are looked at. One gate
+                // by Sysno, before the typed match, so the typed calls and
+                // the untyped set_mempolicy_home_node all take it (in
+                // Linux their compat entry points are the same stubs).
+                SyscallClassification::Determinized if is_memory_policy_syscall(call.number()) => {
+                    Err(Error::Errno(Errno::ENOSYS))
                 }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#724): Deterministic EPERM for privileged mount
@@ -7938,20 +7968,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     Syscall::SchedGetaffinity(s) => self.handle_sched_getaffinity(guest, s).await,
                     Syscall::SchedSetaffinity(s) => self.handle_sched_setaffinity(guest, s).await,
 
-                    // ===== BATCH 3: NUMA memory-placement and Linux CPU-scheduling
-                    // policy. Hermit exposes a single virtual NUMA node and replaces
-                    // the Linux scheduler with Detcore, so these are inoperative and
-                    // are virtualized to fixed, host-independent results (see the
-                    // determinism argument in syscall_classification.rs). Setters and
-                    // count-returning calls are no-ops; getters emulate a default
-                    // single-node / SCHED_OTHER answer.
+                    // ===== BATCH 3: Linux CPU-scheduling policy. Detcore
+                    // replaces the Linux scheduler with its own, so these are
+                    // inoperative and are virtualized to fixed,
+                    // host-independent results (see the determinism argument
+                    // in syscall_classification.rs). Setters are no-ops;
+                    // getters emulate the default SCHED_OTHER answer. The
+                    // NUMA memory-policy calls of this batch never reach
+                    // here: the `is_memory_policy_syscall` gate above refuses
+                    // them with ENOSYS, as a kernel without NUMA does.
                     // AUTONOMOUS-BOT-IMPLEMENTED
                     // TODO-HUMAN-REVIEW(#720)
-                    Syscall::Mbind(_) => Ok(0),
-                    Syscall::SetMempolicy(_) => Ok(0),
-                    Syscall::GetMempolicy(s) => self.handle_get_mempolicy(guest, s).await,
-                    Syscall::MigratePages(_) => Ok(0),
-                    Syscall::MovePages(s) => self.handle_move_pages(guest, s).await,
                     Syscall::SchedSetscheduler(_) => Ok(0),
                     Syscall::SchedSetparam(_) => Ok(0),
                     // Report the fixed default policy SCHED_OTHER (0).

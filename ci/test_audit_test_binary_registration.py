@@ -183,7 +183,7 @@ class RegistrationAuditTest(unittest.TestCase):
 
     def test_nextest_run_registers_a_binary(self) -> None:
         result = self._plant_probe_with_dag_command(
-            "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh "
+            "CARGO_BUILD_JOBS=8 ./ci/run-with-core-build.sh "
             "./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --test zz_probe -j 1",
             declared=["zz_probe"],
         )
@@ -226,7 +226,7 @@ class RegistrationAuditTest(unittest.TestCase):
     def test_wrapper_and_env_prefixed_invocation_still_registers(self) -> None:
         """The positive leg: the tightening must not reject Hermit's real shapes."""
         result = self._plant_probe_with_dag_command(
-            "CARGO_BUILD_JOBS=8 ./ci/run-with-reverie-dbt-budget.sh "
+            "CARGO_BUILD_JOBS=8 ./ci/run-with-core-build.sh "
             "cargo test -p hermit-run --features third-party-backends --test zz_probe",
             declared=["zz_probe"],
         )
@@ -237,7 +237,7 @@ class RegistrationAuditTest(unittest.TestCase):
         result = self._plant_probe_with_dag_command(
             'test "${HERMIT_E2E_EMPTY_WORKDIR:-}" = /test && '
             "prlimit --fsize=67108864:67108864 -- "
-            "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh "
+            "./ci/run-with-core-build.sh ./ci/run-nextest-counted.sh "
             "${CI:+--profile ci} -p hermit-run --features third-party-backends "
             "--test zz_probe -E 'test(=positive) | test(=negative)' -- --include-ignored",
             declared=["zz_probe"],
@@ -350,20 +350,30 @@ class RegistrationAuditTest(unittest.TestCase):
         )
         self.assertEqual(real.returncode, 0, real.stderr)
 
-    def test_prlimit_budget_wrapper_registers_a_binary(self) -> None:
+    def test_prlimit_core_build_wrapper_registers_a_binary(self) -> None:
         result = self._plant_probe_with_dag_command(
             "prlimit --fsize=67108864:67108864 -- "
-            "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh "
+            "./ci/run-with-core-build.sh ./ci/run-nextest-counted.sh "
             "${CI:+--profile ci} -p hermit-run --features third-party-backends --test zz_probe",
             declared=["zz_probe"],
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("ci-registered=2", result.stdout)
 
-    def test_prlimit_wrapped_no_run_does_not_register_a_binary(self) -> None:
+    def test_prlimit_retired_budget_wrapper_does_not_register_a_binary(self) -> None:
         result = self._plant_probe_with_dag_command(
             "prlimit --fsize=67108864:67108864 -- "
             "./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh "
+            "-p hermit-run --test zz_probe",
+            declared=["zz_probe"],
+        )
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("integration_test_binaries", result.stderr)
+
+    def test_prlimit_wrapped_no_run_does_not_register_a_binary(self) -> None:
+        result = self._plant_probe_with_dag_command(
+            "prlimit --fsize=67108864:67108864 -- "
+            "./ci/run-with-core-build.sh ./ci/run-nextest-counted.sh "
             "-p hermit-run --test zz_probe --no-run",
             declared=["zz_probe"],
         )
@@ -390,7 +400,7 @@ class RegistrationAuditTest(unittest.TestCase):
     def test_prlimit_wrapped_echo_does_not_register_a_binary(self) -> None:
         result = self._plant_probe_with_dag_command(
             "prlimit --fsize=67108864:67108864 -- "
-            "./ci/run-with-reverie-dbt-budget.sh echo "
+            "./ci/run-with-core-build.sh echo "
             "cargo test -p hermit-run --test zz_probe",
             declared=["zz_probe"],
         )

@@ -93,6 +93,9 @@ mod liteinst_in_guest_programs;
 #[path = "common/readonly_proc.rs"]
 mod readonly_proc;
 
+#[path = "common/pinned_cpu_notice.rs"]
+mod pinned_cpu_notice;
+
 #[path = "common/process_tree.rs"]
 mod process_tree;
 use process_tree::process_tree_snapshot;
@@ -179,6 +182,7 @@ static MINIMAL_ENV_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_INERT_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
 static EXEC_CLOCK_CONTINUITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PRCTL_SET_PTRACER_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static TIMED_WAIT_SPREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_TWO_THREADS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FIFO_PEER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static BINDER_FD_PASSING_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -195,6 +199,8 @@ static SIGCHLD_BUSY_SIBLING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGKILL_ROBUST_PSHARED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GUEST_SIGCHLD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCESS_SIGNAL_TARGET_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static TWO_CHILD_AFTER_HANDLER_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static TWO_CHILD_SLICE_BURNING_HANDLER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GUEST_DISCARD_AT_SEND_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_RECHECK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_RECHECK_PARTIAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1000,6 +1006,32 @@ fn first_slice_replay_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "first-slice-replay guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn timed_wait_spread_guest() -> &'static Path {
+    TIMED_WAIT_SPREAD_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("timed-wait-spread");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create timed-wait-spread guest directory");
+        let guest = build_root.join("timed_wait_spread");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/timed_wait_spread.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile timed-wait-spread guest");
+        assert!(
+            output.status.success(),
+            "timed-wait-spread guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -5706,7 +5738,15 @@ fn readonly_proc_metadata_detects_replay_mismatch_and_accepts_older_recordings()
     // remains read-only. A mismatch is diagnostic, not an event-format change.
     metadata["proc_readonly"] = false.into();
     fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
-    let replay_args = ["replay", "--autopilot", "--data-dir", directory];
+    // This counts every `hermit: warning:` line below; a `--pinned-cpu`
+    // notice (another run holds the CPU) is placement, not what it checks.
+    let replay_args = [
+        "replay",
+        "--autopilot",
+        "--pinned-cpu-notice=off",
+        "--data-dir",
+        directory,
+    ];
     let replay = hermit_test::hermit_output("hermit run", &mut readonly_proc_command(&replay_args));
     assert_success(&replay, &replay_args);
     assert!(
@@ -9941,7 +9981,8 @@ fn smaps_and_numa_maps_guest() -> &'static Path {
 }
 
 /// What `smaps_and_numa_maps.c` prints in `mode` under Hermit on `backend`
-/// at `--proc=standard`, which lists `numa_maps` and `smaps_rollup`: at L2
+/// at `--proc=standard`, which lists `smaps_rollup` (and, since the
+/// no-NUMA policy, no `numa_maps` at any level): at L2
 /// where `l2` (two runs at bitwise parity under `--verify-strict`, with the
 /// same nonzero number of INFO records compared, exit 0), else in one run.
 /// Hermit's exit status, the guest's stdout and Hermit's stderr.
@@ -9995,8 +10036,8 @@ fn address_space_listing_with(
 }
 
 /// The part of `smaps_and_numa_maps.c`'s output about the stack: from its
-/// line `blocks ok` on, the stack's field labels, `numa_maps` row without
-/// page counts, and `smaps` block without its range and size, which the
+/// line `blocks ok` on, the `numa absent` line, the stack's field labels
+/// and its `smaps` block without its range and size, which the
 /// backend's layout decides (KVM's stack window is LinuxEmu's 8188 kB one,
 /// a native stack about 132 kB), as are the spaces that pad the name to its
 /// column. The guest prints the range on a line before `blocks ok`.
@@ -10137,29 +10178,29 @@ const KVM_SPLIT_SMAPS_REFUSAL: &str = "they are not in the backend's memory map"
 const KVM_ADVISED_SMAPS_REFUSAL: &str = "madvise advice or mlock that reached the backend may have \
     set flags on";
 
-/// Why KVM refuses a process's `numa_maps` once advice that discards pages
-/// reached LinuxEmu for the stack: whether it still holds a resident page,
-/// which decides `kernelpagesize_kB`, is not a fact.
-const KVM_DISCARDED_NUMA_MAPS_REFUSAL: &str = "madvise advice that discards pages reached the \
-    backend for";
-
-/// A process's `smaps`, `smaps_rollup` and `numa_maps`, as
-/// `tests/c/smaps_and_numa_maps.c` checks them against what Linux prints
-/// (fs/proc/task_mmu.c), for a mapping of each kind: anonymous memory, a
-/// file, the stack, the heap and the vDSO.
+/// A process's `smaps` and `smaps_rollup`, and the absence of its
+/// `numa_maps`, as `tests/c/smaps_and_numa_maps.c` checks them: the smaps
+/// files against what Linux prints (fs/proc/task_mmu.c), for a mapping of
+/// each kind (anonymous memory, a file, the stack, the heap and the vDSO),
+/// and `numa_maps` against the kernel built without NUMA that Hermit
+/// presents, which registers no such file
+/// (https://github.com/rrnewton/hermit/issues/5269). The guest reports
+/// `numa absent` where it found none and `numa present` where it did, so
+/// the native run below still gives the smaps lines; Hermit must say
+/// `absent` on both backends, also after the guest discards every page of
+/// its initial stack (the discard that used to make a rendered row
+/// unanswerable on KVM).
 ///
 /// On ptrace the kernel's files, sanitized: every kind is listed, the
-/// stack's flags, `THPeligible`, `ProtectionKey` and `numa_maps` row are the
-/// native run's, and every page count is zero; the rollup, a split stack,
-/// access-pattern advice and advice on another mapping read too, and after
-/// the guest discards every page of its initial stack, the row lacks
-/// `kernelpagesize_kB`, as natively.
+/// stack's flags, `THPeligible` and `ProtectionKey` are the native run's,
+/// and every page count is zero; the rollup, a split stack, access-pattern
+/// advice and advice on another mapping read too.
 ///
 /// On KVM, where Detcore renders the files from the backend's memory map
 /// (package K slice N4 of <https://github.com/rrnewton/hermit/issues/4213>),
 /// the stack alone is listed, as in `maps` (the memory map lists the stack
 /// window only, <https://github.com/rrnewton/reverie/issues/1211>). Its
-/// block and row are compared with ptrace's, each exemption named:
+/// block is compared with ptrace's, each exemption named:
 /// - the range and `Size` are left out by the guest, and the name's padding,
 ///   all of which LinuxEmu's stack window decides;
 /// - `ProtectionKey` is left out of ptrace's: KVM's kernel enables no
@@ -10173,10 +10214,9 @@ const KVM_DISCARDED_NUMA_MAPS_REFUSAL: &str = "madvise advice that discards page
 ///   stack; elsewhere it is 0 on both and compared with the rest.
 ///
 /// What the memory map cannot tell is refused by name: the rollup's range,
-/// the flags of a part a split left of the stack, the flags advice set on
-/// the stack, and the residency of a stack whose pages were discarded.
-/// Advice on a mapping the memory map does not list changes nothing KVM's
-/// files show, and refuses nothing.
+/// the flags of a part a split left of the stack, and the flags advice set
+/// on the stack. Advice on a mapping the memory map does not list changes
+/// nothing KVM's files show, and refuses nothing.
 fn list_the_address_space_in_smaps_and_numa_maps(backend: &str) {
     let kvm = backend == "kvm";
     let (_, files, _) = address_space_listing(backend, "files", true);
@@ -10186,7 +10226,7 @@ fn list_the_address_space_in_smaps_and_numa_maps(backend: &str) {
     }
     assert!(listed("stack"), "{files}");
     assert!(
-        files.contains("blocks ok\nnuma ok\naccounting nonzero 0\nnuma counts 0\n"),
+        files.contains("blocks ok\nnuma absent\naccounting nonzero 0\n"),
         "{files}"
     );
     if kvm {
@@ -10213,14 +10253,17 @@ fn list_the_address_space_in_smaps_and_numa_maps(backend: &str) {
         assert!(!nocpuid.contains("ProtectionKey"), "{nocpuid}");
         assert_eq!(stack_listing(&nocpuid), stack_listing(&files));
         // Advice on the anonymous mapping, which the memory map does not
-        // list, leaves the stack's block and row as they were.
+        // list, leaves the stack's block as it was.
         let (_, other, _) = address_space_listing(backend, "other", true);
         assert_eq!(stack_listing(&other), stack_listing(&files));
+        // Discarding every page of the initial stack refuses nothing now:
+        // there is no numa_maps row whose residency it would decide.
+        let (_, discard, _) = address_space_listing(backend, "discard", true);
+        assert_eq!(discard, "discard ok\nnuma absent\n");
         for (mode, refusal) in [
             ("rollup", KVM_ROLLUP_REFUSAL),
             ("split", KVM_SPLIT_SMAPS_REFUSAL),
             ("advise", KVM_ADVISED_SMAPS_REFUSAL),
-            ("discard", KVM_DISCARDED_NUMA_MAPS_REFUSAL),
         ] {
             let (code, stdout, stderr) = address_space_listing(backend, mode, false);
             // EXIT-CLASS: hermit
@@ -10247,7 +10290,6 @@ fn list_the_address_space_in_smaps_and_numa_maps(backend: &str) {
                 .lines()
                 .filter(|line| {
                     line.starts_with("stack labels ")
-                        || line.starts_with("stack numa ")
                         || line.starts_with("THPeligible:")
                         || line.starts_with("ProtectionKey:")
                         || line.starts_with("VmFlags:")
@@ -10262,16 +10304,15 @@ fn list_the_address_space_in_smaps_and_numa_maps(backend: &str) {
         for mode in ["split", "advise", "other"] {
             let (_, output, _) = address_space_listing(backend, mode, true);
             assert!(
-                output.contains("blocks ok\nnuma ok\naccounting nonzero 0\nnuma counts 0\n"),
+                output.contains("blocks ok\nnuma absent\naccounting nonzero 0\n"),
                 "{mode}:\n{output}"
             );
         }
-        // Every page of the initial stack discarded: no kernelpagesize_kB,
-        // natively and through the sanitizer.
-        let native_discard = native_main_stack_output(&guest, &["discard"]);
-        assert_eq!(native_discard, "discard ok\nstack numa default stack\n");
+        // Every page of the initial stack discarded: still no numa_maps.
+        // (No native comparison: the host kernel has the file, so its run
+        // reports `numa present` by design.)
         let (_, discard, _) = address_space_listing(backend, "discard", true);
-        assert_eq!(discard, native_discard);
+        assert_eq!(discard, "discard ok\nnuma absent\n");
     }
 }
 
@@ -12467,7 +12508,7 @@ fn a_recording_from_before_rendered_io_and_arch_status_is_refused_by_version() {
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
     assert_eq!(
-        metadata["version"], 0x19e,
+        metadata["version"], 0x1a0,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x197);
@@ -21703,11 +21744,14 @@ fn run_kvm_preserves_closed_standard_input() {
             "--backend",
             backend,
             "run",
+            "--pinned-cpu-notice=off",
             "--strict",
             "--base-env=minimal",
             &epoch_arg,
             "--",
         ];
+        // An exact Hermit stderr: a `--pinned-cpu` notice (another run holds
+        // the CPU) is placement, not what this test checks.
         let output = hermit_test::hermit_output(
             "hermit run",
             hermit_command(&args)
@@ -25776,8 +25820,11 @@ fn a_woken_poller_restarts_when_no_handler_runs() {
 /// Linux prints for each. In `mixedshared` the waiter and the leader race for
 /// the caught copy natively, and either line is Linux's: in 10 native runs the
 /// waiter took it in 8 (its poll fails with EINTR) and the leader in 2 (the
-/// waiter's poll is restarted); the line here is the leader's, which ptrace
-/// prints. What Linux never prints is EINTR with the handler on the leader.
+/// waiter's poll is restarted), and in 20 more on 2026-11-10 the waiter in 19
+/// and the leader in 1. The line here is the leader's, which KVM prints;
+/// ptrace prints the waiter's
+/// (`a_woken_poll_fails_with_eintr_when_any_handler_runs`). What Linux never
+/// prints is EINTR with the handler on the leader.
 const MIXED_PENDING_CASES: [(&str, &str); 4] = [
     (
         "mixedpoll",
@@ -26063,7 +26110,17 @@ fn a_woken_poll_fails_with_eintr_when_any_handler_runs() {
     for (mode, expected) in [
         MIXED_PENDING_CASES[0],
         MIXED_PENDING_CASES[2],
-        MIXED_PENDING_CASES[3],
+        // Not MIXED_PENDING_CASES[3], the leader's line, which KVM prints.
+        // On ptrace the SIGALRM falls due while the leader, still in its
+        // nanosleep, blocks it, and Detcore gives it to the waiter, as
+        // Linux's complete_signal does then: the waiter's line, which native
+        // prints in 8 of 10 and 19 of 20 runs. Until
+        // https://github.com/rrnewton/hermit/pull/5259 ptrace printed the
+        // leader's line, Linux's other one.
+        (
+            "mixedshared",
+            "mode=mixedshared first=-1 errno=EINTR eintr=1 usr1=1 on_waiter=1\n",
+        ),
         MIXED_LATE,
     ]
     .into_iter()
@@ -26559,43 +26616,45 @@ enum TargetExpectation {
     Linux,
     /// A KNOWN DIVERGENCE: the line it records, until it closes.
     Diverges(KnownDivergence),
+    /// The backend refuses the run before any line: Detcore chooses Linux's
+    /// receiver, and ending that receiver's wait is a recorded unsupported
+    /// case (a masked `ppoll` that cannot keep a held signal). Judged by the
+    /// refusal itself, never by a substitute line.
+    Refuses,
 }
 
 use TargetExpectation::Diverges;
 use TargetExpectation::Linux;
 
 /// A mode of tests/c/process_signal_target.c, the line Linux prints for it,
-/// and how ptrace's run is judged.
+/// and how ptrace's and KVM's runs are judged.
 struct ProcessSignalTargetCase {
     mode: &'static str,
     linux: &'static str,
     ptrace: TargetExpectation,
+    kvm: TargetExpectation,
 }
 
 const fn target_case(
     mode: &'static str,
     linux: &'static str,
     ptrace: TargetExpectation,
+    kvm: TargetExpectation,
 ) -> ProcessSignalTargetCase {
     ProcessSignalTargetCase {
         mode,
         linux,
         ptrace,
+        kvm,
     }
 }
-
-/// ptrace's KNOWN DIVERGENCE of the #4991 class
-/// (`PROCESS_SIGNAL_TARGET_CASES`).
-const PTRACE_POLLER_PASSED_OVER: TargetExpectation = Diverges(KnownDivergence {
-    issue: "https://github.com/rrnewton/hermit/issues/4991",
-    line: "receiver=W1 interrupted=W1\n",
-});
 
 /// tests/c/process_signal_target.c's modes and the line Linux prints for each:
 /// every boundary the line depends on is reached causally and required (the
 /// guest ends unconfirmed, with no line, past a bound), so each mode has one
 /// native outcome (200 of 200 runs each, and 50 of 50 with four spinners on
-/// its two CPUs, 2026-11-06), and the native half of each test runs it once. Each mode is a process-directed signal the kernel itself
+/// its two CPUs, 2026-11-06; the six `chld-*-lets-in` and `chld-*-keeps-out`
+/// modes likewise on 2026-11-07), and the native half of each test runs it once. Each mode is a process-directed signal the kernel itself
 /// generates for a three-thread process (main thread M, workers W1 and W2): a
 /// child's exit `SIGCHLD`, an ITIMER_REAL expiry or a POSIX timer's
 /// `SIGEV_SIGNAL` (SIGUSR1). Linux's `complete_signal` gives it to the thread
@@ -26621,12 +26680,16 @@ const PTRACE_POLLER_PASSED_OVER: TargetExpectation = Diverges(KnownDivergence {
 /// the merge is then not seen, before S3b as after it (dh-yvwnk,
 /// https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-yvwnk.md).
 ///
-/// ptrace's KNOWN DIVERGENCES are the scheduler's process-directed sends that
-/// it leaves to the host kernel, which finds every guest thread stopped: in
-/// `chld-creator` and `alrm-leader` the copy is taken by W1, which a drain
-/// resumes before M, polling (its poll blocks every signal in place, so the
-/// choice passes it over), takes it
-/// (https://github.com/rrnewton/hermit/issues/4991's class).
+/// ptrace's kernel-sent choice reads the one installed mask on every
+/// backend (`kernel_sent_signal_mask`: a wait's published mask included),
+/// so the modes that once printed a sibling's line here — `chld-creator`,
+/// `alrm-leader`, `chld-ppoll-lets-in`, `chld-pselect-lets-in` (the
+/// https://github.com/rrnewton/hermit/issues/4991 passed-over class) and
+/// `chld-ppoll-keeps-out` (a `ppoll` chosen by its own mask) — print
+/// Linux's line since the one-mask correction in
+/// https://github.com/rrnewton/hermit/pull/5259; their divergence records
+/// are dropped, and `judge_process_signal_target` fails if they diverge
+/// again.
 /// `alrm-ignored-unblocked` holds W2 in a vfork wait, so that the guest sees
 /// the ignored expiry generated, and W2 takes and discards it on its return
 /// from the wait, as Linux does; the #5014 class, a queued ignored expiry
@@ -26638,58 +26701,117 @@ const PTRACE_POLLER_PASSED_OVER: TargetExpectation = Diverges(KnownDivergence {
 /// printed the same at b198041ece8
 /// (<https://github.com/rrnewton/hermit/issues/5242>, trail in minibeads dh-90p9w).
 ///
-/// KVM's half of these cases, and its own KNOWN DIVERGENCES, arrive with the
-/// Reverie pin in which KvmBackend declares
-/// `kernel_signal_targets_are_predictable` (SIGSHARE S3b's flip); this pin
-/// does not, so KVM's receivers are not yet the scheduler's to choose.
-const PROCESS_SIGNAL_TARGET_CASES: [ProcessSignalTargetCase; 23] = [
+/// KVM's KNOWN DIVERGENCES are its POSIX-timer modes but `posix-sigwait`: KVM
+/// steers a timer's process-directed signal only when it is SIGALRM
+/// (https://github.com/rrnewton/hermit/issues/4929), and a `timer_create`
+/// `SIGEV_SIGNAL` timer whose signal is another one (SIGUSR1 here) is
+/// published to the process with no receiver chosen, so no handler runs for
+/// it where Linux's walk or busy rule picks a thread. Each diverged at
+/// b198041ece8, before SIGSHARE S3b, too: `posix-walk` and `posix-busy` with
+/// the same line, and `posix-curr-target` at its setup (no thread took the
+/// steering `SIGCHLD`), which S3b's child-exit choice now completes. This is
+/// <https://github.com/rrnewton/hermit/issues/4995>'s gap (the generalisation
+/// to every timer signal is tracked in minibeads dh-ly7rb), and each record
+/// flips once it closes. `posix-sigwait`, where M waits for the signal, prints
+/// Linux's line on KVM, as it did at b198041ece8. In `chld-busy` KVM gives the
+/// child's `SIGCHLD` to W2, as Linux does, but its backend also queues a
+/// `SIGCHLD` for W1's vfork child, whose exit signal is 0 and for which Linux
+/// sends nothing (https://github.com/rrnewton/reverie/issues/1300), and W1 takes it once released; busy=
+/// names it. Before SIGSHARE S3b that copy merged into the child's, which no
+/// thread had taken, and was not seen.
+const PROCESS_SIGNAL_TARGET_CASES: [ProcessSignalTargetCase; 30] = [
+    target_case("chld-creator", "receiver=M interrupted=M\n", Linux, Linux),
+    target_case("chld-walk", "receiver=W2 interrupted=W2\n", Linux, Linux),
+    target_case("chld-worker", "receiver=W1 interrupted=W1\n", Linux, Linux),
+    target_case("chld-queued", "pending=1 receiver=W2\n", Linux, Linux),
+    target_case("alrm-leader", "receiver=M interrupted=M\n", Linux, Linux),
+    target_case("alrm-walk", "receiver=W2 interrupted=W2\n", Linux, Linux),
+    target_case("alrm-queued", "pending=1 receiver=W1\n", Linux, Linux),
     target_case(
-        "chld-creator",
-        "receiver=M interrupted=M\n",
-        PTRACE_POLLER_PASSED_OVER,
+        "posix-walk",
+        "receiver=W2 interrupted=W2\n",
+        Linux,
+        kvm_unsteered_timer_signal("receiver=none interrupted=none\n"),
     ),
-    target_case("chld-walk", "receiver=W2 interrupted=W2\n", Linux),
-    target_case("chld-worker", "receiver=W1 interrupted=W1\n", Linux),
-    target_case("chld-queued", "pending=1 receiver=W2\n", Linux),
     target_case(
-        "alrm-leader",
-        "receiver=M interrupted=M\n",
-        PTRACE_POLLER_PASSED_OVER,
+        "alrm-ignored-blocked",
+        "pending=1 receiver=W2\n",
+        Linux,
+        Linux,
     ),
-    target_case("alrm-walk", "receiver=W2 interrupted=W2\n", Linux),
-    target_case("alrm-queued", "pending=1 receiver=W1\n", Linux),
-    target_case("posix-walk", "receiver=W2 interrupted=W2\n", Linux),
-    target_case("alrm-ignored-blocked", "pending=1 receiver=W2\n", Linux),
     target_case(
         "alrm-ignored-unblocked",
         "generated=1 pending=0 receiver=none\n",
         Linux,
+        Linux,
     ),
-    target_case("chld-curr-target", "receiver=W2 interrupted=W2\n", Linux),
-    target_case("alrm-curr-target", "receiver=W2 interrupted=W2\n", Linux),
-    target_case("posix-curr-target", "receiver=W2 interrupted=W2\n", Linux),
+    target_case(
+        "chld-curr-target",
+        "receiver=W2 interrupted=W2\n",
+        Linux,
+        Linux,
+    ),
+    target_case(
+        "alrm-curr-target",
+        "receiver=W2 interrupted=W2\n",
+        Linux,
+        Linux,
+    ),
+    target_case(
+        "posix-curr-target",
+        "receiver=W2 interrupted=W2\n",
+        Linux,
+        kvm_unsteered_timer_signal("receiver=none interrupted=none\n"),
+    ),
     target_case(
         "chld-sigwait",
         "waited=1 receiver=none interrupted=none\n",
+        Linux,
         Linux,
     ),
     target_case(
         "alrm-sigwait",
         "waited=1 receiver=none interrupted=none\n",
         Linux,
+        Linux,
     ),
     target_case(
         "posix-sigwait",
         "waited=1 receiver=none interrupted=none\n",
         Linux,
+        Linux,
     ),
-    target_case("chld-busy", "receiver=W2 interrupted=W2 busy=W1\n", Linux),
-    target_case("alrm-busy", "receiver=W2 interrupted=W2 busy=W1\n", Linux),
-    target_case("posix-busy", "receiver=W2 interrupted=W2 busy=W1\n", Linux),
-    target_case("coalesced-child-curr", "steer=W2 chld=W1 final=W2\n", Linux),
+    target_case(
+        "chld-busy",
+        "receiver=W2 interrupted=W2 busy=W1\n",
+        Linux,
+        Diverges(KnownDivergence {
+            issue: "https://github.com/rrnewton/reverie/issues/1300",
+            line: "receiver=W2 interrupted=W2 busy=W1+W1\n",
+        }),
+    ),
+    target_case(
+        "alrm-busy",
+        "receiver=W2 interrupted=W2 busy=W1\n",
+        Linux,
+        Linux,
+    ),
+    target_case(
+        "posix-busy",
+        "receiver=W2 interrupted=W2 busy=W1\n",
+        Linux,
+        kvm_unsteered_timer_signal("receiver=none interrupted=none busy=W1+W1\n"),
+    ),
+    target_case(
+        "coalesced-child-curr",
+        "steer=W2 chld=W1 final=W2\n",
+        Linux,
+        Linux,
+    ),
     target_case(
         "ignored-busy",
         "receiver=none interrupted=none busy=W1\n",
+        Linux,
         Linux,
     ),
     target_case(
@@ -26699,9 +26821,66 @@ const PROCESS_SIGNAL_TARGET_CASES: [ProcessSignalTargetCase; 23] = [
             issue: "https://github.com/rrnewton/hermit/issues/5242",
             line: "steer=W2 pending=1 final=W1\n",
         }),
+        Linux,
     ),
-    target_case("default-child-curr", "steer=W2 pending=0 final=W1\n", Linux),
+    target_case(
+        "default-child-curr",
+        "steer=W2 pending=0 final=W1\n",
+        Linux,
+        Linux,
+    ),
+    target_case(
+        "chld-ppoll-lets-in",
+        "receiver=M interrupted=M\n",
+        Linux,
+        Linux,
+    ),
+    target_case(
+        "chld-ppoll-keeps-out",
+        "receiver=W1 interrupted=W1\n",
+        Linux,
+        Linux,
+    ),
+    target_case(
+        "chld-pselect-lets-in",
+        "receiver=M interrupted=M\n",
+        Linux,
+        Linux,
+    ),
+    target_case(
+        "chld-pselect-keeps-out",
+        "receiver=W1 interrupted=W1\n",
+        Linux,
+        Linux,
+    ),
+    target_case(
+        "chld-suspend-lets-in",
+        "receiver=M interrupted=M\n",
+        Linux,
+        Linux,
+    ),
+    target_case(
+        "chld-suspend-keeps-out",
+        "receiver=W1 interrupted=W1\n",
+        Linux,
+        Linux,
+    ),
+    target_case(
+        "chld-ppoll-pending-temp",
+        "receiver=M interrupted=M\n",
+        TargetExpectation::Refuses,
+        Linux,
+    ),
 ];
+
+/// KVM's KNOWN DIVERGENCE for a POSIX timer whose signal is not SIGALRM
+/// (#4995, minibeads dh-ly7rb; `PROCESS_SIGNAL_TARGET_CASES`): `line`.
+const fn kvm_unsteered_timer_signal(line: &'static str) -> TargetExpectation {
+    Diverges(KnownDivergence {
+        issue: "https://github.com/rrnewton/hermit/issues/4995",
+        line,
+    })
+}
 
 fn process_signal_target_guest() -> &'static Path {
     PROCESS_SIGNAL_TARGET_GUEST.get_or_init(|| compile_c_guest("process_signal_target"))
@@ -26769,6 +26948,9 @@ fn judge_process_signal_target(
     printed: &str,
 ) {
     match expectation {
+        TargetExpectation::Refuses => {
+            panic!("{mode}: refusals are judged by assert_ptrace_refuses, not a line")
+        }
         Linux => assert_eq!(printed, linux, "{mode}: {backend}"),
         Diverges(KnownDivergence { issue, line }) => {
             eprintln!(
@@ -26786,13 +26968,40 @@ fn judge_process_signal_target(
     }
 }
 
-/// SIGSHARE S3b on ptrace: a process-directed signal the kernel generates for
-/// a multithreaded process (a child's exit `SIGCHLD`, an ITIMER_REAL or POSIX
-/// timer expiry) reaches the thread Linux's `complete_signal` chooses, where
-/// the scheduler models signal targets: each mode of
+/// SIGSHARE S3b: on KVM the scheduler models signal targets
+/// (`kernel_signal_targets_are_predictable`), so a process-directed signal the
+/// kernel generates for a multithreaded process reaches the thread Linux's
+/// `complete_signal` chooses, where the scheduler steers it: a child's exit
+/// `SIGCHLD`, and a timer whose signal is SIGALRM. The scheduler chooses the
+/// thread from each thread's mask, wait and pending signals, as on ptrace,
+/// and the backend's delivery permit follows the choice. Each mode of
 /// [`PROCESS_SIGNAL_TARGET_CASES`] must print Linux's line natively, and on
-/// ptrace, at bitwise parity, as its ptrace expectation says. The KVM half
-/// arrives with SIGSHARE S3b's flip.
+/// KVM at bitwise parity as its KVM expectation says. Before S3b KVM printed
+/// `receiver=M interrupted=none` for `chld-creator` and `chld-worker` (the
+/// backend's own choice, M, outside its wait), and `receiver=none` for
+/// `chld-walk` and `posix-walk`, whose copy no thread took.
+#[test]
+fn run_kvm_a_kernel_sent_process_signal_reaches_the_thread_linux_chooses() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM process-signal-target cases: /dev/kvm is unavailable");
+        return;
+    }
+    for case in PROCESS_SIGNAL_TARGET_CASES {
+        assert_eq!(
+            native_process_signal_target(case.mode),
+            case.linux,
+            "{}: natively",
+            case.mode
+        );
+        let kvm = process_signal_target_at_l2(&["--backend=kvm"], case.mode);
+        judge_process_signal_target("KVM", case.mode, case.linux, case.kvm, &kvm);
+    }
+}
+
+/// The native and ptrace halves of
+/// `run_kvm_a_kernel_sent_process_signal_reaches_the_thread_linux_chooses`:
+/// each mode must print Linux's line natively, and on ptrace, at bitwise
+/// parity, as its ptrace expectation says.
 #[test]
 fn a_kernel_sent_process_signal_reaches_the_thread_linux_chooses_natively_and_on_ptrace() {
     for case in PROCESS_SIGNAL_TARGET_CASES {
@@ -26802,9 +27011,347 @@ fn a_kernel_sent_process_signal_reaches_the_thread_linux_chooses_natively_and_on
             "{}: natively",
             case.mode
         );
+        if matches!(case.ptrace, TargetExpectation::Refuses) {
+            assert_ptrace_refuses(case.mode);
+            continue;
+        }
         let ptrace = process_signal_target_at_l2(&[], case.mode);
         judge_process_signal_target("ptrace", case.mode, case.linux, case.ptrace, &ptrace);
     }
+}
+
+/// Two child exits straddling one handler return
+/// (tests/c/two_child_after_handler.c): the creator's `ppoll` is
+/// interrupted by the first child's SIGCHLD, its handler returns, and
+/// only then is the second child released, with no new wait or mask
+/// change. Linux gives both to the creator; a delivery frame that
+/// survives the first handler instead remembers SIGCHLD's automatic
+/// handler block and gives the second to the worker. Native, KVM and
+/// ptrace must all print the creator twice, at strict parity.
+#[test]
+fn two_children_after_a_handler_return_choose_the_creator() {
+    let guest_path =
+        TWO_CHILD_AFTER_HANDLER_GUEST.get_or_init(|| compile_c_guest("two_child_after_handler"));
+    let native = {
+        let output = Command::new(guest_path)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run the two-child guest natively");
+        assert!(output.status.success(), "natively: {output:?}");
+        String::from_utf8(output.stdout).expect("guest stdout should be UTF-8")
+    };
+    assert_eq!(native, "first=M second=M\n", "natively");
+    // ptrace first: it is the half that catches a surviving delivery
+    // frame, and it must not be skipped when /dev/kvm is absent.
+    let mut backends: Vec<&[&str]> = vec![&[][..]];
+    if Path::new("/dev/kvm").exists() {
+        backends.push(&["--backend=kvm"][..]);
+    } else {
+        eprintln!("skipping the KVM two-child case: /dev/kvm is unavailable");
+    }
+    for backend in backends {
+        let _guard = hermit_run_guard();
+        let guest = guest_path.to_str().expect("guest path should be UTF-8");
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let report = directory.path().join("verify.json");
+        let report_arg = report.to_str().expect("report path should be UTF-8");
+        let mut args: Vec<&str> = backend.to_vec();
+        args.extend([
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report_arg,
+            "--",
+            guest,
+        ]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let verdict: serde_json::Value = serde_json::from_slice(
+            &fs::read(&report).expect("strict verification wrote no verdict"),
+        )
+        .expect("strict verification verdict is valid JSON");
+        assert_eq!(verdict["bitwise_parity"], true, "{backend:?}: {verdict}");
+        assert_eq!(stdout(&output), native, "{backend:?}");
+    }
+}
+
+/// The slice-coverage oracle for the test below: was thread M (the
+/// creator, identified by its `ppoll` inbound line) timer-preempted
+/// after its first handler/`ppoll` return and before the second signal
+/// delivery, in detlog order?
+///
+/// The return itself logs no line at info level, so the interval opens
+/// at the first log event that proves it happened: the second child's
+/// `exit_group`. The guest releases that child only from the store
+/// after both the handler and `ppoll` have returned, so any M slice end
+/// after that line is in the post-return, syscall-free window, and any
+/// before it may be the handler's own burn and does not count. A slice
+/// end counts only when sourced by a timer: an `inbound timer
+/// preemption event` for M immediately ending M's timeslice. A yield-
+/// or syscall-ended slice (the cooperative fallback) does not count,
+/// and a run with timeslices disabled has no timer event at all, so
+/// both fail this oracle while still printing M/M.
+fn timer_preemption_of_m_after_first_return(detlog: &str) -> Result<(), String> {
+    let lines: Vec<&str> = detlog.lines().collect();
+    let creator = lines
+        .iter()
+        .find(|line| line.contains("inbound syscall: ppoll("))
+        .and_then(|line| line.split("[detcore, dtid ").nth(1))
+        .and_then(|rest| rest.split(']').next())
+        .ok_or("no ppoll inbound line identifies the creator")?;
+    let timer = format!("[detcore, dtid {creator}] inbound timer preemption event");
+    let ending = format!("[detcore, dtid {creator}] ending timeslice");
+    let delivered = format!("[dtid {creator}] handling inbound signal (#0)");
+    let first_delivery = lines
+        .iter()
+        .position(|line| line.contains(&delivered))
+        .ok_or("the first SIGCHLD delivery to the creator is missing")?;
+    // The first exit after that delivery is the second child's: the
+    // first child exited before it, and nobody else exits until after
+    // the second delivery.
+    let second_child_exit = lines[first_delivery + 1..]
+        .iter()
+        .position(|line| {
+            line.contains("inbound syscall: exit_group")
+                && !line.contains(&format!("[detcore, dtid {creator}]"))
+        })
+        .map(|offset| first_delivery + 1 + offset)
+        .ok_or("the second child's exit is missing")?;
+    let handling = format!("[dtid {creator}] handling inbound signal");
+    let alarm = format!("[dtid {creator}] Alarm fired, delivering signal");
+    let second_delivery = lines[second_child_exit + 1..]
+        .iter()
+        .position(|line| line.contains(&handling) || line.contains(&alarm))
+        .map(|offset| second_child_exit + 1 + offset)
+        .ok_or("the second SIGCHLD delivery is missing")?;
+    for index in second_child_exit + 1..second_delivery {
+        if lines[index].contains(&timer)
+            && lines[index + 1..second_delivery]
+                .iter()
+                .take(2)
+                .any(|line| line.contains(&ending))
+        {
+            return Ok(());
+        }
+    }
+    Err(
+        "no timer-sourced timeslice end for the creator after its first \
+         handler/ppoll return and before the second delivery"
+            .to_string(),
+    )
+}
+
+/// The oracle above must tell a timer preemption in the post-return
+/// window from the two ways a run can print M/M without one: handler
+/// burns before the return, and cooperative yields after it.
+#[test]
+fn timer_preemption_oracle_distinguishes_timer_yield_and_disabled_logs() {
+    let header = "[detcore, dtid 3] inbound syscall: ppoll(NULL, 0, 0x0, 0x0, 8) = ?";
+    let delivered = "[dtid 3] handling inbound signal (#0) SIGCHLD";
+    let child_exit = "[detcore, dtid 7] inbound syscall: exit_group(0) = ?";
+    let second = "[dtid 3] handling inbound signal (#1) SIGCHLD";
+    // Timer preemptions during the handler burn (before the return the
+    // second child's exit proves) never qualify on their own.
+    let burn = format!(
+        "{header}\n{delivered}\n\
+         [detcore, dtid 3] inbound timer preemption event\n\
+         [detcore, dtid 3] ending timeslice T1. 0 syscalls and 0 signals this timeslice.\n\
+         {child_exit}\n"
+    );
+    let positive = format!(
+        "{burn}\
+         [detcore, dtid 3] inbound timer preemption event\n\
+         [detcore, dtid 3] ending timeslice T2. 0 syscalls and 0 signals this timeslice.\n\
+         {second}\n"
+    );
+    assert!(timer_preemption_of_m_after_first_return(&positive).is_ok());
+    // The cooperative fallback ends the creator's slices by yield.
+    let cooperative = format!(
+        "{burn}\
+         [detcore, dtid 3] ending timeslice T2. 2 syscalls and 0 signals this timeslice.\n\
+         {second}\n"
+    );
+    assert!(timer_preemption_of_m_after_first_return(&cooperative).is_err());
+    // Timeslices disabled: no timer event anywhere after the return.
+    assert!(timer_preemption_of_m_after_first_return(&format!("{burn}{second}\n")).is_err());
+}
+
+/// The slice-burning variant of the two-child regression
+/// (tests/c/two_child_slice_burning_handler.c): the first handler burns
+/// CPU past a timeslice before returning, and the creator makes no
+/// syscall between its return and the second exit, so only a slice
+/// boundary can retire what the return left behind. Both exits must
+/// still choose the creator, at strict parity where a device allows.
+#[test]
+fn two_children_after_a_slice_burning_handler_return_choose_the_creator() {
+    let guest_path = TWO_CHILD_SLICE_BURNING_HANDLER_GUEST
+        .get_or_init(|| compile_c_guest("two_child_slice_burning_handler"));
+    let native = {
+        let output = Command::new(guest_path)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run the slice-burning guest natively");
+        assert!(output.status.success(), "natively: {output:?}");
+        String::from_utf8(output.stdout).expect("guest stdout should be UTF-8")
+    };
+    assert_eq!(native, "first=M second=M\n", "natively");
+    // PMU qualification: without a usable branch PMU no timeslice can
+    // expire inside the guest's syscall-free window, the case would pass
+    // vacuously, and it is skipped with this named reason instead. The
+    // ordinary two-child regression above stays unconditional.
+    // The launcher's own qualification (run.rs's timer support):
+    // a supported perf counter and a host PMU profile.
+    let pmu_usable =
+        reverie_ptrace::is_perf_supported() && reverie_ptrace::host_pmu_profile().is_ok();
+    if !pmu_usable {
+        eprintln!(
+            "skipping the slice-burning case: no usable PMU (branch events unavailable), \
+             so no timeslice preemption can be observed here"
+        );
+        return;
+    }
+    // ptrace first, as in the two-child case: it is the half that catches
+    // a surviving delivery frame, and /dev/kvm may be absent. The ptrace
+    // run records its preemptions: without a usable PMU no timeslice can
+    // expire inside the guest's syscall-free window, the case would pass
+    // vacuously, and it is skipped with this named reason instead.
+    let mut backends: Vec<&[&str]> = vec![&[][..]];
+    if Path::new("/dev/kvm").exists() {
+        backends.push(&["--backend=kvm"][..]);
+    } else {
+        eprintln!("skipping the KVM slice-burning case: /dev/kvm is unavailable");
+    }
+    for backend in backends {
+        let _guard = hermit_run_guard();
+        let guest = guest_path.to_str().expect("guest path should be UTF-8");
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let report = directory.path().join("verify.json");
+        let report_arg = report.to_str().expect("report path should be UTF-8");
+        let log = directory.path().join("slice.detlog");
+        let log_arg = log.to_str().expect("log path should be UTF-8");
+        let mut args: Vec<&str> = backend.to_vec();
+        args.extend(["--log", "info", "--log-file", log_arg]);
+        args.extend([
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report_arg,
+            "--",
+            guest,
+        ]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let verdict: serde_json::Value = serde_json::from_slice(
+            &fs::read(&report).expect("strict verification wrote no verdict"),
+        )
+        .expect("strict verification verdict is valid JSON");
+        assert_eq!(verdict["bitwise_parity"], true, "{backend:?}: {verdict}");
+        assert_eq!(stdout(&output), native, "{backend:?}");
+        if backend.is_empty() {
+            // The slice observation: a plain ptrace run of the same guest
+            // must show a timer-sourced preemption of the creator after
+            // its first handler/ppoll return and before the second
+            // delivery (see timer_preemption_of_m_after_first_return).
+            // Counting timeslice endings over the whole log would also
+            // credit the handler's burns and the cooperative yield
+            // fallback, neither of which is a preemption in that window.
+            let qargs = [
+                "--log",
+                "info",
+                "--log-file",
+                log_arg,
+                "run",
+                "--strict",
+                "--base-env=minimal",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--",
+                guest,
+            ];
+            let qualify = hermit(&qargs);
+            assert_success(&qualify, &qargs);
+            assert_eq!(stdout(&qualify), native, "qualify run");
+            let detlog = fs::read_to_string(&log).expect("the qualify run wrote no log");
+            timer_preemption_of_m_after_first_return(&detlog)
+                .unwrap_or_else(|reason| panic!("qualify run has no slice coverage: {reason}"));
+            // Negative control: with timeslices disabled the guest still
+            // prints M/M (the ordinary two-child outcome), but the same
+            // oracle must fail. That proves the oracle distinguishes a
+            // timer preemption in the window from a passing guest.
+            let disabled_log = directory.path().join("slice-disabled.detlog");
+            let disabled_arg = disabled_log.to_str().expect("log path should be UTF-8");
+            let dargs = [
+                "--log",
+                "info",
+                "--log-file",
+                disabled_arg,
+                "run",
+                "--strict",
+                "--base-env=minimal",
+                "--epoch=2026-01-01T00:00:00Z",
+                "--max-timeslice=disabled",
+                "--",
+                guest,
+            ];
+            let disabled = hermit(&dargs);
+            assert_success(&disabled, &dargs);
+            assert_eq!(stdout(&disabled), native, "disabled-timeslice run");
+            let disabled_detlog =
+                fs::read_to_string(&disabled_log).expect("the disabled run wrote no log");
+            assert!(
+                timer_preemption_of_m_after_first_return(&disabled_detlog).is_err(),
+                "the oracle accepted a --max-timeslice=disabled run as slice coverage"
+            );
+        }
+    }
+}
+
+/// `mode` on ptrace refuses: Detcore chooses Linux's receiver (the creator
+/// in its masked `ppoll`), and ending that wait cannot keep the held
+/// private copy, a recorded unsupported case. The refusal, with no
+/// receiver line, is the outcome; a completed run — Linux's line or a
+/// sibling's — fails here, so a wrong receiver cannot hide behind it.
+fn assert_ptrace_refuses(mode: &str) {
+    let _guard = hermit_run_guard();
+    let guest = process_signal_target_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let output = hermit(&[
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--",
+        guest,
+        mode,
+    ]);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{mode}: ptrace must refuse with the policy status: {output:?}"
+    );
+    let stdout = stdout(&output);
+    assert!(
+        stdout.is_empty(),
+        "{mode}: ptrace printed where it must refuse: {stdout:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("HERMIT_POLICY_REFUSAL"),
+        "{mode}: ptrace refused without the policy marker: {stderr}"
+    );
+    assert!(
+        stderr.contains("the ppoll wait cannot keep a held signal")
+            && stderr.contains("the pending SIGUSR2"),
+        "{mode}: ptrace refused for an unrecorded reason: {stderr}"
+    );
 }
 
 /// <https://github.com/rrnewton/hermit/issues/4929> (the Claude review of
@@ -28905,6 +29452,209 @@ fn prctl_set_ptracer_answers_as_the_host_kernel_does() {
     let output = hermit(&args);
     assert_success(&output, &args);
     assert_eq!(stdout(&output), native_stdout);
+}
+
+/// The modes of `tests/c/timed_wait_spread.c`: each one 50 ms timed wait
+/// raced against a worker (`multi`: three condition waits).
+const TIMED_WAIT_SPREAD_MODES: [&str; 6] = [
+    "sleep",
+    "clock-rel",
+    "clock-abs",
+    "futex",
+    "condwait",
+    "multi",
+];
+
+/// The strict chaos run of the timed-wait-spread guest, for `seed`, with
+/// `extra` options: first-pass sleep registration both with and without the
+/// spread, so a spread run and its control differ in the spread alone.
+fn timed_wait_spread_args(seed: &str, extra: &[&'static str]) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "run",
+        "--strict",
+        "--chaos",
+        "--max-timeslice=disabled",
+        "--no-virtualize-cpuid",
+        "--sleep-registration=first-pass",
+    ]
+    .iter()
+    .map(|arg| (*arg).to_owned())
+    .collect();
+    args.push(seed.to_owned());
+    args.extend(extra.iter().map(|arg| (*arg).to_owned()));
+    args
+}
+
+/// The `first=` outcomes the guest printed, one per wait.
+fn timed_wait_spread_outcomes(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| line.split("first=").nth(1))
+        .map(|rest| rest.split_whitespace().next().unwrap_or("").to_owned())
+        .collect()
+}
+
+/// `--chaos-timed-wait-spread` changes which of a timed wait and a worker's
+/// progress comes first: for every mode (nanosleep, relative and absolute
+/// clock_nanosleep, a raw futex wait, a condition wait, and three staggered
+/// condition waits), some seed in 1-8 gives a different outcome with the
+/// spread than the same seed without it, both under first-pass sleep
+/// registration. (Measured at the change: sleep and both clock_nanosleep
+/// forms differ at seeds 2, 4 and 5; futex and condwait at 2, 5 and 7; multi
+/// at 7.) An inert spread fails this. Every run, with and without the spread,
+/// passes the guest's own oracle: no sleep or timeout ends before its
+/// deadline on the guest's clock, measured around the call itself, and no
+/// call returns an unexpected error. A spread run of each mode also repeats
+/// under `--verify --verify-strict`. No PMU timer is needed: the worker's
+/// turns advance the clock.
+#[test]
+fn chaos_timed_wait_spread_reorders_a_wait_against_work_and_keeps_the_clock_honest() {
+    let program = timed_wait_spread_guest()
+        .to_str()
+        .expect("timed-wait-spread guest path should be UTF-8");
+    for mode in TIMED_WAIT_SPREAD_MODES {
+        let outcomes = |seed: u64, extra: &[&'static str]| {
+            let seed = format!("--seed={seed}");
+            let mut args = timed_wait_spread_args(&seed, extra);
+            args.extend(["--".to_owned(), program.to_owned(), mode.to_owned()]);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            let out = stdout(&output);
+            let outcomes = timed_wait_spread_outcomes(&out);
+            assert!(!outcomes.is_empty(), "{args:?}: unexpected output {out:?}");
+            outcomes
+        };
+        let differing: Vec<u64> = (1..=8)
+            .filter(|seed| {
+                outcomes(*seed, &[]) != outcomes(*seed, &["--chaos-timed-wait-spread=10"])
+            })
+            .collect();
+        assert!(
+            !differing.is_empty(),
+            "{mode}: the spread changed no outcome at seeds 1-8"
+        );
+        outcomes(
+            1,
+            &[
+                "--chaos-timed-wait-spread=10",
+                "--verify",
+                "--verify-strict",
+            ],
+        );
+    }
+}
+
+/// A schedule replay of a `--chaos-timed-wait-spread` recording follows it,
+/// for every mode, including the timed futex and condition waits and the
+/// three staggered condition waits, whose replay switches to a waiter whose
+/// shortened threshold is due while other timed events are due too. The
+/// recording registers its sleeps at the first pass, by default under the
+/// spread, and so does the replay. Each case replays with no desync and
+/// prints the recording's outcomes and waits; a replay that drew a wait
+/// from another clock, or woke a shortened wait before its deadline, prints
+/// another, or SHORT. A recording made under
+/// `--sleep-registration=when-chosen` is refused, naming the registration to
+/// record with.
+#[test]
+fn a_schedule_replay_of_a_timed_wait_spread_recording_follows_it() {
+    let program = timed_wait_spread_guest()
+        .to_str()
+        .expect("timed-wait-spread guest path should be UTF-8");
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    // Seeds 1-4 of every mode, and the two seeds at which the replay of
+    // 7b08dd88 (before the replay switch honoured a promised deadline and a
+    // pass that requeues a promised wake always ended without a commit) left
+    // its recording without a desync: condwait seed 20 (ETIMEDOUT recorded,
+    // a wake replayed) and multi seed 6 (every wait 3 ms short of the
+    // recording's).
+    let cases = TIMED_WAIT_SPREAD_MODES
+        .iter()
+        .flat_map(|mode| (1..=4u64).map(move |seed| (*mode, seed)))
+        .chain([("condwait", 20), ("multi", 6)]);
+    for (mode, seed) in cases {
+        let seed_arg = format!("--seed={seed}");
+        let record = dir.path().join(format!("spread-{mode}-{seed}.json"));
+        let record_arg = format!("--record-preemptions-to={}", record.display());
+        let common = [
+            "run",
+            "--strict",
+            "--chaos",
+            "--max-timeslice=disabled",
+            "--no-virtualize-cpuid",
+            "--chaos-timed-wait-spread=10",
+            seed_arg.as_str(),
+        ];
+        let mut args = common.to_vec();
+        args.extend([record_arg.as_str(), "--", program, mode]);
+        let recorded = hermit(&args);
+        assert_success(&recorded, &args);
+        let summary = dir
+            .path()
+            .join(format!("replay-{mode}-{seed}.summary.json"));
+        let summary_arg = format!("--summary-json={}", summary.display());
+        let replay_arg = format!("--replay-schedule-from={}", record.display());
+        let mut args = common.to_vec();
+        args.extend([
+            replay_arg.as_str(),
+            summary_arg.as_str(),
+            "--",
+            program,
+            mode,
+        ]);
+        let replayed = hermit(&args);
+        assert_success(&replayed, &args);
+        assert_eq!(stdout(&replayed), stdout(&recorded), "{mode} seed {seed}");
+        let summary: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
+        assert_eq!(
+            summary["schedevent_desynced"], 0,
+            "{mode} seed {seed}: {summary}"
+        );
+    }
+
+    let record = dir.path().join("when-chosen.json");
+    let record_arg = format!("--record-preemptions-to={}", record.display());
+    let args = [
+        "run",
+        "--strict",
+        "--chaos",
+        "--max-timeslice=disabled",
+        "--no-virtualize-cpuid",
+        "--chaos-timed-wait-spread=10",
+        "--sleep-registration=when-chosen",
+        "--seed=1",
+        record_arg.as_str(),
+        "--",
+        program,
+        "sleep",
+    ];
+    assert_success(&hermit(&args), &args);
+    let replay_arg = format!("--replay-schedule-from={}", record.display());
+    let args = [
+        "run",
+        "--strict",
+        "--chaos",
+        "--max-timeslice=disabled",
+        "--no-virtualize-cpuid",
+        "--chaos-timed-wait-spread=10",
+        "--seed=1",
+        replay_arg.as_str(),
+        "--",
+        program,
+        "sleep",
+    ];
+    let refused = hermit(&args);
+    assert_eq!(
+        refused.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{args:?}"
+    );
+    assert!(
+        stderr(&refused).contains("Record with --sleep-registration=first-pass"),
+        "{}",
+        stderr(&refused)
+    );
 }
 
 /// The same exec-boundary clock trajectory must also be reproducible, so the
@@ -51085,7 +51835,7 @@ fn the_4505_signal_guests_get_past_their_handlers_under_record() {
     };
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
-    assert_eq!(metadata["version"], 0x19e, "RECORD_VERSION moved");
+    assert_eq!(metadata["version"], 0x1a0, "RECORD_VERSION moved");
     metadata["version"] = serde_json::json!(0x17f);
     fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
     let replay_args = ["replay", "--autopilot", "--data-dir", directory];
@@ -52173,12 +52923,15 @@ fn host_cpu_directories() -> usize {
 
 /// Every source a program can size a thread pool from reports the same
 /// count: sysconf, get_nprocs, sched_getaffinity, the /sys CPU lists and
-/// directories, /proc/cpuinfo, /proc/stat, Cpus_allowed, node 0, the
-/// distinct APIC IDs CPUID gives on each CPU, getcpu, sched_getcpu and
+/// directories, /proc/cpuinfo, /proc/stat, Cpus_allowed, the distinct APIC
+/// IDs CPUID gives on each CPU, getcpu, sched_getcpu and
 /// /proc/thread-self/stat on each pinned CPU and the distinct CPUs of one
 /// thread per CPU. One without `--virtual-cpus`, as
 /// before, and N with it, at bitwise parity. On a host with fewer than N CPU
 /// directories the run is refused with the count that would be admitted.
+/// (Node 0's CPU list is no source: the kernel without NUMA that Hermit
+/// presents has no node directory, as
+/// `absent_cpus_and_nodes_are_not_found_and_rseq_is_refused` checks.)
 #[test]
 fn virtual_cpus_every_cpu_count_agrees() {
     let guest = futex_c_guest(&VIRTUAL_CPUS_GUEST, "virtual_cpus")
@@ -52212,7 +52965,7 @@ fn virtual_cpus_every_cpu_count_agrees() {
         }
         assert_success(&output, &args);
         let counts = stdout(&output);
-        assert_eq!(counts.lines().count(), 17, "{flag:?}:\n{counts}");
+        assert_eq!(counts.lines().count(), 16, "{flag:?}:\n{counts}");
         for line in counts.lines() {
             assert!(
                 line.ends_with(&format!("={cpus}")),
@@ -52783,11 +53536,451 @@ fn cpu_directory_reads_list_only_cpu0_on_every_path() {
     assert_eq!(report["bitwise_parity"], true, "{report}");
 }
 
-/// The CPUs and NUMA nodes other than number 0 that the sysfs listings leave
-/// out are not found by a lookup either, however it is spelled: absolutely,
-/// below the entry, relative to a directory descriptor, through
-/// `/sys/bus/cpu/devices`, with stat, access and readlink. cpu0 and node0 stay
-/// found, under the default policy at bitwise parity and under
+/// The `node<N>` backlink in a present CPU's directory, by its device and
+/// bus spellings, is absent from its listing and every lookup of it is
+/// ENOENT on `backend`, at bitwise parity, while a neighbouring topology
+/// file stays found. So is the `numa_node` attribute of the first PCI device
+/// and of the first platform device, which a kernel without NUMA does not
+/// register (drivers/pci/pci-sysfs.c:633-635 and drivers/base/platform.c:1331-1340
+/// at v7.1), by the bus alias, the device's own path, its `subsystem` link,
+/// relative to its directory, below it, and in the listing of the directory
+/// a `..` after its `subsystem` link reaches, while `vendor` and `modalias`,
+/// which every such device has, stay found; and so are memory tiering's
+/// directories and the NUMA and memory policy tunables (mm/Makefile:86 and 99).
+/// The first NVMe controller's `numa_node` reads -1
+/// (drivers/nvme/host/pci.c:2379 with include/linux/device.h:899-907), and
+/// a CXL DAX device's `target_node` 0 (drivers/dax/cxl.c:12-21 with
+/// include/linux/numa.h:57-64), beside no `numa_node`. That `numa_node` and
+/// the CPUs' `online` list seek as sysfs attributes do, to an end, data and
+/// hole a page in, before and after a read, whatever they show
+/// (fs/kernfs/file.c:885-910 and fs/sysfs/file.c:313-314); a duplicate
+/// descriptor shares the position, at the bytes read through either, and a
+/// seek past the largest position, from it or from the end, is EINVAL and
+/// leaves the position (fs/read_write.c:57-63).
+///
+/// The same objects, looked up through symbolic links the test makes
+/// ([`sysfs_links`]), are found or not as by their own paths, also by an
+/// open for writing, `access(W_OK)`, `O_CREAT`, through the guest's own
+/// `/proc/self/fd/<n>` link to the device's directory, by a stat whose
+/// result overwrites its path, by readlink, statfs, listxattr, inotify and
+/// chdir, and after a `..` that leaves the absent node directory, also where
+/// further `..` leave sysfs and where the call would make the last name
+/// (mkdir, `O_CREAT`): the walk fails at the absent directory; also after a
+/// `..` straight after `/proc` or `/proc/self`, and through a link of the
+/// guest's own to its `/proc/self/fd/<n>` for the device's directory. A `..`
+/// after a file is ENOTDIR first (fs/namei.c:2662-2668), as natively, and a
+/// directory the guest may not search on the way (`/root`) EACCES
+/// (fs/namei.c:2600). The link itself stays found by lstat, readlink,
+/// `AT_SYMLINK_NOFOLLOW`, llistxattr, `IN_DONT_FOLLOW` and an
+/// `O_PATH|O_NOFOLLOW` open, and `O_NOFOLLOW` refuses it with ELOOP, as Linux
+/// does. Files of the test's own, beside a `subsystem` link to the PCI bus or
+/// the NVMe class, keep their names and bytes, as do the files of an
+/// ordinary directory bound over all of `/sys`: the rules hold only on the
+/// guest's sysfs mount.
+fn absent_cpu_node_backlinks(backend: &str) {
+    let guest = futex_c_guest(&ABSENT_CPU_LOOKUPS_GUEST, "absent_cpu_lookups")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let links = sysfs_links(directory.path());
+    let links = links.to_str().unwrap();
+    let mut expected = String::from(
+        "bound listing node0: 0\n\
+                    bound openat: ENOENT\n\
+                    bound listing node0: 0\n\
+                    bound openat: ENOENT\n\
+                    /sys/devices/system/cpu/cpu0/node0: ENOENT\n\
+                    stat /sys/devices/system/cpu/cpu0/node0: ENOENT\n\
+                    lstat /sys/devices/system/cpu/cpu0/node0: ENOENT\n\
+                    readlink /sys/devices/system/cpu/cpu0/node0: ENOENT\n\
+                    /sys/bus/cpu/devices/cpu0/node0: ENOENT\n\
+                    stat /sys/bus/cpu/devices/cpu0/node0: ENOENT\n\
+                    lstat /sys/bus/cpu/devices/cpu0/node0: ENOENT\n\
+                    readlink /sys/bus/cpu/devices/cpu0/node0: ENOENT\n\
+                    /sys/bus/cpu/drivers/processor/cpu0/node0: ENOENT\n\
+                    stat /sys/bus/cpu/drivers/processor/cpu0/node0: ENOENT\n\
+                    lstat /sys/bus/cpu/drivers/processor/cpu0/node0: ENOENT\n\
+                    readlink /sys/bus/cpu/drivers/processor/cpu0/node0: ENOENT\n\
+                    /sys/devices/system/cpu/cpu0/node0/cpulist: ENOENT\n\
+                    /sys/devices/system/cpu/cpu0/topology/core_id: ok\n\
+                    pci listing numa_node: 0\n\
+                    pci listing vendor: 1\n\
+                    pci numa_node: ENOENT\n\
+                    stat pci numa_node: ENOENT\n\
+                    access pci numa_node: ENOENT\n\
+                    pci vendor: ok\n\
+                    stat pci vendor: ok\n\
+                    access pci vendor: ok\n\
+                    pci device path numa_node: ENOENT\n\
+                    pci subsystem numa_node: ENOENT\n\
+                    pci below numa_node: ENOENT\n\
+                    pci openat numa_node: ENOENT\n\
+                    pci openat vendor: ok\n\
+                    pci dotdot listing numa_node: 0\n\
+                    pci dotdot openat numa_node: ENOENT\n\
+                    pci dotdot listing vendor: 1\n\
+                    pci dotdot openat vendor: ok\n\
+                    platform listing numa_node: 0\n\
+                    platform listing modalias: 1\n\
+                    platform numa_node: ENOENT\n\
+                    stat platform numa_node: ENOENT\n\
+                    access platform numa_node: ENOENT\n\
+                    platform modalias: ok\n\
+                    stat platform modalias: ok\n\
+                    access platform modalias: ok\n\
+                    platform device path numa_node: ENOENT\n\
+                    platform subsystem numa_node: ENOENT\n\
+                    platform below numa_node: ENOENT\n\
+                    platform openat numa_node: ENOENT\n\
+                    platform openat modalias: ok\n\
+                    platform dotdot listing numa_node: 0\n\
+                    platform dotdot openat numa_node: ENOENT\n\
+                    platform dotdot listing modalias: 1\n\
+                    platform dotdot openat modalias: ok\n\
+                    /sys/bus listing memory_tiering: 0\n\
+                    access /sys/bus/memory_tiering: ENOENT\n\
+                    /sys/devices/virtual listing memory_tiering: 0\n\
+                    access /sys/devices/virtual/memory_tiering: ENOENT\n\
+                    /sys/kernel/mm listing numa: 0\n\
+                    access /sys/kernel/mm/numa: ENOENT\n\
+                    /sys/kernel/mm listing mempolicy: 0\n\
+                    access /sys/kernel/mm/mempolicy: ENOENT\n\
+                    /sys/kernel/mm/numa/demotion_enabled: ENOENT\n",
+    );
+    let first_entry = |path: &str| {
+        fs::read_dir(path).ok().and_then(|entries| {
+            entries
+                .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+                .min()
+        })
+    };
+    let nvme = first_entry("/sys/class/nvme");
+    expected.push_str(match nvme {
+        Some(_) => "nvme listing numa_node: 1\nnvme numa_node: \"-1\"\n",
+        None => "nvme: no device\n",
+    });
+    // A DAX device of a CXL region (this host's), whose region's node is
+    // `phys_to_target_node`'s 0 without NUMA.
+    expected.push_str(match first_entry("/sys/bus/dax/devices") {
+        None => "dax: no device\n",
+        Some(device)
+            if fs::read_link(
+                Path::new("/sys/bus/dax/devices")
+                    .join(&device)
+                    .join("../subsystem"),
+            )
+            .is_ok_and(|subsystem| subsystem.ends_with("bus/cxl")) =>
+        {
+            "dax listing target_node: 1\ndax listing numa_node: 0\ndax target_node: \"0\"\n"
+        }
+        Some(_) => "dax: no cxl device\n",
+    });
+    expected.push_str(match nvme {
+        Some(_) => {
+            "nvme seek: end page, read 3, at 3, end page, data at 3 3, hole at 0 page, \
+             read there 0\n\
+             nvme seek: read 1, dup at 1, dup read 1, at 2, set max 9223372036854775807, \
+             cur +1 EINVAL, dup at 9223372036854775807, end max EINVAL\n"
+        }
+        None => "nvme seek: no device\n",
+    });
+    expected.push_str(
+        "online seek: end page, read 2, at 2, end page, data at 3 3, hole at 0 page, \
+         read there 0\n\
+         online seek: read 1, dup at 1, dup read 1, at 2, set max 9223372036854775807, \
+         cur +1 EINVAL, dup at 9223372036854775807, end max EINVAL\n",
+    );
+    // Through the links.
+    for (name, found, link_found) in [
+        ("attribute", "ENOENT", "ok"),
+        ("control", "ok", "ok"),
+        ("nodes", "ENOENT", "ok"),
+        ("cpu/node0", "ENOENT", "ENOENT"),
+        ("cpu/topology/core_id", "ok", "ok"),
+        ("device/numa_node", "ENOENT", "ENOENT"),
+        ("device/vendor", "ok", "ok"),
+        ("attribute/x", "ENOENT", "ENOENT"),
+        ("own", "ok", "ok"),
+        ("lookalike/numa_node", "ok", "ok"),
+    ] {
+        expected.push_str(&format!(
+            "alias {name}: {found}\nstat alias {name}: {found}\n\
+             lstat alias {name}: {link_found}\naccess alias {name}: {found}\n"
+        ));
+    }
+    expected.push_str(
+        "write alias attribute: ENOENT\n\
+         access W_OK alias attribute: ENOENT\n\
+         readlink alias attribute: ok\n\
+         O_PATH|O_NOFOLLOW alias attribute: ok\n\
+         O_NOFOLLOW alias attribute: ELOOP\n\
+         nofollow access alias attribute: ok\n\
+         nofollow fstatat alias attribute: ok\n\
+         creat alias attribute: as by its path\n\
+         fd stat numa_node: ENOENT\n\
+         fd access numa_node: ENOENT\n\
+         fd open numa_node: ENOENT\n",
+    );
+    // KVM refuses every name below a guest's `/proc/self/fd/<n>` with ELOOP
+    // (as it did before Hermit presented a kernel without NUMA), where Linux
+    // walks into the directory.
+    expected.push_str(match backend {
+        "kvm" => "fd stat vendor: ELOOP\n",
+        _ => "fd stat vendor: ok\n",
+    });
+    expected.push_str(
+        "overwritten stat alias attribute: ENOENT\n\
+         overwritten stat alias control: ok\n",
+    );
+    expected.push_str(match nvme {
+        Some(_) => "alias nvme numa_node: \"-1\"\n",
+        None => "alias nvme numa_node: ENOENT\n",
+    });
+    expected.push_str(
+        "alias lookalike numa_node: \"7\"\n\
+         alias nvme-lookalike numa_node: \"7\"\n\
+         lookalike dotdot listing numa_node: 1\n\
+         lookalike dotdot openat numa_node: ok\n\
+         readlink alias cpu/node0: ENOENT\n\
+         readlink alias cpu/subsystem: ok\n\
+         statfs alias attribute: ENOENT\n\
+         listxattr alias attribute: ENOENT\n\
+         llistxattr alias attribute: ok\n\
+         inotify alias attribute: ENOENT\n\
+         inotify IN_DONT_FOLLOW alias attribute: ok\n\
+         statfs alias control: ok\n\
+         listxattr alias control: ok\n\
+         inotify alias control: ok\n\
+         stat alias nodes/..: ENOENT\n\
+         stat alias cpu/..: ok\n\
+         chdir alias nodes: ENOENT\n\
+         chdir alias device: ok\n\
+         stat alias nodes/../../../..: ENOENT\n\
+         statfs alias nodes/../../../..: ENOENT\n\
+         mkdir alias nodes/fresh-child: ENOENT\n\
+         creat alias nodes/fresh-file: ENOENT\n\
+         stat alias own-file/../nodes: ENOTDIR\n\
+         statfs alias own-file/../nodes: ENOTDIR\n\
+         chdir alias own-file/../nodes: ENOTDIR\n\
+         readlink alias own-file/../nodes/node0: ENOTDIR\n\
+         stat /proc/../alias nodes: ENOENT\n\
+         stat /proc/self/../../alias nodes: ENOENT\n",
+    );
+    // The guest, the namespace's root, may search `/root` only where its
+    // mode lets every user do so, since its owner is outside the namespace:
+    // as this test's user may (and not at all where there is none).
+    expected.push_str(match fs::metadata("/root/..") {
+        Err(error) if error.raw_os_error() == Some(libc::EACCES) => {
+            "stat /proc/../root/../node directory: EACCES\n"
+        }
+        _ => "stat /proc/../root/../node directory: ENOENT\n",
+    });
+    // KVM refuses a name below a guest's `/proc/self/fd/<n>` with ELOOP
+    // through a link too, the control's as well.
+    expected.push_str(match backend {
+        "kvm" => {
+            "stat fd link attribute: ELOOP\n\
+             access fd link attribute: ELOOP\n\
+             stat fd link control: ELOOP\n\
+             access fd link control: ELOOP\n"
+        }
+        _ => {
+            "stat fd link attribute: ENOENT\n\
+             access fd link attribute: ENOENT\n\
+             stat fd link control: ok\n\
+             access fd link control: ok\n"
+        }
+    });
+    // On a host whose kernel has NUMA, the PCI device's attribute and the
+    // CPU's node link exist, also through the links: their absence above
+    // is Hermit's.
+    if Path::new("/sys/devices/system/node").exists() {
+        let native = Command::new(&guest)
+            .args(["backlinks", links])
+            .output()
+            .expect("failed to run the native sysfs control");
+        let native = String::from_utf8_lossy(&native.stdout);
+        for line in [
+            "pci listing numa_node: 1\n",
+            "pci numa_node: ok\n",
+            "pci dotdot listing numa_node: 1\n",
+            "alias attribute: ok\n",
+            "alias cpu/node0: ok\n",
+            "fd stat numa_node: ok\n",
+            "overwritten stat alias attribute: ok\n",
+            "readlink alias cpu/node0: ok\n",
+            "statfs alias attribute: ok\n",
+            "stat alias nodes/..: ok\n",
+            "chdir alias nodes: ok\n",
+            "stat alias nodes/../../../..: ok\n",
+            "statfs alias nodes/../../../..: ok\n",
+            "stat alias own-file/../nodes: ENOTDIR\n",
+            "readlink alias own-file/../nodes/node0: ENOTDIR\n",
+            "stat /proc/../alias nodes: ok\n",
+            "stat /proc/self/../../alias nodes: ok\n",
+            "stat fd link attribute: ok\n",
+            "stat fd link control: ok\n",
+            ", end page, data at 3 3, hole at 0 page, read there 0\n",
+            "online seek: read 1, dup at 1, dup read 1, at 2, set max 9223372036854775807, \
+             cur +1 EINVAL, dup at 9223372036854775807, end max EINVAL\n",
+        ] {
+            assert!(native.contains(line), "{line:?} natively:\n{native}");
+        }
+    }
+    let verdict = directory.path().join("verify.json");
+    let mut args = vec![
+        "--log=info",
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        verdict.to_str().unwrap(),
+    ];
+    // KVM refuses a `--timeout` it cannot enforce; `run_with_deadline`
+    // bounds the run either way.
+    if backend != "kvm" {
+        args.extend(["--timeout", "60"]);
+    }
+    args.extend(["--", guest.as_str(), "backlinks", links]);
+    let (status, log) = run_with_deadline(
+        hermit_command(&args),
+        directory.path(),
+        Duration::from_secs(180),
+        false,
+    );
+    let guest_stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "{backend}: stdout:\n{guest_stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(guest_stdout, expected, "{backend}: stderr:\n{log}");
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
+            .expect("the verdict must be JSON");
+    assert_eq!(report["bitwise_parity"], true, "{backend}: {report}");
+
+    // An ordinary directory bound over all of `/sys`, laid out as sysfs: its
+    // `numa_node` files beside `subsystem` links to the PCI bus and the NVMe
+    // class, and a node directory, are the guest's own, listed, found and
+    // read as they are. (KVM's strict mode refuses a run whose `/sys/module`
+    // cannot show that the host has no binder driver, so KVM runs this
+    // without it.)
+    let fake = directory.path().join("sys");
+    let pci = fake.join("devices/pci0000:00/0000:00:00.0");
+    fs::create_dir_all(pci.join("nvme/nvme0")).unwrap();
+    fs::create_dir_all(fake.join("bus/pci/devices")).unwrap();
+    fs::create_dir_all(fake.join("class/nvme")).unwrap();
+    fs::create_dir_all(fake.join("devices/system/node/node0")).unwrap();
+    let symlink = |target: &str, link: PathBuf| std::os::unix::fs::symlink(target, link).unwrap();
+    symlink("../../../bus/pci", pci.join("subsystem"));
+    symlink(
+        "../../../../../class/nvme",
+        pci.join("nvme/nvme0/subsystem"),
+    );
+    symlink(
+        "../../../devices/pci0000:00/0000:00:00.0",
+        fake.join("bus/pci/devices/0000:00:00.0"),
+    );
+    symlink(
+        "../../devices/pci0000:00/0000:00:00.0/nvme/nvme0",
+        fake.join("class/nvme/nvme0"),
+    );
+    fs::write(pci.join("numa_node"), "7\n").unwrap();
+    fs::write(pci.join("nvme/nvme0/numa_node"), "5\n").unwrap();
+    fs::write(fake.join("devices/system/node/node0/cpulist"), "0\n").unwrap();
+    let mount = format!("--mount=type=bind,source={},target=/sys", fake.display());
+    for (command, expected) in [
+        (
+            vec![
+                "/bin/cat",
+                "/sys/bus/pci/devices/0000:00:00.0/numa_node",
+                "/sys/class/nvme/nvme0/numa_node",
+                "/sys/devices/system/node/node0/cpulist",
+            ],
+            "7\n5\n0\n",
+        ),
+        (
+            vec![
+                guest.as_str(),
+                "bound",
+                "/sys/bus/pci/devices/0000:00:00.0",
+                "numa_node",
+            ],
+            "bound listing numa_node: 1\nbound openat: ok\n",
+        ),
+    ] {
+        let mut args = vec!["--backend", backend, "run"];
+        if backend != "kvm" {
+            args.push("--strict");
+        }
+        args.extend([mount.as_str(), "--"]);
+        args.extend(command);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{backend}: {}", stderr(&output));
+    }
+}
+
+/// The symbolic links [`absent_cpu_node_backlinks`] looks the sysfs objects
+/// up through, made in a new directory below `root`, which it returns:
+/// `attribute` to the first PCI device's `numa_node`, `control` to its
+/// `vendor`, `nodes` to the node directory, `cpu` to cpu0's directory,
+/// `device` to the PCI device's directory, and `nvme` to the first NVMe
+/// controller's `numa_node` (dangling without one); the ordinary file
+/// `own-file` and `own` to it; and the directories `lookalike` and
+/// `nvme-lookalike`, each with a `numa_node` reading 7 and a `subsystem`
+/// link to the PCI bus or the NVMe class.
+fn sysfs_links(root: &Path) -> PathBuf {
+    let links = root.join("links");
+    fs::create_dir(&links).unwrap();
+    let first_entry = |path: &str| {
+        fs::read_dir(path)
+            .ok()
+            .and_then(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+                    .min()
+            })
+            .map(|name| name.to_string_lossy().into_owned())
+    };
+    let pci = first_entry("/sys/bus/pci/devices").expect("this test needs a PCI device");
+    let nvme = first_entry("/sys/class/nvme").unwrap_or_else(|| "none".to_owned());
+    let symlink = |target: String, name: &str| {
+        std::os::unix::fs::symlink(target, links.join(name)).unwrap();
+    };
+    symlink(format!("/sys/bus/pci/devices/{pci}/numa_node"), "attribute");
+    symlink(format!("/sys/bus/pci/devices/{pci}/vendor"), "control");
+    symlink("/sys/devices/system/node".to_owned(), "nodes");
+    symlink("/sys/devices/system/cpu/cpu0".to_owned(), "cpu");
+    symlink(format!("/sys/bus/pci/devices/{pci}"), "device");
+    symlink(format!("/sys/class/nvme/{nvme}/numa_node"), "nvme");
+    fs::write(links.join("own-file"), "guest-owned\n").unwrap();
+    symlink("own-file".to_owned(), "own");
+    for (lookalike, subsystem) in [
+        ("lookalike", "/sys/bus/pci"),
+        ("nvme-lookalike", "/sys/class/nvme"),
+    ] {
+        fs::create_dir(links.join(lookalike)).unwrap();
+        fs::write(links.join(lookalike).join("numa_node"), "7\n").unwrap();
+        symlink(subsystem.to_owned(), &format!("{lookalike}/subsystem"));
+    }
+    links
+}
+
+/// The CPUs other than number 0 that the sysfs listings leave out, and
+/// every NUMA node — Hermit presents a kernel without NUMA, so the node
+/// directory itself does not exist
+/// (https://github.com/rrnewton/hermit/issues/5269) — are not found by a
+/// lookup either, however it is spelled: absolutely, below the entry,
+/// relative to a directory descriptor, through `/sys/bus/cpu/devices`,
+/// with stat, access and readlink. cpu0 stays found, under the default
+/// policy at bitwise parity and under
 /// `--allow-unsupported-syscalls` too. Under the default policy rseq fails
 /// with ENOSYS and leaves its area untouched; under
 /// `--allow-unsupported-syscalls` its registration result matches the same
@@ -52801,7 +53994,7 @@ fn absent_cpus_and_nodes_are_not_found_and_rseq_is_refused() {
     let expected = "/sys/devices/system/node/node1/cpulist: ENOENT\n\
                     /sys/devices/system/cpu/cpu1/topology/core_id: ENOENT\n\
                     /sys/devices/system/cpu/cpu0/topology/core_id: ok\n\
-                    /sys/devices/system/node/node0/cpulist: ok\n\
+                    /sys/devices/system/node/node0/cpulist: ENOENT\n\
                     stat /sys/devices/system/cpu/cpu1: ENOENT\n\
                     access /sys/devices/system/node/node1: ENOENT\n\
                     readlink /sys/bus/cpu/devices/cpu1: ENOENT\n\
@@ -52926,11 +54119,17 @@ fn absent_cpus_and_nodes_are_not_found_and_rseq_is_refused() {
     let bound = directory.path().join("bound");
     fs::create_dir(&bound).unwrap();
     fs::write(bound.join("cpu1"), "guest-owned CPU name").unwrap();
+    fs::write(bound.join("node0"), "guest-owned node name").unwrap();
     fs::write(bound.join("node1"), "guest-owned node name").unwrap();
+    // (Not /sys/devices/system/node/node0, the original first target: on
+    // the kernel without NUMA that Hermit presents the node directory
+    // does not exist, so there is no sysfs path there to bind over, as
+    // for an absent CPU.)
     for (target, name) in [
-        ("/sys/devices/system/node/node0", "cpu1"),
+        ("/sys/devices/system/cpu/cpu0", "cpu1"),
         ("/sys/bus/cpu/drivers/processor", "cpu1"),
         ("/sys/devices/system/memory/memory0", "node1"),
+        ("/sys/devices/system/cpu/cpu0", "node0"),
     ] {
         let expected = format!("bound listing {name}: 1\nbound openat: ok\n");
         let native = Command::new(&guest)
@@ -52950,6 +54149,63 @@ fn absent_cpus_and_nodes_are_not_found_and_rseq_is_refused() {
         assert_success(&output, &args);
         assert_eq!(stdout(&output), expected, "{target}: {}", stderr(&output));
     }
+
+    // A guest-owned `numa_node` in an ordinary directory bound over a PCI
+    // device's, beside a `subsystem` link to the PCI bus as sysfs has one,
+    // stays too: only the attribute on sysfs is absent.
+    let first_pci_device = fs::read_dir("/sys/bus/pci/devices")
+        .ok()
+        .and_then(|entries| {
+            entries
+                .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+                .min()
+        });
+    if let Some(device) = first_pci_device {
+        let alias = Path::new("/sys/bus/pci/devices").join(device);
+        let target = fs::canonicalize(&alias).unwrap();
+        let lookalike = directory.path().join("device");
+        fs::create_dir(&lookalike).unwrap();
+        fs::write(lookalike.join("numa_node"), "guest-owned attribute name").unwrap();
+        std::os::unix::fs::symlink("/sys/bus/pci", lookalike.join("subsystem")).unwrap();
+        let expected = "bound listing numa_node: 1\nbound openat: ok\n";
+        let native = Command::new(&guest)
+            .args(["bound", lookalike.to_str().unwrap(), "numa_node"])
+            .output()
+            .expect("failed to run the native attribute control");
+        assert_success(&native, &["native", guest.as_str(), "bound"]);
+        assert_eq!(stdout(&native), expected);
+        let mount = format!(
+            "--mount=type=bind,source={},target={}",
+            lookalike.display(),
+            target.display()
+        );
+        let alias = alias.to_str().unwrap();
+        let args = [
+            "run",
+            "--strict",
+            &mount,
+            "--",
+            &guest,
+            "bound",
+            alias,
+            "numa_node",
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{alias}: {}", stderr(&output));
+    }
+
+    absent_cpu_node_backlinks("ptrace");
+}
+
+/// [`absent_cpu_node_backlinks`] on KVM.
+#[test]
+fn run_kvm_absent_cpu_node_backlinks_are_not_found() {
+    let test = "run_kvm_absent_cpu_node_backlinks_are_not_found";
+    if kvm_unavailable(test) {
+        return;
+    }
+    absent_cpu_node_backlinks("kvm");
 }
 
 /// A vfork child that waits for a thread other than its own vfork child
@@ -53048,22 +54304,19 @@ fn a_vfork_child_waiting_for_another_thread_completes_at_bitwise_parity() {
     }
 }
 
-/// get_mempolicy answers the questions libnuma asks as a Linux machine with one
-/// NUMA node does (https://github.com/rrnewton/hermit/issues/4214):
-/// `MPOL_F_MEMS_ALLOWED` fills the node mask with node 0 alone, as
-/// `/proc/<pid>/status` reports `Mems_allowed_list: 0`, where Detcore left the
-/// guest's buffer as it was; the default policy's mask is empty; flag
-/// combinations Linux refuses, including a flag above bit 31, are EINVAL; a
-/// `maxnode` of 1, which is enough for one node, leaves the mask unwritten, as
-/// Linux's `copy_nodes_to_user` does for it; a read-only or unmapped mask is
-/// EFAULT (Claude review of https://github.com/rrnewton/hermit/pull/4249); and
-/// `MPOL_F_NODE` alone answers node 0, as Linux does after
-/// `set_mempolicy(MPOL_INTERLEAVE)` (Detcore records no policy, so it answers
-/// so under the default policy too, where Linux says EINVAL). On this two-node
-/// host natively the allowed mask reads 0x3 and a `maxnode` of 1 is EINVAL,
-/// which is the host showing through.
+/// Every memory-policy syscall answers ENOSYS, as on the kernel built
+/// without NUMA that Hermit presents
+/// (https://github.com/rrnewton/hermit/issues/5269): get_mempolicy in
+/// every form libnuma asks it — including the flag combinations and bad
+/// buffers a NUMA kernel would answer EINVAL or EFAULT, which the stub
+/// never reaches — and set_mempolicy, mbind, migrate_pages, move_pages
+/// (leaving its status buffer untouched) and set_mempolicy_home_node.
+/// On this multi-node host natively they succeed or fail on their
+/// arguments, which is the host showing through; the one-node emulation
+/// this guest was written for
+/// (https://github.com/rrnewton/hermit/issues/4214) is gone.
 #[test]
-fn get_mempolicy_answers_as_a_one_node_machine() {
+fn memory_policy_syscalls_answer_enosys_as_without_numa() {
     let guest = futex_c_guest(&GET_MEMPOLICY_ONE_NODE_GUEST, "get_mempolicy_one_node")
         .to_str()
         .unwrap()
@@ -53097,20 +54350,25 @@ fn get_mempolicy_answers_as_a_one_node_machine() {
     );
     assert_eq!(
         stdout,
-        "mems_allowed: rc=0 policy=0 mask=0x1\n\
-         default policy: rc=0 policy=0 mask=0\n\
-         mems_allowed with node: Invalid argument\n\
-         node without addr: rc=0 policy=0 mask=0xffffffffffffffff\n\
-         addr without flag: Invalid argument\n\
-         unknown flag: Invalid argument\n\
-         maxnode 0: Invalid argument\n\
-         maxnode 1: rc=0 policy=0 mask=0xffffffffffffffff\n\
-         node of addr: rc=0 policy=0 mask=0xffffffffffffffff\n\
-         flag above bit 31: Invalid argument\n\
-         read-only mask: Bad address\n\
-         unmapped mask: Bad address\n\
-         set interleave: rc=0\n\
-         interleave node: rc=0 policy=0 mask=0xffffffffffffffff\n",
+        "mems_allowed: Function not implemented\n\
+         default policy: Function not implemented\n\
+         mems_allowed with node: Function not implemented\n\
+         node without addr: Function not implemented\n\
+         addr without flag: Function not implemented\n\
+         unknown flag: Function not implemented\n\
+         maxnode 0: Function not implemented\n\
+         maxnode 1: Function not implemented\n\
+         node of addr: Function not implemented\n\
+         flag above bit 31: Function not implemented\n\
+         read-only mask: Function not implemented\n\
+         unmapped mask: Function not implemented\n\
+         set interleave: Function not implemented\n\
+         interleave node: Function not implemented\n\
+         mbind: Function not implemented\n\
+         migrate_pages: Function not implemented\n\
+         move_pages: Function not implemented\n\
+         move_pages status untouched: 1\n\
+         set_mempolicy_home_node: Function not implemented\n",
         "stderr:\n{log}"
     );
     let report: serde_json::Value =
@@ -56903,8 +58161,7 @@ fn every_sigchld_copy_is_accounted_for_as_on_linux() {
 /// queue, sent at the sender's committed turn, so the wait does not hold it as
 /// it holds the kernel's shared copies. Before, the handler ran only after the
 /// wake (https://github.com/rrnewton/hermit/issues/4132). Every expected line
-/// is native output, apart from `futex-dfl-then-handler`'s handler counts (see
-/// its row), and each run reaches canonical bitwise parity.
+/// is native output, and each run reaches canonical bitwise parity.
 #[test]
 fn a_guests_sigchld_to_a_futex_waiting_sibling_ends_its_wait_as_on_linux() {
     verify_futex_sigchld_modes(&[
@@ -56918,13 +58175,14 @@ fn a_guests_sigchld_to_a_futex_waiting_sibling_ends_its_wait_as_on_linux() {
         ("futex-flush", "cond_wait", 0, 0),
         // SIGCHLD is SIG_DFL when main sends it, and main installs a handler
         // only after: Linux discards the signal at generation, so the wait
-        // returns 0 at the wake, with no handler before it, as natively. The
-        // handler does run once, after the wake, where native runs none: under
-        // ptrace the kernel queues the discarded copy for the tracer (item 2
-        // of https://github.com/rrnewton/hermit/issues/3995). Before the
-        // Claude review of https://github.com/rrnewton/hermit/pull/4290, the
-        // drain read the handler and ended the wait with EINTR.
-        ("futex-dfl-then-handler", "futex 0", 0, 1),
+        // returns 0 at the wake and no handler runs, before the wake or after
+        // it (native, 10 of 10 on 2026-11-10). Until
+        // https://github.com/rrnewton/hermit/pull/5259 the copy ptrace still
+        // queued reached that later handler after the wake (item 2 of
+        // https://github.com/rrnewton/hermit/issues/3995). Before the Claude
+        // review of https://github.com/rrnewton/hermit/pull/4290, the drain
+        // read the handler and ended the wait with EINTR.
+        ("futex-dfl-then-handler", "futex 0", 0, 0),
     ]);
 }
 
@@ -58134,6 +59392,11 @@ fn posix_timer_entries_hermit_refuses_or_diverges_on_are_named() {
 ///   last handler's clock read (T1).
 /// - `d1`: a discarded `SI_QUEUE` copy with bytes 32 to 47 set is pending
 ///   first, yet the handler sees exactly the timer's own 48-byte record.
+/// - `d2`: the same discarded copy with no timer reaches no handler, though
+///   one is installed before the parked worker dequeues it (10 of 10 native
+///   runs, 2026-11-10). Until https://github.com/rrnewton/hermit/pull/5259
+///   Hermit delivered it to that handler, the late-handler residual of
+///   https://github.com/rrnewton/hermit/issues/4293, pinned as a divergence.
 /// - The selection rows (R4-1, R5-1): a private `tgkill` USR2, a shared
 ///   SIGHUP and a private SIGRTMIN are each taken before a shared USR1
 ///   timer entry, valid or stale, by `rt_sigtimedwait` (also with a faulting
@@ -58253,6 +59516,7 @@ fn posix_timer_signal_rows_are_delivered_as_on_linux_at_bitwise_parity() {
             "ppoll_stale_valid",
             "ppoll_stale_valid ret=-1 errno=EINTR\nppoll_stale_valid deliveries=1\n  0 sig=10 SI_TIMER timer=1 overrun=0 value=0x2\n",
         ),
+        ("d2", "d2 deliveries=0\n"),
         (
             "rt2_fault",
             "rt2_fault first=EFAULT\n  sig_is_rtmin=1 code=-1 int=22\n  sig_is_rtmin=0 code=-2 int=111\n  take=EAGAIN\n",
@@ -58368,9 +59632,6 @@ fn posix_timer_signal_rows_are_delivered_as_on_linux_at_bitwise_parity() {
 ///   are excluded, and SIGALRM after `alarm()` is not followed, so a timer
 ///   beside a pending kill takes the fallback, where the sends merge
 ///   (disclosures 2 and 6);
-/// - `d2`: a copy Linux discarded while ignored, still queued for a parked
-///   worker, is delivered to a handler installed later: the late-handler
-///   residual of https://github.com/rrnewton/hermit/issues/4293, as on main.
 /// - `sigchld_timer` (rev 6 §9): a SIGCHLD timer while a child is unreaped
 ///   takes the fallback, whose expiries merge into the pending copy, so the
 ///   timer blocked for 5 periods reports overrun 0 where Linux reports 4
@@ -58410,7 +59671,6 @@ fn posix_timer_signal_rows_hermit_refuses_or_diverges_on_are_named() {
     }
     // (mode, Hermit's output, Linux's output)
     let divergences = [
-        ("d2", "d2 deliveries=1\n", "d2 deliveries=0\n"),
         (
             "fallback_alrm",
             "fallback_alrm deliveries=1\n  0 sig=14 code=0 own_pid=1 value=0\n",
@@ -63770,16 +65030,19 @@ fn procfs_system_directory_links_guest() -> String {
 }
 
 /// `output` of the guest's native `--native-settle` run without its
-/// ` settle=N` fields, after checking that no row below the link budget is
-/// ELOOP on all 8 attempts ("native unsettled"): Linux can overcount the
-/// links of a lookup whose RCU walk a host mount restarts (fs/namei.c v6.12,
-/// `set_nameidata` once, then `path_lookupat` again), and the native
-/// reference takes its settled answer, never a constant.
+/// ` settle=N` fields, after checking that no row stayed ELOOP through all
+/// of the guest's settle attempts (` settle=exhausted`, "native unsettled"):
+/// Linux can overcount the links of a lookup whose RCU walk a host mount
+/// restarts (fs/namei.c v6.12, `set_nameidata` once, then `path_lookupat`
+/// again), and the native reference takes its settled answer, never a
+/// constant. The guest settles only the rows below the link budget: a "41
+/// links" row is asked once, and Linux answers it ELOOP however its walk
+/// goes.
 fn settled_native_reference(output: &str) -> String {
     let mut settled = String::new();
     for line in output.lines() {
         assert!(
-            line.contains("41 links") || !line.contains("ELOOP settle=8"),
+            !line.contains(" settle=exhausted"),
             "native unsettled: {line}"
         );
         let mut rest = line;
@@ -66844,17 +68107,18 @@ fn a_blocking_fifo_open_with_a_host_peer_completes_as_on_linux() {
 /// sleep, wait4, sigtimedwait and signalfd rows ended at once (EINTR, a
 /// signal, a record). Each row is the hermit line under
 /// `--strict --verify --verify-strict` (ptrace, canonical bitwise parity), and
-/// the native line (Linux 7.1.3, 3 of 3 each) where it differs: the wait or
-/// take result is identical, and only the handler count differs, because the
-/// discarded copy is still delivered as the waiter returns to user mode
-/// (item 2 of https://github.com/rrnewton/hermit/issues/3995, whose
-/// suppression is a follow-up). A periodic timer's discarded expiry is
-/// parked and queued again when the signal stops being ignored, only while
-/// the expiry is current (Linux's `it_signal_seq`): rearmed far ahead,
-/// disarmed or deleted, nothing comes. In `signalfd-inread` and the two
-/// `signalfd-eintr` rows the worker is woken out of a real signalfd `read`
-/// outside the schedule by main's discarded SIGUSR1, and a guest-sent signal
-/// does not fix where such a thread rejoins
+/// the native line (Linux 7.1.3, 3 of 3 each) where it differs. None differs:
+/// until https://github.com/rrnewton/hermit/pull/5259 nine rows ran the
+/// handler once more than natively, because the discarded copy was still
+/// delivered as the waiter returned to user mode (item 2 of
+/// https://github.com/rrnewton/hermit/issues/3995); Detcore now delivers
+/// nothing for it (native `handled 0`, 10 of 10 each on 2026-11-10). A
+/// periodic timer's discarded expiry is parked and queued again when the
+/// signal stops being ignored, only while the expiry is current (Linux's
+/// `it_signal_seq`): rearmed far ahead, disarmed or deleted, nothing comes.
+/// In `signalfd-inread` and the two `signalfd-eintr` rows the worker is woken
+/// out of a real signalfd `read` outside the schedule by main's discarded
+/// SIGUSR1, and a guest-sent signal does not fix where such a thread rejoins
 /// (https://github.com/rrnewton/hermit/issues/4359). Those three rows failed
 /// `--verify` in 3 of 9 full validates, so they run under `--strict` alone
 /// until that is fixed; see `HOST_TIMED_REJOIN` in
@@ -66868,59 +68132,27 @@ fn a_blocking_fifo_open_with_a_host_peer_completes_as_on_linux() {
 fn a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take() {
     // (mode, hermit line, native line where it differs)
     assert_discard_at_send_rows(&[
-        (
-            "futex-dfl",
-            "futex -1 ETIMEDOUT, handled 1",
-            Some("futex -1 ETIMEDOUT, handled 0"),
-        ),
-        (
-            "futex-dfl-yield",
-            "futex -1 ETIMEDOUT, handled 1",
-            Some("futex -1 ETIMEDOUT, handled 0"),
-        ),
-        (
-            "futex-ign",
-            "futex -1 ETIMEDOUT, handled 1",
-            Some("futex -1 ETIMEDOUT, handled 0"),
-        ),
-        (
-            "futex-ign-yield",
-            "futex -1 ETIMEDOUT, handled 1",
-            Some("futex -1 ETIMEDOUT, handled 0"),
-        ),
-        (
-            "sleep-dfl",
-            "nanosleep 0 0, handled 1",
-            Some("nanosleep 0 0, handled 0"),
-        ),
-        (
-            "sleep-ign",
-            "nanosleep 0 0, handled 1",
-            Some("nanosleep 0 0, handled 0"),
-        ),
-        (
-            "wait4-dfl",
-            "wait4 child 0, status 7, handled 1",
-            Some("wait4 child 0, status 7, handled 0"),
-        ),
+        ("futex-dfl", "futex -1 ETIMEDOUT, handled 0", None),
+        ("futex-dfl-yield", "futex -1 ETIMEDOUT, handled 0", None),
+        ("futex-ign", "futex -1 ETIMEDOUT, handled 0", None),
+        ("futex-ign-yield", "futex -1 ETIMEDOUT, handled 0", None),
+        ("sleep-dfl", "nanosleep 0 0, handled 0", None),
+        ("sleep-ign", "nanosleep 0 0, handled 0", None),
+        ("wait4-dfl", "wait4 child 0, status 7, handled 0", None),
         ("kept-after-discard", "futex -1 EINTR, handled 1", None),
         ("blocked-keeps", "handled 1", None),
         ("self-take", "sigtimedwait 10 0, handled 0", None),
         (
             "sigtimedwait-ign",
-            "sigtimedwait -1 EAGAIN, handled 1",
-            Some("sigtimedwait -1 EAGAIN, handled 0"),
+            "sigtimedwait -1 EAGAIN, handled 0",
+            None,
         ),
         (
             "sigtimedwait-ign-inwait",
             "sigtimedwait -1 EAGAIN, handled 0",
             None,
         ),
-        (
-            "signalfd-ign",
-            "poll 0, read -1 EAGAIN, handled 1",
-            Some("poll 0, read -1 EAGAIN, handled 0"),
-        ),
+        ("signalfd-ign", "poll 0, read -1 EAGAIN, handled 0", None),
         (
             "sigpipe-take",
             "first -1 EAGAIN, write -1 EPIPE, second 13 0",
@@ -67637,7 +68869,9 @@ fn a_strict_preemption_replay_that_leaves_its_readmissions_ends_there() {
 /// parks decides, from `/proc`, where the copy shows pending and caught, and
 /// the record says Linux discarded it (`without_discarded`). Before, the
 /// wait or sleep ended at once (https://github.com/rrnewton/hermit/issues/4293).
-/// Native lines differ only in the handler count (item 2 of
+/// Each line is the native one. Until
+/// https://github.com/rrnewton/hermit/pull/5259 the first four rows also ran
+/// the handler for the discarded copy as the wait returned (item 2 of
 /// https://github.com/rrnewton/hermit/issues/3995).
 #[test]
 fn a_signal_linux_discarded_before_a_wait_files_does_not_end_it() {
@@ -67645,10 +68879,10 @@ fn a_signal_linux_discarded_before_a_wait_files_does_not_end_it() {
     let guest = guest_discard_at_send_guest().to_str().unwrap().to_owned();
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     for (mode, syscall, line) in [
-        ("futex-dfl", "futex", "futex -1 ETIMEDOUT, handled 1"),
-        ("futex-ign", "futex", "futex -1 ETIMEDOUT, handled 1"),
-        ("sleep-dfl", "clock_nanosleep", "nanosleep 0 0, handled 1"),
-        ("sleep-ign", "clock_nanosleep", "nanosleep 0 0, handled 1"),
+        ("futex-dfl", "futex", "futex -1 ETIMEDOUT, handled 0"),
+        ("futex-ign", "futex", "futex -1 ETIMEDOUT, handled 0"),
+        ("sleep-dfl", "clock_nanosleep", "nanosleep 0 0, handled 0"),
+        ("sleep-ign", "clock_nanosleep", "nanosleep 0 0, handled 0"),
         // A kept SIGEV_THREAD_ID timer expiry lands on the discarded copy
         // while the waiter is held: the scheduler's kept send clears the bit
         // (R5-3), so the wait ends as natively.
@@ -67711,22 +68945,22 @@ fn the_discarded_at_send_rows_record_and_replay() {
     let _guard = hermit_run_guard();
     let guest = guest_discard_at_send_guest().to_str().unwrap().to_owned();
     for (mode, line) in [
-        ("futex-dfl", "futex -1 ETIMEDOUT, handled 1"),
-        ("futex-dfl-yield", "futex -1 ETIMEDOUT, handled 1"),
-        ("futex-ign", "futex -1 ETIMEDOUT, handled 1"),
-        ("futex-ign-yield", "futex -1 ETIMEDOUT, handled 1"),
-        ("sleep-dfl", "nanosleep 0 0, handled 1"),
-        ("sleep-ign", "nanosleep 0 0, handled 1"),
-        ("wait4-dfl", "wait4 child 0, status 7, handled 1"),
+        ("futex-dfl", "futex -1 ETIMEDOUT, handled 0"),
+        ("futex-dfl-yield", "futex -1 ETIMEDOUT, handled 0"),
+        ("futex-ign", "futex -1 ETIMEDOUT, handled 0"),
+        ("futex-ign-yield", "futex -1 ETIMEDOUT, handled 0"),
+        ("sleep-dfl", "nanosleep 0 0, handled 0"),
+        ("sleep-ign", "nanosleep 0 0, handled 0"),
+        ("wait4-dfl", "wait4 child 0, status 7, handled 0"),
         ("kept-after-discard", "futex -1 EINTR, handled 1"),
         ("blocked-keeps", "handled 1"),
         ("self-take", "sigtimedwait 10 0, handled 0"),
-        ("sigtimedwait-ign", "sigtimedwait -1 EAGAIN, handled 1"),
+        ("sigtimedwait-ign", "sigtimedwait -1 EAGAIN, handled 0"),
         (
             "sigtimedwait-ign-inwait",
             "sigtimedwait -1 EAGAIN, handled 0",
         ),
-        ("signalfd-ign", "poll 0, read -1 EAGAIN, handled 1"),
+        ("signalfd-ign", "poll 0, read -1 EAGAIN, handled 0"),
         (
             "sigpipe-take",
             "first -1 EAGAIN, write -1 EPIPE, second 13 0",
@@ -68005,10 +69239,11 @@ fn a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity() {
 /// the R2b-1 design, R4-1, https://github.com/rrnewton/hermit/issues/4273).
 /// Before, the answer exempted it and the wait ended with EINTR. Two chaos
 /// seeds put the waiter's turn after the sender's; `futex -1 EINTR, h1 1,
-/// h2 0` would be the other legal line. Native (Linux 7.1.3, 6 of 6):
-/// `futex -1 ETIMEDOUT, h1 0, h2 0`; Hermit's `h2 1` is the discarded copy
-/// still delivered as the waiter returns (item 2 of
-/// https://github.com/rrnewton/hermit/issues/3995).
+/// h2 0` would be the other legal line. Native (Linux 7.1.3, 6 of 6, and 10
+/// of 10 on 2026-11-10): `futex -1 ETIMEDOUT, h1 0, h2 0`, which Hermit
+/// prints. Until https://github.com/rrnewton/hermit/pull/5259 it printed
+/// `h2 1`: the discarded copy was still delivered as the waiter returned
+/// (item 2 of https://github.com/rrnewton/hermit/issues/3995).
 #[test]
 fn a_flushed_then_discarded_copy_does_not_end_a_woken_futex_wait() {
     let _guard = hermit_run_guard();
@@ -68031,7 +69266,7 @@ fn a_flushed_then_discarded_copy_does_not_end_a_woken_futex_wait() {
         assert_success(&output, &args);
         assert_eq!(
             stdout(&output),
-            "futex-flush-resend: futex -1 ETIMEDOUT, h1 0, h2 1\n",
+            "futex-flush-resend: futex -1 ETIMEDOUT, h1 0, h2 0\n",
             "seed {seed}: stderr:\n{log}"
         );
         assert!(
@@ -68195,17 +69430,12 @@ fn poll_recheck_guest(name: &str) -> String {
 /// leaves it unblocked. Each row runs under `--strict --verify
 /// --verify-strict` at canonical parity. The native line (Linux 7.1.3, 3 of 3
 /// each) is the row's unless a comment gives it:
-/// - a late handler where native runs none is the discarded copy still
-///   delivered as the call returns (https://github.com/rrnewton/hermit/issues/3995);
 /// - the `rtign` rows (an RT signal ignored at the send, then a handler) are
 ///   outside the record of discarded copies
 ///   (https://github.com/rrnewton/hermit/issues/4319): native
 ///   `write 70000, h1 0`; so are the `rt-` flush rows a wake does not reach
 ///   before the flush (`rt-write-partial-flush 0`, both `rt-writev-` rows):
 ///   native `4096`;
-/// - `writev-partial-childexit`: the scheduler picks the SIGCHLD's target from
-///   `writev`'s private mask (https://github.com/rrnewton/hermit/issues/4394):
-///   native `writev 4096, h1 1`;
 /// - the partial-room `-h2` rows held only at the call's entry: a kept send to
 ///   a thread not yet in its call, flushed before the call begins, is not
 ///   counted (https://github.com/rrnewton/hermit/issues/4402): native
@@ -68219,6 +69449,16 @@ fn poll_recheck_guest(name: &str) -> String {
 ///   `writev` that requested a turn first let the flush run before the
 ///   delivery, and the taken copy reached `h2`
 ///   (https://github.com/rrnewton/hermit/issues/4379; arm A21).
+///
+/// Until https://github.com/rrnewton/hermit/pull/5259 two more kinds of row
+/// differed, and both now print the native line (10 of 10 native runs each,
+/// 2026-11-10): a handler where native runs none, the copy Linux discarded at
+/// send still delivered as the call returned (item 2 of
+/// https://github.com/rrnewton/hermit/issues/3995), and
+/// `writev-partial-childexit`, where the scheduler gave the child's SIGCHLD
+/// to main instead of the writer, reading the private mask Hermit blocks
+/// `writev` under (https://github.com/rrnewton/hermit/issues/4394), so the
+/// call wrote all 70000 bytes.
 ///
 /// The rows run as three tests, one per group of guests, so each verified run
 /// is charged to a test with its own CPU budget. Run as one test, the 56
@@ -68249,42 +69489,44 @@ fn run_pipe_calls_woken_by_signals(guests: &[&str], rows: usize) {
             before_flush: false,
             line: "caught-restart 0: read 1 0, h1 1, h2 0",
         },
-        // Native h1 0 (3995).
+        // Native; until https://github.com/rrnewton/hermit/pull/5259 these
+        // printed h1 1 (https://github.com/rrnewton/hermit/issues/3995 item 2).
         PollRecheckRow {
             guest: G,
             args: &["dflthandler", "0"],
             held_at: None,
             before_flush: false,
-            line: "dflthandler 0: read 1 0, h1 1, h2 0",
+            line: "dflthandler 0: read 1 0, h1 0, h2 0",
         },
         PollRecheckRow {
             guest: G,
             args: &["dflthandler", "1"],
             held_at: None,
             before_flush: false,
-            line: "dflthandler 1: read 1 0, h1 1, h2 0",
+            line: "dflthandler 1: read 1 0, h1 0, h2 0",
         },
         PollRecheckRow {
             guest: G,
             args: &["ignhandler", "0"],
             held_at: None,
             before_flush: false,
-            line: "ignhandler 0: read 1 0, h1 1, h2 0",
+            line: "ignhandler 0: read 1 0, h1 0, h2 0",
         },
         PollRecheckRow {
             guest: G,
             args: &["ignhandler", "1"],
             held_at: None,
             before_flush: false,
-            line: "ignhandler 1: read 1 0, h1 1, h2 0",
+            line: "ignhandler 1: read 1 0, h1 0, h2 0",
         },
-        // Native h2 0 (3995).
+        // Native; until https://github.com/rrnewton/hermit/pull/5259 this
+        // printed h2 1 (https://github.com/rrnewton/hermit/issues/3995 item 2).
         PollRecheckRow {
             guest: G,
             args: &["flushresend", "1"],
             held_at: None,
             before_flush: false,
-            line: "flushresend 1: read 1 0, h1 0, h2 1",
+            line: "flushresend 1: read 1 0, h1 0, h2 0",
         },
         // Linux's other legal line: the copy delivered before the flush.
         PollRecheckRow {
@@ -68404,13 +69646,14 @@ fn run_pipe_calls_woken_by_signals(guests: &[&str], rows: usize) {
             before_flush: false,
             line: "dataready 0: read 1 0, h1 1, h2 0",
         },
-        // Native h1 0 (3995).
+        // Native; until https://github.com/rrnewton/hermit/pull/5259 this
+        // printed h1 1 (https://github.com/rrnewton/hermit/issues/3995 item 2).
         PollRecheckRow {
             guest: P,
             args: &["write-partial-ign", "0"],
             held_at: None,
             before_flush: false,
-            line: "write-partial-ign 0: write 70000 0, h1 1",
+            line: "write-partial-ign 0: write 70000 0, h1 0",
         },
         PollRecheckRow {
             guest: P,
@@ -68441,13 +69684,14 @@ fn run_pipe_calls_woken_by_signals(guests: &[&str], rows: usize) {
             before_flush: false,
             line: "writev-partial-chld 0: writev 4096 0, h1 1",
         },
-        // Native writev 4096, h1 1 (4394).
+        // Native; until https://github.com/rrnewton/hermit/pull/5259 this
+        // printed writev 70000 (https://github.com/rrnewton/hermit/issues/4394).
         PollRecheckRow {
             guest: P,
             args: &["writev-partial-childexit", "0"],
             held_at: None,
             before_flush: false,
-            line: "writev-partial-childexit 0: writev 70000 0, h1 1",
+            line: "writev-partial-childexit 0: writev 4096 0, h1 1",
         },
         PollRecheckRow {
             guest: P,
@@ -68585,20 +69829,22 @@ fn run_pipe_calls_woken_by_signals(guests: &[&str], rows: usize) {
             line: "writev-partial-quiet-swap: writev 70000 0, h1 0, h2 0\nwritev-partial-quiet-swap: bytes from the first array",
         },
         // A copy Linux discarded at send, pending at entry, does not end the call
-        // (arm A17); native h1 0 (https://github.com/rrnewton/hermit/issues/3995).
+        // (arm A17), and no handler runs for it, as natively; until
+        // https://github.com/rrnewton/hermit/pull/5259 it ran h1
+        // (https://github.com/rrnewton/hermit/issues/3995 item 2).
         PollRecheckRow {
             guest: E,
             args: &["writev-full-ign"],
             held_at: Some("writev"),
             before_flush: false,
-            line: "writev-full-ign: writev 70000 0, h1 1, h2 0",
+            line: "writev-full-ign: writev 70000 0, h1 0, h2 0",
         },
         PollRecheckRow {
             guest: E,
             args: &["writev-partial-ign"],
             held_at: Some("writev"),
             before_flush: false,
-            line: "writev-partial-ign: writev 70000 0, h1 1, h2 0",
+            line: "writev-partial-ign: writev 70000 0, h1 0, h2 0",
         },
         PollRecheckRow {
             guest: E,
@@ -68747,13 +69993,12 @@ fn partial_and_timer_woken_pipe_calls_end_as_linux_does() {
 /// `KernelSignalWait::block_in_place`), so the attempt's result stands, as on
 /// Linux. Before that, the attempt was one plain injection that a pending
 /// copy stopped, and these rows gave `read -1 EINTR` or a short write
-/// (https://github.com/rrnewton/hermit/issues/4385). Natively:
-/// `read 1, h1 0` for `dflthandler` and `ignhandler`, `read 1, h1 0, h2 0` for
-/// `flushresend 1` and `write 70000, h1 0` for `write-partial-ign 0`: the late
-/// handler in each is the copy Linux discarded at send, still delivered as the
-/// call returns (https://github.com/rrnewton/hermit/issues/3995), as in run
-/// mode. `dataready 0`, `caught 0` and `write-partial-flush 1` give the native
-/// line.
+/// (https://github.com/rrnewton/hermit/issues/4385). Each row gives the
+/// native line, as in run mode. Until
+/// https://github.com/rrnewton/hermit/pull/5259 `dflthandler`, `ignhandler`,
+/// `flushresend 1` and `write-partial-ign 0` ran one more handler than
+/// natively, for the copy Linux discarded at send, still delivered as the
+/// call returned (https://github.com/rrnewton/hermit/issues/3995).
 #[test]
 fn pipe_wake_rows_under_record_and_replay() {
     let _guard = hermit_run_guard();
@@ -68764,22 +70009,22 @@ fn pipe_wake_rows_under_record_and_replay() {
         (
             G,
             &["dflthandler", "0"],
-            "dflthandler 0: read 1 0, h1 1, h2 0",
+            "dflthandler 0: read 1 0, h1 0, h2 0",
         ),
         (
             G,
             &["dflthandler", "1"],
-            "dflthandler 1: read 1 0, h1 1, h2 0",
+            "dflthandler 1: read 1 0, h1 0, h2 0",
         ),
         (
             G,
             &["ignhandler", "0"],
-            "ignhandler 0: read 1 0, h1 1, h2 0",
+            "ignhandler 0: read 1 0, h1 0, h2 0",
         ),
         (
             G,
             &["flushresend", "1"],
-            "flushresend 1: read 1 0, h1 0, h2 1",
+            "flushresend 1: read 1 0, h1 0, h2 0",
         ),
         (G, &["dataready", "0"], "dataready 0: read 1 0, h1 1, h2 0"),
         (G, &["caught", "0"], "caught 0: read -1 EINTR, h1 1, h2 0"),
@@ -68791,7 +70036,7 @@ fn pipe_wake_rows_under_record_and_replay() {
         (
             P,
             &["write-partial-ign", "0"],
-            "write-partial-ign 0: write 70000 0, h1 1",
+            "write-partial-ign 0: write 70000 0, h1 0",
         ),
         // The rewrite of the iovec array lands between the call's entry and
         // its first attempt, in the recording and in the replay (R1).
@@ -73915,7 +75160,6 @@ fn run_kvm_the_callers_own_proc_directories_answer_as_linux() {
         "cmdline/r",
         "stat/r",
         "statm/r",
-        "numa_maps/r",
         "mounts/r",
         "mountinfo/r",
         "smaps/r",
@@ -74220,9 +75464,35 @@ fn proc_other_process_stat_guest() -> &'static Path {
 /// first, so a host that answers otherwise fails here rather than in the
 /// comparison.
 fn proc_other_process_stat_native(backend: &str) -> String {
+    proc_other_process_stat_native_with(backend, |_| {})
+}
+
+fn proc_other_process_stat_native_with(
+    backend: &str,
+    configure: impl FnOnce(&mut Command),
+) -> String {
     let args = proc_other_process_stat_args(backend);
     let mut command = Command::new(proc_other_process_stat_guest());
     without_core_dumps(&mut command);
+    configure(&mut command);
+    // A runner may ignore SIGPIPE/SIGXFSZ. Those dispositions survive exec
+    // and appear in a zombie's sigignore field; they are not guest inputs.
+    // SAFETY: only the child is changed, using async-signal-safe calls.
+    unsafe {
+        command.pre_exec(|| {
+            let mut default = std::mem::zeroed::<libc::sigaction>();
+            default.sa_sigaction = libc::SIG_DFL;
+            if libc::sigemptyset(&mut default.sa_mask) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for signal in [libc::SIGPIPE, libc::SIGXFSZ] {
+                if libc::sigaction(signal, &default, std::ptr::null_mut()) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
     let output = command
         .args(args)
         .stdin(Stdio::null())
@@ -74372,6 +75642,40 @@ fn guest_transcript_at_l2(backend: &str, guest: &Path, guest_args: &[&str]) -> S
         "{backend} compared no INFO messages: {verdict}"
     );
     stdout(&output)
+}
+
+/// An ignored disposition survives exec. The native control must establish
+/// its own SIGPIPE/SIGXFSZ preconditions, including when a runner ignores both.
+#[test]
+fn native_other_process_stat_is_independent_of_ignored_pipe_and_file_size_signals() {
+    for backend in ["ptrace", "kvm"] {
+        proc_other_process_stat_native_with(backend, |command| {
+            // SAFETY: this callback runs only in the child before exec and
+            // uses async-signal-safe sigaction/sigemptyset calls. The parallel
+            // test process's dispositions are never changed.
+            unsafe {
+                command.pre_exec(|| {
+                    let mut ignored = std::mem::zeroed::<libc::sigaction>();
+                    ignored.sa_sigaction = libc::SIG_IGN;
+                    if libc::sigemptyset(&mut ignored.sa_mask) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    for signal in [libc::SIGPIPE, libc::SIGXFSZ] {
+                        let mut observed = std::mem::zeroed::<libc::sigaction>();
+                        if libc::sigaction(signal, &ignored, std::ptr::null_mut()) == -1
+                            || libc::sigaction(signal, std::ptr::null(), &mut observed) == -1
+                        {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        if observed.sa_sigaction != libc::SIG_IGN {
+                            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+                        }
+                    }
+                    Ok(())
+                });
+            }
+        });
+    }
 }
 
 /// Another process's `/proc/<pid>/stat`, `task/<tid>/stat` and `comm`

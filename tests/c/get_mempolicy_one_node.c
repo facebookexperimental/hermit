@@ -9,8 +9,13 @@
 // Asks get_mempolicy the questions libnuma asks, and prints each answer: the
 // return value (or errno), the policy, and the first word of the node mask,
 // which starts as all ones so that a mask the kernel leaves alone shows as
-// such. Under Hermit, which presents one NUMA node, the answers are those of a
-// one-node Linux machine (https://github.com/rrnewton/hermit/issues/4214).
+// such. Under Hermit, which presents a kernel built without NUMA
+// (https://github.com/rrnewton/hermit/issues/5269), every memory-policy
+// syscall -- get_mempolicy in all these forms, and set_mempolicy, mbind,
+// migrate_pages, move_pages and set_mempolicy_home_node below -- answers
+// ENOSYS before its arguments are looked at, exactly as that kernel's
+// cond_syscall stubs do. (The file keeps its one-node-era name; the
+// one-node emulation it was written for is gone.)
 #define _GNU_SOURCE
 #include <errno.h>
 #include <stdio.h>
@@ -23,6 +28,15 @@
 #define MPOL_F_ADDR 2
 #define MPOL_F_MEMS_ALLOWED 4
 #define MPOL_INTERLEAVE 3
+#define MPOL_BIND 2
+
+#ifndef SYS_set_mempolicy_home_node
+#define SYS_set_mempolicy_home_node 450
+#endif
+
+static void report(const char *label, long rc) {
+    printf("%s: %s\n", label, rc < 0 ? strerror(errno) : "rc=0");
+}
 
 static void ask(const char *label, int with_mask, unsigned long maxnode, void *addr,
                 unsigned long flags) {
@@ -74,8 +88,22 @@ int main(void) {
     ask_into_page("unmapped mask", -1);
     // libnuma's numa_get_interleave_node: the next interleave node.
     unsigned long node0 = 1;
-    long set = syscall(SYS_set_mempolicy, MPOL_INTERLEAVE, &node0, 64UL);
-    printf("set interleave: %s\n", set < 0 ? strerror(errno) : "rc=0");
+    report("set interleave", syscall(SYS_set_mempolicy, MPOL_INTERLEAVE, &node0, 64UL));
     ask("interleave node", 0, 0, NULL, MPOL_F_NODE);
+    // The rest of the family, each with arguments a NUMA kernel would take.
+    long page = sysconf(_SC_PAGESIZE);
+    void *pages[1] = {&local};
+    int status[1] = {-777};
+    unsigned long old_nodes = 1;
+    report("mbind", syscall(SYS_mbind, &local, (unsigned long)page, MPOL_BIND, &node0, 64UL, 0UL));
+    report(
+        "migrate_pages",
+        syscall(SYS_migrate_pages, 0, 64UL, &old_nodes, &node0));
+    report(
+        "move_pages", syscall(SYS_move_pages, 0, 1UL, pages, (void *)0, status, 0UL));
+    printf("move_pages status untouched: %d\n", status[0] == -777);
+    report(
+        "set_mempolicy_home_node",
+        syscall(SYS_set_mempolicy_home_node, (unsigned long)&local, (unsigned long)page, 0UL, 0UL));
     return 0;
 }

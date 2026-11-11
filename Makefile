@@ -151,7 +151,7 @@ check-skill-discovery: ## Verify Claude and stock Codex discover the same produc
 # `make lint` is unchanged for humans. The split exists because a single DAG node
 # running the whole target would re-run `cargo clippy` -- a measured 300s in
 # ci/dag/validate.json's lint.clippy hint -- a second time per validate, and would
-# run it OUTSIDE ci/run-with-reverie-dbt-budget.sh, which that node wraps it in.
+# run it OUTSIDE ci/run-with-core-build.sh, which that node wraps it in.
 # So lint-cargo holds exactly the two steps that already have byte-identical DAG
 # nodes (lint.rustfmt, lint.clippy) and stays unscheduled here; lint-checks holds
 # everything else and IS scheduled, as the single node check.lint_checks.
@@ -235,8 +235,11 @@ LINT_CHECK_TARGETS := \
     lint-check-whitespace \
     lint-check-verify-submodules \
     lint-check-reverie-pin \
+    lint-check-private-static-owned \
+    lint-check-private-static-pipeline \
     lint-check-musl-detcore \
     lint-check-nested-lockfiles \
+    lint-check-oss-cargo-twins \
     lint-check-record-version-floor \
     lint-check-known-gap-ledgers \
     lint-check-buck-reindeer-features \
@@ -380,11 +383,24 @@ lint-check-verify-submodules:
 lint-check-reverie-pin:
 	$(SUBMODULE_PROXY) ./ci/run-reverie-pin-check.sh $(_VALIDATE_PIN_ARG)
 
+# The private-static producer controls, including the runtime source rows
+# derived from this checkout's own H head and Reverie gitlink objects. -B and
+# PYTHONDONTWRITEBYTECODE keep __pycache__ out of the checkout.
+lint-check-private-static-owned:
+	PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s hermit-install/private-static/owned -p 'test_*.py'
+
+lint-check-private-static-pipeline:
+	PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s hermit-install/private-static -p test_run_pipeline.py
+
 lint-check-musl-detcore:
 	./ci/check-musl-detcore.sh
 
 lint-check-nested-lockfiles:
 	$(SUBMODULE_PROXY) ./scripts/check-nested-lockfiles.rs
+
+lint-check-oss-cargo-twins:
+	./scripts/check-oss-cargo-twins.sh --self-test
+	./scripts/check-oss-cargo-twins.sh
 
 lint-check-record-version-floor:
 	./scripts/check-record-version-floor.rs $(_VALIDATE_PIN_ARG)

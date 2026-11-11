@@ -11,6 +11,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicI32;
+use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -601,6 +602,44 @@ fn configured_rpc(tid: i32) -> (CoordinatorRpc<detcore::GlobalState>, UnixStream
     (rpc, peer)
 }
 
+/// The busy case's Consumer and RPC, and what its Complete and retry return
+/// when a signal re-enters the owning thread inside its own exchange.
+struct InFlightReentry {
+    consumer: *mut Consumer,
+    rpc: *const CoordinatorRpc<detcore::GlobalState>,
+    results: Option<(Result<(), String>, Result<(), String>)>,
+}
+
+static IN_FLIGHT_REENTRY: AtomicPtr<InFlightReentry> = AtomicPtr::new(std::ptr::null_mut());
+/// The handler announces its return here with one write(2), which is
+/// async-signal-safe; the server thread waits for that byte.
+static IN_FLIGHT_REENTERED_FD: AtomicI32 = AtomicI32::new(-1);
+
+extern "C" fn complete_inside_in_flight_exchange(_signal: libc::c_int) {
+    let state = IN_FLIGHT_REENTRY.load(Ordering::Acquire);
+    if state.is_null() {
+        return;
+    }
+    // SAFETY: the test thread published this state for exactly one signal,
+    // sent to itself while it is blocked inside the exchange this handler
+    // interrupts, and reads it only after that exchange returns. It holds no
+    // allocator or detlog lock there: it waits in the socket read.
+    let state = unsafe { &mut *state };
+    let (consumer, rpc) = unsafe { (&mut *state.consumer, &*state.rpc) };
+    let first = consumer
+        .complete(rpc, consumer.admitted)
+        .map(|_| ())
+        .map_err(|error| error.to_string());
+    let retry = consumer
+        .complete(rpc, consumer.admitted)
+        .map(|_| ())
+        .map_err(|error| error.to_string());
+    state.results = Some((first, retry));
+    let fd = IN_FLIGHT_REENTERED_FD.load(Ordering::Acquire);
+    // SAFETY: a valid socket end owned by the test until the server read it.
+    unsafe { libc::write(fd, [1u8].as_ptr().cast(), 1) };
+}
+
 #[test]
 fn model_consumer_complete_refuses_actual_in_flight_request() {
     isolated(
@@ -608,18 +647,45 @@ fn model_consumer_complete_refuses_actual_in_flight_request() {
         "model_consumer_complete_refuses_actual_in_flight_request",
         "busy",
         || {
+            // Each guest thread owns its coordinator connection (Reverie
+            // 859d5d61), so a request is in flight for Complete only on the
+            // calling thread's own connection: a re-entry. The owning thread
+            // starts a real exchange, and a signal it receives while that
+            // exchange holds its connection runs Complete on the same thread.
             let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+            let pid = unsafe { libc::getpid() };
             let mut consumer = modeled_consumer(tid);
             let clock = consumer.cut_clock.as_ref().unwrap().clone();
             let expected_clock = clock.as_nanos();
             let mm = consumer.cut.prepared_mm;
             let marker = ExecTicket([97; 32]);
             let (rpc, mut peer) = configured_rpc(tid);
-            let (arrived, received) = std::sync::mpsc::sync_channel(0);
-            let (release, released) = std::sync::mpsc::sync_channel(0);
+            let (reentered, mut reentered_peer) = UnixStream::pair().unwrap();
+            // A hang guard only: the byte, not the clock, orders the reply.
+            reentered_peer
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            IN_FLIGHT_REENTERED_FD.store(reentered.as_raw_fd(), Ordering::Release);
+            let mut reentry = InFlightReentry {
+                consumer: &mut consumer,
+                rpc: &rpc,
+                results: None,
+            };
+            IN_FLIGHT_REENTRY.store(&mut reentry, Ordering::Release);
+            let previous = unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                action.sa_sigaction = complete_inside_in_flight_exchange
+                    as extern "C" fn(libc::c_int)
+                    as libc::sighandler_t;
+                action.sa_flags = libc::SA_RESTART;
+                libc::sigemptyset(&mut action.sa_mask);
+                let mut previous: libc::sigaction = std::mem::zeroed();
+                assert_eq!(libc::sigaction(libc::SIGUSR2, &action, &mut previous), 0);
+                previous
+            };
             let server = std::thread::spawn(move || {
-                // This separate test-marked exchange holds the real shared
-                // client lock. It does not use or admit the tested Consumer.
+                // The owning thread's own test-marked exchange holds its real
+                // connection. It does not use or admit the tested Consumer.
                 let envelope = read_frame(&mut peer).unwrap();
                 assert_eq!(envelope.from, Pid::from_raw(tid));
                 let (actual_clock, actual_mm, request) = envelope.request;
@@ -627,8 +693,16 @@ fn model_consumer_complete_refuses_actual_in_flight_request() {
                 assert_eq!(actual_mm, mm);
                 assert!(matches!(request, Q::WithForwardedCount(0, request)
                     if matches!(*request, Q::CompleteNativeExec { ticket } if ticket == marker)));
-                arrived.send(()).unwrap();
-                released.recv_timeout(Duration::from_secs(3)).unwrap();
+                // Receipt of the full first frame, with no response sent,
+                // proves the actual connection is held; no timing assumption.
+                assert_eq!(
+                    unsafe { libc::syscall(libc::SYS_tgkill, pid, tid, libc::SIGUSR2) },
+                    0
+                );
+                let mut byte = [0u8; 1];
+                reentered_peer
+                    .read_exact(&mut byte)
+                    .expect("the owning thread must re-enter its in-flight exchange");
                 let response: Response = (None, R::CompleteNativeExec(Ok(())));
                 write_frame(&mut peer, &response);
                 assert!(
@@ -636,40 +710,32 @@ fn model_consumer_complete_refuses_actual_in_flight_request() {
                     "busy Complete and its retry must not send another request"
                 );
             });
-            std::thread::scope(|scope| {
-                let blocker = scope.spawn(|| {
-                    rpc.send_blocking_unless_in_flight((
-                        clock,
-                        mm,
-                        Q::WithForwardedCount(
-                            0,
-                            Box::new(Q::CompleteNativeExec { ticket: marker }),
-                        ),
-                    ))
-                });
-                // Receipt of the full first frame, with no response sent,
-                // proves the actual connection is held; no timing assumption.
-                received.recv_timeout(Duration::from_secs(3)).unwrap();
-                let result = consumer.complete(&rpc, consumer.admitted);
-                assert_eq!(
-                    result.unwrap_err().to_string(),
-                    "native successor completion transport failed"
-                );
-                assert!(consumer.completion_attempted);
-                assert!(consumer.cut_clock.is_none());
-                assert_eq!(
-                    consumer
-                        .complete(&rpc, consumer.admitted)
-                        .unwrap_err()
-                        .to_string(),
-                    "native successor completion is out of order"
-                );
-                release.send(()).unwrap();
-                assert_eq!(
-                    blocker.join().unwrap().unwrap(),
-                    (None, R::CompleteNativeExec(Ok(())))
-                );
-            });
+            let held = rpc.send_blocking_unless_in_flight((
+                clock,
+                mm,
+                Q::WithForwardedCount(0, Box::new(Q::CompleteNativeExec { ticket: marker })),
+            ));
+            IN_FLIGHT_REENTRY.store(std::ptr::null_mut(), Ordering::Release);
+            IN_FLIGHT_REENTERED_FD.store(-1, Ordering::Release);
+            assert_eq!(
+                unsafe { libc::sigaction(libc::SIGUSR2, &previous, std::ptr::null_mut()) },
+                0
+            );
+            let (result, retry) = reentry
+                .results
+                .take()
+                .expect("Complete must run inside the in-flight exchange");
+            assert_eq!(
+                result.unwrap_err(),
+                "native successor completion transport failed"
+            );
+            assert!(consumer.completion_attempted);
+            assert!(consumer.cut_clock.is_none());
+            assert_eq!(
+                retry.unwrap_err(),
+                "native successor completion is out of order"
+            );
+            assert_eq!(held.unwrap(), (None, R::CompleteNativeExec(Ok(()))));
             drop(rpc);
             server.join().unwrap();
             assert_eq!(detlog::check_empty_forwarding_cut(), Ok(()));

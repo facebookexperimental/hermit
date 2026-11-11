@@ -26,7 +26,8 @@
 //!
 //! The check reads the dep-info rustc wrote for every library build in the
 //! Cargo `deps` directory this test executable sits in that is current, that
-//! is, written after each source it lists last changed. Cargo has just
+//! is, matching its recorded source checksums, or (without checksums)
+//! written after each source it lists last changed. Cargo has just
 //! confirmed that the build this test links is current, so it is always
 //! among them; other current builds of the same sources (other RUSTFLAGS or
 //! features, which a rust-script cache keys separately) are checked too. A
@@ -35,11 +36,14 @@
 //! alternate build was newer than the violating one this test linked
 //! (rev-h5326-astra, 2026-11-09).
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::SystemTime;
+
+use sha2::Digest;
 
 /// Compile-time environment whose value comes from the package manifest,
 /// never from the checkout path or the run: the set the cache accepts from a
@@ -108,20 +112,67 @@ fn first_rule_sources(dep_info: &str) -> Vec<String> {
     sources
 }
 
-/// Whether rustc wrote the dep-info at `path` no earlier than every source
-/// it lists last changed, the test Cargo applies before it links a build as
-/// it is. A source that is missing makes the build out of date.
+/// Cargo's checksum freshness ignores mtimes, including when a warm target
+/// is reused in a fresh checkout. Require complete, unambiguous checksum
+/// records for Cargo's BLAKE3 and SHA-256 algorithms; never fall back to mtimes on
+/// an invalid record. Without checksums, retain the source-mtime rule.
 fn is_current(path: &Path, dep_info: &str, root: &Path) -> bool {
     let Ok(written) = fs::metadata(path).and_then(|metadata| metadata.modified()) else {
         return false;
     };
     let sources = first_rule_sources(dep_info);
-    !sources.is_empty()
-        && sources.iter().all(|source| {
-            fs::metadata(root.join(source))
-                .and_then(|metadata| metadata.modified())
-                .is_ok_and(|changed| changed <= written)
-        })
+    if sources.is_empty() {
+        return false;
+    }
+    let mut checksums = HashMap::new();
+    for record in dep_info
+        .lines()
+        .filter(|line| line.starts_with("# checksum"))
+    {
+        let Some((checksum, rest)) = record
+            .strip_prefix("# checksum:")
+            .and_then(|rest| rest.split_once(" file_len:"))
+        else {
+            return false;
+        };
+        let Some((algorithm, hash)) = checksum.split_once('=') else {
+            return false;
+        };
+        if !matches!(algorithm, "blake3" | "sha256") {
+            return false;
+        }
+        // Checksum paths are raw remainders, unlike the first rule's escapes.
+        let Some((len, source)) = rest.split_once(' ') else {
+            return false;
+        };
+        let (Ok(hash), Ok(len)) = (blake3::Hash::from_hex(hash), len.parse::<u64>()) else {
+            return false;
+        };
+        if checksums.insert(source, (len, algorithm, hash)).is_some() {
+            return false;
+        }
+    }
+    if !checksums.is_empty() {
+        // Cargo also tracks paths named only by checksum records.
+        return sources
+            .iter()
+            .all(|source| checksums.contains_key(source.as_str()))
+            && checksums.iter().all(|(source, (len, algorithm, hash))| {
+                fs::read(root.join(source)).is_ok_and(|bytes| {
+                    bytes.len() as u64 == *len
+                        && match *algorithm {
+                            "blake3" => blake3::hash(&bytes) == *hash,
+                            "sha256" => sha2::Sha256::digest(&bytes)[..] == hash.as_bytes()[..],
+                            _ => false,
+                        }
+                })
+            });
+    }
+    sources.iter().all(|source| {
+        fs::metadata(root.join(source))
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|changed| changed <= written)
+    })
 }
 
 /// Every `# env-dep:` record outside [`MANIFEST_DERIVED`], as `NAME=value`.
@@ -324,4 +375,97 @@ fn a_path_read_in_a_library_build_is_found() {
                    # env-dep:CARGO_MANIFEST_DIR=/src/hermit/ci/manifest-plan\n\
                    # env-dep:CLIPPY_CONF_DIR\n";
     assert!(!is_library_build(checked));
+}
+
+#[test]
+fn dep_info_freshness_uses_checksums_when_present() {
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "checksum-freshness-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("a b.rs");
+    let other = dir.join("lib.rs");
+    let dep = dir.join("hermit_manifest_plan-checksum.d");
+    let stamp = |path: &Path, seconds| {
+        fs::File::open(path)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(seconds))
+            .unwrap();
+    };
+    for path in [&source, &other] {
+        fs::write(path, "same").unwrap();
+        stamp(path, 1);
+    }
+    let rules =
+        "library.d: lib.rs a\\ b.rs\nliblibrary.rlib: lib.rs a\\ b.rs\n# env-dep:HOME=/path\n";
+    let hash = blake3::hash(b"same").to_hex();
+    let first = format!("# checksum:blake3={hash} file_len:4 lib.rs\n");
+    let checksums = format!("{first}# checksum:blake3={hash} file_len:4 a b.rs\n");
+    let text = format!("{rules}{checksums}");
+    fs::write(&dep, &text).unwrap();
+    stamp(&dep, 2);
+
+    stamp(&source, 3); // A fresh checkout preserves bytes but advances mtimes.
+    assert!(is_current(&dep, &text, &dir));
+    assert_eq!(violations(&current_library_builds(&dir, &dir)).len(), 1);
+    let extra = dir.join("extra.rs");
+    let extended = format!("{text}# checksum:blake3={hash} file_len:4 extra.rs\n");
+    fs::write(&extra, "same").unwrap();
+    assert!(is_current(&dep, &extended, &dir));
+    fs::write(&extra, "diff").unwrap();
+    stamp(&extra, 1);
+    assert!(!is_current(&dep, &extended, &dir));
+    fs::remove_file(&extra).unwrap();
+    assert!(!is_current(&dep, &extended, &dir));
+    let sha = format!("{:x}", sha2::Sha256::digest(b"same"));
+    let sha_text = text
+        .replace(hash.as_str(), &sha)
+        .replace("blake3=", "sha256=");
+    let alternate = dir.join("hermit_manifest_plan-sha256.d");
+    fs::write(&alternate, &sha_text).unwrap();
+    fs::write(&dep, text.replace("# env-dep:HOME=/path\n", "")).unwrap();
+    stamp(&dep, 2);
+    let builds = current_library_builds(&dir, &dir);
+    assert_eq!(builds.len(), 2);
+    let found = violations(&builds);
+    assert_eq!(found.len(), 1);
+    assert!(found[0].contains("hermit_manifest_plan-sha256.d"));
+    fs::write(&source, "diff").unwrap(); // Same length, with an older mtime.
+    stamp(&source, 1);
+    assert!(!is_current(&dep, &text, &dir));
+    assert!(current_library_builds(&dir, &dir).is_empty());
+    fs::remove_file(&source).unwrap();
+    assert!(!is_current(&dep, &text, &dir));
+    fs::write(&source, "same").unwrap();
+    stamp(&source, 1);
+
+    for invalid in [
+        format!("{checksums}# checksum:blake3={hash} file_len:4 extra.rs\n"),
+        first.clone(),                 // Missing coverage for the second listed source.
+        format!("{checksums}{first}"), // Duplicate source record.
+        checksums.replace("blake3=", "unknown="),
+        checksums.replace("file_len:4", "file_len:bad"),
+        checksums.replace("file_len:4", "file_len:5"),
+        checksums.replace(hash.as_str(), "bad"),
+        format!("{checksums}# checksum:malformed\n"),
+    ] {
+        assert!(
+            !is_current(&dep, &format!("{rules}{invalid}"), &dir),
+            "{invalid}"
+        );
+    }
+    // Without checksum records, preserve the original mtime rule.
+    assert!(is_current(&dep, rules, &dir));
+    stamp(&source, 2);
+    assert!(is_current(&dep, rules, &dir));
+    stamp(&source, 3);
+    assert!(!is_current(&dep, rules, &dir));
+    fs::remove_file(&source).unwrap();
+    assert!(!is_current(&dep, rules, &dir));
+    fs::remove_dir_all(dir).unwrap();
 }

@@ -130,17 +130,20 @@
  *            For an untimed wait the sibling then wakes the futex, so a wait
  *            that lost the signal to the sibling returns 0 instead of hanging.
  *
- * `held` states the expectation of a Hermit whose gated waits hold a caught
- * SIGCHLD until the call returns, as Hermit's main branch does: the SIGCHLD
- * cannot end the wait, so the wait needs another way to end. It goes with
- * the `exit` sender and futex, poll or epoll (a `spin*` role included), or
- * with chldlate, chldkill and chldthrexit. With `exit`, the call gets the
- * 300 ms timeout of a must-not-wake option, timed or not. With a SIGCHLD
- * flip, the sibling does not wait for the handler: as for chldign, a `timed`
- * wait returns at its 300 ms deadline, and the sibling wakes an untimed one
- * 200 ms after the signal. Either way the handler runs once the call has
- * returned, so the RESULT line reports it. Linux instead ends the wait with
- * EINTR when the SIGCHLD arrives, so these cells hold only under Hermit.
+ * `held` was written for a Hermit whose gated waits held a caught SIGCHLD
+ * until the call returned, so that the SIGCHLD could not end the wait and
+ * the wait needed another way to end. It goes with the `exit` sender and
+ * futex, poll or epoll (a `spin*` role included), or with chldlate, chldkill
+ * and chldthrexit. With `exit`, the call gets the 300 ms timeout of a
+ * must-not-wake option, timed or not. With a SIGCHLD flip, the sibling does
+ * not wait for the handler: as for chldign, a `timed` wait returns at its
+ * 300 ms deadline, and the sibling wakes an untimed one 200 ms after the
+ * signal. Linux ends the wait with EINTR when the SIGCHLD arrives, and so
+ * does Hermit now: the `exit` cells since
+ * https://github.com/rrnewton/hermit/issues/4005, and the flips in polling
+ * mode since https://github.com/rrnewton/hermit/pull/5259. A Hermit that held
+ * the SIGCHLD again would end the wait those other ways, with the handler
+ * run once the call had returned, and the RESULT line would show it.
  *
  * `warm` issues the waiting call's own system-call instruction once before the
  * wait, so a backend that patches a call site on its first execution (LiteInst)

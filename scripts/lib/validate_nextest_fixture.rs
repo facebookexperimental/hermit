@@ -513,6 +513,7 @@ fn context(source: &Path, outcomes: &[StepOutcome], run_id: &str) -> LedgerCtx {
         selection_mode: "only".into(),
         release_builder: super::super::RELEASE_BUILDER_CARGO,
         e2e_runner: super::super::E2E_RUNNER_CARGO,
+        build_mode: super::super::BUILD_MODE_CARGO.into(),
         cache_state: "fixture-owned".into(),
         commit: git_text(source, &["rev-parse", "HEAD"]),
         tree: git_text(source, &["rev-parse", "HEAD^{tree}"]),

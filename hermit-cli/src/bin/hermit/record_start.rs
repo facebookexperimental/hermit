@@ -259,6 +259,12 @@ pub struct StartOpts {
     #[clap(long, alias = "net", value_name = "local|host")]
     network: Option<NetworkingMode>,
 
+    /// `--pinned-cpu-dir` and `--pinned-cpu-notice`, as for `hermit run`. The
+    /// recording and its verify replay are pinned to one CPU under the
+    /// default policy, `--pinned-cpu=share`.
+    #[clap(flatten)]
+    pinned_cpu_placement: super::pinned_cpu::PinnedCpuPlacementArgs,
+
     /// How much of `/proc` the recorded guest sees, as for `hermit run --proc`
     /// (`minimal`, the default, or `standard`). The level is stored in the
     /// recording, and its replay runs at it.
@@ -517,7 +523,13 @@ impl StartOpts {
         network: NetworkingMode,
         backend_mounts: Vec<Mount>,
     ) -> Result<(Container, IdentityGuard), Error> {
-        let mut container = namespace_container(true, None);
+        // This subcommand's own flags under the default policy, never a policy
+        // another subcommand of this process set.
+        super::pinned_cpu::set_settings(
+            self.pinned_cpu_placement
+                .settings(super::pinned_cpu::PinnedCpuPolicy::Share, None),
+        );
+        let mut container = namespace_container(true, None)?;
         network.configure(&mut container, false);
         let (mut identity_mounts, mut identity_guard) = identity_hardening_mounts(None)?;
         let dev_shm = private_dev_shm(self.mount.iter().map(Mount::get_target));
@@ -1529,6 +1541,7 @@ mod tests {
             base_env: BaseEnv::Host,
             mount: Vec::new(),
             network: None,
+            pinned_cpu_placement: Default::default(),
             proc: Default::default(),
             chaos: false,
             seed: None,
@@ -2035,6 +2048,7 @@ mod tests {
             base_env: BaseEnv::Host,
             mount: Vec::new(),
             network: None,
+            pinned_cpu_placement: Default::default(),
             proc: Default::default(),
             chaos: false,
             seed: None,

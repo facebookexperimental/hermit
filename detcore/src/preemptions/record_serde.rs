@@ -28,6 +28,7 @@ use serde::ser::SerializeMap;
 use super::BackgroundStart;
 use super::HostObservedCount;
 use super::PreemptionRecord;
+use super::RecordedTimedWaitSpread;
 use super::ReservedInputMetadata;
 use super::ThreadHistory;
 use super::TimeSkip;
@@ -68,6 +69,8 @@ struct RawRecord {
     post_crash: Option<Vec<crate::post_crash::PostCrashSwitch>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     uncapped_slices: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timed_wait_spread: Option<RecordedTimedWaitSpread>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     callback_checkpoints: BTreeMap<DetTid, Vec<callback_history::Checkpoint>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -135,6 +138,8 @@ struct InfoRecord {
     post_crash: Option<Vec<crate::post_crash::PostCrashSwitch>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     uncapped_slices: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timed_wait_spread: Option<RecordedTimedWaitSpread>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     callback_checkpoints: BTreeMap<DetTid, Vec<callback_history::Checkpoint>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -600,6 +605,56 @@ mod tests {
         }
     }
 
+    /// The `--chaos-timed-wait-spread` and its seed are a run setting, kept by
+    /// the raw record under their old attributes and at their old place, after
+    /// `guest_ids`: a flat record written before the incomplete-record envelope
+    /// existed reads them, writes back byte for byte and reads back as the
+    /// same record, plain and inside the envelope's payload, and the settings
+    /// reader finds them in a file of either form. So a reader never takes the
+    /// spread as off for a spread run, which would replay its waits unspread.
+    #[test]
+    fn the_timed_wait_spread_survives_the_raw_record_and_the_envelope() {
+        let setting = RecordedTimedWaitSpread {
+            spread: 12.5,
+            seed: Some(7),
+        };
+        let flat = r#"{"per_thread":{},"global":[],"chaos_timeslice":1000,"timed_wait_spread":{"spread":12.5,"seed":7},"rng_seed":3}"#;
+        let record: PreemptionRecord = serde_json::from_str(flat).unwrap();
+        assert_eq!(record.timed_wait_spread(), Some(setting));
+        assert_eq!(record.replay_departed_at(), None);
+        let written = serde_json::to_string(&record).unwrap();
+        assert_eq!(written, flat);
+        assert_eq!(
+            serde_json::from_str::<PreemptionRecord>(&written).unwrap(),
+            record
+        );
+
+        let enveloped = format!(
+            r#"{{"incomplete_preemption_record":{{"version":1,"replay_departed_at":7,"record":{flat}}}}}"#
+        );
+        let marked: PreemptionRecord = serde_json::from_str(&enveloped).unwrap();
+        assert_eq!(marked.replay_departed_at(), Some(7));
+        assert_eq!(marked.timed_wait_spread(), Some(setting));
+        let rewritten = serde_json::to_string(&marked).unwrap();
+        assert_eq!(rewritten, enveloped);
+        let back: PreemptionRecord = serde_json::from_str(&rewritten).unwrap();
+        assert_eq!(back, marked);
+        let mut unmarked = back.clone();
+        unmarked.replay_departed_at = None;
+        assert_eq!(unmarked, record);
+
+        let directory = tempfile::tempdir().unwrap();
+        for (name, text) in [("flat.json", flat.to_owned()), ("marked.json", enveloped)] {
+            let path = directory.path().join(name);
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(
+                crate::preemptions::read_recorded_timed_wait_spread(&path),
+                Ok(Some(setting)),
+                "{name}"
+            );
+        }
+    }
+
     #[test]
     fn wrapped_settings_and_file_transforms_retain_the_authoritative_departure() {
         let directory = tempfile::tempdir().unwrap();
@@ -1001,6 +1056,7 @@ mod tests {
             rewrite_exclusives: _,
             rewrite_exclusives_stripped_heuristic: _,
             uncapped_slices: _,
+            timed_wait_spread: _,
             identity: _,
         } = record;
         // A stated overlay provenance round-trips byte for byte, as the

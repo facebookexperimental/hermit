@@ -136,7 +136,18 @@ fn run_deterministic_workload(
     command
         .arg("90")
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log", "off", "run", EPOCH, "--", "/bin/sh"])
+        // The two runs' Hermit stderr must match; a `--pinned-cpu` notice
+        // (another run holds the CPU in one of them) is placement, not what
+        // this checks.
+        .args([
+            "--log",
+            "off",
+            "run",
+            "--pinned-cpu-notice=off",
+            EPOCH,
+            "--",
+            "/bin/sh",
+        ])
         .arg(workload)
         .arg(redis_server)
         .arg(redis_cli)

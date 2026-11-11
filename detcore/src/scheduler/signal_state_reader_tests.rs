@@ -146,7 +146,8 @@ pub(super) fn kvm_scheduler(control: &Arc<ScriptedControl>, installed: bool) -> 
         ..Config::default().with_backend(|backend| *backend = reverie::BackendCapabilities::KVM)
     });
     assert!(scheduler.backend.provides_process_signal_control);
-    assert!(!scheduler.models_signal_targets);
+    // SIGSHARE S3b: KVM's kernel signal targets are predictable.
+    assert!(scheduler.models_signal_targets);
     if installed {
         assert_eq!(
             scheduler
@@ -353,6 +354,12 @@ fn kvm_poller(
 ) -> (Scheduler, Arc<ScriptedControl>) {
     let control = Arc::new(ScriptedControl::default());
     let mut scheduler = kvm_scheduler(&control, true);
+    // These cases pin S2a's drain filter, which decides from the backend's
+    // dispositions where no record of copies Linux discarded at send is
+    // kept. Since SIGSHARE S3b KVM keeps that record (`models_signal_targets`),
+    // and the sender's turn decides instead
+    // (`with_the_record_a_kvm_poll_is_decided_in_the_senders_turn`).
+    scheduler.models_signal_targets = false;
     add_bound_thread(&mut scheduler, POLLER, POLLER);
     control.script(POLLER, vec![Ok(state)]);
     let mut polling = Resources::new(POLLER);
@@ -403,6 +410,257 @@ fn woke_with(scheduler: &Scheduler, signals: &[i32]) -> bool {
                 .iter()
                 .map(|signal| SigWrapper(*signal))
                 .collect::<Vec<_>>()
+}
+
+/// SIGSHARE S3b: KVM keeps the record of copies Linux discarded at send, so a
+/// guest's send to a parked poll is decided in the sender's turn, as on
+/// ptrace: the sender records the copy's fate (`discard_pre_send`, from the
+/// receiver's dispositions read through the backend), and the record refuses
+/// a discarded copy at admission (`notify_signal_pending`), so an unblocked
+/// ignored signal, explicitly or by default, never reaches the drain, and a
+/// caught one wakes the poll. Mutation: with the record not consulted at
+/// admission, the ignored rows wake the poll.
+#[test]
+fn with_the_record_a_kvm_poll_is_decided_in_the_senders_turn() {
+    for (name, state, signal, wakes) in [
+        (
+            "ignored",
+            sets(0, bit(libc::SIGUSR1), 0),
+            libc::SIGUSR1,
+            false,
+        ),
+        ("default-ignored", sets(0, 0, 0), libc::SIGURG, false),
+        (
+            "caught",
+            sets(0, 0, bit(libc::SIGUSR1)),
+            libc::SIGUSR1,
+            true,
+        ),
+    ] {
+        let control = Arc::new(ScriptedControl::default());
+        let mut scheduler = kvm_scheduler(&control, true);
+        assert!(scheduler.models_signal_targets, "{name}");
+        add_bound_thread(&mut scheduler, POLLER, POLLER);
+        control.script(POLLER, vec![Ok(state)]);
+        let mut polling = Resources::new(POLLER);
+        polling.insert(ResourceID::InternalIOPolling, Permission::W);
+        polling.set_signal_interrupt_errno(Errno::ERESTARTSYS);
+        polling.signal_state_task = Some((POLLER.as_raw(), POLLER.as_raw()));
+        polling.fyi("read");
+        scheduler.next_turns.get_mut(&POLLER).unwrap().req = Ivar::full(Ok(polling));
+        scheduler.runqueue_push_back(POLLER);
+        // The guest's send, as the guest hooks record it.
+        let token = scheduler.discard_pre_send(
+            POLLER,
+            discarded_at_send::QueueId::Thread(POLLER),
+            signal,
+            None,
+        );
+        assert_eq!(token.discarded, !wakes, "{name}");
+        scheduler.discard_note_send(token, None, None);
+        let woken = send_and_drain(&mut scheduler, signal);
+        if wakes {
+            assert!(woke_with(&scheduler, &[signal]), "{name}");
+        } else {
+            assert!(woken.is_empty(), "{name}");
+            assert!(keeps_polling(&scheduler), "{name}");
+        }
+    }
+}
+
+// The flag-on counterparts of the `kvm_poller` cases (the Codex review of
+// https://github.com/rrnewton/hermit/pull/5259, P2): KVM as it runs since
+// SIGSHARE S3b (`models_signal_targets`), where each send is recorded in its
+// sender's turn (`discard_pre_send`, `discard_note_send`) before admission
+// and the drain decide. Each keeps the externally meaningful assertion of
+// its flag-off case; an assertion that the backend is asked exactly once,
+// or never, is not kept, since the sender's record reads the receiver's
+// sets too. Mutations: "the drain wakes for a blocked signal" (blocked,
+// published-mask, merge rows), "the hold dropped" (held row), "an unknown
+// state read as empty" (unknown-state row), "admission ignores a
+// decides-itself writev's mask" (writev row).
+
+/// `kvm_poller` with KVM's flag on: the poller names its own task.
+fn kvm_poller_with_the_record(
+    state: SignalSets,
+    decides_itself: bool,
+) -> (Scheduler, Arc<ScriptedControl>) {
+    let control = Arc::new(ScriptedControl::default());
+    let mut scheduler = kvm_scheduler(&control, true);
+    assert!(scheduler.models_signal_targets);
+    add_bound_thread(&mut scheduler, POLLER, POLLER);
+    control.script(POLLER, vec![Ok(state)]);
+    let mut polling = Resources::new(POLLER);
+    polling.insert(ResourceID::InternalIOPolling, Permission::W);
+    polling.set_signal_interrupt_errno(Errno::ERESTARTSYS);
+    polling.signal_state_task = Some((POLLER.as_raw(), POLLER.as_raw()));
+    polling.decides_signal_interruption_itself = decides_itself;
+    polling.fyi(if decides_itself { "writev" } else { "read" });
+    scheduler.next_turns.get_mut(&POLLER).unwrap().req = Ivar::full(Ok(polling));
+    scheduler.runqueue_push_back(POLLER);
+    (scheduler, control)
+}
+
+/// A guest's send of `signal` to the poller, recorded in the sender's turn
+/// as the guest hooks record it, then drained (`send_and_drain`).
+fn recorded_send_and_drain(scheduler: &mut Scheduler, signal: i32) -> Vec<SigWrapper> {
+    let token = scheduler.discard_pre_send(
+        POLLER,
+        discarded_at_send::QueueId::Thread(POLLER),
+        signal,
+        None,
+    );
+    scheduler.discard_note_send(token, None, None);
+    send_and_drain(scheduler, signal)
+}
+
+/// `a_blocked_signal_does_not_wake_a_kvm_poll`, flag on: a caught signal the
+/// thread blocks is kept, not discarded, and still wakes nothing.
+#[test]
+fn with_the_record_a_blocked_signal_does_not_wake_a_kvm_poll() {
+    let (mut scheduler, control) =
+        kvm_poller_with_the_record(sets(bit(libc::SIGUSR1), 0, bit(libc::SIGUSR1)), false);
+    assert!(recorded_send_and_drain(&mut scheduler, libc::SIGUSR1).is_empty());
+    assert!(keeps_polling(&scheduler));
+    let asked = control.asked();
+    assert!(!asked.is_empty());
+    assert!(asked.iter().all(|task| *task == identity(POLLER, POLLER)));
+    assert_eq!(
+        scheduler.discarded_bits(POLLER),
+        (0, 0),
+        "a blocked copy is one Linux queued"
+    );
+}
+
+/// `a_default_ignored_signal_does_not_wake_a_kvm_poll`, flag on: every
+/// default-ignored signal, unblocked, is discarded as it is sent.
+#[test]
+fn with_the_record_a_default_ignored_signal_does_not_wake_a_kvm_poll() {
+    for signal in [libc::SIGCHLD, libc::SIGWINCH, libc::SIGURG, libc::SIGCONT] {
+        let (mut scheduler, _) = kvm_poller_with_the_record(sets(0, 0, 0), false);
+        assert!(
+            recorded_send_and_drain(&mut scheduler, signal).is_empty(),
+            "signal {signal}"
+        );
+        assert!(keeps_polling(&scheduler), "signal {signal}");
+    }
+}
+
+/// `a_caught_signal_wakes_a_kvm_poll`, flag on: the wake keeps the request's
+/// task and leaves the decision with the drain.
+#[test]
+fn with_the_record_a_caught_signal_wakes_a_kvm_poll() {
+    let (mut scheduler, _) = kvm_poller_with_the_record(sets(0, 0, bit(libc::SIGUSR1)), false);
+    recorded_send_and_drain(&mut scheduler, libc::SIGUSR1);
+    assert!(woke_with(&scheduler, &[libc::SIGUSR1]));
+    let request = scheduler.next_turns[&POLLER]
+        .req
+        .try_read()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        request.signal_state_task,
+        Some((POLLER.as_raw(), POLLER.as_raw()))
+    );
+    assert!(!request.decides_signal_interruption_itself);
+}
+
+/// `a_default_fatal_signal_wakes_a_kvm_poll`, flag on.
+#[test]
+fn with_the_record_a_default_fatal_signal_wakes_a_kvm_poll() {
+    let (mut scheduler, _) = kvm_poller_with_the_record(sets(0, 0, 0), false);
+    recorded_send_and_drain(&mut scheduler, libc::SIGTERM);
+    assert!(woke_with(&scheduler, &[libc::SIGTERM]));
+}
+
+/// `held_signals_do_not_wake_a_kvm_poll`, flag on: a caught SIGCHLD and a
+/// caught signal a host-timed source can post are held.
+#[test]
+fn with_the_record_held_signals_do_not_wake_a_kvm_poll() {
+    let (mut scheduler, _) = kvm_poller_with_the_record(sets(0, 0, bit(libc::SIGCHLD)), false);
+    assert!(recorded_send_and_drain(&mut scheduler, libc::SIGCHLD).is_empty());
+    assert!(keeps_polling(&scheduler));
+    let (mut scheduler, _) = kvm_poller_with_the_record(sets(0, 0, bit(libc::SIGUSR2)), false);
+    scheduler.record_host_timed_signals(POLLER, HostTimedSignalScope::Caller, bit(libc::SIGUSR2));
+    assert!(recorded_send_and_drain(&mut scheduler, libc::SIGUSR2).is_empty());
+    assert!(keeps_polling(&scheduler));
+}
+
+/// `a_kvm_poll_is_filtered_by_the_mask_it_published`, flag on: both
+/// inversions of the published mask against the backend's.
+#[test]
+fn with_the_record_a_kvm_poll_is_filtered_by_the_mask_it_published() {
+    let (mut scheduler, _) = kvm_poller_with_the_record(sets(!0, 0, bit(libc::SIGUSR1)), false);
+    assert!(scheduler.set_saved_guest_sigmask(POLLER, Some(0)));
+    recorded_send_and_drain(&mut scheduler, libc::SIGUSR1);
+    assert!(woke_with(&scheduler, &[libc::SIGUSR1]));
+    let (mut scheduler, _) = kvm_poller_with_the_record(sets(0, 0, bit(libc::SIGUSR1)), false);
+    assert!(scheduler.set_saved_guest_sigmask(POLLER, Some(bit(libc::SIGUSR1))));
+    assert!(recorded_send_and_drain(&mut scheduler, libc::SIGUSR1).is_empty());
+    assert!(keeps_polling(&scheduler));
+}
+
+/// `an_already_woken_kvm_poll_merges_only_signals_that_interrupt_it`, flag
+/// on: a blocked signal sent after the wake is not merged, a fatal one is.
+#[test]
+fn with_the_record_an_already_woken_kvm_poll_merges_only_signals_that_interrupt_it() {
+    let (mut scheduler, _) = kvm_poller_with_the_record(
+        sets(
+            bit(libc::SIGUSR2),
+            0,
+            bit(libc::SIGUSR1) | bit(libc::SIGUSR2),
+        ),
+        false,
+    );
+    recorded_send_and_drain(&mut scheduler, libc::SIGUSR1);
+    assert!(woke_with(&scheduler, &[libc::SIGUSR1]));
+    recorded_send_and_drain(&mut scheduler, libc::SIGUSR2);
+    assert!(woke_with(&scheduler, &[libc::SIGUSR1]));
+    recorded_send_and_drain(&mut scheduler, libc::SIGTERM);
+    assert!(woke_with(&scheduler, &[libc::SIGUSR1, libc::SIGTERM]));
+}
+
+/// `a_kvm_writev_that_decides_for_itself_is_not_filtered`'s flag-on
+/// counterpart. That case isolates the drain, which keeps every signal for a
+/// parked pipe `writev` that checks the disposition itself after the wake.
+/// With the record on, a send reaches the drain only past admission in its
+/// sender's turn, which reads the writev's mask (`poll_mask_admits`: the
+/// guest's own while Detcore holds a private one), so a blocked caught signal
+/// never reaches the drain and wakes nothing, as a blocked signal does not
+/// interrupt a Linux `write`; an unblocked caught one still wakes it, and the
+/// drain does not filter it.
+#[test]
+fn with_the_record_a_kvm_writev_that_decides_for_itself_is_admitted_by_its_mask() {
+    let (mut scheduler, _) =
+        kvm_poller_with_the_record(sets(bit(libc::SIGUSR1), 0, bit(libc::SIGUSR1)), true);
+    assert!(recorded_send_and_drain(&mut scheduler, libc::SIGUSR1).is_empty());
+    assert!(keeps_polling(&scheduler));
+    let (mut scheduler, _) = kvm_poller_with_the_record(sets(0, 0, bit(libc::SIGUSR1)), true);
+    recorded_send_and_drain(&mut scheduler, libc::SIGUSR1);
+    assert!(woke_with(&scheduler, &[libc::SIGUSR1]));
+    let request = scheduler.next_turns[&POLLER]
+        .req
+        .try_read()
+        .unwrap()
+        .unwrap();
+    assert!(request.decides_signal_interruption_itself);
+}
+
+/// `a_kvm_poll_whose_state_is_unknown_keeps_every_signal_it_does_not_hold`,
+/// flag on: a thread the backend no longer knows is woken for a signal it
+/// does not hold, never filtered as if its state were empty, and a held
+/// signal stays held.
+#[test]
+fn with_the_record_a_kvm_poll_whose_state_is_unknown_keeps_every_signal_it_does_not_hold() {
+    let (mut scheduler, control) =
+        kvm_poller_with_the_record(sets(bit(libc::SIGUSR1), 0, bit(libc::SIGUSR1)), false);
+    control.script(POLLER, vec![Err(FactError::Errno(reverie::Errno::ESRCH))]);
+    recorded_send_and_drain(&mut scheduler, libc::SIGUSR1);
+    assert!(woke_with(&scheduler, &[libc::SIGUSR1]));
+    assert_eq!(
+        recorded_send_and_drain(&mut scheduler, libc::SIGCHLD),
+        vec![SigWrapper(libc::SIGUSR1)]
+    );
 }
 
 #[test]

@@ -112,8 +112,8 @@ const fn advice_changes_mapping_flags(advice: i32) -> bool {
 /// `madvise_guard_install`, mm/madvise.c in v6.17): `MADV_DONTNEED` and
 /// `MADV_DONTNEED_LOCKED` zap them, `MADV_GUARD_INSTALL` zaps them and
 /// installs guard markers, and `MADV_WIPEONFORK` leaves a later fork's copy
-/// empty. `numa_maps` prints `kernelpagesize_kB` only for a mapping with a
-/// resident page (`MemoryMetadata::pages_discarded`). `MADV_FREE`,
+/// empty. Whether a mapping still holds a resident page is then not a
+/// fact the memory map carries (`MemoryMetadata::pages_discarded`). `MADV_FREE`,
 /// `MADV_COLD` and `MADV_PAGEOUT` would too, but Detcore answers them itself
 /// and never passes them on ([`MadviseAction::Ignore`]).
 const fn advice_discards_pages(advice: i32) -> bool {
@@ -196,7 +196,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 );
                 let result = self.record_or_replay(guest, call).await;
                 // The backend's memory map lists neither the flags this advice
-                // sets nor the pages it discards, so a `smaps` or `numa_maps`
+                // sets nor the pages it discards, so a `smaps`
                 // Detcore renders from that map can no longer derive them for
                 // a listed mapping the advice reached
                 // (`MemoryMetadata::mapping_flags_changed`, `pages_discarded`).

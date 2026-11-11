@@ -450,6 +450,10 @@ impl GlobalRPC<GlobalState> for TurnGuest {
             GlobalRequest::PublishedGuestSigmask(_) => {
                 GlobalResponse::GuestSigmaskForStatus(self.status_mask)
             }
+            GlobalRequest::BeginWaitMask(_) => GlobalResponse::BeginWaitMask(()),
+            GlobalRequest::EndWaitMask => GlobalResponse::EndWaitMask(()),
+            GlobalRequest::WithdrawWaitMask => GlobalResponse::WithdrawWaitMask(()),
+            GlobalRequest::PopDeliveryMask => GlobalResponse::PopDeliveryMask(()),
             // A masked `ppoll` that would block, refused by name: a run that
             // allows unsupported operations reports it and goes on
             // (`Detcore::refuse_masked_ppoll_wait`).
@@ -520,6 +524,7 @@ impl Guest<Detcore> for TurnGuest {
                 );
                 self.read_results.pop_front().unwrap_or(Err(Errno::EAGAIN))
             }
+            Syscall::Readv(_) => self.read_results.pop_front().unwrap_or(Err(Errno::EAGAIN)),
             Syscall::Write(_) | Syscall::Writev(_) => {
                 self.write_results.pop_front().unwrap_or(Err(Errno::EAGAIN))
             }
@@ -1503,6 +1508,98 @@ fn add_pipe(guest: &mut TurnGuest, fd: i32, id: crate::types::OpenFileId) {
         .unwrap()
         .file_handles
         .insert(fd, pipe);
+}
+
+/// A polled pipe read names the read it polls for (`Resources::read_fd`:
+/// its descriptor table and number) on every retry request, `read` and
+/// `readv` alike, which binds a SIGALRM probe reserved for it
+/// (`Scheduler::reserve_sigalrm_poll`, dh-ru056 slice 1). A pipe write and
+/// a socketpair read name none.
+#[tokio::test]
+async fn polled_pipe_reads_name_their_read_fd() {
+    for (operation, socketpair, named) in [
+        ("read", false, true),
+        ("readv", false, true),
+        ("write", false, false),
+        ("read", true, false),
+    ] {
+        let _seam = script(proc_state(0, 0, 0));
+        let mut guest = turn_guest(true, Some(0));
+        let id = crate::types::OpenFileId::new(DetPid::from_raw(THREAD.as_raw()), 710);
+        let fd = crate::fd::DetFd::new(
+            8,
+            nix::fcntl::OFlag::O_RDWR,
+            if socketpair {
+                crate::fd::FdType::Socket
+            } else {
+                crate::fd::FdType::Pipe
+            },
+            id,
+        );
+        fd.set_physically_nonblocking();
+        if socketpair {
+            fd.set_socketpair_endpoint();
+        }
+        guest
+            .thread
+            .file_metadata
+            .lock()
+            .unwrap()
+            .file_handles
+            .insert(8, fd);
+        let tool = tool(&guest);
+        let buffer = Box::leak(Box::new([0u8; 8])).as_mut_ptr() as usize;
+        let iovec = Box::leak(Box::new([buffer, 1usize])).as_mut_ptr() as usize;
+        guest.read_results = VecDeque::from([Err(Errno::EAGAIN), Ok(1)]);
+        guest.write_results = VecDeque::from([Err(Errno::EAGAIN), Ok(1)]);
+        let result = match operation {
+            "read" => {
+                tool.execute_nonblockable_fd_syscall(
+                    &mut guest,
+                    reverie::syscalls::Read::new()
+                        .with_fd(8)
+                        .with_buf(AddrMut::from_raw(buffer))
+                        .with_len(1),
+                )
+                .await
+            }
+            "readv" => {
+                tool.execute_nonblockable_fd_syscall(
+                    &mut guest,
+                    reverie::syscalls::Readv::new()
+                        .with_fd(8)
+                        .with_iov(Addr::from_raw(iovec))
+                        .with_len(1),
+                )
+                .await
+            }
+            "write" => {
+                tool.execute_nonblockable_fd_syscall(
+                    &mut guest,
+                    reverie::syscalls::Write::new()
+                        .with_fd(8)
+                        .with_buf(Addr::from_raw(buffer))
+                        .with_len(1),
+                )
+                .await
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(result.unwrap(), 1, "{operation}, socketpair={socketpair}");
+        let requests: Vec<_> = guest
+            .requests()
+            .into_iter()
+            .filter(|r| r.resources.contains_key(&ResourceID::InternalIOPolling))
+            .collect();
+        assert!(requests.len() >= 2, "{operation}: a retry was filed");
+        let expected = named.then(|| (guest.thread.files_id(), 8));
+        for request in &requests {
+            assert_eq!(
+                request.read_fd, expected,
+                "{operation}, socketpair={socketpair}"
+            );
+        }
+    }
 }
 
 /// Internal-FD routing is independent of the guest-held proof. Actual

@@ -579,6 +579,7 @@ pub(crate) mod test_sources {
 mod tests {
     use reverie::BackendCapabilities;
     use reverie::RcbClockContract;
+    #[cfg(target_arch = "x86_64")]
     use reverie::pmu_config::PmuConfig;
     use reverie::pmu_config::qualify_host;
 
@@ -738,6 +739,8 @@ mod tests {
 
     /// A claim the host does not qualify, or that another installed profile
     /// contradicts, is refused, never written as Known.
+    // x86_64 only: the PMU family/model fixture is an x86 CPU family.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_contradicted_claim_is_refused() {
         let state = PmuState::new();
@@ -847,6 +850,8 @@ mod tests {
 
     /// A record-only qualified run pins its key before it writes, and its
     /// writer's identity is the committed one.
+    // x86_64 only: the PMU family/model fixture is an x86 CPU family.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_record_only_run_pins_before_writing() {
         let state = PmuState::new();
@@ -863,6 +868,8 @@ mod tests {
 
     /// A ticket whose state changed before the commit is refused there, and
     /// nothing is pinned.
+    // x86_64 only: the PMU family/model fixture is an x86 CPU family.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn a_stale_ticket_is_refused_at_the_commit() {
         let state = PmuState::new();

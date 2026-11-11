@@ -313,14 +313,17 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::quotactl_fd
         // TODO-HUMAN-REVIEW(#547)
         | Sysno::writev
-        // ===== BATCH 3: NUMA memory-placement and Linux CPU-scheduling policy =====
-        // Hermit presents a single deterministic virtual CPU and a single virtual
-        // NUMA node, and Detcore replaces the Linux scheduler with its own. NUMA
-        // placement policy and Linux scheduling policy/priority are therefore
-        // inoperative: they cannot change guest-visible computation. Left as
-        // passthrough their results depend on host NUMA topology, host scheduler
-        // state, and privilege (all nondeterministic). They are determinized to
-        // fixed, host-independent results; see the handlers in lib.rs.
+        // ===== BATCH 3: NUMA memory policy and Linux CPU-scheduling policy =====
+        // Detcore presents a kernel built without NUMA
+        // (https://github.com/rrnewton/hermit/issues/5269): the six
+        // memory-policy syscalls are determinized to the fixed `ENOSYS` a
+        // `!CONFIG_NUMA` kernel's `cond_syscall` stubs return
+        // (`is_memory_policy_syscall`, dispatched in lib.rs before the typed
+        // match). Detcore replaces the Linux scheduler with its own, so the
+        // scheduling-policy calls below are likewise determinized, to the
+        // fixed answers their handlers in lib.rs give. Left as passthrough
+        // either family's results would depend on host NUMA topology, host
+        // scheduler state, and privilege (all nondeterministic).
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#720)
         | Sysno::mbind
@@ -1295,6 +1298,28 @@ pub(crate) const fn is_perf_event_enosys_syscall(sysno: Sysno) -> bool {
     )
 }
 
+/// The NUMA memory-policy syscalls. Detcore presents a kernel built without
+/// NUMA (https://github.com/rrnewton/hermit/issues/5269): Linux compiles
+/// `mm/mempolicy.o` only under `CONFIG_NUMA` (mm/Makefile) and the six entry
+/// points are `cond_syscall` stubs (`kernel/sys_ni.c`), so each returns
+/// `ENOSYS` before any argument is looked at — their compat entry points
+/// are the same stubs. The dispatcher refuses all six at one gate, by
+/// `Sysno`, so the
+/// typed calls and the untyped `set_mempolicy_home_node` take the same
+/// answer on every backend, and libnuma's probe (`get_mempolicy`) reports
+/// NUMA unavailable exactly as it does on such a kernel.
+pub(crate) const fn is_memory_policy_syscall(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        Sysno::set_mempolicy
+            | Sysno::get_mempolicy
+            | Sysno::mbind
+            | Sysno::migrate_pages
+            | Sysno::move_pages
+            | Sysno::set_mempolicy_home_node
+    )
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-836): Deterministic ENOSYS refusal set.
 /// Host filesystem and mount-introspection syscalls. `sysfs` reads the host's
@@ -1447,6 +1472,7 @@ pub(crate) const fn is_deterministically_refused_syscall(sysno: Sysno) -> bool {
         || is_process_isolation_refused_syscall(sysno)
         || is_privileged_observation_refused_syscall(sysno)
         || is_perf_event_enosys_syscall(sysno)
+        || is_memory_policy_syscall(sysno)
         || is_mount_introspection_enosys_syscall(sysno)
         || is_host_security_identity_probe_syscall(sysno)
         || is_optional_memory_feature_syscall(sysno)
@@ -2381,9 +2407,9 @@ mod tests {
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::PassThrough);
         }
-        // Batch 3: NUMA memory-placement and Linux CPU-scheduling policy are
-        // determinized to fixed, host-independent results (single virtual NUMA
-        // node + Detcore scheduler).
+        // Batch 3: the NUMA memory-policy syscalls are determinized to the
+        // `ENOSYS` of a kernel built without NUMA, and Linux CPU-scheduling
+        // policy to fixed, host-independent results (Detcore scheduler).
         for sysno in [
             Sysno::mbind,
             Sysno::set_mempolicy,
@@ -2391,6 +2417,15 @@ mod tests {
             Sysno::set_mempolicy_home_node,
             Sysno::migrate_pages,
             Sysno::move_pages,
+        ] {
+            assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
+            assert!(is_memory_policy_syscall(sysno), "{sysno:?}");
+            assert!(
+                is_deterministically_refused_syscall(sysno),
+                "{sysno:?} should be in the deterministic-refusal aggregate"
+            );
+        }
+        for sysno in [
             Sysno::sched_setscheduler,
             Sysno::sched_setparam,
             Sysno::sched_getscheduler,
@@ -2398,6 +2433,7 @@ mod tests {
             Sysno::sched_rr_get_interval,
         ] {
             assert_eq!(classify_syscall(sysno), SyscallClassification::Determinized);
+            assert!(!is_memory_policy_syscall(sysno), "{sysno:?}");
         }
         // Batch 7: asynchronous and message-passing I/O and IPC interfaces
         // Detcore does not model are refused with a deterministic ENOSYS (Linux
@@ -2941,6 +2977,44 @@ mod tests {
     }
 
     #[test]
+    fn memory_policy_syscalls_are_determinized_and_consistent() {
+        // The six NUMA memory-policy syscalls of a kernel built without
+        // NUMA: each is a `cond_syscall` stub there, so each is refused
+        // with ENOSYS at the one dispatch gate, and the helper must agree
+        // exactly with that set across the whole pinned table
+        // (https://github.com/rrnewton/hermit/issues/5269).
+        let refused = [
+            Sysno::set_mempolicy,
+            Sysno::get_mempolicy,
+            Sysno::mbind,
+            Sysno::migrate_pages,
+            Sysno::move_pages,
+            Sysno::set_mempolicy_home_node,
+        ];
+        for sysno in refused {
+            assert_eq!(
+                classify_syscall(sysno),
+                SyscallClassification::Determinized,
+                "{sysno:?} should be Determinized (deterministic ENOSYS refusal)"
+            );
+            assert!(
+                is_memory_policy_syscall(sysno),
+                "{sysno:?} should be in the memory-policy refusal set"
+            );
+        }
+        for sysno in Sysno::iter().chain(std::iter::once(Sysno::last())) {
+            assert_eq!(
+                is_memory_policy_syscall(sysno),
+                refused.contains(&sysno),
+                "{sysno:?} memory-policy helper membership is inconsistent"
+            );
+        }
+        // `getcpu` is not one of them: a kernel without NUMA still answers
+        // it, with node 0.
+        assert!(!is_memory_policy_syscall(Sysno::getcpu));
+    }
+
+    #[test]
     fn remap_file_pages_is_deterministically_unavailable() {
         assert_eq!(
             classify_syscall(Sysno::remap_file_pages),
@@ -3022,6 +3096,7 @@ mod tests {
             Sysno::add_key,
             Sysno::request_key,
             Sysno::landlock_create_ruleset,
+            Sysno::get_mempolicy,
             Sysno::mount,
             Sysno::remap_file_pages,
             Sysno::name_to_handle_at,

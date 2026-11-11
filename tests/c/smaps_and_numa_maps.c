@@ -7,25 +7,29 @@
  */
 
 /*
- * Reads /proc/self/maps, smaps and numa_maps (or smaps_rollup) and checks
- * what Linux's fs/proc/task_mmu.c prints in them (show_smap, __show_smap,
- * show_numa_map and show_smaps_rollup in v6.17):
+ * Reads /proc/self/maps and smaps (or smaps_rollup), checks what Linux's
+ * fs/proc/task_mmu.c prints in them (show_smap, __show_smap and
+ * show_smaps_rollup in v6.17), and checks that /proc/self/numa_maps does
+ * not exist, as on the kernel built without NUMA that Hermit presents
+ * (https://github.com/rrnewton/hermit/issues/5269; Linux registers the
+ * file only under CONFIG_NUMA, fs/proc/base.c). The guest reports which
+ * it found (`numa absent` under Hermit, `numa present` on a NUMA host)
+ * instead of failing, so a native run still gives the smaps lines the
+ * Hermit runs are compared against; the tests require `absent`.
  *
  * - every smaps block's header is a maps line, in the same order, and its
  *   fields are Linux's, in Linux's order: Size, KernelPageSize, MMUPageSize,
  *   the accounting fields, THPeligible, ProtectionKey where any block has it,
  *   and VmFlags, whose rd, wr and ex follow the line's permissions;
  * - Size is the range's, THPeligible 0 or 1, and [stack]'s flags have gd;
- * - numa_maps has one row per maps line but the gate area, in order, each
- *   starting with its mapping's start, the policy, and stack, heap or file=
- *   for those mappings.
+ * - whether opening numa_maps fails with ENOENT.
  *
  * The program makes a mapping of each kind it reports first: anonymous
  * memory, a file (its own executable), the heap (brk), and it has its stack
  * and the vDSO. It reports, per kind, whether maps lists one; the count of
  * accounting values that are not zero (a sanitizer zeroes them all); and the
- * stack's details: its field labels, flags, THPeligible, ProtectionKey and
- * numa_maps row without page counts, then its whole smaps block with the
+ * stack's details: its field labels, flags, THPeligible and ProtectionKey,
+ * then its whole smaps block with the
  * range and size left out, which runs on different backends can compare.
  * Before those, the stack's range, which a test that knows a backend's
  * layout can check THPeligible against.
@@ -41,9 +45,9 @@
  *   other    first gives the anonymous mapping, not the stack, MADV_RANDOM
  *            and MADV_DONTNEED, then as files;
  *   discard  runs on a stack of its own, discards every page of the initial
- *            stack with MADV_DONTNEED, and prints numa_maps' row for it
- *            without page counts: Linux prints kernelpagesize_kB only for a
- *            mapping with a resident page (show_numa_map), and none is left.
+ *            stack with MADV_DONTNEED, and checks numa_maps is still absent:
+ *            the discard reaches a listed mapping, which is what used to
+ *            make its rendered row unanswerable on KVM.
  *
  * Everything is read into static buffers before anything is printed, so no
  * allocation (stdio's own included) adds a mapping between the reads.
@@ -67,12 +71,10 @@
 
 static char maps_text[FILE_BYTES];
 static char smaps_text[FILE_BYTES];
-static char numa_text[FILE_BYTES];
 static char out_buffer[1 << 16];
 
 static char* maps_lines[MAX_LINES];
 static char* smaps_lines[MAX_LINES];
-static char* numa_lines[MAX_LINES];
 
 static const char* const LABELS[] = {
     "Size",          "KernelPageSize", "MMUPageSize",    "Rss",
@@ -123,6 +125,20 @@ static size_t slurp(const char* path, char* buffer, size_t size) {
   close(fd);
   buffer[used] = '\0';
   return used;
+}
+
+/* Whether numa_maps is absent, as on the kernel built without NUMA that
+ * Hermit presents, which registers none in any task's directory. */
+static int numa_maps_absent(void) {
+  int fd = open("/proc/self/numa_maps", O_RDONLY | O_CLOEXEC);
+  if (fd >= 0) {
+    close(fd);
+    return 0;
+  }
+  if (errno != ENOENT) {
+    fail("/proc/self/numa_maps", strerror(errno));
+  }
+  return 1;
 }
 
 /* Split `text` into its lines, in place; their count. */
@@ -304,56 +320,6 @@ static size_t check_block(
   return index;
 }
 
-/* The numa_maps row for maps line `line`, checked, with its page counts
- * (anon=, dirty=, mapped=, mapmax=, swapcache=, active=, writeback=,
- * N<node>=) left out into `kept`; their count. */
-static unsigned long
-check_numa_row(const char* row, const char* line, char* kept, size_t size) {
-  unsigned long start = 0;
-  unsigned long end = 0;
-  range_of(line, &start, &end);
-  char address[32];
-  snprintf(address, sizeof(address), "%08lx ", start);
-  if (strncmp(row, address, strlen(address)) != 0) {
-    fail("numa_maps row does not start at its mapping", row);
-  }
-  const char* name = name_of(line);
-  if (strcmp(name, "[stack]") == 0 && strstr(row, " stack") == NULL) {
-    fail("numa_maps stack row lacks stack", row);
-  }
-  if (strcmp(name, "[heap]") == 0 && strstr(row, " heap") == NULL) {
-    fail("numa_maps heap row lacks heap", row);
-  }
-  if (name[0] == '/' && strstr(row, " file=") == NULL) {
-    fail("numa_maps file row lacks file=", row);
-  }
-  static const char* const counts[] = {
-      "anon=", "dirty=", "mapped=", "mapmax=", "swapcache=", "active=",
-      "writeback="};
-  unsigned long dropped = 0;
-  kept[0] = '\0';
-  const char* token = row + strlen(address);
-  while (*token != '\0') {
-    const char* token_end = strchr(token, ' ');
-    size_t length = token_end == NULL ? strlen(token) : (size_t)(token_end - token);
-    int count = token[0] == 'N' && length > 1 && token[1] >= '0' &&
-        token[1] <= '9' && memchr(token, '=', length) != NULL;
-    for (size_t index = 0; index < sizeof(counts) / sizeof(counts[0]); ++index) {
-      count |= strncmp(token, counts[index], strlen(counts[index])) == 0;
-    }
-    if (count) {
-      ++dropped;
-    } else if (strlen(kept) + length + 2 < size) {
-      if (kept[0] != '\0') {
-        strcat(kept, " ");
-      }
-      strncat(kept, token, length);
-    }
-    token = token_end == NULL ? token + length : token_end + 1;
-  }
-  return dropped;
-}
-
 static void print_kind(
     const char* kind,
     char** lines,
@@ -372,34 +338,16 @@ static unsigned long discard_start;
 static unsigned long discard_end;
 
 /* Called on alternate_stack: discard every page of the initial stack, then
- * print numa_maps' row for it. Never returns, as the frames below it are on
+ * report whether numa_maps is absent. Never returns, as the frames below
  * the stack it discarded; it reads nothing there (argv, the environment and
  * the auxiliary vector are). */
 __attribute__((noreturn, noinline)) static void discard_and_list(void) {
   if (syscall(SYS_madvise, discard_start, discard_end - discard_start, MADV_DONTNEED) != 0) {
     fail("madvise MADV_DONTNEED of the stack", strerror(errno));
   }
-  slurp("/proc/self/numa_maps", numa_text, sizeof(numa_text));
-  size_t numa_count = split_lines(numa_text, numa_lines);
-  char line[160];
-  snprintf(
-      line,
-      sizeof(line),
-      "%lx-%lx rw-p 00000000 00:00 0 [stack]",
-      discard_start,
-      discard_end);
-  char address[32];
-  snprintf(address, sizeof(address), "%08lx ", discard_start);
-  for (size_t index = 0; index < numa_count; ++index) {
-    if (strncmp(numa_lines[index], address, strlen(address)) == 0) {
-      char kept[512];
-      check_numa_row(numa_lines[index], line, kept, sizeof(kept));
-      printf("discard ok\nstack numa %s\n", kept);
-      fflush(stdout);
-      syscall(SYS_exit_group, 0);
-    }
-  }
-  fail("numa_maps lacks the stack's row", address);
+  printf("discard ok\nnuma %s\n", numa_maps_absent() ? "absent" : "present");
+  fflush(stdout);
+  syscall(SYS_exit_group, 0);
   __builtin_unreachable();
 }
 
@@ -545,10 +493,9 @@ int main(int argc, char** argv) {
 
   slurp("/proc/self/maps", maps_text, sizeof(maps_text));
   slurp("/proc/self/smaps", smaps_text, sizeof(smaps_text));
-  slurp("/proc/self/numa_maps", numa_text, sizeof(numa_text));
+  int numa_absent = numa_maps_absent();
   size_t maps_count = split_lines(maps_text, maps_lines);
   size_t smaps_count = split_lines(smaps_text, smaps_lines);
-  size_t numa_count = split_lines(numa_text, numa_lines);
 
   print_kind("anonymous", maps_lines, maps_count, (unsigned long)anonymous);
   print_kind("file", maps_lines, maps_count, (unsigned long)file);
@@ -565,11 +512,8 @@ int main(int argc, char** argv) {
 
   int protection_key = -1;
   size_t at = 0;
-  size_t numa_at = 0;
-  unsigned long numa_counts = 0;
   long stack_line = line_holding(maps_lines, maps_count, stack);
   char stack_labels[1024] = "";
-  char stack_numa[512] = "";
   size_t stack_block = 0;
   size_t stack_block_end = 0;
   for (size_t index = 0; index < maps_count; ++index) {
@@ -579,16 +523,8 @@ int main(int argc, char** argv) {
     }
     size_t next =
         check_block(at, smaps_count, maps_lines[index], &protection_key, labels, sizeof(labels));
-    char kept[512];
-    if (!is_gate(maps_lines[index])) {
-      if (numa_at >= numa_count) {
-        fail("numa_maps lacks a row for", maps_lines[index]);
-      }
-      numa_counts += check_numa_row(numa_lines[numa_at++], maps_lines[index], kept, sizeof(kept));
-    }
     if ((long)index == stack_line) {
       snprintf(stack_labels, sizeof(stack_labels), "%s", labels);
-      snprintf(stack_numa, sizeof(stack_numa), "%s", kept);
       stack_block = at;
       stack_block_end = next;
     }
@@ -603,13 +539,9 @@ int main(int argc, char** argv) {
   if (at != smaps_count) {
     fail("smaps has a block maps does not list", smaps_lines[at]);
   }
-  if (numa_at != numa_count) {
-    fail("numa_maps has a row maps does not list", numa_lines[numa_at]);
-  }
-  printf("blocks ok\nnuma ok\n");
-  printf("accounting nonzero %lu\nnuma counts %lu\n", accounting_nonzero, numa_counts);
+  printf("blocks ok\nnuma %s\n", numa_absent ? "absent" : "present");
+  printf("accounting nonzero %lu\n", accounting_nonzero);
   printf("stack labels %s\n", stack_labels);
-  printf("stack numa %s\n", stack_numa);
   printf("stack block begin\n");
   for (size_t index = stack_block; index < stack_block_end; ++index) {
     const char* line = smaps_lines[index];

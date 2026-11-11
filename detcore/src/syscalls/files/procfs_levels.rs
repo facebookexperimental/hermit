@@ -275,7 +275,7 @@ pub(super) fn dashed_spelling(
 /// Whether the directory `path`, in the tool's view, is on sysfs: not a
 /// user bind or another file system mounted over part of `/sys`, whose
 /// `cpuN` and `nodeN` names are the guest's own.
-fn is_on_sysfs(path: &Path) -> bool {
+pub(super) fn is_on_sysfs(path: &Path) -> bool {
     let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
         return false;
     };
@@ -371,6 +371,250 @@ fn resolve_links(path: &Path) -> Option<PathBuf> {
         }
     }
     Some(resolved)
+}
+
+/// Whether a lookup of `spelling` follows a symbolic link that its last name
+/// names, whatever the call's flags: a spelling that ends in `/`, or whose
+/// last name is `.` or `..`, which Linux resolves through what comes before.
+fn follows_last_name(spelling: &Path) -> bool {
+    let bytes = spelling.as_os_str().as_bytes();
+    bytes.ends_with(b"/")
+        || bytes.rsplit(|byte| *byte == b'/').next() == Some(b".")
+        || bytes.rsplit(|byte| *byte == b'/').next() == Some(b"..")
+}
+
+/// Whether the call `sysno`, its arguments `values`, follows a symbolic link
+/// that the last name of its path operand number `operand` names (in
+/// [`path_operands`]' order), as Linux's lookup of it does
+/// (`LOOKUP_FOLLOW`, fs/namei.c): not for the calls that act on the name
+/// itself (`lstat`, `readlink`, `lchown`, the `l*xattr` calls, and every
+/// call that makes, removes or renames a name), nor where the call's flags
+/// say not to (`AT_SYMLINK_NOFOLLOW`, `O_NOFOLLOW`, `O_CREAT` with
+/// `O_EXCL`, `IN_DONT_FOLLOW`); `linkat` follows its old name only with
+/// `AT_SYMLINK_FOLLOW`. Every other call follows it.
+fn follows_last_link(sysno: Sysno, operand: usize, values: &[usize; 6]) -> bool {
+    // Linux declares the flags `int`.
+    let flags = |position: usize| values[position] as i32;
+    let opens_last = |flags: i32| {
+        flags & libc::O_NOFOLLOW == 0
+            && flags & (libc::O_CREAT | libc::O_EXCL) != libc::O_CREAT | libc::O_EXCL
+    };
+    match sysno {
+        #[cfg(target_arch = "x86_64")]
+        Sysno::lstat
+        | Sysno::lchown
+        | Sysno::readlink
+        | Sysno::mkdir
+        | Sysno::mknod
+        | Sysno::rmdir
+        | Sysno::unlink
+        | Sysno::symlink
+        | Sysno::rename
+        | Sysno::link => false,
+        Sysno::lgetxattr
+        | Sysno::lsetxattr
+        | Sysno::llistxattr
+        | Sysno::lremovexattr
+        | Sysno::readlinkat
+        | Sysno::mkdirat
+        | Sysno::mknodat
+        | Sysno::unlinkat
+        | Sysno::symlinkat
+        | Sysno::renameat
+        | Sysno::renameat2 => false,
+        Sysno::linkat => operand == 0 && flags(4) & libc::AT_SYMLINK_FOLLOW != 0,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::open => opens_last(flags(1)),
+        Sysno::openat => opens_last(flags(2)),
+        Sysno::statx => flags(2) & libc::AT_SYMLINK_NOFOLLOW == 0,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::newfstatat => flags(3) & libc::AT_SYMLINK_NOFOLLOW == 0,
+        #[cfg(target_arch = "aarch64")]
+        Sysno::fstatat => flags(3) & libc::AT_SYMLINK_NOFOLLOW == 0,
+        Sysno::faccessat2 | Sysno::fchmodat2 | Sysno::utimensat => {
+            flags(3) & libc::AT_SYMLINK_NOFOLLOW == 0
+        }
+        Sysno::fchownat | Sysno::execveat => flags(4) & libc::AT_SYMLINK_NOFOLLOW == 0,
+        // The mask is `u32`.
+        Sysno::inotify_add_watch => values[2] as u32 & libc::IN_DONT_FOLLOW == 0,
+        _ => true,
+    }
+}
+
+/// The first object that `is_absent` finds absent on Linux's walk of
+/// `named`, an absolute path in the tool's view, as the entry `name` of the
+/// directory the walk has reached (`is_absent(directory, name)`), with the
+/// names the walk had still to look up after it. The walk looks up each
+/// name in turn in the directory it has reached, follows the symbolic link
+/// that name is (the last name's only where `follow`), and takes a `..` in
+/// the directory it has reached, as `link_path_walk` does (fs/namei.c at
+/// v7.1). It ends, finding nothing, where Linux's walk fails without the
+/// absent object: in a directory it may not search, before any name, `..`
+/// included ([`searchable`]; `may_lookup`, 2600), at a name that is missing,
+/// below a name that is no directory, `..` included (`d_can_lookup`,
+/// ENOTDIR, 2662-2668), and past `MAXSYMLINKS` links (ELOOP). `self` and
+/// `thread-self` in `/proc` are the caller's: where `own_entries` holds the
+/// caller's process and thread directories, those, which the tool's lookup
+/// would take for its own; otherwise as the tool's lookup takes them.
+///
+/// Without `read_links` it looks nothing up and takes every name but the
+/// last for a directory: right for a path that Linux's walk resolves
+/// without following a symbolic link ([`restricted_walk`] with
+/// `RESOLVE_NO_SYMLINKS`).
+fn absent_on_walk(
+    named: &Path,
+    follow: bool,
+    read_links: bool,
+    own_entries: Option<&(PathBuf, PathBuf)>,
+    is_absent: impl Fn(&Path, &[u8]) -> bool,
+) -> Option<(PathBuf, PathBuf)> {
+    let mut pending = named.components().map(owned).collect::<VecDeque<_>>();
+    let mut resolved = PathBuf::from("/");
+    let mut links = 0;
+    while let Some(component) = pending.pop_front() {
+        let name = match component {
+            Owned::Root => {
+                resolved = PathBuf::from("/");
+                continue;
+            }
+            Owned::Current => continue,
+            _ if read_links && !searchable(&resolved) => return None,
+            Owned::Parent => {
+                resolved.pop();
+                continue;
+            }
+            Owned::Name(name) => name,
+        };
+        if let Some((process, thread)) = own_entries.filter(|_| resolved == Path::new("/proc")) {
+            let caller = match name.as_bytes() {
+                b"self" => Some(process),
+                b"thread-self" => Some(thread),
+                _ => None,
+            };
+            if let Some(caller) = caller {
+                if pending.is_empty() && !follow {
+                    return None;
+                }
+                links += 1;
+                if links > MAXSYMLINKS {
+                    return None;
+                }
+                for component in caller.components().rev() {
+                    pending.push_front(owned(component));
+                }
+                continue;
+            }
+        }
+        let next = resolved.join(&name);
+        if is_absent(&resolved, name.as_bytes()) {
+            let mut rest = PathBuf::new();
+            for component in pending {
+                match component {
+                    Owned::Name(name) => rest.push(name),
+                    Owned::Parent => rest.push(".."),
+                    Owned::Root | Owned::Current => {}
+                }
+            }
+            return Some((next, rest));
+        }
+        let last = pending.is_empty();
+        if !read_links {
+            resolved = next;
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&next).ok()?;
+        if metadata.file_type().is_symlink() {
+            if last && !follow {
+                return None;
+            }
+            links += 1;
+            if links > MAXSYMLINKS {
+                return None;
+            }
+            let target = std::fs::read_link(&next).ok()?;
+            for component in target.components().rev() {
+                pending.push_front(owned(component));
+            }
+        } else if metadata.is_dir() || last {
+            resolved = next;
+        } else {
+            return None;
+        }
+    }
+    None
+}
+
+/// How Linux's walk of `named`, an absolute path in the tool's view, ends
+/// under the `openat2` restriction `resolve` (`RESOLVE_NO_SYMLINKS`, say),
+/// following a symbolic link the last name names where `follow`: `Ok` where
+/// it reaches an object, which an `O_PATH` descriptor opened and this closed
+/// again, and the error it fails with otherwise. Issued without the C
+/// library, which under in-guest LiteInst is the guest's
+/// ([`crate::util::raw_syscall`]).
+fn restricted_walk(named: &Path, follow: bool, resolve: u64) -> Result<(), Errno> {
+    /// `struct open_how` (`OPEN_HOW_SIZE_VER0`).
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+    let path = std::ffi::CString::new(named.as_os_str().as_bytes()).map_err(|_| Errno::EINVAL)?;
+    let nofollow = if follow { 0 } else { libc::O_NOFOLLOW };
+    let how = OpenHow {
+        flags: (libc::O_PATH | libc::O_CLOEXEC | nofollow) as u64,
+        mode: 0,
+        resolve,
+    };
+    // SAFETY: a NUL-terminated path and an `open_how` of the size passed,
+    // both alive for the call.
+    let fd = unsafe {
+        crate::util::raw_syscall(
+            libc::SYS_openat2,
+            [
+                libc::AT_FDCWD as u64,
+                path.as_ptr() as u64,
+                &how as *const OpenHow as u64,
+                std::mem::size_of::<OpenHow>() as u64,
+                0,
+                0,
+            ],
+        )
+    };
+    if fd < 0 {
+        return Err(Errno::new(-fd as i32));
+    }
+    // SAFETY: the descriptor openat2 just returned, which nothing else owns.
+    unsafe {
+        crate::util::raw_syscall(libc::SYS_close, [fd as u64, 0, 0, 0, 0, 0]);
+    }
+    Ok(())
+}
+
+/// Whether the walk may look a name up in `directory`, a directory in the
+/// tool's view (`may_lookup`, fs/namei.c:2600 at v7.1), by the kernel's own
+/// check of the tool's credentials (`faccessat2` with `X_OK` and
+/// `AT_EACCESS`), which are the ones the guest starts with: in Hermit's
+/// container both are the namespace's root, with the same capabilities.
+fn searchable(directory: &Path) -> bool {
+    let Ok(path) = std::ffi::CString::new(directory.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: a NUL-terminated path, alive for the call.
+    let result = unsafe {
+        crate::util::raw_syscall(
+            libc::SYS_faccessat2,
+            [
+                libc::AT_FDCWD as u64,
+                path.as_ptr() as u64,
+                libc::X_OK as u64,
+                libc::AT_EACCESS as u64,
+                0,
+                0,
+            ],
+        )
+    };
+    result == 0
 }
 
 /// A path component, owned.
@@ -537,6 +781,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Lookups::Paths(operands) => {
                 let mut replacements = Vec::new();
                 for (index, (dirfd, path)) in operands.into_iter().enumerate() {
+                    let follow = follows_last_link(sysno, index, &values);
                     let decision = match PathPtr::from_ptr(values[path] as *const libc::c_char)
                         .and_then(|address| address.read(&guest.memory()).ok())
                     {
@@ -547,6 +792,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                                 &directory.join(&spelling),
                                 &root,
                                 numbers.as_ref(),
+                                follow,
                             ),
                             None => self.decide(
                                 guest,
@@ -554,6 +800,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                                 &spelling,
                                 &root,
                                 numbers.as_ref(),
+                                follow,
                             ),
                         },
                         None => Decision::default(),
@@ -579,9 +826,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 };
                 let Some(bytes) = self.substituted_socket_address(
                     guest,
+                    sysno,
                     values[address] as u64,
                     length_value,
-                    send,
                     &root,
                     numbers.as_ref(),
                 ) else {
@@ -617,9 +864,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .then(|| {
                         self.substituted_socket_address(
                             guest,
+                            sysno,
                             name,
                             length as usize,
-                            true,
                             &root,
                             numbers.as_ref(),
                         )
@@ -742,10 +989,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// What Detcore decides about `spelling`, relative to `dirfd` (`None`
-    /// for the working directory). It decides nothing for an empty or
-    /// overlong spelling, one it cannot place (a working directory outside
-    /// the root, a directory descriptor whose path it does not know, or, after
-    /// a `chroot`, any directory descriptor: its recorded path may be in the
+    /// for the working directory), which the call looks up following the
+    /// symbolic link its last name names where `follow`
+    /// ([`follows_last_link`]). It decides nothing for an empty or overlong
+    /// spelling, one it cannot place (a working directory outside the root, a
+    /// directory descriptor whose path it does not know, or, after a
+    /// `chroot`, any directory descriptor: its recorded path may be in the
     /// old root's view), and one whose omitted name is not in a procfs
     /// directory (a user bind over part of /proc).
     fn decide<G: Guest<Self>>(
@@ -755,6 +1004,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         spelling: &Path,
         root: &Option<PathBuf>,
         numbers: Option<&BTreeMap<i32, Option<i32>>>,
+        follow: bool,
     ) -> Decision {
         let bytes = spelling.as_os_str().as_bytes();
         if bytes.is_empty() || bytes.len() >= PATH_MAX {
@@ -839,6 +1089,37 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             dashed_spelling(parent, &prefix, &observed, bytes)
         });
+        // A device's `numa_node` that the kernel without NUMA does not
+        // register (`crate::procfs::is_absent_device_attribute`), by whatever
+        // spelling reaches the device: the listings leave it out too, under
+        // the same conditions.
+        let substituted = substituted.or_else(|| {
+            if !self.cfg.virtualize_metadata || root.is_some() || self.cfg.recordreplay_modes {
+                return None;
+            }
+            let prefix = crate::procfs::absent_device_attribute_prefix(&observed)?;
+            let parent = prefix.parent()?;
+            if !is_on_sysfs(parent) {
+                return None;
+            }
+            dashed_spelling(parent, &prefix, &observed, bytes)
+        });
+        // Either, reached however the lookup reaches it: through a symbolic
+        // link to it or to a directory above it, a `..`, or the guest's own
+        // `/proc/self/fd/<n>`, as Linux's walk of the path in the tool's view
+        // does, for every call that looks a path up, following the link the
+        // last name names as the call does
+        // (`Detcore::absent_sysfs_object_on_walk`). The kernel is given the
+        // object's own path, dashed, and the names the walk had still to look
+        // up, so the call fails as one naming the object does.
+        let substituted = substituted.or_else(|| {
+            if !self.cfg.virtualize_metadata || root.is_some() || self.cfg.recordreplay_modes {
+                return None;
+            }
+            let (absent, rest) =
+                self.absent_sysfs_object_on_walk(guest, dirfd, spelling, follow)?;
+            dashed_spelling(absent.parent()?, &absent, &absent.join(rest), bytes)
+        });
         Decision {
             substituted,
             decided,
@@ -905,21 +1186,25 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// An `AF_UNIX` address naming the substituted path, if the address at
-    /// `address`, `length` bytes long, is a pathname address that reaches a
-    /// `/proc` name outside the level. A send's address is looked up only by
-    /// a datagram socket, whose type the caller asks the socket for, so a
-    /// send is checked only outside record and replay (whose replayed
-    /// descriptor is not the socket); the caller refuses one whose
-    /// substituted address does not fit.
+    /// `address`, `length` bytes long, that the socket call `sysno` gives is
+    /// a pathname address that reaches a `/proc` name outside the level, or a
+    /// sysfs object the machine Detcore presents does not have. A send's
+    /// address is looked up only by a datagram socket, whose type the caller
+    /// asks the socket for, so a send is checked only outside record and
+    /// replay (whose replayed descriptor is not the socket); the caller
+    /// refuses one whose substituted address does not fit. A bind makes its
+    /// name, and a connect or a send looks it up, following a symbolic link
+    /// it names (`unix_find_bsd`, net/unix/af_unix.c).
     fn substituted_socket_address<G: Guest<Self>>(
         &self,
         guest: &G,
+        sysno: Sysno,
         address: u64,
         length: usize,
-        send: bool,
         root: &Option<PathBuf>,
         numbers: Option<&BTreeMap<i32, Option<i32>>>,
     ) -> Option<Vec<u8>> {
+        let send = matches!(sysno, Sysno::sendto | Sysno::sendmsg);
         if length > std::mem::size_of::<libc::sockaddr_un>()
             || (send && self.cfg.recordreplay_modes)
         {
@@ -931,7 +1216,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             .read_exact(Addr::<u8>::from_raw(address as usize)?, &mut bytes)
             .ok()?;
         let path = PathBuf::from(OsStr::from_bytes(unix_address_path(&bytes)?));
-        let substituted = self.decide(guest, None, &path, root, numbers).substituted?;
+        let substituted = self
+            .decide(guest, None, &path, root, numbers, sysno != Sysno::bind)
+            .substituted?;
         unix_address(&substituted)
     }
 
@@ -1217,6 +1504,294 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Whether Detcore checks the sysfs object an open reached
+    /// ([`Self::is_absent_sysfs_object`]) once the open has run: where the
+    /// lookup check leaves the same objects out ([`Self::decide`]) and the
+    /// listings drop them (`Detcore::drop_absent_entries`), in run mode with
+    /// virtualized metadata, where the guest's `/sys` is a sysfs mount
+    /// ([`rendered_procfs::sys_device`]), and, as there, only before any
+    /// `chroot`, as the tool reads the object's path in its own root.
+    fn checks_reached_sysfs_objects<G: Guest<Self>>(&self, guest: &G) -> bool {
+        self.cfg.virtualize_metadata
+            && !self.cfg.recordreplay_modes
+            && rendered_procfs::sys_device().is_some()
+            && self.guest_root_in_view(guest) == Some(None)
+    }
+
+    /// Whether the sysfs object at `path`, the kernel's path for it in the
+    /// tool's view, is one the machine Detcore presents does not have, or is
+    /// below one: a CPU or node entry of the directories that list them
+    /// ([`crate::procfs::absent_cpu_entry_prefix`]), or a device's NUMA
+    /// attribute that a kernel without NUMA does not register
+    /// ([`crate::procfs::absent_device_attribute_prefix`]).
+    pub(crate) fn is_absent_sysfs_object(&self, path: &Path) -> bool {
+        self.absent_sysfs_prefix(path).is_some()
+    }
+
+    /// The prefix of `path` that ends at the object
+    /// [`Self::is_absent_sysfs_object`] finds absent.
+    fn absent_sysfs_prefix(&self, path: &Path) -> Option<PathBuf> {
+        crate::procfs::absent_cpu_entry_prefix(path, self.cfg.virtual_cpu_count())
+            .or_else(|| crate::procfs::absent_device_attribute_prefix(path))
+    }
+
+    /// The kernel's path for the calling thread's descriptor `fd`, in the
+    /// tool's view: its link in the tool's `/proc` entry for the caller where
+    /// that entry is the caller's
+    /// ([`crate::procfs_inode::tool_can_name_guest_descriptors`]), and
+    /// elsewhere (KVM) the backend's `link_path` fact
+    /// (`Detcore::own_descriptor_link_from_fact`). `None` where neither names
+    /// an absolute path.
+    pub(crate) fn descriptor_path_in_tool_view<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        fd: RawFd,
+    ) -> Option<PathBuf> {
+        let path = if crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend) {
+            std::fs::read_link(format!("{}/fd/{fd}", self.caller_proc_directory(guest))).ok()?
+        } else {
+            PathBuf::from(
+                <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(
+                    Self::own_descriptor_link_from_fact(guest, fd)??,
+                ),
+            )
+        };
+        path.is_absolute().then_some(path)
+    }
+
+    /// The kernel's path, in the tool's view, for the sysfs object that the
+    /// descriptor `fd` an open just returned is open on, where Detcore checks
+    /// such objects ([`Self::checks_reached_sysfs_objects`]) and the open's
+    /// `identity` (the descriptor's stat) is on the guest's sysfs mount.
+    /// `None` for every other descriptor.
+    pub(crate) fn opened_sysfs_object<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        fd: RawFd,
+        identity: Option<&libc::stat>,
+    ) -> Option<PathBuf> {
+        if !self.checks_reached_sysfs_objects(guest)
+            || identity.map(|stat| stat.st_dev) != rendered_procfs::sys_device()
+        {
+            return None;
+        }
+        self.descriptor_path_in_tool_view(guest, fd)
+    }
+
+    /// `spelling`, which a call looks up relative to `dirfd`, as an absolute
+    /// path in the tool's view that leads where the guest's lookup does:
+    /// below the guest's working directory or the descriptor's directory as
+    /// Detcore knows them ([`Self::observed_path`]), or, for a descriptor
+    /// whose recorded path is a descriptor link's spelling or that has none,
+    /// by the kernel's path for it ([`Self::descriptor_path_in_tool_view`]),
+    /// placed as [`Self::placed_in_tool_view`] places it. `None` where it
+    /// cannot be placed.
+    fn named_in_tool_view<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        dirfd: i32,
+        spelling: &Path,
+    ) -> Option<PathBuf> {
+        let named = match Self::observed_path(guest, dirfd, spelling) {
+            Ok(observed)
+                if observed.is_absolute()
+                    && !Self::starts_at_a_recorded_link(guest, dirfd, spelling) =>
+            {
+                observed
+            }
+            _ if dirfd != libc::AT_FDCWD && !spelling.is_absolute() => self
+                .descriptor_path_in_tool_view(guest, dirfd)?
+                .join(spelling),
+            _ => return None,
+        };
+        self.placed_in_tool_view(guest, named)
+    }
+
+    /// `named`, an absolute path in the guest's view, as a path in the
+    /// tool's view that leads where the guest's lookup does. Through the
+    /// guest's own `/proc/self` or `/proc/thread-self`: its descriptor's path
+    /// for `fd/<n>`, and `/` for its `root`; anything else there by the
+    /// caller's numbers where the tool's `/proc` entry for the caller is the
+    /// caller's ([`Self::own_procfs_entries`]), and not placed where it is
+    /// not (KVM). A `..` straight after `/proc` or `self` leaves the caller's
+    /// entries (`self` is an entry of `/proc` for every caller), and one after
+    /// `thread-self` is the caller's `task` directory. Any other path as it
+    /// is; `None` where it cannot be placed.
+    fn placed_in_tool_view<G: Guest<Self>>(&self, guest: &G, named: PathBuf) -> Option<PathBuf> {
+        let Ok(below) = named.strip_prefix("/proc") else {
+            return Some(named);
+        };
+        let names = below
+            .components()
+            .map(|component| component.as_os_str().as_bytes())
+            .collect::<Vec<_>>();
+        let rest = |skip: usize| below.components().skip(skip).collect::<PathBuf>();
+        match names.as_slice() {
+            [] | [b"..", ..] => return Some(named),
+            [b"self", b"..", ..] => {
+                return self.placed_in_tool_view(guest, Path::new("/proc").join(rest(2)));
+            }
+            [b"thread-self", b"..", ..] => {
+                return self.placed_in_tool_view(guest, Path::new("/proc/self/task").join(rest(2)));
+            }
+            _ => {}
+        }
+        let own = matches!(names.first(), Some(&(b"self" | b"thread-self")));
+        let visible = crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend);
+        match names.as_slice() {
+            [_, b"fd", number, ..] if own => {
+                let fd = std::str::from_utf8(number).ok()?.parse::<RawFd>().ok()?;
+                return Some(self.descriptor_path_in_tool_view(guest, fd)?.join(rest(3)));
+            }
+            [_, b"root", ..] if own => return Some(Path::new("/").join(rest(2))),
+            _ if !visible => return None,
+            _ if !own => return Some(named),
+            _ => {}
+        }
+        // The tool on the guest's own thread (DBT) has the guest's `self`.
+        let Some((process, thread)) = self.own_procfs_entries(guest) else {
+            return Some(named);
+        };
+        let caller = if names.first() == Some(&b"self".as_slice()) {
+            process
+        } else {
+            thread
+        };
+        Some(caller.join(rest(1)))
+    }
+
+    /// The caller's process and thread directories in `/proc`, by its
+    /// numbers, where the tool's `self` and `thread-self` are another task's:
+    /// where the tool names guest descriptors through host procfs
+    /// ([`crate::procfs_inode::tool_can_name_guest_descriptors`]) from
+    /// another task than the guest's (ptrace). `None` where the tool's are
+    /// the guest's (DBT, on the guest's own thread) or where the guest's
+    /// numbers name no host task of its own (KVM).
+    fn own_procfs_entries<G: Guest<Self>>(&self, guest: &G) -> Option<(PathBuf, PathBuf)> {
+        if !crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend)
+            || self.cfg.backend.tool_shares_guest_descriptor_table
+        {
+            return None;
+        }
+        let pid = guest.pid().as_raw();
+        Some((
+            PathBuf::from(format!("/proc/{pid}")),
+            PathBuf::from(format!("/proc/{pid}/task/{}", guest.tid().as_raw())),
+        ))
+    }
+
+    /// The first sysfs object the machine Detcore presents does not have
+    /// that Linux's walk of `spelling`, relative to `dirfd`, reaches
+    /// ([`absent_on_walk`]), following the symbolic link its last name names
+    /// where `follow` (or where the spelling itself does:
+    /// [`follows_last_name`]), as a path in the tool's view, with the names
+    /// the walk had still to look up after it: a CPU or node entry of the
+    /// directories that list them, or a device's NUMA attribute that a
+    /// kernel without NUMA does not register
+    /// ([`crate::procfs::is_absent_cpu_entry`],
+    /// [`crate::procfs::is_absent_device_attribute`]), in a directory on the
+    /// guest's sysfs mount ([`rendered_procfs::sys_device`]). So a symbolic
+    /// link to such an object or to a directory above it, a `..`, and the
+    /// guest's own `/proc/self/fd/<n>` reach it as its own path does
+    /// ([`Self::named_in_tool_view`]), the last also from a link's target
+    /// ([`Self::own_procfs_entries`]).
+    ///
+    /// Which walk a lookup needs, Linux's own walk of the path says, under
+    /// `openat2`'s restrictions ([`restricted_walk`]), wherever the walk
+    /// ends and whatever the call does there (a call that makes a name
+    /// included): where it reaches its object without following a symbolic
+    /// link, the names it went through are the path's own, `..` taken where
+    /// it is, so none is read; otherwise, where it crosses into no other
+    /// mount than the root's, it never reached sysfs, and nothing is walked;
+    /// otherwise each name is looked at and each link read. A lookup that
+    /// reaches no sysfs object costs one or two such opens.
+    fn absent_sysfs_object_on_walk<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        dirfd: i32,
+        spelling: &Path,
+        follow: bool,
+    ) -> Option<(PathBuf, PathBuf)> {
+        let sysfs = rendered_procfs::sys_device()?;
+        let named = self.named_in_tool_view(guest, dirfd, spelling)?;
+        let follow = follow || follows_last_name(spelling);
+        let read_links = match restricted_walk(&named, follow, libc::RESOLVE_NO_SYMLINKS) {
+            Ok(()) => false,
+            // A failure before any mount crossing (`RESOLVE_NO_XDEV` fails
+            // the crossing itself with EXDEV) went through no sysfs object.
+            Err(_) => match restricted_walk(&named, follow, libc::RESOLVE_NO_XDEV) {
+                Ok(())
+                | Err(Errno::ENOENT | Errno::ENOTDIR | Errno::EACCES | Errno::ENAMETOOLONG) => {
+                    return None;
+                }
+                Err(_) => true,
+            },
+        };
+        let cpus = self.cfg.virtual_cpu_count();
+        let own_entries = self.own_procfs_entries(guest);
+        absent_on_walk(
+            &named,
+            follow,
+            read_links,
+            own_entries.as_ref(),
+            |directory, name| {
+                (crate::procfs::is_absent_cpu_entry(directory, name, cpus)
+                    || crate::procfs::is_absent_device_attribute(directory, name))
+                    && std::fs::metadata(directory).is_ok_and(|metadata| metadata.dev() == sysfs)
+            },
+        )
+    }
+
+    /// The answer to the open `call` where the kernel opened `object`, a
+    /// sysfs object the machine Detcore presents does not have
+    /// ([`Self::is_absent_sysfs_object`]), which the lookup check
+    /// ([`Self::decide`]) did not find on the walk it made before the open (a
+    /// link the guest changed in between, say): that of an open of the
+    /// object's own path, with the absent name dashed as the lookup check
+    /// dashes it ([`dashed_spelling`]), which is ENOENT, except that with
+    /// `O_CREAT` the kernel says whether the name could be made in that sysfs
+    /// directory (it refuses, as a read-only mount or for permission), so it
+    /// is asked ([`Self::issue_substituted`]).
+    pub(crate) async fn answer_open_of_absent_sysfs_object<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &syscalls::Openat,
+        object: &Path,
+    ) -> Error {
+        let dashed = self.absent_sysfs_prefix(object).and_then(|prefix| {
+            dashed_spelling(
+                prefix.parent()?,
+                &prefix,
+                object,
+                object.as_os_str().as_bytes(),
+            )
+        });
+        match dashed {
+            Some(bytes) if call.flags().contains(nix::fcntl::OFlag::O_CREAT) => {
+                let values = [
+                    libc::AT_FDCWD as usize,
+                    0,
+                    call.flags().bits() as usize,
+                    call.mode().map_or(0, |mode| mode.bits() as usize),
+                    0,
+                    0,
+                ];
+                let replacement = Replacement {
+                    argument: Some(1),
+                    bytes,
+                };
+                match self
+                    .issue_substituted(guest, Sysno::openat, values, vec![replacement], false)
+                    .await
+                {
+                    Err(error) => error,
+                    Ok(_) => Errno::ENOENT.into(),
+                }
+            }
+            _ => Errno::ENOENT.into(),
+        }
+    }
+
     /// Whether the descriptor `fd` is on procfs, as the descriptor said in
     /// the recording (`fstatfs` through the recording, into a transient
     /// page), so record and replay decide alike. Where there is no page for
@@ -1230,10 +1805,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         fd: RawFd,
     ) -> bool {
+        self.recorded_descriptor_on_procfs(guest, fd)
+            .await
+            .unwrap_or(true)
+    }
+
+    /// [`Self::recorded_descriptor_is_on_procfs`] without its fail-closed
+    /// default: `None` where there is no page for the question.
+    pub(super) async fn recorded_descriptor_on_procfs<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Option<bool> {
         const LENGTH: usize = std::mem::size_of::<libc::statfs>();
-        let Some(page) = map_transient(guest, LENGTH).await else {
-            return true;
-        };
+        let page = map_transient(guest, LENGTH).await?;
         let mut contents = [0u8; LENGTH];
         let answered = self
             .record_or_replay(
@@ -1248,9 +1833,191 @@ impl<T: RecordOrReplay> Detcore<T> {
             && guest.memory().read_exact(page, &mut contents).is_ok();
         unmap_transient(guest, page, LENGTH).await;
         // `f_type` is the first field.
-        answered
-            && i64::from_ne_bytes(contents[..8].try_into().expect("8 bytes"))
-                == libc::PROC_SUPER_MAGIC
+        Some(
+            answered
+                && i64::from_ne_bytes(contents[..8].try_into().expect("8 bytes"))
+                    == libc::PROC_SUPER_MAGIC,
+        )
+    }
+
+    /// The mount `fd` was reached through, its filesystem's device and
+    /// the descriptor's mode, as the descriptor said in the recording
+    /// (`statx(fd, "", AT_EMPTY_PATH)` through the recording, into a
+    /// transient page: the empty path is the fresh page's first, zero,
+    /// byte, and the result buffer follows it), so record and replay
+    /// decide alike. `None` where there is no page for the question, the
+    /// call failed, or it reported no mount ID or type. Under record and
+    /// replay, where the descriptor's link names a bind mount at an
+    /// ordinary path instead of the object it reaches.
+    pub(super) async fn recorded_descriptor_mount_identity<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Option<(u64, u64, u32)> {
+        // `struct statx` (256 bytes) at the page's second half.
+        const STATX_SIZE: usize = 256;
+        const LENGTH: usize = 2 * STATX_SIZE;
+        const MASK_OFFSET: usize = 0;
+        const MODE_OFFSET: usize = 28;
+        const DEV_MAJOR_OFFSET: usize = 136;
+        const DEV_MINOR_OFFSET: usize = 140;
+        const MNT_ID_OFFSET: usize = 144;
+        let page = map_transient(guest, LENGTH).await?;
+        let buffer = page.as_raw() + STATX_SIZE;
+        let mut contents = [0u8; STATX_SIZE];
+        let answered = self
+            .record_or_replay(
+                guest,
+                Syscall::from_raw(
+                    Sysno::statx,
+                    raw_args([
+                        fd as usize,
+                        page.as_raw(),
+                        libc::AT_EMPTY_PATH as usize,
+                        (libc::STATX_BASIC_STATS | reverie::syscalls::linux_abi::STATX_MNT_ID)
+                            as usize,
+                        buffer,
+                        0,
+                    ]),
+                ),
+            )
+            .await
+            .is_ok()
+            && AddrMut::<u8>::from_raw(buffer)
+                .is_some_and(|buffer| guest.memory().read_exact(buffer, &mut contents).is_ok());
+        unmap_transient(guest, page, LENGTH).await;
+        if !answered {
+            return None;
+        }
+        let field_u32 = |offset: usize| {
+            u32::from_ne_bytes(contents[offset..offset + 4].try_into().expect("4 bytes"))
+        };
+        let field_u64 = |offset: usize| {
+            u64::from_ne_bytes(contents[offset..offset + 8].try_into().expect("8 bytes"))
+        };
+        let field_u16 = |offset: usize| {
+            u16::from_ne_bytes(contents[offset..offset + 2].try_into().expect("2 bytes"))
+        };
+        let mask = field_u32(MASK_OFFSET);
+        (mask & reverie::syscalls::linux_abi::STATX_MNT_ID != 0 && mask & libc::STATX_TYPE != 0)
+            .then(|| {
+                (
+                    field_u64(MNT_ID_OFFSET),
+                    libc::makedev(field_u32(DEV_MAJOR_OFFSET), field_u32(DEV_MINOR_OFFSET)),
+                    u32::from(field_u16(MODE_OFFSET)),
+                )
+            })
+    }
+
+    /// Whether the directory `fd` holds procfs's `root` link, as the
+    /// descriptor said in the recording (`statx(fd, "root",
+    /// AT_SYMLINK_NOFOLLOW)` through the recording, into a transient
+    /// page, consuming no descriptor of the guest's), so record and
+    /// replay decide alike. A process's and a thread's directory are
+    /// the only procfs directories that hold that link, and `lstat`
+    /// answers for it where a `readlink` would want ptrace access, so
+    /// on a descriptor already shown to be a procfs directory this
+    /// authenticates a task directory reached by any name — in
+    /// particular a bind of one that took the guest's last free
+    /// descriptor, where reading the mount table, which must open it,
+    /// fails `EMFILE` in the recording and names nothing. `None` where
+    /// there is no page for the question or it reported no type.
+    pub(super) async fn recorded_descriptor_has_root_link<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Option<bool> {
+        // The name `root` in the page's first half, the `struct statx`
+        // (256 bytes) in the second, as in
+        // [`Self::recorded_descriptor_mount_identity`].
+        const STATX_SIZE: usize = 256;
+        const LENGTH: usize = 2 * STATX_SIZE;
+        const MASK_OFFSET: usize = 0;
+        const MODE_OFFSET: usize = 28;
+        let page = map_transient(guest, LENGTH).await?;
+        let buffer = page.as_raw() + STATX_SIZE;
+        let mut contents = [0u8; STATX_SIZE];
+        let answered = guest.memory().write_exact(page, b"root\0").is_ok()
+            && self
+                .record_or_replay(
+                    guest,
+                    Syscall::from_raw(
+                        Sysno::statx,
+                        raw_args([
+                            fd as usize,
+                            page.as_raw(),
+                            libc::AT_SYMLINK_NOFOLLOW as usize,
+                            libc::STATX_TYPE as usize,
+                            buffer,
+                            0,
+                        ]),
+                    ),
+                )
+                .await
+                .is_ok()
+            && AddrMut::<u8>::from_raw(buffer)
+                .is_some_and(|buffer| guest.memory().read_exact(buffer, &mut contents).is_ok());
+        unmap_transient(guest, page, LENGTH).await;
+        if !answered {
+            return Some(false);
+        }
+        let mask = u32::from_ne_bytes(
+            contents[MASK_OFFSET..MASK_OFFSET + 4]
+                .try_into()
+                .expect("4 bytes"),
+        );
+        let mode = u32::from(u16::from_ne_bytes(
+            contents[MODE_OFFSET..MODE_OFFSET + 2]
+                .try_into()
+                .expect("2 bytes"),
+        ));
+        (mask & libc::STATX_TYPE != 0).then_some(mode & libc::S_IFMT == libc::S_IFLNK)
+    }
+
+    /// Whether `fd` was authenticated at its open as a real procfs task
+    /// directory under record and replay: a placeholder bound to a process
+    /// or thread directory is one by construction, and a real descriptor
+    /// carries the authentication its open recorded
+    /// (`OpenFileDescription::recordreplay_task_directory`, from the
+    /// recorded descriptor link naming a task directory — or, where the
+    /// link names a bind of one at an ordinary path, from the
+    /// directory's recorded `root` link or its recorded mount identity
+    /// taken through the recorded mount table — and the descriptor
+    /// itself answering procfs to a recorded `fstatfs`). The identity
+    /// comes from the opened object,
+    /// not the guest's spelling, so an ordinary symlink or a bind mount
+    /// of the directory carries it and a user bind over a task spelling
+    /// does not. A link itself and a missing descriptor are not one.
+    pub(crate) fn recordreplay_task_directory<G: Guest<Self>>(&self, guest: &G, fd: RawFd) -> bool {
+        if !self.cfg.recordreplay_modes {
+            return false;
+        }
+        let Ok((placeholder, link_itself, authenticated)) =
+            guest.thread_state().with_detfd(fd, |detfd| {
+                (
+                    detfd.placeholder(),
+                    detfd.procfs_link_itself(),
+                    detfd.recordreplay_task_directory(),
+                )
+            })
+        else {
+            return false;
+        };
+        if link_itself {
+            return false;
+        }
+        match placeholder {
+            Some(state) => matches!(
+                state.directory,
+                crate::procfs::fd_directory::PlaceholderDirectory::Task(binding)
+                    if matches!(
+                        binding.kind,
+                        crate::procfs::fd_directory::TaskDirectoryKind::Process
+                            | crate::procfs::fd_directory::TaskDirectoryKind::Thread
+                    )
+            ),
+            None => authenticated,
+        }
     }
 
     /// Whether the descriptor `fd` is on the named filesystem, as the
@@ -1580,5 +2347,276 @@ mod tests {
         let looped = directory.path().join("loop");
         std::os::unix::fs::symlink("loop", &looped).unwrap();
         assert_eq!(resolve_links(&looped), None);
+    }
+
+    /// A lookup follows a link its last name names where the spelling ends
+    /// in `/`, `.` or `..`, whatever the call's flags.
+    #[test]
+    fn a_spelling_that_ends_in_a_slash_or_a_dot_follows_its_last_link() {
+        for (spelling, follows) in [
+            ("link", false),
+            ("dir/link", false),
+            ("/abs/link", false),
+            ("link.", false),
+            ("link..", false),
+            ("link/", true),
+            ("link/.", true),
+            ("link/..", true),
+            (".", true),
+            ("..", true),
+            ("dir/./link", false),
+        ] {
+            assert_eq!(
+                follows_last_name(Path::new(spelling)),
+                follows,
+                "{spelling:?}"
+            );
+        }
+    }
+
+    /// Each call follows the symbolic link its last name names as Linux's
+    /// lookup does: not where the call acts on the name itself, nor where its
+    /// flags say not to; `linkat` follows its old name only with
+    /// `AT_SYMLINK_FOLLOW`, and never its new one.
+    #[test]
+    fn each_call_follows_its_last_link_as_linux_does() {
+        let none = [0usize; 6];
+        let with = |position: usize, value: i32| {
+            let mut values = [0usize; 6];
+            values[position] = value as usize;
+            values
+        };
+        for sysno in [
+            Sysno::chdir,
+            Sysno::chroot,
+            Sysno::statfs,
+            Sysno::getxattr,
+            Sysno::listxattr,
+            Sysno::truncate,
+            Sysno::execve,
+            Sysno::faccessat,
+            Sysno::fchmodat,
+            Sysno::utimensat,
+            Sysno::inotify_add_watch,
+        ] {
+            assert!(follows_last_link(sysno, 0, &none), "{sysno:?}");
+        }
+        for sysno in [
+            Sysno::readlinkat,
+            Sysno::lgetxattr,
+            Sysno::llistxattr,
+            Sysno::mkdirat,
+            Sysno::mknodat,
+            Sysno::unlinkat,
+            Sysno::renameat2,
+            Sysno::symlinkat,
+        ] {
+            assert!(!follows_last_link(sysno, 0, &none), "{sysno:?}");
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert!(follows_last_link(Sysno::stat, 0, &none));
+            assert!(!follows_last_link(Sysno::lstat, 0, &none));
+            assert!(!follows_last_link(Sysno::readlink, 0, &none));
+            assert!(follows_last_link(Sysno::open, 0, &with(1, libc::O_RDONLY)));
+            assert!(!follows_last_link(
+                Sysno::open,
+                0,
+                &with(1, libc::O_NOFOLLOW)
+            ));
+            assert!(follows_last_link(Sysno::newfstatat, 0, &none));
+            assert!(!follows_last_link(
+                Sysno::newfstatat,
+                0,
+                &with(3, libc::AT_SYMLINK_NOFOLLOW)
+            ));
+            assert!(!follows_last_link(Sysno::link, 0, &none));
+        }
+        let create = libc::O_CREAT | libc::O_WRONLY;
+        assert!(follows_last_link(Sysno::openat, 0, &with(2, create)));
+        assert!(!follows_last_link(
+            Sysno::openat,
+            0,
+            &with(2, create | libc::O_EXCL)
+        ));
+        assert!(!follows_last_link(
+            Sysno::openat,
+            0,
+            &with(2, libc::O_PATH | libc::O_NOFOLLOW)
+        ));
+        let nofollow = libc::AT_SYMLINK_NOFOLLOW;
+        assert!(!follows_last_link(Sysno::statx, 0, &with(2, nofollow)));
+        assert!(!follows_last_link(Sysno::faccessat2, 0, &with(3, nofollow)));
+        assert!(!follows_last_link(Sysno::fchownat, 0, &with(4, nofollow)));
+        assert!(!follows_last_link(Sysno::execveat, 0, &with(4, nofollow)));
+        assert!(!follows_last_link(
+            Sysno::inotify_add_watch,
+            0,
+            &with(2, libc::IN_DONT_FOLLOW as i32)
+        ));
+        let follow = with(4, libc::AT_SYMLINK_FOLLOW);
+        assert!(follows_last_link(Sysno::linkat, 0, &follow));
+        assert!(!follows_last_link(Sysno::linkat, 1, &follow));
+        assert!(!follows_last_link(Sysno::linkat, 0, &none));
+    }
+
+    /// Linux's walk of a path, as `absent_on_walk` takes it: each name in the
+    /// directory the walk has reached, the links on the way followed (the
+    /// last one only where the call follows it), and a `..` taken where the
+    /// walk is. It ends at the first absent entry, with the names after it;
+    /// it finds nothing at a missing name, below a file, or in a link loop.
+    #[test]
+    fn a_walk_ends_at_the_first_absent_entry() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::util::canonicalize(directory.path()).unwrap();
+        let tree = root.join("tree");
+        std::fs::create_dir_all(tree.join("cpu0")).unwrap();
+        std::fs::create_dir_all(tree.join("node/node0")).unwrap();
+        std::fs::write(tree.join("cpu0/core_id"), "0\n").unwrap();
+        std::fs::write(tree.join("node/node0/cpulist"), "0\n").unwrap();
+        std::os::unix::fs::symlink("../node/node0", tree.join("cpu0/node0")).unwrap();
+        let links = root.join("links");
+        std::fs::create_dir(&links).unwrap();
+        std::os::unix::fs::symlink(tree.join("cpu0"), links.join("cpu")).unwrap();
+        std::os::unix::fs::symlink(tree.join("node"), links.join("nodes")).unwrap();
+        std::os::unix::fs::symlink("cpu", links.join("again")).unwrap();
+        std::os::unix::fs::symlink("loop", links.join("loop")).unwrap();
+        // The `node` directory and every CPU's link to a node are absent.
+        let cpu0 = tree.join("cpu0");
+        let absent = |directory: &Path, name: &[u8]| {
+            (directory == tree && name == b"node")
+                || (directory == cpu0 && name.starts_with(b"node"))
+        };
+        let walk = |path: &Path, follow: bool| absent_on_walk(path, follow, true, None, absent);
+        // By its own path, below it, and through a link to it.
+        assert_eq!(
+            walk(&tree.join("node"), true),
+            Some((tree.join("node"), PathBuf::new()))
+        );
+        assert_eq!(
+            walk(&tree.join("node/node0/cpulist"), true),
+            Some((tree.join("node"), PathBuf::from("node0/cpulist")))
+        );
+        assert_eq!(
+            walk(&links.join("nodes"), true),
+            Some((tree.join("node"), PathBuf::new()))
+        );
+        // The link itself, not followed, is the guest's own.
+        assert_eq!(walk(&links.join("nodes"), false), None);
+        // A CPU's node link, not followed, through links to its directory.
+        assert_eq!(
+            walk(&links.join("cpu/node0"), false),
+            Some((cpu0.join("node0"), PathBuf::new()))
+        );
+        assert_eq!(
+            walk(&links.join("again/node0"), true),
+            Some((cpu0.join("node0"), PathBuf::new()))
+        );
+        // A `..` after the absent object still went through it.
+        assert_eq!(
+            walk(&links.join("nodes/.."), true),
+            Some((tree.join("node"), PathBuf::from("..")))
+        );
+        // A neighbour stays, as do a missing name and a name below a file.
+        assert_eq!(walk(&links.join("cpu/core_id"), true), None);
+        assert_eq!(walk(&links.join("cpu/missing/node0"), true), None);
+        assert_eq!(walk(&links.join("cpu/core_id/node0"), true), None);
+        // A link loop ends the walk, as ELOOP ends Linux's.
+        assert_eq!(walk(&links.join("loop/x"), true), None);
+        // A `..` below a file ends the walk too, as ENOTDIR ends Linux's,
+        // before it reaches the absent directory.
+        std::fs::write(links.join("file"), "").unwrap();
+        assert_eq!(walk(&links.join("file/../nodes"), true), None);
+        assert_eq!(walk(&links.join("file/../nodes/node0"), false), None);
+        // So does one below a file reached through a link, or in a link's
+        // target.
+        assert_eq!(walk(&links.join("cpu/core_id/../node0"), true), None);
+        std::os::unix::fs::symlink("file/../nodes", links.join("via-file")).unwrap();
+        assert_eq!(walk(&links.join("via-file/node0"), true), None);
+        // A directory the walk may not search ends it before any name, `..`
+        // included, as EACCES ends Linux's (one with CAP_DAC_READ_SEARCH
+        // searches it).
+        use std::os::unix::fs::PermissionsExt;
+        let blocked = links.join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let expected = match std::fs::metadata(blocked.join("..")) {
+            Ok(_) => Some((tree.join("node"), PathBuf::new())),
+            Err(error) => {
+                assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+                None
+            }
+        };
+        assert_eq!(walk(&blocked.join("../nodes"), true), expected);
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // `self` in `/proc` is the caller's own process directory, given,
+        // here a test directory; the tool's own is not the caller's.
+        std::os::unix::fs::symlink("/proc/self/node0", links.join("own")).unwrap();
+        let own = (cpu0.clone(), tree.join("thread"));
+        assert_eq!(
+            absent_on_walk(&links.join("own"), true, true, Some(&own), absent),
+            Some((cpu0.join("node0"), PathBuf::new()))
+        );
+        assert_eq!(walk(&links.join("own"), true), None);
+        assert_eq!(
+            absent_on_walk(Path::new("/proc/self"), false, true, Some(&own), absent),
+            None
+        );
+        // A `..` that leaves sysfs after the absent object still went
+        // through it.
+        assert_eq!(
+            walk(&links.join("nodes/../../.."), true),
+            Some((tree.join("node"), PathBuf::from("../../..")))
+        );
+        // Without reading links, every name is taken as it is spelled.
+        assert_eq!(
+            absent_on_walk(&tree.join("cpu0/../node/node0"), true, false, None, absent),
+            Some((tree.join("node"), PathBuf::from("node0")))
+        );
+        assert_eq!(
+            absent_on_walk(&links.join("cpu/node0"), true, false, None, absent),
+            None
+        );
+    }
+
+    /// Linux's walk under `openat2`'s restrictions: a path without a
+    /// symbolic link resolves under `RESOLVE_NO_SYMLINKS`, the last link only
+    /// where it is not followed, and one through a link does not (ELOOP);
+    /// under `RESOLVE_NO_XDEV`, a walk from `/` into another mount fails
+    /// with EXDEV, and one that fails first reports its own failure.
+    #[test]
+    fn a_restricted_walk_reports_what_the_kernel_met() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = crate::util::canonicalize(directory.path()).unwrap();
+        std::fs::create_dir(root.join("directory")).unwrap();
+        std::os::unix::fs::symlink("directory", root.join("link")).unwrap();
+        let symlinks = libc::RESOLVE_NO_SYMLINKS;
+        assert_eq!(
+            restricted_walk(&root.join("directory"), true, symlinks),
+            Ok(())
+        );
+        assert_eq!(
+            restricted_walk(&root.join("directory/../directory"), true, symlinks),
+            Ok(())
+        );
+        assert_eq!(restricted_walk(&root.join("link"), false, symlinks), Ok(()));
+        assert_eq!(
+            restricted_walk(&root.join("link"), true, symlinks),
+            Err(Errno::ELOOP)
+        );
+        assert_eq!(
+            restricted_walk(&root.join("link/x"), false, symlinks),
+            Err(Errno::ELOOP)
+        );
+        assert_eq!(
+            restricted_walk(&root.join("missing/x"), true, symlinks),
+            Err(Errno::ENOENT)
+        );
+        let mounts = libc::RESOLVE_NO_XDEV;
+        assert_eq!(restricted_walk(Path::new("/"), true, mounts), Ok(()));
+        assert_eq!(
+            restricted_walk(Path::new("/proc/self"), true, mounts),
+            Err(Errno::EXDEV)
+        );
     }
 }

@@ -10162,7 +10162,7 @@ async fn inject_traced_clone3<T: RecordOrReplay, G: Guest<Detcore<T>>>(
     copy[..8].copy_from_slice(&traced.to_ne_bytes());
 
     // `GuestStack` starts its allocations 128 bytes below the stack pointer.
-    let rsp = guest.regs().await.rsp as usize;
+    let rsp = crate::arch::stack_pointer(&guest.regs().await) as usize;
     let Some(start) = rsp.checked_sub(128 + CLONE3_STAGED_MAX) else {
         return refused("the stack pointer is too low to stage it");
     };

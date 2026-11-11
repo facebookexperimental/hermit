@@ -283,10 +283,25 @@ where
     ))
 }
 
-/// Query through the runtime, which reports the guest's action and mask even
-/// when it owns a physical SIGALRM handler. These queries run in an owned turn;
-/// a scheduler-side read of the callback's physical mask is not a substitute.
+/// SIGALRM's action and the guest's mask ([`read_sleep_signal_state`] for
+/// SIGALRM alone).
 async fn read_sigalrm_sleep_state<G, T>(guest: &mut G) -> Result<InGuestSleepSigalrm, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    read_sleep_signal_state(guest, kernel_sigset_bit(libc::SIGALRM)).await
+}
+
+/// The actions of the guest's `signals` and its mask, queried through the
+/// runtime, which reports the guest's action and mask even when it owns a
+/// physical SIGALRM handler; a signal not in `signals` counts as `SIG_DFL`.
+/// These queries run in an owned turn; a scheduler-side read of the
+/// callback's physical mask is not a substitute.
+async fn read_sleep_signal_state<G, T>(
+    guest: &mut G,
+    signals: KernelSigset,
+) -> Result<InGuestSleepSigalrm, Error>
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -295,15 +310,24 @@ where
     let action = stack.reserve::<KernelSigaction>();
     let mask = stack.reserve::<KernelSigset>();
     let _stack_guard = stack.commit()?;
-    guest
-        .inject(
-            syscalls::RtSigaction::new()
-                .with_signum(libc::SIGALRM)
-                .with_action(None)
-                .with_old_action(Some(action.cast()))
-                .with_sigsetsize(KERNEL_SIGSET_SIZE),
-        )
-        .await?;
+    let (mut ignored, mut caught) = (0, 0);
+    for signal in (1..=64).filter(|signal| signals & kernel_sigset_bit(*signal) != 0) {
+        guest
+            .inject(
+                syscalls::RtSigaction::new()
+                    .with_signum(signal)
+                    .with_action(None)
+                    .with_old_action(Some(action.cast()))
+                    .with_sigsetsize(KERNEL_SIGSET_SIZE),
+            )
+            .await?;
+        let action: KernelSigaction = guest.memory().read_value(action)?;
+        if action.handler == libc::SIG_IGN as u64 {
+            ignored |= kernel_sigset_bit(signal);
+        } else if action.handler != libc::SIG_DFL as u64 {
+            caught |= kernel_sigset_bit(signal);
+        }
+    }
     guest
         .inject(
             syscalls::RtSigprocmask::new()
@@ -313,19 +337,19 @@ where
                 .with_sigsetsize(KERNEL_SIGSET_SIZE),
         )
         .await?;
-    let action: KernelSigaction = guest.memory().read_value(action)?;
     let mask: KernelSigset = guest.memory().read_value(mask)?;
-    let disposition = if action.handler == libc::SIG_DFL as u64 {
-        SigalrmSleepDisposition::Default
-    } else if action.handler == libc::SIG_IGN as u64 {
-        SigalrmSleepDisposition::Ignored
-    } else {
-        SigalrmSleepDisposition::Handled
-    };
-    Ok(InGuestSleepSigalrm {
-        disposition,
-        blocked: mask & kernel_sigset_bit(libc::SIGALRM) != 0,
-    })
+    Ok(InGuestSleepSigalrm::from_actions(mask, ignored, caught))
+}
+
+/// The signals a scheduler send can reach an in-guest sleep with, whose
+/// actions its snapshot reads (`Detcore::in_guest_sleep_sigalrm_snapshot`):
+/// every signal but SIGKILL and SIGSTOP, whose actions cannot change, and the
+/// in-guest runtime's reserved signals (`Config::in_guest_reserved_signals`),
+/// which no guest can arm a timer with and the scheduler never sends.
+fn sleep_snapshot_signals(config: &crate::Config) -> KernelSigset {
+    !(config.in_guest_reserved_signals
+        | kernel_sigset_bit(libc::SIGKILL)
+        | kernel_sigset_bit(libc::SIGSTOP))
 }
 
 /// A5 step 3c.1d, design D37 rule (iii): before an `rt_sigaction` that moves
@@ -852,7 +876,11 @@ fn self_sigkill_targets_current_task(
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
-    /// Bind a supported in-guest emulated sleep to its guest disposition/mask.
+    /// Bind a supported in-guest emulated sleep to its guest dispositions and
+    /// mask: SIGALRM's, and those of every signal a scheduler send can reach
+    /// it with (`sleep_snapshot_signals`), so that such a send wakes it only
+    /// as Linux would (`InGuestSleepSigalrm::send_leaves_asleep`;
+    /// <https://github.com/rrnewton/hermit/issues/5338>).
     /// Ordinary admitted creation does not share signal dispositions between
     /// processes, and each supported in-guest process has one guest thread.
     /// The snapshot therefore stays current until this request resumes.
@@ -863,12 +891,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !self.cfg.backend.virtualizes_guest_sigalrm {
             return None;
         }
-        match read_sigalrm_sleep_state(guest).await {
+        match read_sleep_signal_state(guest, sleep_snapshot_signals(&self.cfg)).await {
             Ok(state) => Some(state),
             Err(error) => {
                 self.stop_after_in_guest_sleep_signal_loss(
                     guest,
-                    format!("could not query its SIGALRM action/mask before sleeping: {error}"),
+                    format!("could not query its signal actions/mask before sleeping: {error}"),
                 )
                 .await
             }
@@ -892,6 +920,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Ok(InGuestSleepSigalrm {
                 disposition: SigalrmSleepDisposition::Default,
                 blocked: false,
+                ..
             }) => {}
             other => {
                 self.stop_after_in_guest_sleep_signal_loss(
@@ -4923,6 +4952,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// (https://github.com/rrnewton/hermit/issues/4089). The call itself
     /// passes through.
     pub(crate) async fn observe_sigreturn_mask<G: Guest<Self>>(&self, guest: &mut G) {
+        // The frame this sigreturn restores ends its delivery interval,
+        // exactly once: only a reported return (`Tool::handle_sigreturn`
+        // set the flag) pops, and taking the flag here keeps the syscall
+        // entry from popping a second time for the same return.
+        if std::mem::take(&mut guest.thread_state_mut().returned_from_sigreturn) {
+            crate::tool_global::pop_delivery_mask(guest).await;
+        }
         let pending = pending_real_time_among(guest, REAL_TIME_SIGNALS).await;
         if pending == 0 {
             return;
