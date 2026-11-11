@@ -86,7 +86,7 @@ LIBHERMIT_ENV = {
     # revision.
     "HERMIT_BUILD_DATE": "unknown",
     "HERMIT_BUILD_GIT_SHA": "unknown",
-    "HERMIT_REVERIE_PIN": "8143cbd865fa33b1c1a88b94e73b41556cd6f101",
+    "HERMIT_REVERIE_PIN": "56c42cab2cbedc312706869e1848a818c32675d3",
 }
 
 # The unit tests' run-time environment.

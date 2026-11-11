@@ -7,7 +7,7 @@ publish = false
 [dependencies]
 # Explicit since https://github.com/rrnewton/reverie/pull/1375: FULL site
 # patching on x86_64. dh-md601 converts this to a forwarded feature.
-reverie-liteinst-preload = { version = "0.5.7", git = "https://github.com/rrnewton/reverie.git", rev = "8143cbd865fa33b1c1a88b94e73b41556cd6f101", default-features = false, features = ["liteinst"] }
+reverie-liteinst-preload = { version = "0.5.7", git = "https://github.com/rrnewton/reverie.git", rev = "56c42cab2cbedc312706869e1848a818c32675d3", default-features = false, features = ["liteinst"] }
 
 [features]
 allocator-fixture = ["reverie-liteinst-preload/allocator-fixture"]
