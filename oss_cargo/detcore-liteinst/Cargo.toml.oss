@@ -33,12 +33,12 @@ exec-native-injection = ["exec-private-init", "detcore-model/native-exec", "reve
 [dependencies]
 detcore = { package = "hermit-detcore", version = "0.5.6", path = "../detcore" }
 libc = "0.2.186"
-reverie = { package = "reverie-core", version = "0.5.6", git = "https://github.com/rrnewton/reverie.git", rev = "9c3703857154641d85d5de7ec2539bbbce6a984c" }
-reverie-inguest = { version = "0.5.6", git = "https://github.com/rrnewton/reverie.git", rev = "9c3703857154641d85d5de7ec2539bbbce6a984c", default-features = false }
-reverie-liteinst = { version = "0.5.6", git = "https://github.com/rrnewton/reverie.git", rev = "9c3703857154641d85d5de7ec2539bbbce6a984c", default-features = false, features = ["liteinst"] }
+reverie = { package = "reverie-core", version = "0.5.6", git = "https://github.com/rrnewton/reverie.git", rev = "820b48394596cac8f9a496c61d681aa83650b1eb" }
+reverie-inguest = { version = "0.5.6", git = "https://github.com/rrnewton/reverie.git", rev = "820b48394596cac8f9a496c61d681aa83650b1eb", default-features = false }
+reverie-liteinst = { version = "0.5.6", git = "https://github.com/rrnewton/reverie.git", rev = "820b48394596cac8f9a496c61d681aa83650b1eb", default-features = false, features = ["liteinst"] }
 
 detcore-model = { version = "0.5.6", path = "../detcore-model", optional = true }
-reverie-rpc-transport = { version = "0.5.6", git = "https://github.com/rrnewton/reverie.git", rev = "9c3703857154641d85d5de7ec2539bbbce6a984c", optional = true }
+reverie-rpc-transport = { version = "0.5.6", git = "https://github.com/rrnewton/reverie.git", rev = "820b48394596cac8f9a496c61d681aa83650b1eb", optional = true }
 bincode = { version = "2", features = ["serde"], optional = true }
 serde = { version = "1.0.219", features = ["derive"], optional = true }
 sha2 = { version = "0.10.6", optional = true }
