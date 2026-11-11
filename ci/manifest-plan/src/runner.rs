@@ -19013,6 +19013,13 @@ fi
             }
         }
         assert_eq!(history.attempts[0].observations(), recorded.as_ref());
+        // `method` is #[serde(skip)] (cpu_evidence.rs:153): each read-back Spawned is Unrecorded.
+        let read_back = history.attempts[0].observations();
+        for invocation in read_back.iter().flat_map(|o| o.invocations.iter()) {
+            if let LaunchObservation::Spawned { method, .. } = &invocation.launch {
+                assert_eq!(*method, crate::cpu_evidence::SpawnMethod::Unrecorded);
+            }
+        }
         for pointer in [
             "/cpu_observations/binding/run_id",
             "/cpu_observations/invocations/0/live/polls",
