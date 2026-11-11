@@ -27547,6 +27547,37 @@ fn write_ledger(
     )
 }
 
+/// Where the canonical branch retains this run's history row: the production
+/// state root, unless this invocation is the stop-path fixture.
+fn canonical_retained_history_root(
+    state_root: &Path,
+    fixture_root: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, String> {
+    validate_artifacts::retained_history_root(
+        state_root,
+        validate_runtime::stop_test_requested(),
+        fixture_root,
+    )
+}
+
+#[cfg(test)]
+mod canonical_retained_history_root_tests {
+    /// Outside stop mode a set CI_HUB_VALIDATE_LEDGER_TEST_ROOT naming a real
+    /// directory is ignored: the row goes to the production state root.
+    #[test]
+    fn ordinary_validation_retains_history_at_the_production_root() {
+        assert!(!super::validate_runtime::stop_test_requested());
+        let root = tempfile::tempdir().unwrap();
+        let fixture = root.path().join("fixture");
+        std::fs::create_dir(&fixture).unwrap();
+        let production = root.path().join("production");
+        assert_eq!(
+            super::canonical_retained_history_root(&production, Some(fixture.as_os_str())),
+            Ok(production)
+        );
+    }
+}
+
 fn write_ledger_with_snapshot(
     publication: LedgerPublication<'_>,
     raw_inputs: Option<(
@@ -27979,9 +28010,8 @@ fn write_ledger_with_snapshot(
         // re-record this file once the refusal's cause is fixed, instead
         // of the run's only copy of the row dying with the pipe.
         if let Some(state_root) = ledger.parent() {
-            let state_root = match validate_artifacts::retained_history_root(
+            let state_root = match canonical_retained_history_root(
                 state_root,
-                validate_runtime::stop_test_requested(),
                 std::env::var_os("CI_HUB_VALIDATE_LEDGER_TEST_ROOT").as_deref(),
             ) {
                 Ok(root) => root,
