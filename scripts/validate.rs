@@ -27979,9 +27979,20 @@ fn write_ledger_with_snapshot(
         // re-record this file once the refusal's cause is fixed, instead
         // of the run's only copy of the row dying with the pipe.
         if let Some(state_root) = ledger.parent() {
+            let state_root = match validate_artifacts::retained_history_root(
+                state_root,
+                validate_runtime::stop_test_requested(),
+                std::env::var_os("CI_HUB_VALIDATE_LEDGER_TEST_ROOT").as_deref(),
+            ) {
+                Ok(root) => root,
+                Err(error) => {
+                    eprintln!("validate: warning: {error}");
+                    return None;
+                }
+            };
             let retain_as = ctx.run_id.as_deref().unwrap_or(&record_id);
             if let Err(error) = validate_artifacts::publish_run_artifact_noclobber(
-                state_root,
+                &state_root,
                 retain_as,
                 "history-row.json",
                 line.as_bytes(),

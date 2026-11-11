@@ -41,6 +41,28 @@ fn require_plain_directory(path: &Path, description: &str) -> Result<(), String>
     Ok(())
 }
 
+/// Keep stop-test history beside the adapter's private fixture state, while
+/// ordinary validation ignores the fixture override entirely.
+pub(crate) fn retained_history_root(
+    parent: &Path,
+    stop_test_mode: bool,
+    fixture_root: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, String> {
+    if !stop_test_mode {
+        return Ok(parent.to_owned());
+    }
+    let fixture_root = fixture_root
+        .map(PathBuf::from)
+        .filter(|root| root.is_absolute())
+        .ok_or_else(|| {
+            "canonical-stop-history-root-invalid: CI_HUB_VALIDATE_LEDGER_TEST_ROOT must name an absolute directory"
+                .to_string()
+        })?;
+    require_plain_directory(&fixture_root, "stop-test retained history root")
+        .map_err(|error| format!("canonical-stop-history-root-invalid: {error}"))?;
+    Ok(fixture_root)
+}
+
 fn create_plain_directory_path_below(
     root: &Path,
     relative: &Path,
@@ -237,6 +259,68 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use super::*;
+
+    #[test]
+    fn retained_history_root_ignores_all_fixture_values_outside_stop_mode() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("production");
+        let fixture = root.path().join("fixture");
+        fs::create_dir(&fixture).unwrap();
+        let file = root.path().join("file");
+        fs::write(&file, b"not a directory").unwrap();
+        let absent = root.path().join("absent");
+        let alias = root.path().join("alias");
+        symlink(&fixture, &alias).unwrap();
+        for value in [
+            None,
+            Some(std::ffi::OsStr::new("")),
+            Some(std::ffi::OsStr::new("relative")),
+            Some(file.as_os_str()),
+            Some(absent.as_os_str()),
+            Some(alias.as_os_str()),
+            Some(fixture.as_os_str()),
+        ] {
+            assert_eq!(
+                retained_history_root(&parent, false, value).unwrap(),
+                parent,
+                "non-stop validation must ignore fixture root {value:?}"
+            );
+        }
+        assert!(!parent.exists());
+    }
+
+    #[test]
+    fn retained_history_root_accepts_only_an_absolute_plain_stop_fixture() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("production");
+        let fixture = root.path().join("fixture");
+        fs::create_dir(&fixture).unwrap();
+        assert_eq!(
+            retained_history_root(&parent, true, Some(fixture.as_os_str())).unwrap(),
+            fixture
+        );
+        let file = root.path().join("file");
+        fs::write(&file, b"not a directory").unwrap();
+        let absent = root.path().join("absent");
+        let alias = root.path().join("alias");
+        symlink(&fixture, &alias).unwrap();
+        for value in [
+            None,
+            Some(std::ffi::OsStr::new("")),
+            Some(std::ffi::OsStr::new("relative")),
+            Some(file.as_os_str()),
+            Some(absent.as_os_str()),
+            Some(alias.as_os_str()),
+        ] {
+            let error = retained_history_root(&parent, true, value).unwrap_err();
+            assert!(
+                error.starts_with("canonical-stop-history-root-invalid:"),
+                "{value:?}: {error}"
+            );
+        }
+        assert!(!parent.exists());
+        assert!(fs::read_dir(fixture).unwrap().next().is_none());
+    }
 
     #[test]
     fn artifact_publication_preserves_bytes_and_refuses_replacement() {
