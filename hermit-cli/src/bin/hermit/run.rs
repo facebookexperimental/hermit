@@ -8027,6 +8027,36 @@ fn a_manifest_leaves_out_the_work_span_report() {
     assert!(!run.contains_key("work-span-report"), "{run:?}");
 }
 
+/// A run manifest leaves out `--pinned-cpu-dir` and `--pinned-cpu-notice`,
+/// as it leaves out `--log-file`: they place this run on this host and are
+/// not inputs of the run. The saved run configuration keeps them.
+#[test]
+fn a_manifest_leaves_out_the_pinned_cpu_placement_options() {
+    let argv = [
+        "hermit",
+        "run",
+        "--pinned-cpu-dir=/srv/hermit-cpu-locks",
+        "--pinned-cpu-notice=off",
+        "/bin/true",
+    ];
+    let matches = <crate::app::Args as clap::CommandFactory>::command()
+        .try_get_matches_from(argv)
+        .unwrap();
+    let args = crate::app::args_from_matches_with_clock(&matches, SystemTime::now).unwrap();
+    let crate::app::Subcommand::Run(ro) = args.command else {
+        panic!("{argv:?} is not a `run` command");
+    };
+    let config = ro.saved_run_config().unwrap();
+    let (mut global, mut run) = crate::app::run_config::to_manifest_parts(&config).unwrap();
+    assert!(run.contains_key("pinned-cpu-dir"), "{run:?}");
+    assert!(run.contains_key("pinned-cpu-notice"), "{run:?}");
+    crate::app::manifest::drop_outputs(&mut global, &mut run);
+    assert!(!run.contains_key("pinned-cpu-dir"), "{run:?}");
+    assert!(!run.contains_key("pinned-cpu-notice"), "{run:?}");
+    assert!(!global.contains_key("pinned-cpu-dir"), "{global:?}");
+    assert!(!global.contains_key("pinned-cpu-notice"), "{global:?}");
+}
+
 /// A report path with a `..` component, which the container can resolve
 /// into its private `/tmp`, is refused before the guest runs.
 #[test]

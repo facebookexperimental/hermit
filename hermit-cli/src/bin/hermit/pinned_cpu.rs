@@ -756,14 +756,24 @@ impl PinnedCpuSettings {
 
     /// [`LOCK_DIR_ENV`], else [`LOCK_DIR_DEFAULT`].
     pub(crate) fn dir_from_env() -> std::path::PathBuf {
-        std::env::var_os(LOCK_DIR_ENV)
-            .filter(|dir| !dir.is_empty())
-            .map_or_else(|| LOCK_DIR_DEFAULT.into(), std::path::PathBuf::from)
+        Self::dir_from(&|name| std::env::var_os(name))
     }
 
     /// Whether [`NOTICE_ENV`] leaves the notices on.
     pub(crate) fn notice_from_env() -> bool {
-        std::env::var_os(NOTICE_ENV).is_none_or(|value| value != "0")
+        Self::notice_from(&|name| std::env::var_os(name))
+    }
+
+    /// [`Self::dir_from_env`], reading the environment through `env`.
+    fn dir_from(env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> std::path::PathBuf {
+        env(LOCK_DIR_ENV)
+            .filter(|dir| !dir.is_empty())
+            .map_or_else(|| LOCK_DIR_DEFAULT.into(), std::path::PathBuf::from)
+    }
+
+    /// [`Self::notice_from_env`], reading the environment through `env`.
+    fn notice_from(env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+        env(NOTICE_ENV).is_none_or(|value| value != "0")
     }
 }
 
@@ -798,18 +808,44 @@ impl PinnedCpuPlacementArgs {
         policy: PinnedCpuPolicy,
         wait_cap: Option<Duration>,
     ) -> PinnedCpuSettings {
+        self.settings_with_env(policy, wait_cap, &|name| std::env::var_os(name))
+    }
+
+    /// [`Self::settings`], reading the fallbacks through `env`.
+    fn settings_with_env(
+        &self,
+        policy: PinnedCpuPolicy,
+        wait_cap: Option<Duration>,
+        env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    ) -> PinnedCpuSettings {
         PinnedCpuSettings {
             policy,
             dir: self
                 .pinned_cpu_dir
                 .clone()
-                .unwrap_or_else(PinnedCpuSettings::dir_from_env),
+                .unwrap_or_else(|| PinnedCpuSettings::dir_from(env)),
             notice: match self.pinned_cpu_notice.as_deref() {
                 Some(value) => value == "on",
-                None => PinnedCpuSettings::notice_from_env(),
+                None => PinnedCpuSettings::notice_from(env),
             },
             wait_cap,
         }
+    }
+
+    /// The flags that were given, as the environment fallbacks a child
+    /// `hermit` reads when it is not given the flags: `hermit replay
+    /// --dap-listen` execs `hermit-dap`, which starts its own `hermit replay`.
+    /// `--pinned-cpu-notice=on` sets the variable to `1`, so that it also
+    /// overrides an inherited `0`.
+    pub(crate) fn to_env(&self) -> Vec<(&'static str, std::ffi::OsString)> {
+        let mut env = Vec::new();
+        if let Some(dir) = &self.pinned_cpu_dir {
+            env.push((LOCK_DIR_ENV, dir.clone().into_os_string()));
+        }
+        if let Some(notice) = &self.pinned_cpu_notice {
+            env.push((NOTICE_ENV, if notice == "on" { "1" } else { "0" }.into()));
+        }
+        env
     }
 
     /// The flags that were given, spelled for another `hermit` command line
@@ -1341,6 +1377,63 @@ mod tests {
         assert!(PinnedCpuPlacementArgs::default().to_args().is_empty());
         let on = Wrapper::parse_from(["hermit", "--pinned-cpu-notice=on"]).placement;
         assert!(on.settings(PinnedCpuPolicy::Refuse, None).notice);
+    }
+
+    /// With both a flag and its environment variable set, the flag wins; with
+    /// only the variable, the variable is used; with neither, the default.
+    /// The environment is passed in, so no process-wide variable is touched.
+    #[test]
+    fn a_placement_flag_wins_over_its_environment_variable() {
+        #[derive(clap::Parser)]
+        struct Wrapper {
+            #[clap(flatten)]
+            placement: PinnedCpuPlacementArgs,
+        }
+        use clap::Parser;
+        let both = |name: &str| match name {
+            LOCK_DIR_ENV => Some("/from/env".into()),
+            NOTICE_ENV => Some("0".into()),
+            _ => None,
+        };
+        let notice_on_in_env = |name: &str| (name == NOTICE_ENV).then(|| "1".into());
+        let neither = |_: &str| None;
+
+        let flags = Wrapper::parse_from([
+            "hermit",
+            "--pinned-cpu-dir=/from/flag",
+            "--pinned-cpu-notice=on",
+        ])
+        .placement;
+        let given = flags.settings_with_env(PinnedCpuPolicy::Share, None, &both);
+        assert_eq!(given.dir, std::path::Path::new("/from/flag"));
+        assert!(
+            given.notice,
+            "--pinned-cpu-notice=on lost to {NOTICE_ENV}=0"
+        );
+        let off = Wrapper::parse_from(["hermit", "--pinned-cpu-notice=off"]).placement;
+        assert!(
+            !off.settings_with_env(PinnedCpuPolicy::Share, None, &notice_on_in_env)
+                .notice,
+            "--pinned-cpu-notice=off lost to {NOTICE_ENV}=1"
+        );
+
+        let none = PinnedCpuPlacementArgs::default();
+        let from_env = none.settings_with_env(PinnedCpuPolicy::Share, None, &both);
+        assert_eq!(from_env.dir, std::path::Path::new("/from/env"));
+        assert!(!from_env.notice);
+        let default = none.settings_with_env(PinnedCpuPolicy::Share, None, &neither);
+        assert_eq!(default.dir, std::path::Path::new(LOCK_DIR_DEFAULT));
+        assert!(default.notice);
+
+        assert_eq!(
+            flags.to_env(),
+            [
+                (LOCK_DIR_ENV, "/from/flag".into()),
+                (NOTICE_ENV, std::ffi::OsString::from("1")),
+            ]
+        );
+        assert_eq!(off.to_env(), [(NOTICE_ENV, std::ffi::OsString::from("0"))]);
+        assert!(none.to_env().is_empty());
     }
 
     /// A `/proc/stat` with the aggregate line, two full CPU lines, one short

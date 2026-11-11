@@ -1472,7 +1472,11 @@ why, and what to do instead. The wait comes before the run's own `--timeout`
 starts, so a wait and the run together can take up to twice `--timeout`.
 `--pinned-cpu-notice=off` (fallback `HERMIT_PINNED_CPU_NOTICE=0`, and taken by
 the same three subcommands) silences the notices without changing placement.
-`hermit record start` and `hermit replay` always use `--pinned-cpu=share`. The CPU is host placement only:
+`hermit record start` and `hermit replay` always use `--pinned-cpu=share`. A run
+manifest (`hermit run --from`) does not record `--pinned-cpu-dir` or
+`--pinned-cpu-notice`, as it does not record `--log-file`: a rerun uses its own
+host's settings. `hermit replay --dap-listen` passes both on to the replay
+`hermit-dap` starts, as `HERMIT_PINNED_CPU_DIR` and `HERMIT_PINNED_CPU_NOTICE`. The CPU is host placement only:
 guest-visible behavior, and `--verify` results, are the same whichever CPU a
 run gets.
 

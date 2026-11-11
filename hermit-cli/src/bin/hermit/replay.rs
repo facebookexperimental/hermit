@@ -381,17 +381,35 @@ impl ReplayOpts {
             "hermit replay: starting hermit-dap to serve recording {id} to one DAP client; {}",
             super::dap_adapter::attach_hint(&program, self.gdbserver_port)
         );
-        let error = std::process::Command::new(&adapter)
+        let error = self
+            .dap_adapter_command(&adapter, hermit.data_dir(), &id.to_string(), address)
+            .exec();
+        Error::from(error).context(format!("Failed to execute {}", adapter.display()))
+    }
+
+    /// `hermit-dap --listen ADDRESS --replay ID`. hermit-dap starts its own
+    /// `hermit replay --serve-only`, which is not given this replay's flags,
+    /// so `--pinned-cpu-dir` and `--pinned-cpu-notice` reach it as their
+    /// environment fallbacks.
+    fn dap_adapter_command(
+        &self,
+        adapter: &Path,
+        data_dir: &Path,
+        id: &str,
+        address: &str,
+    ) -> std::process::Command {
+        let mut command = std::process::Command::new(adapter);
+        command
             .arg("--listen")
             .arg(address)
             .arg("--replay")
-            .arg(id.to_string())
+            .arg(id)
             .arg("--data-dir")
-            .arg(hermit.data_dir())
+            .arg(data_dir)
             .arg("--gdbserver-port")
             .arg(self.gdbserver_port.to_string())
-            .exec();
-        Error::from(error).context(format!("Failed to execute {}", adapter.display()))
+            .envs(self.pinned_cpu_placement.to_env());
+        command
     }
 
     fn container_main(
@@ -436,5 +454,55 @@ mod tests {
         assert_eq!(replay_network(Some(true)), NetworkingMode::Local);
         assert_eq!(replay_network(Some(false)), NetworkingMode::Host);
         assert_eq!(replay_network(None), NetworkingMode::Host);
+    }
+
+    /// `replay --dap-listen` hands the replay to hermit-dap, whose own
+    /// `hermit replay` must still see the placement flags: they go on as the
+    /// environment variables it falls back to, and nothing else is added.
+    #[test]
+    fn a_dap_replay_passes_the_placement_flags_on() {
+        let env_of = |argv: &[&str]| {
+            let options = ReplayOpts::parse_from(argv);
+            let command = options.dap_adapter_command(
+                Path::new("/bin/hermit-dap"),
+                Path::new("/data"),
+                "0123456789ab",
+                "127.0.0.1:4711",
+            );
+            command
+                .get_envs()
+                .map(|(name, value)| (name.to_owned(), value.map(ToOwned::to_owned)))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            env_of(&[
+                "replay",
+                "--dap-listen=127.0.0.1:4711",
+                "--pinned-cpu-dir=/srv/locks",
+                "--pinned-cpu-notice=off",
+            ]),
+            [
+                (
+                    OsString::from(super::super::pinned_cpu::LOCK_DIR_ENV),
+                    Some(OsString::from("/srv/locks"))
+                ),
+                (
+                    OsString::from(super::super::pinned_cpu::NOTICE_ENV),
+                    Some(OsString::from("0"))
+                ),
+            ]
+        );
+        assert_eq!(
+            env_of(&[
+                "replay",
+                "--dap-listen=127.0.0.1:4711",
+                "--pinned-cpu-notice=on"
+            ]),
+            [(
+                OsString::from(super::super::pinned_cpu::NOTICE_ENV),
+                Some(OsString::from("1"))
+            )]
+        );
+        assert!(env_of(&["replay", "--dap-listen=127.0.0.1:4711"]).is_empty());
     }
 }
