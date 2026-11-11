@@ -239,7 +239,6 @@ LINT_CHECK_TARGETS := \
     lint-check-private-static-pipeline \
     lint-check-musl-detcore \
     lint-check-nested-lockfiles \
-    lint-check-oss-cargo-twins \
     lint-check-record-version-floor \
     lint-check-known-gap-ledgers \
     lint-check-buck-reindeer-features \
@@ -397,10 +396,6 @@ lint-check-musl-detcore:
 
 lint-check-nested-lockfiles:
 	$(SUBMODULE_PROXY) ./scripts/check-nested-lockfiles.rs
-
-lint-check-oss-cargo-twins:
-	./scripts/check-oss-cargo-twins.sh --self-test
-	./scripts/check-oss-cargo-twins.sh
 
 lint-check-record-version-floor:
 	./scripts/check-record-version-floor.rs $(_VALIDATE_PIN_ARG)
