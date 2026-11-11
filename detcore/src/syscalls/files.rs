@@ -8464,11 +8464,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// ([`Self::serving_kernel_enables_protection_keys`]), the host kernel's
     /// transparent huge page settings, and the reader's address space's
     /// record (`MemoryMetadata`), with whether it disabled huge pages asked
-    /// of the backend (`PR_GET_THP_DISABLE`) where that decides an answer: an
-    /// order is allowed to anonymous memory, or the kernel's answer for one
-    /// of `map`'s mappings (`MappingFact::thp_eligible`) is 1. `Err` names a
-    /// fact Detcore could not establish, and a kernel that enables protection
-    /// keys, whose keys follow calls Detcore does not record
+    /// of the backend (`PR_GET_THP_DISABLE`) where that decides the answer
+    /// for one of `map`'s mappings (`smaps::thp_disabled_decides`). `Err`
+    /// names a fact Detcore could not establish, and a kernel that enables
+    /// protection keys, whose keys follow calls Detcore does not record
     /// (`mprotect(PROT_EXEC)` alone gives the execute-only key).
     async fn smaps_facts<G: Guest<Self>>(
         &self,
@@ -8493,12 +8492,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                  which the host's settings decide, and they could not be read: {error}"
             )
         })?;
-        let thp_orders = host_thp.map_or(0, |thp| thp.anonymous_orders());
-        let kernel_allows_one = map
+        let state = guest.thread_state();
+        let unasked = smaps::SmapsFacts {
+            protection_keys_enabled,
+            protection_keys_used: state.may_use_protection_keys(),
+            mapping_flags_changed: state.mapping_flags_may_have_changed(),
+            thp_enabled: host_thp.map(|thp| thp.enabled),
+            thp_orders: host_thp.map_or(0, |thp| thp.anonymous_orders()),
+            thp_disabled: None,
+        };
+        let filesystems = smaps::host_filesystems();
+        let decides = map
             .mappings
             .iter()
-            .any(|mapping| mapping.thp_eligible == Some(true));
-        let thp_disabled = if thp_orders == 0 && !kernel_allows_one {
+            .any(|mapping| smaps::thp_disabled_decides(mapping, &unasked, filesystems));
+        let thp_disabled = if !decides {
             None
         } else {
             let asked = guest
@@ -8519,14 +8527,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
         };
-        let state = guest.thread_state();
         Ok(smaps::SmapsFacts {
-            protection_keys_enabled,
-            protection_keys_used: state.may_use_protection_keys(),
-            mapping_flags_changed: state.mapping_flags_may_have_changed(),
-            thp_enabled: host_thp.map(|thp| thp.enabled),
-            thp_orders,
             thp_disabled,
+            ..unasked
         })
     }
 

@@ -755,98 +755,109 @@ that reads it in small pieces (a guest with 20,000 mappings that reads its
 about 1.3 ms a read at a position of 0.5 MB; one with 5,000 no measurable
 time), and once the task is reaped, the kernel refuses the seek and its
 position falls to 0. On ptrace the map is the kernel's own text, so the file
-reads as before but for a `[uprobes]` line, which is left out of this file
-only (it stays in `smaps`, `numa_maps` and every `maps` captured from the
-kernel): the kernel adds that page to a process when a uprobe installed by
-something else on the host fires in it, so it can be there in one run and not
-in the next. On KVM the map lists
-the mappings of the stack window that LinuxEmu keeps, `[stack]` and the parts a
-split left of it, exactly as Linux prints them, so glibc's `pthread_getattr_np`
-finds the main thread's stack as on Linux. The image, the interpreter, the
-vDSO, the heap and every `mmap(2)` mapping are missing, a named difference of
-the KVM provider (<https://github.com/rrnewton/reverie/issues/1211>), and the
-lowest line starts where LinuxEmu's window does, 8 MiB less a page below the
-stack's top. Once LinuxEmu loses track of the window (an `mprotect(2)` across
-a hole in it, which it refuses whole, or a change a `vfork` partner made), its
-map lists nothing, and the file is again LinuxEmu's one invented `[stack]` line
-over the whole window, in the process and the children it forks, until it
-executes another program. On KVM only `self` and the pid spelling open:
-`thread-self` and `task/<tid>` fail with EACCES, as before this rendering, as
-LinuxEmu's synthetic path table has no entry for them, and so do
-`/proc/self/../self/maps` and `open("/proc/self", O_DIRECTORY)`, through which
-an `openat` would reach the file; a reopen through `/proc/self/fd/N` reads the
-invented line, where Linux reads a fresh map. A descriptor received over
-`SCM_RIGHTS` on KVM is not bound: it reads the invented line while the task
-that opened it is a zombie (Linux reads nothing) and once that task is reaped
-(Linux fails ESRCH), and a process that sends its own descriptor to itself
-reads the invented line through the received copy and the rendered map
-through the original, where Linux's two descriptors share one open file, its
-contents and its position. The descriptor there is
-still LinuxEmu's in-memory file, so `mmap(2)` of it maps the invented line,
-where Linux refuses with ENODEV, and a `stat` of its path or its descriptor
-link reports that line's length; package K slice K10 removes that file.
-Another process's `maps`, which the open does not bind, and a descriptor read
-where the reader does not hold the bound address space (in another process
-that inherited it, or after an `exec`), are captured from the kernel as above.
+reads as before but for a `[uprobes]` line, which is left out of this file only
+(it stays in `smaps` and every `maps` captured from the kernel): the kernel
+adds that page to a process when a uprobe installed by something else on the
+host fires in it, so it can be there in one run and not in the next. On KVM the
+map lists every mapping LinuxEmu holds for the process, each as Linux prints
+it: the image, the interpreter, the heap, every `mmap(2)` mapping, and the
+stack window's mappings, `[stack]` and the parts a split left of it, so glibc's
+`pthread_getattr_np` finds the main thread's stack as on Linux. LinuxEmu gives
+the guest no `[vdso]`, `[vvar]` or `[vsyscall]`, as Linux lists none for a
+kernel booted with `vdso=0` and `vsyscall=none`, and the stack window's lowest
+line starts where LinuxEmu's window does, 8 MiB less a page below the stack's
+top. Where LinuxEmu does not know what maps a page (in an image it loaded from
+bytes), it leaves out that page and every line that touches it and marks the
+list incomplete, a named difference of the KVM provider
+(<https://github.com/rrnewton/reverie/issues/1211>). Once LinuxEmu loses track
+of the stack window (an `mprotect(2)` across a hole in it, which it refuses
+whole, or a change a `vfork` partner made), its map lists nothing, and the file
+is again LinuxEmu's one invented `[stack]` line over the whole window, in the
+process and the children it forks, until it executes another program. On KVM
+only `self` and the pid spelling open: `thread-self` and `task/<tid>` fail with
+EACCES, as before this rendering, as LinuxEmu's synthetic path table has no
+entry for them, and so do `/proc/self/../self/maps` and `open("/proc/self",
+O_DIRECTORY)`, through which an `openat` would reach the file; a reopen through
+`/proc/self/fd/N` reads the invented line, where Linux reads a fresh map. A
+descriptor received over `SCM_RIGHTS` on KVM is not bound: it reads the
+invented line while the task that opened it is a zombie (Linux reads nothing)
+and once that task is reaped (Linux fails ESRCH), and a process that sends its
+own descriptor to itself reads the invented line through the received copy and
+the rendered map through the original, where Linux's two descriptors share one
+open file, its contents and its position. The descriptor there is still
+LinuxEmu's in-memory file, so `mmap(2)` of it maps the invented line, where
+Linux refuses with ENODEV, and a `stat` of its path or its descriptor link
+reports that line's length; package K slice K10 removes that file. Another
+process's `maps`, which the open does not bind, and a descriptor read where the
+reader does not hold the bound address space (in another process that inherited
+it, or after an `exec`), are captured from the kernel as above.
 
-Where the guest's procfs is not the kernel's (KVM), there is no kernel
-`smaps`, `smaps_rollup` or `numa_maps` to sanitize, and Detcore renders each
-process's itself from the backend's memory map (package K slice N4 of
+Where the guest's procfs is not the kernel's (KVM), there is no kernel `smaps`
+or `smaps_rollup` to sanitize, and Detcore renders each process's itself from
+the backend's memory map (package K slice N4 of
 <https://github.com/rrnewton/hermit/issues/4213>,
 `detcore/src/procfs/memory_map/smaps.rs`): a per-process file Detcore opens
 with a placeholder, as it does `statm`, whose open binds the task and its
 address space as a `maps` does, and whose first read prints what Linux's
-`show_smap`, `show_smaps_rollup` and `show_numa_map` print for the listed
-mappings, which the same sanitizers then normalize, so that the guest reads,
-for each mapping, the bytes ptrace's sanitized file gives. The fields the
-memory map does not list are derived from facts the same way on every
-backend: `KernelPageSize` and `MMUPageSize` from the page size;
-`THPeligible` from the host's transparent huge page settings, which a KVM
-guest reads in sysfs too and which ptrace's sanitized file also follows, the
-mapping's size and alignment, and whether the address space disabled huge
-pages (`PR_GET_THP_DISABLE`, asked of the backend), as Linux's
-`thp_vma_allowable_orders` decides it for an anonymous mapping (Detcore
-answers `MADV_HUGEPAGE` itself and never passes it on); `ProtectionKey`
-where the kernel serving the process enables protection keys
-(`arch_pkeys_enabled`), which Detcore asks of that kernel through the
-backend with a `pkey_mprotect` that changes nothing (key 0 of a page no
-mapping can hold: EINVAL without keys, ENOMEM with them); the initial
-stack's `VmFlags` from `setup_arg_pages`' flags and its protection;
-`numa_maps`' policy `default`, Detcore's one-node model, which records no
-policy; and its `kernelpagesize_kB`, which Linux prints only for a mapping
-with a resident page, for the initial stack, which holds one from exec on.
-What cannot be derived is refused by name through the unsupported-operation
-policy, never printed as a plausible value: any mapping but the initial
-stack (whose flags depend on how it was made, and whose residency is the
-host's); a listed mapping that `madvise(2)` access-pattern, fork or dump
-advice or `mlock(2)` reached (`MemoryMetadata::mapping_flags_changed`), and,
-in `numa_maps`, one that advice that discards pages reached
-(`MADV_DONTNEED`, `MADV_DONTNEED_LOCKED`, `MADV_GUARD_INSTALL`,
-`MADV_WIPEONFORK`: `MemoryMetadata::pages_discarded`), while advice on a
-mapping the memory map does not list refuses nothing; a kernel that enables
-protection keys, whose keys follow calls Detcore does not record
-(`mprotect(PROT_EXEC)` alone gives the execute-only key); `smaps_rollup` from
-a memory map that lists only some mappings (its header spans the whole
-address space); another process's file (the memory map describes the
-reader's own process only); and a read where the reader does not hold the
-bound address space. On KVM the memory map lists the stack window only, so
-`smaps` and `numa_maps` list `[stack]` alone, a named difference
-(<https://github.com/rrnewton/reverie/issues/1211>), with every byte of its
-block and row the same as ptrace's but for three named differences: its range
-and size, which LinuxEmu's window decides; the `ProtectionKey` line, which
-KVM's kernel does not print because it enables no protection keys (its vCPU
-runs with CR4.PKE clear, and LinuxEmu answers the protection-key calls as
-Linux on such a CPU), where the host kernel beneath ptrace prints one; and,
-on a host whose transparent huge page setting is `always`, `THPeligible`,
-which follows the mapping's size, so that KVM's 8188 kB window prints 1
-where a native-sized stack prints 0. `smaps_rollup`, a stack a split left in
-parts, advice that sets flags on the stack, and `numa_maps` after advice
-that discards the stack's pages are refused. Elsewhere the kernel's three
+`show_smap` and `show_smaps_rollup` print for the listed mappings, which the
+same sanitizers then normalize, so that the guest reads, for each mapping, the
+bytes ptrace's sanitized file gives. The fields the memory map does not list
+are derived from facts the same way on every backend. `KernelPageSize` and
+`MMUPageSize` come from the page size, and `VmFlags` from the flags the memory
+map gives each mapping (`MappingFact::vm_flags`, which the backend
+establishes), or for the initial stack, where it gives none, from
+`setup_arg_pages`' flags and the stack's protection. `THPeligible` is decided
+as Linux's `thp_vma_allowable_orders` decides it. It is 0 for a mapping whose
+flags hold `VM_NOHUGEPAGE`, which `MAP_STACK` sets. For anonymous memory it
+follows the host's transparent huge page settings, which a KVM guest reads in
+sysfs too and which ptrace's sanitized file also follows, the mapping's size
+and alignment, and whether the address space disabled huge pages
+(`PR_GET_THP_DISABLE`, asked of the backend). For a file or shared memory it is
+0 where no block a file may have fits the mapping; else the host kernel's
+answer for a mapping of its own of the same file, where the backend asked it
+(LinuxEmu asks for a file on overlayfs or tmpfs); else 0 where the address
+space disabled huge pages; else 0 for a file on a disk filesystem under the
+host's `madvise` or `never`. `ProtectionKey` is printed where the kernel
+serving the process enables protection keys (`arch_pkeys_enabled`), which
+Detcore asks of that kernel through the backend with a `pkey_mprotect` that
+changes nothing (key 0 of a page no mapping can hold: EINVAL without keys,
+ENOMEM with them). What cannot be derived is refused by name through the
+unsupported-operation policy, never printed as a plausible value: a mapping
+whose flags the memory map does not give, but for the initial stack; a mapping
+whose flags hold `VM_HUGEPAGE`, which only a backend's own flags could set
+(Detcore answers `MADV_HUGEPAGE` itself and passes it on to no backend), and
+whose orders follow host settings Detcore does not read; a file or shared
+memory whose `THPeligible` follows rules Detcore does not model, where the
+backend did not ask the kernel (a file on a disk filesystem under the host's
+`always`, on tmpfs, on overlayfs or on a device the host's mount table does not
+list, and shared anonymous memory); a listed mapping that `madvise(2)`
+access-pattern, fork or dump advice or `mlock(2)` reached
+(`MemoryMetadata::mapping_flags_changed`), while advice on a mapping the memory
+map does not list refuses nothing; a kernel that enables protection keys, whose
+keys follow calls Detcore does not record (`mprotect(PROT_EXEC)` alone gives
+the execute-only key); `smaps_rollup` from a memory map that lists only some
+mappings (its header spans the whole address space); another process's file
+(Detcore renders the reader's own address space only); and a read where the
+reader does not hold the bound address space. KVM's memory map lists every
+mapping of an image loaded from a file, so `smaps` shows them all; for an image
+loaded from bytes the list is incomplete, `smaps` shows only the mappings it
+lists, a named difference (<https://github.com/rrnewton/reverie/issues/1211>),
+and `smaps_rollup` is refused. Every byte of a mapping's block is the same as
+ptrace's but for three named differences: the stack's range and size, which
+LinuxEmu's window decides; the `ProtectionKey` line, which KVM's kernel does
+not print because it enables no protection keys (its vCPU runs with CR4.PKE
+clear, and LinuxEmu answers the protection-key calls as Linux on such a CPU),
+where the host kernel beneath ptrace prints one; and, on a host whose
+transparent huge page setting is `always`, the stack's `THPeligible`, which
+follows the mapping's size, so that KVM's 8188 kB window prints 1 where a
+native-sized stack prints 0. `numa_maps` is not rendered: the kernel Detcore
+presents is built without NUMA and registers no such file
+(<https://github.com/rrnewton/hermit/issues/5269>). Elsewhere the kernel's two
 files are captured and sanitized as above, as before Detcore rendered any:
-every spelling of them is the kernel's, decided from the backend's
-capabilities before any request to the global tool.
+every spelling of them is the kernel's, decided from the backend's capabilities
+before any request to the global tool.
 
-This is not a complete host-independent representation of any of the three
+This is not a complete host-independent representation of any of these
 files. Fields not listed above remain exactly as the host kernel reported them,
 and a separately opened file receives a separate snapshot. The normalized
 fields are stable; equality across runs still depends on every unnormalized
@@ -1127,7 +1138,7 @@ The main implementation entry points are:
 | FD model | `detcore/src/fd.rs` |
 | Deterministic procfs snapshots | `detcore/src/procfs.rs`, `detcore/src/syscalls/files.rs` |
 | A process's own `maps` from the backend's memory map | `detcore/src/procfs/memory_map.rs` |
-| A process's `smaps`, `smaps_rollup` and `numa_maps` from the backend's memory map | `detcore/src/procfs/memory_map/smaps.rs` |
+| A process's `smaps` and `smaps_rollup` from the backend's memory map | `detcore/src/procfs/memory_map/smaps.rs` |
 | Logical time | `detcore-model/src/time.rs`, `detcore/src/syscalls/time.rs` |
 | Signal handling | `detcore/src/syscalls/signal.rs` |
 | CPUID table | `detcore/src/cpuid.rs` |

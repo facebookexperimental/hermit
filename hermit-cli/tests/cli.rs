@@ -10134,7 +10134,10 @@ fn host_anonymous_thp_orders() -> u64 {
 /// `MADV_HUGEPAGE` marked, in an address space that did not disable huge
 /// pages, on this host (`__thp_vma_allowable_orders` for smaps): whether it
 /// holds a naturally aligned block of an allowed order, tried from the
-/// largest (`thp_vma_suitable_order` at `vm_end` less the block).
+/// largest (`thp_vma_suitable_order` at `vm_end` less the block). Both bounds
+/// are computed in unsigned arithmetic, which wraps, as Linux computes them
+/// and as Detcore's renderer does (`holds_block` in
+/// `detcore/src/procfs/memory_map/smaps.rs`).
 fn host_thp_eligible(start: u64, end: u64) -> &'static str {
     let orders = host_anonymous_thp_orders();
     let eligible = (2..=9)
@@ -10142,10 +10145,8 @@ fn host_thp_eligible(start: u64, end: u64) -> &'static str {
         .filter(|order| orders & (1 << order) != 0)
         .any(|order| {
             let size = 4096u64 << order;
-            end.checked_sub(size).is_some_and(|address| {
-                let aligned = address & !(size - 1);
-                aligned >= start && aligned + size <= end
-            })
+            let aligned = end.wrapping_sub(size) & !(size - 1);
+            aligned >= start && aligned.wrapping_add(size) <= end
         });
     if eligible { "1" } else { "0" }
 }

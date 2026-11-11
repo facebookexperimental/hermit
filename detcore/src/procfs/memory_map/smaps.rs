@@ -61,20 +61,25 @@
 //!   (`PR_SET_THP_DISABLE`, asked of the backend as for anonymous memory:
 //!   either of its modes refuses them to a mapping `MADV_HUGEPAGE` did not
 //!   mark, `vma_thp_disabled`). The kernel beneath ptrace gives the guest's
-//!   own mapping of the file the same answer. Otherwise what backs it
-//!   decides, after the host's `enabled` setting ([`HostThp::enabled`]): a
-//!   file on a disk filesystem (btrfs, ext2/3/4, XFS), which the host's mount
-//!   table names for the device the memory map gives ([`HostFilesystems`]),
-//!   prints 0 under `madvise` and `never`. Under `always` it depends on the
-//!   filesystem's huge page fault handler and on whether any task holds the
-//!   file open for writing (`file_thp_enabled`), which no fact says, so the
-//!   file is refused. Shared memory follows
-//!   shmem's own settings, its mount's `huge=` option and the file's size
-//!   (`shmem_allowable_huge_orders`), and overlayfs the filesystem of a layer
-//!   it does not show, so where the backend did not ask, a file on tmpfs, on
-//!   overlayfs, on any other filesystem or on a device the mount table does
-//!   not list (the kernel's internal mount that backs shared anonymous memory
-//!   and memfds) is refused by name.
+//!   own mapping of the file the same answer. Where the backend did not ask,
+//!   the address space's refusal still comes first, as Linux tests it before
+//!   any rule of what backs the mapping (`__thp_vma_allowable_orders`,
+//!   mm/huge_memory.c:136-137 at v7.1.3), so the value is 0 there.
+//!   Otherwise what backs it decides, after the host's `enabled` setting
+//!   ([`HostThp::enabled`]): a file on a disk filesystem (btrfs, ext2/3/4,
+//!   XFS), which the host's mount table names for the device the memory map
+//!   gives ([`HostFilesystems`]), prints 0 under `madvise` and `never`.
+//!   Under `always` it depends on the filesystem's huge page fault handler
+//!   and on whether any task holds the file open for writing
+//!   (`file_thp_enabled`), which no fact says, so the file is refused.
+//!   Shared memory follows shmem's own settings, its mount's `huge=` option
+//!   and the file's size (`shmem_allowable_huge_orders`), and overlayfs the
+//!   filesystem of a layer it does not show, so where the backend did not
+//!   ask, a file on tmpfs, on overlayfs, on any other filesystem or on a
+//!   device the mount table does not list (the kernel's internal mount that
+//!   backs shared anonymous memory and memfds) is refused by name. Detcore
+//!   asks the backend whether the address space disabled huge pages wherever
+//!   that decides a mapping's value ([`thp_disabled_decides`]).
 //! - `ProtectionKey` is printed where the kernel serving the process enables
 //!   protection keys (`arch_pkeys_enabled`, `cpu_feature_enabled(OSPKE)`): a
 //!   fact of that kernel, not of the CPU the guest is shown (ptrace's guests
@@ -117,9 +122,9 @@
 //! area excluded, which is not in the address space's tree), and the sums of
 //! the accounting fields, which the sanitizer prints as `0 kB`. Only a
 //! complete memory map says where the address space starts: an incomplete
-//! one (KVM's lists the stack window only) is refused, since a reader must
-//! not infer from a missing entry that no mapping is there
-//! (`reverie::MemoryMap::complete`).
+//! one (KVM's where a page's mapping is not known, as for an image loaded
+//! from bytes) is refused, since a reader must not infer from a missing
+//! entry that no mapping is there (`reverie::MemoryMap::complete`).
 //!
 //! An incomplete list renders only the mappings it lists, as [`super::render`]
 //! does for `maps`: the others are missing from the file, a named difference
@@ -313,10 +318,16 @@ impl HostThp {
 
 /// The host kernel's settings ([`HostThp::read`] of
 /// `/sys/kernel/mm/transparent_hugepage`), read once per tool process, so
-/// that every `smaps` a run renders takes the same answer even if the host's
-/// administrator changes them while it runs, as every open of a run's
-/// `/proc/diskstats` takes the host's table as the run first read it
-/// (`tool_global::host_diskstats`).
+/// that every `smaps` the process renders takes the same answer even if the
+/// host's administrator changes them meanwhile. Only KVM renders `smaps`
+/// (`Detcore::renders_address_space_files`), and there one tool process
+/// serves every guest process of a run, so that is every `smaps` of the run.
+/// The settings are not recorded, and each run reads them again (each run
+/// of a `--verify` pair, each run of a bisection), so two runs agree only
+/// while the host keeps its settings: they are an input from outside the
+/// run, as the host's block devices are to the `/proc/diskstats` a run
+/// renders (`tool_global::host_diskstats`, read once per run). A KVM guest
+/// can read the same settings in sysfs.
 pub(crate) fn host_thp() -> Result<Option<HostThp>, String> {
     static HOST: std::sync::OnceLock<Result<Option<HostThp>, String>> = std::sync::OnceLock::new();
     HOST.get_or_init(|| HostThp::read(Path::new("/sys/kernel/mm/transparent_hugepage")))
@@ -384,14 +395,18 @@ impl HostFilesystems {
 
 /// The supervisor's filesystems ([`HostFilesystems::parse`] of its
 /// `/proc/self/mountinfo`), read once per tool process, as the host's
-/// transparent huge page settings are ([`host_thp`]), so every `smaps` a run
-/// renders takes the same answer. A run's mounts are made before its guest
-/// starts, and the guest makes none (Detcore refuses `mount(2)` and
-/// `umount2(2)`): a device a later mount of the host's added is in no table,
-/// so a mapping of it is refused rather than misread. A device number names
-/// one superblock until that superblock is gone, and a mapped file keeps its
-/// superblock, so the table names a mapped file's filesystem unless the host
-/// itself unmounted a filesystem and mounted another while the run went on.
+/// transparent huge page settings are ([`host_thp`]), so every `smaps` the
+/// process renders, every one of a KVM run, takes the same answer. A run's
+/// mounts are made before its guest starts, and the guest makes none
+/// (Detcore refuses `mount(2)` and `umount2(2)`): a device a later mount of
+/// the host's added is in no table, so a mapping of it is refused rather
+/// than misread. A device number names one superblock until that superblock
+/// is gone, and a mapped file keeps its superblock, so the table names a
+/// mapped file's filesystem unless the host itself unmounted a filesystem
+/// and mounted another while the run went on. Like the settings, the table
+/// is not recorded: another run reads its own, and gives the same answers
+/// where its mounts put the same filesystems on the devices its mappings
+/// name.
 pub(crate) fn host_filesystems() -> Result<&'static HostFilesystems, &'static str> {
     static HOST: std::sync::OnceLock<Result<HostFilesystems, String>> = std::sync::OnceLock::new();
     HOST.get_or_init(|| {
@@ -450,10 +465,12 @@ pub(crate) struct SmapsFacts {
     /// ([`HostThp::anonymous_orders`]), none where the host has none.
     pub(crate) thp_orders: u64,
     /// Whether the address space disabled transparent huge pages
-    /// (`PR_GET_THP_DISABLE`), where it decides an answer: [`Self::thp_orders`]
-    /// allows an order, or the kernel's answer for a mapping
-    /// (`MappingFact::thp_eligible`) is 1; `None` where it was not asked
-    /// because neither holds.
+    /// (`PR_GET_THP_DISABLE`), where that decides a mapping's answer
+    /// ([`thp_disabled_decides`]): [`Self::thp_orders`] allows an order to
+    /// anonymous memory, the kernel's answer for a mapping
+    /// (`MappingFact::thp_eligible`) is 1, or a file's or shared memory's
+    /// mapping without that answer, which a block fits, would be refused for
+    /// what backs it; `None` where it was not asked because none holds.
     pub(crate) thp_disabled: Option<bool>,
 }
 
@@ -596,6 +613,15 @@ fn thp_eligibility(
             )),
         };
     }
+    // Without the kernel's answer, the address space's own refusal of huge
+    // pages still comes first: Linux tests it before any rule of what backs
+    // the mapping (`__thp_vma_allowable_orders`, mm/huge_memory.c:136-137 at
+    // v7.1.3), and in either mode it refuses them to a mapping no
+    // `MADV_HUGEPAGE` marked (`vma_thp_disabled`,
+    // include/linux/huge_mm.h:331-353).
+    if facts.thp_disabled == Some(true) {
+        return Ok(false);
+    }
     let Some(raw_device) = backing else {
         return Err(format!(
             "Linux's smaps prints whether {} may have transparent huge pages, which for shared \
@@ -635,6 +661,30 @@ fn thp_eligibility(
             named(mapping)
         )),
     }
+}
+
+/// Whether the answer to whether the address space disabled transparent huge
+/// pages (`PR_GET_THP_DISABLE`) decides `mapping`'s `THPeligible`, so that
+/// Detcore asks the backend for it ([`SmapsFacts::thp_disabled`]):
+/// [`thp_eligibility`] refuses the mapping without the answer, and gives 0
+/// where the address space disabled them. `facts` are the reader's, whatever
+/// their answer, and `filesystems` the host's mount table, as
+/// [`render_smaps`] takes them.
+pub(crate) fn thp_disabled_decides(
+    mapping: &MappingFact,
+    facts: &SmapsFacts,
+    filesystems: Result<&HostFilesystems, &str>,
+) -> bool {
+    let unasked = SmapsFacts {
+        thp_disabled: None,
+        ..*facts
+    };
+    let disabled = SmapsFacts {
+        thp_disabled: Some(true),
+        ..*facts
+    };
+    thp_eligibility(mapping, mapping.vm_flags, &unasked, filesystems).is_err()
+        && thp_eligibility(mapping, mapping.vm_flags, &disabled, filesystems) == Ok(false)
 }
 
 /// `show_smap_vma_flags`'s name for each flag a memory map may give
@@ -1695,6 +1745,127 @@ mod tests {
         .unwrap()
         .with_thp_eligible(true);
         assert_eq!(render_one(shared, &allowed), Ok(true));
+    }
+
+    /// Where the backend did not ask the kernel, a disabled address space
+    /// makes a file's or shared memory's `THPeligible` 0 before what backs
+    /// it decides, as `vma_thp_disabled` comes first in
+    /// `__thp_vma_allowable_orders`: a file on a disk filesystem under
+    /// `always`, on tmpfs, on overlayfs or on a device the mount table does
+    /// not list, and shared anonymous memory, each refused otherwise. The
+    /// backend is asked exactly where the answer decides a mapping's value.
+    #[test]
+    fn a_disabled_address_space_decides_an_unanswered_files_thp_eligibility() {
+        let filesystems = HostFilesystems::parse(
+            "1 0 0:32 / / rw - btrfs /dev/nvme1n1p4 rw\n\
+             4 1 0:24 / /dev/shm rw - tmpfs tmpfs rw,huge=within_size\n\
+             5 1 0:47 / /image rw - overlay overlay rw,lowerdir=/l\n",
+        )
+        .unwrap();
+        let render_one = |mapping: &MappingFact, facts: &SmapsFacts| {
+            render_smaps(
+                &MemoryMap::new(vec![mapping.clone()], true).unwrap(),
+                facts,
+                Ok(&filesystems),
+            )
+            .map(|text| {
+                String::from_utf8(text)
+                    .unwrap()
+                    .contains("THPeligible:           1\n")
+            })
+        };
+        let decides = |mapping: &MappingFact, facts: &SmapsFacts| {
+            thp_disabled_decides(mapping, facts, Ok(&filesystems))
+        };
+        // 2 MiB at a 2 MiB boundary, from file offset 0: every order fits.
+        let file = |device: &str, flags: u64| {
+            with_flags(
+                &format!("7f0000000000-7f0000200000 r--p 00000000 {device} 7 /f"),
+                flags,
+            )
+        };
+        let shared = MappingFact::new(
+            0x7f00_0000_0000,
+            0x7f00_0020_0000,
+            libc::PROT_READ as u32,
+            true,
+            0,
+            MappingBacking::NamedSharedAnonymous {
+                raw_device: libc::makedev(0, 1),
+                raw_inode: 3,
+                name: b"pool".to_vec(),
+            },
+        )
+        .unwrap()
+        .with_vm_flags(READ_ONLY | reverie::VM_SHARED | reverie::VM_MAYSHARE)
+        .unwrap();
+        let always = SmapsFacts {
+            thp_enabled: Some(ThpEnabled::Always),
+            ..HOST
+        };
+        // btrfs 0:32 under `always`, tmpfs 0:24, overlayfs 0:47 and the
+        // unlisted 0:1, as `maps` prints them in hex, and shared memory.
+        for (mapping, facts) in [
+            (file("00:20", READ_ONLY), always),
+            (file("00:18", READ_ONLY), HOST),
+            (file("00:2f", READ_ONLY), HOST),
+            (file("00:01", READ_ONLY), HOST),
+            (shared, HOST),
+        ] {
+            let answered = |disabled: Option<bool>| SmapsFacts {
+                thp_disabled: disabled,
+                ..facts
+            };
+            assert!(render_one(&mapping, &answered(None)).is_err());
+            assert!(render_one(&mapping, &answered(Some(false))).is_err());
+            assert_eq!(render_one(&mapping, &answered(Some(true))), Ok(false));
+            assert!(decides(&mapping, &answered(None)));
+            // The question is the same whatever the facts already hold.
+            assert!(decides(&mapping, &answered(Some(false))));
+        }
+        // Nothing to ask where the value is 0 whatever the answer: a file on
+        // a disk filesystem under `madvise`, a mapping no order fits, a
+        // kernel's answer of 0, a mapping `MADV_NOHUGEPAGE` marked, and a
+        // host without transparent huge pages; nor where the mapping is
+        // refused whatever the answer, as one `MADV_HUGEPAGE` marked is.
+        assert_eq!(render_one(&file("00:20", READ_ONLY), &HOST), Ok(false));
+        assert!(!decides(&file("00:20", READ_ONLY), &HOST));
+        let page = with_flags(
+            "7f0000001000-7f0000002000 r--p 00000000 00:18 7 /f",
+            READ_ONLY,
+        );
+        assert!(!decides(&page, &HOST));
+        assert!(!decides(
+            &file("00:18", READ_ONLY).with_thp_eligible(false),
+            &HOST
+        ));
+        assert!(!decides(
+            &file("00:18", READ_ONLY | reverie::VM_NOHUGEPAGE),
+            &HOST
+        ));
+        let no_thp = SmapsFacts {
+            thp_enabled: None,
+            ..HOST
+        };
+        assert!(!decides(&file("00:18", READ_ONLY), &no_thp));
+        assert!(!decides(
+            &file("00:18", READ_ONLY | reverie::VM_HUGEPAGE),
+            &HOST
+        ));
+        // As before, the answer decides a kernel's answer of 1, and anonymous
+        // memory where the host allows it an order.
+        assert!(decides(
+            &file("00:18", READ_ONLY).with_thp_eligible(true),
+            &HOST
+        ));
+        let two_mib = 2 << 20;
+        let anonymous = stack(0x7000_0000, 0x7000_0000 + two_mib, read_write());
+        assert!(!decides(&anonymous, &HOST));
+        let pmd = SmapsFacts {
+            thp_orders: 1 << 9,
+            ..HOST
+        };
+        assert!(decides(&anonymous, &pmd));
     }
 
     /// Where no order a file may have fits a mapping, a block aligned to its
