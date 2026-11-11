@@ -41,8 +41,10 @@ const SCRIPT: &str = "#!/bin/sh\nexit 0\n";
 /// The spawns granted to the six spawners together before each write-and-run
 /// step. The unbounded storm completed a median of 29 spawns per step (p10 24,
 /// p90 33; 8,496 to 8,628 per run) in each of 5 passing runs, counted between
-/// the starts of consecutive steps, so the bounded storm is at least as dense
-/// as the one the mutant measurements above were made with.
+/// the starts of consecutive steps. The grant matches that measured median, so
+/// a run starts at most 29 spawns per step on average (8,700 in all). A step
+/// draws more than 29 only from grants that earlier steps left unused, and a
+/// run whose steps would have drawn more than the median now gets fewer.
 const SPAWNS_PER_STEP: u64 = 29;
 
 /// A fresh directory under the temporary root, removed when dropped.
