@@ -58,6 +58,7 @@ use crate::cpu_evidence::LiveCpuSource;
 use crate::cpu_evidence::NotStartedReason;
 use crate::cpu_evidence::RegistrationObservation;
 use crate::cpu_evidence::ReturnedCpuCharge;
+use crate::cpu_evidence::SpawnMethod;
 use crate::cpu_evidence::SpawnStage;
 use crate::cpu_evidence::TerminationPath;
 use crate::cpu_evidence::WaitCpuObservation;
@@ -8069,7 +8070,11 @@ fn execute_process_with_cpu_poll_interval(
     let mut observation =
         InvocationCpuObservation::pending(ordinal, request.role, request.command, meter.source());
     let enrollment = match &meter {
-        LiveCpuMeter::Cgroup(cgroup) => Some((cgroup.enrollment_fd(), cgroup.path())),
+        LiveCpuMeter::Cgroup(cgroup) => Some(Enrollment {
+            directory: cgroup.directory_fd(),
+            procs: cgroup.enrollment_fd(),
+            path: cgroup.path(),
+        }),
         _ => None,
     };
     let result = spawn_process(
@@ -8721,13 +8726,62 @@ fn check_cgroup_membership(
     Ok(())
 }
 
+/// The invocation cgroup a child starts in: its directory, which clone3's
+/// CLONE_INTO_CGROUP takes; its `cgroup.procs`, which the pre_exec join
+/// writes when clone3 is refused; and its path, for messages.
+#[derive(Clone, Copy)]
+struct Enrollment<'a> {
+    directory: RawFd,
+    procs: RawFd,
+    path: &'a Path,
+}
+
+/// The leader of an invocation, which the monitor waits for by PID (wait4).
+#[derive(Debug)]
+struct SpawnedLeader {
+    pid: u32,
+}
+
+impl SpawnedLeader {
+    fn id(&self) -> u32 {
+        self.pid
+    }
+}
+
+impl From<Child> for SpawnedLeader {
+    /// A child `Command` started. Dropping the `Child` neither waits for nor
+    /// signals the process; the monitor reaps it with wait4.
+    fn from(child: Child) -> Self {
+        Self { pid: child.id() }
+    }
+}
+
 fn spawn_process(
     cwd: &Path,
     stdout: &Path,
     stderr: &Path,
-    enrollment: Option<(RawFd, &Path)>,
+    enrollment: Option<Enrollment<'_>>,
     observation: &mut InvocationCpuObservation,
-) -> Result<Child, String> {
+) -> Result<SpawnedLeader, String> {
+    spawn_process_with(
+        &crate::vfork_spawn::CLONE3,
+        cwd,
+        stdout,
+        stderr,
+        enrollment,
+        observation,
+    )
+}
+
+/// [`spawn_process`], with clone3 as `clone3` finds it.
+fn spawn_process_with(
+    clone3: &crate::vfork_spawn::Clone3Support,
+    cwd: &Path,
+    stdout: &Path,
+    stderr: &Path,
+    enrollment: Option<Enrollment<'_>>,
+    observation: &mut InvocationCpuObservation,
+) -> Result<SpawnedLeader, String> {
     let mut open_capture = |path: &Path, stage| {
         File::create(path).map_err(|error| {
             let reason = format!("{}: {error}", path.display());
@@ -8741,6 +8795,49 @@ fn spawn_process(
     };
     let stdout_file = open_capture(stdout, SpawnStage::StdoutCapture)?;
     let stderr_file = open_capture(stderr, SpawnStage::StderrCapture)?;
+    // A child that joins a cgroup is created in it by clone3, without a copy
+    // of this process (dh-7n47nt); only where clone3 is refused does it take
+    // the pre_exec join below, which forks.
+    let mut method = SpawnMethod::Command;
+    if let Some(enrollment) = enrollment {
+        let program = &observation.command.argv[0];
+        let started = start_in_cgroup(
+            clone3,
+            &observation.command,
+            cwd,
+            [&stdout_file, &stderr_file],
+            enrollment,
+        );
+        let failure = match started {
+            Ok(crate::vfork_spawn::Started::Running { pid }) => {
+                observation.launch = LaunchObservation::Spawned {
+                    pid,
+                    method: SpawnMethod::Clone3IntoCgroup,
+                };
+                remember_spawned_group(pid);
+                return Ok(SpawnedLeader { pid });
+            }
+            Ok(crate::vfork_spawn::Started::Unusable { reason }) => {
+                method = SpawnMethod::CommandAfterClone3Refused { reason };
+                None
+            }
+            Ok(crate::vfork_spawn::Started::JoinFailed(error)) => Some(format!(
+                "cannot join invocation cgroup {} before exec, so {program} was not started: {error}",
+                enrollment.path.display()
+            )),
+            Ok(crate::vfork_spawn::Started::Failed(error)) | Err(error) => {
+                Some(format!("cannot execute {program}: {error}"))
+            }
+        };
+        if let Some(reason) = failure {
+            observation.launch = LaunchObservation::SpawnFailed {
+                stage: SpawnStage::Spawn,
+                reason: reason.clone(),
+            };
+            observation.termination = TerminationPath::SpawnFailed;
+            return Err(reason);
+        }
+    }
     // A failed cgroup join and a failed exec reach this process as the same
     // bare error code, so the child writes one byte to this pipe when the join
     // is what failed.
@@ -8776,7 +8873,7 @@ fn spawn_process(
     // other thread that page-faults waits for it (dh-7n47nt).
     command.process_group(0);
     let join_report_fd = join_report.as_ref().map(|(_, write)| write.as_raw_fd());
-    if let Some((fd, _)) = enrollment {
+    if let Some(Enrollment { procs: fd, .. }) = enrollment {
         // Join the invocation cgroup before exec, so every CPU cycle of the
         // program and of anything it starts is charged to that cgroup. The
         // descriptor is close-on-exec, so the program never sees it. std sets
@@ -8820,13 +8917,16 @@ fn spawn_process(
     };
     match spawned {
         Ok(child) => {
-            observation.launch = LaunchObservation::Spawned { pid: child.id() };
+            observation.launch = LaunchObservation::Spawned {
+                pid: child.id(),
+                method,
+            };
             remember_spawned_group(child.id());
-            Ok(child)
+            Ok(SpawnedLeader::from(child))
         }
         Err(error) => {
             let reason = match enrollment {
-                Some((_, cgroup)) if join_failed => format!(
+                Some(Enrollment { path: cgroup, .. }) if join_failed => format!(
                     "cannot join invocation cgroup {} before exec, so {program} was not started: {error}",
                     cgroup.display()
                 ),
@@ -8840,6 +8940,42 @@ fn spawn_process(
             Err(reason)
         }
     }
+}
+
+/// Starts `command` in `enrollment`'s cgroup with clone3, with stdin on
+/// /dev/null and stdout and stderr on `captures`. `Err` when those
+/// descriptors cannot be prepared.
+fn start_in_cgroup(
+    clone3: &crate::vfork_spawn::Clone3Support,
+    command: &CommandIdentity,
+    cwd: &Path,
+    captures: [&File; 2],
+    enrollment: Enrollment<'_>,
+) -> std::io::Result<crate::vfork_spawn::Started> {
+    // Close-on-exec copies above 2, so that the child's dup3 onto 0, 1 and 2
+    // never overwrites a source it has yet to copy.
+    let above_stdio = |fd: RawFd| -> std::io::Result<OwnedFd> {
+        let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if copy < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: fcntl returned a new descriptor that nothing else owns.
+        Ok(unsafe { OwnedFd::from_raw_fd(copy) })
+    };
+    let null = File::open("/dev/null")?;
+    let stdin = above_stdio(null.as_raw_fd())?;
+    let stdout = above_stdio(captures[0].as_raw_fd())?;
+    let stderr = above_stdio(captures[1].as_raw_fd())?;
+    Ok(crate::vfork_spawn::start(
+        clone3,
+        &crate::vfork_spawn::Program {
+            argv: &command.argv,
+            env_overrides: &command.env_overrides,
+            cwd,
+            stdio: [stdin.as_raw_fd(), stdout.as_raw_fd(), stderr.as_raw_fd()],
+            cgroup: enrollment.directory,
+        },
+    ))
 }
 
 /// A close-on-exec, nonblocking pipe, read end first, through which a child
@@ -8857,7 +8993,7 @@ fn join_failure_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
 /// `proccpu` does. The seconds are converted to microseconds here, and a
 /// conversion failure is a failed sample like any other.
 fn monitor_process<R>(
-    child: Child,
+    child: impl Into<SpawnedLeader>,
     limits: ProcessLimits,
     started: Instant,
     observation: &mut InvocationCpuObservation,
@@ -8891,7 +9027,7 @@ fn monitor_process<R>(
 /// `CELL_CPU_ACCOUNTING_GRACE`. `register` binds the reader once at spawn;
 /// `sample` returns the invocation's CPU in microseconds.
 fn monitor_live_cpu<R>(
-    child: Child,
+    child: impl Into<SpawnedLeader>,
     limits: ProcessLimits,
     started: Instant,
     observation: &mut InvocationCpuObservation,
@@ -8920,7 +9056,7 @@ fn monitor_live_cpu<R>(
 /// a recorded trigger.
 #[allow(clippy::too_many_arguments)]
 fn monitor_live_cpu_in<R>(
-    child: Child,
+    child: impl Into<SpawnedLeader>,
     limits: ProcessLimits,
     started: Instant,
     observation: &mut InvocationCpuObservation,
@@ -8934,7 +9070,7 @@ fn monitor_live_cpu_in<R>(
         cpu_budget_usec,
         cpu_poll_interval,
     } = limits;
-    let pid = child.id();
+    let pid = child.into().id();
     let leader = LeaderPidFd::open(pid);
     // Authenticate once at spawn and retain this generation's owner through
     // final wait/stop. Disabled accounting never registers or samples a reader.
@@ -17824,18 +17960,52 @@ fi
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// Waits for and reaps `leader`, and returns how it ended.
+    fn wait_for_leader(leader: &SpawnedLeader) -> ExitStatus {
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(leader.id() as libc::pid_t, &mut status, 0) };
+        assert_eq!(waited, leader.id() as libc::pid_t, "waitpid failed");
+        ExitStatus::from_raw(status)
+    }
+
     /// What a program `spawn_process` started in a fresh invocation cgroup
     /// did, once it exited.
     struct CgroupSpawned {
         status: ExitStatus,
         stdout: String,
         stderr: String,
+        method: SpawnMethod,
     }
 
     /// Starts `program` with `args` and environment overrides `env` through
-    /// `spawn_process` in a fresh invocation cgroup, waits for it, and removes
-    /// the cgroup. `None` when this environment declares it has no cgroups.
+    /// `spawn_process` in a fresh invocation cgroup, waits for it, removes the
+    /// cgroup, and asserts that clone3 created the program. `None` when this
+    /// environment declares it has no cgroups.
     fn spawn_in_a_fresh_cgroup(
+        test: &str,
+        root: &Path,
+        program: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Option<Result<CgroupSpawned, String>> {
+        let spawned = spawn_in_a_fresh_cgroup_with(
+            &crate::vfork_spawn::CLONE3,
+            test,
+            root,
+            program,
+            args,
+            env,
+        )?;
+        if let Ok(spawned) = &spawned {
+            assert_eq!(spawned.method, SpawnMethod::Clone3IntoCgroup);
+        }
+        Some(spawned)
+    }
+
+    /// [`spawn_in_a_fresh_cgroup`] with clone3 as `clone3` finds it, whatever
+    /// method started the program.
+    fn spawn_in_a_fresh_cgroup_with(
+        clone3: &crate::vfork_spawn::Clone3Support,
         test: &str,
         root: &Path,
         program: &str,
@@ -17863,17 +18033,26 @@ fi
             request.command,
             Some(LiveCpuSource::CgroupV2InvocationCpuStatV1),
         );
-        let spawned = spawn_process(
+        let spawned = spawn_process_with(
+            clone3,
             &request.cwd,
             &request.stdout,
             &request.stderr,
-            Some((cgroup.enrollment_fd(), cgroup.path())),
+            Some(Enrollment {
+                directory: cgroup.directory_fd(),
+                procs: cgroup.enrollment_fd(),
+                path: cgroup.path(),
+            }),
             &mut observation,
         )
-        .map(|mut child| CgroupSpawned {
-            status: child.wait().unwrap(),
+        .map(|child| CgroupSpawned {
+            status: wait_for_leader(&child),
             stdout: fs::read_to_string(&request.stdout).unwrap(),
             stderr: fs::read_to_string(&request.stderr).unwrap(),
+            method: match &observation.launch {
+                LaunchObservation::Spawned { method, .. } => method.clone(),
+                other => panic!("a started program records Spawned, not {other:?}"),
+            },
         });
         cgroup.finish().unwrap();
         Some(spawned)
@@ -17888,6 +18067,108 @@ fi
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    /// Each kind of clone3 refusal takes its own path (dh-7n47nt):
+    /// - ENOSYS, E2BIG, EINVAL and EPERM mean clone3 cannot be used here (an
+    ///   older kernel or a seccomp filter). The program starts through
+    ///   `Command` with the pre_exec join, still in its invocation cgroup, and
+    ///   the refusal is remembered: the next spawn does not call clone3.
+    /// - EBADF, EACCES, ENOENT, ENODEV, EBUSY and EOPNOTSUPP are about the
+    ///   cgroup: a failed join, not remembered.
+    /// - Anything else, such as EAGAIN or ENOMEM, means no child: a failed
+    ///   spawn, not remembered.
+    #[test]
+    fn each_kind_of_clone3_refusal_takes_its_own_path() {
+        let test = "each_kind_of_clone3_refusal_takes_its_own_path";
+        let root = spawn_test_root("clone3-refusals");
+        let invocation = format!("/hermit-e2e-invocation-{}-", std::process::id());
+        let attempts = |clone3: &crate::vfork_spawn::Clone3Support| {
+            clone3.attempts.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        for errno in [libc::ENOSYS, libc::E2BIG, libc::EINVAL, libc::EPERM] {
+            let clone3 = crate::vfork_spawn::Clone3Support::refusing(errno);
+            let reason = format!(
+                "clone3 with CLONE_INTO_CGROUP was refused: {}",
+                std::io::Error::from_raw_os_error(errno)
+            );
+            for spawn in 1..=2 {
+                let Some(spawned) = spawn_in_a_fresh_cgroup_with(
+                    &clone3,
+                    test,
+                    &root,
+                    "/bin/cat",
+                    &["/proc/self/cgroup"],
+                    &[],
+                ) else {
+                    return;
+                };
+                let spawned = spawned.unwrap();
+                assert!(spawned.status.success(), "{}", spawned.stderr);
+                assert!(
+                    spawned.stdout.contains(&invocation),
+                    "errno {errno}: not in its invocation cgroup: {:?}",
+                    spawned.stdout
+                );
+                assert_eq!(
+                    spawned.method,
+                    SpawnMethod::CommandAfterClone3Refused {
+                        reason: reason.clone()
+                    },
+                    "errno {errno}, spawn {spawn}"
+                );
+                assert_eq!(attempts(&clone3), 1, "errno {errno}, spawn {spawn}");
+            }
+        }
+        for errno in [
+            libc::EBADF,
+            libc::EACCES,
+            libc::ENOENT,
+            libc::ENODEV,
+            libc::EBUSY,
+            libc::EOPNOTSUPP,
+        ] {
+            let clone3 = crate::vfork_spawn::Clone3Support::refusing(errno);
+            let tail = format!(
+                " before exec, so /bin/true was not started: {}",
+                std::io::Error::from_raw_os_error(errno)
+            );
+            for spawn in 1..=2 {
+                let Some(spawned) =
+                    spawn_in_a_fresh_cgroup_with(&clone3, test, &root, "/bin/true", &[], &[])
+                else {
+                    return;
+                };
+                let error = spawned
+                    .err()
+                    .unwrap_or_else(|| panic!("errno {errno} started"));
+                assert!(
+                    error.starts_with("cannot join invocation cgroup /") && error.ends_with(&tail),
+                    "errno {errno}: {error}"
+                );
+                assert_eq!(attempts(&clone3), spawn, "errno {errno}");
+            }
+        }
+        for errno in [libc::EAGAIN, libc::ENOMEM] {
+            let clone3 = crate::vfork_spawn::Clone3Support::refusing(errno);
+            for spawn in 1..=2 {
+                let Some(spawned) =
+                    spawn_in_a_fresh_cgroup_with(&clone3, test, &root, "/bin/true", &[], &[])
+                else {
+                    return;
+                };
+                assert_eq!(
+                    spawned.err(),
+                    Some(format!(
+                        "cannot execute /bin/true: {}",
+                        std::io::Error::from_raw_os_error(errno)
+                    )),
+                    "errno {errno}"
+                );
+                assert_eq!(attempts(&clone3), spawn, "errno {errno}");
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// A program that cannot be executed in a cgroup is a spawn failure that
@@ -18138,7 +18419,7 @@ fi
         label: &str,
         script: &str,
         cpu_enabled: bool,
-    ) -> (Child, Instant, InvocationCpuObservation) {
+    ) -> (SpawnedLeader, Instant, InvocationCpuObservation) {
         spawn_fixture_with_source(
             root,
             label,
@@ -18152,7 +18433,7 @@ fi
         label: &str,
         script: &str,
         cpu_source: Option<LiveCpuSource>,
-    ) -> (Child, Instant, InvocationCpuObservation) {
+    ) -> (SpawnedLeader, Instant, InvocationCpuObservation) {
         let started = Instant::now();
         let request = ProcessRequest::new(
             InvocationRole::Execution {
@@ -18180,8 +18461,10 @@ fi
     }
 
     /// Spawn `program` with `enrollment` standing in for an invocation
-    /// cgroup's `cgroup.procs` descriptor, and return the spawn error.
+    /// cgroup's directory and `cgroup.procs` descriptor, with clone3 as
+    /// `clone3` finds it, and return the spawn error.
     fn spawn_error_with_enrollment(
+        clone3: &crate::vfork_spawn::Clone3Support,
         root: &Path,
         label: &str,
         program: &str,
@@ -18205,14 +18488,16 @@ fi
             request.command,
             Some(LiveCpuSource::CgroupV2InvocationCpuStatV1),
         );
-        let error = spawn_process(
+        let error = spawn_process_with(
+            clone3,
             &request.cwd,
             &request.stdout,
             &request.stderr,
-            Some((
-                enrollment.as_raw_fd(),
-                Path::new("/sys/fs/cgroup/stand-in-invocation"),
-            )),
+            Some(Enrollment {
+                directory: enrollment.as_raw_fd(),
+                procs: enrollment.as_raw_fd(),
+                path: Path::new("/sys/fs/cgroup/stand-in-invocation"),
+            }),
             &mut observation,
         )
         .expect_err("the spawn must fail");
@@ -18222,12 +18507,19 @@ fi
     #[test]
     fn a_failed_spawn_names_the_exec_or_the_cgroup_join_whichever_failed() {
         let root = cpu_reader_test_root("spawn-failure-step");
+        // Where clone3 is refused, the child joins in a pre_exec closure.
+        let refused = crate::vfork_spawn::Clone3Support::refusing(libc::ENOSYS);
         // The join's write succeeds on /dev/null, so only the exec can fail,
         // and its reason reads exactly as it does without a cgroup.
         let accepting = OpenOptions::new().write(true).open("/dev/null").unwrap();
         let missing = root.join("missing-program");
-        let (error, observation) =
-            spawn_error_with_enrollment(&root, "exec", missing.to_str().unwrap(), &accepting);
+        let (error, observation) = spawn_error_with_enrollment(
+            &refused,
+            &root,
+            "exec",
+            missing.to_str().unwrap(),
+            &accepting,
+        );
         let exec_failure = format!(
             "cannot execute {}: No such file or directory (os error 2)",
             missing.display()
@@ -18244,9 +18536,23 @@ fi
         // A descriptor opened read-only refuses the join's write, so the join
         // fails before an existing program could be started.
         let refusing = File::open("/dev/null").unwrap();
-        let (error, observation) =
-            spawn_error_with_enrollment(&root, "join", "/bin/true", &refusing);
         let join_failure = "cannot join invocation cgroup /sys/fs/cgroup/stand-in-invocation before exec, so /bin/true was not started: Bad file descriptor (os error 9)";
+        let (error, observation) =
+            spawn_error_with_enrollment(&refused, &root, "join", "/bin/true", &refusing);
+        assert_eq!(error, join_failure);
+        assert_eq!(
+            observation.launch,
+            LaunchObservation::SpawnFailed {
+                stage: SpawnStage::Spawn,
+                reason: join_failure.into(),
+            }
+        );
+        assert_eq!(observation.termination, TerminationPath::SpawnFailed);
+        // clone3 refuses a directory descriptor that is no cgroup (EBADF), and
+        // that reads as the same failed join.
+        let clone3 = crate::vfork_spawn::Clone3Support::new();
+        let (error, observation) =
+            spawn_error_with_enrollment(&clone3, &root, "clone3-join", "/bin/true", &refusing);
         assert_eq!(error, join_failure);
         assert_eq!(
             observation.launch,
@@ -18274,7 +18580,7 @@ fi
     }
 
     fn measured_final_cpu(observation: &InvocationCpuObservation) -> u64 {
-        let LaunchObservation::Spawned { pid } = observation.launch else {
+        let LaunchObservation::Spawned { pid, .. } = observation.launch else {
             panic!("expected a real launched process: {observation:?}");
         };
         let FinalWaitObservation::Reaped {
@@ -19858,7 +20164,11 @@ fi
             &request.cwd,
             &request.stdout,
             &request.stderr,
-            Some((cgroup.enrollment_fd(), cgroup.path())),
+            Some(Enrollment {
+                directory: cgroup.directory_fd(),
+                procs: cgroup.enrollment_fd(),
+                path: cgroup.path(),
+            }),
             &mut observation,
         )
         .unwrap();
@@ -20680,7 +20990,7 @@ fi
             }
             // The escaped process kept the leader's process group, so the
             // stop's group signals reach it outside the cgroup.
-            let LaunchObservation::Spawned { pid: leader } = observation.launch else {
+            let LaunchObservation::Spawned { pid: leader, .. } = observation.launch else {
                 panic!("{case}: not launched: {observation:?}");
             };
             let escaped = fs::read_to_string(&pid_file).unwrap_or_default();

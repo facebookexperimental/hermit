@@ -91,6 +91,7 @@ pub mod timeouts;
 pub mod typedlog;
 pub mod validation_dag;
 mod validation_dag_static;
+mod vfork_spawn;
 
 // Lets the shared scripts/lib files below name this library as
 // `hermit_manifest_plan::...`, as they do when scripts/validate.rs includes them.
