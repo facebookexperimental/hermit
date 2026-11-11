@@ -1027,13 +1027,25 @@ fn prepare_cpu_wrapper(
 }
 
 /// Explicit standalone preparation. Official test consumers never call this.
-/// Standalone preparation owns the default cohort's store files only.
+///
+/// Standalone preparation owns the default cohort's store files in the store
+/// of the Cargo target directory it builds into: `ci/nextest-binaries` under
+/// `CARGO_TARGET_DIR` when that is set, else the checkout's own store under
+/// `target/`. Its exclusive lock keeps it from rebuilding binaries beneath a
+/// consumer of that same target. A build into a private target, such as each
+/// real Nextest fixture case's, therefore never waits on the checkout's lock,
+/// which every outer test node holds shared for its whole run (dh-g3xj4x).
 pub fn build_cpu_wrapper(root: &Path) -> Result<PathBuf, PreparationError> {
     if std::env::var(REQUIRED_ENV).as_deref() == Ok("1") {
         return Err("an official consumer cannot build a CPU wrapper".into());
     }
     let root = root.canonicalize().map_err(|e| e.to_string())?;
-    let artifacts = LockedArtifacts::open(&root, true, DEFAULT_COHORT)?;
+    let target = match std::env::var_os("CARGO_TARGET_DIR").filter(|dir| !dir.is_empty()) {
+        Some(dir) => root.join(dir),
+        None => root.join("target"),
+    };
+    let artifacts =
+        LockedArtifacts::open_store(&target.join("ci/nextest-binaries"), true, DEFAULT_COHORT)?;
     let cargo_path = artifacts.root.join("standalone-cargo.json");
     cargo_output(
         &root,
@@ -1041,12 +1053,24 @@ pub fn build_cpu_wrapper(root: &Path) -> Result<PathBuf, PreparationError> {
         &cargo_path,
     )?;
     let cargo = read_json(&cargo_path)?;
+    let cargo_target = Path::new(string(&cargo, "target_directory")?);
+    // The lock protects only the target it lives in.
+    if cargo_target.canonicalize().map_err(|e| e.to_string())?
+        != target.canonicalize().map_err(|e| e.to_string())?
+    {
+        return Err(format!(
+            "standalone CPU wrapper store is locked under {} but Cargo builds into {}",
+            target.display(),
+            cargo_target.display()
+        )
+        .into());
+    }
     let events = artifacts.root.join("standalone-cpu-wrapper.jsonl");
     prepare_cpu_wrapper(&root, &events, None)?;
     Ok(cpu_wrapper_artifact(
         &fs::read_to_string(events).map_err(|e| e.to_string())?,
         &cargo,
-        Path::new(string(&cargo, "target_directory")?),
+        cargo_target,
     )?
     .path)
 }
@@ -1547,7 +1571,12 @@ struct LockedArtifacts {
 
 impl LockedArtifacts {
     fn open(root: &Path, exclusive: bool, cohort: PreparedCohort) -> Result<Self, String> {
-        let root = root.join("target/ci/nextest-binaries");
+        Self::open_store(&root.join("target/ci/nextest-binaries"), exclusive, cohort)
+    }
+
+    /// Lock the artifact store at STORE itself rather than the checkout's.
+    fn open_store(store: &Path, exclusive: bool, cohort: PreparedCohort) -> Result<Self, String> {
+        let root = store.to_owned();
         fs::create_dir_all(&root).map_err(|e| e.to_string())?;
         let record = cohort.record_path(&root);
         if let Some(parent) = record.parent() {
@@ -5713,6 +5742,93 @@ mod tests {
         );
         drop(native);
         drop(consumer);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Set only in the child run of the next test: the checkout it prepares in.
+    const STANDALONE_WRAPPER_CHILD_ENV: &str = "HERMIT_TEST_STANDALONE_WRAPPER_ROOT";
+
+    /// dh-g3xj4x: each real Nextest fixture case runs `build-cpu-wrapper` with
+    /// a private CARGO_TARGET_DIR inside the outer validation's checkout,
+    /// while the outer test nodes hold that checkout's store lock shared. The
+    /// child below is that operation; this parent holds the shared lock for
+    /// it. The checkout has no Cargo tooling, so the operation fails quickly
+    /// once past the lock, and the child only reports that it returned.
+    #[test]
+    fn standalone_cpu_wrapper_never_waits_on_the_checkout_store_lock() {
+        use std::os::unix::process::CommandExt;
+
+        if let Some(root) = std::env::var_os(STANDALONE_WRAPPER_CHILD_ENV) {
+            let result = build_cpu_wrapper(Path::new(&root));
+            println!(
+                "standalone-cpu-wrapper-returned: {}",
+                match result {
+                    Ok(path) => path.display().to_string(),
+                    Err(error) => error.message,
+                }
+            );
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "hermit-standalone-wrapper-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let store = root.join("target/ci/nextest-binaries");
+        fs::create_dir_all(&store).unwrap();
+        let outer = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(store.join("lock"))
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(outer.as_raw_fd(), libc::LOCK_SH) }, 0);
+        let private = root.join("fixture-target");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+                "nextest_binaries::tests::standalone_cpu_wrapper_never_waits_on_the_checkout_store_lock",
+            ])
+            .env(STANDALONE_WRAPPER_CHILD_ENV, &root)
+            .env("CARGO_TARGET_DIR", &private)
+            .env_remove(REQUIRED_ENV)
+            .env_remove(PROJECT_ENV)
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let group = child.id() as libc::pid_t;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                unsafe { libc::kill(-group, libc::SIGKILL) };
+                child.wait().unwrap();
+                panic!(
+                    "HANG: build_cpu_wrapper with CARGO_TARGET_DIR={} waited 30 s on {}, \
+                     the checkout store lock an outer consumer holds shared; killed process group {group}",
+                    private.display(),
+                    store.join("lock").display()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "child failed: {stdout}");
+        // libtest prints the child's line after "test <name> ... ".
+        assert_eq!(
+            stdout.matches("standalone-cpu-wrapper-returned: ").count(),
+            1,
+            "{stdout}"
+        );
+        assert!(
+            private.join("ci/nextest-binaries/lock").is_file(),
+            "the standalone store must be the private target's"
+        );
+        drop(outer);
         fs::remove_dir_all(&root).unwrap();
     }
 
