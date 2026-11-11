@@ -17675,6 +17675,17 @@ fn print_super_stress_verdict(
     blocking
 }
 
+/// Every node tag an execution plan runs: its main DAG and its second one, as
+/// `append_run_parity` reads them.
+fn executed_step_tags(first: &DagConfig, second: Option<&DagConfig>) -> BTreeSet<String> {
+    first
+        .steps
+        .iter()
+        .chain(second.iter().flat_map(|second| second.steps.iter()))
+        .map(Step::tag)
+        .collect()
+}
+
 /// The super stress table as printed lines, and its blocking count.
 ///
 /// A probe that was not selected ran no repetition and none was expected, so
@@ -32347,18 +32358,7 @@ check_build_mode_selection(
     // Super stress pass rates, from typed outcomes rather than a scraped report.
     if plan.super_mode {
         let reps = validate_super::repetitions();
-        let executed: BTreeSet<String> = execution_plan
-            .cfg
-            .steps
-            .iter()
-            .chain(
-                execution_plan
-                    .second
-                    .iter()
-                    .flat_map(|second| second.steps.iter()),
-            )
-            .map(Step::tag)
-            .collect();
+        let executed = executed_step_tags(&execution_plan.cfg, execution_plan.second.as_ref());
         let rates = validate_classification::stress_rates(
             &classification,
             &outcomes,

@@ -825,6 +825,50 @@ fn super_stress_selection_bracket(
         return Err("the no-runner note printed while a probe was selected".into());
     }
 
+    // That probe's run still fails, through the live caller's own paths. Its
+    // node failing without writing rows is a product failure, which
+    // RunClassification::blocking_failures counts against super's nonblocking
+    // set; its node never running is NO_RESULT, which no_results counts and
+    // which makes the run NO_RESULT, not green.
+    let super_nonblocking: BTreeSet<String> = STRESS_PROBES
+        .iter()
+        .filter(|probe| probe.nonblocking())
+        .map(tag)
+        .collect();
+    let mut rowless = fixture_outcome(&tag(&strict), 1);
+    rowless.test_results = None;
+    let failed = classify_run(&[rowless.clone()], &[], &[], &only_strict, &[]);
+    let rates = stress_rates(
+        &failed,
+        std::slice::from_ref(&rowless),
+        20,
+        &only_strict,
+        &pressure,
+    );
+    let (lines, _) = super::super_stress_verdict_lines(&rates, 20, 1, 1);
+    if failed.blocking_failures(&super_nonblocking) != 1
+        || !line_of(&lines, strict.slug())?
+            .trim_start()
+            .starts_with("NO_RESULT")
+    {
+        return Err(format!(
+            "a selected probe that failed without results was not a blocking failure: {failed:?}"
+        ));
+    }
+    let never_ran = classify_run(&[], &[], &[tag(&strict)], &only_strict, &[]);
+    let rates = stress_rates(&never_ran, &[], 20, &only_strict, &pressure);
+    let (lines, _) = super::super_stress_verdict_lines(&rates, 20, 1, 1);
+    if never_ran.no_results() != 1
+        || !never_ran.no_result_nodes.contains(&tag(&strict))
+        || !line_of(&lines, strict.slug())?
+            .trim_start()
+            .starts_with("NO_RESULT")
+    {
+        return Err(format!(
+            "a selected probe that never ran was not NO_RESULT: {never_ran:?}"
+        ));
+    }
+
     // The same probe selected with its product result prints its rate.
     let rates = stress_rates(classes, complete, 1, &only_strict, &pressure);
     let (lines, blocking) = super::super_stress_verdict_lines(&rates, 1, 1, 1);
@@ -832,6 +876,72 @@ fn super_stress_selection_bracket(
     if !line.contains("1/1 (100%)") || line.contains("NO_RESULT") || blocking != 0 {
         return Err(format!(
             "a selected probe with results did not print its rate: {line}"
+        ));
+    }
+
+    // An explicit selection of one probe, as `--selected
+    // superstress.ptrace_pipeline` makes: super's pressure filter did not run,
+    // so the other core probes are not selected for another reason. They are
+    // still never NO_RESULT, and the no-runner note (about super's pressure
+    // tier) does not apply.
+    let pipeline = super::validate_super::StressProbe::PtracePipeline;
+    let only_pipeline: BTreeSet<String> = [tag(&pipeline)].into();
+    let rates = stress_rates(classes, complete, 1, &only_pipeline, &BTreeSet::new());
+    let (lines, _) = super::super_stress_verdict_lines(&rates, 1, 1, 1);
+    for probe in STRESS_PROBES.iter().filter(|probe| **probe != pipeline) {
+        let line = line_of(&lines, probe.slug())?;
+        let (want_selection, want_text) =
+            if super::validate_super::CORE_STRESS_PROBES.contains(probe) {
+                (
+                    ProbeSelection::NotSelected,
+                    "not selected (not in this run's selection)",
+                )
+            } else {
+                (
+                    ProbeSelection::NoNode,
+                    "not selected (no node in the validation DAG)",
+                )
+            };
+        let rate = rates.iter().find(|rate| rate.probe == *probe).unwrap();
+        if rate.selection != want_selection
+            || rate.ran != 0
+            || !line.contains(want_text)
+            || line.contains("NO_RESULT")
+        {
+            return Err(format!(
+                "a probe outside an explicit selection was not named as not selected: {line}"
+            ));
+        }
+    }
+    if lines
+        .iter()
+        .any(|line| line.contains("No scheduled runner selects superstress.*"))
+    {
+        return Err("the no-runner note printed for an explicit selection".into());
+    }
+
+    // A probe selected only through the second DAG of an execution plan is
+    // selected: the live caller's executed set covers both DAGs.
+    let node = |group: &str, job: &str| {
+        validate_plan::node(group, job, "fixture", "true".into(), Vec::new(), 1, 1, 0)
+    };
+    let first = super::DagConfig {
+        steps: vec![node("build", "fixture")],
+        ..Default::default()
+    };
+    let second = super::DagConfig {
+        steps: vec![node("superstress", &pipeline.job_stem())],
+        ..Default::default()
+    };
+    let executed = super::executed_step_tags(&first, Some(&second));
+    let rates = stress_rates(classes, complete, 1, &executed, &BTreeSet::new());
+    let rate = rates.iter().find(|rate| rate.probe == pipeline).unwrap();
+    if !executed.contains(&tag(&pipeline))
+        || rate.selection != ProbeSelection::Selected
+        || super::executed_step_tags(&first, None).contains(&tag(&pipeline))
+    {
+        return Err(format!(
+            "a probe selected through the second DAG was not selected: {executed:?}"
         ));
     }
     Ok(())
@@ -1687,7 +1797,8 @@ mod timeout_tests {
             // finished, so the allowance is the budget at dispatch.
             let setup_started = super::super::monotonic_now_ns().unwrap();
             let _ = super::super::settled_log_len(&log);
-            let setup_elapsed_ns = super::super::monotonic_now_ns().unwrap() - setup_started;
+            let setup_elapsed_ns =
+                super::super::monotonic_now_ns().unwrap() - setup_started;
             let deadline = super::super::monotonic_now_ns().unwrap() + allowance;
             if cold_log {
                 // This case exercises expiry during setup by construction:
@@ -1715,7 +1826,8 @@ mod timeout_tests {
                 // or below a step's own wall bound. If that ever holds at
                 // dispatch, the fixture is invalid: fail here, loudly,
                 // rather than let a refusal masquerade as a cutoff.
-                let remaining_s = super::super::remaining_budget_s(Some(deadline)).unwrap();
+                let remaining_s =
+                    super::super::remaining_budget_s(Some(deadline)).unwrap();
                 assert!(
                     remaining_s > 4,
                     "invalid cutoff fixture: remaining budget {remaining_s} s \
