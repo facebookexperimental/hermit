@@ -714,10 +714,23 @@ fn commit_tree(root: &Path, sha: &str) -> Result<String, String> {
     Ok(tree)
 }
 
+/// Where the checkout stands against its local copy of the landing branch,
+/// `origin/<landing branch>` (Hermit's landing branch from
+/// `ci/landing-branches.env` or the environment), after the run.
 pub(crate) fn post_run_main_observation(root: &Path) -> Result<Value, String> {
+    let landing = hermit_manifest_plan::landing_branch::hermit(root)?;
+    post_run_landing_observation(root, &landing)
+}
+
+/// [`post_run_main_observation`] against `origin/<landing>`.
+fn post_run_landing_observation(root: &Path, landing: &str) -> Result<Value, String> {
     let main = git(
         root,
-        &["rev-parse", "--verify", "refs/remotes/origin/main^{commit}"],
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("refs/remotes/origin/{landing}^{{commit}}"),
+        ],
     )?;
     commit_tree(root, &main)?;
     let target = git(root, &["rev-parse", "--verify", "HEAD^{commit}"])?;
@@ -2261,7 +2274,11 @@ for entry in Path('/proc/self/fd').iterdir():
         f.command(&["checkout", "--quiet", "--detach", &target]);
         f.command(&["update-ref", "refs/remotes/origin/main", &later]);
         proof.verify_source(&f.0).unwrap();
-        assert_eq!(post_run_main_observation(&f.0).unwrap()["behind"], 1);
+        // The fixture's landing branch is main.
+        assert_eq!(
+            post_run_landing_observation(&f.0, "main").unwrap()["behind"],
+            1
+        );
         let falsely_admitted = f.authority(&target, &later);
         assert!(f.admit(&falsely_admitted, &target).is_err());
         // A literal commit can be made to claim false ancestry by .git/info/grafts.

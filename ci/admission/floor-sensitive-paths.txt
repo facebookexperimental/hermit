@@ -60,6 +60,13 @@ scripts/validate.rs
 scripts/lib/validate*
 # Included with #[path] by all three comparators and by the driver.
 scripts/lib/rust_script_prelude.rs
+# The landing-branch settings: check-reverie-pin.rs judges ancestry against
+# REVERIE_LANDING_BRANCH, and both floor comparators default their base to
+# HERMIT_LANDING_BRANCH. Their reader, ci/manifest-plan/src/landing_branch.rs,
+# is included with #[path] by both; the include test names it through
+# scripts/../, which only the **/ form matches.
+ci/landing-branches.env
+**/landing_branch.rs
 
 # The pin nodes' wrappers: pre.reverie_pin* runs run-reverie-pin-check.sh with
 # --base-ref; check.lint_checks runs lint-checks-node.sh with

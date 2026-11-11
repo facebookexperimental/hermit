@@ -8,8 +8,9 @@ The report splits open PRs into two buckets:
 * ``free-to-land`` -- everything else; an agent may land these once CI is green.
 
 After the open-PR buckets the report also prints a ``Recent main CI`` section
-per repo: the CI conclusions of the most recent workflow runs on the ``main``
-branch (like the checkmark column at ``github.com/<repo>/commits/main``), so
+per repo: the CI conclusions of the most recent workflow runs on the repo's
+landing branch (``main`` today; the ``ci/landing-branches.env`` setting, like
+the checkmark column at ``github.com/<repo>/commits/<branch>``), so
 main-branch health is visible without opening the browser. Failing runs are
 called out explicitly. Use ``--main-limit`` to change how many runs are shown
 and ``--no-main-ci`` to omit the section entirely.
@@ -34,11 +35,22 @@ from typing import Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from check_outcome_adapter import classify_check, select_latest_checks  # noqa: E402
+from landing_branch import (  # noqa: E402
+    HERMIT_LANDING_BRANCH,
+    REVERIE_LANDING_BRANCH,
+    landing_branch,
+)
 
 DEFAULT_REPOS = ("rrnewton/hermit", "rrnewton/reverie")
 DEFAULT_WARN_THRESHOLD = 10
 DEFAULT_MAIN_LIMIT = 10
 HUMAN_REVIEW_LABEL = "human-review"
+# The landing-branch setting (ci/landing-branches.env) naming the branch whose
+# recent CI runs the report shows.
+LANDING_BRANCH_KEYS = {
+    "rrnewton/hermit": HERMIT_LANDING_BRANCH,
+    "rrnewton/reverie": REVERIE_LANDING_BRANCH,
+}
 REGULAR_PORTABLE_CHECK = "Regular tests (GitHub-managed portable)"
 REQUIRED_CHECKS = {
     # Live repository policy (queried 2026-08-04): both main branches require
@@ -302,6 +314,17 @@ def parse_workflow_run(repo: str, raw: object) -> WorkflowRun:
     )
 
 
+def main_ci_branch(repo: str) -> str:
+    """REPO's landing branch, whose runs the ``Recent main CI`` section shows."""
+    key = LANDING_BRANCH_KEYS.get(repo)
+    if key is None:
+        raise ValueError(
+            f"{repo}: no landing-branch setting names its branch; "
+            "pass --no-main-ci"
+        )
+    return landing_branch(key)
+
+
 def fetch_main_runs(repo: str, limit: int) -> list[WorkflowRun]:
     command = [
         "with-proxy",
@@ -311,7 +334,7 @@ def fetch_main_runs(repo: str, limit: int) -> list[WorkflowRun]:
         "-R",
         repo,
         "--branch",
-        "main",
+        main_ci_branch(repo),
         "--limit",
         str(limit),
         "--json",

@@ -158,23 +158,30 @@ enum PrLookup {
     /// Ask `gh` for the PR of the checked-out branch.
     AskGh,
     /// There can be no PR to label, for this reason.
-    NoPr(&'static str),
+    NoPr(String),
 }
 
 /// Decide how to find the PR from `$PR_NUMBER` (PR_ENV), the checked-out branch
-/// (BRANCH, `None` when HEAD is detached) and whether HEAD is already on
-/// `origin/main` (ON_MAIN). `gh pr view --json` is a GraphQL call, and on a
-/// detached HEAD, on `main`, or for a commit already on `origin/main` it can
-/// find no PR, so those cases make no call. Before this, every validate of
-/// main spent one GraphQL request (10-15 a day) that could only fail.
-fn pr_lookup(pr_env: Option<&str>, branch: Option<&str>, on_main: bool) -> PrLookup {
+/// (BRANCH, `None` when HEAD is detached), Hermit's landing branch (LANDING,
+/// `main` today; `ci/landing-branches.env`) and whether HEAD is already on
+/// `origin/<LANDING>` (ON_LANDING). `gh pr view --json` is a GraphQL call, and
+/// on a detached HEAD, on the landing branch, or for a commit already on
+/// `origin/<LANDING>` it can find no PR, so those cases make no call. Before
+/// this, every validate of main spent one GraphQL request (10-15 a day) that
+/// could only fail.
+fn pr_lookup(
+    pr_env: Option<&str>,
+    branch: Option<&str>,
+    landing: &str,
+    on_landing: bool,
+) -> PrLookup {
     if let Some(pr) = pr_env.filter(|pr| !pr.is_empty()) {
         return PrLookup::Env(pr.to_string());
     }
     match branch {
-        None => PrLookup::NoPr("HEAD is detached, so it has no branch PR"),
-        Some("main") => PrLookup::NoPr("main has no PR"),
-        Some(_) if on_main => PrLookup::NoPr("HEAD is already on origin/main"),
+        None => PrLookup::NoPr("HEAD is detached, so it has no branch PR".into()),
+        Some(branch) if branch == landing => PrLookup::NoPr(format!("{landing} has no PR")),
+        Some(_) if on_landing => PrLookup::NoPr(format!("HEAD is already on origin/{landing}")),
         Some(_) => PrLookup::AskGh,
     }
 }
@@ -187,18 +194,21 @@ fn git_output(args: &[&str]) -> Option<String> {
 }
 
 /// Resolve the PR: `$PR_NUMBER`, else, for a named branch not yet on
-/// `origin/main`, ask `gh` (through `with-proxy` when available, because
-/// networked `gh` requires it here). Err carries why there is no PR.
+/// `origin/<landing branch>`, ask `gh` (through `with-proxy` when available,
+/// because networked `gh` requires it here). Err carries why there is no PR.
+/// The landing branch is the checkout's setting; validate runs from its root.
 fn resolve_pr() -> Result<String, String> {
     let pr_env = std::env::var("PR_NUMBER").ok();
+    let landing = hermit_manifest_plan::landing_branch::hermit(std::path::Path::new("."))?;
+    let landing_ref = format!("origin/{landing}");
     let branch = git_output(&["symbolic-ref", "--quiet", "--short", "HEAD"]);
-    let on_main = Command::new("git")
-        .args(["merge-base", "--is-ancestor", "HEAD", "origin/main"])
+    let on_landing = Command::new("git")
+        .args(["merge-base", "--is-ancestor", "HEAD", landing_ref.as_str()])
         .status()
         .is_ok_and(|status| status.success());
-    match pr_lookup(pr_env.as_deref(), branch.as_deref(), on_main) {
+    match pr_lookup(pr_env.as_deref(), branch.as_deref(), &landing, on_landing) {
         PrLookup::Env(pr) => return Ok(pr),
-        PrLookup::NoPr(reason) => return Err(reason.into()),
+        PrLookup::NoPr(reason) => return Err(reason),
         PrLookup::AskGh => {}
     }
     if !has_cmd("gh") {
@@ -416,29 +426,59 @@ pub fn self_test() -> Result<String, String> {
         ));
     }
     // The PR lookup makes no network call where no PR can exist.
-    for (pr_env, branch, on_main, want) in [
-        (Some("42"), None, true, PrLookup::Env("42".into())),
-        (Some(""), Some("feature"), false, PrLookup::AskGh),
-        (None, Some("feature"), false, PrLookup::AskGh),
+    for (pr_env, branch, landing, on_landing, want) in [
+        (Some("42"), None, "main", true, PrLookup::Env("42".into())),
+        (Some(""), Some("feature"), "main", false, PrLookup::AskGh),
+        (None, Some("feature"), "main", false, PrLookup::AskGh),
         (
             None,
             None,
+            "main",
             false,
-            PrLookup::NoPr("HEAD is detached, so it has no branch PR"),
+            PrLookup::NoPr("HEAD is detached, so it has no branch PR".into()),
         ),
-        (None, Some("main"), true, PrLookup::NoPr("main has no PR")),
-        (None, Some("main"), false, PrLookup::NoPr("main has no PR")),
+        (
+            None,
+            Some("main"),
+            "main",
+            true,
+            PrLookup::NoPr("main has no PR".into()),
+        ),
+        (
+            None,
+            Some("main"),
+            "main",
+            false,
+            PrLookup::NoPr("main has no PR".into()),
+        ),
         (
             None,
             Some("landed"),
+            "main",
             true,
-            PrLookup::NoPr("HEAD is already on origin/main"),
+            PrLookup::NoPr("HEAD is already on origin/main".into()),
+        ),
+        // The landing branch is the setting, not the name `main`.
+        (None, Some("main"), "integration", false, PrLookup::AskGh),
+        (
+            None,
+            Some("integration"),
+            "integration",
+            false,
+            PrLookup::NoPr("integration has no PR".into()),
+        ),
+        (
+            None,
+            Some("landed"),
+            "integration",
+            true,
+            PrLookup::NoPr("HEAD is already on origin/integration".into()),
         ),
     ] {
-        let got = pr_lookup(pr_env, branch, on_main);
+        let got = pr_lookup(pr_env, branch, landing, on_landing);
         if got != want {
             return Err(format!(
-                "receipt: pr_lookup({pr_env:?}, {branch:?}, {on_main}) gave {got:?}, want {want:?}"
+                "receipt: pr_lookup({pr_env:?}, {branch:?}, {landing:?}, {on_landing}) gave {got:?}, want {want:?}"
             ));
         }
     }

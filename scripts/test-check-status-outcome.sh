@@ -213,8 +213,10 @@ pr_status=$(
 grep -Fq 'rrnewton/hermit#2363' <<<"$pr_status"
 grep -Fq 'ci=green' <<<"$pr_status"
 
+# The gh fixture above answers for a landing branch named main, so the run
+# names that branch itself rather than inheriting another one.
 dag_health=$(
-    DEV_HERMIT_PARENT="$tmp/changed-parent" PR_DAG_PROXY="" "$ROOT_DIR/scripts/pr-dag-health.sh" --repo rrnewton/hermit --format json --no-commute
+    DEV_HERMIT_PARENT="$tmp/changed-parent" HERMIT_LANDING_BRANCH=main PR_DAG_PROXY="" "$ROOT_DIR/scripts/pr-dag-health.sh" --repo rrnewton/hermit --format json --no-commute
 )
 jq -e '
     .prs[0].number == 2363 and

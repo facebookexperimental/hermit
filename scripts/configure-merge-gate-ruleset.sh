@@ -1,7 +1,23 @@
 #!/usr/bin/env bash
-# Reconcile Hermit's main rulesets with the owner policy: green branches may
-# land by fast-forward; branch deletion, non-fast-forward updates, and nonlinear
-# history are prohibited. Hosted checks and PR state remain advisory.
+# Reconcile Hermit's landing-branch rulesets with the owner policy: green
+# branches may land by fast-forward; branch deletion, non-fast-forward updates,
+# and nonlinear history are prohibited. Hosted checks and PR state remain
+# advisory.
+#
+# The two landing rulesets name the repository's default branch
+# (~DEFAULT_BRANCH), so they follow it when the landing branch is renamed.
+#
+# One additional ruleset may protect the upstream branch, the fast-forward-only
+# inbox that mirrors facebookexperimental (HERMIT_UPSTREAM_BRANCH from the
+# environment or ci/landing-branches.env, or --upstream-branch; main today). It
+# is recognized by naming exactly refs/heads/<upstream> and nothing else.
+# --check accepts it without judging its rules, which are the owner's, and
+# --apply never writes it. --check fails when two rulesets each protect the
+# upstream branch, or when a ruleset names it among other refs; the JSON
+# booleans keep describing only the two landing rulesets, so such a failure
+# reads state=fail with the reason on stderr. --apply refuses to rewrite a
+# landing ruleset that names the upstream branch, because rewriting it to
+# ~DEFAULT_BRANCH would silently drop that branch's protection.
 
 set -euo pipefail
 
@@ -9,9 +25,13 @@ readonly DEFAULT_REPO="rrnewton/hermit"
 readonly DEFAULT_GATE_RULESET_NAME="main check gating (admin-bypassable)"
 readonly DEFAULT_HISTORY_RULESET_NAME="main history protection"
 
+# shellcheck source=scripts/lib/landing_branch.sh
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib/landing_branch.sh"
+
 repo=$DEFAULT_REPO
 gate_ruleset_name=$DEFAULT_GATE_RULESET_NAME
 history_ruleset_name=$DEFAULT_HISTORY_RULESET_NAME
+upstream_branch=
 mode=check
 json_output=0
 
@@ -28,6 +48,9 @@ Options:
   --repo R                  Repository (default: rrnewton/hermit).
   --ruleset-name N          Legacy check-gating ruleset name.
   --history-ruleset-name N  History-protection ruleset name.
+  --upstream-branch B       Upstream (inbox) branch whose one additional
+                            ruleset is tolerated (default: HERMIT_UPSTREAM_BRANCH
+                            from the environment or ci/landing-branches.env).
   --json                     Emit the check result as one JSON object.
   -h, --help                Show this help.
 EOF
@@ -43,6 +66,10 @@ while (($# > 0)); do
             history_ruleset_name=${2:?--history-ruleset-name requires a value}
             shift 2
             ;;
+        --upstream-branch)
+            upstream_branch=${2:?--upstream-branch requires a branch}
+            shift 2
+            ;;
         --json) json_output=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'configure-merge-gate-ruleset: unknown argument: %s\n' "$1" >&2; exit 2 ;;
@@ -53,6 +80,15 @@ if [[ $mode != check && $json_output == 1 ]]; then
     printf 'configure-merge-gate-ruleset: --json is valid only with --check\n' >&2
     exit 2
 fi
+
+if [[ -z $upstream_branch ]]; then
+    upstream_branch=$(landing_branch HERMIT_UPSTREAM_BRANCH) || exit 2
+elif ! landing_branch_valid "$upstream_branch"; then
+    printf 'configure-merge-gate-ruleset: --upstream-branch %q is not a branch name\n' \
+        "$upstream_branch" >&2
+    exit 2
+fi
+readonly upstream_ref="refs/heads/$upstream_branch"
 
 for command in gh jq sha256sum; do
     if ! command -v "$command" >/dev/null 2>&1; then
@@ -118,6 +154,21 @@ scope_is_default_branch() {
     ' >/dev/null
 }
 
+# Whether the ruleset on stdin names the upstream branch among its includes.
+names_upstream() {
+    jq -e --arg ref "$upstream_ref" \
+        '(.conditions.ref_name.include // []) | any(.[]; . == $ref)' >/dev/null
+}
+
+# Whether the ruleset on stdin has the upstream ruleset's scope: a branch
+# ruleset that names refs/heads/<upstream> and nothing else.
+scope_is_upstream_only() {
+    jq -e --arg ref "$upstream_ref" '
+      .target == "branch" and
+      .conditions == {ref_name: {exclude: [], include: [$ref]}}
+    ' >/dev/null
+}
+
 current_gate=$(read_ruleset "$gate_ruleset_id")
 current_history=$(read_ruleset "$history_ruleset_id")
 gate_rule_count=$(jq '.rules | length' <<<"$current_gate")
@@ -148,6 +199,30 @@ if [[ $mode == check ]]; then
         failed=1
         history_matches=false
     fi
+    # Every other ruleset that names the upstream branch. One with exactly the
+    # upstream scope is tolerated, whatever its rules; it is not a landing
+    # ruleset, so it changes neither JSON boolean.
+    mapfile -t other_ids < <(
+        jq -r --argjson gate "$gate_ruleset_id" --argjson history "$history_ruleset_id" \
+            '.[] | select(.id != $gate and .id != $history) | .id' <<<"$rulesets"
+    )
+    upstream_ids=()
+    for id in "${other_ids[@]}"; do
+        candidate=$(read_ruleset "$id" </dev/null)
+        names_upstream <<<"$candidate" || continue
+        if scope_is_upstream_only <<<"$candidate"; then
+            upstream_ids+=("$id")
+        else
+            printf 'FAIL: ruleset %s names the upstream branch %s among other refs (scope=%s); the upstream ruleset must name only %s.\n' \
+                "$id" "$upstream_branch" "$(scope_state <<<"$candidate")" "$upstream_ref" >&2
+            failed=1
+        fi
+    done
+    if ((${#upstream_ids[@]} > 1)); then
+        printf 'FAIL: rulesets %s each protect the upstream branch %s; at most one additional ruleset may.\n' \
+            "${upstream_ids[*]}" "$upstream_ref" >&2
+        failed=1
+    fi
     if ((failed != 0)); then
         if ((json_output == 1)); then
             jq -cn \
@@ -163,11 +238,25 @@ if [[ $mode == check ]]; then
             --arg state pass \
             '{schema:1,state:$state,gate_policy_matches:true,history_policy_matches:true}'
     else
-        printf 'PASS: check-gating ruleset %s is inert; history ruleset %s enforces zero-bypass deletion + non-fast-forward + linear history.\n' \
-            "$gate_ruleset_id" "$history_ruleset_id"
+        upstream_note=
+        if ((${#upstream_ids[@]} == 1)); then
+            upstream_note="; upstream ruleset ${upstream_ids[0]} protects $upstream_ref (its rules are not judged here)"
+        fi
+        printf 'PASS: check-gating ruleset %s is inert; history ruleset %s enforces zero-bypass deletion + non-fast-forward + linear history%s.\n' \
+            "$gate_ruleset_id" "$history_ruleset_id" "$upstream_note"
     fi
     exit 0
 fi
+
+# A landing ruleset that names the upstream branch is not rewritten: rewriting
+# it to ~DEFAULT_BRANCH would drop that branch's protection without a word.
+for landing_ruleset in "$current_gate" "$current_history"; do
+    if names_upstream <<<"$landing_ruleset"; then
+        printf 'configure-merge-gate-ruleset: ruleset %s names the upstream branch %s; rewriting it to ~DEFAULT_BRANCH would drop that protection. Give the upstream branch its own ruleset first.\n' \
+            "$(jq -r '.id' <<<"$landing_ruleset")" "$upstream_ref" >&2
+        exit 1
+    fi
+done
 
 desired_gate=$(jq '
   {

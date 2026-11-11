@@ -18,6 +18,9 @@
 #   REPORT_VERSION=v4 scripts/progress-report.sh
 #   NO_PULL=1 scripts/progress-report.sh       # skip the git pull step
 #
+# The pull and the report's branch are Hermit's landing branch
+# (HERMIT_LANDING_BRANCH, ci/landing-branches.env).
+#
 # Idempotent: re-running overwrites today's report and the /tmp logs.
 
 set -uo pipefail
@@ -27,6 +30,8 @@ cd "$ROOT_DIR" || exit 1
 
 # shellcheck source=scripts/lib/test_results.sh
 source "$ROOT_DIR/scripts/lib/test_results.sh"
+# shellcheck source=scripts/lib/landing_branch.sh
+source "$ROOT_DIR/scripts/lib/landing_branch.sh"
 
 REPORT_VERSION=${REPORT_VERSION:-v3}
 DATE_UTC=$(date -u +%Y-%m-%d)
@@ -150,10 +155,11 @@ echo "== Hermit progress report ${REPORT_VERSION} (${DATE_UTC}) =="
 # ---------------------------------------------------------------------------
 # 0. Context + pull
 # ---------------------------------------------------------------------------
+LANDING_BRANCH=$(landing_branch HERMIT_LANDING_BRANCH) || exit 1
 PULL_RESULT="skipped (NO_PULL=1)"
 if [[ -z ${NO_PULL:-} ]]; then
-  echo "-- git pull origin main"
-  if PULL_OUT=$(proxy git pull origin main 2>&1); then
+  echo "-- git pull origin $LANDING_BRANCH"
+  if PULL_OUT=$(proxy git pull origin "$LANDING_BRANCH" 2>&1); then
     PULL_RESULT=$(printf '%s' "$PULL_OUT" | tail -n1)
   else
     PULL_RESULT="FAILED (kept current HEAD): $(printf '%s' "$PULL_OUT" | tail -n1)"
@@ -241,7 +247,7 @@ PRS=$(git log --oneline -40 | grep -iE 'Merge pull request' | head -12 \
   echo "| Field | Value |"
   echo "| --- | --- |"
   echo "| Commit tested | \`$COMMIT\` (\`$SHORT\`) |"
-  echo "| Branch | main (pull: $PULL_RESULT) |"
+  echo "| Branch | $LANDING_BRANCH (pull: $PULL_RESULT) |"
   echo "| Date (UTC) | $DATE_UTC |"
   echo "| Backend | ptrace |"
   echo "| Host CPU | $CPU |"

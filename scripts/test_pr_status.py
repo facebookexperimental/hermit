@@ -6,9 +6,13 @@ Run with: python3 scripts/test_pr_status.py
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 import check_outcome_adapter
+import landing_branch
 import pr_status
 
 
@@ -422,6 +426,59 @@ class ParseArgsMainCiTest(unittest.TestCase):
     def test_main_limit_must_be_positive(self) -> None:
         with self.assertRaises(SystemExit):
             pr_status.parse_args(["--main-limit", "0"])
+
+
+class LandingBranchTest(unittest.TestCase):
+    """ci/landing-branches.env: the variable wins, and there is no default."""
+
+    KEY = landing_branch.HERMIT_LANDING_BRANCH
+
+    def _root(self, text: str) -> Path:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        (root / "ci").mkdir()
+        (root / landing_branch.SETTINGS_FILE).write_text(text, encoding="utf-8")
+        return root
+
+    def test_the_variable_wins_over_the_file(self) -> None:
+        root = self._root("# comment\n\nHERMIT_LANDING_BRANCH=main\n")
+        self.assertEqual(
+            landing_branch.landing_branch(self.KEY, root, {self.KEY: "integration"}),
+            "integration",
+        )
+        self.assertEqual(landing_branch.landing_branch(self.KEY, root, {}), "main")
+
+    def test_there_is_no_default_branch(self) -> None:
+        for text, environ in (
+            ("REVERIE_LANDING_BRANCH=main\n", {}),
+            ("HERMIT_LANDING_BRANCH=\n", {}),
+            ("HERMIT_LANDING_BRANCH=main\nHERMIT_LANDING_BRANCH=main\n", {}),
+            ("HERMIT_LANDING_BRANCH = main\n", {}),
+            ("HERMIT_LANDING_BRANCH=a..b\n", {}),
+            ("HERMIT_LANDING_BRANCH=main\n", {self.KEY: ""}),
+        ):
+            with self.subTest(text=text, environ=environ), self.assertRaises(
+                ValueError
+            ):
+                landing_branch.landing_branch(self.KEY, self._root(text), environ)
+        with self.assertRaises(ValueError):
+            landing_branch.landing_branch(self.KEY, Path("/nonexistent"), {})
+
+    def test_main_ci_reads_each_repositorys_setting(self) -> None:
+        with patch.object(
+            pr_status, "landing_branch", side_effect=lambda key: f"branch-of-{key}"
+        ):
+            self.assertEqual(
+                pr_status.main_ci_branch("rrnewton/hermit"),
+                "branch-of-HERMIT_LANDING_BRANCH",
+            )
+            self.assertEqual(
+                pr_status.main_ci_branch("rrnewton/reverie"),
+                "branch-of-REVERIE_LANDING_BRANCH",
+            )
+            with self.assertRaises(ValueError):
+                pr_status.main_ci_branch("someone/else")
 
 
 if __name__ == "__main__":

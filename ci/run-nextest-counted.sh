@@ -7,6 +7,8 @@ readonly SCRIPT_DIR
 readonly RESULT_WRITER="$SCRIPT_DIR/nextest-test-results.rs"
 readonly TIMEOUT_CONFIG_WRITER="$SCRIPT_DIR/nextest-timeout-config.rs"
 readonly PREBUILT_RUST_SCRIPT="$SCRIPT_DIR/rust-script-bin/rust-script"
+# shellcheck source=scripts/lib/landing_branch.sh
+source "$SCRIPT_DIR/../scripts/lib/landing_branch.sh"
 
 nextest_config=
 cpu_measurement_dir=
@@ -343,7 +345,8 @@ function run_nextest {
         # Freshness is checked hermit-side in ci/census-check.sh: the
         # expected base commit is HERMIT_CENSUS_BASE_COMMIT when the
         # adapter declares one, else this checkout's merge-base with
-        # origin/main; a base stamped with another commit, a short/
+        # origin/<landing branch> (HERMIT_LANDING_BRANCH,
+        # ci/landing-branches.env); a base stamped with another commit, a short/
         # truncated base, or an unstamped base is refused by name. Since
         # the count pins were deleted the census is the only disappearance
         # guard, so a counted node REQUIRES its base: with none supplied
@@ -376,9 +379,15 @@ function run_nextest {
         [[ ${HERMIT_CENSUS_ALLOW_NO_BASE:-} == 1 ]] && census_args+=(--allow-no-base)
         local expected_base_commit=${HERMIT_CENSUS_EXPECTED_BASE_COMMIT:-${HERMIT_CENSUS_BASE_COMMIT:-}}
         if [[ -z $expected_base_commit ]]; then
-            expected_base_commit=$(git -C "$SCRIPT_DIR/.." merge-base HEAD origin/main 2>/dev/null || true)
+            local landing_branch_name
+            if ! landing_branch_name=$(landing_branch HERMIT_LANDING_BRANCH); then
+                printf 'run-nextest-counted: the census base defaults to the landing branch, whose setting cannot be read\n' >&2
+                cleanup_nextest_config
+                return 1
+            fi
+            expected_base_commit=$(git -C "$SCRIPT_DIR/.." merge-base HEAD "origin/$landing_branch_name" 2>/dev/null || true)
             [[ -n $expected_base_commit ]] || \
-                expected_base_commit=$(git -C "$SCRIPT_DIR/.." rev-parse origin/main 2>/dev/null || true)
+                expected_base_commit=$(git -C "$SCRIPT_DIR/.." rev-parse "origin/$landing_branch_name" 2>/dev/null || true)
         fi
         [[ -n $expected_base_commit ]] && census_args+=(--expected-base-commit "$expected_base_commit")
         if [[ ${HERMIT_CENSUS_REPORT_ONLY:-} == 1 ]]; then

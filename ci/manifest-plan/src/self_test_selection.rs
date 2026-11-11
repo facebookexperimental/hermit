@@ -3,13 +3,16 @@
 //!
 //! A self-test with trigger paths ([`crate::validation_dag::ToolSelfTest`]'s
 //! `run_when_changed`) runs when any path changed since the merge base with
-//! `origin/main`, committed or not, lies under one of them ([`is_under`]). A self-test that
-//! does not run prints one line containing [`NOT_RUN_MARKER`], so the node log
-//! and the scheduler's one-line node summary both say it was not run.
+//! `origin/<landing branch>` (Hermit's landing branch, `main` today; see
+//! [`crate::landing_branch`]), committed or not, lies under one of them
+//! ([`is_under`]). A self-test that does not run prints one line containing
+//! [`NOT_RUN_MARKER`], so the node log and the scheduler's one-line node
+//! summary both say it was not run.
 //!
-//! Selection errs toward running. Main always runs, and so does any change set
-//! this module cannot resolve: a shallow clone, a missing `origin/main`, an
-//! empty change set, or any git failure.
+//! Selection errs toward running. The landing branch always runs, and so does
+//! any change set this module cannot resolve: an unreadable landing-branch
+//! setting, a shallow clone, a missing `origin/<landing branch>`, an empty
+//! change set, or any git failure.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -99,10 +102,16 @@ pub fn decide(
     Decision::Skip { base, changed }
 }
 
-/// The merge base with `origin/main` and every path changed since it,
-/// committed or not. `Err` names why the change set could not be resolved;
-/// the caller then runs the self-test.
+/// The merge base with `origin/<landing branch>`, for the landing branch the
+/// checkout at `root` sets, and every path changed since it, committed or
+/// not. `Err` names why the change set could not be resolved; the caller then
+/// runs the self-test.
 pub fn change_set(root: &Path) -> Result<(String, Vec<String>), String> {
+    change_set_on(root, &crate::landing_branch::hermit(root)?)
+}
+
+/// [`change_set`] against the landing branch `landing`.
+pub fn change_set_on(root: &Path, landing: &str) -> Result<(String, Vec<String>), String> {
     let git = |args: &[&str]| -> Result<Vec<u8>, String> {
         let output = git_command()
             .arg("-C")
@@ -120,24 +129,27 @@ pub fn change_set(root: &Path) -> Result<(String, Vec<String>), String> {
         Ok(output.stdout)
     };
     let text = |bytes: Vec<u8>| String::from_utf8_lossy(&bytes).trim().to_string();
+    let local = format!("refs/heads/{landing}");
+    let remotes = format!("refs/remotes/*/{landing}");
     let mains = text(git(&[
         "for-each-ref",
         "--contains",
         "HEAD",
         "--format=%(refname)",
-        "refs/heads/main",
-        "refs/remotes/*/main",
+        local.as_str(),
+        remotes.as_str(),
     ])?);
     if !mains.is_empty() {
         return Err(format!(
-            "HEAD is on main ({}), and main runs every self-test",
+            "HEAD is on {landing} ({}), and {landing} runs every self-test",
             mains.split_whitespace().collect::<Vec<_>>().join(", ")
         ));
     }
     if text(git(&["rev-parse", "--is-shallow-repository"])?) != "false" {
         return Err("this clone is shallow, so its merge base cannot be trusted".into());
     }
-    let base = text(git(&["merge-base", "HEAD", "refs/remotes/origin/main"])?);
+    let origin = format!("refs/remotes/origin/{landing}");
+    let base = text(git(&["merge-base", "HEAD", origin.as_str()])?);
     if base.len() != 40 || !base.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(format!("git merge-base printed {base:?}, not a commit"));
     }
@@ -329,7 +341,7 @@ mod tests {
         std::fs::create_dir_all(repo.0.join("ci/compat-envelope")).unwrap();
         std::fs::write(repo.0.join("ci/compat-envelope/new.rs"), "untracked").unwrap();
         assert_eq!(
-            change_set(&repo.0),
+            change_set_on(&repo.0, "main"),
             Ok((
                 base.clone(),
                 vec![
@@ -341,14 +353,14 @@ mod tests {
         // Without the untracked file the branch touches no trigger.
         std::fs::remove_file(repo.0.join("ci/compat-envelope/new.rs")).unwrap();
         assert!(matches!(
-            decide(None, change_set(&repo.0), TRIGGERS),
+            decide(None, change_set_on(&repo.0, "main"), TRIGGERS),
             Decision::Skip { base: skipped, .. } if skipped == base
         ));
 
         // A commit already contained in main runs, through the local branch
         // or through any remote's main.
         repo.git(&["switch", "-q", "main"]);
-        let on_main = change_set(&repo.0).unwrap_err();
+        let on_main = change_set_on(&repo.0, "main").unwrap_err();
         assert!(
             on_main.contains("HEAD is on main (refs/heads/main"),
             "{on_main}"
@@ -357,7 +369,7 @@ mod tests {
         let topic = repo.git(&["rev-parse", "HEAD"]);
         repo.git(&["branch", "-q", "-D", "main"]);
         repo.git(&["update-ref", "refs/remotes/upstream/main", &topic]);
-        let remote_main = change_set(&repo.0).unwrap_err();
+        let remote_main = change_set_on(&repo.0, "main").unwrap_err();
         assert!(
             remote_main.contains("HEAD is on main (refs/remotes/upstream/main)"),
             "{remote_main}"
@@ -366,8 +378,21 @@ mod tests {
 
         // No origin/main to take a merge base from runs.
         repo.git(&["update-ref", "-d", "refs/remotes/origin/main"]);
-        let no_base = change_set(&repo.0).unwrap_err();
+        let no_base = change_set_on(&repo.0, "main").unwrap_err();
         assert!(no_base.contains("git merge-base"), "{no_base}");
+
+        // The landing branch is the setting, not the name `main`: with the
+        // landing branch named `integration`, origin/main is no merge base
+        // and refs/remotes/upstream/main does not place HEAD on it.
+        repo.git(&["update-ref", "refs/remotes/origin/main", &base]);
+        repo.git(&["update-ref", "refs/remotes/upstream/main", &topic]);
+        let elsewhere = change_set_on(&repo.0, "integration").unwrap_err();
+        assert!(elsewhere.contains("git merge-base"), "{elsewhere}");
+        repo.git(&["update-ref", "refs/remotes/origin/integration", &base]);
+        assert!(matches!(
+            change_set_on(&repo.0, "integration"),
+            Ok((merge_base, _)) if merge_base == base
+        ));
     }
 
     #[test]
@@ -395,7 +420,7 @@ mod tests {
         repo.git(&["mv", "ci/compat-envelope/old.rs", "docs-old.rs"]);
         repo.git(&["rm", "-q", "ci/compat-envelope/gone.rs"]);
         repo.git(&["commit", "-qm", "move"]);
-        let (_, moved) = change_set(&repo.0).unwrap();
+        let (_, moved) = change_set_on(&repo.0, "main").unwrap();
         assert_eq!(
             moved,
             vec![
@@ -412,7 +437,7 @@ mod tests {
         gitlink(&"2".repeat(40));
         repo.git(&["commit", "-qm", "bump"]);
         assert_eq!(
-            change_set(&repo.0),
+            change_set_on(&repo.0, "main"),
             Ok((base, vec!["agent-utils".to_string()]))
         );
     }
@@ -437,7 +462,7 @@ mod tests {
         clone.git(&["switch", "-q", "-c", "topic"]);
         clone.git(&["branch", "-q", "-D", "main"]);
         clone.git(&["update-ref", "-d", "refs/remotes/origin/main"]);
-        let shallow = change_set(&clone.0).unwrap_err();
+        let shallow = change_set_on(&clone.0, "main").unwrap_err();
         assert!(shallow.contains("this clone is shallow"), "{shallow}");
     }
 

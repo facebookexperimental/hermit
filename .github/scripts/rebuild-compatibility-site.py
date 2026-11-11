@@ -558,7 +558,11 @@ def upload_asset(release, pin, path, sha, size):
 # f1e2a1b1, 2026-10-12), while the 10-11 releases, whose target commits had
 # main's workflows, were made. The builder's Hermit commit is named in the
 # release notes instead, and stays in the registry entry.
-RELEASE_TARGET = "main"
+#
+# So the create names no --target at all: GitHub then makes the tag from the
+# repository's default branch (the release API's target_commitish default),
+# whatever that branch is called, rather than from a branch name written here
+# that would go stale when the default branch is renamed.
 
 
 def publish_release(pin, archive, registry, ledger_commit, hermit_commit):
@@ -580,8 +584,6 @@ def publish_release(pin, archive, registry, ledger_commit, hermit_commit):
                 tag,
                 "--repo",
                 REPOSITORY,
-                "--target",
-                RELEASE_TARGET,
                 "--latest=false",
                 "--title",
                 pin["release_title"],

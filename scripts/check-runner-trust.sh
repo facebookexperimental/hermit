@@ -19,22 +19,29 @@
 #   * Merge commits are commits: their author is checked like any other.
 #     There is no merge exemption.
 #   * If the commit range cannot be established, refuse. An empty range
-#     (HEAD is the base tip, e.g. a schedule run on main) passes.
+#     (HEAD is the base tip, e.g. a schedule run on the landing branch)
+#     passes.
 #
 # Base-range rule:
-#   * --base <rev> / $RUNNER_TRUST_BASE if given, else origin/main, else
-#     main. The range is merge-base(base, HEAD)..HEAD, so a dispatched
-#     feature branch is judged on exactly the commits it adds on top of
-#     main, and a workflow_dispatch on main itself yields an empty range.
-#   * If origin/main is absent the script tries `git fetch origin main`
-#     once; if the base still cannot be resolved, or merge-base fails,
-#     it refuses rather than guessing.
+#   * --base <rev> / $RUNNER_TRUST_BASE if given, else origin/<landing>,
+#     else <landing>, where <landing> is Hermit's landing branch
+#     (HERMIT_LANDING_BRANCH, ci/landing-branches.env; main today). The
+#     range is merge-base(base, HEAD)..HEAD, so a dispatched feature branch
+#     is judged on exactly the commits it adds on top of the landing branch,
+#     and a workflow_dispatch on the landing branch itself yields an empty
+#     range.
+#   * If origin/<landing> is absent the script tries `git fetch origin
+#     <landing>` once; if the setting cannot be read, the base still cannot
+#     be resolved, or merge-base fails, it refuses rather than guessing.
 #
 # Usage:
 #   scripts/check-runner-trust.sh [--actor NAME] [--base REV] [--head REV]
 #   scripts/check-runner-trust.sh --self-test
 # Actor defaults to $GITHUB_ACTOR. Exit 0 = trusted, 1 = refused.
 set -euo pipefail
+
+# shellcheck source=scripts/lib/landing_branch.sh
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/lib/landing_branch.sh"
 
 ALLOWED_ACTORS=("hermit-bot3" "rrnewton")
 # Author identities are matched by email, not display name: names are
@@ -76,7 +83,7 @@ check_actor() {
 }
 
 check_authors() {
-  local head base merge_base line author committer sha
+  local head base merge_base line author committer sha landing
   head="$(git rev-parse --verify "${head_arg}^{commit}" 2>/dev/null)" || {
     echo "::error::runner-trust: cannot resolve HEAD rev '$head_arg'; refusing" >&2; return 1; }
   base=""
@@ -84,15 +91,17 @@ check_authors() {
     base="$(git rev-parse --verify "${base_arg}^{commit}" 2>/dev/null)" || {
       echo "::error::runner-trust: cannot resolve --base '$base_arg'; refusing" >&2; return 1; }
   else
-    if ! git rev-parse --verify --quiet "origin/main^{commit}" >/dev/null; then
-      git fetch --no-tags origin main >/dev/null 2>&1 || true
+    landing="$(landing_branch HERMIT_LANDING_BRANCH)" || {
+      echo "::error::runner-trust: cannot read Hermit's landing branch setting; refusing" >&2; return 1; }
+    if ! git rev-parse --verify --quiet "origin/${landing}^{commit}" >/dev/null; then
+      git fetch --no-tags origin "$landing" >/dev/null 2>&1 || true
     fi
-    for cand in origin/main main; do
+    for cand in "origin/$landing" "$landing"; do
       if git rev-parse --verify --quiet "${cand}^{commit}" >/dev/null; then
         base="$(git rev-parse "${cand}^{commit}")"; echo "runner-trust: base is $cand ($base)"; break
       fi
     done
-    [ -n "$base" ] || { echo "::error::runner-trust: cannot establish base (no origin/main or main); refusing" >&2; return 1; }
+    [ -n "$base" ] || { echo "::error::runner-trust: cannot establish base (no origin/$landing or $landing); refusing" >&2; return 1; }
   fi
   merge_base="$(git merge-base "$base" "$head")" || {
     echo "::error::runner-trust: no merge-base between base $base and HEAD $head; refusing" >&2; return 1; }

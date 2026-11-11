@@ -2006,17 +2006,21 @@ impl FreshCheckout {
         // 06:48Z and every part cloned after it was refused for measuring
         // 1e5ebe34, a commit already on main. The measured commit is the
         // only base this run has, so the check compares the pin with
-        // itself and its other clauses still run.
+        // itself and its other clauses still run. "main" here is Hermit's
+        // landing branch as the measured commit records it (the same
+        // setting the pin check reads there), `main` today.
+        let landing = hermit_manifest_plan::landing_branch::hermit(&self.path)
+            .map_err(|e| format!("fresh pressure-test checkout names no landing branch: {e}"))?;
         command_ok(
             fresh_checkout_git()
                 .args([
                     "-C",
                     &self.path.to_string_lossy(),
                     "update-ref",
-                    "refs/remotes/origin/main",
+                    &format!("refs/remotes/origin/{landing}"),
                 ])
                 .arg(&self.sha),
-            "point the fresh checkout's origin/main at the measured commit",
+            "point the fresh checkout's origin/<landing branch> at the measured commit",
         )?;
         command_ok(
             fresh_checkout_git().args([
@@ -17427,20 +17431,25 @@ fn inherited_location_fresh_checkout_self_test(source: &Path, sha: &str) -> Resu
 
 /// A generated checkout's origin/main names the measured commit even when the
 /// source has moved past it, so the Reverie pin check cannot refuse a commit
-/// already on main as a regression. The inherited-location self-test has
-/// already advanced SOURCE past SHA.
+/// already on main as a regression. "main" is the checkout's Hermit landing
+/// branch (`ci/landing-branches.env`, which the fixture commits). The
+/// inherited-location self-test has already advanced SOURCE past SHA.
 fn fresh_checkout_base_self_test(source: &Path, sha: &str) -> Result<(), String> {
     let advanced = git_output(source, &["rev-parse", "HEAD"])?;
     if advanced == sha {
         return Err("base self-test needs a source that has moved past the prepared commit".into());
     }
     let fresh = FreshCheckout::prepare(source, sha)?;
-    let base = git_output(&fresh.path, &["rev-parse", "refs/remotes/origin/main"]);
+    let base = hermit_manifest_plan::landing_branch::hermit(&fresh.path).and_then(|landing| {
+        let base_ref = format!("refs/remotes/origin/{landing}");
+        let base = git_output(&fresh.path, &["rev-parse", &base_ref])?;
+        Ok((base_ref, base))
+    });
     fresh.cleanup()?;
-    let base = base?;
+    let (base_ref, base) = base?;
     if base != sha {
         return Err(format!(
-            "generated checkout's origin/main is {base}, not the measured commit {sha}"
+            "generated checkout's {base_ref} is {base}, not the measured commit {sha}"
         ));
     }
     Ok(())
@@ -20689,6 +20698,13 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
     fs::write(clone_source.join("tracked"), "usable\n")
         .map_err(|e| format!("cannot write no-hardlinks clone fixture: {e}"))?;
+    // A generated checkout points origin/<landing branch> at the measured
+    // commit, so the fixture names its landing branch.
+    fs::write(
+        clone_source.join("ci/landing-branches.env"),
+        "HERMIT_LANDING_BRANCH=main\n",
+    )
+    .map_err(|e| format!("cannot write generated-checkout fixture landing branch: {e}"))?;
     command_ok(
         Command::new("git")
             .args([
@@ -20696,6 +20712,7 @@ fn self_test(root: &Path) -> Result<(), String> {
                 ".gitignore",
                 "tracked",
                 "ci/compat-envelope/pressure-test.rs",
+                "ci/landing-branches.env",
                 "agent-utils/rs/dagrun/Cargo.toml",
             ])
             .current_dir(&clone_source),

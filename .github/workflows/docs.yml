@@ -53,8 +53,14 @@ jobs:
     # Source delivery is safe before private-source access is installed. A
     # skipped scheduled job is inactive, not a successful ledger rebuild.
     # Manual Docs remains available; an explicit rebuild still checks access.
+    # The canonical branch is the repository's default branch, whatever it is
+    # called. A schedule always runs on the default branch, so a scheduled run
+    # counts as canonical by its event name, without relying on the schedule
+    # payload to name the repository's default branch.
     if: >-
-      github.repository == 'rrnewton/hermit' && github.ref == 'refs/heads/main' &&
+      github.repository == 'rrnewton/hermit' &&
+      (github.event_name == 'schedule' ||
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) &&
       (github.event_name != 'schedule' || vars.COMPATIBILITY_NIGHTLY_ENABLED == 'true')
     # A ledger rebuild runs on the self-hosted `gate` runner; every other Docs
     # run stays on ubuntu-latest. The
@@ -548,7 +554,7 @@ jobs:
       # Release assets are checksum-bound handoffs from separately reviewed
       # real-ledger builds. Reconstruct every retained content-addressed path and
       # independently validate every byte and mode before publishing it.
-      if: github.ref == 'refs/heads/main'
+      if: github.event_name == 'schedule' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
       env:
         GH_TOKEN: ${{ github.token }}
         NIGHTLY_REGISTRY_ASSET: ${{ steps.website-rebuild.outputs.registry_asset || inputs.compatibility_registry_asset }}
@@ -669,9 +675,9 @@ jobs:
           finalize "$pins" target/doc/compatibility "$releases" \
           .github/compatibility-site-builder.json
     - name: Deploy to GitHub Pages
-      # Only publish from the canonical branch, not from manual dispatch on a
-      # feature branch.
-      if: github.ref == 'refs/heads/main'
+      # Only publish from the canonical branch (the repository's default
+      # branch), not from manual dispatch on a feature branch.
+      if: github.event_name == 'schedule' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
       uses: peaceiris/actions-gh-pages@v4
       with:
         github_token: ${{ secrets.GITHUB_TOKEN }}

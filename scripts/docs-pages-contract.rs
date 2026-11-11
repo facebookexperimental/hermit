@@ -356,11 +356,13 @@ fn validate_contract(workflow: &str, landing: &str) -> Result<(), Vec<String>> {
         Ok(step) => step,
         Err(error) => return Err(vec![error]),
     };
+    // The canonical branch is the repository's default branch, whatever it
+    // is called; a scheduled run is on it by definition.
     require_once(
         &mut errors,
         "publication step",
         &step,
-        "if: github.ref == 'refs/heads/main'",
+        "if: github.event_name == 'schedule' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)",
     );
     let shell = match literal_block(&step, "run") {
         Ok(shell) => shell,
