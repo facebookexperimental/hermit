@@ -48,10 +48,13 @@ mod rust_script_prelude;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitCode;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 /// The pin, relative to the repository root.
 const PIN_FILE: &str = "ci/rustfmt-toolchain.toml";
@@ -266,7 +269,13 @@ fn check_identity(found: &str, pin: &Pin, formatter: &Formatter) -> Result<(), S
 fn self_test(formatter: &Resolved, root: &Path) -> Result<(), String> {
     const BAD: &str = "use std::{fs, path::Path};\n\nfn main() {\n    let _ = fs::metadata(Path::new(\".\"));\n}\n";
     const GOOD: &str = "use std::fs;\nuse std::path::Path;\n\nfn main() {\n    let _ = fs::metadata(Path::new(\".\"));\n}\n";
-    let scratch = env::temp_dir().join(format!("cargo-fmt-pinned-{}", std::process::id()));
+    // One directory per call: the unit tests run self-tests concurrently.
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    let scratch = env::temp_dir().join(format!(
+        "cargo-fmt-pinned-{}-{}",
+        std::process::id(),
+        CALLS.fetch_add(1, Ordering::Relaxed)
+    ));
     fs::create_dir_all(&scratch).map_err(|error| format!("{}: {error}", scratch.display()))?;
     let result = (|| {
         for (name, text, expected) in [("bad", BAD, 1), ("good", GOOD, 0)] {
@@ -285,16 +294,26 @@ fn self_test(formatter: &Resolved, root: &Path) -> Result<(), String> {
                 .map(OsString::from)
                 .collect();
             args.push(root.join("rustfmt.toml").into_os_string());
-            let code = cargo_fmt_in(formatter, &args, &dir)
+            let status = cargo_fmt_in(formatter, &args, &dir)
                 .output()
                 .map_err(|error| format!("cannot run {}: {error}", formatter.cargo_fmt.display()))?
-                .status
-                .code()
-                .unwrap_or(1);
-            if code != expected {
-                return Err(format!(
-                    "self-test: cargo fmt --all -- --check on the {name} fixture exited {code}, expected {expected}"
-                ));
+                .status;
+            // Only the exact exit code counts: a fixture run killed by a
+            // signal proves nothing about the formatter, so it fails the
+            // self-test rather than passing as the bad fixture's rejection.
+            match (status.code(), status.signal()) {
+                (Some(code), _) if code == expected => {}
+                (Some(code), _) => {
+                    return Err(format!(
+                        "self-test: cargo fmt --all -- --check on the {name} fixture exited {code}, expected {expected}"
+                    ));
+                }
+                (None, signal) => {
+                    return Err(format!(
+                        "self-test: cargo fmt --all -- --check on the {name} fixture was killed by signal {}, expected exit {expected}",
+                        signal.map_or_else(|| "(unknown)".to_string(), |signal| signal.to_string())
+                    ));
+                }
             }
         }
         Ok(())
@@ -758,5 +777,29 @@ mod tests {
         );
         final_path_with("b", &[("CARGO_HOME", &home)], Some(&home.join("bin")));
         fs::remove_dir_all(home).unwrap();
+    }
+
+    /// A fixture run killed by a signal is a failed self-test, never the bad
+    /// fixture's expected rejection: here cargo-fmt kills itself with SIGTERM
+    /// on the brace-import package only, and the formatter otherwise behaves
+    /// as the pinned one does.
+    #[test]
+    fn a_self_test_fixture_killed_by_a_signal_fails_the_self_test() {
+        let root = test_root();
+        let toolchain = fake_toolchain("signalled", "x", STRICT);
+        executable(
+            &toolchain.join("bin/cargo-fmt"),
+            &format!(
+                "#!/bin/sh\nif grep -q 'use std::{{' src/main.rs; then kill -TERM $$; fi\n{}",
+                FAKE_CARGO_FMT.trim_start_matches("#!/bin/sh\n")
+            ),
+        );
+        let resolved = Formatter::Toolchain(toolchain.clone()).resolve().unwrap();
+        let error = self_test(&resolved, &root).unwrap_err();
+        assert!(
+            error.contains("bad fixture was killed by signal 15"),
+            "{error}"
+        );
+        fs::remove_dir_all(toolchain).unwrap();
     }
 }
