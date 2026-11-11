@@ -80,6 +80,24 @@ thread_local! {
         const { RefCell::new(ManuallyDrop::new(BTreeMap::new())) };
 }
 
+/// Remove `key` from the OWNERS map in `owners`, dropping the map itself
+/// when it becomes empty. Taking an empty map is safe because it drops no
+/// entries: it only frees the map's own first BTreeMap node (a bounded
+/// 192 bytes), which the `ManuallyDrop` above would otherwise retain for
+/// the life of the thread and LeakSanitizer would report at exit. A
+/// non-empty map — in particular one holding a quarantined entry, which
+/// must never be dropped or polled again — is never taken. Returns
+/// whether the entry was present.
+fn remove_owner<K: Ord, V>(owners: &mut ManuallyDrop<BTreeMap<K, V>>, key: &K) -> bool {
+    let removed = owners.remove(key).is_some();
+    if owners.is_empty() {
+        drop(std::mem::ManuallyDrop::into_inner(std::mem::take(
+            &mut *owners,
+        )));
+    }
+    removed
+}
+
 /// The phase whose original owner remains retained.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum HermitCleanupStage {
@@ -823,7 +841,7 @@ fn drive<T: 'static>(entry: Rc<Entry>, recovery: bool) -> Result<T, Error> {
     match polled {
         Ok(Some(result)) => {
             OWNERS.with(|owners| {
-                owners.borrow_mut().remove(&entry.key);
+                remove_owner(&mut owners.borrow_mut(), &entry.key);
             });
             if entry.quarantined.replace(false) {
                 let mut unresolved = UNRESOLVED

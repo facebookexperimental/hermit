@@ -1036,3 +1036,152 @@ fn a_deadlock_whose_teardown_failed_stays_hermits_failure() {
         );
     }
 }
+
+/// Child half of the LeakSanitizer canary below: with
+/// `HERMIT_LSAN_CANARY_CHILD` set it leaks one distinctive allocation and
+/// returns, so the sanitizer reports that leak at process exit. Without
+/// the variable it does nothing, so ordinary runs of this binary do not
+/// leak.
+#[test]
+fn lsan_canary_leak_child() {
+    if std::env::var_os("HERMIT_LSAN_CANARY_CHILD").is_some() {
+        let leaked = std::hint::black_box(vec![0u8; 424_242]);
+        std::mem::forget(leaked);
+    }
+}
+
+/// Whether this process links the AddressSanitizer runtime, asked of the
+/// dynamic symbol table rather than by scanning this binary's bytes.
+fn asan_runtime_present() -> bool {
+    let mut symbol = b"__asan".to_vec();
+    symbol.extend_from_slice(b"_init\0");
+    let found = unsafe { libc::dlsym(libc::RTLD_DEFAULT, symbol.as_ptr().cast::<libc::c_char>()) };
+    !found.is_null()
+}
+
+/// `remove_owner` frees the OWNERS map only once it is empty, so a map
+/// holding a live or quarantined entry is never taken: the entry stays
+/// in the map and the map keeps its allocation.
+#[test]
+fn remove_owner_never_takes_a_non_empty_map() {
+    let mut owners = std::mem::ManuallyDrop::new(std::collections::BTreeMap::new());
+    owners.insert(1u64, 10u64);
+    owners.insert(2u64, 20u64);
+
+    assert!(remove_owner(&mut owners, &1));
+    assert_eq!(owners.len(), 1);
+    assert_eq!(owners.get(&2), Some(&20), "the live entry must stay put");
+
+    assert!(
+        !remove_owner(&mut owners, &99),
+        "a missing key removes nothing"
+    );
+    assert_eq!(owners.len(), 1);
+}
+
+/// Once the last entry is removed, `remove_owner` leaves an empty map
+/// that can still be used. Whether its allocation was freed is not
+/// observable here; `remove_owner_frees_the_retained_map_node` observes
+/// that at process exit.
+#[test]
+fn remove_owner_leaves_an_empty_reusable_map() {
+    let mut owners = std::mem::ManuallyDrop::new(std::collections::BTreeMap::new());
+    owners.insert(1u64, 10u64);
+
+    assert!(remove_owner(&mut owners, &1));
+    assert!(owners.is_empty());
+    owners.insert(3u64, 30u64);
+    assert_eq!(owners.get(&3), Some(&30));
+}
+
+/// Child half of the process-exit free check below: leave a map in a
+/// `ManuallyDrop` after `remove_owner` empties it. If the take is ever
+/// lost, the retained BTreeMap node is still allocated when this process
+/// exits and LeakSanitizer reports it.
+#[test]
+fn remove_owner_map_child() {
+    if std::env::var_os("HERMIT_REMOVE_OWNER_CHILD").is_none() {
+        return;
+    }
+    let mut owners = std::mem::ManuallyDrop::new(std::collections::BTreeMap::new());
+    owners.insert(1u64, 10u64);
+    assert!(remove_owner(&mut owners, &1));
+    std::hint::black_box(&owners);
+}
+
+/// Process-level counterpart to the replacement check above: in an
+/// AddressSanitizer build, run the child with leak detection on and
+/// require a clean exit. A build without the runtime has no free to
+/// observe at exit, so it returns without asserting.
+#[test]
+fn remove_owner_frees_the_retained_map_node() {
+    if !asan_runtime_present() {
+        return;
+    }
+    let exe = std::env::current_exe().expect("test binary path");
+    let output = Command::new(&exe)
+        .args([
+            "--exact",
+            "ptrace_completion::tests::remove_owner_map_child",
+            "--nocapture",
+        ])
+        .env("HERMIT_REMOVE_OWNER_CHILD", "1")
+        // This crate's fbcode unit tests run with detect_leaks=0; this
+        // child turns detection back on for itself.
+        .env("LSAN_OPTIONS", "detect_leaks=1")
+        .output()
+        .expect("failed to run the remove_owner child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("1 passed"),
+        "the remove-owner child must have run: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the emptied OWNERS map must be freed before exit: {stderr}"
+    );
+    assert!(
+        !stderr.contains("detected memory leaks"),
+        "LeakSanitizer must not report the emptied OWNERS map: {stderr}"
+    );
+}
+
+/// The OWNERS fix frees its map node rather than suppressing the leak
+/// report, so LeakSanitizer must keep reporting every other leak. This
+/// canary proves leak detection itself is still active: a deliberate
+/// leak anywhere else is still reported and still fails the process. In
+/// a build without AddressSanitizer there is no leak detection to prove,
+/// so it returns without asserting.
+#[test]
+fn lsan_still_reports_a_deliberate_leak_outside_owners() {
+    let exe = std::env::current_exe().expect("test binary path");
+    if !asan_runtime_present() {
+        return;
+    }
+    let output = Command::new(&exe)
+        .args([
+            "--exact",
+            "ptrace_completion::tests::lsan_canary_leak_child",
+            "--nocapture",
+        ])
+        .env("HERMIT_LSAN_CANARY_CHILD", "1")
+        // This crate's fbcode unit tests run with detect_leaks=0; the
+        // canary child turns detection back on for itself.
+        .env("LSAN_OPTIONS", "detect_leaks=1")
+        .output()
+        .expect("failed to run the LSAN canary child");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "the deliberate canary leak must fail the child: {stderr}"
+    );
+    assert!(
+        stderr.contains("detected memory leaks"),
+        "LeakSanitizer must report the canary leak: {stderr}"
+    );
+    assert!(
+        stderr.contains("424242 byte(s) leaked"),
+        "the report must name the canary allocation, not the OWNERS node: {stderr}"
+    );
+}
