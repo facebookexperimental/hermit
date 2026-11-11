@@ -721,11 +721,10 @@ fn preparation_profile<'a>(
         return Err(format!("{tag} has duplicate prepared commands"));
     }
     let profile = rest.split_whitespace().next().unwrap_or("");
-    for cohort in [crate::nextest_binaries::NATIVE_EXEC_COHORT] {
-        if let Ok(expected) = crate::nextest_binaries::cohort_prepare_command(profile, cohort) {
-            if expected.strip_prefix(marker) == Some(rest) {
-                return Ok(Some((profile, cohort)));
-            }
+    let cohort = crate::nextest_binaries::NATIVE_EXEC_COHORT;
+    if let Ok(expected) = crate::nextest_binaries::cohort_prepare_command(profile, cohort) {
+        if expected.strip_prefix(marker) == Some(rest) {
+            return Ok(Some((profile, cohort)));
         }
     }
     // The full producer appends `--build-mode "${HERMIT_VALIDATE_BUILD_MODE:-cargo}"`

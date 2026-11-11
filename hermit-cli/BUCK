@@ -14,10 +14,10 @@ load(":release_alias.bzl", "hermit_release_aliases")
 oncall("hermit")
 
 hermit_build_env = {
-    "CARGO_PKG_VERSION": "0.5.5",
+    "CARGO_PKG_VERSION": "0.5.6",
     "HERMIT_BUILD_DATE": "unknown",
     "HERMIT_BUILD_GIT_SHA": "unknown",
-    "HERMIT_REVERIE_PIN": "131093f62a50f50c3428fc58c1897e770d864049",
+    "HERMIT_REVERIE_PIN": "f2129d99a44d809a5bb56df130cade723d7e6ebd",
 }
 
 # The shadow release entrypoint supplies these values from Git/Cargo metadata
@@ -67,7 +67,7 @@ rust_library(
         "cargo_toml_config": {
             "package": {
                 "name": "hermit-run",
-                "version": "0.5.5",
+                "version": "0.5.6",
                 "readme": "README.md",
                 "homepage": "https://hermetic-infra.org",
                 "documentation": "https://docs.rs/hermit-run",
@@ -204,7 +204,7 @@ rust_binary(
         "cargo_toml_config": {
             "package": {
                 "name": "hermit-run",
-                "version": "0.5.5",
+                "version": "0.5.6",
                 "readme": "README.md",
                 "homepage": "https://hermetic-infra.org",
                 "documentation": "https://docs.rs/hermit-run",

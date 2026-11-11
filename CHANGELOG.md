@@ -1,8 +1,94 @@
 # Hermit
 
-Notable changes for users. Versions 0.5.0, 0.5.2 and 0.5.5 describe crate
-releases; 0.5.1 and 0.5.3 describe selected development snapshots, and 0.5.4
+Notable changes for users. Versions 0.5.0, 0.5.2, 0.5.5 and 0.5.6 describe
+crate releases; 0.5.1 and 0.5.3 describe selected development snapshots, and 0.5.4
 is a package-version alignment. The 0.5.2 release branches from 0.5.0.
+
+## 0.5.6
+
+Release for the 2026-11-10 fbsource import. It pins Reverie 0.5.6
+(`f2129d99`) and summarizes the changes since 0.5.5.
+
+- No NUMA: Detcore presents a kernel built without NUMA on every backend.
+  The deterministic virtual machine has one memory node.
+  - The six memory-policy system calls (`set_mempolicy`, `get_mempolicy`,
+    `mbind`, `migrate_pages`, `move_pages` and `set_mempolicy_home_node`)
+    fail with `ENOSYS`.
+  - These do not exist: `/proc/<pid>/numa_maps`, `/sys/devices/system/node`,
+    `/sys/bus/node`, memory tiering's sysfs directories, and the NUMA and
+    memory-policy tunables under `/sys/kernel/mm`.
+  - A device on the pci, platform, cxl, dax, nd or vmbus bus has no
+    `numa_node`, whatever path reaches it.
+  - `/proc/vmstat` and `/proc/zoneinfo` leave out the NUMA counters.
+  - `/proc/<pid>/sched` leaves out NUMA balancing's lines.
+  - `Mems_allowed` prints as `1`.
+- sysfs paths: Detcore walks each looked-up path as Linux does, and decides
+  every pathname call by the object the walk reaches. A symbolic link or a
+  `..` no longer reaches an object the machine does not have.
+- sysfs seeks: a seek on a rendered sysfs attribute measures the end from the
+  attribute's size, as Linux does. A seek past the largest file offset fails
+  with `EINVAL`.
+- LiteInst: on in-guest LiteInst, a `pause()` or `nanosleep()` wakes only for
+  a signal the guest catches and has not blocked, as on Linux. Before, an
+  ignored `SIGCHLD`, or a timer signal that the guest ignored or blocked,
+  ended the sleep with `EINTR`, and no handler ran.
+- Signals: suppose a `SIGALRM` comes due while a single-threaded process with
+  a handler waits in a pipe read. Detcore now delivers it deterministically:
+  - if no data has arrived, the read returns `EINTR`;
+  - otherwise the read completes, and then the handler runs.
+  Record and replay cover it. Before, the run recorded a determinism loss.
+  This covers `SIGALRM` and pipe reads only.
+- Signals: Detcore picks the thread that takes a kernel-sent process signal,
+  such as a child's exit `SIGCHLD` or a timer's signal, by the mask each
+  thread has in force, as Linux's `complete_signal` does. The temporary mask
+  of a `ppoll`, `pselect6` or `sigsuspend` call counts as the thread's mask.
+  - KVM: Detcore now makes this choice, as it already did on ptrace. Before,
+    the backend chose the thread, or none. Detcore also reads each sleeper's
+    signal mask and dispositions on KVM, so by default a queued plain sleep
+    registers at the first scheduler pass, as on ptrace
+    (`--sleep-registration`).
+  - ptrace: a signal that Linux discards when it is sent, because the guest
+    ignores it and has not blocked it, no longer reaches a handler the guest
+    installs later. Under ptrace the kernel queues such a signal anyway.
+  - `--debug-futex-mode=polling`: a futex wait that a caught `SIGCHLD`
+    reaches ends with `EINTR` when the child exits, as in the default precise
+    mode and on Linux. Before, Hermit held the signal until the wait returned.
+  - Known gaps on KVM: a POSIX timer whose signal is not `SIGALRM` still
+    reaches no thread (https://github.com/rrnewton/hermit/issues/4995), and
+    one case with a busy worker thread differs from Linux
+    (https://github.com/rrnewton/reverie/issues/1300).
+- Chaos: `--chaos-timed-wait-spread=FACTOR` wakes each sleep, and each futex
+  wait with a timeout, after a seeded fraction of the other threads'
+  progress, drawn log-uniform between 1/FACTOR and FACTOR. A race decided by
+  a sleep against concurrent work can then change order between seeds. The
+  waiter never observes less than the time it asked for, and a fixed seed
+  reproduces the run; recorded schedules store the value and the seed. It
+  needs `--chaos` and the ptrace backend. Poll, epoll and select timeouts and
+  signal timers are not spread.
+- Pinned CPUs: a run pinned to one CPU now says so before the guest starts
+  when that CPU is shared with another Hermit run, cannot be reserved, or is
+  reserved only within its network namespace, with a `hermit: warning:
+  cpu-shared:`, `cpu-unreserved:` or `cpu-netns-only:` notice.
+  `hermit run --pinned-cpu=refuse` or `--pinned-cpu=wait[:SECONDS]` refuses
+  or waits instead of sharing (`share` is the default). A reservation also
+  locks a file under `/dev/shm/hermit-pinned-cpu`, so runs in different
+  network namespaces that share that directory see each other's
+  reservations. `hermit run`, `hermit replay` and `hermit record start` take
+  `--pinned-cpu-dir` and `--pinned-cpu-notice=on|off`.
+- LiteInst: the in-guest runtime no longer allocates on the guest's heap
+  before `main`. Its dispatch-stack list had registered a glibc thread-exit
+  destructor at the first dispatch.
+- Build: Detcore and the hermit-run library compile for aarch64 Linux. This is
+  compile support only; x86_64 behaviour is unchanged.
+- Align every first-party package and internal requirement at 0.5.6, and pin
+  Reverie 0.5.6.
+
+Incompatible changes:
+
+- Recordings: the record format moves from `0x19e` to `0x1a0` and must match
+  exactly, so 0.5.5 recordings are refused.
+- A guest's memory-policy system calls fail with `ENOSYS`. 0.5.5 emulated one
+  node for `get_mempolicy` and `move_pages`.
 
 ## 0.5.5
 

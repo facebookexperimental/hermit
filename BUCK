@@ -57,7 +57,7 @@ rust_library(
         "cargo_toml_config": {
             "package": {
                 "name": "hermit-inguest-engine",
-                "version": "0.5.5",
+                "version": "0.5.6",
                 "build": "build.rs",
                 "publish": False,
             },
