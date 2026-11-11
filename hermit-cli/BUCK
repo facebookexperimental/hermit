@@ -80,13 +80,13 @@ LIBHERMIT_TEST_DEPS = [
 LIBHERMIT_ENV = {
     # src/bin/hermit/version.rs reports it in `hermit --version`. Keep in sync
     # with the version in Cargo.toml.
-    "CARGO_PKG_VERSION": "0.5.6",
+    "CARGO_PKG_VERSION": "0.5.7",
     # The open-source Buck build's version string names these (an fbcode
     # build reports BuildInfo instead); a regular build embeds no date or
     # revision.
     "HERMIT_BUILD_DATE": "unknown",
     "HERMIT_BUILD_GIT_SHA": "unknown",
-    "HERMIT_REVERIE_PIN": "820b48394596cac8f9a496c61d681aa83650b1eb",
+    "HERMIT_REVERIE_PIN": "8143cbd865fa33b1c1a88b94e73b41556cd6f101",
 }
 
 # The unit tests' run-time environment.

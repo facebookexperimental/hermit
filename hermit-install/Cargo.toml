@@ -1,6 +1,6 @@
 [package]
 name = "hermit-install"
-version = "0.5.6"
+version = "0.5.7"
 edition = "2024"
 license = "BSD-3-Clause"
 repository = "https://github.com/facebookexperimental/hermit"
@@ -14,6 +14,6 @@ path = "src/lib.rs"
 default = []
 
 [dependencies]
-reverie-liteinst-artifact = { version = "0.5.6", git = "https://github.com/rrnewton/reverie.git", rev = "820b48394596cac8f9a496c61d681aa83650b1eb", default-features = false }
+reverie-liteinst-artifact = { version = "0.5.7", git = "https://github.com/rrnewton/reverie.git", rev = "8143cbd865fa33b1c1a88b94e73b41556cd6f101", default-features = false }
 serde_json = "1"
 toml = "0.8"
