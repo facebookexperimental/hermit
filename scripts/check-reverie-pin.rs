@@ -145,6 +145,7 @@ impl LandingBranches {
     }
 }
 
+#[derive(Default)]
 struct Config {
     repo: Option<PathBuf>,
     #[cfg(test)]
@@ -173,23 +174,6 @@ struct Config {
     /// A caller with no such ref (a fresh clone, an isolated fixture) simply
     /// gets no floor asserted.
     base_ref: String,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            repo: None,
-            #[cfg(test)]
-            remote: None,
-            print_pin: false,
-            update_to_latest: false,
-            skip_verify_build: false,
-            offline: false,
-            staged_advisory: false,
-            no_base: false,
-            base_ref: String::new(),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -3920,7 +3904,7 @@ mod tests {
         let undeclared = run_with_config(Config {
             repo: Some(root.clone()),
             remote: Some(remote.to_string_lossy().into_owned()),
-            ..Config::default() // base_ref defaults to origin/main, which does not exist here
+            ..Config::default() // empty base_ref is origin/main in tests; absent here
         });
         assert!(
             undeclared.is_err(),
