@@ -18,10 +18,12 @@
 //! of its own, never on this thread's.
 //!
 //! clone3 needs Linux 5.3 and CLONE_INTO_CGROUP 5.7. Where clone3 is refused
-//! as a call (ENOSYS, E2BIG, EINVAL or EPERM, as on older kernels or under a
-//! seccomp filter), [`Started::Unusable`] tells the caller to start the
-//! program the old way, and the refusal is remembered for the rest of the
-//! process. A refusal that is about the cgroup itself is a failed join.
+//! as a call (ENOSYS, E2BIG or EINVAL, as on older kernels or under a seccomp
+//! filter, or EPERM from a filter, which a probe tells apart from a cgroup
+//! that refused the child), [`Started::Unusable`] tells the caller to start
+//! the program the old way, and the refusal is remembered for the rest of the
+//! process, with one line on stderr. A refusal that is about the cgroup itself
+//! is a failed join.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -68,12 +70,28 @@ pub(crate) enum Started {
 /// Whether clone3 has been refused as a call in this process.
 pub(crate) struct Clone3Support {
     unusable: OnceLock<String>,
-    /// For a test: answer every clone3 with this errno instead of calling it.
+    /// For a test: answer the first `inject_limit` clone3 calls with this
+    /// errno instead of making them.
     #[cfg(test)]
     pub(crate) inject: Option<i32>,
+    #[cfg(test)]
+    inject_limit: usize,
+    /// For a test: answer the EPERM probe with this errno instead of making
+    /// it.
+    #[cfg(test)]
+    inject_probe: Option<i32>,
+    /// For a test: the child kills itself before exec.
+    #[cfg(test)]
+    kill_child_before_exec: bool,
     /// For a test: how many times clone3 was called, or answered for.
     #[cfg(test)]
     pub(crate) attempts: std::sync::atomic::AtomicUsize,
+    /// For a test: how many EPERM probes were made, or answered for.
+    #[cfg(test)]
+    pub(crate) probes: std::sync::atomic::AtomicUsize,
+    /// For a test: how many refusal notices went to stderr.
+    #[cfg(test)]
+    pub(crate) notices: std::sync::atomic::AtomicUsize,
 }
 
 impl Clone3Support {
@@ -83,35 +101,90 @@ impl Clone3Support {
             #[cfg(test)]
             inject: None,
             #[cfg(test)]
+            inject_limit: 0,
+            #[cfg(test)]
+            inject_probe: None,
+            #[cfg(test)]
+            kill_child_before_exec: false,
+            #[cfg(test)]
             attempts: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            probes: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            notices: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// For a test: a [`Clone3Support`] with these injections.
+    #[cfg(test)]
+    const fn injecting(
+        inject: Option<i32>,
+        inject_limit: usize,
+        inject_probe: Option<i32>,
+        kill_child_before_exec: bool,
+    ) -> Self {
+        Self {
+            unusable: OnceLock::new(),
+            inject,
+            inject_limit,
+            inject_probe,
+            kill_child_before_exec,
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+            probes: std::sync::atomic::AtomicUsize::new(0),
+            notices: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     /// For a test: a [`Clone3Support`] whose clone3 always fails with
-    /// `errno`, without being called.
+    /// `errno`, without being called, as under a filter that refuses every
+    /// clone3: the EPERM probe gets `errno` too.
     #[cfg(test)]
     pub(crate) const fn refusing(errno: i32) -> Self {
-        Self {
-            unusable: OnceLock::new(),
-            inject: Some(errno),
-            attempts: std::sync::atomic::AtomicUsize::new(0),
-        }
+        Self::injecting(Some(errno), usize::MAX, Some(errno), false)
+    }
+
+    /// For a test: a [`Clone3Support`] whose first clone3 fails with `errno`,
+    /// without being called, as a cgroup that refuses one child would make it
+    /// fail. The EPERM probe and every later clone3 are real.
+    #[cfg(test)]
+    pub(crate) const fn refusing_once(errno: i32) -> Self {
+        Self::injecting(Some(errno), 1, None, false)
+    }
+
+    /// For a test: [`Clone3Support::refusing_once`], with the EPERM probe
+    /// answered `probe` instead of made.
+    #[cfg(test)]
+    pub(crate) const fn refusing_once_with_probe(errno: i32, probe: i32) -> Self {
+        Self::injecting(Some(errno), 1, Some(probe), false)
+    }
+
+    /// For a test: a [`Clone3Support`] whose children kill themselves with
+    /// SIGKILL before they exec.
+    #[cfg(test)]
+    pub(crate) const fn killing_children_before_exec() -> Self {
+        Self::injecting(None, 0, None, true)
     }
 }
 
 /// This process's [`Clone3Support`].
 pub(crate) static CLONE3: Clone3Support = Clone3Support::new();
 
-/// What an errno from clone3 means.
+/// What an errno from clone3 means. The cgroup errnos are those of Linux
+/// v6.12's `cgroup_css_set_fork` (kernel/cgroup/cgroup.c) and what it calls;
+/// the others are clone3's own argument checks (kernel/fork.c).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Refusal {
     /// clone3, or one of its flags, is not available here: an older kernel
     /// (ENOSYS before 5.3; E2BIG or EINVAL for arguments or a flag it does not
-    /// know, before 5.7) or a seccomp filter (ENOSYS or EPERM).
+    /// know, before 5.7) or a seccomp filter (ENOSYS).
     Unusable,
+    /// Either a seccomp filter refused clone3 or the cgroup's write
+    /// permission check did (`inode_permission`, for an immutable file or a
+    /// security module); [`probe_refuses_clone3`] tells which.
+    FilterOrJoin,
     /// The cgroup refused the child: not a cgroup directory (EBADF), not
-    /// allowed (EACCES, ENOENT), removed (ENODEV), a cgroup that may not hold
-    /// processes (EBUSY, EOPNOTSUPP).
+    /// allowed (EACCES, ENOENT), on a read-only mount (EROFS), removed
+    /// (ENODEV), a cgroup that may not hold processes (EBUSY, EOPNOTSUPP).
     Join,
     /// Anything else, such as EAGAIN or ENOMEM: no child was created.
     Failed,
@@ -119,14 +192,52 @@ enum Refusal {
 
 fn refusal(errno: i32) -> Refusal {
     match errno {
-        libc::ENOSYS | libc::E2BIG | libc::EINVAL | libc::EPERM => Refusal::Unusable,
+        libc::ENOSYS | libc::E2BIG | libc::EINVAL => Refusal::Unusable,
+        libc::EPERM => Refusal::FilterOrJoin,
         libc::EBADF
         | libc::EACCES
         | libc::ENOENT
+        | libc::EROFS
         | libc::ENODEV
         | libc::EBUSY
         | libc::EOPNOTSUPP => Refusal::Join,
         _ => Refusal::Failed,
+    }
+}
+
+/// Whether clone3 itself is refused here, asked by a call that cannot create
+/// a child: clone3 with no arguments, which Linux refuses with EINVAL before
+/// it reads anything (`copy_clone_args_from_user`: a size below
+/// `CLONE_ARGS_SIZE_VER0`), unless a seccomp filter refuses the call first
+/// (EPERM or ENOSYS).
+fn probe_refuses_clone3(support: &Clone3Support) -> bool {
+    matches!(probe_clone3(support), libc::EPERM | libc::ENOSYS)
+}
+
+/// The errno of clone3 with no arguments: EINVAL where clone3 is allowed.
+fn probe_clone3(support: &Clone3Support) -> i32 {
+    #[cfg(test)]
+    {
+        support.probes.fetch_add(1, Ordering::Relaxed);
+        if let Some(errno) = support.inject_probe {
+            return errno;
+        }
+    }
+    #[cfg(not(test))]
+    let _ = support;
+    let result = unsafe { syscall6(libc::SYS_clone3, [0, 0, 0, 0, 0, 0]) };
+    -result as i32
+}
+
+/// Remembers that clone3 is unusable here for `reason`, and says so on
+/// stderr the first time: every later start in this process forks.
+fn remember_unusable(support: &Clone3Support, reason: &str) {
+    if support.unusable.set(reason.to_string()).is_ok() {
+        #[cfg(test)]
+        support.notices.fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "manifest-plan: {reason}; invocations in a cgroup start with fork() from now on (dh-7n47nt)"
+        );
     }
 }
 
@@ -137,7 +248,7 @@ pub(crate) fn start(support: &Clone3Support, program: &Program) -> Started {
             reason: reason.clone(),
         };
     }
-    let prepared = match Prepared::new(program) {
+    let prepared = match Prepared::new(support, program) {
         Ok(prepared) => prepared,
         Err(error) => return Started::Failed(error),
     };
@@ -155,20 +266,24 @@ pub(crate) fn start(support: &Clone3Support, program: &Program) -> Started {
     if result < 0 {
         let errno = (-result) as i32;
         let error = io::Error::from_raw_os_error(errno);
+        let unusable = |error: io::Error| {
+            let reason = format!("clone3 with CLONE_INTO_CGROUP was refused: {error}");
+            remember_unusable(support, &reason);
+            Started::Unusable { reason }
+        };
         return match refusal(errno) {
-            Refusal::Unusable => {
-                let reason = format!("clone3 with CLONE_INTO_CGROUP was refused: {error}");
-                let _ = support.unusable.set(reason.clone());
-                Started::Unusable { reason }
-            }
-            Refusal::Join => Started::JoinFailed(error),
+            Refusal::Unusable => unusable(error),
+            Refusal::FilterOrJoin if probe_refuses_clone3(support) => unusable(error),
+            Refusal::FilterOrJoin | Refusal::Join => Started::JoinFailed(error),
             Refusal::Failed => Started::Failed(error),
         };
     }
     let pid = result as u32;
     // CLONE_VFORK returned only after the child execed or exited, and the
     // kernel's completion of that wait orders the child's store before this
-    // load.
+    // load. A child killed by a signal before it execed stored nothing, so it
+    // reads as a started program that a signal killed, which its wait
+    // reports.
     let failure = prepared.state.failure.load(Ordering::Relaxed);
     if failure != 0 {
         // The child stored why it could not exec and exited; reap it.
@@ -206,9 +321,11 @@ fn clone_into_cgroup(
 ) -> i64 {
     #[cfg(test)]
     {
-        support.attempts.fetch_add(1, Ordering::Relaxed);
+        let attempt = support.attempts.fetch_add(1, Ordering::Relaxed);
         if let Some(errno) = support.inject {
-            return -i64::from(errno);
+            if attempt < support.inject_limit {
+                return -i64::from(errno);
+            }
         }
     }
     #[cfg(not(test))]
@@ -266,8 +383,9 @@ const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
 /// The child's stack: no more than raw system calls run on it. Its frames
 /// stay far under 1 KiB even unoptimized, and execve runs on the kernel's
 /// stack, so 64 KiB leaves more than 64 times what it needs. A guard page
-/// below it turns an overflow into the child's own SIGSEGV, which reads as a
-/// child that died before exec, never as a write into this process's memory.
+/// below it turns an overflow into the child's own SIGSEGV, never a write
+/// into this process's memory; [`start`] then reports a started program that
+/// SIGSEGV killed, as for any child a signal kills before it execs.
 const CHILD_STACK_BYTES: usize = 64 * 1024;
 
 struct ChildStack {
@@ -349,10 +467,15 @@ pub(crate) struct ChildState {
     stdio: [RawFd; 3],
     /// The errno that stopped the child, or 0 if it reached the program.
     failure: AtomicI32,
+    /// For a test: the child kills itself first.
+    #[cfg(test)]
+    kill_before_exec: bool,
 }
 
 impl Prepared {
-    fn new(program: &Program) -> io::Result<Self> {
+    fn new(support: &Clone3Support, program: &Program) -> io::Result<Self> {
+        #[cfg(not(test))]
+        let _ = support;
         let invalid = |what: &str| io::Error::new(io::ErrorKind::InvalidInput, what.to_string());
         let c_string =
             |bytes: Vec<u8>| CString::new(bytes).map_err(|_| invalid("a NUL byte in an argument"));
@@ -438,6 +561,8 @@ impl Prepared {
             cwd: cwd_pointer,
             stdio: program.stdio,
             failure: AtomicI32::new(0),
+            #[cfg(test)]
+            kill_before_exec: support.kill_child_before_exec,
         };
         pointers.push(candidate_list);
         pointers.push(argv);
@@ -479,14 +604,25 @@ unsafe extern "C" fn vfork_child(state: *const ChildState) -> ! {
         let state = &*state;
         let fail = |errno: isize| -> ! {
             state.failure.store(errno as i32, Ordering::Relaxed);
-            syscall6(libc::SYS_exit_group, [127, 0, 0, 0, 0, 0]);
-            loop {}
+            // exit_group does not return; the loop only gives the closure
+            // its `!` type.
+            loop {
+                syscall6(libc::SYS_exit_group, [127, 0, 0, 0, 0, 0]);
+            }
         };
         let check = |result: isize| {
             if result < 0 {
                 fail(-result);
             }
         };
+        #[cfg(test)]
+        if state.kill_before_exec {
+            let pid = syscall6(libc::SYS_getpid, [0; 6]);
+            syscall6(
+                libc::SYS_kill,
+                [pid as usize, libc::SIGKILL as usize, 0, 0, 0, 0],
+            );
+        }
         // The program leads a process group of its own.
         check(syscall6(libc::SYS_setpgid, [0, 0, 0, 0, 0, 0]));
         // Its stdin, stdout and stderr. The caller passes descriptors above 2,
@@ -508,7 +644,12 @@ unsafe extern "C" fn vfork_child(state: *const ChildState) -> ! {
         // before any is unblocked, so no handler of this process can run in
         // the child; SIGPIPE, which Rust programs ignore, too, as
         // `std::process::Command` resets it. exec would reset handled ones
-        // anyway; ignored ones stay ignored, as with Command.
+        // anyway; ignored ones stay ignored, as with Command. clone3's
+        // CLONE_CLEAR_SIGHAND would reset the handled ones but leaves SIG_IGN
+        // alone (`flush_signal_handlers(tsk, 0)`), so it would not reset
+        // SIGPIPE as Command does; hence this loop. The child has its own copy
+        // of the handlers (no CLONE_SIGHAND), so none of this touches this
+        // process's.
         let mut signal = 1;
         while signal < 65 {
             if signal != libc::SIGKILL as usize && signal != libc::SIGSTOP as usize {
@@ -668,7 +809,7 @@ mod arch {
                 "ud2",
                 "2:",
                 child = sym super::vfork_child,
-                inlateout("rax") libc::SYS_clone3 as i64 => result,
+                inlateout("rax") libc::SYS_clone3 => result,
                 inlateout("rdi") args => _,
                 in("rsi") core::mem::size_of::<CloneArgs>(),
                 in("r12") state,
@@ -774,13 +915,15 @@ mod tests {
 
     #[test]
     fn each_clone3_errno_maps_to_its_refusal() {
-        for errno in [libc::ENOSYS, libc::E2BIG, libc::EINVAL, libc::EPERM] {
+        for errno in [libc::ENOSYS, libc::E2BIG, libc::EINVAL] {
             assert_eq!(refusal(errno), Refusal::Unusable, "errno {errno}");
         }
+        assert_eq!(refusal(libc::EPERM), Refusal::FilterOrJoin);
         for errno in [
             libc::EBADF,
             libc::EACCES,
             libc::ENOENT,
+            libc::EROFS,
             libc::ENODEV,
             libc::EBUSY,
             libc::EOPNOTSUPP,
@@ -790,5 +933,16 @@ mod tests {
         for errno in [libc::EAGAIN, libc::ENOMEM] {
             assert_eq!(refusal(errno), Refusal::Failed, "errno {errno}");
         }
+    }
+
+    /// The EPERM probe makes a real clone3 call, which creates no child; on
+    /// this host, with no filter on clone3, it does not read as refused.
+    #[test]
+    fn the_eperm_probe_finds_clone3_allowed_here() {
+        let support = Clone3Support::new();
+        assert_eq!(probe_clone3(&support), libc::EINVAL);
+        assert!(!probe_refuses_clone3(&support));
+        assert!(probe_refuses_clone3(&Clone3Support::refusing(libc::EPERM)));
+        assert!(probe_refuses_clone3(&Clone3Support::refusing(libc::ENOSYS)));
     }
 }

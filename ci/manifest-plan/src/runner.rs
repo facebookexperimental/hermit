@@ -17960,6 +17960,33 @@ fi
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// This process's zombie children that were created by this thread and
+    /// never execed: a child that clone3 made keeps the creating thread's
+    /// name until it execs, and libtest names each test's thread after the
+    /// test. A failed start that did not reap its child leaves one here.
+    fn unreaped_children_of_this_thread() -> Vec<String> {
+        let me = std::process::id().to_string();
+        let comm = fs::read_to_string("/proc/thread-self/comm").unwrap();
+        let mut zombies = Vec::new();
+        for entry in fs::read_dir("/proc").unwrap().flatten() {
+            let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else {
+                continue;
+            };
+            let name = &stat[open + 1..close];
+            let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+            if fields.first() == Some(&"Z")
+                && fields.get(1) == Some(&me.as_str())
+                && name == comm.trim_end()
+            {
+                zombies.push(stat[..open].trim().to_string());
+            }
+        }
+        zombies
+    }
+
     /// Waits for and reaps `leader`, and returns how it ended.
     fn wait_for_leader(leader: &SpawnedLeader) -> ExitStatus {
         let mut status = 0;
@@ -18012,13 +18039,30 @@ fi
         args: &[&str],
         env: &[(&str, &str)],
     ) -> Option<Result<CgroupSpawned, String>> {
+        spawn_in_a_fresh_cgroup_in(clone3, test, root, root, program, args, env, &|_| {})
+    }
+
+    /// [`spawn_in_a_fresh_cgroup_with`], with `cwd` as the program's working
+    /// directory, and `prepare` given the cgroup's path before the spawn.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_in_a_fresh_cgroup_in(
+        clone3: &crate::vfork_spawn::Clone3Support,
+        test: &str,
+        root: &Path,
+        cwd: &Path,
+        program: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+        prepare: &dyn Fn(&Path),
+    ) -> Option<Result<CgroupSpawned, String>> {
         let mut cgroup = crate::invocation_cgroup::tests::real_cgroup_or_declared_absent(test)?;
+        prepare(cgroup.path());
         let request = ProcessRequest::new(
             InvocationRole::Execution {
                 attempt_index: "1".into(),
                 backend: RequiredNullable::Null,
             },
-            root,
+            cwd,
             program,
             &args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>(),
             &env.iter()
@@ -18070,12 +18114,16 @@ fi
     }
 
     /// Each kind of clone3 refusal takes its own path (dh-7n47nt):
-    /// - ENOSYS, E2BIG, EINVAL and EPERM mean clone3 cannot be used here (an
-    ///   older kernel or a seccomp filter). The program starts through
-    ///   `Command` with the pre_exec join, still in its invocation cgroup, and
-    ///   the refusal is remembered: the next spawn does not call clone3.
-    /// - EBADF, EACCES, ENOENT, ENODEV, EBUSY and EOPNOTSUPP are about the
-    ///   cgroup: a failed join, not remembered.
+    /// - ENOSYS, E2BIG and EINVAL mean clone3 cannot be used here (an older
+    ///   kernel or a seccomp filter), and so does EPERM when a probe without
+    ///   CLONE_INTO_CGROUP is refused too (a filter). The program starts
+    ///   through `Command` with the pre_exec join, still in its invocation
+    ///   cgroup, and the refusal is remembered, with one notice: the next
+    ///   spawn does not call clone3.
+    /// - EBADF, EACCES, ENOENT, EROFS, ENODEV, EBUSY and EOPNOTSUPP are about
+    ///   the cgroup: a failed join, not remembered; so is EPERM when the probe
+    ///   is not refused (see
+    ///   `an_eperm_from_the_cgroup_fails_that_spawn_and_the_next_uses_clone3`).
     /// - Anything else, such as EAGAIN or ENOMEM, means no child: a failed
     ///   spawn, not remembered.
     #[test]
@@ -18088,6 +18136,7 @@ fi
         };
         for errno in [libc::ENOSYS, libc::E2BIG, libc::EINVAL, libc::EPERM] {
             let clone3 = crate::vfork_spawn::Clone3Support::refusing(errno);
+            let probes = if errno == libc::EPERM { 1 } else { 0 };
             let reason = format!(
                 "clone3 with CLONE_INTO_CGROUP was refused: {}",
                 std::io::Error::from_raw_os_error(errno)
@@ -18118,12 +18167,23 @@ fi
                     "errno {errno}, spawn {spawn}"
                 );
                 assert_eq!(attempts(&clone3), 1, "errno {errno}, spawn {spawn}");
+                assert_eq!(
+                    clone3.probes.load(std::sync::atomic::Ordering::Relaxed),
+                    probes,
+                    "errno {errno}, spawn {spawn}"
+                );
+                assert_eq!(
+                    clone3.notices.load(std::sync::atomic::Ordering::Relaxed),
+                    1,
+                    "errno {errno}, spawn {spawn}"
+                );
             }
         }
         for errno in [
             libc::EBADF,
             libc::EACCES,
             libc::ENOENT,
+            libc::EROFS,
             libc::ENODEV,
             libc::EBUSY,
             libc::EOPNOTSUPP,
@@ -18171,6 +18231,249 @@ fi
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// An EPERM from a clone3 with CLONE_INTO_CGROUP, where clone3 itself is
+    /// allowed (the probe without CLONE_INTO_CGROUP is not refused), is the
+    /// cgroup's permission check refusing the child: that spawn's join fails,
+    /// nothing is remembered, and the next spawn uses clone3 (dh-7n47nt F1).
+    #[test]
+    fn an_eperm_from_the_cgroup_fails_that_spawn_and_the_next_uses_clone3() {
+        let test = "an_eperm_from_the_cgroup_fails_that_spawn_and_the_next_uses_clone3";
+        let root = spawn_test_root("clone3-eperm-once");
+        // The probe answered EINVAL by injection, and made for real (this
+        // host has no filter on clone3, so it answers EINVAL too).
+        let injected =
+            crate::vfork_spawn::Clone3Support::refusing_once_with_probe(libc::EPERM, libc::EINVAL);
+        let real = crate::vfork_spawn::Clone3Support::refusing_once(libc::EPERM);
+        for clone3 in [&injected, &real] {
+            let Some(first) =
+                spawn_in_a_fresh_cgroup_with(clone3, test, &root, "/bin/true", &[], &[])
+            else {
+                return;
+            };
+            let error = first.err().expect("the first spawn's join fails");
+            assert!(
+                error.starts_with("cannot join invocation cgroup /")
+                    && error.ends_with(" before exec, so /bin/true was not started: Operation not permitted (os error 1)"),
+                "{error}"
+            );
+            let second = spawn_in_a_fresh_cgroup_with(clone3, test, &root, "/bin/true", &[], &[])
+                .unwrap()
+                .unwrap();
+            assert!(second.status.success(), "{}", second.stderr);
+            assert_eq!(second.method, SpawnMethod::Clone3IntoCgroup);
+            let count = |counter: &std::sync::atomic::AtomicUsize| {
+                counter.load(std::sync::atomic::Ordering::Relaxed)
+            };
+            assert_eq!(count(&clone3.attempts), 2);
+            assert_eq!(count(&clone3.probes), 1);
+            assert_eq!(count(&clone3.notices), 0);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A target cgroup this process may not write to refuses the child for
+    /// real (EACCES from the kernel's permission check on its cgroup.procs):
+    /// that spawn's join fails, and the next spawn, into a writable cgroup,
+    /// still uses clone3.
+    #[test]
+    fn an_unwritable_cgroup_fails_that_spawn_and_the_next_uses_clone3() {
+        let test = "an_unwritable_cgroup_fails_that_spawn_and_the_next_uses_clone3";
+        let root = spawn_test_root("clone3-unwritable");
+        let clone3 = crate::vfork_spawn::Clone3Support::new();
+        let read_only = |cgroup: &Path| {
+            fs::set_permissions(
+                cgroup.join("cgroup.procs"),
+                fs::Permissions::from_mode(0o444),
+            )
+            .unwrap();
+        };
+        let Some(first) = spawn_in_a_fresh_cgroup_in(
+            &clone3,
+            test,
+            &root,
+            &root,
+            "/bin/true",
+            &[],
+            &[],
+            &read_only,
+        ) else {
+            return;
+        };
+        let error = first
+            .err()
+            .expect("the spawn into an unwritable cgroup fails");
+        assert!(
+            error.starts_with("cannot join invocation cgroup /")
+                && error.ends_with(
+                    " before exec, so /bin/true was not started: Permission denied (os error 13)"
+                ),
+            "{error}"
+        );
+        let second = spawn_in_a_fresh_cgroup_with(&clone3, test, &root, "/bin/true", &[], &[])
+            .unwrap()
+            .unwrap();
+        assert!(second.status.success(), "{}", second.stderr);
+        assert_eq!(second.method, SpawnMethod::Clone3IntoCgroup);
+        assert_eq!(
+            clone3.attempts.load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        assert_eq!(clone3.notices.load(std::sync::atomic::Ordering::Relaxed), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A well-formed clone3 with CLONE_INTO_CGROUP is accepted by this
+    /// kernel: none of its argument checks refuses it (EINVAL, E2BIG), so a
+    /// regression in the arguments fails here instead of quietly sending
+    /// every spawn back to fork() (dh-7n47nt F3). Kernels older than 5.7,
+    /// which have no CLONE_INTO_CGROUP, are skipped.
+    #[test]
+    fn clone3_into_a_cgroup_is_accepted_by_this_kernel() {
+        let test = "clone3_into_a_cgroup_is_accepted_by_this_kernel";
+        let release = fs::read_to_string("/proc/sys/kernel/osrelease").unwrap();
+        let mut numbers = release
+            .trim()
+            .split(|c: char| !c.is_ascii_digit())
+            .map(|part| part.parse::<u32>().unwrap_or(0));
+        let version = (numbers.next().unwrap_or(0), numbers.next().unwrap_or(0));
+        if version < (5, 7) {
+            eprintln!(
+                "{test}: skipped, kernel {} has no CLONE_INTO_CGROUP",
+                release.trim()
+            );
+            return;
+        }
+        let root = spawn_test_root("clone3-accepted");
+        let clone3 = crate::vfork_spawn::Clone3Support::new();
+        let Some(spawned) =
+            spawn_in_a_fresh_cgroup_with(&clone3, test, &root, "/bin/true", &[], &[])
+        else {
+            return;
+        };
+        let spawned = spawned.unwrap();
+        assert!(spawned.status.success(), "{}", spawned.stderr);
+        assert_eq!(spawned.method, SpawnMethod::Clone3IntoCgroup);
+        assert_eq!(clone3.notices.load(std::sync::atomic::Ordering::Relaxed), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A child that a signal kills before it execs is reported as a started
+    /// program that the signal killed: it stored no failure, and its wait
+    /// reports the signal (dh-7n47nt F4).
+    #[test]
+    fn a_child_killed_before_exec_reads_as_a_started_program_killed_by_the_signal() {
+        let test = "a_child_killed_before_exec_reads_as_a_started_program_killed_by_the_signal";
+        let root = spawn_test_root("clone3-killed-before-exec");
+        let clone3 = crate::vfork_spawn::Clone3Support::killing_children_before_exec();
+        let Some(spawned) =
+            spawn_in_a_fresh_cgroup_with(&clone3, test, &root, "/bin/true", &[], &[])
+        else {
+            return;
+        };
+        let spawned = spawned.expect("a child killed before exec still reads as started");
+        assert_eq!(spawned.method, SpawnMethod::Clone3IntoCgroup);
+        assert_eq!(spawned.status.signal(), Some(libc::SIGKILL));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A working directory that does not exist fails the spawn with the same
+    /// message through clone3 as through `Command`.
+    #[test]
+    fn a_missing_working_directory_reads_as_it_does_through_command() {
+        let test = "a_missing_working_directory_reads_as_it_does_through_command";
+        let root = spawn_test_root("missing-cwd");
+        let missing = root.join("no-such-directory");
+        let command = crate::vfork_spawn::Clone3Support::refusing(libc::ENOSYS);
+        let clone3 = crate::vfork_spawn::Clone3Support::new();
+        let mut errors = Vec::new();
+        for support in [&command, &clone3] {
+            let Some(spawned) = spawn_in_a_fresh_cgroup_in(
+                support,
+                test,
+                &root,
+                &missing,
+                "/bin/true",
+                &[],
+                &[],
+                &|_| {},
+            ) else {
+                return;
+            };
+            errors.push(spawned.err().expect("a missing cwd fails the spawn"));
+            assert_eq!(unreaped_children_of_this_thread(), Vec::<String>::new());
+        }
+        assert_eq!(
+            errors[0],
+            "cannot execute /bin/true: No such file or directory (os error 2)"
+        );
+        assert_eq!(errors[1], errors[0]);
+        assert_eq!(
+            clone3.attempts.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// In the PATH search, a program found but not executable (EACCES) is
+    /// reported over a later directory that lacks it (ENOENT), and a later
+    /// directory that has it runs it, as execvp does; through clone3 as
+    /// through `Command`.
+    #[test]
+    fn the_path_search_reports_a_denied_program_over_a_missing_one() {
+        let test = "the_path_search_reports_a_denied_program_over_a_missing_one";
+        let root = spawn_test_root("path-eacces");
+        let denied = root.join("denied");
+        let empty = root.join("empty");
+        let runnable = root.join("runnable");
+        for dir in [&denied, &empty, &runnable] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let name = "hermit-spawn-eacces-probe";
+        fs::write(denied.join(name), "#!/bin/sh\nprintf denied\n").unwrap();
+        fs::set_permissions(denied.join(name), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(runnable.join(name), "#!/bin/sh\nprintf ran\n").unwrap();
+        fs::set_permissions(runnable.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+        let denied_then_missing = format!("{}:{}", denied.display(), empty.display());
+        let denied_then_runnable = format!("{}:{}", denied.display(), runnable.display());
+        let command = crate::vfork_spawn::Clone3Support::refusing(libc::ENOSYS);
+        let clone3 = crate::vfork_spawn::Clone3Support::new();
+        for support in [&command, &clone3] {
+            let Some(spawned) = spawn_in_a_fresh_cgroup_with(
+                support,
+                test,
+                &root,
+                name,
+                &[],
+                &[("PATH", &denied_then_missing)],
+            ) else {
+                return;
+            };
+            assert_eq!(
+                spawned.err(),
+                Some(format!(
+                    "cannot execute {name}: Permission denied (os error 13)"
+                ))
+            );
+            let spawned = spawn_in_a_fresh_cgroup_with(
+                support,
+                test,
+                &root,
+                name,
+                &[],
+                &[("PATH", &denied_then_runnable)],
+            )
+            .unwrap()
+            .unwrap();
+            assert!(spawned.status.success(), "{}", spawned.stderr);
+            assert_eq!(spawned.stdout, "ran");
+        }
+        assert_eq!(
+            clone3.attempts.load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     /// A program that cannot be executed in a cgroup is a spawn failure that
     /// names the program and the exec's error: a missing file (ENOENT) and a
     /// file without execute permission (EACCES).
@@ -18190,6 +18493,7 @@ fi
                 missing.display()
             ))
         );
+        assert_eq!(unreaped_children_of_this_thread(), Vec::<String>::new());
         let plain = root.join("not-executable");
         fs::write(&plain, "#!/bin/sh\nexit 0\n").unwrap();
         fs::set_permissions(&plain, fs::Permissions::from_mode(0o644)).unwrap();
