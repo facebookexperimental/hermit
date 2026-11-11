@@ -257,20 +257,29 @@ fn cargo_command_packages(
     let mut command_index = 0;
     while command_index < tokens.len() {
         let counted_nextest = tokens[command_index].ends_with("/ci/run-nextest-counted.sh");
+        // The pinned-formatter selector runs `cargo fmt` with the arguments it
+        // is given, so it formats exactly what `cargo fmt` would.
+        let pinned_fmt = tokens[command_index].ends_with("/scripts/cargo-fmt-pinned.rs");
         let prepared_nextest = tokens[command_index].ends_with("/ci/nextest-binaries.rs")
             && matches!(
                 tokens.get(command_index + 1).map(String::as_str),
                 Some("run" | "list")
             );
-        if tokens[command_index] != "cargo" && !counted_nextest && !prepared_nextest {
+        if tokens[command_index] != "cargo" && !counted_nextest && !prepared_nextest && !pinned_fmt
+        {
             command_index += 1;
             continue;
         }
-        let subcommand = tokens
-            .get(command_index + 1)
-            .map(String::as_str)
-            .unwrap_or_default();
+        let subcommand = if pinned_fmt {
+            "fmt"
+        } else {
+            tokens
+                .get(command_index + 1)
+                .map(String::as_str)
+                .unwrap_or_default()
+        };
         let recognized = counted_nextest
+            || pinned_fmt
             || prepared_nextest
             || matches!(subcommand, "build" | "test" | "clippy" | "fmt" | "doc")
             || (subcommand == "nextest"
@@ -286,7 +295,7 @@ fn cargo_command_packages(
         let mut workspace = subcommand == "fmt";
         let mut explicit = BTreeSet::new();
         let mut excluded = BTreeSet::new();
-        let mut cursor = command_index + if counted_nextest { 1 } else { 2 };
+        let mut cursor = command_index + if counted_nextest || pinned_fmt { 1 } else { 2 };
         while cursor < tokens.len() && !matches!(tokens[cursor].as_str(), "&&" | "||" | ";") {
             let token = tokens[cursor].trim_end_matches(';');
             match token {
@@ -1186,6 +1195,16 @@ mod tests {
             BTreeSet::from(["a".into(), "b".into(), "c".into()])
         );
         assert!(cargo_command_packages("cargo nextest show-config", &all, &defaults).is_empty());
+        // lint.rustfmt formats through the pinned-formatter selector, which
+        // runs `cargo fmt` with its own arguments: every workspace package.
+        assert_eq!(
+            cargo_command_packages(
+                "./scripts/cargo-fmt-pinned.rs --self-test && ./scripts/cargo-fmt-pinned.rs --all -- --check",
+                &all,
+                &defaults
+            ),
+            all
+        );
     }
 
     #[test]

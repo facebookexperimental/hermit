@@ -1441,14 +1441,14 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
     StaticStepSpec {
         group: r########"lint"########,
         job: r########"rustfmt"########,
-        desc: r########"Rustfmt (cargo fmt --all -- --check)"########,
-        description: r########"Runs `cargo fmt --all -- --check` over the root workspace (agent-utils is excluded) with the dedicated formatter toolchain nightly-2026-07-12, pinned separately from the stable compiler pin because the rustfmt.toml options it enforces (std, external and crate import groups, one import per item, and formatted code in doc comments) are nightly-only: stable rustfmt warns about and ignores them, so running the check with the compiler toolchain would silently stop enforcing them. It prints the would-be diff and exits nonzero instead of rewriting, which keeps formatting changes out of unrelated diffs. A brace import such as `use std::{fs, path::Path};`, or a std import placed after an external-crate import, is reported."########,
+        desc: r########"Rustfmt (cargo fmt --all -- --check, pinned formatter)"########,
+        description: r########"Runs `cargo fmt --all -- --check` over the root workspace (agent-utils is excluded) through scripts/cargo-fmt-pinned.rs, with the formatter toolchain pinned in ci/rustfmt-toolchain.toml, separately from the stable compiler pin: the rustfmt.toml options it enforces (std, external and crate import groups, one import per item, and formatted code in doc comments) are nightly-only, and stable rustfmt formats as if they were absent. The script finds that formatter at $HERMIT_RUSTFMT_TOOLCHAIN or through rustup, never uses the rustfmt on PATH, refuses any formatter whose `rustfmt --version` is not the pinned line (exit 2), and first checks that the formatter rejects a brace import and accepts its split form. The pinned validation image does not carry the pinned formatter yet, so in the offline split this step refuses with exit 2 rather than check with the image's stable rustfmt, until https://github.com/rrnewton/hermit/issues/5397 lands. The check prints the would-be diff and exits nonzero instead of rewriting, which keeps formatting changes out of unrelated diffs. A brace import such as `use std::{fs, path::Path};`, or a std import placed after an external-crate import, is reported."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; RUSTUP_TOOLCHAIN=nightly-2026-07-12 cargo fmt --all -- --check"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./scripts/cargo-fmt-pinned.rs --self-test && ./scripts/cargo-fmt-pinned.rs --all -- --check"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,

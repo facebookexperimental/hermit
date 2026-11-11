@@ -426,7 +426,7 @@ Focused contributions are welcome. Before opening a pull request:
 4. Run formatting and the broadest tests your Linux host supports:
 
    ```bash
-   cargo fmt --all -- --check
+   ./scripts/cargo-fmt-pinned.rs --all -- --check
    cargo test -p AFFECTED_PACKAGE
    cargo test --workspace
    ```
