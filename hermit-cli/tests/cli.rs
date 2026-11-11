@@ -10311,7 +10311,6 @@ fn smaps_numa_maps_and_the_rollup_list_the_address_space_as_on_linux() {
 
 /// [`list_the_address_space_in_smaps_and_numa_maps`] on KVM.
 #[test]
-#[ignore = "known failure: in the pinned validate root the guest's libc is on overlayfs, outside LinuxEmu's FLAG_NEUTRAL_FILESYSTEMS (btrfs, ext2/3/4, XFS, tmpfs), so the backend gives its mappings no VmFlags and Detcore refuses smaps by name; it passes where every file the guest maps is on one of those (capability gap, minibeads dh-9j8ue; the kvm lane re-enables it with the overlay probe designed in dev-hermit ai_docs/plans/2026-11-10-kvm-overlay-file-vm-flags-probe.md)"]
 fn run_kvm_smaps_and_numa_maps_render_the_stack_from_the_memory_map() {
     let test = "run_kvm_smaps_and_numa_maps_render_the_stack_from_the_memory_map";
     if kvm_unavailable(test) {
@@ -75128,7 +75127,6 @@ fn the_callers_own_proc_directories_answer_as_linux() {
 /// slice 2b-3 serves `environ` from Detcore's record of the exec strings,
 /// `environ`, which Linux lists before `auxv`.
 #[test]
-#[ignore = "known failure: the read-listed mode reads smaps, and in the pinned validate root the guest's libc is on overlayfs, outside LinuxEmu's FLAG_NEUTRAL_FILESYSTEMS (btrfs, ext2/3/4, XFS, tmpfs), so the backend gives its mappings no VmFlags and Detcore refuses smaps by name; it passes where every file the guest maps is on one of those (capability gap, minibeads dh-9j8ue; the kvm lane re-enables it with the overlay probe designed in dev-hermit ai_docs/plans/2026-11-10-kvm-overlay-file-vm-flags-probe.md)"]
 fn run_kvm_the_callers_own_proc_directories_answer_as_linux() {
     let test = "run_kvm_the_callers_own_proc_directories_answer_as_linux";
     if kvm_unavailable(test) {

@@ -8440,7 +8440,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         };
         let rendered = match file {
-            AddressSpaceFile::Smaps => match self.smaps_facts(guest).await {
+            AddressSpaceFile::Smaps => match self.smaps_facts(guest, &map).await {
                 Ok(facts) => smaps::render_smaps(&map, &facts, smaps::host_filesystems()),
                 Err(refusal) => Err(refusal),
             },
@@ -8464,13 +8464,16 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// ([`Self::serving_kernel_enables_protection_keys`]), the host kernel's
     /// transparent huge page settings, and the reader's address space's
     /// record (`MemoryMetadata`), with whether it disabled huge pages asked
-    /// of the backend (`PR_GET_THP_DISABLE`) where an order is allowed at
-    /// all. `Err` names a fact Detcore could not establish, and a kernel that
-    /// enables protection keys, whose keys follow calls Detcore does not
-    /// record (`mprotect(PROT_EXEC)` alone gives the execute-only key).
+    /// of the backend (`PR_GET_THP_DISABLE`) where that decides an answer: an
+    /// order is allowed to anonymous memory, or the kernel's answer for one
+    /// of `map`'s mappings (`MappingFact::thp_eligible`) is 1. `Err` names a
+    /// fact Detcore could not establish, and a kernel that enables protection
+    /// keys, whose keys follow calls Detcore does not record
+    /// (`mprotect(PROT_EXEC)` alone gives the execute-only key).
     async fn smaps_facts<G: Guest<Self>>(
         &self,
         guest: &mut G,
+        map: &reverie::MemoryMap,
     ) -> Result<crate::procfs::memory_map::smaps::SmapsFacts, String> {
         use crate::procfs::memory_map::smaps;
 
@@ -8491,13 +8494,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
         })?;
         let thp_orders = host_thp.map_or(0, |thp| thp.anonymous_orders());
-        let thp_disabled = if thp_orders == 0 {
+        let kernel_allows_one = map
+            .mappings
+            .iter()
+            .any(|mapping| mapping.thp_eligible == Some(true));
+        let thp_disabled = if thp_orders == 0 && !kernel_allows_one {
             None
         } else {
             let asked = guest
                 .inject(syscalls::Prctl::new().with_option(libc::PR_GET_THP_DISABLE))
                 .await;
             match asked {
+                // 1, or 3 with `PR_THP_DISABLE_EXCEPT_ADVISED`: either mode
+                // refuses huge pages to every mapping the renderer answers
+                // for, none of which `MADV_HUGEPAGE` marked
+                // (`smaps::thp_eligibility`, `vma_thp_disabled`).
                 Ok(disabled) => Some(disabled != 0),
                 Err(error) => {
                     return Err(format!(

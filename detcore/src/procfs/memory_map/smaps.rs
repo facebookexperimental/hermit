@@ -52,7 +52,16 @@
 //!   difference as its range and `Size`. Any other mapping (a file's, shared
 //!   memory's) prints 0 where no order a file may have fits it, a block
 //!   aligned to its size in the address space and in the file
-//!   (`thp_vma_suitable_order`), whatever backs it. Otherwise what backs it
+//!   (`thp_vma_suitable_order`), whatever backs it. Where the backend asked
+//!   the kernel it runs on (`MappingFact::thp_eligible`: the value that
+//!   kernel prints for a mapping of its own of the same open file, with the
+//!   same protection, sharing, length and offset within a PMD-sized block,
+//!   which LinuxEmu asks for a file on overlayfs or tmpfs), that answer is
+//!   the value, but 0 where the address space disabled huge pages
+//!   (`PR_SET_THP_DISABLE`, asked of the backend as for anonymous memory:
+//!   either of its modes refuses them to a mapping `MADV_HUGEPAGE` did not
+//!   mark, `vma_thp_disabled`). The kernel beneath ptrace gives the guest's
+//!   own mapping of the file the same answer. Otherwise what backs it
 //!   decides, after the host's `enabled` setting ([`HostThp::enabled`]): a
 //!   file on a disk filesystem (btrfs, ext2/3/4, XFS), which the host's mount
 //!   table names for the device the memory map gives ([`HostFilesystems`]),
@@ -62,10 +71,10 @@
 //!   file is refused. Shared memory follows
 //!   shmem's own settings, its mount's `huge=` option and the file's size
 //!   (`shmem_allowable_huge_orders`), and overlayfs the filesystem of a layer
-//!   it does not show, so a file on tmpfs, on overlayfs, on any other
-//!   filesystem or on a device the mount table does not list (the kernel's
-//!   internal mount that backs shared anonymous memory and memfds) is refused
-//!   by name.
+//!   it does not show, so where the backend did not ask, a file on tmpfs, on
+//!   overlayfs, on any other filesystem or on a device the mount table does
+//!   not list (the kernel's internal mount that backs shared anonymous memory
+//!   and memfds) is refused by name.
 //! - `ProtectionKey` is printed where the kernel serving the process enables
 //!   protection keys (`arch_pkeys_enabled`, `cpu_feature_enabled(OSPKE)`): a
 //!   fact of that kernel, not of the CPU the guest is shown (ptrace's guests
@@ -441,8 +450,10 @@ pub(crate) struct SmapsFacts {
     /// ([`HostThp::anonymous_orders`]), none where the host has none.
     pub(crate) thp_orders: u64,
     /// Whether the address space disabled transparent huge pages
-    /// (`PR_GET_THP_DISABLE`), where [`Self::thp_orders`] makes it matter;
-    /// `None` where it was not asked because no order is allowed.
+    /// (`PR_GET_THP_DISABLE`), where it decides an answer: [`Self::thp_orders`]
+    /// allows an order, or the kernel's answer for a mapping
+    /// (`MappingFact::thp_eligible`) is 1; `None` where it was not asked
+    /// because neither holds.
     pub(crate) thp_disabled: Option<bool>,
 }
 
@@ -567,6 +578,23 @@ fn thp_eligibility(
         mapping.offset / PAGE_SIZE,
     ) {
         return Ok(false);
+    }
+    if let Some(eligible) = mapping.thp_eligible {
+        // The value the kernel the backend runs on printed for a mapping of
+        // its own of the same file and shape (`MappingFact::thp_eligible`),
+        // which answers for the mapping alone: the address space's own
+        // refusal of huge pages (`PR_SET_THP_DISABLE`, `vma_thp_disabled`)
+        // makes it 0, in either of that call's modes, as no `MADV_HUGEPAGE`
+        // marked the mapping (refused above).
+        return match (eligible, facts.thp_disabled) {
+            (false, _) | (true, Some(false)) => Ok(eligible),
+            (true, Some(true)) => Ok(false),
+            (true, None) => Err(format!(
+                "Linux's smaps prints whether {} may have transparent huge pages, and whether \
+                 the address space disabled them was not asked",
+                named(mapping)
+            )),
+        };
     }
     let Some(raw_device) = backing else {
         return Err(format!(
@@ -1576,6 +1604,97 @@ mod tests {
         )
         .unwrap_err();
         assert!(refusal.contains("shared anonymous memory"), "{refusal}");
+    }
+
+    /// Where the backend asked the host kernel (`MappingFact::thp_eligible`),
+    /// a file's `THPeligible` is the kernel's answer, on overlayfs, on tmpfs
+    /// and for shared anonymous memory alike, which are refused without it;
+    /// the address space's own refusal of huge pages makes it 0, and is
+    /// refused unasked. Where the host has none, the mapping refuses them
+    /// (`MADV_NOHUGEPAGE`) or no order fits, it stays 0 whatever the kernel
+    /// said.
+    #[test]
+    fn a_files_thp_eligibility_is_the_kernels_answer_where_the_backend_asked() {
+        let filesystems = HostFilesystems::parse(
+            "4 1 0:24 / /dev/shm rw - tmpfs tmpfs rw,huge=within_size\n\
+             5 1 0:47 / /image rw - overlay overlay rw,lowerdir=/l\n",
+        )
+        .unwrap();
+        let render_one = |mapping: MappingFact, facts: &SmapsFacts| {
+            render_smaps(
+                &MemoryMap::new(vec![mapping], true).unwrap(),
+                facts,
+                Ok(&filesystems),
+            )
+            .map(|text| {
+                String::from_utf8(text)
+                    .unwrap()
+                    .contains("THPeligible:           1\n")
+            })
+        };
+        let file = |line: &str, flags: u64, eligible: bool| {
+            with_flags(line, flags).with_thp_eligible(eligible)
+        };
+        let allowed = SmapsFacts {
+            thp_disabled: Some(false),
+            ..HOST
+        };
+        let disabled = SmapsFacts {
+            thp_disabled: Some(true),
+            ..HOST
+        };
+        // tmpfs 0:24 and overlayfs 0:47, as `maps` prints them in hex; 2 MiB
+        // at a 2 MiB boundary, from file offset 0.
+        for device in ["00:18", "00:2f"] {
+            let line = format!("7f0000000000-7f0000200000 r--p 00000000 {device} 7 /f");
+            assert_eq!(render_one(file(&line, READ_ONLY, true), &allowed), Ok(true));
+            assert_eq!(
+                render_one(file(&line, READ_ONLY, false), &allowed),
+                Ok(false)
+            );
+            assert_eq!(
+                render_one(file(&line, READ_ONLY, true), &disabled),
+                Ok(false)
+            );
+            assert_eq!(render_one(file(&line, READ_ONLY, false), &HOST), Ok(false));
+            let refusal = render_one(file(&line, READ_ONLY, true), &HOST).unwrap_err();
+            assert!(refusal.contains("was not asked"), "{refusal}");
+            let no_thp = SmapsFacts {
+                thp_enabled: None,
+                ..allowed
+            };
+            assert_eq!(render_one(file(&line, READ_ONLY, true), &no_thp), Ok(false));
+            assert_eq!(
+                render_one(
+                    file(&line, READ_ONLY | reverie::VM_NOHUGEPAGE, true),
+                    &allowed
+                ),
+                Ok(false)
+            );
+            // Offset 4 KiB into the file: no block is aligned in both.
+            let misaligned = format!("7f0000000000-7f0000200000 r--p 00001000 {device} 7 /f");
+            assert_eq!(
+                render_one(file(&misaligned, READ_ONLY, true), &allowed),
+                Ok(false)
+            );
+        }
+        let shared = MappingFact::new(
+            0x7f00_0000_0000,
+            0x7f00_0020_0000,
+            libc::PROT_READ as u32,
+            true,
+            0,
+            MappingBacking::NamedSharedAnonymous {
+                raw_device: libc::makedev(0, 1),
+                raw_inode: 3,
+                name: b"pool".to_vec(),
+            },
+        )
+        .unwrap()
+        .with_vm_flags(READ_ONLY | reverie::VM_SHARED | reverie::VM_MAYSHARE)
+        .unwrap()
+        .with_thp_eligible(true);
+        assert_eq!(render_one(shared, &allowed), Ok(true));
     }
 
     /// Where no order a file may have fits a mapping, a block aligned to its
