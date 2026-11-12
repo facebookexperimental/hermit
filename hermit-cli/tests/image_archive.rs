@@ -1698,4 +1698,12 @@ fn run_help_documents_local_image_forms_without_buildah() {
         !help.contains("buildah"),
         "help must not claim buildah materialization:\n{help}"
     );
+    assert!(
+        !help.contains("PROTOTYPE"),
+        "image mode is supported, not a prototype:\n{help}"
+    );
+    assert!(
+        flat.contains("compose with it"),
+        "help must state that --mount/--bind compose with --image:\n{help}"
+    );
 }

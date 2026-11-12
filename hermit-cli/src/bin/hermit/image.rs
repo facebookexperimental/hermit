@@ -6,7 +6,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! PROTOTYPE: OCI image rootfs materialization for `hermit run --image`.
+//! OCI image rootfs materialization for `hermit run --image`.
 //!
 //! This is the *filesystem half* of hermit-as-container-runtime. Hermit already
 //! owns the *namespace half* (PID/mount/user namespaces via reverie-process);
@@ -248,7 +248,7 @@ fn env_file(cache: &Path) -> PathBuf {
     cache.join(ENV_BASENAME)
 }
 
-/// The subset of an image's OCI runtime config that the prototype applies so the
+/// The subset of an image's OCI runtime config that image mode applies so the
 /// guest sees the deterministic, digest-pinned environment the image declares.
 #[derive(Default)]
 pub(crate) struct ImageConfig {

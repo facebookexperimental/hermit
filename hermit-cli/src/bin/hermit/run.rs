@@ -2362,7 +2362,7 @@ pub struct RunOpts {
     #[clap(long, value_name = "dirpath")]
     tmp: Option<PathBuf>,
 
-    /// PROTOTYPE: run the guest against the root filesystem of an OCI image
+    /// Run the guest against the root filesystem of an OCI image
     /// instead of the host filesystem. The image is materialized into a
     /// read-only cached root and the guest is `chroot`ed into it with an
     /// isolated writable `/tmp`, so its FILE INPUTS come deterministically
@@ -2393,11 +2393,14 @@ pub struct RunOpts {
     /// `/bin/sh`) or a relative path containing a `/` (e.g. `./bin/sh`),
     /// which is resolved against the image working directory; a bare
     /// command name is searched on the image's PATH. Requires namespaces
-    /// (incompatible with `--no-namespace`). The prototype supports the
+    /// (incompatible with `--no-namespace`). Supports the
     /// ptrace and kvm backends. `--mount` (bind and tmpfs types, with
     /// `readonly` and bind propagation as in host mode) and `--bind`
     /// compose with it: their targets are paths inside the image rootfs,
-    /// created there if missing, while the image itself stays read-only.
+    /// created there if missing (a target Hermit cannot install there
+    /// refuses by name; a target under an earlier caller mount must
+    /// exist in that mount's content, and symlinks there are followed),
+    /// while the image itself stays read-only.
     #[clap(long, value_name = "OCI-REFERENCE")]
     image: Option<String>,
 
@@ -11453,7 +11456,7 @@ fn normalize_guest_path(path: &Path) -> Result<PathBuf, Error> {
 }
 
 /// Resolve a guest program path to an absolute path *inside the image rootfs*,
-/// mirroring execve(2) pathname resolution for the `--image` prototype:
+/// mirroring execve(2) pathname resolution for `--image`:
 ///
 ///   * an absolute path is used as-is;
 ///   * a relative path that contains a `/` (e.g. `./bin/sh`, `bin/busybox`) is
@@ -14647,7 +14650,7 @@ impl RunOpts {
             if self.image.is_some() {
                 anyhow::bail!(
                     "--work-span-report={report} is written from inside the run container, and \
-                     --image (a prototype) replaces its root, so the report would be lost"
+                     --image replaces its root, so the report would be lost"
                 );
             }
             if !matches!(backend, Backend::Ptrace) {
@@ -14762,7 +14765,7 @@ impl RunOpts {
             if self.image.is_some() {
                 anyhow::bail!(
                     "--record-access-trace-to={trace} is written from inside the run container, \
-                     and --image (a prototype) replaces its root, so the trace would be lost; drop \
+                     and --image replaces its root, so the trace would be lost; drop \
                      --image, or drop --record-access-trace-to"
                 );
             }
@@ -15966,8 +15969,8 @@ impl RunOpts {
     /// not its name, so a relative summary reaches the host directory even
     /// when that directory is under `/tmp`. Modes that never write the summary
     /// are not refused: DBT, `--namespace-only` and `--hb-list-events` (checked
-    /// earlier). `--no-namespace` has no private mounts, and `--image` (a
-    /// prototype) replaces the whole root, which this mapping does not model.
+    /// earlier). `--no-namespace` has no private mounts, and `--image`
+    /// replaces the whole root, which this mapping does not model.
     fn validate_summary_json_visibility(&self) -> Result<(), Error> {
         if self.namespace_only || self.image.is_some() {
             return Ok(());
@@ -16101,7 +16104,7 @@ impl RunOpts {
     /// checks it: its host path, the path as the command names it, and the
     /// image rootfs it resolves in, if any.
     fn guest_program_on_host(&self) -> Result<(PathBuf, PathBuf, Option<PathBuf>), Error> {
-        // PROTOTYPE (--image): the guest program is interpreted inside the
+        // With --image, the guest program is interpreted inside the
         // materialized OCI rootfs, not on the host filesystem. Resolve and
         // validate it against the rootfs so that image-only binaries (e.g.
         // busybox's `/bin/busybox`, absent from the host) are accepted, and so
@@ -18743,7 +18746,7 @@ impl RunOpts {
     /// table (`IdentityGuard::record_plan`). A native exec domain's container
     /// follows the plan with its declared-input mounts, and has no table.
     fn container(&self, tmpfs: &Path) -> Result<(Container, IdentityGuard), Error> {
-        // PROTOTYPE: when an OCI image is requested, the guest runs against the
+        // When an OCI image is requested, the guest runs against the
         // image's materialized rootfs (deterministic file inputs) rather than
         // the host filesystem. This replaces the default namespace+mounts setup
         // with a chroot into the pinned image root.
@@ -19043,7 +19046,7 @@ impl RunOpts {
         if self.prepared_program.is_some() {
             command.arg0(self.program_path());
         }
-        // PROTOTYPE (--image): the guest lives inside the OCI rootfs, so the
+        // With --image, the guest lives inside the OCI rootfs, so the
         // guest working directory must be one that exists under the image root.
         // Default it to the image's declared `WorkingDir`, else `/` (a bare
         // chroot leaves cwd pointing at the — now unreachable — host cwd, which
@@ -19055,7 +19058,7 @@ impl RunOpts {
             command.current_dir(cfg.workdir.as_deref().unwrap_or("/"));
         }
 
-        // PROTOTYPE (--image): an OCI rootfs is a self-contained filesystem, so
+        // With --image, an OCI rootfs is a self-contained filesystem, so
         // leaking the host environment (a host `PATH` full of paths absent from
         // the image) both breaks usability and undermines determinism. Instead
         // start from the `--base-env=minimal` defaults, apply the image's *own*

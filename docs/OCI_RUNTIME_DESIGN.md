@@ -22,9 +22,9 @@ The canonical form is `hermit oci run`, not an overloaded
 `hermit run -it ubuntu`. Existing `hermit run PROGRAM` treats its first
 positional argument as a host-visible program. Guessing whether that argument
 is a program or an image would be ambiguous, and `-i` and `-t` must also remain
-useful for host-visible programs. The prototype's explicit form,
-`hermit run --image IMAGE -- PROGRAM`, may remain as a compatibility alias once
-both paths use the same implementation.
+useful for host-visible programs. The explicit form,
+`hermit run --image IMAGE -- PROGRAM`, remains as a compatibility alias; both
+paths use the same implementation.
 
 Use these Rust crates:
 

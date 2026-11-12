@@ -1735,7 +1735,7 @@ fn superblock_options_as_root(options: &[u8]) -> Vec<u8> {
         .join(&b',')
 }
 
-/// PROTOTYPE: a container whose root filesystem is a materialized OCI image
+/// A container whose root filesystem is a materialized OCI image
 /// rootfs. This is the *filesystem half* of hermit-as-container-runtime: the
 /// guest's file inputs come deterministically from the pinned image rather than
 /// from the host filesystem.
