@@ -159,9 +159,12 @@ const HOST_BUILD_VARIANTS: [(&str, &str); 2] = [
 /// The same one-build producers in their canonical pinned-root form, for a
 /// `--pinned-root` run: cloned under their base names exactly as the host
 /// variants are, with their pinned-only prerequisites retained verbatim.
-const PINNED_BUILD_VARIANTS: [(&str, &str); 2] = [
+const PINNED_BUILD_VARIANTS: [(&str, &str); 3] = [
     ("build.workspace", "build.workspace_in_pinned_root"),
     ("build.e2e_artifact", "build.e2e_artifact_in_pinned_root"),
+    // The test-harness binary cells execute must be the pinned build in
+    // the split target, not a host build the container cannot see.
+    ("setup.manifest_plan", "setup.manifest_plan_in_pinned_root"),
 ];
 /// The pinned one-build closure: the two producers above under their base
 /// names plus every canonical prerequisite they reach. `setup.nextest`
@@ -8500,10 +8503,13 @@ fn pinned_build_steps(canonical: &DagConfig) -> Result<Vec<Step>, String> {
     let mut steps = Vec::with_capacity(canonical.steps.len());
     for step in &canonical.steps {
         let tag = step.tag();
-        if let Some((base, pinned)) = PINNED_BUILD_VARIANTS.iter().find(|(base, _)| *base == tag) {
-            return Err(format!(
-                "canonical build graph defines {base} directly; the pinned pressure graph clones only {pinned}, so it refuses to guess which producer to run"
-            ));
+        if PINNED_BUILD_VARIANTS.iter().any(|(base, _)| *base == tag) {
+            // The canonical graph defines setup.manifest_plan directly
+            // beside its pinned variant (the one-build producers exist
+            // only as variants). The pinned clone under the base name
+            // replaces the host step; a missing pinned variant is
+            // refused by the completeness check below.
+            continue;
         }
         // Host-variant and other unselected canonical steps pass through
         // untouched, exactly as pinned steps do in `host_build_steps`;
@@ -8863,6 +8869,18 @@ fn write_plan_after_scorecard_check(
                 && direct_exact_hermit_build(exact_cell);
             let command = if direct_backend_build {
                 DIRECT_EXACT_HERMIT_BUILD.into()
+            } else if selection.pinned_root && tag == "gate.manifest" {
+                // The manifest gate executes the pinned test-harness
+                // binary, so it runs inside the pinned root too and
+                // waits for the pinned rust-script artifacts it loads.
+                if !step
+                    .deps
+                    .iter()
+                    .any(|dep| dep == "build.rust_scripts_in_pinned_root")
+                {
+                    step.deps.push("build.rust_scripts_in_pinned_root".into());
+                }
+                pinned_wrap_cmd(root, results, step.cmd.clone())?
             } else {
                 step.cmd.clone()
             };
@@ -10358,12 +10376,12 @@ fn validate_run_contract_with_resume(
     }
     if let Some(epoch) = &metadata.hermit_epoch {
         let pinned = format!(" HERMIT_EPOCH={} ", shell_quote(epoch));
-        if let Some(step) = dag
-            .steps
-            .iter()
-            .filter(|step| step.group == "cell")
-            .find(|step| !step.cmd.contains(&pinned))
-        {
+        if let Some(step) = dag.steps.iter().filter(|step| step.group == "cell").find(|step| {
+            // A pinned cell launches its harness inside the wrapper;
+            // the epoch pin brackets the inner command.
+            let launched = pinned_inner_cmd(&step.cmd).unwrap_or_else(|| step.cmd.clone());
+            !launched.contains(&pinned)
+        }) {
             return Err(format!(
                 "generated DAG cell {} was not launched with the series HERMIT_EPOCH {epoch}",
                 step.job
