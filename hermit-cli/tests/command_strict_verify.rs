@@ -15,8 +15,10 @@ mod hermit_test;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::process::Output;
 use std::process::Stdio;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -87,6 +89,34 @@ fn assert_l2_under_strict_verify_at_standard(case: &StrictCommandCase) {
 
 fn assert_l2_under_strict_verify_with(case: &StrictCommandCase, run_args: &[&str]) {
     let program = required_command(case);
+    let (output, rendered) = strict_verify_output(&program, case.args, case.stdin, run_args);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "{} did not reach L2 under strict verification ({rendered})\n\
+         status: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        case.name,
+        output.status,
+    );
+    assert!(
+        stderr.contains("Determinism verified") || stdout.contains("Determinism verified"),
+        "{} exited 0 without Hermit's determinism marker ({rendered})\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}",
+        case.name,
+    );
+}
+
+/// Runs `program args` under `hermit --log=info run --strict --verify`, with
+/// `run_args` after `--verify`, in a fresh HOME and working directory, and
+/// returns its output and the rendered command line.
+fn strict_verify_output(
+    program: &Path,
+    args: &[&str],
+    stdin: Option<&[u8]>,
+    run_args: &[&str],
+) -> (Output, String) {
     let home = tempfile::tempdir().expect("failed to create isolated command HOME");
     std::fs::create_dir_all(home.path().join(".config/procps"))
         .expect("failed to preseed the isolated procps HOME");
@@ -118,11 +148,11 @@ fn assert_l2_under_strict_verify_with(case: &StrictCommandCase, run_args: &[&str
     configure_pinned_root(&mut command);
     command
         .arg("--")
-        .arg(&program)
-        .args(case.args)
+        .arg(program)
+        .args(args)
         .env("HOME", home.path())
         .current_dir(working_directory.path())
-        .stdin(if case.stdin.is_some() {
+        .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {
             Stdio::null()
@@ -136,7 +166,7 @@ fn assert_l2_under_strict_verify_with(case: &StrictCommandCase, run_args: &[&str
         let mut child = command
             .spawn()
             .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
-        if let Some(input) = case.stdin {
+        if let Some(input) = stdin {
             child
                 .stdin
                 .take()
@@ -149,22 +179,7 @@ fn assert_l2_under_strict_verify_with(case: &StrictCommandCase, run_args: &[&str
             .unwrap_or_else(|error| panic!("failed to collect {rendered}: {error}"));
         (output, ())
     });
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert!(
-        output.status.success(),
-        "{} did not reach L2 under strict verification ({rendered})\n\
-         status: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
-        case.name,
-        output.status,
-    );
-    assert!(
-        stderr.contains("Determinism verified") || stdout.contains("Determinism verified"),
-        "{} exited 0 without Hermit's determinism marker ({rendered})\n\
-         stdout:\n{stdout}\nstderr:\n{stderr}",
-        case.name,
-    );
+    (output, rendered)
 }
 
 #[test]
@@ -481,43 +496,6 @@ fn process_accounting_commands_are_deterministic_under_strict_verify() {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-861): Review strict I/O-accounting command coverage.
-#[test]
-#[ignore = "e2e: requires hermit + PMU/mount namespaces + sysstat tools"]
-fn io_accounting_commands_are_deterministic_under_strict_verify() {
-    let _guard = hermit_run_lock();
-    let cases = [StrictCommandCase {
-        name: "iostat disk",
-        candidates: &["/usr/bin/iostat"],
-        args: &["-d", "-x", "1", "1"],
-        stdin: None,
-    }];
-
-    for case in &cases {
-        assert_l2_under_strict_verify(case);
-    }
-
-    // These read names only the `standard` /proc level has.
-    let standard_cases = [
-        StrictCommandCase {
-            name: "vmstat disk",
-            candidates: &["/usr/bin/vmstat"],
-            args: &["-d", "1", "2"],
-            stdin: None,
-        },
-        StrictCommandCase {
-            name: "pidstat disk",
-            candidates: &["/usr/bin/pidstat"],
-            args: &["-d", "-p", "1", "1", "1"],
-            stdin: None,
-        },
-    ];
-    for case in &standard_cases {
-        assert_l2_under_strict_verify_at_standard(case);
-    }
-}
-
-// AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-873): Review kernel pseudo-file command coverage.
 #[test]
 #[ignore = "e2e: requires hermit + mount namespaces + util-linux/procps/sysstat"]
@@ -575,45 +553,143 @@ fn ionice_query_is_deterministic_under_strict_verify() {
     assert_l2_under_strict_verify(&case);
 }
 
+/// The names iostat and lsmod read at the default `/proc` level, where the
+/// removed io_accounting and kernel_activity cases ran them.
+const DEFAULT_LEVEL_ACTIVITY_FILES: &[&str] = &[
+    "/proc/uptime",
+    "/proc/stat",
+    "/proc/cmdline",
+    "/proc/modules",
+];
+
+/// The names iostat -d -x, vmstat -d, pidstat -d, lsmod, lsirq and mpstat -I
+/// SCPU read at the `standard` level, where those cases ran the other four.
+const STANDARD_LEVEL_ACTIVITY_FILES: &[&str] = &[
+    "/proc/uptime",
+    "/proc/stat",
+    "/proc/cmdline",
+    "/proc/modules",
+    "/proc/diskstats",
+    "/proc/softirqs",
+    "/proc/interrupts",
+    "/proc/self/io",
+    "/proc/1/io",
+    "/proc/1/stat",
+    "/proc/1/schedstat",
+    "/proc/1/status",
+    "/proc/sys/kernel/osrelease",
+    "/sys/devices/system/cpu/online",
+];
+
+/// The `/proc` and `/sys` reads that iostat -d -x, vmstat -d and pidstat -d
+/// (the old io_accounting case) and lsmod, lsirq and mpstat -I SCPU (the old
+/// kernel_activity case) made, made instead by one in-repo guest,
+/// tests/c/procfs_activity_sampler.c. sysstat is in neither fbsource's
+/// third-party tree nor its CI hosts, so fbsource skipped both cases. The
+/// guest reads the tools' files the way they do: stdio reads (openat, fstat,
+/// read, close) of each counter file before and after a one-second interval,
+/// waited out once with alarm(2) and pause(2) as sysstat does and once with
+/// clock_nanosleep(2) as procps does; getdents64 listings of
+/// /sys/devices/system/cpu and /sys/block with newfstatat(2) and access(2) of
+/// each entry and a rewind (lseek) of each device's stat file; and uname(2),
+/// time(2), /etc/localtime and /proc/self/auxv. It prints every line it reads
+/// and fails if the uptime does not advance across a wait. It runs at the
+/// `standard` level and at the default level, each to canonical bitwise
+/// parity (`--verify-strict`), and each level must present the names the
+/// tools read there.
 // AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-861): Review strict I/O-accounting command coverage.
 // TODO-HUMAN-REVIEW(PR-883): Review interrupt and module command coverage.
 #[test]
-#[ignore = "e2e: requires hermit + util-linux/sysstat/kmod"]
-fn kernel_activity_commands_are_deterministic_under_strict_verify() {
+#[ignore = "e2e: requires hermit + PMU/mount namespaces + cc"]
+fn activity_counter_reads_are_deterministic_under_strict_verify() {
     let _guard = hermit_run_lock();
-    let cases = [StrictCommandCase {
-        name: "lsmod",
-        candidates: &["/usr/sbin/lsmod", "/usr/bin/lsmod"],
-        args: &[],
-        stdin: None,
-    }];
+    let build = tempfile::Builder::new()
+        .prefix("procfs-activity-sampler-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest build directory");
+    let guest = compile_c_guest("procfs_activity_sampler", build.path());
 
-    for case in &cases {
-        assert_l2_under_strict_verify(case);
+    let standard = assert_bitwise_parity_under_strict_verify(&guest, &["--proc=standard"]);
+    for path in STANDARD_LEVEL_ACTIVITY_FILES {
+        assert_read(&standard, path, "--proc=standard");
     }
+    let default = assert_bitwise_parity_under_strict_verify(&guest, &[]);
+    for path in DEFAULT_LEVEL_ACTIVITY_FILES {
+        assert_read(&default, path, "the default level");
+    }
+}
 
-    // These read names only the `standard` /proc level has.
-    let standard_cases = [
-        StrictCommandCase {
-            name: "lsirq",
-            candidates: &["/usr/bin/lsirq"],
-            args: &["--noheadings", "--output", "IRQ,TOTAL,NAME"],
-            stdin: None,
-        },
-        // Only CPU 0's row. Hermit zeroes every /proc/softirqs counter, and the all-CPU form
-        // printed 632 zero rows on a 316-CPU host, one traced write per field; validate killed
-        // this test at its 22 CPU-s cap (https://github.com/rrnewton/hermit/issues/3395). `-P 0`
-        // still reads and hashes the whole file (every CPU column) and keeps the 1 s resample.
-        StrictCommandCase {
-            name: "mpstat softirqs",
-            candidates: &["/usr/bin/mpstat"],
-            args: &["-I", "SCPU", "-P", "0", "1", "1"],
-            stdin: None,
-        },
-    ];
-    for case in &standard_cases {
-        assert_l2_under_strict_verify_at_standard(case);
-    }
+/// Compiles tests/c/`name`.c into `directory`.
+fn compile_c_guest(name: &str, directory: &Path) -> PathBuf {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let source = repository.join("tests/c").join(format!("{name}.c"));
+    let guest = directory.join(name);
+    let output = Command::new("cc")
+        .args(["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run cc on {}: {error}", source.display()));
+    assert!(
+        output.status.success(),
+        "cc failed on {}\nstdout:\n{}\nstderr:\n{}",
+        source.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    guest
+}
+
+/// Runs `guest` under `hermit run --strict --verify --verify-strict`, with
+/// `run_args`, requires canonical bitwise parity over a nonempty INFO log, and
+/// returns the guest's stdout.
+fn assert_bitwise_parity_under_strict_verify(guest: &Path, run_args: &[&str]) -> String {
+    let report_directory =
+        tempfile::tempdir().expect("failed to create the verification report directory");
+    let report_path = report_directory.path().join("verify.json");
+    let report_arg = format!("--verify-json={}", report_path.display());
+    let mut verify_args = vec!["--verify-strict", report_arg.as_str()];
+    verify_args.extend_from_slice(run_args);
+    let (output, rendered) = strict_verify_output(guest, &[], None, &verify_args);
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{rendered} failed\nstatus: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status,
+    );
+    let report_bytes = std::fs::read(&report_path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", report_path.display()));
+    let report: serde_json::Value =
+        serde_json::from_slice(&report_bytes).expect("Hermit's verification report is JSON");
+    let compared = |side: &str| report["compared_log_messages"][side].as_u64().unwrap_or(0);
+    assert!(
+        report["verdict"] == "matched"
+            && report["verified"] == true
+            && report["bitwise_parity"] == true
+            && report["comparison"]["strictness"] == "canonical"
+            && report["comparison"]["log_scope"] == "info"
+            && compared("left") > 0
+            && compared("left") == compared("right"),
+        "{rendered}: the report is not canonical bitwise parity over a nonempty log: {report}",
+    );
+    stdout
+}
+
+/// Requires the guest's "`path`: N lines" line, which it prints after reading
+/// a file it could open.
+fn assert_read(stdout: &str, path: &str, level: &str) {
+    let read = stdout.lines().any(|line| {
+        line.strip_prefix(path)
+            .and_then(|rest| rest.strip_prefix(": "))
+            .and_then(|rest| rest.strip_suffix(" lines"))
+            .is_some_and(|count| count.parse::<u64>().is_ok())
+    });
+    assert!(read, "at {level}, the guest did not read {path}:\n{stdout}");
 }
 
 /// The NUMA tools on the kernel without NUMA that Hermit presents
