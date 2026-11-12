@@ -10,6 +10,7 @@
 //!
 //! Of course this overlaps somewhat with "files.rs".
 
+use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::os::unix::io::RawFd;
@@ -4818,7 +4819,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// only ever claim that no process outside the guest holds the object;
     /// once a descriptor may have left the guest, the scheduler stops trusting
     /// every mark (`Scheduler::polls_only_guest_state`).
-    async fn classify_received_descriptors<G: Guest<Self>>(
+    pub(crate) async fn classify_received_descriptors<G: Guest<Self>>(
         &self,
         guest: &mut G,
         channel: RawFd,
@@ -5002,6 +5003,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         // descriptor can reach another process.
         Box::pin(self.share_sent_record_sequences(guest, &headers)).await;
         let in_turn = self.completes_in_turn(guest, call);
+        self.untrack_sent_pipe_status(guest, &headers, outside_turn)
+            .await;
         if outside_turn || !sent_descriptors(guest, &headers).0.is_empty() {
             Self::note_descriptors_passed_out(guest, call.fd(), &headers, outside_turn);
         }
@@ -5093,6 +5096,155 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await?;
         guest.thread_state_mut().send_inspection = Some(inspection);
         Ok((copies, outside_turn))
+    }
+
+    /// Before a send that may pass descriptors over `SCM_RIGHTS`, where the
+    /// runtime virtualizes SIGALRM: each pipe read description it may pass
+    /// loses its tracked status in the SIGALRM ledger
+    /// (`SigalrmControl::UntrackPipeStatus`), whoever receives it. Linux's
+    /// receiver installs the same `struct file`, whose status flags `setfl`
+    /// then changes for every holder
+    /// (<https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/fcntl.c?h=v6.12#n40>),
+    /// but a receiver whose Detcore runs in its own process models the
+    /// descriptor as a description of its own and publishes a change under
+    /// that identity, which no reader of the sender's description would ask
+    /// about. A guest-held channel revokes no mark, so without this a read of
+    /// the sent description could be admitted on a status the receiver has
+    /// changed (finding 1 of coord7's review of 29b3e6a8). The receiver's
+    /// own description is untracked at the receipt
+    /// (`untrack_received_pipe_status`), and each attempt after the first
+    /// untracks what it passes then (`pipe_reads_an_attempt_passes`). Control data
+    /// that cannot be read, or a send outside the caller's turn, may pass
+    /// any descriptor: every pipe read description the table holds loses
+    /// its status then. Sent before the send itself, regardless of its
+    /// result, as the export it accompanies is noted
+    /// (`note_descriptors_passed_out`).
+    pub(crate) async fn untrack_sent_pipe_status<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        headers: &[usize],
+        outside_turn: bool,
+    ) {
+        let ids = Self::pipe_reads_sent(guest, headers, outside_turn);
+        Self::untrack_pipe_statuses(guest, &ids).await;
+    }
+
+    /// The pipe read descriptions a send whose messages' headers are at
+    /// `headers` may pass over `SCM_RIGHTS`, read from the messages and the
+    /// descriptor table as they are now, for `untrack_sent_pipe_status`:
+    /// every one the table holds when the control data cannot be read, a
+    /// later message's control data may be an earlier one's result
+    /// (`batch_results_may_feed_control`), or the send runs outside the
+    /// caller's turn. None unless the runtime
+    /// virtualizes SIGALRM in a run that sequentializes threads, the only
+    /// runs whose ledger records a pipe's status.
+    fn pipe_reads_sent<G: Guest<Self>>(
+        guest: &G,
+        headers: &[usize],
+        outside_turn: bool,
+    ) -> Vec<crate::types::OpenFileId> {
+        let config = guest.config();
+        if !(config.backend.virtualizes_guest_sigalrm && config.sequentialize_threads) {
+            return Vec::new();
+        }
+        let (sent, unread) = sent_descriptors(guest, headers);
+        if unread || outside_turn || batch_results_may_feed_control(guest, headers) {
+            guest.thread_state().pipe_read_descriptions(None)
+        } else {
+            guest.thread_state().pipe_read_descriptions(Some(&sent))
+        }
+    }
+
+    /// The pipe read descriptions the attempt of `call`, a `sendmsg` or
+    /// `sendmmsg` about to run in the caller's turn, passes over
+    /// `SCM_RIGHTS`, other than those in `untracked`, read from its
+    /// messages and the descriptor table as the attempt will import them
+    /// (`untrack_sent_pipe_status`). The handler's untracking reads them at
+    /// entry, which no later attempt is bound to: Linux imports each
+    /// `sendmmsg` attempt's messages again, from memory another process may
+    /// have rewritten while the call waited, and a `sendmsg`'s descriptor
+    /// numbers, which the kernel looks up at each attempt, may name other
+    /// descriptions by then (`copy_msghdr_from_user` and `scm_fp_copy` per
+    /// attempt, Linux v6.12
+    /// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/socket.c?h=v6.12#n2529>,
+    /// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/core/scm.c?h=v6.12#n113>).
+    /// Without this, a pipe named only from the second attempt kept its
+    /// status, which its receiver could change unseen (finding 1 of
+    /// rev5338-cx's review of 4d17d5ab).
+    pub(crate) fn pipe_reads_an_attempt_passes<G: Guest<Self>>(
+        guest: &G,
+        call: Syscall,
+        untracked: &BTreeSet<crate::types::OpenFileId>,
+    ) -> Vec<crate::types::OpenFileId> {
+        let Some((_, headers)) = send_headers(call) else {
+            return Vec::new();
+        };
+        let mut ids = Self::pipe_reads_sent(guest, &headers, false);
+        ids.retain(|id| !untracked.contains(id));
+        ids
+    }
+
+    /// After a receive that recorded `received` (`record_received_descriptors`)
+    /// over `SCM_RIGHTS` or binder, where the runtime virtualizes SIGALRM: each
+    /// pipe read description the receiver now holds through them loses its
+    /// tracked status in the SIGALRM ledger
+    /// (`SigalrmControl::UntrackPipeStatus`), in the receiver's turn. Linux's
+    /// receiver installs the sender's `struct file` (`receive_fd`, Linux
+    /// v6.12
+    /// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/file.c?h=v6.12#n1301>),
+    /// whose status flags the sender's processes share, but a receiver
+    /// whose Detcore runs in its own process records it as a description of
+    /// its own (`record_received_descriptors`, `Receipt::New`), with no
+    /// status in the ledger under that identity, whose flags are the model's
+    /// own guess. Marked guest-held when the receiver already holds the same
+    /// pipe (`classify_received_descriptors`), as after a fork, its read would
+    /// otherwise be admitted on a copy no other holder's change reaches
+    /// (finding B1 of coord7's review of 4d17d5ab). Untracked, the gate
+    /// refuses it by name, as phase 1 refused every pipe read before slice 2,
+    /// and so for each fork alias that shares its identity. Only recorded
+    /// receipts are named: only they can be marked guest-held
+    /// (`classify_received_descriptors`), and a number a receive outside the
+    /// turn delivered may name another description by now, which the receipt
+    /// path neither records nor marks (N2 of coord7's review of 858541a9).
+    pub(crate) async fn untrack_received_pipe_status<G: Guest<Self>>(
+        guest: &mut G,
+        received: &[RawFd],
+    ) {
+        let config = guest.config();
+        if !(config.backend.virtualizes_guest_sigalrm && config.sequentialize_threads) {
+            return;
+        }
+        let ids: BTreeSet<crate::types::OpenFileId> = received
+            .iter()
+            .filter_map(|&fd| {
+                guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| {
+                        (detfd.ty() == FdType::Pipe
+                            && detfd.status_flags() & libc::O_ACCMODE != libc::O_WRONLY)
+                            .then(|| detfd.open_file_id())
+                    })
+                    .ok()
+                    .flatten()
+            })
+            .collect();
+        let ids: Vec<_> = ids.into_iter().collect();
+        Self::untrack_pipe_statuses(guest, &ids).await;
+    }
+
+    /// The pipe read descriptions `ids` each lose their tracked status in the
+    /// SIGALRM ledger (`SigalrmControl::UntrackPipeStatus`).
+    pub(crate) async fn untrack_pipe_statuses<G: Guest<Self>>(
+        guest: &mut G,
+        ids: &[crate::types::OpenFileId],
+    ) {
+        for &id in ids {
+            crate::tool_global::sigalrm_refuses(
+                guest,
+                crate::tool_global::SigalrmControl::UntrackPipeStatus { id },
+            )
+            .await;
+        }
     }
 
     /// Note, for the scheduler, that a send on `sockfd` may pass
@@ -5189,23 +5341,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !config.sequentialize_threads || config.recordreplay_modes {
             return false;
         }
-        let (sockfd, headers): (RawFd, Vec<usize>) = match call {
-            Syscall::Sendmsg(call) => (
-                call.fd(),
-                call.msg()
-                    .map(|header| header.as_raw())
-                    .into_iter()
-                    .collect(),
-            ),
-            Syscall::Sendmmsg(call) => (
-                call.sockfd(),
-                call.msgvec().map_or_else(Vec::new, |vector| {
-                    (0..call.vlen().min(libc::UIO_MAXIOV as u32) as usize)
-                        .map(|index| vector.as_raw() + index * std::mem::size_of::<Mmsghdr>())
-                        .collect()
-                }),
-            ),
-            _ => return false,
+        let Some((sockfd, headers)) = send_headers(call) else {
+            return false;
         };
         let reaches_a_guest = guest
             .thread_state()
@@ -5431,6 +5568,122 @@ where
     })
 }
 
+/// The socket of `call`, a `sendmsg` or `sendmmsg`, and the guest addresses
+/// of the message headers Linux could send: one for `sendmsg`, one per entry
+/// for `sendmmsg`, whose entries are `mmsghdr`s, each a `msghdr` followed by
+/// `msg_len`. `None` for any other call.
+fn send_headers(call: Syscall) -> Option<(RawFd, Vec<usize>)> {
+    match call {
+        Syscall::Sendmsg(call) => Some((
+            call.fd(),
+            call.msg()
+                .map(|header| header.as_raw())
+                .into_iter()
+                .collect(),
+        )),
+        Syscall::Sendmmsg(call) => Some((
+            call.sockfd(),
+            call.msgvec().map_or_else(Vec::new, |vector| {
+                (0..call.vlen().min(libc::UIO_MAXIOV as u32) as usize)
+                    .map(|index| vector.as_raw() + index * std::mem::size_of::<Mmsghdr>())
+                    .collect()
+            }),
+        )),
+        _ => None,
+    }
+}
+
+/// Whether a later message of the `sendmmsg` batch whose entries are at
+/// `headers` may take its control data from memory the same call writes
+/// first: Linux sends each entry and stores its byte count in the entry's
+/// `msg_len` before it copies the next entry's header and control data
+/// (`__sys_sendmmsg`, Linux v6.12
+/// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/socket.c?h=v6.12#n2747>;
+/// the control copy in `____sys_sendmsg`,
+/// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/socket.c?h=v6.12#n2584>).
+/// A control buffer over an earlier entry's `msg_len` may then name a
+/// descriptor no scan before the call sees: an `SCM_RIGHTS`
+/// item whose descriptor is an earlier entry's `msg_len` passes the
+/// descriptor numbered by that entry's payload length (finding 1 of
+/// rev5338-cx's review of 858541a9). The same holds for a control buffer
+/// that reaches those bytes through another address: two shared mappings
+/// of one page (finding 1 of rev5338-cx's review of 8fec6777). Before the
+/// call, conservatively, either of:
+/// - any earlier entry's `msg_len` over any later entry's control buffer by
+///   address, as `msg_len_may_overwrite_control` decides after it, or a
+///   header that cannot be read;
+/// - a later entry that reads control data (`reads_control_data`) after an
+///   earlier entry whose `msg_len` store may be seen through another
+///   address: in a shared mapping, or anywhere once a shared mapping's
+///   backing is unknown (`MemoryMetadata::may_share_backing`), or anywhere
+///   at all where the backend runs its tool inside the guest's process
+///   (`tool_runs_in_guest_process`). Elsewhere the `msg_len`'s page is
+///   private, so its store reaches a later control buffer only at its own
+///   address, which the first test covers.
+///
+/// Never true for one message (`sendmsg`, or a one-entry batch).
+pub(crate) fn batch_results_may_feed_control<T, G>(guest: &G, headers: &[usize]) -> bool
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    // Every entry but the last writes a result a later entry may read; every
+    // entry but the first may read one. A header that cannot be read counts.
+    let Some((_, results)) = headers.split_last() else {
+        return false;
+    };
+    if results.is_empty() {
+        return false;
+    }
+    if msg_len_may_overwrite_control(guest, results, &headers[1..]) {
+        return true;
+    }
+    let runtime_unseen = tool_runs_in_guest_process(&guest.config().backend);
+    let may_be_seen_elsewhere = |header: &usize| {
+        runtime_unseen
+            || header
+                .checked_add(std::mem::offset_of!(Mmsghdr, msg_len))
+                .is_none_or(|length| {
+                    guest
+                        .thread_state()
+                        .memory_may_share_backing(length, std::mem::size_of::<u32>())
+                })
+    };
+    (1..headers.len()).any(|later| {
+        reads_control_data(guest, headers[later])
+            && headers[..later].iter().any(may_be_seen_elsewhere)
+    })
+}
+
+/// Whether the message whose header is at `header` may have Linux read
+/// control data: its header cannot be read, or names a nonempty control
+/// buffer (`____sys_sendmsg` copies `msg_controllen` bytes).
+fn reads_control_data<T, G>(guest: &G, header: usize) -> bool
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    Addr::<Msghdr>::from_raw(header)
+        .and_then(|header| guest.memory().read_value::<_, Msghdr>(header).ok())
+        .is_none_or(|message| message.msg_controllen != 0)
+}
+
+/// Whether the backend runs its tool inside each guest process: it promotes
+/// open files before the native lifecycle calls it performs there, or runs
+/// guest code inside the tool's handler (`BackendCapabilities`;
+/// LITEINST_IN_GUEST does both, ptrace neither). Such a backend's runtime
+/// maps memory of its own in the guest's address space with calls that
+/// never reach Detcore: LiteInst's in-guest runtime maps its RPC queue and
+/// its guest log buffer shared and writable
+/// (`reverie-rpc-transport/src/mapped.rs`, `guest_log/buffer.rs`). Detcore's
+/// shared-mapping model then proves no page of that address space private
+/// (`batch_results_may_feed_control`; minibeads dh-cge466 would have the
+/// runtime register those mappings).
+pub(crate) fn tool_runs_in_guest_process(backend: &reverie::BackendCapabilities) -> bool {
+    backend.promotes_open_files_before_native_lifecycle
+        || backend.runs_guest_code_between_injections
+}
+
 /// The descriptors the messages at `headers` name in `SCM_RIGHTS`, and
 /// whether a header or control buffer could not be read in full, in which case
 /// the list may be incomplete (`mark_exported_listeners`).
@@ -5515,6 +5768,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             Err(refusal) => return refusal,
         };
         let in_turn = self.completes_in_turn(guest, call);
+        self.untrack_sent_pipe_status(guest, &headers, outside_turn)
+            .await;
         if outside_turn || !sent_descriptors(guest, &headers).0.is_empty() {
             Self::note_descriptors_passed_out(guest, call.sockfd(), &headers, outside_turn);
         }
@@ -5682,6 +5937,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await?;
         self.classify_received_descriptors(guest, call.sockfd(), &recorded)
             .await;
+        Self::untrack_received_pipe_status(guest, &recorded).await;
         // Where the tool discovers received descriptors, recvmsg's refresh
         // covers every descriptor delivered, as before; elsewhere only those
         // this receipt recorded.
@@ -6153,6 +6409,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await?;
         self.classify_received_descriptors(guest, call.fd(), &recorded)
             .await;
+        Self::untrack_received_pipe_status(guest, &recorded).await;
         self.note_short_batch(guest, from, call.vlen() as usize);
         // Only the descriptors this receipt recorded.
         self.refresh_received_locks(guest, &recorded, super::files::LockCall::Recvmmsg)

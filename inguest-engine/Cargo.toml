@@ -1,7 +1,7 @@
 [package]
 name = "hermit-inguest-engine"
 description = "Shared compiled in-guest Detcore engine for ordinary native entry shims."
-version = "0.5.6"
+version = "0.5.7"
 edition = "2024"
 build = "build.rs"
 license = "BSD-3-Clause"
@@ -47,16 +47,16 @@ native-first-instruction-observer = ["reverie-inguest/native-entry-observer"]
 dispatch-observer = ["detcore/dispatch-observer"]
 
 [dependencies]
-detcore = { package = "hermit-detcore", version = "0.5.6", path = "../detcore" }
+detcore = { package = "hermit-detcore", version = "0.5.7", path = "../detcore" }
 libc = "0.2.186"
 rand = "0.10.2"
 tracing = "0.1.41"
 # One exact core source owns the shared ordinary/native Guest and RPC services.
 # Native compilation and loader qualification remain separate required gates.
-reverie = { package = "reverie-core", version = "0.5.6", git = "https://github.com/rrnewton/reverie.git", rev = "f2129d99a44d809a5bb56df130cade723d7e6ebd" }
-reverie-inguest = { version = "0.5.6", git = "https://github.com/rrnewton/reverie.git", rev = "f2129d99a44d809a5bb56df130cade723d7e6ebd", default-features = false, features = ["coordinator-rpc", "rcb-clock"] }
-reverie-liteinst = { version = "0.5.6", git = "https://github.com/rrnewton/reverie.git", rev = "f2129d99a44d809a5bb56df130cade723d7e6ebd", default-features = false }
-reverie-rpc-transport = { version = "0.5.6", git = "https://github.com/rrnewton/reverie.git", rev = "f2129d99a44d809a5bb56df130cade723d7e6ebd" }
+reverie = { package = "reverie-core", version = "0.5.7", git = "https://github.com/rrnewton/reverie.git", rev = "8143cbd865fa33b1c1a88b94e73b41556cd6f101" }
+reverie-inguest = { version = "0.5.7", git = "https://github.com/rrnewton/reverie.git", rev = "8143cbd865fa33b1c1a88b94e73b41556cd6f101", default-features = false, features = ["coordinator-rpc", "rcb-clock"] }
+reverie-liteinst = { version = "0.5.7", git = "https://github.com/rrnewton/reverie.git", rev = "8143cbd865fa33b1c1a88b94e73b41556cd6f101", default-features = false }
+reverie-rpc-transport = { version = "0.5.7", git = "https://github.com/rrnewton/reverie.git", rev = "8143cbd865fa33b1c1a88b94e73b41556cd6f101" }
 
 [dev-dependencies]
 serde_json = "1.0.140"

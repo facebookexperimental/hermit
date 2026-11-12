@@ -10,15 +10,15 @@
 # binaries into the test.detcore_misc/parallel/time selections only after
 # exact name-set and Cargo-twin case-set equality checks.
 #
-# Placement is buck-harvest-only by default: binaries land in
+# Placement is buck-harvest-only: binaries land in
 # target/validate/buck-harvest/<name>, and nextest prepare repoints the
 # recorded metadata at them (option b; Cargo's target files are never
 # written). The manifest and buck-harvest/ are also mirrored into
 # ignored/hermetic/split/target/validate/, the pinned prepare's declared
 # input location (its /src/target mount shadows this checkout's target/).
-# HARVEST_ALLOW_PLACED=1 is the explicit legacy opt-in that
-# instead replaces an existing Cargo counterpart in
-# target/validate/deps/; prepare refuses any manifest produced that way.
+# Binaries are accepted only after every RUNPATH entry resolves under
+# /nix/store and each one ldd-resolves and lists inside the pinned root;
+# the manifest is published only after that gate passes.
 #
 # The OSS shim reports no sanitizer (shim/build_defs/sanitizers.bzl), so in
 # this repository the Buck cohort is the unsanitized OSS configuration; in
@@ -55,8 +55,27 @@ TARGETS=(
   "hermit//detcore:tests_time|tests_time"
 )
 
-if [[ ! -f shim/third-party/rust/BUCK ]]; then
+# Regenerate when the authoritative cache key differs: the generated
+# graph is gitignored, so a long-lived slot keeps its copy across input
+# bumps and would compile detcore against a vendored set the tree no
+# longer names (observed: tokio 1.53.1 vendor vs 1.54.1 lock ->
+# E0599/E0277 in detcore). The key comes from
+# bootstrap/rust-deps-cache-key.rs, the same input list the rust-deps
+# cache trusts. Its decline (exit 3) or error (exit 1) means
+# regenerate unconditionally and write no stamp. The stamp lives in
+# vendor/, which the key walk excludes, so it never feeds its own key.
+stamp_file=shim/third-party/rust/vendor/.stamp
+vendored_key=$(./bootstrap/rust-deps-cache-key.rs . 2>/dev/null) && key_rc=0 || key_rc=$?
+if [[ $key_rc -ne 0 || ! -f shim/third-party/rust/BUCK || ! -f $stamp_file ||
+      $(cat "$stamp_file" 2>/dev/null) != "$vendored_key" ]]; then
   ./bootstrap/regenerate-rust-deps
+  if [[ $key_rc -eq 0 ]]; then
+    stamp_tmp=$(mktemp shim/third-party/rust/vendor/.stamp.XXXXXX)
+    printf '%s\n' "$vendored_key" >"$stamp_tmp"
+    mv "$stamp_tmp" "$stamp_file"
+  else
+    rm -f "$stamp_file"
+  fi
 fi
 
 mkdir -p target/validate/buck-harvest
@@ -75,8 +94,12 @@ for entry in "${TARGETS[@]}"; do
   BUCK_TARGETS+=("${entry%%|*}")
 done
 
+# Build against the pinned root's sysroot input so the binaries carry the
+# nix RUNPATH their Cargo twins carry and execute where prepare lists them
+# (inside the pinned root). A digest drift refuses in the staging script.
+bash shim/modes/stage-pinned-sysroot
 echo "harvest-reverie-buck: building ${#BUCK_TARGETS[@]} detcore targets with $BUCK2" >&2
-"$BUCK2" build --show-output "${BUCK_TARGETS[@]}" > "$BUILD_LOG" 2>&1 || {
+"$BUCK2" build -c hermit.rust_sysroot=pinned-rust-sysroot --show-output "${BUCK_TARGETS[@]}" > "$BUILD_LOG" 2>&1 || {
   tail -n 30 "$BUILD_LOG" >&2
   echo "harvest-reverie-buck: buck build failed (log retained at $BUILD_LOG)" >&2
   exit 2
@@ -94,30 +117,8 @@ for entry in "${TARGETS[@]}"; do
     echo "harvest-reverie-buck: no build output for $target" >&2
     exit 2
   fi
-  # Place over the Cargo counterpart when exactly one exists, else
-  # buck-harvest/. Multiple stale counterparts are a refusal: picking the
-  # first glob match could replace a binary prepare does not name.
-  dest=""
   placed=false
-  matches=()
-  for candidate in target/validate/deps/${name}-*; do
-    if [[ -f $candidate && -x $candidate && $candidate != *.d ]]; then
-      matches+=("$candidate")
-    fi
-  done
-  if [[ ${#matches[@]} -gt 1 ]]; then
-    echo "harvest-reverie-buck: multiple Cargo counterparts for $name: ${matches[*]}" >&2
-    exit 2
-  fi
-  # Placement over a Cargo counterpart only behind the explicit legacy
-  # opt-in HARVEST_ALLOW_PLACED=1; the default is buck-harvest/ only.
-  if [[ ${HARVEST_ALLOW_PLACED:-} == 1 && ${#matches[@]} -eq 1 ]]; then
-    dest=${matches[0]}
-    placed=true
-  fi
-  if [[ -z $dest ]]; then
-    dest=target/validate/buck-harvest/${name}
-  fi
+  dest=target/validate/buck-harvest/${name}
   cp -- "$src" "$dest"
   chmod 755 "$dest"
   touch "$dest"
@@ -131,6 +132,57 @@ for entry in "${TARGETS[@]}"; do
   bytes=$(stat -c %s "$dest")
   ENTRIES="${ENTRIES}${target}|${name}|${src}|${dest}|${placed}|${sha}|${bytes}|${listed}"$'\n'
   echo "harvest-reverie-buck: $name <- $src => $dest (placed=$placed, $listed cases)" >&2
+done
+
+# Route (ii) staging: prepare runs inside the pinned root, where
+# /src/target is the split output mount (ignored/hermetic/split/target)
+# and shadows this checkout's target/. Mirror the declared input --
+# the manifest and the buck-harvest files it names, nothing else --
+# into that location so prepare can read and hash-verify it there.
+# Prepare's verification is unchanged: it refuses missing, mismatched
+# or extra files by name against this same manifest.
+PINNED_VALIDATE=ignored/hermetic/split/target/validate
+mkdir -p "$PINNED_VALIDATE"
+rm -rf "$PINNED_VALIDATE/buck-harvest" "$PINNED_VALIDATE/harvested-files.json"
+mkdir -p "$PINNED_VALIDATE/buck-harvest"
+printf '%s' "$ENTRIES" | while IFS='|' read -r _target name _src dest _placed _sha _bytes _listed; do
+  case $dest in
+    target/validate/buck-harvest/*)
+      cp -- "$dest" "$PINNED_VALIDATE/buck-harvest/$name"
+      ;;
+    *)
+      echo "harvest-reverie-buck: refusing to mirror non-buck-harvest dest $dest" >&2
+      exit 2
+      ;;
+  esac
+done
+echo "harvest-reverie-buck: staged buck-harvest into $PINNED_VALIDATE (manifest withheld until acceptance)" >&2
+
+# Acceptance, before anything is published: every RUNPATH entry must lie
+# under /nix/store (no host paths, however inert), and every harvested
+# binary must resolve and list INSIDE the pinned root, where prepare runs
+# it. A host-linked binary passes every host check above and then fails
+# prepare with exit 127, so prove both here, where failures name this
+# producer. The manifest is written only after this gate passes, so a
+# failing harvest leaves no publishable input behind.
+mkdir -p ignored/hermetic/split/cargo
+for entry in "${TARGETS[@]}"; do
+  name=${entry##*|}
+  rpath=$(readelf -d "target/validate/buck-harvest/$name" | sed -n 's/.*RUNPATH.*\[\(.*\)\]/\1/p')
+  [[ -n $rpath ]] || { echo "harvest-reverie-buck: $name has no RUNPATH" >&2; exit 2; }
+  IFS=: read -ra rpath_entries <<<"$rpath"
+  for dir in "${rpath_entries[@]}"; do
+    [[ $dir == /nix/store/* ]] || {
+      echo "harvest-reverie-buck: $name RUNPATH entry outside /nix/store: $dir" >&2
+      exit 2
+    }
+  done
+  ./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split \
+    --src-rw --cargo-home ignored/hermetic/split/cargo -- \
+    bash -c "ldd /src/target/validate/buck-harvest/$name | grep -q 'not found' && exit 1; /src/target/validate/buck-harvest/$name --list >/dev/null" || {
+    echo "harvest-reverie-buck: $name does not resolve/execute inside the pinned root" >&2
+    exit 2
+  }
 done
 
 printf '%s' "$ENTRIES" | python3 -c '
@@ -162,24 +214,5 @@ with open("target/validate/harvested-files.json", "w") as fh:
     fh.write("\n")
 print(f"harvest-reverie-buck: wrote target/validate/harvested-files.json with {len(files)} files", file=sys.stderr)
 '
-# Route (ii) staging: prepare runs inside the pinned root, where
-# /src/target is the split output mount (ignored/hermetic/split/target)
-# and shadows this checkout's target/. Mirror the declared input --
-# the manifest and the buck-harvest files it names, nothing else --
-# into that location so prepare can read and hash-verify it there.
-# Prepare's verification is unchanged: it refuses missing, mismatched
-# or extra files by name against this same manifest.
-PINNED_VALIDATE=ignored/hermetic/split/target/validate
-mkdir -p "$PINNED_VALIDATE"
-rm -rf "$PINNED_VALIDATE/buck-harvest"
-mkdir -p "$PINNED_VALIDATE/buck-harvest"
 cp -- "$MANIFEST" "$PINNED_VALIDATE/harvested-files.json"
-printf '%s' "$ENTRIES" | while IFS='|' read -r _target name _src dest _placed _sha _bytes _listed; do
-  case $dest in
-    target/validate/buck-harvest/*)
-      cp -- "$dest" "$PINNED_VALIDATE/buck-harvest/$name"
-      ;;
-  esac
-done
-echo "harvest-reverie-buck: staged manifest and buck-harvest into $PINNED_VALIDATE" >&2
 echo "harvest-reverie-buck: done" >&2

@@ -1347,6 +1347,34 @@ fn kill_child_and_wait_guest() -> &'static Path {
     })
 }
 
+static SIGNAL_TARGETS_NOT_LIVE_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+fn signal_targets_not_live_guest() -> &'static Path {
+    SIGNAL_TARGETS_NOT_LIVE_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("signal-targets-not-live");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create signal-targets-not-live guest directory");
+        let guest = build_root.join("signal_targets_not_live");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/signal_targets_not_live.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile signal-targets-not-live guest");
+        assert!(
+            output.status.success(),
+            "signal-targets-not-live guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
 static ROBUST_FUTEX_UNEXCHANGEABLE_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 
 fn robust_futex_unexchangeable_word_guest() -> &'static Path {
@@ -10135,7 +10163,10 @@ fn host_anonymous_thp_orders() -> u64 {
 /// `MADV_HUGEPAGE` marked, in an address space that did not disable huge
 /// pages, on this host (`__thp_vma_allowable_orders` for smaps): whether it
 /// holds a naturally aligned block of an allowed order, tried from the
-/// largest (`thp_vma_suitable_order` at `vm_end` less the block).
+/// largest (`thp_vma_suitable_order` at `vm_end` less the block). Both bounds
+/// are computed in unsigned arithmetic, which wraps, as Linux computes them
+/// and as Detcore's renderer does (`holds_block` in
+/// `detcore/src/procfs/memory_map/smaps.rs`).
 fn host_thp_eligible(start: u64, end: u64) -> &'static str {
     let orders = host_anonymous_thp_orders();
     let eligible = (2..=9)
@@ -10143,10 +10174,8 @@ fn host_thp_eligible(start: u64, end: u64) -> &'static str {
         .filter(|order| orders & (1 << order) != 0)
         .any(|order| {
             let size = 4096u64 << order;
-            end.checked_sub(size).is_some_and(|address| {
-                let aligned = address & !(size - 1);
-                aligned >= start && aligned + size <= end
-            })
+            let aligned = end.wrapping_sub(size) & !(size - 1);
+            aligned >= start && aligned.wrapping_add(size) <= end
         });
     if eligible { "1" } else { "0" }
 }
@@ -10164,18 +10193,10 @@ fn printed_stack_range(output: &str) -> (u64, u64) {
     )
 }
 
-/// Why KVM refuses a process's `smaps_rollup` (package K slice N4): its
-/// header spans the whole address space, and KVM's memory map lists only the
-/// stack window.
-const KVM_ROLLUP_REFUSAL: &str = "Linux's smaps_rollup gives the range from the address space's \
-    first mapping to its last one, and the backend's memory map lists only some of its mappings";
-
-/// Why KVM refuses a process's `smaps` that lists a part of the stack window
-/// a split left: its flags are not in the memory map.
-const KVM_SPLIT_SMAPS_REFUSAL: &str = "they are not in the backend's memory map";
-
 /// Why KVM refuses a process's `smaps` once access-pattern advice reached
-/// LinuxEmu for the stack: the flag it sets (`rr`) is not in the memory map.
+/// LinuxEmu, for the stack or for any other mapping: Detcore refuses every
+/// mapping's flags after advice or `mlock` that may set one
+/// (`mapping_flags_changed`), rather than take them from the memory map.
 const KVM_ADVISED_SMAPS_REFUSAL: &str = "madvise advice or mlock that reached the backend may have \
     set flags on";
 
@@ -10190,18 +10211,20 @@ const KVM_ADVISED_SMAPS_REFUSAL: &str = "madvise advice or mlock that reached th
 /// the native run below still gives the smaps lines; Hermit must say
 /// `absent` on both backends, also after the guest discards every page of
 /// its initial stack (the discard that used to make a rendered row
-/// unanswerable on KVM).
+/// unanswerable on KVM). On both backends the rollup reads, and so does a
+/// stack split in three by a `PROT_NONE` page.
 ///
 /// On ptrace the kernel's files, sanitized: every kind is listed, the
 /// stack's flags, `THPeligible` and `ProtectionKey` are the native run's,
-/// and every page count is zero; the rollup, a split stack, access-pattern
-/// advice and advice on another mapping read too.
+/// and every page count is zero; access-pattern advice on the stack and on
+/// another mapping reads too.
 ///
-/// On KVM, where Detcore renders the files from the backend's memory map
-/// (package K slice N4 of <https://github.com/rrnewton/hermit/issues/4213>),
-/// the stack alone is listed, as in `maps` (the memory map lists the stack
-/// window only, <https://github.com/rrnewton/reverie/issues/1211>). Its
-/// block is compared with ptrace's, each exemption named:
+/// On KVM Detcore renders the files from the backend's memory map (package
+/// K slice N4 of <https://github.com/rrnewton/hermit/issues/4213>), which
+/// lists every mapping (<https://github.com/rrnewton/reverie/pull/1319>) and
+/// carries each one's flags (`MappingFact::vm_flags`): every kind is listed
+/// but the vDSO, of which the memory map lists none. The stack's block, whole
+/// and split, is compared with ptrace's, each exemption named:
 /// - the range and `Size` are left out by the guest, and the name's padding,
 ///   all of which LinuxEmu's stack window decides;
 /// - `ProtectionKey` is left out of ptrace's: KVM's kernel enables no
@@ -10214,37 +10237,49 @@ const KVM_ADVISED_SMAPS_REFUSAL: &str = "madvise advice or mlock that reached th
 ///   window rather than against ptrace's, which is for a native-sized
 ///   stack; elsewhere it is 0 on both and compared with the rest.
 ///
-/// What the memory map cannot tell is refused by name: the rollup's range,
-/// the flags of a part a split left of the stack, and the flags advice set
-/// on the stack. Advice on a mapping the memory map does not list changes
-/// nothing KVM's files show, and refuses nothing.
+/// What Detcore does not take from the memory map is refused by name: the
+/// flags advice may set, on the stack or on another mapping.
 fn list_the_address_space_in_smaps_and_numa_maps(backend: &str) {
     let kvm = backend == "kvm";
     let (_, files, _) = address_space_listing(backend, "files", true);
     let listed = |kind: &str| files.contains(&format!("kind {kind} listed\n"));
-    for kind in ["anonymous", "file", "heap", "vdso"] {
-        assert_eq!(listed(kind), !kvm, "{kind}:\n{files}");
+    for kind in ["anonymous", "file", "stack", "heap"] {
+        assert!(listed(kind), "{kind}:\n{files}");
     }
-    assert!(listed("stack"), "{files}");
+    assert_eq!(listed("vdso"), !kvm, "vdso:\n{files}");
     assert!(
         files.contains("blocks ok\nnuma absent\naccounting nonzero 0\n"),
         "{files}"
     );
+    let (_, rollup, _) = address_space_listing(backend, "rollup", true);
+    assert_eq!(rollup, "rollup ok\naccounting nonzero 0\n");
+    let (_, split, _) = address_space_listing(backend, "split", true);
+    assert!(
+        split.contains("blocks ok\nnuma absent\naccounting nonzero 0\n"),
+        "split:\n{split}"
+    );
+    // Every page of the initial stack discarded: still no numa_maps.
+    // (No native comparison: the host kernel has the file, so its run
+    // reports `numa present` by design.)
+    let (_, discard, _) = address_space_listing(backend, "discard", true);
+    assert_eq!(discard, "discard ok\nnuma absent\n");
     if kvm {
         assert!(!files.contains("ProtectionKey"), "{files}");
-        let (_, ptrace, _) = address_space_listing("ptrace", "files", true);
-        let (kvm_listing, kvm_thp) = without_thp_eligible(&stack_listing(&files));
-        let (ptrace_listing, ptrace_thp) =
-            without_thp_eligible(&without_protection_key(&stack_listing(&ptrace)));
-        assert_eq!(kvm_listing, ptrace_listing);
-        let (start, end) = printed_stack_range(&files);
-        assert_eq!(
-            kvm_thp.as_deref(),
-            Some(host_thp_eligible(start, end)),
-            "KVM's THPeligible for its window {start:#x}-{end:#x}"
-        );
-        if host_anonymous_thp_orders() == 0 {
-            assert_eq!(kvm_thp, ptrace_thp);
+        for (mode, listing) in [("files", &files), ("split", &split)] {
+            let (_, ptrace, _) = address_space_listing("ptrace", mode, true);
+            let (kvm_listing, kvm_thp) = without_thp_eligible(&stack_listing(listing));
+            let (ptrace_listing, ptrace_thp) =
+                without_thp_eligible(&without_protection_key(&stack_listing(&ptrace)));
+            assert_eq!(kvm_listing, ptrace_listing, "{mode}");
+            let (start, end) = printed_stack_range(listing);
+            assert_eq!(
+                kvm_thp.as_deref(),
+                Some(host_thp_eligible(start, end)),
+                "{mode}: KVM's THPeligible for its stack {start:#x}-{end:#x}"
+            );
+            if host_anonymous_thp_orders() == 0 {
+                assert_eq!(kvm_thp, ptrace_thp, "{mode}");
+            }
         }
         // The guest shown the vCPU's own CPUID (OSPKE clear, PKU set) reads
         // the same block: the kernel serving it decides, not the CPUID.
@@ -10253,19 +10288,7 @@ fn list_the_address_space_in_smaps_and_numa_maps(backend: &str) {
         assert_eq!(code, Some(0), "--no-virtualize-cpuid:\n{nocpuid}\n{stderr}");
         assert!(!nocpuid.contains("ProtectionKey"), "{nocpuid}");
         assert_eq!(stack_listing(&nocpuid), stack_listing(&files));
-        // Advice on the anonymous mapping, which the memory map does not
-        // list, leaves the stack's block as it was.
-        let (_, other, _) = address_space_listing(backend, "other", true);
-        assert_eq!(stack_listing(&other), stack_listing(&files));
-        // Discarding every page of the initial stack refuses nothing now:
-        // there is no numa_maps row whose residency it would decide.
-        let (_, discard, _) = address_space_listing(backend, "discard", true);
-        assert_eq!(discard, "discard ok\nnuma absent\n");
-        for (mode, refusal) in [
-            ("rollup", KVM_ROLLUP_REFUSAL),
-            ("split", KVM_SPLIT_SMAPS_REFUSAL),
-            ("advise", KVM_ADVISED_SMAPS_REFUSAL),
-        ] {
+        for mode in ["advise", "other"] {
             let (code, stdout, stderr) = address_space_listing(backend, mode, false);
             // EXIT-CLASS: hermit
             assert_eq!(
@@ -10279,7 +10302,7 @@ fn list_the_address_space_in_smaps_and_numa_maps(backend: &str) {
                 "{mode}: {stderr}"
             );
             assert!(
-                stderr.contains("read refused: ") && stderr.contains(refusal),
+                stderr.contains("read refused: ") && stderr.contains(KVM_ADVISED_SMAPS_REFUSAL),
                 "{mode}: {stderr}"
             );
         }
@@ -10300,20 +10323,13 @@ fn list_the_address_space_in_smaps_and_numa_maps(backend: &str) {
         };
         assert_eq!(derived(&files), derived(&native), "{native}");
         assert!(!native.contains("accounting nonzero 0\n"), "{native}");
-        let (_, rollup, _) = address_space_listing(backend, "rollup", true);
-        assert_eq!(rollup, "rollup ok\naccounting nonzero 0\n");
-        for mode in ["split", "advise", "other"] {
+        for mode in ["advise", "other"] {
             let (_, output, _) = address_space_listing(backend, mode, true);
             assert!(
                 output.contains("blocks ok\nnuma absent\naccounting nonzero 0\n"),
                 "{mode}:\n{output}"
             );
         }
-        // Every page of the initial stack discarded: still no numa_maps.
-        // (No native comparison: the host kernel has the file, so its run
-        // reports `numa present` by design.)
-        let (_, discard, _) = address_space_listing(backend, "discard", true);
-        assert_eq!(discard, "discard ok\nnuma absent\n");
     }
 }
 
@@ -10325,7 +10341,6 @@ fn smaps_numa_maps_and_the_rollup_list_the_address_space_as_on_linux() {
 
 /// [`list_the_address_space_in_smaps_and_numa_maps`] on KVM.
 #[test]
-#[ignore = "known failure: Detcore refuses smaps flags it cannot source for non-stack mappings (capability gap, minibeads dh-9j8ue, kvm lane re-enables); Reverie #1319 made the KVM memory map complete, so the old stack-only pass was not Linux-faithful"]
 fn run_kvm_smaps_and_numa_maps_render_the_stack_from_the_memory_map() {
     let test = "run_kvm_smaps_and_numa_maps_render_the_stack_from_the_memory_map";
     if kvm_unavailable(test) {
@@ -24881,6 +24896,53 @@ fn run_kvm_argument_errors_on_another_process_procfs_answer_as_linux() {
                 .any(|line| line.contains(" refused: ") || line.contains(" refused by the backend")),
             "{backend}: a call was refused by name\nstderr:\n{stderr}"
         );
+    }
+}
+
+/// tests/c/signal_targets_not_live.c: every signal-sending call to a child
+/// that has exited and has not been reaped (a zombie: 0, the signal dropped),
+/// to the same child once reaped (ESRCH) and to an exited thread (ESRCH),
+/// with a caller's siginfo of each kind checked before the target is looked
+/// up (EFAULT, E2BIG, EPERM) and the signal number only once it is found
+/// (EINVAL). On ptrace the kernel answers; on KVM Detcore answers each call
+/// from its own model, without forwarding it, as the KVM cross-process
+/// signal design's section 3 has it: the backend's record of an exit or a
+/// reap is not what the sender's turn reads. Both match the native run line
+/// by line.
+#[test]
+fn signals_to_targets_that_are_not_live_answer_as_on_linux() {
+    let _guard = hermit_run_guard();
+    let guest = signal_targets_not_live_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let native = Command::new(guest)
+        .output()
+        .expect("run the signal-targets-not-live guest natively");
+    assert!(native.status.success(), "native: {native:?}");
+    let native = stdout(&native);
+    assert!(
+        native.contains("zombie, kill: 0\n")
+            && native.contains("reaped, kill: -1 ESRCH\n")
+            && native.contains("exited thread, tgkill: -1 ESRCH\n"),
+        "the native run is the oracle:\n{native}"
+    );
+    for backend in ["--backend=ptrace", "--backend=kvm"] {
+        if backend == "--backend=kvm"
+            && kvm_unavailable("signals_to_targets_that_are_not_live_answer_as_on_linux")
+        {
+            continue;
+        }
+        let args = [
+            backend,
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--",
+            guest,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), native, "{backend}");
     }
 }
 
@@ -75128,9 +75190,8 @@ fn the_callers_own_proc_directories_answer_as_linux() {
 /// Every name those listings give opens and reads without a refusal (the
 /// guest's read-listed mode). Since Reverie #1319 the backend's memory
 /// map is complete and `smaps_rollup` is listed (and native Linux lists
-/// it too); the whole test is nevertheless disabled under dh-9j8ue
-/// because `numa_maps` refuses for file mappings while `MappingFact`
-/// carries no residency.
+/// it too), and `smaps` renders each mapping's flags from it
+/// (`MappingFact::vm_flags`).
 /// Then the guest's other modes ([`OWN_DIRECTORY_MODES`]): the open of
 /// `/proc/self` itself (`O_PATH|O_NOFOLLOW`), by its plain spelling and
 /// through `..`, which opens the link on Linux and for which this backend has
@@ -75143,7 +75204,6 @@ fn the_callers_own_proc_directories_answer_as_linux() {
 /// slice 2b-3 serves `environ` from Detcore's record of the exec strings,
 /// `environ`, which Linux lists before `auxv`.
 #[test]
-#[ignore = "known failure: numa_maps under KVM refuses for file mappings because the backend's MappingFact carries no residency (capability gap, minibeads dh-9j8ue, kvm lane re-enables); Reverie #1319 made the KVM memory map complete, so read-listed now reaches mappings Detcore cannot render"]
 fn run_kvm_the_callers_own_proc_directories_answer_as_linux() {
     let test = "run_kvm_the_callers_own_proc_directories_answer_as_linux";
     if kvm_unavailable(test) {

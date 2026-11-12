@@ -131,10 +131,11 @@ build-identity = "source"
 ```
 
 When preparing the registry release projection, change that value to
-`"registry"` in its manifest and corresponding autocargo package metadata in
-`hermit-cli/BUCK` before running `cargo package -p hermit-run` or
-`cargo publish -p hermit-run`. Keep both values at `"source"` in the ordinary
-source tree. Cargo preserves this metadata in the packaged manifest.
+`"registry"` in its manifest before running `cargo package -p hermit-run` or
+`cargo publish -p hermit-run`. Keep it at `"source"` in the ordinary source
+tree. `hermit-cli/BUCK` is fbsource's copy and carries no Cargo package
+metadata in this repository. Cargo preserves this metadata in the packaged
+manifest.
 Removing backend features is a separate packaging choice and does not change
 the build identity. A missing or invalid identity is a build error.
 

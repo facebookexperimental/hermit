@@ -1,8 +1,81 @@
 # Hermit
 
-Notable changes for users. Versions 0.5.0, 0.5.2, 0.5.5 and 0.5.6 describe
-crate releases; 0.5.1 and 0.5.3 describe selected development snapshots, and 0.5.4
-is a package-version alignment. The 0.5.2 release branches from 0.5.0.
+Notable changes for users. Versions 0.5.0, 0.5.2, 0.5.5, 0.5.6 and 0.5.7
+describe crate releases; 0.5.1 and 0.5.3 describe selected development
+snapshots, and 0.5.4 is a package-version alignment. The 0.5.2 release
+branches from 0.5.0.
+
+## 0.5.7
+
+Release for the 2026-11-11 fbsource import. It pins Reverie 0.5.7
+(`8143cbd8`) and summarizes the changes since 0.5.6.
+
+- KVM `smaps`: Detcore renders `/proc/<pid>/smaps` for every mapping in the
+  backend's memory map. Before, it rendered the initial stack and refused
+  the read at the first other mapping.
+  - `VmFlags` come from the flags the backend gives each mapping, named in
+    Linux's bit order.
+  - `THPeligible` follows Linux's rules. For a file on overlayfs or tmpfs
+    it is the host kernel's answer for a mapping of the same file, which
+    Reverie 0.5.7 asks for. In an address space that called
+    `PR_SET_THP_DISABLE` it is 0.
+  - What no fact decides is still refused by name, for example a mapping
+    that `madvise` advice or `mlock` changed.
+- KVM speed: with Reverie 0.5.7, a guest's file `mmap` no longer makes the
+  backend read its whole `/proc/self/mountinfo`. Two KVM runs of a git
+  workload in a container with 886 mounts had spent 1.81 s of their 6.28 s
+  on those reads.
+- KVM signals: Detcore answers a signal sent to a target that is not live
+  (a zombie, a reaped process or an exited thread) from its own model of
+  the run, at the sender's turn, instead of forwarding it to the backend.
+  `tgkill`, `tkill` and `rt_tgsigqueueinfo` to a zombie leader answer 0, as
+  on Linux, where they answered `ESRCH`, and an invalid signal number sent
+  to a reaped process answers `ESRCH`, where it answered `EINVAL`.
+  `rt_sigqueueinfo` and `pidfd_send_signal` to a zombie now answer from the
+  same model, after Linux's siginfo checks. ptrace still leaves these sends
+  to the kernel.
+- In-guest SIGALRM: on `--backend in-guest-trap` with guest SIGALRM handlers
+  admitted (the per-run opt-in `REVERIE_LITEINST_SIGALRM_HANDLERS=1`, with
+  site patching off), a handler without `SA_RESTART` now interrupts a
+  blocking read of a pipe that only guest processes hold, as on Linux. The
+  read returns `EINTR` after the handler runs; data or EOF that arrived
+  first is returned first; a child's exit interrupts nothing. Before, every
+  such read was refused with `EOPNOTSUPP`.
+  - These reads are still refused with `EOPNOTSUPP`, and a warning names
+    the reason: under an `SA_RESTART` handler; of a named FIFO or the
+    container's stdio; under any recording or replay; after a descriptor
+    may have left the guest; and wherever Hermit cannot prove the pipe's
+    status flags current, such as after another process changed them
+    through a forked copy, or after the pipe end was sent or received over
+    `SCM_RIGHTS`.
+  - If what admitted a read stops holding before the read ends, the run
+    stops with exit 122 and `HERMIT_SIGALRM_PIPE_STATUS_DIVERGED` or
+    `HERMIT_SIGALRM_PIPE_AUTHORITY_REVOKED`, and the guest sees no result.
+- `--verify` and `--strict`: the CPU identity in verification reports and
+  in the refusal of an inexact branch counter now comes from reading only
+  the first processor's block of `/proc/cpuinfo`: one 4 KiB read, where the
+  whole file on a 316-CPU host is 617,230 bytes and about 2 ms of CPU.
+- Pinned CPUs: at `--log=info` a pinned run logs one `pinned CPU placement`
+  line with its CPU, how it holds it (reserved, kept, shared or
+  unreserved), and whether its reservation coordinates through a host lock
+  directory or only within its network namespace.
+- Buck: the 30 BUCK files and 3 `.bzl` files that Hermit shares with
+  fbsource were brought in line with fbsource's copies; the open-source shim
+  supplies stand-ins for the internal `.bzl` files they load. Release targets are defined in
+  `hermit-cli/release_alias.bzl`, and targets that need internal-only inputs
+  are marked broken-in-oss. The registry release projection now sets
+  `build-identity` in hermit-cli's Cargo manifest only.
+- Packaging: the `oss_cargo/` manifest copies are retired. Each crate's
+  `Cargo.toml` exists once, at its crate path.
+- Align every first-party package and internal requirement at 0.5.7, and
+  pin Reverie 0.5.7.
+
+Incompatible changes:
+
+- In-guest runtime: Hermit and its in-guest runtime
+  (`libdetcore_liteinst.so`) check one protocol revision, which moves from
+  56 to 57, so a 0.5.6 runtime and a 0.5.7 Hermit refuse each other by
+  name.
 
 ## 0.5.6
 

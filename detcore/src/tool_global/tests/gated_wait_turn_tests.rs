@@ -234,6 +234,9 @@ struct TurnGuest {
     /// query fails instead.
     action_mask: u64,
     action_query_fails: bool,
+    /// What signal phase 1's ledger answers `SigalrmControl::DueEntry` with
+    /// (every other ledger control is answered `false`).
+    sigalrm_due: bool,
     /// Every injected syscall, in order.
     injected: Vec<Sysno>,
     /// What each injected `read` returns, in order (`EAGAIN` once empty).
@@ -263,6 +266,23 @@ struct TurnGuest {
     /// The set of each injected `rt_sigtimedwait` (A5 step 3c.1d's removal of
     /// ignored signals, D37), in order.
     sigtimedwait_sets: Vec<u64>,
+    /// Set once a request is answered `Signaled` with SIGALRM, the wake a due
+    /// entry substitutes: from then on the ledger answers `DueEntry` true
+    /// too, as it does for the woken read's completion (dh-ru056 slice 2).
+    due_after_wake: std::sync::atomic::AtomicBool,
+    /// What the ledger answers `SigalrmControl::TakeEntry` with.
+    take_entry: bool,
+    /// What the ledger answers `SigalrmControl::PipeStatusDiffers` with.
+    pipe_status_differs: bool,
+    /// What the ledger answers `SigalrmControl::GuestHeldMarksRevoked` with.
+    guest_held_revoked: bool,
+    /// Every signal the backend was asked to deliver after a syscall
+    /// (`Guest::defer_signal_delivery`), in order.
+    deliveries: Vec<i32>,
+    /// The return register of the completed projection
+    /// (`ThreadState::signal_register_projection`) at each RPC sent while
+    /// one is set: what the signal pipeline reads as the guest's registers.
+    projected_returns: Mutex<Vec<i64>>,
     /// What each injected `rt_sigtimedwait` returns, in order (`EAGAIN` once
     /// empty: nothing left to dequeue).
     sigtimedwait_results: VecDeque<Result<i64, Errno>>,
@@ -345,6 +365,13 @@ impl GlobalRPC<GlobalState> for TurnGuest {
     ) -> <GlobalState as GlobalTool>::Response {
         let request = crate::tool_global::without_cpu_publication(message.2);
         self.rpcs.lock().unwrap().push(request.clone());
+        if let Some(projection) = self.thread.signal_register_projection {
+            #[cfg(target_arch = "x86_64")]
+            let value = projection.rax as i64;
+            #[cfg(target_arch = "aarch64")]
+            let value = projection.regs[0] as i64;
+            self.projected_returns.lock().unwrap().push(value);
+        }
         let response = match request {
             GlobalRequest::RequestResources(ref request, _) => {
                 if request.poll_attempt == 1
@@ -363,13 +390,19 @@ impl GlobalRPC<GlobalState> for TurnGuest {
                     assert!(old.is_some(), "the scripted dup2 replaces an existing slot");
                 }
                 *self.clock.lock().unwrap() += self.clock_step_on_request;
-                GlobalResponse::RequestResources(
-                    self.answers
-                        .lock()
-                        .unwrap()
-                        .pop_front()
-                        .unwrap_or(ResumeStatus::Normal),
-                )
+                let answer = self
+                    .answers
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(ResumeStatus::Normal);
+                if matches!(&answer, ResumeStatus::Signaled(Some(signals))
+                    if signals.contains(&crate::types::SigWrapper::from(Signal::SIGALRM)))
+                {
+                    self.due_after_wake
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                GlobalResponse::RequestResources(answer)
             }
             GlobalRequest::ReleaseAllResources => GlobalResponse::ReleaseAllResources(()),
             GlobalRequest::SetSavedGuestSigmask(_) => GlobalResponse::SetSavedGuestSigmask(()),
@@ -398,7 +431,25 @@ impl GlobalRPC<GlobalState> for TurnGuest {
             ),
             GlobalRequest::NamesHermitTask(..) => GlobalResponse::NamesHermitTask(false),
             GlobalRequest::TouchFile(_) => GlobalResponse::TouchFile(()),
-            // Signal phase 1's ledger: no entry is due, nothing is refused.
+            // Signal phase 1's ledger: an entry is due only where the test
+            // says so; nothing is refused.
+            GlobalRequest::Sigalrm(crate::tool_global::SigalrmControl::DueEntry) => {
+                GlobalResponse::Sigalrm(
+                    self.sigalrm_due
+                        || self
+                            .due_after_wake
+                            .load(std::sync::atomic::Ordering::SeqCst),
+                )
+            }
+            GlobalRequest::Sigalrm(crate::tool_global::SigalrmControl::TakeEntry) => {
+                GlobalResponse::Sigalrm(self.take_entry)
+            }
+            GlobalRequest::Sigalrm(crate::tool_global::SigalrmControl::PipeStatusDiffers {
+                ..
+            }) => GlobalResponse::Sigalrm(self.pipe_status_differs),
+            GlobalRequest::Sigalrm(crate::tool_global::SigalrmControl::GuestHeldMarksRevoked) => {
+                GlobalResponse::Sigalrm(self.guest_held_revoked)
+            }
             GlobalRequest::Sigalrm(_) => GlobalResponse::Sigalrm(false),
             GlobalRequest::PendingRealTimeExpirations(_) => {
                 GlobalResponse::PendingRealTimeExpirations(0)
@@ -736,8 +787,14 @@ impl Guest<Detcore> for TurnGuest {
     ) -> Result<i64, Error> {
         self.inject(call).await.map_err(Error::from)
     }
-    async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> reverie::Never {
-        panic!("a wait must not tail-inject")
+    async fn tail_inject<S: SyscallInfo>(&mut self, call: S) -> reverie::Never {
+        // A test that expects the guest to end catches this panic and reads
+        // which call ended it.
+        panic!("a wait must not tail-inject: tail-injected {}", call.name())
+    }
+    async fn defer_signal_delivery(&mut self, event: reverie::SignalEvent) -> Result<(), Error> {
+        self.deliveries.push(event.signal());
+        Ok(())
     }
     fn set_timer(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
         Ok(())
@@ -792,6 +849,7 @@ fn turn_guest(gate: bool, own_mask: Option<u64>) -> TurnGuest {
         action_flags: 0,
         action_mask: 0,
         action_query_fails: false,
+        sigalrm_due: false,
         injected: Vec::new(),
         read_results: VecDeque::new(),
         write_results: VecDeque::new(),
@@ -804,6 +862,12 @@ fn turn_guest(gate: bool, own_mask: Option<u64>) -> TurnGuest {
         tight_stack: false,
         memory_reads: Default::default(),
         sigtimedwait_sets: Vec::new(),
+        due_after_wake: std::sync::atomic::AtomicBool::new(false),
+        take_entry: false,
+        pipe_status_differs: false,
+        guest_held_revoked: false,
+        deliveries: Vec::new(),
+        projected_returns: Mutex::new(Vec::new()),
         sigtimedwait_results: VecDeque::new(),
         sigtimedwait_after_requests: Vec::new(),
         probe_results: VecDeque::new(),
@@ -3467,3 +3531,514 @@ async fn under_the_gate_a_refused_send_s_unreadable_siginfo_is_efault_only_where
 }
 
 mod temporary_mask_turn_tests;
+
+/// Runs `step` to its end, or to the guest's end: `Err` with the harness's
+/// panic message when a call was tail-injected, which names the call
+/// (`TurnGuest::tail_inject`), so a test can show the guest never resumed.
+async fn to_guest_end<F: std::future::Future>(step: F) -> Result<F::Output, String> {
+    use futures::FutureExt;
+    std::panic::AssertUnwindSafe(step)
+        .catch_unwind()
+        .await
+        .map_err(|payload| {
+            payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default()
+        })
+}
+
+/// Whether `guest` filed a stopping refusal that names `name`.
+fn filed_stop(guest: &TurnGuest, name: &str) -> bool {
+    guest
+        .rpcs
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|rpc| matches!(rpc, GlobalRequest::StoppingRefusal(reason) if reason.contains(name)))
+}
+
+/// dev-hermit dh-ru056 slice 2, rulings C2.1-C2.4 (T2.1): at the
+/// restart checkpoint, in a process whose runtime virtualizes SIGALRM, a
+/// call's `-ERESTARTSYS` becomes `-EINTR` exactly when its process's SIGALRM
+/// entry is due, by Linux's table with the guest's own `sa_flags` (read by an
+/// injected query of the runtime's virtual action; flags without
+/// `SA_RESTART`, such as `SA_SIGINFO`, give `-EINTR`), and the call is
+/// marked for delivery at its completion. That value is what every later
+/// observer sees, since the checkpoint runs before them. An entry not due, a
+/// result that is no `-ERESTARTSYS`, a process without a handler, or a
+/// backend that does not virtualize SIGALRM leave the result as it is, with
+/// no query; an `SA_RESTART` action, which phase 1's gate refuses at the
+/// read's entry, stops the run by name.
+#[tokio::test]
+async fn the_sigalrm_restart_checkpoint_returns_eintr_only_for_a_due_entry() {
+    let restart = || Err::<i64, Error>(Errno::ERESTARTSYS.into());
+    for (case, handled, virtualizes, due, flags, res, eintr) in [
+        ("due", true, true, true, 0, restart(), true),
+        (
+            "due-siginfo",
+            true,
+            true,
+            true,
+            (libc::SA_SIGINFO | libc::SA_NODEFER) as u32 as u64,
+            restart(),
+            true,
+        ),
+        ("not-due", true, true, false, 0, restart(), false),
+        ("unhandled", false, true, true, 0, restart(), false),
+        ("not-virtualized", true, false, true, 0, restart(), false),
+        (
+            "eagain",
+            true,
+            true,
+            true,
+            0,
+            Err(Errno::EAGAIN.into()),
+            false,
+        ),
+        ("count", true, true, true, 0, Ok(1), false),
+    ] {
+        let mut guest = turn_guest(false, Some(0));
+        guest.config.backend.virtualizes_guest_sigalrm = virtualizes;
+        guest.thread.sigalrm_handled = handled;
+        guest.sigalrm_due = due;
+        guest.action_flags = flags;
+        let tool = Detcore::new(Pid::from_raw(THREAD.as_raw()), &guest.config);
+        let call = reverie::syscalls::Syscall::Read(reverie::syscalls::Read::new().with_fd(5));
+        let expected = if eintr {
+            Err(Errno::EINTR)
+        } else {
+            res.as_ref().map(|v| *v).map_err(|e| match e {
+                Error::Errno(errno) => *errno,
+                _ => unreachable!(),
+            })
+        };
+        let result = tool
+            .sigalrm_restart_checkpoint(&mut guest, &call, res)
+            .await;
+        let result = result.map_err(|e| match e {
+            Error::Errno(errno) => errno,
+            other => panic!("{case}: {other:?}"),
+        });
+        assert_eq!(result, expected, "{case}");
+        assert_eq!(guest.thread.sigalrm_interrupts_completion, eintr, "{case}");
+        let queried = guest.injected.contains(&Sysno::rt_sigaction);
+        assert_eq!(queried, eintr, "{case}: the virtual action is queried");
+        assert!(
+            !guest
+                .rpcs
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|rpc| matches!(rpc, GlobalRequest::StoppingRefusal(_))),
+            "{case}"
+        );
+    }
+
+    // SA_RESTART: phase 1 refuses such a read at its entry; one that gets
+    // here stops the run by name (C2.4) and ends the guest, with the
+    // in-guest delivery gate on or off (coord7 review of ec9b2177, S1).
+    for gate in [false, true] {
+        let mut guest = turn_guest(gate, Some(0));
+        guest.config.backend.virtualizes_guest_sigalrm = true;
+        guest.thread.sigalrm_handled = true;
+        guest.sigalrm_due = true;
+        guest.action_flags = libc::SA_RESTART as u32 as u64;
+        let tool = Detcore::new(Pid::from_raw(THREAD.as_raw()), &guest.config);
+        let call = reverie::syscalls::Syscall::Read(reverie::syscalls::Read::new().with_fd(5));
+        let end = to_guest_end(tool.sigalrm_restart_checkpoint(&mut guest, &call, restart())).await;
+        let ended = end.expect_err("the guest never resumes");
+        assert!(
+            ended.contains("tail-injected exit_group"),
+            "gate={gate}: {ended}"
+        );
+        assert!(
+            filed_stop(&guest, "HERMIT_SIGALRM_RESTART_AFTER_HANDLER"),
+            "gate={gate}"
+        );
+        assert!(!guest.thread.sigalrm_interrupts_completion);
+    }
+}
+
+/// Review P1-b of 8871d444: a pipe read phase 1 admitted ends at the restart
+/// checkpoint, before any observer, however its wait ended. When the status
+/// another process last published for the pipe's description differs from
+/// the reader's copy, the run stops by name and the guest never resumes,
+/// with the in-guest delivery gate on or off; otherwise the result goes on
+/// unchanged. Either way the admission's note is taken.
+#[tokio::test]
+async fn an_admitted_pipe_read_whose_status_diverged_stops_at_its_end() {
+    let id = crate::types::OpenFileId::new(DetPid::from_raw(THREAD.as_raw()), 730);
+    for (gate, differs, res) in [
+        (true, false, Ok(1)),
+        (true, false, Err(Errno::ERESTARTSYS)),
+        (false, true, Ok(1)),
+        (true, true, Ok(0)),
+        (true, true, Err(Errno::ERESTARTSYS)),
+    ] {
+        let mut guest = turn_guest(gate, Some(0));
+        guest.config.backend.virtualizes_guest_sigalrm = true;
+        guest.thread.sigalrm_handled = true;
+        guest.thread.sigalrm_admitted_pipe_read = Some((id, libc::O_RDONLY));
+        guest.pipe_status_differs = differs;
+        let tool = Detcore::new(Pid::from_raw(THREAD.as_raw()), &guest.config);
+        let call = reverie::syscalls::Syscall::Read(reverie::syscalls::Read::new().with_fd(5));
+        let res = res.map_err(Error::from);
+        let expected = format!("{res:?}");
+        let end = to_guest_end(tool.sigalrm_restart_checkpoint(&mut guest, &call, res)).await;
+        let case = format!("gate={gate} differs={differs} {expected}");
+        assert_eq!(
+            guest.thread.sigalrm_admitted_pipe_read, None,
+            "{case}: taken"
+        );
+        assert!(
+            guest.rpcs.lock().unwrap().iter().any(|rpc| matches!(
+                rpc,
+                GlobalRequest::Sigalrm(crate::tool_global::SigalrmControl::PipeStatusDiffers {
+                    id: asked,
+                    flags: libc::O_RDONLY,
+                }) if *asked == id
+            )),
+            "{case}: asked"
+        );
+        if differs {
+            let ended = end.expect_err("the guest never resumes");
+            assert!(
+                ended.contains("tail-injected exit_group"),
+                "{case}: {ended}"
+            );
+            assert!(
+                filed_stop(&guest, "HERMIT_SIGALRM_PIPE_STATUS_DIVERGED"),
+                "{case}"
+            );
+        } else {
+            assert_eq!(format!("{:?}", end.expect("resumes")), expected, "{case}");
+            assert!(!filed_stop(&guest, "HERMIT_SIGALRM"), "{case}");
+        }
+    }
+
+    // A call the gate did not admit asks nothing.
+    let mut guest = turn_guest(true, Some(0));
+    guest.config.backend.virtualizes_guest_sigalrm = true;
+    guest.thread.sigalrm_handled = true;
+    guest.pipe_status_differs = true;
+    let tool = Detcore::new(Pid::from_raw(THREAD.as_raw()), &guest.config);
+    let call = reverie::syscalls::Syscall::Read(reverie::syscalls::Read::new().with_fd(5));
+    let res = tool
+        .sigalrm_restart_checkpoint(&mut guest, &call, Ok(1))
+        .await;
+    assert!(matches!(res, Ok(1)));
+    assert!(guest.rpcs().is_empty(), "{:?}", guest.rpcs());
+}
+
+/// Finding 2 of the review of 29b3e6a8: a pipe read phase 1 admitted on
+/// guest-held marks ends at the restart checkpoint however its last attempt
+/// went, including the attempt the wake of a no-progress probe makes. When a
+/// descriptor has left the guest since (the marks are revoked) and an entry
+/// is due, whether that attempt found data or the wake's EINTR may have
+/// depended on a process outside the guest, so the run stops by name and the
+/// guest never resumes, with the in-guest delivery gate on or off. With no
+/// entry due, or with the marks intact, the result goes on as before; a read
+/// the gate did not admit asks nothing about the marks.
+#[tokio::test]
+async fn an_admitted_pipe_read_whose_marks_were_revoked_stops_at_its_end_while_due() {
+    let id = crate::types::OpenFileId::new(DetPid::from_raw(THREAD.as_raw()), 731);
+    let call = reverie::syscalls::Syscall::Read(reverie::syscalls::Read::new().with_fd(5));
+    for (gate, admitted, revoked, due, res, stops) in [
+        // The wake's attempt found nothing: Linux's EINTR, but the marks it
+        // rested on are gone.
+        (false, true, true, true, Err(Errno::ERESTARTSYS), true),
+        (true, true, true, true, Err(Errno::ERESTARTSYS), true),
+        // The last attempt found data while an entry was due.
+        (false, true, true, true, Ok(1), true),
+        // Nothing raced the read: no entry is due.
+        (false, true, true, false, Ok(1), false),
+        // The marks still count: the wake's EINTR, as before.
+        (false, true, false, true, Err(Errno::ERESTARTSYS), false),
+        // Not admitted by the gate: the marks are not asked about.
+        (false, false, true, true, Err(Errno::ERESTARTSYS), false),
+    ] {
+        let mut guest = turn_guest(gate, Some(0));
+        guest.config.backend.virtualizes_guest_sigalrm = true;
+        guest.thread.sigalrm_handled = true;
+        if admitted {
+            guest.thread.sigalrm_admitted_pipe_read = Some((id, libc::O_RDONLY));
+        }
+        guest.guest_held_revoked = revoked;
+        guest.sigalrm_due = due;
+        let tool = Detcore::new(Pid::from_raw(THREAD.as_raw()), &guest.config);
+        let case = format!("gate={gate} admitted={admitted} revoked={revoked} due={due} {res:?}");
+        let interrupted = matches!(res, Err(Errno::ERESTARTSYS)) && due;
+        let res = res.map_err(Error::from);
+        let unchanged = format!("{res:?}");
+        let end = to_guest_end(tool.sigalrm_restart_checkpoint(&mut guest, &call, res)).await;
+        let asked = guest.rpcs.lock().unwrap().iter().any(|rpc| {
+            matches!(
+                rpc,
+                GlobalRequest::Sigalrm(crate::tool_global::SigalrmControl::GuestHeldMarksRevoked)
+            )
+        });
+        assert_eq!(asked, admitted, "{case}: the marks are asked about");
+        if stops {
+            let ended = end.expect_err("the guest never resumes");
+            assert!(
+                ended.contains("tail-injected exit_group"),
+                "{case}: {ended}"
+            );
+            assert!(
+                filed_stop(&guest, "HERMIT_SIGALRM_PIPE_AUTHORITY_REVOKED"),
+                "{case}"
+            );
+        } else {
+            let resumed = format!("{:?}", end.expect("resumes"));
+            if interrupted {
+                assert_eq!(
+                    resumed,
+                    format!("{:?}", Err::<i64, _>(Error::from(Errno::EINTR))),
+                    "{case}"
+                );
+            } else {
+                assert_eq!(resumed, unchanged, "{case}");
+            }
+            assert!(!filed_stop(&guest, "HERMIT_SIGALRM"), "{case}");
+        }
+    }
+}
+
+/// dev-hermit dh-ru056 slice 2, ruling C2.1 (T2.1): a completion the restart
+/// checkpoint marked must deliver its SIGALRM. A delivered one hands the
+/// signal pipeline the completed projection, whose return register is the
+/// `-EINTR` the guest resumes with (C2.3: a `-512` there would show the
+/// handler the restart code), and stops nothing. One whose entry is no
+/// longer due stops the run by name and ends the guest, with the in-guest
+/// delivery gate on or off (coord7 review of ec9b2177, S1), rather than
+/// return `-EINTR` with no handler run. A completion that still returns
+/// `-ERESTARTSYS` asks the ledger nothing: no SIGALRM ended its wait, so the
+/// in-guest runtime restarts it, and an entry that fell due meanwhile is
+/// delivered at the restarted call's entry.
+#[tokio::test]
+async fn a_marked_sigalrm_completion_delivers_or_stops_the_run() {
+    let call = reverie::syscalls::Syscall::Read(reverie::syscalls::Read::new().with_fd(5));
+
+    let mut guest = turn_guest(false, Some(0));
+    guest.config.backend.virtualizes_guest_sigalrm = true;
+    guest.thread.sigalrm_handled = true;
+    guest.thread.sigalrm_interrupts_completion = true;
+    guest.sigalrm_due = true;
+    guest.take_entry = true;
+    let tool = Detcore::new(Pid::from_raw(THREAD.as_raw()), &guest.config);
+    let result = tool
+        .complete_syscall(&mut guest, &call, Err(Errno::EINTR.into()))
+        .await;
+    assert!(
+        matches!(result, Err(Error::Errno(Errno::EINTR))),
+        "{result:?}"
+    );
+    assert_eq!(
+        guest.deliveries,
+        [libc::SIGALRM],
+        "delivered at the completion"
+    );
+    let projected = guest.projected_returns.lock().unwrap().clone();
+    assert!(!projected.is_empty(), "the pipeline read the projection");
+    assert!(
+        projected
+            .iter()
+            .all(|value| *value == -i64::from(libc::EINTR)),
+        "{projected:?}"
+    );
+    assert!(guest.thread.signal_register_projection.is_none(), "cleared");
+    assert!(!filed_stop(&guest, "HERMIT_SIGALRM"), "{:?}", guest.rpcs());
+
+    for gate in [false, true] {
+        let mut guest = turn_guest(gate, Some(0));
+        guest.config.backend.virtualizes_guest_sigalrm = true;
+        guest.thread.sigalrm_handled = true;
+        guest.thread.sigalrm_interrupts_completion = true;
+        guest.sigalrm_due = false;
+        let tool = Detcore::new(Pid::from_raw(THREAD.as_raw()), &guest.config);
+        let end =
+            to_guest_end(tool.complete_syscall(&mut guest, &call, Err(Errno::EINTR.into()))).await;
+        let ended = end.expect_err("the guest never resumes");
+        assert!(
+            ended.contains("tail-injected exit_group"),
+            "gate={gate}: {ended}"
+        );
+        assert!(!guest.thread.sigalrm_interrupts_completion, "taken");
+        assert!(
+            filed_stop(&guest, "HERMIT_SIGALRM_EINTR_WITHOUT_DELIVERY"),
+            "gate={gate}"
+        );
+        assert!(guest.deliveries.is_empty());
+    }
+
+    let mut guest = turn_guest(false, Some(0));
+    guest.config.backend.virtualizes_guest_sigalrm = true;
+    guest.thread.sigalrm_handled = true;
+    guest.sigalrm_due = true;
+    let tool = Detcore::new(Pid::from_raw(THREAD.as_raw()), &guest.config);
+    let result = tool
+        .complete_syscall(&mut guest, &call, Err(Errno::ERESTARTSYS.into()))
+        .await;
+    assert!(matches!(result, Err(Error::Errno(Errno::ERESTARTSYS))));
+    let rpcs = guest.rpcs.lock().unwrap();
+    assert!(
+        !rpcs
+            .iter()
+            .any(|rpc| matches!(rpc, GlobalRequest::Sigalrm(_))),
+        "a restarted call asks the ledger nothing: {rpcs:?}"
+    );
+}
+
+/// Collects every INFO message that is a DETLOG syscall finish record.
+#[derive(Clone, Default)]
+struct FinishLog(std::sync::Arc<Mutex<Vec<String>>>);
+
+impl tracing::Subscriber for FinishLog {
+    // As `WarnLog`: "sometimes" for every callsite, so another test's
+    // subscriber cannot leave the INFO callsite cached as never.
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::sometimes()
+    }
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::INFO)
+    }
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() == tracing::Level::INFO
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut visitor = MessageVisitor(None);
+        event.record(&mut visitor);
+        if let Some(message) = visitor.0
+            && message.contains("DETLOG")
+            && message.contains("finish syscall")
+        {
+            self.0.lock().unwrap().push(message);
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// dev-hermit dh-ru056 slice 2, ruling T2.2 (coord7 review of ec9b2177, B1):
+/// through the whole syscall pipeline (`handle_syscall_event`), a read of a
+/// guest-held polled pipe in a process whose SIGALRM handler has no
+/// `SA_RESTART`, woken from its polling wait by the due SIGALRM's wake, ends
+/// with `-ERESTARTSYS`, which the restart checkpoint turns into `-EINTR`
+/// before every observer: DETLOG's finish record and the posthook
+/// happens-before anchor (a plain checkpoint, not an interrupted one) both
+/// see `-EINTR`, the handler is delivered at the completion with `-EINTR` in
+/// the projection's return register, and nothing stops the run. Mutations:
+/// the checkpoint moved below the posthook anchor (DETLOG and the anchor
+/// would see the raw restart code), and `-512` passed to the delivery (the
+/// projection would hold it).
+#[cfg(target_arch = "x86_64")]
+#[tokio::test]
+async fn a_sigalrm_interrupted_pipe_read_shows_eintr_to_detlog_and_the_posthook_anchor() {
+    use detcore_model::happens_before::HappensBeforeSpec;
+    let _seam = script(proc_state(0, 0, 0));
+    let log = FinishLog::default();
+    let _subscriber = tracing::subscriber::set_default(log.clone());
+    // The in-guest delivery gate is off on every shipped route
+    // (`IN_GUEST_RUNTIME_DELIVERS_SIGNALS`); phase 1's SIGALRM is delivered
+    // without it.
+    let mut guest = turn_guest(false, Some(0));
+    guest.config.happens_before = Some(
+        HappensBeforeSpec::from_json(&format!(
+            r#"{{"version": 1, "events": {{"r": {{"thread": "{}", "syscall": "read",
+                                         "phase": "posthook"}}}}}}"#,
+            THREAD.as_raw()
+        ))
+        .unwrap()
+        .normalize()
+        .unwrap(),
+    );
+    guest.config.backend.virtualizes_guest_sigalrm = true;
+    guest.thread.sigalrm_handled = true;
+    guest.take_entry = true;
+    let pipe = crate::fd::DetFd::new(
+        8,
+        nix::fcntl::OFlag::O_RDONLY,
+        crate::fd::FdType::Pipe,
+        crate::types::OpenFileId::new(DetPid::from_raw(THREAD.as_raw()), 740),
+    );
+    pipe.set_physically_nonblocking();
+    pipe.set_guest_held();
+    guest
+        .thread
+        .file_metadata
+        .lock()
+        .unwrap()
+        .file_handles
+        .insert(8, pipe);
+    // The probe finds the pipe empty; the retry's grant is the SIGALRM wake.
+    guest.read_results = VecDeque::from([Err(Errno::EAGAIN)]);
+    guest.answers.lock().unwrap().extend([
+        ResumeStatus::Normal,
+        ResumeStatus::Signaled(Some(vec![crate::types::SigWrapper::from(Signal::SIGALRM)])),
+    ]);
+    let tool = <Detcore as Tool>::new(Pid::from_raw(THREAD.as_raw()), &guest.config);
+    let buffer = Box::leak(Box::new([0u8; 8])).as_mut_ptr() as usize;
+    let result = tool
+        .handle_syscall_event(
+            &mut guest,
+            Syscall::Read(
+                reverie::syscalls::Read::new()
+                    .with_fd(8)
+                    .with_buf(AddrMut::from_raw(buffer))
+                    .with_len(1),
+            ),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(Error::Errno(Errno::EINTR))),
+        "{result:?}; rpcs {:?}",
+        guest.rpcs()
+    );
+    let finishes = log.0.lock().unwrap().clone();
+    let read_finish: Vec<_> = finishes
+        .iter()
+        .filter(|line| line.contains(": read("))
+        .collect();
+    assert_eq!(read_finish.len(), 1, "{finishes:?}");
+    assert!(
+        read_finish[0].contains("EINTR") && !read_finish[0].contains("ERESTARTSYS"),
+        "{}",
+        read_finish[0]
+    );
+    let anchors: Vec<_> = guest
+        .requests()
+        .iter()
+        .flat_map(|request| request.resources.keys().cloned())
+        .filter(|rid| {
+            matches!(
+                rid,
+                ResourceID::HappensBeforePosthookInterrupted { .. }
+                    | ResourceID::HappensBeforeSyscallCheckpoint { .. }
+            )
+        })
+        .collect();
+    assert!(
+        matches!(
+            anchors.as_slice(),
+            [ResourceID::HappensBeforeSyscallCheckpoint { anchors, .. }] if anchors == &["r".to_owned()]
+        ),
+        "{anchors:?}"
+    );
+    assert_eq!(guest.deliveries, [libc::SIGALRM]);
+    let projected = guest.projected_returns.lock().unwrap().clone();
+    assert!(
+        !projected.is_empty() && projected.iter().all(|v| *v == -i64::from(libc::EINTR)),
+        "{projected:?}"
+    );
+    assert!(!filed_stop(&guest, "HERMIT_"), "{:?}", guest.rpcs());
+}

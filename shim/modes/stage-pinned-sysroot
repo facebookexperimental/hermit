@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Stage the pinned root's rust sysroot as a Buck input (shim/pinned-rust-sysroot)
+# and regenerate shim/pinned_link_args.bzl from the pinned image's own
+# /nix/store lib dirs, so harvest binaries built with
+# -c hermit.rust_sysroot=pinned-rust-sysroot carry the nix RUNPATH their
+# Cargo twins carry and execute inside the pinned root where prepare lists
+# them. Every value comes from the image named by ci/hermetic/image.digest
+# (a pinned source). On digest change the staged inputs and the generated
+# .bzl are regenerated in place (commit the .bzl); refusals are only for an
+# unresolvable probe, sysroot, lib dir, compiler, or cmake.
+# Idempotent; reflinks when it can. The staged sysroot dir is gitignored.
+set -euo pipefail
+
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
+cd "$root"
+digest=$(tr -d ' \n' < ci/hermetic/image.digest)
+dst=$root/shim/pinned-rust-sysroot
+marker=$dst/.pinned-image
+args_file=$root/shim/pinned_link_args.bzl
+
+if [[ -f $marker && $(cat "$marker") == "$digest" && -f $args_file &&
+      -d shim/third-party/libunwind/staged && -d shim/third-party/xz/staged &&
+      -e shim/third-party/cmake/staged/bin/cmake ]] &&
+    grep -qF "\"$digest\"" "$args_file"; then
+    echo "stage-pinned-sysroot: up to date for $digest"
+    exit 0
+fi
+
+# Ask the pinned image itself (never host guesses): its rustc sysroot and the
+# store dirs holding the sonames harvest binaries need. ldd on the image's
+# rustc names the exact glibc/libgcc store dirs its own toolchain uses.
+mkdir -p ignored/hermetic/split/cargo
+probe=$(./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split \
+    --src-rw --cargo-home ignored/hermetic/split/cargo -- bash -c '
+set -eu
+echo "SYSROOT=$(rustc --print sysroot)"
+ldd "$(rustc --print sysroot)/bin/rustc" | sed -n "s/.*=> \(\/nix\/store\/[^ ]*\) .*/LDD \1/p"
+for so in libunwind-x86_64.so.8 liblzma.so.5; do
+  for p in /nix/store/*/lib/$so; do echo "SONAME $so ${p%/lib/*}"; done
+done
+for p in /nix/store/*/bin/cmake; do echo "CMAKE $p"; done
+echo "GCC $(readlink -f "$(command -v gcc)")"
+echo "GXX $(readlink -f "$(command -v g++)")"
+') || {
+    echo "stage-pinned-sysroot: pinned image probe failed (image $digest present?)" >&2
+    exit 1
+}
+sysroot=$(sed -n 's/^SYSROOT=//p' <<<"$probe" | head -n1)
+[[ $sysroot == /nix/store/* && -d $sysroot ]] || {
+    echo "stage-pinned-sysroot: pinned sysroot $sysroot is not on this host's /nix/store; materialize the pinned image closure first" >&2
+    exit 1
+}
+glibc_lib=$(sed -n 's|^LDD \(/nix/store/[^ ]*/lib/libc\.so\.6\)$|\1|p' <<<"$probe" | head -n1)
+libgcc_lib=$(sed -n 's|^LDD \(/nix/store/[^ ]*/lib/libgcc_s\.so\.1\)$|\1|p' <<<"$probe" | head -n1)
+unwind_lib=$(sed -n 's|^SONAME libunwind-x86_64\.so\.8 \(/nix/store/[^ ]*\)$|\1/lib|p' <<<"$probe" | head -n1)
+xz_lib=$(sed -n 's|^SONAME liblzma\.so\.5 \(/nix/store/[^ ]*\)$|\1/lib|p' <<<"$probe" | head -n1)
+glibc_lib=${glibc_lib%/libc.so.6}
+libgcc_lib=${libgcc_lib%/libgcc_s.so.1}
+gcc_bin=$(sed -n 's|^GCC \(/nix/store/[^ ]*/bin/gcc\)$|\1|p' <<<"$probe" | head -n1)
+gxx_bin=$(sed -n 's|^GXX \(/nix/store/[^ ]*/bin/g++\)$|\1|p' <<<"$probe" | head -n1)
+for pair in "gcc:$gcc_bin" "g++:$gxx_bin"; do
+    [[ ${pair#*:} == /nix/store/*/bin/* && -x ${pair#*:} ]] || {
+        echo "stage-pinned-sysroot: could not resolve ${pair%%:*} in the pinned image" >&2
+        exit 1
+    }
+done
+for pair in "glibc:$glibc_lib" "libgcc:$libgcc_lib" "libunwind:$unwind_lib" "xz:$xz_lib"; do
+    [[ ${pair#*:} == /nix/store/*/lib ]] || {
+        echo "stage-pinned-sysroot: could not resolve ${pair%%:*} lib dir in the pinned image" >&2
+        exit 1
+    }
+done
+
+[[ -e $dst ]] && chmod -R u+w "$dst"
+rm -rf "${dst:?}"
+cp -a --reflink=auto "$sysroot" "$dst"
+# Nix store files are read-only; make the staged copy writable so later
+# restages (and buck's input handling) never trip over 0444 modes.
+chmod -R u+w "$dst"
+rm -rf "${dst:?}/share/doc" "${dst:?}/lib/rustlib/src" "${dst:?}/lib/rustlib/rustc-src"
+# Stage the pinned image's own libunwind/xz/cmake for the sysroot-mode
+# third-party switch (host_system_libraries + cmake-dir read staged/ when
+# hermit.rust_sysroot is set). All bytes come from the pinned /nix/store
+# paths resolved above, never host packages.
+stage_lib_dir() {
+    local src_dir=$1 dst_dir=$2
+    [[ -e $dst_dir ]] && chmod -R u+w "$dst_dir"
+    rm -rf "${dst_dir:?}"
+    mkdir -p "$dst_dir"
+    local copied=0 f
+    for f in "$src_dir"/*.so*; do
+        [[ -e $f ]] || continue
+        cp -L "$f" "$dst_dir"/
+        copied=$((copied + 1))
+    done
+    [[ $copied -gt 0 ]] || {
+        echo "stage-pinned-sysroot: no shared libraries staged from $src_dir" >&2
+        exit 1
+    }
+    chmod -R u+w "$dst_dir"
+}
+stage_lib_dir "$unwind_lib" shim/third-party/libunwind/staged
+stage_lib_dir "$xz_lib" shim/third-party/xz/staged
+cmake_bin=$(sed -n 's|^CMAKE \(/nix/store/[^ ]*/bin/cmake\)$|\1|p' <<<"$probe" | head -n1)
+[[ $cmake_bin == /nix/store/*/bin/cmake && -x $cmake_bin ]] || {
+    echo "stage-pinned-sysroot: could not resolve cmake in the pinned image" >&2
+    exit 1
+}
+[[ -e shim/third-party/cmake/staged ]] && chmod -R u+w shim/third-party/cmake/staged
+rm -rf shim/third-party/cmake/staged
+mkdir -p shim/third-party/cmake/staged/bin
+ln -s "$cmake_bin" shim/third-party/cmake/staged/bin/cmake
+
+printf '%s\n' "$digest" >"$marker"
+
+cat >"$args_file" <<EOF
+"""Link args that make harvest binaries executable inside the pinned root.
+
+Generated by shim/modes/stage-pinned-sysroot from the pinned image named in
+ci/hermetic/image.digest; do not hand-edit. The dirs are the pinned image's
+own /nix/store lib dirs (libunwind, glibc, libgcc, xz): linking the harvest
+targets against them with a matching RUNPATH makes the Buck-built binaries
+resolve exactly like their Cargo twins, which the nix cc-wrapper links the
+same way. Regenerate (and commit the result) whenever image.digest changes;
+staging regenerates on digest change and refuses only unresolvable inputs.
+"""
+
+PINNED_IMAGE_DIGEST = "$digest"
+
+PINNED_GCC = "$gcc_bin"
+
+PINNED_GXX = "$gxx_bin"
+
+PINNED_LINK_ARGS = [
+    "-Clink-arg=-Wl,--dynamic-linker,${glibc_lib%/lib}/lib64/ld-linux-x86-64.so.2",
+    "-Clink-arg=-L$unwind_lib",
+    "-Clink-arg=-Wl,-rpath,$unwind_lib:$glibc_lib:$libgcc_lib:$xz_lib",
+]
+EOF
+echo "stage-pinned-sysroot: staged $sysroot for $digest"

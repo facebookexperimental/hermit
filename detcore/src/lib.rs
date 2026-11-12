@@ -1262,13 +1262,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     async fn complete_after_posthook<G: Guest<Self>>(
         &self,
         guest: &mut G,
+        call: &Syscall,
         count: u64,
         res: Result<i64, Error>,
         interrupted: Option<Errno>,
     ) -> Result<i64, Error> {
         self.publish_posthook_checkpoint(guest, count, &res, interrupted)
             .await;
-        self.complete_syscall(guest, res).await
+        self.complete_syscall(guest, call, res).await
     }
 
     /// A5 step 3c.1c, D40: resolve a `WaitSignalEnd::BehindCaught` end, in
@@ -1464,6 +1465,141 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Signal phase 1's restart checkpoint for a due guest-handled SIGALRM
+    /// (dev-hermit dh-ru056 slice 2: design rev.2 section 6 R2, rulings
+    /// C2.1-C2.4), run right after [`Self::wait_end_checkpoint`] and so before
+    /// every observer of the result. In a process whose runtime virtualizes
+    /// SIGALRM, a call that finished with `-ERESTARTSYS` while its process's
+    /// SIGALRM entry is due for it returns what Linux's `handle_signal`
+    /// returns for the first caught delivery at that return
+    /// (`caught_signal_return`, with the guest's own `sa_flags`, read from the
+    /// runtime's virtual table): `-EINTR`, since phase 1's gate admits no
+    /// such call under an `SA_RESTART` handler (one that gets here stops the
+    /// run by name and ends the guest, C2.4). The delivery itself stays at
+    /// the completion ([`Self::complete_syscall`]), after the observers,
+    /// where ptrace's signal-delivery stop also follows the syscall's exit;
+    /// this marks the call (`ThreadState::sigalrm_interrupts_completion`) so
+    /// that the completion delivers it or stops the run (C2.1). Between the
+    /// two points no other thread can take or block the entry: in-guest
+    /// processes are single-threaded, so only this thread takes it, and only
+    /// its own calls change its mask or disposition. The observers between
+    /// them may yield to the scheduler only under `--happens-before` (the
+    /// posthook anchor and the post-handler hook), which launch refuses on
+    /// the in-guest backends.
+    ///
+    /// A pipe read phase 1 admitted also ends here first: the run stops by
+    /// name if another process changed the description's status flags while
+    /// it waited (review P1-b of 8871d444), or if a descriptor left the guest
+    /// before its last attempt while an entry is due for it (finding 2 of
+    /// the review of 29b3e6a8).
+    ///
+    /// Any other result, an entry that is not due, or a process that does not
+    /// handle SIGALRM, is returned as it is: a raw `-ERESTARTSYS` goes back to
+    /// the in-guest runtime's restart protocol, the faithful restart of a call
+    /// no handler interrupts.
+    ///
+    /// The `-EINTR` is what DETLOG's `SyscallResult` and every later observer
+    /// record, as the guest sees it. Under ptrace the kernel applies the table
+    /// and Hermit's record shows the restart code: a named record difference
+    /// between the backends (C2.5), like the default-fatal row of
+    /// [`Self::wait_end_checkpoint`]. The posthook happens-before anchor
+    /// differs the same way: a plain `HappensBeforeSyscallCheckpoint` here,
+    /// `HappensBeforePosthookInterrupted` with `ERESTARTSYS` under ptrace.
+    async fn sigalrm_restart_checkpoint<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &Syscall,
+        res: Result<i64, Error>,
+    ) -> Result<i64, Error> {
+        use crate::signal_restart::CaughtSignalReturn;
+        guest.thread_state_mut().sigalrm_interrupts_completion = false;
+        // A pipe read the gate admitted ends here however its wait ended (a
+        // due SIGALRM's probe, data, or the last writer's close). While it
+        // waited, another process may have changed the description's status,
+        // which this process's copy does not show. Linux returns EINTR, the
+        // data or end of file in each of those cases, before any O_NONBLOCK
+        // test, so the stop is a deliberate over-refusal, stricter than
+        // Linux wherever it fires: it withholds a result rather than reason
+        // about which copy of the status decided the wait (review P1-b,
+        // museli-lt's requirement (ii); finding 6 of coord7's review of
+        // 29b3e6a8; `sigalrm_pipe_status_diverged_refusal`).
+        if let Some((id, flags)) = guest.thread_state_mut().sigalrm_admitted_pipe_read.take() {
+            if tool_global::sigalrm_refuses(
+                guest,
+                tool_global::SigalrmControl::PipeStatusDiffers { id, flags },
+            )
+            .await
+            {
+                let reason = crate::refused_signal_controls::sigalrm_pipe_status_diverged_refusal(
+                    call.number().name(),
+                    guest.thread_state().dettid.as_raw(),
+                );
+                self.stop_guest_by_name(guest, reason).await
+            }
+            // The gate admitted the read on guest-held marks. If a descriptor
+            // has left the guest since, at any point up to this read's last
+            // attempt (the wake a no-progress probe substituted included),
+            // and an entry is due, whether that attempt found data or the
+            // wake's EINTR may have depended on a process outside the guest:
+            // stop the run by name rather than return either (review of
+            // 29b3e6a8, finding 2). With no entry due, nothing raced the read.
+            if tool_global::sigalrm_refuses(
+                guest,
+                tool_global::SigalrmControl::GuestHeldMarksRevoked,
+            )
+            .await
+                && tool_global::sigalrm_refuses(guest, tool_global::SigalrmControl::DueEntry).await
+            {
+                let reason =
+                    crate::refused_signal_controls::sigalrm_pipe_authority_revoked_at_end_refusal(
+                        call.number().name(),
+                        guest.thread_state().dettid.as_raw(),
+                    );
+                self.stop_guest_by_name(guest, reason).await
+            }
+        }
+        if !(self.cfg.backend.virtualizes_guest_sigalrm && guest.thread_state().sigalrm_handled)
+            || !matches!(res, Err(Error::Errno(Errno::ERESTARTSYS)))
+            || !tool_global::sigalrm_refuses(guest, tool_global::SigalrmControl::DueEntry).await
+        {
+            return res;
+        }
+        let flags = crate::syscalls::helpers::caught_action_flags(guest, libc::SIGALRM).await?;
+        match crate::signal_restart::caught_signal_return(crate::signal_restart::ERESTARTSYS, flags)
+        {
+            CaughtSignalReturn::Returns(value) => {
+                guest.thread_state_mut().sigalrm_interrupts_completion = true;
+                Err(Errno::new(i32::try_from(-value).unwrap_or(libc::EINVAL)).into())
+            }
+            CaughtSignalReturn::Restarts => {
+                let reason = crate::refused_signal_controls::sigalrm_restart_after_handler_refusal(
+                    call.number().name(),
+                    guest.thread_state().dettid.as_raw(),
+                );
+                self.stop_guest_by_name(guest, reason).await
+            }
+        }
+    }
+
+    /// Ends the run with the named refusal `reason`, for a slice-2 SIGALRM
+    /// backstop (dev-hermit dh-ru056): the coordinator records the policy
+    /// refusal (`tool_global::stopping_refusal`), which ends the run where the
+    /// in-guest delivery gate is on, and then the guest's process ends with
+    /// the backend's `exit_group`, as [`Self::stop_after_sigalrm_loss`] ends
+    /// it, so the guest never resumes with the result, whatever the gate
+    /// (coord7 review of ec9b2177, S1).
+    async fn stop_guest_by_name<G: Guest<Self>>(&self, guest: &mut G, reason: String) -> ! {
+        tracing::error!("{}", reason);
+        crate::tool_global::stopping_refusal(guest, reason).await;
+        guest_log::flush_unsent();
+        match guest
+            .tail_inject(
+                reverie::syscalls::ExitGroup::new()
+                    .with_status(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+            )
+            .await {}
+    }
+
     /// Ends the run with the named refusal `refusal` of a woken wait's return
     /// (`settle_woken_wait_at_return`, `check_woken_wait_delivery`), printed
     /// as it is, with the policy refusal's status, as `Detcore::network_refuse`
@@ -1478,19 +1614,42 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// errno, not a backend failure): in a process that handles SIGALRM, a due
     /// entry is delivered here, where Linux would deliver a signal that became
     /// pending while the call ran (design section 4, point a).
+    ///
+    /// A call the restart checkpoint marked (`-ERESTARTSYS` turned `-EINTR`
+    /// for a due SIGALRM, [`Self::sigalrm_restart_checkpoint`]) must deliver
+    /// it here, and the run stops by name, ending the guest, if it does not
+    /// (dh-ru056 slice 2, ruling C2.1). A call that still returns
+    /// `-ERESTARTSYS` delivers nothing: no SIGALRM ended its wait, Linux
+    /// would restart it, and the in-guest runtime does, so an entry that fell
+    /// due meanwhile is delivered at the restarted call's entry
+    /// (`sigalrm_at_syscall_entry`), not handed to a frame the restart would
+    /// skip.
     async fn complete_syscall<G: Guest<Self>>(
         &self,
         guest: &mut G,
+        call: &Syscall,
         res: Result<i64, Error>,
     ) -> Result<i64, Error> {
+        let interrupts =
+            std::mem::take(&mut guest.thread_state_mut().sigalrm_interrupts_completion);
         if self.cfg.backend.virtualizes_guest_sigalrm && guest.thread_state().sigalrm_handled {
             let completed = match &res {
+                Err(Error::Errno(Errno::ERESTARTSYS)) => None,
                 Ok(value) => Some(*value),
                 Err(Error::Errno(errno)) => Some(-i64::from(errno.into_raw())),
                 Err(_) => None,
             };
-            if completed.is_some() {
-                self.deliver_due_sigalrm(guest, false, completed).await;
+            let delivered = match completed {
+                Some(_) => self.deliver_due_sigalrm(guest, false, completed).await,
+                None => false,
+            };
+            if interrupts && !delivered {
+                let reason =
+                    crate::refused_signal_controls::sigalrm_interrupt_without_delivery_refusal(
+                        call.number().name(),
+                        guest.thread_state().dettid.as_raw(),
+                    );
+                self.stop_guest_by_name(guest, reason).await
             }
         }
         res
@@ -1797,7 +1956,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         match observed {
             Err(error) => Some(
-                self.complete_after_posthook(guest, count, Err(error), interrupted)
+                self.complete_after_posthook(guest, call, count, Err(error), interrupted)
                     .await,
             ),
             Ok(()) => None,
@@ -5972,6 +6131,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         Arc::default()
                     },
                     sigalrm_blocked_published: pts.1.sigalrm_blocked_published,
+                    sigalrm_restarts: pts.1.sigalrm_restarts,
+                    // A new thread has made no syscall yet.
+                    sigalrm_interrupts_completion: false,
+                    sigalrm_admitted_pipe_read: None,
                     handler_restore_rt_reported: pts.1.handler_restore_rt_reported,
                     signal_register_projection: None,
                     last_accounted_user_time,
@@ -6348,6 +6511,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // exec resets a handled signal to its default action.
         guest.thread_state_mut().sigalrm_handled = false;
         guest.thread_state_mut().sigalrm_blocked_published = false;
+        guest.thread_state_mut().sigalrm_restarts = false;
         // Only a successful exec reaches this callback. Delete the old image's
         // POSIX timer IDs while exec still owns its scheduler turn; the global
         // notification below cancels their deadlines before the pre-handler
@@ -7013,7 +7177,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // Signal phase 1: a process that handles SIGALRM runs only the calls
             // its table places (`sigalrm_phase1`).
             let sigalrm_refusal = if guest.thread_state().sigalrm_handled {
-                self.sigalrm_phase1_gate(guest, call)
+                Box::pin(self.sigalrm_phase1_gate(guest, call)).await
             } else {
                 None
             };
@@ -8335,6 +8499,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // result the guest sees here, before anything below observes `res`.
             // With the gate off it changes nothing.
             let (res, interrupted) = self.wait_end_checkpoint(guest, &call, res).await;
+            // The same position for a due guest-handled SIGALRM (dh-ru056
+            // slice 2): a restart code it interrupts becomes `-EINTR` here.
+            let res = self.sigalrm_restart_checkpoint(guest, &call, res).await;
 
             // A call Detcore injected that the backend left to the Tool
             // (`UnsupportedOperation::ToolDecided`), such as the getpgrp a clone3
@@ -8410,6 +8577,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             {
                 return Box::pin(self.complete_after_posthook(
                     guest,
+                    &call,
                     new_count,
                     Err(error),
                     interrupted,
@@ -8479,6 +8647,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             if let Err(error) = self.detlog_memory_maps(guest) {
                 return Box::pin(self.complete_after_posthook(
                     guest,
+                    &call,
                     new_count,
                     Err(error),
                     interrupted,
@@ -8544,7 +8713,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 .await;
 
             // Signal phase 1, step I4: a due SIGALRM entry is delivered here.
-            let res = self.complete_syscall(guest, res).await;
+            let res = self.complete_syscall(guest, &call, res).await;
             // The last step, after every await of this handler: a call a signal
             // woke settles its errno from what the backend's return to user mode
             // delivers, with no scheduling point between this read and that

@@ -358,18 +358,37 @@ pub(super) fn validation_completeness_detail(
 ///
 /// Each probe is one node whose repetitions are rows of its structured test
 /// results. Rows count only when the classification says the node produced a
-/// product result; a node without one contributes no repetitions, so the
-/// shortfall is reported as NO_RESULT rather than as passes or failures.
+/// product result; a selected node without one contributes no repetitions, so
+/// the shortfall is reported as NO_RESULT rather than as passes or failures.
+///
+/// `selected` is the executed plan's node tags. A probe outside it never ran
+/// and none of its repetitions was expected: `pressure_excluded` names the
+/// nodes super's selection removed with the pressure tier, and a probe with no
+/// node in the generator (CORE_STRESS_PROBES) has no node to select.
 pub(super) fn stress_rates(
     classified: &RunClassification,
     outcomes: &[StepOutcome],
     reps: i64,
+    selected: &BTreeSet<String>,
+    pressure_excluded: &BTreeSet<String>,
 ) -> Vec<super::validate_super::ProbeRate> {
+    use super::validate_super::ProbeSelection;
     super::validate_super::STRESS_PROBES
         .iter()
         .map(|probe| {
             let tag = format!("superstress.{}", probe.job_stem());
-            let rows: Vec<_> = if classified.product_result_nodes.contains(&tag) {
+            let selection = if selected.contains(&tag) {
+                ProbeSelection::Selected
+            } else if pressure_excluded.contains(&tag) {
+                ProbeSelection::PressureTier
+            } else if !super::validate_super::CORE_STRESS_PROBES.contains(probe) {
+                ProbeSelection::NoNode
+            } else {
+                ProbeSelection::NotSelected
+            };
+            let rows: Vec<_> = if selection == ProbeSelection::Selected
+                && classified.product_result_nodes.contains(&tag)
+            {
                 outcomes
                     .iter()
                     .filter(|outcome| outcome.tag == tag)
@@ -384,6 +403,7 @@ pub(super) fn stress_rates(
                 passed: rows.iter().filter(|row| row.passed).count(),
                 ran: rows.len(),
                 planned: reps as usize,
+                selection,
             }
         })
         .collect()
@@ -720,6 +740,242 @@ fn product_evidence_bracket() -> Result<(), String> {
     Ok(())
 }
 
+/// Unselected stress probes are named as not selected, never as NO_RESULT; a
+/// selected probe without a product result is still NO_RESULT, and a selected
+/// probe with results prints its rate.
+fn super_stress_selection_bracket(
+    classes: &RunClassification,
+    complete: &[StepOutcome],
+) -> Result<(), String> {
+    use super::validate_super::ProbeSelection;
+    use super::validate_super::STRESS_PROBES;
+    let tag =
+        |probe: &super::validate_super::StressProbe| format!("superstress.{}", probe.job_stem());
+    let line_of = |lines: &[String], slug: &str| -> Result<String, String> {
+        lines
+            .iter()
+            .find(|line| line.split_whitespace().nth(1) == Some(slug))
+            .cloned()
+            .ok_or_else(|| format!("super stress table has no row for {slug}: {lines:?}"))
+    };
+    // Super today: every core probe removed with the pressure tier, and the
+    // legacy DBT descriptor without a node. Nothing is selected.
+    let pressure: BTreeSet<String> = super::validate_super::CORE_STRESS_PROBES
+        .iter()
+        .map(tag)
+        .collect();
+    let rates = stress_rates(classes, complete, 20, &BTreeSet::new(), &pressure);
+    let (lines, blocking) = super::super_stress_verdict_lines(&rates, 20, 1, 1);
+    for probe in STRESS_PROBES {
+        let line = line_of(&lines, probe.slug())?;
+        let (want_selection, want_text) =
+            if super::validate_super::CORE_STRESS_PROBES.contains(probe) {
+                (ProbeSelection::PressureTier, "not selected (pressure tier)")
+            } else {
+                (
+                    ProbeSelection::NoNode,
+                    "not selected (no node in the validation DAG)",
+                )
+            };
+        let rate = rates.iter().find(|rate| rate.probe == *probe).unwrap();
+        if rate.selection != want_selection
+            || rate.ran != 0
+            || !line.contains(want_text)
+            || line.contains("NO_RESULT")
+        {
+            return Err(format!(
+                "an unselected probe was not named as not selected: {line}"
+            ));
+        }
+    }
+    if blocking != 0
+        || !lines
+            .iter()
+            .any(|line| line.contains("No scheduled runner selects superstress.*"))
+    {
+        return Err(format!(
+            "the unselected super stress table claims a result: {lines:?}"
+        ));
+    }
+
+    // One selected probe without a product result: NO_RESULT, as before.
+    let strict = super::validate_super::StressProbe::PtraceStrictVerify;
+    let only_strict: BTreeSet<String> = [tag(&strict)].into();
+    let rates = stress_rates(
+        &RunClassification::default(),
+        complete,
+        20,
+        &only_strict,
+        &pressure,
+    );
+    let (lines, _) = super::super_stress_verdict_lines(&rates, 20, 1, 1);
+    let line = line_of(&lines, strict.slug())?;
+    if !line.trim_start().starts_with("NO_RESULT")
+        || !line.contains("0/20")
+        || line.contains("not selected")
+    {
+        return Err(format!(
+            "a selected probe without a result lost its NO_RESULT row: {line}"
+        ));
+    }
+    if lines
+        .iter()
+        .any(|line| line.contains("No scheduled runner selects superstress.*"))
+    {
+        return Err("the no-runner note printed while a probe was selected".into());
+    }
+
+    // That probe's run still fails, through the live caller's own paths. Its
+    // node failing without writing rows is a product failure, which
+    // RunClassification::blocking_failures counts against super's nonblocking
+    // set; its node never running is NO_RESULT, which no_results counts and
+    // which makes the run NO_RESULT, not green.
+    let super_nonblocking: BTreeSet<String> = STRESS_PROBES
+        .iter()
+        .filter(|probe| probe.nonblocking())
+        .map(tag)
+        .collect();
+    let mut rowless = fixture_outcome(&tag(&strict), 1);
+    rowless.test_results = None;
+    let failed = classify_run(&[rowless.clone()], &[], &[], &only_strict, &[]);
+    let rates = stress_rates(
+        &failed,
+        std::slice::from_ref(&rowless),
+        20,
+        &only_strict,
+        &pressure,
+    );
+    let (lines, _) = super::super_stress_verdict_lines(&rates, 20, 1, 1);
+    if failed.blocking_failures(&super_nonblocking) != 1
+        || !line_of(&lines, strict.slug())?
+            .trim_start()
+            .starts_with("NO_RESULT")
+    {
+        return Err(format!(
+            "a selected probe that failed without results was not a blocking failure: {failed:?}"
+        ));
+    }
+    let never_ran = classify_run(&[], &[], &[tag(&strict)], &only_strict, &[]);
+    let rates = stress_rates(&never_ran, &[], 20, &only_strict, &pressure);
+    let (lines, _) = super::super_stress_verdict_lines(&rates, 20, 1, 1);
+    if never_ran.no_results() != 1
+        || !never_ran.no_result_nodes.contains(&tag(&strict))
+        || !line_of(&lines, strict.slug())?
+            .trim_start()
+            .starts_with("NO_RESULT")
+    {
+        return Err(format!(
+            "a selected probe that never ran was not NO_RESULT: {never_ran:?}"
+        ));
+    }
+
+    // The same probe selected with its product result prints its rate.
+    let rates = stress_rates(classes, complete, 1, &only_strict, &pressure);
+    let (lines, blocking) = super::super_stress_verdict_lines(&rates, 1, 1, 1);
+    let line = line_of(&lines, strict.slug())?;
+    if !line.contains("1/1 (100%)") || line.contains("NO_RESULT") || blocking != 0 {
+        return Err(format!(
+            "a selected probe with results did not print its rate: {line}"
+        ));
+    }
+
+    // An explicit selection of one probe, as `--selected
+    // superstress.ptrace_pipeline` makes: super's pressure filter did not run,
+    // so the other core probes are not selected for another reason. They are
+    // still never NO_RESULT, and the no-runner note (about super's pressure
+    // tier) does not apply.
+    let pipeline = super::validate_super::StressProbe::PtracePipeline;
+    let only_pipeline: BTreeSet<String> = [tag(&pipeline)].into();
+    let rates = stress_rates(classes, complete, 1, &only_pipeline, &BTreeSet::new());
+    let (lines, _) = super::super_stress_verdict_lines(&rates, 1, 1, 1);
+    for probe in STRESS_PROBES.iter().filter(|probe| **probe != pipeline) {
+        let line = line_of(&lines, probe.slug())?;
+        let (want_selection, want_text) =
+            if super::validate_super::CORE_STRESS_PROBES.contains(probe) {
+                (
+                    ProbeSelection::NotSelected,
+                    "not selected (not in this run's selection)",
+                )
+            } else {
+                (
+                    ProbeSelection::NoNode,
+                    "not selected (no node in the validation DAG)",
+                )
+            };
+        let rate = rates.iter().find(|rate| rate.probe == *probe).unwrap();
+        if rate.selection != want_selection
+            || rate.ran != 0
+            || !line.contains(want_text)
+            || line.contains("NO_RESULT")
+        {
+            return Err(format!(
+                "a probe outside an explicit selection was not named as not selected: {line}"
+            ));
+        }
+    }
+    if lines
+        .iter()
+        .any(|line| line.contains("No scheduled runner selects superstress.*"))
+    {
+        return Err("the no-runner note printed for an explicit selection".into());
+    }
+
+    // Nothing selected and nothing removed as pressure tier: every probe is
+    // still not selected, but the note's claim (super's pressure filter
+    // removed them) would be false, so it is absent.
+    let rates = stress_rates(classes, complete, 20, &BTreeSet::new(), &BTreeSet::new());
+    let (lines, blocking) = super::super_stress_verdict_lines(&rates, 20, 1, 1);
+    for probe in STRESS_PROBES {
+        let line = line_of(&lines, probe.slug())?;
+        let rate = rates.iter().find(|rate| rate.probe == *probe).unwrap();
+        if rate.selection == ProbeSelection::Selected
+            || rate.selection == ProbeSelection::PressureTier
+            || rate.ran != 0
+            || !line.contains("not selected (")
+            || line.contains("NO_RESULT")
+        {
+            return Err(format!(
+                "an unselected probe outside the pressure tier was not named as not selected: {line}"
+            ));
+        }
+    }
+    if blocking != 0
+        || lines
+            .iter()
+            .any(|line| line.contains("No scheduled runner selects superstress.*"))
+    {
+        return Err(format!(
+            "the no-runner note printed with no probe removed as pressure tier: {lines:?}"
+        ));
+    }
+
+    // A probe selected only through the second DAG of an execution plan is
+    // selected: the live caller's executed set covers both DAGs.
+    let node = |group: &str, job: &str| {
+        validate_plan::node(group, job, "fixture", "true".into(), Vec::new(), 1, 1, 0)
+    };
+    let first = super::DagConfig {
+        steps: vec![node("build", "fixture")],
+        ..Default::default()
+    };
+    let second = super::DagConfig {
+        steps: vec![node("superstress", &pipeline.job_stem())],
+        ..Default::default()
+    };
+    let executed = super::executed_step_tags(&first, Some(&second));
+    let rates = stress_rates(classes, complete, 1, &executed, &BTreeSet::new());
+    let rate = rates.iter().find(|rate| rate.probe == pipeline).unwrap();
+    if !executed.contains(&tag(&pipeline))
+        || rate.selection != ProbeSelection::Selected
+        || super::executed_step_tags(&first, None).contains(&tag(&pipeline))
+    {
+        return Err(format!(
+            "a probe selected through the second DAG was not selected: {executed:?}"
+        ));
+    }
+    Ok(())
+}
+
 fn populations_bracket() -> Result<(), String> {
     let outcomes = [
         fixture_outcome("pass", 0),
@@ -868,8 +1124,11 @@ fn populations_bracket() -> Result<(), String> {
         .collect();
     let planned = complete.iter().map(|outcome| outcome.tag.clone()).collect();
     let classes = classify_run(&complete, &[], &[], &planned, &[]);
+    let every_probe: BTreeSet<String> =
+        complete.iter().map(|outcome| outcome.tag.clone()).collect();
+    let no_pressure = BTreeSet::new();
     let old = super::validate_super::stress_rates(&complete, 1);
-    let new = stress_rates(&classes, &complete, 1);
+    let new = stress_rates(&classes, &complete, 1, &every_probe, &no_pressure);
     if old.iter().zip(&new).any(|(a, b)| {
         (a.probe, a.passed, a.ran, a.planned) != (b.probe, b.passed, b.ran, b.planned)
     }) || new
@@ -878,7 +1137,7 @@ fn populations_bracket() -> Result<(), String> {
     {
         return Err("classification super rates changed a complete product population".into());
     }
-    let partial = stress_rates(&classes, &complete, 2);
+    let partial = stress_rates(&classes, &complete, 2, &every_probe, &no_pressure);
     if partial
         .iter()
         .any(|rate| (rate.passed, rate.ran, rate.planned) != (1, 1, 2))
@@ -886,7 +1145,13 @@ fn populations_bracket() -> Result<(), String> {
     {
         return Err("classification super rates invented a failed repetition".into());
     }
-    let empty_rates = stress_rates(&RunClassification::default(), &complete, 2);
+    let empty_rates = stress_rates(
+        &RunClassification::default(),
+        &complete,
+        2,
+        &every_probe,
+        &no_pressure,
+    );
     if empty_rates
         .iter()
         .any(|rate| (rate.passed, rate.ran, rate.planned) != (0, 0, 2))
@@ -895,6 +1160,7 @@ fn populations_bracket() -> Result<(), String> {
     {
         return Err("classification super rates changed absent or complete populations".into());
     }
+    super_stress_selection_bracket(&classes, &complete)?;
     let nonblocking_outcomes: Vec<_> = super::validate_super::STRESS_PROBES
         .iter()
         .filter(|probe| probe.nonblocking())
@@ -905,7 +1171,13 @@ fn populations_bracket() -> Result<(), String> {
         .map(|outcome| outcome.tag.clone())
         .collect();
     let nonblocking = classify_run(&nonblocking_outcomes, &[], &[], &nonblocking_plan, &[]);
-    let nonblocking_rates = stress_rates(&nonblocking, &nonblocking_outcomes, 2);
+    let nonblocking_rates = stress_rates(
+        &nonblocking,
+        &nonblocking_outcomes,
+        2,
+        &every_probe,
+        &no_pressure,
+    );
     if nonblocking_rates
         .iter()
         .filter(|rate| rate.probe.nonblocking())
@@ -921,7 +1193,7 @@ fn populations_bracket() -> Result<(), String> {
     let mut failed_outcomes = complete.clone();
     failed_outcomes[0] = probe_outcome(&super::validate_super::STRESS_PROBES[0], &[true, false]);
     let failed = classify_run(&failed_outcomes, &[], &[], &planned, &[]);
-    let failed_rates = stress_rates(&failed, &failed_outcomes, 2);
+    let failed_rates = stress_rates(&failed, &failed_outcomes, 2, &every_probe, &no_pressure);
     if (failed_rates[0].passed, failed_rates[0].ran) != (1, 2)
         || super::print_super_stress_verdict(&failed_rates, 2, 1, 1) != 1
     {
@@ -931,7 +1203,7 @@ fn populations_bracket() -> Result<(), String> {
     // repetitions; the shortfall is displayed as NO_RESULT, not as passes.
     let mut rowless = complete;
     rowless[0].test_results = None;
-    let rowless_rates = stress_rates(&classes, &rowless, 1);
+    let rowless_rates = stress_rates(&classes, &rowless, 1, &every_probe, &no_pressure);
     if (rowless_rates[0].passed, rowless_rates[0].ran) != (0, 0) {
         return Err("classification super rates counted a node without result rows".into());
     }

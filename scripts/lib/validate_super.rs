@@ -488,6 +488,23 @@ pub fn stress_nodes(
     out
 }
 
+/// Why a stress probe was or was not part of a run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeSelection {
+    /// The probe's node was in the executed plan: a missing repetition is
+    /// NO_RESULT.
+    Selected,
+    /// Super's selection removed it with the rest of the pressure tier
+    /// (hermit_manifest_plan::validation_dag::PRESSURE_LABEL).
+    PressureTier,
+    /// The validation DAG has no node for it: a legacy descriptor outside
+    /// CORE_STRESS_PROBES, kept only to decode old reports.
+    NoNode,
+    /// Not in this run's selection for another reason, such as an explicit
+    /// `--selected` that did not name it.
+    NotSelected,
+}
+
 /// Per-probe pass rate, derived from typed outcomes.
 #[derive(Clone, Debug)]
 pub struct ProbeRate {
@@ -496,6 +513,9 @@ pub struct ProbeRate {
     /// Repetitions that actually ran (a skipped dependent never ran).
     pub ran: usize,
     pub planned: usize,
+    /// Whether the probe was selected at all. An unselected probe ran no
+    /// repetition, and none was expected.
+    pub selection: ProbeSelection,
 }
 
 /// Recompute `run_super_probe`'s report from typed `StepOutcome`s.
@@ -528,6 +548,7 @@ pub fn stress_rates(outcomes: &[StepOutcome], reps: i64) -> Vec<ProbeRate> {
             passed,
             ran,
             planned: reps as usize,
+            selection: ProbeSelection::Selected,
         });
     }
     rates
@@ -702,6 +723,7 @@ pub fn self_test(root: &Path) -> Result<String, String> {
             passed: reps as usize,
             ran: reps as usize,
             planned: reps as usize,
+            selection: ProbeSelection::Selected,
         })
         .collect::<Vec<_>>();
     if stress_verdict(&all_green, reps, 1, 1) != 0 {

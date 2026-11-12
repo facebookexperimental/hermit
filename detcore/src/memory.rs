@@ -104,6 +104,13 @@ pub(crate) struct MemoryMetadata {
     /// exec replaces the address space.
     #[serde(default)]
     pub(crate) pages_discarded: bool,
+    /// Whether a `MAP_SHARED` mapping was made whose backing object Detcore
+    /// could not resolve (`Detcore::handle_mmap`). It is in no entry of
+    /// `shared_mappings`, so an address outside every entry no longer shows
+    /// that the address's page is private (`may_share_backing`). Never
+    /// cleared: a fork copies it; an exec replaces the address space.
+    #[serde(default)]
+    unresolved_shared_mapping: bool,
     /// aarch64: the file-backed ranges `crate::store_exclusive` has seen in
     /// this address space, and whether each was scanned for exclusive pairs.
     /// Not part of the serialized model.
@@ -149,6 +156,7 @@ impl MemoryMetadata {
             && !self.protection_keys
             && !self.mapping_flags_changed
             && !self.pages_discarded
+            && !self.unresolved_shared_mapping
     }
 
     /// Record a program break reported by a `brk(2)` return.
@@ -222,6 +230,45 @@ impl MemoryMetadata {
         object_offset: u64,
     ) {
         self.insert_mapping(start, len, object, object_offset);
+    }
+
+    /// Record a shared mapping whose backing object is unknown
+    /// (`unresolved_shared_mapping`).
+    pub(crate) fn map_unresolved_shared(&mut self) {
+        self.unresolved_shared_mapping = true;
+    }
+
+    /// Whether a store to the `len` bytes at `start` may be seen through
+    /// another address of this or another address space: unless the bytes
+    /// lie outside every shared mapping, and every shared mapping's backing
+    /// is known (`unresolved_shared_mapping`). Outside them a page is
+    /// private, and Linux's store to it, from the guest or from the kernel
+    /// (`put_user`), lands in a page only this address space maps, at this
+    /// address: copy-on-write gives a private file mapping, or a page a fork
+    /// shares, its own copy first. Detcore sees every shared mapping the
+    /// guest makes: it traps `mmap`, `munmap` and `mremap` in every
+    /// configuration (`Detcore::subscriptions`, `--passthru-opt` included;
+    /// none is in `UNTRAPPED_PASSTHROUGH`), and `shmat` and
+    /// `remap_file_pages` are refused with a fixed `ENOSYS`
+    /// (`syscall_classification`). Not covered: memory a backend's runtime
+    /// maps in the guest's address space with calls that never reach
+    /// Detcore; a caller treats every address as unproven where the backend
+    /// runs such a runtime (`crate::syscalls::tool_runs_in_guest_process`).
+    /// A record that outlives its mapping (an exec, or a fork with
+    /// `MADV_DONTFORK`) only answers true more often.
+    pub(crate) fn may_share_backing(&self, start: usize, len: usize) -> bool {
+        if self.unresolved_shared_mapping {
+            return true;
+        }
+        let Some(end) = start.checked_add(len) else {
+            return true;
+        };
+        // Mappings do not overlap, so of those that start before `end`, the
+        // last ends last.
+        self.shared_mappings
+            .range(..end)
+            .next_back()
+            .is_some_and(|(&mapping_start, &mapping)| mapping.end(mapping_start) > start)
     }
 
     fn insert_mapping(
@@ -454,6 +501,48 @@ mod tests {
             matches!(mappings.futex_id(mm(10), 0x1ffc), FutexID::Shared { .. }),
             "mmap lengths must be rounded to the kernel's page boundary"
         );
+    }
+
+    /// Finding 1 of rev5338-cx's review of 8fec6777: a store into a shared
+    /// mapping may be seen through another mapping of its page, so only a
+    /// store outside every shared mapping, with every backing known, is
+    /// proven to stay at its address.
+    #[test]
+    fn a_store_shares_backing_unless_its_page_is_proven_private() {
+        let object = SharedMemoryObjectId::File {
+            device: 1,
+            inode: 2,
+        };
+        let mut mappings = MemoryMetadata::new();
+        // Two mappings of one page (P and Q in the review), and an
+        // anonymous shared mapping.
+        mappings.map_object(0x1000, 0x1000, object, 0);
+        mappings.map_object(0x4000, 0x1000, object, 0);
+        mappings.map_anonymous(mm(10), 0x9000, 0x1000);
+        // A shared alias: true at both addresses, and for bytes that only
+        // start or end inside one.
+        assert!(mappings.may_share_backing(0x1038, 4));
+        assert!(mappings.may_share_backing(0x4038, 4));
+        assert!(mappings.may_share_backing(0x9ffe, 4));
+        assert!(mappings.may_share_backing(0x0ffe, 4));
+        // Proven private: outside every shared mapping, next to one too.
+        assert!(!mappings.may_share_backing(0x2000, 4));
+        assert!(!mappings.may_share_backing(0x0ffc, 4));
+        assert!(!mappings.may_share_backing(0x7000, 4));
+        // Bytes that wrap the address space prove nothing.
+        assert!(mappings.may_share_backing(usize::MAX - 1, 4));
+        // Unknown backing: a shared mapping Detcore could not resolve makes
+        // every address unproven.
+        mappings.map_unresolved_shared();
+        assert!(mappings.may_share_backing(0x2000, 4));
+        assert!(mappings.may_share_backing(0x7000, 4));
+        assert!(!mappings.is_fresh_for_native_exec());
+        let mut unresolved_only = MemoryMetadata::new();
+        unresolved_only.map_unresolved_shared();
+        assert!(unresolved_only.may_share_backing(0x2000, 4));
+        assert!(!unresolved_only.is_fresh_for_native_exec());
+        // A fresh address space has no shared mapping: private everywhere.
+        assert!(!MemoryMetadata::new().may_share_backing(0x2000, 4));
     }
 
     #[test]

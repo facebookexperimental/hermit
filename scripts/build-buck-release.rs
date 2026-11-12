@@ -1,7 +1,7 @@
 #!/usr/bin/env -S rust-script --force
 //! ```cargo
 //! [dependencies]
-//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "d2d102aa2e508d279b2a798b096dfb46d0f6977b" }
+//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "14bdac8225059c5bb95dd7cc82399d402ecbd082" }
 //! detcore-model = { path = "../detcore-model" }
 //! hermit-manifest-plan = { path = "../ci/manifest-plan" }
 //! flate2 = "=1.1.10"
@@ -8302,16 +8302,21 @@ esac
 
     #[test]
     fn release_buck_target_uses_declared_library_dependencies_and_exact_rpath() {
-        let buck = fs::read_to_string(source_root().join("hermit-cli/BUCK")).unwrap();
+        // hermit-cli/BUCK defines the release targets through this macro.
+        let buck = fs::read_to_string(source_root().join("hermit-cli/release_alias.bzl")).unwrap();
         assert!(buck.contains("\"fbsource//third-party/xz:lzma\""));
         assert!(
             buck.contains("\"fbsource//third-party/libunwind:unwind-ptrace\"")
         );
-        assert!(buck.contains("deps = [release_lzma_target, release_unwind_target] + ["));
-        assert!(buck.contains("link-arg=-Wl,--disable-new-dtags"));
-        assert!(buck.contains(&format!("link-arg=-Wl,-rpath,{RELEASE_RPATH}")));
-        assert!(!buck.contains("-Clink-arg=-llzma"));
-        assert!(!buck.contains("-Clink-arg=-l:liblzma"));
+        assert!(buck.contains(
+            "deps = [\n            release_lzma_target,\n            release_unwind_target,\n"
+        ));
+        // The open-source build hands each flag to the linker as -Clink-arg.
+        assert!(buck.contains("\"-Wl,--disable-new-dtags\""));
+        assert!(buck.contains(&format!("\"-Wl,-rpath,{RELEASE_RPATH}\"")));
+        assert!(buck.contains("(\"-C\", \"link-arg=\" + flag)"));
+        assert!(!buck.contains("-llzma"));
+        assert!(!buck.contains("-l:liblzma"));
         assert!(!buck.contains("LD_LIBRARY_PATH"));
     }
 

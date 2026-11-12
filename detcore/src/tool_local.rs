@@ -6708,6 +6708,30 @@ pub struct ThreadState<T> {
     /// virtual bit with this one and publishes a change.
     pub(crate) sigalrm_blocked_published: bool,
 
+    /// Whether this thread's process's guest SIGALRM action, as the runtime
+    /// last reported it, has `SA_RESTART` (dev-hermit dh-ru056 slice 2):
+    /// recorded with the disposition, in the turn of the `rt_sigaction` that
+    /// may change it (`publish_virtual_sigalrm`), and false while SIGALRM is
+    /// not handled. Signal phase 1's gate refuses a polled pipe read under
+    /// such a handler (`sigalrm_phase1::descriptor_class`): Linux runs the
+    /// handler and then restarts the read, which the in-guest host cannot do.
+    pub(crate) sigalrm_restarts: bool,
+
+    /// Set at the restart checkpoint when this call's `-ERESTARTSYS` became
+    /// `-EINTR` because a due guest-handled SIGALRM is to be delivered at its
+    /// completion (`Detcore::sigalrm_restart_checkpoint`); taken by that
+    /// completion, which must deliver it (dh-ru056 slice 2).
+    #[serde(skip)]
+    pub(crate) sigalrm_interrupts_completion: bool,
+
+    /// The open file description and status flags of the pipe read signal
+    /// phase 1's gate admitted for this call as a guest-held polled pipe
+    /// (`Detcore::sigalrm_phase1_gate`), cleared at every gate. Taken at the
+    /// call's end, which stops the run by name if another process has since
+    /// changed the description's status (dh-ru056 slice 2, review P1-b).
+    #[serde(skip)]
+    pub(crate) sigalrm_admitted_pipe_read: Option<(crate::types::OpenFileId, i32)>,
+
     /// The real-time signals this thread's process has already recorded as
     /// unblocked by a handler's restored mask
     /// (`Scheduler::handler_restore_unblocked`), so a delivery adds nothing
@@ -7964,6 +7988,9 @@ impl<T> ThreadState<T> {
             published_mask: Some(None),
             published_dispositions: Arc::default(),
             sigalrm_blocked_published: false,
+            sigalrm_restarts: false,
+            sigalrm_interrupts_completion: false,
+            sigalrm_admitted_pipe_read: None,
             handler_restore_rt_reported: 0,
             signal_register_projection: None,
             last_accounted_user_time,
@@ -8538,6 +8565,24 @@ impl<T> ThreadState<T> {
             .map_object(start, len, object, object_offset);
     }
 
+    /// Record a shared mapping whose backing object is unknown
+    /// (`MemoryMetadata::map_unresolved_shared`).
+    pub(crate) fn map_shared_unresolved(&self) {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .map_unresolved_shared();
+    }
+
+    /// Whether a store to the `len` bytes at `start` may be seen through
+    /// another address (`MemoryMetadata::may_share_backing`).
+    pub(crate) fn memory_may_share_backing(&self, start: usize, len: usize) -> bool {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .may_share_backing(start, len)
+    }
+
     /// Remove a range from the shared mapping model.
     pub(crate) fn unmap_memory(&self, start: usize, len: usize) {
         self.memory_metadata
@@ -8821,6 +8866,27 @@ impl<T> ThreadState<T> {
             .file_handles
             .values()
             .any(|detfd| detfd.procfs_rendered_path().is_some())
+    }
+
+    /// The pipe read descriptions this table's descriptors `fds` name, or,
+    /// with `None`, every one it holds, each once and in order: the
+    /// descriptions phase 1's SIGALRM ledger records a status for
+    /// (`SigalrmControl::PublishPipeStatus`, dh-ru056 slice 2).
+    pub(crate) fn pipe_read_descriptions(&self, fds: Option<&[RawFd]>) -> Vec<OpenFileId> {
+        let metadata = self.metadata();
+        let reads = |detfd: &DetFd| {
+            (detfd.ty() == FdType::Pipe && detfd.status_flags() & libc::O_ACCMODE != libc::O_WRONLY)
+                .then(|| detfd.open_file_id())
+        };
+        let ids: BTreeSet<OpenFileId> = match fds {
+            Some(fds) => fds
+                .iter()
+                .filter_map(|fd| metadata.file_handles.get(fd))
+                .filter_map(reads)
+                .collect(),
+            None => metadata.file_handles.values().filter_map(reads).collect(),
+        };
+        ids.into_iter().collect()
     }
 
     /// Get a mutable reference of `DetFd` from a raw file descriptor, and

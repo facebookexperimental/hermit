@@ -495,6 +495,30 @@ fn row_cells_ran_under_cargo(row: &serde_json::Value) -> bool {
     }
 }
 
+/// A `--build-mode buck` row keeps `release_builder` at Cargo (the E2E
+/// payload identity is unchanged; only its prepared Nextest binaries came
+/// from the Buck harvest), so the builder pair alone cannot keep it from
+/// answering a Cargo request. The mode stamps do (`build_mode` and the
+/// per-cohort `prepared_cohort_modes` the writer records with it): a row
+/// whose stamps name anything but Cargo is never Cargo evidence. An absent
+/// stamp predates the writer, when Cargo was the only mode. A stamp that
+/// is present but malformed (non-string mode, non-object cohort map)
+/// names no mode, so it is not Cargo evidence either.
+fn row_build_mode_is_cargo(row: &serde_json::Value) -> bool {
+    if let Some(mode) = row.get("build_mode") {
+        if mode.as_str() != Some(crate::BUILD_MODE_CARGO) {
+            return false;
+        }
+    }
+    match row.get("prepared_cohort_modes") {
+        None => true,
+        Some(serde_json::Value::Object(cohorts)) => cohorts
+            .values()
+            .all(|mode| mode.as_str() == Some(crate::BUILD_MODE_CARGO)),
+        Some(_) => false,
+    }
+}
+
 /// The gate-coverage half of the predicate, shared by both producers.
 fn gate_coverage_ok(row: &serde_json::Value) -> bool {
     match (i(row, "gates_expected"), i(row, "gates_run")) {
@@ -898,7 +922,9 @@ pub fn history_estimate(
 /// A ledger row is a baseline only when it is a full pass by the bar a reused
 /// pass must meet: profile `full`, selection mode `full`, anchored to its commit
 /// with a clean tree (`commit_anchored`, not `tree_dirty`, as `row_matches_key`
-/// requires), cells run under Cargo, and `pass_row_qualifies` (no failures,
+/// requires), cells run under Cargo with Cargo-built Nextest binaries
+/// (`row_build_mode_is_cargo`: a `--build-mode buck` row's `release_builder`
+/// still reads Cargo), and `pass_row_qualifies` (no failures,
 /// every expected gate run, tests and nodes executed, no planned node absent).
 /// A dirty-tree pass validated something other than its commit. A quick, `--only`, `--selected` or
 /// test-free pass ran less than the nodes `--selective` would skip as unchanged
@@ -944,6 +970,7 @@ fn selective_baseline_from(
                         && r.get("commit_anchored").and_then(|v| v.as_bool()) == Some(true)
                         && r.get("tree_dirty").and_then(|v| v.as_bool()) == Some(false)
                         && row_cells_ran_under_cargo(r)
+                        && row_build_mode_is_cargo(r)
                         && pass_row_qualifies(r)
                         && s(r, "commit") != "unknown"
                         && !s(r, "commit").is_empty()
@@ -1978,6 +2005,65 @@ pub fn self_test() -> Result<String, String> {
     if selective_baseline(&named_cargo, None, "mine", &exists_all).as_deref() != Some("eee") {
         return Err("selective: an explicitly Cargo green must remain a baseline".into());
     }
+    // A green stamped --build-mode buck keeps release_builder at cargo, so
+    // only the mode stamps distinguish it from the explicitly-Cargo green
+    // above (the dh-yeycju reviewer probe): it must never be the baseline.
+    for (why, stamp) in [
+        (
+            "build_mode buck with its cohort modes",
+            serde_json::json!({"build_mode": "buck", "prepared_cohort_modes": {"default": "buck", "native-exec": "cargo"}}),
+        ),
+        (
+            "build_mode buck without cohort modes",
+            serde_json::json!({"build_mode": "buck"}),
+        ),
+        (
+            "a non-string build_mode",
+            serde_json::json!({"build_mode": 7}),
+        ),
+        ("a null build_mode", serde_json::json!({"build_mode": null})),
+        (
+            "a buck cohort mode without build_mode",
+            serde_json::json!({"prepared_cohort_modes": {"default": "buck", "native-exec": "cargo"}}),
+        ),
+        (
+            "a non-object prepared_cohort_modes",
+            serde_json::json!({"prepared_cohort_modes": "buck"}),
+        ),
+    ] {
+        let mut row = qualifying(
+            serde_json::json!({"slot": "mine", "commit": "mmm", "producer": "validate.rs", "release_builder": "cargo", "e2e_payload": crate::e2e_payload_identity("cargo")}),
+        );
+        if let (Some(o), Some(e)) = (row.as_object_mut(), stamp.as_object()) {
+            for (k, val) in e {
+                o.insert(k.clone(), val.clone());
+            }
+        }
+        let mut rows = ledger_rows.clone();
+        rows.push(row.clone());
+        if selective_baseline(&rows, None, "mine", &exists_all).as_deref() != Some("bbb") {
+            return Err(format!(
+                "selective: a newer green with {why} must not become the Cargo baseline"
+            ));
+        }
+        if selective_baseline(std::slice::from_ref(&row), None, "mine", &exists_all).is_some() {
+            return Err(format!(
+                "selective: a green with {why} alone must give no baseline"
+            ));
+        }
+        refused += 1;
+    }
+    // The same green with the Cargo stamps a --build-mode cargo write
+    // emits stays a baseline.
+    let mut stamped_cargo = ledger_rows.clone();
+    stamped_cargo.push(qualifying(serde_json::json!({"slot": "mine", "commit": "nnn", "producer": "validate.rs", "release_builder": "cargo", "e2e_payload": crate::e2e_payload_identity("cargo"), "build_mode": "cargo", "prepared_cohort_modes": {"default": "cargo", "native-exec": "cargo"}})));
+    if selective_baseline(&stamped_cargo, None, "mine", &exists_all).as_deref() != Some("nnn") {
+        return Err(
+            "selective: a green stamped build_mode cargo (all cohorts cargo) must remain a baseline"
+                .into(),
+        );
+    }
+    accepted += 1;
     let mut mismatched = ledger_rows.clone();
     mismatched.push(qualifying(serde_json::json!({"slot": "mine", "commit": "fff", "producer": "validate.rs", "release_builder": "cargo", "e2e_payload": crate::e2e_payload_identity("buck")})));
     mismatched.push(qualifying(serde_json::json!({"slot": "mine", "commit": "ggg", "producer": "validate.rs", "release_builder": "cargo"})));

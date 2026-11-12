@@ -13,16 +13,20 @@
 //!
 //! The backend's list is exact for each mapping it lists, but it need not be
 //! complete (`reverie::MemoryMap::complete`). On ptrace it is the kernel's own
-//! text, so the rendered file is the one the kernel prints. On KVM it holds the
-//! stack window's mappings only, `[stack]` and the parts a split left of it:
-//! the image, the interpreter, the vDSO, the heap and every mapping `mmap(2)`
-//! made are missing from the rendered file, a named difference of the KVM
-//! provider (<https://github.com/rrnewton/reverie/issues/1211>). Nothing here
-//! infers from a missing line that no mapping is there, and an incomplete list
-//! that lists nothing is no answer: KVM's, once LinuxEmu has lost track of the
-//! stack window (an `mprotect(2)` across a hole in it, which LinuxEmu refuses
-//! whole where Linux changes the part before the hole, or a change a `vfork`
-//! partner made). The file is then read as it was before this rendering.
+//! text, so the rendered file is the one the kernel prints. On KVM it holds
+//! every mapping LinuxEmu keeps for the process (the image, the interpreter,
+//! the heap, every mapping `mmap(2)` made, and the stack window's mappings,
+//! `[stack]` and the parts a split left of it) and none of the kernel's, as
+//! LinuxEmu gives the guest no vDSO. Where LinuxEmu does not know what maps a
+//! page (in an image it loaded from bytes), it leaves out that page and every
+//! line that touches it and marks the list incomplete, a named difference of
+//! the KVM provider (<https://github.com/rrnewton/reverie/issues/1211>).
+//! Nothing here infers from a missing line that no mapping is there, and an
+//! incomplete list that lists nothing is no answer: KVM's, once LinuxEmu has
+//! lost track of the stack window (an `mprotect(2)` across a hole in it, which
+//! LinuxEmu refuses whole where Linux changes the part before the hole, or a
+//! change a `vfork` partner made). The file is then read as it was before
+//! this rendering.
 //!
 //! One line the kernel prints is left out, and only here: `[uprobes]`, the
 //! page the kernel adds to a process the first time a uprobe fires in it

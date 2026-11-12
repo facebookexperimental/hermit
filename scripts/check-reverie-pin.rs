@@ -2051,14 +2051,30 @@ fn exact_40_hex_tokens(line: &str) -> Vec<String> {
 /// canonical Reverie pin in its explicit compile-time environment.
 const BUCK_BUILD_PIN_SITE: &str = "hermit-cli/BUCK";
 
+/// The dictionary in [`BUCK_BUILD_PIN_SITE`] that holds that environment.
+/// hermit-cli/BUCK is fbsource's file, mirrored here, and this is its name
+/// there.
+const BUCK_BUILD_ENV: &str = "LIBHERMIT_ENV";
+
+/// The only active lines that may name [`BUCK_BUILD_ENV`] are its one
+/// definition, [`BUCK_BUILD_ENV_CONSUMERS`] targets that compile libhermit's
+/// sources with it, and at most one [`UNSTAMPED_RELEASE_ALIAS`].
+const BUCK_BUILD_ENV_OPENER: &str = "LIBHERMIT_ENV = {";
+const BUCK_BUILD_ENV_CONSUMER: &str = "env = LIBHERMIT_ENV,";
+
+/// libhermit, its unit tests and the KVM integration harness: each compiles
+/// libhermit's sources, so each reads the environment.
+const BUCK_BUILD_ENV_CONSUMERS: usize = 3;
+
 /// Bind Buck-built Hermit's reported Reverie provenance to the canonical pin.
 ///
 /// Cargo builds obtain `HERMIT_REVERIE_PIN` from `hermit-cli/build.rs`, which
-/// reads Cargo metadata. Buck does not run that build script: both its library
-/// and binary targets consume `hermit_build_env` from [`BUCK_BUILD_PIN_SITE`].
-/// A stale value therefore produces a working binary that reports the wrong
-/// backend revision, even while every Cargo entry and the submodule gitlink are
-/// uniform. The ordinary pin gate must cover that active non-Cargo binding.
+/// reads Cargo metadata. Buck does not run that build script: every target that
+/// compiles libhermit's sources consumes [`BUCK_BUILD_ENV`] from
+/// [`BUCK_BUILD_PIN_SITE`]. A stale value therefore produces a working binary
+/// that reports the wrong backend revision, even while every Cargo entry and
+/// the submodule gitlink are uniform. The ordinary pin gate must cover that
+/// active non-Cargo binding.
 ///
 /// The release targets may also consume it, through the one
 /// [`UNSTAMPED_RELEASE_ALIAS`] line, when CI builds them without the release
@@ -2102,8 +2118,9 @@ fn parse_buck_build_pin_binding(line: &str) -> Result<Option<String>, String> {
     Ok(Some(value.to_string()))
 }
 
-const UNSTAMPED_RELEASE_ALIAS: &str =
-    "release_build_env = hermit_build_env if release_unstamped else {";
+/// The release targets' macro (hermit-cli/release_alias.bzl) takes the
+/// environment as its `unstamped_env` argument.
+const UNSTAMPED_RELEASE_ALIAS: &str = "unstamped_env = LIBHERMIT_ENV,";
 
 fn check_buck_build_pin_binding(root: &Path, pin: &str) -> Result<i32, String> {
     let path = root.join(BUCK_BUILD_PIN_SITE);
@@ -2125,25 +2142,25 @@ fn check_buck_build_pin_binding(root: &Path, pin: &str) -> Result<i32, String> {
     let mut invalid_mentions = Vec::new();
     for (index, line) in lines.iter().enumerate() {
         let code = line.split('#').next().unwrap_or("").trim();
-        if !code.contains("hermit_build_env") {
+        if !code.contains(BUCK_BUILD_ENV) {
             continue;
         }
         match code {
-            "hermit_build_env = {" => build_env_starts.push(index),
-            "env = hermit_build_env," => build_env_consumers += 1,
+            BUCK_BUILD_ENV_OPENER => build_env_starts.push(index),
+            BUCK_BUILD_ENV_CONSUMER => build_env_consumers += 1,
             UNSTAMPED_RELEASE_ALIAS => release_aliases += 1,
             _ => invalid_mentions.push((index + 1, code)),
         }
     }
     if build_env_starts.len() != 1
-        || build_env_consumers != 2
+        || build_env_consumers != BUCK_BUILD_ENV_CONSUMERS
         || release_aliases > 1
         || !invalid_mentions.is_empty()
     {
         loud_header("BUCK BUILD ENV MISSING OR AMBIGUOUS - BLOCKED");
         eprintln!("Canonical Reverie pin: {pin}");
         eprintln!(
-            "Expected exactly one canonical `hermit_build_env = {{` block, two `env = hermit_build_env,` consumers, at most one `{UNSTAMPED_RELEASE_ALIAS}` line, and no reassignment or mutation in {BUCK_BUILD_PIN_SITE}; found {} block opener(s), {} consumer(s), {} alias line(s), and {} unsupported active mention(s).",
+            "Expected exactly one canonical `{BUCK_BUILD_ENV_OPENER}` block, {BUCK_BUILD_ENV_CONSUMERS} `{BUCK_BUILD_ENV_CONSUMER}` consumers, at most one `{UNSTAMPED_RELEASE_ALIAS}` line, and no reassignment or mutation in {BUCK_BUILD_PIN_SITE}; found {} block opener(s), {} consumer(s), {} alias line(s), and {} unsupported active mention(s).",
             build_env_starts.len(),
             build_env_consumers,
             release_aliases,
@@ -2163,7 +2180,7 @@ fn check_buck_build_pin_binding(root: &Path, pin: &str) -> Result<i32, String> {
         loud_header("BUCK BUILD ENV UNTERMINATED - BLOCKED");
         eprintln!("Canonical Reverie pin: {pin}");
         eprintln!(
-            "The `hermit_build_env = {{` block in {BUCK_BUILD_PIN_SITE} has no closing `}}` line."
+            "The `{BUCK_BUILD_ENV_OPENER}` block in {BUCK_BUILD_PIN_SITE} has no closing `}}` line."
         );
         return Ok(1);
     };
@@ -2916,7 +2933,7 @@ mod tests {
         fs::create_dir_all(root.join("hermit-cli")).unwrap();
         let buck = |pin: &str| {
             format!(
-                "hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\nrust_library(\n    env = hermit_build_env,\n)\nrust_binary(\n    env = hermit_build_env,\n)\n"
+                "LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\nrust_library(\n    env = LIBHERMIT_ENV,\n)\nrust_unittest(\n    env = LIBHERMIT_ENV,\n)\nrust_binary(\n    env = LIBHERMIT_ENV,\n)\n"
             )
         };
         fs::write(root.join(BUCK_BUILD_PIN_SITE), buck(&old)).unwrap();
@@ -2958,7 +2975,7 @@ mod tests {
         let main = "2".repeat(40);
         let root = core_carry_fixture("core-complete-carry", &old);
         fs::create_dir_all(root.join("hermit-cli")).unwrap();
-        fs::write(root.join(BUCK_BUILD_PIN_SITE), format!("hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{old}\",\n}}\nrust_library(\n    env = hermit_build_env,\n)\nrust_binary(\n    env = hermit_build_env,\n)\n")).unwrap();
+        fs::write(root.join(BUCK_BUILD_PIN_SITE), format!("LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"{old}\",\n}}\nrust_library(\n    env = LIBHERMIT_ENV,\n)\nrust_unittest(\n    env = LIBHERMIT_ENV,\n)\nrust_binary(\n    env = LIBHERMIT_ENV,\n)\n")).unwrap();
         assert!(git_in(&root, &["add", "-A"]).unwrap().status.success());
         finish_core_pin_update(&root, &old, &main, false, false).unwrap();
         assert!(
@@ -3690,7 +3707,7 @@ mod tests {
         fs::write(
             buck_dir.join("BUCK"),
             format!(
-                "hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{stale}\",\n}}\nrust_library(\n    env = hermit_build_env,\n)\nrust_binary(\n    env = hermit_build_env,\n)\n"
+                "LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"{stale}\",\n}}\nrust_library(\n    env = LIBHERMIT_ENV,\n)\nrust_unittest(\n    env = LIBHERMIT_ENV,\n)\nrust_binary(\n    env = LIBHERMIT_ENV,\n)\n"
             ),
         )
         .expect("write stale Buck binding");
@@ -4423,14 +4440,14 @@ mod tests {
         let buck = buck_dir.join("BUCK");
         let consumed = |body: String| {
             format!(
-                "{body}rust_library(\n    env = hermit_build_env,\n)\nrust_binary(\n    env = hermit_build_env,\n)\n"
+                "{body}rust_library(\n    env = LIBHERMIT_ENV,\n)\nrust_unittest(\n    env = LIBHERMIT_ENV,\n)\nrust_binary(\n    env = LIBHERMIT_ENV,\n)\n"
             )
         };
 
         fs::write(
             &buck,
             consumed(format!(
-                "# HERMIT_REVERIE_PIN = {stale}\nhermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\", # previously {stale}\n}}\nnote = \"HERMIT_REVERIE_PIN {stale}\"\n"
+                "# HERMIT_REVERIE_PIN = {stale}\nLIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\", # previously {stale}\n}}\nnote = \"HERMIT_REVERIE_PIN {stale}\"\n"
             )),
         )
         .expect("write matching Buck binding");
@@ -4442,7 +4459,7 @@ mod tests {
         fs::write(
             &buck,
             consumed(format!(
-                "hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{stale}\",\n}}\n"
+                "LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"{stale}\",\n}}\n"
             )),
         )
         .expect("write stale Buck binding");
@@ -4466,20 +4483,20 @@ mod tests {
         fs::write(
             &buck,
             consumed(format!(
-                "hermit_build_env = {{\n}}\nunused_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\n"
+                "LIBHERMIT_ENV = {{\n}}\nunused_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\n"
             )),
         )
         .expect("write binding in an unused dictionary");
         assert_eq!(
             check_buck_build_pin_binding(&root, pin).expect("check unused dictionary spoof"),
             1,
-            "a binding outside hermit_build_env must not satisfy the build provenance gate"
+            "a binding outside LIBHERMIT_ENV must not satisfy the build provenance gate"
         );
 
         fs::write(
             &buck,
             consumed(format!(
-                "hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\nhermit_build_env = {{ # later shadow\n    \"HERMIT_REVERIE_PIN\": \"{stale}\",\n}}\n"
+                "LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\nLIBHERMIT_ENV = {{ # later shadow\n    \"HERMIT_REVERIE_PIN\": \"{stale}\",\n}}\n"
             )),
         )
         .expect("write shadowing build environment");
@@ -4492,20 +4509,20 @@ mod tests {
         fs::write(
             &buck,
             consumed(format!(
-                "hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\nhermit_build_env.update({{\"OTHER\": \"value\"}})\n"
+                "LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\nLIBHERMIT_ENV.update({{\"OTHER\": \"value\"}})\n"
             )),
         )
         .expect("write build environment mutation");
         assert_eq!(
             check_buck_build_pin_binding(&root, pin).expect("check build environment mutation"),
             1,
-            "post-definition mutation of hermit_build_env must fail closed"
+            "post-definition mutation of LIBHERMIT_ENV must fail closed"
         );
 
         fs::write(
             &buck,
             consumed(format!(
-                "hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"unknown\", # expected {pin}\n}}\n"
+                "LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"unknown\", # expected {pin}\n}}\n"
             )),
         )
         .expect("write malformed binding with a pin in its comment");
@@ -4518,7 +4535,7 @@ mod tests {
         fs::write(
             &buck,
             consumed(format!(
-                "hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\n"
+                "LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\n"
             )),
         )
         .expect("write duplicate bindings");
@@ -4530,10 +4547,10 @@ mod tests {
 
         let aliased = |alias: &str| {
             consumed(format!(
-                "hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\n{alias}}}\n"
+                "LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\nhermit_release_targets(\n{alias})\n"
             ))
         };
-        fs::write(&buck, aliased(&format!("{UNSTAMPED_RELEASE_ALIAS}\n")))
+        fs::write(&buck, aliased(&format!("    {UNSTAMPED_RELEASE_ALIAS}\n")))
             .expect("write unstamped release alias");
         assert_eq!(
             check_buck_build_pin_binding(&root, pin).expect("check unstamped release alias"),
@@ -4543,7 +4560,7 @@ mod tests {
         fs::write(
             &buck,
             aliased(&format!(
-                "{UNSTAMPED_RELEASE_ALIAS}\n}}\n{UNSTAMPED_RELEASE_ALIAS}\n"
+                "    {UNSTAMPED_RELEASE_ALIAS}\n)\nhermit_release_targets(\n    {UNSTAMPED_RELEASE_ALIAS}\n"
             )),
         )
         .expect("write duplicated unstamped release alias");
@@ -4552,19 +4569,15 @@ mod tests {
             1,
             "a second alias line is ambiguous and must fail closed"
         );
-        fs::write(
-            &buck,
-            aliased("release_build_env = hermit_build_env if True else {\n"),
-        )
-        .expect("write near-miss alias");
+        fs::write(&buck, aliased("    unstamped_env = LIBHERMIT_ENV | {},\n"))
+            .expect("write near-miss alias");
         assert_eq!(
             check_buck_build_pin_binding(&root, pin).expect("check near-miss alias"),
             1,
             "only the exact alias line is accepted"
         );
 
-        fs::write(&buck, consumed("hermit_build_env = {}\n".to_string()))
-            .expect("erase Buck binding");
+        fs::write(&buck, consumed("LIBHERMIT_ENV = {}\n".to_string())).expect("erase Buck binding");
         assert_eq!(
             check_buck_build_pin_binding(&root, pin).expect("check erased Buck binding"),
             1,
@@ -4573,7 +4586,7 @@ mod tests {
 
         fs::write(
             &buck,
-            format!("hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\n"),
+            format!("LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\n"),
         )
         .expect("write build environment with zero consumers");
         assert_eq!(
@@ -4585,14 +4598,27 @@ mod tests {
         fs::write(
             &buck,
             format!(
-                "hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\nrust_library(\n    env = hermit_build_env,\n)\n"
+                "LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\nrust_library(\n    env = LIBHERMIT_ENV,\n)\n"
             ),
         )
         .expect("write build environment with one consumer");
         assert_eq!(
             check_buck_build_pin_binding(&root, pin).expect("check one consumer"),
             1,
-            "both current Buck targets must consume the checked build environment"
+            "every current Buck consumer must consume the checked build environment"
+        );
+
+        fs::write(
+            &buck,
+            format!(
+                "LIBHERMIT_ENV = {{\n    \"HERMIT_REVERIE_PIN\": \"{pin}\",\n}}\nrust_library(\n    env = LIBHERMIT_ENV,\n)\nrust_binary(\n    env = LIBHERMIT_ENV,\n)\n"
+            ),
+        )
+        .expect("write build environment with two consumers");
+        assert_eq!(
+            check_buck_build_pin_binding(&root, pin).expect("check two consumers"),
+            1,
+            "a dropped consumer must fail closed rather than pass on a smaller count"
         );
 
         fs::remove_dir_all(root).expect("remove Buck fixture");

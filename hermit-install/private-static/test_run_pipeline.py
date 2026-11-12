@@ -356,21 +356,26 @@ class AdapterControls(unittest.TestCase):
 
     def test_guard_escalates_to_kill_when_term_is_ignored(self):
         ready = self.root / 'ready'
-        program = ("import signal,time;from pathlib import Path;"
+        # The guard may fire as soon as ready exists, so publish it complete.
+        program = ("import os,signal,time;from pathlib import Path;"
                    "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
-                   f"Path({str(ready)!r}).write_text('ready');time.sleep(60)")
+                   f"ready=Path({str(ready)!r});pending=ready.with_suffix('.tmp');"
+                   "pending.write_text('ready');os.replace(pending,ready);time.sleep(60)")
         def free(_):
             return RUNNER.DISK_FLOOR_BYTES - 1 if ready.exists() else RUNNER.DISK_FLOOR_BYTES
         result = self.engine(program, free=free)
         self.assertEqual(result['native']['signal'], signal.SIGKILL)
+        self.assertEqual(ready.read_text(), 'ready')
         self.assertTrue(result['guard_breaches'])
         self.assertLess(result['wall_seconds'], 5)
 
     def test_guard_stops_the_owned_child_process_group(self):
         pidfile = self.root / 'descendant'
-        program = ("import subprocess,time;from pathlib import Path;"
+        # A final pathname must not become visible before the PID is written.
+        program = ("import os,subprocess,time;from pathlib import Path;"
                    f"p=subprocess.Popen([{PYTHON!r},'-c','import time;time.sleep(60)']);"
-                   f"Path({str(pidfile)!r}).write_text(str(p.pid));time.sleep(60)")
+                   f"pidfile=Path({str(pidfile)!r});pending=pidfile.with_suffix('.tmp');"
+                   "pending.write_text(str(p.pid));os.replace(pending,pidfile);time.sleep(60)")
         def free(_):
             return RUNNER.DISK_FLOOR_BYTES - 1 if pidfile.exists() else RUNNER.DISK_FLOOR_BYTES
         result = self.engine(program, free=free)

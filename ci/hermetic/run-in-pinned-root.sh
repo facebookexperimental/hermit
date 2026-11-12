@@ -532,6 +532,41 @@ device_args=()
 if [[ -e /dev/kvm ]]; then
     device_args+=(--device /dev/kvm)
 fi
+
+# Hermit's pinned-CPU reservation coordinates through lock files in
+# /dev/shm/hermit-pinned-cpu. Podman's private /dev/shm makes an unmounted
+# copy per container, so concurrent validation containers cannot see each
+# other's reservations and can draw the same CPU. When the host provides a
+# shared directory in root's shared form (mode 1777), bind that one directory
+# at Hermit's default guest path so every container coordinates through the
+# host files. The default source is the guest path itself;
+# HERMIT_VALIDATE_PINNED_CPU_HOST_DIR may name another absolute host
+# directory (validation fixtures and nonstandard host layouts). An explicit
+# source that is missing or not a mode-1777 directory refuses rather than
+# silently losing coordination; absent default state leaves the fallback.
+guest_pinned_cpu_dir=/dev/shm/hermit-pinned-cpu
+host_pinned_cpu_dir=${HERMIT_VALIDATE_PINNED_CPU_HOST_DIR:-$guest_pinned_cpu_dir}
+if [[ -n ${HERMIT_VALIDATE_PINNED_CPU_HOST_DIR:-} ]]; then
+    if [[ $host_pinned_cpu_dir != /* || $host_pinned_cpu_dir == *[,$'\t\r\n']* ]]; then
+        echo "run-in-pinned-root: HERMIT_VALIDATE_PINNED_CPU_HOST_DIR must be an absolute path Podman can represent exactly" >&2
+        exit 2
+    fi
+    if [[ ! -d $host_pinned_cpu_dir ]] ||
+        (( (0$(stat -c %a "$host_pinned_cpu_dir") & 07777) != 01777 )); then
+        echo "run-in-pinned-root: HERMIT_VALIDATE_PINNED_CPU_HOST_DIR is not a mode-1777 directory: $host_pinned_cpu_dir" >&2
+        exit 2
+    fi
+    extra_mounts+=(
+        --mount
+        "type=bind,source=$host_pinned_cpu_dir,destination=$guest_pinned_cpu_dir"
+    )
+elif [[ -d $host_pinned_cpu_dir ]] &&
+    (( (0$(stat -c %a "$host_pinned_cpu_dir") & 07777) == 01777 )); then
+    extra_mounts+=(
+        --mount
+        "type=bind,source=$host_pinned_cpu_dir,destination=$guest_pinned_cpu_dir"
+    )
+fi
 for name in "${pass_env[@]}"; do
     [[ $name =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
         echo "run-in-pinned-root: invalid environment name '$name'." >&2

@@ -4342,6 +4342,16 @@ async fn sched_loop_inner(
         if let Some(refusal) = vfork_refusal {
             exit_on_scheduler_refusal(&refusal);
         }
+        // The ordinary turn function takes a SIGALRM ledger stop before its
+        // selection (`Scheduler::take_sigalrm_stop`), so that no other turn
+        // commits first. The signal-control one never takes it: no backend
+        // that virtualizes a guest SIGALRM uses it today. Assert that none
+        // is left over, before another backend does (coord7's review of
+        // 29b3e6a8, N2).
+        debug_assert!(
+            !sched.lock().unwrap().sigalrm_stop_pending(),
+            "a SIGALRM ledger stop outlived the turn that set it"
+        );
         // D44's arming assertion under the in-guest delivery gate.
         let kernel_run_refusal = sched.lock().unwrap().kernel_run_signal_refusal.take();
         if let Some(refusal) = kernel_run_refusal {
@@ -4984,6 +4994,10 @@ async fn do_ordinary_turn_blocking(
             exit_on_scheduler_refusal(&refusal);
         }
         if let Some(refusal) = sched.rejoin_refusal.take() {
+            drop(sched);
+            exit_on_scheduler_refusal(&refusal);
+        }
+        if let Some(refusal) = sched.take_sigalrm_stop() {
             drop(sched);
             exit_on_scheduler_refusal(&refusal);
         }
@@ -19663,7 +19677,8 @@ impl Scheduler {
             // (`reserved_probe_to_resume`). Its grant spends the alarm
             // priority of https://github.com/rrnewton/hermit/issues/4929;
             // the probe itself, like a SIGCHLD taker, is exempt from that
-            // bound (one probe grant per due entry).
+            // bound (one probe grant per due entry, under the runtime's
+            // contract to deliver the entry at the read's completion).
             let reserved_probe = if decider.is_none() {
                 self.reserved_probe_to_resume()
             } else {

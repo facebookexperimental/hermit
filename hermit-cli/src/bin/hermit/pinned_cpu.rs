@@ -57,8 +57,9 @@
 //! (0700) unless it runs as root; root's shared form is mode 1777 with the
 //! sticky bit (`open_lock_dir`). A container with a private `/dev/shm` has a
 //! private copy of the default directory, so it coordinates only within
-//! itself unless one directory is bind-mounted into every container and named
-//! by `--pinned-cpu-dir`; nothing can detect that case from inside.
+//! itself unless one directory is bind-mounted into every container (the
+//! validation wrapper bind-mounts a host shared-form directory at the
+//! default path); nothing can detect that case from inside.
 //!
 //! A run that cannot keep other runs off its CPU (it shares one, cannot
 //! reserve one, or can reserve one only within its network namespace) says
@@ -514,6 +515,17 @@ pub(crate) enum Coordination {
     /// Only runs in this network namespace: the lock directory is unusable,
     /// for the reason given.
     NetworkNamespaceOnly(String),
+}
+
+impl fmt::Display for Coordination {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Coordination::Host(dir) => write!(f, "host lock directory {}", dir.display()),
+            Coordination::NetworkNamespaceOnly(reason) => {
+                write!(f, "network-namespace only ({reason})")
+            }
+        }
+    }
 }
 
 /// The mode a lock directory is created with: root's shared form (1777 with
@@ -1066,11 +1078,18 @@ pub(crate) fn place(allowed: &[usize]) -> Result<Option<Choice>, PlacementRefusa
         .clone()
         .unwrap_or_else(PinnedCpuSettings::from_env);
     let start = std::time::Instant::now();
-    admit(
+    let coordination = std::cell::RefCell::new(None);
+    let placed = admit(
         allowed,
         settings.policy,
         settings.wait_cap,
-        |allowed| choose_for_run(allowed, &settings.dir),
+        |allowed| {
+            let chosen = choose_for_run(allowed, &settings.dir);
+            if let Some((_, scope)) = &chosen {
+                *coordination.borrow_mut() = Some(scope.clone());
+            }
+            chosen
+        },
         thread::sleep,
         || start.elapsed(),
         &mut |kind, text| {
@@ -1083,7 +1102,17 @@ pub(crate) fn place(allowed: &[usize]) -> Result<Option<Choice>, PlacementRefusa
                 let _ = writeln!(io::stderr().lock(), "{text}");
             }
         },
-    )
+    );
+    if let Ok(Some(choice)) = &placed {
+        let coordination = coordination.borrow();
+        tracing::info!(
+            cpu = choice.cpu,
+            hold = ?choice.hold,
+            coordination = coordination.as_ref().map(ToString::to_string),
+            "pinned CPU placement"
+        );
+    }
+    placed
 }
 
 /// Two readings of `/proc/stat`, [`SAMPLE_WINDOW`] apart, and the PMU-bound

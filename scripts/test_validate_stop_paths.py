@@ -813,13 +813,16 @@ def run_canonical_adapter_contract(*, refuse: bool) -> None:
     with tempfile.TemporaryDirectory(prefix="validate-canonical-adapter-") as tmp:
         tmpdir = Path(tmp)
         canonical_root = tmpdir / "canonical-root"
+        canonical_root.mkdir()
+        writer_input = tmpdir / "writer-input.json"
         if refuse:
             parent = tmpdir / "parent"
             adapter = parent / "ci-hub" / "ledger" / "validate_rows.py"
             adapter.parent.mkdir(parents=True)
             adapter.write_text(
                 "import sys\n"
-                "sys.stdin.read()\n"
+                "from pathlib import Path\n"
+                f"Path({str(writer_input)!r}).write_bytes(sys.stdin.buffer.read())\n"
                 "print('planted refusal', file=sys.stderr)\n"
                 "raise SystemExit(2)\n"
             )
@@ -860,7 +863,31 @@ def run_canonical_adapter_contract(*, refuse: bool) -> None:
         assert process.returncode == 1, output
         raw_after = raw_shadow.read_bytes() if raw_shadow.exists() else None
         assert raw_after == raw_before, "canonical write touched the retired raw shadow"
+        retained = list(canonical_root.glob("ignored/validate/artifacts/*/history-row.json"))
+        assert len(retained) == 1, (
+            "canonical stop-test history row was not retained in its private root",
+            retained,
+            output,
+        )
+        retained_bytes = retained[0].read_bytes()
+        retained_row = json.loads(retained_bytes)
+        assert_schema5_contract(retained_row)
+        assert retained[0].parent.name == retained_row["record_id"], retained_row
+        assert retained_row["checks"] == 2, retained_row
+        assert retained_row["validation_complete"] is False, retained_row
+        assert [gate["name"] for gate in retained_row["gates"]] == [
+            "stop-test completed gate 1",
+            "stop-test completed gate 2",
+        ], retained_row
+        # Bind this check to our own row; other validations may legitimately add
+        # artifacts while this fixture runs against the real parent adapter.
+        parent_artifact = parent / retained[0].relative_to(canonical_root)
+        assert not parent_artifact.exists(), (
+            "canonical stop-test history row escaped into parent artifacts",
+            parent_artifact,
+        )
         if refuse:
+            assert writer_input.read_bytes() == retained_bytes, output
             assert not list(canonical_root.glob("ledger/**/*.jsonl")), output
             assert "canonical ledger writer" in output and "refused" in output, output
         else:
@@ -870,11 +897,10 @@ def run_canonical_adapter_contract(*, refuse: bool) -> None:
             # The producer does not write that path and has not for some time:
             # publication into `ledger/<team>/<host>/<YYYY-MM>.jsonl` is a
             # separate later step, and what this run produces is one append to
-            # the live spool. Measured against the real adapter: the only file
-            # created anywhere under CI_HUB_VALIDATE_LEDGER_TEST_ROOT is
+            # the live spool. The Python adapter writes beneath the test root at
             #   ignored/ci-hub/validate-ledger-spool/<team>__<host>__<YYYY-MM>__<uuid>.jsonl
-            # so the old assertion could only ever see an empty list. It was not
-            # a flake and it was not wrong about the CONTENT -- it was looking
+            # so the old published-shard assertion could only see an empty list.
+            # It was not a flake and was not wrong about the CONTENT -- it looked
             # one stage downstream of the thing under test.
             #
             # THE PATH IS NOT HARDCODED AGAIN. The producer prints the shard it
@@ -911,7 +937,59 @@ def run_canonical_adapter_contract(*, refuse: bool) -> None:
             events = [json.loads(line) for line in shard.read_text().splitlines()]
             assert len(events) == 1, events
             assert events[0]["schema"] == "validate-ledger/v1", events[0]
-            assert_schema5_contract(events[0]["legacy_row"])
+            row = events[0]["legacy_row"]
+            assert_schema5_contract(row)
+            # The adapter may enrich the row. Its producer identity and outcome
+            # must still agree with the exact bytes retained before invocation.
+            for field in (
+                "record_id",
+                "run_id",
+                "commit",
+                "checks",
+                "validation_complete",
+                "result",
+                "raw_result",
+                "exit_code",
+                "profile",
+                "repo",
+            ):
+                assert retained_row[field] == row[field], (field, retained_row, row)
+
+
+def run_canonical_history_root_refusals() -> None:
+    """An invalid stop-only root must never fall back to parent state."""
+    for label, value in (("missing", None), ("empty", ""), ("relative", "relative-root")):
+        with tempfile.TemporaryDirectory(prefix=f"validate-history-root-{label}-") as tmp:
+            tmpdir = Path(tmp)
+            parent = tmpdir / "parent"
+            writer_called = tmpdir / "writer-called"
+            adapter = parent / "ci-hub" / "ledger" / "validate_rows.py"
+            adapter.parent.mkdir(parents=True)
+            adapter.write_text(
+                "import sys\n"
+                "from pathlib import Path\n"
+                f"Path({str(writer_called)!r}).write_bytes(sys.stdin.buffer.read())\n"
+                "raise SystemExit(2)\n"
+            )
+            env = stop_test_env(tmpdir, tmpdir / "unused-ledger.jsonl")
+            env.update(DEV_HERMIT_PARENT=str(parent), VALIDATE_STOP_TEST_EXIT_EARLY="1")
+            env.pop("HERMIT_VALIDATE_LEDGER")
+            env.pop("CI_HUB_VALIDATE_LEDGER_TEST_ROOT", None)
+            if value is not None:
+                env["CI_HUB_VALIDATE_LEDGER_TEST_ROOT"] = value
+            process = subprocess.run(
+                [str(VALIDATE), "full"],
+                cwd=ROOT,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+            output = process.stdout.decode(errors="replace")
+            assert process.returncode == 1, (label, output)
+            assert "canonical-stop-history-root-invalid" in output, (label, output)
+            assert not writer_called.exists(), (label, "canonical writer was invoked", output)
+            assert not (parent / "ignored").exists(), (label, "parent state was created", output)
 
 
 def run_cleanup_signal_race() -> None:
@@ -1056,6 +1134,7 @@ def main(argv: list[str] | None = None) -> None:
         except NoParentAdapter as exc:
             unevaluated.append(f"canonical adapter contract, accept arm: {exc}")
     run_canonical_adapter_contract(refuse=True)
+    run_canonical_history_root_refusals()
     run_cleanup_signal_race()
     leaked = [path for path in TEST_ROOTS if path.exists()]
     assert not leaked, f"stop-path test residue: {leaked}"

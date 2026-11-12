@@ -1062,6 +1062,557 @@ fn liteinst_in_guest_pause_sleeps_through_a_discarded_or_blocked_timer_signal() 
     }
 }
 
+/// One single `hermit run --strict` of a SIGALRM pipe-read fixture mode, with
+/// no verification: its exit status, stdout and stderr. The stderr is where
+/// a refusal's named reason, a warning, reaches the user; a verified run keeps
+/// its internal runs' logs to itself.
+fn single_sigalrm_pipe_read_run(
+    guest: &Path,
+    backend: &str,
+    mode: &str,
+) -> (std::process::ExitStatus, String, String) {
+    use super::kvm_cancellation::bounded_command_with_timeout;
+    use super::kvm_cancellation::bounded_read;
+
+    let directory = process_build_root(&format!("sigalrm-pipe-read-single-{backend}-{mode}"));
+    fs::create_dir_all(&directory).expect("SIGALRM pipe-read directory");
+    let mut command = Command::new(hermit_binary());
+    command
+        .args(["--backend", backend, "run"])
+        .arg(format!("--epoch={VIRTUAL_TIME_EPOCH}"))
+        .args([
+            "--strict",
+            "--max-timeslice=disabled",
+            "--base-env=minimal",
+            "--env=REVERIE_LITEINST_SITE_PATCHING=0",
+            "--env=REVERIE_LITEINST_SIGALRM_HANDLERS=1",
+        ])
+        .env_remove("REVERIE_LITEINST_SIGALRM_HANDLERS")
+        .env_remove("RUST_LOG")
+        .env_remove("HERMIT_LOG")
+        .env_remove("HERMIT_LOG_FILE")
+        .stdin(Stdio::null())
+        .arg("--")
+        .arg(guest)
+        .arg(mode);
+    let status = bounded_command_with_timeout(&mut command, &directory, Duration::from_secs(57));
+    let stdout = bounded_read(&directory.join("stdout"), 1024 * 1024);
+    let stderr = bounded_read(&directory.join("stderr"), 16 * 1024 * 1024);
+    (
+        status,
+        String::from_utf8_lossy(&stdout).into_owned(),
+        String::from_utf8_lossy(&stderr).into_owned(),
+    )
+}
+
+/// The fixture's `eintr` result on Linux: the read returns -1/EINTR after the
+/// handler, whose frame holds -EINTR just past the syscall; a second read
+/// returns the byte at the child's write.
+const SIGALRM_PIPE_READ_EINTR: &str = concat!(
+    "read=-1 errno=4 byte=- window=at_alarm hits_at_return=1\n",
+    "frame result_eintr=1 ip_after_syscall=1\n",
+    "read2=1 errno=0 byte=x window=at_write\n",
+    "child_exit=0\n",
+);
+
+/// dev-hermit dh-ru056 slice 2 (T2.3, T2.6, T2.7, T1.6): a guest-handled
+/// SIGALRM against a blocking read of a pipe whose other end a child holds
+/// behaves, under in-guest-trap, exactly as Linux and ptrace do, each
+/// verified at L2 on its own backend. The read returns EINTR after the
+/// handler, whose frame holds -EINTR in its result register just past the
+/// syscall (`eintr`). Data written before the alarm is returned first
+/// (`data`), as is EOF from a child that closed its end (`eof`). The SIGCHLD
+/// of a child that exits first interrupts nothing (`childexit`). A SIGALRM
+/// blocked across the read does not interrupt it: the read returns the byte,
+/// and the handler runs when SIGALRM is unblocked, before `sigprocmask`
+/// returns (`blocked`, coord7 review of ec9b2177, S4(a)). (`scmswitch_other`,
+/// the unrelated-pipe control of finding 1 of rev5338-cx's review of
+/// 4d17d5ab, moved to the refusal test in round 10.2: see there.)
+#[test]
+fn in_guest_trap_sigalrm_interrupts_a_guest_held_pipe_read_as_ptrace_does() {
+    let _guard = hermit_run_guard();
+    let guest = sigalrm_fixture("liteinst_sigalrm_pipe_read");
+    for (mode, linux) in [
+        ("eintr", SIGALRM_PIPE_READ_EINTR),
+        (
+            "data",
+            concat!(
+                "read=1 errno=0 byte=x window=before_alarm hits_at_return=0\n",
+                "pause=-1 errno=4 hits=1\n",
+                "child_exit=0\n",
+            ),
+        ),
+        (
+            "eof",
+            concat!(
+                "read=0 errno=0 byte=- window=before_alarm hits_at_return=0\n",
+                "alarm_left=2\n",
+                "child_exit=0\n",
+            ),
+        ),
+        (
+            "childexit",
+            concat!(
+                "read=-1 errno=4 byte=- window=at_alarm hits_at_return=1\n",
+                "frame result_eintr=1 ip_after_syscall=1\n",
+                "child_exit=0\n",
+            ),
+        ),
+        (
+            "blocked",
+            concat!(
+                "read=1 errno=0 byte=x window=at_write hits_at_return=0\n",
+                "unblock=0 hits_at_return=1\n",
+                "child_exit=0\n",
+            ),
+        ),
+    ] {
+        for backend in ["ptrace", "in-guest-trap"] {
+            let stdout = strict_sigalrm_fixture_run(&guest, backend, Some("1"), "0", mode);
+            assert_eq!(String::from_utf8_lossy(&stdout), linux, "{backend}/{mode}");
+        }
+    }
+}
+
+/// dev-hermit dh-ru056 slice 2 (T2.4) and the reviews of ec9b2177, 8871d444
+/// and 29b3e6a8: the pipe reads slice 2 does not place keep phase 1's
+/// refusal under in-guest-trap, EOPNOTSUPP at the read's entry with no
+/// handler run, each verified at L2, and the refusal names its reason on the
+/// run's stderr. Under ptrace, where the kernel runs the handler, each runs
+/// as Linux does, verified at L2. The reads:
+/// - `restart`: under an SA_RESTART handler, which Linux runs and then
+///   restarts the read.
+/// - `fifo`: of a named FIFO, which a process outside the container could
+///   fill.
+/// - `setfl` and `fionbio`: of a pipe whose status the child changed after
+///   the fork (review P1-b); Linux returns EAGAIN at once, since the
+///   processes share the description's flags, while the reader's copy of the
+///   model still says blocking.
+/// - `setfl_exit`: as `setfl`, where the child that changed the status has
+///   exited before the read; the description, and its status, live on in
+///   the parent (finding 3 of rev5338-cx's review of 29b3e6a8).
+/// - `scmsetfl`: as `setfl`, where the child changed the status through the
+///   end the parent passed it over SCM_RIGHTS on a socketpair, a guest-held
+///   channel; Linux's receiver holds the same description, so Linux returns
+///   EAGAIN at once (finding 1 of coord7's review of 29b3e6a8).
+/// - `scmsetfl_nowait` and `scmmsetfl_nowait`: as `scmsetfl`, where the
+///   send, by `sendmsg` or a one-message `sendmmsg`, carries MSG_DONTWAIT and
+///   so runs once in the turn, outside the retry loop: only the handler's
+///   untracking reaches it (B2 of coord7's review of 4d17d5ab).
+/// - `scmrecv`: the child passes its read end to the parent, which reads the
+///   end it received while it still holds its own copy from the fork. The
+///   receiver's Detcore records a description of its own, which it marks
+///   guest-held; Linux's is the same blocking description, so Linux returns
+///   EINTR after the handler (B1 of coord7's review of 4d17d5ab).
+/// - `scmmrecv`: as `scmrecv`, where the parent receives with `recvmmsg`,
+///   whose receipt untracks through its own call site (N1 of coord7's
+///   review of 858541a9).
+/// - `scmalias` and `scmalias_wait`: as `scmsetfl`, where the read end is
+///   passed by a two-message `sendmmsg` whose second `SCM_RIGHTS` item lies
+///   over the first entry's own `msg_len`, which names another pipe until
+///   Linux stores the first message's byte count there, the read end's
+///   number, before it copies the second message's control data. Sent with
+///   MSG_DONTWAIT and without, so through the handler alone and through the
+///   retry loop (finding 1 of rev5338-cx's review of 858541a9). Linux
+///   returns EAGAIN; the ptrace backend does not yet (see the loop), so its
+///   run is held to L2 repeatability only.
+/// - `scmalias_shared` and `scmalias_shared_wait`: as `scmalias` and
+///   `scmalias_wait`, where the batch lies in one memfd page mapped twice,
+///   shared, and the second message reads its item through the other
+///   mapping, so no two of the batch's addresses meet (finding 1 of
+///   rev5338-cx's review of 8fec6777). Linux returns EAGAIN.
+/// - `scmswitch`: as `scmsetfl`, where the end passed is named only after
+///   the send waited: the second message of a `sendmmsg` batch, whose first
+///   waited for room, has shared control data that the child rewrote from
+///   another pipe's read end to the read end during the wait. Linux copies
+///   it once the first message is sent, so the child receives the read end,
+///   and Linux returns EAGAIN at once (finding 1 of rev5338-cx's review of
+///   4d17d5ab).
+/// - `scmswitch_other`: as `scmswitch`, where the control data is rewritten
+///   to a third pipe's read end, so the read end itself is never passed and
+///   Linux returns EINTR after the handler (rev5338-cx's unrelated-pipe
+///   control). In-guest, the runtime maps shared memory Detcore does not
+///   see, so no `msg_len` of the batch is proven private, and the send
+///   untracks every pipe the parent holds (round 10.2, coord7, 2:32 PM ET;
+///   `tool_runs_in_guest_process`). The read is then refused by name: a
+///   deliberate over-refusal until minibeads dh-cge466 has the runtime
+///   register those mappings. ptrace stays compared with Linux.
+/// - `stdin`: of the container's standard input, which phase 1's earlier
+///   rule refuses as stdio that may wait. Under ptrace the guest's standard
+///   input is the container's own, empty, so the read returns 0: the
+///   ptrace result this row measures, not Linux's with a host pipe. This is
+///   not T1.4 coverage: `hermit run` hands the guest no host pipe, and by
+///   coord7's ruling in bead dh-ru056 T1.4 rests on the unit-test
+///   unmarked-pipe rows.
+#[test]
+fn in_guest_trap_refuses_by_name_the_sigalrm_pipe_reads_slice_2_does_not_place() {
+    let _guard = hermit_run_guard();
+    let guest = sigalrm_fixture("liteinst_sigalrm_pipe_read");
+    let refused = concat!(
+        "read=-1 errno=95 byte=- window=before_alarm hits_at_return=0\n",
+        "child_exit=0\n",
+    );
+    let eagain = concat!(
+        "read=-1 errno=11 byte=- window=before_alarm hits_at_return=0\n",
+        "child_exit=0\n",
+    );
+    let diverged = "a pipe read whose status flags another process may have changed through a \
+                    copy of the description that a fork or SCM_RIGHTS made, which this process's \
+                    copy does not show";
+    // In-guest-trap refuses `mode`'s read at its entry, verified at L2, and
+    // names `reason` once on a single run's stderr.
+    let refused_by_name_in_guest = |mode: &str, reason: &str| {
+        let trap = strict_sigalrm_fixture_run(&guest, "in-guest-trap", Some("1"), "0", mode);
+        assert_eq!(
+            String::from_utf8_lossy(&trap),
+            refused,
+            "in-guest-trap/{mode}"
+        );
+        let (status, stdout, stderr) = single_sigalrm_pipe_read_run(&guest, "in-guest-trap", mode);
+        assert_eq!(status.code(), Some(0), "in-guest-trap/{mode}: {stderr}");
+        assert_eq!(stdout, refused, "in-guest-trap/{mode}");
+        let named = format!(
+            "read refused (EOPNOTSUPP) in a process that handles SIGALRM: {reason} (signal phase 1)."
+        );
+        assert_eq!(
+            stderr.matches(&named).count(),
+            1,
+            "in-guest-trap/{mode}: the one refusal, by name: {stderr}"
+        );
+    };
+    for (mode, under_ptrace, reason) in [
+        (
+            "restart",
+            concat!(
+                "read=1 errno=0 byte=x window=at_write hits_at_return=1\n",
+                "frame result_eintr=0 ip_after_syscall=0\n",
+                "child_exit=0\n",
+            ),
+            "a pipe read under an SA_RESTART SIGALRM handler: dh-ru056 slice 2 admits only a \
+             handler without SA_RESTART",
+        ),
+        (
+            "fifo",
+            SIGALRM_PIPE_READ_EINTR,
+            "a read or seek of a named FIFO, which a process outside the container may open and fill",
+        ),
+        ("setfl", eagain, diverged),
+        ("fionbio", eagain, diverged),
+        // The child that set the status has exited before the read: the
+        // status stays the description's while the parent holds it (the
+        // ledger keeps it until its last holder goes, and its creator holds
+        // it from the `pipe2`).
+        ("setfl_exit", eagain, diverged),
+        // The child changed the status through a received end, which its
+        // Detcore models as a description of its own: the send marked the
+        // parent's description untracked.
+        ("scmsetfl", eagain, diverged),
+        // The read end was named only by the send's attempt after its wait,
+        // which marked the parent's description untracked then.
+        ("scmswitch", eagain, diverged),
+        // Sent once, in the turn: the handler's untracking alone.
+        ("scmsetfl_nowait", eagain, diverged),
+        ("scmmsetfl_nowait", eagain, diverged),
+        // The receiver's own description, untracked at the receipt.
+        ("scmrecv", SIGALRM_PIPE_READ_EINTR, diverged),
+        ("scmmrecv", SIGALRM_PIPE_READ_EINTR, diverged),
+        // The batch's second item read through a second shared mapping of
+        // the first entry's msg_len (finding 1 of rev5338-cx's review of
+        // 8fec6777): its msg_len's page may be seen elsewhere, so the send
+        // marked every pipe the parent holds untracked.
+        ("scmalias_shared", eagain, diverged),
+        ("scmalias_shared_wait", eagain, diverged),
+        // An unrelated pipe passed by a batch whose later entry reads control
+        // data: in-guest, no msg_len is proven private (see the doc above).
+        ("scmswitch_other", SIGALRM_PIPE_READ_EINTR, diverged),
+        (
+            "stdin",
+            concat!(
+                "read=0 errno=0 byte=- window=before_alarm hits_at_return=0\n",
+                "child_exit=0\n",
+            ),
+            "I/O on the container's stdio that may wait",
+        ),
+    ] {
+        let ptrace = strict_sigalrm_fixture_run(&guest, "ptrace", Some("1"), "0", mode);
+        assert_eq!(
+            String::from_utf8_lossy(&ptrace),
+            under_ptrace,
+            "ptrace/{mode}"
+        );
+        refused_by_name_in_guest(mode, reason);
+    }
+    // rev5338-cx's aliased batches (finding 1 of its review of 858541a9):
+    // Linux returns EAGAIN (`eagain`, measured natively with this fixture).
+    // The ptrace backend does not yet: the batch's msg_len overlaps its
+    // control data, so Detcore gives up following the rights it sent
+    // (`lose_peer_lockstep`), the receiver records a description of its
+    // own, and the O_NONBLOCK it sets never reaches the sender's model,
+    // whose read waits and returns EINTR (bead dh-lxp0wg, a pre-existing
+    // ptrace divergence that slice 2 does not touch). So its
+    // run is held to L2 repeatability, not compared with Linux.
+    for mode in ["scmalias", "scmalias_wait"] {
+        strict_sigalrm_fixture_run(&guest, "ptrace", Some("1"), "0", mode);
+        refused_by_name_in_guest(mode, diverged);
+    }
+}
+
+/// dev-hermit dh-ru056 slice 2, review P1-b with museli-lt's added
+/// requirement: the child sets O_NONBLOCK on the shared read end while the
+/// parent's admitted read waits, and the SIGALRM then falls due. Linux's
+/// interrupted wait returns ERESTARTSYS before any O_NONBLOCK test, so under
+/// ptrace the read returns EINTR after the handler and a second read EAGAIN
+/// at once, verified at L2. In-guest, the reader's copy of the description
+/// no longer shows its status, and the read's end stops the run by name,
+/// with the policy refusal's status, before the guest sees any result. The
+/// stop is a deliberate over-refusal, stricter than Linux, whose EINTR here
+/// is the same as the in-guest result would have been (finding 6 of coord7's
+/// review of 29b3e6a8): what it rules out is a silent result decided by a
+/// stale copy.
+#[test]
+fn in_guest_trap_stops_by_name_when_a_waiting_pipe_reads_status_changes() {
+    let _guard = hermit_run_guard();
+    let guest = sigalrm_fixture("liteinst_sigalrm_pipe_read");
+    let ptrace = strict_sigalrm_fixture_run(&guest, "ptrace", Some("1"), "0", "setfl_mid");
+    assert_eq!(
+        String::from_utf8_lossy(&ptrace),
+        concat!(
+            "read=-1 errno=4 byte=- window=at_alarm hits_at_return=1\n",
+            "frame result_eintr=1 ip_after_syscall=1\n",
+            "read2=-1 errno=11 byte=- window=at_alarm\n",
+            "child_exit=0\n",
+        ),
+        "ptrace/setfl_mid"
+    );
+    let (status, stdout, stderr) =
+        single_sigalrm_pipe_read_run(&guest, "in-guest-trap", "setfl_mid");
+    assert_eq!(
+        status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "the policy refusal's status: {stderr}"
+    );
+    assert_eq!(stdout, "", "the guest saw no result of the read");
+    assert!(
+        stderr.contains(
+            "hermit refused to continue the run (HERMIT_SIGALRM_PIPE_STATUS_DIVERGED): read in \
+             thread 3 was admitted by signal phase 1 on a pipe whose status flags another \
+             process may have changed while it waited"
+        ),
+        "{stderr}"
+    );
+}
+
+/// dev-hermit dh-ru056 slice 2, review P1-a of 8871d444, finding 4 of
+/// coord7's review of 29b3e6a8: while the parent's admitted read waits, the
+/// child offers a descriptor over SCM_RIGHTS on an AF_UNIX socket that is not
+/// connected. The send fails, but an export counts from the attempt: the
+/// scheduler then trusts no guest-held mark, the parent's due SIGALRM finds
+/// its read with no deterministic probe, and the turn loop ends the run by
+/// name before the next selection (`Scheduler::take_sigalrm_stop`), status
+/// 122, before the guest sees any result. Under ptrace nothing is
+/// virtualized: the read returns EINTR after the handler, as in `eintr`,
+/// verified at L2. The message is the scheduler's, which names the waiting
+/// thread; the read's own end would name the call instead
+/// (`sigalrm_pipe_authority_revoked_at_end_refusal`).
+#[test]
+fn in_guest_trap_stops_by_name_when_a_waiting_pipe_reads_authority_is_revoked() {
+    let _guard = hermit_run_guard();
+    let guest = sigalrm_fixture("liteinst_sigalrm_pipe_read");
+    let ptrace = strict_sigalrm_fixture_run(&guest, "ptrace", Some("1"), "0", "revoke");
+    assert_eq!(
+        String::from_utf8_lossy(&ptrace),
+        SIGALRM_PIPE_READ_EINTR,
+        "ptrace/revoke"
+    );
+    let (status, stdout, stderr) = single_sigalrm_pipe_read_run(&guest, "in-guest-trap", "revoke");
+    assert_eq!(
+        status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "the policy refusal's status: {stderr}"
+    );
+    assert_eq!(stdout, "", "the guest saw no result of the read");
+    assert!(
+        stderr.contains(
+            "hermit refused to continue the run (HERMIT_SIGALRM_PIPE_AUTHORITY_REVOKED): thread 3 \
+             waits in a pipe read that signal phase 1 admitted because only guests held the pipe"
+        ),
+        "{stderr}"
+    );
+    // The scheduler's stop, not the read's end: the end-of-read check names
+    // its call instead (`sigalrm_pipe_authority_revoked_at_end_refusal`), and
+    // would stop the same run with the same status had the scheduler's stop
+    // not been taken (N2 of coord7's review of 4d17d5ab).
+    assert!(
+        !stderr.contains("was admitted by signal phase 1 because only guests held the pipe, and"),
+        "the scheduler stopped the run, not the read's end: {stderr}"
+    );
+}
+
+/// dev-hermit dh-ru056 slice 2, design D6 (T2.5): record and replay of a
+/// SIGALRM-interrupted pipe read does not apply today, by named refusal.
+/// `hermit record` refuses both in-guest backends, the only ones that
+/// virtualize a guest SIGALRM handler, before any guest runs. Under ptrace,
+/// where the kernel delivers the signal and applies its restart table, the
+/// slice's restart checkpoint (`Detcore::sigalrm_restart_checkpoint`) never
+/// engages: the recorded read finishes with the kernel's `ERESTARTSYS`, which
+/// the checkpoint would have turned into `EINTR`, the guest sees Linux's
+/// result, and the replay matches the recording.
+#[test]
+fn sigalrm_pipe_read_record_is_refused_in_guest_and_untouched_under_ptrace() {
+    use super::kvm_cancellation::bounded_command_with_timeout;
+    use super::kvm_cancellation::bounded_read;
+
+    let _guard = hermit_run_guard();
+    let guest = sigalrm_fixture("liteinst_sigalrm_pipe_read");
+    // Record mode's contract is a real host clock: it runs without virtual
+    // time (`hermit::RECORD_REPLAY_VIRTUALIZES_TIME` is `false`,
+    // hermit-cli/src/lib.rs:149), so the guest's `clock_gettime` reads the host
+    // clock while its alarm and the child's sleep run on Detcore's timers, and
+    // the fixture's `window=` labels measure the host's speed, not the program.
+    // Only those labels are left out of the record comparisons, which still
+    // require exactly two of them; every other field is the program's and
+    // Linux's, and is compared exactly. Run mode, on virtual time, compares
+    // the labels too.
+    let without_windows = |text: &str| -> String {
+        text.split_inclusive('\n')
+            .map(|line| {
+                let (body, end) = line
+                    .strip_suffix('\n')
+                    .map_or((line, ""), |body| (body, "\n"));
+                let fields = body
+                    .split(' ')
+                    .filter(|field| !field.starts_with("window="))
+                    .collect::<Vec<_>>();
+                format!("{}{end}", fields.join(" "))
+            })
+            .collect()
+    };
+    let eintr = without_windows(SIGALRM_PIPE_READ_EINTR);
+    let run = |name: &str, args: &[&str]| {
+        let directory = process_build_root(&format!("sigalrm-pipe-record-{name}"));
+        fs::create_dir_all(&directory).expect("SIGALRM record directory");
+        let data = directory.join("data");
+        let mut command = Command::new(hermit_binary());
+        command
+            .args(args)
+            .arg(format!("--data-dir={}", data.display()))
+            .arg("--")
+            .arg(&guest)
+            .arg("eintr")
+            .env_remove("RUST_LOG")
+            .env_remove("HERMIT_LOG")
+            .env_remove("HERMIT_LOG_FILE")
+            .stdin(Stdio::null());
+        let status =
+            bounded_command_with_timeout(&mut command, &directory, Duration::from_secs(57));
+        let stdout = bounded_read(&directory.join("stdout"), 1024 * 1024);
+        let stderr = bounded_read(&directory.join("stderr"), 64 * 1024 * 1024);
+        (
+            status,
+            String::from_utf8_lossy(&stdout).into_owned(),
+            String::from_utf8_lossy(&stderr).into_owned(),
+        )
+    };
+
+    for backend in ["in-guest-trap", "liteinst"] {
+        let (status, stdout, stderr) = run(
+            backend,
+            &["--log=error", "--backend", backend, "record", "start"],
+        );
+        assert_eq!(
+            status.code(),
+            Some(hermit::HERMIT_INTERNAL_FAILURE_EXIT),
+            "{backend}: {stderr}"
+        );
+        assert!(stdout.is_empty(), "{backend}: no guest ran: {stdout}");
+        let refusal = format!(
+            "the LiteInst preload backend is available only through `hermit --backend {backend} \
+             run`; other subcommands, including `analyze` and `bisect`, do not use the preload \
+             runtime"
+        );
+        assert!(stderr.contains(&refusal), "{backend}: {stderr}");
+    }
+
+    let (status, stdout, stderr) = run("ptrace", &["--log=info", "record", "start"]);
+    assert_eq!(status.code(), Some(0), "ptrace record: {stderr}");
+    assert_eq!(
+        stdout.matches(" window=").count(),
+        2,
+        "ptrace record: {stdout}"
+    );
+    assert_eq!(without_windows(&stdout), eintr, "ptrace record: {stdout}");
+    let interrupted = stderr
+        .lines()
+        .filter(|line| line.contains("DETLOG") && line.contains(": read(3, "))
+        .filter(|line| line.contains(", 1) = Err(Errno("))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        interrupted.len(),
+        1,
+        "one interrupted read: {interrupted:?}"
+    );
+    assert!(
+        interrupted[0].contains("= Err(Errno(ERESTARTSYS))"),
+        "the kernel's restart code, not the checkpoint's EINTR: {}",
+        interrupted[0]
+    );
+
+    // Replay returns the clock values the recording observed (record mode's
+    // real host clock, hermit-cli/src/lib.rs:149), so it must reproduce THIS
+    // recording's `window=` labels exactly: the recording, not the fixture
+    // constant, is the reference, and `without_windows` does not apply here.
+    let windows = |text: &str| -> Vec<String> {
+        text.split_whitespace()
+            .filter(|field| field.starts_with("window="))
+            .map(str::to_owned)
+            .collect()
+    };
+    let recorded = stdout;
+    let recording = process_build_root("sigalrm-pipe-record-ptrace").join("data");
+    for attempt in 1..=2 {
+        let directory = process_build_root(&format!("sigalrm-pipe-replay-{attempt}"));
+        fs::create_dir_all(&directory).expect("SIGALRM replay directory");
+        let mut command = Command::new(hermit_binary());
+        command
+            .args(["--log=info", "replay", "--autopilot"])
+            .arg(format!("--data-dir={}", recording.display()))
+            .env_remove("RUST_LOG")
+            .env_remove("HERMIT_LOG")
+            .env_remove("HERMIT_LOG_FILE")
+            .stdin(Stdio::null());
+        let status =
+            bounded_command_with_timeout(&mut command, &directory, Duration::from_secs(57));
+        let replayed = bounded_read(&directory.join("stdout"), 1024 * 1024);
+        let replayed = String::from_utf8_lossy(&replayed).into_owned();
+        let stderr = bounded_read(&directory.join("stderr"), 64 * 1024 * 1024);
+        let stderr = String::from_utf8_lossy(&stderr);
+        assert_eq!(status.code(), Some(0), "replay {attempt}: {stderr}");
+        assert_eq!(
+            windows(&replayed),
+            windows(&recorded),
+            "replay {attempt} reproduces the recording's labels: {replayed}"
+        );
+        assert_eq!(replayed, recorded, "replay {attempt}");
+    }
+
+    let (status, stdout, stderr) = run("ptrace-verify", &["record", "--verify"]);
+    assert_eq!(status.code(), Some(0), "ptrace record --verify: {stderr}");
+    assert_eq!(
+        stdout.matches(" window=").count(),
+        2,
+        "ptrace record --verify: {stdout}"
+    );
+    assert_eq!(
+        without_windows(&stdout),
+        eintr,
+        "ptrace record --verify: {stdout}"
+    );
+    assert!(
+        stderr.contains("Success: replay matched recording."),
+        "ptrace record --verify: {stderr}"
+    );
+}
+
 /// This bridge covers emulated sleeps, not a running process's alarm. The
 /// existing missing-exit check must still refuse an alarm outside the bridge.
 #[test]

@@ -328,6 +328,57 @@ exit 91
     }
 
     #[test]
+    fn shared_pinned_cpu_dir_is_mounted_only_in_shared_form() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let f = Fixture::new();
+        let shared = f.dir.path().join("pinned-cpu");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        let ran = f
+            .command()
+            .args(["--src", ".", "--out", "out", "--", "true"])
+            .env("HERMIT_VALIDATE_PINNED_CPU_HOST_DIR", &shared)
+            .output()
+            .unwrap();
+        assert!(ran.status.success(), "{ran:?}");
+        assert!(
+            f.calls().contains(&format!(
+                "type=bind,source={},destination=/dev/shm/hermit-pinned-cpu",
+                shared.display()
+            )),
+            "{}",
+            f.calls()
+        );
+
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let calls_before = f
+            .calls()
+            .lines()
+            .filter(|line| line.starts_with("run "))
+            .count();
+        let refused = f
+            .command()
+            .args(["--src", ".", "--out", "out", "--", "true"])
+            .env("HERMIT_VALIDATE_PINNED_CPU_HOST_DIR", &shared)
+            .output()
+            .unwrap();
+        assert_eq!(refused.status.code(), Some(2), "{refused:?}");
+        assert!(
+            String::from_utf8_lossy(&refused.stderr)
+                .contains("is not a mode-1777 directory"),
+            "{refused:?}"
+        );
+        assert_eq!(
+            f.calls()
+                .lines()
+                .filter(|line| line.starts_with("run "))
+                .count(),
+            calls_before
+        );
+    }
+
+    #[test]
     fn absence_and_inspection_errors_keep_actual_status_and_stderr() {
         let f = Fixture::new();
         std::fs::write(

@@ -8440,8 +8440,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         };
         let rendered = match file {
-            AddressSpaceFile::Smaps => match self.smaps_facts(guest).await {
-                Ok(facts) => smaps::render_smaps(&map, &facts),
+            AddressSpaceFile::Smaps => match self.smaps_facts(guest, &map).await {
+                Ok(facts) => smaps::render_smaps(&map, &facts, smaps::host_filesystems()),
                 Err(refusal) => Err(refusal),
             },
             AddressSpaceFile::SmapsRollup => smaps::render_smaps_rollup(&map),
@@ -8464,13 +8464,15 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// ([`Self::serving_kernel_enables_protection_keys`]), the host kernel's
     /// transparent huge page settings, and the reader's address space's
     /// record (`MemoryMetadata`), with whether it disabled huge pages asked
-    /// of the backend (`PR_GET_THP_DISABLE`) where an order is allowed at
-    /// all. `Err` names a fact Detcore could not establish, and a kernel that
-    /// enables protection keys, whose keys follow calls Detcore does not
-    /// record (`mprotect(PROT_EXEC)` alone gives the execute-only key).
+    /// of the backend (`PR_GET_THP_DISABLE`) where that decides the answer
+    /// for one of `map`'s mappings (`smaps::thp_disabled_decides`). `Err`
+    /// names a fact Detcore could not establish, and a kernel that enables
+    /// protection keys, whose keys follow calls Detcore does not record
+    /// (`mprotect(PROT_EXEC)` alone gives the execute-only key).
     async fn smaps_facts<G: Guest<Self>>(
         &self,
         guest: &mut G,
+        map: &reverie::MemoryMap,
     ) -> Result<crate::procfs::memory_map::smaps::SmapsFacts, String> {
         use crate::procfs::memory_map::smaps;
 
@@ -8484,21 +8486,37 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
         }
         let protection_keys_enabled = false;
-        let thp_orders = smaps::host_thp()
-            .map_err(|error| {
-                format!(
-                    "Linux's smaps prints whether each mapping may have transparent huge pages, \
-                     which the host's settings decide, and they could not be read: {error}"
-                )
-            })?
-            .map_or(0, |thp| thp.anonymous_orders());
-        let thp_disabled = if thp_orders == 0 {
+        let host_thp = smaps::host_thp().map_err(|error| {
+            format!(
+                "Linux's smaps prints whether each mapping may have transparent huge pages, \
+                 which the host's settings decide, and they could not be read: {error}"
+            )
+        })?;
+        let state = guest.thread_state();
+        let unasked = smaps::SmapsFacts {
+            protection_keys_enabled,
+            protection_keys_used: state.may_use_protection_keys(),
+            mapping_flags_changed: state.mapping_flags_may_have_changed(),
+            thp_enabled: host_thp.map(|thp| thp.enabled),
+            thp_orders: host_thp.map_or(0, |thp| thp.anonymous_orders()),
+            thp_disabled: None,
+        };
+        let filesystems = smaps::host_filesystems();
+        let decides = map
+            .mappings
+            .iter()
+            .any(|mapping| smaps::thp_disabled_decides(mapping, &unasked, filesystems));
+        let thp_disabled = if !decides {
             None
         } else {
             let asked = guest
                 .inject(syscalls::Prctl::new().with_option(libc::PR_GET_THP_DISABLE))
                 .await;
             match asked {
+                // 1, or 3 with `PR_THP_DISABLE_EXCEPT_ADVISED`: either mode
+                // refuses huge pages to every mapping the renderer answers
+                // for, none of which `MADV_HUGEPAGE` marked
+                // (`smaps::thp_eligibility`, `vma_thp_disabled`).
                 Ok(disabled) => Some(disabled != 0),
                 Err(error) => {
                     return Err(format!(
@@ -8509,13 +8527,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
         };
-        let state = guest.thread_state();
         Ok(smaps::SmapsFacts {
-            protection_keys_enabled,
-            protection_keys_used: state.may_use_protection_keys(),
-            mapping_flags_changed: state.mapping_flags_may_have_changed(),
-            thp_orders,
             thp_disabled,
+            ..unasked
         })
     }
 
@@ -12918,6 +12932,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 object: SharedMemoryObjectId,
                 offset: u64,
             },
+            /// A descriptor Detcore cannot look up: the mapping is shared,
+            /// with an unknown backing object.
+            Unresolved,
         }
 
         let backing = if call.flags().contains(MapFlags::MAP_SHARED) {
@@ -12940,6 +12957,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         SharedBacking::File { object, offset }
                     })
                     .ok()
+                    .or(Some(SharedBacking::Unresolved))
             }
         } else {
             None
@@ -12966,6 +12984,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .thread_state()
                     .map_shared_object(start, len, object, offset);
             }
+            Some(SharedBacking::Unresolved) => guest.thread_state().map_shared_unresolved(),
             None => {}
         }
         // A file mapping keeps its open file description, and a flock lock it
@@ -14047,6 +14066,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         detfd.set_physically_nonblocking();
                     }
                 })?;
+                self.publish_pipe_status(guest, fd).await;
                 Ok(result)
             }
             F_DUPFD(_) | F_DUPFD_CLOEXEC(_) => {
@@ -15430,6 +15450,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 guest.thread_state().with_detfd(fd, |detfd| {
                     detfd.set_logical_nonblocking(enabled);
                 })?;
+                self.publish_pipe_status(guest, fd).await;
                 return Ok(0);
             }
         }
@@ -15470,8 +15491,45 @@ impl<T: RecordOrReplay> Detcore<T> {
                     detfd.set_nonblocking(enabled);
                 }
             })?;
+            if nonblocking.is_some() {
+                self.publish_pipe_status(guest, fd).await;
+            }
         }
         Ok(result)
+    }
+
+    /// After a guest's `pipe2`, `F_SETFL` or `FIONBIO` on descriptor `fd`,
+    /// where the runtime virtualizes SIGALRM: a pipe read description's status
+    /// flags, as the caller's process now holds them, go to the scheduler's
+    /// SIGALRM ledger (`SigalrmControl::PublishPipeStatus`). Such a backend
+    /// runs Detcore in each guest process and copies a description's model at
+    /// a fork, while Linux's processes share one `struct file` whose flags
+    /// `setfl` changes for all of them
+    /// (<https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/fcntl.c?h=v6.12#n40>),
+    /// so signal phase 1 admits a pipe read only where the reader's copy is
+    /// the description's latest status (dh-ru056 slice 2, review P1-b). The
+    /// publication at `pipe2` names the creator as the description's first
+    /// holder, which the ledger's record of holders starts from (review of
+    /// 29b3e6a8, finding 3). A write end is never read, so only a read end is
+    /// published. Only where phase 1's gate can admit a pipe read does the
+    /// ledger's record matter: a runtime that virtualizes a guest SIGALRM
+    /// handler, with sequentialized threads, the guard below.
+    async fn publish_pipe_status<G: Guest<Self>>(&self, guest: &mut G, fd: RawFd) {
+        if !(self.cfg.backend.virtualizes_guest_sigalrm && self.cfg.sequentialize_threads) {
+            return;
+        }
+        let Ok(Some((id, flags))) = guest.thread_state().with_detfd(fd, |detfd| {
+            let flags = detfd.status_flags();
+            (detfd.ty() == FdType::Pipe && flags & libc::O_ACCMODE != libc::O_WRONLY)
+                .then(|| (detfd.open_file_id(), flags))
+        }) else {
+            return;
+        };
+        crate::tool_global::sigalrm_refuses(
+            guest,
+            crate::tool_global::SigalrmControl::PublishPipeStatus { id, flags },
+        )
+        .await;
     }
 
     /// `Self::run_binder_call_with` from a fresh snapshot of the call's
@@ -16208,6 +16266,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 },
             )
             .await?;
+        // A pipe end a binder transaction delivered and this receipt
+        // recorded is the sender's description, which this process's Detcore
+        // records as its own (`Detcore::untrack_received_pipe_status`).
+        Self::untrack_received_pipe_status(guest, &recorded).await;
         self.refresh_received_locks(guest, &recorded, LockCall::BinderWriteRead)
             .await
     }
@@ -16837,6 +16899,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .thread_state()
                     .with_detfd(fd, |detfd| detfd.set_guest_held())?;
             }
+            // The read end's first status, which makes this process the
+            // first of the description's holders in the SIGALRM ledger
+            // (`publish_pipe_status`).
+            self.publish_pipe_status(guest, fds[0]).await;
             if internally_nonblocking {
                 self.maybe_set_nonblocking_fd(guest, fds[0]);
                 self.maybe_set_nonblocking_fd(guest, fds[1]);
@@ -18384,9 +18450,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             let (targets, zombie) = resolve_kill_targets_and_exit(guest, process).await;
             if targets.is_empty() && zombie == Some(false) {
-                return self.gone_pidfd_signal_answer(guest, call, signal).await;
+                return self
+                    .terminal_pidfd_signal_answer(guest, call, signal, false)
+                    .await;
             }
             terminal_no_effect = targets.is_empty() && zombie == Some(true);
+            // A zombie is answered from Detcore's model where the backend's
+            // own record of the reap is not read (section 3 of the KVM
+            // cross-process signal design).
+            if terminal_no_effect
+                && crate::syscalls::signal::answers_non_live_targets(guest.config())
+            {
+                return self
+                    .terminal_pidfd_signal_answer(guest, call, signal, true)
+                    .await;
+            }
         }
         // The thread scope sends to the thread whose id is the pid, like
         // `tgkill(pid, pid)`; the process scope to its process.
@@ -18596,47 +18674,63 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(value)
     }
 
-    /// The answer to a `pidfd_send_signal` whose target Detcore saw exit and
-    /// that is gone, in Linux's order: a non-NULL `info` is copied and its
-    /// layout checked against its own `si_signo` (EFAULT, E2BIG), then that
-    /// `si_signo` against the signal (EINVAL), then a forged `si_code`
-    /// (EPERM), and only then is the task missing (ESRCH). The copy, the layout
-    /// check and the `si_code` check are the kernel's: the same `info` goes to
+    /// The answer to a `pidfd_send_signal` whose target Detcore saw exit, in
+    /// Linux's order: a non-NULL `info` is copied and its layout checked
+    /// against its own `si_signo` (EFAULT, E2BIG), then that `si_signo`
+    /// against the signal (EINVAL), then a forged `si_code` (EPERM). Then a
+    /// process that is gone is missing (ESRCH), and a zombie (`zombie`) is
+    /// found, so the signal number is checked (EINVAL) and the signal dropped
+    /// (0, `prepare_signal` during the group exit); Detcore answers a zombie
+    /// only where it answers targets that are not live itself
+    /// (`answers_non_live_targets`). The copy, the layout check and the
+    /// `si_code` check are the kernel's: the same `info` goes to
     /// `rt_sigqueueinfo` naming a pid no task can have, which makes those
     /// checks and sends nothing (as
     /// <https://github.com/rrnewton/hermit/issues/4124> does for that call).
     /// `rt_sigqueueinfo` checks the layout against the signal it is given, so
     /// it is given the info's own `si_signo`.
-    async fn gone_pidfd_signal_answer<G: Guest<Self>>(
+    async fn terminal_pidfd_signal_answer<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: Syscall,
         signal: i32,
+        zombie: bool,
     ) -> Result<i64, Error> {
+        let found = |signal: i32| -> Result<i64, Error> {
+            if !zombie {
+                Err(Errno::ESRCH.into())
+            } else if crate::syscalls::signal::valid_signal(signal) {
+                Ok(0)
+            } else {
+                Err(Errno::EINVAL.into())
+            }
+        };
         let info = match call {
             Syscall::Other(_, args) => args.arg2,
             _ => 0,
         };
         let Some(info) = AddrMut::<GuestSiginfo>::from_raw(info) else {
-            return Err(Errno::ESRCH.into());
+            return found(signal);
         };
         let signo = guest.memory().read_value(info.cast::<libc::c_int>()).ok();
         let probe = syscalls::RtSigqueueinfo::new()
             .with_tgid(super::signal::NO_SUCH_PID)
             .with_sig(signo.unwrap_or(signal))
             .with_siginfo(Some(info.cast()));
-        let checked = guest.inject(probe).await;
-        let answer = match checked {
-            Err(errno @ (Errno::EPERM | Errno::ESRCH)) => errno,
+        let forged = match guest.inject(probe).await {
+            Err(Errno::EPERM) => true,
+            // A backend that checks the signal number before the target
+            // refuses it with EINVAL after the siginfo checks; the number is
+            // checked below, as Linux checks it once the target is found.
+            Ok(_) | Err(Errno::ESRCH | Errno::EINVAL) => false,
             Err(errno) => return Err(errno.into()),
-            Ok(_) => Errno::ESRCH,
         };
         // The copy succeeded, so the kernel could read `si_signo`; a page
         // only the kernel reaches (`[vvar]`) cannot be decided here.
         let Some(signo) = signo else {
             tracing::error!(
-                "[detcore, dtid {}] pidfd_send_signal to a gone process with a siginfo_t at \
-                 {:#x} is not supported: Hermit cannot read its si_signo \
+                "[detcore, dtid {}] pidfd_send_signal to a process that has exited with a \
+                 siginfo_t at {:#x} is not supported: Hermit cannot read its si_signo \
                  (https://github.com/rrnewton/hermit/issues/4108)",
                 guest.thread_state().dettid,
                 info.as_raw(),
@@ -18648,7 +18742,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         if signo != signal {
             return Err(Errno::EINVAL.into());
         }
-        Err(answer.into())
+        if forged {
+            return Err(Errno::EPERM.into());
+        }
+        found(signal)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -23049,6 +23146,11 @@ mod inject_fstat_scratch {
         /// descriptor received outside the model do where it is gone; any
         /// other answer is not scripted.
         fcntl_ebadf: bool,
+        /// Whether an injected syscall that nothing here scripts runs in this
+        /// process, on the test's own descriptors, as the probes of a
+        /// received descriptor (`fcntl`, `fstatfs`, ...) do; otherwise it is
+        /// a test failure.
+        unscripted_real: bool,
         /// For a `BINDER_WRITE_READ`: the commands Linux writes into its read
         /// buffer before the call fails with this errno, leaving the header
         /// as it was, as when the copy back of a read-only header faults.
@@ -23062,6 +23164,9 @@ mod inject_fstat_scratch {
         unreported_at_ioctl: Option<bool>,
         /// The determinism losses the guest reported to the global state.
         determinism_losses: std::sync::Mutex<Vec<String>>,
+        /// The SIGALRM ledger controls sent (`GlobalRequest::Sigalrm`), each
+        /// answered as not refused.
+        sigalrm_controls: std::sync::Mutex<Vec<crate::tool_global::SigalrmControl>>,
         /// The resource sets this guest requested from the scheduler, in
         /// order, for a test that witnesses a turn release.
         resource_requests: std::sync::Mutex<Vec<Vec<crate::resources::ResourceID>>>,
@@ -23124,10 +23229,12 @@ mod inject_fstat_scratch {
                 binder_read_consumed: None,
                 ppoll_ready: None,
                 fcntl_ebadf: false,
+                unscripted_real: false,
                 counts_memory_reads: false,
                 binder_read_fault: None,
                 unreported_at_ioctl: None,
                 determinism_losses: Default::default(),
+                sigalrm_controls: Default::default(),
                 resource_requests: Default::default(),
                 capture_resource_requests: false,
                 blocking_grant_gate: None,
@@ -23224,6 +23331,15 @@ mod inject_fstat_scratch {
             if let GlobalRequest::RecordDeterminismLoss(reason) = &message.2 {
                 self.determinism_losses.lock().unwrap().push(reason.clone());
                 return (None, GlobalResponse::RecordDeterminismLoss(()));
+            }
+            // A received descriptor's lock state, which its recording
+            // publishes; acknowledged, as the global state does.
+            if self.unscripted_real && matches!(&message.2, GlobalRequest::DescriptionLocks(..)) {
+                return (None, GlobalResponse::DescriptionLocks(()));
+            }
+            if let GlobalRequest::Sigalrm(control) = &message.2 {
+                self.sigalrm_controls.lock().unwrap().push(*control);
+                return (None, GlobalResponse::Sigalrm(false));
             }
             if let GlobalRequest::CreateChildThread(..) = &message.2 {
                 return (None, GlobalResponse::CreateChildThread(None));
@@ -23500,6 +23616,19 @@ mod inject_fstat_scratch {
                         .write_exact(AddrMut::<u8>::from_raw(data).unwrap(), &bytes)?;
                     0
                 }
+                // SAFETY: a probe Detcore asked for, on descriptors and memory
+                // of this process that the test owns.
+                _ if self.unscripted_real => unsafe {
+                    libc::syscall(
+                        number.id() as libc::c_long,
+                        args.arg0,
+                        args.arg1,
+                        args.arg2,
+                        args.arg3,
+                        args.arg4,
+                        args.arg5,
+                    )
+                },
                 other => panic!("unexpected injected syscall {other:?}"),
             };
             Errno::result(raw)
@@ -23973,6 +24102,75 @@ mod inject_fstat_scratch {
             crate::syscalls::binder::delivered(&LocalMemory::new(), argument, 0).fds,
             vec![123]
         );
+    }
+
+    /// N1 of coord7's review of 858541a9, at the binder receipt: a pipe read
+    /// end a binder transaction delivers, recorded in the caller's turn, loses
+    /// its tracked SIGALRM status where the runtime virtualizes SIGALRM
+    /// (`Detcore::untrack_received_pipe_status`), as one received over
+    /// SCM_RIGHTS does. The object names a real pipe's read end, so the
+    /// receipt's probes record it as a pipe. Where SIGALRM is not virtualized
+    /// nothing is sent (the control). Mutation "the binder receipt untracks
+    /// nothing": no control is sent.
+    #[tokio::test]
+    async fn a_pipe_end_a_binder_read_delivers_loses_its_sigalrm_status() {
+        use std::os::fd::AsRawFd;
+
+        use crate::syscalls::binder::BinderRun;
+        use crate::tool_global::SigalrmControl;
+
+        let (reader, _writer) = nix::unistd::pipe2(OFlag::O_NONBLOCK).unwrap();
+        let received = reader.as_raw_fd();
+        let mut object = [0u8; 24];
+        object[..4].copy_from_slice(&0x6664_2a85u32.to_ne_bytes()); // BINDER_TYPE_FD
+        object[8..12].copy_from_slice(&(received as u32).to_ne_bytes());
+        let offsets = [0u64];
+        let mut transaction = [0u8; 64];
+        transaction[40..48].copy_from_slice(&8u64.to_ne_bytes());
+        transaction[48..56].copy_from_slice(&(object.as_ptr() as u64).to_ne_bytes());
+        transaction[56..64].copy_from_slice(&(offsets.as_ptr() as u64).to_ne_bytes());
+        let mut commands = 0x8040_7202u32.to_ne_bytes().to_vec(); // BR_TRANSACTION
+        commands.extend_from_slice(&transaction);
+        let words = [
+            0,
+            0,
+            0,
+            commands.len() as u64,
+            commands.len() as u64,
+            commands.as_ptr() as u64,
+        ];
+        for virtualized in [true, false] {
+            let (_, mut guest) = ScriptedGuest::new(true, false);
+            guest.unscripted_real = true;
+            guest.config.sequentialize_threads = true;
+            guest.config = guest
+                .config
+                .clone()
+                .with_backend(|backend| backend.virtualizes_guest_sigalrm = virtualized);
+            let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+            assert!(tool.records_received_descriptors(&guest));
+            tool.take_binder_receipts(
+                &mut guest,
+                99,
+                words.as_ptr() as usize,
+                0,
+                BinderRun::InTurn,
+            )
+            .await
+            .unwrap();
+            let (ty, id) = guest
+                .thread
+                .with_detfd(received, |detfd| (detfd.ty(), detfd.open_file_id()))
+                .unwrap();
+            assert_eq!(ty, FdType::Pipe, "recorded as a pipe");
+            let controls = guest.sigalrm_controls.lock().unwrap().clone();
+            let expected = if virtualized {
+                vec![SigalrmControl::UntrackPipeStatus { id }]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(controls, expected, "virtualized {virtualized}");
+        }
     }
 
     /// A binder read in the caller's turn whose descriptors cannot be named

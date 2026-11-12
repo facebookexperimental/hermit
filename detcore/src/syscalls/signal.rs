@@ -845,6 +845,126 @@ fn deterministic_kill_target(
     }
 }
 
+/// Whether Detcore answers a signal to a target that is not live from its own
+/// model of the run, without forwarding the call (the KVM cross-process
+/// signal design, section 3): on a backend that owns signal delivery
+/// (`provides_process_signal_control`, KVM), whose own record of an exit or a
+/// reap is not what the sender's turn reads, under sequentialized threads,
+/// where that model is the schedule's. Elsewhere the kernel answers from the
+/// guest's own tasks.
+pub(crate) fn answers_non_live_targets(config: &crate::config::Config) -> bool {
+    config.backend.provides_process_signal_control && config.sequentialize_threads
+}
+
+/// Whether Linux's `check_kill_permission` takes `sig` as a signal number
+/// (`valid_signal`: 0 to `_NSIG`), which it asks only once it has found the
+/// target.
+pub(crate) fn valid_signal(sig: libc::c_int) -> bool {
+    (0..=64).contains(&sig)
+}
+
+/// What the thread a thread-directed send names (`tid`, in thread group
+/// `tgid` for the calls that name one) is in Detcore's model, for the
+/// calls Detcore answers without forwarding (`answers_non_live_targets`).
+async fn named_thread<G, T>(
+    guest: &mut G,
+    tgid: Option<libc::pid_t>,
+    tid: libc::pid_t,
+) -> NamedThread
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let Some(process) = registered_process_of(guest, DetTid::from_raw(tid)).await else {
+        return NamedThread::Gone;
+    };
+    let (targets, zombie) = resolve_kill_targets_and_exit(guest, DetPid::from_raw(tid)).await;
+    classify_named_thread(tgid, tid, process, &targets, zombie)
+}
+
+/// [`named_thread`] from the facts it reads: `process`, the process the
+/// thread tree registers `tid` under; `targets`, the live threads of the
+/// process the id names (`resolve_kill_targets_and_exit`); and `zombie`,
+/// whether that process exited and has not been reaped (`None` if it has
+/// not exited, or has been reaped).
+///
+/// The thread tree keeps every thread that ever registered, so `process`
+/// says nothing about liveness: a thread is live while it has turn state,
+/// which is what makes it one of its process's signal targets.
+fn classify_named_thread(
+    tgid: Option<libc::pid_t>,
+    tid: libc::pid_t,
+    process: DetPid,
+    targets: &[DetTid],
+    zombie: Option<bool>,
+) -> NamedThread {
+    if targets.contains(&DetTid::from_raw(tid)) {
+        // `do_send_specific` finds no task whose thread group is not the one
+        // the call names (ESRCH).
+        return if tgid.is_none_or(|tgid| tgid == process.as_raw()) {
+            NamedThread::Live
+        } else {
+            NamedThread::Gone
+        };
+    }
+    // An exited thread that led no process was released as it exited
+    // (`exit_notify`'s autoreap of a non-leader), and a leader's id is its
+    // thread group's.
+    if process.as_raw() != tid || tgid.is_some_and(|tgid| tgid != tid) {
+        return NamedThread::Gone;
+    }
+    match (targets.is_empty(), zombie) {
+        (true, Some(true)) => NamedThread::ZombieLeader,
+        (false, _) => NamedThread::ExitedLeader,
+        (true, _) => NamedThread::Gone,
+    }
+}
+
+/// What Detcore answers a thread-directed send whose target is `named`, not
+/// live, where `valid` says whether the signal number is one Linux takes
+/// (after the caller's siginfo checks). A missing task is ESRCH before the
+/// signal number is looked at; a found one checks it (EINVAL) and drops the
+/// signal of a zombie leader (0).
+fn non_live_thread_answer(named: NamedThread, valid: bool, sig: libc::c_int) -> NonLiveAnswer {
+    match named {
+        NamedThread::Live | NamedThread::Gone => NonLiveAnswer::Errno(Errno::ESRCH),
+        _ if !valid => NonLiveAnswer::Errno(Errno::EINVAL),
+        NamedThread::ZombieLeader => NonLiveAnswer::Sent,
+        NamedThread::ExitedLeader if sig == 0 || sig == libc::SIGKILL => NonLiveAnswer::Sent,
+        NamedThread::ExitedLeader => NonLiveAnswer::ExitedLeaderQueue,
+    }
+}
+
+/// [`non_live_thread_answer`]'s answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NonLiveAnswer {
+    /// The call fails with this errno.
+    Errno(Errno),
+    /// The call succeeds (0), the signal dropped.
+    Sent,
+    /// Linux queues the signal on an exited leader, where no thread takes
+    /// it; the backend keeps no queue for an exited thread, so the send is
+    /// refused by name.
+    ExitedLeaderQueue,
+}
+
+/// The answer to a send to a process that is gone, from the probe that
+/// makes the caller's siginfo checks against a pid no task can have. Linux
+/// checks the signal number only once it has found the target
+/// (`check_kill_permission`); LinuxEmu checks it before the lookup. So where
+/// Detcore answers targets that are not live (`answers_non_live`), the
+/// probe's EINVAL, which only that check can give to a positive pid, is
+/// ESRCH.
+fn gone_process_probe_answer(
+    probe: Result<i64, Errno>,
+    answers_non_live: bool,
+) -> Result<i64, Errno> {
+    match probe {
+        Err(Errno::EINVAL) if answers_non_live => Err(Errno::ESRCH),
+        probe => probe,
+    }
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1119): Review unmaskable process-group SIGKILL forwarding.
 fn can_forward_process_group_signal(
@@ -1863,9 +1983,16 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// state, inside this call's turn.
     async fn publish_virtual_sigalrm<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
         let (handled, blocked) = virtual_sigalrm_state(guest).await?;
+        // The handler's SA_RESTART bit, from the same virtual table, for
+        // phase 1's gate (`ThreadState::sigalrm_restarts`).
+        let restarts = handled
+            && super::helpers::caught_action_flags(guest, libc::SIGALRM).await?
+                & libc::SA_RESTART as u32 as u64
+                != 0;
         sigalrm_refuses(guest, SigalrmControl::Publish { handled, blocked }).await;
         guest.thread_state_mut().sigalrm_handled = handled;
         guest.thread_state_mut().sigalrm_blocked_published = blocked;
+        guest.thread_state_mut().sigalrm_restarts = restarts;
         Ok(())
     }
 
@@ -3550,6 +3677,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Ok(0);
         }
+        // A target that is not live is answered from Detcore's model where
+        // the backend's own record of it is not read (section 3 of the KVM
+        // cross-process signal design). Non-positive ids are EINVAL first.
+        if answers_non_live_targets(guest.config())
+            && tgid > 0
+            && tid > 0
+            && let Some(answer) = self
+                .send_to_non_live_thread(guest, Sysno::tgkill, Some(tgid), tid, call.sig(), None)
+                .await
+        {
+            return answer;
+        }
         let reserved_exit = self
             .reserve_controlled_self_sigkill_exit(
                 guest,
@@ -3686,6 +3825,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await
         {
             return Ok(0);
+        }
+        // As in `tgkill`, a target that is not live is answered from
+        // Detcore's model where the backend's record of it is not read.
+        if answers_non_live_targets(guest.config())
+            && tid > 0
+            && let Some(answer) = self
+                .send_to_non_live_thread(guest, Sysno::tkill, None, tid, call.sig(), None)
+                .await
+        {
+            return answer;
         }
         let reserved_exit = self
             .reserve_controlled_self_sigkill_exit(
@@ -4431,6 +4580,93 @@ impl<T: RecordOrReplay> Detcore<T> {
         )
     }
 
+    /// The answer to a thread-directed send (`tgkill`, `tkill`,
+    /// `rt_tgsigqueueinfo`) whose target is not live in Detcore's model
+    /// (`named_thread`), where Detcore answers such targets without
+    /// forwarding (`answers_non_live_targets`); `None` for a live target,
+    /// which takes the ordinary path. In Linux's order: a caller's siginfo is
+    /// checked before the lookup, by `siginfo_probe`, the same call to ids no
+    /// task can have (EFAULT, E2BIG, EPERM); then a missing task is ESRCH;
+    /// then a found one checks the signal number (EINVAL) and drops the
+    /// signal of a zombie leader (0, `prepare_signal` during the group exit).
+    /// The leader of a process whose other threads live on keeps a signal
+    /// sent to it in its own queue, where no thread takes it, after
+    /// `prepare_signal`'s effects on the process: signal 0 answers 0, a
+    /// SIGKILL changes nothing (https://github.com/rrnewton/hermit/issues/4445)
+    /// and answers 0, and any other signal is refused by name, since the
+    /// backend keeps no queue for an exited thread.
+    async fn send_to_non_live_thread<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        tgid: Option<libc::pid_t>,
+        tid: libc::pid_t,
+        sig: libc::c_int,
+        siginfo_probe: Option<syscalls::RtTgsigqueueinfo>,
+    ) -> Option<Result<i64, Error>> {
+        let named = named_thread(guest, tgid, tid).await;
+        if named == NamedThread::Live {
+            return None;
+        }
+        let mut valid = valid_signal(sig);
+        if let Some(probe) = siginfo_probe {
+            match self.record_or_replay(guest, probe).await {
+                Ok(_) | Err(Errno::ESRCH) => {}
+                // The ids are positive, so only the signal number is left
+                // that the probe's target lookup can refuse first.
+                Err(Errno::EINVAL) => valid = false,
+                Err(errno) => return Some(Err(errno.into())),
+            }
+        }
+        Some(match non_live_thread_answer(named, valid, sig) {
+            NonLiveAnswer::Errno(errno) => Err(errno.into()),
+            NonLiveAnswer::Sent => Ok(0),
+            NonLiveAnswer::ExitedLeaderQueue => {
+                tracing::error!(
+                    "[detcore, dtid {}] {} of signal {} to thread {}, the leader of a process \
+                     whose other threads live on, is not supported: Linux queues it on the \
+                     exited leader, where no thread takes it, and this backend keeps no \
+                     queue for an exited thread (https://github.com/rrnewton/hermit/issues/5036)",
+                    guest.thread_state().dettid,
+                    sysno,
+                    sig,
+                    tid,
+                );
+                self.refuse_unserviceable_operation(guest, sysno, Errno::ENOSYS)
+                    .await
+            }
+        })
+    }
+
+    /// The answer to a `rt_sigqueueinfo` to a zombie, where Detcore answers
+    /// targets that are not live itself (`answers_non_live_targets`): the
+    /// siginfo checks Linux makes before it looks the process up (EFAULT,
+    /// E2BIG, EPERM), made by the same call to a pid no task can have; then,
+    /// the zombie found, the check of the signal number (EINVAL); and 0, the
+    /// signal dropped (`prepare_signal` during the group exit). Forwarded,
+    /// the answer would be the backend's, whose record of the reap need not
+    /// be in step with Detcore's at this turn.
+    async fn zombie_sigqueueinfo_answer<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::RtSigqueueinfo,
+    ) -> Result<i64, Error> {
+        match self
+            .record_or_replay(guest, call.with_tgid(NO_SUCH_PID))
+            .await
+        {
+            Ok(_) | Err(Errno::ESRCH) => {}
+            // The pid is positive, so only the signal number is left that
+            // the probe's process lookup can refuse first.
+            Err(Errno::EINVAL) => return Err(Errno::EINVAL.into()),
+            Err(errno) => return Err(errno.into()),
+        }
+        if !valid_signal(call.sig()) {
+            return Err(Errno::EINVAL.into());
+        }
+        Ok(0)
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#812)
     /// Queue a thread-directed signal with an accompanying `siginfo_t`. Like
@@ -4530,6 +4766,27 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await
         {
             return Ok(0);
+        }
+        // As in `tgkill`, a target that is not live is answered from
+        // Detcore's model where the backend's record of it is not read,
+        // after the siginfo checks Linux makes first, which the same call to
+        // ids no task can have makes (non-positive ids are EINVAL after the
+        // copy, so they take the ordinary path).
+        if answers_non_live_targets(guest.config())
+            && call.tgid() > 0
+            && tid > 0
+            && let Some(answer) = self
+                .send_to_non_live_thread(
+                    guest,
+                    Sysno::rt_tgsigqueueinfo,
+                    Some(call.tgid()),
+                    tid,
+                    call.sig(),
+                    Some(call.with_tgid(NO_SUCH_PID).with_tid(NO_SUCH_PID)),
+                )
+                .await
+        {
+            return answer;
         }
         // A SIGKILL to an exited leader changes nothing, as in `tgkill`
         // (https://github.com/rrnewton/hermit/issues/4445).
@@ -4720,6 +4977,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .record_or_replay(guest, call.with_tgid(NO_SUCH_PID))
                     .await?);
             }
+            if targets.is_empty()
+                && zombie == Some(true)
+                && answers_non_live_targets(guest.config())
+            {
+                return self.zombie_sigqueueinfo_answer(guest, call).await;
+            }
             return Ok(self.record_or_replay(guest, call).await?);
         }
         if call.sig() == libc::SIGALRM {
@@ -4795,10 +5058,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             // make those checks against a pid no task can have, so its answer
             // cannot depend on whether the host has reaped the real one yet
             // (https://github.com/rrnewton/hermit/issues/4124).
+            // Where Detcore answers targets that are not live, the
+            // signal number is not checked first (`gone_process_probe_answer`).
             Err(Error::Errno(Errno::ESRCH)) => {
-                return Ok(self
+                let probe = self
                     .record_or_replay(guest, call.with_tgid(NO_SUCH_PID))
-                    .await?);
+                    .await;
+                return Ok(gone_process_probe_answer(
+                    probe,
+                    answers_non_live_targets(guest.config()),
+                )?);
             }
             target => target?,
         };
@@ -4825,13 +5094,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // answer: it validates, finds the zombie, and returns 0. A
                 // backend that must name a receiving thread has none to name,
                 // and keeps ESRCH
-                // (https://github.com/rrnewton/hermit/issues/4091).
+                // (https://github.com/rrnewton/hermit/issues/4091). Where
+                // Detcore answers targets that are not live itself, it makes
+                // the same checks and answers from its model
+                // (`zombie_sigqueueinfo_answer`).
                 if guest
                     .config()
                     .backend
                     .requires_thread_directed_process_signals
                 {
                     return Err(Errno::ESRCH.into());
+                }
+                if answers_non_live_targets(guest.config()) {
+                    return self.zombie_sigqueueinfo_answer(guest, call).await;
                 }
                 return Ok(self.record_or_replay(guest, call).await?);
             }
@@ -6383,6 +6658,24 @@ pub(crate) enum ProcessSignalTarget {
     /// unchanged too, and the signal waits in the process's shared queue for
     /// the first thread that can take it, waking none.
     SharedQueue,
+}
+
+/// What a thread-directed send names in Detcore's model (`named_thread`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NamedThread {
+    /// A live thread, of the thread group the call names, if it names one.
+    Live,
+    /// The leader of a process that has exited and has not been reaped:
+    /// Linux still finds it, and drops the signal (`prepare_signal` during the
+    /// group exit), answering 0.
+    ZombieLeader,
+    /// The leader of a process whose other threads live on: Linux finds it,
+    /// a zombie, and queues the signal on it, where no thread takes it.
+    ExitedLeader,
+    /// No task: an exited thread that leads no process, a reaped process, an
+    /// id no task has had, or a thread of another thread group than the one
+    /// named (ESRCH).
+    Gone,
 }
 
 enum OwnProcessSend {
@@ -8610,5 +8903,127 @@ mod suspend_decline_tests {
             SuspendDecline::Declined,
             "an ignored one the temporary mask blocks stays"
         );
+    }
+}
+
+#[cfg(test)]
+mod not_live_target_tests {
+    use super::*;
+
+    fn tid(raw: i32) -> DetTid {
+        DetTid::from_raw(raw)
+    }
+
+    fn pid(raw: i32) -> DetPid {
+        DetPid::from_raw(raw)
+    }
+
+    /// A child that has exited and has not been reaped is a zombie: Linux
+    /// still finds its leader, drops a valid signal (0) and refuses an
+    /// invalid signal number (EINVAL). Its id stays registered, and it has
+    /// no live thread.
+    #[test]
+    fn a_zombie_leader_is_found_and_its_signal_dropped() {
+        let named = classify_named_thread(Some(7), 7, pid(7), &[], Some(true));
+        assert_eq!(named, NamedThread::ZombieLeader);
+        assert_eq!(
+            non_live_thread_answer(named, true, libc::SIGUSR1),
+            NonLiveAnswer::Sent
+        );
+        assert_eq!(non_live_thread_answer(named, true, 0), NonLiveAnswer::Sent);
+        assert_eq!(
+            non_live_thread_answer(named, false, 99),
+            NonLiveAnswer::Errno(Errno::EINVAL)
+        );
+    }
+
+    /// The same child once reaped names no task: ESRCH, also for a signal
+    /// number Linux refuses, which it checks only once it has found the
+    /// target.
+    #[test]
+    fn a_reaped_leader_is_esrch_even_for_an_invalid_signal() {
+        let named = classify_named_thread(Some(7), 7, pid(7), &[], None);
+        assert_eq!(named, NamedThread::Gone);
+        assert_eq!(
+            non_live_thread_answer(named, false, 99),
+            NonLiveAnswer::Errno(Errno::ESRCH)
+        );
+        assert_eq!(
+            non_live_thread_answer(named, true, libc::SIGUSR1),
+            NonLiveAnswer::Errno(Errno::ESRCH)
+        );
+    }
+
+    /// The thread tree keeps an exited thread registered under its process,
+    /// so registration is not liveness: an exited non-leader names no task,
+    /// and the leader of a process whose other threads live on is an exited
+    /// leader. (Taking registration for liveness forwarded the sends to the
+    /// zombie and the reaped child, which LinuxEmu answered ESRCH and
+    /// EINVAL.)
+    #[test]
+    fn a_registered_thread_without_turn_state_is_not_live() {
+        assert_eq!(
+            classify_named_thread(Some(3), 5, pid(3), &[tid(3)], None),
+            NamedThread::Gone
+        );
+        assert_eq!(
+            classify_named_thread(None, 5, pid(3), &[tid(3)], None),
+            NamedThread::Gone
+        );
+        let leader = classify_named_thread(Some(3), 3, pid(3), &[tid(5)], None);
+        assert_eq!(leader, NamedThread::ExitedLeader);
+        assert_eq!(non_live_thread_answer(leader, true, 0), NonLiveAnswer::Sent);
+        assert_eq!(
+            non_live_thread_answer(leader, true, libc::SIGKILL),
+            NonLiveAnswer::Sent
+        );
+        assert_eq!(
+            non_live_thread_answer(leader, true, libc::SIGUSR1),
+            NonLiveAnswer::ExitedLeaderQueue
+        );
+    }
+
+    /// A live thread is live in its own thread group and names no task in
+    /// any other (`do_send_specific`'s ESRCH); so does a zombie leader named
+    /// in another thread group.
+    #[test]
+    fn a_live_thread_is_live_only_in_its_own_thread_group() {
+        let live = [tid(3), tid(5)];
+        assert_eq!(
+            classify_named_thread(Some(3), 5, pid(3), &live, None),
+            NamedThread::Live
+        );
+        assert_eq!(
+            classify_named_thread(None, 5, pid(3), &live, None),
+            NamedThread::Live
+        );
+        assert_eq!(
+            classify_named_thread(Some(4), 5, pid(3), &live, None),
+            NamedThread::Gone
+        );
+        assert_eq!(
+            classify_named_thread(Some(4), 7, pid(7), &[], Some(true)),
+            NamedThread::Gone
+        );
+    }
+
+    /// `rt_sigqueueinfo` to a reaped process: LinuxEmu answers the probe to
+    /// a pid no task has with EINVAL for an invalid signal number, which it
+    /// checks first; Linux looks the target up first (ESRCH). Where Detcore
+    /// answers targets that are not live it is ESRCH; elsewhere the kernel's
+    /// answer stands, and the siginfo checks' errnos pass through.
+    #[test]
+    fn a_gone_process_probe_einval_is_esrch_where_detcore_answers() {
+        assert_eq!(
+            gone_process_probe_answer(Err(Errno::EINVAL), true),
+            Err(Errno::ESRCH)
+        );
+        assert_eq!(
+            gone_process_probe_answer(Err(Errno::EINVAL), false),
+            Err(Errno::EINVAL)
+        );
+        for errno in [Errno::ESRCH, Errno::EPERM, Errno::EFAULT, Errno::E2BIG] {
+            assert_eq!(gone_process_probe_answer(Err(errno), true), Err(errno));
+        }
     }
 }

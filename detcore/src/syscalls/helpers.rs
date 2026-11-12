@@ -4168,6 +4168,9 @@ where
     let mut turn_wait =
         checks_at_turn.then(|| KernelSignalWait::new(guest, 0, false, interrupt_errno));
     let mut published = PublishedWaitMask::default();
+    // The pipe read descriptions an attempt of this send passed, whose
+    // SIGALRM status it untracked (`Detcore::pipe_reads_an_attempt_passes`).
+    let mut untracked_pipe_reads = std::collections::BTreeSet::new();
 
     let result: Result<i64, Error> = loop {
         // A sibling can replace a descriptor while the previous request
@@ -4297,6 +4300,36 @@ where
             displaced = entry_import
                 .as_ref()
                 .map(|entry| entry.reinstate(&mut guest.memory()));
+        }
+        // Each pipe read description this attempt passes over SCM_RIGHTS, as
+        // Linux will import its messages and look up their descriptors,
+        // loses its SIGALRM status first: the handler read them at entry,
+        // and an attempt after a wait may pass others
+        // (`Detcore::pipe_reads_an_attempt_passes`). The captured bytes go
+        // back around the requests, as above, and the attempt reads again
+        // after them, until it passes no description it has not untracked.
+        let mut untracking = Ok(());
+        loop {
+            let ids = Detcore::<T>::pipe_reads_an_attempt_passes(
+                guest,
+                call.into(),
+                &untracked_pipe_reads,
+            );
+            if ids.is_empty() {
+                break;
+            }
+            untracking = put_back_entry_import(guest, &entry_import, displaced.take(), false);
+            if untracking.is_err() {
+                break;
+            }
+            Detcore::<T>::untrack_pipe_statuses(guest, &ids).await;
+            untracked_pipe_reads.extend(ids);
+            displaced = entry_import
+                .as_ref()
+                .map(|entry| entry.reinstate(&mut guest.memory()));
+        }
+        if let Err(error) = untracking {
+            break Err(error);
         }
         // A receive whose descriptors Detcore names reads its geometry again
         // right before each attempt: a sibling may have changed it while an

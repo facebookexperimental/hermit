@@ -337,7 +337,12 @@ pub(super) struct ParkedRequests {
     /// `Scheduler::reserved_probe_to_resume`) sets it, spending the alarm
     /// priority, but is itself selected whether or not that priority is
     /// available. Like a SIGCHLD taker it is exempt from the bound, which
-    /// holds it to one probe grant per due entry instead.
+    /// holds it to one probe grant per due entry instead, under the runtime's
+    /// contract to deliver the entry at the read's completion. `Completed` is
+    /// not checked further, so a completion that skips the delivery, followed
+    /// by a polling read on another descriptor, can be probed again for the
+    /// same entry; the thread's own grants come between the two probes, so
+    /// there is no livelock.
     pub alarm_priority_served: Option<DetPid>,
     /// The pollers `Scheduler::wake_polling_alarm_receiver` woke, until step 3
     /// next resumes each: their substituted request is a signal delivery the

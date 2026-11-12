@@ -2984,6 +2984,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/signal_targets_not_live.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/signal_targets_not_live.c is owned by hermit-cli/tests/cli.rs: signals_to_targets_that_are_not_live_answer_as_on_linux compiles this guest, which makes every signal-sending call (kill, tgkill, tkill, rt_sigqueueinfo, rt_tgsigqueueinfo, pidfd_send_signal) to a zombie child, the same child once reaped and an exited thread, and requires the ptrace and KVM runs' stdout to equal the native run's line by line; it remains a guest fixture because its oracle is the native run on the host, which the cli test makes beside the two backend runs."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/signal_then_sibling_exit.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/signal_then_sibling_exit.c is owned by hermit-cli/tests/cli.rs: run_kvm_a_sibling_may_exit_while_its_signal_is_taken runs it on the KVM backend, where a worker signals the main thread and exits at once while the main thread takes the signal at a system-call return (spin) or in a sigsuspend loop; the worker's exit must not fail the parked signal protocol (https://github.com/rrnewton/hermit/issues/4367), and since delivery permits are per thread it proceeds while the main thread holds its own (https://github.com/rrnewton/hermit/issues/4899). It requires repeated run --strict --verify --verify-strict runs, with chaos seeds for sigsuspend, at bitwise parity, so it remains a guest fixture rather than a manifest cell."

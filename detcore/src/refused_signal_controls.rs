@@ -274,6 +274,99 @@ pub(crate) fn realtime_instances_unknown_refusal(call: &str, signal: i32, caller
     )
 }
 
+/// The run-wide stopping refusal for a polled pipe read whose `-ERESTARTSYS`
+/// the restart checkpoint would turn into `-EINTR` for a due guest-handled
+/// SIGALRM whose action has `SA_RESTART` (dev-hermit dh-ru056 slice 2, ruling
+/// C2.4). Phase 1's gate refuses such a read at its entry, so this is a
+/// defect of that argument. Linux would run the handler and then restart the
+/// read, which the in-guest host cannot do. Fail closed.
+pub(crate) fn sigalrm_restart_after_handler_refusal(call: &str, caller: i32) -> String {
+    format!(
+        "hermit refused to continue the run (HERMIT_SIGALRM_RESTART_AFTER_HANDLER): {call} in \
+         thread {caller} finished with ERESTARTSYS while its process's due SIGALRM handler has \
+         SA_RESTART, which signal phase 1 refuses at the read's entry; Linux would run the \
+         handler and then restart the call, which the in-guest host cannot do (dev-hermit \
+         dh-ru056 slice 2, ruling C2.4)."
+    )
+}
+
+/// The run-wide stopping refusal for a call whose `-ERESTARTSYS` the restart
+/// checkpoint turned into `-EINTR` for a due guest-handled SIGALRM that its
+/// completion then did not deliver (dev-hermit dh-ru056 slice 2, ruling
+/// C2.1). The guest must never see `-EINTR` without the handler's run, and
+/// nothing in the calling thread's own turn can take or block the entry
+/// between the two points, so this is a defect of that argument. Fail
+/// closed.
+pub(crate) fn sigalrm_interrupt_without_delivery_refusal(call: &str, caller: i32) -> String {
+    format!(
+        "hermit refused to continue the run (HERMIT_SIGALRM_EINTR_WITHOUT_DELIVERY): {call} in \
+         thread {caller} was to return EINTR for its process's due SIGALRM, but the SIGALRM was \
+         not delivered at its completion; the guest would see EINTR with no handler run \
+         (dev-hermit dh-ru056 slice 2, ruling C2.1)."
+    )
+}
+
+/// The scheduler's run-ending refusal for a pipe read that signal phase 1
+/// admitted on guest-held marks, found by a due guest-handled SIGALRM after a
+/// descriptor export revoked those marks while it waited (dev-hermit dh-ru056
+/// slice 2, review P1-a). Whether the reserved probe would find data could
+/// then depend on a process outside the guest, so no probe is reserved, and
+/// Linux would interrupt the read here. Fail closed.
+pub(crate) fn sigalrm_pipe_authority_revoked_refusal(reader: i32) -> String {
+    format!(
+        "hermit refused to continue the run (HERMIT_SIGALRM_PIPE_AUTHORITY_REVOKED): thread \
+         {reader} waits in a pipe read that signal phase 1 admitted because only guests held \
+         the pipe, and a descriptor has since left the guest, so a due SIGALRM cannot \
+         interrupt it deterministically (dev-hermit dh-ru056 slice 2)."
+    )
+}
+
+/// The run-wide stopping refusal for a pipe read signal phase 1 admitted that
+/// finished while the pipe description's status flags may differ from the
+/// reader's copy: another process published a change after a fork, or the
+/// description left a process over `SCM_RIGHTS`, whose receiver's copy
+/// Detcore cannot follow (dev-hermit dh-ru056 slice 2, review P1-b of
+/// 8871d444, finding 1 of coord7's review of 29b3e6a8).
+///
+/// A deliberate over-refusal: it is stricter than Linux in every case it
+/// fires. The read's end is a SIGALRM wake, data or end of file. An
+/// interrupted wait returns -ERESTARTSYS before any `O_NONBLOCK` test, so
+/// EINTR after a non-`SA_RESTART` handler; data and end of file are returned
+/// before that test too (`pipe_read`, fs/pipe.c at v6.12, lines 352-356 and
+/// 390-391,
+/// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/pipe.c?h=v6.12#n352>).
+/// The stop withholds a result Linux could give rather than reason about
+/// which copy of the status decided the wait (museli-lt's requirement (ii)
+/// for slice 2).
+pub(crate) fn sigalrm_pipe_status_diverged_refusal(call: &str, caller: i32) -> String {
+    format!(
+        "hermit refused to continue the run (HERMIT_SIGALRM_PIPE_STATUS_DIVERGED): {call} in \
+         thread {caller} was admitted by signal phase 1 on a pipe whose status flags another \
+         process may have changed while it waited, through a copy of the description that a \
+         fork or SCM_RIGHTS made, which this process's copy of the description does not show \
+         (dev-hermit dh-ru056 slice 2)."
+    )
+}
+
+/// The run-wide stopping refusal for a pipe read signal phase 1 admitted on
+/// guest-held marks, ending with its process's SIGALRM due after a
+/// descriptor export revoked those marks before its last attempt: the
+/// attempt a no-progress probe's wake makes, or one that found data
+/// (dev-hermit dh-ru056 slice 2, finding 2 of rev5338-cx's review of
+/// 29b3e6a8). Whether that attempt found data or returned the wake's EINTR
+/// may then have depended on a process outside the guest. The scheduler
+/// stops such a read before its wake is granted
+/// ([`sigalrm_pipe_authority_revoked_refusal`]); this is the read's own end.
+/// Fail closed.
+pub(crate) fn sigalrm_pipe_authority_revoked_at_end_refusal(call: &str, caller: i32) -> String {
+    format!(
+        "hermit refused to continue the run (HERMIT_SIGALRM_PIPE_AUTHORITY_REVOKED): {call} in \
+         thread {caller} was admitted by signal phase 1 because only guests held the pipe, and \
+         it ended with a SIGALRM due after a descriptor had left the guest, so its result may \
+         depend on a process outside the guest (dev-hermit dh-ru056 slice 2)."
+    )
+}
+
 /// The run-wide stopping refusal (A5 design D49) for a caught end whose
 /// restart table restarts the call with a code other than `ERESTARTSYS`
 /// (D40): the restart needs the register rewind and post-handler delivery of
