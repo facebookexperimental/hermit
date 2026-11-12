@@ -1159,3 +1159,5 @@ Start at the Detcore dispatch for policy questions and at Reverie's tracing task
 for execution-control questions. Scheduler bugs often cross both local and
 global Detcore state, so trace the request IVar, response IVar, run-queue entry,
 and logical-time update as one protocol.
+
+<!-- CodeSync import round-trip test (2026-11-12). Throwaway: do not land. -->
