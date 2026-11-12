@@ -35,6 +35,7 @@ rust_library(
         "fbsource//third-party/rust:shell-words",
         "fbsource//third-party/rust:tracing",
         "//hermetic_infra/reverie:reverie-syscalls",
+        "//hermetic_infra/reverie:reverie-procfs",
     ],
 )
 
