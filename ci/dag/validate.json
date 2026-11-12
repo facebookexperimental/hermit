@@ -5958,6 +5958,13 @@
           "category": "c-programs",
           "test": "c-programs/pidfd-waitid-child",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pidfd-waitid-child",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -49735,6 +49742,13 @@
           "test": "c-programs/pidfd-waitid-child",
           "mode": "verify",
           "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pidfd-waitid-child",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",

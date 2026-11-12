@@ -20930,7 +20930,10 @@ mod nextest_timeout_tests {
                 // 2997 with compat/shred and compat/sysctl-random-uuid
                 // verify/KVM back from DROP-6 and DROP-7 (3 of 3 strict
                 // verify runs each in the pinned root at 19b45f66).
-                assert_eq!(all.len(), 2997, "the original all-owner population is retained");
+                // 2998 with c-programs/pidfd-waitid-child verify/KVM (KVM opens
+                // a pidfd for another guest process since Reverie 1410, and
+                // Detcore answers waitid(P_PIDFD) from its pidfd model).
+                assert_eq!(all.len(), 2998, "the original all-owner population is retained");
             }
             let expected = all.iter().map(|cell| cell.id.clone()).collect::<BTreeSet<_>>();
             assert_eq!(expected.len(), all.len(), "duplicate all-owner cell identity");
