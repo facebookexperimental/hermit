@@ -5420,6 +5420,12 @@
     },
     {
       "disposition": "support-data",
+      "path": "tests/runtime/package.json",
+      "runner": "Hermit managed-runtime integration targets",
+      "why": "tests/runtime/package.json is owned by Hermit managed-runtime integration targets: It declares `{\"type\": \"commonjs\"}` for the Node.js probe `random.js`. Node.js 24 reads package.json in each parent directory of a script to choose CommonJS or ESM and fails on any error other than ENOENT; this file ends that walk inside the repository, so a checkout under an autofs /home does not reach the EPERM Hermit's container gets there (https://github.com/rrnewton/hermit/issues/5439). It is data for that integration probe, not a guest the generic manifest builder could run."
+    },
+    {
+      "disposition": "support-data",
       "path": "tests/runtime/random.go",
       "runner": "Hermit managed-runtime integration targets",
       "why": "tests/runtime/random.go is owned by Hermit managed-runtime integration targets: The runtime probe `random.go` exercises randomness through one specific managed language. Its integration owner selects and launches the required interpreter/compiler; the generic shell/C/Rust manifest builder cannot provide that language toolchain contract."

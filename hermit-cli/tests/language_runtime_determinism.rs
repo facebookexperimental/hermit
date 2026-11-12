@@ -8,7 +8,10 @@
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
+#[path = "common/prepared_tools.rs"]
+mod prepared_tools;
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
@@ -74,7 +77,12 @@ fn fresh_build_dir(name: &str) -> PathBuf {
     directory
 }
 
-fn executable(candidates: &[&str]) -> PathBuf {
+/// The executable the harness declared for `name` in `HERMIT_PREPARED_TOOLS`,
+/// or else the first candidate that is an executable file.
+fn executable(name: &str, candidates: &[&str]) -> PathBuf {
+    if let Some(declared) = prepared_tools::prepared_tool(name) {
+        return declared;
+    }
     candidates
         .iter()
         .map(PathBuf::from)
@@ -156,7 +164,7 @@ fn assert_runtime_entropy_is_determinized(runtime: &str, invocation: Invocation)
 #[test]
 #[ignore = "requires the optional Go runtime matrix toolchain"]
 fn go_runtime_entropy_is_determinized() {
-    let go = executable(&["/usr/bin/go", "/usr/local/go/bin/go"]);
+    let go = executable("go", &["/usr/bin/go", "/usr/local/go/bin/go"]);
     let build = fresh_build_dir("go");
     let binary = build.join("runtime-random");
     let mut command = bounded_command(go.as_os_str());
@@ -171,7 +179,7 @@ fn go_runtime_entropy_is_determinized() {
 
 #[test]
 fn ruby_runtime_entropy_is_determinized() {
-    let ruby = executable(&["/usr/bin/ruby", "/bin/ruby"]);
+    let ruby = executable("ruby", &["/usr/bin/ruby", "/bin/ruby"]);
     assert_runtime_entropy_is_determinized(
         "Ruby",
         Invocation::new(
@@ -187,7 +195,7 @@ fn ruby_runtime_entropy_is_determinized() {
 #[test]
 fn ruby_thread_prctls_are_supported_in_fail_closed_mode() {
     let _guard = runtime_lock();
-    let ruby = executable(&["/usr/bin/ruby", "/bin/ruby"]);
+    let ruby = executable("ruby", &["/usr/bin/ruby", "/bin/ruby"]);
     let mut command = bounded_command(env!("CARGO_BIN_EXE_hermit"));
     command
         .args([
@@ -208,7 +216,7 @@ fn ruby_thread_prctls_are_supported_in_fail_closed_mode() {
 
 #[test]
 fn node_runtime_entropy_is_determinized() {
-    let node = executable(&["/usr/bin/node", "/bin/node"]);
+    let node = executable("node", &["/usr/bin/node", "/bin/node"]);
     assert_runtime_entropy_is_determinized(
         "Node.js",
         Invocation::new(node, [source("random.js").into_os_string()]),
@@ -218,8 +226,8 @@ fn node_runtime_entropy_is_determinized() {
 #[test]
 #[ignore = "requires the optional OpenJDK toolchain"]
 fn jvm_runtime_entropy_is_determinized() {
-    let javac = executable(&["/usr/bin/javac"]);
-    let java = executable(&["/usr/bin/java"]);
+    let javac = executable("javac", &["/usr/bin/javac"]);
+    let java = executable("java", &["/usr/bin/java"]);
     let build = fresh_build_dir("java");
     let mut command = bounded_command(javac.as_os_str());
     command
@@ -245,7 +253,7 @@ fn jvm_runtime_entropy_is_determinized() {
 #[test]
 #[ignore = "requires the optional OCaml native compiler"]
 fn ocaml_runtime_entropy_is_determinized() {
-    let ocamlopt = executable(&["/usr/bin/ocamlopt"]);
+    let ocamlopt = executable("ocamlopt", &["/usr/bin/ocamlopt"]);
     let build = fresh_build_dir("ocaml");
     let copied_source = build.join("random.ml");
     fs::copy(source("random.ml"), &copied_source).expect("failed to copy OCaml runtime probe");
@@ -258,7 +266,7 @@ fn ocaml_runtime_entropy_is_determinized() {
 
 #[test]
 fn python_runtime_entropy_is_determinized() {
-    let python = executable(&["/usr/bin/python3", "/bin/python3"]);
+    let python = executable("python3", &["/usr/bin/python3", "/bin/python3"]);
     let mut version = bounded_command(python.as_os_str());
     version.arg("-VV");
     let version = command_output(version, "inspect Python runtime");
@@ -283,4 +291,89 @@ fn python_runtime_entropy_is_determinized() {
             ],
         ),
     );
+}
+
+/// Writes an empty file `name` in `directory` with `mode`.
+fn tool_file_with_mode(directory: &Path, name: &str, mode: u32) -> PathBuf {
+    fs::create_dir_all(directory).expect("failed to create a fixture directory");
+    let path = directory.join(name);
+    fs::write(&path, b"").expect("failed to write a fixture file");
+    fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("failed to set a mode");
+    path
+}
+
+/// The HERMIT_PREPARED_TOOLS text that declares each `(name, path)`.
+fn tool_declaration(entries: &[(&str, &Path)]) -> OsString {
+    let declared: BTreeMap<&str, &Path> = entries.iter().copied().collect();
+    serde_json::to_string(&declared)
+        .expect("failed to write a tool declaration")
+        .into()
+}
+
+#[test]
+fn a_declared_tool_is_used_only_when_declared() {
+    assert_eq!(
+        prepared_tools::parse_prepared_tools(None),
+        Ok(BTreeMap::new())
+    );
+    let root = tempfile::tempdir().expect("failed to create a fixture directory");
+    let lua = tool_file_with_mode(root.path(), "lua", 0o755);
+    // Unlike Redis, a tool need not keep its own file name.
+    let node = tool_file_with_mode(root.path(), "node-linux-x64", 0o755);
+    let declared = tool_declaration(&[("lua", &lua), ("node", &node)]);
+    let expected = BTreeMap::from([("lua".to_owned(), lua), ("node".to_owned(), node)]);
+    assert_eq!(
+        prepared_tools::parse_prepared_tools(Some(declared)),
+        Ok(expected)
+    );
+}
+
+#[test]
+fn a_bad_tool_declaration_is_refused_rather_than_replaced() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let root = tempfile::tempdir().expect("failed to create a fixture directory");
+    let lua = tool_file_with_mode(root.path(), "lua", 0o755);
+    let plain = tool_file_with_mode(&root.path().join("plain"), "lua", 0o644);
+    let directory = root.path().join("directory/lua");
+    fs::create_dir_all(&directory).expect("failed to create a fixture directory");
+    let missing = root.path().join("missing/node");
+    let cases: [(OsString, &str); 11] = [
+        (OsString::from_vec(vec![0xff]), "is not UTF-8"),
+        ("not json".into(), "is not a JSON object of paths"),
+        (r#"{"lua": 1}"#.into(), "is not a JSON object of paths"),
+        ("{}".into(), "names no tool"),
+        (tool_declaration(&[("", &lua)]), "which is not a file name"),
+        (
+            tool_declaration(&[("bin/lua", &lua)]),
+            "which is not a file name",
+        ),
+        (
+            tool_declaration(&[("lua", Path::new("lua"))]),
+            "which is not absolute",
+        ),
+        (
+            tool_declaration(&[("lua", &directory)]),
+            "which is not an executable file",
+        ),
+        (
+            tool_declaration(&[("lua", &plain)]),
+            "which is not an executable file",
+        ),
+        (
+            tool_declaration(&[("node", &missing)]),
+            "No such file or directory",
+        ),
+        // One bad entry refuses the whole declaration, the good one included.
+        (
+            tool_declaration(&[("lua", &lua), ("node", &missing)]),
+            "names node",
+        ),
+    ];
+    for (declared, problem) in cases {
+        let shown = format!("{declared:?}");
+        let refused = prepared_tools::parse_prepared_tools(Some(declared));
+        let refused = refused.expect_err(&format!("accepted {shown}"));
+        assert!(refused.contains(problem), "{shown}: {refused}");
+    }
 }
