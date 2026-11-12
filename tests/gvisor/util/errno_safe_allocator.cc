@@ -13,11 +13,17 @@
 // limitations under the License.
 
 // Local adaptation: unsized delete explicitly matches the runtime's noexcept.
+// Local adaptation: the std::nothrow forms are replaced as well. libstdc++'s
+// std::get_temporary_buffer (std::stable_sort, which gtest runs before any
+// test body) allocates with nothrow new and frees with sized delete; with
+// only the plain forms replaced, ASAN reports alloc-dealloc-mismatch.
 
 // new and delete that preserves errno in case of success.
 
 #include <errno.h>
 #include <stdlib.h>
+
+#include <new>
 
 namespace {
 void* errno_safe_malloc(size_t size) {
@@ -38,7 +44,19 @@ void errno_safe_free(void* p) {
 
 void* operator new(size_t size) { return errno_safe_malloc(size); }
 void* operator new[](size_t size) { return errno_safe_malloc(size); }
+void* operator new(size_t size, const std::nothrow_t&) noexcept {
+  return errno_safe_malloc(size);
+}
+void* operator new[](size_t size, const std::nothrow_t&) noexcept {
+  return errno_safe_malloc(size);
+}
 void operator delete(void* p) noexcept { errno_safe_free(p); }
 void operator delete[](void* p) noexcept { errno_safe_free(p); }
 void operator delete(void* p, size_t) noexcept { errno_safe_free(p); }
 void operator delete[](void* p, size_t) noexcept { errno_safe_free(p); }
+void operator delete(void* p, const std::nothrow_t&) noexcept {
+  errno_safe_free(p);
+}
+void operator delete[](void* p, const std::nothrow_t&) noexcept {
+  errno_safe_free(p);
+}
