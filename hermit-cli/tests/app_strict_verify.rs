@@ -85,6 +85,8 @@ use std::sync::MutexGuard;
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_test_binary;
+#[path = "common/prepared_tools.rs"]
+mod prepared_tools;
 
 /// Serialize Hermit runs because the deterministic scheduler and runtime
 /// fixtures are process-global resources on the shared host.
@@ -256,11 +258,16 @@ fn run_hermit_command(mut command: Command) -> Output {
     }
 }
 
-/// Resolve the first candidate path that names an existing regular file.
+/// Resolve the executable the harness declared for `name` in
+/// `HERMIT_PREPARED_TOOLS`, or else the first candidate path that names an
+/// existing regular file.
 ///
 /// These applications are installed by the portable CI job, so a missing
 /// binary is a hard error rather than a silent skip.
 fn required_app(name: &str, candidates: &[&str]) -> PathBuf {
+    if let Some(declared) = prepared_tools::prepared_tool(name) {
+        return declared;
+    }
     candidates
         .iter()
         .map(PathBuf::from)
