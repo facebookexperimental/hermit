@@ -60,16 +60,9 @@ declare -A shards=(
 
 # Exactly one deferred test identity per listed script, and why; each is listed
 # before partitioning and must appear exactly once, with tests left to run.
-# - scripts/validate.rs: owner scope. Core qualification retains every
-#   validate.rs test except this complete DBT-positive case. Its source
-#   assertions remain intact; third-party nightly registration and execution
-#   are pending, not supplied by this filter.
-declare -A deferred_cases=(
-    [scripts/validate.rs]=validate_evidence::tests::requalification_captures_and_publishes_the_committed_owner_without_full_authority
-)
-declare -A deferred_reasons=(
-    [scripts/validate.rs]='core scope, one DBT case deferred'
-)
+# None is deferred today.
+declare -A deferred_cases=()
+declare -A deferred_reasons=()
 
 files=()
 for f in $(git ls-files '*.rs' ':!:third-party/**' ':!:scripts/lib/**'); do
