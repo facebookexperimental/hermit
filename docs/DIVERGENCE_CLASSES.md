@@ -132,10 +132,13 @@ ends. A cause is named only when all of these hold:
 Then the report's verdict is `infrastructure_error` with
 `infrastructure_error.kind` `host_input_changed`, naming the run, the path and
 both identities. The comparison and the divergence position are kept, stderr
-carries a `HERMIT_HOST_INPUT_CHANGED` line, and the run still exits 1. The
-validation harness reruns such a cell once, unless either run also breaks a
-stdout assertion the cell declares; a second divergence stays a failure. The
-row stays its own type, an infrastructure ERROR, and is never counted as a
+carries a `HERMIT_HOST_INPUT_CHANGED` line, and the run still exits 1.
+`hermit run --verify` itself then reruns the pair once (announced on
+stderr); the published report and exit status are the second attempt's, so
+a single replacement no longer fails the invocation, while a change in
+both attempts keeps the infrastructure verdict above. The validation
+harness's own one-rerun policy for such a cell is a second, independent
+layer. The row stays its own type, an infrastructure ERROR, and is never counted as a
 pass.
 
 Each open is reported to Detcore's global state with an observation request

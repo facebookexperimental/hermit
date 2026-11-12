@@ -435,6 +435,128 @@ pub fn verify_across_host_action_with(
     (root, stderr, report)
 }
 
+/// [`verify_across_host_action`] across one or two verification attempts:
+/// a pair whose divergence is named as a host-input change is rerun once
+/// by `hermit run --verify` itself, so the harness may have to serve the
+/// FIFO for a second pair. `attempts` gives, per attempt, whether to
+/// replace `F` during its run 1 and the two lines to send. Returns the
+/// input directory, stderr, the final typed report, and hermit's exit
+/// code (unasserted: a clean retry verifies and propagates the guest
+/// status, an exhausted one keeps the divergence exit).
+pub fn verify_across_attempts(
+    hermit: &Path,
+    name: &str,
+    guest: &str,
+    attempts: &[(bool, [&str; 2])],
+) -> (
+    std::path::PathBuf,
+    String,
+    hermit::canonical_verdict::VerificationReport,
+    Option<i32>,
+) {
+    use std::io::Write;
+
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("create test directory");
+    std::fs::write(root.join("F"), "input\n").expect("write F");
+    std::fs::write(root.join("A"), "input\n").expect("write A");
+    std::fs::write(root.join("B"), "input\n").expect("write B");
+    let fifo = root.join("fifo");
+    nix::unistd::mkfifo(
+        &fifo,
+        nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+    )
+    .expect("mkfifo");
+    let report_path = root.join("verify.json");
+    let stderr_path = root.join("stderr");
+    let stderr_file = std::fs::File::create(&stderr_path).expect("create stderr file");
+    let mut child = Command::new("timeout")
+        .args(["--kill-after", "5s", "300s"])
+        .arg(hermit)
+        .arg("run")
+        .args(["--strict", detcore_model::config::CANONICAL_TEST_EPOCH_ARG])
+        .args(["--verify", "--verify-strict", "--verify-json"])
+        .arg(&report_path)
+        .args([
+            "--base-env=minimal",
+            "--mount=type=tmpfs,target=/test",
+            "--workdir=/test",
+            "--",
+            "/bin/sh",
+            "-c",
+            guest,
+            "sh",
+        ])
+        .arg(&root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(stderr_file)
+        .spawn()
+        .expect("failed to start hermit");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(290);
+
+    for (attempt, (replace_in_run1, lines)) in attempts.iter().enumerate() {
+        // Synchronize to this attempt's Run 1 banner before opening the
+        // FIFO writer. The previous attempt's run-2 guest can still hold
+        // the FIFO open while hermit compares that pair; a nonblocking
+        // writer would pair with that stale reader, its line would be
+        // discarded when the old guest closes, and this attempt's run 1
+        // would then wait forever for a writer that already came and went.
+        while std::fs::read_to_string(&stderr_path)
+            .unwrap_or_default()
+            .matches("Run1")
+            .count()
+            <= attempt
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "run 1 of attempt {} never started\n{}",
+                attempt + 1,
+                hermit_state(&mut child, &stderr_path)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // Run 1 of this attempt: once its guest waits on the FIFO it has
+        // opened F once.
+        let mut writer = open_fifo_writer(&fifo, deadline, &mut child, &stderr_path);
+        if *replace_in_run1 {
+            let copy = root.join("F.new");
+            std::fs::copy(root.join("F"), &copy).expect("copy F");
+            std::fs::rename(&copy, root.join("F")).expect("replace F");
+        }
+        writeln!(writer, "{}", lines[0]).expect("send run 1 its line");
+        drop(writer);
+
+        // Run 2 of this attempt starts only after run 1 finished the FIFO.
+        while std::fs::read_to_string(&stderr_path)
+            .unwrap_or_default()
+            .matches("Run2")
+            .count()
+            <= attempt
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "run 2 of attempt {} never started\n{}",
+                attempt + 1,
+                hermit_state(&mut child, &stderr_path)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let mut writer = open_fifo_writer(&fifo, deadline, &mut child, &stderr_path);
+        writeln!(writer, "{}", lines[1]).expect("send run 2 its line");
+        drop(writer);
+    }
+
+    let output = child.wait_with_output().expect("wait for hermit");
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    let report = hermit::canonical_verdict::VerificationReport::from_current_json_slice(
+        &std::fs::read(&report_path).expect("read verify json"),
+    )
+    .expect("parse verify json");
+    (root, stderr, report, output.status.code())
+}
+
 /// [`verify_across_host_action`]'s setup for a run that hermit ends during run
 /// 1: run 1 gets `line`, and run 2 must never start. Returns hermit's exit
 /// status, stderr, and the typed report; fails fast if run 2 starts.

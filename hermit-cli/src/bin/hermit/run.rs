@@ -16158,6 +16158,37 @@ impl RunOpts {
         self.refuse_an_invalid_replayed_record()?;
         detcore::preemptions::validate_config_replay_inputs(&self.effective_det_config())?;
         <detcore::Detcore as reverie::Tool>::facility_admission(&self.det_opts.det_config)?;
+        // A host package manager can replace a file under a frozen bind
+        // while the container is set up, detaching the bind before the
+        // guest starts (https://github.com/rrnewton/hermit/issues/4799).
+        // Setup proves that typed case (`hermit::SetupDetached`) and
+        // nothing guest-visible has happened yet, so retry setup with a
+        // fresh snapshot. Every other failure returns at once.
+        const SETUP_ATTEMPTS: u32 = 5;
+        for attempt in 1..=SETUP_ATTEMPTS {
+            match self.run_once(global, capture_output) {
+                Err(error) if hermit::is_setup_detached(&error) => {
+                    if attempt == SETUP_ATTEMPTS {
+                        return Err(error.context(format!(
+                            "container setup was still detached after {SETUP_ATTEMPTS} attempts"
+                        )));
+                    }
+                    crate::app::tracing::diagnostic_eprintln!(
+                        "hermit: container setup attempt {attempt} of {SETUP_ATTEMPTS} found a \
+                         frozen host file replaced during setup; retrying with a fresh snapshot"
+                    );
+                }
+                other => return other,
+            }
+        }
+        unreachable!("the last setup attempt returns")
+    }
+
+    fn run_once(
+        &self,
+        global: &GlobalOpts,
+        capture_output: bool,
+    ) -> Result<(ExitStatus, Option<Output>, Option<detcore::TerminalOutcome>), Error> {
         let mut options = self.clone();
         options.capture_launch_namespace_mounts();
         options.det_opts.det_config.annotated_priority_replay =
@@ -17251,6 +17282,22 @@ impl RunOpts {
     pub(super) fn verify_with_evidence<P, F>(
         &self,
         evidence: VerificationEvidence,
+        execute: impl FnMut(
+            &Self,
+            fs::File,
+            &Path,
+            ForwardedDetlogPlan,
+            VerificationRun,
+        ) -> Result<super::backend_hook::PhysicalRun<P>, Error>,
+        finish: impl Fn(P, &Output, VerificationRun) -> Result<F, Error>,
+        pair_evidence: impl Fn(&F, &F) -> Result<super::backend_hook::PairEvidence, Error>,
+    ) -> Result<ExitStatus, Error> {
+        self.verify_with_evidence_attempt(evidence, execute, finish, pair_evidence, false)
+    }
+
+    fn verify_with_evidence_attempt<P, F>(
+        &self,
+        evidence: VerificationEvidence,
         mut execute: impl FnMut(
             &Self,
             fs::File,
@@ -17260,6 +17307,7 @@ impl RunOpts {
         ) -> Result<super::backend_hook::PhysicalRun<P>, Error>,
         finish: impl Fn(P, &Output, VerificationRun) -> Result<F, Error>,
         pair_evidence: impl Fn(&F, &F) -> Result<super::backend_hook::PairEvidence, Error>,
+        retried: bool,
     ) -> Result<ExitStatus, Error> {
         let VerificationEvidence {
             requirement,
@@ -17725,6 +17773,35 @@ impl RunOpts {
             },
         )?;
         drop(host_inputs_file);
+
+        // One pair retry, only for a proven host-input change: the
+        // divergence above was named as a host file replaced during a
+        // run (its report is already published and announced), so the
+        // pair says nothing about the guest. Rerun both runs once; the
+        // second attempt's verdict is the published one. A second
+        // host-input change, and every other outcome, stands as concluded.
+        if !retried
+            && matches!(
+                outcome.host_input_change,
+                Some(hermit::canonical_verdict::InfrastructureError::HostInputChanged { .. })
+            )
+        {
+            crate::app::tracing::diagnostic_eprintln!(
+                ":: host input changed during verification; rerunning the pair once"
+            );
+            return self.verify_with_evidence_attempt(
+                VerificationEvidence {
+                    requirement,
+                    records_run_metadata,
+                    transport,
+                    native_identity_diagnostic,
+                },
+                execute,
+                finish,
+                pair_evidence,
+                true,
+            );
+        }
 
         // On divergence, still return the nonzero status and skip
         // the backend banner — but EMIT THE GUEST'S OUTPUT FIRST when both runs
@@ -20349,6 +20426,7 @@ pub(super) fn conclude_verification(
             store_exclusive_retries_line(retries)
         );
     }
+    outcome.host_input_change = host_input_change;
     Ok(outcome)
 }
 

@@ -576,6 +576,8 @@ pub use error::Context;
 pub use error::Error;
 pub use error::FailureKind;
 pub use error::SerializableError;
+pub use error::SetupDetached;
+pub use error::is_setup_detached;
 use goblin::elf::Elf;
 use goblin::elf::header;
 use goblin::elf::section_header;
