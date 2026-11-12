@@ -7,7 +7,7 @@ sys.dont_write_bytecode = True
 ASSETS=Path(__file__).resolve().parent.parent/'assets'
 ROOT='detcore_liteinst_mapped_entry'
 MAINTAINED=Path(__file__).resolve().parent.parent/'archive/prepare.py'
-MAINTAINED_SHA='904de44071c5296579233478742f2bdfbab5b14c0a3a0af9f38f00b5ebee8656'
+MAINTAINED_SHA='11ebff546e9719fda0e4a5bb32e268327382496926e52cc731b54e6ce1c9d3f4'
 # Preserve the existing private static-image C/TLS ABI; retention is not provenance.
 ABI_ROOTS=['__init_tls', 'malloc', '__libc_malloc', '__libc_malloc_impl', 'calloc', '__libc_calloc', 'free', '__libc_free', 'realloc', '__libc_realloc', 'reallocarray', 'aligned_alloc', 'memalign', 'valloc', 'posix_memalign', 'malloc_usable_size', '__malloc_allzerop']
 RO_ROOTS={'.reverie_inguest_fixed_gate_template':(4096,4096,2),'.rodata.hermit_mapped_layout':(96,8,0x200002)} # measured SHF_ALLOC / SHF_ALLOC|SHF_GNU_RETAIN
@@ -246,7 +246,7 @@ def main():
    for stream in ('stdout','stderr'):
     fact=q[stream];need(sha(fact['path'])==fact['sha256'],'retained factory Runner stream changed');files[fact['path']]=fact['sha256']
   toolfile=Path(a.inspection_tools_json)
-  need(sha(toolfile)==a.inspection_tools_sha256=='b5b75a7dbf58d0805bbfcfb8d1fc17e55b1c528a2d2d210d5def39ea559d97a0','original actual tool inventory changed')
+  need(sha(toolfile)==a.inspection_tools_sha256=='3cb125f0204fb78605be0493a2941a118624b903aa819eede5ab911afe88503e','original actual tool inventory changed')
   files[str(toolfile)]=sha(toolfile);tools=json.loads(toolfile.read_text())['tools']
   for fact in tools.values():files[fact['path']]=fact['sha256']
   prefix=Path(c['private_inputs']['toolchain']['prefix']);inventory=json.loads(Path(c['private_inputs']['toolchain']['input_inventory']).read_text())
@@ -321,7 +321,7 @@ def main():
   for key,digest in [('memcpy_source','790bdd75f7736c83ed7a21f8813b20454ead1ccfc49e806a88692d2a471024eb'),('stack_chk_source','2ea4d8cf6758daddecf8973913ac196ffa76fdb355cea391ca890aeafdc2ac6c')]:
    need(identity(paths[key])['sha256']==digest,'actual native source prerequisite changed: '+key);files[paths[key]]=digest
   authority=Path(paths['musl_source_authority']);native_inventory=authority/'inventory.json'
-  need(sha(native_inventory)=='6aeea4469c8ba49c4c475a6694972e6a1ef3974954c9f986f99d7d1bce926275','native source authority inventory differs')
+  need(sha(native_inventory)=='3beab05d07515e2005d1ee59b66327a4c5de385be4ba689f180d9cc470c62bf1','native source authority inventory differs')
   files[str(native_inventory)]=sha(native_inventory)
   for row in json.loads(native_inventory.read_text())['files']:
    relative=Path(row['path']);need(not relative.is_absolute() and all(p not in ('..','.') for p in relative.parts),'native source path escape')

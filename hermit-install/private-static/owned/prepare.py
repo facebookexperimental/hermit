@@ -25,7 +25,7 @@ D = Path(__file__).resolve().parent
 ASSETS = D / 'assets'
 BINDING = ASSETS / 'source_guard.py'
 PRIVATE_GUARD = ASSETS / 'native_guard.py'
-PRIVATE_INVENTORY_SHA256 = 'f825b66769fb55bee298b0a41277b38767970e5cad4beca8400f02dcdd811fcc'
+PRIVATE_INVENTORY_SHA256 = 'ecabca6176a177d2c1426caa9e2508fad967c4e4792a7c2bad9c513d26d99866'
 CODEGEN = '-C relocation-model=pic -C code-model=small -C target-feature=+crt-static -C link-self-contained=yes'
 STREAM = 64 * 1024 * 1024
 RUNTIME_COHORT = D / 'runtime_cohort.py'
@@ -600,7 +600,7 @@ def bind_prepared(c, x):
         c['files'][str(p)] = sha(p)
     need(sha(LEGACY) == LEGACY_SHA, 'existing strict V12 inspection source changed')
     toolsfile = Path(x.inspection_tools_json)
-    need(sha(toolsfile) == x.inspection_tools_sha256 == 'b5b75a7dbf58d0805bbfcfb8d1fc17e55b1c528a2d2d210d5def39ea559d97a0', 'actual inspection tool inventory changed')
+    need(sha(toolsfile) == x.inspection_tools_sha256 == '3cb125f0204fb78605be0493a2941a118624b903aa819eede5ab911afe88503e', 'actual inspection tool inventory changed')
     c['files'][str(toolsfile)] = sha(toolsfile)
     c['inspection_tools'] = json.loads(toolsfile.read_text())['tools']
     for v in c['inspection_tools'].values():c['files'][v['path']] = v['sha256']

@@ -24,10 +24,10 @@ PACKAGE_ROLE_SCHEMA = 'hermit.private-static-package-roles.source-owned.v1'
 # Code-pinned SHA256 values, each also checked by the pipeline stage named in
 # its citation. test_file_pins.py classifies these literals as EXCLUDED inputs
 # outside this tree; a pin change is a reviewed change here and there together.
-PRIVATE_INVENTORY_SHA256 = 'f825b66769fb55bee298b0a41277b38767970e5cad4beca8400f02dcdd811fcc'  # owned/prepare.py PRIVATE_INVENTORY_SHA256
-INSPECTION_TOOLS_SHA256 = 'b5b75a7dbf58d0805bbfcfb8d1fc17e55b1c528a2d2d210d5def39ea559d97a0'  # owned/prepare.py inspection tool inventory
+PRIVATE_INVENTORY_SHA256 = 'ecabca6176a177d2c1426caa9e2508fad967c4e4792a7c2bad9c513d26d99866'  # owned/prepare.py PRIVATE_INVENTORY_SHA256
+INSPECTION_TOOLS_SHA256 = '3cb125f0204fb78605be0493a2941a118624b903aa819eede5ab911afe88503e'  # owned/prepare.py inspection tool inventory
 MUSL_ARCHIVE_SHA256 = 'a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4'  # owned/prepare.py musl source archive
-AUTHORITY_INVENTORY_SHA256 = '6aeea4469c8ba49c4c475a6694972e6a1ef3974954c9f986f99d7d1bce926275'  # owned/section/prepare.py authority inventory.json
+AUTHORITY_INVENTORY_SHA256 = '3beab05d07515e2005d1ee59b66327a4c5de385be4ba689f180d9cc470c62bf1'  # owned/section/prepare.py authority inventory.json
 MEMCPY_SOURCE_SHA256 = '790bdd75f7736c83ed7a21f8813b20454ead1ccfc49e806a88692d2a471024eb'  # owned/section/prepare.py memcpy_source
 STACK_CHK_SOURCE_SHA256 = '2ea4d8cf6758daddecf8973913ac196ffa76fdb355cea391ca890aeafdc2ac6c'  # owned/section/prepare.py stack_chk_source
 OPTIONAL_STD_WEAK_SHA256 = '0f9c4e63d9f15b2486e8c0a9af89c4c2ad88fcad7c1a5127a95d8031e13ec2d3'  # owned/prepare.py std_weak

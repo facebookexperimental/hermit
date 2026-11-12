@@ -23,7 +23,7 @@ D = Path(__file__).resolve().parent
 ASSETS = D.parent / 'assets'
 BINDING = ASSETS / 'source_guard.py'
 PRIVATE_GUARD = ASSETS / 'native_guard.py'
-PRIVATE_INVENTORY_SHA256 = 'f825b66769fb55bee298b0a41277b38767970e5cad4beca8400f02dcdd811fcc'
+PRIVATE_INVENTORY_SHA256 = 'ecabca6176a177d2c1426caa9e2508fad967c4e4792a7c2bad9c513d26d99866'
 CODEGEN = '-C relocation-model=pic -C code-model=small -C target-feature=+crt-static -C link-self-contained=yes'
 STREAM = 64 * 1024 * 1024
 
