@@ -3454,6 +3454,7 @@ fn merge_attempt_directories(dirs: &[PathBuf]) -> Result<(usize, Vec<MergedCellV
     let mut required: Option<usize> = None;
     let mut planned_cells: Option<Vec<CellId>> = None;
     let mut campaign_sha: Option<String> = None;
+    let mut campaign_pinned: Option<bool> = None;
     let mut metadatas: Vec<Option<RunMetadata>> = Vec::new();
     for dir in dirs {
         let run_json = dir.join("run.json");
@@ -3468,6 +3469,17 @@ fn merge_attempt_directories(dirs: &[PathBuf]) -> Result<(usize, Vec<MergedCellV
                         dir.display(),
                         reps,
                         existing
+                    ));
+                }
+                _ => {}
+            }
+            match &campaign_pinned {
+                None => campaign_pinned = Some(metadata.pinned_root),
+                Some(existing) if *existing != metadata.pinned_root => {
+                    return Err(format!(
+                        "cannot merge {} (pinned_root={}) with the earlier directories (pinned_root={existing}); merge only attempt directories of one campaign in one environment, or summarize each directory separately",
+                        dir.display(),
+                        metadata.pinned_root
                     ));
                 }
                 _ => {}
@@ -8374,22 +8386,43 @@ fn compat_fixture_step(
     results: &Path,
     run_state: &Path,
     required_builds: &BTreeSet<&str>,
+    pinned_root: bool,
 ) -> Result<Step, String> {
+    // Fixtures must be prepared in the environment the evidence names:
+    // the canonical graph carries a pinned twin for exactly this (the
+    // preparing environment's toolchain builds the guest inputs), and a
+    // pinned plan copies that twin under the base tag its consumers
+    // wait for. Copying the host node into a pinned plan would certify
+    // host-built guest inputs as pinned evidence.
+    let source_tag = if pinned_root {
+        "compatprep.fixtures_in_pinned_root"
+    } else {
+        VALIDATE_FIXTURE_STEP
+    };
     let matches: Vec<&Step> = canonical
         .steps
         .iter()
-        .filter(|step| step.tag() == VALIDATE_FIXTURE_STEP)
+        .filter(|step| step.tag() == source_tag)
         .collect();
     let [source] = matches.as_slice() else {
         return Err(format!(
-            "{PORTABLE_DAG} has {} {VALIDATE_FIXTURE_STEP} node(s); the pressure graph copies exactly one",
+            "{PORTABLE_DAG} has {} {source_tag} node(s); the pressure graph copies exactly one",
             matches.len()
         ));
     };
     // Refuse a reshaped validation command rather than guess where it now
     // writes: the fixture root the manifests name must be what it fills.
     let expected_tail = format!(" $VALIDATE_RUN_STATE/{COMPAT_FIXTURE_ROOT}");
-    if !source.cmd.ends_with(&expected_tail) || source.cmd.contains(PINNED_ROOT_LAUNCHER) {
+    if pinned_root {
+        if !source.cmd.starts_with(PINNED_ROOT_LAUNCHER)
+            || !source.cmd.contains(&expected_tail)
+        {
+            return Err(format!(
+                "{PORTABLE_DAG} {source_tag} no longer runs in the pinned root into $VALIDATE_RUN_STATE/{COMPAT_FIXTURE_ROOT}: {}",
+                source.cmd
+            ));
+        }
+    } else if !source.cmd.ends_with(&expected_tail) || source.cmd.contains(PINNED_ROOT_LAUNCHER) {
         return Err(format!(
             "{PORTABLE_DAG} {VALIDATE_FIXTURE_STEP} no longer runs on the host into $VALIDATE_RUN_STATE/{COMPAT_FIXTURE_ROOT}: {}",
             source.cmd
@@ -8413,6 +8446,10 @@ fn compat_fixture_step(
         ));
     }
     let mut step = (*source).clone();
+    if pinned_root {
+        // Consumers wait for the base tag in either environment.
+        step.job = "fixtures".into();
+    }
     let marker = build_marker(results, VALIDATE_FIXTURE_STEP);
     step.cmd = format!(
         "mkdir -p {state_dir}; if test -f {marker}; then exit 0; fi; ( {command} ) && printf 'ok\\n' > {marker}",
@@ -8589,9 +8626,14 @@ fn pinned_wrap_cmd(root: &Path, results: &Path, cmd: String) -> Result<String, S
     // DAGRUN_ARTIFACT_READY_DIR host-side; requesting them through
     // --env makes the launcher mount and translate them (an unset name
     // is skipped), without which the step's structured results are
-    // refused even when the cell itself passed.
+    // refused even when the cell itself passed. HERMIT_E2E_EMPTY_WORKDIR
+    // must cross too: step.env sets /test for the launcher process, and
+    // without forwarding the harness runs the non-isolated workdir
+    // shape canonical validation refuses to promote from. Builders and
+    // cells share the split cargo home the canonical pinned producers
+    // use, seeded once by setup.pinned_root_fetch.
     Ok(format!(
-        "{PINNED_ROOT_LAUNCHER} --src . --out {out} --src-rw --cargo-home \"${{CARGO_HOME:-$HOME/.cargo}}\" --env DAGRUN_TEST_COUNTS_PATH --env DAGRUN_ARTIFACT_READY_DIR -- bash -c {inner}",
+        "{PINNED_ROOT_LAUNCHER} --src . --out {out} --src-rw --cargo-home ignored/hermetic/split/cargo --env DAGRUN_TEST_COUNTS_PATH --env DAGRUN_ARTIFACT_READY_DIR --env HERMIT_E2E_EMPTY_WORKDIR -- bash -c {inner}",
         out = shell_quote(&out.to_string_lossy()),
         inner = shell_quote(&translated),
     ))
@@ -8643,9 +8685,14 @@ fn pinned_build_variant_self_test(canonical: &DagConfig) -> Result<(), String> {
     missing.steps.remove(workspace_pinned);
     let mut unwrapped = canonical.clone();
     unwrapped.steps[workspace_pinned].cmd = "true".into();
+    let mut duplicated = canonical.clone();
+    duplicated
+        .steps
+        .push(canonical.steps[workspace_pinned].clone());
     for (label, fixture, needle) in [
         ("missing", &missing, "lost pinned build variant"),
         ("unwrapped", &unwrapped, PINNED_ROOT_LAUNCHER),
+        ("duplicated", &duplicated, "duplicates pinned variant"),
     ] {
         let error = pinned_build_steps(fixture)
             .err()
@@ -8668,6 +8715,92 @@ fn pinned_inner_cmd(cmd: &str) -> Option<String> {
     let inner = rest.split_once("-- bash -c ")?.1;
     let inner = inner.strip_prefix('\'')?.strip_suffix('\'')?;
     Some(inner.replace("'\\''", "'"))
+}
+
+/// Whether CMD is exactly the [`pinned_wrap_cmd`] form: the launcher on
+/// the checkout with the split out/cargo homes, the forwarded scheduler
+/// and workdir environment, and one shell-quoted inner command, nothing
+/// else. Substring presence is not enough (the manifest side brackets
+/// pinned commands exactly, and so does this audit).
+fn pinned_wrapper_exact(cmd: &str) -> bool {
+    let Some(rest) = cmd.strip_prefix(&format!("{PINNED_ROOT_LAUNCHER} --src . --out '")) else {
+        return false;
+    };
+    let Some((out, rest)) = rest.split_once('\'') else {
+        return false;
+    };
+    if !out.ends_with("/ignored/hermetic/split") {
+        return false;
+    }
+    let Some(inner) = rest.strip_prefix(
+        " --src-rw --cargo-home ignored/hermetic/split/cargo \
+--env DAGRUN_TEST_COUNTS_PATH --env DAGRUN_ARTIFACT_READY_DIR \
+--env HERMIT_E2E_EMPTY_WORKDIR -- bash -c ",
+    ) else {
+        return false;
+    };
+    inner.starts_with('\'')
+        && inner.ends_with('\'')
+        && pinned_inner_cmd(cmd).is_some()
+}
+
+/// Bracket `pinned_wrap_cmd` itself: the exact emitted form, the
+/// forwarded environment, and both fail-closed refusals.
+fn pinned_wrap_self_test() -> Result<(), String> {
+    let root = Path::new("/checkout");
+    let results = root.join("ignored").join("run");
+    let wrapped = pinned_wrap_cmd(
+        root,
+        &results,
+        "run --results /checkout/ignored/run/cells/x/results.jsonl".into(),
+    )?;
+    if !pinned_wrapper_exact(&wrapped)
+        || !wrapped.contains("--env HERMIT_E2E_EMPTY_WORKDIR")
+        || !wrapped.contains("--env DAGRUN_TEST_COUNTS")
+        || !wrapped.contains("--cargo-home ignored/hermetic/split/cargo")
+    {
+        return Err(format!("pinned wrap lost its exact form: {wrapped}"));
+    }
+    if pinned_inner_cmd(&wrapped).as_deref()
+        != Some("run --results /src/ignored/run/cells/x/results.jsonl")
+    {
+        return Err(format!("pinned wrap mistranslated its inner command: {wrapped}"));
+    }
+    for (label, bad_results, bad_cmd, needle) in [
+        (
+            "results outside checkout",
+            Path::new("/elsewhere/run"),
+            "true".to_string(),
+            "requires --results under the checkout",
+        ),
+        (
+            "residual host path",
+            results.as_path(),
+            "cat /checkout".to_string(),
+            "outside a /src path",
+        ),
+    ] {
+        match pinned_wrap_cmd(root, bad_results, bad_cmd) {
+            Err(error) if error.contains(needle) => {}
+            other => {
+                return Err(format!("pinned wrap accepted {label}: {other:?}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether CMD contains one exact [`pinned_wrap_cmd`] segment (the
+/// copied manifest gate carries its build-marker shell around the
+/// wrapped command, unlike generated prepare/cell steps).
+fn pinned_wrapper_exact_segment(cmd: &str) -> bool {
+    let Some(start) = cmd.find(PINNED_ROOT_LAUNCHER) else {
+        return false;
+    };
+    let tail = &cmd[start..];
+    tail.char_indices()
+        .filter(|(_, ch)| *ch == '\'')
+        .any(|(index, _)| pinned_wrapper_exact(&tail[..=index]))
 }
 
 fn base_cell_slug(cell: &CellId) -> String {
@@ -8945,6 +9078,7 @@ fn write_plan_after_scorecard_check(
             results,
             &run_state,
             &required_builds,
+            selection.pinned_root,
         )?);
     }
 
@@ -9427,7 +9561,7 @@ fn write_plan_after_scorecard_check(
         selection.kvm_guest_cap(),
     )?;
     let expected_runs = cells.len().saturating_mul(selection.run_count());
-    audit_dag(&dag, expected_runs, run_timeout_seconds, &cell_timeouts)?;
+    audit_dag(&dag, expected_runs, run_timeout_seconds, &cell_timeouts, selection.pinned_root)?;
     let mut dag_text = dag_to_json(&dag);
     dag_text.push('\n');
     let reparsed = dag_from_json(&dag_text)
@@ -9438,6 +9572,7 @@ fn write_plan_after_scorecard_check(
         expected_runs,
         run_timeout_seconds,
         &cell_timeouts,
+        selection.pinned_root,
     )?;
     let retained_output = results.join("dag.json");
     write_file_durable(&retained_output, dag_text.as_bytes())?;
@@ -9522,6 +9657,7 @@ fn audit_dag(
     expected_cells: usize,
     run_timeout: i64,
     expected_cell_timeouts: &BTreeMap<String, i64>,
+    expect_pinned: bool,
 ) -> Result<(), String> {
     audit_dag_impl(
         dag,
@@ -9529,6 +9665,7 @@ fn audit_dag(
         run_timeout,
         expected_cell_timeouts,
         false,
+        expect_pinned,
     )
 }
 
@@ -9550,6 +9687,7 @@ fn audit_dag_retained(
     run_timeout: i64,
     expected_cell_timeouts: &BTreeMap<String, i64>,
     allow_plain_rename: bool,
+    expect_pinned: bool,
 ) -> Result<(), String> {
     audit_dag_impl(
         dag,
@@ -9557,6 +9695,7 @@ fn audit_dag_retained(
         run_timeout,
         expected_cell_timeouts,
         allow_plain_rename,
+        expect_pinned,
     )
 }
 
@@ -9566,6 +9705,7 @@ fn audit_dag_impl(
     run_timeout: i64,
     expected_cell_timeouts: &BTreeMap<String, i64>,
     allow_plain_rename: bool,
+    expect_pinned: bool,
 ) -> Result<(), String> {
     let mut tags = BTreeSet::new();
     let mut deps = Vec::new();
@@ -9602,6 +9742,31 @@ fn audit_dag_impl(
         for dep in &step.deps {
             deps.push((tag.clone(), dep.clone()));
         }
+        // Pinned-ness is re-derived, not construction-trusted: in a
+        // pinned run every generated prepare/cell step (and the copied
+        // manifest gate, which executes the pinned harness binary) must
+        // carry the exact wrapper, and the copied fixture node must be
+        // the launcher form. An unwrapped step would execute on the
+        // host and summarize under pinned metadata.
+        if expect_pinned {
+            if matches!(step.group.as_str(), "prepare" | "cell")
+                && !pinned_wrapper_exact(&step.cmd)
+            {
+                return Err(format!(
+                    "{tag} is not wrapped in the exact pinned form in a pinned run"
+                ));
+            }
+            if tag == "gate.manifest" && !pinned_wrapper_exact_segment(&step.cmd) {
+                return Err(format!(
+                    "{tag} is not wrapped in the exact pinned form in a pinned run"
+                ));
+            }
+            if step.group == "compatprep" && !step.cmd.contains(PINNED_ROOT_LAUNCHER) {
+                return Err(format!(
+                    "{tag} prepares compat fixtures on the host in a pinned run"
+                ));
+            }
+        }
         if step.group == "cell" {
             cells += 1;
             let expected_timeout = expected_cell_timeouts
@@ -9613,10 +9778,20 @@ fn audit_dag_impl(
                 ));
             }
             // A pinned cell brackets its inner harness command; the
-            // wrapper itself must be the exact pinned form.
+            // wrapper itself must be the exact pinned form, and the
+            // hermetic workdir variable the harness must see inside
+            // the container is part of that exact form.
+            if expect_pinned
+                && step.env.get(HERMETIC_TEST_WORKDIR_ENV).map(String::as_str)
+                    != Some(HERMETIC_TEST_WORKDIR)
+            {
+                return Err(format!(
+                    "{tag} lost its hermetic guest workdir environment in a pinned run"
+                ));
+            }
             let cmd_owned;
             let cmd: &str = if step.cmd.starts_with(PINNED_ROOT_LAUNCHER) {
-                if !step.cmd.contains(" --src . --out ") || !step.cmd.contains(" --src-rw ") {
+                if !pinned_wrapper_exact(&step.cmd) {
                     return Err(format!(
                         "{tag} lost its pinned-root wrapper form"
                     ));
@@ -10369,6 +10544,7 @@ fn validate_run_contract_with_resume(
         metadata.run_timeout_seconds,
         &dag_cell_timeouts,
         legacy_publication_exempt(metadata),
+        metadata.pinned_root,
     )?;
     let dag_cells: BTreeSet<_> = dag
         .steps
@@ -10383,8 +10559,14 @@ fn validate_run_contract_with_resume(
         let pinned = format!(" HERMIT_EPOCH={} ", shell_quote(epoch));
         if let Some(step) = dag.steps.iter().filter(|step| step.group == "cell").find(|step| {
             // A pinned cell launches its harness inside the wrapper;
-            // the epoch pin brackets the inner command.
-            let launched = pinned_inner_cmd(&step.cmd).unwrap_or_else(|| step.cmd.clone());
+            // the epoch pin brackets the inner command. In a pinned run
+            // a cell with no inner command is unwrapped, never audited
+            // as a host cell.
+            let launched = match (metadata.pinned_root, pinned_inner_cmd(&step.cmd)) {
+                (true, Some(inner)) => inner,
+                (true, None) => return true,
+                (false, _) => step.cmd.clone(),
+            };
             !launched.contains(&pinned)
         }) {
             return Err(format!(
@@ -16666,6 +16848,7 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
         20,
         metadata.run_timeout_seconds,
         &expected_timeouts,
+        false,
     )
     .is_ok()
     {
@@ -17131,6 +17314,101 @@ fn validate_run_state_plan_check(
 /// Every preparation and cell names the run's VALIDATE_RUN_STATE, and a plan
 /// whose cells read the real-compat fixtures prepares them first, as
 /// validation does.
+/// End-to-end pinned plan shape: a fixture-reading compat cell planned
+/// with pinned_root=true copies the pinned fixture twin (never the host
+/// node), wraps every preparation/cell (and the manifest gate) in the
+/// exact pinned form, and waits for the whole pinned closure. Results
+/// must live under the checkout for the /src translation, so the plan
+/// directory is a scratch under the checkout's ignored/, removed after.
+fn pinned_plan_self_test(root: &Path) -> Result<(), String> {
+    let plan = root
+        .join("ignored")
+        .join(format!("pressure-self-test-pinned-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&plan);
+    let result = pinned_plan_self_test_at(root, &plan);
+    let _ = fs::remove_dir_all(&plan);
+    result
+}
+
+fn pinned_plan_self_test_at(root: &Path, plan: &Path) -> Result<(), String> {
+    let checked = CheckedScorecard {
+        root,
+        enforce_host_capabilities: false,
+        memory_budget_override: Some(i64::MAX),
+    };
+    let cell = CellId {
+        lane: "portable".into(),
+        category: "compat".into(),
+        test: "compat/cat".into(),
+        mode: "verify".into(),
+        backend: "ptrace".into(),
+    };
+    fs::create_dir_all(plan)
+        .map_err(|e| format!("cannot create {}: {e}", plan.display()))?;
+    let selection = CellSelection {
+        test: Some(cell.test.clone()),
+        mode: Some(cell.mode.clone()),
+        backend: Some(cell.backend.clone()),
+        green: true,
+        repetitions: Some(1),
+        run_timeout_seconds: Some(1_000_000_000),
+        pinned_root: true,
+        ..CellSelection::default()
+    };
+    let (metadata, dag) =
+        write_plan_after_scorecard_check(&checked, plan, &plan.join("dag.json"), &selection)?;
+    if !metadata.pinned_root {
+        return Err("pinned plan did not record pinned_root in run.json".into());
+    }
+    // The compat cell reads the fixtures: the copied node must be the
+    // pinned twin under the base tag, never the host preparation.
+    let fixtures: Vec<&Step> = dag
+        .steps
+        .iter()
+        .filter(|step| step.tag() == VALIDATE_FIXTURE_STEP)
+        .collect();
+    let [fixture] = fixtures.as_slice() else {
+        return Err(format!(
+            "pinned compat plan has {} fixture node(s)",
+            fixtures.len()
+        ));
+    };
+    if !fixture.cmd.contains(PINNED_ROOT_LAUNCHER) {
+        return Err(format!(
+            "pinned compat plan prepares fixtures on the host: {}",
+            fixture.cmd
+        ));
+    }
+    for step in &dag.steps {
+        let tag = step.tag();
+        if (matches!(step.group.as_str(), "prepare" | "cell")
+            && !pinned_wrapper_exact(&step.cmd))
+            || (tag == "gate.manifest" && !pinned_wrapper_exact_segment(&step.cmd))
+        {
+            return Err(format!(
+                "pinned compat plan left {tag} unwrapped: {}",
+                step.cmd
+            ));
+        }
+        if step.group == "cell"
+            && step.env.get(HERMETIC_TEST_WORKDIR_ENV).map(String::as_str)
+                != Some(HERMETIC_TEST_WORKDIR)
+        {
+            return Err(format!(
+                "pinned compat plan cell {tag} lost its hermetic workdir environment"
+            ));
+        }
+    }
+    if !dag
+        .steps
+        .iter()
+        .any(|step| step.tag() == "setup.pinned_root_fetch")
+    {
+        return Err("pinned compat plan lost its pinned closure".into());
+    }
+    Ok(())
+}
+
 fn validate_run_state_self_test(root: &Path, scratch: &Path) -> Result<(), String> {
     let ordinary = ordinary_red_cell(root)?;
     let reader = compat_fixture_reader_red_cell(root)?;
@@ -17162,8 +17440,38 @@ fn compat_fixture_step_refusal_self_test(root: &Path) -> Result<(), String> {
     let builds = required_build_tags(None);
     let results = Path::new("/results");
     let state = results.join(VALIDATE_RUN_STATE_DIR);
-    compat_fixture_step(&canonical, results, &state, &builds)
+    compat_fixture_step(&canonical, results, &state, &builds, false)
         .map_err(|e| format!("the current {VALIDATE_FIXTURE_STEP} was refused: {e}"))?;
+    // The pinned twin copies under the base tag with its launcher intact;
+    // a twin reshaped to run on the host refuses.
+    let pinned_step = compat_fixture_step(&canonical, results, &state, &builds, true)
+        .map_err(|e| format!("the current pinned {VALIDATE_FIXTURE_STEP} twin was refused: {e}"))?;
+    if pinned_step.tag() != VALIDATE_FIXTURE_STEP
+        || !pinned_step.cmd.contains(PINNED_ROOT_LAUNCHER)
+    {
+        return Err(format!(
+            "pinned {VALIDATE_FIXTURE_STEP} copy lost its base tag or launcher: {} {}",
+            pinned_step.tag(),
+            pinned_step.cmd
+        ));
+    }
+    let pinned_index = canonical
+        .steps
+        .iter()
+        .position(|step| step.tag() == "compatprep.fixtures_in_pinned_root")
+        .ok_or_else(|| format!("{PORTABLE_DAG} has no pinned {VALIDATE_FIXTURE_STEP} twin"))?;
+    let mut host_twin = canonical.clone();
+    host_twin.steps[pinned_index].cmd = format!(
+        "./tests/compat/prepare_real_compat_fixtures.sh $VALIDATE_RUN_STATE/{COMPAT_FIXTURE_ROOT}"
+    );
+    match compat_fixture_step(&host_twin, results, &state, &builds, true) {
+        Err(error) if error.contains("no longer runs in the pinned root") => {}
+        other => {
+            return Err(format!(
+                "pinned {VALIDATE_FIXTURE_STEP} copy accepted a host twin: {other:?}"
+            ));
+        }
+    }
     let index = canonical
         .steps
         .iter()
@@ -17182,7 +17490,7 @@ fn compat_fixture_step_refusal_self_test(root: &Path) -> Result<(), String> {
         ("duplicated node", &duplicated, "has 2"),
         ("missing node", &missing, "has 0"),
     ] {
-        match compat_fixture_step(dag, results, &state, &builds) {
+        match compat_fixture_step(dag, results, &state, &builds, false) {
             Err(error) if error.contains(expected) => {}
             other => {
                 return Err(format!(
@@ -17197,6 +17505,7 @@ fn compat_fixture_step_refusal_self_test(root: &Path) -> Result<(), String> {
         spaced,
         &spaced.join(VALIDATE_RUN_STATE_DIR),
         &builds,
+        false,
     ) {
         Err(error) if error.contains("would split") => Ok(()),
         other => Err(format!(
@@ -19059,10 +19368,10 @@ fn resume_merge_self_test_at(scratch: &Path) -> Result<(), String> {
     )
     .map_err(|e| format!("cannot build plain-rename DAG fixture: {e}"))?;
     let plain_times = BTreeMap::from([("cell.fixture".to_string(), 20)]);
-    if audit_dag(&plain_dag, 1, 100, &plain_times).is_ok() {
+    if audit_dag(&plain_dag, 1, 100, &plain_times, false).is_ok() {
         return Err("newly generated DAG audit accepted a plain rename".into());
     }
-    audit_dag_retained(&plain_dag, 1, 100, &plain_times, true)
+    audit_dag_retained(&plain_dag, 1, 100, &plain_times, true, false)
         .map_err(|e| format!("retained plain-rename DAG must audit for summarize: {e}"))?;
     // (13b) The plain-rename exemption is scoped to genuinely old
     // campaigns: a run.json without the durable-format marker is exempt,
@@ -19081,6 +19390,7 @@ fn resume_merge_self_test_at(scratch: &Path) -> Result<(), String> {
         100,
         &plain_times,
         legacy_publication_exempt(&legacy_meta),
+        false,
     )
     .is_ok()
     {
@@ -20431,6 +20741,53 @@ fn self_test(root: &Path) -> Result<(), String> {
             }
         }
     }
+    // --pinned-root combinations: a plain pinned probe is valid; each
+    // refused combination names the pinned rule.
+    let pinned_probe = CellSelection {
+        pinned_root: true,
+        probe_disabled: true,
+        backend: Some("ptrace".into()),
+        cells_file: Some(PathBuf::from("cells.jsonl")),
+        repetitions: Some(3),
+        ..CellSelection::default()
+    };
+    validate_repetition_selection(&pinned_probe)
+        .map_err(|e| format!("a valid --pinned-root selection was refused: {e}"))?;
+    for (what, invalid, needle) in [
+        (
+            "with --parity-all",
+            CellSelection {
+                parity_all: true,
+                ..pinned_probe.clone()
+            },
+            "cannot be combined with --parity-all",
+        ),
+        (
+            "with --resume",
+            CellSelection {
+                resume_dir: Some(PathBuf::from("retained")),
+                ..pinned_probe.clone()
+            },
+            "cannot be combined with --resume",
+        ),
+        (
+            "with native backend",
+            CellSelection {
+                backend: Some("native".into()),
+                ..pinned_probe.clone()
+            },
+            "cannot run the native backend",
+        ),
+    ] {
+        match validate_repetition_selection(&invalid) {
+            Err(error) if error.contains(needle) => {}
+            other => {
+                return Err(format!(
+                    "--pinned-root {what} was not refused by name: {other:?}"
+                ));
+            }
+        }
+    }
     if !parity_all_runs_backend("ptrace")
         || parity::ParityBackend::ALL
             .iter()
@@ -20591,6 +20948,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot parse canonical build-dependency fixture: {e}"))?;
     host_build_variant_self_test(&canonical_build_dag)?;
     pinned_build_variant_self_test(&canonical_build_dag)?;
+    pinned_wrap_self_test()?;
     canonical_build_dag.steps = host_build_steps(&canonical_build_dag)
         .map_err(|e| format!("current canonical host build variants were refused: {e}"))?;
     let all_required_builds = required_build_tags(None);
@@ -20747,32 +21105,64 @@ fn self_test(root: &Path) -> Result<(), String> {
     let fixture = dag_from_json(&fixture_text)
         .map_err(|e| format!("cannot parse generated-DAG fixture: {e}"))?;
     let fixture_timeouts = BTreeMap::from([("cell.fixture".to_string(), 20)]);
-    audit_dag(&fixture, 1, 100, &fixture_timeouts)
+    audit_dag(&fixture, 1, 100, &fixture_timeouts, false)
         .map_err(|e| format!("positive generated-DAG bracket failed: {e}"))?;
+    // Pinned expectation re-derives the wrapper: the same fixture
+    // unwrapped refuses, exactly wrapped (with the hermetic workdir
+    // environment) passes, and wrapped without that environment refuses.
+    match audit_dag(&fixture, 1, 100, &fixture_timeouts, true) {
+        Err(error) if error.contains("not wrapped in the exact pinned form") => {}
+        other => {
+            return Err(format!(
+                "pinned audit accepted an unwrapped cell: {other:?}"
+            ));
+        }
+    }
+    let mut pinned_fixture = fixture.clone();
+    pinned_fixture.steps[0].cmd = pinned_wrap_cmd(
+        Path::new("/fixture-root"),
+        Path::new("/fixture-root/ignored/run"),
+        exact_cell_command.to_string(),
+    )?;
+    pinned_fixture.steps[0]
+        .env
+        .insert(HERMETIC_TEST_WORKDIR_ENV.into(), HERMETIC_TEST_WORKDIR.into());
+    audit_dag(&pinned_fixture, 1, 100, &fixture_timeouts, true)
+        .map_err(|e| format!("positive pinned generated-DAG bracket failed: {e}"))?;
+    let mut pinned_no_workdir = pinned_fixture.clone();
+    pinned_no_workdir.steps[0].env.remove(HERMETIC_TEST_WORKDIR_ENV);
+    match audit_dag(&pinned_no_workdir, 1, 100, &fixture_timeouts, true) {
+        Err(error) if error.contains("hermetic guest workdir") => {}
+        other => {
+            return Err(format!(
+                "pinned audit accepted a cell without its hermetic workdir: {other:?}"
+            ));
+        }
+    }
     let fixture_round_trip = dag_from_json(&dag_to_json(&fixture))
         .map_err(|e| format!("cannot reparse generated-DAG fixture: {e}"))?;
     assert_plan_round_trip(&fixture, &fixture_round_trip)
         .map_err(|e| format!("positive generated-DAG round-trip bracket failed: {e}"))?;
     let mut missing_memory_cap = fixture.clone();
     missing_memory_cap.steps[0].hint.hard_mem_max_bytes = None;
-    if audit_dag(&missing_memory_cap, 1, 100, &fixture_timeouts).is_ok() {
+    if audit_dag(&missing_memory_cap, 1, 100, &fixture_timeouts, false).is_ok() {
         return Err("step without a hard memory cap was accepted".into());
     }
     let mut missing_cpu_cap = fixture.clone();
     missing_cpu_cap.steps[0].cpu_timeout = 0;
-    if audit_dag(&missing_cpu_cap, 1, 100, &fixture_timeouts).is_ok() {
+    if audit_dag(&missing_cpu_cap, 1, 100, &fixture_timeouts, false).is_ok() {
         return Err("step without an explicit CPU cap was accepted".into());
     }
     let mut missing_resource_cap = fixture.clone();
     missing_resource_cap.resource_caps.remove("manifest_guest");
-    if audit_dag(&missing_resource_cap, 1, 100, &fixture_timeouts).is_ok() {
+    if audit_dag(&missing_resource_cap, 1, 100, &fixture_timeouts, false).is_ok() {
         return Err("step whose named resource has no capacity was accepted".into());
     }
     let mut ungrantable_resource = fixture.clone();
     ungrantable_resource
         .resource_caps
         .insert("manifest_guest".into(), 0);
-    if audit_dag(&ungrantable_resource, 1, 100, &fixture_timeouts).is_ok() {
+    if audit_dag(&ungrantable_resource, 1, 100, &fixture_timeouts, false).is_ok() {
         return Err("step whose named resource demand exceeds capacity was accepted".into());
     }
     // A DBT test's host /tmp is one unit that one cell holds alone.
@@ -20790,7 +21180,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         .resources
         .insert(host_tmp.clone(), 1);
     exclusive_host_tmp.resource_caps.insert(host_tmp.clone(), 1);
-    audit_dag(&exclusive_host_tmp, 1, 100, &fixture_timeouts)
+    audit_dag(&exclusive_host_tmp, 1, 100, &fixture_timeouts, false)
         .map_err(|e| format!("positive DBT host /tmp bracket failed: {e}"))?;
     let exclusive_host_tmp_round_trip = dag_from_json(&dag_to_json(&exclusive_host_tmp))
         .map_err(|e| format!("cannot reparse DBT host /tmp fixture: {e}"))?;
@@ -20804,7 +21194,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         ("capacity", &shared_host_tmp),
         ("demand", &doubled_host_tmp),
     ] {
-        if audit_dag(dag, 1, 100, &fixture_timeouts).is_ok() {
+        if audit_dag(dag, 1, 100, &fixture_timeouts, false).is_ok() {
             return Err(format!(
                 "a DBT test's host /tmp with a {label} of two units was accepted"
             ));
@@ -20815,19 +21205,19 @@ fn self_test(root: &Path) -> Result<(), String> {
     unused_host_tmp
         .resource_caps
         .insert(format!("{DBT_HOST_TMP_RESOURCE_PREFIX}unused"), 2);
-    if audit_dag(&unused_host_tmp, 1, 100, &fixture_timeouts).is_ok() {
+    if audit_dag(&unused_host_tmp, 1, 100, &fixture_timeouts, false).is_ok() {
         return Err("a two-unit DBT host /tmp grant that no step demands was accepted".into());
     }
     let mut widened_cell_timeout = fixture.clone();
     widened_cell_timeout.steps[0].timeout = 21;
-    if audit_dag(&widened_cell_timeout, 1, 100, &fixture_timeouts).is_ok() {
+    if audit_dag(&widened_cell_timeout, 1, 100, &fixture_timeouts, false).is_ok() {
         return Err("cell wall timeout wider than its selected cap was accepted".into());
     }
     let mut disabled_fixture = fixture.clone();
     disabled_fixture.steps[0].cmd = exact_cell_command
         .replace("--include-manual", "--probe-disabled")
         .replace("--test fixture", "--test fixture --backend kvm");
-    audit_dag(&disabled_fixture, 1, 100, &fixture_timeouts)
+    audit_dag(&disabled_fixture, 1, 100, &fixture_timeouts, false)
         .map_err(|e| format!("positive disabled-cell bracket failed: {e}"))?;
     let mut prepared_fixture = fixture.clone();
     prepared_fixture.steps[0].cmd = "printf '125\\n' > '/results/cells/fixture/harness-status'; \
@@ -20841,12 +21231,12 @@ fn self_test(root: &Path) -> Result<(), String> {
          sync -- . || status=$?; \
          printf '%s\\n' \"$status\" > harness-status; exit \"$status\""
         .into();
-    audit_dag(&prepared_fixture, 1, 100, &fixture_timeouts)
+    audit_dag(&prepared_fixture, 1, 100, &fixture_timeouts, false)
         .map_err(|e| format!("positive preparation-refusal bracket failed: {e}"))?;
     prepared_fixture.steps[0].cmd = prepared_fixture.steps[0]
         .cmd
         .replace("printf '126", "printf '0");
-    if audit_dag(&prepared_fixture, 1, 100, &fixture_timeouts).is_ok() {
+    if audit_dag(&prepared_fixture, 1, 100, &fixture_timeouts, false).is_ok() {
         return Err("prebuilt cell without the preparation-failure refusal was accepted".into());
     }
     let mut nested_timeout_fixture = fixture.clone();
@@ -20854,25 +21244,25 @@ fn self_test(root: &Path) -> Result<(), String> {
         "env HERMIT_BIN",
         "timeout --kill-after=10s 20s env HERMIT_BIN",
     );
-    if audit_dag(&nested_timeout_fixture, 1, 100, &fixture_timeouts).is_ok() {
+    if audit_dag(&nested_timeout_fixture, 1, 100, &fixture_timeouts, false).is_ok() {
         return Err("cell with a nested wall timeout was accepted".into());
     }
     let mut swallowed_failure_fixture = fixture.clone();
     swallowed_failure_fixture.steps[0].cmd =
         exact_cell_command.replace("exit \"$status\"", "exit 0");
-    if audit_dag(&swallowed_failure_fixture, 1, 100, &fixture_timeouts).is_ok() {
+    if audit_dag(&swallowed_failure_fixture, 1, 100, &fixture_timeouts, false).is_ok() {
         return Err("cell command that hid its terminal status was accepted".into());
     }
     let mut direct_result_fixture = fixture.clone();
     direct_result_fixture.steps[0].cmd = exact_cell_command
         .replace("results.in-progress.jsonl", "results.jsonl")
         .replace("mv --", "cp --");
-    if audit_dag(&direct_result_fixture, 1, 100, &fixture_timeouts).is_ok() {
+    if audit_dag(&direct_result_fixture, 1, 100, &fixture_timeouts, false).is_ok() {
         return Err("cell command without terminal result publication was accepted".into());
     }
     let mut missing_exact_selector = fixture;
     missing_exact_selector.steps[0].cmd = exact_cell_command.replace("--mode verify", "");
-    if audit_dag(&missing_exact_selector, 1, 100, &fixture_timeouts).is_ok() {
+    if audit_dag(&missing_exact_selector, 1, 100, &fixture_timeouts, false).is_ok() {
         return Err("negative generated-DAG bracket accepted a cell without an exact mode".into());
     }
 
@@ -21709,6 +22099,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     disabled_cells_file_self_test(root, &scratch)?;
     focused_run_type_selection_self_test(root, &scratch)?;
     validate_run_state_self_test(root, &scratch)?;
+    pinned_plan_self_test(root)?;
     parity_reference_sample_self_test(root, &scratch)?;
     run_state_exclusive_self_test(root, &scratch)?;
     unsampleable_sample_self_test(root, &scratch)?;
@@ -22007,6 +22398,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         4,
         cells_file_metadata.run_timeout_seconds,
         &cells_file_timeouts,
+        false,
     )
     .is_ok()
     {
@@ -22360,6 +22752,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         3,
         repeated_metadata.run_timeout_seconds,
         &repeated_timeouts,
+        false,
     )?;
     let mut missing_repetition = repeated_dag.clone();
     let missing_job = repeated_cell_steps[0].job.clone();
@@ -22371,6 +22764,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         3,
         repeated_metadata.run_timeout_seconds,
         &repeated_timeouts,
+        false,
     )
     .is_ok()
     {
@@ -22385,6 +22779,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         3,
         repeated_metadata.run_timeout_seconds,
         &repeated_timeouts,
+        false,
     )
     .is_ok()
     {
@@ -22399,6 +22794,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         3,
         repeated_metadata.run_timeout_seconds,
         &repeated_timeouts,
+        false,
     )
     .expect_err("repeated-plan audit accepted a missing Buck artifact producer");
     if !missing_buck_error.contains("build.e2e_artifact")
@@ -22422,6 +22818,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         3,
         repeated_metadata.run_timeout_seconds,
         &repeated_timeouts,
+        false,
     )
     .is_ok()
     {
@@ -23060,6 +23457,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         expected_green_cell_runs,
         green_batch_metadata.run_timeout_seconds,
         &green_batch_timeouts,
+        false,
     )
     .is_ok()
     {
@@ -24026,6 +24424,30 @@ fn self_test(root: &Path) -> Result<(), String> {
         return Err(format!(
             "two appended result observations were not retained independently: {appended:?}"
         ));
+    }
+    // A pinned-root row records its artifact directory in container
+    // coordinates; it maps onto the retained host root by its
+    // runs/<run-id> tail, and an escaping tail still refuses.
+    let mut pinned_row = second_row.clone();
+    pinned_row.artifact_dir = format!(
+        "/src/ignored/run/runs/{}/cell-attempt-2",
+        pinned_row.run_id
+    );
+    if result_artifact_dir(&scratch, &pinned_row)?.as_path()
+        != scratch
+            .join("runs")
+            .join(&pinned_row.run_id)
+            .join("cell-attempt-2")
+            .as_path()
+    {
+        return Err("pinned artifact directory did not map onto the retained root".into());
+    }
+    pinned_row.artifact_dir = format!(
+        "/src/ignored/run/runs/{}/../escape",
+        pinned_row.run_id
+    );
+    if result_artifact_dir(&scratch, &pinned_row).is_ok() {
+        return Err("pinned artifact directory escaping the retained root was accepted".into());
     }
     if read_current_result_rows(&appended_results)?.len() != 2 {
         return Err("the existing current retry history lost strict admission".into());
@@ -33873,18 +34295,18 @@ mod pressure_planning_tests {
         )
         .unwrap();
         let times = BTreeMap::from([("cell.fixture".to_string(), 20)]);
-        assert_eq!(audit_dag(&dag, 1, 100, &times), Ok(()));
+        assert_eq!(audit_dag(&dag, 1, 100, &times, false), Ok(()));
         // A grant that a step demands: one unit granted, one unit demanded.
         let active = format!("{DBT_HOST_TMP_RESOURCE_PREFIX}fixture");
         dag.resource_caps.insert(active.clone(), 1);
         dag.steps[0].hint.resources.insert(active.clone(), 1);
-        assert_eq!(audit_dag(&dag, 1, 100, &times), Ok(()));
+        assert_eq!(audit_dag(&dag, 1, 100, &times, false), Ok(()));
         for (demand, capacity) in [(0, 1), (-1, 1), (1, 0), (1, 2), (2, 2), (2, 1)] {
             let mut bad = dag.clone();
             bad.resource_caps.insert(active.clone(), capacity);
             bad.steps[0].hint.resources.insert(active.clone(), demand);
             assert!(
-                audit_dag(&bad, 1, 100, &times).is_err(),
+                audit_dag(&bad, 1, 100, &times, false).is_err(),
                 "demand {demand}, capacity {capacity}"
             );
         }
@@ -33896,7 +34318,7 @@ mod pressure_planning_tests {
         for capacity in [2, 0, -1] {
             let mut bad = dag.clone();
             bad.resource_caps.insert(unused.clone(), capacity);
-            let Err(error) = audit_dag(&bad, 1, 100, &times) else {
+            let Err(error) = audit_dag(&bad, 1, 100, &times, false) else {
                 panic!("the audit accepted {capacity} unit(s) of {unused}, which no step demands");
             };
             assert!(
@@ -33905,7 +34327,7 @@ mod pressure_planning_tests {
             );
         }
         dag.resource_caps.insert(unused, 1);
-        assert_eq!(audit_dag(&dag, 1, 100, &times), Ok(()));
+        assert_eq!(audit_dag(&dag, 1, 100, &times, false), Ok(()));
     }
 }
 
