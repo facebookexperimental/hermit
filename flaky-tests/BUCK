@@ -138,3 +138,10 @@ buck_export_file(
     name = "Cargo.toml",
     visibility = ["//hermetic_infra/hermit:"],
 )
+
+# stress_suite.rs compiles this guest at run time from the integration tests'
+# repository (//hermetic_infra/hermit:integration-repository).
+buck_export_file(
+    name = "cas_sequence_easy.rs",
+    visibility = ["//hermetic_infra/hermit:"],
+)

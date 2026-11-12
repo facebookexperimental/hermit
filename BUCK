@@ -143,6 +143,8 @@ buck_filegroup(
     srcs = {
         "detcore/tests/fixtures": "//hermetic_infra/hermit/detcore:tests-fixtures",
         "detcore/tests/lit": "//hermetic_infra/hermit/detcore/tests/lit:guest-sources",
+        # stress_suite.rs compiles it at run time, with tests/stress/concurrency.rs.
+        "flaky-tests/cas_sequence_easy.rs": "//hermetic_infra/hermit/flaky-tests:cas_sequence_easy.rs",
         "hermit-cli": "//hermetic_infra/hermit/hermit-cli:integration-cli-tree",
         "tests": "//hermetic_infra/hermit/tests:integration-tree",
         # rr_suite.rs compiles the pinned rr test programs at run time from
