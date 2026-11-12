@@ -156,6 +156,30 @@ const HOST_BUILD_VARIANTS: [(&str, &str); 2] = [
     ("build.workspace", "build.workspace_on_host"),
     ("build.e2e_artifact", "build.e2e_artifact_on_host"),
 ];
+/// The same one-build producers in their canonical pinned-root form, for a
+/// `--pinned-root` run: cloned under their base names exactly as the host
+/// variants are, with their pinned-only prerequisites retained verbatim.
+const PINNED_BUILD_VARIANTS: [(&str, &str); 2] = [
+    ("build.workspace", "build.workspace_in_pinned_root"),
+    ("build.e2e_artifact", "build.e2e_artifact_in_pinned_root"),
+];
+/// The pinned one-build closure: the two producers above under their base
+/// names plus every canonical prerequisite they reach. `setup.nextest`
+/// (a host-variant prerequisite) is not among them.
+const PINNED_REQUIRED_BUILD_TAGS: [&str; 12] = [
+    "pre.submodules",
+    "pre.reverie_pin",
+    "build.rust_scripts",
+    "build.rust_scripts_in_pinned_root",
+    "setup.manifest_plan",
+    "setup.pinned_root_fetch",
+    "gate.manifest",
+    "build.workspace_compile_in_pinned_root",
+    "build.liteinst_runtime_in_pinned_root",
+    "build.workspace",
+    "build.buck_release_artifact",
+    "build.e2e_artifact",
+];
 const PINNED_ROOT_LAUNCHER: &str = "./ci/hermetic/run-in-pinned-root.sh";
 /// The one Hermit binary every generated exact cell runs.
 const EXACT_CELL_HERMIT_BIN: &str = "HERMIT_BIN=\"$PWD/target/ci/hermit\"";
@@ -296,7 +320,11 @@ Commands:
       [--green --backend BACKEND --repetitions COUNT] [--no-retry] [--jobs COUNT]
       [--probe-disabled --backend BACKEND]
       [--parity-all --repetitions COUNT] [--reuse-fresh-checkout]
-      [--resume DIR]
+      [--pinned-root] [--resume DIR]
+      With --pinned-root, build with the canonical pinned-root producers
+      and run every prepare/cell step inside the pinned root (fail-closed;
+      --results must be under the checkout); the retained evidence then
+      records environment pinned-root instead of host.
       Run bounded probes for the selected red cells. An exact-cell run uses the
       current working tree for fast fix/test iteration; a dirty result is
       labelled exploratory and cannot promote the scorecard. Batch runs require
@@ -1117,6 +1145,12 @@ struct CellSelection {
     /// beside its ptrace reference. Requires `--repetitions`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     parity_all: bool,
+    /// `--pinned-root`: build with the canonical pinned-root producers and
+    /// run every prepare/cell step inside the pinned root, so the retained
+    /// evidence records `environment: pinned-root`. Fail-closed: a missing
+    /// pinned variant or image refuses; there is no host fallback.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pinned_root: bool,
     /// `--no-retry`: every repetition is exactly one harness attempt, so the
     /// repeated sample is N first-attempt observations (`test-harness run
     /// --no-retry`). Requires `--repetitions`.
@@ -1369,6 +1403,23 @@ fn population_label(green: bool, probe_disabled: bool, parity_all: bool) -> &'st
 }
 
 fn validate_repetition_selection(selection: &CellSelection) -> Result<(), String> {
+    if selection.pinned_root {
+        if selection.parity_all {
+            return Err(
+                "--pinned-root cannot be combined with --parity-all; the parity post-pass compares host-planned references".into(),
+            );
+        }
+        if selection.resume_dir.is_some() {
+            return Err(
+                "--pinned-root cannot be combined with --resume; plan a fresh pinned run instead".into(),
+            );
+        }
+        if selection.backend.as_deref() == Some("native") {
+            return Err(
+                "--pinned-root cannot run the native backend; hermetic validation cannot isolate a naked cell".into(),
+            );
+        }
+    }
     if selection.parity_all {
         if selection.repetitions.is_none() {
             return Err("--parity-all requires --repetitions".into());
@@ -3202,6 +3253,7 @@ fn inherit_resume_selection(
         green: retained.green,
         probe_disabled: retained.probe_disabled,
         parity_all: retained.parity_all,
+        pinned_root: retained.pinned_root,
         no_retry: retained.no_retry,
         jobs: requested.jobs,
         manifest_guest_cap: retained
@@ -3260,6 +3312,9 @@ fn inherit_resume_selection(
     }
     if requested.parity_all && !retained.parity_all {
         return Err(conflict("--parity-all"));
+    }
+    if requested.pinned_root && !retained.pinned_root {
+        return Err(conflict("--pinned-root"));
     }
     if !requested.parity_select.is_empty() && requested.parity_select != retained.parity_select {
         return Err(conflict("--parity-select"));
@@ -3778,6 +3833,9 @@ struct RunMetadata {
     /// `--parity-all` (see [`CellSelection::parity_all`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     parity_all: bool,
+    /// `--pinned-root` (see [`CellSelection::pinned_root`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pinned_root: bool,
     /// Whether every harness invocation ran with `--no-retry`.
     #[serde(default)]
     no_retry: bool,
@@ -5790,6 +5848,12 @@ fn result_options(
                     return Err("--parity-all may be specified only once".into());
                 }
                 selection.parity_all = true;
+            }
+            "--pinned-root" if allow_selection => {
+                if selection.pinned_root {
+                    return Err("--pinned-root may be specified only once".into());
+                }
+                selection.pinned_root = true;
             }
             "--no-retry" if allow_selection => {
                 if selection.no_retry {
@@ -8074,13 +8138,14 @@ fn selected_cell_dependencies(
     ]
 }
 
-fn retain_required_build_dependencies(
-    step: &mut Step,
+/// Every prerequisite of a copied canonical command must be inside the
+/// explicitly selected closure; an unknown prerequisite refuses rather
+/// than silently shrinking or expanding the closure.
+fn require_build_dependencies_within(
+    step: &Step,
     required_builds: &BTreeSet<&str>,
 ) -> Result<(), String> {
     let tag = step.tag();
-    // The selected set is explicit. Never import an arbitrary future closure,
-    // and never omit a prerequisite of a copied canonical command.
     for dependency in &step.deps {
         if !required_builds.contains(dependency.as_str()) {
             return Err(format!(
@@ -8088,6 +8153,15 @@ fn retain_required_build_dependencies(
             ));
         }
     }
+    Ok(())
+}
+
+fn retain_required_build_dependencies(
+    step: &mut Step,
+    required_builds: &BTreeSet<&str>,
+) -> Result<(), String> {
+    let tag = step.tag();
+    require_build_dependencies_within(step, required_builds)?;
     for (consumer, dependency) in REQUIRED_CANONICAL_BUILD_EDGES {
         if tag == consumer
             && required_builds.contains(dependency)
@@ -8410,6 +8484,181 @@ fn host_build_steps(canonical: &DagConfig) -> Result<Vec<Step>, String> {
     Ok(steps)
 }
 
+/// Clone the canonical steps with the pinned-root variants of the one-build
+/// producers under their base names, rewriting every dependency on them.
+/// The mirror of [`host_build_steps`]: a missing or ambiguous pinned
+/// variant, or one whose command does not run through the pinned-root
+/// launcher, refuses. A pinned run must never fall back to a host producer.
+fn pinned_build_steps(canonical: &DagConfig) -> Result<Vec<Step>, String> {
+    let base_of = |tag: &str| {
+        PINNED_BUILD_VARIANTS
+            .iter()
+            .find(|(_, pinned)| *pinned == tag)
+            .map(|(base, _)| *base)
+    };
+    let mut found = BTreeSet::new();
+    let mut steps = Vec::with_capacity(canonical.steps.len());
+    for step in &canonical.steps {
+        let tag = step.tag();
+        if let Some((base, pinned)) = PINNED_BUILD_VARIANTS.iter().find(|(base, _)| *base == tag) {
+            return Err(format!(
+                "canonical build graph defines {base} directly; the pinned pressure graph clones only {pinned}, so it refuses to guess which producer to run"
+            ));
+        }
+        // Host-variant and other unselected canonical steps pass through
+        // untouched, exactly as pinned steps do in `host_build_steps`;
+        // the caller's required-tag filter drops them from the plan.
+        let mut step = step.clone();
+        if let Some(base) = base_of(&tag) {
+            if !found.insert(base) {
+                return Err(format!(
+                    "canonical build graph duplicates pinned variant {tag}"
+                ));
+            }
+            if !step.cmd.contains(PINNED_ROOT_LAUNCHER) {
+                return Err(format!(
+                    "canonical pinned variant {tag} does not run through {PINNED_ROOT_LAUNCHER}; refusing to call it pinned"
+                ));
+            }
+            let (group, job) = base
+                .split_once('.')
+                .expect("pinned build variant base has a group");
+            if step.group != group {
+                return Err(format!(
+                    "canonical pinned variant {tag} is not in group {group}"
+                ));
+            }
+            step.job = job.into();
+        }
+        for dependency in &mut step.deps {
+            if let Some(base) = base_of(dependency) {
+                *dependency = base.into();
+            }
+        }
+        steps.push(step);
+    }
+    for (base, pinned) in PINNED_BUILD_VARIANTS {
+        if !found.contains(base) {
+            return Err(format!(
+                "canonical build graph lost pinned build variant {pinned} (cloned as {base})"
+            ));
+        }
+    }
+    Ok(steps)
+}
+
+/// The build tags a `--pinned-root` plan retains: the pinned closure, for
+/// batch and exact selections alike (the direct exact Hermit build is a
+/// host build and never substitutes in a pinned plan).
+fn pinned_required_build_tags() -> BTreeSet<&'static str> {
+    PINNED_REQUIRED_BUILD_TAGS.into_iter().collect()
+}
+
+/// Wrap one generated prepare/cell command in the pinned root. Every
+/// generated path lives under the results directory, so a pinned plan
+/// requires `--results` under the checkout: host checkout paths then map
+/// to `/src` inside the container by one prefix translation, and the
+/// run's shared pinned-out directory supplies the container target the
+/// pinned producers populated. Anything else refuses by name; a pinned
+/// command is never emitted unwrapped.
+fn pinned_wrap_cmd(root: &Path, results: &Path, cmd: String) -> Result<String, String> {
+    let root_text = root.to_string_lossy();
+    if !results.starts_with(root) {
+        return Err(format!(
+            "--pinned-root requires --results under the checkout ({root_text}), got {}; refusing to plan a host run under a pinned name",
+            results.display()
+        ));
+    }
+    let translated = cmd.replace(&format!("{root_text}/"), "/src/");
+    if translated.contains(root_text.as_ref()) {
+        return Err(
+            "--pinned-root generated a command naming the host checkout outside a /src path; refusing to plan it".into(),
+        );
+    }
+    // The container target must be the one the canonical pinned
+    // producers populated: they all run with `--out
+    // ignored/hermetic/split`, whose target mounts at `/src/target`.
+    let out = root.join("ignored").join("hermetic").join("split");
+    Ok(format!(
+        "{PINNED_ROOT_LAUNCHER} --src . --out {out} --src-rw --cargo-home \"${{CARGO_HOME:-$HOME/.cargo}}\" -- bash -c {inner}",
+        out = shell_quote(&out.to_string_lossy()),
+        inner = shell_quote(&translated),
+    ))
+}
+
+/// Bracket the pinned-variant selection against the committed canonical
+/// graph, mirroring `host_build_variant_self_test`: the exact pinned
+/// commands are cloned under their base names, and a missing, duplicated,
+/// ambiguous, or non-launcher variant refuses.
+fn pinned_build_variant_self_test(canonical: &DagConfig) -> Result<(), String> {
+    let selected = pinned_build_steps(canonical)
+        .map_err(|e| format!("current canonical pinned build variants were refused: {e}"))?;
+    let selected_tags: BTreeSet<_> = selected.iter().map(Step::tag).collect();
+    for (base, pinned) in PINNED_BUILD_VARIANTS {
+        let original = canonical
+            .steps
+            .iter()
+            .find(|step| step.tag() == pinned)
+            .ok_or_else(|| format!("canonical build graph lost {pinned}"))?;
+        let cloned = selected
+            .iter()
+            .find(|step| step.tag() == base)
+            .ok_or_else(|| format!("pinned build selection lost {base}"))?;
+        if cloned.cmd != original.cmd
+            || !cloned.cmd.contains(PINNED_ROOT_LAUNCHER)
+            || selected_tags.contains(pinned)
+        {
+            return Err(format!("{pinned} was not cloned exactly as {base}"));
+        }
+    }
+    // Every retained pinned-closure step's prerequisites stay inside the
+    // explicit pinned closure after cloning.
+    let closure = pinned_required_build_tags();
+    for step in selected
+        .iter()
+        .filter(|step| closure.contains(step.tag().as_str()))
+    {
+        require_build_dependencies_within(step, &closure)?;
+    }
+    let pinned_index = |tag: &str| {
+        canonical
+            .steps
+            .iter()
+            .position(|step| step.tag() == tag)
+            .ok_or_else(|| format!("canonical build graph lost {tag}"))
+    };
+    let workspace_pinned = pinned_index("build.workspace_in_pinned_root")?;
+    let mut missing = canonical.clone();
+    missing.steps.remove(workspace_pinned);
+    let mut unwrapped = canonical.clone();
+    unwrapped.steps[workspace_pinned].cmd = "true".into();
+    for (label, fixture, needle) in [
+        ("missing", &missing, "lost pinned build variant"),
+        ("unwrapped", &unwrapped, PINNED_ROOT_LAUNCHER),
+    ] {
+        let error = pinned_build_steps(fixture)
+            .err()
+            .ok_or_else(|| format!("pinned build selection accepted a {label} variant"))?;
+        if !error.contains(needle) {
+            return Err(format!(
+                "{label} pinned build variant refusal named the wrong nodes: {error}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The inner command of a [`pinned_wrap_cmd`] step, shell-unquoted, or
+/// None when CMD is not in the exact wrapped form. The generated-DAG
+/// audit brackets the harness command by substring; for a pinned step it
+/// brackets this inner command and separately requires the wrapper.
+fn pinned_inner_cmd(cmd: &str) -> Option<String> {
+    let rest = cmd.strip_prefix(PINNED_ROOT_LAUNCHER)?;
+    let inner = rest.split_once("-- bash -c ")?.1;
+    let inner = inner.strip_prefix('\'')?.strip_suffix('\'')?;
+    Some(inner.replace("'\\''", "'"))
+}
+
 fn base_cell_slug(cell: &CellId) -> String {
     sanitize(&format!(
         "{}-{}-{}-{}-{}",
@@ -8571,7 +8820,11 @@ fn write_plan_after_scorecard_check(
                 .expect("exact selection has backend"),
         )
     });
-    let required_builds = required_build_tags(exact_cell);
+    let required_builds = if selection.pinned_root {
+        pinned_required_build_tags()
+    } else {
+        required_build_tags(exact_cell)
+    };
     require_generated_node_count(
         cells.len(),
         selection.run_count(),
@@ -8594,12 +8847,20 @@ fn write_plan_after_scorecard_check(
     }
 
     let mut steps = Vec::new();
-    for mut step in host_build_steps(&canonical)? {
+    let build_steps = if selection.pinned_root {
+        pinned_build_steps(&canonical)?
+    } else {
+        host_build_steps(&canonical)?
+    };
+    for mut step in build_steps {
         let tag = step.tag();
         if required_builds.contains(tag.as_str()) {
             let marker = build_marker(results, &tag);
-            let direct_backend_build =
-                tag == "build.e2e_artifact" && direct_exact_hermit_build(exact_cell);
+            // The direct exact build is a host cargo build; it never
+            // substitutes for the pinned producer in a pinned plan.
+            let direct_backend_build = !selection.pinned_root
+                && tag == "build.e2e_artifact"
+                && direct_exact_hermit_build(exact_cell);
             let command = if direct_backend_build {
                 DIRECT_EXACT_HERMIT_BUILD.into()
             } else {
@@ -8621,6 +8882,12 @@ fn write_plan_after_scorecard_check(
                 retain_required_build_dependencies(&mut step, &accepted)?;
                 step.deps
                     .retain(|dependency| dependency != DIRECT_BUILD_REPLACED_PREREQUISITE);
+            } else if selection.pinned_root {
+                // Pinned canonical edges are preserved verbatim by the
+                // clone (the pinned graph orders the two producers
+                // oppositely to the host edge invariant); the subset
+                // check still refuses any unknown prerequisite.
+                require_build_dependencies_within(&step, &required_builds)?;
             } else {
                 retain_required_build_dependencies(&mut step, &required_builds)?;
             }
@@ -8704,12 +8971,28 @@ fn write_plan_after_scorecard_check(
             rerun_guard = incomplete_status_rerun_guard(&status_path),
             incomplete = INCOMPLETE_ATTEMPT_STATUS,
         );
+        let cmd = if selection.pinned_root {
+            pinned_wrap_cmd(root, results, cmd)?
+        } else {
+            cmd
+        };
         let wall = preparation_node_timeout(budget)?;
         let mut preparation_deps = if selection.is_exact() {
             selected_cell_dependencies(true, false, &cell.mode, &cell.backend, None)
         } else {
             vec!["setup.manifest_plan".into(), "build.e2e_artifact".into()]
         };
+        if selection.pinned_root {
+            // The pinned producer chains do not order every retained
+            // early node before preparations the way the host chains
+            // do; wait for the whole pinned closure explicitly, which
+            // is what the memory phase bound already assumes.
+            for tag in &required_builds {
+                if !preparation_deps.iter().any(|dep| dep == tag) {
+                    preparation_deps.push((*tag).into());
+                }
+            }
+        }
         if reads_compat_fixtures {
             preparation_deps.push(VALIDATE_FIXTURE_STEP.into());
         }
@@ -8892,6 +9175,11 @@ fn write_plan_after_scorecard_check(
                 incomplete = INCOMPLETE_ATTEMPT_STATUS,
                 preparation_guard = preparation_guard,
             );
+            let cmd = if selection.pinned_root {
+                pinned_wrap_cmd(root, results, cmd)?
+            } else {
+                cmd
+            };
             let wall =
                 pressure_timeout(budget, selection.cell_timeout_seconds, selection.no_retry)?;
             cell_timeouts.insert(tag.clone(), wall);
@@ -8914,6 +9202,14 @@ fn write_plan_after_scorecard_check(
                 &cell.backend,
                 preparation_tags.get(&cell.test).map(String::as_str),
             );
+            if selection.pinned_root {
+                // As for preparations: wait for the whole pinned closure.
+                for tag in &required_builds {
+                    if !deps.iter().any(|dep| dep == tag) {
+                        deps.push((*tag).into());
+                    }
+                }
+            }
             if reads_compat_fixtures {
                 deps.push(VALIDATE_FIXTURE_STEP.into());
             }
@@ -9163,6 +9459,7 @@ fn write_plan_after_scorecard_check(
         green: selection.green,
         probe_disabled: selection.probe_disabled,
         parity_all: selection.parity_all,
+        pinned_root: selection.pinned_root,
         no_retry: selection.no_retry,
         jobs: selection.scheduler_jobs(),
         manifest_guest_cap: selection.manifest_guest_cap(),
@@ -9292,7 +9589,22 @@ fn audit_dag_impl(
                     "{tag} wall timeout {timeout}s does not equal its derived {expected_timeout}s cap"
                 ));
             }
-            let cmd = &step.cmd;
+            // A pinned cell brackets its inner harness command; the
+            // wrapper itself must be the exact pinned form.
+            let cmd_owned;
+            let cmd: &str = if step.cmd.starts_with(PINNED_ROOT_LAUNCHER) {
+                if !step.cmd.contains(" --src . --out ") || !step.cmd.contains(" --src-rw ") {
+                    return Err(format!(
+                        "{tag} lost its pinned-root wrapper form"
+                    ));
+                }
+                cmd_owned = pinned_inner_cmd(&step.cmd).ok_or_else(|| {
+                    format!("{tag} lost its pinned-root inner harness command")
+                })?;
+                &cmd_owned
+            } else {
+                &step.cmd
+            };
             let enabled_selector = cmd.contains("--include-manual");
             let disabled_selector = cmd.contains("--probe-disabled");
             let prepared_input =
@@ -9652,6 +9964,7 @@ fn validate_run_contract_with_resume(
         green: metadata.green,
         probe_disabled: metadata.probe_disabled,
         parity_all: metadata.parity_all,
+        pinned_root: metadata.pinned_root,
         no_retry: metadata.no_retry,
         jobs: Some(metadata.jobs),
         manifest_guest_cap: metadata
@@ -20240,6 +20553,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     let mut canonical_build_dag = dag_from_json(&canonical_build_text)
         .map_err(|e| format!("cannot parse canonical build-dependency fixture: {e}"))?;
     host_build_variant_self_test(&canonical_build_dag)?;
+    pinned_build_variant_self_test(&canonical_build_dag)?;
     canonical_build_dag.steps = host_build_steps(&canonical_build_dag)
         .map_err(|e| format!("current canonical host build variants were refused: {e}"))?;
     let all_required_builds = required_build_tags(None);
@@ -23309,6 +23623,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         green: false,
         probe_disabled: false,
         parity_all: false,
+        pinned_root: false,
         no_retry: false,
         jobs: default_jobs(),
         manifest_guest_cap: DEFAULT_MANIFEST_GUEST_CAP,
