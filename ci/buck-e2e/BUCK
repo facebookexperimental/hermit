@@ -9,7 +9,15 @@
 # file does not list either way. The open-source build's stand-in for that file
 # (shim/hermetic_infra/hermit/fb-only/e2e_cells.bzl) keeps every cell and gives
 # the bundle the inputs ./stage stages from a cargo build.
-load("@fbcode//hermetic_infra/hermit/fb-only:e2e_cells.bzl", "E2E_PLAN", "EXCLUDED_BACKENDS", "KEPT_CATEGORIES", "e2e_bundle_inputs", "kept_cells")
+load(
+    "@fbcode//hermetic_infra/hermit/fb-only:e2e_cells.bzl",
+    "E2E_PLAN",
+    "EXCLUDED_BACKENDS",
+    "KEPT_CATEGORIES",
+    "e2e_bundle_inputs",
+    "kept_cells",
+    "required_host_caps",
+)
 load("@fbcode_macros//build_defs:fbcode_configured_alias.bzl", "fbcode_configured_alias")
 load("@fbcode_macros//build_defs:native_rules.bzl", "buck_genrule")
 load(":defs.bzl", "hermit_e2e_bundle", "hermit_e2e_cells")
@@ -146,4 +154,8 @@ hermit_e2e_cells(
         "schema": E2E_PLAN["schema"],
     },
     re_exclusions = _RE_EXCLUSIONS,
+    # The host capabilities whose absence fails a cell instead of skipping it,
+    # by fb-only/e2e_cells.bzl: fbsource's CI hosts must give the kvm cells
+    # /dev/kvm. The open-source build's stand-in requires none.
+    require_host_caps_for = required_host_caps(),
 )

@@ -100,6 +100,17 @@ def cell_slug(cell):
 def pmu_armed(cell):
     return cell["backend"] in ["ptrace", "liteinst", "in-guest-trap"] and cell["category"] != "compat" and cell_id(cell) not in PMU_FREE_CELLS
 
+# The host capabilities a cell's requires_host_capabilities can name (the harness's
+# HostCapability vocabulary, ci/manifest-plan/src/runner.rs).
+HOST_CAPABILITIES = ["cpuid-faulting", "kvm"]
+
+def _requires_host_caps_here(cell, require_host_caps, require_host_caps_for):
+    """Whether a local cell gets HERMIT_E2E_REQUIRE_HOST_CAPS=1 (hermit_e2e_cells)."""
+    if require_host_caps:
+        return True
+    caps = cell.get("requires_host_capabilities") or []
+    return len(caps) > 0 and len([c for c in caps if c not in require_host_caps_for]) == 0
+
 def _cpuid_on_re_eligible(cell, cpuid_on_re):
     # The in-guest backends refuse the preemption timer and every enabled verify cell
     # runs --max-timeslice=disabled (ci/manifest-plan/src/runner.rs
@@ -259,14 +270,35 @@ hermit_e2e_bundle = rule(
     },
 )
 
-def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh", labels = [], require_host_caps = False):
+def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh", labels = [], require_host_caps = False, require_host_caps_for = []):
     """One hermit_e2e_cell_test per plan cell, plus test suites all / re / local.
 
     `labels` are added to every cell's test, e.g. a consumer's CI scheduling labels.
     `require_host_caps = True` sets HERMIT_E2E_REQUIRE_HOST_CAPS=1 on every local cell:
     a cell the harness withholds as HOST-INAPPLICABLE then fails instead of being
     skipped (cell.sh), for a consumer whose CI hosts must have the capability.
+
+    `require_host_caps_for`, a list of host capabilities (e.g. ["kvm"]), sets it instead
+    only on the local cells that require at least one capability and every one of them
+    in that list. It is a separate keyword so that a defs.bzl without it fails to load
+    rather than reading a list as `require_host_caps = True`.
+
+    cell.sh's flag fails every HOST-INAPPLICABLE verdict of a flagged cell, not only the
+    one for a listed capability: a cell that also needs an unlisted capability keeps
+    its skip, but the harness also withholds a cell its hermit binary refuses on an
+    inexact retired-branch counter (test-harness.rs cell_host_inapplicable_reason,
+    runner.rs refused_on_an_inexact_branch_counter: verify, chaos and replay cells, and
+    custom cells run with --strict, that keep a timeslice on ptrace, e9patch or kvm).
+    requires_host_capabilities never names that counter, so on a host whose counter is
+    inexact a flagged cell fails too.
     """
+    if require_host_caps not in [True, False]:
+        fail("require_host_caps must be True or False; pass a list of host capabilities as require_host_caps_for")
+    if require_host_caps and require_host_caps_for:
+        fail("require_host_caps = True already flags every local cell; drop require_host_caps_for")
+    unknown = [c for c in require_host_caps_for if c not in HOST_CAPABILITIES]
+    if unknown:
+        fail("require_host_caps_for names unknown host capabilities {} (known: {})".format(unknown, HOST_CAPABILITIES))
     routing = read_root_config("hermit_e2e", "routing", "hybrid")
     if routing not in ["hybrid", "local"]:
         fail("-c hermit_e2e.routing must be hybrid or local, got " + routing)
@@ -320,7 +352,7 @@ def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh"
             "HERMIT_E2E_ROUTE": where,
             "HERMIT_E2E_ROUTE_REASON": reason,
         }
-        if require_host_caps and where == "local":
+        if where == "local" and _requires_host_caps_here(cell, require_host_caps, require_host_caps_for):
             env["HERMIT_E2E_REQUIRE_HOST_CAPS"] = "1"
         if nonce:
             env["HERMIT_E2E_NONCE"] = nonce

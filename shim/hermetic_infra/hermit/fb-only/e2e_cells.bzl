@@ -44,6 +44,12 @@ _HERMIT = {
     "staged": ":staged-hermit",
 }
 
+def required_host_caps():
+    """No host capability is required here: a cell whose capability the host
+    lacks is skipped (ci/buck-e2e/BUCK passes this to hermit_e2e_cells as
+    require_host_caps_for). The internal file requires kvm on its CI hosts."""
+    return []
+
 def e2e_bundle_inputs():
     """The inputs of ci/buck-e2e's :bundle, as export_file targets of what
     ci/buck-e2e/stage staged into staged/ (gitignored) from a cargo-built
