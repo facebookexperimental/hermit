@@ -15,14 +15,14 @@
     "sha256": "d313a47a769e91e6d297c5452edf66b9129370f381c25e228385efdb01d60972"
   },
   {
-    "bytes": 2331,
+    "bytes": 2369,
     "path": "assets/elf_metadata.py",
-    "sha256": "c6fe4a6db783ca4af300e5cfbf595e545b17e746cd8594eccbf2ecb7c81215d5"
+    "sha256": "1fee4c7665f2fed7b8442a28b2733fe3327097dfc9c1c8f1003303149e57a3c7"
   },
   {
     "bytes": 11572,
     "path": "assets/final_inspection.py",
-    "sha256": "26a037c4af80f9ade6e7156e2f2adf636dae33d7e64db2e463e55e93bbdb5af9"
+    "sha256": "fab47ec4ec846687d60da5f6f157e5edd94803e75cf31df6383de548d340c6bb"
   },
   {
     "bytes": 2041,
@@ -72,7 +72,7 @@
   {
     "bytes": 92951,
     "path": "prepare.py",
-    "sha256": "702f2f557c2bc0922fab09a303daa345ca90d3f0541af94f31fcc421b5419372"
+    "sha256": "31856cd73c0e295632b3124bd239db742f6d37433aa207ba21a0f639fcf63fb5"
   },
   {
     "bytes": 34384,
@@ -105,6 +105,16 @@
     "sha256": "b41103fa7f60290d5836aa87978d7f8828a798d1025f972510164a1b64cc9b15"
   },
   {
+    "bytes": 2316,
+    "path": "test_elf_metadata.py",
+    "sha256": "02d6743db03b3dbec5f87818f3a0c5536b77f5b7595540de6021aa5e797597ed"
+  },
+  {
+    "bytes": 19889,
+    "path": "test_file_pins.py",
+    "sha256": "564e02fe7f2451350a2341b9de11dd15ddba4a42de933efa455f540e9200a72c"
+  },
+  {
     "bytes": 6580,
     "path": "test_handoff_cohort.py",
     "sha256": "4ab039acec171218ffc78a55d6b0aa8025f51bf42e48d0ae9ddc781c5ba22153"
@@ -125,6 +135,11 @@
     "sha256": "826e766d27b7cc97c0012f279a976e3cdc04e5aee6a20fd481b3bfa5476fc426"
   },
   {
+    "bytes": 3847,
+    "path": "test_zero_native_data.py",
+    "sha256": "048a57f80aed61d25b5f09e2844fcb67b5115181272aeda022b12d0390a57f8b"
+  },
+  {
     "bytes": 14642,
     "path": "view_leaf_controls.rs",
     "sha256": "7ee3656c58f4ad0a07c14c53b7244e4ce3753f66aa23610f200840d8afd3a5e4"
@@ -133,15 +148,5 @@
     "bytes": 9256,
     "path": "view_leaf_protocol.py",
     "sha256": "dc26da7940c5827f367fef9ea0d3f8048096e9cc06f377a10b6416d2cdc55cf9"
-  },
-  {
-    "bytes": 3847,
-    "path": "test_zero_native_data.py",
-    "sha256": "048a57f80aed61d25b5f09e2844fcb67b5115181272aeda022b12d0390a57f8b"
-  },
-  {
-    "bytes": 19889,
-    "path": "test_file_pins.py",
-    "sha256": "564e02fe7f2451350a2341b9de11dd15ddba4a42de933efa455f540e9200a72c"
   }
 ]

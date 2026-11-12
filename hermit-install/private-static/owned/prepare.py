@@ -413,7 +413,7 @@ def files_close(c):
 
 
 LEGACY = ASSETS / 'final_inspection.py'
-LEGACY_SHA = '26a037c4af80f9ade6e7156e2f2adf636dae33d7e64db2e463e55e93bbdb5af9'
+LEGACY_SHA = 'fab47ec4ec846687d60da5f6f157e5edd94803e75cf31df6383de548d340c6bb'
 
 
 def file_fact(path):
@@ -617,7 +617,7 @@ def bind_prepared(c, x):
     c['files'][str(census_objdump)] = census_tool['sha256']
     # Existing diagnostic helpers only; their CLI/main is never invoked here.
     for name, digest in {
-        'elf_metadata.py': 'c6fe4a6db783ca4af300e5cfbf595e545b17e746cd8594eccbf2ecb7c81215d5',
+        'elf_metadata.py': '1fee4c7665f2fed7b8442a28b2733fe3327097dfc9c1c8f1003303149e57a3c7',
         'archive_metadata.py': 'd313a47a769e91e6d297c5452edf66b9129370f381c25e228385efdb01d60972',
         'source_guard.py': 'a8923bcf3c25d22c3eff98f9a6ad02b66cdafa11aed183372f41a32271a88830',
         'native_guard.py': 'd05e3d63b7c914d2e2794d97dbda4a7e94f5c904aa7cdf8515c37c1c0d4bdda5',

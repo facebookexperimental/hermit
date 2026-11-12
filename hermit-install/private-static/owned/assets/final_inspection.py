@@ -11,7 +11,7 @@ B = Path(__file__).resolve().parent
 ROOT='detcore_liteinst_mapped_entry'
 
 
-HELPERS={'elf_metadata.py': 'c6fe4a6db783ca4af300e5cfbf595e545b17e746cd8594eccbf2ecb7c81215d5'}
+HELPERS={'elf_metadata.py': '1fee4c7665f2fed7b8442a28b2733fe3327097dfc9c1c8f1003303149e57a3c7'}
 
 
 def need(ok,why):

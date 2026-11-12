@@ -32,7 +32,7 @@ def elf_headers(path):
             if kind == 1:
                 need(LOW <= vaddr and vaddr + memsz <= HIGH and memsz > 0, 'PT_LOAD outside fixed runtime window')
                 need(not (flags & 1 and flags & 2), 'writable executable PT_LOAD')
-                need(align == 4096 and vaddr % align == offset % align, 'unexpected PT_LOAD alignment')
+                need(4096 <= align <= 65536 and align & (align - 1) == 0 and vaddr % align == offset % align, 'unexpected PT_LOAD alignment')
             segments.append(dict(index=index, type=kind, flags=flags, offset=offset, vaddr=vaddr,
                                  filesz=filesz, memsz=memsz, align=align))
         loads = [s for s in segments if s['type'] == 1]
