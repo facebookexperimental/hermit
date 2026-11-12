@@ -65,8 +65,10 @@ static void write_rounds(void) {
       }
       long long elapsed = monotonic_us() - start;
       completed_sleeps++;
-      if (elapsed < shortest_sleep_us) shortest_sleep_us = elapsed;
-      if (elapsed > longest_sleep_us) longest_sleep_us = elapsed;
+      if (elapsed < shortest_sleep_us) { shortest_sleep_us = elapsed;
+}
+      if (elapsed > longest_sleep_us) { longest_sleep_us = elapsed;
+}
     }
   }
 }
