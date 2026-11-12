@@ -422,6 +422,31 @@ mod tests {
         assert_eq!(short_id(""), "");
     }
 
+    // `hermit oci run` forwards --mount/--bind into the embedded RunOpts,
+    // so image mount composition is shared with `hermit run --image` by
+    // construction, not reimplemented here.
+    #[test]
+    fn oci_run_forwards_mounts_into_run_opts() {
+        let opts = OciOpts::try_parse_from([
+            "oci",
+            "run",
+            "busybox",
+            "--mount=type=tmpfs,target=/scratch",
+            "--bind=/srv:/data:ro",
+            "--",
+            "/bin/true",
+        ])
+        .expect("oci run should parse mounts as run options");
+        match opts.command {
+            OciSubcommand::Run(run) => {
+                assert_eq!(run.run.mount.len(), 1, "the --mount lands in RunOpts");
+                assert_eq!(run.run.bind.len(), 1, "the --bind lands in RunOpts");
+                assert!(run.run.bind[0].readonly, "the :ro spelling is carried");
+            }
+            other => panic!("expected the run subcommand, got {other:?}"),
+        }
+    }
+
     #[test]
     fn human_size_uses_the_decimal_convention_podman_prints() {
         assert_eq!(human_size(0), "0 B");
