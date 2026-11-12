@@ -140,8 +140,8 @@
     "sha256": "048a57f80aed61d25b5f09e2844fcb67b5115181272aeda022b12d0390a57f8b"
   },
   {
-    "bytes": 16935,
+    "bytes": 19889,
     "path": "test_file_pins.py",
-    "sha256": "647e58a38ba951892bf3a5a3cea4c4d966f68c5e8559284432cd308c792f8c4b"
+    "sha256": "0523dca6af46c433d8a1f69895e80c658b7f58d8e8921b38e2480353b75d3821"
   }
 ]

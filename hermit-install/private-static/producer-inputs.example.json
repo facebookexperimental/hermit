@@ -1,0 +1,88 @@
+{
+  "schema": "hermit.private-static-producer-inputs.v1",
+  "heads": {
+    "H": "PLACEHOLDER:40-hex Hermit commit checked out at paths.H",
+    "runtime_R": "PLACEHOLDER:40-hex Reverie commit = the reverie gitlink of heads.H",
+    "tool_R": "PLACEHOLDER:40-hex Reverie commit checked out at paths.tool_R (normally = runtime_R)"
+  },
+  "paths": {
+    "H": "PLACEHOLDER:/abs/canonical/hermit checkout (clean, at heads.H, reverie submodule at runtime_R)",
+    "runtime_R": "PLACEHOLDER:/abs/canonical/reverie checkout at heads.runtime_R (clean)",
+    "tool_R": "PLACEHOLDER:/abs/canonical/reverie checkout at heads.tool_R (clean)",
+    "cargo": "PLACEHOLDER:devbig014 <private July12 musl prefix>/bin/cargo",
+    "rustc": "PLACEHOLDER:devbig014 <private July12 musl prefix>/bin/rustc",
+    "host_cargo": "PLACEHOLDER:/abs/host GNU cargo (executable, != cargo)",
+    "host_rustc": "PLACEHOLDER:/abs/host GNU rustc (executable, != rustc)",
+    "target": "PLACEHOLDER:<paths.H>/target (must already exist)",
+    "cargo_home": "PLACEHOLDER:/abs offline CARGO_HOME with registry/src populated for the locked crates",
+    "runner": "PLACEHOLDER:<paths.H>/hermit-install/private-static/run_pipeline.py",
+    "native_inputs_json": "PLACEHOLDER:devbig014 native-inputs manifest (toolchain prefix/inventory/cargo/rustc/rustdoc digests, host tools)",
+    "inspection_tools_json": "PLACEHOLDER:devbig014 inspection-tools manifest, sha256 must be b5b75a7dbf58d0805bbfcfb8d1fc17e55b1c528a2d2d210d5def39ea559d97a0",
+    "musl_source_archive": "PLACEHOLDER:devbig014 musl 1.2.5 source archive, sha256 must be a9a118bbe84d8764da0ea0d28b3ab3fae8477fc7e4085d90102b8596fc7c75e4",
+    "memcpy_source": "PLACEHOLDER:devbig014 memcpy source file, sha256 must be 790bdd75f7736c83ed7a21f8813b20454ead1ccfc49e806a88692d2a471024eb",
+    "musl_source_authority": "PLACEHOLDER:devbig014 musl source-authority DIRECTORY whose inventory.json has sha256 6aeea4469c8ba49c4c475a6694972e6a1ef3974954c9f986f99d7d1bce926275",
+    "stack_chk_source": "PLACEHOLDER:devbig014 __stack_chk_fail source file, sha256 must be 2ea4d8cf6758daddecf8973913ac196ffa76fdb355cea391ca890aeafdc2ac6c",
+    "optional_std_weak_source": "PLACEHOLDER:devbig014 file, sha256 must be 0f9c4e63d9f15b2486e8c0a9af89c4c2ad88fcad7c1a5127a95d8031e13ec2d3",
+    "optional_std_destructors_source": "PLACEHOLDER:devbig014 file, sha256 must be 5634b13e8faa9ead0e7dac104abf51a990bc14cbc39c5c6bae22a7b70811e2b3",
+    "optional_musl_dl_iterate_source": "PLACEHOLDER:devbig014 file, sha256 must be 802a537924c900ff607b65bda465bf66899890b7b0707c0cd55c7b800db20327"
+  },
+  "digests": {
+    "native_inputs": "PLACEHOLDER:sha256 of paths.native_inputs_json",
+    "inspection_tools": "b5b75a7dbf58d0805bbfcfb8d1fc17e55b1c528a2d2d210d5def39ea559d97a0",
+    "runner": "PLACEHOLDER:sha256 of paths.runner (run_pipeline.py at heads.H)",
+    "initializer_module": "PLACEHOLDER:sha256 of <tool_R>/reverie-liteinst-artifact/src/private_static/selected_initializers.rs",
+    "tls_source_module": "PLACEHOLDER:sha256 of <tool_R>/reverie-liteinst-artifact/src/private_static/tls_sources.rs",
+    "native_leaf_module": "PLACEHOLDER:sha256 of <tool_R>/reverie-liteinst-artifact/src/private_static/selected_initializers/native_leaves.rs",
+    "ordinary_gate_module": "PLACEHOLDER:sha256 of <tool_R>/reverie-liteinst-artifact/src/private_static/selected_initializers/ordinary_gate.rs",
+    "terminal_module": "PLACEHOLDER:sha256 of <tool_R>/reverie-liteinst-artifact/src/private_static/selected_initializers/terminal_observation.rs",
+    "view_site_module": "PLACEHOLDER:sha256 of <tool_R>/reverie-liteinst-artifact/src/private_static/selected_initializers/view_site.rs",
+    "view_table_module": "PLACEHOLDER:sha256 of <tool_R>/reverie-liteinst-artifact/src/private_static/selected_initializers/view_table.rs",
+    "package_roles_module": "PLACEHOLDER:sha256 of <tool_R>/reverie-liteinst-artifact/src/private_static/selected_initializers/package_roles.rs (present ONLY with the source-owned data_roles below)"
+  },
+  "data_roles": {
+    "schema": "hermit.private-static-package-roles.source-owned.v1",
+    "fallback_entry": {
+      "symbol": "fallback_entry",
+      "offset": 0
+    },
+    "completion_syscall": {
+      "symbol": "fallback_entry",
+      "offset": 44
+    },
+    "sites": [
+      {
+        "operation": 1,
+        "number": 158,
+        "owner": {
+          "symbol": "__set_thread_area",
+          "offset": 13,
+          "owner_sha256": "PLACEHOLDER:64-hex owner body sha256 of __set_thread_area"
+        }
+      },
+      {
+        "operation": 2,
+        "number": 218,
+        "owner": {
+          "symbol": "__init_tp",
+          "offset": 44
+        }
+      },
+      {
+        "operation": 3,
+        "number": 7,
+        "owner": {
+          "symbol": "__init_libc",
+          "offset": 302
+        }
+      },
+      {
+        "operation": 4,
+        "number": 2,
+        "owner": {
+          "symbol": "__init_libc",
+          "offset": 388
+        }
+      }
+    ]
+  }
+}

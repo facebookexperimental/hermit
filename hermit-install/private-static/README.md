@@ -87,6 +87,48 @@ a diff stat, and the trap.rs gate-block digests when trap.rs changed. No
 `R ` lines means no reviewed runtime source changed.
 
 
+## Filling the producer-inputs config
+
+`producer-inputs.example.json` is the schema reference: every code-pinned
+digest is filled, every host value is a `PLACEHOLDER:` token.
+`fill_producer_inputs.py` turns real inputs into the filled config. It
+canonicalizes each path, verifies every code-pinned SHA256 the stages check
+(private toolchain inventory and binaries, musl archive and source authority,
+the memcpy/stack_chk/optional sources, the inspection-tools manifest), reads
+`heads.H` from the Hermit checkout and asserts its `reverie` gitlink equals
+`heads.runtime_R`, computes the file and module digests from the tool Reverie
+checkout, and writes only `--out`. It never builds or fetches; the musl 1.2.5
+archive, if absent, is fetched once by the lane through the approved
+read-only route and verified against its pin before filling.
+
+```sh
+python3 H/hermit-install/private-static/fill_producer_inputs.py \
+  --hermit H --runtime-reverie RUNTIME_R --tool-reverie TOOL_R \
+  --private-prefix JULY12_PREFIX --native-inputs-json NATIVE_INPUTS \
+  --inspection-tools-json INSPECTION_TOOLS --musl-archive MUSL_TAR \
+  --musl-authority MUSL_AUTHORITY --memcpy-source MEMCPY \
+  --stack-chk-source STACK_CHK --optional-source-dir OPTIONAL_DIR \
+  --cargo-home CARGO_HOME --host-toolchain HOST_TOOLCHAIN \
+  --owner-sha256 SET_THREAD_AREA_OWNER_SHA256 --out FILLED_CONFIG
+```
+
+Then prepare with the filled config, its independently measured SHA256 and
+the producer-source manifest SHA256, into a fresh evidence name and a fresh
+publication directory:
+
+```sh
+python3 H/hermit-install/private-static/owned/pipeline.py prepare \
+  --config FILLED_CONFIG --config-sha256 CONFIG_SHA \
+  --source-manifest-sha256 SOURCE_MANIFEST_SHA \
+  --evidence-root EVIDENCE --name NAME --publish-directory PUBLISH_DIR
+```
+
+Launch the emitted recipe only with at least 590 GiB free on the `H/target`
+filesystem (the run reserves 24 GiB and stops below its disk floor), and
+return the evidence: published image and descriptor SHA256s,
+`pipeline-result.json`, the filled config and its SHA256, and the H and R
+heads it was filled from.
+
 ## Bounded producer launch
 
 First prepare the current config and pipeline binding using the commands above.

@@ -389,7 +389,7 @@ lint-check-private-static-owned:
 	PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s hermit-install/private-static/owned -p 'test_*.py'
 
 lint-check-private-static-pipeline:
-	PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s hermit-install/private-static -p test_run_pipeline.py
+	PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s hermit-install/private-static -p 'test_*.py'
 
 lint-check-musl-detcore:
 	./ci/check-musl-detcore.sh
