@@ -8585,8 +8585,13 @@ fn pinned_wrap_cmd(root: &Path, results: &Path, cmd: String) -> Result<String, S
     // producers populated: they all run with `--out
     // ignored/hermetic/split`, whose target mounts at `/src/target`.
     let out = root.join("ignored").join("hermetic").join("split");
+    // The dagrun scheduler owns DAGRUN_TEST_COUNTS_PATH /
+    // DAGRUN_ARTIFACT_READY_DIR host-side; requesting them through
+    // --env makes the launcher mount and translate them (an unset name
+    // is skipped), without which the step's structured results are
+    // refused even when the cell itself passed.
     Ok(format!(
-        "{PINNED_ROOT_LAUNCHER} --src . --out {out} --src-rw --cargo-home \"${{CARGO_HOME:-$HOME/.cargo}}\" -- bash -c {inner}",
+        "{PINNED_ROOT_LAUNCHER} --src . --out {out} --src-rw --cargo-home \"${{CARGO_HOME:-$HOME/.cargo}}\" --env DAGRUN_TEST_COUNTS_PATH --env DAGRUN_ARTIFACT_READY_DIR -- bash -c {inner}",
         out = shell_quote(&out.to_string_lossy()),
         inner = shell_quote(&translated),
     ))
@@ -12590,8 +12595,22 @@ fn repeated_summary_line(
 }
 
 fn result_artifact_dir(results: &Path, row: &CellResult) -> Result<PathBuf, String> {
-    let path = PathBuf::from(&row.artifact_dir);
     let retained_root = results.join("runs").join(&row.run_id);
+    // A pinned-root cell records its artifact directory in container
+    // coordinates (/src/.../runs/<run-id>/...). Map it onto the retained
+    // host root by its runs/<run-id> tail; the component checks below
+    // still refuse any tail that escapes the retained root.
+    let path = if row.artifact_dir.starts_with("/src/") {
+        let needle = format!("/runs/{}/", row.run_id);
+        match row.artifact_dir.find(&needle) {
+            Some(index) => {
+                retained_root.join(&row.artifact_dir[index + needle.len()..])
+            }
+            None => PathBuf::from(&row.artifact_dir),
+        }
+    } else {
+        PathBuf::from(&row.artifact_dir)
+    };
     if row.artifact_dir.is_empty()
         || path.components().any(|component| {
             matches!(
