@@ -2442,17 +2442,99 @@ fn cpu_profile_v3_qualification() -> Result<(), String> {
     }
 }
 
-/// Runs a v3 command through `attempt`, which returns its exit code, stdout,
-/// stderr and anything else the caller needs. Returns `Some` when the run
-/// qualified and exited 0, and `None` when it was refused by name on a host that
-/// `hermit host-capabilities --cpu-profile x86-64-v3` also refuses. The
-/// qualification fails closed under transient load, so a refusal on a host
-/// that does qualify gets one more attempt; a second refusal fails the test.
+/// The fixed start of the reason a test records (`record_test_skip`) when
+/// `hermit host-capabilities --cpu-profile x86-64-v3` refuses this host; the
+/// refusal's own reason follows it.
+const V3_SKIP_REASON_PREFIX: &str = "host does not qualify for --cpu-profile x86-64-v3: ";
+
+/// The skip reason for a v3 refusal whose qualification said `reason`: one
+/// trimmed, nonempty line, as the skip-marker parser requires.
+fn v3_skip_reason(reason: &str) -> String {
+    let reason = reason.trim();
+    let reason = if reason.is_empty() {
+        "host-capabilities printed no reason"
+    } else {
+        reason
+    };
+    format!("{V3_SKIP_REASON_PREFIX}{reason}")
+}
+
+/// Runs a v3 command for the test named `test` through `attempt`, which
+/// returns its exit code, stdout, stderr and anything else the caller needs.
+/// Returns `Some` when the run qualified and exited 0. When it was refused by
+/// name on a host that `hermit host-capabilities --cpu-profile x86-64-v3`
+/// also refuses, returns `None` after recording a named runtime skip for
+/// `test` (`record_test_skip`); never a silent pass. The qualification fails
+/// closed under transient load, so a refusal on a host that does qualify gets
+/// one more attempt; a second refusal fails the test.
 ///
 /// With HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1, as a lane on hosts that must
 /// qualify sets it, any refusal fails the test: there an unqualified host is a
-/// failure, never a pass.
+/// failure, never a skip.
 fn v3_run_or_refusal<T>(
+    test: &str,
+    attempt: impl FnMut() -> (Option<i32>, String, String, T),
+) -> Option<(String, String, T)> {
+    v3_run_or_refusal_qualified_by(test, cpu_profile_v3_qualification, attempt)
+}
+
+/// [`v3_run_or_refusal`] with the host's qualification from `qualification`
+/// instead of `hermit host-capabilities`; the refusal policy still comes from
+/// the runner's environment (`V3Refusals::from_env`). The second v3 run of a
+/// test passes [`v3_qualified_a_moment_ago`], and
+/// [`v3_refusals_follow_the_runners_environment`]'s child a refusing host's.
+fn v3_run_or_refusal_qualified_by<T>(
+    test: &str,
+    qualification: impl Fn() -> Result<(), String>,
+    attempt: impl FnMut() -> (Option<i32>, String, String, T),
+) -> Option<(String, String, T)> {
+    v3_run_or_refusal_with(test, &V3Refusals::from_env(), qualification, attempt)
+}
+
+/// The qualification for a v3 run after one in the same test qualified and
+/// passed: a refusal now fails the test, through
+/// `v3_run_or_refusal_qualified_by(.., v3_qualified_a_moment_ago, ..)`, rather
+/// than record a skip after part of the test already ran on a qualifying host.
+fn v3_qualified_a_moment_ago() -> Result<(), String> {
+    v3_still_qualifies(cpu_profile_v3_qualification())
+}
+
+/// [`v3_qualified_a_moment_ago`] given the host's `verdict` now: panics on a
+/// refusal, so that the refusal is never recorded as a skip.
+fn v3_still_qualifies(verdict: Result<(), String>) -> Result<(), String> {
+    if let Err(reason) = verdict {
+        panic!("the host qualified a moment ago, now refuses: {reason}");
+    }
+    Ok(())
+}
+
+/// What a v3 refusal on a host that does not qualify does: fail the test
+/// (`required`), or record a skip, to `skip_file` when there is one.
+struct V3Refusals {
+    required: bool,
+    skip_file: Option<PathBuf>,
+}
+
+impl V3Refusals {
+    /// As the runner asks, by HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 and
+    /// `HERMIT_TEST_SKIP_FILE`. Read once, when a v3 run starts; its attempts
+    /// do not read the variables again.
+    fn from_env() -> Self {
+        Self {
+            required: std::env::var("HERMIT_TEST_REQUIRE_CPU_PROFILE_V3").as_deref() == Ok("1"),
+            skip_file: std::env::var_os("HERMIT_TEST_SKIP_FILE").map(PathBuf::from),
+        }
+    }
+}
+
+/// [`v3_run_or_refusal`] with the refusal policy taken from `refusals` and the
+/// host's qualification from `qualification`, instead of the environment and
+/// `hermit host-capabilities`. The unit tests drive it without touching the
+/// process environment, which libtest's test threads share.
+fn v3_run_or_refusal_with<T>(
+    test: &str,
+    refusals: &V3Refusals,
+    qualification: impl Fn() -> Result<(), String>,
     mut attempt: impl FnMut() -> (Option<i32>, String, String, T),
 ) -> Option<(String, String, T)> {
     for retry in [false, true] {
@@ -2464,14 +2546,19 @@ fn v3_run_or_refusal<T>(
                     log.contains("--cpu-profile x86-64-v3 refused:"),
                     "exit 122 without the profile's refusal:\nstdout:\n{stdout}\nstderr:\n{log}"
                 );
-                let required =
-                    std::env::var("HERMIT_TEST_REQUIRE_CPU_PROFILE_V3").as_deref() == Ok("1");
-                match cpu_profile_v3_qualification() {
-                    Err(reason) if required => panic!(
+                match qualification() {
+                    Err(reason) if refusals.required => panic!(
                         "HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 but the host does not qualify: \
                          {reason}\nstderr:\n{log}"
                     ),
-                    Err(_) => return None,
+                    Err(reason) => {
+                        record_test_skip_to(
+                            refusals.skip_file.as_deref(),
+                            test,
+                            &v3_skip_reason(&reason),
+                        );
+                        return None;
+                    }
                     Ok(()) if !retry => continue,
                     Ok(()) => panic!(
                         "a qualifying host refused v3 twice:\nstdout:\n{stdout}\nstderr:\n{log}"
@@ -6258,8 +6345,15 @@ fn dbt_unavailable(test: &str) -> bool {
 /// processes cannot interleave entries; a longer entry is a programming
 /// error and panics rather than truncate.
 fn record_test_skip(test: &str, reason: &str) {
+    let sidecar = std::env::var_os("HERMIT_TEST_SKIP_FILE").map(PathBuf::from);
+    record_test_skip_to(sidecar.as_deref(), test, reason);
+}
+
+/// [`record_test_skip`] with the sidecar named by `sidecar` instead of
+/// `HERMIT_TEST_SKIP_FILE`.
+fn record_test_skip_to(sidecar: Option<&Path>, test: &str, reason: &str) {
     println!("HERMIT-TEST-SKIP: {test}\t{reason}");
-    let Some(path) = std::env::var_os("HERMIT_TEST_SKIP_FILE") else {
+    let Some(path) = sidecar else {
         return;
     };
     let line = format!("HERMIT-TEST-SKIP: {test}\t{reason}\n");
@@ -6270,7 +6364,7 @@ fn record_test_skip(test: &str, reason: &str) {
     );
     let mut file = std::fs::OpenOptions::new()
         .append(true)
-        .open(&path)
+        .open(path)
         .expect("HERMIT_TEST_SKIP_FILE must name the runner's writable skip sidecar");
     let written = file
         .write(line.as_bytes())
@@ -6301,28 +6395,381 @@ fn kvm_unavailable(test: &str) -> bool {
     true
 }
 
+/// The environment variable that makes [`skip_environment_child`] run, naming
+/// what it does: `record` or `v3`.
+const SKIP_ENVIRONMENT_CHILD: &str = "HERMIT_TEST_SKIP_ENVIRONMENT_CHILD";
+
+/// Runs [`skip_environment_child`] in `mode` in a child of this test binary
+/// whose environment holds `HERMIT_TEST_SKIP_FILE` and
+/// `HERMIT_TEST_REQUIRE_CPU_PROFILE_V3` only as `skip_file` and `require` set
+/// them. The variables reach the child as the runner exports them, without
+/// touching this process's environment, which libtest's test threads share.
+/// Returns the child's exit code, stdout and stderr.
+fn run_skip_environment_child(
+    mode: &str,
+    skip_file: Option<&Path>,
+    require: Option<&str>,
+) -> (Option<i32>, String, String) {
+    let mut child = Command::new(std::env::current_exe().unwrap());
+    child
+        .args([
+            "--exact",
+            "skip_environment_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(SKIP_ENVIRONMENT_CHILD, mode)
+        .env_remove("HERMIT_TEST_SKIP_FILE")
+        .env_remove("HERMIT_TEST_REQUIRE_CPU_PROFILE_V3")
+        .stdin(Stdio::null());
+    if let Some(skip_file) = skip_file {
+        child.env("HERMIT_TEST_SKIP_FILE", skip_file);
+    }
+    if let Some(require) = require {
+        child.env("HERMIT_TEST_REQUIRE_CPU_PROFILE_V3", require);
+    }
+    let output = child.output().unwrap();
+    (output.status.code(), stdout(&output), stderr(&output))
+}
+
+/// The child of [`record_test_skip_appends_one_marker_line_to_the_sidecar`]
+/// and [`v3_refusals_follow_the_runners_environment`]: a no-op unless its
+/// variable names a mode. `record` records the same skip twice through
+/// `record_test_skip`; `v3` prints the refusal policy the environment asks
+/// for and runs a refused v3 attempt under it, through
+/// `v3_run_or_refusal_qualified_by` as `v3_run_or_refusal` does, on a host
+/// that refuses v3.
+#[test]
+fn skip_environment_child() {
+    let Ok(mode) = std::env::var(SKIP_ENVIRONMENT_CHILD) else {
+        return;
+    };
+    match mode.as_str() {
+        "record" => {
+            record_test_skip("run_kvm_example", "no /dev/kvm on this host");
+            record_test_skip("run_kvm_example", "no /dev/kvm on this host");
+        }
+        "v3" => {
+            let refusals = V3Refusals::from_env();
+            // On stderr, where libtest's own `test ... ` line does not run
+            // into them.
+            eprintln!("required={}", refusals.required);
+            eprintln!("skip_file={:?}", refusals.skip_file);
+            let ran = v3_run_or_refusal_qualified_by(
+                "skip_environment_child",
+                || Err(V3_FAKE_REFUSAL.to_owned()),
+                v3_refused_attempt,
+            );
+            assert!(ran.is_none());
+        }
+        other => panic!("{SKIP_ENVIRONMENT_CHILD}={other:?} names no mode"),
+    }
+}
+
+/// `record_test_skip` appends one marker line per call to the sidecar the
+/// runner names in `HERMIT_TEST_SKIP_FILE`, and prints it; without the
+/// variable it only prints.
 #[test]
 fn record_test_skip_appends_one_marker_line_to_the_sidecar() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let sidecar = directory.path().join("skips.txt");
     fs::write(&sidecar, "").unwrap();
-    // SAFETY: Nextest runs each test in a process of its own, and this test
-    // starts no thread before it sets the variable.
-    unsafe {
-        std::env::set_var("HERMIT_TEST_SKIP_FILE", &sidecar);
-    }
-    record_test_skip("run_kvm_example", "no /dev/kvm on this host");
-    record_test_skip("run_kvm_example", "no /dev/kvm on this host");
-    unsafe {
-        std::env::remove_var("HERMIT_TEST_SKIP_FILE");
-    }
+    let marker = "HERMIT-TEST-SKIP: run_kvm_example\tno /dev/kvm on this host\n";
+    let (status, out, err) = run_skip_environment_child("record", Some(&sidecar), None);
+    assert_eq!(status, Some(0), "stdout:\n{out}\nstderr:\n{err}");
     // One line per call, in the exact shape the result parser reads; a
     // duplicate is the parser's refusal to make, not the helper's to hide.
-    assert_eq!(
-        fs::read_to_string(&sidecar).unwrap(),
-        "HERMIT-TEST-SKIP: run_kvm_example\tno /dev/kvm on this host\n\
-         HERMIT-TEST-SKIP: run_kvm_example\tno /dev/kvm on this host\n"
+    assert_eq!(fs::read_to_string(&sidecar).unwrap(), marker.repeat(2));
+    assert_eq!(out.matches(marker).count(), 2, "{out}");
+
+    let (status, out, err) = run_skip_environment_child("record", None, None);
+    assert_eq!(status, Some(0), "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(out.matches(marker).count(), 2, "{out}");
+    assert_eq!(fs::read_to_string(&sidecar).unwrap(), marker.repeat(2));
+}
+
+/// `v3_run_or_refusal` takes its refusal policy from the runner's
+/// environment (`V3Refusals::from_env`, through
+/// `v3_run_or_refusal_qualified_by`, which the child calls with a refusing
+/// host's qualification): a refusal on a host that refuses v3 records one
+/// named skip in `HERMIT_TEST_SKIP_FILE` unless
+/// `HERMIT_TEST_REQUIRE_CPU_PROFILE_V3` is exactly `1`, and then fails the
+/// test and records nothing.
+#[test]
+fn v3_refusals_follow_the_runners_environment() {
+    let marker = format!(
+        "HERMIT-TEST-SKIP: skip_environment_child\t{}\n",
+        v3_skip_reason(V3_FAKE_REFUSAL)
     );
+    for require in [None, Some("0"), Some("1")] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let sidecar = directory.path().join("skips.txt");
+        fs::write(&sidecar, "").unwrap();
+        let (status, out, err) = run_skip_environment_child("v3", Some(&sidecar), require);
+        let context = format!("require {require:?}:\nstdout:\n{out}\nstderr:\n{err}");
+        let required = require == Some("1");
+        assert!(
+            err.lines()
+                .any(|line| line == format!("required={required}")),
+            "{context}"
+        );
+        assert!(
+            err.lines()
+                .any(|line| line == format!("skip_file={:?}", Some(&sidecar))),
+            "{context}"
+        );
+        let skips = fs::read_to_string(&sidecar).unwrap();
+        if required {
+            assert_eq!(status, Some(101), "{context}");
+            assert!(
+                err.contains("HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 but the host does not qualify")
+                    && err.contains(V3_FAKE_REFUSAL),
+                "{context}"
+            );
+            assert_eq!(skips, "", "{context}");
+        } else {
+            assert_eq!(status, Some(0), "{context}");
+            assert_eq!(skips, marker, "{context}");
+        }
+    }
+}
+
+/// The refusal a fake refusing host prints, as `hermit host-capabilities
+/// --cpu-profile x86-64-v3` words it on a Skylake-SP host.
+const V3_FAKE_REFUSAL: &str =
+    "XCR0 0x2ff enables components the XINUSE probe does not cover (it covers 0x2e7)";
+
+/// A v3 run that the profile refuses by name, as `v3_run_or_refusal`'s
+/// `attempt` returns it.
+fn v3_refused_attempt() -> (Option<i32>, String, String, ()) {
+    (
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        String::new(),
+        format!("--cpu-profile x86-64-v3 refused: {V3_FAKE_REFUSAL}\n"),
+        (),
+    )
+}
+
+/// Runs `body` with refusals that fail the test when `require`, and otherwise
+/// record skips to a fresh, empty sidecar of this test's own. Returns `body`'s
+/// panic message, if it panicked, and what the sidecar then holds.
+fn v3_skip_sidecar_after(
+    require: bool,
+    body: impl FnOnce(&V3Refusals),
+) -> (Option<String>, String) {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let sidecar = directory.path().join("skips.txt");
+    fs::write(&sidecar, "").unwrap();
+    let refusals = V3Refusals {
+        required: require,
+        skip_file: Some(sidecar.clone()),
+    };
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&refusals)));
+    let panic = outcome.err().map(|payload| {
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| {
+                payload
+                    .downcast_ref::<&str>()
+                    .map(|text| (*text).to_owned())
+            })
+            .unwrap_or_default()
+    });
+    (panic, fs::read_to_string(&sidecar).unwrap())
+}
+
+/// On a host that refuses v3, a refused run ends the test with one skip
+/// marker naming the test and the qualification's reason, not a silent pass.
+#[test]
+fn v3_refusal_on_a_refusing_host_records_a_named_skip() {
+    let test = "v3_refusal_on_a_refusing_host_records_a_named_skip";
+    let mut attempts = 0;
+    let (panic, skips) = v3_skip_sidecar_after(false, |refusals| {
+        let ran = v3_run_or_refusal_with(
+            test,
+            refusals,
+            || Err(V3_FAKE_REFUSAL.to_owned()),
+            || {
+                attempts += 1;
+                v3_refused_attempt()
+            },
+        );
+        assert!(ran.is_none());
+    });
+    assert_eq!(panic, None);
+    assert_eq!(attempts, 1, "a refusing host is not asked twice");
+    assert_eq!(
+        skips,
+        format!(
+            "HERMIT-TEST-SKIP: {test}\thost does not qualify for --cpu-profile x86-64-v3: \
+             {V3_FAKE_REFUSAL}\n"
+        )
+    );
+}
+
+/// Under HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 a refusing host fails the test
+/// and records no skip that could stand in for the failure.
+#[test]
+fn v3_refusal_under_require_panics_and_records_nothing() {
+    let (panic, skips) = v3_skip_sidecar_after(true, |refusals| {
+        v3_run_or_refusal_with(
+            "v3_refusal_under_require_panics_and_records_nothing",
+            refusals,
+            || Err(V3_FAKE_REFUSAL.to_owned()),
+            v3_refused_attempt,
+        );
+    });
+    let panic = panic.expect("a required v3 profile refused without failing the test");
+    assert!(
+        panic.contains("HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 but the host does not qualify")
+            && panic.contains(V3_FAKE_REFUSAL),
+        "{panic}"
+    );
+    assert_eq!(skips, "");
+}
+
+/// A host that qualifies gets one more attempt after a refusal; a second
+/// refusal fails the test and records no skip.
+#[test]
+fn v3_refusal_on_a_qualifying_host_retries_then_fails() {
+    let mut attempts = 0;
+    let (panic, skips) = v3_skip_sidecar_after(false, |refusals| {
+        v3_run_or_refusal_with(
+            "v3_refusal_on_a_qualifying_host_retries_then_fails",
+            refusals,
+            || Ok(()),
+            || {
+                attempts += 1;
+                v3_refused_attempt()
+            },
+        );
+    });
+    let panic = panic.expect("a qualifying host refused v3 twice without failing the test");
+    assert!(
+        panic.contains("a qualifying host refused v3 twice"),
+        "{panic}"
+    );
+    assert_eq!(attempts, 2);
+    assert_eq!(skips, "");
+}
+
+/// A second v3 run in a test whose first one qualified and passed fails the
+/// test on a refusal (`v3_qualified_a_moment_ago`) and records no skip, even
+/// where a refusing host would otherwise record one.
+#[test]
+fn v3_refusal_after_qualifying_a_moment_ago_fails_and_records_nothing() {
+    let mut attempts = 0;
+    let (panic, skips) = v3_skip_sidecar_after(false, |refusals| {
+        v3_run_or_refusal_with(
+            "v3_refusal_after_qualifying_a_moment_ago_fails_and_records_nothing",
+            refusals,
+            || v3_still_qualifies(Err(V3_FAKE_REFUSAL.to_owned())),
+            || {
+                attempts += 1;
+                v3_refused_attempt()
+            },
+        );
+    });
+    let panic = panic.expect("a host that qualified a moment ago refused without failing");
+    assert!(
+        panic.contains("the host qualified a moment ago, now refuses")
+            && panic.contains(V3_FAKE_REFUSAL),
+        "{panic}"
+    );
+    assert_eq!(attempts, 1);
+    assert_eq!(skips, "");
+}
+
+/// The recorded reason is the fixed prefix and the qualification's reason
+/// trimmed to one nonempty line, so the skip-marker parser accepts it.
+#[test]
+fn v3_skip_reason_is_one_trimmed_nonempty_line() {
+    for (reason, expected) in [
+        (format!("{V3_FAKE_REFUSAL} \n"), V3_FAKE_REFUSAL),
+        (" \t".to_owned(), "host-capabilities printed no reason"),
+    ] {
+        let recorded = v3_skip_reason(&reason);
+        assert_eq!(recorded, format!("{V3_SKIP_REASON_PREFIX}{expected}"));
+        assert_eq!(recorded.trim(), recorded);
+        assert!(!recorded.contains(['\t', '\n']), "{recorded:?}");
+    }
+}
+
+/// A run that exits 0 is returned as it ran, without asking the host to
+/// qualify and without a skip.
+#[test]
+fn v3_run_or_refusal_returns_a_qualified_run() {
+    let (panic, skips) = v3_skip_sidecar_after(false, |refusals| {
+        let ran = v3_run_or_refusal_with(
+            "v3_run_or_refusal_returns_a_qualified_run",
+            refusals,
+            || panic!("a run that exited 0 asked the host to qualify"),
+            || (Some(0), "ran\n".to_owned(), "log\n".to_owned(), 7),
+        );
+        assert_eq!(ran, Some(("ran\n".to_owned(), "log\n".to_owned(), 7)));
+    });
+    assert_eq!(panic, None);
+    assert_eq!(skips, "");
+}
+
+/// A run that neither exits 0 nor is refused by the policy's exit code, here
+/// one that exits 1 and one that was killed, fails the test and records no
+/// skip, even with the refusal's text on stderr and a host that refuses v3.
+#[test]
+fn v3_run_or_refusal_fails_a_run_that_was_not_refused() {
+    // EXIT-CLASS: guest. The fake run's guest exited 1 and hermit forwarded
+    // that status; only the policy refusal's exit code may become a skip.
+    for status in [Some(1), None] {
+        let mut attempts = 0;
+        let (panic, skips) = v3_skip_sidecar_after(false, |refusals| {
+            v3_run_or_refusal_with(
+                "v3_run_or_refusal_fails_a_run_that_was_not_refused",
+                refusals,
+                || Err(V3_FAKE_REFUSAL.to_owned()),
+                || {
+                    attempts += 1;
+                    let (_, stdout, stderr, ()) = v3_refused_attempt();
+                    (status, stdout, stderr, ())
+                },
+            );
+        });
+        let panic = panic.expect("a v3 run that was not refused did not fail the test");
+        assert!(
+            panic.contains(&format!("v3 run exited {status:?}")),
+            "{panic}"
+        );
+        assert_eq!(attempts, 1);
+        assert_eq!(skips, "");
+    }
+}
+
+/// Exit 122 without the profile's refusal on stderr is some other policy
+/// refusal: it fails the test and records no skip, even on a host that
+/// refuses v3.
+#[test]
+fn v3_run_or_refusal_fails_exit_122_without_the_profile_refusal() {
+    let (panic, skips) = v3_skip_sidecar_after(false, |refusals| {
+        v3_run_or_refusal_with(
+            "v3_run_or_refusal_fails_exit_122_without_the_profile_refusal",
+            refusals,
+            || Err(V3_FAKE_REFUSAL.to_owned()),
+            || {
+                (
+                    Some(HERMIT_POLICY_REFUSAL_EXIT),
+                    String::new(),
+                    "some other policy refused this run\n".to_owned(),
+                    (),
+                )
+            },
+        );
+    });
+    let panic = panic.expect("exit 122 without the profile's refusal did not fail the test");
+    assert!(
+        panic.contains("exit 122 without the profile's refusal"),
+        "{panic}"
+    );
+    assert_eq!(skips, "");
 }
 
 /// Every backend that runs Detcore, in the order the cross-backend tests
@@ -53399,18 +53846,16 @@ fn cpu_profile_v3_qualifies_the_host_once_and_reuses_the_verdict() {
         let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
         (output.status.code(), stdout(&output), stderr(&output), ())
     };
-    let Some((_, first, ())) = v3_run_or_refusal(run) else {
-        eprintln!(
-            "cpu_profile_v3_qualifies_the_host_once_and_reuses_the_verdict: SKIPPED: this host does \
-             not qualify for x86-64-v3"
-        );
+    let test = "cpu_profile_v3_qualifies_the_host_once_and_reuses_the_verdict";
+    let Some((_, first, ())) = v3_run_or_refusal(test, run) else {
         return;
     };
     let warning = "WARNING: qualifying this host for --cpu-profile x86-64-v3";
     assert_eq!(first.matches(warning).count(), 1, "{first}");
     let written = std::fs::read(&path).expect("the first v3 run caches its probe");
     let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
-    let (_, second, ()) = v3_run_or_refusal(run).expect("the host qualified a moment ago");
+    let (_, second, ()) = v3_run_or_refusal_qualified_by(test, v3_qualified_a_moment_ago, run)
+        .expect("unreachable: the qualification panics first");
     assert!(
         !second.contains(warning),
         "a cached verdict is not measured again:\n{second}"
@@ -53452,7 +53897,9 @@ fn every_test_command_gets_its_own_cache_directory() {
 #[test]
 fn cpu_profile_v3_cpuinfo_matches_cpuid() {
     let Some((stdout, log, report)) =
-        v3_run_or_refusal(|| cpuinfo_matches_cpuid_run(&[], &["--cpu-profile", "x86-64-v3"]))
+        v3_run_or_refusal("cpu_profile_v3_cpuinfo_matches_cpuid", || {
+            cpuinfo_matches_cpuid_run(&[], &["--cpu-profile", "x86-64-v3"])
+        })
     else {
         return;
     };
@@ -61364,7 +61811,7 @@ fn a_failed_exec_of_a_declaring_image_keeps_its_error() {
 #[test]
 fn a_v3_profile_runs_an_image_declaring_v3() {
     let v3 = isa_fixture("v3-profile-v3", Some(0b111), 0, IsaLink::Static);
-    let ran = v3_run_or_refusal(|| {
+    let ran = v3_run_or_refusal("a_v3_profile_runs_an_image_declaring_v3", || {
         let (status, stdout, stderr) = isa_run(&[
             "run",
             "--cpu-profile",
@@ -61555,10 +62002,10 @@ fn auto_does_not_upgrade_for_a_later_exec() {
 
 /// Runs `image` with `--cpu-profile auto`, which `what` makes resolve to
 /// x86-64-v3, then qualified like an explicit one: it runs where the host
-/// qualifies, and is refused by the qualification's name where it does not
-/// (`v3_run_or_refusal`).
-fn assert_auto_resolves_v3(image: &Path, what: &str) {
-    let ran = v3_run_or_refusal(|| {
+/// qualifies, and is refused by the qualification's name where it does not,
+/// which records a skip for the test named `test` (`v3_run_or_refusal`).
+fn assert_auto_resolves_v3(test: &str, image: &Path, what: &str) {
+    let ran = v3_run_or_refusal(test, || {
         let (status, stdout, stderr) = isa_run(&[
             "--log=debug",
             "run",
@@ -61586,7 +62033,11 @@ fn assert_auto_resolves_v3(image: &Path, what: &str) {
 #[test]
 fn auto_resolves_v3_for_an_image_declaring_it() {
     let v3 = isa_fixture("auto-v3", Some(0b111), 0, IsaLink::Static);
-    assert_auto_resolves_v3(&v3, "the executable ");
+    assert_auto_resolves_v3(
+        "auto_resolves_v3_for_an_image_declaring_it",
+        &v3,
+        "the executable ",
+    );
 }
 
 /// An unmarked image whose program interpreter declares x86-64-v3 resolves
@@ -61595,7 +62046,11 @@ fn auto_resolves_v3_for_an_image_declaring_it() {
 fn auto_resolves_v3_for_an_interpreter_declaring_it() {
     let loader_v3 = isa_fixture("auto-loader-v3", Some(0b111), 0, IsaLink::Interpreter);
     let on_v3 = isa_fixture("auto-on-v3", None, 44, IsaLink::Interpreted(&loader_v3));
-    assert_auto_resolves_v3(&on_v3, "its program interpreter ");
+    assert_auto_resolves_v3(
+        "auto_resolves_v3_for_an_interpreter_declaring_it",
+        &on_v3,
+        "its program interpreter ",
+    );
 }
 
 /// Records `bits`' fixture (`isa_needed.c`, exit 0) as `name` with
@@ -61604,8 +62059,9 @@ fn auto_resolves_v3_for_an_interpreter_declaring_it() {
 /// deriving it again, under any profile its own environment names or none.
 /// A recording claiming auto itself is refused. A v3 recording goes through
 /// `v3_run_or_refusal`: where the host does not qualify, the case ends at the
-/// qualification's named refusal.
-fn assert_auto_recording_replays_as(name: &str, bits: Option<u32>) {
+/// qualification's named refusal, recorded as a skip for the test named
+/// `test`.
+fn assert_auto_recording_replays_as(test: &str, name: &str, bits: Option<u32>) {
     let image = isa_fixture(name, bits, 0, IsaLink::Static);
     let image = image.to_str().unwrap();
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -61624,7 +62080,7 @@ fn assert_auto_recording_replays_as(name: &str, bits: Option<u32>) {
         (status, stdout, stderr, ())
     };
     let expected = if bits.is_some() {
-        if v3_run_or_refusal(record).is_none() {
+        if v3_run_or_refusal(test, record).is_none() {
             return;
         }
         "x86-64-v3"
@@ -61685,14 +62141,22 @@ fn assert_auto_recording_replays_as(name: &str, bits: Option<u32>) {
 /// holds x86-64-v2.
 #[test]
 fn auto_records_v2_for_an_unmarked_image_and_replay_uses_it() {
-    assert_auto_recording_replays_as("auto-record-unmarked", None);
+    assert_auto_recording_replays_as(
+        "auto_records_v2_for_an_unmarked_image_and_replay_uses_it",
+        "auto-record-unmarked",
+        None,
+    );
 }
 
 /// [`assert_auto_recording_replays_as`] for an image declaring x86-64-v3:
 /// the recording holds x86-64-v3.
 #[test]
 fn auto_records_v3_for_an_image_declaring_it_and_replay_uses_it() {
-    assert_auto_recording_replays_as("auto-record-v3", Some(0b111));
+    assert_auto_recording_replays_as(
+        "auto_records_v3_for_an_image_declaring_it_and_replay_uses_it",
+        "auto-record-v3",
+        Some(0b111),
+    );
 }
 
 /// A `--verify-replay-of` half replays the first half's recording under
@@ -61958,7 +62422,10 @@ fn cpu_profile_v3_guest_sees_the_v3_cpu_at_bitwise_parity() {
             (status.and_then(|status| status.code()), stdout, log, report)
         };
         let (stdout, log, report) = if profile == "x86-64-v3" {
-            match v3_run_or_refusal(attempt) {
+            match v3_run_or_refusal(
+                "cpu_profile_v3_guest_sees_the_v3_cpu_at_bitwise_parity",
+                attempt,
+            ) {
                 Some(outcome) => outcome,
                 None => continue,
             }
@@ -62006,7 +62473,8 @@ fn cpu_profile_v3_guest_sees_the_v3_cpu_at_bitwise_parity() {
 #[test]
 fn cpu_profile_v3_lazy_binding_xsave_is_identical_on_the_hashed_stack() {
     let guest = cpuid_profile_v3_lazy_guest().to_str().unwrap().to_owned();
-    let outcome = v3_run_or_refusal(|| {
+    let test = "cpu_profile_v3_lazy_binding_xsave_is_identical_on_the_hashed_stack";
+    let outcome = v3_run_or_refusal(test, || {
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let verdict = directory.path().join("verify.json");
         let (status, log) = run_with_deadline(
@@ -62090,7 +62558,9 @@ fn cpu_profile_v3_host_loader_sees_exactly_x86_64_v3() {
             .expect("failed to read the loader's stdout");
         (status.and_then(|status| status.code()), stdout, log, ())
     };
-    let Some((diagnostics, _, ())) = v3_run_or_refusal(|| run(&["--list-diagnostics"])) else {
+    let test = "cpu_profile_v3_host_loader_sees_exactly_x86_64_v3";
+    let Some((diagnostics, _, ())) = v3_run_or_refusal(test, || run(&["--list-diagnostics"]))
+    else {
         return;
     };
     let value = |key: &str| -> u64 {
@@ -62114,9 +62584,9 @@ fn cpu_profile_v3_host_loader_sees_exactly_x86_64_v3() {
         0,
         "RTM is active:\n{diagnostics}"
     );
-    let Some((help, _, ())) = v3_run_or_refusal(|| run(&["--help"])) else {
-        return;
-    };
+    let (help, _, ()) =
+        v3_run_or_refusal_qualified_by(test, v3_qualified_a_moment_ago, || run(&["--help"]))
+            .expect("unreachable: the qualification panics first");
     assert!(help.contains("x86-64-v3 (supported, searched)"), "{help}");
     assert!(
         help.lines().any(|line| line.trim() == "x86-64-v4"),
@@ -62131,7 +62601,7 @@ fn cpu_profile_v3_host_loader_sees_exactly_x86_64_v3() {
 #[test]
 fn cpu_profile_v3_records_and_replays_the_v3_guest() {
     let guest = cpuid_profile_v3_guest().to_str().unwrap().to_owned();
-    let outcome = v3_run_or_refusal(|| {
+    let outcome = v3_run_or_refusal("cpu_profile_v3_records_and_replays_the_v3_guest", || {
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let data_dir = format!(
             "--data-dir={}",
@@ -62175,7 +62645,8 @@ fn cpu_profile_v3_replay_refuses_a_recording_from_a_different_cpu() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let data = directory.path().join("recording");
     let data_dir = format!("--data-dir={}", data.display());
-    let recorded = v3_run_or_refusal(|| {
+    let test = "cpu_profile_v3_replay_refuses_a_recording_from_a_different_cpu";
+    let recorded = v3_run_or_refusal(test, || {
         let (status, log) = run_with_deadline(
             hermit_command(&[
                 "record",
