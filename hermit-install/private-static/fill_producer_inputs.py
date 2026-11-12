@@ -229,6 +229,8 @@ def legacy_roles(path):
     for owner in owners:
         need(isinstance(owner, dict) and set(owner) == {'symbol', 'offset', 'owner_sha256'}
              and isinstance(owner['symbol'], str) and owner['symbol']
+             and len(owner['symbol']) <= 16384
+             and not any(v in owner['symbol'] for v in ('\0', '\n', '\r'))
              and type(owner['offset']) is int and 0 <= owner['offset'] < 256 * 1024
              and isinstance(owner['owner_sha256'], str)
              and re.fullmatch('[0-9a-f]{64}', owner['owner_sha256']),

@@ -232,6 +232,21 @@ class FillerControls(unittest.TestCase):
         self.assertNotIn('package_roles_module', config['digests'])
         self.assertEqual(len(config['digests']), 10)
 
+    def test_legacy_roles_refuse_unbounded_symbols(self):
+        for symbol in ('bad\nsymbol', 'bad\rsymbol', 'bad\0symbol', 'x' * 16385):
+            with self.subTest(symbol=repr(symbol[:12])):
+                tree = self.tree('legacy-' + str(len(symbol)) + '-' + str(abs(hash(symbol)) % 9999))
+                owner = dict(symbol=symbol, offset=1, owner_sha256='b' * 64)
+                roles = dict(fallback_entry=owner, completion_syscall=owner, sites=[
+                    dict(operation=op, number=num, owner=owner)
+                    for op, num in ((1, 158), (2, 218), (3, 7), (4, 2))])
+                path = tree.write('legacy-roles.json', json.dumps(roles).encode())
+                tree.inputs.legacy_roles = str(path)
+                tree.inputs.owner_sha256 = None
+                with self.assertRaises(RuntimeError) as caught:
+                    tree.fill()
+                self.assertIn('owner', str(caught.exception))
+
     def test_help_and_roles_group(self):
         result = subprocess.run([PYTHON, '-B', str(SCRIPT), '--help'],
                                 env=self.environment, stdout=subprocess.PIPE,
