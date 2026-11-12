@@ -34312,7 +34312,7 @@ mod pressure_planning_tests {
         }
         let mut missing = dag.clone();
         missing.resource_caps.remove(&active);
-        assert!(audit_dag(&missing, 1, 100, &times).is_err());
+        assert!(audit_dag(&missing, 1, 100, &times, false).is_err());
         // A grant no step demands is part of the plan too.
         let unused = format!("{DBT_HOST_TMP_RESOURCE_PREFIX}unused");
         for capacity in [2, 0, -1] {
