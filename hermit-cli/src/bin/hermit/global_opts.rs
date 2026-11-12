@@ -54,9 +54,7 @@ pub(crate) const CONTROLLER_TARGET: &str = "hermit::controller";
 /// recording stores its choice, and `hermit replay` replays in the same network.
 /// `--gdbserver`, and a replay served to gdb, keep the guest's network: the
 /// gdbserver's port is bound in the host's network namespace, where a host gdb
-/// client reaches it. The DBT backend does not apply `--network` yet:
-/// its guest sees the host network
-/// (<https://github.com/rrnewton/hermit/issues/3543>).
+/// client reaches it.
 ///
 /// In record mode, the guest's system call results are saved so that
 /// `hermit replay` can reproduce the execution. Recordings are stored in
@@ -82,9 +80,8 @@ pub struct GlobalOpts {
     /// for the whole invocation, measured before the HERMIT_LOG_MAX_BYTES file
     /// truncation.
     ///
-    /// Not counted: stdout; the guest's own output, including the DETLOG
-    /// records the SaBRe backend writes from inside the guest; hermit messages
-    /// that do not go through tracing, such as error reports, the `--verify`
+    /// Not counted: stdout; the guest's own output; hermit messages that do
+    /// not go through tracing, such as error reports, the `--verify`
     /// comparison and retention report, and everything `log-diff` prints.
     ///
     /// At the crossing hermit drops the write that crossed and every tracing
@@ -103,10 +100,9 @@ pub struct GlobalOpts {
     /// it runs inside hermit's PID namespace, which dies with hermit.
     ///
     /// Refused with exit 122, before any guest starts, where the guest could
-    /// outlive hermit: --backend=dbt; --no-namespace with every backend,
-    /// --gdbserver runs included, and so the trials of `analyze` and `bisect`
-    /// when their run arguments include --no-namespace; and `hermit
-    /// --backend=sabre strace`.
+    /// outlive hermit: --no-namespace with every backend, --gdbserver runs
+    /// included, and so the trials of `analyze` and `bisect` when their run
+    /// arguments include --no-namespace.
     ///
     /// SIZE is a byte count with an optional K/M/G/T suffix in powers of 1024,
     /// e.g. 8G. Omit the flag for no cap.

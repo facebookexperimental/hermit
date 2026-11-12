@@ -10,6 +10,16 @@ Audited revisions:
 - Hermit [`065980ea`](https://github.com/rrnewton/hermit/tree/065980ea661f9d5e84b4fbaa0c69f4a4f69a81a9)
 - Reverie [`37f04b76`](https://github.com/rrnewton/reverie/tree/37f04b7661a4f77955ba2fce7d3c9e8f1886631d)
 
+**Superseded in part by the third-party split (ee51613d1cd, 2026-11-02).**
+`hermit-run` now defines no `dbt`, `sabre`, `e9patch` or `third-party-backends`
+feature: DBT runs from hermit-dynamorio, and SaBRe and e9patch from
+hermit-3rdparty-patching, as extension executables. The features
+`hermit-cli/Cargo.toml` does define are `liteinst`, `native-exec`,
+`native-exec-input-admission`, `exec-stop-launcher`, `loader-rcb-observation`,
+and the test-support features `kvm-execution-tests`, `kvm-native-test-support`
+and `mm-cancellation-test-support`. The rows below for the moved backends
+describe the audited revision only.
+
 The `liteinst` feature rows, the backend matrix, and the release-contract text
 describe the tree after [#3516](https://github.com/rrnewton/hermit/pull/3516),
 which postdates the audited Hermit revision. The cfg occurrence counts in the

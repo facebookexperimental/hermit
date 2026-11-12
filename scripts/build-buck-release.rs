@@ -296,7 +296,7 @@ where
             "missing --dotslash; provide the absolute public DotSlash 0.5.9 path".to_owned()
         })?,
         cargo_binary: cargo_binary.ok_or_else(|| {
-            "missing --cargo-binary; first build Cargo release with third-party-backends and HERMIT_STAMP_GIT_SHA=1".to_owned()
+            "missing --cargo-binary; first build the Cargo release with `HERMIT_STAMP_GIT_SHA=1 cargo build --release --workspace --features hermit-run/liteinst` (docs/BUCK2_OSS.md)".to_owned()
         })?,
         install_bundle: install_bundle.ok_or_else(|| {
             "missing --install-bundle; first build the authoritative hermit-install bundle"

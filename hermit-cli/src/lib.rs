@@ -2429,12 +2429,19 @@ fn liteinst_unavailable_reason() -> Option<String> {
 
 // LiteInst is an experimental backend whose architecture is not settled, so the
 // published crate leaves it out: `reverie-liteinst` (and through it `liteinst2`)
-// is an optional dependency behind the `liteinst` feature, which
-// `third-party-backends` enables for every validation build.
+// is an optional dependency behind the `liteinst` feature, which every
+// validation build enables.
 #[cfg(not(feature = "liteinst"))]
 fn liteinst_unavailable_reason() -> Option<String> {
-    Some("this build was compiled without the liteinst backend: the `liteinst` feature is not enabled; rebuild with `--features liteinst` (or `--features third-party-backends`). This says nothing about whether LiteInst works on this machine -- it has not been checked".to_owned())
+    Some(LITEINST_FEATURE_ABSENT.to_owned())
 }
+
+/// Why `liteinst` and `in-guest-trap` cannot run in a build without the
+/// `liteinst` feature, and the commands that build them from a Hermit
+/// checkout. The published crate cannot enable the feature: its LiteInst
+/// dependencies are not on crates.io.
+#[cfg_attr(feature = "liteinst", allow(dead_code))]
+const LITEINST_FEATURE_ABSENT: &str = "this build was compiled without the liteinst backend: the `liteinst` feature is not enabled; from a Hermit checkout, rebuild with `cargo build --release -p hermit-run --features liteinst`, and build the in-guest runtime that liteinst and in-guest-trap also need with `cargo build --release -p detcore-liteinst`. This says nothing about whether LiteInst works on this machine -- it has not been checked";
 
 #[cfg(feature = "liteinst")]
 fn liteinst_runtime_unavailable_reason() -> Option<String> {
@@ -3524,8 +3531,8 @@ mod kvm_execution_tests;
 /// The other backends still run on the calling thread, which then needs that
 /// stack itself: launching from a thread spawned with 4 MiB
 /// (`std::thread::Builder::stack_size`) is recommended for them, and Rust's
-/// default 2 MiB for a spawned thread or a test is not enough in a debug build
-/// with the `third-party-backends` feature. Optimised builds need much less:
+/// default 2 MiB for a spawned thread or a test may not be enough in a debug
+/// build. Optimised builds need much less:
 /// in the `validate` profile a 512 KiB thread was enough.
 pub fn run(
     command: Command,
@@ -9252,6 +9259,22 @@ mod tests {
                 );
                 assert!(!message.contains("requires root privileges"));
             }
+        }
+    }
+
+    /// The liteinst-unavailable message's command builds this package with
+    /// the feature its `cfg` tests. The message once also offered a feature
+    /// that no package defines.
+    #[test]
+    fn the_liteinst_feature_message_builds_this_package_with_its_feature() {
+        assert!(LITEINST_FEATURE_ABSENT.contains("--features liteinst`"));
+        // Buck does not set CARGO_PKG_NAME; Cargo does.
+        if let Some(package) = option_env!("CARGO_PKG_NAME") {
+            let command = format!("`cargo build --release -p {package} --features liteinst`");
+            assert!(
+                LITEINST_FEATURE_ABSENT.contains(&command),
+                "{LITEINST_FEATURE_ABSENT}"
+            );
         }
     }
 

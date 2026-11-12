@@ -6309,8 +6309,9 @@ fn run_refuses_non_core_backends_at_dispatch() {
 ///
 /// `default = []` in hermit-cli/Cargo.toml, so a plain `cargo test` excludes
 /// DBT and these 18 tests failed on EVERY default build -- not merely on hosts
-/// lacking DynamoRIO. Validate is unaffected: it builds
-/// `--features third-party-backends`, which includes `dbt`.
+/// lacking DynamoRIO. Since the third-party split (ee51613d1cd) hermit-run has
+/// no `dbt` feature at all, so in this repository they always skip; DBT runs
+/// from hermit-dynamorio.
 ///
 /// Setting `HERMIT_REQUIRE_DBT` turns the skip back into a failure, so a CI job
 /// that intends to cover DBT cannot silently stop covering it. That mirrors
@@ -6324,13 +6325,13 @@ fn dbt_unavailable(test: &str) -> bool {
         std::env::var_os("HERMIT_REQUIRE_DBT").is_none(),
         "HERMIT_REQUIRE_DBT is set, but this test binary was built WITHOUT the \
          `dbt` feature, so {test} cannot exercise the backend it claims to cover. \
-         Rebuild with --features dbt (or third-party-backends), or unset \
-         HERMIT_REQUIRE_DBT to allow skipping."
+         hermit-run no longer defines that feature (DBT runs from hermit-dynamorio); \
+         unset HERMIT_REQUIRE_DBT to allow skipping."
     );
     eprintln!(
-        "skipping {test}: built without the `dbt` feature (hermit-cli default = []); \
-         an absent backend is not a product failure. Build with --features dbt or \
-         --features third-party-backends to exercise it."
+        "skipping {test}: built without the `dbt` feature, which hermit-run no longer \
+         defines; an absent backend is not a product failure. DBT runs from \
+         hermit-dynamorio."
     );
     true
 }

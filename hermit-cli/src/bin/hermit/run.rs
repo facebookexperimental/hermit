@@ -1617,9 +1617,9 @@ pub struct RunOpts {
     /// held, default 10 s; past it the run ends with
     /// HERMIT_HB_HOLD_BUDGET_EXCEEDED). A version-2 spec needs the preemption
     /// timer and is refused without it. Both
-    /// kinds are enforced only when the guest runs under the ptrace runtime
-    /// (the default, or `--backend=e9patch`): with `--namespace-only` or
-    /// another backend, the run is refused before the guest starts (exit 122)
+    /// kinds are enforced only when the guest runs on the ptrace backend, the
+    /// default: with `--namespace-only` or another backend, the run is
+    /// refused before the guest starts (exit 122)
     /// rather than run with the ordering ignored. A spec the user must fix
     /// (missing, unreadable, not valid JSON, not a valid program) is refused the
     /// same way; any other failure to read it, such as EIO, is a Hermit failure
@@ -1771,8 +1771,8 @@ pub struct RunOpts {
     /// syscalls already fail closed in ordinary runs. `--no-virtualize-time` is still accepted:
     /// clock syscalls then return host time, so the run is not reproducible; record it with
     /// `hermit record` to reproduce it. `--verify --verify-strict` reports the difference; plain
-    /// `--verify` reports it only when host time reaches the guest's output. On the ptrace and
-    /// e9patch backends, `--strict` also refuses to run when the host's performance counters fail
+    /// `--verify` reports it only when host time reaches the guest's output. On the ptrace
+    /// backend, `--strict` also refuses to run when the host's performance counters fail
     /// Reverie's validation, because the virtual clock counts retired branches and cannot be exact;
     /// with `--max-timeslice=disabled` Detcore uses no branch count, so that run is not refused
     /// (Reverie still sets up, calibrates and incidentally reads the counters, but none of
@@ -2166,7 +2166,7 @@ pub struct RunOpts {
     /// that draw small values run much slower: every timeslice ends with a timer event, and the
     /// ptrace backend steps the guest through the last skid margin of each slice (all of a slice
     /// shorter than the margin, which is 100 to 10000 branches depending on the processor). Needs a
-    /// backend with a PMU timer (ptrace, with or without e9patch preprocessing); elsewhere use
+    /// backend with a PMU timer (ptrace); elsewhere use
     /// `--target-timeslice`. Cannot be combined with a positive `--max-timeslice`, with
     /// `--target-timeslice` or with `--chaos-timeslice-range`. There is nothing to draw with
     /// `--max-timeslice=disabled` or on a host without usable performance counters. A run that
@@ -2266,8 +2266,9 @@ pub struct RunOpts {
     /// "guest_signal":int|null,"first_divergent_scheduler_turn":int|null,
     /// "first_divergent_virtual_nanoseconds":int|null,
     /// "first_divergent_record":int|null,"first_divergent_syscall":int|null}`.
-    /// `dbt_counted_branches` is present only when DBT completed a typed
-    /// whole-process comparison; it is omitted for other backends and no-result.
+    /// `dbt_counted_branches` appears only in a report from an extension
+    /// executable whose backend counts branches (hermit-dynamorio); hermit's
+    /// own backends never write it, and neither does a no-result report.
     /// If a sandbox exits before returning its guest Output, the report instead
     /// records `verdict: "no_result"` and `no_result_reason.kind:
     /// "container_failed"`, with `run: "run1"|"run2"` and the container's
@@ -2305,8 +2306,7 @@ pub struct RunOpts {
     /// `--verify-verbose` and `--no-detlog-io-buffers` choose the comparison
     /// as they do for `--verify`, and both runs must choose the same one. Give
     /// both runs one `--epoch` (or HERMIT_EPOCH): the comparison refuses runs
-    /// whose virtual clocks started at different epochs. On DBT the directory
-    /// also holds DynamoRIO's typed statistics stream. The exit status is the
+    /// whose virtual clocks started at different epochs. The exit status is the
     /// guest's when the run completed.
     #[clap(
         long,
@@ -10648,7 +10648,8 @@ fn strict_help_describes_compatibility_and_opt_outs() {
         "Select the process instrumentation backend",
         "This is a global option",
         "ptrace",
-        "dbt",
+        "liteinst",
+        "in-guest-trap",
         "kvm",
     ] {
         assert!(

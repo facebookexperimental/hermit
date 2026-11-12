@@ -168,9 +168,9 @@ pub struct LogDiffCLIOpts {
     #[clap(long)]
     canonical_info: bool,
 
-    /// Versioned record envelope applied before selecting messages. DBT logs
-    /// must opt into their transport envelope explicitly; the default preserves
-    /// every parsed record.
+    /// Versioned record envelope applied before selecting messages. Logs from
+    /// hermit-dynamorio's backend must opt into their transport envelope
+    /// explicitly; the default preserves every parsed record.
     #[clap(long, value_enum, default_value = "all-records-v1")]
     record_envelope: RecordEnvelopeArg,
 
