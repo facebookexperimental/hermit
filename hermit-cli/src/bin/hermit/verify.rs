@@ -835,6 +835,10 @@ pub struct VerificationOutcome {
     /// report schema (the report carries it as its infrastructure error);
     /// the verification owner reads it to decide on its one pair retry.
     pub host_input_change: Option<hermit::canonical_verdict::InfrastructureError>,
+    /// Pairs discarded before this outcome's pair, each by its proven
+    /// infrastructure error, carried into the report's
+    /// `discarded_attempts` so the rerun leaves a machine-readable trace.
+    pub discarded_attempts: Vec<hermit::canonical_verdict::InfrastructureError>,
     /// Why verification did not reach a verdict. None for a completed match or
     /// divergence; current no-result producers must provide a typed reason.
     pub no_result_reason: Option<NoResultReason>,
@@ -1004,6 +1008,7 @@ pub(crate) fn verification_report(outcome: &VerificationOutcome) -> Verification
         verdict: outcome.verdict,
         no_result_reason: outcome.no_result_reason.clone(),
         infrastructure_error: None,
+        discarded_attempts: outcome.discarded_attempts.clone(),
         comparison: (outcome.verdict != Verdict::NoResult)
             .then(|| comparison_report(&outcome.comparison)),
         compared_log_messages: if outcome.verdict == Verdict::NoResult {
@@ -1118,6 +1123,7 @@ pub fn write_skid_overshoot_verification_json(
         let refused = VerificationOutcome {
             verdict: Verdict::NoResult,
             host_input_change: None,
+            discarded_attempts: Vec::new(),
             no_result_reason: Some(NoResultReason::ComparisonRefused { detail }),
             ..outcome.clone()
         };
@@ -2447,6 +2453,7 @@ fn compare_two_runs_with_unsupported_scan(
         Ok(VerificationOutcome {
             verdict,
             host_input_change: None,
+            discarded_attempts: Vec::new(),
             no_result_reason,
             refused_log_comparison: comparison_refusal_reason,
             guest_status: out2.status,
@@ -2468,6 +2475,7 @@ fn compare_two_runs_with_unsupported_scan(
         Ok(VerificationOutcome {
             verdict: Verdict::Matched,
             host_input_change: None,
+            discarded_attempts: Vec::new(),
             no_result_reason: None,
             refused_log_comparison: None,
             guest_status: out2.status,
@@ -4731,6 +4739,7 @@ mod tests {
         let diverged = VerificationOutcome {
             verdict: Verdict::Diverged,
             host_input_change: None,
+            discarded_attempts: Vec::new(),
             ..canonical
         };
         let text = announce(&diverged);
@@ -5906,6 +5915,7 @@ mod tests {
         let diverged = VerificationOutcome {
             verdict: Verdict::Diverged,
             host_input_change: None,
+            discarded_attempts: Vec::new(),
             no_result_reason: None,
             refused_log_comparison: None,
             guest_status: ExitStatus::Exited(0),
@@ -5968,6 +5978,7 @@ mod tests {
         let not_diverged = VerificationOutcome {
             verdict: Verdict::NoResult,
             host_input_change: None,
+            discarded_attempts: Vec::new(),
             ..named.clone()
         };
         assert_eq!(
@@ -6377,6 +6388,7 @@ pub(super) mod native_branch_policy_tests {
         VerificationOutcome {
             verdict,
             host_input_change: None,
+            discarded_attempts: Vec::new(),
             no_result_reason: (verdict == Verdict::NoResult).then(|| {
                 super::NoResultReason::ComparisonRefused {
                     detail: "fixture comparator refusal".into(),

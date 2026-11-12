@@ -24734,6 +24734,7 @@ backends_disabled:
             verdict: Verdict::Matched,
             no_result_reason: None,
             infrastructure_error: None,
+            discarded_attempts: Vec::new(),
             comparison: Some(crate::canonical_verdict::ComparisonReport {
                 strictness: crate::canonical_verdict::LogCompareStrictness::Canonical,
                 display_name: Some("BitwiseInfoV1".into()),

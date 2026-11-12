@@ -263,6 +263,20 @@ fn a_host_file_replaced_during_run_1_is_named_and_the_pair_is_rerun() {
     );
     assert!(report.verified, "the clean rerun verifies: {stderr}");
     assert!(report.bitwise_parity, "{stderr}");
+    // The discarded pair is recorded in the machine-readable report, so
+    // a JSON-only consumer does not see an ordinary clean pass.
+    assert_eq!(
+        report.discarded_attempts.len(),
+        1,
+        "one discarded pair recorded: {stderr}"
+    );
+    assert!(
+        matches!(
+            report.discarded_attempts[0],
+            hermit::canonical_verdict::InfrastructureError::HostInputChanged { .. }
+        ),
+        "{stderr}"
+    );
     assert_eq!(code, Some(0), "guest status propagates: {stderr}");
 }
 
@@ -313,6 +327,11 @@ fn a_host_file_replaced_in_both_attempts_keeps_the_infrastructure_verdict() {
     );
     assert!(stderr.contains("Failure: nondeterministic."), "{stderr}");
     assert_eq!(
+        report.discarded_attempts.len(),
+        1,
+        "the first discarded pair is recorded beside the final verdict: {stderr}"
+    );
+    assert_eq!(
         code,
         Some(hermit::HERMIT_VERIFICATION_DIVERGENCE_EXIT),
         "{stderr}"
@@ -336,7 +355,9 @@ fn a_divergence_with_no_host_file_change_names_no_host_input_change() {
         "{stderr}"
     );
     assert_eq!(report.infrastructure_error, None, "{stderr}");
+    assert!(report.discarded_attempts.is_empty(), "{stderr}");
     assert!(!stderr.contains("HERMIT_HOST_INPUT_CHANGED"), "{stderr}");
+    assert!(!stderr.contains("rerunning the pair"), "{stderr}");
 }
 
 /// The counterexample a pattern alone cannot refuse: the guest replaces `F`
@@ -358,7 +379,9 @@ fn a_guest_that_replaces_a_file_after_diverging_names_no_host_input_change() {
         "{stderr}"
     );
     assert_eq!(report.infrastructure_error, None, "{stderr}");
+    assert!(report.discarded_attempts.is_empty(), "{stderr}");
     assert!(!stderr.contains("HERMIT_HOST_INPUT_CHANGED"), "{stderr}");
+    assert!(!stderr.contains("rerunning the pair"), "{stderr}");
 }
 
 /// The counterexample a log prefix cannot refuse: the guest replaces `F` with
@@ -522,7 +545,9 @@ fn under_passthru_opt_an_unobserved_rebinding_names_no_host_input_change() {
         "{stderr}"
     );
     assert_eq!(report.infrastructure_error, None, "{stderr}");
+    assert!(report.discarded_attempts.is_empty(), "{stderr}");
     assert!(!stderr.contains("HERMIT_HOST_INPUT_CHANGED"), "{stderr}");
+    assert!(!stderr.contains("rerunning the pair"), "{stderr}");
     assert!(
         stderr.contains("HERMIT_HOST_INPUT_CHANGE_UNATTRIBUTED")
             && stderr.contains("--passthru-opt"),
@@ -547,7 +572,9 @@ fn under_passthru_opt_a_host_replacement_is_reported_but_not_named() {
         "{stderr}"
     );
     assert_eq!(report.infrastructure_error, None, "{stderr}");
+    assert!(report.discarded_attempts.is_empty(), "{stderr}");
     assert!(!stderr.contains("HERMIT_HOST_INPUT_CHANGED"), "{stderr}");
+    assert!(!stderr.contains("rerunning the pair"), "{stderr}");
     let unattributed = stderr
         .lines()
         .find(|line| line.starts_with("HERMIT_HOST_INPUT_CHANGE_UNATTRIBUTED"))

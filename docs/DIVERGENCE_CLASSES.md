@@ -134,12 +134,13 @@ Then the report's verdict is `infrastructure_error` with
 both identities. The comparison and the divergence position are kept, stderr
 carries a `HERMIT_HOST_INPUT_CHANGED` line, and the run still exits 1.
 `hermit run --verify` itself then reruns the pair once (announced on
-stderr); the published report and exit status are the second attempt's, so
-a single replacement no longer fails the invocation, while a change in
-both attempts keeps the infrastructure verdict above. The validation
-harness's own one-rerun policy for such a cell is a second, independent
-layer. The row stays its own type, an infrastructure ERROR, and is never counted as a
-pass.
+stderr); the published report and exit status are the second attempt's,
+with the discarded pair recorded in the report's `discarded_attempts`,
+so a single replacement no longer fails the invocation, while a change
+in both attempts keeps the infrastructure verdict above. The
+validation harness's own one-rerun policy for such a cell is a second,
+independent layer. The row stays its own type, an infrastructure
+ERROR, and is never counted as a pass.
 
 Each open is reported to Detcore's global state with an observation request
 that carries no logical time and is answered before any clock or scheduler

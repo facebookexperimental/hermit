@@ -22882,6 +22882,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                     verdict: canonical_verdict::Verdict::Matched,
                     no_result_reason: None,
                     infrastructure_error: None,
+                    discarded_attempts: Vec::new(),
                     // `Some`: this fixture is a REACHED verdict (verified,
                     // bitwise_parity, "matched"). `None` is reserved for the
                     // documented producer no-result state.
@@ -23828,6 +23829,7 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                 },
                 no_result_reason: None,
                 infrastructure_error: None,
+                discarded_attempts: Vec::new(),
                 comparison: Some(canonical_verdict::ComparisonReport {
                     strictness: canonical_verdict::LogCompareStrictness::Canonical,
                     display_name: Some("BitwiseInfoV1".into()),

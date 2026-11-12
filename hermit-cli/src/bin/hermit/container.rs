@@ -572,14 +572,23 @@ impl MountInfoRootSource {
             if (source_metadata.dev(), source_metadata.ino())
                 != (target_metadata.dev(), target_metadata.ino())
             {
-                // Typed: the host replaced the file under the completed
-                // mount during setup (its rename detached the bind), so
-                // the launcher may retry setup with a fresh snapshot.
-                return Err(Error::new(hermit::SetupDetached).context(format!(
+                let message = format!(
                     "Refusing mountinfo provenance for {}: the completed mount target does not match \
                      the pinned Hermit-owned source",
                     self.target.display()
-                )));
+                );
+                // Typed only for the frozen-file binds, where the host
+                // replacing the file under the completed mount during
+                // setup (its rename detaching the bind) is the proven
+                // cause and a setup retry can recover. A mismatch at a
+                // directory root (private /tmp, nscd) has no such proven
+                // cause, so it stays an ordinary, unretryable refusal.
+                if self.target.as_path() == Path::new(GROUP_FILE)
+                    || self.target.as_path() == Path::new(LD_SO_CACHE)
+                {
+                    return Err(Error::new(hermit::SetupDetached).context(message));
+                }
+                return Err(Error::msg(message));
             }
         }
         let raw_mount_id = mount_id_for_fd(target.as_raw_fd()).with_context(|| {

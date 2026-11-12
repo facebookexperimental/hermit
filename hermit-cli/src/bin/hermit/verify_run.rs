@@ -610,6 +610,7 @@ fn compare_with_application(
                 passthru_opt: record1.passthru_opt,
                 // A `--verify-run` record does not say.
                 rewrite_exclusives: None,
+                discarded_attempts: Vec::new(),
             },
             CompletedVerificationRun {
                 output: &out1,
