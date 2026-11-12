@@ -24,6 +24,8 @@ const WORKFLOW: &str = ".github/workflows/docs.yml";
 const RELEASE_PINS: &str = ".github/compatibility-site-releases.json";
 const PUBLISHER: &str = ".github/scripts/publish-compatibility-site.py";
 const LANDING_PAGE: &str = "docs/site/index.html";
+/// The custom domain every gh-pages deploy writes as its CNAME file.
+const PAGES_CNAME: &str = "cname: hermetic-infra.org";
 const PUBLICATION_STEP: &str = "Add reviewed compatibility website";
 const BUILDER_CHECKOUT_STEP: &str = "Check out reviewed website builder";
 const SERVED_REGISTRY_QUERY: &str = "if jq -e 'any(.[]; .name == \"releases.json\" and .type == \"file\")' \"$scratch/served.json\" >/dev/null; then";
@@ -525,6 +527,9 @@ fn validate_contract(workflow: &str, landing: &str) -> Result<(), Vec<String>> {
         workflow,
         "force_orphan: true",
     );
+    // force_orphan rewrites gh-pages from scratch, so every deploy must write
+    // the custom domain's CNAME file or GitHub Pages drops hermetic-infra.org.
+    require_once(&mut errors, "deployment step", workflow, PAGES_CNAME);
     if errors.is_empty() {
         Ok(())
     } else {
@@ -1372,6 +1377,13 @@ with tempfile.TemporaryDirectory(prefix="docs-pages-black-box-", dir="/tmp") as 
             assert_ne!(changed, rebuild, "mutation did not apply: {diagnostic}");
             assert_rejected(&mutate(&changed), &landing, diagnostic);
         }
+    }
+
+    #[test]
+    fn every_deploy_must_write_the_custom_domain() {
+        let (workflow, landing) = actual();
+        assert_rejected(&workflow.replacen(PAGES_CNAME, "", 1), &landing, PAGES_CNAME);
+        assert_rejected(&format!("{workflow}\n# {PAGES_CNAME}\n"), &landing, PAGES_CNAME);
     }
 
     #[test]

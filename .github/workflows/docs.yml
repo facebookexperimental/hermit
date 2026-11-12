@@ -1,8 +1,8 @@
 name: Docs
 
 # Build the rustdoc API documentation for the workspace and publish it to the
-# `gh-pages` branch, which GitHub Pages serves at
-# https://rrnewton.github.io/hermit/. The workspace rustdoc remains available
+# `gh-pages` branch, which GitHub Pages serves at https://hermetic-infra.org/
+# (https://rrnewton.github.io/hermit/ redirects there). The workspace rustdoc remains available
 # below the landing page at `hermit/index.html`.
 
 on:
@@ -684,6 +684,11 @@ jobs:
         publish_dir: ./target/doc
         # Overwrite the branch each run instead of accumulating history.
         force_orphan: true
+        # force_orphan rewrites gh-pages from scratch, so the custom domain's
+        # CNAME file must be written by every deploy: without it GitHub Pages
+        # drops hermetic-infra.org (the crates.io homepage of every Hermit
+        # crate) and leaves the domain unclaimed (dev-hermit dh-0393py).
+        cname: hermetic-infra.org
     - name: Verify the rebuilt website at ordinary public URLs
       if: github.event_name == 'schedule' || inputs.rebuild_compatibility
       timeout-minutes: 11
