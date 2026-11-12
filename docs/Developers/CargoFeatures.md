@@ -38,7 +38,7 @@ and executable are both named `hermit`) and are declared in
 | `sabre` | Off | SaBRe runtime availability and its enabled-path test. The external loader and plugin are staged separately. |
 | `e9patch` | Off | e9patch runtime availability. The preprocessing module remains compiled because it shares parser and instruction-map machinery with core code. |
 | `liteinst` | Off | Optional `reverie-liteinst` dependency plus LiteInst dispatch and availability; a build without it refuses `--backend=liteinst`. |
-| `third-party-backends` | Off | Aggregate enabling `dbt`, `sabre`, `e9patch`, and `liteinst`; it has no direct source cfg. |
+| `third-party-backends` | Removed | Before its removal, an aggregate enabling `dbt`, `sabre`, `e9patch`, and `liteinst`, with no direct source cfg. `hermit-run` no longer defines it. |
 
 The workspace's
 [`default-members`](https://github.com/rrnewton/hermit/blob/065980ea661f9d5e84b4fbaa0c69f4a4f69a81a9/Cargo.toml)
@@ -73,10 +73,11 @@ the repeated name is intentional rather than a shared feature.
 | `e9patch` | No | `e9patch` | Staged `e9tool` and `e9patch`; execution remains ptrace-backed preprocessing rather than a separate Detcore runtime. |
 
 The intended split is a core Cargo release containing ptrace and KVM, and a
-developer build that explicitly enables and stages all third-party
-backends. Plain `make` is that all-backend developer build
-(`-p hermit-run --features third-party-backends`), and `make release-core` stays
-feature-free.
+developer build that enables the optional first-party backend. Plain `make`
+(`make build`) is that developer build (`-p hermit-run --features liteinst`),
+and `make release-core` stays feature-free. DBT, SaBRe and e9patch are no
+longer `hermit-run` features; they run as extension executables (see the note
+at the top).
 
 This matches the release plan only if "single static core binary" means one
 Hermit executable with no third-party backend features. It is not currently a
@@ -104,10 +105,10 @@ the largest groups are
 and
 [`safeptrace/src`](https://github.com/rrnewton/reverie/tree/37f04b7661a4f77955ba2fce7d3c9e8f1886631d/safeptrace/src).
 
-Each Hermit leaf feature, the empty feature set, and the aggregate compile
-independently. `third-party-backends` is deliberately only a manifest aggregate;
-adding direct cfg uses of the aggregate would make individual leaf builds
-behave differently.
+At the audited revision, each Hermit leaf feature, the empty feature set, and
+the `third-party-backends` aggregate compiled independently, and the aggregate
+was deliberately manifest-only. `hermit-run` no longer defines the aggregate
+(see the note at the top).
 
 ## Recommendations
 
@@ -117,8 +118,9 @@ behave differently.
    build plus its runtime package or an embedded runtime.
 2. Keep `hermit`'s Cargo `default` feature set empty. Express the all-backend
    developer policy in `make`, not by changing the published crate defaults.
-3. Keep both no-feature and `third-party-backends` builds in CI. Also retain
-   independent leaf-feature checks so accidental coupling is detected.
+3. Keep both no-feature and `liteinst` builds in CI; the validation DAG builds
+   `-p hermit-run --features liteinst`. Also retain independent leaf-feature
+   checks so accidental coupling is detected.
 4. Continue setting `default-features = false` on Hermit's `reverie-dbt` and
    `reverie-liteinst` dependencies; Hermit supplies the Detcore DBT runtime and
    controls LiteInst activation itself.
