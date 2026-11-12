@@ -1009,9 +1009,8 @@ pub struct Config {
     /// Recorded schedules store the value and the seed, and a replay under others is refused.
     /// Not spread: poll, epoll and select timeouts, signal timers, and waits with no finite
     /// future deadline. Needs `--chaos`, or a replay of preemptions recorded with it, threads
-    /// sequentialized by Detcore's scheduler, and the ptrace backend (or e9patch preprocessing,
-    /// which runs on it); must be finite, above 1 and at most 1000
-    /// (`MAX_CHAOS_TIMED_WAIT_SPREAD`). Unset (the default), nothing changes.
+    /// sequentialized by Detcore's scheduler, and the ptrace backend; must be finite, above 1
+    /// and at most 1000 (`MAX_CHAOS_TIMED_WAIT_SPREAD`). Unset (the default), nothing changes.
     /// Its sleeps are registered at the first scheduler pass by default
     /// (`--sleep-registration=first-pass`), so a schedule replay draws each wake time from the
     /// committed time the recording drew it from; `--replay-schedule-from` refuses a record of
@@ -1319,9 +1318,8 @@ pub struct Config {
     /// a gdbserver, Detcore also takes no reports of the guest's signal-handler
     /// returns, so a multithreaded guest whose handlers take scheduler turns can
     /// be scheduled differently than without one (docs/SIGNAL_STATE_CHECK.md).
-    /// Only the ptrace backend (the default, and `--backend=e9patch`, whose
-    /// rewritten guest runs under it) serves gdb: `--backend=kvm`, `dbt`,
-    /// `sabre`, `liteinst` and `in-guest-trap`, and `--namespace-only`, refuse
+    /// Only the ptrace backend, the default, serves gdb: `--backend=kvm`,
+    /// `liteinst` and `in-guest-trap`, and `--namespace-only`, refuse
     /// `--gdbserver` and `--dap-listen`.
     #[clap(long)]
     pub gdbserver: bool,
@@ -1392,8 +1390,7 @@ pub struct Config {
     /// from their chaos PRNG, which can put a woken thread in a lower band; and a random
     /// `--sched-heuristic` does not select first in, first out. In those cases a woken thread is not
     /// guaranteed to run first. Applies to the precise futex mode while threads are sequentialized,
-    /// on the ptrace backend (including e9patch preprocessing, which runs on it); replay applies it
-    /// as the recorded run did.
+    /// on the ptrace backend; replay applies it as the recorded run did.
     #[serde(default)]
     #[clap(long)]
     pub futex_wake_yields: bool,
@@ -1417,7 +1414,7 @@ pub struct Config {
     /// readies nothing; and an end reopened by path (`/proc/self/fd/N`, as `/dev/fd/N` process
     /// substitution does) is a channel of its own, so the other side's actions do not ready it. Recorded
     /// schedules store the value, and a replay under another value is refused. Refused without
-    /// sequentialized threads, on the DBT, KVM and LiteInst backends, with `--namespace-only`,
+    /// sequentialized threads, on the KVM, liteinst and in-guest-trap backends, with `--namespace-only`,
     /// `--strace-only` or `--debug-externalize-sockets`, and
     /// under a `--sched-heuristic` that does not select by priority; never applied in record mode.
     #[serde(default)]
@@ -1447,7 +1444,7 @@ pub struct Config {
     /// priority wakes later. Unset, `when-chosen` under `--chaos` or a `--sched-heuristic` that
     /// does not select by priority, where those late wakes are what real sleep-ordered races
     /// depend on, and on a backend whose sleepers' signal mask and dispositions the scheduler
-    /// does not read (DBT, SaBRe and LiteInst without the in-guest delivery gate, KVM), and
+    /// does not read (liteinst and in-guest-trap without the in-guest delivery gate), and
     /// `first-pass` otherwise, and always under `--chaos-timed-wait-spread`, whose wake times a
     /// schedule replay can then reproduce. On such a backend a sleep parked at the first pass
     /// would be ended by any signal the scheduler sends it, including one Linux ignores or the
@@ -1513,8 +1510,7 @@ pub struct Config {
     /// under the other is refused.
     /// Refused where no timeslice ends by expiry (`--max-timeslice=disabled` without
     /// `--target-timeslice`) or no Detcore scheduler orders the threads (`--namespace-only`,
-    /// `--strace-only`, `--no-sequentialize-threads`), and with the DBT backend; never applied
-    /// in record mode.
+    /// `--strace-only`, `--no-sequentialize-threads`); never applied in record mode.
     #[serde(default)]
     #[clap(long)]
     pub cap_preemption_charge: bool,
@@ -1545,8 +1541,8 @@ pub struct Config {
     /// the bound fired. On the kvm backend the run exits 124 without a summary, and `--verify`
     /// with the bound is refused there. Needs sequentialized threads and virtual time: refused
     /// with `--no-sequentialize-threads`, `--namespace-only`, `--strace-only` or
-    /// `--no-virtualize-time`, and on the dbt, liteinst, in-guest-trap and sabre backends, where
-    /// it has not been qualified. Also refused before guest or debugger startup with
+    /// `--no-virtualize-time`, and on the liteinst and in-guest-trap backends, where it has not
+    /// been qualified. Also refused before guest or debugger startup with
     /// `--gdbserver` or `--dap-listen`: a debugger can suppress a fatal signal after Detcore
     /// marks its process doomed, leaving a survivor outside the bound. Remove the debugger
     /// option or the virtual bound, or use `--timeout` for a wall-clock bound instead.
@@ -1714,7 +1710,7 @@ pub struct Config {
     /// (`[anon:<name>]`) counts as anonymous. `--detlog-anon=pages` adds a short digest for each
     /// 4 KiB page that is not all zero, to find the page where two runs part.
     ///
-    /// ptrace backend only (also with e9patch preprocessing): the mappings come from the guest
+    /// ptrace backend only: the mappings come from the guest
     /// task's own `/proc/<tid>/maps`, which an in-guest tool shares and a VMM's does not hold.
     /// Other backends refuse the flag. EXPENSIVE: every byte of every such mapping is read at
     /// every syscall, in 1 MiB pieces, so a guest with a large heap pays for its whole size each

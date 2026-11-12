@@ -15940,7 +15940,7 @@ fn first_dependency_cycle(steps: &[Step]) -> Option<Vec<String>> {
 fn build_release_hermit_node(gate: &str, bin: &str) -> dagrun::model::Step {
     let default = bin.ends_with("target/release/hermit");
     let cmd = if default {
-        "cargo build --release -p hermit-run --features third-party-backends".to_string()
+        "cargo build --release -p hermit-run --features liteinst".to_string()
     } else {
         // A caller-supplied binary is reused rather than rebuilt, but it must
         // exist: silently proceeding with a missing binary would fail every row

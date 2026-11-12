@@ -319,13 +319,10 @@ pub struct StartOpts {
     /// "all_records_v1","strip_lines":bool,
     /// "canonicalize_addresses":bool,"full_trace":bool,"exact_remainder":bool,
     /// "stripped_prefixes":[str],"canonicalizations":[str],"ignore_lines":bool,
-    /// "skip_commit":bool,"skip_detlog":bool},"dbt_counted_branches":
-    /// {"left":int,"right":int},"guest_exit_code":int|null,
+    /// "skip_commit":bool,"skip_detlog":bool},"guest_exit_code":int|null,
     /// "guest_signal":int|null,"first_divergent_scheduler_turn":int|null,
     /// "first_divergent_virtual_nanoseconds":int|null,
     /// "first_divergent_record":int|null,"first_divergent_syscall":int|null}`.
-    /// `dbt_counted_branches` is present only when DBT completed a typed
-    /// whole-process comparison; it is omitted for other backends and no-result.
     /// ALL FOUR divergence coordinates are emitted, and they are four
     /// DIFFERENT KEYSPACES that must never be compared across axes: one real
     /// divergence was record 7495, syscall 1074, scheduler turn 196 -- three

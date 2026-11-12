@@ -2587,6 +2587,49 @@ mod tests {
         }
     }
 
+    /// No help page names a backend that `--backend` rejects. DynamoRIO's
+    /// DBT, SaBRe and e9patch left the core and run as extension executables,
+    /// and the help went on naming them. Every word that is one of their
+    /// names fails here, and so does every `--backend` value the parser would
+    /// refuse. A longer identifier that contains a name, such as the report
+    /// field `dbt_counted_branches` or the project `hermit-dynamorio`, is not
+    /// a backend's name.
+    #[test]
+    fn no_help_page_names_a_backend_that_backend_rejects() {
+        use clap::ValueEnum;
+
+        fn pages(command: &mut clap::Command, path: String, out: &mut Vec<(String, String)>) {
+            out.push((path.clone(), command.render_long_help().to_string()));
+            for subcommand in command.get_subcommands_mut() {
+                let path = format!("{path} {}", subcommand.get_name());
+                pages(subcommand, path, out);
+            }
+        }
+        let mut command = command_without_epoch_env();
+        command.build();
+        let mut out = Vec::new();
+        pages(&mut command, "hermit".to_owned(), &mut out);
+        assert!(out.len() > 16, "only {} help pages", out.len());
+
+        let removed = ["dbt", "dynamorio", "e9patch", "sabre"];
+        let value = regex::Regex::new(r"--backend[= ]`?([A-Za-z0-9_-]+)").unwrap();
+        for (page, help) in &out {
+            for word in help.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-')) {
+                assert!(
+                    !removed.contains(&word.to_ascii_lowercase().as_str()),
+                    "`{page} --help` names {word:?}, which is not a backend of this build:\n{help}"
+                );
+            }
+            for found in value.captures_iter(help) {
+                assert!(
+                    hermit::Backend::from_str(&found[1], false).is_ok(),
+                    "`{page} --help` names --backend={}, which --backend rejects:\n{help}",
+                    &found[1]
+                );
+            }
+        }
+    }
+
     #[test]
     fn top_level_help_states_what_the_defaults_actually_are() {
         let mut command = command_without_epoch_env();
@@ -2618,7 +2661,6 @@ mod tests {
             "A recording stores its choice",
             "`--gdbserver`, and a replay served to gdb, keep the guest's network",
             "bound in the host's network namespace",
-            "The DBT backend does not apply `--network` yet",
             "`$XDG_CACHE_HOME/hermit`, which is `~/.cache/hermit`",
             "`--data-dir` or `HERMIT_DATA_DIR`",
         ] {
