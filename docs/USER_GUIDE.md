@@ -1687,10 +1687,18 @@ outside `/tmp`, or expose only the required path:
 hermit run --bind=/host/path:/guest-name -- /tmp/guest-name
 ```
 
-`--bind=SOURCE` exposes a host path under guest `/tmp` with its name preserved;
-`--bind=SOURCE:TARGET` selects the target under guest `/tmp` or the guest's
-private `/dev/shm` (below). For general mount targets, use Docker-style
-`--mount` syntax. Mount sources must exist before Hermit starts.
+`--bind` is Docker's `-v` spelling, shorthand for `--mount type=bind` at any
+guest target: `--bind=SOURCE` preserves the path, `--bind=SOURCE:TARGET`
+selects the target, and a trailing `:ro` makes the bind read-only (`:rw`
+spells the default). Mount sources must exist before Hermit starts. In host
+mode a target must exist too, except one under guest `/tmp` (created in the
+private `/tmp`), one under an earlier `--mount` or `--bind` of the same run,
+and — for `--bind` only — `/dev/shm` itself or, when the guest's `/dev/shm`
+is Hermit's private one, a target below it. With `--image`, targets are
+paths inside the image rootfs instead. An invalid bind is an
+error; Hermit never warns and silently skips a mount it was asked for. For
+input binds under `--verify`, prefer `:ro`: a writable bind is shared by the
+two runs, so the first run's writes are the second run's inputs.
 
 `--tmp=DIR` uses a chosen host directory as guest `/tmp`. `--tmp=/tmp` exposes
 the real host `/tmp`, which is convenient for diagnosis but weakens isolation
@@ -1713,7 +1721,7 @@ one from host `/tmp` when `TMPDIR` or `--tmp` keeps the private `/tmp` in the
 host's `/dev/shm` (it is then bound first). `--bind
 /dev/shm` keeps the host's `/dev/shm` for a guest that talks to host processes
 through it, `--bind DIR:/dev/shm` uses host directory `DIR` instead, and a
-`--mount` at `/dev/shm` (or at `/dev`) replaces it. A `--no-namespace` run uses
+`--mount` or `--bind` at `/dev/shm`, `/dev` or `/` replaces it. A `--no-namespace` run uses
 the host's `/dev/shm`, an `--image` run has none, and `hermit replay` does not
 make one, as it answers the guest's calls from the recording.
 
@@ -1727,7 +1735,7 @@ still list, create, open and remove POSIX message queues as files in
 likewise gets keys and names that no other run or host process holds; it no
 longer reaches the host's System V objects or message queues, which only a
 `--no-namespace` run, sharing the host's IPC namespace, still does. A
-`--mount` at `/dev/mqueue`, `/dev` or `/` replaces the private mqueue mount,
+`--mount` or `--bind` at `/dev/mqueue`, `/dev` or `/` replaces the private mqueue mount,
 and `--mount type=bind,source=/dev/mqueue,target=/dev/mqueue` shows the
 host's queues there; a mount below `/dev/mqueue` is refused. `hermit replay`
 gets the IPC namespace but no private `/dev/mqueue`, and an `--image` run's

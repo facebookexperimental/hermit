@@ -1737,7 +1737,8 @@ fn superblock_options_as_root(options: &[u8]) -> Vec<u8> {
 /// Backend/device and caller-bind choices for [`image_container`].
 pub(super) struct ImageContainerOpts<'a> {
     pub bind_kvm: bool,
-    pub workdir_binds: &'a [(PathBuf, PathBuf)],
+    /// Caller binds as (source, guest target, read-only).
+    pub workdir_binds: &'a [(PathBuf, PathBuf, bool)],
 }
 
 pub(super) fn image_container(
@@ -1775,9 +1776,10 @@ pub(super) fn image_container(
     // Caller work directories (--bind HOST:GUEST with --image): bound after
     // the read-only root so the guest can read/write its test workdir while
     // the image itself stays immutable. Targets are guest-absolute paths.
-    for (source, target) in opts.workdir_binds {
+    for (source, target, readonly) in opts.workdir_binds {
         let rel = target.strip_prefix("/").unwrap_or(target);
-        container.mount(Mount::bind(source, rootfs.join(rel)));
+        let mount = Mount::bind(source, rootfs.join(rel));
+        container.mount(if *readonly { mount.readonly() } else { mount });
     }
 
     // Mount the deterministic /proc into the target root. The materializer

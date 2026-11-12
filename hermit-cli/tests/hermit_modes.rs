@@ -1062,6 +1062,54 @@ fn default_bind_mounts() {
     command_output(command, "tmpfs bind mounts");
 }
 
+/// A `--bind` at a target outside `/tmp` and `/dev/shm` is a general
+/// bind mount (the `--mount type=bind` shorthand): the guest sees the
+/// bound file at the chosen path, writes go through unless `:ro`, and
+/// nothing is silently dropped with a warning.
+#[test]
+fn default_general_bind_outside_tmp() {
+    let _guard = hermit_run_lock();
+    let root = tempfile::tempdir().expect("failed to create general bind test directory");
+    let marker = root.path().join("marker");
+    fs::write(&marker, b"hermit-general-bind\n").expect("failed to write marker fixture");
+
+    // Writable: the guest reads the bound file at /etc/hostname and its
+    // write lands in the host file.
+    let mut command = default_hermit_command("minimal");
+    command
+        .arg(format!("--bind={}:/etc/hostname", marker.display()))
+        .arg("--")
+        .args([
+            "/bin/sh",
+            "-c",
+            "test \"$(cat /etc/hostname)\" = hermit-general-bind && echo guest-wrote > /etc/hostname",
+        ]);
+    command_output(command, "general bind outside /tmp");
+    assert_eq!(
+        fs::read(&marker).expect("marker still readable"),
+        b"guest-wrote\n",
+        "a writable general bind writes through to the host source"
+    );
+
+    // Read-only (`:ro`): the same write is refused in the guest.
+    fs::write(&marker, b"hermit-general-bind\n").expect("failed to reset marker fixture");
+    let mut command = default_hermit_command("minimal");
+    command
+        .arg(format!("--bind={}:/etc/hostname:ro", marker.display()))
+        .arg("--")
+        .args([
+            "/bin/sh",
+            "-c",
+            "test \"$(cat /etc/hostname)\" = hermit-general-bind && ! (echo guest-wrote > /etc/hostname) 2>/dev/null",
+        ]);
+    command_output(command, "read-only general bind outside /tmp");
+    assert_eq!(
+        fs::read(&marker).expect("marker still readable"),
+        b"hermit-general-bind\n",
+        "a :ro general bind leaves the host source unchanged"
+    );
+}
+
 #[test]
 fn default_preserved_tmpfs() {
     let _guard = hermit_run_lock();

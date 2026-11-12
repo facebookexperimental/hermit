@@ -2624,24 +2624,41 @@ impl ParityGuestInputs {
     }
 
     /// The inputs as the guest sees them. A `--bind=SOURCE:TARGET` is seen
-    /// only at its target, so its host source is dropped; every other field,
+    /// only at its target, so its host source is dropped; its `:ro`/`:rw`
+    /// option is kept, as the guest sees that too. Every other field,
     /// `--mount=` arguments included, is kept as launched.
     fn guest_view(&self) -> Self {
         let mut view = self.clone();
         for mount in &mut view.mounts {
             if let Some(target) = bind_target(mount) {
-                *mount = format!("--bind=:{target}");
+                *mount = format!("--bind=:{target}{}", bind_option(mount).unwrap_or_default());
             }
         }
         view
     }
 }
 
+/// The `:ro`/`:rw` suffix of a `--bind=` argument, parsed as hermit
+/// parses it (an option only after a source:target split). `None` for
+/// any other argument, and for a bind without the suffix.
+fn bind_option(mount: &str) -> Option<&str> {
+    let bind = mount.strip_prefix("--bind=")?;
+    [":ro", ":rw"].into_iter().find(|suffix| {
+        bind.strip_suffix(suffix)
+            .is_some_and(|rest| rest.contains(':'))
+    })
+}
+
 /// The guest target of a `--bind=` argument, parsed as hermit parses it
-/// (reverie-process `Bind`: the text after the first `:`, or the source when
-/// there is none). `None` for any other argument.
+/// (reverie-process `Bind`: a trailing `:ro`/`:rw` after a
+/// source:target split is an option, then the text after the first `:`,
+/// or the source when there is none). `None` for any other argument.
 fn bind_target(mount: &str) -> Option<&str> {
     let bind = mount.strip_prefix("--bind=")?;
+    let bind = match bind.strip_suffix(":ro").or_else(|| bind.strip_suffix(":rw")) {
+        Some(rest) if rest.contains(':') => rest,
+        _ => bind,
+    };
     Some(bind.split_once(':').map_or(bind, |(_, target)| target))
 }
 
@@ -9648,6 +9665,20 @@ mod tests {
     /// sides and the guests were launched with one view; the host sources of
     /// the binds are the only thing allowed to differ.
     #[test]
+    fn bind_target_and_option_parse_the_readonly_suffix() {
+        assert_eq!(bind_target("--bind=/src:/tgt:ro"), Some("/tgt"));
+        assert_eq!(bind_option("--bind=/src:/tgt:ro"), Some(":ro"));
+        assert_eq!(bind_target("--bind=/src:/tgt:rw"), Some("/tgt"));
+        assert_eq!(bind_option("--bind=/src:/tgt:rw"), Some(":rw"));
+        assert_eq!(bind_target("--bind=/src:/tgt"), Some("/tgt"));
+        assert_eq!(bind_option("--bind=/src:/tgt"), None);
+        // A suffix is an option only after a source:target split.
+        assert_eq!(bind_target("--bind=/path:ro"), Some("ro"));
+        assert_eq!(bind_option("--bind=/path:ro"), None);
+        assert_eq!(bind_target("--mount=type=bind,source=/s,target=/t"), None);
+    }
+
+    #[test]
     fn equal_inputs_need_equalization_on_both_sides_and_one_guest_view() {
         let reference = equalized_launch("/r/c-programs-mmap-determinism-verify-ptrace");
         let candidate = equalized_launch("/r/c-programs-mmap-determinism-verify-kvm");
@@ -9714,6 +9745,9 @@ mod tests {
         });
         unequal("another bind target", &|inputs| {
             inputs.mounts[0] = "--bind=/r/kvm/workdir/1:/tmp/elsewhere".into();
+        });
+        unequal("a read-only bind at the same target", &|inputs| {
+            inputs.mounts[0] = format!("{}:ro", inputs.mounts[0]);
         });
         unequal("an extra bind", &|inputs| {
             inputs.mounts.push("--bind=/tmp/extra".into());
