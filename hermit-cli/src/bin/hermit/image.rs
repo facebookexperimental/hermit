@@ -125,6 +125,138 @@ pub(crate) fn canonical_image_ref(image_ref: &str) -> String {
     image_ref.to_string()
 }
 
+/// A SHA-256 digest explicitly pinned in a store reference, without the
+/// algorithm prefix. Accepts `name@sha256:<hex>`, `sha256:<hex>` and a bare
+/// 64-hex image ID.
+fn pinned_sha256(image_ref: &str) -> Option<String> {
+    let candidate = image_ref
+        .trim()
+        .rsplit_once("@sha256:")
+        .map_or_else(|| image_ref.trim().strip_prefix("sha256:").unwrap_or(image_ref.trim()), |(_, digest)| digest);
+    (candidate.len() == 64 && candidate.chars().all(|c| c.is_ascii_hexdigit()))
+        .then(|| candidate.to_ascii_lowercase())
+}
+
+/// Convert a store resolution into the identity a manifest records,
+/// refusing a pinned reference that does not name the resolved content.
+/// A `name@sha256:` pin is accepted when it equals the selected image ID,
+/// the selected platform-manifest digest, or one of the store's recorded
+/// repo digests (the multi-arch index case). A bare ID/`sha256:<id>` pin
+/// must equal the selected image ID.
+fn image_from_resolved(
+    image_ref: &str,
+    resolved: &crate::app::podman_store::ResolvedImage,
+) -> Result<crate::app::manifest::Image, Error> {
+    use crate::app::manifest::Image;
+    use crate::app::manifest::ImageSource;
+
+    if let Some(pinned) = pinned_sha256(image_ref) {
+        let selected_manifest = resolved
+            .digest
+            .as_deref()
+            .and_then(|digest| digest.strip_prefix("sha256:"));
+        let repo_matches = resolved.repo_digests.iter().any(|repo_digest| {
+            repo_digest
+                .rsplit_once("@sha256:")
+                .is_some_and(|(_, digest)| digest.eq_ignore_ascii_case(&pinned))
+        });
+        let pinned_is_manifest_reference = image_ref.contains("@sha256:");
+        let matches = if pinned_is_manifest_reference {
+            pinned == resolved.id
+                || selected_manifest.is_some_and(|digest| digest.eq_ignore_ascii_case(&pinned))
+                || repo_matches
+        } else {
+            pinned == resolved.id
+        };
+        if !matches {
+            return Err(Error::msg(format!(
+                "image {image_ref:?} pins sha256:{pinned}, but the local store selected                  image id {} with manifest digest {}; refusing to record an                  unverified image identity in the run manifest",
+                resolved.id,
+                resolved.digest.as_deref().unwrap_or("<none>")
+            )));
+        }
+    }
+    Ok(Image {
+        source: ImageSource::PodmanStore,
+        reference: Some(resolved.reference.clone()),
+        identity: resolved.id.clone(),
+        manifest_digest: resolved.digest.clone(),
+        image_id: Some(resolved.id.clone()),
+    })
+}
+
+/// Convert a loaded local image's verified namespaced identity into the
+/// manifest representation.
+fn image_from_local_identity(
+    kind: crate::app::image_source::LocalImageKind,
+    identity: &str,
+) -> Result<crate::app::manifest::Image, Error> {
+    use crate::app::image_source::LocalImageKind;
+    use crate::app::manifest::Image;
+    use crate::app::manifest::ImageSource;
+
+    let digest = identity
+        .rsplit_once("sha256:")
+        .map(|(_, digest)| digest.to_owned())
+        .filter(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+        .ok_or_else(|| {
+            Error::msg(format!(
+                "local image identity {identity:?} does not carry a lowercase sha256 digest"
+            ))
+        })?;
+    Ok(match kind {
+        LocalImageKind::OciDir => Image {
+            source: ImageSource::OciDir,
+            reference: None,
+            identity: digest.clone(),
+            manifest_digest: Some(format!("sha256:{digest}")),
+            image_id: None,
+        },
+        LocalImageKind::DockerArchive => Image {
+            source: ImageSource::DockerArchive,
+            reference: None,
+            identity: digest.clone(),
+            manifest_digest: None,
+            image_id: Some(digest),
+        },
+    })
+}
+
+/// Resolve an `--image` value to the content identity a run manifest
+/// records. Store references must resolve successfully in the local store;
+/// a digest spelled in the reference is only a cross-check, never a
+/// substitute for resolution against actual local content.
+pub(crate) fn resolved_image_identity(
+    image_ref: &str,
+) -> Result<crate::app::manifest::Image, Error> {
+    use crate::app::image_source::ImageSourceRef;
+
+    match crate::app::image_source::parse_image_source(image_ref) {
+        ImageSourceRef::Local { kind, path } => {
+            let identity = crate::app::image_source::local_identity(kind, &path)?;
+            image_from_local_identity(kind, &identity)
+        }
+        ImageSourceRef::BareRelative { kind, remainder } => {
+            Err(crate::app::image_source::bare_relative_error(kind, &remainder))
+        }
+        ImageSourceRef::StoreReference => {
+            let store = crate::app::podman_store::PodmanStore::probe()?
+                .ok_or_else(|| {
+                    Error::msg(format!(
+                        "cannot resolve image {image_ref:?} for the run manifest:                          no local podman store is available"
+                    ))
+                })?;
+            let resolved = store.resolve(image_ref)?;
+            image_from_resolved(image_ref, &resolved)
+        }
+    }
+}
+
 /// Compute the cache directory that holds materialized rootfs trees. Keyed by
 /// the SHA-256 of the complete image reference so distinct references cannot
 /// alias after filesystem sanitization.
@@ -382,16 +514,54 @@ fn parse_workdir(contents: &str) -> Option<String> {
     }
 }
 
+/// A materialized rootfs and the content identity it was materialized
+/// from, when that identity could be established. `identity` is `None`
+/// only on the legacy store-cache fallback where no store resolution is
+/// available; callers that recorded an identity must refuse to run against
+/// such a tree.
+pub(crate) struct MaterializedRootfs {
+    pub path: PathBuf,
+    pub identity: Option<crate::app::manifest::Image>,
+}
+
+/// Refuse a materialized tree whose content identity differs from the
+/// identity a run manifest recorded. An absent expected identity means the
+/// run made no manifest claim and imposes no check.
+pub(crate) fn ensure_materialized_identity_matches(
+    image_ref: &str,
+    expected: Option<&crate::app::manifest::Image>,
+    actual: Option<&crate::app::manifest::Image>,
+) -> Result<(), Error> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let actual = actual.ok_or_else(|| {
+        Error::msg(format!(
+            "image {image_ref:?} materialized without a resolved content identity, \
+             so it cannot be bound to the identity recorded in this run's manifest"
+        ))
+    })?;
+    if expected.same_content_identity(actual) {
+        Ok(())
+    } else {
+        Err(Error::msg(format!(
+            "image {image_ref:?} materialized as {actual:?}, which does not match \
+             the image identity recorded in this run's manifest ({expected:?}); \
+             refusing to run different content than the manifest names"
+        )))
+    }
+}
+
 /// Materialize the given OCI image reference into a plain, user-owned rootfs
-/// directory and return its path. Reusing a previously materialized reference is
-/// a no-op that returns the cached directory.
+/// directory and return it with its resolved identity. Reusing a previously
+/// materialized reference is a no-op that returns the cached directory.
 ///
 /// `image_ref` must already be in the local podman store, e.g.
 /// `docker.io/library/busybox@sha256:...` (digest-pinned, recommended for
 /// determinism) or `docker.io/library/busybox:latest`, or name a local image
 /// input — `oci-dir:/path` or `docker-archive:/path.tar` with an absolute or
 /// `./`-/`../`-relative path (see [`crate::app::image_source`]).
-pub(crate) fn materialize_rootfs(image_ref: &str) -> Result<PathBuf, Error> {
+pub(crate) fn materialize_rootfs(image_ref: &str) -> Result<MaterializedRootfs, Error> {
     use crate::app::image_source::ImageSourceRef;
     match crate::app::image_source::parse_image_source(image_ref) {
         ImageSourceRef::Local { kind, path } => {
@@ -404,7 +574,22 @@ pub(crate) fn materialize_rootfs(image_ref: &str) -> Result<PathBuf, Error> {
         }
         ImageSourceRef::StoreReference => {}
     }
-    let cache = rootfs_cache_dir(&canonical_image_ref(image_ref))?;
+    // Resolve once and use that exact resolution for both the cache key
+    // and the layer copy below, so the identity returned here is the
+    // identity of the tree being executed. A failed resolution preserves
+    // the legacy cache-hit fallback, but yields no identity.
+    let resolved_store = match crate::app::podman_store::PodmanStore::probe()? {
+        Some(store) => store.resolve(image_ref).ok().map(|resolved| (store, resolved)),
+        None => None,
+    };
+    let identity = resolved_store
+        .as_ref()
+        .map(|(_, resolved)| image_from_resolved(image_ref, resolved))
+        .transpose()?;
+    let cache = match &resolved_store {
+        Some((_, resolved)) => rootfs_cache_dir(&resolved.id)?,
+        None => rootfs_cache_dir(&canonical_image_ref(image_ref))?,
+    };
     let rootfs = cache.join("rootfs");
     if ready_marker(&cache).exists() {
         tracing::info!(
@@ -412,7 +597,10 @@ pub(crate) fn materialize_rootfs(image_ref: &str) -> Result<PathBuf, Error> {
             image_ref,
             rootfs.display()
         );
-        return Ok(rootfs);
+        return Ok(MaterializedRootfs {
+            path: rootfs,
+            identity,
+        });
     }
 
     tracing::info!("Materializing OCI rootfs for {}", image_ref);
@@ -420,10 +608,19 @@ pub(crate) fn materialize_rootfs(image_ref: &str) -> Result<PathBuf, Error> {
         .with_context(|| format!("Failed to create rootfs cache dir {}", rootfs.display()))?;
 
     // Copy the merged tree out of the local podman store's overlay layers.
-    if materialize_via_podman_store(image_ref, &cache, &rootfs)? {
+    let materialized = match &resolved_store {
+        Some((store, resolved)) => {
+            materialize_via_podman_store(store, resolved, &cache, &rootfs)?
+        }
+        None => false,
+    };
+    if materialized {
         std::fs::write(ready_marker(&cache), image_ref.as_bytes())
             .context("Failed to write OCI rootfs readiness marker")?;
-        return Ok(rootfs);
+        return Ok(MaterializedRootfs {
+            path: rootfs,
+            identity,
+        });
     }
 
     Err(Error::msg(format!(
@@ -437,17 +634,12 @@ pub(crate) fn materialize_rootfs(image_ref: &str) -> Result<PathBuf, Error> {
 /// Returns `Ok(false)` when no store holds the image. Layers apply
 /// base-first; overlay whiteouts are honored.
 fn materialize_via_podman_store(
-    image_ref: &str,
+    store: &crate::app::podman_store::PodmanStore,
+    resolved: &crate::app::podman_store::ResolvedImage,
     cache: &Path,
     rootfs: &Path,
 ) -> Result<bool, Error> {
-    let Some(store) = crate::app::podman_store::PodmanStore::probe()? else {
-        return Ok(false);
-    };
-    let Ok(resolved) = store.resolve(image_ref) else {
-        return Ok(false);
-    };
-    let Ok(layers) = store.overlay_dirs(&resolved) else {
+    let Ok(layers) = store.overlay_dirs(resolved) else {
         return Ok(false);
     };
     if layers.is_empty() {
@@ -457,7 +649,7 @@ fn materialize_via_podman_store(
     for layer in layers.iter().rev() {
         apply_overlay_layer(Path::new(layer), rootfs)?;
     }
-    let config = store.config(&resolved)?;
+    let config = store.config(resolved)?;
     finish_materialized_rootfs(cache, rootfs, &config)?;
     Ok(true)
 }
@@ -510,8 +702,9 @@ fn remove_tree(path: &Path) {
 fn materialize_via_local_source(
     kind: crate::app::image_source::LocalImageKind,
     path: &Path,
-) -> Result<PathBuf, Error> {
+) -> Result<MaterializedRootfs, Error> {
     let loaded = crate::app::image_source::load_local_image(kind, path)?;
+    let identity = Some(image_from_local_identity(kind, &loaded.identity)?);
     let cache = local_rootfs_cache_dir(&loaded.identity)?;
     let rootfs = cache.join("rootfs");
     if ready_marker(&cache).exists() {
@@ -520,7 +713,10 @@ fn materialize_via_local_source(
             loaded.identity,
             rootfs.display()
         );
-        return Ok(rootfs);
+        return Ok(MaterializedRootfs {
+            path: rootfs,
+            identity,
+        });
     }
     let base = cache
         .parent()
@@ -578,17 +774,26 @@ fn materialize_via_local_source(
     // final location directly, so it is cleared to unblock the rename.
     if ready_marker(&cache).exists() {
         remove_tree(&staging);
-        return Ok(rootfs);
+        return Ok(MaterializedRootfs {
+            path: rootfs,
+            identity,
+        });
     }
     if std::fs::symlink_metadata(&cache).is_ok() {
         remove_tree(&cache);
     }
     match std::fs::rename(&staging, &cache) {
-        Ok(()) => Ok(rootfs),
+        Ok(()) => Ok(MaterializedRootfs {
+            path: rootfs,
+            identity,
+        }),
         Err(rename_err) => {
             if ready_marker(&cache).exists() {
                 remove_tree(&staging);
-                Ok(rootfs)
+                Ok(MaterializedRootfs {
+                    path: rootfs,
+                    identity,
+                })
             } else {
                 Err(Error::from(rename_err).context(format!(
                     "Failed to move materialized rootfs for {} into place at {}",
@@ -1198,6 +1403,98 @@ mod tests {
             resolve_in_rootfs(rootfs, Path::new("/../../../store")),
             rootfs.join("store")
         );
+    }
+
+    fn resolved_fixture() -> crate::app::podman_store::ResolvedImage {
+        crate::app::podman_store::ResolvedImage {
+            reference: "docker.io/library/debian:trixie-slim".to_string(),
+            id: "a".repeat(64),
+            digest: Some(format!("sha256:{}", "b".repeat(64))),
+            repo_digests: vec![format!(
+                "docker.io/library/debian@sha256:{}",
+                "c".repeat(64)
+            )],
+        }
+    }
+
+    #[test]
+    fn image_from_resolved_cross_checks_pins() {
+        let resolved = resolved_fixture();
+        // A multi-arch pin names the repo/index digest, while `digest`
+        // names the selected platform manifest; both are accepted only
+        // when the store resolution itself records that relationship.
+        let by_repo = format!(
+            "docker.io/library/debian@sha256:{}",
+            "c".repeat(64)
+        );
+        assert!(image_from_resolved(&by_repo, &resolved).is_ok());
+        let by_manifest = format!(
+            "docker.io/library/debian@sha256:{}",
+            "b".repeat(64)
+        );
+        assert!(image_from_resolved(&by_manifest, &resolved).is_ok());
+        let by_id = "a".repeat(64);
+        assert!(image_from_resolved(&by_id, &resolved).is_ok());
+        let mismatch = format!(
+            "docker.io/library/debian@sha256:{}",
+            "d".repeat(64)
+        );
+        let err = image_from_resolved(&mismatch, &resolved).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("pins sha256:"),
+            "mismatched pin must refuse by name: {err:#}"
+        );
+    }
+
+    #[test]
+    fn materialized_identity_must_match_manifest_identity() {
+        let expected = crate::app::manifest::Image {
+            source: crate::app::manifest::ImageSource::PodmanStore,
+            reference: Some("docker.io/library/debian:trixie-slim".to_string()),
+            identity: "a".repeat(64),
+            manifest_digest: Some(format!("sha256:{}", "b".repeat(64))),
+            image_id: Some("a".repeat(64)),
+        };
+        let mut same = expected.clone();
+        same.reference = Some("a".repeat(64));
+        ensure_materialized_identity_matches("debian", Some(&expected), Some(&same)).unwrap();
+        let mut different = same.clone();
+        different.identity = "d".repeat(64);
+        different.image_id = Some("d".repeat(64));
+        assert!(
+            ensure_materialized_identity_matches("debian", Some(&expected), Some(&different))
+                .is_err()
+        );
+        assert!(
+            ensure_materialized_identity_matches("debian", Some(&expected), None).is_err()
+        );
+        ensure_materialized_identity_matches("debian", None, None).unwrap();
+    }
+
+    #[test]
+    fn resolved_identity_refuses_bare_relative_and_unresolved_store_refs() {
+        let bare = resolved_image_identity("oci-dir:my-image").unwrap_err();
+        assert!(format!("{bare:#}").contains("./my-image"), "{bare:#}");
+        let missing = resolved_image_identity("localhost.invalid/muse-prov/missing:1").unwrap_err();
+        assert!(
+            format!("{missing:#}").contains("No local image matches")
+                || format!("{missing:#}").contains("no local podman store"),
+            "{missing:#}"
+        );
+    }
+
+    #[test]
+    fn pinned_sha256_accepts_only_complete_hex_digests() {
+        let digest = "a".repeat(64);
+        assert_eq!(
+            pinned_sha256(&format!("docker.io/library/debian@sha256:{digest}")),
+            Some(digest.clone())
+        );
+        assert_eq!(pinned_sha256(&format!("sha256:{digest}")), Some(digest.clone()));
+        assert_eq!(pinned_sha256(&digest), Some(digest));
+        assert_eq!(pinned_sha256("docker.io/library/debian:trixie-slim"), None);
+        assert_eq!(pinned_sha256("docker.io/library/debian@sha256:not-hex"), None);
+        assert_eq!(pinned_sha256("docker.io/library/debian@sha512:abcd"), None);
     }
 
     /// L1: a store reference spelled exactly like a local identity must

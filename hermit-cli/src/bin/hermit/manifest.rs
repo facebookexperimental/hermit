@@ -79,8 +79,14 @@ use hermit::Id;
 use serde::Deserialize;
 use serde::Serialize;
 
-/// The `schema` value of the manifest format this hermit writes and reads.
+/// The original `schema` value of the manifest format. Documents without
+/// resolved image provenance keep writing this version.
 pub(crate) const SCHEMA: &str = "hermit-recording-manifest/v1";
+
+/// The schema revision that adds the optional resolved `image` identity.
+/// The reader accepts both revisions; the writer uses this one only when an
+/// image identity is present, so existing v1 recordings stay readable.
+pub(crate) const SCHEMA_V2: &str = "hermit-recording-manifest/v2";
 
 /// The manifest file's name inside its recording directory.
 pub(crate) const MANIFEST_NAME: &str = hermit::MANIFEST_NAME;
@@ -390,6 +396,132 @@ impl Exit {
     }
 }
 
+/// Where a run's input image came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ImageSource {
+    /// A reference resolved against the local podman store.
+    PodmanStore,
+    /// A local OCI layout directory (`oci-dir:`).
+    OciDir,
+    /// A local Docker archive tarball (`docker-archive:`).
+    DockerArchive,
+}
+
+/// The resolved identity of a run's `--image` input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct Image {
+    pub(crate) source: ImageSource,
+    /// The store reference as supplied. Omitted for local sources, whose
+    /// reference is a host path already present in the recorded options.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) reference: Option<String>,
+    /// Canonical content identity for the source: a podman image ID, an
+    /// OCI manifest digest without the algorithm prefix, or a
+    /// docker-archive config digest without the algorithm prefix.
+    pub(crate) identity: String,
+    /// OCI manifest digest (`sha256:...`) when the source records one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) manifest_digest: Option<String>,
+    /// Canonical image/config ID (64 hex digits) when the source has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) image_id: Option<String>,
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(is_sha256_hex)
+}
+
+impl Image {
+    /// Whether two records name the same image content. The supplied
+    /// reference is intentionally not compared: the same content can be
+    /// reached through a tag, an ID, or a digest-pinned reference.
+    pub(crate) fn same_content_identity(&self, other: &Self) -> bool {
+        self.source == other.source
+            && self.identity == other.identity
+            && self.manifest_digest == other.manifest_digest
+            && self.image_id == other.image_id
+    }
+
+    fn validate(&self) -> Result<(), Error> {
+        anyhow::ensure!(
+            is_sha256_hex(&self.identity),
+            "manifest image identity {:?} is not a lowercase SHA-256 hex digest",
+            self.identity
+        );
+        if let Some(reference) = &self.reference {
+            anyhow::ensure!(
+                !reference.is_empty(),
+                "manifest image reference must not be empty"
+            );
+        }
+        if let Some(digest) = &self.manifest_digest {
+            anyhow::ensure!(
+                is_sha256_digest(digest),
+                "manifest image manifest_digest {digest:?} is not a sha256 digest"
+            );
+        }
+        if let Some(image_id) = &self.image_id {
+            anyhow::ensure!(
+                is_sha256_hex(image_id),
+                "manifest image image_id {image_id:?} is not a lowercase SHA-256 hex digest"
+            );
+        }
+        match self.source {
+            ImageSource::PodmanStore => {
+                anyhow::ensure!(
+                    self.reference.is_some(),
+                    "a podman-store manifest image must record its supplied reference"
+                );
+                anyhow::ensure!(
+                    self.image_id.as_deref() == Some(self.identity.as_str()),
+                    "a podman-store manifest image identity must be its image ID"
+                );
+            }
+            ImageSource::OciDir => {
+                anyhow::ensure!(
+                    self.reference.is_none(),
+                    "an oci-dir manifest image must not record a host reference"
+                );
+                anyhow::ensure!(
+                    self.image_id.is_none(),
+                    "an oci-dir manifest image must not record an image ID"
+                );
+                anyhow::ensure!(
+                    self.manifest_digest.as_deref()
+                        == Some(format!("sha256:{}", self.identity).as_str()),
+                    "an oci-dir manifest image identity must be its manifest digest"
+                );
+            }
+            ImageSource::DockerArchive => {
+                anyhow::ensure!(
+                    self.reference.is_none(),
+                    "a docker-archive manifest image must not record a host reference"
+                );
+                anyhow::ensure!(
+                    self.manifest_digest.is_none(),
+                    "a docker-archive manifest image must not record a manifest digest"
+                );
+                anyhow::ensure!(
+                    self.image_id.as_deref() == Some(self.identity.as_str()),
+                    "a docker-archive manifest image identity must be its config ID"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One manifest document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -403,6 +535,10 @@ pub(crate) struct Manifest {
     pub(crate) created: String,
     pub(crate) command: Command,
     pub(crate) inputs: Inputs,
+    /// Resolved input-image identity, when the run used `--image` and it
+    /// could be resolved before execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) image: Option<Image>,
     /// Configured maximum and runtime timer capability, not measured delivery.
     /// Absent for older documents and execution without instrumentation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -426,10 +562,19 @@ impl Manifest {
             created: rfc3339_utc(std::time::SystemTime::now()),
             command,
             inputs,
+            image: None,
             preemption: None,
             exit: None,
             artifacts: None,
         }
+    }
+
+    /// Attach a resolved input-image identity, promoting the document to
+    /// the schema revision that defines the field.
+    pub(crate) fn with_image(mut self, image: Image) -> Self {
+        self.schema = SCHEMA_V2.to_owned();
+        self.image = Some(image);
+        self
     }
 }
 
@@ -576,10 +721,21 @@ pub(crate) fn parse(text: &str) -> Result<Manifest, Error> {
     let manifest: Manifest =
         serde_json::from_str(text).context("the file is not a hermit manifest")?;
     anyhow::ensure!(
-        manifest.schema == SCHEMA,
-        "the manifest's schema is {:?}; this hermit reads {SCHEMA:?}",
+        manifest.schema == SCHEMA || manifest.schema == SCHEMA_V2,
+        "the manifest's schema is {:?}; this hermit reads {SCHEMA:?} and {SCHEMA_V2:?}",
         manifest.schema
     );
+    anyhow::ensure!(
+        manifest.schema == SCHEMA_V2 || manifest.image.is_none(),
+        "a {SCHEMA} manifest cannot carry an image identity"
+    );
+    anyhow::ensure!(
+        manifest.schema != SCHEMA_V2 || manifest.image.is_some(),
+        "a {SCHEMA_V2} manifest must carry an image identity"
+    );
+    if let Some(image) = &manifest.image {
+        image.validate()?;
+    }
     Ok(manifest)
 }
 
@@ -1059,6 +1215,120 @@ mod tests {
         assert!(directory.path().join(&kept).exists());
         assert!(!directory.path().join(&network.id).exists());
         assert!(!directory.path().join(&newer.id).exists());
+    }
+
+    #[test]
+    fn an_image_manifest_uses_schema_v2_and_survives_write_and_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("id").join(MANIFEST_NAME);
+        let manifest = sample().with_image(Image {
+            source: ImageSource::PodmanStore,
+            reference: Some("docker.io/library/debian:trixie-slim".to_owned()),
+            identity: "a".repeat(64),
+            manifest_digest: Some(format!("sha256:{}", "b".repeat(64))),
+            image_id: Some("a".repeat(64)),
+        });
+        assert_eq!(manifest.schema, SCHEMA_V2);
+        write(&path, &manifest).unwrap();
+        assert_eq!(read(&path).unwrap(), manifest);
+    }
+
+    #[test]
+    fn a_no_image_manifest_serializes_exactly_as_v1() {
+        let mut manifest = sample();
+        manifest.hermit.version = "test".to_owned();
+        manifest.id = "abc".to_owned();
+        manifest.created = "2026-10-13T23:55:00.000000Z".to_owned();
+        let text = serde_json::to_string_pretty(&manifest).unwrap();
+        let expected = r#"{
+  "schema": "hermit-recording-manifest/v1",
+  "hermit": {
+    "version": "test"
+  },
+  "id": "abc",
+  "kind": "inputs-only",
+  "created": "2026-10-13T23:55:00.000000Z",
+  "command": {
+    "program": "/bin/date",
+    "args": [
+      "-u"
+    ],
+    "cwd": "/tmp"
+  },
+  "inputs": {
+    "global": {
+      "log": "info"
+    },
+    "run": {
+      "epoch": "2026-10-13T23:55:00.123456Z",
+      "seed": 42
+    },
+    "host_drawn": {
+      "epoch": "host-now",
+      "seed": "SystemRandom"
+    }
+  }
+}"#;
+        assert_eq!(text, expected);
+        assert_eq!(parse(&text).unwrap(), manifest);
+    }
+
+    #[test]
+    fn schema_versions_and_image_shape_are_checked() {
+        let image_manifest = sample().with_image(Image {
+            source: ImageSource::PodmanStore,
+            reference: Some("docker.io/library/debian:trixie-slim".to_owned()),
+            identity: "a".repeat(64),
+            manifest_digest: Some(format!("sha256:{}", "b".repeat(64))),
+            image_id: Some("a".repeat(64)),
+        });
+        let valid_v2: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&image_manifest).unwrap()).unwrap();
+        assert!(parse(&valid_v2.to_string()).is_ok());
+
+        let mut v1_with_image = valid_v2.clone();
+        v1_with_image["schema"] = SCHEMA.into();
+        assert!(parse(&v1_with_image.to_string()).is_err());
+
+        let mut v2_without_image = valid_v2.clone();
+        v2_without_image.as_object_mut().unwrap().remove("image");
+        assert!(parse(&v2_without_image.to_string()).is_err());
+
+        for name in [
+            "uppercase identity",
+            "short identity",
+            "manifest digest without prefix",
+            "manifest digest non-hex",
+            "image ID mismatch",
+            "empty reference",
+        ] {
+            let mut bad = valid_v2.clone();
+            match name {
+                "uppercase identity" => bad["image"]["identity"] = "A".repeat(64).into(),
+                "short identity" => bad["image"]["identity"] = "abc".into(),
+                "manifest digest without prefix" => {
+                    bad["image"]["manifest_digest"] = "b".repeat(64).into()
+                }
+                "manifest digest non-hex" => {
+                    bad["image"]["manifest_digest"] = format!("sha256:{}", "z".repeat(64)).into()
+                }
+                "image ID mismatch" => {
+                    bad["image"]["image_id"] = "c".repeat(64).into();
+                }
+                "empty reference" => bad["image"]["reference"] = "".into(),
+                _ => unreachable!(),
+            }
+            assert!(parse(&bad.to_string()).is_err(), "{name}");
+        }
+
+        let mut oci = valid_v2.clone();
+        oci["image"] = serde_json::json!({
+            "source": "oci-dir",
+            "reference": "oci-dir:/host/path",
+            "identity": "b".repeat(64),
+            "manifest_digest": format!("sha256:{}", "b".repeat(64)),
+        });
+        assert!(parse(&oci.to_string()).is_err(), "oci-dir hosts no reference");
     }
 
     #[test]

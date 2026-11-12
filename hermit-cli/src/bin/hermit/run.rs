@@ -2725,6 +2725,11 @@ pub struct RunOpts {
     #[clap(skip)]
     pending_network_manifest: Option<crate::app::manifest::Manifest>,
 
+    /// Runtime-only: the resolved image identity recorded in this run's
+    /// manifest, checked against every materialized rootfs before use.
+    #[clap(skip)]
+    manifest_image: Option<crate::app::manifest::Image>,
+
     /// Read-only overlay that exposes the rewritten ELF at its original guest path.
     #[clap(skip)]
     executable_overlay: Option<ExecutableOverlayMount>,
@@ -14007,12 +14012,16 @@ impl RunOpts {
         // For the same reason, the run manifest too. It is a convenience
         // beside the warning that already prints the inputs, so a data
         // directory that cannot be written does not stop the run.
-        let recording = self.begin_manifest(global).unwrap_or_else(|error| {
-            crate::app::tracing::diagnostic_eprintln!(
-                "hermit: WARNING: this run's manifest was not written: {error:#}"
-            );
-            None
-        });
+        let recording = match self.begin_manifest(global) {
+            Ok(recording) => recording,
+            Err(error) if error.downcast_ref::<PolicyRefusal>().is_some() => return Err(error),
+            Err(error) => {
+                crate::app::tracing::diagnostic_eprintln!(
+                    "hermit: WARNING: this run's manifest was not written: {error:#}"
+                );
+                None
+            }
+        };
         self.warn_of_host_drawn_inputs(global, recording)?;
         // After every refusal above, which holds in every build, so a build
         // without the feature refuses those runs the way a feature build does;
@@ -16100,6 +16109,22 @@ impl RunOpts {
         validate_executable(&host, &requested, rootfs.as_deref())
     }
 
+    /// Materialize an image rootfs and, when this run recorded an image
+    /// identity in its manifest, refuse to use a tree materialized from any
+    /// other content. The comparison intentionally ignores the supplied
+    /// reference: tags and IDs can name the same content through different
+    /// spellings.
+    fn materialize_image_rootfs(&self, image_ref: &str) -> Result<PathBuf, Error> {
+        let materialized = crate::app::image::materialize_rootfs(image_ref)?;
+        crate::app::image::ensure_materialized_identity_matches(
+            image_ref,
+            self.manifest_image.as_ref(),
+            materialized.identity.as_ref(),
+        )
+        .map_err(|error| Error::new(PolicyRefusal).context(format!("{error:#}")))?;
+        Ok(materialized.path)
+    }
+
     /// Where the guest program is on the host, as [`Self::validate_program`]
     /// checks it: its host path, the path as the command names it, and the
     /// image rootfs it resolves in, if any.
@@ -16115,7 +16140,7 @@ impl RunOpts {
             // Materialize before building the command: on a cold cache this is
             // what makes the image's Env/WorkingDir available for relative-path
             // resolution during first-run validation.
-            let rootfs = crate::app::image::materialize_rootfs(image)?;
+            let rootfs = self.materialize_image_rootfs(image)?;
             let command = self.guest_command()?;
             let requested = Path::new(command.get_program());
             // `guest_command()` sets the image working directory (WorkingDir, or
@@ -18756,7 +18781,7 @@ impl RunOpts {
         // and no tmpfs of Hermit's is there for a guest to reach.
         let mounts_placeholder = self.mounts_directory_placeholder();
         if let Some(image) = &self.image {
-            let rootfs = crate::app::image::materialize_rootfs(image)?;
+            let rootfs = self.materialize_image_rootfs(image)?;
             let workdir_binds: Vec<(PathBuf, PathBuf, bool)> = self
                 .bind
                 .iter()
@@ -19654,6 +19679,10 @@ impl RunOpts {
         let (mut global_inputs, mut run_inputs) =
             crate::app::run_config::to_manifest_parts(&config)?;
         manifest::drop_outputs(&mut global_inputs, &mut run_inputs);
+        let supplied_image_reference = run_inputs
+            .get("image")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
         if self.timer_downgrade.is_some() {
             run_inputs.insert(
                 manifest::MAX_TIMESLICE_KEY.to_owned(),
@@ -19679,6 +19708,21 @@ impl RunOpts {
         );
         if !self.namespace_only {
             document.preemption = Some(self.preemption_summary());
+        }
+        if let Some(image_ref) = &self.image {
+            let mut image = crate::app::image::resolved_image_identity(image_ref).map_err(|error| {
+                Error::new(PolicyRefusal).context(format!(
+                    "cannot bind a resolved image identity for this manifest-requested \
+                     --image run: {error:#}"
+                ))
+            })?;
+            // `self.image` may already have been canonicalized to a store ID;
+            // the captured run options retain the reference as supplied.
+            if image.reference.is_some() && supplied_image_reference.is_some() {
+                image.reference = supplied_image_reference;
+            }
+            self.manifest_image = Some(image.clone());
+            document = document.with_image(image);
         }
         let path = match &network_trace {
             // The trace stays where its user named it, with its manifest
