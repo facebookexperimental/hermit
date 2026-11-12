@@ -69,10 +69,11 @@ name: CI (GitHub-managed portable)
 # case also skips without a JDK, is scheduled by no DAG step or manifest. A job
 # that starts running Java must add the package to its own list.
 
+# Pushes to main, the exported tip, also run it (owner, 2026-11-12).
 on:
   workflow_dispatch:
   push:
-    branches: [integration]
+    branches: [integration, main]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
