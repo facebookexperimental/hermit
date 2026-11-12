@@ -18,6 +18,12 @@
  * Each case runs in a forked child, so a request that succeeds cannot change
  * the scheduling of the process doing the probing.
  *
+ * Optional input: --sched-nice N (0..19) sets the requested nice in every
+ * case; without it the request is nice 0, as before. The driver passes the
+ * same non-lowering value to both legs, because the host may inherit a
+ * positive nice while Hermit exposes nice 0. Context goes to stderr so it
+ * cannot change the compared transcript.
+ *
  * Deliberately excluded: every case whose answer depends on the host's
  * configuration or the caller's privileges rather than on the interface, since
  * such a case would make this test's verdict depend on the machine. That means
@@ -30,7 +36,9 @@
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -50,6 +58,7 @@
 #define OFF_SIZE 0
 #define OFF_POLICY 4
 #define OFF_FLAGS 8
+#define OFF_NICE 16
 #define OFF_PRIORITY 20
 #define OFF_RUNTIME 24
 #define OFF_DEADLINE 32
@@ -66,6 +75,7 @@ struct req {
   uint32_t size;
   uint32_t policy;
   uint64_t sched_flags;
+  int32_t nice;
   uint32_t priority;
   uint64_t runtime;
   uint64_t deadline;
@@ -108,6 +118,7 @@ static void probe(const char* name, struct req r) {
     put32(buf, OFF_SIZE, r.size);
     put32(buf, OFF_POLICY, r.policy);
     put64(buf, OFF_FLAGS, r.sched_flags);
+    put32(buf, OFF_NICE, (uint32_t)r.nice);
     put32(buf, OFF_PRIORITY, r.priority);
     put64(buf, OFF_RUNTIME, r.runtime);
     put64(buf, OFF_DEADLINE, r.deadline);
@@ -141,9 +152,49 @@ static void probe(const char* name, struct req r) {
       out.size_after);
 }
 
-int main(void) {
+int main(int argc, char** argv) {
+  long requested_nice = 0;
+  if (argc != 1) {
+    if (argc != 3 || strcmp(argv[1], "--sched-nice") != 0) {
+      fprintf(stderr, "usage: %s [--sched-nice N (0..19)]\n", argv[0]);
+      return 2;
+    }
+    char* end;
+    errno = 0;
+    requested_nice = strtol(argv[2], &end, 10);
+    if (errno || end == argv[2] || *end || requested_nice < 0 ||
+        requested_nice > 19) {
+      fprintf(stderr, "--sched-nice must be an integer in 0..19\n");
+      return 2;
+    }
+  }
+
+  errno = 0;
+  int current_nice = getpriority(PRIO_PROCESS, 0);
+  if (errno) {
+    perror("getpriority");
+    return 2;
+  }
+  struct rlimit limit;
+  if (getrlimit(RLIMIT_NICE, &limit) != 0) {
+    perror("getrlimit(RLIMIT_NICE)");
+    return 2;
+  }
+  fprintf(
+      stderr,
+      "sched-setattr-context nice=%d RLIMIT_NICE=%llu/%llu requested_nice=%ld\n",
+      current_nice,
+      (unsigned long long)limit.rlim_cur,
+      (unsigned long long)limit.rlim_max,
+      requested_nice);
+  if (argc != 1 && requested_nice < current_nice) {
+    fprintf(stderr, "--sched-nice would lower the current nice\n");
+    return 2;
+  }
+
   struct req base = {0};
   base.size = SCHED_ATTR_SIZE_VER0;
+  base.nice = (int32_t)requested_nice;
 
   /* The first clause: !uattr || pid < 0 || flags -- all EINVAL. */
   struct req r = base;
