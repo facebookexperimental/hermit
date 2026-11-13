@@ -1,7 +1,13 @@
 {
   "files": [
     {
-      "disposition": "buck-fixture",
+      "disposition": "fbsource-only",
+      "path": "tests/.autodeps.skip_target_generation",
+      "runner": "Meta Buck test targets",
+      "why": "tests/.autodeps.skip_target_generation is owned by Meta Buck test targets: It tells Meta's autodeps not to synthesize standalone Buck targets for the scripts and guest fixtures under tests/, while autodeps still verifies the dependencies of existing targets. Autodeps reads it directly; it is not a guest program or public manifest input."
+    },
+    {
+      "disposition": "fbsource-only",
       "path": "tests/BUCK",
       "runner": "Meta Buck test targets",
       "why": "tests/BUCK is owned by Meta Buck test targets: It declares the internal test target graph for the tests tree. The public Cargo and E2E manifest paths do not execute this build metadata as a guest, but Meta's Buck build consumes it directly."
@@ -19,7 +25,7 @@
       "why": "tests/DEBUGGING.md is owned by Hermit determinism investigation maintainers: It indexes current manifest-cell failures by bucket and preserves bounded evidence, current explanations, and the next discriminating check without acting as an executable workload."
     },
     {
-      "disposition": "buck-fixture",
+      "disposition": "fbsource-only",
       "path": "tests/bin/BUCK",
       "runner": "Meta Buck test targets",
       "why": "tests/bin/BUCK is owned by Meta Buck test targets: It declares internal targets for the C fixtures in tests/bin. Buck consumes this metadata directly; the file is neither a guest executable nor an input selected by the public manifest runner."
@@ -43,13 +49,13 @@
       "why": "tests/bin/robust_futex_test.c is owned by target/debug/test-harness via tests/e2e/manifests/bin-c.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
-      "disposition": "buck-fixture",
+      "disposition": "fbsource-only",
       "path": "tests/c/BUCK",
       "runner": "Meta Buck test targets",
       "why": "tests/c/BUCK is owned by Meta Buck test targets: It declares the internal build and test targets for the C guest corpus. Buck consumes this metadata directly while the public test harness obtains its program selection from the centralized manifests."
     },
     {
-      "disposition": "buck-fixture",
+      "disposition": "fbsource-only",
       "path": "tests/c/PACKAGE",
       "runner": "Meta Buck test targets",
       "why": "tests/c/PACKAGE is owned by Meta Buck test targets: It supplies package-level Buck policy for the C guest corpus. The file configures the internal build graph and is not itself a guest program or public manifest input."
@@ -3097,7 +3103,7 @@
       "why": "tests/c/sigtimedwait_queued_signal_before_child_exit.c is owned by hermit-cli/tests/external_signal_interrupt.rs: The integration suite compiles this guest and checks that rt_sigtimedwait returns a queued SIGUSR1 from the wait set, with the child's siginfo, before EINTR for the SIGCHLD of the child's exit, as on Linux."
     },
     {
-      "disposition": "buck-fixture",
+      "disposition": "fbsource-only",
       "path": "tests/c/simple/BUCK",
       "runner": "Meta Buck test targets",
       "why": "tests/c/simple/BUCK is owned by Meta Buck test targets: It declares internal targets for the small C guest fixtures in this directory. Buck consumes this metadata directly; it is not an executable guest or public manifest input."
@@ -3907,7 +3913,7 @@
       "why": "tests/debugger/.gitignore is owned by tests/debugger/run_debugger_tests.sh: The debugger asset `.gitignore` is support metadata for generated debugger sessions. The driver owns ports, process cleanup, and replay assertions that a standalone manifest program cannot supply."
     },
     {
-      "disposition": "buck-fixture",
+      "disposition": "fbsource-only",
       "path": "tests/debugger/BUCK",
       "runner": "Meta Buck test targets",
       "why": "tests/debugger/BUCK is owned by Meta Buck test targets: It declares internal debugger test targets and their dependencies. Buck consumes this metadata directly; it is not a guest program or public manifest input."
@@ -3919,7 +3925,7 @@
       "why": "tests/debugger/README.md is owned by tests/debugger/run_debugger_tests.sh: The debugger asset `README.md` is support metadata for generated debugger sessions. The driver owns ports, process cleanup, and replay assertions that a standalone manifest program cannot supply."
     },
     {
-      "disposition": "buck-fixture",
+      "disposition": "fbsource-only",
       "path": "tests/debugger/guests/BUCK",
       "runner": "Meta Buck test targets",
       "why": "tests/debugger/guests/BUCK is owned by Meta Buck test targets: It declares internal build targets for debugger guest fixtures. Buck consumes this metadata directly, while the file itself has no runtime observation contract."
@@ -5095,6 +5101,12 @@
       "why": "Included verbatim by the refusal-detail regression controls to verify that a real scorecard rejection retains its cell identity and cause. The diagnostic text is compared in memory; its recorded paths are never executed."
     },
     {
+      "disposition": "fbsource-only",
+      "path": "tests/gvisor/BUCK",
+      "runner": "Meta Buck test targets",
+      "why": "tests/gvisor/BUCK is owned by Meta Buck test targets: It declares the internal hermit_bin_test targets for the copied gVisor cases and their shared :test_util library. Buck consumes this metadata directly; it is not a guest program or public manifest input."
+    },
+    {
       "disposition": "buck-fixture",
       "path": "tests/gvisor/README.md",
       "runner": "Meta Buck test targets",
@@ -5383,6 +5395,12 @@
       "why": "tests/qemu-boot/strict_l2_userspace_test.sh is owned by scripts/validate.rs QEMU_L2_ONLY or the direct QEMU suite: The `strict_l2_userspace_test` QEMU driver builds an initramfs, manages QMP/serial processes, and asserts guest boot or network state. Its nested VM lifecycle and downloaded kernel artifacts require dedicated orchestration outside the userspace program manifest."
     },
     {
+      "disposition": "fbsource-only",
+      "path": "tests/record_workloads.bzl",
+      "runner": "Meta Buck test targets",
+      "why": "tests/record_workloads.bzl is owned by Meta Buck test targets: It defines the Buck genrules that build record_replay's prepared C workloads as their consumer builds them, loaded by tests/BUCK and tests/c/BUCK. Buck loads it directly; it is not a guest program or public manifest input."
+    },
+    {
       "disposition": "guest-fixture",
       "path": "tests/reproducible-builds/README.md",
       "runner": "tests/reproducible-builds/run.sh",
@@ -5413,7 +5431,7 @@
       "why": "tests/reproducible-builds/run.sh is owned by reproducible-build E2E suite: run.sh performs two isolated Cargo builds of the pinned fixture and compares their artifacts. That paired-build assertion is a build-system experiment, not a single Hermit guest observation."
     },
     {
-      "disposition": "buck-fixture",
+      "disposition": "fbsource-only",
       "path": "tests/runtime/BUCK",
       "runner": "Meta Buck test targets",
       "why": "tests/runtime/BUCK is owned by Meta Buck test targets: It declares internal targets for runtime integration fixtures. Buck consumes this metadata directly; the file is build policy and has no standalone guest behavior."
@@ -5845,7 +5863,7 @@
       "why": "tests/stress/scheduling_fairness.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `scheduling_fairness` is built from `tests/stress/scheduling_fairness.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
-      "disposition": "buck-fixture",
+      "disposition": "fbsource-only",
       "path": "tests/util/BUCK",
       "runner": "Meta Buck test targets",
       "why": "tests/util/BUCK is owned by Meta Buck test targets: It declares internal targets for shared test utilities. Buck consumes this metadata directly; the file configures the test graph rather than acting as an executable test input."

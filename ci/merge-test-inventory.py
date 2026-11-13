@@ -32,6 +32,13 @@ which is tracked files plus genuinely new untracked ones, minus ignored build
 output. Pruning is on by default and ``--no-prune`` exists only to make the
 hazard visible in tests.
 
+One kind of entry is never pruned: disposition ``fbsource-only``, for Buck
+metadata such as ``tests/BUCK`` that ShipIt strips from the GitHub export
+(facebookexperimental/hermit). The export's tree lacks those files by design,
+and merging there must not drop them from the inventory every other tree
+needs. The manifest gate (ci/manifest-plan) checks that exactly the files
+ShipIt strips carry that disposition.
+
 When both sides register the SAME path, the first input wins and later ones are
 reported, not merged. That precedence is deliberate and is the same lesson as
 pruning. A stale branch's copy of an entry that already exists is, by
@@ -65,13 +72,18 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 ENTRY_KEYS = ("disposition", "path", "runner", "why")
+# Files ShipIt strips from the GitHub export; absent there by design.
+FBSOURCE_ONLY = "fbsource-only"
 
 
 def _load(path: Path) -> dict:
@@ -156,7 +168,7 @@ def merge(
     pruned: List[str] = []
     if present is not None:
         for path in sorted(chosen):
-            if path not in present:
+            if path not in present and chosen[path].get("disposition") != FBSOURCE_ONLY:
                 pruned.append(path)
                 del chosen[path]
 
@@ -176,7 +188,12 @@ def check(path: Path, repo_root: Path) -> int:
     duplicates = sorted({p for p in paths if paths.count(p) > 1})
     if duplicates:
         problems.append(f"duplicate paths: {', '.join(duplicates)}")
-    phantoms = sorted(set(paths) - existing_test_files(repo_root))
+    fbsource_only = {
+        entry["path"]
+        for entry in doc["files"]
+        if entry.get("disposition") == FBSOURCE_ONLY
+    }
+    phantoms = sorted(set(paths) - existing_test_files(repo_root) - fbsource_only)
     if phantoms:
         problems.append(
             "entries for files that do not exist (a rename was merged without "
@@ -269,6 +286,56 @@ def _self_test() -> int:
     # Identical duplicates are not an override at all.
     _, _, overrides = merge([mine, doc(entry("tests/a.c", "manifest-test"))], present)
     expect("identical duplicate is not an override", overrides == [])
+
+    # The GitHub export lacks fbsource-only files by design: merging there keeps
+    # their entries...
+    export = doc(entry("tests/BUCK", FBSOURCE_ONLY), entry("tests/a.c"))
+    entries, pruned, _ = merge([export], present)
+    expect(
+        "an absent fbsource-only entry is kept",
+        [e["path"] for e in entries] == ["tests/BUCK", "tests/a.c"] and pruned == [],
+    )
+    # ...but a missing file of any other disposition is still pruned.
+    entries, pruned, _ = merge(
+        [doc(entry("tests/BUCK", FBSOURCE_ONLY), entry("tests/gone.c"))], present
+    )
+    expect(
+        "an absent ordinary entry is still pruned beside an fbsource-only one",
+        [e["path"] for e in entries] == ["tests/BUCK"] and pruned == ["tests/gone.c"],
+    )
+
+    # --check applies the same rule to a committed inventory, in a real checkout.
+    with tempfile.TemporaryDirectory(prefix="merge-test-inventory-") as scratch:
+        root = Path(scratch)
+        subprocess.run(
+            ["git", "-c", "init.defaultBranch=main", "init", "-q", str(root)],
+            check=True,
+        )
+        (root / "tests").mkdir()
+        (root / "tests" / "a.c").write_text("")
+        inventory = root / "test-files.json"
+        inventory.write_text(
+            json.dumps(doc(entry("tests/BUCK", FBSOURCE_ONLY), entry("tests/a.c")))
+        )
+        expect("--check accepts an absent fbsource-only entry", check(inventory, root) == 0)
+        inventory.write_text(
+            json.dumps(
+                doc(
+                    entry("tests/BUCK", FBSOURCE_ONLY),
+                    entry("tests/a.c"),
+                    entry("tests/gone.c"),
+                )
+            )
+        )
+        refused = io.StringIO()
+        with contextlib.redirect_stderr(refused):
+            status = check(inventory, root)
+        expect(
+            "--check still refuses an absent ordinary entry, and names only it",
+            status == 1
+            and "tests/gone.c" in refused.getvalue()
+            and "tests/BUCK" not in refused.getvalue(),
+        )
 
     if failures:
         print(f"\nself-test FAILED: {len(failures)} case(s)", file=sys.stderr)

@@ -51,6 +51,13 @@ const MODES: [&str; 5] = ["verify", "chaos", "replay", "naked", "custom"];
 const MATRIX_SYMMETRY_BASELINE: &str = "ci/matrix-symmetry-baseline.json";
 const CI_REASON_BASELINE: &str = "ci/ci-reason-baseline.json";
 const TEST_INVENTORY: &str = "tests/e2e/manifests/inventory/test-files.json";
+/// The inventory disposition of a file below tests/ that ShipIt strips from the
+/// GitHub export, facebookexperimental/hermit: Buck build metadata such as
+/// tests/BUCK and tests/c/PACKAGE. Trees that carry the Buck build have the
+/// file and the export does not, so an entry with this disposition may name a
+/// file the tree lacks. Among inventory entries, exactly the paths
+/// `shipit_strips_from_export` matches carry it.
+const FBSOURCE_ONLY: &str = "fbsource-only";
 
 const HELP: &str = "\
 Usage: hermit-manifest-plan [--format <FORMAT>] [--root <HERMIT_CHECKOUT>] [--source-snapshot]
@@ -737,7 +744,9 @@ fn validate_retired_ids(repo_root: &Path, documents: &[Value], seen_ids: &BTreeS
         .unwrap_or_else(|error| die(error));
 }
 
-/// Require the inventory to be an exact partition of the test tree.
+/// Require the inventory to be an exact partition of the test tree, except that
+/// an `fbsource-only` entry may name a file the tree lacks: ShipIt strips those
+/// files from the GitHub export, whose tree must pass this check too.
 ///
 /// Git is the population authority on purpose: tracked files and genuinely new
 /// untracked files qualify, while ignored compiler/test output does not. This is
@@ -774,6 +783,9 @@ fn validate_test_inventory(
 
     let mut paths = Vec::with_capacity(files.len());
     let mut inventory_manifest_tests = BTreeSet::new();
+    let mut fbsource_only = BTreeSet::new();
+    let mut exported_but_fbsource_only = Vec::new();
+    let mut stripped_but_not_fbsource_only = Vec::new();
     for (index, entry) in files.iter().enumerate() {
         let location = format!("{TEST_INVENTORY}: files[{index}]");
         let entry_object = entry
@@ -800,7 +812,28 @@ fn validate_test_inventory(
         if disposition == "manifest-test" {
             inventory_manifest_tests.insert(path.to_string());
         }
+        match (
+            disposition == FBSOURCE_ONLY,
+            shipit_strips_from_export(path),
+        ) {
+            (true, true) => {
+                fbsource_only.insert(path.to_string());
+            }
+            (true, false) => exported_but_fbsource_only.push(path.to_string()),
+            (false, true) => stripped_but_not_fbsource_only.push(path.to_string()),
+            (false, false) => {}
+        }
         paths.push(path.to_string());
+    }
+    if !exported_but_fbsource_only.is_empty() {
+        die(format!(
+            "{TEST_INVENTORY}: disposition {FBSOURCE_ONLY} is only for files ShipIt strips from the GitHub export, and it exports these: {exported_but_fbsource_only:?}"
+        ));
+    }
+    if !stripped_but_not_fbsource_only.is_empty() {
+        die(format!(
+            "{TEST_INVENTORY}: ShipIt strips these files from the GitHub export, so their disposition must be {FBSOURCE_ONLY}: {stripped_but_not_fbsource_only:?}"
+        ));
     }
 
     if paths.windows(2).any(|pair| pair[0] > pair[1]) {
@@ -827,7 +860,12 @@ fn validate_test_inventory(
         TestPopulation::Snapshot => snapshot_test_population(repo_root),
     };
     let unregistered: Vec<_> = present.difference(&registered).cloned().collect();
-    let phantoms: Vec<_> = registered.difference(&present).cloned().collect();
+    // An fbsource-only file is absent from the export by design.
+    let phantoms: Vec<_> = registered
+        .difference(&present)
+        .filter(|path| !fbsource_only.contains(*path))
+        .cloned()
+        .collect();
     if !unregistered.is_empty() || !phantoms.is_empty() {
         die(format!(
             "test inventory is stale; every file in tests/ must have an explicit disposition; unregistered={unregistered:?}, phantom={phantoms:?}"
@@ -854,6 +892,130 @@ fn validate_test_inventory(
             "manifest programs and disposition=manifest-test inventory entries differ; missing={missing:?}, stale={stale:?}"
         ));
     }
+}
+
+/// Whether ShipIt strips `path`, a path below tests/, from the GitHub export
+/// (facebookexperimental/hermit). This copies, for such paths, the rules in
+/// configerator:
+/// - source/opensource/sensitive/shipit_global_config.cconf, stripCommonFiles;
+/// - source/opensource/shipit_config/facebookexperimental/hermit.cconf,
+///   stripCommonFilesExceptions and defaultStrippedFiles.
+///
+/// ShipIt strips a path that matches a stripCommonFiles rule and no
+/// stripCommonFilesExceptions rule, or that matches a defaultStrippedFiles
+/// rule; the exceptions override nothing else. It matches the fbsource path,
+/// fbcode/hermetic_infra/hermit/<path>. Rules anchored at the fbsource root or
+/// at the Hermit root cannot match a path below tests/ and are not copied. If
+/// those configs change, change this.
+///
+/// The answer is exact for every path this accepts. It dies instead of
+/// answering for a path that would need more of the regex engine than this
+/// copies: one with an empty component or a newline, which a regex `.` does not
+/// match, or with a non-ASCII character where a rule reads `\w`, which ShipIt's
+/// regex engine takes as any Unicode word character.
+fn shipit_strips_from_export(path: &str) -> bool {
+    let undecided = |why: &str| -> ! {
+        die(format!(
+            "cannot tell whether ShipIt strips {path:?} from the GitHub export: {why}; \
+             this copy of its rules decides only paths without one"
+        ))
+    };
+    if path.split('/').any(str::is_empty) {
+        undecided("it has an empty path component");
+    }
+    if path.contains('\n') {
+        undecided("it has a newline");
+    }
+    let mut components = vec!["hermit"];
+    components.extend(path.split('/'));
+    let file = components.last().copied().unwrap_or_default();
+    // `\w+`. An ASCII character outside `\w` decides it; a non-ASCII one could
+    // be a Unicode word character, which this copy does not decide.
+    let is_word = |text: &str| {
+        if text.is_empty()
+            || text.chars().any(|character| {
+                character.is_ascii() && !(character.is_ascii_alphanumeric() || character == '_')
+            })
+        {
+            return false;
+        }
+        if !text.is_ascii() {
+            undecided("it has a non-ASCII character where a rule reads \\w");
+        }
+        true
+    };
+    // stripCommonFiles, global. Components: (^|/)fb[-_]?only(/|$),
+    // (^|/)fb(/|$), (^|/)meta[-_]?only(/|$), (^|/)\.patternlint(/|$), and a
+    // `facebook` component whose parent is not `com`.
+    let common_component = components.iter().enumerate().skip(1).any(|(index, name)| {
+        matches!(
+            *name,
+            "fbonly"
+                | "fb-only"
+                | "fb_only"
+                | "fb"
+                | "metaonly"
+                | "meta-only"
+                | "meta_only"
+                | ".patternlint"
+        ) || (*name == "facebook" && components[index - 1] != "com")
+    });
+    // File names: AUTODEPS, TARGETS, TARGETS.v1, TARGETS.v2, PLATFORM, PACKAGE,
+    // BUCK_TREE, .hgsparse(-\w+)?, BUCK, BUCK.\w+, FBBUILD_CONFIG, BUILD_MODE,
+    // CFM_RULES, .pyre_configuration.local, .autodeps.toml, .flow.dotslash,
+    // .rewrite-lockfile.fb.
+    let common_name = matches!(
+        file,
+        "AUTODEPS"
+            | "TARGETS"
+            | "TARGETS.v1"
+            | "TARGETS.v2"
+            | "PLATFORM"
+            | "PACKAGE"
+            | "BUCK_TREE"
+            | ".hgsparse"
+            | "BUCK"
+            | "FBBUILD_CONFIG"
+            | "BUILD_MODE"
+            | "CFM_RULES"
+            | ".pyre_configuration.local"
+            | ".autodeps.toml"
+            | ".flow.dotslash"
+            | ".rewrite-lockfile.fb"
+    ) || file.strip_prefix(".hgsparse-").is_some_and(is_word)
+        || file.strip_prefix("BUCK.").is_some_and(is_word);
+    // (^|/)CLAUDE\.md$, any case. No non-ASCII character case-folds to a letter
+    // of CLAUDE.md or of bzl below, so ASCII case-insensitivity is exact.
+    let claude_md = file.eq_ignore_ascii_case("CLAUDE.md");
+    // Suffixes and substrings: \.bzl$ (any case), \.mk$, \.owner$,
+    // re_worker_requirements$, and the two pull_request_metadata files.
+    let common_suffix = claude_md
+        || file.to_ascii_lowercase().ends_with(".bzl")
+        || file.ends_with(".mk")
+        || file.ends_with(".owner")
+        || path.ends_with("re_worker_requirements")
+        || path.contains("pull_request_metadata_DO_NOT_COMMIT_THIS_FILE.json")
+        || path.contains("pull_request_metadata_DO_NOT_COMMIT_THIS_FILE_OR_YOU_WILL_BE_FIRED.json");
+    // stripCommonFilesExceptions, hermit.cconf. Exceptions apply only to
+    // stripCommonFiles, but to all of it, component rules included.
+    // - @/tests/helpers.bzl@ keeps the shared Buck helper the exported tests
+    //   read. It is unanchored, and its unescaped `.` matches any character
+    //   but a newline (refused above), so tests/fb/tests/helpers_bzl matches.
+    // - @^fbcode/hermetic_infra/hermit/(.+/)?CLAUDE\.md$@i keeps every
+    //   CLAUDE.md below the Hermit root, tests/fb/CLAUDE.md included.
+    let full = format!("/{path}");
+    let helpers_bzl = full.match_indices("/tests/helpers").any(|(at, needle)| {
+        let mut rest = full[at + needle.len()..].chars();
+        rest.next().is_some() && rest.as_str().starts_with("bzl")
+    });
+    let excepted = helpers_bzl || claude_md;
+    // defaultStrippedFiles, hermit.cconf: (.+/)?\.autodeps\.skip_target_generation$
+    // and (.+/)?\.skill_reset[^/]*/.
+    let hermit_default = file == ".autodeps.skip_target_generation"
+        || components[1..components.len() - 1]
+            .iter()
+            .any(|name| name.starts_with(".skill_reset"));
+    ((common_component || common_name || common_suffix) && !excepted) || hermit_default
 }
 
 /// The `tests/` population Git reports: tracked files plus untracked files that
@@ -2004,6 +2166,215 @@ mod tests {
         assert_eq!(population, TestPopulation::Snapshot);
         let (_, _, population) = parse_options(vec![]).unwrap();
         assert_eq!(population, TestPopulation::Git);
+    }
+
+    // ------------------------------------------ fbsource-only inventory entries
+    //
+    // ShipIt strips Buck metadata such as tests/BUCK from the GitHub export, so
+    // the export's own tree lacks files the inventory names. These bracket the
+    // exemption from both sides: the export passes, and a missing REAL file, a
+    // present but unregistered Buck file, or a disposition that does not match
+    // the strip rule still fails.
+
+    #[test]
+    fn the_strip_rule_follows_the_shipit_config() {
+        for path in [
+            "tests/BUCK",
+            "tests/c/PACKAGE",
+            "tests/c/simple/BUCK",
+            "tests/x/TARGETS",
+            "tests/x/TARGETS.v2",
+            "tests/x/BUCK.v2",
+            "tests/x/BUCK_TREE",
+            "tests/x/PLATFORM",
+            "tests/record_workloads.bzl",
+            "tests/x/defs.BZL",
+            "tests/x/rules.mk",
+            "tests/x/team.owner",
+            "tests/.autodeps.skip_target_generation",
+            "tests/fb-only/a.c",
+            "tests/fb_only/a.c",
+            "tests/x/fb/a.c",
+            "tests/x/meta-only/a.c",
+            "tests/facebook/a.c",
+            "tests/x/.skill_reset_20260816/AGENTS.md",
+            // No exception overrides defaultStrippedFiles.
+            "tests/x/.skill_reset_20260816/CLAUDE.md",
+            // Under a stripped directory, only an excepted name is exported.
+            "tests/fb/CLAUDE.md.orig",
+            "tests/fb/xCLAUDE.md",
+            "tests/fb/tests/helpers.bzx",
+        ] {
+            assert!(shipit_strips_from_export(path), "{path} should be stripped");
+        }
+        for path in [
+            "tests/helpers.bzl",
+            "tests/c/a.c",
+            "tests/c/BUCKET.c",
+            "tests/x/BUCK.",
+            "tests/x/TARGETS.v3",
+            "tests/x/fbx/a.c",
+            "tests/x/com/facebook/A.java",
+            "tests/x/CLAUDE.md",
+            "tests/e2e/manifests/inventory/test-files.json",
+            // hermit.cconf's CLAUDE.md exception overrides every stripCommonFiles
+            // rule, the component rules included, in any case.
+            "tests/fb/CLAUDE.md",
+            "tests/fb-only/claude.md",
+            "tests/x/meta_only/Claude.Md",
+            "tests/facebook/CLAUDE.md",
+            // The helpers.bzl exception is unanchored and its `.` matches anything.
+            "tests/fb/tests/helpers.bzl",
+            "tests/fb/tests/helpers_bzl",
+            // An ASCII character outside \w decides BUCK.\w+ whatever else it has.
+            "tests/x/BUCK.\u{e9}-x",
+        ] {
+            assert!(
+                !shipit_strips_from_export(path),
+                "{path} should be exported"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot tell whether ShipIt strips \"tests//BUCK\"")]
+    fn the_strip_rule_refuses_an_empty_component() {
+        shipit_strips_from_export("tests//BUCK");
+    }
+
+    #[test]
+    #[should_panic(expected = "it has a newline")]
+    fn the_strip_rule_refuses_a_newline() {
+        shipit_strips_from_export("tests/a\nb/BUCK");
+    }
+
+    #[test]
+    #[should_panic(expected = "non-ASCII character where a rule reads")]
+    fn the_strip_rule_refuses_a_unicode_word_it_cannot_decide() {
+        shipit_strips_from_export("tests/x/BUCK.\u{e9}");
+    }
+
+    /// A temporary tree holding the given files, removed on drop even when the
+    /// test panics.
+    struct InventoryTree(PathBuf);
+
+    impl InventoryTree {
+        fn new(name: &str, files: &[&str]) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("inventory-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            for file in files {
+                let path = root.join(file);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, "").unwrap();
+            }
+            InventoryTree(root)
+        }
+    }
+
+    impl Drop for InventoryTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn inventory_of(entries: &[(&str, &str)]) -> JsonValue {
+        let mut entries = entries.to_vec();
+        entries.sort();
+        json!({
+            "schema": 2,
+            "files": entries
+                .iter()
+                .map(|(path, disposition)| json!({
+                    "path": path,
+                    "disposition": disposition,
+                    "runner": "a runner",
+                    "why": "a reason",
+                }))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    const EXPORTED_FILES: [&str; 2] = ["tests/c/a.c", "tests/helpers.bzl"];
+
+    fn full_inventory() -> JsonValue {
+        inventory_of(&[
+            ("tests/BUCK", FBSOURCE_ONLY),
+            ("tests/c/PACKAGE", FBSOURCE_ONLY),
+            ("tests/c/a.c", "guest-fixture"),
+            ("tests/helpers.bzl", "support-data"),
+        ])
+    }
+
+    fn check_inventory(tree: &InventoryTree, inventory: &JsonValue) {
+        validate_test_inventory(
+            &tree.0,
+            TestPopulation::Snapshot,
+            inventory,
+            &BTreeSet::new(),
+        );
+    }
+
+    #[test]
+    fn an_export_shaped_tree_passes_without_its_fbsource_only_files() {
+        let tree = InventoryTree::new("export", &EXPORTED_FILES);
+        check_inventory(&tree, &full_inventory());
+    }
+
+    #[test]
+    fn a_tree_that_carries_the_buck_files_passes_too() {
+        let tree = InventoryTree::new(
+            "buck",
+            &[
+                "tests/BUCK",
+                "tests/c/PACKAGE",
+                "tests/c/a.c",
+                "tests/helpers.bzl",
+            ],
+        );
+        check_inventory(&tree, &full_inventory());
+    }
+
+    #[test]
+    #[should_panic(expected = "phantom=[\"tests/c/a.c\"]")]
+    fn an_export_shaped_tree_missing_a_real_test_file_still_fails() {
+        let tree = InventoryTree::new("missing", &["tests/helpers.bzl"]);
+        check_inventory(&tree, &full_inventory());
+    }
+
+    #[test]
+    #[should_panic(expected = "unregistered=[\"tests/c/BUCK\"]")]
+    fn a_present_buck_file_must_still_be_registered() {
+        let tree = InventoryTree::new(
+            "unregistered",
+            &["tests/c/BUCK", "tests/c/a.c", "tests/helpers.bzl"],
+        );
+        check_inventory(&tree, &full_inventory());
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "is only for files ShipIt strips from the GitHub export, and it exports these: [\"tests/c/a.c\"]"
+    )]
+    fn fbsource_only_on_an_exported_file_is_refused() {
+        let tree = InventoryTree::new("exported", &["tests/helpers.bzl"]);
+        let inventory = inventory_of(&[
+            ("tests/c/a.c", FBSOURCE_ONLY),
+            ("tests/helpers.bzl", "support-data"),
+        ]);
+        check_inventory(&tree, &inventory);
+    }
+
+    #[test]
+    #[should_panic(expected = "so their disposition must be fbsource-only: [\"tests/BUCK\"]")]
+    fn a_stripped_file_with_another_disposition_is_refused() {
+        let tree = InventoryTree::new("misdisposed", &EXPORTED_FILES);
+        let inventory = inventory_of(&[
+            ("tests/BUCK", "buck-fixture"),
+            ("tests/c/a.c", "guest-fixture"),
+            ("tests/helpers.bzl", "support-data"),
+        ]);
+        check_inventory(&tree, &inventory);
     }
 
     fn parse_mode(text: &str) -> Value {
