@@ -5080,8 +5080,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// `getcwd` gives, and an exec of the caller's own `exe` link spelled
     /// under `/proc` the image it executes. Only an ELF image is recorded:
     /// `None` for a script (the executor reads its interpreter its own way),
-    /// for a name without a slash (which the executor searches on `PATH`,
-    /// where Linux does not), for a path relative to a directory descriptor
+    /// for a name without a slash (which the executor, as Linux does, also
+    /// resolves from the working directory, but which this record leaves to
+    /// the executor), for a path relative to a directory descriptor
     /// or empty (`AT_EMPTY_PATH`), for any other path under `/proc` (the
     /// tool's `/proc` is not the guest's), in a nested PID namespace, and for
     /// the tool's own image, which a path through the tool's `/proc` could

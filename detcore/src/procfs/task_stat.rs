@@ -90,12 +90,11 @@
 //! in every descendant that has not renamed itself or exec'd since (cells
 //! `system-utils/stat-script-root` and `system-utils/stat-alias-root` check
 //! the three files against the native output; before 2b-2 their KVM rows
-//! said `status=bash`, the executor's name). The same split can follow a
-//! guest exec by a spelling the executor canonicalizes: a slashless
-//! `execve("alias", ...)` of a symbolic link `alias -> actual` can be named
-//! `actual` by the executor while the record, `stat`, `status` and `comm`
-//! say `alias`, as Linux does. After `PR_SET_NAME`, both follow the same
-//! rule.
+//! said `status=bash`, the executor's name). A guest exec does not reopen
+//! the split: the executor names the new image by the filename the exec was
+//! given, as Linux does, so an exec of a symbolic link `alias -> actual` is
+//! `alias` to `PR_GET_NAME` and to the record alike. After `PR_SET_NAME`,
+//! both follow the same rule.
 //!
 //! The rules are Linux 6.17's (fs/proc/array.c `do_task_stat`, fs/exec.c
 //! `begin_new_exec`, kernel/sys.c `PR_SET_NAME`, fs/proc/base.c
