@@ -481,10 +481,23 @@ fn append_hermit_args_with_execution_root_mode(
     if !has_explicit_base_env {
         execution_root.insert(0, "--base-env=minimal".into());
     }
-    if !private_mount || command_args.contains(&OsStr::new("--mount=type=tmpfs,target=/test")) {
+    // A case that already chooses its own workdir keeps it: the execution
+    // root's tmpfs mount exists only to provide that workdir, and a second
+    // --workdir (any target) would make clap refuse the command.
+    let case_has_workdir = command_args.iter().any(|arg| {
+        arg.to_str()
+            .is_some_and(|arg| arg.starts_with("--workdir"))
+    }) || command_args
+        .windows(2)
+        .any(|pair| pair[0] == OsStr::new("--workdir"));
+    if !private_mount
+        || case_has_workdir
+        || command_args.contains(&OsStr::new("--mount=type=tmpfs,target=/test"))
+    {
         execution_root.retain(|arg| arg != OsStr::new("--mount=type=tmpfs,target=/test"));
     }
-    if command_args.contains(&OsStr::new("--workdir=/test"))
+    if case_has_workdir
+        || command_args.contains(&OsStr::new("--workdir=/test"))
         || command_args
             .windows(2)
             .any(|pair| pair == [OsStr::new("--workdir"), OsStr::new("/test")])
@@ -4837,6 +4850,34 @@ fn stdout(output: &Output) -> String {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).expect("hermit stderr should be UTF-8")
+}
+
+/// With the isolated-workdir request set, a case that already mounts its
+/// own tmpfs workdir keeps exactly that pair: the harness adds neither
+/// its /test mount nor a second --workdir (which clap would refuse).
+#[test]
+fn pinned_root_arguments_keep_a_cases_own_tmpfs_workdir() {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    let args = [
+        "run",
+        "--mount=type=tmpfs,target=/tmp/timerfd-workdir",
+        "--workdir=/tmp/timerfd-workdir",
+        "--",
+        "/bin/true",
+    ];
+    append_hermit_args_with_execution_root(&mut command, &args, Some(OsStr::new("/test")))
+        .expect("the documented workdir request should build a command");
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        [
+            OsStr::new("run"),
+            OsStr::new("--mount=type=tmpfs,target=/tmp/timerfd-workdir"),
+            OsStr::new("--workdir=/tmp/timerfd-workdir"),
+            OsStr::new("--base-env=minimal"),
+            OsStr::new("--"),
+            OsStr::new("/bin/true"),
+        ]
+    );
 }
 
 #[test]

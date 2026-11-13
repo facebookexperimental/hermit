@@ -154,16 +154,19 @@ fn matches(expected: &str, actual: &str) -> bool {
 /// Run `mode` under strict verification and require a bitwise match with
 /// stdout matching `expected`.
 /// A private tmpfs working directory. The guest writes no file.
+/// The target is under /tmp, which Hermit stages privately and creates,
+/// because a tmpfs target outside it must exist on the host (a host
+/// without /test refused these runs before the guest started).
 /// In-guest LiteInst cannot deliver a preemption timer yet and refuses a run
 /// that keeps one, so it runs without time slices.
 fn private_workdir(backend: &str) -> &'static [&'static str] {
     match backend {
         "liteinst" => &[
-            "--mount=type=tmpfs,target=/test",
-            "--workdir=/test",
+            "--mount=type=tmpfs,target=/tmp/timerfd-workdir",
+            "--workdir=/tmp/timerfd-workdir",
             "--max-timeslice=disabled",
         ],
-        _ => &["--mount=type=tmpfs,target=/test", "--workdir=/test"],
+        _ => &["--mount=type=tmpfs,target=/tmp/timerfd-workdir", "--workdir=/tmp/timerfd-workdir"],
     }
 }
 
@@ -277,8 +280,8 @@ pub(super) fn signal_during_publish(backend: &str) {
         "run",
         "--base-env=minimal",
         "--strict",
-        "--mount=type=tmpfs,target=/test",
-        "--workdir=/test",
+        "--mount=type=tmpfs,target=/tmp/timerfd-workdir",
+        "--workdir=/tmp/timerfd-workdir",
         "--",
         guest().to_str().unwrap(),
         "catchup-sigcont",
