@@ -836,48 +836,95 @@ fn same_core_package(
     Ok(())
 }
 
-/// Hold the original core producer's shared generation lock. Consumers retain
-/// this guard until their actual Nextest child has joined, alongside their own
-/// project lock. There is no fallback to building a wrapper in a test node.
-fn project_tools(project: Option<&PreparedProject>) -> Result<Option<LockedArtifacts>, String> {
-    let Some(project) = project else {
-        return Ok(None);
-    };
-    // The core tool cohort is the default cohort by construction; the
-    // record check below refuses a project record in its place.
-    let locked = LockedArtifacts::open(&project.tools_root, false, DEFAULT_COHORT)?;
-    check_identity(&project.core_preparation, false)?;
-    let record = locked.current()?;
-    if record.schema != RECORD_SCHEMA
-        || record.project.is_some()
-        || record.repository != project.tools_root
-    {
-        return Err("tool cohort is not the original core preparation owner".into());
-    }
-    check_identity(&record.cargo_metadata, false)?;
-    let cargo = read_json(&record.cargo_metadata.path)?;
-    let target = Path::new(string(&cargo, "target_directory")?);
-    if target != record.target
-        || target.canonicalize().map_err(|e| e.to_string())? != target
-        || record.sources != sources(&cargo, &project.tools_root)?
-        || record.rustc != rustc_identity()?
-    {
-        return Err("core tool cohort has changed source, compiler, or Cargo target".into());
-    }
-    // These are the producer's recorded config inputs, not a claim that two
-    // distinct Cargo projects have the same target-dir/build environment. The
-    // immutable core record retains its actual original build environment;
-    // the consumer's own environment is still checked by verify_record.
-    for (path, identity) in &record.cargo_config {
-        match identity {
-            Some(identity) => check_identity(identity, false)?,
-            None if !path.try_exists().map_err(|e| e.to_string())? => (),
-            None => return Err("core tool cohort Cargo configuration changed".into()),
+/// A prepared project's core tool owner: its store, locked shared, and its
+/// published record. It is step 1 of the global lock order, taken before the
+/// project's own store; its target is locked with the project's own in step 3.
+/// Consumers keep it until their Nextest child has joined. There is no
+/// fallback to building a wrapper in a test node.
+struct ToolOwner {
+    project: PreparedProject,
+    record: PreparedRecord,
+    _store: LockedArtifacts,
+}
+
+impl ToolOwner {
+    fn open(project: Option<PreparedProject>) -> Result<Option<Self>, String> {
+        let Some(project) = project else {
+            return Ok(None);
+        };
+        // The core tool cohort is the default cohort by construction; the
+        // record check below refuses a project record in its place.
+        let store = LockedArtifacts::open(&project.tools_root, false, DEFAULT_COHORT)?;
+        check_identity(&project.core_preparation, false)?;
+        let record = store.current()?;
+        if record.schema != RECORD_SCHEMA
+            || record.project.is_some()
+            || record.repository != project.tools_root
+        {
+            return Err("tool cohort is not the original core preparation owner".into());
         }
+        Ok(Some(Self {
+            project,
+            record,
+            _store: store,
+        }))
     }
-    verify_cpu_wrapper(&record, &cargo)?;
-    check_identity(&project.core_preparation, false)?;
-    Ok(Some(locked))
+
+    /// Check the core preparation, with its target locked (step 3).
+    fn verify(&self) -> Result<(), String> {
+        let (project, record) = (&self.project, &self.record);
+        check_identity(&record.cargo_metadata, false)?;
+        let cargo = read_json(&record.cargo_metadata.path)?;
+        let target = Path::new(string(&cargo, "target_directory")?);
+        if target != record.target
+            || target.canonicalize().map_err(|e| e.to_string())? != target
+            || record.sources != sources(&cargo, &project.tools_root)?
+            || record.rustc != rustc_identity()?
+        {
+            return Err("core tool cohort has changed source, compiler, or Cargo target".into());
+        }
+        // These are the producer's recorded config inputs, not a claim that two
+        // distinct Cargo projects have the same target-dir/build environment. The
+        // immutable core record retains its actual original build environment;
+        // the consumer's own environment is still checked by verify_record.
+        for (path, identity) in &record.cargo_config {
+            match identity {
+                Some(identity) => check_identity(identity, false)?,
+                None if !path.try_exists().map_err(|e| e.to_string())? => (),
+                None => return Err("core tool cohort Cargo configuration changed".into()),
+            }
+        }
+        verify_cpu_wrapper(record, &cargo, None)?;
+        check_identity(&project.core_preparation, false)
+    }
+}
+
+/// The locks of a reader of a published generation, in the global lock
+/// order: the tool owner's store, ROOT's cohort store, then both targets.
+struct ReaderLocks {
+    owner: Option<ToolOwner>,
+    artifacts: LockedArtifacts,
+}
+
+impl ReaderLocks {
+    /// Steps 1 and 2. PROJECT is ROOT's prepared project, which
+    /// `verify_record` requires the record to name.
+    fn open(
+        root: &Path,
+        cohort: PreparedCohort,
+        project: Option<PreparedProject>,
+    ) -> Result<Self, String> {
+        let owner = ToolOwner::open(project)?;
+        let artifacts = LockedArtifacts::open(root, false, cohort)?;
+        Ok(Self { owner, artifacts })
+    }
+
+    /// Step 3, then RECORD (and its tool owner) checked under every lock.
+    fn verify(&mut self, root: &Path, record: &PreparedRecord) -> Result<Value, String> {
+        self.artifacts
+            .lock_targets(&record.target, self.owner.as_ref())?;
+        verify_record(root, record, &self.artifacts, self.owner.as_ref())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -958,10 +1005,20 @@ fn cpu_wrapper_artifact(
     found.ok_or_else(|| "Cargo did not report the normal CPU wrapper executable".into())
 }
 
-fn verify_cpu_wrapper(record: &PreparedRecord, cargo: &Value) -> Result<(), String> {
+/// OWNER is the held tool owner of RECORD's project, whose target the caller
+/// has locked; a core record has none.
+fn verify_cpu_wrapper(
+    record: &PreparedRecord,
+    cargo: &Value,
+    owner: Option<&ToolOwner>,
+) -> Result<(), String> {
     if let Some(project) = &record.project {
-        let tools = project_tools(Some(project))?.ok_or("missing prepared tool owner")?;
-        let core = tools.current()?;
+        let owner = owner.ok_or("missing prepared tool owner")?;
+        if owner.project != *project {
+            return Err("held tool owner belongs to a different prepared project".into());
+        }
+        owner.verify()?;
+        let core = &owner.record;
         same_core_package(project, cargo, &read_json(&core.cargo_metadata.path)?)?;
         if core.cpu_wrapper != record.cpu_wrapper {
             return Err("project CPU wrapper differs from its core tool cohort".into());
@@ -1026,27 +1083,109 @@ fn prepare_cpu_wrapper(
     cargo_output(root, &args, destination)
 }
 
+/// The Cargo target a producer builds into, locked exclusively before any
+/// build, together with its prepared project's core tool owner's target,
+/// shared (step 3 of the global lock order). One operation cannot hold one
+/// target both ways, so a project that builds into its core tool owner's
+/// target is refused by name.
+fn lock_producer_target(
+    artifacts: &mut LockedArtifacts,
+    cargo: &Value,
+    tool_owner: Option<&ToolOwner>,
+    root: &Path,
+    cohort: PreparedCohort,
+    operation: &str,
+) -> Result<PathBuf, String> {
+    let target = PathBuf::from(string(cargo, "target_directory")?);
+    fs::create_dir_all(&target).map_err(|e| {
+        format!(
+            "cannot create the Cargo target directory {}: {e}",
+            target.display()
+        )
+    })?;
+    if !target.is_absolute() || target.canonicalize().ok().as_ref() != Some(&target) {
+        return Err(format!(
+            "Cargo reported a noncanonical target directory {}",
+            target.display()
+        ));
+    }
+    check_cohort_target(root, cohort, &target, operation)?;
+    if let Some(owner) = tool_owner {
+        if directory_key(&owner.record.target).ok() == Some(directory_key(&target)?) {
+            return Err(format!(
+                "{operation} refused: this prepared project builds into Cargo target {}, which is its core tool owner's target; give the project its own target",
+                target.display()
+            ));
+        }
+    }
+    artifacts.lock_targets(&target, tool_owner)?;
+    Ok(target)
+}
+
 /// Explicit standalone preparation. Official test consumers never call this.
-/// Standalone preparation owns the default cohort's store files only.
+///
+/// It locks the Cargo target it builds into exclusively, the same
+/// `TargetLock` every producer and reader of that target takes, and no
+/// artifact store's lock. A build into a private target, such as each real
+/// Nextest fixture case's, therefore never waits on the checkout's store
+/// lock, which every outer test node holds shared for its whole run; a build
+/// into a target a prepared generation uses waits for that generation's
+/// producer and readers (dh-g3xj4x). Its own files live in the store
+/// directory under that target.
 pub fn build_cpu_wrapper(root: &Path) -> Result<PathBuf, PreparationError> {
     if std::env::var(REQUIRED_ENV).as_deref() == Ok("1") {
         return Err("an official consumer cannot build a CPU wrapper".into());
     }
     let root = root.canonicalize().map_err(|e| e.to_string())?;
-    let artifacts = LockedArtifacts::open(&root, true, DEFAULT_COHORT)?;
-    let cargo_path = artifacts.root.join("standalone-cargo.json");
-    cargo_output(
-        &root,
-        &["metadata", "--locked", "--format-version", "1"].map(String::from),
-        &cargo_path,
-    )?;
+    let metadata = ["metadata", "--locked", "--format-version", "1"].map(String::from);
+    let output = cargo_command(&root, &metadata)?
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .map_err(|e| e.to_string())?;
+    cargo_status(output.status, &metadata)?;
+    let reported: Value = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("invalid Cargo metadata: {e}"))?;
+    let reported = Path::new(string(&reported, "target_directory")?);
+    if !reported.is_absolute() {
+        return Err(format!(
+            "Cargo reported a relative target directory {}",
+            reported.display()
+        )
+        .into());
+    }
+    fs::create_dir_all(reported).map_err(|e| {
+        format!(
+            "cannot create the Cargo target directory {}: {e}",
+            reported.display()
+        )
+    })?;
+    let target = reported.canonicalize().map_err(|e| {
+        format!(
+            "cannot resolve the Cargo target directory {}: {e}",
+            reported.display()
+        )
+    })?;
+    let _target = acquire_targets(&[(&target, true)])?;
+    let store = target.join("ci/nextest-binaries");
+    let cargo_path = store.join("standalone-cargo.json");
+    cargo_output(&root, &metadata, &cargo_path)?;
     let cargo = read_json(&cargo_path)?;
-    let events = artifacts.root.join("standalone-cpu-wrapper.jsonl");
+    let cargo_target = Path::new(string(&cargo, "target_directory")?);
+    // The lock protects only the target it lives in.
+    if cargo_target.canonicalize().ok().as_deref() != Some(target.as_path()) {
+        return Err(format!(
+            "standalone CPU wrapper build refused: Cargo's target directory changed from {} to {} after its lock was taken",
+            target.display(),
+            cargo_target.display()
+        )
+        .into());
+    }
+    let events = store.join("standalone-cpu-wrapper.jsonl");
     prepare_cpu_wrapper(&root, &events, None)?;
     Ok(cpu_wrapper_artifact(
         &fs::read_to_string(events).map_err(|e| e.to_string())?,
         &cargo,
-        Path::new(string(&cargo, "target_directory")?),
+        cargo_target,
     )?
     .path)
 }
@@ -1054,10 +1193,10 @@ pub fn build_cpu_wrapper(root: &Path) -> Result<PathBuf, PreparationError> {
 pub fn cpu_wrapper(root: &Path) -> Result<PathBuf, String> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let cohort = PreparedCohort::from_env()?;
-    let artifacts = LockedArtifacts::open(&root, false, cohort)?;
-    let record = artifacts.current()?;
+    let mut locks = ReaderLocks::open(&root, cohort, project(&root)?)?;
+    let record = locks.artifacts.current()?;
     check_cohort_target(&root, cohort, &record.target, "prepared CPU wrapper lookup")?;
-    verify_record(&root, &record)?;
+    locks.verify(&root, &record)?;
     Ok(record.cpu_wrapper.executable.path)
 }
 
@@ -1068,31 +1207,81 @@ pub fn budget_context(
     args: &[String],
     launch: Option<&Path>,
 ) -> Result<String, String> {
+    budget_context_with(root, args, launch, None)
+}
+
+/// The selection the Nextest budgets calibrate: the regular crates, which
+/// belong to the default cohort.
+const REGULAR_BUDGET_SELECTION: [&str; 9] = [
+    "--workspace",
+    "--exclude",
+    "hermit-detcore",
+    "--exclude",
+    "hermit-detcore-tests",
+    "--exclude",
+    "hermit-run",
+    "--exclude",
+    "hermetic_infra_hermit_flaky-tests",
+];
+
+/// What `run` hands its budget check. A default-cohort run passes its own
+/// record and Cargo metadata, whose locks it already holds. Another cohort's
+/// selection needs none: the check answers it without a lock. A non-default
+/// cohort running the regular selection is refused by name, because its
+/// check would need the default cohort's store after this run's target.
+fn budget_held<'a>(
+    cohort: PreparedCohort,
+    build: &[String],
+    record: &'a PreparedRecord,
+    cargo: &'a Value,
+) -> Result<Option<(&'a PreparedRecord, &'a Value)>, String> {
+    if cohort.is_default() {
+        return Ok(Some((record, cargo)));
+    }
+    if REGULAR_BUDGET_SELECTION
+        .iter()
+        .copied()
+        .eq(build.iter().map(String::as_str))
+    {
+        return Err(format!(
+            "prepared Nextest run refused: cohort {} runs the regular budget selection, which belongs to the default cohort; resolve and run its budgets in a default-cohort run",
+            cohort.name()
+        ));
+    }
+    Ok(None)
+}
+
+/// HELD is the default cohort's record and its verified Cargo metadata when
+/// the caller already holds their locks, as `run` of the default cohort
+/// does: it may take no lock after its targets.
+fn budget_context_with(
+    root: &Path,
+    args: &[String],
+    launch: Option<&Path>,
+    held: Option<(&PreparedRecord, &Value)>,
+) -> Result<String, String> {
     let launch_context = match launch {
         Some(path) => crate::nextest_cohort::verify(path)?,
         None => (None, None),
     };
     let parsed = split_arguments(args)?;
-    let regular = [
-        "--workspace",
-        "--exclude",
-        "hermit-detcore",
-        "--exclude",
-        "hermit-detcore-tests",
-        "--exclude",
-        "hermit-run",
-        "--exclude",
-        "hermetic_infra_hermit_flaky-tests",
-    ];
-    if parsed.build != regular {
+    if parsed.build != REGULAR_BUDGET_SELECTION {
         return Ok("null".into());
     }
     // The regular selection belongs to the default cohort.
     let root = root.canonicalize().map_err(|e| e.to_string())?;
-    let artifacts = LockedArtifacts::open(&root, false, DEFAULT_COHORT)?;
-    let record = artifacts.current()?;
-    let cargo = verify_record(&root, &record)?;
-    verify_selection(&record, &cargo, &parsed.build)?;
+    let locked;
+    let (record, cargo) = match held {
+        Some(held) => held,
+        None => {
+            let mut locks = ReaderLocks::open(&root, DEFAULT_COHORT, project(&root)?)?;
+            let record = locks.artifacts.current()?;
+            let cargo = locks.verify(&root, &record)?;
+            locked = (locks, record, cargo);
+            (&locked.1, &locked.2)
+        }
+    };
+    verify_selection(record, cargo, &parsed.build)?;
     let excluded = format!(":(exclude){}", crate::nextest_cpu::CALIBRATION_PATH);
     let tree = git_bytes(&root, &["ls-tree", "-r", "-z", "HEAD"])?;
     let mut source_hash = Sha256::new();
@@ -1536,18 +1725,186 @@ fn config_selections_for_project(
     Ok(selections)
 }
 
+/// One cohort's artifact store, locked shared or exclusive.
+///
+/// # The global lock order (dh-g3xj4x)
+///
+/// An operation that holds several locks at once takes them in ONE order:
+///
+/// 1. its prepared project's core tool owner's store, shared
+///    ([`ToolOwner::open`]);
+/// 2. its own cohort store, shared to read or exclusive to produce;
+/// 3. every Cargo target it reads or builds, all at once, ordered by each
+///    target directory's (device, inode) ([`acquire_targets`]): its own
+///    target in its store's mode, and its tool owner's target shared.
+///
+/// It requests no lock after step 3. A thread that holds a target lock and
+/// asks for any store or target lock is refused by name ("lock order
+/// violated") instead of being allowed to wait. Every wait therefore happens
+/// while holding only locks earlier in this order. Core stores rank before
+/// project stores, because a tool owner is never itself a project. Two stores
+/// of one rank are never held together. Targets are taken in ascending
+/// (device, inode) order. So no chain of waits can lead back to its start. Standalone
+/// preparation takes step 3 alone.
 struct LockedArtifacts {
     /// The artifact store; generation staging directories live here for
     /// every cohort.
     root: PathBuf,
     /// This cohort's published record inside the store.
     record: PathBuf,
+    exclusive: bool,
     _lock: fs::File,
+    /// The Cargo target locks of this operation, taken by
+    /// [`LockedArtifacts::lock_targets`] and held for the store lock's
+    /// lifetime.
+    targets: Vec<TargetLock>,
+}
+
+thread_local! {
+    /// Cargo target locks this thread holds. While any is held the thread
+    /// may take no further lock (the global lock order).
+    static TARGETS_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The identity of an existing directory, alias-proof: two spellings of one
+/// directory, through a symlink or a bind mount, have the same key.
+fn directory_key(path: &Path) -> Result<(u64, u64), String> {
+    let metadata = fs::metadata(path)
+        .map_err(|e| format!("cannot stat Cargo target {}: {e}", path.display()))?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+/// Take the Cargo target locks of REQUESTS (target, exclusive), the last
+/// step of the global lock order: all at once, ordered by directory key. A
+/// target requested twice, under any spelling, is locked once, and only if
+/// both requests are shared.
+fn acquire_targets(requests: &[(&Path, bool)]) -> Result<Vec<TargetLock>, String> {
+    if TARGETS_HELD.get() != 0 {
+        return Err(format!(
+            "lock order violated: Cargo target locks for {} requested while this thread already holds one",
+            requests
+                .iter()
+                .map(|(target, _)| target.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let mut ordered = requests
+        .iter()
+        .map(|&(target, exclusive)| Ok((directory_key(target)?, target, exclusive)))
+        .collect::<Result<Vec<_>, String>>()?;
+    ordered.sort_by_key(|(key, ..)| *key);
+    let mut locks: Vec<TargetLock> = Vec::new();
+    for (key, target, exclusive) in ordered {
+        if let Some(last) = locks.last().filter(|last| last.key == key) {
+            if last.exclusive || exclusive {
+                return Err(format!(
+                    "Cargo target {} (also requested as {}) is requested both exclusively and shared by one operation",
+                    last.target.display(),
+                    target.display()
+                ));
+            }
+            continue;
+        }
+        locks.push(TargetLock::acquire(target, exclusive)?);
+    }
+    Ok(locks)
+}
+
+/// The lock of one effective Cargo target directory (dh-g3xj4x).
+///
+/// Every writer of a target, a producer and standalone preparation alike,
+/// holds it exclusively for its whole build. Every reader of a published
+/// generation holds it shared for as long as its store lock. A writer
+/// therefore never rebuilds binaries beneath a reader of the same target,
+/// whichever artifact store each of them uses. Writers find the target
+/// Cargo itself reports, so `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR` and
+/// `build.target-dir` all lead to it; the lock is keyed by that directory's
+/// [`directory_key`], so symlink and bind-mount spellings are one target.
+/// The file is `ci/nextest-binaries/target.lock` under the target, distinct
+/// from every store's own lock even for the checkout's `target/`, so the two
+/// kinds of lock never alias.
+///
+/// A TargetLock is not `Send`: [`TARGETS_HELD`] counts the locks of the
+/// thread that took them, so they must be released on that thread.
+struct TargetLock {
+    target: PathBuf,
+    /// The target directory's [`directory_key`].
+    key: (u64, u64),
+    exclusive: bool,
+    _lock: fs::File,
+    _this_thread: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for TargetLock {
+    fn drop(&mut self) {
+        TARGETS_HELD.set(TARGETS_HELD.get() - 1);
+    }
+}
+
+impl TargetLock {
+    /// TARGET must already exist; a reader never creates the target it reads.
+    /// Only [`acquire_targets`] calls this, so the lock order is checked.
+    fn acquire(target: &Path, exclusive: bool) -> Result<Self, String> {
+        if target.canonicalize().ok().as_deref() != Some(target) {
+            return Err(format!(
+                "Cargo target lock key {} is not an existing canonical directory",
+                target.display()
+            ));
+        }
+        let key = directory_key(target)?;
+        let directory = target.join("ci/nextest-binaries");
+        fs::create_dir_all(&directory).map_err(|e| {
+            format!(
+                "cannot create the lock directory of Cargo target {}: {e}",
+                target.display()
+            )
+        })?;
+        let path = directory.join("target.lock");
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|e| format!("cannot open Cargo target lock {}: {e}", path.display()))?;
+        if unsafe {
+            libc::flock(
+                lock.as_raw_fd(),
+                if exclusive {
+                    libc::LOCK_EX
+                } else {
+                    libc::LOCK_SH
+                },
+            )
+        } != 0
+        {
+            return Err(format!(
+                "cannot lock Cargo target {}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        TARGETS_HELD.set(TARGETS_HELD.get() + 1);
+        Ok(Self {
+            target: target.to_owned(),
+            key,
+            exclusive,
+            _lock: lock,
+            _this_thread: std::marker::PhantomData,
+        })
+    }
 }
 
 impl LockedArtifacts {
     fn open(root: &Path, exclusive: bool, cohort: PreparedCohort) -> Result<Self, String> {
         let root = root.join("target/ci/nextest-binaries");
+        if TARGETS_HELD.get() != 0 {
+            return Err(format!(
+                "lock order violated: artifact store {} requested while this thread holds a Cargo target lock",
+                root.display()
+            ));
+        }
         fs::create_dir_all(&root).map_err(|e| e.to_string())?;
         let record = cohort.record_path(&root);
         if let Some(parent) = record.parent() {
@@ -1581,8 +1938,22 @@ impl LockedArtifacts {
         Ok(Self {
             root,
             record,
+            exclusive,
             _lock: lock,
+            targets: Vec::new(),
         })
+    }
+
+    /// Step 3 of the global lock order: TARGET, this store's generation's
+    /// Cargo target, in the store lock's mode, and OWNER's target shared,
+    /// together, for the store lock's lifetime.
+    fn lock_targets(&mut self, target: &Path, owner: Option<&ToolOwner>) -> Result<(), String> {
+        let mut requests = vec![(target, self.exclusive)];
+        if let Some(owner) = owner {
+            requests.push((owner.record.target.as_path(), false));
+        }
+        self.targets = acquire_targets(&requests)?;
+        Ok(())
     }
 
     fn current(&self) -> Result<PreparedRecord, String> {
@@ -1645,19 +2016,29 @@ fn preparation_build_jobs() -> String {
 
 fn cargo_output(root: &Path, args: &[String], destination: &Path) -> Result<(), PreparationError> {
     let output = fs::File::create(destination).map_err(|e| e.to_string())?;
+    let status = cargo_command(root, args)?
+        .stdout(output)
+        .status()
+        .map_err(|e| e.to_string())?;
+    cargo_status(status, args)
+}
+
+fn cargo_command(root: &Path, args: &[String]) -> Result<Command, String> {
     let prepared_project = project(root)?;
     let wrapper_root = prepared_project
         .as_ref()
         .map(|project| project.tools_root.as_path())
         .unwrap_or(root);
-    let status = Command::new(wrapper_root.join("ci/run-with-core-build.sh"))
+    let mut command = Command::new(wrapper_root.join("ci/run-with-core-build.sh"));
+    command
         .arg("cargo")
         .args(args)
         .env("CARGO_BUILD_JOBS", preparation_build_jobs())
-        .current_dir(root)
-        .stdout(output)
-        .status()
-        .map_err(|e| e.to_string())?;
+        .current_dir(root);
+    Ok(command)
+}
+
+fn cargo_status(status: std::process::ExitStatus, args: &[String]) -> Result<(), PreparationError> {
     if !status.success() {
         return Err(PreparationError {
             message: format!("Cargo preparation failed ({status}): {args:?}"),
@@ -1742,7 +2123,23 @@ fn check_identity(expected: &FileIdentity, executable: bool) -> Result<(), Strin
     Ok(())
 }
 
-fn verify_record(root: &Path, record: &PreparedRecord) -> Result<Value, String> {
+/// ARTIFACTS must hold RECORD's Cargo target lock, and OWNER's: a record
+/// checked while a writer may still change its target proves nothing.
+fn verify_record(
+    root: &Path,
+    record: &PreparedRecord,
+    artifacts: &LockedArtifacts,
+    owner: Option<&ToolOwner>,
+) -> Result<Value, String> {
+    for target in std::iter::once(&record.target).chain(owner.map(|owner| &owner.record.target)) {
+        let key = directory_key(target).ok();
+        if !artifacts.targets.iter().any(|lock| Some(lock.key) == key) {
+            return Err(format!(
+                "prepared record checked without holding its Cargo target lock {}",
+                target.display()
+            ));
+        }
+    }
     if record.schema != RECORD_SCHEMA
         || record.repository != root
         || record.project != project(root)?
@@ -1783,7 +2180,7 @@ fn verify_record(root: &Path, record: &PreparedRecord) -> Result<Value, String> 
     {
         return Err("prepared executables are stale: compiler, Cargo configuration, or build environment changed".into());
     }
-    verify_cpu_wrapper(record, &cargo)?;
+    verify_cpu_wrapper(record, &cargo, owner)?;
     Ok(cargo)
 }
 
@@ -3005,7 +3402,7 @@ pub fn prepare(
             "a prepared project prepares only the default cohort".to_string(),
         ));
     }
-    let tool_owner = project_tools(prepared_project.as_ref())?;
+    let tool_owner = ToolOwner::open(prepared_project.clone())?;
     let selections = profile_selections_in_cohort(&root, profile, cohort)?;
     let feature_set = prepared_feature_set(&selections)?;
     if let Some(expected) = cohort.expected_feature_set() {
@@ -3019,7 +3416,7 @@ pub fn prepare(
     // Each extension selection is listed in its own Cargo project. Core
     // workspace union/installer requirements remain the unchanged core path.
     let cargo_profile = build_cargo_profile(profile, prepared_project.is_some());
-    let artifacts = LockedArtifacts::open(&root, true, cohort)?;
+    let mut artifacts = LockedArtifacts::open(&root, true, cohort)?;
     let generation = artifacts.root.join(format!(
         "generation-{}-{}",
         std::process::id(),
@@ -3041,20 +3438,26 @@ pub fn prepare(
         &cargo_path,
     )?;
     let cargo = read_json(&cargo_path)?;
-    if let (Some(project), Some(owner)) = (&prepared_project, &tool_owner) {
-        let core = owner.current()?;
-        same_core_package(project, &cargo, &read_json(&core.cargo_metadata.path)?)?;
-    }
     let (before_sources, before_source_parts) = sources_and_parts(&cargo, &root)?;
     let before_rustc = rustc_identity()?;
     let before_environment = build_environment();
     let before_config = cargo_config(&root)?;
-    let target = PathBuf::from(string(&cargo, "target_directory")?);
-    fs::create_dir_all(&target).map_err(|e| e.to_string())?;
-    if !target.is_absolute() || target.canonicalize().map_err(|e| e.to_string())? != target {
-        return Err("Cargo reported a noncanonical target directory".into());
+    let target = lock_producer_target(
+        &mut artifacts,
+        &cargo,
+        tool_owner.as_ref(),
+        &root,
+        cohort,
+        &format!("prepare {profile}"),
+    )?;
+    if let Some(owner) = &tool_owner {
+        owner.verify()?;
+        same_core_package(
+            &owner.project,
+            &cargo,
+            &read_json(&owner.record.cargo_metadata.path)?,
+        )?;
     }
-    check_cohort_target(&root, cohort, &target, &format!("prepare {profile}"))?;
     // A validate-profile profile compiles every selection in ONE listing; the
     // others list each selection by itself. Either way each selection's
     // binaries-metadata is the part of its listing that its Cargo selectors
@@ -3157,7 +3560,7 @@ pub fn prepare(
         )?;
     }
     let cpu_wrapper = match &tool_owner {
-        Some(tool_owner) => tool_owner.current()?.cpu_wrapper,
+        Some(tool_owner) => tool_owner.record.cpu_wrapper.clone(),
         None => CpuWrapperRecord {
             executable: cpu_wrapper_artifact(
                 &fs::read_to_string(&cpu_wrapper_path).map_err(|e| e.to_string())?,
@@ -3269,7 +3672,7 @@ pub fn prepare(
         build_mode: build_mode.to_string(),
         feature_set,
     };
-    let checked_cargo = verify_record(&root, &record)?;
+    let checked_cargo = verify_record(&root, &record, &artifacts, tool_owner.as_ref())?;
     for selection in record.selections.values() {
         verify_selection(&record, &checked_cargo, &selection.build_args)?;
     }
@@ -3356,10 +3759,11 @@ pub fn run(
         return Err(format!("official Nextest consumer has no {SELECTION_ENV}"));
     }
     let cohort = PreparedCohort::from_env()?;
-    let artifacts = LockedArtifacts::open(&root, false, cohort)?;
+    // The tool owner's locks are held through the Nextest child too.
+    let mut locks = ReaderLocks::open(&root, cohort, project(&root)?)?;
     // Refuse a record from the wrong mode or feature set before any
     // selection lookup, so the refusal names the cohort mismatch.
-    let value = artifacts.current_value()?;
+    let value = locks.artifacts.current_value()?;
     check_prepared_cohort(
         &value,
         &format!("prepared Nextest {operation}"),
@@ -3367,15 +3771,14 @@ pub fn run(
         &expected_build_mode_for(cohort)?,
         cohort.expected_feature_set(),
     )?;
-    let record = artifacts.record_from(value)?;
+    let record = locks.artifacts.record_from(value)?;
     check_cohort_target(
         &root,
         cohort,
         &record.target,
         &format!("prepared Nextest {operation}"),
     )?;
-    let tool_owner = project_tools(record.project.as_ref())?;
-    let cargo = verify_record(&root, &record)?;
+    let cargo = locks.verify(&root, &record)?;
     let selection = verify_selection(&record, &cargo, &parsed.build)?;
     let guests = verify_guests(&record)?;
     let lit_guests = verify_lit_guests(&record)?;
@@ -3405,8 +3808,13 @@ pub fn run(
             serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
         map.validate()?;
         let actual: Option<crate::nextest_cpu::BudgetContext> =
-            serde_json::from_str(&budget_context(&root, args, launch)?)
-                .map_err(|e| e.to_string())?;
+            serde_json::from_str(&budget_context_with(
+                &root,
+                args,
+                launch,
+                budget_held(cohort, &parsed.build, &record, &cargo)?,
+            )?)
+            .map_err(|e| e.to_string())?;
         if actual.as_ref() != Some(&map.context) {
             return Err(format!(
                 "Nextest source/build/launch context changed after budget resolution ({}); resolve again before running",
@@ -3445,8 +3853,7 @@ pub fn run(
         .map_err(|e| format!("cannot run prepared Nextest: {e}"))?;
     // Keep the shared lock until the child has joined. Preserve Nextest's
     // status; a refusal never becomes an empty or successful test report.
-    drop(artifacts);
-    drop(tool_owner);
+    drop(locks);
     Ok(exit_code(status))
 }
 
@@ -3470,10 +3877,10 @@ pub fn assert_profile(
         Some(expected) => expected.to_string(),
         None => prepared_feature_set(&producer_selections)?,
     };
-    let artifacts = LockedArtifacts::open(&root, false, cohort)?;
+    let mut locks = ReaderLocks::open(&root, cohort, project(&root)?)?;
     // Read the profile from the raw record first: a record from before schema
     // 6 does not deserialize, and its refusal must still say what to rerun.
-    let value = artifacts.current_value()?;
+    let value = locks.artifacts.current_value()?;
     check_prepared_cargo_profile(
         &value,
         profile,
@@ -3492,7 +3899,7 @@ pub fn assert_profile(
         &expected_build_mode_for(cohort)?,
         Some(&expected_feature_set),
     )?;
-    let record = artifacts.record_from(value)?;
+    let record = locks.artifacts.record_from(value)?;
     check_cohort_target(
         &root,
         cohort,
@@ -3503,7 +3910,7 @@ pub fn assert_profile(
             format!("assert {profile} --prepared-by {producer}")
         },
     )?;
-    let cargo = verify_record(&root, &record)?;
+    let cargo = locks.verify(&root, &record)?;
     for args in profile_selections_in_cohort(&root, profile, cohort)?.values() {
         verify_selection(&record, &cargo, args)?;
     }
@@ -3516,8 +3923,8 @@ pub fn assert_profile(
 pub fn executable(root: &Path, package: &str, name: &str) -> Result<PathBuf, String> {
     let root = root.canonicalize().map_err(|e| e.to_string())?;
     let cohort = PreparedCohort::from_env()?;
-    let artifacts = LockedArtifacts::open(&root, false, cohort)?;
-    let value = artifacts.current_value()?;
+    let mut locks = ReaderLocks::open(&root, cohort, project(&root)?)?;
+    let value = locks.artifacts.current_value()?;
     check_prepared_cohort(
         &value,
         "prepared executable lookup",
@@ -3525,9 +3932,9 @@ pub fn executable(root: &Path, package: &str, name: &str) -> Result<PathBuf, Str
         &expected_build_mode_for(cohort)?,
         cohort.expected_feature_set(),
     )?;
-    let record = artifacts.record_from(value)?;
+    let record = locks.artifacts.record_from(value)?;
     check_cohort_target(&root, cohort, &record.target, "prepared executable lookup")?;
-    let cargo = verify_record(&root, &record)?;
+    let cargo = locks.verify(&root, &record)?;
     let ids = cargo["packages"]
         .as_array()
         .ok_or("missing Cargo packages")?
@@ -4436,11 +4843,39 @@ mod tests {
         }
         let mut old_schema = record.clone();
         old_schema.schema = 2;
+        old_schema.target = old_schema.target.canonicalize().unwrap();
+        let unlocked = LockedArtifacts::open(&fixture.root, false, DEFAULT_COHORT).unwrap();
         assert!(
-            verify_record(&fixture.root, &old_schema)
+            verify_record(&fixture.root, &old_schema, &unlocked, None)
+                .unwrap_err()
+                .contains("checked without holding its Cargo target lock")
+        );
+        drop(unlocked);
+        // A project record also needs its tool owner's target lock held.
+        let owner_target = fixture.root.join("owner-target");
+        fs::create_dir_all(&owner_target).unwrap();
+        let owner_target = owner_target.canonicalize().unwrap();
+        let (core, project) = published_core(&owner_target);
+        let owner = ToolOwner::open(Some(project)).unwrap().unwrap();
+        let mut held = LockedArtifacts::open(&fixture.root, false, DEFAULT_COHORT).unwrap();
+        held.lock_targets(&old_schema.target, None).unwrap();
+        let unheld_owner =
+            verify_record(&fixture.root, &old_schema, &held, Some(&owner)).unwrap_err();
+        assert!(
+            unheld_owner.contains(&format!(
+                "checked without holding its Cargo target lock {}",
+                owner_target.display()
+            )),
+            "{unheld_owner}"
+        );
+        assert!(
+            verify_record(&fixture.root, &old_schema, &held, None)
                 .unwrap_err()
                 .contains("schema")
         );
+        drop(held);
+        drop(owner);
+        fs::remove_dir_all(&core.root).unwrap();
     }
 
     #[test]
@@ -4644,7 +5079,7 @@ mod tests {
             let f = Fixture::new();
             let (record, _) = f.selection();
             let cargo = f.wrapper_cargo();
-            assert!(verify_cpu_wrapper(&record, &cargo).is_ok());
+            assert!(verify_cpu_wrapper(&record, &cargo, None).is_ok());
             match mode {
                 "metadata" => fs::remove_file(&record.cpu_wrapper.metadata.path).unwrap(),
                 "binary" => fs::remove_file(&record.cpu_wrapper.executable.path).unwrap(),
@@ -4659,7 +5094,7 @@ mod tests {
                 _ => unreachable!(),
             }
             assert!(
-                verify_cpu_wrapper(&record, &cargo).is_err(),
+                verify_cpu_wrapper(&record, &cargo, None).is_err(),
                 "accepted {mode}"
             );
         }
@@ -4810,7 +5245,7 @@ mod tests {
         let actual = project_at(&f.root, &path).unwrap();
         assert_eq!(actual.graph.path, f.root.join("graph.json"));
         fs::write(&preparation, "changed fixture record").unwrap();
-        assert!(project_tools(Some(&actual)).is_err());
+        assert!(ToolOwner::open(Some(actual.clone())).is_err());
         descriptor["repository"] = serde_json::json!(tools.root);
         fs::write(&path, serde_json::to_vec(&descriptor).unwrap()).unwrap();
         assert!(project_at(&f.root, &path).is_err());
@@ -4843,7 +5278,7 @@ mod tests {
             shared_package: "unprovided-core-owner".into(),
         };
         assert!(same_core_package(&project, &f.cargo, &f.cargo).is_err());
-        assert!(project_tools(Some(&project)).is_err());
+        assert!(ToolOwner::open(Some(project.clone())).is_err());
         let mut graph = dagrun::io::dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let mut step = graph
             .steps
@@ -5713,6 +6148,626 @@ mod tests {
         );
         drop(native);
         drop(consumer);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Set only in the child runs of the standalone CPU wrapper tests: the
+    /// checkout the child prepares in.
+    const STANDALONE_WRAPPER_CHILD_ENV: &str = "HERMIT_TEST_STANDALONE_WRAPPER_ROOT";
+
+    /// Stands in for the core-build wrapper of a standalone CPU wrapper
+    /// fixture. Each `cargo metadata` reports the next line of fake-targets
+    /// (the last line repeating), as Cargo reports its effective target
+    /// whatever selected it. Each `cargo build` is recorded in fake-builds
+    /// and fails, so a child returns soon after it starts building.
+    const FAKE_CORE_BUILD: &str = r#"#!/bin/sh
+case "$2" in
+metadata)
+    calls=$(($(cat fake-metadata-calls 2>/dev/null || echo 0) + 1))
+    echo "$calls" > fake-metadata-calls
+    target=$(sed -n "${calls}p" fake-targets)
+    [ -n "$target" ] || target=$(tail -n 1 fake-targets)
+    printf '{"target_directory":"%s","packages":[]}\n' "$target"
+    ;;
+build)
+    echo build >> fake-builds
+    exit 7
+    ;;
+*)
+    exit 9
+    ;;
+esac
+"#;
+
+    /// In a child run, build the CPU wrapper and report what it returned.
+    fn standalone_wrapper_child() -> bool {
+        let Some(root) = std::env::var_os(STANDALONE_WRAPPER_CHILD_ENV) else {
+            return false;
+        };
+        let result = build_cpu_wrapper(Path::new(&root));
+        println!(
+            "standalone-cpu-wrapper-returned: {}",
+            match result {
+                Ok(path) => path.display().to_string(),
+                Err(error) => error.message,
+            }
+        );
+        true
+    }
+
+    /// A canonical checkout whose standalone builds Cargo reports into the
+    /// targets written to its fake-targets.
+    fn standalone_fixture() -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-standalone-wrapper-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(root.join("ci")).unwrap();
+        let script = root.join("ci/run-with-core-build.sh");
+        fs::write(&script, FAKE_CORE_BUILD).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        root.canonicalize().unwrap()
+    }
+
+    /// Run TEST's child: `build_cpu_wrapper` in ROOT, in its own process
+    /// group, with only CARGO_TARGET_DIR of the official environment.
+    fn spawn_standalone(test: &str, root: &Path, target_dir: &Path) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+                &format!("nextest_binaries::tests::{test}"),
+            ])
+            .env(STANDALONE_WRAPPER_CHILD_ENV, root)
+            .env("CARGO_TARGET_DIR", target_dir)
+            .env_remove("CARGO_BUILD_TARGET_DIR")
+            .env_remove(REQUIRED_ENV)
+            .env_remove(PROJECT_ENV)
+            .stdout(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    }
+
+    /// Wait up to 30 s for CHILD, then what it returned. On expiry, kill
+    /// its process group and panic with HANG.
+    fn standalone_result(mut child: std::process::Child, hang: &str) -> String {
+        let group = child.id() as libc::pid_t;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                unsafe { libc::kill(-group, libc::SIGKILL) };
+                child.wait().unwrap();
+                panic!("HANG: {hang}; waited 30 s, killed process group {group}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "child failed: {stdout}");
+        // libtest prints the child's line after "test <name> ... ".
+        let marker = "standalone-cpu-wrapper-returned: ";
+        assert_eq!(stdout.matches(marker).count(), 1, "{stdout}");
+        let returned = &stdout[stdout.find(marker).unwrap() + marker.len()..];
+        returned.lines().next().unwrap_or_default().to_owned()
+    }
+
+    fn fake_builds(root: &Path) -> usize {
+        fs::read_to_string(root.join("fake-builds")).map_or(0, |log| log.lines().count())
+    }
+
+    /// dh-g3xj4x: each real Nextest fixture case runs `build-cpu-wrapper` with
+    /// a private CARGO_TARGET_DIR inside the outer validation's checkout,
+    /// while the outer test nodes hold that checkout's store lock shared. The
+    /// child is that operation; this parent holds the shared lock for it.
+    #[test]
+    fn standalone_cpu_wrapper_never_waits_on_the_checkout_store_lock() {
+        if standalone_wrapper_child() {
+            return;
+        }
+        let root = standalone_fixture();
+        let store = root.join("target/ci/nextest-binaries");
+        fs::create_dir_all(&store).unwrap();
+        let outer = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(store.join("lock"))
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(outer.as_raw_fd(), libc::LOCK_SH) }, 0);
+        let private = root.join("fixture-target");
+        fs::write(
+            root.join("fake-targets"),
+            format!("{}\n", private.display()),
+        )
+        .unwrap();
+        let returned = standalone_result(
+            spawn_standalone(
+                "standalone_cpu_wrapper_never_waits_on_the_checkout_store_lock",
+                &root,
+                &private,
+            ),
+            &format!(
+                "build_cpu_wrapper with CARGO_TARGET_DIR={} waited on {}, the checkout store lock an outer consumer holds shared",
+                private.display(),
+                store.join("lock").display()
+            ),
+        );
+        assert!(returned.contains("Cargo preparation failed"), "{returned}");
+        assert_eq!(fake_builds(&root), 1);
+        assert!(
+            private.join("ci/nextest-binaries/target.lock").is_file(),
+            "the standalone build must lock the private target"
+        );
+        drop(outer);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// dh-g3xj4x review: a standalone build into a target that a prepared
+    /// generation's producer or reader holds must wait for it, whichever
+    /// store that generation uses and however Cargo was pointed there.
+    #[test]
+    fn standalone_cpu_wrapper_waits_for_the_producer_and_readers_of_its_target() {
+        if standalone_wrapper_child() {
+            return;
+        }
+        // (holder, exclusive, Cargo reports the target through a symlink,
+        // CARGO_TARGET_DIR names the target)
+        for (holder, exclusive, through_link, named) in [
+            ("a prepared consumer", false, true, false),
+            ("a producer", true, false, true),
+        ] {
+            let root = standalone_fixture();
+            let private = root.join("fixture-target");
+            fs::create_dir_all(&private).unwrap();
+            let link = root.join("target-link");
+            std::os::unix::fs::symlink(&private, &link).unwrap();
+            let reported = if through_link { &link } else { &private };
+            fs::write(
+                root.join("fake-targets"),
+                format!("{}\n", reported.display()),
+            )
+            .unwrap();
+            let mut held = LockedArtifacts::open(&root, exclusive, DEFAULT_COHORT).unwrap();
+            held.lock_targets(&private, None).unwrap();
+            let target_dir = if named {
+                private.clone()
+            } else {
+                root.join("elsewhere")
+            };
+            let mut child = spawn_standalone(
+                "standalone_cpu_wrapper_waits_for_the_producer_and_readers_of_its_target",
+                &root,
+                &target_dir,
+            );
+            let release = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < release {
+                if child.try_wait().unwrap().is_some() || fake_builds(&root) != 0 {
+                    let returned = standalone_result(child, "unreachable");
+                    panic!(
+                        "CONCURRENT: build_cpu_wrapper (Cargo reports {}, CARGO_TARGET_DIR={}) ran while {holder} held Cargo target {}: {returned}",
+                        reported.display(),
+                        target_dir.display(),
+                        private.display()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            drop(held);
+            let returned = standalone_result(
+                child,
+                &format!("build_cpu_wrapper still waited after {holder} released its locks"),
+            );
+            assert!(returned.contains("Cargo preparation failed"), "{returned}");
+            assert_eq!(fake_builds(&root), 1);
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    /// The standalone build names each target it cannot lock rather than
+    /// building or failing with a bare OS error.
+    #[test]
+    fn standalone_cpu_wrapper_refuses_unlockable_targets_by_name() {
+        if standalone_wrapper_child() {
+            return;
+        }
+        for case in ["moved", "relative", "uncreatable"] {
+            let root = standalone_fixture();
+            fs::write(root.join("a-file"), "").unwrap();
+            let (targets, expected) = match case {
+                // A target redirected between the read that chose the lock
+                // and the read under it.
+                "moved" => (
+                    format!(
+                        "{}\n{}\n",
+                        root.join("first").display(),
+                        root.join("second").display()
+                    ),
+                    format!(
+                        "Cargo's target directory changed from {} to {} after its lock was taken",
+                        root.join("first").display(),
+                        root.join("second").display()
+                    ),
+                ),
+                "relative" => (
+                    "relative-target\n".to_string(),
+                    "Cargo reported a relative target directory relative-target".to_string(),
+                ),
+                _ => (
+                    format!("{}\n", root.join("a-file/target").display()),
+                    format!(
+                        "cannot create the Cargo target directory {}",
+                        root.join("a-file/target").display()
+                    ),
+                ),
+            };
+            fs::write(root.join("fake-targets"), targets).unwrap();
+            let returned = standalone_result(
+                spawn_standalone(
+                    "standalone_cpu_wrapper_refuses_unlockable_targets_by_name",
+                    &root,
+                    &root.join("first"),
+                ),
+                &format!("build_cpu_wrapper with a {case} target"),
+            );
+            assert!(returned.contains(&expected), "{case}: {returned}");
+            assert_eq!(fake_builds(&root), 0, "{case}");
+            assert!(!root.join("second").exists(), "{case}");
+            fs::remove_dir_all(&root).unwrap();
+        }
+    }
+
+    /// The producer takes the same target lock before any build: it waits
+    /// for a standalone build or another store's producer of its target, and
+    /// refuses by name a project target that is its core tool owner's, whose
+    /// lock it already holds.
+    #[test]
+    fn producer_target_lock_waits_for_standalone_builds_and_refuses_the_core_target() {
+        let root = standalone_fixture();
+        let target = root.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let cargo = serde_json::json!({ "target_directory": target });
+        // A ToolOwner holds locks of the thread that opened it, so each
+        // producer opens its own.
+        let producer = |project: Option<PreparedProject>| {
+            let (root, cargo) = (root.clone(), cargo.clone());
+            let (send, receive) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let owner = ToolOwner::open(project).unwrap();
+                let mut artifacts = LockedArtifacts::open(&root, true, DEFAULT_COHORT).unwrap();
+                let result = lock_producer_target(
+                    &mut artifacts,
+                    &cargo,
+                    owner.as_ref(),
+                    &root,
+                    DEFAULT_COHORT,
+                    "prepare fixture",
+                );
+                let _ = send.send(result);
+            });
+            receive
+        };
+        let other = standalone_fixture();
+        for holder in ["a standalone build", "another store's producer"] {
+            let held = if holder == "a standalone build" {
+                (Some(acquire_targets(&[(&target, true)]).unwrap()), None)
+            } else {
+                let mut producer = LockedArtifacts::open(&other, true, DEFAULT_COHORT).unwrap();
+                producer.lock_targets(&target, None).unwrap();
+                (None, Some(producer))
+            };
+            let waiting = producer(None);
+            assert!(
+                waiting
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .is_err(),
+                "CONCURRENT: the producer locked Cargo target {} while {holder} held it",
+                target.display()
+            );
+            drop(held);
+            let locked = waiting
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap_or_else(|_| {
+                    panic!("HANG: the producer still waited after {holder} released its target")
+                });
+            assert_eq!(locked.unwrap(), target);
+        }
+
+        let (tools, project) = published_core(&target);
+        let refused = producer(Some(project))
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("HANG: the project producer waited on its own tool owner's target lock")
+            .unwrap_err();
+        assert!(
+            refused.contains("which is its core tool owner's target"),
+            "{refused}"
+        );
+        fs::remove_dir_all(&tools.root).unwrap();
+        fs::remove_dir_all(&other).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The global lock order's last rule: a thread holding a Cargo target lock
+    /// is refused, by name, any further store or target lock instead of being
+    /// allowed to wait for it. Releasing the target lifts the refusal.
+    #[test]
+    fn a_thread_holding_a_target_lock_takes_no_further_lock() {
+        let root = standalone_fixture();
+        let (first, second) = (root.join("first"), root.join("second"));
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let held = acquire_targets(&[(&first, false)]).unwrap();
+        let store = LockedArtifacts::open(&root, false, DEFAULT_COHORT)
+            .err()
+            .unwrap();
+        assert!(
+            store.starts_with("lock order violated: artifact store"),
+            "{store}"
+        );
+        let target = acquire_targets(&[(&second, false)]).err().unwrap();
+        assert!(
+            target.starts_with("lock order violated: Cargo target locks"),
+            "{target}"
+        );
+        drop(held);
+        let mut store = LockedArtifacts::open(&root, false, DEFAULT_COHORT).unwrap();
+        store.lock_targets(&first, None).unwrap();
+        drop(store);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// coord7 review of e99604a2, F2 and F7. A default-cohort `run` must hand
+    /// its budget check its own record: the check could not lock the default
+    /// cohort again after run's target, and without the record it is refused
+    /// "lock order violated" (shown last). Another cohort's run of the regular
+    /// selection is refused by name before any lock; its other selections
+    /// need no record.
+    #[test]
+    fn run_hands_its_budget_check_its_own_record() {
+        let fixture = Fixture::new();
+        let (record, _) = fixture.selection();
+        let regular = REGULAR_BUDGET_SELECTION.map(String::from).to_vec();
+        let held = budget_held(DEFAULT_COHORT, &regular, &record, &fixture.cargo).unwrap();
+        assert!(
+            held.is_some_and(
+                |(held, cargo)| std::ptr::eq(held, &record) && std::ptr::eq(cargo, &fixture.cargo)
+            ),
+            "a default-cohort run must pass its own record"
+        );
+        let refused = budget_held(NATIVE_EXEC_COHORT, &regular, &record, &fixture.cargo)
+            .err()
+            .unwrap();
+        assert!(
+            refused.contains(&format!(
+                "cohort {} runs the regular budget selection, which belongs to the default cohort",
+                NATIVE_EXEC_COHORT.name()
+            )),
+            "{refused}"
+        );
+        let other = vec!["-p".to_string(), "fixture".into(), "--lib".into()];
+        assert!(
+            budget_held(NATIVE_EXEC_COHORT, &other, &record, &fixture.cargo)
+                .unwrap()
+                .is_none()
+        );
+        let root = fixture.root.canonicalize().unwrap();
+        let target = acquire_targets(&[(&fixture.target.canonicalize().unwrap(), false)]).unwrap();
+        let unheld = budget_context_with(&root, &regular, None, None).unwrap_err();
+        assert!(unheld.starts_with("lock order violated"), "{unheld}");
+        drop(target);
+        fs::remove_dir_all(&fixture.root).unwrap();
+    }
+
+    /// A core checkout whose published default-cohort record names Cargo
+    /// target TARGET, and a prepared project whose tool owner it is.
+    fn published_core(target: &Path) -> (Fixture, PreparedProject) {
+        let core = Fixture::new();
+        let (mut record, _) = core.selection();
+        record.target = target.to_owned();
+        let store = core.root.join("target/ci/nextest-binaries");
+        fs::create_dir_all(&store).unwrap();
+        let path = DEFAULT_COHORT.record_path(&store);
+        fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        let identity = file_identity(&path, false).unwrap();
+        let project = PreparedProject {
+            descriptor: identity.clone(),
+            graph: identity.clone(),
+            tools_root: core.root.clone(),
+            core_preparation: identity,
+            shared_package: "fixture".into(),
+        };
+        (core, project)
+    }
+
+    /// Whether a thread of this process waits in flock(2) for the lock file
+    /// PATH: a "->" line of /proc/locks with this process's pid and PATH's
+    /// inode. The readiness barrier of the lock-order tests: it shows a
+    /// contender has reached its contested lock. The device field is not
+    /// compared: on btrfs, /proc/locks names the filesystem's device while
+    /// stat(2) names the subvolume's (measured: 00:2c against 0:48 for one
+    /// file), so only the inode and pid identify the file and the waiter.
+    fn flock_waiter_on(path: &Path) -> bool {
+        let inode = format!(":{}", fs::metadata(path).unwrap().ino());
+        let pid = std::process::id().to_string();
+        fs::read_to_string("/proc/locks")
+            .unwrap()
+            .lines()
+            .any(|line| {
+                let fields = line.split_whitespace().collect::<Vec<_>>();
+                fields.get(1) == Some(&"->")
+                    && fields.get(2) == Some(&"FLOCK")
+                    && fields.get(5) == Some(&pid.as_str())
+                    && fields.get(6).is_some_and(|file| file.ends_with(&inode))
+            })
+    }
+
+    fn within_30_s(mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while std::time::Instant::now() < deadline {
+            if condition() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// dh-g3xj4x review of 2f6f5e85, P1: a project reader held its own target
+    /// TP shared and then asked for its core tool owner's store, while a core
+    /// producer building into TP held that store exclusively and asked for TP.
+    /// Under the global lock order the reader queues for the core store
+    /// before it holds any target, so the producer gets TP and both finish.
+    #[test]
+    fn a_project_reader_holds_no_target_while_it_waits_for_a_core_producer() {
+        let root = standalone_fixture();
+        let (project_target, core_target) = (root.join("project-target"), root.join("core-target"));
+        fs::create_dir_all(&project_target).unwrap();
+        fs::create_dir_all(&core_target).unwrap();
+        let (core, project) = published_core(&core_target);
+        let reader_root = root.join("project");
+        fs::create_dir_all(&reader_root).unwrap();
+        let mut record = core.selection().0;
+        record.target = project_target.clone();
+        record.repository = reader_root.clone();
+        record.project = Some(project.clone());
+
+        let (held, producer_holds) = std::sync::mpsc::channel();
+        let (go, producer_go) = std::sync::mpsc::channel::<()>();
+        let (done, producer_done) = std::sync::mpsc::channel();
+        {
+            let (core_root, target) = (core.root.clone(), project_target.clone());
+            std::thread::spawn(move || {
+                let mut producer = LockedArtifacts::open(&core_root, true, DEFAULT_COHORT).unwrap();
+                held.send(()).unwrap();
+                producer_go.recv().unwrap();
+                let result = lock_producer_target(
+                    &mut producer,
+                    &serde_json::json!({ "target_directory": target }),
+                    None,
+                    &core_root,
+                    DEFAULT_COHORT,
+                    "prepare core",
+                );
+                let _ = done.send(result);
+            });
+        }
+        producer_holds
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the core producer never locked its store");
+        let (read, reader_done) = std::sync::mpsc::channel();
+        {
+            let reader_root = reader_root.clone();
+            std::thread::spawn(move || {
+                let result = ReaderLocks::open(&reader_root, DEFAULT_COHORT, Some(project))
+                    .and_then(|mut locks| locks.verify(&reader_root, &record));
+                let _ = read.send(result);
+            });
+        }
+        let core_store = core.root.join("target/ci/nextest-binaries/lock");
+        assert!(
+            within_30_s(|| flock_waiter_on(&core_store)),
+            "the project reader never queued for its tool owner's store {}",
+            core_store.display()
+        );
+        go.send(()).unwrap();
+        assert_eq!(
+            producer_done
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap_or_else(|_| panic!(
+                    "DEADLOCK: the core producer, holding its store, waited 30 s for Cargo target {} while a project reader of that target waited for the store",
+                    project_target.display()
+                ))
+                .unwrap(),
+            project_target
+        );
+        let error = reader_done
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("HANG: the project reader still waited after the core producer finished")
+            .unwrap_err();
+        // The fixture record is not a real preparation; any refusal past the
+        // locks will do, but never a lock refusal.
+        assert!(!error.contains("lock"), "{error}");
+        fs::remove_dir_all(&core.root).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// dh-g3xj4x review of 2f6f5e85, P2: project producer 1 (core target T1,
+    /// own target T2) and project producer 2 (core target T2, own target T1)
+    /// each held one target shared and waited for the other exclusively.
+    /// This test holds both targets shared until both producers queue, then
+    /// releases them at once. Taken together in path order, the two producers
+    /// finish one after the other.
+    #[test]
+    fn crossed_project_producers_take_their_targets_in_one_order() {
+        let root = standalone_fixture();
+        let (t1, t2) = (root.join("target-1"), root.join("target-2"));
+        fs::create_dir_all(&t1).unwrap();
+        fs::create_dir_all(&t2).unwrap();
+        let cores = [published_core(&t1), published_core(&t2)];
+        let gate = acquire_targets(&[(&t1, false), (&t2, false)]).unwrap();
+        let mut finished = Vec::new();
+        for (index, (_, project)) in cores.iter().enumerate() {
+            let own_root = root.join(format!("project-{}", index + 1));
+            fs::create_dir_all(&own_root).unwrap();
+            let own_target = if index == 0 { t2.clone() } else { t1.clone() };
+            let project = project.clone();
+            assert_ne!(project.tools_root, own_root);
+            let (ready, is_ready) = std::sync::mpsc::channel();
+            let (done, producer_done) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let owner = ToolOwner::open(Some(project));
+                let artifacts = LockedArtifacts::open(&own_root, true, DEFAULT_COHORT);
+                let (owner, mut artifacts) = match (owner, artifacts) {
+                    (Ok(owner), Ok(artifacts)) => (owner, artifacts),
+                    (owner, artifacts) => {
+                        let _ = ready.send(Err(format!("{:?} {:?}", owner.err(), artifacts.err())));
+                        return;
+                    }
+                };
+                ready.send(Ok(())).unwrap();
+                let result = lock_producer_target(
+                    &mut artifacts,
+                    &serde_json::json!({ "target_directory": own_target }),
+                    owner.as_ref(),
+                    &own_root,
+                    DEFAULT_COHORT,
+                    "prepare project",
+                );
+                let _ = done.send(result);
+            });
+            is_ready
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("a project producer never opened its stores")
+                .unwrap_or_else(|error| panic!("project producer {}: {error}", index + 1));
+            finished.push(producer_done);
+        }
+        for target in [&t1, &t2] {
+            let lock = target.join("ci/nextest-binaries/target.lock");
+            assert!(
+                within_30_s(|| flock_waiter_on(&lock)),
+                "no project producer queued for Cargo target {}",
+                target.display()
+            );
+        }
+        drop(gate);
+        for (index, done) in finished.iter().enumerate() {
+            done.recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap_or_else(|_| panic!(
+                    "DEADLOCK: project producer {} still waited 30 s after the crossed targets {} and {} were released",
+                    index + 1,
+                    t1.display(),
+                    t2.display()
+                ))
+                .unwrap();
+        }
+        for (core, _) in &cores {
+            fs::remove_dir_all(&core.root).unwrap();
+        }
         fs::remove_dir_all(&root).unwrap();
     }
 

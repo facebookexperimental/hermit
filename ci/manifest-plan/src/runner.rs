@@ -58,6 +58,7 @@ use crate::cpu_evidence::LiveCpuSource;
 use crate::cpu_evidence::NotStartedReason;
 use crate::cpu_evidence::RegistrationObservation;
 use crate::cpu_evidence::ReturnedCpuCharge;
+use crate::cpu_evidence::SpawnMethod;
 use crate::cpu_evidence::SpawnStage;
 use crate::cpu_evidence::TerminationPath;
 use crate::cpu_evidence::WaitCpuObservation;
@@ -8033,6 +8034,115 @@ impl LiveCpuMeter {
     }
 }
 
+/// The startup clone3 probe, before this run's first cgroup-carrying
+/// start: one dedicated probe cgroup, created exactly as a real
+/// invocation's is (the same parent choice), probed into, reaped and
+/// removed. It runs once per process; later calls return at once.
+/// A probe cgroup that cannot be created is no verdict: the real
+/// invocation's own refusal paths decide, as before.
+/// The order the first budgeted invocation takes: the startup
+/// probe finishes (and drops its cgroup) before the first real
+/// invocation cgroup is allocated, so the probe never competes
+/// with a real cgroup for the parent's last slot.
+fn probe_before_first_real_cgroup<T>(probe: impl FnOnce(), allocate_real: impl FnOnce() -> T) -> T {
+    probe();
+    allocate_real()
+}
+
+fn probe_clone3_for_the_run(plan: &LiveCpuPlan) {
+    let parent = plan.cgroup_parent.clone();
+    probe_clone3_for_the_run_with(plan, &crate::vfork_spawn::CLONE3, move || {
+        let created = match &parent {
+            Some(parent) => InvocationCgroup::create_in(parent),
+            None => InvocationCgroup::create(),
+        };
+        created.ok().map(|cgroup| {
+            (
+                cgroup.directory_fd(),
+                Box::new(cgroup) as Box<dyn std::any::Any + Send>,
+            )
+        })
+    });
+}
+
+/// [`probe_clone3_for_the_run`] with the probe cgroup's creation
+/// given: the probe cgroup is created (and dropped) inside the one
+/// shared initialization, before any real invocation cgroup is
+/// allocated.
+fn probe_clone3_for_the_run_with(
+    plan: &LiveCpuPlan,
+    support: &std::sync::Arc<crate::vfork_spawn::Clone3Support>,
+    create_probe_cgroup: impl FnOnce() -> Option<(RawFd, Box<dyn std::any::Any + Send>)>
+    + Send
+    + 'static,
+) {
+    let _ = plan;
+    support.probe_cgroup_clone_once(create_probe_cgroup);
+}
+
+/// The probe record's own run-level output, written once per
+/// process next to the run's other files
+/// (`<result_root>/runs/<run_id>/clone3-probe.json`). A run whose
+/// probe never ran writes nothing.
+/// Publish the probe record for this run. The record is mandatory
+/// structured output: a write failure fails the cell (through
+/// `record_cell`'s failure path) rather than silently losing the
+/// record, because a run that cannot publish its evidence cannot
+/// be judged from it. Only a success consumes the once: a failed
+/// attempt is retried by the next cell.
+/// Publish `record` (the probe's, when it has run) for this run.
+/// Publish the probe record with its once state given.
+fn publish_probe_record_with(
+    context: &RunContext,
+    record: Option<crate::vfork_spawn::CgroupProbeRecord>,
+    written: &std::sync::Mutex<bool>,
+) -> Result<(), String> {
+    let Some(record) = record else {
+        return Ok(());
+    };
+    let dir = context.result_root.join("runs").join(&context.run_id);
+    match write_probe_record_once(&dir, &record, written) {
+        Ok(_) => Ok(()),
+        Err(reason) => {
+            eprintln!("manifest-plan: {reason}");
+            Err(reason)
+        }
+    }
+}
+
+/// Write `record` as `clone3-probe.json` in `dir`, at most once per
+/// successful write per `written`: `Ok(true)` only for the caller
+/// that wrote it, and a named error the caller must not drop.
+fn write_probe_record_once(
+    dir: &std::path::Path,
+    record: &crate::vfork_spawn::CgroupProbeRecord,
+    written: &std::sync::Mutex<bool>,
+) -> Result<bool, String> {
+    let mut written = written
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if *written {
+        return Ok(false);
+    }
+    let path = dir.join("clone3-probe.json");
+    std::fs::create_dir_all(dir).map_err(|error| {
+        format!(
+            "cannot create {} for the clone3 probe record: {error}",
+            dir.display()
+        )
+    })?;
+    let text = serde_json::to_string_pretty(record)
+        .map_err(|error| format!("cannot encode the clone3 probe record: {error}"))?;
+    std::fs::write(&path, text).map_err(|error| {
+        format!(
+            "cannot write clone3 probe record {}: {error}",
+            path.display()
+        )
+    })?;
+    *written = true;
+    Ok(true)
+}
+
 fn execute_process_with_cpu_poll_interval(
     request: ProcessRequest,
     limits: ProcessLimits,
@@ -8040,8 +8150,12 @@ fn execute_process_with_cpu_poll_interval(
 ) -> Result<ProcessOutput, String> {
     let started = Instant::now();
     let ordinal = observations.len() as u64 + 1;
+    let plan = LiveCpuPlan::current();
     let meter = if limits.cpu_budget_usec.is_some() {
-        LiveCpuMeter::choose(&LiveCpuPlan::current())
+        probe_before_first_real_cgroup(
+            || probe_clone3_for_the_run(&plan),
+            || LiveCpuMeter::choose(&plan),
+        )
     } else {
         Ok(LiveCpuMeter::Disabled)
     };
@@ -8069,7 +8183,11 @@ fn execute_process_with_cpu_poll_interval(
     let mut observation =
         InvocationCpuObservation::pending(ordinal, request.role, request.command, meter.source());
     let enrollment = match &meter {
-        LiveCpuMeter::Cgroup(cgroup) => Some((cgroup.enrollment_fd(), cgroup.path())),
+        LiveCpuMeter::Cgroup(cgroup) => Some(Enrollment {
+            directory: cgroup.directory_fd(),
+            procs: cgroup.enrollment_fd(),
+            path: cgroup.path(),
+        }),
         _ => None,
     };
     let result = spawn_process(
@@ -8721,13 +8839,62 @@ fn check_cgroup_membership(
     Ok(())
 }
 
+/// The invocation cgroup a child starts in: its directory, which clone3's
+/// CLONE_INTO_CGROUP takes; its `cgroup.procs`, which the pre_exec join
+/// writes when clone3 is refused; and its path, for messages.
+#[derive(Clone, Copy)]
+struct Enrollment<'a> {
+    directory: RawFd,
+    procs: RawFd,
+    path: &'a Path,
+}
+
+/// The leader of an invocation, which the monitor waits for by PID (wait4).
+#[derive(Debug)]
+struct SpawnedLeader {
+    pid: u32,
+}
+
+impl SpawnedLeader {
+    fn id(&self) -> u32 {
+        self.pid
+    }
+}
+
+impl From<Child> for SpawnedLeader {
+    /// A child `Command` started. Dropping the `Child` neither waits for nor
+    /// signals the process; the monitor reaps it with wait4.
+    fn from(child: Child) -> Self {
+        Self { pid: child.id() }
+    }
+}
+
 fn spawn_process(
     cwd: &Path,
     stdout: &Path,
     stderr: &Path,
-    enrollment: Option<(RawFd, &Path)>,
+    enrollment: Option<Enrollment<'_>>,
     observation: &mut InvocationCpuObservation,
-) -> Result<Child, String> {
+) -> Result<SpawnedLeader, String> {
+    spawn_process_with(
+        &crate::vfork_spawn::CLONE3,
+        cwd,
+        stdout,
+        stderr,
+        enrollment,
+        observation,
+    )
+}
+
+/// [`spawn_process`], with clone3 as `clone3` finds it.
+fn spawn_process_with(
+    clone3: &crate::vfork_spawn::Clone3Support,
+    cwd: &Path,
+    stdout: &Path,
+    stderr: &Path,
+    enrollment: Option<Enrollment<'_>>,
+    observation: &mut InvocationCpuObservation,
+) -> Result<SpawnedLeader, String> {
     let mut open_capture = |path: &Path, stage| {
         File::create(path).map_err(|error| {
             let reason = format!("{}: {error}", path.display());
@@ -8741,6 +8908,49 @@ fn spawn_process(
     };
     let stdout_file = open_capture(stdout, SpawnStage::StdoutCapture)?;
     let stderr_file = open_capture(stderr, SpawnStage::StderrCapture)?;
+    // A child that joins a cgroup is created in it by clone3, without a copy
+    // of this process (dh-7n47nt); only where clone3 is refused does it take
+    // the pre_exec join below, which forks.
+    let mut method = SpawnMethod::Command;
+    if let Some(enrollment) = enrollment {
+        let program = &observation.command.argv[0];
+        let started = start_in_cgroup(
+            clone3,
+            &observation.command,
+            cwd,
+            [&stdout_file, &stderr_file],
+            enrollment,
+        );
+        let failure = match started {
+            Ok(crate::vfork_spawn::Started::Running { pid }) => {
+                observation.launch = LaunchObservation::Spawned {
+                    pid,
+                    method: SpawnMethod::Clone3IntoCgroup,
+                };
+                remember_spawned_group(pid);
+                return Ok(SpawnedLeader { pid });
+            }
+            Ok(crate::vfork_spawn::Started::Unusable { reason }) => {
+                method = SpawnMethod::CommandAfterClone3Refused { reason };
+                None
+            }
+            Ok(crate::vfork_spawn::Started::JoinFailed(error)) => Some(format!(
+                "cannot join invocation cgroup {} before exec, so {program} was not started: {error}",
+                enrollment.path.display()
+            )),
+            Ok(crate::vfork_spawn::Started::Failed(error)) | Err(error) => {
+                Some(format!("cannot execute {program}: {error}"))
+            }
+        };
+        if let Some(reason) = failure {
+            observation.launch = LaunchObservation::SpawnFailed {
+                stage: SpawnStage::Spawn,
+                reason: reason.clone(),
+            };
+            observation.termination = TerminationPath::SpawnFailed;
+            return Err(reason);
+        }
+    }
     // A failed cgroup join and a failed exec reach this process as the same
     // bare error code, so the child writes one byte to this pipe when the join
     // is what failed.
@@ -8776,7 +8986,7 @@ fn spawn_process(
     // other thread that page-faults waits for it (dh-7n47nt).
     command.process_group(0);
     let join_report_fd = join_report.as_ref().map(|(_, write)| write.as_raw_fd());
-    if let Some((fd, _)) = enrollment {
+    if let Some(Enrollment { procs: fd, .. }) = enrollment {
         // Join the invocation cgroup before exec, so every CPU cycle of the
         // program and of anything it starts is charged to that cgroup. The
         // descriptor is close-on-exec, so the program never sees it. std sets
@@ -8820,13 +9030,16 @@ fn spawn_process(
     };
     match spawned {
         Ok(child) => {
-            observation.launch = LaunchObservation::Spawned { pid: child.id() };
+            observation.launch = LaunchObservation::Spawned {
+                pid: child.id(),
+                method,
+            };
             remember_spawned_group(child.id());
-            Ok(child)
+            Ok(SpawnedLeader::from(child))
         }
         Err(error) => {
             let reason = match enrollment {
-                Some((_, cgroup)) if join_failed => format!(
+                Some(Enrollment { path: cgroup, .. }) if join_failed => format!(
                     "cannot join invocation cgroup {} before exec, so {program} was not started: {error}",
                     cgroup.display()
                 ),
@@ -8840,6 +9053,42 @@ fn spawn_process(
             Err(reason)
         }
     }
+}
+
+/// Starts `command` in `enrollment`'s cgroup with clone3, with stdin on
+/// /dev/null and stdout and stderr on `captures`. `Err` when those
+/// descriptors cannot be prepared.
+fn start_in_cgroup(
+    clone3: &crate::vfork_spawn::Clone3Support,
+    command: &CommandIdentity,
+    cwd: &Path,
+    captures: [&File; 2],
+    enrollment: Enrollment<'_>,
+) -> std::io::Result<crate::vfork_spawn::Started> {
+    // Close-on-exec copies above 2, so that the child's dup3 onto 0, 1 and 2
+    // never overwrites a source it has yet to copy.
+    let above_stdio = |fd: RawFd| -> std::io::Result<OwnedFd> {
+        let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+        if copy < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: fcntl returned a new descriptor that nothing else owns.
+        Ok(unsafe { OwnedFd::from_raw_fd(copy) })
+    };
+    let null = File::open("/dev/null")?;
+    let stdin = above_stdio(null.as_raw_fd())?;
+    let stdout = above_stdio(captures[0].as_raw_fd())?;
+    let stderr = above_stdio(captures[1].as_raw_fd())?;
+    Ok(crate::vfork_spawn::start(
+        clone3,
+        &crate::vfork_spawn::Program {
+            argv: &command.argv,
+            env_overrides: &command.env_overrides,
+            cwd,
+            stdio: [stdin.as_raw_fd(), stdout.as_raw_fd(), stderr.as_raw_fd()],
+            cgroup: enrollment.directory,
+        },
+    ))
 }
 
 /// A close-on-exec, nonblocking pipe, read end first, through which a child
@@ -8857,7 +9106,7 @@ fn join_failure_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
 /// `proccpu` does. The seconds are converted to microseconds here, and a
 /// conversion failure is a failed sample like any other.
 fn monitor_process<R>(
-    child: Child,
+    child: impl Into<SpawnedLeader>,
     limits: ProcessLimits,
     started: Instant,
     observation: &mut InvocationCpuObservation,
@@ -8891,7 +9140,7 @@ fn monitor_process<R>(
 /// `CELL_CPU_ACCOUNTING_GRACE`. `register` binds the reader once at spawn;
 /// `sample` returns the invocation's CPU in microseconds.
 fn monitor_live_cpu<R>(
-    child: Child,
+    child: impl Into<SpawnedLeader>,
     limits: ProcessLimits,
     started: Instant,
     observation: &mut InvocationCpuObservation,
@@ -8920,7 +9169,7 @@ fn monitor_live_cpu<R>(
 /// a recorded trigger.
 #[allow(clippy::too_many_arguments)]
 fn monitor_live_cpu_in<R>(
-    child: Child,
+    child: impl Into<SpawnedLeader>,
     limits: ProcessLimits,
     started: Instant,
     observation: &mut InvocationCpuObservation,
@@ -8934,7 +9183,7 @@ fn monitor_live_cpu_in<R>(
         cpu_budget_usec,
         cpu_poll_interval,
     } = limits;
-    let pid = child.id();
+    let pid = child.into().id();
     let leader = LeaderPidFd::open(pid);
     // Authenticate once at spawn and retain this generation's owner through
     // final wait/stop. Disabled accounting never registers or samples a reader.
@@ -9570,10 +9819,60 @@ fn record_cell(
     cell: &SelectedCell,
     run: impl FnOnce(&mut CellRunProgress) -> Result<CellResult, String>,
 ) -> Result<CellResult, CellRunFailure> {
+    record_cell_with_probe_record(
+        context,
+        cell,
+        || crate::vfork_spawn::CLONE3.cgroup_probe_record(),
+        run,
+    )
+}
+
+/// [`record_cell`], with the probe record to publish given (the
+/// process's own, in production).
+fn record_cell_with_probe_record(
+    context: &RunContext,
+    cell: &SelectedCell,
+    get_probe_record: impl FnOnce() -> Option<crate::vfork_spawn::CgroupProbeRecord>,
+    run: impl FnOnce(&mut CellRunProgress) -> Result<CellResult, String>,
+) -> Result<CellResult, CellRunFailure> {
+    static WRITTEN: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+    record_cell_with_probe_record_in_state(context, cell, get_probe_record, &WRITTEN, run)
+}
+
+/// [`record_cell_with_probe_record`] with the publication once
+/// state given (its own, in a test).
+fn record_cell_with_probe_record_in_state(
+    context: &RunContext,
+    cell: &SelectedCell,
+    get_probe_record: impl FnOnce() -> Option<crate::vfork_spawn::CgroupProbeRecord>,
+    written: &std::sync::Mutex<bool>,
+    run: impl FnOnce(&mut CellRunProgress) -> Result<CellResult, String>,
+) -> Result<CellResult, CellRunFailure> {
     let mut progress = CellRunProgress::default();
     let outcome = run(&mut progress);
+    // The record is read only now: the probe may have run during
+    // this very cell (the first cell of the process), and a record
+    // read before the run would silently publish nothing.
+    let probe_record = get_probe_record();
     let mut observations = empty_cpu_observations(context, cell);
     observations.invocations = progress.observations;
+    if let Err(reason) = publish_probe_record_with(context, probe_record, written) {
+        return Err(match outcome {
+            Ok(mut result) => {
+                result.cpu_observations = Some(observations);
+                CellRunFailure {
+                    reason,
+                    observations: Box::new(result.cpu_observations.take().expect("attached above")),
+                    attempts: result.attempts,
+                }
+            }
+            Err(_) => CellRunFailure {
+                reason,
+                observations: Box::new(observations),
+                attempts: progress.attempts,
+            },
+        });
+    }
     match outcome {
         Ok(mut result) => {
             result.cpu_observations = Some(observations);
@@ -17708,11 +18007,23 @@ fi
         static FORKS_ON_THIS_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     }
 
+    /// How many times this process has called fork(), on any thread:
+    /// the same prepare handler, counted process-wide. Only exact in
+    /// a process running one test (the child
+    /// [`alone_in_a_child_process`] starts).
+    static FORKS_IN_PROCESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn forks_in_process() -> u64 {
+        forks_on_this_thread();
+        FORKS_IN_PROCESS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The number of fork() calls this thread has made since the counter was
     /// installed in this process.
     fn forks_on_this_thread() -> u64 {
         extern "C" fn count_fork() {
             FORKS_ON_THIS_THREAD.with(|forks| forks.set(forks.get() + 1));
+            FORKS_IN_PROCESS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         static INSTALL: std::sync::Once = std::sync::Once::new();
         INSTALL.call_once(|| {
@@ -17768,6 +18079,759 @@ fi
         assert_eq!(
             pid, pgid,
             "the invocation does not lead its own process group"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A budgeted invocation, which joins an invocation cgroup, starts
+    /// without fork() of this process (dh-7n47nt stage 2): the cgroup join is
+    /// made by clone3's CLONE_INTO_CGROUP instead of a pre_exec closure, which
+    /// forces fork(). Its program is in the invocation cgroup from its first
+    /// instruction.
+    #[test]
+    fn an_invocation_in_a_cgroup_starts_without_forking_this_process() {
+        let test = "an_invocation_in_a_cgroup_starts_without_forking_this_process";
+        if !alone_in_a_child_process(&format!("runner::tests::{test}")) {
+            return;
+        }
+        let Some(mut probe) = crate::invocation_cgroup::tests::real_cgroup_or_declared_absent(test)
+        else {
+            return;
+        };
+        probe.finish().unwrap();
+        let root =
+            std::env::temp_dir().join(format!("hermit-runner-cgroup-spawn-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let mut observations = Vec::new();
+        let before = forks_on_this_thread();
+        let output = execute_process(
+            ProcessRequest::new(
+                InvocationRole::Execution {
+                    attempt_index: "1".into(),
+                    backend: RequiredNullable::Null,
+                },
+                &root,
+                "/bin/cat",
+                &["/proc/self/cgroup".into()],
+                &BTreeMap::new(),
+                &root.join("cgroup.stdout"),
+                &root.join("cgroup.stderr"),
+            ),
+            (Instant::now() + Duration::from_secs(60), Some(5_000_000)),
+            &mut observations,
+        )
+        .unwrap();
+        let forks = forks_on_this_thread() - before;
+        assert!(output.status.success());
+        let LiveCpuObservation::Enabled(live) = &observations[0].live else {
+            panic!("a budgeted invocation enables live CPU observation");
+        };
+        assert_eq!(live.source, LiveCpuSource::CgroupV2InvocationCpuStatV1);
+        assert_eq!(forks, 0, "starting the invocation forked this process");
+        // The startup probe must not fork at all: it starts its
+        // child with clone3, on its setup thread, before this
+        // invocation. This process runs only this test, so the
+        // count is exact.
+        assert_eq!(
+            forks_in_process(),
+            0,
+            "the startup probe must not fork this process"
+        );
+        assert!(
+            crate::vfork_spawn::CLONE3.cgroup_probe_record().is_some(),
+            "the startup probe ran before the first invocation"
+        );
+        let cgroup = fs::read_to_string(root.join("cgroup.stdout")).unwrap();
+        let invocation = format!("/hermit-e2e-invocation-{}-", std::process::id());
+        assert!(
+            cgroup.starts_with("0::/") && cgroup.contains(&invocation),
+            "the program was not in its invocation cgroup: {cgroup:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// This process's zombie children that were created by this thread and
+    /// never execed: a child that clone3 made keeps the creating thread's
+    /// name until it execs, and libtest names each test's thread after the
+    /// test. A failed start that did not reap its child leaves one here.
+    ///
+    /// The kernel keeps only 15 bytes of a thread's name, and every
+    /// `runner::tests::` thread's is "runner::tests::", so in the parallel
+    /// libtest process this also sees another test's child that failed to
+    /// exec and is not reaped yet. A test that asserts on it runs alone, in
+    /// the child process [`alone_in_a_child_process`] starts.
+    fn unreaped_children_of_this_thread() -> Vec<String> {
+        let me = std::process::id().to_string();
+        let comm = fs::read_to_string("/proc/thread-self/comm").unwrap();
+        let mut zombies = Vec::new();
+        for entry in fs::read_dir("/proc").unwrap().flatten() {
+            let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+                continue;
+            };
+            let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else {
+                continue;
+            };
+            let name = &stat[open + 1..close];
+            let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+            if fields.first() == Some(&"Z")
+                && fields.get(1) == Some(&me.as_str())
+                && name == comm.trim_end()
+            {
+                zombies.push(stat[..open].trim().to_string());
+            }
+        }
+        zombies
+    }
+
+    /// Whether this is the child process that runs the test `case` alone.
+    /// In the libtest process, this runs `case` in a child libtest process
+    /// with no other test, asserts that the child ran it and that it passed,
+    /// and returns false: the caller then returns.
+    fn alone_in_a_child_process(case: &str) -> bool {
+        const CHILD: &str = "HERMIT_TEST_ALONE_IN_A_CHILD_PROCESS";
+        if std::env::var_os(CHILD).is_some_and(|value| value == case) {
+            return true;
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", case, "--nocapture"])
+            .env(CHILD, case)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("test result: ok. 1 passed;"),
+            "the child process did not run {case}: {stdout}"
+        );
+        print!("{stdout}");
+        false
+    }
+
+    /// Waits for and reaps `leader`, and returns how it ended.
+    fn wait_for_leader(leader: &SpawnedLeader) -> ExitStatus {
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(leader.id() as libc::pid_t, &mut status, 0) };
+        assert_eq!(waited, leader.id() as libc::pid_t, "waitpid failed");
+        ExitStatus::from_raw(status)
+    }
+
+    /// What a program `spawn_process` started in a fresh invocation cgroup
+    /// did, once it exited.
+    struct CgroupSpawned {
+        status: ExitStatus,
+        stdout: String,
+        stderr: String,
+        method: SpawnMethod,
+    }
+
+    /// Starts `program` with `args` and environment overrides `env` through
+    /// `spawn_process` in a fresh invocation cgroup, waits for it, removes the
+    /// cgroup, and asserts that clone3 created the program. `None` when this
+    /// environment declares it has no cgroups.
+    fn spawn_in_a_fresh_cgroup(
+        test: &str,
+        root: &Path,
+        program: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Option<Result<CgroupSpawned, String>> {
+        let spawned = spawn_in_a_fresh_cgroup_with(
+            &crate::vfork_spawn::CLONE3,
+            test,
+            root,
+            program,
+            args,
+            env,
+        )?;
+        if let Ok(spawned) = &spawned {
+            assert_eq!(spawned.method, SpawnMethod::Clone3IntoCgroup);
+        }
+        Some(spawned)
+    }
+
+    /// [`spawn_in_a_fresh_cgroup`] with clone3 as `clone3` finds it, whatever
+    /// method started the program.
+    fn spawn_in_a_fresh_cgroup_with(
+        clone3: &crate::vfork_spawn::Clone3Support,
+        test: &str,
+        root: &Path,
+        program: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Option<Result<CgroupSpawned, String>> {
+        spawn_in_a_fresh_cgroup_in(clone3, test, root, root, program, args, env, &|_| {})
+    }
+
+    /// [`spawn_in_a_fresh_cgroup_with`], with `cwd` as the program's working
+    /// directory, and `prepare` given the cgroup's path before the spawn.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_in_a_fresh_cgroup_in(
+        clone3: &crate::vfork_spawn::Clone3Support,
+        test: &str,
+        root: &Path,
+        cwd: &Path,
+        program: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+        prepare: &dyn Fn(&Path),
+    ) -> Option<Result<CgroupSpawned, String>> {
+        let mut cgroup = crate::invocation_cgroup::tests::real_cgroup_or_declared_absent(test)?;
+        prepare(cgroup.path());
+        let request = ProcessRequest::new(
+            InvocationRole::Execution {
+                attempt_index: "1".into(),
+                backend: RequiredNullable::Null,
+            },
+            cwd,
+            program,
+            &args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>(),
+            &env.iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            &root.join("spawned.stdout"),
+            &root.join("spawned.stderr"),
+        );
+        let mut observation = InvocationCpuObservation::pending(
+            1,
+            request.role,
+            request.command,
+            Some(LiveCpuSource::CgroupV2InvocationCpuStatV1),
+        );
+        let spawned = spawn_process_with(
+            clone3,
+            &request.cwd,
+            &request.stdout,
+            &request.stderr,
+            Some(Enrollment {
+                directory: cgroup.directory_fd(),
+                procs: cgroup.enrollment_fd(),
+                path: cgroup.path(),
+            }),
+            &mut observation,
+        )
+        .map(|child| CgroupSpawned {
+            status: wait_for_leader(&child),
+            stdout: fs::read_to_string(&request.stdout).unwrap(),
+            stderr: fs::read_to_string(&request.stderr).unwrap(),
+            method: match &observation.launch {
+                LaunchObservation::Spawned { method, .. } => method.clone(),
+                other => panic!("a started program records Spawned, not {other:?}"),
+            },
+        });
+        cgroup.finish().unwrap();
+        Some(spawned)
+    }
+
+    /// A fresh directory for one of the spawn tests below.
+    fn spawn_test_root(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-spawn-{label}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// Each kind of clone3 refusal takes its own path (dh-7n47nt):
+    /// - ENOSYS, E2BIG and EINVAL mean clone3 cannot be used here (an older
+    ///   kernel or a seccomp filter), and so does EPERM when a probe without
+    ///   CLONE_INTO_CGROUP is refused too (a filter). The program starts
+    ///   through `Command` with the pre_exec join, still in its invocation
+    ///   cgroup, and the refusal is remembered, with one notice: the next
+    ///   spawn does not call clone3.
+    /// - EBADF, EACCES, ENOENT, EROFS, ENODEV, EBUSY and EOPNOTSUPP are about
+    ///   the cgroup: a failed join, not remembered; so is EPERM when the probe
+    ///   is not refused (see
+    ///   `an_eperm_from_the_cgroup_fails_that_spawn_and_the_next_uses_clone3`).
+    /// - Anything else, such as EAGAIN or ENOMEM, means no child: a failed
+    ///   spawn, not remembered.
+    #[test]
+    fn each_kind_of_clone3_refusal_takes_its_own_path() {
+        let test = "each_kind_of_clone3_refusal_takes_its_own_path";
+        let root = spawn_test_root("clone3-refusals");
+        let invocation = format!("/hermit-e2e-invocation-{}-", std::process::id());
+        let attempts = |clone3: &crate::vfork_spawn::Clone3Support| {
+            clone3.attempts.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        for errno in [libc::ENOSYS, libc::E2BIG, libc::EINVAL, libc::EPERM] {
+            let clone3 = crate::vfork_spawn::Clone3Support::refusing(errno);
+            let probes = if errno == libc::EPERM { 1 } else { 0 };
+            let reason = format!(
+                "clone3 with CLONE_INTO_CGROUP was refused: {}",
+                std::io::Error::from_raw_os_error(errno)
+            );
+            for spawn in 1..=2 {
+                let Some(spawned) = spawn_in_a_fresh_cgroup_with(
+                    &clone3,
+                    test,
+                    &root,
+                    "/bin/cat",
+                    &["/proc/self/cgroup"],
+                    &[],
+                ) else {
+                    return;
+                };
+                let spawned = spawned.unwrap();
+                assert!(spawned.status.success(), "{}", spawned.stderr);
+                assert!(
+                    spawned.stdout.contains(&invocation),
+                    "errno {errno}: not in its invocation cgroup: {:?}",
+                    spawned.stdout
+                );
+                assert_eq!(
+                    spawned.method,
+                    SpawnMethod::CommandAfterClone3Refused {
+                        reason: reason.clone()
+                    },
+                    "errno {errno}, spawn {spawn}"
+                );
+                assert_eq!(attempts(&clone3), 1, "errno {errno}, spawn {spawn}");
+                assert_eq!(
+                    clone3.probes.load(std::sync::atomic::Ordering::Relaxed),
+                    probes,
+                    "errno {errno}, spawn {spawn}"
+                );
+                assert_eq!(
+                    clone3.notices.load(std::sync::atomic::Ordering::Relaxed),
+                    1,
+                    "errno {errno}, spawn {spawn}"
+                );
+            }
+        }
+        for errno in [
+            libc::EBADF,
+            libc::EACCES,
+            libc::ENOENT,
+            libc::EROFS,
+            libc::ENODEV,
+            libc::EBUSY,
+            libc::EOPNOTSUPP,
+        ] {
+            let clone3 = crate::vfork_spawn::Clone3Support::refusing(errno);
+            let tail = format!(
+                " before exec, so /bin/true was not started: {}",
+                std::io::Error::from_raw_os_error(errno)
+            );
+            for spawn in 1..=2 {
+                let Some(spawned) =
+                    spawn_in_a_fresh_cgroup_with(&clone3, test, &root, "/bin/true", &[], &[])
+                else {
+                    return;
+                };
+                let error = spawned
+                    .err()
+                    .unwrap_or_else(|| panic!("errno {errno} started"));
+                assert!(
+                    error.starts_with("cannot join invocation cgroup /") && error.ends_with(&tail),
+                    "errno {errno}: {error}"
+                );
+                assert_eq!(attempts(&clone3), spawn, "errno {errno}");
+            }
+        }
+        for errno in [libc::EAGAIN, libc::ENOMEM] {
+            let clone3 = crate::vfork_spawn::Clone3Support::refusing(errno);
+            for spawn in 1..=2 {
+                let Some(spawned) =
+                    spawn_in_a_fresh_cgroup_with(&clone3, test, &root, "/bin/true", &[], &[])
+                else {
+                    return;
+                };
+                assert_eq!(
+                    spawned.err(),
+                    Some(format!(
+                        "cannot execute /bin/true: {}",
+                        std::io::Error::from_raw_os_error(errno)
+                    )),
+                    "errno {errno}"
+                );
+                assert_eq!(attempts(&clone3), spawn, "errno {errno}");
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An EPERM from a clone3 with CLONE_INTO_CGROUP, where clone3 itself is
+    /// allowed (the probe without CLONE_INTO_CGROUP is not refused), is the
+    /// cgroup's permission check refusing the child: that spawn's join fails,
+    /// nothing is remembered, and the next spawn uses clone3 (dh-7n47nt F1).
+    #[test]
+    fn an_eperm_from_the_cgroup_fails_that_spawn_and_the_next_uses_clone3() {
+        let test = "an_eperm_from_the_cgroup_fails_that_spawn_and_the_next_uses_clone3";
+        let root = spawn_test_root("clone3-eperm-once");
+        // The probe answered EINVAL by injection, and made for real (this
+        // host has no filter on clone3, so it answers EINVAL too).
+        let injected =
+            crate::vfork_spawn::Clone3Support::refusing_once_with_probe(libc::EPERM, libc::EINVAL);
+        let real = crate::vfork_spawn::Clone3Support::refusing_once(libc::EPERM);
+        for clone3 in [&injected, &real] {
+            let Some(first) =
+                spawn_in_a_fresh_cgroup_with(clone3, test, &root, "/bin/true", &[], &[])
+            else {
+                return;
+            };
+            let error = first.err().expect("the first spawn's join fails");
+            assert!(
+                error.starts_with("cannot join invocation cgroup /")
+                    && error.ends_with(" before exec, so /bin/true was not started: Operation not permitted (os error 1)"),
+                "{error}"
+            );
+            let second = spawn_in_a_fresh_cgroup_with(clone3, test, &root, "/bin/true", &[], &[])
+                .unwrap()
+                .unwrap();
+            assert!(second.status.success(), "{}", second.stderr);
+            assert_eq!(second.method, SpawnMethod::Clone3IntoCgroup);
+            let count = |counter: &std::sync::atomic::AtomicUsize| {
+                counter.load(std::sync::atomic::Ordering::Relaxed)
+            };
+            assert_eq!(count(&clone3.attempts), 2);
+            assert_eq!(count(&clone3.probes), 1);
+            assert_eq!(count(&clone3.notices), 0);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A target cgroup this process may not write to refuses the child for
+    /// real (EACCES from the kernel's permission check on its cgroup.procs):
+    /// that spawn's join fails, and the next spawn, into a writable cgroup,
+    /// still uses clone3.
+    #[test]
+    fn an_unwritable_cgroup_fails_that_spawn_and_the_next_uses_clone3() {
+        let test = "an_unwritable_cgroup_fails_that_spawn_and_the_next_uses_clone3";
+        // Mode 0444 refuses only a writer without CAP_DAC_OVERRIDE, so as root
+        // this refusal cannot be produced this way.
+        if unsafe { libc::geteuid() } == 0 {
+            println!(
+                "SKIPPED {test}: running as root, which mode 0444 on cgroup.procs does not refuse"
+            );
+            return;
+        }
+        let root = spawn_test_root("clone3-unwritable");
+        let clone3 = crate::vfork_spawn::Clone3Support::new();
+        let read_only = |cgroup: &Path| {
+            fs::set_permissions(
+                cgroup.join("cgroup.procs"),
+                fs::Permissions::from_mode(0o444),
+            )
+            .unwrap();
+        };
+        let Some(first) = spawn_in_a_fresh_cgroup_in(
+            &clone3,
+            test,
+            &root,
+            &root,
+            "/bin/true",
+            &[],
+            &[],
+            &read_only,
+        ) else {
+            return;
+        };
+        let error = first
+            .err()
+            .expect("the spawn into an unwritable cgroup fails");
+        assert!(
+            error.starts_with("cannot join invocation cgroup /")
+                && error.ends_with(
+                    " before exec, so /bin/true was not started: Permission denied (os error 13)"
+                ),
+            "{error}"
+        );
+        let second = spawn_in_a_fresh_cgroup_with(&clone3, test, &root, "/bin/true", &[], &[])
+            .unwrap()
+            .unwrap();
+        assert!(second.status.success(), "{}", second.stderr);
+        assert_eq!(second.method, SpawnMethod::Clone3IntoCgroup);
+        assert_eq!(
+            clone3.attempts.load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        assert_eq!(clone3.notices.load(std::sync::atomic::Ordering::Relaxed), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A well-formed clone3 with CLONE_INTO_CGROUP is accepted by this
+    /// kernel: none of its argument checks refuses it (EINVAL, E2BIG), so a
+    /// regression in the arguments fails here instead of quietly sending
+    /// every spawn back to fork() (dh-7n47nt F3). Kernels older than 5.7,
+    /// which have no CLONE_INTO_CGROUP, are skipped.
+    #[test]
+    fn clone3_into_a_cgroup_is_accepted_by_this_kernel() {
+        let test = "clone3_into_a_cgroup_is_accepted_by_this_kernel";
+        let release = fs::read_to_string("/proc/sys/kernel/osrelease").unwrap();
+        let mut numbers = release
+            .trim()
+            .split(|c: char| !c.is_ascii_digit())
+            .map(|part| part.parse::<u32>().unwrap_or(0));
+        let version = (numbers.next().unwrap_or(0), numbers.next().unwrap_or(0));
+        if version < (5, 7) {
+            eprintln!(
+                "{test}: skipped, kernel {} has no CLONE_INTO_CGROUP",
+                release.trim()
+            );
+            return;
+        }
+        let root = spawn_test_root("clone3-accepted");
+        let clone3 = crate::vfork_spawn::Clone3Support::new();
+        let Some(spawned) =
+            spawn_in_a_fresh_cgroup_with(&clone3, test, &root, "/bin/true", &[], &[])
+        else {
+            return;
+        };
+        let spawned = spawned.unwrap();
+        assert!(spawned.status.success(), "{}", spawned.stderr);
+        assert_eq!(spawned.method, SpawnMethod::Clone3IntoCgroup);
+        assert_eq!(clone3.notices.load(std::sync::atomic::Ordering::Relaxed), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A child that a signal kills before it execs is reported as a started
+    /// program that the signal killed: it stored no failure, and its wait
+    /// reports the signal (dh-7n47nt F4).
+    #[test]
+    fn a_child_killed_before_exec_reads_as_a_started_program_killed_by_the_signal() {
+        let test = "a_child_killed_before_exec_reads_as_a_started_program_killed_by_the_signal";
+        let root = spawn_test_root("clone3-killed-before-exec");
+        let clone3 = crate::vfork_spawn::Clone3Support::killing_children_before_exec();
+        let Some(spawned) =
+            spawn_in_a_fresh_cgroup_with(&clone3, test, &root, "/bin/true", &[], &[])
+        else {
+            return;
+        };
+        let spawned = spawned.expect("a child killed before exec still reads as started");
+        assert_eq!(spawned.method, SpawnMethod::Clone3IntoCgroup);
+        assert_eq!(spawned.status.signal(), Some(libc::SIGKILL));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A working directory that does not exist fails the spawn with the same
+    /// message through clone3 as through `Command`.
+    #[test]
+    fn a_missing_working_directory_reads_as_it_does_through_command() {
+        let test = "a_missing_working_directory_reads_as_it_does_through_command";
+        if !alone_in_a_child_process(&format!("runner::tests::{test}")) {
+            return;
+        }
+        let root = spawn_test_root("missing-cwd");
+        let missing = root.join("no-such-directory");
+        let command = crate::vfork_spawn::Clone3Support::refusing(libc::ENOSYS);
+        let clone3 = crate::vfork_spawn::Clone3Support::new();
+        let mut errors = Vec::new();
+        for support in [&command, &clone3] {
+            let Some(spawned) = spawn_in_a_fresh_cgroup_in(
+                support,
+                test,
+                &root,
+                &missing,
+                "/bin/true",
+                &[],
+                &[],
+                &|_| {},
+            ) else {
+                return;
+            };
+            errors.push(spawned.err().expect("a missing cwd fails the spawn"));
+            assert_eq!(unreaped_children_of_this_thread(), Vec::<String>::new());
+        }
+        assert_eq!(
+            errors[0],
+            "cannot execute /bin/true: No such file or directory (os error 2)"
+        );
+        assert_eq!(errors[1], errors[0]);
+        assert_eq!(
+            clone3.attempts.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// In the PATH search, a program found but not executable (EACCES) is
+    /// reported over a later directory that lacks it (ENOENT), and a later
+    /// directory that has it runs it, as execvp does; through clone3 as
+    /// through `Command`.
+    #[test]
+    fn the_path_search_reports_a_denied_program_over_a_missing_one() {
+        let test = "the_path_search_reports_a_denied_program_over_a_missing_one";
+        let root = spawn_test_root("path-eacces");
+        let denied = root.join("denied");
+        let empty = root.join("empty");
+        let runnable = root.join("runnable");
+        for dir in [&denied, &empty, &runnable] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        let name = "hermit-spawn-eacces-probe";
+        fs::write(denied.join(name), "#!/bin/sh\nprintf denied\n").unwrap();
+        fs::set_permissions(denied.join(name), fs::Permissions::from_mode(0o644)).unwrap();
+        fs::write(runnable.join(name), "#!/bin/sh\nprintf ran\n").unwrap();
+        fs::set_permissions(runnable.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+        let denied_then_missing = format!("{}:{}", denied.display(), empty.display());
+        let denied_then_runnable = format!("{}:{}", denied.display(), runnable.display());
+        let command = crate::vfork_spawn::Clone3Support::refusing(libc::ENOSYS);
+        let clone3 = crate::vfork_spawn::Clone3Support::new();
+        for support in [&command, &clone3] {
+            let Some(spawned) = spawn_in_a_fresh_cgroup_with(
+                support,
+                test,
+                &root,
+                name,
+                &[],
+                &[("PATH", &denied_then_missing)],
+            ) else {
+                return;
+            };
+            assert_eq!(
+                spawned.err(),
+                Some(format!(
+                    "cannot execute {name}: Permission denied (os error 13)"
+                ))
+            );
+            let spawned = spawn_in_a_fresh_cgroup_with(
+                support,
+                test,
+                &root,
+                name,
+                &[],
+                &[("PATH", &denied_then_runnable)],
+            )
+            .unwrap()
+            .unwrap();
+            assert!(spawned.status.success(), "{}", spawned.stderr);
+            assert_eq!(spawned.stdout, "ran");
+        }
+        assert_eq!(
+            clone3.attempts.load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A program that cannot be executed in a cgroup is a spawn failure that
+    /// names the program and the exec's error: a missing file (ENOENT) and a
+    /// file without execute permission (EACCES).
+    #[test]
+    fn a_program_that_cannot_be_executed_in_a_cgroup_is_named_with_its_error() {
+        let test = "a_program_that_cannot_be_executed_in_a_cgroup_is_named_with_its_error";
+        if !alone_in_a_child_process(&format!("runner::tests::{test}")) {
+            return;
+        }
+        let root = spawn_test_root("unexecutable");
+        let missing = root.join("missing-program");
+        let Some(error) = spawn_in_a_fresh_cgroup(test, &root, missing.to_str().unwrap(), &[], &[])
+        else {
+            return;
+        };
+        assert_eq!(
+            error.err(),
+            Some(format!(
+                "cannot execute {}: No such file or directory (os error 2)",
+                missing.display()
+            ))
+        );
+        assert_eq!(unreaped_children_of_this_thread(), Vec::<String>::new());
+        let plain = root.join("not-executable");
+        fs::write(&plain, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&plain, fs::Permissions::from_mode(0o644)).unwrap();
+        let error =
+            spawn_in_a_fresh_cgroup(test, &root, plain.to_str().unwrap(), &[], &[]).unwrap();
+        assert_eq!(
+            error.err(),
+            Some(format!(
+                "cannot execute {}: Permission denied (os error 13)",
+                plain.display()
+            ))
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An executable file without a `#!` line runs under /bin/sh, as execvp
+    /// runs it (ENOEXEC).
+    #[test]
+    fn an_executable_without_an_interpreter_line_runs_under_the_shell() {
+        let test = "an_executable_without_an_interpreter_line_runs_under_the_shell";
+        let root = spawn_test_root("no-shebang");
+        let script = root.join("plain-script");
+        fs::write(&script, "printf 'ran %s' \"$1\"\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let Some(spawned) =
+            spawn_in_a_fresh_cgroup(test, &root, script.to_str().unwrap(), &["arg"], &[])
+        else {
+            return;
+        };
+        let spawned = spawned.unwrap();
+        assert!(spawned.status.success(), "{}", spawned.stderr);
+        assert_eq!(spawned.stdout, "ran arg");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A program named without a `/` is looked up in the PATH the
+    /// invocation's environment overrides set, not in this process's PATH.
+    #[test]
+    fn a_program_is_looked_up_in_the_overridden_path() {
+        let test = "a_program_is_looked_up_in_the_overridden_path";
+        let root = spawn_test_root("override-path");
+        let bin = root.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let script = bin.join("hermit-spawn-path-probe");
+        fs::write(&script, "#!/bin/sh\nprintf found\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+        let Some(spawned) = spawn_in_a_fresh_cgroup(
+            test,
+            &root,
+            "hermit-spawn-path-probe",
+            &[],
+            &[("PATH", &path)],
+        ) else {
+            return;
+        };
+        let spawned = spawned.unwrap();
+        assert!(spawned.status.success(), "{}", spawned.stderr);
+        assert_eq!(spawned.stdout, "found");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The program starts as std::process::Command starts one: leading a
+    /// process group of its own, in its working directory, with stdin on
+    /// /dev/null, no blocked signals and SIGPIPE at its default action.
+    #[test]
+    fn a_program_in_a_cgroup_starts_with_the_process_state_command_gives() {
+        let test = "a_program_in_a_cgroup_starts_with_the_process_state_command_gives";
+        let root = spawn_test_root("process-state");
+        let script = "set -e; \
+            read -r _ _ _ _ pgid _ < /proc/$$/stat; \
+            printf 'group=%s\\n' \"$([ \"$pgid\" = $$ ] && echo own || echo other)\"; \
+            printf 'cwd=%s\\n' \"$(pwd -P)\"; \
+            printf 'stdin=%s\\n' \"$(readlink /proc/$$/fd/0)\"; \
+            grep -E '^(SigBlk|SigIgn):' /proc/$$/status";
+        let Some(spawned) = spawn_in_a_fresh_cgroup(test, &root, "/bin/sh", &["-c", script], &[])
+        else {
+            return;
+        };
+        let spawned = spawned.unwrap();
+        assert!(spawned.status.success(), "{}", spawned.stderr);
+        let line = |key: &str| {
+            spawned
+                .stdout
+                .lines()
+                .find_map(|line| line.strip_prefix(key))
+                .map(str::trim)
+                .unwrap_or_else(|| panic!("no {key} in {:?}", spawned.stdout))
+                .to_string()
+        };
+        assert_eq!(line("group="), "own");
+        assert_eq!(line("cwd="), root.canonicalize().unwrap().to_str().unwrap());
+        assert_eq!(line("stdin="), "/dev/null");
+        assert_eq!(line("SigBlk:"), "0000000000000000");
+        let ignored = u64::from_str_radix(&line("SigIgn:"), 16).unwrap();
+        assert_eq!(
+            ignored & (1 << (libc::SIGPIPE - 1)),
+            0,
+            "SIGPIPE is ignored in the program: SigIgn {ignored:016x}"
         );
         fs::remove_dir_all(root).unwrap();
     }
@@ -17898,7 +18962,7 @@ fi
         label: &str,
         script: &str,
         cpu_enabled: bool,
-    ) -> (Child, Instant, InvocationCpuObservation) {
+    ) -> (SpawnedLeader, Instant, InvocationCpuObservation) {
         spawn_fixture_with_source(
             root,
             label,
@@ -17912,7 +18976,7 @@ fi
         label: &str,
         script: &str,
         cpu_source: Option<LiveCpuSource>,
-    ) -> (Child, Instant, InvocationCpuObservation) {
+    ) -> (SpawnedLeader, Instant, InvocationCpuObservation) {
         let started = Instant::now();
         let request = ProcessRequest::new(
             InvocationRole::Execution {
@@ -17940,8 +19004,10 @@ fi
     }
 
     /// Spawn `program` with `enrollment` standing in for an invocation
-    /// cgroup's `cgroup.procs` descriptor, and return the spawn error.
+    /// cgroup's directory and `cgroup.procs` descriptor, with clone3 as
+    /// `clone3` finds it, and return the spawn error.
     fn spawn_error_with_enrollment(
+        clone3: &crate::vfork_spawn::Clone3Support,
         root: &Path,
         label: &str,
         program: &str,
@@ -17965,14 +19031,16 @@ fi
             request.command,
             Some(LiveCpuSource::CgroupV2InvocationCpuStatV1),
         );
-        let error = spawn_process(
+        let error = spawn_process_with(
+            clone3,
             &request.cwd,
             &request.stdout,
             &request.stderr,
-            Some((
-                enrollment.as_raw_fd(),
-                Path::new("/sys/fs/cgroup/stand-in-invocation"),
-            )),
+            Some(Enrollment {
+                directory: enrollment.as_raw_fd(),
+                procs: enrollment.as_raw_fd(),
+                path: Path::new("/sys/fs/cgroup/stand-in-invocation"),
+            }),
             &mut observation,
         )
         .expect_err("the spawn must fail");
@@ -17982,12 +19050,19 @@ fi
     #[test]
     fn a_failed_spawn_names_the_exec_or_the_cgroup_join_whichever_failed() {
         let root = cpu_reader_test_root("spawn-failure-step");
+        // Where clone3 is refused, the child joins in a pre_exec closure.
+        let refused = crate::vfork_spawn::Clone3Support::refusing(libc::ENOSYS);
         // The join's write succeeds on /dev/null, so only the exec can fail,
         // and its reason reads exactly as it does without a cgroup.
         let accepting = OpenOptions::new().write(true).open("/dev/null").unwrap();
         let missing = root.join("missing-program");
-        let (error, observation) =
-            spawn_error_with_enrollment(&root, "exec", missing.to_str().unwrap(), &accepting);
+        let (error, observation) = spawn_error_with_enrollment(
+            &refused,
+            &root,
+            "exec",
+            missing.to_str().unwrap(),
+            &accepting,
+        );
         let exec_failure = format!(
             "cannot execute {}: No such file or directory (os error 2)",
             missing.display()
@@ -18004,9 +19079,23 @@ fi
         // A descriptor opened read-only refuses the join's write, so the join
         // fails before an existing program could be started.
         let refusing = File::open("/dev/null").unwrap();
-        let (error, observation) =
-            spawn_error_with_enrollment(&root, "join", "/bin/true", &refusing);
         let join_failure = "cannot join invocation cgroup /sys/fs/cgroup/stand-in-invocation before exec, so /bin/true was not started: Bad file descriptor (os error 9)";
+        let (error, observation) =
+            spawn_error_with_enrollment(&refused, &root, "join", "/bin/true", &refusing);
+        assert_eq!(error, join_failure);
+        assert_eq!(
+            observation.launch,
+            LaunchObservation::SpawnFailed {
+                stage: SpawnStage::Spawn,
+                reason: join_failure.into(),
+            }
+        );
+        assert_eq!(observation.termination, TerminationPath::SpawnFailed);
+        // clone3 refuses a directory descriptor that is no cgroup (EBADF), and
+        // that reads as the same failed join.
+        let clone3 = crate::vfork_spawn::Clone3Support::new();
+        let (error, observation) =
+            spawn_error_with_enrollment(&clone3, &root, "clone3-join", "/bin/true", &refusing);
         assert_eq!(error, join_failure);
         assert_eq!(
             observation.launch,
@@ -18034,7 +19123,7 @@ fi
     }
 
     fn measured_final_cpu(observation: &InvocationCpuObservation) -> u64 {
-        let LaunchObservation::Spawned { pid } = observation.launch else {
+        let LaunchObservation::Spawned { pid, .. } = observation.launch else {
             panic!("expected a real launched process: {observation:?}");
         };
         let FinalWaitObservation::Reaped {
@@ -18112,10 +19201,24 @@ fi
         let history = CellCpuHistoryV1::from_source_rows(&[(row.attempt, source.clone())])
             .unwrap()
             .unwrap();
-        assert_eq!(
-            history.attempts[0].observations(),
-            row.cpu_observations.as_ref()
-        );
+        // How a process was started is kept in memory only (LaunchObservation's
+        // `method` is not serialized, dh-7n47nt), so every record reads back as
+        // SpawnMethod::Unrecorded. The round trip must give back everything
+        // else exactly, and that one field as Unrecorded.
+        let mut recorded = row.cpu_observations.clone();
+        for invocation in recorded.iter_mut().flat_map(|o| o.invocations.iter_mut()) {
+            if let LaunchObservation::Spawned { method, .. } = &mut invocation.launch {
+                *method = crate::cpu_evidence::SpawnMethod::Unrecorded;
+            }
+        }
+        assert_eq!(history.attempts[0].observations(), recorded.as_ref());
+        // `method` is #[serde(skip)] (cpu_evidence.rs:153): each read-back Spawned is Unrecorded.
+        let read_back = history.attempts[0].observations();
+        for invocation in read_back.iter().flat_map(|o| o.invocations.iter()) {
+            if let LaunchObservation::Spawned { method, .. } = &invocation.launch {
+                assert_eq!(*method, crate::cpu_evidence::SpawnMethod::Unrecorded);
+            }
+        }
         for pointer in [
             "/cpu_observations/binding/run_id",
             "/cpu_observations/invocations/0/live/polls",
@@ -19293,6 +20396,222 @@ fi
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// The production order, driven through the same helper the
+    /// budgeted path calls: with room for exactly one live cgroup
+    /// at a time, the probe is created and dropped before the real
+    /// allocation, and both complete. Reversing the helper's order
+    /// leaves the slot held when the probe asks for it, the probe
+    /// records `unavailable`, and this test fails.
+    #[test]
+    fn the_probe_finishes_before_the_first_real_cgroup_is_allocated() {
+        use std::sync::atomic::AtomicUsize;
+        struct Slot {
+            live: std::sync::Arc<AtomicUsize>,
+            events: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+        }
+        impl Drop for Slot {
+            fn drop(&mut self) {
+                self.events.lock().unwrap().push("probe-drop");
+                self.live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let live = std::sync::Arc::new(AtomicUsize::new(0));
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let plan = LiveCpuPlan {
+            allow_process_group_scan: Ok(false),
+            cgroup_parent: None,
+        };
+        let support = std::sync::Arc::new(crate::vfork_spawn::Clone3Support::new());
+        let create =
+            |live: &std::sync::Arc<AtomicUsize>,
+             events: &std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>| {
+                if live.fetch_add(1, std::sync::atomic::Ordering::Relaxed) != 0 {
+                    live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    return None;
+                }
+                events.lock().unwrap().push("probe-create");
+                Some((
+                    -1,
+                    Box::new(Slot {
+                        live: std::sync::Arc::clone(live),
+                        events: std::sync::Arc::clone(events),
+                    }) as Box<dyn std::any::Any + Send>,
+                ))
+            };
+        let real = probe_before_first_real_cgroup(
+            || {
+                let live = std::sync::Arc::clone(&live);
+                let events = std::sync::Arc::clone(&events);
+                probe_clone3_for_the_run_with(&plan, &support, move || create(&live, &events))
+            },
+            || {
+                if live.fetch_add(1, std::sync::atomic::Ordering::Relaxed) != 0 {
+                    live.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    return Err("the probe still holds the only cgroup slot".to_string());
+                }
+                events.lock().unwrap().push("real-create");
+                Ok(())
+            },
+        );
+        assert_eq!(real, Ok(()));
+        let record = support.cgroup_probe_record().expect("probe ran");
+        assert_eq!(record.outcome, "no_verdict");
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["probe-create", "probe-drop", "real-create"]
+        );
+    }
+
+    /// The run-level probe record is written exactly once, even
+    /// when cells finish concurrently: one writer wins, and the file
+    /// holds that record.
+    #[test]
+    fn the_probe_record_file_is_written_once() {
+        let root = cpu_reader_test_root("probe-record-once");
+        let dir = root.join("runs").join("fixture-run");
+        let record = crate::vfork_spawn::CgroupProbeRecord {
+            outcome: "usable".to_string(),
+            kernel: "test-kernel".to_string(),
+            reason: None,
+            child_wait: "pidfd".to_string(),
+        };
+        let written = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let wins = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = dir.clone();
+                let record = record.clone();
+                let written = std::sync::Arc::clone(&written);
+                let wins = std::sync::Arc::clone(&wins);
+                std::thread::spawn(move || {
+                    if write_probe_record_once(&dir, &record, &written).unwrap() {
+                        wins.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(wins.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let text = std::fs::read_to_string(dir.join("clone3-probe.json")).unwrap();
+        let back: crate::vfork_spawn::CgroupProbeRecord = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, record);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A failed probe-record write is a named error, and it does not
+    /// consume the once: with the obstacle gone, the next attempt
+    /// writes the record.
+    /// The record_cell failed-write path at cell level: the write
+    /// is refused (the run directory's parent is a file), the cell
+    /// fails by that name, and the failure still carries the
+    /// completed attempt's invocations.
+    #[test]
+    fn a_failed_probe_record_write_fails_the_cell_with_its_invocations() {
+        let root = cpu_reader_test_root("probe-record-cell");
+        let mut context = run_context(&root);
+        let blocker = root.join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        context.result_root = blocker;
+        let cell = native_cpu_cell("/bin/true", 1);
+        let record = crate::vfork_spawn::CgroupProbeRecord {
+            outcome: "usable".to_string(),
+            kernel: "test-kernel".to_string(),
+            reason: None,
+            child_wait: "pidfd".to_string(),
+        };
+        let failure = record_cell_with_probe_record_in_state(
+            &context,
+            &cell,
+            || Some(record.clone()),
+            &std::sync::Mutex::new(false),
+            |progress| {
+                progress
+                    .observations
+                    .push(InvocationCpuObservation::pending(
+                        1,
+                        InvocationRole::Preparation,
+                        CommandIdentity {
+                            argv: vec!["/bin/true".to_string()],
+                            cwd: "/".to_string(),
+                            env_overrides: BTreeMap::new(),
+                        },
+                        None,
+                    ));
+                Err("cell failed".to_string())
+            },
+        )
+        .expect_err("the record write must fail this cell");
+        assert!(
+            failure.reason.contains("clone3 probe record"),
+            "{}",
+            failure.reason
+        );
+        assert_eq!(failure.observations.invocations.len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The first cell of a process publishes the probe record
+    /// that only came into existence during that cell: the record
+    /// is read after the run, not snapshotted before it. With the
+    /// old order (read before the run) the getter sees nothing and
+    /// no file is written, and this test fails.
+    #[test]
+    fn the_first_cell_publishes_the_probe_record_it_ran_with() {
+        let root = cpu_reader_test_root("probe-record-first-cell");
+        let context = run_context(&root);
+        let cell = native_cpu_cell("/bin/true", 1);
+        let during_run = std::cell::RefCell::new(None);
+        let result = record_cell_with_probe_record_in_state(
+            &context,
+            &cell,
+            || during_run.borrow().clone(),
+            &std::sync::Mutex::new(false),
+            |_progress| {
+                *during_run.borrow_mut() = Some(crate::vfork_spawn::CgroupProbeRecord {
+                    outcome: "usable".to_string(),
+                    kernel: "test-kernel".to_string(),
+                    reason: None,
+                    child_wait: "pidfd".to_string(),
+                });
+                Err("cell failed".to_string())
+            },
+        );
+        assert!(result.is_err());
+        let file = root
+            .join("results")
+            .join("runs")
+            .join("fixture")
+            .join("clone3-probe.json");
+        let text =
+            std::fs::read_to_string(&file).expect("the first cell must publish its probe record");
+        let back: crate::vfork_spawn::CgroupProbeRecord = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.outcome, "usable");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_probe_record_write_is_named_and_retried() {
+        let root = cpu_reader_test_root("probe-record-retry");
+        let dir = root.join("runs").join("fixture-run");
+        std::fs::create_dir_all(dir.join("clone3-probe.json")).unwrap();
+        let record = crate::vfork_spawn::CgroupProbeRecord {
+            outcome: "usable".to_string(),
+            kernel: "test-kernel".to_string(),
+            reason: None,
+            child_wait: "pidfd".to_string(),
+        };
+        let written = std::sync::Mutex::new(false);
+        let error = write_probe_record_once(&dir, &record, &written)
+            .expect_err("a directory in the record's place refuses the write");
+        assert!(error.contains("clone3-probe.json"), "{error}");
+        std::fs::remove_dir_all(dir.join("clone3-probe.json")).unwrap();
+        assert!(write_probe_record_once(&dir, &record, &written).unwrap());
+        assert!(!write_probe_record_once(&dir, &record, &written).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn a_malformed_fallback_marker_refuses_the_budgeted_command_before_launch() {
         let root = cpu_reader_test_root("malformed-marker");
@@ -19618,7 +20937,11 @@ fi
             &request.cwd,
             &request.stdout,
             &request.stderr,
-            Some((cgroup.enrollment_fd(), cgroup.path())),
+            Some(Enrollment {
+                directory: cgroup.directory_fd(),
+                procs: cgroup.enrollment_fd(),
+                path: cgroup.path(),
+            }),
             &mut observation,
         )
         .unwrap();
@@ -20440,7 +21763,7 @@ fi
             }
             // The escaped process kept the leader's process group, so the
             // stop's group signals reach it outside the cgroup.
-            let LaunchObservation::Spawned { pid: leader } = observation.launch else {
+            let LaunchObservation::Spawned { pid: leader, .. } = observation.launch else {
                 panic!("{case}: not launched: {observation:?}");
             };
             let escaped = fs::read_to_string(&pid_file).unwrap_or_default();
@@ -23818,6 +25141,7 @@ backends_disabled:
             verdict: Verdict::Matched,
             no_result_reason: None,
             infrastructure_error: None,
+            discarded_attempts: Vec::new(),
             comparison: Some(crate::canonical_verdict::ComparisonReport {
                 strictness: crate::canonical_verdict::LogCompareStrictness::Canonical,
                 display_name: Some("BitwiseInfoV1".into()),

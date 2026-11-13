@@ -40,7 +40,9 @@
 set -uo pipefail
 
 REPO="${PR_DAG_REPO:-rrnewton/hermit}"
-MAIN_BRANCH="${PR_DAG_MAIN:-main}"
+# PR_DAG_MAIN overrides the repository's landing branch (set below from
+# ci/landing-branches.env once --repo is known).
+MAIN_BRANCH="${PR_DAG_MAIN:-}"
 FORMAT="both"                 # human | json | both
 OUT="pr-dag-health.json"
 DO_COMMUTE=1
@@ -73,6 +75,17 @@ git_() { if [ -n "$PROXY" ]; then "$PROXY" git "$@"; else git "$@"; fi; }
 
 log "pr-dag-health: querying open PRs for $REPO ..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -z "$MAIN_BRANCH" ]; then
+    # shellcheck source=scripts/lib/landing_branch.sh
+    source "$SCRIPT_DIR/lib/landing_branch.sh"
+    case "$REPO" in
+        rrnewton/hermit) MAIN_BRANCH="$(landing_branch HERMIT_LANDING_BRANCH)" \
+            || die "cannot read Hermit's landing branch setting" ;;
+        rrnewton/reverie) MAIN_BRANCH="$(landing_branch REVERIE_LANDING_BRANCH)" \
+            || die "cannot read Reverie's landing branch setting" ;;
+        *) die "no landing-branch setting names $REPO's branch; set PR_DAG_MAIN" ;;
+    esac
+fi
 RAW="$(gh_ pr list -R "$REPO" --state open --limit "$LIMIT" \
     --json number,title,headRefName,headRefOid,baseRefName,labels,isDraft,author,mergeable,mergeStateStatus,statusCheckRollup 2>/dev/null)" \
     || die "gh pr list failed (is the proxy/auth configured?)"
@@ -245,7 +258,7 @@ fi
 # Human-readable report.
 # ---------------------------------------------------------------------------
 if [ "$FORMAT" != json ]; then
-    printf '%s' "$MODEL" | jq -r '
+    printf '%s' "$MODEL" | jq -r --arg main "$MAIN_BRANCH" '
       def col($n): (tostring | (. + (" " * $n))[:$n]);
       "==================================================================",
       "PR DAG health -- \(.repo)",
@@ -272,7 +285,7 @@ if [ "$FORMAT" != json ]; then
       "------------------------------------------------------------------",
       (if (.commute_candidates|length)==0 then "  (none detected / commute check unavailable)"
        else (.commute_candidates[]
-         | "  PR #\(.number) (base \(.base)) commutes cleanly -> consider: gh pr edit \(.number) --base main   (skip the float)"
+         | "  PR #\(.number) (base \(.base)) commutes cleanly -> consider: gh pr edit \(.number) --base \($main)   (skip the float)"
            + "\n      \(.title)")
        end),
       "",

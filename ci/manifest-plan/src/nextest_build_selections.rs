@@ -268,6 +268,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "self_schedstat_determinism",
             "--test",
+            "setup_retry",
+            "--test",
             "sigmask_preemption",
             "--test",
             "signal_determinism",

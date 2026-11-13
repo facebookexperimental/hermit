@@ -833,7 +833,10 @@ fn oci_dir_composes_with_mount_and_bind() {
             "run".to_string(),
             format!("--image={image}"),
             "--strict".to_string(),
-            format!("--mount=type=bind,source={},target=/data,readonly", data.display()),
+            format!(
+                "--mount=type=bind,source={},target=/data,readonly",
+                data.display()
+            ),
             "--mount=type=tmpfs,target=/scratch".to_string(),
             format!("--bind={}:/work", work.display()),
             "--".to_string(),
@@ -849,14 +852,26 @@ fn oci_dir_composes_with_mount_and_bind() {
     );
     assert_guest_ran(&output);
     let stdout = stdout_of(&output);
-    assert!(stdout.contains("FILE /data/input.txt=from-bind-mount"), "{stdout}");
+    assert!(
+        stdout.contains("FILE /data/input.txt=from-bind-mount"),
+        "{stdout}"
+    );
     assert!(
         stdout.contains("WROTE /data/input.txt=ERR30"),
         "a readonly bind refuses the guest write with EROFS: {stdout}"
     );
-    assert!(stdout.contains("WROTE /scratch/scratch.txt=from-tmpfs"), "{stdout}");
-    assert!(stdout.contains("FILE /scratch/scratch.txt=from-tmpfs"), "{stdout}");
-    assert!(stdout.contains("FILE /work/work.txt=from-bind-flag"), "{stdout}");
+    assert!(
+        stdout.contains("WROTE /scratch/scratch.txt=from-tmpfs"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("FILE /scratch/scratch.txt=from-tmpfs"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("FILE /work/work.txt=from-bind-flag"),
+        "{stdout}"
+    );
     assert_eq!(
         std::fs::read(work.join("out.txt")).unwrap(),
         b"guest-output",
@@ -906,7 +921,10 @@ fn oci_dir_composes_with_mount_and_bind() {
             "--strict".to_string(),
             "--verify".to_string(),
             "--verify-strict".to_string(),
-            format!("--mount=type=bind,source={},target=/data,readonly", data.display()),
+            format!(
+                "--mount=type=bind,source={},target=/data,readonly",
+                data.display()
+            ),
             "--mount=type=tmpfs,target=/scratch".to_string(),
             "--".to_string(),
             "/bin/guest".to_string(),
@@ -937,7 +955,10 @@ fn oci_dir_composes_with_mount_and_bind() {
             "run".to_string(),
             format!("--image={image}"),
             "--strict".to_string(),
-            format!("--mount=type=bind,source={},target=/tmp/data,readonly", data.display()),
+            format!(
+                "--mount=type=bind,source={},target=/tmp/data,readonly",
+                data.display()
+            ),
             format!("--bind={}:/tmp/work", work.display()),
             "--".to_string(),
             "/bin/guest".to_string(),
@@ -948,8 +969,14 @@ fn oci_dir_composes_with_mount_and_bind() {
     );
     assert_guest_ran(&under_tmp);
     let stdout = stdout_of(&under_tmp);
-    assert!(stdout.contains("FILE /tmp/data/input.txt=from-bind-mount"), "{stdout}");
-    assert!(stdout.contains("FILE /tmp/work/work.txt=from-bind-flag"), "{stdout}");
+    assert!(
+        stdout.contains("FILE /tmp/data/input.txt=from-bind-mount"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("FILE /tmp/work/work.txt=from-bind-flag"),
+        "{stdout}"
+    );
     assert_eq!(
         std::fs::read(work.join("tmp-out.txt")).unwrap(),
         b"from-tmp-bind",
@@ -958,9 +985,15 @@ fn oci_dir_composes_with_mount_and_bind() {
 
     // Refusals, by name, before any guest runs.
     for (mount, named) in [
-        ("--mount=type=volume,target=/data", "type=volume is not supported"),
+        (
+            "--mount=type=volume,target=/data",
+            "type=volume is not supported",
+        ),
         ("--mount=type=tmpfs,target=/proc", "inside /proc"),
-        ("--mount=type=tmpfs,target=relative", "must be an absolute path"),
+        (
+            "--mount=type=tmpfs,target=relative",
+            "must be an absolute path",
+        ),
         ("--mount=target=/data", "bind mount with no source"),
         ("--bind=/srv:/proc", "inside /proc"),
         ("--bind=/srv:/", "would replace the whole OCI rootfs"),

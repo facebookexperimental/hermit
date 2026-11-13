@@ -72,6 +72,7 @@ fn canonical_report(verdict: Verdict) -> VerificationReport {
         verdict,
         no_result_reason: None,
         infrastructure_error: None,
+        discarded_attempts: Vec::new(),
         comparison: Some(ComparisonReport {
             strictness: LogCompareStrictness::Canonical,
             display_name: Some("BitwiseInfoV1".into()),

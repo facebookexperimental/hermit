@@ -7,7 +7,7 @@
   {
     "bytes": 25250,
     "path": "archive/prepare.py",
-    "sha256": "904de44071c5296579233478742f2bdfbab5b14c0a3a0af9f38f00b5ebee8656"
+    "sha256": "11ebff546e9719fda0e4a5bb32e268327382496926e52cc731b54e6ce1c9d3f4"
   },
   {
     "bytes": 16545,
@@ -15,14 +15,14 @@
     "sha256": "d313a47a769e91e6d297c5452edf66b9129370f381c25e228385efdb01d60972"
   },
   {
-    "bytes": 2331,
+    "bytes": 2369,
     "path": "assets/elf_metadata.py",
-    "sha256": "c6fe4a6db783ca4af300e5cfbf595e545b17e746cd8594eccbf2ecb7c81215d5"
+    "sha256": "1fee4c7665f2fed7b8442a28b2733fe3327097dfc9c1c8f1003303149e57a3c7"
   },
   {
     "bytes": 11572,
     "path": "assets/final_inspection.py",
-    "sha256": "26a037c4af80f9ade6e7156e2f2adf636dae33d7e64db2e463e55e93bbdb5af9"
+    "sha256": "fab47ec4ec846687d60da5f6f157e5edd94803e75cf31df6383de548d340c6bb"
   },
   {
     "bytes": 2041,
@@ -72,7 +72,7 @@
   {
     "bytes": 92951,
     "path": "prepare.py",
-    "sha256": "3b212e877d39e737aa294ca684f14d6933f0e70510d871e8b881cd850e32b42d"
+    "sha256": "31856cd73c0e295632b3124bd239db742f6d37433aa207ba21a0f639fcf63fb5"
   },
   {
     "bytes": 34384,
@@ -87,7 +87,7 @@
   {
     "bytes": 28022,
     "path": "section/prepare.py",
-    "sha256": "eaa6332904f30b420b2beac76f1379fdd236e535de65444d98f70387104948ee"
+    "sha256": "164b69763818ac7b31783b1d2d7ea9b555d7ce0e6eafa4bd1c455aaa1cd78d0c"
   },
   {
     "bytes": 4716,
@@ -103,6 +103,16 @@
     "bytes": 45049,
     "path": "test_cancellation.py",
     "sha256": "b41103fa7f60290d5836aa87978d7f8828a798d1025f972510164a1b64cc9b15"
+  },
+  {
+    "bytes": 2316,
+    "path": "test_elf_metadata.py",
+    "sha256": "02d6743db03b3dbec5f87818f3a0c5536b77f5b7595540de6021aa5e797597ed"
+  },
+  {
+    "bytes": 19889,
+    "path": "test_file_pins.py",
+    "sha256": "564e02fe7f2451350a2341b9de11dd15ddba4a42de933efa455f540e9200a72c"
   },
   {
     "bytes": 6580,
@@ -125,6 +135,11 @@
     "sha256": "8fe3fe76bfddecbe080b08f6c2fbff411d6a9de1e613b50270830c9b5adb05be"
   },
   {
+    "bytes": 3847,
+    "path": "test_zero_native_data.py",
+    "sha256": "048a57f80aed61d25b5f09e2844fcb67b5115181272aeda022b12d0390a57f8b"
+  },
+  {
     "bytes": 14642,
     "path": "view_leaf_controls.rs",
     "sha256": "7ee3656c58f4ad0a07c14c53b7244e4ce3753f66aa23610f200840d8afd3a5e4"
@@ -133,15 +148,5 @@
     "bytes": 9256,
     "path": "view_leaf_protocol.py",
     "sha256": "dc26da7940c5827f367fef9ea0d3f8048096e9cc06f377a10b6416d2cdc55cf9"
-  },
-  {
-    "bytes": 3847,
-    "path": "test_zero_native_data.py",
-    "sha256": "048a57f80aed61d25b5f09e2844fcb67b5115181272aeda022b12d0390a57f8b"
-  },
-  {
-    "bytes": 16935,
-    "path": "test_file_pins.py",
-    "sha256": "647e58a38ba951892bf3a5a3cea4c4d966f68c5e8559284432cd308c792f8c4b"
   }
 ]

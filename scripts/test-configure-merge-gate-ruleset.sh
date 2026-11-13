@@ -60,18 +60,25 @@ cat >"$tmp/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
 state=${FAKE_GH_STATE:?}
+rulesets=("$state/gate.json" "$state/history.json")
+for extra in "$state"/extra-*.json; do
+    if [[ -e $extra ]]; then
+        rulesets+=("$extra")
+    fi
+done
 
 if [[ ${1:-} == api && ${2:-} == --paginate ]]; then
-    jq -s '[.[] | {id, name}]' "$state/gate.json" "$state/history.json"
+    jq -s '[.[] | {id, name}]' "${rulesets[@]}"
     exit 0
 fi
 
-if [[ ${1:-} == api && ${2:-} == repos/rrnewton/hermit/rulesets/42 ]]; then
-    file="$state/gate.json"
-elif [[ ${1:-} == api && ${2:-} == repos/rrnewton/hermit/rulesets/43 ]]; then
-    file="$state/history.json"
-else
-    file=""
+file=""
+if [[ ${1:-} == api && ${2:-} == repos/rrnewton/hermit/rulesets/* ]]; then
+    for candidate in "${rulesets[@]}"; do
+        if [[ $(jq .id "$candidate") == "${2##*/}" ]]; then
+            file=$candidate
+        fi
+    done
 fi
 if [[ -n $file ]]; then
     reads=$(<"$state/read-count")
@@ -145,10 +152,7 @@ jq '.rules = [] | .bypass_actors = []' "$tmp/state/gate.json" >"$tmp/state/rules
 mv "$tmp/state/ruleset.next" "$tmp/state/gate.json"
 jq '
   .enforcement = "active" |
-  .rules = [.rules[] | select(
-    .type == "deletion" or .type == "non_fast_forward" or
-    .type == "required_linear_history"
-  )] |
+  .rules = [.rules[] | select(.type == "deletion" or .type == "non_fast_forward")] |
   .bypass_actors = [] |
   .conditions.ref_name.include = ["refs/heads/not-main"]
 ' "$tmp/state/history.json" >"$tmp/state/ruleset.next"
@@ -165,27 +169,50 @@ else
     exit 1
 fi
 
-# All three history rules are load-bearing. A rule-empty gate does not make a
-# default-branch history policy correct when linear-history enforcement is
+# Both history rules are load-bearing. A rule-empty gate does not make a
+# default-branch history policy correct when non-fast-forward protection is
 # missing.
 write_drifted_policy
 jq '.rules = [] | .bypass_actors = []' "$tmp/state/gate.json" >"$tmp/state/ruleset.next"
 mv "$tmp/state/ruleset.next" "$tmp/state/gate.json"
 jq '
   .enforcement = "active" |
-  .rules = [.rules[] | select(.type != "required_linear_history")] |
+  .rules = [.rules[] | select(.type == "deletion")] |
   .bypass_actors = []
 ' "$tmp/state/history.json" >"$tmp/state/ruleset.next"
 mv "$tmp/state/ruleset.next" "$tmp/state/history.json"
-if run_configure --check >"$tmp/check-no-linear.out" 2>&1; then
-    echo "FAIL: missing linear-history protection was accepted" >&2
+if run_configure --check >"$tmp/check-no-nff.out" 2>&1; then
+    echo "FAIL: missing non-fast-forward protection was accepted" >&2
     exit 1
-elif grep -Fq 'types=deletion,non_fast_forward' "$tmp/check-no-linear.out" &&
-     grep -Fq 'required_linear_history' "$tmp/check-no-linear.out"; then
+elif grep -Fq 'types=deletion enforcement=active' "$tmp/check-no-nff.out" &&
+     grep -Fq 'expected deletion,non_fast_forward /' "$tmp/check-no-nff.out"; then
     negative=$((negative + 1))
 else
-    cat "$tmp/check-no-linear.out" >&2
-    echo "FAIL: missing-linear refusal did not report the exact policy delta" >&2
+    cat "$tmp/check-no-nff.out" >&2
+    echo "FAIL: missing-non-fast-forward refusal did not report the exact policy delta" >&2
+    exit 1
+fi
+
+# A linear-history rule is drift, not extra safety: it refuses the exact
+# ancestry merges that facebookexperimental imports land as
+# (https://github.com/rrnewton/hermit/pull/5377,
+# https://github.com/rrnewton/hermit/pull/5385,
+# https://github.com/rrnewton/hermit/pull/5391).
+write_drifted_policy
+jq '.rules = [] | .bypass_actors = []' "$tmp/state/gate.json" >"$tmp/state/ruleset.next"
+mv "$tmp/state/ruleset.next" "$tmp/state/gate.json"
+jq '.enforcement = "active" | .bypass_actors = []' "$tmp/state/history.json" \
+    >"$tmp/state/ruleset.next"
+mv "$tmp/state/ruleset.next" "$tmp/state/history.json"
+if run_configure --check >"$tmp/check-linear.out" 2>&1; then
+    echo "FAIL: a linear-history rule that refuses ancestry-merge imports was accepted" >&2
+    exit 1
+elif grep -Fq 'types=deletion,non_fast_forward,required_linear_history' "$tmp/check-linear.out" &&
+     grep -Fq 'expected deletion,non_fast_forward /' "$tmp/check-linear.out"; then
+    negative=$((negative + 1))
+else
+    cat "$tmp/check-linear.out" >&2
+    echo "FAIL: the linear-history refusal did not report the exact policy delta" >&2
     exit 1
 fi
 
@@ -196,7 +223,7 @@ run_configure --apply >"$tmp/apply.out"
   .target == "branch" and .enforcement == "active" and (.bypass_actors == []) and
   .conditions == {"ref_name":{"exclude":[],"include":["~DEFAULT_BRANCH"]}}
 ' "$tmp/state/gate.json") == true ]]
-[[ $(jq '[.rules[].type] | sort == ["deletion","non_fast_forward","required_linear_history"]' \
+[[ $(jq '[.rules[].type] | sort == ["deletion","non_fast_forward"]' \
     "$tmp/state/history.json") == true ]]
 [[ $(jq '
   .target == "branch" and .enforcement == "active" and (.bypass_actors == []) and
@@ -213,7 +240,84 @@ run_configure --apply >"$tmp/apply-idempotent.out"
 [[ $(<"$tmp/state/put-count") == 2 ]]
 positive=$((positive + 1))
 
-printf 'NEGATIVE refusals: %d/4   POSITIVE acceptances: %d/2\n' \
+# One additional ruleset may protect the upstream (inbox) branch the setting
+# names; the fixture calls that branch `inbox` so the setting, not a literal,
+# is what selects it. --check accepts the ruleset without judging its rules and
+# keeps the four-key JSON contract, and --apply leaves it byte-identical.
+cat >"$tmp/state/extra-inbox.json" <<'JSON'
+{
+  "id": 44,
+  "name": "upstream inbox protection",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {"ref_name": {"exclude": [], "include": ["refs/heads/inbox"]}},
+  "rules": [{"type": "deletion"}, {"type": "non_fast_forward"}],
+  "bypass_actors": []
+}
+JSON
+cp "$tmp/state/extra-inbox.json" "$tmp/inbox.expected"
+HERMIT_UPSTREAM_BRANCH=inbox run_configure --check >"$tmp/check-inbox.out"
+grep -Fq 'upstream ruleset 44 protects refs/heads/inbox' "$tmp/check-inbox.out"
+HERMIT_UPSTREAM_BRANCH=inbox run_configure --check --json >"$tmp/check-inbox.json"
+[[ $(jq -c 'keys' "$tmp/check-inbox.json") == \
+    '["gate_policy_matches","history_policy_matches","schema","state"]' ]]
+[[ $(jq -r '.state' "$tmp/check-inbox.json") == pass ]]
+puts_before=$(<"$tmp/state/put-count")
+run_configure --upstream-branch inbox --apply >"$tmp/apply-inbox.out"
+cmp -s "$tmp/inbox.expected" "$tmp/state/extra-inbox.json"
+[[ $(<"$tmp/state/put-count") == "$puts_before" ]]
+positive=$((positive + 1))
+
+# Only one: a second ruleset protecting the upstream branch is refused.
+jq '.id = 45 | .name = "second inbox protection"' "$tmp/inbox.expected" \
+    >"$tmp/state/extra-inbox2.json"
+if run_configure --upstream-branch inbox --check >"$tmp/check-two-inbox.out" 2>&1; then
+    echo "FAIL: two upstream rulesets were accepted" >&2
+    exit 1
+elif grep -Fq 'each protect the upstream branch refs/heads/inbox' "$tmp/check-two-inbox.out"; then
+    negative=$((negative + 1))
+else
+    cat "$tmp/check-two-inbox.out" >&2
+    echo "FAIL: the two-upstream refusal did not name the upstream branch" >&2
+    exit 1
+fi
+rm -f -- "$tmp/state/extra-inbox2.json"
+
+# The upstream ruleset names only the upstream branch: one that also reaches
+# the landing branch would add rules the landing policy does not allow for.
+jq '.conditions.ref_name.include = ["refs/heads/inbox", "~DEFAULT_BRANCH"]' \
+    "$tmp/inbox.expected" >"$tmp/state/extra-inbox.json"
+if run_configure --upstream-branch inbox --check >"$tmp/check-mixed-inbox.out" 2>&1; then
+    echo "FAIL: an upstream ruleset that also names the landing branch was accepted" >&2
+    exit 1
+elif grep -Fq 'names the upstream branch inbox among other refs' "$tmp/check-mixed-inbox.out"; then
+    negative=$((negative + 1))
+else
+    cat "$tmp/check-mixed-inbox.out" >&2
+    echo "FAIL: the mixed-scope refusal did not name the upstream branch" >&2
+    exit 1
+fi
+cp "$tmp/inbox.expected" "$tmp/state/extra-inbox.json"
+
+# --apply never moves a landing ruleset off the upstream branch: rewriting it
+# to ~DEFAULT_BRANCH would drop the upstream branch's protection silently.
+jq '.conditions.ref_name.include = ["refs/heads/inbox"]' "$tmp/state/history.json" \
+    >"$tmp/state/ruleset.next"
+mv "$tmp/state/ruleset.next" "$tmp/state/history.json"
+puts_before=$(<"$tmp/state/put-count")
+if run_configure --upstream-branch inbox --apply >"$tmp/apply-retargeted.out" 2>&1; then
+    echo "FAIL: --apply rewrote a landing ruleset that protects the upstream branch" >&2
+    exit 1
+elif grep -Fq 'names the upstream branch refs/heads/inbox' "$tmp/apply-retargeted.out" &&
+     [[ $(<"$tmp/state/put-count") == "$puts_before" ]]; then
+    negative=$((negative + 1))
+else
+    cat "$tmp/apply-retargeted.out" >&2
+    echo "FAIL: the retargeted landing ruleset was not refused before any PUT" >&2
+    exit 1
+fi
+
+printf 'NEGATIVE refusals: %d/8   POSITIVE acceptances: %d/3\n' \
     "$negative" "$positive"
-[[ $negative == 4 && $positive == 2 ]]
-echo "PASS: zero-bypass deletion, non-fast-forward, and linear-history rules remain active"
+[[ $negative == 8 && $positive == 3 ]]
+echo "PASS: zero-bypass deletion and non-fast-forward rules remain active with no linear-history rule; one upstream ruleset is tolerated and never rewritten"

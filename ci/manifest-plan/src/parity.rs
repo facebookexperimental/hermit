@@ -2655,7 +2655,10 @@ fn bind_option(mount: &str) -> Option<&str> {
 /// or the source when there is none). `None` for any other argument.
 fn bind_target(mount: &str) -> Option<&str> {
     let bind = mount.strip_prefix("--bind=")?;
-    let bind = match bind.strip_suffix(":ro").or_else(|| bind.strip_suffix(":rw")) {
+    let bind = match bind
+        .strip_suffix(":ro")
+        .or_else(|| bind.strip_suffix(":rw"))
+    {
         Some(rest) if rest.contains(':') => rest,
         _ => bind,
     };

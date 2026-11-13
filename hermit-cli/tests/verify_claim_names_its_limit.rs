@@ -237,13 +237,60 @@ fn verify_across_host_action_passthru(
 }
 
 /// The sar divergence in miniature: a host file replaced between run 1's two
-/// opens of it. `--verify` reports the divergence as a typed host input
-/// change, naming the run, the file and both of its host identities, and
-/// still fails.
+/// opens of it. The first pair's divergence is named as a host input
+/// change, and `--verify` then reruns the pair once; with no second
+/// replacement the rerun verifies. The naming (run, file, both
+/// identities in the first attempt's report line) stays on stderr.
 #[test]
-fn a_host_file_replaced_during_run_1_is_named_as_the_cause() {
-    let (root, stderr, report) =
-        verify_across_host_action("host-input-replaced", HOST_INPUT_GUEST, true, ["go", "go"]);
+fn a_host_file_replaced_during_run_1_is_named_and_the_pair_is_rerun() {
+    let (root, stderr, report, code) = host_input::verify_across_attempts(
+        Path::new(env!("CARGO_BIN_EXE_hermit")),
+        "host-input-replaced",
+        HOST_INPUT_GUEST,
+        &[(true, ["go", "go"]), (false, ["go", "go"])],
+    );
+    assert!(
+        stderr.contains("HERMIT_HOST_INPUT_CHANGED host input changed during run 1: "),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("{}", root.join("F").display())),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("rerunning the pair once"),
+        "the retry is announced: {stderr}"
+    );
+    assert!(report.verified, "the clean rerun verifies: {stderr}");
+    assert!(report.bitwise_parity, "{stderr}");
+    // The discarded pair is recorded in the machine-readable report, so
+    // a JSON-only consumer does not see an ordinary clean pass.
+    assert_eq!(
+        report.discarded_attempts.len(),
+        1,
+        "one discarded pair recorded: {stderr}"
+    );
+    assert!(
+        matches!(
+            report.discarded_attempts[0],
+            hermit::canonical_verdict::InfrastructureError::HostInputChanged { .. }
+        ),
+        "{stderr}"
+    );
+    assert_eq!(code, Some(0), "guest status propagates: {stderr}");
+}
+
+/// The retry is single: a host file replaced during BOTH attempts keeps
+/// the typed infrastructure verdict, naming the run, the file and both
+/// of its host identities, and still fails as a divergence exits.
+#[test]
+fn a_host_file_replaced_in_both_attempts_keeps_the_infrastructure_verdict() {
+    let (root, stderr, report, code) = host_input::verify_across_attempts(
+        Path::new(env!("CARGO_BIN_EXE_hermit")),
+        "host-input-replaced-both-attempts",
+        HOST_INPUT_GUEST,
+        &[(true, ["go", "go"]), (true, ["go", "go"])],
+    );
     assert!(!report.verified, "{stderr}");
     assert!(!report.bitwise_parity);
     assert_eq!(
@@ -279,6 +326,16 @@ fn a_host_file_replaced_during_run_1_is_named_as_the_cause() {
         "{stderr}"
     );
     assert!(stderr.contains("Failure: nondeterministic."), "{stderr}");
+    assert_eq!(
+        report.discarded_attempts.len(),
+        1,
+        "the first discarded pair is recorded beside the final verdict: {stderr}"
+    );
+    assert_eq!(
+        code,
+        Some(hermit::HERMIT_VERIFICATION_DIVERGENCE_EXIT),
+        "{stderr}"
+    );
 }
 
 /// The control: the same guest diverging because the host sent each run a
@@ -298,7 +355,9 @@ fn a_divergence_with_no_host_file_change_names_no_host_input_change() {
         "{stderr}"
     );
     assert_eq!(report.infrastructure_error, None, "{stderr}");
+    assert!(report.discarded_attempts.is_empty(), "{stderr}");
     assert!(!stderr.contains("HERMIT_HOST_INPUT_CHANGED"), "{stderr}");
+    assert!(!stderr.contains("rerunning the pair"), "{stderr}");
 }
 
 /// The counterexample a pattern alone cannot refuse: the guest replaces `F`
@@ -320,7 +379,9 @@ fn a_guest_that_replaces_a_file_after_diverging_names_no_host_input_change() {
         "{stderr}"
     );
     assert_eq!(report.infrastructure_error, None, "{stderr}");
+    assert!(report.discarded_attempts.is_empty(), "{stderr}");
     assert!(!stderr.contains("HERMIT_HOST_INPUT_CHANGED"), "{stderr}");
+    assert!(!stderr.contains("rerunning the pair"), "{stderr}");
 }
 
 /// The counterexample a log prefix cannot refuse: the guest replaces `F` with
@@ -484,7 +545,9 @@ fn under_passthru_opt_an_unobserved_rebinding_names_no_host_input_change() {
         "{stderr}"
     );
     assert_eq!(report.infrastructure_error, None, "{stderr}");
+    assert!(report.discarded_attempts.is_empty(), "{stderr}");
     assert!(!stderr.contains("HERMIT_HOST_INPUT_CHANGED"), "{stderr}");
+    assert!(!stderr.contains("rerunning the pair"), "{stderr}");
     assert!(
         stderr.contains("HERMIT_HOST_INPUT_CHANGE_UNATTRIBUTED")
             && stderr.contains("--passthru-opt"),
@@ -509,7 +572,9 @@ fn under_passthru_opt_a_host_replacement_is_reported_but_not_named() {
         "{stderr}"
     );
     assert_eq!(report.infrastructure_error, None, "{stderr}");
+    assert!(report.discarded_attempts.is_empty(), "{stderr}");
     assert!(!stderr.contains("HERMIT_HOST_INPUT_CHANGED"), "{stderr}");
+    assert!(!stderr.contains("rerunning the pair"), "{stderr}");
     let unattributed = stderr
         .lines()
         .find(|line| line.starts_with("HERMIT_HOST_INPUT_CHANGE_UNATTRIBUTED"))

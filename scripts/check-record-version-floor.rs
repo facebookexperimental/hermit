@@ -76,6 +76,8 @@
 //!   * either constant missing or unparseable  -> rc 2
 //!   * the main ref cannot be resolved (a depth-1 CI clone has no `origin/main`)
 //!         -> rc 2, unless `--allow-missing-history` is passed
+//!   * no base is named and the Hermit landing branch setting cannot be read
+//!         -> rc 2, even with `--allow-missing-history`
 //!   * the history walk yields no `RECORD_VERSION` at all -> rc 2
 //!
 //! `--allow-missing-history` exists so a caller with genuinely no history
@@ -84,7 +86,11 @@
 //!
 //! # Which main: `--base-ref`
 //!
-//! By default "main" is the live `origin/main`. A validation passes
+//! By default "main" is the live `origin/main`: the Hermit landing branch,
+//! `HERMIT_LANDING_BRANCH` in `ci/landing-branches.env` (or that environment
+//! variable), which is `main` today; the local branch of that name when there
+//! is no `origin/` one. The setting is read only when no base is named, and
+//! there is no default for it. A validation passes
 //! `--base-ref SHA` instead, the base its driver recorded at launch (the
 //! admission floor, which `make` also hands to `ci/run-reverie-pin-check.sh`):
 //! the main a pull request was validated against, or the commit itself when
@@ -120,6 +126,12 @@
 
 #[path = "lib/rust_script_prelude.rs"]
 mod rust_script_prelude;
+
+// The landing-branch settings (ci/landing-branches.env), shared with the
+// manifest-plan library; this checker reads Hermit's.
+#[allow(dead_code)]
+#[path = "../ci/manifest-plan/src/landing_branch.rs"]
+mod landing_branch;
 
 use std::path::Path;
 use std::process::Command;
@@ -262,10 +274,26 @@ fn required_floor(history: &[u32], tree: u32) -> u32 {
     history.iter().copied().chain([tree]).max().unwrap_or(tree)
 }
 
-/// The ref standing for "what has shipped". `origin/main` first, because a
-/// developer's local `main` can lag or lead.
-fn resolve_main_ref(root: &Path) -> Option<String> {
-    for candidate in ["origin/main", "main"] {
+/// Hermit's landing branch, whose history is the live "what has shipped".
+/// There is no default: an unreadable setting is a checker error, never a
+/// silent `main`.
+#[cfg(not(test))]
+fn hermit_landing_branch(root: &Path) -> Result<String, String> {
+    landing_branch::hermit(root)
+}
+
+/// The tests' fixture repositories name their landing branch `main`.
+#[cfg(test)]
+fn hermit_landing_branch(_root: &Path) -> Result<String, String> {
+    Ok("main".to_string())
+}
+
+/// The ref standing for "what has shipped": the landing branch,
+/// `origin/<landing>` first, because a developer's local branch can lag or
+/// lead.
+fn resolve_main_ref(root: &Path, landing: &str) -> Option<String> {
+    let remote = format!("origin/{landing}");
+    for candidate in [remote.as_str(), landing] {
         if git(root, &["rev-parse", "--verify", "--quiet", candidate]).is_some() {
             return Some(candidate.to_string());
         }
@@ -346,11 +374,25 @@ fn run_in(root: &Path, args: &[String]) -> i32 {
         return 2;
     };
 
+    // The live main is the Hermit landing branch. Its setting is read only
+    // when no base is named, because a named base never consults the live
+    // main; so `landing` is None only when the closure below is never called.
+    let landing = match options.base_ref {
+        Some(_) => None,
+        None => match hermit_landing_branch(root) {
+            Ok(branch) => Some(branch),
+            Err(error) => {
+                loud("CHECKER ERROR - cannot read the Hermit landing branch");
+                eprintln!("{error}");
+                return 2;
+            }
+        },
+    };
     let main_ref = match choose_main_ref(
         options.base_ref.as_deref(),
         |reference| resolve_commit(root, reference),
         |sha| is_ancestor_of_head(root, sha),
-        || resolve_main_ref(root),
+        || resolve_main_ref(root, landing.as_deref()?),
     ) {
         Ok(main_ref) => main_ref,
         Err(error) => {
@@ -369,10 +411,13 @@ fn run_in(root: &Path, args: &[String]) -> i32 {
             );
             return 0;
         }
-        loud("CHECKER ERROR - cannot resolve origin/main or main");
+        let landing = landing.as_deref().unwrap_or("<landing branch>");
+        loud(&format!(
+            "CHECKER ERROR - cannot resolve origin/{landing} or {landing}"
+        ));
         eprintln!(
-            "\"has shipped\" is a fact about main and cannot be read from this tree.\n\
-             A depth-1 CI clone has no origin/main; fetch history, or pass\n\
+            "\"has shipped\" is a fact about {landing} and cannot be read from this tree.\n\
+             A depth-1 CI clone has no origin/{landing}; fetch history, or pass\n\
              --allow-missing-history to DECLARE that the derivation is being skipped."
         );
         return 2;

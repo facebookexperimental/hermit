@@ -1652,6 +1652,7 @@ def evaluate_cells(routing: str, pmu_on_re: str = "true", cpuid_on_re: str | Non
         "attrs": _Anything(),
         "read_root_config": lambda section, key, default=None: config.get((section, key), default),
         "native": _Anything(),
+        "fail": _starlark_fail,
     }
     exec(compile(defs_source(), str(DEFS), "exec"), namespace)
     assert "_cell_test_impl" in rule_calls, rule_calls
@@ -1679,6 +1680,18 @@ def load_defs() -> tuple[dict, list[str]]:
     return namespace, attr_names
 
 
+class StarlarkFail(Exception):
+    """Starlark's fail() in defs.bzl, under evaluate_cells."""
+
+
+def _starlark_fail(message: str) -> None:
+    raise StarlarkFail(message)
+
+
+def cell_slug(cell: dict) -> str:
+    return "{}-{}-{}".format(cell["test"].replace("/", "-"), cell["mode"], cell["backend"])
+
+
 class RequireHostCapsTest(unittest.TestCase):
     """hermit_e2e_cells(require_host_caps=True) sets cell.sh's HERMIT_E2E_REQUIRE_HOST_CAPS=1
     on exactly the local cells; by default no cell carries it."""
@@ -1697,6 +1710,32 @@ class RequireHostCapsTest(unittest.TestCase):
         for routing in ("hybrid", "local"):
             for target in evaluate_cells(routing).values():
                 self.assertNotIn("HERMIT_E2E_REQUIRE_HOST_CAPS", target["env"], target["name"])
+
+    def test_a_capability_list_flags_only_local_cells_needing_only_those(self) -> None:
+        # cell.sh's flag fails a withheld cell whichever capability withheld it, so
+        # require_host_caps_for flags a local cell only when every capability it
+        # requires is listed.
+        plan = {cell_slug(c): c for c in json.loads(PLAN.read_text())["cells"]}
+        for required in (["kvm"], ["cpuid-faulting"], ["cpuid-faulting", "kvm"]):
+            targets = evaluate_cells("hybrid", "true", "true", require_host_caps_for=required)
+            flagged = 0
+            for name, target in targets.items():
+                caps = plan[name].get("requires_host_capabilities") or []
+                expected = "1" if (target["route"] == "local" and caps
+                                   and all(c in required for c in caps)) else None
+                self.assertEqual(target["env"].get("HERMIT_E2E_REQUIRE_HOST_CAPS"), expected,
+                                 (required, name))
+                flagged += expected == "1"
+            self.assertGreater(flagged, 0, required)
+
+    def test_a_list_is_never_read_as_the_bool(self) -> None:
+        # A list passed to require_host_caps would read as True and flag every local
+        # cell; it is refused instead, as are an unknown capability and both at once.
+        for kwargs in ({"require_host_caps": ["kvm"]},
+                       {"require_host_caps_for": ["kvmm"]},
+                       {"require_host_caps": True, "require_host_caps_for": ["kvm"]}):
+            with self.assertRaises(StarlarkFail, msg=kwargs):
+                evaluate_cells("hybrid", **kwargs)
 
 
 class ContainerChoiceTest(unittest.TestCase):

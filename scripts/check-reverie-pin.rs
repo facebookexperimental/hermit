@@ -45,7 +45,8 @@
 //!         -> BLOCKED rc=1 (pre-existing behaviour, kept). Plain `--offline`
 //!            never asks: it judges no remote policy and says so by name.
 //!   * the monotonicity BASE cannot be resolved (no such ref, a depth-1 clone
-//!     with no `origin/main`, an incoherent base pinning two revisions)
+//!     with no `origin/<Hermit landing branch>`, an incoherent base pinning two
+//!     revisions)
 //!         -> CHECKER ERROR rc=2 unless `--no-base` is passed. An unevaluated
 //!            monotonicity check is INDISTINGUISHABLE from a passing one, and
 //!            it shipped exactly that way: with no base ref the gate printed
@@ -61,11 +62,16 @@
 //! their contents are not tracked by the Hermit repository.
 //!
 //! Every reported pin carries the commit it was read from. The checker reads
-//! the *working tree*, so in a checkout that sits behind `main` it faithfully
-//! reports the pin of an older commit — which then reads as a stale pin when
-//! compared against live Reverie `main`. A bare pin value records none of that,
-//! so the reported pin is always accompanied on stderr by its HEAD, plus a loud
-//! warning when HEAD is a strict ancestor of `origin/main`.
+//! the *working tree*, so in a checkout that sits behind the landing branch it
+//! faithfully reports the pin of an older commit — which then reads as a stale
+//! pin when compared against Reverie's live landing branch. A bare pin value
+//! records none of that, so the reported pin is always accompanied on stderr by
+//! its HEAD, plus a loud warning when HEAD is a strict ancestor of
+//! `origin/<Hermit landing branch>`.
+//!
+//! The two landing branches, Hermit's and Reverie's, are read from
+//! `ci/landing-branches.env` or the environment variables named there; both are
+//! `main` today. The owner rule above names Reverie's by its current name.
 //!
 //! Local use on Meta hosts:
 //!
@@ -81,6 +87,12 @@
 
 #[path = "lib/rust_script_prelude.rs"]
 mod rust_script_prelude;
+
+// The landing-branch settings (ci/landing-branches.env), shared with the
+// manifest-plan library; this checker reads two of them.
+#[allow(dead_code)]
+#[path = "../ci/manifest-plan/src/landing_branch.rs"]
+mod landing_branch;
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -103,8 +115,37 @@ use std::sync::OnceLock;
 /// guarantee: `refuse_config_rewritten_authority_url` proves that Git contacts
 /// exactly this URL, and refuses a rewrite of it from any config scope.
 const DEFAULT_REMOTE: &str = "https://github.com/rrnewton/reverie";
-const MAIN_REF: &str = "refs/heads/main";
-const DEFAULT_BASE_REF: &str = "origin/main";
+
+/// The landing branches a run judges against (ci/landing-branches.env, or the
+/// environment). Reverie's is the history the pin must be on; Hermit's
+/// `origin/<branch>` is the default monotonicity floor.
+struct LandingBranches {
+    hermit: String,
+    reverie: String,
+}
+
+impl LandingBranches {
+    /// The checkout's setting. There is no default: an unreadable setting is a
+    /// checker error, never a silent `main`.
+    #[cfg(not(test))]
+    fn for_run(root: &Path) -> Result<Self, String> {
+        Ok(Self {
+            hermit: landing_branch::hermit(root)?,
+            reverie: landing_branch::reverie(root)?,
+        })
+    }
+
+    /// The tests' fixture repositories name their landing branches `main`.
+    #[cfg(test)]
+    fn for_run(_root: &Path) -> Result<Self, String> {
+        Ok(Self {
+            hermit: "main".to_string(),
+            reverie: "main".to_string(),
+        })
+    }
+}
+
+#[derive(Default)]
 struct Config {
     repo: Option<PathBuf>,
     #[cfg(test)]
@@ -128,27 +169,11 @@ struct Config {
     /// Declare that this invocation has NO monotonicity base, so an
     /// unresolvable base is an intended skip rather than a silent one.
     no_base: bool,
-    /// Revision whose recorded pin is the monotonicity floor. Defaults to
-    /// `origin/main`: the base a PR would land on. A caller with no such ref
-    /// (a fresh clone, an isolated fixture) simply gets no floor asserted.
+    /// Revision whose recorded pin is the monotonicity floor. Empty means the
+    /// default, `origin/<Hermit landing branch>`: the base a PR would land on.
+    /// A caller with no such ref (a fresh clone, an isolated fixture) simply
+    /// gets no floor asserted.
     base_ref: String,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            repo: None,
-            #[cfg(test)]
-            remote: None,
-            print_pin: false,
-            update_to_latest: false,
-            skip_verify_build: false,
-            offline: false,
-            staged_advisory: false,
-            no_base: false,
-            base_ref: DEFAULT_BASE_REF.to_string(),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -171,7 +196,7 @@ fn usage() -> &'static str {
        --print-pin                         Print the single locally recorded pin; no network\n\
        --update-to-latest                  Advance every derived Cargo pin site to the main tip\n\
        --no-verify-build                   Skip the post-bump compile check (UNSAFE)\n\
-       --base-ref REF                      Monotonicity floor (default: origin/main)\n\
+       --base-ref REF                      Monotonicity floor (default: origin/<Hermit landing branch>)\n\
        --offline                           Local consistency only; no networked policy checks\n\
        --no-base                           Declare there is no monotonicity base (skip it)\n\
        --staged-pin-advisory               Pre-commit advisory on a STAGED pin edit\n\
@@ -198,7 +223,13 @@ fn parse_args() -> Result<Config, String> {
         match args[i].as_str() {
             "--repo" => config.repo = Some(PathBuf::from(take_value(&args, &mut i, "--repo")?)),
             "--print-pin" => config.print_pin = true,
-            "--base-ref" => config.base_ref = take_value(&args, &mut i, "--base-ref")?,
+            "--base-ref" => {
+                let value = take_value(&args, &mut i, "--base-ref")?;
+                if value.is_empty() {
+                    return Err("--base-ref requires a non-empty revision".into());
+                }
+                config.base_ref = value;
+            }
             "--offline" => config.offline = true,
             "--no-base" => config.no_base = true,
             "--staged-pin-advisory" => config.staged_advisory = true,
@@ -264,6 +295,8 @@ fn git_root() -> Result<PathBuf, String> {
 /// strict ancestor of even a stale `origin/main` still means being behind.
 struct CheckoutProvenance {
     head: String,
+    /// Hermit's landing branch, whose `origin/<branch>` is compared.
+    landing: String,
     /// `Some(main)` only when HEAD is a *strict ancestor* of local `origin/main`.
     ///
     /// Strict ancestry, not inequality: a PR head legitimately differs from
@@ -280,11 +313,13 @@ fn rev_parse(root: &Path, rev: &str) -> Option<String> {
     is_full_sha(&value).then_some(value)
 }
 
-fn checkout_provenance(root: &Path) -> Option<CheckoutProvenance> {
+fn checkout_provenance(root: &Path, landing: &str) -> Option<CheckoutProvenance> {
     let head = rev_parse(root, "HEAD")?;
-    let Some(main) = rev_parse(root, "refs/remotes/origin/main") else {
+    let landing = landing.to_string();
+    let Some(main) = rev_parse(root, &format!("refs/remotes/origin/{landing}")) else {
         return Some(CheckoutProvenance {
             head,
+            landing,
             behind_main: None,
         });
     };
@@ -293,6 +328,7 @@ fn checkout_provenance(root: &Path) -> Option<CheckoutProvenance> {
             .is_ok_and(|output| output.status.success());
     Some(CheckoutProvenance {
         head,
+        landing,
         behind_main: behind.then_some(main),
     })
 }
@@ -311,14 +347,21 @@ fn report_provenance(provenance: Option<&CheckoutProvenance>) {
     let Some(main) = &provenance.behind_main else {
         return;
     };
-    loud_header("CHECKOUT IS BEHIND origin/main - PIN VALUE IS HISTORICAL");
+    let landing = &provenance.landing;
+    loud_header(&format!(
+        "CHECKOUT IS BEHIND origin/{landing} - PIN VALUE IS HISTORICAL"
+    ));
     eprintln!("HEAD         {}", provenance.head);
-    eprintln!("origin/main  {main}");
-    eprintln!("HEAD is a strict ancestor of origin/main, so the pin reported here is the pin AT");
-    eprintln!("THAT OLDER COMMIT -- not the pin on main. Comparing it against live Reverie main");
-    eprintln!("will show a spurious 'stale pin' and can trigger a bump that is not needed.");
-    eprintln!("Fast-forward this checkout, or read the pin from main without checking it out:");
-    eprintln!("  git show origin/main:detcore/Cargo.toml");
+    eprintln!("origin/{landing}  {main}");
+    eprintln!(
+        "HEAD is a strict ancestor of origin/{landing}, so the pin reported here is the pin AT"
+    );
+    eprintln!("THAT OLDER COMMIT -- not the pin on {landing}. Comparing it against live Reverie");
+    eprintln!("main will show a spurious 'stale pin' and can trigger a bump that is not needed.");
+    eprintln!(
+        "Fast-forward this checkout, or read the pin from {landing} without checking it out:"
+    );
+    eprintln!("  git show origin/{landing}:detcore/Cargo.toml");
     eprintln!("This is a warning, not a refusal: the exit code is unchanged.");
 }
 
@@ -662,7 +705,7 @@ fn classify_cache_path(cache: &Path) -> Result<CacheState, String> {
     ))
 }
 
-fn reverie_graph(root: &Path, remote: &str) -> Result<GuardedGitRepo, String> {
+fn reverie_graph(root: &Path, remote: &str, branch: &str) -> Result<GuardedGitRepo, String> {
     // Resolved BEFORE anything is created, so `git init` and the guard below
     // both act on the same object.
     let cache = resolve_cache_path(root, "target/ci/reverie-graph.git")?;
@@ -714,14 +757,8 @@ fn reverie_graph(root: &Path, remote: &str) -> Result<GuardedGitRepo, String> {
     // poisons any retry. Both were observed -- the promisor poisoning as an
     // intermittent bracket failure. Measured unfiltered: 1.4s / 12 MB, far
     // inside this node's 120s timeout. A gate should buy robustness with that.
-    let fetch = graph.run(&[
-        "fetch",
-        "--no-tags",
-        "--quiet",
-        "--force",
-        remote,
-        "+refs/heads/main:refs/heads/main",
-    ])?;
+    let refspec = format!("+refs/heads/{branch}:refs/heads/{branch}");
+    let fetch = graph.run(&["fetch", "--no-tags", "--quiet", "--force", remote, &refspec])?;
     if !fetch.status.success() {
         return Err(format!(
             "could not fetch the Reverie commit graph from {remote}: {}",
@@ -866,7 +903,7 @@ const ACK_ENV: &str = "HERMIT_PIN_BELOW_MASTER_ACK";
 ///
 /// Rarity is where this gets its power: it fires only on deliberate pin edits,
 /// so it stays readable instead of decaying into a reflex flag. Do not widen it.
-fn staged_pin_advisory(root: &Path, remote: &str) -> Result<i32, String> {
+fn staged_pin_advisory(root: &Path, remote: &str, branch: &str) -> Result<i32, String> {
     let staged = read_pins(root)?;
     let candidate = match unique_pin(&staged) {
         Ok(pin) => pin.to_string(),
@@ -881,11 +918,11 @@ fn staged_pin_advisory(root: &Path, remote: &str) -> Result<i32, String> {
     if head == candidate {
         return Ok(0); // CASE 1: no pin edit in this commit.
     }
-    let main = query_main(remote)?;
+    let main = query_main(remote, branch)?;
     if candidate == main {
         return Ok(0); // CASE 2: bumped all the way.
     }
-    let graph = reverie_graph(root, remote)?;
+    let graph = reverie_graph(root, remote, branch)?;
     if !is_ancestor(&graph, &head, &candidate)? {
         return Ok(0); // CASE 4: regression (or off-history) -- CI refuses it.
     }
@@ -910,19 +947,20 @@ fn staged_pin_advisory(root: &Path, remote: &str) -> Result<i32, String> {
     Ok(1)
 }
 
-fn query_main(remote: &str) -> Result<String, String> {
+fn query_main(remote: &str, branch: &str) -> Result<String, String> {
     // The tip this returns IS the authority: every later comparison is against
     // it. Prove the URL is the one named before asking it anything.
     under_git_env(|| refuse_redirected_authority(remote, authority_git_command()?))?;
+    let main_ref = format!("refs/heads/{branch}");
     let output = under_git_env(|| {
         authority_git_command()?
-            .args(["ls-remote", "--exit-code", remote, MAIN_REF])
+            .args(["ls-remote", "--exit-code", remote, main_ref.as_str()])
             .output()
             .map_err(|error| format!("could not run git ls-remote: {error}"))
     })?;
     if !output.status.success() {
         return Err(format!(
-            "git ls-remote {remote} {MAIN_REF} failed: {}",
+            "git ls-remote {remote} {main_ref} failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
@@ -1329,8 +1367,8 @@ impl GuardedGitRepo {
         // A NON-BARE cache is the precondition for the incident this file
         // exists to prevent, not a style preference. A repository with a
         // worktree has a checked-out HEAD, and `fetch --force
-        // +refs/heads/main:refs/heads/main` -- which this script runs -- will
-        // move a checked-out branch. That is how a foreign fetch once updated a
+        // +refs/heads/<branch>:refs/heads/<branch>` -- which this script runs,
+        // for Reverie's landing branch -- will move a checked-out branch. That is how a foreign fetch once updated a
         // checked-out `main` in this repository and left a Hermit checkout
         // sitting at Reverie's HEAD, reporting 3,615 apparently-dirty paths.
         // Nothing above proves bareness: distinctness from the product only
@@ -1357,8 +1395,8 @@ impl GuardedGitRepo {
             return Err(format!(
                 "REFUSING Reverie graph cache: {} is not a bare repository \
                  (rev-parse --is-bare-repository reported {bare:?}). A cache with a worktree has \
-                 a checked-out HEAD that this script's `fetch --force` into refs/heads/main can \
-                 move.",
+                 a checked-out HEAD that this script's `fetch --force` into the landing branch \
+                 can move.",
                 cache_git_dir.display()
             ));
         }
@@ -2233,9 +2271,10 @@ fn check_buck_build_pin_binding(root: &Path, pin: &str) -> Result<i32, String> {
 
 fn run_with_config(config: Config) -> Result<i32, String> {
     let root = config.repo.clone().map_or_else(git_root, Ok)?;
+    let branches = LandingBranches::for_run(&root)?;
     let scan = read_pins(&root)?;
     let pins = &scan.occurrences;
-    let provenance = checkout_provenance(&root);
+    let provenance = checkout_provenance(&root, &branches.hermit);
 
     if config.print_pin {
         println!("{}", unique_pin(&scan)?);
@@ -2248,7 +2287,7 @@ fn run_with_config(config: Config) -> Result<i32, String> {
         let advisory_remote = DEFAULT_REMOTE;
         #[cfg(test)]
         let advisory_remote = config.remote.as_deref().unwrap_or(DEFAULT_REMOTE);
-        return staged_pin_advisory(&root, advisory_remote);
+        return staged_pin_advisory(&root, advisory_remote, &branches.reverie);
     }
 
     let tracked_manifests = scan
@@ -2294,7 +2333,11 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     let remote = DEFAULT_REMOTE;
     #[cfg(test)]
     let remote = config.remote.as_deref().unwrap_or(DEFAULT_REMOTE);
-    let base_ref = config.base_ref.as_str();
+    let default_base_ref = format!("origin/{}", branches.hermit);
+    let base_ref = match config.base_ref.as_str() {
+        "" => default_base_ref.as_str(),
+        named => named,
+    };
 
     // Plain --offline never reads main, so it must not ask for it: the
     // pre-commit hook runs this on hosts that cannot reach the remote, and a
@@ -2304,7 +2347,7 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     let main = if config.offline && !config.update_to_latest {
         None
     } else {
-        match query_main(remote) {
+        match query_main(remote, &branches.reverie) {
             Ok(main) => Some(main),
             Err(error) => {
                 loud_header("COULD NOT VERIFY REVERIE MAIN HISTORY - BLOCKED");
@@ -2386,19 +2429,22 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     if !is_full_sha(&main) {
         return Err(format!("refusing to judge against invalid main {main:?}"));
     }
-    let graph = reverie_graph(&root, remote)?;
+    let graph = reverie_graph(&root, remote, &branches.reverie)?;
 
     // (1) ANCESTRY: the pin must be on Reverie's main history. This refuses a
     // dead, abandoned, or rewritten commit -- the case a tip-equality check
     // never even asked about.
     if !is_ancestor(&graph, pin, &main)? {
-        loud_header("REVERIE PIN IS NOT ON reverie/main HISTORY - BLOCKED");
+        let reverie_branch = &branches.reverie;
+        loud_header(&format!(
+            "REVERIE PIN IS NOT ON reverie/{reverie_branch} HISTORY - BLOCKED"
+        ));
         eprintln!("Hermit pin:  {pin}");
         eprintln!("Reverie main: {main}");
         eprintln!(
-            "The pin is not reachable from rrnewton/reverie:main. It names a commit that was\n\
-             abandoned, rewritten, or never merged -- so nothing on main contains it and no\n\
-             amount of waiting will put it on main history."
+            "The pin is not reachable from rrnewton/reverie:{reverie_branch}. It names a commit that was\n\
+             abandoned, rewritten, or never merged -- so nothing on {reverie_branch} contains it and no\n\
+             amount of waiting will put it on {reverie_branch} history."
         );
         eprintln!(
             "Affected metadata: {entries} revision entries across {pin_files} tracked Cargo files."
@@ -2422,27 +2468,22 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     // concurrently by many agents, and ADVANCING an existing origin/main under
     // them is exactly the moving-reference hazard removed elsewhere today. If
     // the ref resolves we do not touch it.
-    if base_ref == DEFAULT_BASE_REF
+    if base_ref == default_base_ref
         && !git_in(&root, &["rev-parse", "--verify", "--quiet", base_ref])
             .map(|o| o.status.success())
             .unwrap_or(false)
     {
+        let fetch_refspec = format!("{0}:refs/remotes/origin/{0}", branches.hermit);
         let _ = git_in(
             &root,
-            &[
-                "fetch",
-                "--no-tags",
-                "--quiet",
-                "origin",
-                "main:refs/remotes/origin/main",
-            ],
+            &["fetch", "--no-tags", "--quiet", "origin", &fetch_refspec],
         );
     }
     let resolved_base = base_pin(&root, base_ref);
     if resolved_base.is_none() && !config.no_base {
         return Err(format!(
             "cannot resolve a monotonicity base from {base_ref:?}: the ref is missing (a \
-             depth-1 clone has no origin/main), unreadable, or pins more than one Reverie \
+             depth-1 clone has no {default_base_ref}), unreadable, or pins more than one Reverie \
              revision. REFUSING rather than skipping: an unevaluated monotonicity check is \
              indistinguishable from a passing one. Fetch the base ref, pass --base-ref, or \
              pass --no-base to declare that this invocation genuinely has no base."
@@ -3409,7 +3450,7 @@ mod tests {
         fs::create_dir_all(cache.parent().expect("cache parent")).expect("create cache parent");
         symlink(root.join(".git"), &cache).expect("point cache at product git-dir");
 
-        let error = reverie_graph(&root, remote.to_str().expect("UTF-8 fixture path"))
+        let error = reverie_graph(&root, remote.to_str().expect("UTF-8 fixture path"), "main")
             .expect_err("cache resolving to product common git-dir must be refused");
         // This fixture builds the alias with a SYMLINK, so the symlink guard is
         // the one that fires, and it fires EARLIER than the identity guard did
@@ -3451,7 +3492,7 @@ mod tests {
         set_origin_main(&root, &main);
         checkout_detached(&root, &old);
 
-        let provenance = checkout_provenance(&root).expect("resolve provenance");
+        let provenance = checkout_provenance(&root, "main").expect("resolve provenance");
         assert_eq!(provenance.head, old);
         assert_eq!(
             provenance.behind_main.as_deref(),
@@ -3471,7 +3512,7 @@ mod tests {
         set_origin_main(&root, &main);
         checkout_detached(&root, &main);
 
-        let provenance = checkout_provenance(&root).expect("resolve provenance");
+        let provenance = checkout_provenance(&root, "main").expect("resolve provenance");
         assert_eq!(provenance.head, main);
         assert_eq!(provenance.behind_main, None);
     }
@@ -3490,7 +3531,7 @@ mod tests {
         let pr_head = commit_file(&root, "c", "feature\n");
 
         assert_ne!(pr_head, main);
-        let provenance = checkout_provenance(&root).expect("resolve provenance");
+        let provenance = checkout_provenance(&root, "main").expect("resolve provenance");
         assert_eq!(provenance.head, pr_head);
         assert_eq!(
             provenance.behind_main, None,
@@ -3506,7 +3547,7 @@ mod tests {
         init_fixture_repo(&root);
         let head = commit_file(&root, "a", "only\n");
 
-        let provenance = checkout_provenance(&root).expect("resolve provenance");
+        let provenance = checkout_provenance(&root, "main").expect("resolve provenance");
         assert_eq!(provenance.head, head);
         assert_eq!(provenance.behind_main, None);
     }
@@ -3863,7 +3904,7 @@ mod tests {
         let undeclared = run_with_config(Config {
             repo: Some(root.clone()),
             remote: Some(remote.to_string_lossy().into_owned()),
-            ..Config::default() // base_ref defaults to origin/main, which does not exist here
+            ..Config::default() // empty base_ref is origin/main in tests; absent here
         });
         assert!(
             undeclared.is_err(),
@@ -4944,7 +4985,7 @@ mod tests {
              exercise the wrong guard"
         );
 
-        let error = reverie_graph(&root, remote.to_str().expect("UTF-8 fixture path"))
+        let error = reverie_graph(&root, remote.to_str().expect("UTF-8 fixture path"), "main")
             .expect_err("a real directory aliasing the product must be refused");
         // A linked worktree carries a `.git` FILE, so the filesystem
         // classification now refuses it before any Git command is aimed at the
@@ -5054,7 +5095,7 @@ mod tests {
         fs::create_dir_all(cache.parent().expect("cache parent")).expect("create cache parent");
         symlink(&elsewhere, &cache).expect("point cache outside the checkout");
 
-        let error = reverie_graph(&root, remote.to_str().expect("UTF-8 fixture path"))
+        let error = reverie_graph(&root, remote.to_str().expect("UTF-8 fixture path"), "main")
             .expect_err("a symlinked cache must be refused");
         assert!(
             error.contains("is a symbolic link"),
@@ -5560,7 +5601,7 @@ mod tests {
         fs::write(&global, "").expect("write an empty global config");
 
         // Control: without the rule, the authority answers with its own tip.
-        let tip = with_test_global_config(&global, || query_main(authority_url))
+        let tip = with_test_global_config(&global, || query_main(authority_url, "main"))
             .expect("an unredirected authority must be queried");
         assert_eq!(tip, authority_main);
 
@@ -5569,7 +5610,7 @@ mod tests {
             format!("[url \"{mirror_url}\"]\n\tinsteadOf = {authority_url}\n"),
         )
         .expect("write the redirecting global config");
-        let outcome = with_test_global_config(&global, || query_main(authority_url));
+        let outcome = with_test_global_config(&global, || query_main(authority_url, "main"));
         assert_ne!(
             outcome.as_deref(),
             Ok(mirror_main.as_str()),
@@ -5613,7 +5654,7 @@ mod tests {
         let config = git_in(&cache, &["config", &rule, authority_url]).unwrap();
         assert!(config.status.success(), "write the cache's redirect rule");
 
-        let outcome = reverie_graph(&product, authority_url);
+        let outcome = reverie_graph(&product, authority_url, "main");
         if let Ok(graph) = &outcome {
             let fetched = graph.run(&["rev-parse", "refs/heads/main"]).unwrap();
             panic!(

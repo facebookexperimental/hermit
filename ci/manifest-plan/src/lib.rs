@@ -62,6 +62,7 @@ pub mod host_capability;
 pub mod imported_results;
 pub mod invocation_cgroup;
 pub mod known_gaps;
+pub mod landing_branch;
 pub mod ledger;
 #[cfg_attr(not(buck_build), path = "../../../hermit-cli/src/logdiff_report.rs")]
 #[cfg_attr(buck_build, path = "../mapped/hermit-cli/logdiff_report.rs")]
@@ -91,6 +92,7 @@ pub mod timeouts;
 pub mod typedlog;
 pub mod validation_dag;
 mod validation_dag_static;
+mod vfork_spawn;
 
 // Lets the shared scripts/lib files below name this library as
 // `hermit_manifest_plan::...`, as they do when scripts/validate.rs includes them.

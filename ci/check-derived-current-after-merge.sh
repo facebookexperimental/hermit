@@ -65,14 +65,23 @@
 # bypassed, and an unenforced check is worse than none -- it reads as coverage
 # while providing none.
 #
-# Usage:  ci/check-derived-current-after-merge.sh [BASE_REF]     (default origin/main)
+# Usage:  ci/check-derived-current-after-merge.sh [BASE_REF]
+#         (default origin/<landing branch>: HERMIT_LANDING_BRANCH, ci/landing-branches.env)
 # Exit:   0 not applicable, or derived artifacts current after merge
-#         1 could not evaluate (dirty tree, merge conflict) -- fail closed, not silent
+#         1 could not evaluate (dirty tree, merge conflict, no landing branch
+#           setting) -- fail closed, not silent
 #         2 derived artifacts are STALE after merge; run scorecard.rs update
 
 set -euo pipefail
 
-BASE_REF="${1:-origin/main}"
+if [[ -n ${1:-} ]]; then
+    BASE_REF=$1
+else
+    # shellcheck source=scripts/lib/landing_branch.sh
+    source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/../scripts/lib/landing_branch.sh"
+    landing=$(landing_branch HERMIT_LANDING_BRANCH) || exit 1
+    BASE_REF=origin/$landing
+fi
 GENERATOR="ci/compat-envelope/scorecard.rs"
 
 INPUT_GLOBS=(

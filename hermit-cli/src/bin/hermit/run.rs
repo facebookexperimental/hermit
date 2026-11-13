@@ -494,6 +494,7 @@ struct MappedVerificationRun {
 
 /// Descriptor-free forwarding selection retained by the common container owner.
 /// Open the one physical stream only inside that container's child.
+#[derive(Clone, Copy)]
 pub(super) enum ForwardedDetlogPlan {
     None,
     Socket { opened: bool },
@@ -16832,6 +16833,37 @@ impl RunOpts {
         self.refuse_an_invalid_replayed_record()?;
         detcore::preemptions::validate_config_replay_inputs(&self.effective_det_config())?;
         <detcore::Detcore as reverie::Tool>::facility_admission(&self.det_opts.det_config)?;
+        // A host package manager can replace a file under a frozen bind
+        // while the container is set up, detaching the bind before the
+        // guest starts (https://github.com/rrnewton/hermit/issues/4799).
+        // Setup proves that typed case (`hermit::SetupDetached`) and
+        // nothing guest-visible has happened yet, so retry setup with a
+        // fresh snapshot. Every other failure returns at once.
+        const SETUP_ATTEMPTS: u32 = 5;
+        for attempt in 1..=SETUP_ATTEMPTS {
+            match self.run_once(global, capture_output) {
+                Err(error) if hermit::is_setup_detached(&error) => {
+                    if attempt == SETUP_ATTEMPTS {
+                        return Err(error.context(format!(
+                            "container setup was still detached after {SETUP_ATTEMPTS} attempts"
+                        )));
+                    }
+                    crate::app::tracing::diagnostic_eprintln!(
+                        "hermit: container setup attempt {attempt} of {SETUP_ATTEMPTS} found a \
+                         frozen host file replaced during setup; retrying with a fresh snapshot"
+                    );
+                }
+                other => return other,
+            }
+        }
+        unreachable!("the last setup attempt returns")
+    }
+
+    fn run_once(
+        &self,
+        global: &GlobalOpts,
+        capture_output: bool,
+    ) -> Result<(ExitStatus, Option<Output>, Option<detcore::TerminalOutcome>), Error> {
         let mut options = self.clone();
         options.capture_launch_namespace_mounts();
         options.det_opts.det_config.annotated_priority_replay =
@@ -17992,6 +18024,22 @@ impl RunOpts {
     pub(super) fn verify_with_evidence<P, F>(
         &self,
         evidence: VerificationEvidence,
+        execute: impl FnMut(
+            &Self,
+            fs::File,
+            &Path,
+            ForwardedDetlogPlan,
+            VerificationRun,
+        ) -> Result<super::backend_hook::PhysicalRun<P>, Error>,
+        finish: impl Fn(P, &Output, VerificationRun) -> Result<F, Error>,
+        pair_evidence: impl Fn(&F, &F) -> Result<super::backend_hook::PairEvidence, Error>,
+    ) -> Result<ExitStatus, Error> {
+        self.verify_with_evidence_attempt(evidence, execute, finish, pair_evidence, Vec::new())
+    }
+
+    fn verify_with_evidence_attempt<P, F>(
+        &self,
+        evidence: VerificationEvidence,
         mut execute: impl FnMut(
             &Self,
             fs::File,
@@ -18001,6 +18049,7 @@ impl RunOpts {
         ) -> Result<super::backend_hook::PhysicalRun<P>, Error>,
         finish: impl Fn(P, &Output, VerificationRun) -> Result<F, Error>,
         pair_evidence: impl Fn(&F, &F) -> Result<super::backend_hook::PairEvidence, Error>,
+        discarded_attempts: Vec<hermit::canonical_verdict::InfrastructureError>,
     ) -> Result<ExitStatus, Error> {
         let VerificationEvidence {
             requirement,
@@ -18424,6 +18473,9 @@ impl RunOpts {
         };
 
         let summary2 = summary2_path.and_then(read_verify_summary);
+        // Read before the move into the conclusion: whether this attempt
+        // may still discard its pair for one rerun.
+        let may_discard_pair = discarded_attempts.is_empty();
         let outcome = conclude_verification(
             VerificationConclusion {
                 verify_json: self.verify_json.as_deref(),
@@ -18434,6 +18486,7 @@ impl RunOpts {
                 application_backend: self.application_backend,
                 passthru_opt: self.det_opts.det_config.passthru_opt,
                 rewrite_exclusives: Some(self.rewrite_exclusives),
+                discarded_attempts,
             },
             CompletedVerificationRun {
                 output: &out1,
@@ -18466,6 +18519,37 @@ impl RunOpts {
             },
         )?;
         drop(host_inputs_file);
+
+        // One pair retry, only for a proven host-input change: the
+        // divergence above was named as a host file replaced during a
+        // run (its report is already published and announced), so the
+        // pair says nothing about the guest. Rerun both runs once; the
+        // second attempt's verdict is the published one, with this
+        // discarded pair recorded in its report. A second host-input
+        // change, and every other outcome, stands as concluded.
+        if may_discard_pair
+            && let Some(discarded) = outcome.host_input_change.clone()
+            && matches!(
+                discarded,
+                hermit::canonical_verdict::InfrastructureError::HostInputChanged { .. }
+            )
+        {
+            crate::app::tracing::diagnostic_eprintln!(
+                ":: host input changed during verification; rerunning the pair once"
+            );
+            return self.verify_with_evidence_attempt(
+                VerificationEvidence {
+                    requirement,
+                    records_run_metadata,
+                    transport,
+                    native_identity_diagnostic,
+                },
+                execute,
+                finish,
+                pair_evidence,
+                vec![discarded],
+            );
+        }
 
         // On divergence, still return the nonzero status and skip
         // the backend banner — but EMIT THE GUEST'S OUTPUT FIRST when both runs
@@ -18594,7 +18678,31 @@ impl RunOpts {
     fn with_verification_ld_so_cache(&self) -> Result<Self, Error> {
         let mut shared = self.clone();
         if shared.ld_so_cache_snapshot.is_none() {
-            shared.ld_so_cache_snapshot = Some(super::container::LdSoCacheSnapshot::of_host()?);
+            // The capture proves the file did not change while it was
+            // read; a package-manager replacement inside that read is
+            // the same setup race as a detached bind, so recapture a
+            // bounded number of times before refusing.
+            const CAPTURE_ATTEMPTS: u32 = 5;
+            for attempt in 1..=CAPTURE_ATTEMPTS {
+                match super::container::LdSoCacheSnapshot::of_host() {
+                    Ok(snapshot) => {
+                        shared.ld_so_cache_snapshot = Some(snapshot);
+                        break;
+                    }
+                    Err(error) if hermit::is_setup_detached(&error) => {
+                        if attempt == CAPTURE_ATTEMPTS {
+                            return Err(error.context(format!(
+                                "host dynamic-linker cache capture was still changing after {CAPTURE_ATTEMPTS} attempts"
+                            )));
+                        }
+                        crate::app::tracing::diagnostic_eprintln!(
+                            "hermit: host dynamic-linker cache capture attempt {attempt} of \
+                             {CAPTURE_ATTEMPTS} found it replaced during capture; retrying"
+                        );
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         }
         Ok(shared)
     }
@@ -19117,6 +19225,63 @@ impl RunOpts {
     }
 
     fn run_verify(
+        &self,
+        log: (fs::File, &Path),
+        forwarded_detlogs: ForwardedDetlogPlan,
+        global: &GlobalOpts,
+        run: VerificationRun,
+        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))] mapped: Option<
+            MappedVerificationRun,
+        >,
+    ) -> Result<VerificationRunOutput, Error> {
+        // Per-leg twin of the `run` setup retry: a leg whose container
+        // setup proved a frozen bind was detached retries setup with a
+        // rebuilt container. The options already carry the pair's one
+        // shared ld.so.cache snapshot, so every attempt rebinds the same
+        // captured bytes through a fresh frozen file (never recaptured
+        // per attempt, which would reintroduce issue 4693 within a pair).
+        const SETUP_ATTEMPTS: u32 = 5;
+        let run_label = match run {
+            VerificationRun::Run1 => "run 1",
+            VerificationRun::Run2 => "run 2",
+        };
+        let (mut first_log, log_path) = (Some(log.0), log.1);
+        for attempt in 1..=SETUP_ATTEMPTS {
+            let log_file = match first_log.take() {
+                Some(file) => file,
+                None => fs::File::create(log_path).context("recreating verification log")?,
+            };
+            #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+            let mapped_attempt = mapped.as_ref().map(|mapped| MappedVerificationRun {
+                image: mapped.image.clone(),
+                policy: mapped.policy,
+            });
+            match self.run_verify_once(
+                (log_file, log_path),
+                forwarded_detlogs,
+                global,
+                run,
+                #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+                mapped_attempt,
+            ) {
+                Err(error) if hermit::is_setup_detached(&error) => {
+                    if attempt == SETUP_ATTEMPTS {
+                        return Err(error.context(format!(
+                            "verification {run_label} setup was still detached after {SETUP_ATTEMPTS} attempts"
+                        )));
+                    }
+                    crate::app::tracing::diagnostic_eprintln!(
+                        "hermit: verification {run_label} setup attempt {attempt} of {SETUP_ATTEMPTS} \
+                         found a frozen host file replaced during setup; retrying with a fresh snapshot"
+                    );
+                }
+                other => return other,
+            }
+        }
+        unreachable!("the last setup attempt returns")
+    }
+
+    fn run_verify_once(
         &self,
         log: (fs::File, &Path),
         forwarded_detlogs: ForwardedDetlogPlan,
@@ -21028,6 +21193,9 @@ pub(super) struct VerificationConclusion<'a> {
     /// divergence that store-exclusive failures explain suggests
     /// ([`store_exclusive_retries`]).
     pub(super) rewrite_exclusives: Option<bool>,
+    /// Pairs the owner already discarded before this pair, carried into
+    /// the published report so a rerun leaves a machine-readable trace.
+    pub(super) discarded_attempts: Vec<hermit::canonical_verdict::InfrastructureError>,
 }
 
 /// Compare two completed verification runs, publish the report to the
@@ -21050,6 +21218,7 @@ pub(super) fn conclude_verification(
         application_backend,
         passthru_opt,
         rewrite_exclusives,
+        discarded_attempts,
     } = conclusion;
     let out1 = run1.output;
     let out2 = run2.output;
@@ -21133,6 +21302,7 @@ pub(super) fn conclude_verification(
         },
         comparison_options,
     )?;
+    outcome.discarded_attempts = discarded_attempts;
     let native_messages = evidence.map(|comparison| comparison.apply(&mut outcome));
     outcome.runtime = verification_runtime_from_summaries(summary1.as_ref(), summary2.as_ref());
     // A divergence that failed store-exclusives explain is named as such
@@ -21213,6 +21383,7 @@ pub(super) fn conclude_verification(
             store_exclusive_retries_line(retries)
         );
     }
+    outcome.host_input_change = host_input_change;
     Ok(outcome)
 }
 

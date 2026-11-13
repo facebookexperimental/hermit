@@ -35,8 +35,9 @@
 # actually in the file is refused as truncated/short
 # (census-base-truncated), and a header commit that differs from
 # --expected-base-commit (the counted wrapper derives it from the
-# checkout's merge-base with origin/main, or HERMIT_CENSUS_BASE_COMMIT)
-# is refused as stale (census-base-stale). --report-only is a
+# checkout's merge-base with origin/<landing branch> -- HERMIT_LANDING_BRANCH,
+# ci/landing-branches.env -- or HERMIT_CENSUS_BASE_COMMIT) is refused as
+# stale (census-base-stale). --report-only is a
 # manual/local debugging aid only; the counted wrapper never passes it.
 #
 # Exit codes: 0 pass, 1 unrecorded disappearance (census-diff), 2 usage /

@@ -136,9 +136,39 @@ fn deserialize_env<'de, D: Deserializer<'de>>(
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LaunchObservation {
-    NotStarted { reason: NotStartedReason },
-    SpawnFailed { stage: SpawnStage, reason: String },
-    Spawned { pid: u32 },
+    NotStarted {
+        reason: NotStartedReason,
+    },
+    SpawnFailed {
+        stage: SpawnStage,
+        reason: String,
+    },
+    Spawned {
+        pid: u32,
+        /// How the process was started. Kept in memory only: these records
+        /// are read by tools built from older revisions, whose readers refuse
+        /// an unknown field, so writing it waits for a reader that accepts it
+        /// on every tool root (dh-7n47nt). A record read back says
+        /// [`SpawnMethod::Unrecorded`].
+        #[serde(skip)]
+        method: SpawnMethod,
+    },
+}
+
+/// How an invocation's process was started.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SpawnMethod {
+    /// Read back from a record, which does not carry the method.
+    #[default]
+    Unrecorded,
+    /// `std::process::Command`, which uses posix_spawn when it can.
+    Command,
+    /// clone3 with CLONE_VM, CLONE_VFORK and CLONE_INTO_CGROUP: no copy of
+    /// the runner, and created in its invocation cgroup.
+    Clone3IntoCgroup,
+    /// `std::process::Command` with a pre_exec cgroup join, which forks the
+    /// runner, because clone3 was refused for `reason`.
+    CommandAfterClone3Refused { reason: String },
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -611,7 +641,7 @@ impl InvocationCpuObservation {
             "missing invocation identity/command",
         )?;
         let pid = match &self.launch {
-            LaunchObservation::Spawned { pid } => {
+            LaunchObservation::Spawned { pid, .. } => {
                 require(*pid > 0, "zero launched pid")?;
                 Some(*pid)
             }
@@ -1266,6 +1296,39 @@ pub(crate) mod tests {
                 "\"env_overrides\":{\"A\":\"1\",\"A\":\"2\"}",
             );
         assert!(serde_json::from_str::<CellCpuObservationsV1>(&raw).is_err());
+    }
+
+    /// A row this head writes must deserialize with the type as it
+    /// was before the clone3 probe existed (the same three fields,
+    /// unknown fields refused): the probe record lives in its own
+    /// run-level output, never in this row.
+    #[test]
+    fn a_written_row_reads_with_the_pre_probe_type() {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct PreProbeRow {
+            version: u64,
+            binding: CellCpuBinding,
+            invocations: Vec<InvocationCpuObservation>,
+        }
+        let row = CellCpuObservationsV1 {
+            version: 1,
+            binding: CellCpuBinding {
+                run_id: "fixture".into(),
+                hermit_sha: "0".repeat(40),
+                lane: "portable".into(),
+                category: "fixture".into(),
+                test: "fixture/native-cpu".into(),
+                mode: "naked".into(),
+                backend: RequiredNullable::Null,
+                outer_attempt: 1,
+                run_index: RequiredNullable::Null,
+            },
+            invocations: Vec::new(),
+        };
+        let value = serde_json::to_value(&row).unwrap();
+        assert!(serde_json::from_value::<PreProbeRow>(value).is_ok());
     }
 
     #[test]

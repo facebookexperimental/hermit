@@ -396,9 +396,9 @@ its required single-run and 200-run evidence remain unexecuted in this change.
   explicit `/tmp` the backend-abstraction gate failed at `mktemp`, and it failed
   in its *negative control*, so it reported itself untrustworthy rather than
   passing vacuously. Good failure mode; the directory still has to exist.
-- The image pins `rustc 1.99.0-nightly (26ae60a9e 2026-07-28)`, which matches the
-  commit stage 1 observed on the host, so the pin reproduces the toolchain that
-  was already in use rather than silently changing it.
+- The image pins `rustc 1.97.1 (8bab26f4f 2026-07-14)`, the exact stable
+  release `rust-toolchain.toml` names, so host and pinned-root validation
+  use the same compiler rather than quietly splitting.
 
 ## Pin freshness — the policy, and the check that is missing
 

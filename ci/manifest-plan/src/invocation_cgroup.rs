@@ -577,6 +577,12 @@ impl InvocationCgroup {
         self.procs_write.as_raw_fd()
     }
 
+    /// This cgroup's directory, the descriptor clone3's CLONE_INTO_CGROUP
+    /// creates a child in. Close-on-exec, like the others.
+    pub fn directory_fd(&self) -> RawFd {
+        self.child.as_raw_fd()
+    }
+
     fn verify_identity(&self) -> Result<(), String> {
         let held = file_identity(&self.child, "held invocation cgroup")?;
         if held != self.identity {

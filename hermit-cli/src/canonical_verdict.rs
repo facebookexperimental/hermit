@@ -475,6 +475,16 @@ pub struct VerificationReport {
     /// report written before this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_exclusive_retries: Option<StoreExclusiveRetries>,
+    /// Completed verification pairs discarded before the pair this report
+    /// describes, each by its proven infrastructure error (today: a
+    /// host-input change, after which `run --verify` reruns the pair
+    /// once). The final verdict rests on the reported pair alone; this
+    /// records that the guest also executed the discarded pairs and why
+    /// they were set aside, so a JSON-only consumer does not see an
+    /// ordinary clean pass. Absent when no pair was discarded, and in a
+    /// report written before this field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub discarded_attempts: Vec<InfrastructureError>,
 }
 
 /// [`VerificationReport::store_exclusive_retries`].
@@ -552,6 +562,7 @@ impl VerificationReport {
             verdict: Verdict::NoResult,
             no_result_reason: Some(NoResultReason::NotRun),
             infrastructure_error: None,
+            discarded_attempts: Vec::new(),
             comparison: None,
             compared_log_messages: None,
             compared_outputs: None,
@@ -1348,6 +1359,7 @@ mod tests {
             verdict: Verdict::Matched,
             no_result_reason: None,
             infrastructure_error: None,
+            discarded_attempts: Vec::new(),
             comparison: Some(ComparisonReport {
                 strictness,
                 display_name: None,

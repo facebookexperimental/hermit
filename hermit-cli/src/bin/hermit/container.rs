@@ -572,11 +572,23 @@ impl MountInfoRootSource {
             if (source_metadata.dev(), source_metadata.ino())
                 != (target_metadata.dev(), target_metadata.ino())
             {
-                return Err(Error::msg(format!(
+                let message = format!(
                     "Refusing mountinfo provenance for {}: the completed mount target does not match \
                      the pinned Hermit-owned source",
                     self.target.display()
-                )));
+                );
+                // Typed only for the frozen-file binds, where the host
+                // replacing the file under the completed mount during
+                // setup (its rename detaching the bind) is the proven
+                // cause and a setup retry can recover. A mismatch at a
+                // directory root (private /tmp, nscd) has no such proven
+                // cause, so it stays an ordinary, unretryable refusal.
+                if self.target.as_path() == Path::new(GROUP_FILE)
+                    || self.target.as_path() == Path::new(LD_SO_CACHE)
+                {
+                    return Err(Error::new(hermit::SetupDetached).context(message));
+                }
+                return Err(Error::msg(message));
             }
         }
         let raw_mount_id = mount_id_for_fd(target.as_raw_fd()).with_context(|| {
@@ -834,7 +846,7 @@ impl IdentityGuard {
     /// is created for this, so no guest PID moves. Nothing for a plan with
     /// no record.
     pub(super) fn record_plan(&mut self) -> Result<(), Error> {
-        let MountPlan::Recorded(_, installations, recorded) = &mut self.plan else {
+        let MountPlan::Recorded(plan, installations, recorded) = &mut self.plan else {
             return Ok(());
         };
         if recorded.is_some() {
@@ -847,8 +859,32 @@ impl IdentityGuard {
                  so the plan's rows cannot be told from the host's"
             );
         }
-        check_installed_rows(&rows, installations, is_this_namespaces_proc)
-            .map_err(|refusal| anyhow!("refusing the container's mount table: {refusal}"))?;
+        if let Err(refusal) = check_installed_rows(&rows, installations, is_this_namespaces_proc) {
+            // A bind installation with no row at its target was detached
+            // when the host replaced the file underneath it during setup
+            // (https://github.com/rrnewton/hermit/issues/4799): typed, so
+            // the launcher may retry setup. Any other refusal (a fresh
+            // mount missing, the first row not this namespace's /proc)
+            // stays an ordinary, unretryable refusal.
+            let detached_bind = plan
+                .iter()
+                .zip(installations.iter())
+                .any(|(planned, inst)| {
+                    is_bind_mount(&planned.mount)
+                        && !inst.mountpoints.is_empty()
+                        && !inst.ids.iter().any(|id| {
+                            rows.iter().any(|row| {
+                                row.raw_mount_id == *id
+                                    && inst.mountpoints.contains(&row.mountpoint)
+                            })
+                        })
+                });
+            let message = format!("refusing the container's mount table: {refusal}");
+            if detached_bind {
+                return Err(Error::new(hermit::SetupDetached).context(message));
+            }
+            anyhow::bail!(message);
+        }
         *recorded = Some(rows);
         Ok(())
     }
@@ -1332,12 +1368,17 @@ impl LdSoCacheSnapshot {
         read(&mut file, &mut bytes)?;
         let after = nix::sys::stat::fstat(&file)?;
         let origin = HostFileIdentity::from_stat(&before);
-        anyhow::ensure!(
-            origin == HostFileIdentity::from_stat(&after)
-                && (before.st_ctime, before.st_ctime_nsec) == (after.st_ctime, after.st_ctime_nsec)
-                && u64::try_from(origin.size).ok() == Some(bytes.len() as u64),
-            "the host dynamic-linker cache changed while it was captured"
-        );
+        if !(origin == HostFileIdentity::from_stat(&after)
+            && (before.st_ctime, before.st_ctime_nsec) == (after.st_ctime, after.st_ctime_nsec)
+            && u64::try_from(origin.size).ok() == Some(bytes.len() as u64))
+        {
+            // Typed like a detached frozen bind: setup may retry with a
+            // fresh capture; the guest has not started.
+            anyhow::bail!(
+                Error::new(hermit::SetupDetached)
+                    .context("the host dynamic-linker cache changed while it was captured")
+            );
+        }
         Ok(Self::from_captured(bytes, origin))
     }
 
@@ -5889,6 +5930,12 @@ pub fn classify_container_result<T>(
                 // child: the first `Error:` line keeps naming the failure.
                 FailureKind::BackendRunFailure => {
                     Error::new(hermit::BackendRunFailure).context(format!("{error:#}"))
+                }
+                // Re-attach the marker under the child's message, as in the
+                // child, so the launcher's setup retry can downcast for it
+                // (`hermit::is_setup_detached`) without parsing prose.
+                FailureKind::SetupDetached => {
+                    Error::new(hermit::SetupDetached).context(format!("{error:#}"))
                 }
                 FailureKind::Error => error,
             })

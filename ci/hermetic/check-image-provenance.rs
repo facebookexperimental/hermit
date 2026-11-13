@@ -36,10 +36,10 @@ use sha2::Sha256;
 const PROVENANCE: &str = "ci/hermetic/image.provenance.json";
 const PIN: &str = "ci/hermetic/image.digest";
 const METHOD: &str = "two-clean-isolated-nix-stores-v1";
-const SUPERSEDED_REFERENCE: &str = "localhost/hermit-hermetic-validate@sha256:7facbb1c720365215f215030c6e1c652628db55ddabbfddad4b5c3725f19b17c";
+const SUPERSEDED_REFERENCE: &str = "localhost/hermit-hermetic-validate@sha256:4e1605ecbb13a6c5c6f45f4259f49e2c07efb21a7e6e7b7aabb5b97329232d6e";
 const SUPERSEDED_ARCHIVE_SHA256: &str =
-    "92d3399bf185179c7b56544d636a8280c2e9938ab8c71c7bbfcdb8fe72c773e8";
-/// The replaced 7facbb1c root has no gVisor C++ test libraries; the rationale must name the property
+    "df1f0dd4f9aa0c82fd6fedceac64d5607143add2f8d0d40a0163850b19289453";
+/// The replaced 4e1605ec root pins nightly Rust; the rationale must name the property
 /// this repin repairs (the pin is now the reproducible isolated build).
 const RATIONALE_MARKER: &str = "reproducible";
 /// Both isolated builds recorded `nix --version` before building.
@@ -55,7 +55,7 @@ const EVIDENCE_LIMITATIONS: [&str; 6] = [
     "Each build substituted only from cache.nixos.org under its trusted key; the removed realized inputs (rust-script, cargo-nextest and coreutils) were rebuilt in each store. Substituted paths are trusted by Nix signature or content hash and NAR hash, not rebuilt.",
     "Both builds forced the Nix sandbox on (--option sandbox true), so builders ran as unprivileged nixbld users with a fixed build directory; no host shell or host path is an image input. This is the issue-5031 fix the previous receipt could not claim (its builds ran unsandboxed).",
     "Build logs, unit records and Nix path-info records were retained only on the build host; this receipt does not authenticate them.",
-    "The superseded 7facbb1c archive was not rebuilt for this receipt; its 92d3399b SHA-256 is carried from the prior receipt that produced the replaced pin.",
+    "The superseded 4e1605ec archive was not rebuilt for this receipt; its df1f0dd4 SHA-256 is carried from the prior receipt that produced the replaced pin.",
     "The recorded build-source commit and tree are historical review evidence. Rebases can rewrite their ancestry; live verification establishes equivalence only for the four enumerated image input files, not the complete source tree or archive.",
 ];
 
@@ -70,20 +70,20 @@ struct ExpectedRun {
 
 const EXPECTED_RUNS: [ExpectedRun; 2] = [
     ExpectedRun {
-        run_id: "hermetic-gtest-repin-a.service",
-        source_snapshot_identity: "src@48:6415744274",
-        nix_store_identity: "nix-root/nix@48:6415748303",
-        podman_store_identity: "gtest-repin-a/podman-data",
-        memory_peak_bytes: 8_589_938_688,
-        cpu_nanoseconds: 1_472_214_479_000,
+        run_id: "hermetic-stable-abseil-repin5-c.service",
+        source_snapshot_identity: "src@50:3834828530",
+        nix_store_identity: "nix-root/nix@50:3834843063",
+        podman_store_identity: "musestable-5213-abseil-repin/c/podman-data",
+        memory_peak_bytes: 8590163968,
+        cpu_nanoseconds: 1774605025000,
     },
     ExpectedRun {
-        run_id: "hermetic-gtest-repin-b.service",
-        source_snapshot_identity: "src@48:6417250157",
-        nix_store_identity: "nix-root/nix@48:6417254190",
-        podman_store_identity: "gtest-repin-b/podman-data",
-        memory_peak_bytes: 8_589_934_592,
-        cpu_nanoseconds: 1_388_853_031_000,
+        run_id: "hermetic-stable-abseil-repin5-d.service",
+        source_snapshot_identity: "src@50:3834836059",
+        nix_store_identity: "nix-root/nix@50:3834843081",
+        podman_store_identity: "musestable-5213-abseil-repin/d/podman-data",
+        memory_peak_bytes: 8590176256,
+        cpu_nanoseconds: 1776617838000,
     },
 ];
 
@@ -454,6 +454,32 @@ fn validate_artifact(artifact: &Value, context: &str) -> Result<(), String> {
             ));
         }
     }
+    // The recorded manifest length must be the length of the compact
+    // Docker-v2 manifest those descriptors reconstruct to; a nonzero
+    // length alone once let a wrong 391 stand for the real 598.
+    let mut reconstructed = format!(
+        "{{\"schemaVersion\":2,\"mediaType\":\"{}\",\"config\":{{\"mediaType\":\"application/vnd.docker.container.image.v1+json\",\"digest\":\"{}\",\"size\":{}}},\"layers\":[",
+        string(artifact, "manifest_media_type", context)?,
+        string(artifact, "config_digest", context)?,
+        unsigned(artifact, "config_size_bytes", context)?,
+    );
+    for (index, layer) in layers.iter().enumerate() {
+        if index > 0 {
+            reconstructed.push(',');
+        }
+        reconstructed.push_str(&format!(
+            "{{\"mediaType\":\"application/vnd.docker.image.rootfs.diff.tar.gzip\",\"digest\":\"{}\",\"size\":{}}}",
+            string(layer, "digest", &format!("{context}.layers[{index}]"))?,
+            unsigned(layer, "size_bytes", &format!("{context}.layers[{index}]"))?,
+        ));
+    }
+    reconstructed.push_str("]}");
+    if reconstructed.len() as u64 != unsigned(artifact, "manifest_size_bytes", context)? {
+        return Err(format!(
+            "{context}.manifest_size_bytes does not equal the reconstructed manifest length {}",
+            reconstructed.len()
+        ));
+    }
     Ok(())
 }
 
@@ -507,13 +533,13 @@ fn validate_semantics(root: &Value) -> Result<(), String> {
     let new = string(repin, "replacement_reference", "repin")?;
     if old != SUPERSEDED_REFERENCE {
         return Err(format!(
-            "repin.superseded_reference must retain the replaced 7facbb1c reference {SUPERSEDED_REFERENCE:?}"
+            "repin.superseded_reference must retain the replaced 4e1605ec reference {SUPERSEDED_REFERENCE:?}"
         ));
     }
     let old_archive = string(repin, "superseded_archive_sha256", "repin")?;
     if old_archive != SUPERSEDED_ARCHIVE_SHA256 {
         return Err(format!(
-            "repin.superseded_archive_sha256 must retain the 7facbb1c build's 92d3399b archive SHA-256 {SUPERSEDED_ARCHIVE_SHA256:?}"
+            "repin.superseded_archive_sha256 must retain the 4e1605ec build's df1f0dd4 archive SHA-256 {SUPERSEDED_ARCHIVE_SHA256:?}"
         ));
     }
     if old == new || !string(repin, "rationale", "repin")?.contains(RATIONALE_MARKER) {
@@ -955,7 +981,7 @@ mod tests {
         assert!(
             validate_semantics(&reference)
                 .unwrap_err()
-                .contains("must retain the replaced 7facbb1c reference")
+                .contains("must retain the replaced 4e1605ec reference")
         );
 
         let mut archive = record();
@@ -963,8 +989,17 @@ mod tests {
         assert!(
             validate_semantics(&archive)
                 .unwrap_err()
-                .contains("must retain the 7facbb1c build's 92d3399b archive SHA-256")
+                .contains("must retain the 4e1605ec build's df1f0dd4 archive SHA-256")
         );
+    }
+
+    #[test]
+    fn rejects_a_manifest_length_that_is_not_the_reconstructed_length() {
+        let mut wrong = record();
+        *mutate(&mut wrong, "/runs/0/artifact/manifest_size_bytes") = Value::from(391);
+        assert!(validate_semantics(&wrong)
+            .unwrap_err()
+            .contains("does not equal the reconstructed manifest length"));
     }
 
     #[test]

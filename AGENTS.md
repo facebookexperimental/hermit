@@ -102,15 +102,17 @@ hardware-sensitive test merely to make a local VM green.
 
 ## Lint And Format
 
-The checked-in rustfmt configuration requires the selected toolchain.
-Before finishing a Rust change, run:
+The checked-in rustfmt configuration needs the nightly formatter pinned in
+`ci/rustfmt-toolchain.toml`; stable rustfmt ignores its nightly-only options.
+`scripts/cargo-fmt-pinned.rs` runs `cargo fmt` with that formatter and refuses
+any other. Before finishing a Rust change, run:
 
 ```bash
-cargo fmt --all -- --check
+./scripts/cargo-fmt-pinned.rs --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Use `cargo fmt --all` to apply formatting. Fix warnings in code you change; do
+Use `make fmt` to apply formatting. Fix warnings in code you change; do
 not add broad `allow` attributes unless the warning is intentionally inapplicable
 and the reason is documented.
 

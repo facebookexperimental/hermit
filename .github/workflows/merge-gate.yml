@@ -67,8 +67,14 @@ jobs:
           REPO: ${{ github.repository }}
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          # Pull requests land on the repository's default branch.
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
+          if [ -z "$DEFAULT_BRANCH" ]; then
+            echo "::error::The event names no repository default branch to select pull requests by."
+            exit 1
+          fi
 
           case "$HEAD_BRANCH" in
             gh-readonly-queue/*)
@@ -79,7 +85,7 @@ jobs:
 
           owner="${REPO%%/*}"
           matches="$(
-            gh api "repos/${REPO}/pulls?state=open&base=main&head=${owner}:${HEAD_BRANCH}&per_page=10" |
+            gh api "repos/${REPO}/pulls?state=open&base=${DEFAULT_BRANCH}&head=${owner}:${HEAD_BRANCH}&per_page=10" |
               jq -c --arg sha "$HEAD_SHA" 'map({number, current: (.head.sha == $sha)})'
           )"
 
@@ -366,6 +372,8 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
+          # Pull requests land on the repository's default branch.
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
 
@@ -376,14 +384,18 @@ jobs:
               echo "::error::workflow_dispatch requires a pr_number input."
               exit 1
             fi
+            if [ -z "$DEFAULT_BRANCH" ]; then
+              echo "::error::The event names no repository default branch to select pull requests by."
+              exit 1
+            fi
             expected_head="$SHA"
             [ "$EVENT_NAME" = pull_request ] && expected_head="$PR_HEAD_SHA"
             pr_numbers="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" |
-              jq -r --arg sha "$expected_head" '
-                select(.base.ref == "main" and .state == "open" and .head.sha == $sha)
+              jq -r --arg sha "$expected_head" --arg base "$DEFAULT_BRANCH" '
+                select(.base.ref == $base and .state == "open" and .head.sha == $sha)
                 | .number')"
             if [ -z "$pr_numbers" ]; then
-              echo "::error::PR #${PR_NUMBER} is not an open main PR at dispatched head ${expected_head}."
+              echo "::error::PR #${PR_NUMBER} is not an open ${DEFAULT_BRANCH} PR at dispatched head ${expected_head}."
               exit 1
             fi
           else
@@ -526,6 +538,8 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
+          # Pull requests land on the repository's default branch.
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           # Self-hosted gate runners use Actions' minimal PATH; Rust lives in
@@ -541,8 +555,12 @@ jobs:
               echo "::error::workflow_dispatch requires a pr_number input."
               exit 1
             fi
+            if [ -z "$DEFAULT_BRANCH" ]; then
+              echo "::error::The event names no repository default branch to select pull requests by."
+              exit 1
+            fi
             pr_numbers="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" |
-              jq -r 'select(.base.ref == "main") | .number')"
+              jq -r --arg base "$DEFAULT_BRANCH" 'select(.base.ref == $base) | .number')"
           else
             owner="${REPO%%/*}"
             name="${REPO#*/}"
@@ -721,6 +739,8 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
+          # Pull requests land on the repository's default branch.
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
 
@@ -846,10 +866,14 @@ jobs:
               echo "::error::workflow_dispatch requires a pr_number input."
               exit 1
             fi
+            if [ -z "$DEFAULT_BRANCH" ]; then
+              echo "::error::The event names no repository default branch to select pull requests by."
+              exit 1
+            fi
             expected_head="$SHA"
             [ "$EVENT_NAME" = pull_request ] && expected_head="$PR_HEAD_SHA"
-            pull_requests="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" | jq -c --arg sha "$expected_head" '
-              [select(.base.ref == "main" and .state == "open" and .head.sha == $sha) | {
+            pull_requests="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" | jq -c --arg sha "$expected_head" --arg base "$DEFAULT_BRANCH" '
+              [select(.base.ref == $base and .state == "open" and .head.sha == $sha) | {
                 number,
                 head: {sha: .head.sha, ref: .head.ref, repo: .head.repo.full_name},
                 labels

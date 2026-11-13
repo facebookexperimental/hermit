@@ -64,6 +64,13 @@ pub enum FailureKind {
     /// Carried so the parent can record the verification run as failed by its
     /// backend instead of leaving the pending no-result stamp.
     BackendRunFailure,
+    /// Container setup proved, before the guest started, that a host file
+    /// under a Hermit-owned frozen bind was replaced during setup (a
+    /// package manager's `ldconfig` rename detaches the bind in the guest
+    /// namespace: <https://github.com/rrnewton/hermit/issues/4799>). The
+    /// guest has not run, so the parent may retry setup with a fresh
+    /// snapshot; carried so that retry keys on this class, never on prose.
+    SetupDetached,
     /// The run ended with a scheduler terminal outcome
     /// ([`crate::SchedulerEndedRun`]): a deadlock under Hermit's model, or its
     /// virtual clock passed `--virtual-timeout`. Its own outcome, neither a
@@ -111,6 +118,35 @@ pub struct SerializableError {
     /// An unresolved owner is separate from the primary failure class. This
     /// same-image container field is not a cross-version wire compatibility promise.
     cleanup_stage: Option<crate::HermitCleanupStage>,
+}
+
+/// Marker for a setup-detachment failure ([`FailureKind::SetupDetached`]):
+/// container setup proved a Hermit-owned frozen bind was detached by a
+/// host replacement before the guest started. Created in the container
+/// child (or in the parent while capturing a frozen snapshot) and
+/// re-attached on the parent side of the boundary, like `PolicyRefusal`
+/// in the binary, so the launcher's setup retry downcasts for it instead
+/// of matching message text.
+#[derive(Debug)]
+pub struct SetupDetached;
+
+impl std::fmt::Display for SetupDetached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "container setup found a frozen host file replaced during setup; \
+             the guest had not started"
+        )
+    }
+}
+
+impl std::error::Error for SetupDetached {}
+
+/// Whether `err` is a setup-detachment failure ([`SetupDetached`]) anywhere
+/// in its chain, on either side of the container boundary.
+pub fn is_setup_detached(err: &Error) -> bool {
+    err.downcast_ref::<SetupDetached>().is_some()
+        || err.chain().any(|cause| cause.is::<SetupDetached>())
 }
 
 impl SerializableError {
@@ -311,7 +347,9 @@ fn classify_unwrapped(error: &Error) -> FailureKind {
     if let Some(primary) = finalization_primary(error) {
         return classify_preserving_cleanup(primary).0;
     }
-    if let Some(error) = error.downcast_ref::<crate::SkidOvershootError>() {
+    if is_setup_detached(error) {
+        FailureKind::SetupDetached
+    } else if let Some(error) = error.downcast_ref::<crate::SkidOvershootError>() {
         FailureKind::SkidOvershoot {
             count: error.count(),
         }
@@ -443,6 +481,22 @@ pub(crate) async fn terminal_replay_refusal_for_test() -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_detached_keeps_its_kind_across_the_container_boundary() {
+        let error =
+            Error::new(SetupDetached).context("Refusing mountinfo provenance for /etc/ld.so.cache");
+        assert!(is_setup_detached(&error));
+        let serialized = SerializableError::from(error);
+        assert_eq!(serialized.kind(), FailureKind::SetupDetached);
+        // The restored (string) form alone must NOT classify: the parent
+        // re-attaches the marker from `kind`, never from prose.
+        let restored = Error::from(serialized);
+        assert!(!is_setup_detached(&restored));
+        assert!(is_setup_detached(
+            &Error::new(SetupDetached).context(format!("{restored:#}"))
+        ));
+    }
 
     #[test]
     fn record_format_refusal_keeps_its_kind_through_context_and_reverie() {

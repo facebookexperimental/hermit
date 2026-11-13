@@ -6,7 +6,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#![cfg_attr(feature = "nightly", feature(internal_output_capture))]
+#![cfg_attr(
+    all(feature = "nightly", detcore_testutils_nightly),
+    feature(internal_output_capture)
+)]
 
 //! Testing utilities.
 
@@ -1173,7 +1176,7 @@ fn run_function_test_driver(run: impl Fn()) {
     // output reaches the streams only under an uncaptured runner — nextest,
     // as validation runs, or `cargo test -- --nocapture` — the same stable
     // contract reverie-ptrace documents for `spawn_fn_with_config`.
-    #[cfg(feature = "nightly")]
+    #[cfg(all(feature = "nightly", detcore_testutils_nightly))]
     let output_capture = std::io::set_output_capture(None);
     let pid = unsafe { libc::fork() };
     let fork_error = (pid < 0).then(io::Error::last_os_error);
@@ -1191,7 +1194,7 @@ fn run_function_test_driver(run: impl Fn()) {
         }
         unsafe { libc::_exit(status) };
     }
-    #[cfg(feature = "nightly")]
+    #[cfg(all(feature = "nightly", detcore_testutils_nightly))]
     std::io::set_output_capture(output_capture);
     if let Some(error) = fork_error {
         panic!("cannot fork function-test driver: {error}");

@@ -259,7 +259,11 @@ class HostedAdapterTests(unittest.TestCase):
         args = request.call_args.args
         self.assertEqual(args[:3], ("release", "create", pin["tag"]))
         self.assertIn("--latest=false", args)
-        self.assertEqual(args[args.index("--target") + 1], "main")
+        # No --target: GitHub tags the default branch's head, whatever that
+        # branch is called (rebuild-compatibility-site.py, publish_release).
+        self.assertFalse(
+            any(str(arg).startswith("--target") for arg in args), args
+        )
         self.assertIn(self.config["hermit_commit"], args[args.index("--notes") + 1])
         for forbidden in ("--draft", "--prerelease", "--clobber"):
             self.assertNotIn(forbidden, args)

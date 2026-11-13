@@ -1,0 +1,17 @@
+# The formatter toolchain, the ONE place it is pinned. scripts/cargo-fmt-pinned.rs
+# reads this file for the lint.rustfmt validation step and `make fmt`/`make
+# lint-cargo`. It is separate from the stable compiler pin in rust-toolchain.toml
+# because rustfmt.toml's import grouping, one-import-per-item and doc-comment
+# formatting options are nightly-only: stable rustfmt warns about them and
+# formats as if they were absent.
+#
+# The pinned validation image does not carry this formatter yet, so the offline
+# split's lint.rustfmt refuses (exit 2) rather than check with the image's stable
+# rustfmt, until https://github.com/rrnewton/hermit/issues/5397 lands.
+#
+# identity is the exact `rustfmt --version` line of this channel's rustfmt. The
+# script refuses any other formatter, and its tests check that identity and
+# channel agree (a nightly build, from a commit dated the channel's date or the
+# day before), so bumping one without the other fails in that test.
+channel = "nightly-2026-07-12"
+identity = "rustfmt 1.9.0-nightly (be8e82435e 2026-07-11)"

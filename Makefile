@@ -42,7 +42,7 @@ HERMIT_DEBUG_BIN ?= target/debug/hermit
 
 .PHONY: build install-deps install-hooks release-core prune-stale-release help checkout-all check-build-tools \
 	install-build-tools check-submodules verify-submodules check-skill-discovery validate validate-plan \
-	validate-self-test validate-timeout-layers-test lint lint-parent-checks lint-script-tests \
+	validate-self-test validate-timeout-layers-test lint lint-parent-checks lint-script-tests fmt \
 	validate-kvm validate-dbt validate-sabre validate-e9patch
 
 build: prune-stale-release install-deps ## Build the development Hermit binary with first-party backends
@@ -389,7 +389,7 @@ lint-check-private-static-owned:
 	PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s hermit-install/private-static/owned -p 'test_*.py'
 
 lint-check-private-static-pipeline:
-	PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s hermit-install/private-static -p test_run_pipeline.py
+	PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s hermit-install/private-static -p 'test_*.py'
 
 lint-check-musl-detcore:
 	./ci/check-musl-detcore.sh
@@ -465,8 +465,15 @@ lint-script-tests: ## Run the unit tests carried by rust-script entrypoints (CI 
 	./scripts/run-script-tests.sh
 
 lint-cargo: ## The two compile-heavy lint passes; CI runs these as lint.rustfmt and lint.clippy
-	$(CARGO) fmt --all -- --check
+	./scripts/cargo-fmt-pinned.rs --self-test
+	./scripts/cargo-fmt-pinned.rs --all -- --check
 	$(CARGO) clippy --workspace --all-targets --all-features -- -D warnings
+
+# The formatter is the one ci/rustfmt-toolchain.toml pins, found and checked by
+# scripts/cargo-fmt-pinned.rs exactly as lint.rustfmt finds it: never the stable
+# compiler pin's rustfmt, which ignores rustfmt.toml's nightly-only options.
+fmt: ## Format the root workspace with the pinned formatter (what lint.rustfmt checks)
+	./scripts/cargo-fmt-pinned.rs --all
 
 help: ## Show this help (the list of make targets)
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z0-9_-]+:.*?## / {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
