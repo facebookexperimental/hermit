@@ -4,10 +4,12 @@ name: OSS Buck2 nightly
 # deliberately separate from landing evidence and never runs for a pull request
 # or a push to main.
 #
-# TEMPORARY (dh-2y5z03): on the facebookexperimental/hermit mirror each job's
-# first step says the Buck build is skipped, and every later step is skipped,
-# because the Buck graph is not exported there until dh-2y5z03 V4. The V4 diff
-# removes this skip.
+# TEMPORARY (dh-2y5z03): the Buck graph is not exported to the
+# facebookexperimental/hermit mirror until dh-2y5z03 V4, so there both build
+# jobs are skipped by their job-level `if:`, and the mirror-skip job runs and
+# says why. The skip stays out of the steps, whose text
+# scripts/check-github-actions-triggers.rs binds by hash. The V4 diff removes
+# the mirror-skip job, the two job-level `if:` lines and this note.
 on:
   schedule:
     - cron: "17 10 * * *"
@@ -24,26 +26,31 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  mirror-skip:
+    name: Buck build skipped on the facebookexperimental mirror
+    if: github.repository == 'facebookexperimental/hermit'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Say why the Buck build is skipped
+        run: |
+          echo "SKIPPED on the facebookexperimental mirror: the Buck graph is not exported until dh-2y5z03 V4"
+
   buck-release-evidence:
     name: Supplemental feature-complete Buck release evidence
     runs-on: ubuntu-24.04
     timeout-minutes: 180
+    if: github.repository != 'facebookexperimental/hermit'
 
     steps:
-      - name: Skip the Buck build on the facebookexperimental mirror
-        if: github.repository == 'facebookexperimental/hermit'
-        run: |
-          echo "SKIPPED on the facebookexperimental mirror: the Buck graph is not exported until dh-2y5z03 V4"
-
       - name: Check out Hermit and its pinned sources
-        if: github.repository != 'facebookexperimental/hermit'
         uses: actions/checkout@v4
         with:
           submodules: recursive
           persist-credentials: false
 
       - name: Configure isolated per-run caches
-        if: github.repository != 'facebookexperimental/hermit'
         shell: bash
         env:
           GH_TOKEN: ""
@@ -64,7 +71,6 @@ jobs:
           echo "$RUNNER_TEMP/cargo-home/bin" >>"$GITHUB_PATH"
 
       - name: Install build prerequisites and pinned Rust toolchain
-        if: github.repository != 'facebookexperimental/hermit'
         timeout-minutes: 15
         shell: bash
         env:
@@ -96,7 +102,6 @@ jobs:
       # https://github.com/rrnewton/hermit/issues/3301 removed both tests with
       # the DBT matrix leg. Deleting this step is a separate decision.
       - name: Enable unprivileged user namespaces
-        if: github.repository != 'facebookexperimental/hermit'
         timeout-minutes: 2
         shell: bash
         env:
@@ -115,7 +120,6 @@ jobs:
           unshare --user --map-root-user true
 
       - name: Test the Buck release driver and refusal contracts
-        if: github.repository != 'facebookexperimental/hermit'
         timeout-minutes: 15
         shell: bash
         env:
@@ -129,7 +133,6 @@ jobs:
         run: rust-script --test scripts/build-buck-release.rs
 
       - name: Install public DotSlash
-        if: github.repository != 'facebookexperimental/hermit'
         timeout-minutes: 5
         shell: bash
         env:
@@ -156,7 +159,6 @@ jobs:
           echo "PUBLIC_DOTSLASH=$bin_dir/dotslash" >>"$GITHUB_ENV"
 
       - name: Regenerate the shared Rust dependency graph
-        if: github.repository != 'facebookexperimental/hermit'
         timeout-minutes: 45
         shell: bash
         env:
@@ -170,7 +172,6 @@ jobs:
         run: ./bootstrap/regenerate-rust-deps
 
       - name: Configure Buck Rust flags
-        if: github.repository != 'facebookexperimental/hermit'
         shell: bash
         env:
           GH_TOKEN: ""
@@ -198,7 +199,6 @@ jobs:
           echo "$wrapper_dir" >>"$GITHUB_PATH"
 
       - name: Capture the feature-complete Hermit release build
-        if: github.repository != 'facebookexperimental/hermit'
         id: release-build
         timeout-minutes: 45
         shell: bash
@@ -257,7 +257,7 @@ jobs:
 
       - name: Reconcile and scan release evidence
         id: release-evidence
-        if: always() && github.repository != 'facebookexperimental/hermit'
+        if: always()
         timeout-minutes: 10
         shell: bash
         env:
@@ -329,7 +329,7 @@ jobs:
             --candidate-exit "$candidate_rc"
 
       - name: Upload feature-complete release evidence
-        if: always() && steps.release-evidence.outputs.safe-to-upload == 'true' && github.repository != 'facebookexperimental/hermit'
+        if: always() && steps.release-evidence.outputs.safe-to-upload == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: buck2-phase1-release-${{ github.run_id }}
@@ -341,22 +341,16 @@ jobs:
     name: Regenerate and build the OSS Buck2 graph
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    if: github.repository != 'facebookexperimental/hermit'
 
     steps:
-      - name: Skip the Buck build on the facebookexperimental mirror
-        if: github.repository == 'facebookexperimental/hermit'
-        run: |
-          echo "SKIPPED on the facebookexperimental mirror: the Buck graph is not exported until dh-2y5z03 V4"
-
       - name: Check out Hermit and its pinned sources
-        if: github.repository != 'facebookexperimental/hermit'
         uses: actions/checkout@v4
         with:
           submodules: recursive
           persist-credentials: false
 
       - name: Configure isolated legacy-job caches
-        if: github.repository != 'facebookexperimental/hermit'
         shell: bash
         env:
           GH_TOKEN: ""
@@ -377,7 +371,6 @@ jobs:
           echo "$RUNNER_TEMP/cargo-home/bin" >>"$GITHUB_PATH"
 
       - name: Install legacy-job prerequisites and pinned Rust toolchain
-        if: github.repository != 'facebookexperimental/hermit'
         timeout-minutes: 15
         shell: bash
         env:
@@ -403,7 +396,6 @@ jobs:
           test "$("$resolved_rust_script" --version)" = "rust-script 0.36.0"
 
       - name: Install legacy-job public DotSlash
-        if: github.repository != 'facebookexperimental/hermit'
         timeout-minutes: 5
         shell: bash
         env:
@@ -430,7 +422,6 @@ jobs:
           echo "PUBLIC_DOTSLASH=$bin_dir/dotslash" >>"$GITHUB_ENV"
 
       - name: Regenerate the legacy shared Rust dependency graph
-        if: github.repository != 'facebookexperimental/hermit'
         timeout-minutes: 45
         shell: bash
         env:
@@ -444,7 +435,6 @@ jobs:
         run: ./bootstrap/regenerate-rust-deps
 
       - name: Configure legacy Buck Rust flags
-        if: github.repository != 'facebookexperimental/hermit'
         shell: bash
         env:
           GH_TOKEN: ""
@@ -471,7 +461,6 @@ jobs:
           echo "$wrapper_dir" >>"$GITHUB_PATH"
 
       - name: Build the four Reverie targets
-        if: github.repository != 'facebookexperimental/hermit'
         timeout-minutes: 45
         shell: bash
         env:
@@ -492,7 +481,7 @@ jobs:
 
       - name: Run the full third-party diagnostic
         id: third-party-diagnostic
-        if: always() && github.repository != 'facebookexperimental/hermit'
+        if: always()
         timeout-minutes: 45
         shell: bash
         env:
@@ -529,7 +518,7 @@ jobs:
 
       - name: Scan and package the full third-party diagnostic
         id: third-party-evidence
-        if: always() && github.repository != 'facebookexperimental/hermit'
+        if: always()
         timeout-minutes: 10
         shell: bash
         env:
@@ -556,7 +545,7 @@ jobs:
           echo "safe-to-upload=true" >>"$GITHUB_OUTPUT"
 
       - name: Upload the full third-party diagnostic log
-        if: always() && steps.third-party-evidence.outputs.safe-to-upload == 'true' && github.repository != 'facebookexperimental/hermit'
+        if: always() && steps.third-party-evidence.outputs.safe-to-upload == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: buck2-third-party-diagnostic-${{ github.run_id }}
@@ -565,7 +554,7 @@ jobs:
           retention-days: 7
 
       - name: Build the Hermit green gate
-        if: always() && github.repository != 'facebookexperimental/hermit'
+        if: always()
         timeout-minutes: 45
         shell: bash
         env:

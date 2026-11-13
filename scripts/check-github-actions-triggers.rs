@@ -14,8 +14,10 @@
 //!
 //! Local exact-head validation is the landing authority. The portable workflow
 //! is supplemental evidence and may run automatically only after a commit is
-//! pushed to `integration`, and for pull requests not opened by the project bot
-//! (owner decision, 2026-10-27): its `pull_request` trigger must use exactly
+//! pushed to `integration` or `main`, and for pull requests not opened by the
+//! project bot (owner decision, 2026-10-27; `main` since owner Slack 6324,
+//! 2026-11-12, which asked for automated GitHub CI on the facebookexperimental
+//! mirror's main, the exported tip): its `pull_request` trigger must use exactly
 //! PORTABLE_PR_TYPES, and every job that can start without a predecessor or
 //! runs under `always()` must carry PORTABLE_PR_GATE, so a bot or draft pull
 //! request runs nothing. Two owner-approved maintenance workflows also run
@@ -44,6 +46,11 @@ const BUCK2_OSS_NIGHTLY: &str = "buck2-oss-nightly.yml";
 const RUST_SCRIPT_VERSION: &str = "0.36.0";
 /// The only `pull_request` activity types ci-portable.yml may list.
 const PORTABLE_PR_TYPES: [&str; 4] = ["opened", "synchronize", "reopened", "ready_for_review"];
+/// The branches whose pushes start ci-portable.yml: `integration`, and `main`
+/// since owner Slack 6324 (2026-11-12) asked for automated GitHub CI on the
+/// facebookexperimental/hermit mirror's main. Every other workflow may
+/// push-trigger only on `integration`.
+const PORTABLE_PUSH_BRANCHES: [&str; 2] = ["integration", "main"];
 /// The gate every ci-portable.yml entry job carries: a pull_request run whose
 /// author is hermit-bot3, or whose pull request is a draft, does nothing.
 const PORTABLE_PR_GATE: &str = "github.event_name != 'pull_request' || (github.event.pull_request.user.login != 'hermit-bot3' && !github.event.pull_request.draft)";
@@ -305,7 +312,9 @@ fn validate(name: &str, triggers: &Triggers) -> Vec<String> {
         errors.push("missing `workflow_dispatch` trigger".to_string());
     }
     if triggers.events.contains("push") {
-        if triggers.push_branches.as_deref() != Some(&["integration".to_string()]) {
+        if name != PORTABLE
+            && triggers.push_branches.as_deref() != Some(&["integration".to_string()])
+        {
             errors.push("`push.branches` must contain exactly `integration`".to_string());
         }
     } else if triggers.push_branches.is_some() {
@@ -361,8 +370,18 @@ fn validate(name: &str, triggers: &Triggers) -> Vec<String> {
                 PORTABLE_PR_TYPES.join(", ")
             ));
         }
-        if triggers.push_branches.as_deref() != Some(&["integration".to_string()]) {
-            errors.push("ci-portable.yml must push-trigger exactly on `integration`".to_string());
+        if !triggers
+            .push_branches
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(String::as_str)
+            .eq(PORTABLE_PUSH_BRANCHES.iter().copied())
+        {
+            errors.push(format!(
+                "ci-portable.yml must push-trigger exactly on [{}]",
+                PORTABLE_PUSH_BRANCHES.join(", ")
+            ));
         }
     }
     errors
@@ -1090,7 +1109,11 @@ fn buck2_nightly_required_markers() -> Vec<(&'static str, &'static str)> {
 // blocks. Semantic validators and mutation tests remain the security boundary.
 const RELEASE_CAPTURE_BLOCK_FNV1A64: u64 = 0xd47269f7822be906;
 const RELEASE_FINALIZE_BLOCK_FNV1A64: u64 = 0x2391b53a25c3213a;
-const RELEASE_UPLOAD_BLOCK_FNV1A64: u64 = 0x729e01b3370e7f6f;
+// The upload step is the last of buck-release-evidence, so its block runs to
+// oss-buck2's first step and includes oss-buck2's job header. That header's
+// one `if:` line, the temporary dh-2y5z03 mirror skip, is the only difference
+// from the reviewed block (hash 0x729e01b3370e7f6f without it).
+const RELEASE_UPLOAD_BLOCK_FNV1A64: u64 = 0xeea2b5ddfeac99ef;
 const LEGACY_REVERIE_BLOCK_FNV1A64: u64 = 0x560c7d2fcc02b62f;
 const LEGACY_DIAGNOSTIC_CAPTURE_BLOCK_FNV1A64: u64 = 0x0ce72a075541cfdf;
 const LEGACY_DIAGNOSTIC_FINALIZE_BLOCK_FNV1A64: u64 = 0x6c037b9cd4dabcaf;
@@ -1471,7 +1494,7 @@ fn main() {
     rust_script_prelude::init();
     match run(Path::new(WORKFLOW_DIR)) {
         Ok(count) => println!(
-            "GitHub Actions triggers OK: {count} workflows; automatic runs are limited to integration, non-bot pull requests and exact approved schedules"
+            "GitHub Actions triggers OK: {count} workflows; automatic runs are limited to integration (and main for ci-portable.yml), non-bot pull requests and exact approved schedules"
         ),
         Err(errors) => {
             for error in errors {
@@ -1547,17 +1570,41 @@ mod tests {
         }
     }
 
-    const PORTABLE_ON: &str = "name: portable\non:\n  workflow_dispatch:\n  push:\n    branches: [integration]\n  pull_request:\n    types: [opened, synchronize, reopened, ready_for_review]\njobs:\n";
+    const PORTABLE_ON: &str = "name: portable\non:\n  workflow_dispatch:\n  push:\n    branches: [integration, main]\n  pull_request:\n    types: [opened, synchronize, reopened, ready_for_review]\njobs:\n";
 
     #[test]
-    fn portable_policy_accepts_integration_manual_and_gated_pull_requests() {
+    fn portable_policy_accepts_integration_and_main_pushes_manual_and_gated_pull_requests() {
         assert!(validate(PORTABLE, &parsed(PORTABLE_ON)).is_empty());
+    }
+
+    #[test]
+    fn portable_push_branches_must_be_exactly_integration_and_main() {
+        for branches in [
+            "[integration]",
+            "[main]",
+            "[main, integration]",
+            "[integration, main, release]",
+        ] {
+            let source = PORTABLE_ON.replace("[integration, main]", branches);
+            assert!(
+                !validate(PORTABLE, &parsed(&source)).is_empty(),
+                "{branches}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_portable_workflow_may_push_trigger_on_main() {
+        let triggers = parsed(
+            "on:\n  workflow_dispatch:\n  push:\n    branches: [integration, main]\njobs:\n",
+        );
+        assert!(!validate("other.yml", &triggers).is_empty());
     }
 
     #[test]
     fn portable_now_requires_its_pull_request_trigger() {
         let triggers = parsed(
-            "name: portable\non:\n  workflow_dispatch:\n  push:\n    branches: [integration]\njobs:\n",
+            "name: portable\non:\n  workflow_dispatch:\n  push:\n    branches: [integration, main]\njobs:\n",
         );
         assert!(!validate(PORTABLE, &triggers).is_empty());
     }

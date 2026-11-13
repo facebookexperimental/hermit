@@ -167,7 +167,8 @@ comparing an ordinary GitHub Actions runner with a capability-bearing runner:
 
 ### `regular` — GitHub-managed portable (`ubuntu-latest`)
 
-Runs after a push to `integration` or by `workflow_dispatch`. It asks
+Runs after a push to `integration` or `main` (`main` since owner Slack 6324,
+2026-11-12), or by `workflow_dispatch`. It asks
 `scripts/validate.rs` for selected step tags from the constructed portable plan and covers the
 **environment-independent subset**:
 
