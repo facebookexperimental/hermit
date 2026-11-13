@@ -1248,7 +1248,28 @@ mod e2e_payload_identity_tests {
     fn buck_identity_matches_the_release_rustc_flags() {
         let buck = e2e_payload_identity(RELEASE_BUILDER_BUCK);
         assert_eq!(buck["profile"], "release");
-        let shim = read(&test_source_root(), "shim/BUCK");
+        let root = test_source_root();
+        // On the GitHub export each Buck file below is absent, and its check is
+        // skipped, saying so (stripped_from_export).
+        if !stripped_from_export(&root, "shim/BUCK", "the release flag check") {
+            release_flags_match(&buck, &read(&root, "shim/BUCK"));
+        }
+        // The release target's own rustc_flags come after the toolchain's and
+        // would override them, in either the one- or two-token spelling.
+        // hermit-cli/BUCK defines the release targets through release_alias.bzl.
+        for path in ["hermit-cli/BUCK", "hermit-cli/release_alias.bzl"] {
+            if stripped_from_export(&root, path, "its rustc_flags override check") {
+                continue;
+            }
+            let target = read(&root, path);
+            for class in ["debug-assertions", "overflow-checks"] {
+                assert!(!target.contains(class), "{path} sets {class}");
+            }
+        }
+    }
+
+    /// shim/BUCK's release flag list agrees with the recorded identity.
+    fn release_flags_match(buck: &serde_json::Value, shim: &str) {
         let start = shim
             .find("HERMIT_RELEASE_RUSTC_FLAGS = [")
             .expect("release flag list");
@@ -1275,15 +1296,75 @@ mod e2e_payload_identity_tests {
                 "{field} contradicted by {flags}"
             );
         }
-        // The release target's own rustc_flags come after the toolchain's and
-        // would override them, in either the one- or two-token spelling.
-        // hermit-cli/BUCK defines the release targets through release_alias.bzl.
-        for path in ["hermit-cli/BUCK", "hermit-cli/release_alias.bzl"] {
-            let target = read(&test_source_root(), path);
-            for class in ["debug-assertions", "overflow-checks"] {
-                assert!(!target.contains(class), "{path} sets {class}");
+    }
+
+    #[test]
+    fn only_an_absent_buck_file_on_the_export_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("hermit-cli")).unwrap();
+        let export = Some(EXPORT_REPOSITORY);
+        for absent in [
+            "hermit-cli/BUCK",
+            "shim/BUCK",
+            "hermit-cli/release_alias.bzl",
+            "x/defs.BZL",
+        ] {
+            assert!(export_strip_applies(root, absent, export), "{absent}");
+            for other in [
+                None,
+                Some("rrnewton/hermit"),
+                Some(""),
+                Some("FacebookExperimental/hermit"),
+                Some("facebookexperimental/hermit-fork"),
+                Some("facebookexperimental/hermit "),
+            ] {
+                assert!(
+                    !export_strip_applies(root, absent, other),
+                    "{absent} {other:?}"
+                );
             }
         }
+        // Only Buck files: any other missing file still fails on the export.
+        for other_file in [
+            "hermit-cli/Cargo.toml",
+            "hermit-cli/BUCK.v2",
+            "x/BUCKET",
+            "Makefile",
+        ] {
+            assert!(
+                !export_strip_applies(root, other_file, export),
+                "{other_file}"
+            );
+        }
+        // Present, or anything at all at the path, is not absent.
+        std::fs::write(root.join("hermit-cli/BUCK"), "").unwrap();
+        assert!(!export_strip_applies(root, "hermit-cli/BUCK", export));
+        std::fs::create_dir(root.join("hermit-cli/release_alias.bzl")).unwrap();
+        assert!(!export_strip_applies(
+            root,
+            "hermit-cli/release_alias.bzl",
+            export
+        ));
+        std::fs::create_dir(root.join("x")).unwrap();
+        std::os::unix::fs::symlink("nowhere", root.join("x/defs.BZL")).unwrap();
+        assert!(!export_strip_applies(root, "x/defs.BZL", export));
+        // The line names what removes the skip. V4 exports hermit-cli's Buck
+        // files; the open-source Buck layer under shim/ waits for dh-8zi9o4.
+        for shared in ["hermit-cli/BUCK", "hermit-cli/release_alias.bzl"] {
+            let line = export_skip_line(shared, "a check");
+            assert!(
+                line.contains("dh-2y5z03 V4") && !line.contains("dh-8zi9o4"),
+                "{line}"
+            );
+        }
+        let line = export_skip_line("shim/BUCK", "a check");
+        assert!(
+            line.contains("open-source Buck layer")
+                && line.contains("dh-8zi9o4")
+                && !line.contains("V4"),
+            "{line}"
+        );
     }
 
     #[test]
@@ -3286,6 +3367,61 @@ fn assert_submodule_fixture_source(
     Ok(())
 }
 
+/// The GitHub export ShipIt publishes, which carries no BUCK or .bzl file; see
+/// `stripped_from_export`.
+const EXPORT_REPOSITORY: &str = "facebookexperimental/hermit";
+
+/// Whether `relative` is a Buck file that ShipIt strips (a BUCK or .bzl file),
+/// nothing at all is at it below `root`, and `repository` is exactly
+/// `EXPORT_REPOSITORY`. Anywhere else, or with the file present, it is false,
+/// so a checkout missing the file still fails. Each skip it allows comes out as
+/// `export_skip_line` says.
+fn export_strip_applies(root: &Path, relative: &str, repository: Option<&str>) -> bool {
+    let name = relative.rsplit('/').next().unwrap_or(relative);
+    let buck_file = name == "BUCK" || name.to_ascii_lowercase().ends_with(".bzl");
+    let absent = matches!(
+        std::fs::symlink_metadata(root.join(relative)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    );
+    buck_file && absent && repository == Some(EXPORT_REPOSITORY)
+}
+
+/// The SKIPPED line for skipping `what` because `relative` is absent on the
+/// export. The file decides what removes the skip. dh-2y5z03 V4 exports the
+/// shared Buck files, such as hermit-cli's, and deletes their skips. The
+/// open-source Buck layer under shim/ stays off the export even after V4, so
+/// its skips name dh-8zi9o4, which decides where that layer lives after the
+/// branch flip, and come out when that is resolved.
+fn export_skip_line(relative: &str, what: &str) -> String {
+    if relative.starts_with("shim/") {
+        format!(
+            "validate.rs: SKIPPED on {EXPORT_REPOSITORY}: {relative} is absent: it belongs \
+             to the open-source Buck layer, which this export does not carry; {what} needs \
+             that layer, and this skip comes out when dh-8zi9o4 (where that layer lives \
+             after the branch flip) is resolved"
+        )
+    } else {
+        format!(
+            "validate.rs: SKIPPED on {EXPORT_REPOSITORY}: {relative} is absent, because \
+             ShipIt strips it from this export; {what} is skipped until dh-2y5z03 V4 \
+             exports it and deletes this skip"
+        )
+    }
+}
+
+/// `export_strip_applies` for this process's GITHUB_REPOSITORY. When it holds,
+/// the caller skips `what` (the part that reads the file), and this prints its
+/// `export_skip_line` to stderr directly, so a test harness's output capture
+/// does not hide it.
+fn stripped_from_export(root: &Path, relative: &str, what: &str) -> bool {
+    let repository = std::env::var("GITHUB_REPOSITORY").ok();
+    let applies = export_strip_applies(root, relative, repository.as_deref());
+    if applies {
+        let _ = writeln!(std::io::stderr(), "{}", export_skip_line(relative, what));
+    }
+    applies
+}
+
 // Keep the development overlay and its staged population identical by using
 // one list for both operations. The source-identity check below refuses any
 // changed tracked file omitted from this explicit service-result fixture.
@@ -3873,7 +4009,20 @@ impl SubmoduleServiceBracket {
         // A self-test can run from an uncommitted edit while it is being developed.
         // Overlay exactly this test's production files, then commit only when that
         // changed the clone. The real child therefore still runs from a clean SHA.
-        for relative in SUBMODULE_SERVICE_FIXTURE_SOURCES {
+        // On the GitHub export, the list's Buck file is absent; that one copy is
+        // skipped, saying so (stripped_from_export), and the case still runs.
+        let sources = SUBMODULE_SERVICE_FIXTURE_SOURCES
+            .iter()
+            .copied()
+            .filter(|relative| {
+                !stripped_from_export(
+                    root,
+                    relative,
+                    "its copy into the submodule-service fixture",
+                )
+            })
+            .collect::<Vec<_>>();
+        for relative in &sources {
             exec_safe_fs::copy(root.join(relative), checkout.join(relative)).map_err(|error| {
                 format!("submodule service result: cannot copy {relative} into fixture: {error}")
             })?;
@@ -3881,7 +4030,7 @@ impl SubmoduleServiceBracket {
         submodule_checked_command(
             scratch_git()
                 .args(["add", "--"])
-                .args(SUBMODULE_SERVICE_FIXTURE_SOURCES)
+                .args(&sources)
                 .current_dir(&checkout),
             "stage the fixture sources",
         )?;

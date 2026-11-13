@@ -53,6 +53,9 @@ BUILD = os.path.join(PKG, "build")
 PATHS = ["test/syscalls/linux", "test/util", "MODULE.bazel"]
 GVISOR_URL = "https://github.com/google/gvisor"
 MANIFEST = os.path.join(BUILD, "upstream.sha256")
+# The GitHub export ShipIt publishes. It does not carry the open-source Buck
+# layer, which includes the BUCK file this script generates; see export_skips().
+EXPORT_REPOSITORY = "facebookexperimental/hermit"
 
 sys.path.insert(0, BUILD)
 import gen_build  # noqa: E402
@@ -160,7 +163,20 @@ def self_test():
             fh.write(b"// extra\n")
         problems = verify_manifest(tree, manifest)
         assert any("not in hash manifest" in p for p in problems), problems
-        print("refresh-gvisor-tests self-test: ok (clean, one-byte edit, extra file)")
+        # The export skip: a missing generated BUCK on the export alone.
+        absent = os.path.join(tmp, "absent", "BUCK")
+        assert export_skips("../BUCK", absent, EXPORT_REPOSITORY)
+        for other in (None, "", "rrnewton/hermit", "facebookexperimental/hermit-fork"):
+            assert not export_skips("../BUCK", absent, other), other
+        assert not export_skips("gen.bzl", absent, EXPORT_REPOSITORY)
+        assert not export_skips("../BUCK", victim, EXPORT_REPOSITORY)
+        line = export_skip_line(os.path.join(BUILD, "../BUCK"))
+        assert line.startswith("refresh-gvisor-tests: SKIPPED on facebookexperimental/hermit:"
+                               " third-party/gvisor-syscall-tests/BUCK is absent:"), line
+        assert "open-source Buck layer" in line and "dh-8zi9o4" in line, line
+        assert "V4" not in line, line
+        print("refresh-gvisor-tests self-test: ok (clean, one-byte edit, extra file,"
+              " export skip)")
         return 0
     finally:
         shutil.rmtree(tmp)
@@ -172,6 +188,27 @@ def dep_versions(module_text):
         if name in ("abseil-cpp", "googletest", "google_benchmark"):
             out[name] = ver
     return out
+
+
+def export_skips(name, path, repository):
+    """Whether --check skips the generated file `name` at `path`: only a BUCK
+    file, only when nothing at all is at the path, and only when `repository`
+    is exactly EXPORT_REPOSITORY. Anywhere else a missing generated file is
+    still stale. That BUCK file belongs to the open-source Buck layer, which
+    the export does not carry even after dh-2y5z03 V4 (V4 lists it among the
+    files it keeps stripped). So the skip comes out when dh-8zi9o4, which
+    decides where that layer lives after the branch flip, is resolved."""
+    return (os.path.basename(name) == "BUCK" and not os.path.lexists(path)
+            and repository == EXPORT_REPOSITORY)
+
+
+def export_skip_line(path):
+    """The SKIPPED line --check prints for the generated BUCK at `path`."""
+    return ("refresh-gvisor-tests: SKIPPED on %s: %s is absent: it belongs to the"
+            " open-source Buck layer, which this export does not carry; its"
+            " staleness check needs that layer, and this skip comes out when"
+            " dh-8zi9o4 (where that layer lives after the branch flip) is resolved"
+            % (EXPORT_REPOSITORY, os.path.relpath(os.path.normpath(path), ROOT)))
 
 
 def check():
@@ -187,6 +224,9 @@ def check():
     bad = []
     for name, text in files.items():
         p = os.path.join(BUILD, name)
+        if export_skips(name, p, os.environ.get("GITHUB_REPOSITORY")):
+            print(export_skip_line(p))
+            continue
         if not os.path.exists(p) or open(p).read() != text:
             bad.append(name)
     on_disk = {"combined_only/" + f for f in os.listdir(os.path.join(BUILD, "combined_only"))}
