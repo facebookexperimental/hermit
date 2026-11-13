@@ -295,16 +295,24 @@ impl Scheduler {
         }
         #[cfg(not(test))]
         {
-            let status =
-                std::fs::read_to_string(format!("/proc/{}/status", process.as_raw())).ok()?;
-            crate::syscalls::KernelSignalState::parse(&status).map(|state| state.shared_pending)
+            Self::shared_pending_from_status_file(process)
         }
     }
 
-    /// Reconcile `process`'s `Inactive` `ITIMER_REAL` at the committed time
-    /// `t`: re-arm it when its copy has left the shared queue, or when the
-    /// process stopped being observable (rule 6). Returns the new deadline if
-    /// it re-armed.
+    /// `process`'s shared pending set from its leader's status file
+    /// (`read_process_shared_pending`'s production read, factored out
+    /// so a test runs this exact read). The file is read as bytes: its
+    /// `Name:` line is the leader's `comm`, which need not be UTF-8,
+    /// and only the ASCII signal lines are parsed from it.
+    fn shared_pending_from_status_file(process: DetPid) -> Option<u64> {
+        let status = std::fs::read(format!("/proc/{}/status", process.as_raw())).ok()?;
+        crate::syscalls::KernelSignalState::parse_bytes(&status).map(|state| state.shared_pending)
+    }
+
+    /// Reconcile `process`'s `Inactive` `ITIMER_REAL` at the committed
+    /// time `t`: re-arm it when its copy has left the shared queue, or
+    /// when the process stopped being observable (rule 6). Returns the
+    /// new deadline if it re-armed.
     ///
     /// With an installed signal control the process's timer is the
     /// controlled one, which restarts here when its backend has acknowledged
@@ -478,6 +486,66 @@ mod tests {
 
     fn at(ns: u64) -> LogicalTime {
         LogicalTime::from_nanos(ns)
+    }
+
+    /// The production status read behind `read_process_shared_pending`
+    /// (`shared_pending_from_status_file`, not the test seam) reads a
+    /// process whose leader named itself with bytes that are not UTF-8:
+    /// the `Name:` line is then not UTF-8, and the shared pending set
+    /// must still be read from the ASCII signal lines after it.
+    #[test]
+    fn the_production_status_read_reads_a_process_whose_leader_name_is_not_utf8() {
+        // The child renames itself, then writes a byte to the pipe:
+        // the parent reads the status only after that byte, so the
+        // rename is guaranteed to have happened first. Without the
+        // handshake the parent could read the inherited ASCII name
+        // and the test would pass even with the strict UTF-8 read
+        // restored, whenever it won that race.
+        let mut fds = [0; 2];
+        // SAFETY: the array is writable and owns both descriptors.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: the child only renames itself, reports that, sets
+        // an alarm and pauses; the parent kills and reaps it.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0);
+        if child == 0 {
+            let name = b"\xff\xfeprobe\0";
+            let name_arg = name.as_ptr() as libc::c_ulong;
+            unsafe {
+                let renamed = libc::prctl(libc::PR_SET_NAME, name_arg, 0, 0, 0);
+                let report: u8 = if renamed == 0 { b'R' } else { b'F' };
+                let _ = libc::write(fds[1], &report as *const u8 as *const libc::c_void, 1);
+                if renamed != 0 {
+                    libc::_exit(5);
+                }
+                libc::alarm(20);
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        // SAFETY: this parent closes its copies around the child.
+        let mut report: u8 = 0;
+        let read = unsafe {
+            libc::close(fds[1]);
+            libc::read(fds[0], &mut report as *mut u8 as *mut libc::c_void, 1)
+        };
+        // SAFETY: the child is this test's own, killed before reaping.
+        let pending = if read == 1 && report == b'R' {
+            Scheduler::shared_pending_from_status_file(DetPid::from_raw(child))
+        } else {
+            None
+        };
+        unsafe {
+            libc::kill(child, libc::SIGKILL);
+            libc::waitpid(child, std::ptr::null_mut(), 0);
+            libc::close(fds[0]);
+        }
+        assert!(
+            read == 1 && report == b'R',
+            "the forked child failed to rename itself with PR_SET_NAME"
+        );
+        assert_eq!(pending, Some(0));
     }
 
     /// A traced scheduler with one single-threaded process 100 whose

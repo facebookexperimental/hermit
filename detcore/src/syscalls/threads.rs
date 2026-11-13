@@ -1085,27 +1085,33 @@ pub(crate) fn ignored_at_generation(ignored: KernelSigset, caught: KernelSigset)
 }
 
 impl KernelSignalState {
-    /// Parse the five signal lines of a `/proc/<pid>/task/<tid>/status` file.
-    pub(crate) fn parse(status: &str) -> Option<Self> {
+    /// Parse the five signal lines of a `/proc/<pid>/task/<tid>/status`
+    /// file, from its raw bytes. The file's `Name:` line is
+    /// the thread's `comm`, which a guest may set to bytes that are not
+    /// UTF-8 (`PR_SET_NAME` accepts any bytes); the five signal lines are
+    /// ASCII, so no line but those five is decoded here.
+    pub(crate) fn parse_bytes(status: &[u8]) -> Option<Self> {
         let mut thread_pending = None;
         let mut shared_pending = None;
         let mut state = KernelSignalState::default();
         let mut blocked = None;
         let mut ignored = None;
         let mut caught = None;
-        for line in status.lines() {
-            let Some((key, value)) = line.split_once(':') else {
+        for line in status.split(|byte| *byte == b'\n') {
+            let Some(colon) = line.iter().position(|byte| *byte == b':') else {
                 continue;
             };
+            let (key, value) = (&line[..colon], &line[colon + 1..]);
             let slot = match key {
-                "SigPnd" => &mut thread_pending,
-                "ShdPnd" => &mut shared_pending,
-                "SigBlk" => &mut blocked,
-                "SigIgn" => &mut ignored,
-                "SigCgt" => &mut caught,
+                b"SigPnd" => &mut thread_pending,
+                b"ShdPnd" => &mut shared_pending,
+                b"SigBlk" => &mut blocked,
+                b"SigIgn" => &mut ignored,
+                b"SigCgt" => &mut caught,
                 _ => continue,
             };
-            *slot = Some(KernelSigset::from_str_radix(value.trim(), 16).ok()?);
+            let value = std::str::from_utf8(value).ok()?.trim();
+            *slot = Some(KernelSigset::from_str_radix(value, 16).ok()?);
         }
         state.thread_pending = thread_pending?;
         state.shared_pending = shared_pending?;
@@ -1119,7 +1125,7 @@ impl KernelSignalState {
     /// The signal sets a backend reports for a task (`reverie::SignalSets`:
     /// `SigPnd`, `ShdPnd`, `SigBlk`, `SigIgn` and `SigCgt`, as Linux shows
     /// them in the task's status file), in this type's terms, as
-    /// [`parse`](Self::parse) builds them from that file.
+    /// [`parse_bytes`](Self::parse_bytes) builds them from that file.
     pub(crate) fn from_backend_sets(sets: &reverie::SignalSets) -> Self {
         KernelSignalState {
             pending: sets.pending | sets.shared_pending,
@@ -1422,7 +1428,7 @@ pub(crate) fn read_kernel_signal_state(pid: Pid, tid: Pid) -> Result<KernelSigna
         return Err(Errno::ENOSYS);
     }
     let status = status_files::read(pid, tid)?;
-    KernelSignalState::parse(&status).ok_or(Errno::EIO)
+    KernelSignalState::parse_bytes(&status).ok_or(Errno::EIO)
 }
 
 /// Drop thread `tid`'s open status files (`status_files`). Called when the
@@ -1461,8 +1467,8 @@ pub(crate) fn keep_status_files_open() {
 /// own binary does at startup ([`keep_status_files_open`]). Where Detcore runs
 /// inside the guest (liteinst, in-guest-trap, DBT, SaBRe), a kept file would
 /// be a descriptor in the guest's own table, visible to it and inherited by its
-/// children; there nothing enables keeping, every read is the plain
-/// `read_to_string` of the path, and the map is never created (a `BTreeMap`,
+/// children; there nothing enables keeping, every read is the plain byte
+/// read of the path, and the map is never created (a `BTreeMap`,
 /// so no hasher state either).
 mod status_files {
     use std::collections::BTreeMap;
@@ -1518,8 +1524,10 @@ mod status_files {
     }
 
     /// The whole file, read from offset 0. procfs regenerates a status file
-    /// for every read that starts at offset 0.
-    fn read_whole(file: &File) -> std::io::Result<String> {
+    /// for every read that starts at offset 0. The bytes are returned
+    /// undecoded: the `Name:` line is the thread's `comm`, which need not
+    /// be UTF-8, and only the ASCII signal lines are parsed from them.
+    fn read_whole(file: &File) -> std::io::Result<Vec<u8>> {
         let mut bytes = Vec::with_capacity(4096);
         loop {
             let filled = bytes.len();
@@ -1530,35 +1538,34 @@ mod status_files {
                 break;
             }
         }
-        String::from_utf8(bytes)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        Ok(bytes)
     }
 
-    /// Thread `tid`'s status file text. `ESRCH` when it cannot be read, as
+    /// Thread `tid`'s status file bytes. `ESRCH` when it cannot be read, as
     /// when the path could not be read before this cache.
-    pub(super) fn read(pid: Pid, tid: Pid) -> Result<String, Errno> {
+    pub(super) fn read(pid: Pid, tid: Pid) -> Result<Vec<u8>, Errno> {
         if !enabled() {
             let path = format!("/proc/{}/task/{}/status", pid.as_raw(), tid.as_raw());
-            return std::fs::read_to_string(path).map_err(|_| Errno::ESRCH);
+            return std::fs::read(path).map_err(|_| Errno::ESRCH);
         }
         let key = (pid.as_raw(), tid.as_raw());
         let kept = open().get(&key).cloned();
         if let Some(file) = kept {
-            if let Ok(text) = read_whole(&file)
-                && !text.is_empty()
+            if let Ok(bytes) = read_whole(&file)
+                && !bytes.is_empty()
             {
-                return Ok(text);
+                return Ok(bytes);
             }
             open().remove(&key);
         }
         let path = format!("/proc/{}/task/{}/status", key.0, key.1);
         let file = File::open(path).map_err(|_| Errno::ESRCH)?;
-        let text = read_whole(&file).map_err(|_| Errno::ESRCH)?;
+        let bytes = read_whole(&file).map_err(|_| Errno::ESRCH)?;
         let mut files = open();
         if files.len() < CAPACITY {
             files.insert(key, Arc::new(file));
         }
-        Ok(text)
+        Ok(bytes)
     }
 
     /// Drop every kept file of thread `tid`.
@@ -1590,7 +1597,7 @@ mod status_files {
 
     /// `read_whole`, for tests.
     #[cfg(test)]
-    pub(super) fn read_kept(file: &File) -> std::io::Result<String> {
+    pub(super) fn read_kept(file: &File) -> std::io::Result<Vec<u8>> {
         read_whole(file)
     }
 }
@@ -8201,6 +8208,65 @@ mod tests {
         .unwrap();
     }
 
+    /// A thread may name itself with bytes that are not UTF-8
+    /// (`PR_SET_NAME` accepts any bytes): the `Name:` line of its status
+    /// then is not UTF-8, but its signal state must still be read, both
+    /// through the path read used before files are kept and through a
+    /// kept file read afresh.
+    #[test]
+    fn a_thread_with_a_non_utf8_name_still_has_a_readable_signal_state() {
+        std::thread::spawn(|| {
+            // SAFETY: names only this spawned thread, with a
+            // NUL-terminated byte string that outlives the call.
+            let name = b"\xff\xfeprobe\0";
+            let name_arg = name.as_ptr() as libc::c_ulong;
+            let named = unsafe { libc::prctl(libc::PR_SET_NAME, name_arg, 0, 0, 0) };
+            assert_eq!(named, 0);
+            let pid = Pid::from_raw(unsafe { libc::getpid() });
+            let tid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
+            // The path read, before keeping is enabled for this thread.
+            assert!(read_kernel_signal_state(pid, tid).is_ok());
+            status_files::enable();
+            // A fresh kept file, then the kept file read again.
+            assert!(read_kernel_signal_state(pid, tid).is_ok());
+            assert!(status_files::keeps(pid, tid));
+            assert!(read_kernel_signal_state(pid, tid).is_ok());
+            forget_thread_status(tid);
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// `real_uid` of a thread that named itself with non-UTF-8 bytes:
+    /// the `Uid:` line after the non-UTF-8 `Name:` line still reads.
+    #[test]
+    fn a_thread_with_a_non_utf8_name_still_has_a_readable_uid() {
+        std::thread::spawn(|| {
+            // SAFETY: names only this spawned thread, as in
+            // `a_thread_with_a_non_utf8_name_still_has_a_readable_signal_state`.
+            let name = b"\xff\xfeprobe\0";
+            let name_arg = name.as_ptr() as libc::c_ulong;
+            let named = unsafe { libc::prctl(libc::PR_SET_NAME, name_arg, 0, 0, 0) };
+            assert_eq!(named, 0);
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+            let own = unsafe { libc::getuid() };
+            assert_eq!(real_uid(tid), Some(own));
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// The uid byte parser: a non-UTF-8 name is skipped, and a missing
+    /// or malformed `Uid:` line gives no uid.
+    #[test]
+    fn uid_from_status_bytes_reads_only_the_uid_line() {
+        let status: &[u8] = b"Name:\t\xff\xfeprobe\nUid:\t1000\t1000\t1000\t1000\n";
+        assert_eq!(uid_from_status_bytes(status), Some(1000));
+        assert_eq!(uid_from_status_bytes(b"Name:\tguest\n"), None);
+        let malformed: &[u8] = b"Name:\t\xff\xfeprobe\nUid:\trecent\n";
+        assert_eq!(uid_from_status_bytes(malformed), None);
+    }
+
     /// Until keeping is enabled, which only Hermit's own process does, a read
     /// keeps no file: no descriptor of this process names the thread's status
     /// file afterwards. Detcore linked into a guest is in this state, so its
@@ -8250,10 +8316,18 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let error = loop {
             match status_files::read_kept(&kept) {
-                Ok(text) => {
+                Ok(bytes) => {
                     let own = format!("\nPid:\t{}\n", tid.as_raw());
-                    assert!(text.contains(&own), "{text}");
-                    assert!(std::time::Instant::now() < deadline, "{text}");
+                    assert!(
+                        bytes
+                            .windows(own.len())
+                            .any(|window| window == own.as_bytes()),
+                        "kept file no longer shows its own thread"
+                    );
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "thread still listed 5 s after it was joined"
+                    );
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 Err(error) => break error,
@@ -8743,7 +8817,7 @@ mod tests {
                       ShdPnd:\t0000000000000400\nSigBlk:\t0000000000000800\n\
                       SigIgn:\t0000000000001000\nSigCgt:\t0000000000000400\n";
         assert_eq!(
-            KernelSignalState::parse(status),
+            KernelSignalState::parse_bytes(status.as_bytes()),
             Some(KernelSignalState {
                 pending: bits(&[libc::SIGUSR1, libc::SIGSEGV]),
                 thread_pending: bits(&[libc::SIGUSR1]),
@@ -8755,14 +8829,35 @@ mod tests {
         );
         // Every line is required: a missing one is not an empty set.
         assert_eq!(
-            KernelSignalState::parse("SigPnd:\t0\nShdPnd:\t0\nSigBlk:\t0\nSigIgn:\t0\n"),
+            KernelSignalState::parse_bytes(b"SigPnd:\t0\nShdPnd:\t0\nSigBlk:\t0\nSigIgn:\t0\n"),
             None
         );
         assert_eq!(
-            KernelSignalState::parse(
-                "SigPnd:\tzz\nShdPnd:\t0\nSigBlk:\t0\nSigIgn:\t0\nSigCgt:\t0\n"
+            KernelSignalState::parse_bytes(
+                b"SigPnd:\tzz\nShdPnd:\t0\nSigBlk:\t0\nSigIgn:\t0\nSigCgt:\t0\n"
             ),
             None
+        );
+    }
+
+    /// The status of a thread whose name is not UTF-8: `Name:` carries the
+    /// raw `comm` bytes, and the ASCII signal lines after it still parse.
+    #[test]
+    fn kernel_signal_state_parses_a_status_whose_name_is_not_utf8() {
+        let status: &[u8] = b"Name:\t\xff\xfeprobe\nSigQ:\t1/1024\n\
+                              SigPnd:\t0000000000000200\nShdPnd:\t0000000000000400\n\
+                              SigBlk:\t0000000000000800\nSigIgn:\t0000000000001000\n\
+                              SigCgt:\t0000000000000400\n";
+        assert_eq!(
+            KernelSignalState::parse_bytes(status),
+            Some(KernelSignalState {
+                pending: bits(&[libc::SIGUSR1, libc::SIGSEGV]),
+                thread_pending: bits(&[libc::SIGUSR1]),
+                shared_pending: bits(&[libc::SIGSEGV]),
+                blocked: bits(&[libc::SIGUSR2]),
+                ignored: bits(&[libc::SIGPIPE]),
+                caught: bits(&[libc::SIGSEGV]),
+            })
         );
     }
 
@@ -10035,16 +10130,30 @@ mod tests {
     }
 }
 
-/// The real uid of thread `tid`, from `/proc/<tid>/status`.
+/// The real uid of thread `tid`, from `/proc/<tid>/status`. The file is
+/// read as bytes: its `Name:` line is the thread's `comm`, which need
+/// not be UTF-8, and only the ASCII `Uid:` field is decoded.
 pub(crate) fn real_uid(tid: i32) -> Option<u32> {
-    let status = std::fs::read_to_string(format!("/proc/{tid}/status")).ok()?;
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix("Uid:"))?
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()
+    let status = std::fs::read(format!("/proc/{tid}/status")).ok()?;
+    uid_from_status_bytes(&status)
+}
+
+/// The first (real) uid of a status file's `Uid:` line, from its raw
+/// bytes; `None` when the line is missing or its value is not a decimal
+/// uid.
+fn uid_from_status_bytes(status: &[u8]) -> Option<u32> {
+    for line in status.split(|byte| *byte == b'\n') {
+        let Some(value) = line.strip_prefix(b"Uid:") else {
+            continue;
+        };
+        let value = std::str::from_utf8(value).ok()?.trim_start();
+        return value
+            .split(|byte: char| byte.is_whitespace())
+            .next()?
+            .parse()
+            .ok();
+    }
+    None
 }
 
 /// The sizes of the three versions of `struct clone_args`
