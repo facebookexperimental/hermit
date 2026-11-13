@@ -1,4 +1,0 @@
-# @lint-ignore-every AUTODEPS2
-# These benchmark drivers are not part of the fbsource Buck graph.
-
-oncall("hermit")
