@@ -32,7 +32,8 @@ jobs:
     steps:
       - name: Skip the Buck build on the facebookexperimental mirror
         if: github.repository == 'facebookexperimental/hermit'
-        run: echo "SKIPPED on the facebookexperimental mirror: the Buck graph is not exported until dh-2y5z03 V4"
+        run: |
+          echo "SKIPPED on the facebookexperimental mirror: the Buck graph is not exported until dh-2y5z03 V4"
 
       - name: Check out Hermit and its pinned sources
         if: github.repository != 'facebookexperimental/hermit'
@@ -344,7 +345,8 @@ jobs:
     steps:
       - name: Skip the Buck build on the facebookexperimental mirror
         if: github.repository == 'facebookexperimental/hermit'
-        run: echo "SKIPPED on the facebookexperimental mirror: the Buck graph is not exported until dh-2y5z03 V4"
+        run: |
+          echo "SKIPPED on the facebookexperimental mirror: the Buck graph is not exported until dh-2y5z03 V4"
 
       - name: Check out Hermit and its pinned sources
         if: github.repository != 'facebookexperimental/hermit'

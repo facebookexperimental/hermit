@@ -1,11 +1,15 @@
 #!/usr/bin/env -S rust-script --force
-/*
- * Copyright (c) Meta Platforms, Inc. and affiliates.
- * All rights reserved.
- *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree.
- */
+//! Copyright (c) Meta Platforms, Inc. and affiliates.
+//! All rights reserved.
+//!
+//! This source code is licensed under the BSD-style license found in the
+//! LICENSE file in the root directory of this source tree.
+//!
+//! ```cargo
+//! [dependencies]
+//! serde_yaml = "0.9"
+//! ```
+//!
 //! Enforce the repository's GitHub Actions trigger policy.
 //!
 //! Local exact-head validation is the landing authority. The portable workflow
@@ -19,6 +23,11 @@
 //! dispatchable. This checker deliberately accepts only the small YAML shape
 //! used here. An unfamiliar or ambiguous trigger block is an error, never a
 //! silent pass.
+//!
+//! Every workflow file must also parse as YAML. The checks below read lines,
+//! and only the shapes they police, so a file GitHub cannot load passed them:
+//! GitHub then starts none of its jobs. buck2-oss-nightly.yml was such a file
+//! on 2026-11-12 (a plain scalar containing ": ").
 
 #[path = "lib/rust_script_prelude.rs"]
 mod rust_script_prelude;
@@ -1365,6 +1374,15 @@ fn validate_buck2_nightly_contract(source: &str) -> Vec<String> {
     errors
 }
 
+/// Why GitHub would refuse to load `source`, if it would. GitHub reads a
+/// workflow only if it is valid YAML; one that is not starts no job, so none of
+/// the line-oriented checks in this file would see anything wrong with it.
+fn yaml_parse_error(source: &str) -> Option<String> {
+    serde_yaml::from_str::<serde_yaml::Value>(source)
+        .err()
+        .map(|error| format!("is not valid YAML, so GitHub would start none of its jobs: {error}"))
+}
+
 fn workflow_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let entries =
         fs::read_dir(dir).map_err(|error| format!("cannot read {}: {error}", dir.display()))?;
@@ -1404,6 +1422,9 @@ fn run(dir: &Path) -> Result<usize, Vec<String>> {
                 continue;
             }
         };
+        if let Some(error) = yaml_parse_error(&source) {
+            errors.push(format!("{}: {error}", path.display()));
+        }
         match parse_triggers(&source) {
             Ok(triggers) => {
                 errors.extend(
@@ -1467,6 +1488,63 @@ mod tests {
 
     fn parsed(source: &str) -> Triggers {
         parse_triggers(source).expect("fixture should parse")
+    }
+
+    /// D131563454's skip step, reduced: `run: echo "...: ..."` is a plain
+    /// scalar, and a plain scalar may not contain ": ". GitHub refused the
+    /// whole file ("You have an error in your yaml syntax on line 35").
+    const UNQUOTED_COLON_STEP: &str = "on:\n  workflow_dispatch:\njobs:\n  a:\n    runs-on: ubuntu-24.04\n    steps:\n      - name: say\n        run: echo \"SKIPPED on the mirror: not exported\"\n";
+
+    #[test]
+    fn a_workflow_that_is_not_yaml_is_refused() {
+        let error = yaml_parse_error(UNQUOTED_COLON_STEP)
+            .expect("a plain scalar containing \": \" must not parse");
+        assert!(error.contains("is not valid YAML"), "{error}");
+        // The same step as a block scalar is valid, so the check is about the
+        // syntax and not about the text.
+        let block = UNQUOTED_COLON_STEP.replace("run: echo", "run: |\n          echo");
+        assert_eq!(yaml_parse_error(&block), None);
+    }
+
+    #[test]
+    fn run_reports_a_workflow_that_is_not_yaml() {
+        let dir = std::env::temp_dir().join(format!(
+            "check-github-actions-triggers-yaml-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(PORTABLE),
+            include_str!("../.github/workflows/ci-portable.yml"),
+        )
+        .unwrap();
+        fs::write(dir.join("broken.yml"), UNQUOTED_COLON_STEP).unwrap();
+        let result = run(&dir);
+        fs::remove_dir_all(&dir).unwrap();
+        let errors = result.expect_err("a workflow that is not YAML must fail the run");
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("broken.yml: is not valid YAML")),
+            "{errors:#?}"
+        );
+    }
+
+    #[test]
+    fn checked_in_workflows_parse_as_yaml() {
+        for (name, source) in [
+            (PORTABLE, include_str!("../.github/workflows/ci-portable.yml")),
+            (
+                VALIDATION_LEVELS,
+                include_str!("../.github/workflows/validation-levels.yml"),
+            ),
+            (
+                BUCK2_OSS_NIGHTLY,
+                include_str!("../.github/workflows/buck2-oss-nightly.yml"),
+            ),
+        ] {
+            assert_eq!(yaml_parse_error(source), None, "{name}");
+        }
     }
 
     const PORTABLE_ON: &str = "name: portable\non:\n  workflow_dispatch:\n  push:\n    branches: [integration]\n  pull_request:\n    types: [opened, synchronize, reopened, ready_for_review]\njobs:\n";
