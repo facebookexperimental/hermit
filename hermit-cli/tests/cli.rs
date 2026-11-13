@@ -10046,6 +10046,26 @@ fn main_stack_maps_guest() -> &'static Path {
     compiled_c_guest(&MAIN_STACK_MAPS_GUEST, "main_stack_maps")
 }
 
+/// The toolchain's `rustc` for building a Rust guest at run time: `$RUSTC`
+/// when the runner names one, else the `rustc` beside the `cargo` that
+/// built this test (`$CARGO`'s sibling, the same toolchain), else the
+/// `rustc` on PATH. A bare `rustc` from PATH alone fails on hosts whose
+/// PATH has none, before the case runs anything.
+fn toolchain_rustc() -> PathBuf {
+    if let Some(rustc) = std::env::var_os("RUSTC") {
+        return PathBuf::from(rustc);
+    }
+    if let Some(cargo) = std::env::var_os("CARGO")
+        && let Some(bin) = Path::new(&cargo).parent()
+    {
+        let rustc = bin.join("rustc");
+        if rustc.exists() {
+            return rustc;
+        }
+    }
+    PathBuf::from("rustc")
+}
+
 /// `hermit-cli/tests/fixtures/main_stack_bounds.rs`, built once per test
 /// process with the toolchain's `rustc`.
 fn main_stack_bounds_guest() -> &'static Path {
@@ -10053,7 +10073,7 @@ fn main_stack_bounds_guest() -> &'static Path {
         let build_root = process_build_root("main_stack_bounds");
         fs::create_dir_all(&build_root).expect("failed to create the guest's build directory");
         let guest = build_root.join("main_stack_bounds");
-        let output = Command::new("rustc")
+        let output = Command::new(toolchain_rustc())
             .args(["--edition=2024", "-C", "debuginfo=1"])
             .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/main_stack_bounds.rs"))
             .arg("-o")
