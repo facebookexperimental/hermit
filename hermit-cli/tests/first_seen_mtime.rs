@@ -83,6 +83,19 @@ fn host_mtime(path: &Path) -> Duration {
 }
 
 fn hermit_run(extra: &[&str], script: &str, args: &[&Path]) -> Output {
+    // The validate DAG sets HERMIT_E2E_EMPTY_WORKDIR=/test and provides
+    // /test; configure_guest_execution then requires --workdir=/test. In
+    // every other environment use a private tmpfs workdir under /tmp, which
+    // Hermit stages and creates: a tmpfs target outside /tmp must exist on
+    // the host, and hosts without /test refused these runs before the guest
+    // started.
+    let workdir = if std::env::var_os("HERMIT_E2E_EMPTY_WORKDIR").is_some() {
+        "/test"
+    } else {
+        "/tmp/first-seen-mtime-workdir"
+    };
+    let mount = format!("--mount=type=tmpfs,target={workdir}");
+    let workdir_arg = format!("--workdir={workdir}");
     let mut command = Command::new("timeout");
     command
         .args(["--kill-after", "5s", "90s"])
@@ -95,8 +108,8 @@ fn hermit_run(extra: &[&str], script: &str, args: &[&Path]) -> Output {
         // between the two --verify runs.
         .args([
             "--base-env=minimal",
-            "--mount=type=tmpfs,target=/test",
-            "--workdir=/test",
+            mount.as_str(),
+            workdir_arg.as_str(),
             "--",
             "/bin/sh",
             "-c",

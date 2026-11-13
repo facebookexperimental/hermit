@@ -377,8 +377,11 @@ pub fn verify_across_host_action_with(
         .arg(&report_path)
         .args([
             "--base-env=minimal",
-            "--mount=type=tmpfs,target=/test",
-            "--workdir=/test",
+            // Private tmpfs workdir under /tmp, which Hermit stages and
+            // creates: a tmpfs target outside /tmp must exist on the host,
+            // and hosts without /test refused these runs.
+            "--mount=type=tmpfs,target=/tmp/host-input-workdir",
+            "--workdir=/tmp/host-input-workdir",
             "--",
             "/bin/sh",
             "-c",
@@ -474,8 +477,11 @@ pub fn verify_ended_in_run_1(
         .arg(&report_path)
         .args([
             "--base-env=minimal",
-            "--mount=type=tmpfs,target=/test",
-            "--workdir=/test",
+            // Private tmpfs workdir under /tmp, which Hermit stages and
+            // creates: a tmpfs target outside /tmp must exist on the host,
+            // and hosts without /test refused these runs.
+            "--mount=type=tmpfs,target=/tmp/host-input-workdir",
+            "--workdir=/tmp/host-input-workdir",
             "--",
             "/bin/sh",
             "-c",
