@@ -210,6 +210,23 @@ fn validate_mount_targets(
     Ok(())
 }
 
+/// Refuse a non-image run's `--mount` and `--bind` targets by the host's
+/// paths, in this order: first a target the guest's own `/dev/mqueue`
+/// would cover ([`refuse_below_private_mqueue`], by `is_dir`), then a
+/// missing `--mount` target ([`validate_mount_targets`], by `exists`).
+/// The mqueue rule goes first because existence on the host says nothing
+/// about it: a target below the private `/dev/mqueue` is refused whether
+/// or not the host has that path.
+fn refuse_host_mount_targets(
+    mounts: &[MountArg],
+    binds: &[Bind],
+    exists: impl Fn(&Path) -> bool,
+    is_dir: impl Fn(&Path) -> bool,
+) -> Result<(), Error> {
+    refuse_below_private_mqueue(mounts, binds, is_dir)?;
+    validate_mount_targets(mounts, exists)
+}
+
 /// The first `--bind` target that `exists` reports missing, of those
 /// Hermit mounts onto as they are: the bind twin of
 /// [`missing_mount_target`]. A target inside /tmp goes to the private
@@ -5365,6 +5382,46 @@ fn a_mount_the_private_dev_mqueue_would_cover_is_refused_before_its_target_is_lo
         refused.contains("--mount target /dev/mqueue/below does not exist on this host"),
         "{refused}"
     );
+}
+
+/// A non-image run checks its mount targets against the private
+/// `/dev/mqueue` before their existence on the host, and the mqueue rule
+/// refuses a target below it whether or not that path exists on the host:
+/// an existing host path would not make mounting there safe, since the
+/// guest's own mqueue filesystem covers it. On a host without
+/// `/dev/mqueue`, a missing target is named as missing and an existing one
+/// passes.
+#[test]
+fn a_target_below_the_private_dev_mqueue_is_refused_whether_or_not_it_exists() {
+    let mounts = run_opts_for(&[
+        "hermit",
+        "run",
+        "--mount=type=tmpfs,target=/dev/mqueue/below",
+        "/bin/true",
+    ])
+    .mount;
+    let dev_mqueue = |path: &Path| path == Path::new("/dev/mqueue");
+    for target_exists in [true, false] {
+        let refused =
+            refuse_host_mount_targets(&mounts, &[], move |_: &Path| target_exists, dev_mqueue)
+                .unwrap_err()
+                .to_string();
+        assert!(
+            refused.contains(
+                "cannot mount at /dev/mqueue/below: the guest's /dev/mqueue is its own mqueue filesystem"
+            ),
+            "target exists on the host: {target_exists}: {refused}"
+        );
+    }
+    let no_dev_mqueue = |_: &Path| false;
+    let refused = refuse_host_mount_targets(&mounts, &[], |_: &Path| false, no_dev_mqueue)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        refused.contains("--mount target /dev/mqueue/below does not exist on this host"),
+        "{refused}"
+    );
+    assert!(refuse_host_mount_targets(&mounts, &[], |_: &Path| true, no_dev_mqueue).is_ok());
 }
 
 /// The below-mqueue refusal sees both flags together: a cover from
@@ -15436,7 +15493,7 @@ impl RunOpts {
         // their existence against the materialized rootfs when the
         // container is built, not against the host here.
         if self.image.is_none() {
-            validate_mount_targets(&self.mount, Path::exists)?;
+            refuse_host_mount_targets(&self.mount, &self.bind, Path::exists, Path::is_dir)?;
         }
         // `--bind` targets are guest paths on the same footing as
         // `--mount` targets. With `--image` they name paths inside the
@@ -15445,9 +15502,6 @@ impl RunOpts {
         // rootfs, and refuses what it cannot).
         for bind in &self.bind {
             refuse_bind_target_with_option(bind_paths(bind).1)?;
-        }
-        if self.image.is_none() {
-            refuse_below_private_mqueue(&self.mount, &self.bind, Path::is_dir)?;
         }
         if self.image.is_none() {
             validate_bind_targets(
